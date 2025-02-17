@@ -5,7 +5,7 @@ using Nixie;
 
 namespace Lux;
 
-public class RaftManager
+public sealed class RaftManager
 {
     internal static readonly string LocalEndpoint = GetLocalEndpointFromEnv();
 
@@ -176,7 +176,7 @@ public class RaftManager
             }
             catch (AskTimeoutException e)
             {
-                Console.WriteLine("AmILeader: {Error}", e.Message);
+                Console.WriteLine("AmILeader: {0}", e.Message);
             }
         }
 
@@ -210,7 +210,7 @@ public class RaftManager
             }
             catch (AskTimeoutException e)
             {
-                Console.WriteLine("WaitForLeader: {Error}", e.Message);
+                Console.WriteLine("WaitForLeader: {0}", e.Message);
             }
         }
 

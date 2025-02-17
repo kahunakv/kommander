@@ -7,7 +7,7 @@ using Nixie;
 
 Console.WriteLine("Hello, World!");
 
-var aas = new ActorSystem();
+ActorSystem aas = new();
 var p = new RaftManager(aas);
 
 WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
@@ -51,4 +51,4 @@ app.MapGet("/v1/raft/get-leader/{partitionId}", async (int partitionId, HttpRequ
   
 app.MapGet("/", () => "Lux Raft Node");
 
-app.Run("http://*:8004");  
+app.Run("http://*:8004");
