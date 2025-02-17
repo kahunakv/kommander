@@ -1,5 +1,5 @@
 ﻿
-namespace Lux;
+namespace Lux.Data;
 
 public readonly struct RaftRequest
 {

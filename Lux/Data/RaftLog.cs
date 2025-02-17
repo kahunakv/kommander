@@ -1,7 +1,7 @@
 ﻿
 //using MessagePack;
 
-namespace Lux;
+namespace Lux.Data;
 
 //[MessagePackObject]
 public sealed class RaftLog

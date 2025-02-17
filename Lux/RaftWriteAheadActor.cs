@@ -4,6 +4,7 @@ using Flurl.Http;
 
 using Nixie;
 using System.Text.Json;
+using Lux.Data;
 
 namespace Lux;
 
@@ -73,7 +74,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         }
         catch (Exception ex)
         {
-            //logger.LogError("[{LocalEndpoint}/{PartitionId}] {Message}\n{StackTrace}", RaftManager.LocalEndpoint, partition.PartitionId, ex.Message, ex.StackTrace);
+            Console.WriteLine("[{0}/{1}] {2}\n{3}", RaftManager.LocalEndpoint, partition.PartitionId, ex.Message, ex.StackTrace);
         }
 
         return new();
