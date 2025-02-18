@@ -1,4 +1,4 @@
-# Lux (Raft Consensus)
+# 🔱 Lux (Raft Consensus)
 
 Lux is an open-source, distributed consensus library implemented in C# for the .NET platform. It leverages the Raft algorithm to provide a robust and reliable mechanism for leader election, log replication, and data consistency across clusters. Lux is designed to be flexible and resilient, supporting multiple discovery mechanisms and communication protocols to suit various distributed system architectures.
 

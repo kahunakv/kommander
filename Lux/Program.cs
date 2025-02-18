@@ -1,14 +1,23 @@
 ﻿// See https://aka.ms/new-console-template for more information
 
 using Lux;
+using Lux.Data;
 using Lux.Services;
 using Microsoft.Extensions.Primitives;
 using Nixie;
 
-Console.WriteLine("Hello, World!");
+string[] arguments = Environment.GetCommandLineArgs();
+
+RaftConfiguration config = new()
+{
+    Host = arguments[1],
+    Port = int.Parse(arguments[2])
+};
+
+Console.WriteLine("Hello, World! {0} {1}", config.Host, config.Port);
 
 ActorSystem aas = new();
-var p = new RaftManager(aas);
+var p = new RaftManager(aas, config);
 
 WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 
@@ -25,20 +34,25 @@ app.MapPost("/v1/raft/append-logs", async (HttpRequest request) =>
     return Results.Ok(header.ToString());
 });
 
-app.MapPost("/v1/raft/request-vote", async (HttpRequest request) =>
+app.MapPost("/v1/raft/request-vote", async (RequestVotesRequest request, HttpRequest httpRequest, RaftManager raft) =>
 {
     await Task.CompletedTask;
     
-    StringValues header = request.Headers["X-Idempotent-Key"];    
-    return Results.Ok(header.ToString());
+    raft.RequestVote(request);
+
+    return new RequestVotesResponse();
 });
 
-app.MapPost("/v1/raft/vote", async (HttpRequest request) =>
+app.MapPost("/v1/raft/vote", async (VoteRequest request, HttpRequest httpRequest, RaftManager raft) =>
 {
     await Task.CompletedTask;
     
-    StringValues header = request.Headers["X-Idempotent-Key"];    
-    return Results.Ok(header.ToString());
+    raft.Vote(request);
+    
+    //StringValues header = request.Headers["X-Idempotent-Key"];    
+    //return Results.Ok(header.ToString());
+
+    return new VoteResponse();
 });
 
 app.MapGet("/v1/raft/get-leader/{partitionId}", async (int partitionId, HttpRequest request) =>
@@ -51,4 +65,4 @@ app.MapGet("/v1/raft/get-leader/{partitionId}", async (int partitionId, HttpRequ
   
 app.MapGet("/", () => "Lux Raft Node");
 
-app.Run("http://*:8004");
+app.Run("http://*:" + config.Port);

@@ -13,9 +13,9 @@ internal sealed class ClusterHandler
         this.manager = manager;
     }
 
-    public async Task JoinCluster()
+    public async Task JoinCluster(RaftConfiguration configuration)
     {
-        await d.Register();
+        await d.Register(configuration);
     }
 
     public async Task UpdateNodes()

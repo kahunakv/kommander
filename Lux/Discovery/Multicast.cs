@@ -2,8 +2,17 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace Lux.Discovery;
+
+public sealed class MulticastDiscoveryPayload
+{
+    public string? Host { get; set; }
+    
+    public int Port { get; set; }
+}
 
 public class Multicast : IDiscovery
 {
@@ -13,7 +22,7 @@ public class Multicast : IDiscovery
 
     private readonly Dictionary<string, bool> nodes = new();
 
-    private async Task StartBroadcasting()
+    private async Task StartBroadcasting(RaftConfiguration configuration)
     {
         using UdpClient udpClient = new();
         
@@ -22,14 +31,20 @@ public class Multicast : IDiscovery
 
         IPEndPoint multicastEndpoint = new(MulticastAddress, Port);
 
-        Console.WriteLine("Starting broadcaster...");
+        Console.WriteLine("Starting broadcaster... {0} {1}", configuration.Host, configuration.Port);
+
+        MulticastDiscoveryPayload payload = new()
+        {
+            Host = configuration.Host,
+            Port = configuration.Port
+        };
+        
+        // Construct your discovery message.
+        string message = JsonSerializer.Serialize(payload); //$"Hello from node {Environment.MachineName} at {DateTime.Now}";
+        byte[] data = Encoding.UTF8.GetBytes(message);
 
         while (true)
         {
-            // Construct your discovery message.
-            string message = $"Hello from node {Environment.MachineName} at {DateTime.Now}";
-            byte[] data = Encoding.UTF8.GetBytes(message);
-
             // Send the multicast message.
             await udpClient.SendAsync(data, data.Length, multicastEndpoint);
             Console.WriteLine($"Sent: {message}");
@@ -39,7 +54,7 @@ public class Multicast : IDiscovery
         }
     }
 
-    private async Task StartListening()
+    private async Task StartListening(RaftConfiguration configuration)
     {
         using UdpClient udpClient = new();
         
@@ -58,21 +73,28 @@ public class Multicast : IDiscovery
         while (true)
         {
             UdpReceiveResult result = await udpClient.ReceiveAsync();
-            string receivedMessage = Encoding.UTF8.GetString(result.Buffer);
+            string payloadMessage = Encoding.UTF8.GetString(result.Buffer);
+
+            MulticastDiscoveryPayload? payload = JsonSerializer.Deserialize<MulticastDiscoveryPayload>(payloadMessage);
+            if (payload == null)
+                continue;
 
             string host = result.RemoteEndPoint.Address.ToString();
             
-            Console.WriteLine($"Received from {host}: {receivedMessage}");
+            Console.WriteLine($"Received from {host}: {payloadMessage}");
 
-            nodes[host + ":8004"] = true;
+            if (configuration.Host == payload.Host && configuration.Port == payload.Port)
+                continue;
+            
+            nodes[payload.Host + ":" + payload.Port] = true;
         }
     }
 
-    public async Task Register()
+    public async Task Register(RaftConfiguration configuration)
     {
         _ = Task.WhenAll(
-            StartBroadcasting(),
-            StartListening()
+            StartBroadcasting(configuration),
+            StartListening(configuration)
         );
 
         await Task.CompletedTask;

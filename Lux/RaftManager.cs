@@ -7,11 +7,13 @@ namespace Lux;
 
 public sealed class RaftManager
 {
-    internal static readonly string LocalEndpoint = GetLocalEndpointFromEnv();
+    internal readonly string LocalEndpoint;
 
     private static string? localEndpoint;
 
     private readonly ActorSystem actorSystem;
+
+    private RaftConfiguration configuration;
 
     private readonly RaftPartition[] partitions = new RaftPartition[MaxPartitions];
 
@@ -31,9 +33,11 @@ public sealed class RaftManager
 
     public event Func<string, Task<bool>>? OnReplicationReceived;
     
-    public RaftManager(ActorSystem actorSystem)
+    public RaftManager(ActorSystem actorSystem, RaftConfiguration configuration)
     {
         this.actorSystem = actorSystem;
+        this.configuration = configuration;
+        this.LocalEndpoint = configuration.Host + ":" + configuration.Port;
 
         Cluster = new(this);
     }
@@ -46,7 +50,7 @@ public sealed class RaftManager
                 partitions[i] = new(actorSystem, this, i);
         }
 
-        await Cluster.JoinCluster();
+        await Cluster.JoinCluster(configuration);
     }
 
     public async Task UpdateNodes()

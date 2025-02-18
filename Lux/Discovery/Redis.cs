@@ -5,7 +5,7 @@ public class Redis : IDiscovery
 {
     private const string ClusterFormationKey = "raft-matchmaker-cluster";
     
-    public Task Register()
+    public Task Register(RaftConfiguration configuration)
     {
         //RedisConnection connection = await GetConnection();
         //await connection.BasicRetry(async database => await database.HashSetAsync(ClusterFormationKey, RaftManager.LocalEndpoint, RaftManager.GetCurrentTime()));

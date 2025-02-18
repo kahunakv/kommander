@@ -52,7 +52,7 @@ public sealed class RaftPartition
 
     public async ValueTask<NodeState> GetState()
     {
-        if (!string.IsNullOrEmpty(Leader) && Leader == RaftManager.LocalEndpoint)
+        if (!string.IsNullOrEmpty(Leader) && Leader == raftManager.LocalEndpoint)
             return NodeState.Leader;
 
         RaftResponse response = await raftActor.Ask(raftStateRequest, TimeSpan.FromSeconds(5));

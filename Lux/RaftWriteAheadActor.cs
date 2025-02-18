@@ -74,7 +74,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         }
         catch (Exception ex)
         {
-            Console.WriteLine("[{0}/{1}] {2}\n{3}", RaftManager.LocalEndpoint, partition.PartitionId, ex.Message, ex.StackTrace);
+            Console.WriteLine("[{0}/{1}] {2}\n{3}", manager.LocalEndpoint, partition.PartitionId, ex.Message, ex.StackTrace);
         }
 
         return new();
@@ -82,7 +82,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
     private async ValueTask Ping(long term)
     {
-        AppendLogsRequest request = new(partition.PartitionId, term, RaftManager.LocalEndpoint);
+        AppendLogsRequest request = new(partition.PartitionId, term, manager.LocalEndpoint);
 
         string payload = JsonSerializer.Serialize(request); // , RaftJsonContext.Default.AppendLogsRequest
 
