@@ -24,69 +24,92 @@ public class Multicast : IDiscovery
 
     private async Task StartBroadcasting(RaftConfiguration configuration)
     {
-        using UdpClient udpClient = new();
-        
-        // Allow multicast loopback so the sender can receive its own messages if needed.
-        udpClient.MulticastLoopback = true;
-
-        IPEndPoint multicastEndpoint = new(MulticastAddress, Port);
-
-        Console.WriteLine("Starting broadcaster... {0} {1}", configuration.Host, configuration.Port);
-
-        MulticastDiscoveryPayload payload = new()
+        try
         {
-            Host = configuration.Host,
-            Port = configuration.Port
-        };
-        
-        // Construct your discovery message.
-        string message = JsonSerializer.Serialize(payload); //$"Hello from node {Environment.MachineName} at {DateTime.Now}";
-        byte[] data = Encoding.UTF8.GetBytes(message);
+            using UdpClient udpClient = new();
+            
+            // Allow multicast loopback so the sender can receive its own messages if needed.
+            udpClient.MulticastLoopback = true;
 
-        while (true)
+            IPEndPoint multicastEndpoint = new(MulticastAddress, Port);
+
+            Console.WriteLine("Starting broadcaster... {0} {1}", configuration.Host, configuration.Port);
+
+            MulticastDiscoveryPayload payload = new()
+            {
+                Host = configuration.Host,
+                Port = configuration.Port
+            };
+            
+            // Construct your discovery message.
+            string message = JsonSerializer.Serialize(payload); //$"Hello from node {Environment.MachineName} at {DateTime.Now}";
+            byte[] data = Encoding.UTF8.GetBytes(message);
+
+            while (true)
+            {
+                // Send the multicast message.
+                await udpClient.SendAsync(data, data.Length, multicastEndpoint);
+                Console.WriteLine($"Sent: {message}");
+
+                // Wait for a specified interval before sending the next announcement.
+                await Task.Delay(5000); // 5 seconds delay
+            }
+        }
+        catch (Exception ex)
         {
-            // Send the multicast message.
-            await udpClient.SendAsync(data, data.Length, multicastEndpoint);
-            Console.WriteLine($"Sent: {message}");
-
-            // Wait for a specified interval before sending the next announcement.
-            await Task.Delay(5000); // 5 seconds delay
+            Console.WriteLine("StartListening: {0}", ex.Message);
         }
     }
 
     private async Task StartListening(RaftConfiguration configuration)
     {
-        using UdpClient udpClient = new();
-        
-        // Allow multiple sockets to use the same port.
-        udpClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-
-        // Bind to the multicast port on any IP address.
-        IPEndPoint localEp = new(IPAddress.Any, Port);
-        udpClient.Client.Bind(localEp);
-
-        // Join the multicast group.
-        udpClient.JoinMulticastGroup(MulticastAddress);
-
-        Console.WriteLine($"Listening for multicast messages on {MulticastAddress}:{Port}...");
-
-        while (true)
+        try
         {
-            UdpReceiveResult result = await udpClient.ReceiveAsync();
-            string payloadMessage = Encoding.UTF8.GetString(result.Buffer);
+            using UdpClient udpClient = new();
 
-            MulticastDiscoveryPayload? payload = JsonSerializer.Deserialize<MulticastDiscoveryPayload>(payloadMessage);
-            if (payload == null)
-                continue;
+            // Allow multiple sockets to use the same port.
+            udpClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
 
-            string host = result.RemoteEndPoint.Address.ToString();
-            
-            Console.WriteLine($"Received from {host}: {payloadMessage}");
+            // Bind to the multicast port on any IP address.
+            IPEndPoint localEp = new(IPAddress.Any, Port);
+            udpClient.Client.Bind(localEp);
 
-            if (configuration.Host == payload.Host && configuration.Port == payload.Port)
-                continue;
-            
-            nodes[payload.Host + ":" + payload.Port] = true;
+            // Join the multicast group.
+            udpClient.JoinMulticastGroup(MulticastAddress);
+
+            Console.WriteLine($"Listening for multicast messages on {MulticastAddress}:{Port}...");
+
+            while (true)
+            {
+                UdpReceiveResult result = await udpClient.ReceiveAsync();
+                string payloadMessage = Encoding.UTF8.GetString(result.Buffer);
+
+                string host = result.RemoteEndPoint.Address.ToString();
+
+                MulticastDiscoveryPayload? payload =
+                    JsonSerializer.Deserialize<MulticastDiscoveryPayload>(payloadMessage);
+                if (payload == null)
+                {
+                    Console.WriteLine($"Received invalid message from {host}");
+                    continue;
+                }
+
+                Console.WriteLine($"Received from {host}: {payloadMessage}");
+
+                if (configuration.Host == payload.Host && configuration.Port == payload.Port)
+                {
+                    Console.WriteLine($"Received message from self: {host}");
+                    continue;
+                }
+
+                nodes[payload.Host + ":" + payload.Port] = true;
+
+                Console.WriteLine($"Updated node {payload.Host}:{payload.Port}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("StartListening: {0}", ex.Message);
         }
     }
 

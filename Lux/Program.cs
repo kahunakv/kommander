@@ -1,5 +1,4 @@
-﻿// See https://aka.ms/new-console-template for more information
-
+﻿
 using Lux;
 using Lux.Data;
 using Lux.Services;
@@ -14,10 +13,10 @@ RaftConfiguration config = new()
     Port = int.Parse(arguments[2])
 };
 
-Console.WriteLine("Hello, World! {0} {1}", config.Host, config.Port);
+Console.WriteLine("LUX! {0} {1}", config.Host, config.Port);
 
 ActorSystem aas = new();
-var p = new RaftManager(aas, config);
+RaftManager p = new(aas, config);
 
 WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 
@@ -49,9 +48,6 @@ app.MapPost("/v1/raft/vote", async (VoteRequest request, HttpRequest httpRequest
     
     raft.Vote(request);
     
-    //StringValues header = request.Headers["X-Idempotent-Key"];    
-    //return Results.Ok(header.ToString());
-
     return new VoteResponse();
 });
 
