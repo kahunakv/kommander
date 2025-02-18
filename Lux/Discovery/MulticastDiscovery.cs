@@ -14,7 +14,7 @@ public sealed class MulticastDiscoveryPayload
     public int Port { get; set; }
 }
 
-public class Multicast : IDiscovery
+public class MulticastDiscovery : IDiscovery
 {
     private static readonly IPAddress MulticastAddress = IPAddress.Parse("239.0.0.222");
     
@@ -70,12 +70,14 @@ public class Multicast : IDiscovery
             // Allow multiple sockets to use the same port.
             udpClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
 
+            IPAddress x = IPAddress.Parse(configuration.Host ?? "");
+
             // Bind to the multicast port on any IP address.
             IPEndPoint localEp = new(IPAddress.Any, Port);
             udpClient.Client.Bind(localEp);
 
             // Join the multicast group.
-            udpClient.JoinMulticastGroup(MulticastAddress);
+            udpClient.JoinMulticastGroup(MulticastAddress, x);
 
             Console.WriteLine($"Listening for multicast messages on {MulticastAddress}:{Port}...");
 
@@ -83,11 +85,12 @@ public class Multicast : IDiscovery
             {
                 UdpReceiveResult result = await udpClient.ReceiveAsync();
                 string payloadMessage = Encoding.UTF8.GetString(result.Buffer);
+                
+                Console.WriteLine($"Received packet {result.Buffer.Length}");
 
                 string host = result.RemoteEndPoint.Address.ToString();
 
-                MulticastDiscoveryPayload? payload =
-                    JsonSerializer.Deserialize<MulticastDiscoveryPayload>(payloadMessage);
+                MulticastDiscoveryPayload? payload = JsonSerializer.Deserialize<MulticastDiscoveryPayload>(payloadMessage);
                 if (payload == null)
                 {
                     Console.WriteLine($"Received invalid message from {host}");
@@ -102,7 +105,7 @@ public class Multicast : IDiscovery
                     continue;
                 }
 
-                nodes[payload.Host + ":" + payload.Port] = true;
+                nodes[string.Concat(payload.Host, ":", payload.Port)] = true;
 
                 Console.WriteLine($"Updated node {payload.Host}:{payload.Port}");
             }

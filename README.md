@@ -6,21 +6,21 @@ Lux is an open-source, distributed consensus library implemented in C# for the .
 
 ## Features
 
-- **Raft Consensus Algorithm:**  
+- **Raft Consensus Algorithm:**
   Implemented using the Raft algorithm to handle leader election, log replication, and fault tolerance.
 
-- **Distributed Cluster Discovery:**  
+- **Distributed Cluster Discovery:**
   Discover other nodes in the cluster using either:
   - **Registries:** Centralized or decentralized service registries.
   - **Multicast Discovery:** Automatic node discovery via multicast messages.
 
-- **Persistent Log Replication:**  
+- **Persistent Log Replication:**
   Each node persists its log to disk to ensure data durability. Lux utilizes a Write-Ahead Log (WAL) internally to safeguard against data loss.
 
-- **Flexible Role Management:**  
+- **Flexible Role Management:**
   Nodes can serve as leaders and followers simultaneously across different partitions, enabling granular control over cluster responsibilities.
 
-- **Multiple Communication Protocols:**  
+- **Multiple Communication Protocols:**
   Achieve consensus and data replication over:
   - **HTTP:** For RESTful interactions and easier integration with web services.
   - **Plain TCP:** For low-latency and high-throughput scenarios.
@@ -131,8 +131,6 @@ Lux is licensed under the MIT License. See the [LICENSE](LICENSE) file for detai
 ## Community & Support
 
 - **GitHub Issues:** Report bugs or request features via our [GitHub Issues](https://github.com/your-repo/lux/issues) page.
-- **Discussion Forum:** Join our community discussions on [Discourse](https://discourse.example.com).
-- **Chat:** Connect with us on [Gitter](https://gitter.im/lux-project/community) for real-time support and collaboration.
 
 ---
 

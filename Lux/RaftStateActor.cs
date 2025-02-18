@@ -50,7 +50,6 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     {
         try
         {
-
             await RestoreWal();
 
             switch (message.Type)
@@ -155,11 +154,11 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         foreach (RaftNode node in manager.Nodes)
         {
-            Console.WriteLine("[{0}/{1}] Asked {2} for votes on Term={3}", manager.LocalEndpoint, partition.PartitionId, node.Ip, term);
+            Console.WriteLine("[{0}/{1}] Asked {2} for votes on Term={3}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, term);
 
             try
             {
-                await ("http://" + node.Ip)
+                await ("http://" + node.Endpoint)
                                 .WithOAuthBearerToken("xxx")
                                 .AppendPathSegments("v1/raft/request-vote")
                                 .WithHeader("Accept", "application/json")
@@ -239,19 +238,19 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     {
         if (state == NodeState.Leader)
         {
-            //logger.LogWarning("[{LocalEndpoint}/{PartitionId}] Received vote but already declared as leader from {Endpoint} Term={VoteTerm}. Ignoring...", RaftManager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm);
+            Console.WriteLine("[{0}/{1}] Received vote but already declared as leader from {2} Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm);
             return;
         }
 
         if (state == NodeState.Follower)
         {
-            //logger.LogWarning("[{LocalEndpoint}/{PartitionId}] Received vote but we didn't ask for it from {Endpoint} Term={VoteTerm}. Ignoring...", RaftManager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm);
+            Console.WriteLine("[{0}/{1}] Received vote but we didn't ask for it from {2} Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm);
             return;
         }
 
         if (voteTerm < term)
         {
-            //logger.LogWarning("[{LocalEndpoint}/{PartitionId}] Received vote on previous term from {Endpoint} Term={VoteTerm}. Ignoring...", RaftManager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm);
+            Console.WriteLine("[{0}/{1}] Received vote on previous term from {2} Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm);
             return;
         }
 

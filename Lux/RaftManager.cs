@@ -1,6 +1,7 @@
 
 using System.Diagnostics;
 using Lux.Data;
+using Lux.Discovery;
 using Nixie;
 
 namespace Lux;
@@ -13,7 +14,7 @@ public sealed class RaftManager
 
     private readonly ActorSystem actorSystem;
 
-    private RaftConfiguration configuration;
+    private readonly RaftConfiguration configuration;
 
     private readonly RaftPartition[] partitions = new RaftPartition[MaxPartitions];
 
@@ -23,7 +24,7 @@ public sealed class RaftManager
 
     internal List<RaftNode> Nodes { get; set; } = [];
 
-    internal ClusterHandler Cluster { get; }
+    private ClusterHandler Cluster { get; }
 
     public ActorSystem ActorSystem => actorSystem;
 
@@ -33,13 +34,13 @@ public sealed class RaftManager
 
     public event Func<string, Task<bool>>? OnReplicationReceived;
     
-    public RaftManager(ActorSystem actorSystem, RaftConfiguration configuration)
+    public RaftManager(ActorSystem actorSystem, RaftConfiguration configuration, IDiscovery discovery)
     {
         this.actorSystem = actorSystem;
         this.configuration = configuration;
-        this.LocalEndpoint = configuration.Host + ":" + configuration.Port;
+        this.LocalEndpoint = string.Concat(configuration.Host, ":", configuration.Port);
 
-        Cluster = new(this);
+        Cluster = new(this, discovery);
     }
     
     public async Task JoinCluster()
@@ -224,20 +225,6 @@ public sealed class RaftManager
     public int GetPartitionKey(string partitionKey)
     {
         return HashUtils.ConsistentHash(partitionKey, MaxPartitions);
-    }
-
-    private static string GetLocalEndpointFromEnv()
-    {
-        if (!string.IsNullOrEmpty(localEndpoint))
-            return localEndpoint;
-
-        localEndpoint = string.Concat(
-            Environment.GetEnvironmentVariable("BACKEND_POD_IP") ?? "127.0.0.1",
-            ":",
-            Environment.GetEnvironmentVariable("BACKEND_POD_PORT") ?? "8004"
-        );
-
-        return localEndpoint;
     }
 
     internal static long GetCurrentTime()

@@ -1,7 +1,7 @@
 
 namespace Lux.Discovery;
 
-public class Redis : IDiscovery
+public class RedisDiscovery : IDiscovery
 {
     private const string ClusterFormationKey = "raft-matchmaker-cluster";
     

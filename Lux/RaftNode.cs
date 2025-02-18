@@ -3,10 +3,10 @@ namespace Lux;
 
 public sealed class RaftNode
 {
-    public string Ip { get; }
+    public string Endpoint { get; }
 
-    public RaftNode(string ip)
+    public RaftNode(string endpoint)
     {
-        Ip = ip;
+        Endpoint = endpoint;
     }
 }

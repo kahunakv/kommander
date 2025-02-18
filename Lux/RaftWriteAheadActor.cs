@@ -94,6 +94,8 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         if (recovered)
             return 0;
 
+        await Task.CompletedTask;
+
         recovered = true;
         
         long currentTime = GetCurrentTime();
@@ -245,7 +247,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
     {
         try
         {
-            await ("http://" + node.Ip)
+            await ("http://" + node.Endpoint)
                     .WithOAuthBearerToken("x")
                     .AppendPathSegments("v1/raft/append-logs")
                     .WithHeader("Accept", "application/json")
