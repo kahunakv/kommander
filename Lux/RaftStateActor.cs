@@ -22,7 +22,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
     private NodeState state = NodeState.Follower;
 
-    private long term;
+    private long currentTerm;
 
     private long lastHeartbeat = -1;
 
@@ -130,12 +130,12 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         state = NodeState.Candidate;
         voteStartedAt = GetCurrentTime();
 
-        while (votes.ContainsKey(++term))
+        while (votes.ContainsKey(++currentTerm))
             continue;
 
-        SetVotes(term, 1);
+        SetVotes(currentTerm, 1);
 
-        Console.WriteLine("[{0}/{1}] Voted to become leader. Term={2}", manager.LocalEndpoint, partition.PartitionId, term);
+        Console.WriteLine("[{0}/{1}] Voted to become leader. Term={2}", manager.LocalEndpoint, partition.PartitionId, currentTerm);
 
         await RequestVotes();
     }
@@ -148,13 +148,13 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
 
-        RequestVotesRequest request = new(partition.PartitionId, term, manager.LocalEndpoint);
+        RequestVotesRequest request = new(partition.PartitionId, currentTerm, manager.LocalEndpoint);
 
         string payload = JsonSerializer.Serialize(request); // , RaftJsonContext.Default.RequestVotesRequest
 
         foreach (RaftNode node in manager.Nodes)
         {
-            Console.WriteLine("[{0}/{1}] Asked {2} for votes on Term={3}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, term);
+            Console.WriteLine("[{0}/{1}] Asked {2} for votes on Term={3}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, currentTerm);
 
             try
             {
@@ -185,7 +185,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         lastHeartbeat = GetCurrentTime();
 
-        walActor.Send(new(RaftWALActionType.Ping, term));
+        walActor.Send(new(RaftWALActionType.Ping, currentTerm));
     }
 
     private async Task Vote(string endpoint, long voteTerm)
@@ -196,13 +196,13 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
 
-        if (state != NodeState.Follower && voteTerm == term)
+        if (state != NodeState.Follower && voteTerm == currentTerm)
         {
             Console.WriteLine("[{0}/{1}] Received request to vote from {2} but we're candidate or leader on the same Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm);
             return;
         }
 
-        if (term > voteTerm)
+        if (currentTerm > voteTerm)
         {
             Console.WriteLine("[{0}/{1}] Received request to vote on previous term from {2} Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm);
             return;
@@ -248,15 +248,14 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
 
-        if (voteTerm < term)
+        if (voteTerm < currentTerm)
         {
             Console.WriteLine("[{0}/{1}] Received vote on previous term from {2} Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm);
             return;
         }
 
         int numberVotes = IncreaseVotes(voteTerm);
-
-        int quorum = Math.Max(2, (manager.Nodes.Count / 2) + 1);
+        int quorum = Math.Min(2, (manager.Nodes.Count / 2) + 1);
 
         if (numberVotes < quorum)
         {
@@ -274,24 +273,24 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
     private void AppendLogs(string endpoint, long leaderTerm, List<RaftLog>? logs)
     {
-        if (term > leaderTerm)
+        if (currentTerm > leaderTerm)
         {
-            //logger.LogWarning("[{LocalEndpoint}/{PartitionId}] Received logs from a leader {Endopoint} with old Term={LeaderTerm}. Ignoring...", RaftManager.LocalEndpoint, partition.PartitionId, endpoint, leaderTerm);
+            Console.WriteLine("[{0}/{1}] Received logs from a leader {2} with old Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, endpoint, leaderTerm);
             return;
         }
 
-        if (leaderTerm >= term)
+        if (leaderTerm >= currentTerm)
         {
             if (logs is not null)
-                walActor.Send(new(RaftWALActionType.Update, term, logs));
+                walActor.Send(new(RaftWALActionType.Update, currentTerm, logs));
 
             state = NodeState.Follower;
             lastHeartbeat = GetCurrentTime();
-            term = leaderTerm;
+            currentTerm = leaderTerm;
 
             if (partition.Leader != endpoint)
             {
-                //logger.LogInformation("[{LocalEndpoint}/{PartitionId}] Leader is now {Endpoint} LeaderTerm={LeaderTerm}", RaftManager.LocalEndpoint, partition.PartitionId, endpoint, leaderTerm);
+                Console.WriteLine("[{0}/{1}] Leader is now {2} LeaderTerm={3}", manager.LocalEndpoint, partition.PartitionId, endpoint, leaderTerm);
                 partition.Leader = endpoint;
             }
         }
@@ -305,7 +304,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         if (state != NodeState.Leader)
             return;
 
-        walActor.Send(new(RaftWALActionType.Append, term, logs));
+        walActor.Send(new(RaftWALActionType.Append, currentTerm, logs));
     }
 
     private void ReplicateCheckpoint()
@@ -313,7 +312,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         if (state != NodeState.Leader)
             return;
 
-        walActor.Send(new(RaftWALActionType.AppendCheckpoint, term));
+        walActor.Send(new(RaftWALActionType.AppendCheckpoint, currentTerm));
     }
 
     private int SetVotes(long term, int number)

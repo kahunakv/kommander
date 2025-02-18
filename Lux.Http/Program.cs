@@ -26,12 +26,13 @@ builder.Services.AddHostedService<InstrumentationService>();
 
 WebApplication app = builder.Build();
 
-app.MapPost("/v1/raft/append-logs", async (HttpRequest request) =>
+app.MapPost("/v1/raft/append-logs", async (AppendLogsRequest request, HttpRequest httpRequest, RaftManager raft) =>
 {
     await Task.CompletedTask;
     
-    StringValues header = request.Headers["X-Idempotent-Key"];    
-    return Results.Ok(header.ToString());
+    raft.AppendLogs(request);
+
+    return new AppendLogsResponse();
 });
 
 app.MapPost("/v1/raft/request-vote", async (RequestVotesRequest request, HttpRequest httpRequest, RaftManager raft) =>
