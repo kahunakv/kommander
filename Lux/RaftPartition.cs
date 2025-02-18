@@ -52,10 +52,14 @@ public sealed class RaftPartition
 
     public async ValueTask<NodeState> GetState()
     {
+        Console.WriteLine("GetState {0} {1}", Leader, raftManager.LocalEndpoint);
+        
         if (!string.IsNullOrEmpty(Leader) && Leader == raftManager.LocalEndpoint)
             return NodeState.Leader;
 
         RaftResponse response = await raftActor.Ask(raftStateRequest, TimeSpan.FromSeconds(5));
+        
+        Console.WriteLine("GetState {0} {1} {2}", Leader, raftManager.LocalEndpoint, response.Type);
 
         if (response.Type == RaftResponseType.None)
             throw new RaftException("Unknown response (2)");

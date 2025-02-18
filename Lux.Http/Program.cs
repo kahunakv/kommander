@@ -52,12 +52,12 @@ app.MapPost("/v1/raft/vote", async (VoteRequest request, HttpRequest httpRequest
     return new VoteResponse();
 });
 
-app.MapGet("/v1/raft/get-leader/{partitionId}", async (int partitionId, HttpRequest request) =>
+app.MapGet("/v1/raft/get-leader/{partitionId}", async (int partitionId, HttpRequest httpRequest, RaftManager raft) =>
 {
-    await Task.CompletedTask;
-    
-    StringValues header = request.Headers["X-Idempotent-Key"];    
-    return Results.Ok(header.ToString());
+    //StringValues header = request.Headers["X-Idempotent-Key"];    
+    //return Results.Ok(header.ToString());
+
+    return Results.Ok(await raft.WaitForLeader(partitionId));
 });
   
 app.MapGet("/", () => "Lux Raft Node");

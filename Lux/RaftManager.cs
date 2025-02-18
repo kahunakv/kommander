@@ -10,15 +10,13 @@ public sealed class RaftManager
 {
     internal readonly string LocalEndpoint;
 
-    private static string? localEndpoint;
-
     private readonly ActorSystem actorSystem;
 
     private readonly RaftConfiguration configuration;
 
     private readonly RaftPartition[] partitions = new RaftPartition[MaxPartitions];
 
-    private const int MaxPartitions = 8;
+    private const int MaxPartitions = 1;
 
     //internal ILogger<IRaft> Logger { get; }
 
@@ -151,7 +149,7 @@ public sealed class RaftManager
         }
         catch (AskTimeoutException e)
         {
-            Console.WriteLine("AmILeaderQuick: {Error}", e.Message);
+            Console.WriteLine("AmILeaderQuick: {0}", e.Message);
         }
 
         return false;
@@ -207,7 +205,7 @@ public sealed class RaftManager
 
                 if (string.IsNullOrEmpty(partition.Leader))
                 {
-                    await Task.Delay(500 + System.Random.Shared.Next(-50, 50));
+                    await Task.Delay(500 + Random.Shared.Next(-50, 50));
                     continue;
                 }
 
