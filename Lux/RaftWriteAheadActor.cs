@@ -248,6 +248,8 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             await ("http://" + node.Ip)
                     .WithOAuthBearerToken("x")
                     .AppendPathSegments("v1/raft/append-logs")
+                    .WithHeader("Accept", "application/json")
+                    .WithHeader("Content-Type", "application/json")
                     .WithTimeout(10)
                     .WithSettings(o => o.HttpVersion = "2.0")
                     .PostStringAsync(payload)
