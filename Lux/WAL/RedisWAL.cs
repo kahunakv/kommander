@@ -25,6 +25,11 @@ public sealed class RedisWAL : IWAL
 
         await Task.CompletedTask;
     }
+    
+    public async Task AppendUpdate(int partitionId, RaftLog log)
+    {
+        await Task.CompletedTask; // do nothing
+    }
 
     private async ValueTask<ulong> Recover()
     {

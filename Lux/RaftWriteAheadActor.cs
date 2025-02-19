@@ -134,10 +134,9 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         {
             log.Id = nextId++;
             log.Time = currentTime;
+            logs.Add(log.Id, log);
             
             await walAdapter.Append(partition.PartitionId, log);
-
-            logs.Add(log.Id, log);
         }
 
         List<RaftLog> requestLogs = new(8);
@@ -189,7 +188,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
             if (log.Id != nextId)
             {
-                // logger.LogWarning("[{LocalEndpoint}/{PartitionId}] Received logs from the leader with old id={Id} expecting={NextId}. Ignoring...", RaftManager.LocalEndpoint, partition.PartitionId, log.Id, nextId);
+                Console.WriteLine("[{0}/{1}] Received logs from the leader with old id={2} expecting={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, log.Id, nextId);
                 continue;
             }
 
@@ -197,13 +196,15 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
             if (log.Type == RaftLogType.Checkpoint)
             {
-                // logger.LogInformation("[{LocalEndpoint}/{PartitionId}] Setting WAL log to checkpoint", RaftManager.LocalEndpoint, partition.PartitionId);
+                Console.WriteLine("[{0}/{1}] Setting WAL log to checkpoint", manager.LocalEndpoint, partition.PartitionId);
 
                 logs.Clear();
                 continue;
             }
 
             logs.Add(log.Id, log);
+            
+            await walAdapter.AppendUpdate(partition.PartitionId, log);
 
             await manager.InvokeReplicationReceived(log.Message);
         }

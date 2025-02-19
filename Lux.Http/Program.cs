@@ -12,7 +12,8 @@ string[] arguments = Environment.GetCommandLineArgs();
 RaftConfiguration config = new()
 {
     Host = arguments[1],
-    Port = int.Parse(arguments[2])
+    Port = int.Parse(arguments[2]),
+    MaxPartitions = 3
 };
 
 Console.WriteLine("LUX! {0} {1}", config.Host, config.Port);

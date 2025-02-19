@@ -5,11 +5,11 @@ namespace Lux.WAL;
 
 public class SqliteWAL : IWAL
 {
-    private readonly Lock _lock = new();
+    private static readonly Lock _lock = new();
     
-    private SqliteConnection? connection;
+    private static SqliteConnection? connection;
     
-    private void TryOpenDatabase()
+    private static void TryOpenDatabase()
     {
         if (connection is not null)
             return;
@@ -80,23 +80,20 @@ public class SqliteWAL : IWAL
         
         TryOpenDatabase();
         
-        const string insertQuery = "INSERT INTO storage (id, partitionId, message, time) VALUES (@id, @partitionId, @message, @time);";
+        const string insertQuery = "INSERT INTO logs (id, partitionId, type, message, time) VALUES (@id, @partitionId, @message, @time);";
         
         using SqliteCommand insertCommand =  new(insertQuery, connection);
         insertCommand.Parameters.Clear();
         insertCommand.Parameters.AddWithValue("@id", log.Id);
         insertCommand.Parameters.AddWithValue("@partitionId", partitionId);
+        insertCommand.Parameters.AddWithValue("@type", log.Type);
         insertCommand.Parameters.AddWithValue("@message", log.Message);
         insertCommand.Parameters.AddWithValue("@time", log.Time);
         insertCommand.ExecuteNonQuery();
     }
     
-    public void Dispose()
+    public async Task AppendUpdate(int partitionId, RaftLog log)
     {
-        lock (_lock)
-        {
-            connection?.Dispose();
-            connection = null;
-        }
+        await Append(partitionId, log);
     }
 }

@@ -17,6 +17,11 @@ public class InstrumentationService : BackgroundService //, IDisposable
         while (true)
         {
             await raftManager.UpdateNodes();
+
+            if (await raftManager.AmILeader(0))
+            {
+                raftManager.ReplicateLogs(0, "Hello, World! " + DateTime.UtcNow);
+            }
     
             await Task.Delay(1000, stoppingToken);
         }
