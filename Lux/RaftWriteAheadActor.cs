@@ -5,6 +5,7 @@ using Flurl.Http;
 using Nixie;
 using System.Text.Json;
 using Lux.Data;
+using Lux.WAL;
 
 namespace Lux;
 
@@ -20,28 +21,30 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
     private readonly RaftPartition partition;
 
+    private readonly IWAL walAdapter;
+
     //private readonly ILogger<IRaft> logger;
 
     private bool recovered;
 
-    private ulong nextId;
+    private ulong nextId = 1;
 
     private ulong operations;
 
     private readonly SortedDictionary<ulong, RaftLog> logs = [];
-
-    private readonly List<RaftLog> requestLogs = new(8);
 
     private readonly List<ulong> modifications = [];
 
     public RaftWriteAheadActor(
         IActorContextStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse> _, 
         RaftManager manager, 
-        RaftPartition partition
+        RaftPartition partition,
+        IWAL walAdapter
     )
     {
         this.manager = manager;
         this.partition = partition;
+        this.walAdapter = walAdapter;
     }
 
     public async Task<RaftWALResponse> Receive(RaftWALRequest message)
@@ -52,13 +55,8 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
             switch (message.Type)
             {
-                case RaftWALActionType.Ping:
-                    await Ping(message.Term);
-                    break;
-
                 case RaftWALActionType.Append:
-                    await Append(message.Term, message.Logs);
-                    break;
+                    return new(await Append(message.Logs));
 
                 case RaftWALActionType.AppendCheckpoint:
                     await AppendCheckpoint(message.Term);
@@ -80,15 +78,6 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         return new();
     }
 
-    private async ValueTask Ping(long term)
-    {
-        AppendLogsRequest request = new(partition.PartitionId, term, manager.LocalEndpoint);
-
-        string payload = JsonSerializer.Serialize(request); // , RaftJsonContext.Default.AppendLogsRequest
-
-        await AppendLogsToNodes(payload);
-    }
-
     private async ValueTask<ulong> Recover()
     {
         if (recovered)
@@ -103,23 +92,11 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
         manager.InvokeRestoreStarted();
 
-        /*RedisConnection connection = await GetConnection();
-
-        RedisValue[] values = await connection.BasicRetry(async database => await database.ListRangeAsync(ClusterWalKeyPrefix + partition.PartitionId, -MaxWalLength, -1));
-
-        foreach (RedisValue value in values)
+        await foreach (RaftLog log in walAdapter.ReadLogs(partition.PartitionId))
         {
-            byte[]? data = (byte[]?)value;
-            if (data is null)
-                continue;
-
-            RaftLog? log = MessagePackSerializer.Deserialize<RaftLog>(data);
-            if (log is null)
-                continue;
-
             if (logs.ContainsKey(log.Id))
             {
-                logger.LogInformation("[{LocalEndpoint}/{PartitionId}] Log #{Id} is already in the WAL", RaftManager.LocalEndpoint, partition.PartitionId, log.Id);
+                Console.WriteLine("[{0}/{1}] Log #{2} is already in the WAL", manager.LocalEndpoint, partition.PartitionId, log.Id);
                 continue;
             }
 
@@ -136,41 +113,34 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             await manager.InvokeReplicationReceived(log.Message);
         }
 
-        if (values.Length == 0)
-            nextId = 1;
+        //if (values.Length == 0)
+        //    nextId = 1;
 
         manager.InvokeRestoreFinished();
 
-        //logger.LogInformation("[{LocalEndpoint}/{PartitionId}] WAL restored at #{NextId} in {Elapsed}ms", RaftManager.LocalEndpoint, partition.PartitionId, nextId - 1, stopWatch.GetElapsedMilliseconds());
-
-        //Sender.Tell(nextId);*/
+        Console.WriteLine("[{0}/{1}] WAL restored at #{2} in {3}ms", manager.LocalEndpoint, partition.PartitionId, nextId - 1, stopWatch.ElapsedMilliseconds);
 
         return nextId;
     }
 
-    private async Task Append(long term, List<RaftLog>? appendLogs)
+    private async Task<List<RaftLog>> Append(List<RaftLog>? appendLogs)
     {
         if (appendLogs is null)
-            return;
+            return [];
         
         long currentTime = GetCurrentTime();
-
-        /*RedisConnection connection = await GetConnection();        
 
         foreach (RaftLog log in appendLogs)
         {
             log.Id = nextId++;
             log.Time = currentTime;
-
-            byte[] command = MessagePackSerializer.Serialize(log);
-            string walKey = ClusterWalKeyPrefix + partition.PartitionId;
-
-            await connection.BasicRetry(async database => await database.ListRightPushAsync(walKey, command));
+            
+            await walAdapter.Append(partition.PartitionId, log);
 
             logs.Add(log.Id, log);
         }
 
-        requestLogs.Clear();
+        List<RaftLog> requestLogs = new(8);
 
         for (ulong i = (nextId - 8); i < nextId; i++)
         {
@@ -178,13 +148,11 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 requestLogs.Add(value);
         }
 
-        AppendLogsRequest request = new(partition.PartitionId, term, RaftManager.LocalEndpoint, requestLogs);
-        string payload = JsonSerializer.Serialize(request); // RaftJsonContext.Default.AppendLogsRequest
-        await AppendLogsToNodes(payload);*/
-
         Collect(currentTime);
 
         await Compact(currentTime);
+
+        return requestLogs;
     }
 
     private async Task AppendCheckpoint(long term)
@@ -241,44 +209,6 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         }
 
         Collect(GetCurrentTime());
-    }
-
-    private async Task AppendLogToNode(RaftNode node, string payload)
-    {
-        try
-        {
-            await ("http://" + node.Endpoint)
-                    .WithOAuthBearerToken("x")
-                    .AppendPathSegments("v1/raft/append-logs")
-                    .WithHeader("Accept", "application/json")
-                    .WithHeader("Content-Type", "application/json")
-                    .WithTimeout(10)
-                    .WithSettings(o => o.HttpVersion = "2.0")
-                    .PostStringAsync(payload)
-                    .ReceiveJson<AppendLogsResponse>();
-        }
-        catch (Exception e)
-        {
-            // logger.LogWarning("[{LocalEndpoint}/{PartitionId}] {Message}", RaftManager.LocalEndpoint, partition.PartitionId, e.Message);
-        }
-    }
-
-    private async Task AppendLogsToNodes(string payload)
-    {
-        if (manager.Nodes.Count == 0)
-        {
-            // logger.LogWarning("[{LocalEndpoint}/{PartitionId}] No other nodes availables to replicate logs", RaftManager.LocalEndpoint, partition.PartitionId);
-            return;
-        }
-
-        List<RaftNode> nodes = manager.Nodes;
-
-        List<Task> tasks = new(nodes.Count);
-
-        foreach (RaftNode node in nodes)
-            tasks.Add(AppendLogToNode(node, payload));
-
-        await Task.WhenAll(tasks);
     }
 
     private static long GetCurrentTime()

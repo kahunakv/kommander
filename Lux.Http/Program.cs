@@ -3,7 +3,8 @@ using Lux;
 using Lux.Data;
 using Lux.Discovery;
 using Lux.Services;
-using Microsoft.Extensions.Primitives;
+using Lux.WAL;
+
 using Nixie;
 
 string[] arguments = Environment.GetCommandLineArgs();
@@ -17,7 +18,13 @@ RaftConfiguration config = new()
 Console.WriteLine("LUX! {0} {1}", config.Host, config.Port);
 
 ActorSystem aas = new();
-RaftManager p = new(aas, config, new StaticDiscovery(arguments[3].Split(",").Select(x => new RaftNode(x)).ToList()));
+
+RaftManager p = new(
+    aas, 
+    config, 
+    new StaticDiscovery(arguments[3].Split(",").Select(x => new RaftNode(x)).ToList()),
+    new SqliteWAL()
+);
 
 WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 

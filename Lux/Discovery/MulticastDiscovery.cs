@@ -4,15 +4,9 @@ using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Lux.WAL.Data;
 
 namespace Lux.Discovery;
-
-public sealed class MulticastDiscoveryPayload
-{
-    public string? Host { get; set; }
-    
-    public int Port { get; set; }
-}
 
 public class MulticastDiscovery : IDiscovery
 {

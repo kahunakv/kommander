@@ -3,9 +3,8 @@ namespace Lux.Data;
 
 public enum RaftWALActionType
 {
-    Ping = 0,
-    Append = 1,
-    AppendCheckpoint = 2,
-    Recover = 3,
-    Update = 4
+    Append = 0,
+    AppendCheckpoint = 1,
+    Recover = 2,
+    Update = 3
 }

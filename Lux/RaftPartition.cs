@@ -1,7 +1,7 @@
 
 using Lux.Data;
+using Lux.WAL;
 using Nixie;
-using Microsoft.Extensions.Logging;
 
 namespace Lux;
 
@@ -17,12 +17,17 @@ public sealed class RaftPartition
 
     internal int PartitionId { get; }
 
-    public RaftPartition(ActorSystem actorSystem, RaftManager raftManager, int partitionId)
+    public RaftPartition(ActorSystem actorSystem, RaftManager raftManager, IWAL walAdapter, int partitionId)
     {
         this.raftManager = raftManager;
         PartitionId = partitionId;
 
-        raftActor = actorSystem.SpawnStruct<RaftStateActor, RaftRequest, RaftResponse>("bra-" + partitionId, raftManager, this);
+        raftActor = actorSystem.SpawnStruct<RaftStateActor, RaftRequest, RaftResponse>(
+            "bra-" + partitionId, 
+            raftManager, 
+            this,
+            walAdapter
+        );
     }
 
     public void RequestVote(RequestVotesRequest request)

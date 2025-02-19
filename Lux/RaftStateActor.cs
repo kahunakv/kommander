@@ -3,6 +3,7 @@ using Nixie;
 using System.Text.Json;
 using Flurl.Http;
 using Lux.Data;
+using Lux.WAL;
 
 namespace Lux;
 
@@ -30,14 +31,24 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
     private bool restored;
 
-    public RaftStateActor(IActorContextStruct<RaftStateActor, RaftRequest, RaftResponse> context, RaftManager manager, RaftPartition partition)
+    public RaftStateActor(
+        IActorContextStruct<RaftStateActor, RaftRequest, RaftResponse> context, 
+        RaftManager manager, 
+        RaftPartition partition,
+        IWAL walAdapter
+    )
     {
         this.manager = manager;
         this.partition = partition;
         
-        walActor = manager.ActorSystem.SpawnStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse>("bra-wal-" + partition.PartitionId, manager, partition);
+        walActor = context.ActorSystem.SpawnStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse>(
+            "bra-wal-" + partition.PartitionId, 
+            manager, 
+            partition,
+            walAdapter
+        );
 
-        manager.ActorSystem.StartPeriodicTimerStruct(
+        context.ActorSystem.StartPeriodicTimerStruct(
             context.Self,
             "check-election",
             checkLeaderRequest,
@@ -70,11 +81,11 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                     break;
 
                 case RaftRequestType.ReceiveVote:
-                    ReceivedVote(message.Endpoint ?? "", message.Term);
+                    await ReceivedVote(message.Endpoint ?? "", message.Term);
                     break;
 
                 case RaftRequestType.ReplicateLogs:
-                    ReplicateLogs(message.Log);
+                    await ReplicateLogs(message.Log);
                     break;
 
                 case RaftRequestType.ReplicateCheckpoint:
@@ -107,7 +118,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         if (state == NodeState.Leader)
         {
             if (lastHeartbeat > 0 && ((currentTime - lastHeartbeat) > 1500))
-                SendHearthbeat();
+                await SendHearthbeat();
+            
             return;
         }
 
@@ -159,14 +171,14 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             try
             {
                 await ("http://" + node.Endpoint)
-                                .WithOAuthBearerToken("xxx")
-                                .AppendPathSegments("v1/raft/request-vote")
-                                .WithHeader("Accept", "application/json")
-                                .WithHeader("Content-Type", "application/json")
-                                .WithTimeout(5)
-                                .WithSettings(o => o.HttpVersion = "2.0")
-                                .PostStringAsync(payload)
-                                .ReceiveJson<RequestVotesResponse>();
+                        .WithOAuthBearerToken("xxx")
+                        .AppendPathSegments("v1/raft/request-vote")
+                        .WithHeader("Accept", "application/json")
+                        .WithHeader("Content-Type", "application/json")
+                        .WithTimeout(5)
+                        .WithSettings(o => o.HttpVersion = "2.0")
+                        .PostStringAsync(payload)
+                        .ReceiveJson<RequestVotesResponse>();
             }
             catch (Exception e)
             {
@@ -175,7 +187,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         }
     }
 
-    private void SendHearthbeat()
+    private async Task SendHearthbeat()
     {
         if (manager.Nodes.Count == 0)
         {
@@ -185,7 +197,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         lastHeartbeat = GetCurrentTime();
 
-        walActor.Send(new(RaftWALActionType.Ping, currentTerm));
+        await Ping(currentTerm);
     }
 
     private async Task Vote(string endpoint, long voteTerm)
@@ -234,7 +246,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         }
     }
 
-    private void ReceivedVote(string endpoint, long voteTerm)
+    private async Task ReceivedVote(string endpoint, long voteTerm)
     {
         if (state == NodeState.Leader)
         {
@@ -268,7 +280,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         Console.WriteLine("[{0}/{1}] Received vote from {2} and proclamed leader Term={3} Votes={4} Quorum={5}", manager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm, numberVotes, quorum);
 
-        SendHearthbeat();
+        await SendHearthbeat();
     }
 
     private void AppendLogs(string endpoint, long leaderTerm, List<RaftLog>? logs)
@@ -296,7 +308,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         }
     }
 
-    private void ReplicateLogs(List<RaftLog>? logs)
+    private async Task ReplicateLogs(List<RaftLog>? logs)
     {
         if (logs is null)
             return;
@@ -304,7 +316,13 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         if (state != NodeState.Leader)
             return;
 
-        walActor.Send(new(RaftWALActionType.Append, currentTerm, logs));
+        RaftWALResponse response = await walActor.Ask(new(RaftWALActionType.Append, currentTerm, logs));
+        if (response.Logs is null)
+            return;
+        
+        AppendLogsRequest request = new(partition.PartitionId, currentTerm, manager.LocalEndpoint, response.Logs);
+        string payload = JsonSerializer.Serialize(request); // RaftJsonContext.Default.AppendLogsRequest
+        await AppendLogsToNodes(payload);
     }
 
     private void ReplicateCheckpoint()
@@ -329,6 +347,53 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             votes.Add(term, 1);
 
         return votes[term];
+    }
+    
+    private async ValueTask Ping(long term)
+    {
+        AppendLogsRequest request = new(partition.PartitionId, term, manager.LocalEndpoint);
+
+        string payload = JsonSerializer.Serialize(request); // , RaftJsonContext.Default.AppendLogsRequest
+
+        await AppendLogsToNodes(payload);
+    }
+    
+    private async Task AppendLogsToNodes(string payload)
+    {
+        if (manager.Nodes.Count == 0)
+        {
+            Console.WriteLine("[{0}/{1}] No other nodes availables to replicate logs", manager.LocalEndpoint, partition.PartitionId);
+            return;
+        }
+
+        List<RaftNode> nodes = manager.Nodes;
+
+        List<Task> tasks = new(nodes.Count);
+
+        foreach (RaftNode node in nodes)
+            tasks.Add(AppendLogToNode(node, payload));
+
+        await Task.WhenAll(tasks);
+    }
+    
+    private async Task AppendLogToNode(RaftNode node, string payload)
+    {
+        try
+        {
+            await ("http://" + node.Endpoint)
+                .WithOAuthBearerToken("x")
+                .AppendPathSegments("v1/raft/append-logs")
+                .WithHeader("Accept", "application/json")
+                .WithHeader("Content-Type", "application/json")
+                .WithTimeout(10)
+                .WithSettings(o => o.HttpVersion = "2.0")
+                .PostStringAsync(payload)
+                .ReceiveJson<AppendLogsResponse>();
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("[{0}/{1}] {2}", manager.LocalEndpoint, partition.PartitionId, e.Message);
+        }
     }
 
     private static long GetCurrentTime()

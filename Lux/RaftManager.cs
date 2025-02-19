@@ -2,6 +2,7 @@
 using System.Diagnostics;
 using Lux.Data;
 using Lux.Discovery;
+using Lux.WAL;
 using Nixie;
 
 namespace Lux;
@@ -13,18 +14,14 @@ public sealed class RaftManager
     private readonly ActorSystem actorSystem;
 
     private readonly RaftConfiguration configuration;
+    
+    private readonly IWAL walAdapter;
+    
+    private readonly ClusterHandler clusterHandler;
 
-    private readonly RaftPartition[] partitions = new RaftPartition[MaxPartitions];
-
-    private const int MaxPartitions = 1;
-
-    //internal ILogger<IRaft> Logger { get; }
+    private readonly RaftPartition?[] partitions;
 
     internal List<RaftNode> Nodes { get; set; } = [];
-
-    private ClusterHandler Cluster { get; }
-
-    public ActorSystem ActorSystem => actorSystem;
 
     public event Action? OnRestoreStarted;
 
@@ -32,24 +29,28 @@ public sealed class RaftManager
 
     public event Func<string, Task<bool>>? OnReplicationReceived;
     
-    public RaftManager(ActorSystem actorSystem, RaftConfiguration configuration, IDiscovery discovery)
+    public RaftManager(ActorSystem actorSystem, RaftConfiguration configuration, IDiscovery discovery, IWAL walAdapter)
     {
         this.actorSystem = actorSystem;
         this.configuration = configuration;
-        this.LocalEndpoint = string.Concat(configuration.Host, ":", configuration.Port);
+        this.walAdapter = walAdapter;
+        
+        LocalEndpoint = string.Concat(configuration.Host, ":", configuration.Port);
+        
+        partitions = new RaftPartition[configuration.MaxPartitions];
 
-        Cluster = new(this, discovery);
+        clusterHandler = new(this, discovery);
     }
     
     public async Task JoinCluster()
     {
         if (partitions[0] is null)
         {
-            for (int i = 0; i < MaxPartitions; i++)
-                partitions[i] = new(actorSystem, this, i);
+            for (int i = 0; i < configuration.MaxPartitions; i++)
+                partitions[i] = new(actorSystem, this, walAdapter, i);
         }
 
-        await Cluster.JoinCluster(configuration);
+        await clusterHandler.JoinCluster(configuration);
     }
 
     public async Task UpdateNodes()
@@ -57,18 +58,18 @@ public sealed class RaftManager
         if (partitions[0] is null)
             return;
 
-        await Cluster.UpdateNodes();
+        await clusterHandler.UpdateNodes();
     }
 
     private RaftPartition GetPartition(int partition)
     {
-        if (partitions[0] is null)
+        if (partitions[partition] is null)
             throw new RaftException("It has not yet joined the cluster.");
 
         if (partition < 0 || partition >= partitions.Length)
             throw new RaftException("Invalid partition.");
 
-        return partitions[partition];
+        return partitions[partition]!;
     }
 
     public void RequestVote(RequestVotesRequest request)
@@ -222,7 +223,7 @@ public sealed class RaftManager
     
     public int GetPartitionKey(string partitionKey)
     {
-        return HashUtils.ConsistentHash(partitionKey, MaxPartitions);
+        return HashUtils.ConsistentHash(partitionKey, configuration.MaxPartitions);
     }
 
     internal static long GetCurrentTime()
