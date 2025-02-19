@@ -7,7 +7,9 @@ public interface IWAL
 {
     public IAsyncEnumerable<RaftLog> ReadLogs(int partitionId);
 
-    Task Append(int partitionId, RaftLog log);
+    public Task Append(int partitionId, RaftLog log);
 
-    Task AppendUpdate(int partitionId, RaftLog log);
+    public Task AppendUpdate(int partitionId, RaftLog log);
+
+    public Task<bool> ExistLog(int partitionId, ulong id);
 }

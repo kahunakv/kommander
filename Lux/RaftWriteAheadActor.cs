@@ -11,10 +11,6 @@ namespace Lux;
 
 public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALResponse>
 {
-    private const string ClusterWalKeyPrefix = "raft-wal-v2-";
-
-    private const int MaxWalLength = 4096;
-
     private const int MaxLogEntries = 10000;
 
     private readonly RaftManager manager;
@@ -31,9 +27,9 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
     private ulong operations;
 
-    private readonly SortedDictionary<ulong, RaftLog> logs = [];
+    //private readonly SortedDictionary<ulong, RaftLog> logs = [];
 
-    private readonly List<ulong> modifications = [];
+    //private readonly List<ulong> modifications = [];
 
     public RaftWriteAheadActor(
         IActorContextStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse> _, 
@@ -83,38 +79,24 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         if (recovered)
             return 0;
 
-        await Task.CompletedTask;
-
         recovered = true;
         
-        long currentTime = GetCurrentTime();
         Stopwatch stopWatch = Stopwatch.StartNew();
 
         manager.InvokeRestoreStarted();
 
+        bool found = false;
+
         await foreach (RaftLog log in walAdapter.ReadLogs(partition.PartitionId))
         {
-            if (logs.ContainsKey(log.Id))
-            {
-                Console.WriteLine("[{0}/{1}] Log #{2} is already in the WAL", manager.LocalEndpoint, partition.PartitionId, log.Id);
-                continue;
-            }
-
-            if (log.Time == 0 || (log.Time > 0 && (currentTime - log.Time) > 1800))
-            {
-                nextId = log.Id + 1;
-                continue;
-            }
-
-            logs.Add(log.Id, log);
-
+            found = true;
             nextId = log.Id + 1;
 
             await manager.InvokeReplicationReceived(log.Message);
         }
 
-        //if (values.Length == 0)
-        //    nextId = 1;
+        if (!found)
+            nextId = 1;
 
         manager.InvokeRestoreFinished();
 
@@ -134,18 +116,17 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         {
             log.Id = nextId++;
             log.Time = currentTime;
-            logs.Add(log.Id, log);
             
             await walAdapter.Append(partition.PartitionId, log);
         }
 
         List<RaftLog> requestLogs = new(8);
 
-        for (ulong i = (nextId - 8); i < nextId; i++)
+        /*for (ulong i = (nextId - 8); i < nextId; i++)
         {
             if (logs.TryGetValue(i, out RaftLog? value))
                 requestLogs.Add(value);
-        }
+        }*/
 
         Collect(currentTime);
 
@@ -183,7 +164,10 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
         foreach (RaftLog log in updateLogs)
         {
-            if (logs.ContainsKey(log.Id))
+            if (await walAdapter.ExistLog(partition.PartitionId, log.Id))
+                continue;
+            
+            /*if (logs.ContainsKey(log.Id))
                 continue;
 
             if (log.Id != nextId)
@@ -202,7 +186,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 continue;
             }
 
-            logs.Add(log.Id, log);
+            logs.Add(log.Id, log);*/
             
             await walAdapter.AppendUpdate(partition.PartitionId, log);
 

@@ -26,7 +26,7 @@ public class SqliteWAL : IWAL
 
             connection.Open();
 
-            const string createTableQuery = "CREATE TABLE IF NOT EXISTS logs (id INT PRIMARY KEY, partitionId INT, type INT, message TEXT COLLATE BINARY, time INT);";
+            const string createTableQuery = "CREATE TABLE IF NOT EXISTS logs (id INT, partitionId INT, type INT, message TEXT COLLATE BINARY, time INT) PRIMARY KEY(id, partitionId);";
             using SqliteCommand command1 = new(createTableQuery, connection);
             command1.ExecuteNonQuery();
             
@@ -58,20 +58,43 @@ public class SqliteWAL : IWAL
         
         TryOpenDatabase();
         
-        const string query = "SELECT id, type, message, time FROM logs ORDER BY id ASC;";
+        const string query = "SELECT id, type, message, time FROM logs WHERE partitionId = @partitionId ORDER BY id ASC;";
         using SqliteCommand command = new(query, connection);
         using SqliteDataReader reader = command.ExecuteReader();
         
         while (reader.Read())
         {
-            yield return new RaftLog
+            yield return new()
             {
-                Id = (ulong)reader.GetInt64(0),
-                Type = (RaftLogType)reader.GetInt32(1),
-                Message = reader.GetString(2),
-                Time = reader.GetInt64(3)
+                Id = reader.IsDBNull(0) ? 0 : (ulong)reader.GetInt64(0),
+                Type = reader.IsDBNull(1) ? RaftLogType.Regular : (RaftLogType)reader.GetInt32(1),
+                Message = reader.IsDBNull(2) ? "" : reader.GetString(2),
+                Time = reader.IsDBNull(3) ? 0 : reader.GetInt64(3)
             };
         }
+    }
+    
+    public async Task<bool> ExistLog(int partitionId, ulong id)
+    {
+        await Task.CompletedTask;
+        
+        TryOpenDatabase();
+        
+        const string query = "SELECT COUNT(*) AS cnt FROM logs WHERE partition = @partitionId AND id = @id";
+        
+        using SqliteCommand command = new(query, connection);
+        
+        command.Parameters.AddWithValue("@id", id);
+        command.Parameters.AddWithValue("@partitionId", partitionId);
+        
+        using SqliteDataReader reader = command.ExecuteReader();
+        
+        while (reader.Read())
+        {
+            return (reader.IsDBNull(0) ? 0 : reader.GetInt32(0)) > 0;
+        }
+
+        return false;
     }
 
     public async Task Append(int partitionId, RaftLog log)
