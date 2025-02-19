@@ -80,7 +80,7 @@ public class SqliteWAL : IWAL
         
         TryOpenDatabase();
         
-        const string insertQuery = "INSERT INTO logs (id, partitionId, type, message, time) VALUES (@id, @partitionId, @message, @time);";
+        const string insertQuery = "INSERT INTO logs (id, partitionId, type, message, time) VALUES (@id, @partitionId, @type, @message, @time);";
         
         using SqliteCommand insertCommand =  new(insertQuery, connection);
         insertCommand.Parameters.Clear();
