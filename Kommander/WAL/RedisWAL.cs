@@ -91,4 +91,9 @@ public sealed class RedisWAL : IWAL
 
         return 0; 
     }
+
+    public Task<ulong> GetMaxLog(int partitionId)
+    {
+        return Task.FromResult<ulong>(0);
+    }
 }

@@ -6,6 +6,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Kommander", "Kommander\Komm
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Kommander.Http", "Kommander.Http\Kommander.Http.csproj", "{A3A93F43-D36C-466C-8FE2-00D6157307DB}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Kommander.Tests", "Kommander.Tests\Kommander.Tests.csproj", "{AC44B4FE-33FE-43C2-9518-BE726DFCBA84}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -20,6 +22,10 @@ Global
 		{A3A93F43-D36C-466C-8FE2-00D6157307DB}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{A3A93F43-D36C-466C-8FE2-00D6157307DB}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{A3A93F43-D36C-466C-8FE2-00D6157307DB}.Release|Any CPU.Build.0 = Release|Any CPU
+		{AC44B4FE-33FE-43C2-9518-BE726DFCBA84}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{AC44B4FE-33FE-43C2-9518-BE726DFCBA84}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{AC44B4FE-33FE-43C2-9518-BE726DFCBA84}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{AC44B4FE-33FE-43C2-9518-BE726DFCBA84}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

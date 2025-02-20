@@ -65,6 +65,10 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 
                 case RaftWALActionType.GetMaxLog:
                     return new(await GetMaxLog());
+                
+                default:
+                    Console.WriteLine("[{0}/{1}] Unknown action type: {2}", manager.LocalEndpoint, partition.PartitionId, message.Type);
+                    break;
             }
         }
         catch (Exception ex)
@@ -135,9 +139,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
     
     private async Task<ulong> GetMaxLog()
     {
-        await Task.CompletedTask;
-        
-        return nextId - 1;
+        return await walAdapter.GetMaxLog(partition.PartitionId);
     }
 
     private async Task AppendCheckpoint(long term)
@@ -170,7 +172,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         if (updateLogs.Count == 0)
             return;
         
-        Console.WriteLine("Got {0} logs from the leader", updateLogs.Count);
+        //Console.WriteLine("Got {0} logs from the leader", updateLogs.Count);
 
         foreach (RaftLog log in updateLogs)
         {

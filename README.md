@@ -2,6 +2,8 @@
 
 Kommander is an open-source, distributed consensus library implemented in C# for the .NET platform. It leverages the Raft algorithm to provide a robust and reliable mechanism for leader election, log replication, and data consistency across clusters. Kommander is designed to be flexible and resilient, supporting multiple discovery mechanisms and communication protocols to suit various distributed system architectures.
 
+**This is an alpha project please don't use it in production.**
+
 ---
 
 ## Features
@@ -47,7 +49,7 @@ To install Kommander into your C#/.NET project, you can use the .NET CLI or the 
 #### Using .NET CLI
 
 ```shell
-dotnet add package Kommander --version 0.0.1
+dotnet add package Kommander --version 0.0.2
 ```
 
 ### Using NuGet Package Manager
@@ -55,7 +57,7 @@ dotnet add package Kommander --version 0.0.1
 Search for Kommander and install it from the NuGet package manager UI, or use the Package Manager Console:
 
 ```shell
-Install-Package Kommander -Version 0.0.1
+Install-Package Kommander -Version 0.0.2
 ```
 
 Or, using the NuGet Package Manager in Visual Studio, search for **Kommander** and install it.

@@ -14,4 +14,6 @@ public interface IWAL
     public Task AppendUpdate(int partitionId, RaftLog log);
 
     public Task<bool> ExistLog(int partitionId, ulong id);
+    
+    public Task<ulong> GetMaxLog(int partitionId);
 }

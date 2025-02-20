@@ -18,7 +18,7 @@ public sealed class RaftManager
     
     private readonly IWAL walAdapter;
 
-    private ICommunication communication;
+    private readonly ICommunication communication;
     
     private readonly ClusterHandler clusterHandler;
 

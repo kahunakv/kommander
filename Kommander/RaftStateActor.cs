@@ -96,6 +96,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 case RaftRequestType.ReplicateCheckpoint:
                     ReplicateCheckpoint();
                     break;
+                
+                default:
+                    Console.WriteLine("Invalid message type: {0}", message.Type);
+                    break;
             }
         }
         catch (Exception ex)
@@ -169,28 +173,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         RequestVotesRequest request = new(partition.PartitionId, currentTerm, currentMaxLog.NextId, manager.LocalEndpoint);
 
-        //string payload = JsonSerializer.Serialize(request); // , RaftJsonContext.Default.RequestVotesRequest
-
         foreach (RaftNode node in manager.Nodes)
         {
             Console.WriteLine("[{0}/{1}] Asked {2} for votes on Term={3}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, currentTerm);
-
-            /*try
-            {
-                await ("http://" + node.Endpoint)
-                        .WithOAuthBearerToken("xxx")
-                        .AppendPathSegments("v1/raft/request-vote")
-                        .WithHeader("Accept", "application/json")
-                        .WithHeader("Content-Type", "application/json")
-                        .WithTimeout(5)
-                        .WithSettings(o => o.HttpVersion = "2.0")
-                        .PostStringAsync(payload)
-                        .ReceiveJson<RequestVotesResponse>();
-            }
-            catch (Exception e)
-            {
-                Console.WriteLine("[{0}/{1}] {2}", manager.LocalEndpoint, partition.PartitionId, e.Message);
-            }*/
             
             await communication.RequestVotes(manager, partition, node, request);
         }
@@ -232,7 +217,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         RaftWALResponse localMaxId = await walActor.Ask(new(RaftWALActionType.GetMaxLog));
         if (localMaxId.NextId > remoteMaxLogId)
         {
-            Console.WriteLine("[{0}/{1}] Received request to vote on outdated log {2} RemoteMaxId={3} LocalMaxId={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, localMaxId, remoteMaxLogId);
+            Console.WriteLine("[{0}/{1}] Received request to vote on outdated log from {2} RemoteMaxId={3} LocalMaxId={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, localMaxId.NextId, remoteMaxLogId);
             return;
         }
 
@@ -241,25 +226,6 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         Console.WriteLine("[{0}/{1}] Requested vote from {2} Term={3}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, voteTerm);
 
         VoteRequest request = new(partition.PartitionId, voteTerm, manager.LocalEndpoint);
-
-        /*string payload = JsonSerializer.Serialize(request); // RaftJsonContext.Default.RequestVotesRequest
-
-        try
-        {
-            await ("http://" + endpoint)
-                    .WithOAuthBearerToken("xxx")
-                    .AppendPathSegments("v1/raft/vote")
-                    .WithHeader("Accept", "application/json")
-                    .WithHeader("Content-Type", "application/json")
-                    .WithTimeout(5)
-                    .WithSettings(o => o.HttpVersion = "2.0")
-                    .PostStringAsync(payload)
-                    .ReceiveJson<VoteResponse>();
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine("[{0}/{1}] {2}", manager.LocalEndpoint, partition.PartitionId, e.Message);
-        }*/
         
         await communication.Vote(manager, partition, node, request);
     }

@@ -6,7 +6,7 @@ namespace Kommander.WAL;
 
 public class SqliteWAL : IWAL
 {
-    private static readonly Lock _lock = new();
+    private static readonly object _lock = new();
     
     private static SqliteConnection? connection;
     
@@ -147,5 +147,24 @@ public class SqliteWAL : IWAL
     public async Task AppendUpdate(int partitionId, RaftLog log)
     {
         await Append(partitionId, log);
+    }
+    
+    public async Task<ulong> GetMaxLog(int partitionId)
+    {
+        await Task.CompletedTask;
+        
+        TryOpenDatabase();
+        
+        const string query = "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId";
+        using SqliteCommand command = new(query, connection);
+        
+        command.Parameters.AddWithValue("@partitionId", partitionId);
+        
+        using SqliteDataReader reader = command.ExecuteReader();
+        
+        while (reader.Read())
+            return (reader.IsDBNull(0) ? 0 : (ulong)reader.GetInt64(0));
+
+        return 0;
     }
 }
