@@ -62,6 +62,9 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
                 case RaftWALActionType.Recover:
                     return new(await Recover());
+                
+                case RaftWALActionType.GetMaxLog:
+                    return new(await GetMaxLog());
             }
         }
         catch (Exception ex)
@@ -128,6 +131,13 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         await Compact(currentTime);
 
         return requestLogs;
+    }
+    
+    private async Task<ulong> GetMaxLog()
+    {
+        await Task.CompletedTask;
+        
+        return nextId - 1;
     }
 
     private async Task AppendCheckpoint(long term)

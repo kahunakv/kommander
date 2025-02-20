@@ -2,6 +2,7 @@
 using Nixie;
 using System.Text.Json;
 using Flurl.Http;
+using Kommander.Communication;
 using Kommander.Data;
 using Kommander.WAL;
 
@@ -16,6 +17,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     private readonly RaftManager manager;
 
     private readonly RaftPartition partition;
+
+    private readonly ICommunication communication;
 
     private readonly IActorRefStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse> walActor;
 
@@ -35,11 +38,13 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         IActorContextStruct<RaftStateActor, RaftRequest, RaftResponse> context, 
         RaftManager manager, 
         RaftPartition partition,
-        IWAL walAdapter
+        IWAL walAdapter,
+        ICommunication communication
     )
     {
         this.manager = manager;
         this.partition = partition;
+        this.communication = communication;
         
         walActor = context.ActorSystem.SpawnStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse>(
             "bra-wal-" + partition.PartitionId, 
@@ -77,7 +82,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                     break;
 
                 case RaftRequestType.RequestVote:
-                    await Vote(message.Endpoint ?? "", message.Term);
+                    await Vote(new(message.Endpoint ?? ""), message.Term, message.MaxLogId);
                     break;
 
                 case RaftRequestType.ReceiveVote:
@@ -159,16 +164,18 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             Console.WriteLine("[{0}/{1}] No other nodes availables to vote", manager.LocalEndpoint, partition.PartitionId);
             return;
         }
+        
+        RaftWALResponse currentMaxLog = await walActor.Ask(new(RaftWALActionType.GetMaxLog));
 
-        RequestVotesRequest request = new(partition.PartitionId, currentTerm, manager.LocalEndpoint);
+        RequestVotesRequest request = new(partition.PartitionId, currentTerm, currentMaxLog.NextId, manager.LocalEndpoint);
 
-        string payload = JsonSerializer.Serialize(request); // , RaftJsonContext.Default.RequestVotesRequest
+        //string payload = JsonSerializer.Serialize(request); // , RaftJsonContext.Default.RequestVotesRequest
 
         foreach (RaftNode node in manager.Nodes)
         {
             Console.WriteLine("[{0}/{1}] Asked {2} for votes on Term={3}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, currentTerm);
 
-            try
+            /*try
             {
                 await ("http://" + node.Endpoint)
                         .WithOAuthBearerToken("xxx")
@@ -183,7 +190,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             catch (Exception e)
             {
                 Console.WriteLine("[{0}/{1}] {2}", manager.LocalEndpoint, partition.PartitionId, e.Message);
-            }
+            }*/
+            
+            await communication.RequestVotes(manager, partition, node, request);
         }
     }
 
@@ -200,33 +209,40 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         await Ping(currentTerm);
     }
 
-    private async Task Vote(string endpoint, long voteTerm)
+    private async Task Vote(RaftNode node, long voteTerm, ulong remoteMaxLogId)
     {
         if (votes.ContainsKey(voteTerm))
         {
-            Console.WriteLine("[{0}/{1}] Received request to vote from {2} but already voted in that Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm);
+            Console.WriteLine("[{0}/{1}] Received request to vote from {2} but already voted in that Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, voteTerm);
             return;
         }
 
         if (state != NodeState.Follower && voteTerm == currentTerm)
         {
-            Console.WriteLine("[{0}/{1}] Received request to vote from {2} but we're candidate or leader on the same Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm);
+            Console.WriteLine("[{0}/{1}] Received request to vote from {2} but we're candidate or leader on the same Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, voteTerm);
             return;
         }
 
         if (currentTerm > voteTerm)
         {
-            Console.WriteLine("[{0}/{1}] Received request to vote on previous term from {2} Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm);
+            Console.WriteLine("[{0}/{1}] Received request to vote on previous term from {2} Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, voteTerm);
+            return;
+        }
+        
+        RaftWALResponse localMaxId = await walActor.Ask(new(RaftWALActionType.GetMaxLog));
+        if (localMaxId.NextId > remoteMaxLogId)
+        {
+            Console.WriteLine("[{0}/{1}] Received request to vote on outdated log {2} RemoteMaxId={3} LocalMaxId={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, localMaxId, remoteMaxLogId);
             return;
         }
 
         lastHeartbeat = GetCurrentTime();
 
-        Console.WriteLine("[{0}/{1}] Requested vote from {2} Term={3}", manager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm);
+        Console.WriteLine("[{0}/{1}] Requested vote from {2} Term={3}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, voteTerm);
 
-        RequestVotesRequest request = new(partition.PartitionId, voteTerm, manager.LocalEndpoint);
+        VoteRequest request = new(partition.PartitionId, voteTerm, manager.LocalEndpoint);
 
-        string payload = JsonSerializer.Serialize(request); // RaftJsonContext.Default.RequestVotesRequest
+        /*string payload = JsonSerializer.Serialize(request); // RaftJsonContext.Default.RequestVotesRequest
 
         try
         {
@@ -238,12 +254,14 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                     .WithTimeout(5)
                     .WithSettings(o => o.HttpVersion = "2.0")
                     .PostStringAsync(payload)
-                    .ReceiveJson<RequestVotesResponse>();
+                    .ReceiveJson<VoteResponse>();
         }
         catch (Exception e)
         {
             Console.WriteLine("[{0}/{1}] {2}", manager.LocalEndpoint, partition.PartitionId, e.Message);
-        }
+        }*/
+        
+        await communication.Vote(manager, partition, node, request);
     }
 
     private async Task ReceivedVote(string endpoint, long voteTerm)
@@ -321,8 +339,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         
         AppendLogsRequest request = new(partition.PartitionId, currentTerm, manager.LocalEndpoint, response.Logs);
-        string payload = JsonSerializer.Serialize(request); // RaftJsonContext.Default.AppendLogsRequest
-        await AppendLogsToNodes(payload);
+        await AppendLogsToNodes(request);
     }
 
     private void ReplicateCheckpoint()
@@ -351,14 +368,15 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     
     private async ValueTask Ping(long term)
     {
+        if (state != NodeState.Leader)
+            return;
+        
         AppendLogsRequest request = new(partition.PartitionId, term, manager.LocalEndpoint);
 
-        string payload = JsonSerializer.Serialize(request); // , RaftJsonContext.Default.AppendLogsRequest
-
-        await AppendLogsToNodes(payload);
+        await AppendLogsToNodes(request);
     }
     
-    private async Task AppendLogsToNodes(string payload)
+    private async Task AppendLogsToNodes(AppendLogsRequest request)
     {
         if (manager.Nodes.Count == 0)
         {
@@ -371,31 +389,14 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         List<Task> tasks = new(nodes.Count);
 
         foreach (RaftNode node in nodes)
-            tasks.Add(AppendLogToNode(node, payload));
+            tasks.Add(AppendLogToNode(node, request));
 
         await Task.WhenAll(tasks);
     }
     
-    private async Task AppendLogToNode(RaftNode node, string payload)
+    private async Task AppendLogToNode(RaftNode node, AppendLogsRequest request)
     {
-        try
-        {
-            await ("http://" + node.Endpoint)
-                .WithOAuthBearerToken("x")
-                .AppendPathSegments("v1/raft/append-logs")
-                .WithHeader("Accept", "application/json")
-                .WithHeader("Content-Type", "application/json")
-                .WithTimeout(10)
-                .WithSettings(o => o.HttpVersion = "2.0")
-                .PostStringAsync(payload)
-                .ReceiveJson<AppendLogsResponse>();
-            
-            Console.WriteLine("[{0}/{1}] Logs replicated to {2}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint);
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine("[{0}/{1}] {2}", manager.LocalEndpoint, partition.PartitionId, e.Message);
-        }
+        await communication.AppendLogToNode(manager, partition, node, request);
     }
 
     private static long GetCurrentTime()

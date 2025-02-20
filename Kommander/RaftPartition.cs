@@ -1,4 +1,5 @@
 
+using Kommander.Communication;
 using Kommander.Data;
 using Kommander.WAL;
 using Nixie;
@@ -17,32 +18,34 @@ public sealed class RaftPartition
 
     internal int PartitionId { get; }
 
-    public RaftPartition(ActorSystem actorSystem, RaftManager raftManager, IWAL walAdapter, int partitionId)
+    public RaftPartition(ActorSystem actorSystem, RaftManager raftManager, IWAL walAdapter, ICommunication communication, int partitionId)
     {
         this.raftManager = raftManager;
+        
         PartitionId = partitionId;
 
         raftActor = actorSystem.SpawnStruct<RaftStateActor, RaftRequest, RaftResponse>(
             "bra-" + partitionId, 
             raftManager, 
             this,
-            walAdapter
+            walAdapter,
+            communication
         );
     }
 
     public void RequestVote(RequestVotesRequest request)
     {
-        raftActor.Send(new(RaftRequestType.RequestVote, request.Term, request.Endpoint));
+        raftActor.Send(new(RaftRequestType.RequestVote, request.Term, request.MaxLogId, request.Endpoint));
     }
 
     public void Vote(VoteRequest request)
     {
-        raftActor.Send(new(RaftRequestType.ReceiveVote, request.Term, request.Endpoint));
+        raftActor.Send(new(RaftRequestType.ReceiveVote, request.Term, 0, request.Endpoint));
     }
 
     public void AppendLogs(AppendLogsRequest request)
     {
-        raftActor.Send(new(RaftRequestType.AppendLogs, request.Term, request.Endpoint, request.Logs));
+        raftActor.Send(new(RaftRequestType.AppendLogs, request.Term, 0, request.Endpoint, request.Logs));
     }
 
     public void ReplicateLogs(string message)

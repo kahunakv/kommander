@@ -1,5 +1,6 @@
 
 using System.Diagnostics;
+using Kommander.Communication;
 using Kommander.Data;
 using Kommander.Discovery;
 using Kommander.WAL;
@@ -16,6 +17,8 @@ public sealed class RaftManager
     private readonly RaftConfiguration configuration;
     
     private readonly IWAL walAdapter;
+
+    private ICommunication communication;
     
     private readonly ClusterHandler clusterHandler;
 
@@ -29,11 +32,12 @@ public sealed class RaftManager
 
     public event Func<string, Task<bool>>? OnReplicationReceived;
     
-    public RaftManager(ActorSystem actorSystem, RaftConfiguration configuration, IDiscovery discovery, IWAL walAdapter)
+    public RaftManager(ActorSystem actorSystem, RaftConfiguration configuration, IDiscovery discovery, IWAL walAdapter, ICommunication communication)
     {
         this.actorSystem = actorSystem;
         this.configuration = configuration;
         this.walAdapter = walAdapter;
+        this.communication = communication;
         
         LocalEndpoint = string.Concat(configuration.Host, ":", configuration.Port);
         
@@ -47,7 +51,7 @@ public sealed class RaftManager
         if (partitions[0] is null)
         {
             for (int i = 0; i < configuration.MaxPartitions; i++)
-                partitions[i] = new(actorSystem, this, walAdapter, i);
+                partitions[i] = new(actorSystem, this, walAdapter, communication, i);
         }
 
         await clusterHandler.JoinCluster(configuration);
