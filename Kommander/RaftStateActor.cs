@@ -1,7 +1,5 @@
 ﻿
 using Nixie;
-using System.Text.Json;
-using Flurl.Http;
 using Kommander.Communication;
 using Kommander.Data;
 using Kommander.WAL;
@@ -11,8 +9,6 @@ namespace Kommander;
 public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 {
     private static readonly RaftRequest checkLeaderRequest = new(RaftRequestType.CheckLeader);
-    
-    private readonly int ElectionTimeout = Random.Shared.Next(1750, 2550);
 
     private readonly RaftManager manager;
 
@@ -31,6 +27,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     private long lastHeartbeat = -1;
 
     private long voteStartedAt = -1;
+
+    private int electionTimeout = Random.Shared.Next(1000, 2000);
 
     private bool restored;
 
@@ -134,13 +132,13 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         if (state == NodeState.Candidate)
         {
-            if ((currentTime - voteStartedAt) < 1500)
+            if (voteStartedAt > 0 && (currentTime - voteStartedAt) < electionTimeout)
                 return;
         }
 
         if (state == NodeState.Follower)
         {
-            if (lastHeartbeat > 0 && ((currentTime - lastHeartbeat) < ElectionTimeout))
+            if (lastHeartbeat > 0 && ((currentTime - lastHeartbeat) < electionTimeout))
                 return;
         }
 
@@ -150,6 +148,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         partition.Leader = "";
         state = NodeState.Candidate;
         voteStartedAt = GetCurrentTime();
+        electionTimeout = Random.Shared.Next(1000, 2000);
 
         while (votes.ContainsKey(++currentTerm))
             continue;
@@ -175,6 +174,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         foreach (RaftNode node in manager.Nodes)
         {
+            if (node.Endpoint == manager.LocalEndpoint)
+                throw new RaftException("Corrupted nodes");
+            
             Console.WriteLine("[{0}/{1}] Asked {2} for votes on Term={3}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, currentTerm);
             
             await communication.RequestVotes(manager, partition, node, request);
@@ -217,7 +219,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         RaftWALResponse localMaxId = await walActor.Ask(new(RaftWALActionType.GetMaxLog));
         if (localMaxId.NextId > remoteMaxLogId)
         {
-            Console.WriteLine("[{0}/{1}] Received request to vote on outdated log from {2} RemoteMaxId={3} LocalMaxId={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, localMaxId.NextId, remoteMaxLogId);
+            Console.WriteLine("[{0}/{1}] Received request to vote on outdated log from {2} RemoteMaxId={3} LocalMaxId={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, remoteMaxLogId, localMaxId.NextId);
             return;
         }
 

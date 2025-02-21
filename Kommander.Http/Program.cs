@@ -1,7 +1,6 @@
 
 using Kommander;
 using Kommander.Communication;
-using Kommander.Data;
 using Kommander.Discovery;
 using Kommander.Services;
 using Kommander.WAL;

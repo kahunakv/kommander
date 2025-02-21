@@ -26,6 +26,10 @@ public sealed class RaftManager
 
     internal List<RaftNode> Nodes { get; set; } = [];
 
+    public IWAL WalAdapter => walAdapter;
+    
+    public ICommunication Communication => communication;
+
     public event Action? OnRestoreStarted;
 
     public event Action? OnRestoreFinished;
