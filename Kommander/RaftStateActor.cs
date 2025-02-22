@@ -476,7 +476,12 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         
         AppendLogsRequest request = new(partition.PartitionId, currentTerm, manager.LocalEndpoint, getRangeResponse.Logs);
         AppendLogsResponse response = await communication.AppendLogToNode(manager, partition, node, request);
-        lastCommitIndexes[node.Endpoint] = response.CommitedIndex;
+
+        if (response.CommitedIndex > 0)
+        {
+            lastCommitIndexes[node.Endpoint] = response.CommitedIndex;
+            Console.WriteLine("[{0}/{1}/{2}] Appended logs to {3} CommitedIndex={4}", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, response.CommitedIndex);
+        }
     }
 
     /// <summary>

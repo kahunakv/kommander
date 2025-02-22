@@ -155,6 +155,9 @@ public class TestThreeNodeCluster
 
         RaftManager? leader = await GetLeader([node1, node2, node3]);
         Assert.NotNull(leader);
+
+        var r = await node1.WalAdapter.GetMaxLog(0);
+        Assert.Equal(1, r);
     }
 
     private static async Task<RaftManager?> GetLeader(RaftManager[] nodes)

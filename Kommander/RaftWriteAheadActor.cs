@@ -185,6 +185,8 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             //    continue;
             
             await walAdapter.AppendUpdate(partition.PartitionId, log);
+            
+            Console.WriteLine("[{0}/{1}] Applied log #{2}", manager.LocalEndpoint, partition.PartitionId, log.Id);
 
             await manager.InvokeReplicationReceived(log.Message);
 

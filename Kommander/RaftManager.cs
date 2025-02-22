@@ -32,6 +32,8 @@ public sealed class RaftManager
     public IWAL WalAdapter => walAdapter;
     
     public ICommunication Communication => communication;
+    
+    public RaftConfiguration Configuration => configuration;
 
     public event Action? OnRestoreStarted;
 

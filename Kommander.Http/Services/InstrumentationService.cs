@@ -19,17 +19,13 @@ public class InstrumentationService : BackgroundService //, IDisposable
         {
             await raftManager.UpdateNodes();
 
-            for (int i = 0; i < 3; i++)
+            for (int i = 0; i < raftManager.Configuration.MaxPartitions ; i++)
             {
                 if (await raftManager.AmILeader(i))
-                {
-                    Console.WriteLine("IAM LEADER {0}", i);
-
                     raftManager.ReplicateLogs(i, "Hello, World! " + DateTime.UtcNow);
-                }
             }
 
-            await Task.Delay(1000, stoppingToken);
+            await Task.Delay(3000, stoppingToken);
         }
     }
 }

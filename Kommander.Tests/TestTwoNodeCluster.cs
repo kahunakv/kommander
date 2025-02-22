@@ -158,6 +158,12 @@ public class TestTwoNodeCluster
         Assert.NotNull(leader);
         
         Assert.Equal(node1.GetLocalEndpoint(), leader.GetLocalEndpoint());
+        
+        long maxNode1 = await node1.WalAdapter.GetMaxLog(0);
+        Assert.Equal(2, maxNode1);
+        
+        long maxNode2 = await node1.WalAdapter.GetMaxLog(0);
+        Assert.Equal(2, maxNode2);
     }
     
     [Fact]
@@ -196,6 +202,12 @@ public class TestTwoNodeCluster
         Assert.NotNull(leader);
         
         Assert.Equal(node1.GetLocalEndpoint(), leader.GetLocalEndpoint());
+        
+        long maxNode1 = await node1.WalAdapter.GetMaxLog(0);
+        Assert.Equal(2, maxNode1);
+        
+        long maxNode2 = await node1.WalAdapter.GetMaxLog(0);
+        Assert.Equal(2, maxNode2);
     }
     
     private static async Task<RaftManager?> GetLeader(RaftManager[] nodes)

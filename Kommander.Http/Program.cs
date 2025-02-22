@@ -13,7 +13,7 @@ RaftConfiguration config = new()
 {
     Host = arguments[1],
     Port = int.Parse(arguments[2]),
-    MaxPartitions = 3
+    MaxPartitions = 1
 };
 
 Console.WriteLine("Kommander! {0} {1}", config.Host, config.Port);
