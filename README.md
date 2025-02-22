@@ -39,7 +39,7 @@ Raft is a consensus protocol that helps a cluster of nodes maintain a replicated
 
 ### Prerequisites
 
-- [.NET 9.0 SDK](https://dotnet.microsoft.com/download/dotnet/9.0) or higher
+- [.NET 8.0 SDK](https://dotnet.microsoft.com/download/dotnet/9.0) or higher
 - A C# development environment (e.g., Visual Studio, VS Code)
 
 ### Installation
@@ -49,7 +49,7 @@ To install Kommander into your C#/.NET project, you can use the .NET CLI or the 
 #### Using .NET CLI
 
 ```shell
-dotnet add package Kommander --version 0.0.2
+dotnet add package Kommander --version 0.0.3
 ```
 
 ### Using NuGet Package Manager
@@ -57,7 +57,7 @@ dotnet add package Kommander --version 0.0.2
 Search for Kommander and install it from the NuGet package manager UI, or use the Package Manager Console:
 
 ```shell
-Install-Package Kommander -Version 0.0.2
+Install-Package Kommander -Version 0.0.3
 ```
 
 Or, using the NuGet Package Manager in Visual Studio, search for **Kommander** and install it.
@@ -69,50 +69,41 @@ Or, using the NuGet Package Manager in Visual Studio, search for **Kommander** a
 Below is a basic example demonstrating how to set up a simple Kommander node, join a cluster, and start the consensus process.
 
 ```csharp
-using Kommander;
-using Kommander.Configuration;
-using Kommander.Discovery;
-using Kommander.LogReplication;
 
-class Program
+// Identify the node configuration, including the host, port, and the maximum number of partitions.
+RaftConfiguration config = new()
 {
-    static async Task Main(string[] args)
-    {
-        // Configure node settings
-        var nodeConfig = new NodeConfiguration
-        {
-            NodeId = Guid.NewGuid().ToString(),
-            DataDirectory = "path/to/data",
-            CommunicationProtocol = CommunicationProtocol.Http, // or CommunicationProtocol.Tcp
-            Port = 5000
-        };
+    Host = "localhost",
+    Port = 8001,
+    MaxPartitions = 1
+};
 
-        // Initialize discovery mechanism (Registry-based or Multicast)
-        IDiscovery discovery = new MulticastDiscovery(nodeConfig); // or new RegistryDiscovery(nodeConfig, registryUrl);
+// Create a Raft node with the specified configuration.
+// - The node will use a static discovery mechanism to find other nodes in the cluster.
+// - The node will use a SQLite Write-Ahead Log (WAL) for log persistence.
+// - The node will use HTTP for communication with other nodes.
+RaftManager node = new(
+    new ActorSystem(), 
+    config, 
+    new StaticDiscovery([new("localhost:8002"), new("localhost:8003")]),
+    new SqliteWAL(),
+    new HTTPCommunication()
+);
 
-        // Configure Raft consensus settings
-        var raftConfig = new RaftConfiguration
-        {
-            ElectionTimeout = TimeSpan.FromSeconds(5),
-            HeartbeatInterval = TimeSpan.FromSeconds(1)
-        };
+// Start the node and join the cluster.
+await node.JoinCluster();
 
-        // Initialize the Kommander node
-        var KommanderNode = new KommanderNode(nodeConfig, raftConfig, discovery);
+// Check if the node is the leader of partition 0 and replicate a log entry.
+if (await node.AmILeader(0))
+    await node.ReplicateLogs(0, "Kommander is awesome!");
 
-        // Start the node
-        await KommanderNode.StartAsync();
+// Subscribe to the OnReplicationReceived event to receive log entries from other nodes
+// if the node is a follower
+node.OnReplicationReceived += (sender, e) =>
+{
+    Console.WriteLine($"Received log: {e.Message}");
+};
 
-        // Example: Append a log entry (this operation will be replicated across the cluster)
-        var logEntry = new LogEntry { Command = "SetValue", Data = "example_data" };
-        await KommanderNode.ReplicateAsync(logEntry);
-
-        Console.WriteLine("Kommander node started. Press any key to exit.");
-        Console.ReadKey();
-
-        await KommanderNode.StopAsync();
-    }
-}
 ```
 
 ### Advanced Configuration
