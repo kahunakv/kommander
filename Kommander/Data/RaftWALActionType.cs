@@ -8,5 +8,6 @@ public enum RaftWALActionType
     Recover = 2,
     Update = 3,
     GetMaxLog = 4,
-    GetCurrentTerm = 5
+    GetCurrentTerm = 5,
+    GetRange = 6
 }

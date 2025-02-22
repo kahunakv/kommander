@@ -4,29 +4,38 @@ namespace Kommander.WAL;
 
 public class InMemoryWAL : IWAL
 {
-    private readonly Dictionary<int, SortedDictionary<ulong, RaftLog>> logs = new();
+    private readonly Dictionary<int, SortedDictionary<long, RaftLog>> logs = new();
     
     public async IAsyncEnumerable<RaftLog> ReadLogs(int partitionId)
     {
         await Task.CompletedTask;
         
-        if (logs.TryGetValue(partitionId, out SortedDictionary<ulong, RaftLog>? partitionLogs))
+        if (logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
         {
-            foreach (KeyValuePair<ulong, RaftLog> keyValue in partitionLogs)
+            foreach (KeyValuePair<long, RaftLog> keyValue in partitionLogs)
                 yield return keyValue.Value;
         }
     }
 
-    public IAsyncEnumerable<RaftLog> ReadLogsRange(int partitionId, ulong startLogIndex, ulong endLogIndex)
+    public async IAsyncEnumerable<RaftLog> ReadLogsRange(int partitionId, long startLogIndex)
     {
-        throw new NotImplementedException();
+        await Task.CompletedTask;
+        
+        if (logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+        {
+            foreach (KeyValuePair<long, RaftLog> keyValue in partitionLogs)
+            {
+                if (keyValue.Key >= startLogIndex)
+                    yield return keyValue.Value;
+            }
+        }
     }
 
     public async Task Append(int partitionId, RaftLog log)
     {
         await Task.CompletedTask;
         
-        if (logs.TryGetValue(partitionId, out SortedDictionary<ulong, RaftLog>? partitionLogs))
+        if (logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
             partitionLogs.Add(log.Id, log);
         else
             logs.Add(partitionId, new() {{ log.Id, log }});
@@ -37,28 +46,28 @@ public class InMemoryWAL : IWAL
         await Append(partitionId, log);
     }
 
-    public Task<bool> ExistLog(int partitionId, ulong id)
+    public Task<bool> ExistLog(int partitionId, long id)
     {
-        if (logs.TryGetValue(partitionId, out SortedDictionary<ulong, RaftLog>? partitionLogs))
+        if (logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
             return Task.FromResult(partitionLogs.ContainsKey(id));
         
         return Task.FromResult(false);
     }
 
-    public Task<ulong> GetMaxLog(int partitionId)
+    public Task<long> GetMaxLog(int partitionId)
     {
-        if (logs.TryGetValue(partitionId, out SortedDictionary<ulong, RaftLog>? partitionLogs))
+        if (logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
         {
             if (partitionLogs.Count > 0)
                 return Task.FromResult(partitionLogs.Keys.Max());
         }
 
-        return Task.FromResult<ulong>(0);
+        return Task.FromResult<long>(0);
     }
 
     public Task<long> GetCurrentTerm(int partitionId)
     {
-        if (logs.TryGetValue(partitionId, out SortedDictionary<ulong, RaftLog>? partitionLogs))
+        if (logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
         {
             if (partitionLogs.Count > 0)
                 return Task.FromResult(partitionLogs[partitionLogs.Keys.Max()].Term);

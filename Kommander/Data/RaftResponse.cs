@@ -6,6 +6,8 @@ public readonly struct RaftResponse
 
     public NodeState State { get; } = NodeState.Follower;
     
+    public long CurrentIndex { get; } = 0;
+    
     public RaftResponse(RaftResponseType type, NodeState state)
     {
         Type = type;
@@ -15,5 +17,11 @@ public readonly struct RaftResponse
     public RaftResponse(RaftResponseType type)
     {
         Type = type;
+    }
+    
+    public RaftResponse(RaftResponseType type, long currentIndex)
+    {
+        Type = type;
+        CurrentIndex = currentIndex;
     }
 }

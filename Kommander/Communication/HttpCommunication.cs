@@ -28,7 +28,7 @@ public class HttpCommunication : ICommunication
             Console.WriteLine("[{0}/{1}] {2}", manager.LocalEndpoint, partition.PartitionId, e.Message);
         }
         
-        return new RequestVotesResponse();
+        return new();
     }
 
     public async Task<VoteResponse> Vote(RaftManager manager, RaftPartition partition, RaftNode node, VoteRequest request)
@@ -52,7 +52,7 @@ public class HttpCommunication : ICommunication
             Console.WriteLine("[{0}/{1}] {2}", manager.LocalEndpoint, partition.PartitionId, e.Message);
         }
 
-        return new VoteResponse();
+        return new();
     }
 
     public async Task<AppendLogsResponse> AppendLogToNode(RaftManager manager, RaftPartition partition, RaftNode node, AppendLogsRequest request)
@@ -61,7 +61,7 @@ public class HttpCommunication : ICommunication
         
         try
         {
-            await ("http://" + node.Endpoint)
+            AppendLogsResponse? response = await ("http://" + node.Endpoint)
                 .WithOAuthBearerToken("x")
                 .AppendPathSegments("v1/raft/append-logs")
                 .WithHeader("Accept", "application/json")
@@ -72,12 +72,14 @@ public class HttpCommunication : ICommunication
                 .ReceiveJson<AppendLogsResponse>();
             
             Console.WriteLine("[{0}/{1}] Logs replicated to {2}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint);
+
+            return response;
         }
         catch (Exception e)
         {
             Console.WriteLine("[{0}/{1}] {2}", manager.LocalEndpoint, partition.PartitionId, e.Message);
         }
 
-        return new AppendLogsResponse();
+        return new(-1);
     }
 }

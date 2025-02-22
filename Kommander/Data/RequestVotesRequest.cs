@@ -7,11 +7,11 @@ public sealed class RequestVotesRequest
 
     public long Term { get; set; }
     
-    public ulong MaxLogId { get; set; }
+    public long MaxLogId { get; set; }
 
     public string Endpoint { get; set; }
 
-    public RequestVotesRequest(int partition, long term, ulong maxLogId, string endpoint)
+    public RequestVotesRequest(int partition, long term, long maxLogId, string endpoint)
     {
         Partition = partition;
         Term = term;

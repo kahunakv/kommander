@@ -71,7 +71,7 @@ public class SqliteWAL : IWAL
         {
             yield return new()
             {
-                Id = reader.IsDBNull(0) ? 0 : (ulong)reader.GetInt64(0),
+                Id = reader.IsDBNull(0) ? 0 : reader.GetInt64(0),
                 Term = reader.IsDBNull(1) ? 0 : reader.GetInt64(1),
                 Type = reader.IsDBNull(2) ? RaftLogType.Regular : (RaftLogType)reader.GetInt32(2),
                 Message = reader.IsDBNull(3) ? "" : reader.GetString(3),
@@ -80,18 +80,17 @@ public class SqliteWAL : IWAL
         }
     }
     
-    public async IAsyncEnumerable<RaftLog> ReadLogsRange(int partitionId, ulong startLogIndex, ulong endLogIndex)
+    public async IAsyncEnumerable<RaftLog> ReadLogsRange(int partitionId, long startLogIndex)
     {
         await Task.CompletedTask;
         
         TryOpenDatabase();
         
-        const string query = "SELECT id, term, type, message, time FROM logs WHERE partitionId = @partitionId AND id >= @startIndex AND id <= @endIndex ORDER BY id ASC;";
+        const string query = "SELECT id, term, type, message, time FROM logs WHERE partitionId = @partitionId AND id >= @startIndex ORDER BY id ASC;";
         using SqliteCommand command = new(query, connection);
         
         command.Parameters.AddWithValue("@partitionId", partitionId);
         command.Parameters.AddWithValue("@startIndex", startLogIndex);
-        command.Parameters.AddWithValue("@endIndex", endLogIndex);
         
         using SqliteDataReader reader = command.ExecuteReader();
         
@@ -99,7 +98,7 @@ public class SqliteWAL : IWAL
         {
             yield return new()
             {
-                Id = reader.IsDBNull(0) ? 0 : (ulong)reader.GetInt64(0),
+                Id = reader.IsDBNull(0) ? 0 : reader.GetInt64(0),
                 Term = reader.IsDBNull(1) ? 0 : reader.GetInt64(1),
                 Type = reader.IsDBNull(2) ? RaftLogType.Regular : (RaftLogType)reader.GetInt32(2),
                 Message = reader.IsDBNull(3) ? "" : reader.GetString(3),
@@ -108,7 +107,7 @@ public class SqliteWAL : IWAL
         }
     }
     
-    public async Task<bool> ExistLog(int partitionId, ulong id)
+    public async Task<bool> ExistLog(int partitionId, long id)
     {
         await Task.CompletedTask;
         
@@ -152,7 +151,7 @@ public class SqliteWAL : IWAL
         await Append(partitionId, log);
     }
     
-    public async Task<ulong> GetMaxLog(int partitionId)
+    public async Task<long> GetMaxLog(int partitionId)
     {
         await Task.CompletedTask;
         
@@ -166,7 +165,7 @@ public class SqliteWAL : IWAL
         using SqliteDataReader reader = command.ExecuteReader();
         
         while (reader.Read())
-            return (reader.IsDBNull(0) ? 0 : (ulong)reader.GetInt64(0));
+            return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
 
         return 0;
     }

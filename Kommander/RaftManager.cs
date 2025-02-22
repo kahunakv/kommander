@@ -95,10 +95,10 @@ public sealed class RaftManager
         partition.Vote(request);
     }
 
-    public void AppendLogs(AppendLogsRequest request)
+    public async Task<long> AppendLogs(AppendLogsRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
-        partition.AppendLogs(request);
+        return await partition.AppendLogs(request);
     }
 
     public void ReplicateLogs(int partitionId, string message)

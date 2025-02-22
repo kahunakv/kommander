@@ -63,12 +63,14 @@ public sealed class RaftPartition
     }
 
     /// <summary>
-    /// Append logs to the partition.
+    /// Append logs to the partition returning the commited index.
     /// </summary>
     /// <param name="request"></param>
-    public void AppendLogs(AppendLogsRequest request)
+    /// <returns></returns>
+    public async Task<long> AppendLogs(AppendLogsRequest request)
     {
-        raftActor.Send(new(RaftRequestType.AppendLogs, request.Term, 0, request.Endpoint, request.Logs));
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.AppendLogs, request.Term, 0, request.Endpoint, request.Logs));
+        return response.CurrentIndex;
     }
 
     /// <summary>

@@ -1,12 +1,14 @@
 ﻿
-using System.Diagnostics;
-
 using Nixie;
 using Kommander.Data;
 using Kommander.WAL;
 
 namespace Kommander;
 
+/// <summary>
+/// This actor is responsible for controlling concurrency
+/// when accessing the replicated log persisted on disk.
+/// </summary>
 public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALResponse>
 {
     private const int MaxLogEntries = 10000;
@@ -21,7 +23,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
     private bool recovered;
 
-    private ulong commitIndex = 1;
+    private long commitIndex = 1;
 
     private ulong operations;
 
@@ -50,15 +52,18 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             switch (message.Type)
             {
                 case RaftWALActionType.Append:
-                    return new(await Append(message.Term, message.Logs));
+                    await Append(message.Term, message.Logs);
+                    break;
 
                 case RaftWALActionType.AppendCheckpoint:
                     await AppendCheckpoint(message.Term);
                     break;
 
                 case RaftWALActionType.Update:
-                    await Update(message.Logs);
-                    break;
+                    return new(await Update(message.Logs));
+                
+                case RaftWALActionType.GetRange:
+                    return new(await GetRange(message.CurrentIndex));
 
                 case RaftWALActionType.Recover:
                     return new(await Recover());
@@ -67,7 +72,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                     return new(await GetMaxLog());
                 
                 case RaftWALActionType.GetCurrentTerm:
-                    return new((ulong)(await GetCurrentTerm()));
+                    return new(await GetCurrentTerm());
                 
                 default:
                     Console.WriteLine("[{0}/{1}] Unknown action type: {2}", manager.LocalEndpoint, partition.PartitionId, message.Type);
@@ -82,7 +87,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         return new();
     }
 
-    private async ValueTask<ulong> Recover()
+    private async ValueTask<long> Recover()
     {
         if (recovered)
             return 0;
@@ -109,10 +114,10 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         return commitIndex;
     }
 
-    private async Task<List<RaftLog>> Append(long term, List<RaftLog>? appendLogs)
+    private async Task Append(long term, List<RaftLog>? appendLogs)
     {
-        if (appendLogs is null)
-            return [];
+        if (appendLogs is null || appendLogs.Count == 0)
+            return;
         
         long currentTime = GetCurrentTime();
 
@@ -124,20 +129,9 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             
             await walAdapter.Append(partition.PartitionId, log);
         }
-
-        List<RaftLog> requestLogs = new(8);
-
-        await foreach (RaftLog log in walAdapter.ReadLogsRange(partition.PartitionId, commitIndex - 8, commitIndex))
-            requestLogs.Add(log);
-        
-        Collect(currentTime);
-
-        await Compact(currentTime);
-
-        return requestLogs;
     }
     
-    private async Task<ulong> GetMaxLog()
+    private async Task<long> GetMaxLog()
     {
         return await walAdapter.GetMaxLog(partition.PartitionId);
     }
@@ -169,20 +163,26 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         await Task.CompletedTask;
     }
 
-    private async Task Update(List<RaftLog>? updateLogs)
+    private async Task<long> Update(List<RaftLog>? updateLogs)
     {
         if (updateLogs is null)
-            return;
+            return -1;
         
         if (updateLogs.Count == 0)
-            return;
+            return -1;
         
         //Console.WriteLine("Got {0} logs from the leader", updateLogs.Count);
 
         foreach (RaftLog log in updateLogs)
         {
-            if (await walAdapter.ExistLog(partition.PartitionId, log.Id))
+            if (log.Id != commitIndex)
+            {
+                Console.WriteLine("[{0}/{1}] Log #{2} is not the expected #{3}", manager.LocalEndpoint, partition.PartitionId, log.Id, commitIndex);
                 continue;
+            }
+            
+            //if (await walAdapter.ExistLog(partition.PartitionId, log.Id))
+            //    continue;
             
             await walAdapter.AppendUpdate(partition.PartitionId, log);
 
@@ -192,11 +192,23 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         }
 
         Collect(GetCurrentTime());
+
+        return commitIndex;
     }
 
     private static long GetCurrentTime()
     {
         return ((DateTimeOffset)DateTime.UtcNow).ToUnixTimeMilliseconds();
+    }
+    
+    private async Task<List<RaftLog>> GetRange(long startLogIndex)
+    {
+        List<RaftLog> logs = new(8);
+        
+        await foreach (RaftLog log in walAdapter.ReadLogsRange(partition.PartitionId, startLogIndex))
+            logs.Add(log);
+
+        return logs;
     }
 
     private void Collect(long currentTime)

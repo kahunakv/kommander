@@ -25,9 +25,13 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
     private readonly Dictionary<long, int> votes = [];
 
+    private readonly Dictionary<string, long> lastCommitIndexes = [];
+
     private NodeState state = NodeState.Follower;
 
     private long currentTerm;
+
+    private long currentIndex;
 
     private long lastHeartbeat = -1;
 
@@ -94,8 +98,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                     return new(RaftResponseType.State, state);
 
                 case RaftRequestType.AppendLogs:
-                    AppendLogs(message.Endpoint ?? "", message.Term, message.Log);
-                    break;
+                    return new(RaftResponseType.None, await AppendLogs(message.Endpoint ?? "", message.Term, message.Logs));
 
                 case RaftRequestType.RequestVote:
                     await Vote(new(message.Endpoint ?? ""), message.Term, message.MaxLogId);
@@ -106,11 +109,11 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                     break;
 
                 case RaftRequestType.ReplicateLogs:
-                    await ReplicateLogs(message.Log);
+                    await ReplicateLogs(message.Logs);
                     break;
 
                 case RaftRequestType.ReplicateCheckpoint:
-                    ReplicateCheckpoint();
+                    await ReplicateCheckpoint();
                     break;
                 
                 default:
@@ -140,6 +143,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         Stopwatch stopWatch = Stopwatch.StartNew();
 
         RaftWALResponse currentCommitIndexResponse = await walActor.Ask(new(RaftWALActionType.Recover));
+        currentIndex = (long)currentCommitIndexResponse.NextId;
+        
         Console.WriteLine("[{0}/{1}/{2}] WAL restored at #{3} in {4}ms", manager.LocalEndpoint, partition.PartitionId, state, currentCommitIndexResponse.NextId, stopWatch.ElapsedMilliseconds);
         
         RaftWALResponse currentTermResponse = await walActor.Ask(new(RaftWALActionType.GetCurrentTerm));
@@ -234,7 +239,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         lastHeartbeat = GetCurrentTime();
 
-        await Ping(currentTerm);
+        await Ping();
     }
 
     /// <summary>
@@ -244,7 +249,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <param name="node"></param>
     /// <param name="voteTerm"></param>
     /// <param name="remoteMaxLogId"></param>
-    private async Task Vote(RaftNode node, long voteTerm, ulong remoteMaxLogId)
+    private async Task Vote(RaftNode node, long voteTerm, long remoteMaxLogId)
     {
         if (votes.ContainsKey(voteTerm))
         {
@@ -332,18 +337,24 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <param name="endpoint"></param>
     /// <param name="leaderTerm"></param>
     /// <param name="logs"></param>
-    private void AppendLogs(string endpoint, long leaderTerm, List<RaftLog>? logs)
+    /// <returns></returns>
+    private async Task<long> AppendLogs(string endpoint, long leaderTerm, List<RaftLog>? logs)
     {
+        long commitedIndex = -1;
+        
         if (currentTerm > leaderTerm)
         {
             Console.WriteLine("[{0}/{1}/{2}] Received logs from a leader {3} with old Term={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, leaderTerm);
-            return;
+            return commitedIndex;
         }
 
         if (leaderTerm >= currentTerm)
         {
             if (logs is not null)
-                walActor.Send(new(RaftWALActionType.Update, currentTerm, logs));
+            {
+                RaftWALResponse updateResponse = await walActor.Ask(new(RaftWALActionType.Update, currentTerm, logs));
+                commitedIndex = updateResponse.NextId;
+            }
 
             state = NodeState.Follower;
             lastHeartbeat = GetCurrentTime();
@@ -355,6 +366,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 partition.Leader = endpoint;
             }
         }
+
+        return commitedIndex;
     }
 
     /// <summary>
@@ -368,24 +381,24 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         if (state != NodeState.Leader)
             return;
-
-        RaftWALResponse response = await walActor.Ask(new(RaftWALActionType.Append, currentTerm, logs));
-        if (response.Logs is null)
-            return;
         
-        AppendLogsRequest request = new(partition.PartitionId, currentTerm, manager.LocalEndpoint, response.Logs);
-        await AppendLogsToNodes(request);
+        // Append logs to the Write-Ahead Log
+        RaftWALResponse appendResponse = await walActor.Ask(new(RaftWALActionType.Append, currentTerm, logs));
+        currentIndex = (long)appendResponse.NextId;
+        
+        // Replicate logs to other nodes in the cluster
+        await AppendLogsToNodes();
     }
 
     /// <summary>
     /// Replicates the checkpoint to other nodes in the cluster when the node is the leader.
     /// </summary>
-    private void ReplicateCheckpoint()
+    private async Task ReplicateCheckpoint()
     {
         if (state != NodeState.Leader)
             return;
 
-        walActor.Send(new(RaftWALActionType.AppendCheckpoint, currentTerm));
+        await walActor.Ask(new(RaftWALActionType.AppendCheckpoint, currentTerm));
     }
 
     /// <summary>
@@ -419,21 +432,18 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// Pings the other nodes in the cluster to replicate logs when the node is the leader.
     /// </summary>
     /// <param name="term"></param>
-    private async ValueTask Ping(long term)
+    private async ValueTask Ping()
     {
         if (state != NodeState.Leader)
             return;
         
-        AppendLogsRequest request = new(partition.PartitionId, term, manager.LocalEndpoint);
-
-        await AppendLogsToNodes(request);
+        await AppendLogsToNodes();
     }
     
     /// <summary>
     /// Appends logs to the Write-Ahead Log and replicates them to other nodes in the cluster when the node is the leader.
     /// </summary>
-    /// <param name="request"></param>
-    private async Task AppendLogsToNodes(AppendLogsRequest request)
+    private async Task AppendLogsToNodes()
     {
         if (manager.Nodes.Count == 0)
         {
@@ -446,7 +456,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         List<Task> tasks = new(nodes.Count);
 
         foreach (RaftNode node in nodes)
-            tasks.Add(AppendLogToNode(node, request));
+            tasks.Add(AppendLogToNode(node));
 
         await Task.WhenAll(tasks);
     }
@@ -455,10 +465,18 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// Appends logs to a specific node in the cluster.
     /// </summary>
     /// <param name="node"></param>
-    /// <param name="request"></param>
-    private async Task AppendLogToNode(RaftNode node, AppendLogsRequest request)
+    private async Task AppendLogToNode(RaftNode node)
     {
-        await communication.AppendLogToNode(manager, partition, node, request);
+        if (!lastCommitIndexes.TryGetValue(node.Endpoint, out long lastCommitIndex))
+            lastCommitIndex = currentIndex - 8;
+        
+        RaftWALResponse getRangeResponse = await walActor.Ask(new(RaftWALActionType.GetRange, currentTerm, lastCommitIndex));
+        if (getRangeResponse.Logs is null)
+            return;
+        
+        AppendLogsRequest request = new(partition.PartitionId, currentTerm, manager.LocalEndpoint, getRangeResponse.Logs);
+        AppendLogsResponse response = await communication.AppendLogToNode(manager, partition, node, request);
+        lastCommitIndexes[node.Endpoint] = response.CommitedIndex;
     }
 
     /// <summary>

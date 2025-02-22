@@ -27,11 +27,13 @@ public class InMemoryCommunication : ICommunication
         return Task.FromResult(new VoteResponse());
     }
 
-    public Task<AppendLogsResponse> AppendLogToNode(RaftManager manager, RaftPartition partition, RaftNode node, AppendLogsRequest request)
+    public async Task<AppendLogsResponse> AppendLogToNode(RaftManager manager, RaftPartition partition, RaftNode node, AppendLogsRequest request)
     {
-        if (nodes.TryGetValue(node.Endpoint, out RaftManager? targetNode))
-            targetNode.AppendLogs(request);
+        long commitedIndex = -1;
         
-        return Task.FromResult(new AppendLogsResponse());
+        if (nodes.TryGetValue(node.Endpoint, out RaftManager? targetNode))
+            commitedIndex = await targetNode.AppendLogs(request);
+        
+        return new(commitedIndex);
     }
 }

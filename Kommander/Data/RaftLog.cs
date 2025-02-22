@@ -7,7 +7,7 @@ namespace Kommander.Data;
 public sealed class RaftLog
 {
     //[Key(0)]
-    public ulong Id { get; set; }
+    public long Id { get; set; }
 
     //[Key(1)]
     public RaftLogType Type { get; set; } = RaftLogType.Regular;
