@@ -1,4 +1,5 @@
 ﻿
+using System.Diagnostics;
 using Nixie;
 using Kommander.Communication;
 using Kommander.Data;
@@ -26,9 +27,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
     private long lastHeartbeat = -1;
 
-    private long voteStartedAt = -1;
+    private long votingStartedAt = -1;
 
-    private int electionTimeout = Random.Shared.Next(1000, 2000);
+    private int electionTimeout = Random.Shared.Next(1000, 3000);
 
     private bool restored;
 
@@ -55,8 +56,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             context.Self,
             "check-election",
             checkLeaderRequest,
-            TimeSpan.FromSeconds(Random.Shared.Next(8, 12)),
-            TimeSpan.FromMilliseconds(Random.Shared.Next(50, 120))
+            TimeSpan.FromSeconds(1),
+            TimeSpan.FromMilliseconds(100)
         );
     }
 
@@ -114,8 +115,14 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
 
         restored = true;
+        lastHeartbeat = GetCurrentTime();
+        Stopwatch stopWatch = Stopwatch.StartNew();
 
-        await walActor.Ask(new(RaftWALActionType.Recover));
+        RaftWALResponse currentCommitIndexResponse = await walActor.Ask(new(RaftWALActionType.Recover));
+        Console.WriteLine("[{0}/{1}/{2}] WAL restored at #{3} in {4}ms", manager.LocalEndpoint, partition.PartitionId, state, currentCommitIndexResponse.NextId, stopWatch.ElapsedMilliseconds);
+        
+        RaftWALResponse currentTermResponse = await walActor.Ask(new(RaftWALActionType.GetCurrentTerm));
+        currentTerm = (long)currentTermResponse.NextId;
     }
 
     private async Task CheckClusterLeadership()
@@ -132,8 +139,15 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         if (state == NodeState.Candidate)
         {
-            if (voteStartedAt > 0 && (currentTime - voteStartedAt) < electionTimeout)
+            if (votingStartedAt > 0 && (currentTime - votingStartedAt) < 1500)
                 return;
+            
+            Console.WriteLine("[{0}/{1}/{2}] Voting concluded after {3}ms. No quorum available", manager.LocalEndpoint, partition.PartitionId, state, (currentTime - votingStartedAt));
+            
+            state = NodeState.Follower;
+            lastHeartbeat = currentTime;
+            electionTimeout = Random.Shared.Next(1000, 3000);
+            return;
         }
 
         if (state == NodeState.Follower)
@@ -142,20 +156,15 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 return;
         }
 
-        if (state == NodeState.Candidate)
-            Console.WriteLine("[{0}/{1}] Voting concluded after {2}ms. No quorum available", manager.LocalEndpoint, partition.PartitionId, (currentTime - voteStartedAt));
-
         partition.Leader = "";
         state = NodeState.Candidate;
-        voteStartedAt = GetCurrentTime();
-        electionTimeout = Random.Shared.Next(1000, 2000);
-
-        while (votes.ContainsKey(++currentTerm))
-            continue;
-
+        votingStartedAt = GetCurrentTime();
+        
+        currentTerm++;
+        
         SetVotes(currentTerm, 1);
 
-        Console.WriteLine("[{0}/{1}] Voted to become leader. Term={2}", manager.LocalEndpoint, partition.PartitionId, currentTerm);
+        Console.WriteLine("[{0}/{1}/{2}] Voted to become leader after {3}ms. Term={4}", manager.LocalEndpoint, partition.PartitionId, state, currentTime - lastHeartbeat, currentTerm);
 
         await RequestVotes();
     }
@@ -164,7 +173,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     {
         if (manager.Nodes.Count == 0)
         {
-            Console.WriteLine("[{0}/{1}] No other nodes availables to vote", manager.LocalEndpoint, partition.PartitionId);
+            Console.WriteLine("[{0}/{1}/{2}] No other nodes availables to vote", manager.LocalEndpoint, partition.PartitionId, state);
             return;
         }
         
@@ -177,7 +186,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             if (node.Endpoint == manager.LocalEndpoint)
                 throw new RaftException("Corrupted nodes");
             
-            Console.WriteLine("[{0}/{1}] Asked {2} for votes on Term={3}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, currentTerm);
+            Console.WriteLine("[{0}/{1}/{2}] Asked {3} for votes on Term={4}", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, currentTerm);
             
             await communication.RequestVotes(manager, partition, node, request);
         }
@@ -187,7 +196,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     {
         if (manager.Nodes.Count == 0)
         {
-            Console.WriteLine("[{0}/{1}] No other nodes availables to send hearthbeat", manager.LocalEndpoint, partition.PartitionId);
+            Console.WriteLine("[{0}/{1}/{2}] No other nodes availables to send hearthbeat", manager.LocalEndpoint, partition.PartitionId, state);
             return;
         }
 
@@ -200,32 +209,36 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     {
         if (votes.ContainsKey(voteTerm))
         {
-            Console.WriteLine("[{0}/{1}] Received request to vote from {2} but already voted in that Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, voteTerm);
+            Console.WriteLine("[{0}/{1}/{2}] Received request to vote from {3} but already voted in that Term={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, voteTerm);
             return;
         }
 
         if (state != NodeState.Follower && voteTerm == currentTerm)
         {
-            Console.WriteLine("[{0}/{1}] Received request to vote from {2} but we're candidate or leader on the same Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, voteTerm);
+            Console.WriteLine("[{0}/{1}/{2}] Received request to vote from {3} but we're candidate or leader on the same Term={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, voteTerm);
             return;
         }
 
         if (currentTerm > voteTerm)
         {
-            Console.WriteLine("[{0}/{1}] Received request to vote on previous term from {2} Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, voteTerm);
+            Console.WriteLine("[{0}/{1}/{2}] Received request to vote on previous term from {3} Term={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, voteTerm);
             return;
         }
         
         RaftWALResponse localMaxId = await walActor.Ask(new(RaftWALActionType.GetMaxLog));
         if (localMaxId.NextId > remoteMaxLogId)
         {
-            Console.WriteLine("[{0}/{1}] Received request to vote on outdated log from {2} RemoteMaxId={3} LocalMaxId={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, remoteMaxLogId, localMaxId.NextId);
+            Console.WriteLine("[{0}/{1}/{2}] Received request to vote on outdated log from {3} RemoteMaxId={4} LocalMaxId={5}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, remoteMaxLogId, localMaxId.NextId);
+            
+            // If we know that we have a commitIndex ahead of other nodes in this partition,
+            // we increase the term to force being chosen as leaders.
+            currentTerm++;  
             return;
         }
 
         lastHeartbeat = GetCurrentTime();
 
-        Console.WriteLine("[{0}/{1}] Requested vote from {2} Term={3}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, voteTerm);
+        Console.WriteLine("[{0}/{1}/{2}] Requested vote from {3} Term={4}", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, voteTerm);
 
         VoteRequest request = new(partition.PartitionId, voteTerm, manager.LocalEndpoint);
         
@@ -236,19 +249,19 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     {
         if (state == NodeState.Leader)
         {
-            Console.WriteLine("[{0}/{1}] Received vote but already declared as leader from {2} Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm);
+            Console.WriteLine("[{0}/{1}/{2}] Received vote but already declared as leader from {3} Term={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, voteTerm);
             return;
         }
 
         if (state == NodeState.Follower)
         {
-            Console.WriteLine("[{0}/{1}] Received vote but we didn't ask for it from {2} Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm);
+            Console.WriteLine("[{0}/{1}/{2}] Received vote but we didn't ask for it from {3} Term={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, voteTerm);
             return;
         }
 
         if (voteTerm < currentTerm)
         {
-            Console.WriteLine("[{0}/{1}] Received vote on previous term from {2} Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm);
+            Console.WriteLine("[{0}/{1}/{2}] Received vote on previous term from {3} Term={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, voteTerm);
             return;
         }
 
@@ -257,14 +270,14 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         if (numberVotes < quorum)
         {
-            Console.WriteLine("[{0}/{1}] Received vote from {2} Term={3} Votes={4} Quorum={5}", manager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm, numberVotes, quorum);
+            Console.WriteLine("[{0}/{1}/{2}] Received vote from {3} Term={4} Votes={5} Quorum={6}", manager.LocalEndpoint, partition.PartitionId, state, endpoint, voteTerm, numberVotes, quorum);
             return;
         }
 
         state = NodeState.Leader;
         partition.Leader = manager.LocalEndpoint;
 
-        Console.WriteLine("[{0}/{1}] Received vote from {2} and proclamed leader Term={3} Votes={4} Quorum={5}", manager.LocalEndpoint, partition.PartitionId, endpoint, voteTerm, numberVotes, quorum);
+        Console.WriteLine("[{0}/{1}/{2}] Received vote from {3} and proclamed leader Term={4} Votes={5} Quorum={6}", manager.LocalEndpoint, partition.PartitionId, state, endpoint, voteTerm, numberVotes, quorum);
 
         await SendHearthbeat();
     }
@@ -273,7 +286,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     {
         if (currentTerm > leaderTerm)
         {
-            Console.WriteLine("[{0}/{1}] Received logs from a leader {2} with old Term={3}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, endpoint, leaderTerm);
+            Console.WriteLine("[{0}/{1}/{2}] Received logs from a leader {3} with old Term={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, leaderTerm);
             return;
         }
 
@@ -288,7 +301,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
             if (partition.Leader != endpoint)
             {
-                Console.WriteLine("[{0}/{1}] Leader is now {2} LeaderTerm={3}", manager.LocalEndpoint, partition.PartitionId, endpoint, leaderTerm);
+                Console.WriteLine("[{0}/{1}/{2}] Leader is now {3} LeaderTerm={4}", manager.LocalEndpoint, partition.PartitionId, state, endpoint, leaderTerm);
                 partition.Leader = endpoint;
             }
         }
@@ -348,7 +361,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     {
         if (manager.Nodes.Count == 0)
         {
-            Console.WriteLine("[{0}/{1}] No other nodes availables to replicate logs", manager.LocalEndpoint, partition.PartitionId);
+            Console.WriteLine("[{0}/{1}/{2}] No other nodes availables to replicate logs", manager.LocalEndpoint, partition.PartitionId, state);
             return;
         }
 

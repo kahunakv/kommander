@@ -1,6 +1,8 @@
 
 using Kommander.Data;
 using Microsoft.Data.Sqlite;
+// ReSharper disable MethodHasAsyncOverload
+// ReSharper disable UseAwaitUsing
 
 namespace Kommander.WAL;
 
@@ -27,7 +29,7 @@ public class SqliteWAL : IWAL
 
             connection.Open();
 
-            const string createTableQuery = "CREATE TABLE IF NOT EXISTS logs (id INT, partitionId INT, type INT, message TEXT COLLATE BINARY, time INT, PRIMARY KEY(partitionId, id));";
+            const string createTableQuery = "CREATE TABLE IF NOT EXISTS logs (id INT, partitionId INT, term INT, type INT, message TEXT COLLATE BINARY, time INT, PRIMARY KEY(partitionId, id));";
             using SqliteCommand command1 = new(createTableQuery, connection);
             command1.ExecuteNonQuery();
             
@@ -59,7 +61,7 @@ public class SqliteWAL : IWAL
         
         TryOpenDatabase();
         
-        const string query = "SELECT id, type, message, time FROM logs WHERE partitionId = @partitionId ORDER BY id ASC;";
+        const string query = "SELECT id, term, type, message, time FROM logs WHERE partitionId = @partitionId ORDER BY id ASC;";
         using SqliteCommand command = new(query, connection);
         command.Parameters.AddWithValue("@partitionId", partitionId);
         
@@ -70,9 +72,10 @@ public class SqliteWAL : IWAL
             yield return new()
             {
                 Id = reader.IsDBNull(0) ? 0 : (ulong)reader.GetInt64(0),
-                Type = reader.IsDBNull(1) ? RaftLogType.Regular : (RaftLogType)reader.GetInt32(1),
-                Message = reader.IsDBNull(2) ? "" : reader.GetString(2),
-                Time = reader.IsDBNull(3) ? 0 : reader.GetInt64(3)
+                Term = reader.IsDBNull(1) ? 0 : reader.GetInt64(1),
+                Type = reader.IsDBNull(2) ? RaftLogType.Regular : (RaftLogType)reader.GetInt32(2),
+                Message = reader.IsDBNull(3) ? "" : reader.GetString(3),
+                Time = reader.IsDBNull(4) ? 0 : reader.GetInt64(4)
             };
         }
     }
@@ -83,7 +86,7 @@ public class SqliteWAL : IWAL
         
         TryOpenDatabase();
         
-        const string query = "SELECT id, type, message, time FROM logs WHERE partitionId = @partitionId AND id >= @startIndex AND id <= @endIndex ORDER BY id ASC;";
+        const string query = "SELECT id, term, type, message, time FROM logs WHERE partitionId = @partitionId AND id >= @startIndex AND id <= @endIndex ORDER BY id ASC;";
         using SqliteCommand command = new(query, connection);
         
         command.Parameters.AddWithValue("@partitionId", partitionId);
@@ -97,9 +100,10 @@ public class SqliteWAL : IWAL
             yield return new()
             {
                 Id = reader.IsDBNull(0) ? 0 : (ulong)reader.GetInt64(0),
-                Type = reader.IsDBNull(1) ? RaftLogType.Regular : (RaftLogType)reader.GetInt32(1),
-                Message = reader.IsDBNull(2) ? "" : reader.GetString(2),
-                Time = reader.IsDBNull(3) ? 0 : reader.GetInt64(3)
+                Term = reader.IsDBNull(1) ? 0 : reader.GetInt64(1),
+                Type = reader.IsDBNull(2) ? RaftLogType.Regular : (RaftLogType)reader.GetInt32(2),
+                Message = reader.IsDBNull(3) ? "" : reader.GetString(3),
+                Time = reader.IsDBNull(4) ? 0 : reader.GetInt64(4)
             };
         }
     }
@@ -119,9 +123,7 @@ public class SqliteWAL : IWAL
         using SqliteDataReader reader = command.ExecuteReader();
         
         while (reader.Read())
-        {
             return (reader.IsDBNull(0) ? 0 : reader.GetInt32(0)) > 0;
-        }
 
         return false;
     }
@@ -132,12 +134,13 @@ public class SqliteWAL : IWAL
         
         TryOpenDatabase();
         
-        const string insertQuery = "INSERT INTO logs (id, partitionId, type, message, time) VALUES (@id, @partitionId, @type, @message, @time);";
+        const string insertQuery = "INSERT INTO logs (id, partitionId, term, type, message, time) VALUES (@id, @partitionId, @term, @type, @message, @time);";
         using SqliteCommand insertCommand =  new(insertQuery, connection);
         
         insertCommand.Parameters.Clear();
         insertCommand.Parameters.AddWithValue("@id", log.Id);
         insertCommand.Parameters.AddWithValue("@partitionId", partitionId);
+        insertCommand.Parameters.AddWithValue("@term", log.Term);
         insertCommand.Parameters.AddWithValue("@type", log.Type);
         insertCommand.Parameters.AddWithValue("@message", log.Message);
         insertCommand.Parameters.AddWithValue("@time", log.Time);
@@ -164,6 +167,25 @@ public class SqliteWAL : IWAL
         
         while (reader.Read())
             return (reader.IsDBNull(0) ? 0 : (ulong)reader.GetInt64(0));
+
+        return 0;
+    }
+    
+    public async Task<long> GetCurrentTerm(int partitionId)
+    {
+        await Task.CompletedTask;
+        
+        TryOpenDatabase();
+        
+        const string query = "SELECT MAX(term) AS max FROM logs WHERE partitionId = @partitionId";
+        using SqliteCommand command = new(query, connection);
+        
+        command.Parameters.AddWithValue("@partitionId", partitionId);
+        
+        using SqliteDataReader reader = command.ExecuteReader();
+        
+        while (reader.Read())
+            return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
 
         return 0;
     }

@@ -11,6 +11,8 @@ public sealed class RaftLog
 
     //[Key(1)]
     public RaftLogType Type { get; set; } = RaftLogType.Regular;
+    
+    public long Term { get; set; }
 
     //[Key(2)]
     public long Time { get; set; }

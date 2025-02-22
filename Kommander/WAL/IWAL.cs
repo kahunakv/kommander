@@ -16,4 +16,6 @@ public interface IWAL
     public Task<bool> ExistLog(int partitionId, ulong id);
     
     public Task<ulong> GetMaxLog(int partitionId);
+    
+    public Task<long> GetCurrentTerm(int partitionId);
 }

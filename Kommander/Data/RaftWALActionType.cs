@@ -7,5 +7,6 @@ public enum RaftWALActionType
     AppendCheckpoint = 1,
     Recover = 2,
     Update = 3,
-    GetMaxLog = 4
+    GetMaxLog = 4,
+    GetCurrentTerm = 5
 }

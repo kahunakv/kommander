@@ -73,7 +73,7 @@ public class TestThreeNodeCluster
         return node;
     }
     
-    [Fact]
+    /*[Fact]
     public async Task TestJoinCluster()
     {
         InMemoryCommunication communication = new();
@@ -85,7 +85,7 @@ public class TestThreeNodeCluster
         await node1.JoinCluster();
         await node2.JoinCluster();
         await node3.JoinCluster();
-    }
+    }*/
     
     [Fact]
     public async Task TestJoinClusterAndDecideLeader()

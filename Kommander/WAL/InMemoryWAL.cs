@@ -55,4 +55,15 @@ public class InMemoryWAL : IWAL
 
         return Task.FromResult<ulong>(0);
     }
+
+    public Task<long> GetCurrentTerm(int partitionId)
+    {
+        if (logs.TryGetValue(partitionId, out SortedDictionary<ulong, RaftLog>? partitionLogs))
+        {
+            if (partitionLogs.Count > 0)
+                return Task.FromResult(partitionLogs[partitionLogs.Keys.Max()].Term);
+        }
+
+        return Task.FromResult<long>(0);
+    }
 }

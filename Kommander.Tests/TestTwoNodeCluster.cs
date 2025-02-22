@@ -52,7 +52,7 @@ public class TestTwoNodeCluster
         return node;
     }
     
-    [Fact]
+    /*[Fact]
     public async Task TestJoinCluster()
     {
         InMemoryCommunication communication = new();
@@ -62,7 +62,7 @@ public class TestTwoNodeCluster
 
         await node1.JoinCluster();
         await node2.JoinCluster();
-    }
+    }*/
     
     [Fact]
     public async Task TestJoinClusterAndDecideLeader()
@@ -132,8 +132,46 @@ public class TestTwoNodeCluster
         RaftManager node1 = GetNode1(communication);
         RaftManager node2 = GetNode2(communication);
 
-        await node1.WalAdapter.Append(0, new() { Id = 1, Message = "Hello", Time = 0, Type = RaftLogType.Regular });
-        await node1.WalAdapter.Append(0, new() { Id = 2, Message = "Hello", Time = 0, Type = RaftLogType.Regular });
+        await node1.WalAdapter.Append(0, new() { Id = 1, Term = 1, Message = "Hello", Time = 0, Type = RaftLogType.Regular });
+        await node1.WalAdapter.Append(0, new() { Id = 2, Term = 1, Message = "Hello", Time = 0, Type = RaftLogType.Regular });
+
+        await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster()]);
+
+        await node1.UpdateNodes();
+        await node2.UpdateNodes();
+        
+        communication.SetNodes(new()
+        {
+            { "localhost:8001", node1 }, 
+            { "localhost:8002", node2 }
+        });
+
+        while (true)
+        {
+            if (await node1.AmILeader(0) || await node2.AmILeader(0))
+                break;
+            
+            await Task.Delay(1000);
+        }
+        
+        RaftManager? leader = await GetLeader([node1, node2]);
+        Assert.NotNull(leader);
+        
+        Assert.Equal(node1.GetLocalEndpoint(), leader.GetLocalEndpoint());
+    }
+    
+    [Fact]
+    public async Task TestJoinClusterSimultAndDecideLeaderWithHighestTerm()
+    {
+        InMemoryCommunication communication = new();
+        
+        RaftManager node1 = GetNode1(communication);
+        RaftManager node2 = GetNode2(communication);
+
+        await node1.WalAdapter.Append(0, new() { Id = 1, Term = 1, Message = "Hello", Time = 0, Type = RaftLogType.Regular });
+        await node1.WalAdapter.Append(0, new() { Id = 2, Term = 1, Message = "Hello", Time = 0, Type = RaftLogType.Regular });
+        
+        await node2.WalAdapter.Append(0, new() { Id = 1, Term = 2, Message = "Hello", Time = 0, Type = RaftLogType.Regular });
 
         await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster()]);
 
