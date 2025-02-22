@@ -6,6 +6,9 @@ using Nixie;
 
 namespace Kommander;
 
+/// <summary>
+/// Represents a partition in a Raft cluster.
+/// </summary>
 public sealed class RaftPartition
 {
     private static readonly RaftRequest raftStateRequest = new(RaftRequestType.GetState);
@@ -18,6 +21,14 @@ public sealed class RaftPartition
 
     internal int PartitionId { get; }
 
+    /// <summary>
+    /// Constructor
+    /// </summary>
+    /// <param name="actorSystem"></param>
+    /// <param name="raftManager"></param>
+    /// <param name="walAdapter"></param>
+    /// <param name="communication"></param>
+    /// <param name="partitionId"></param>
     public RaftPartition(ActorSystem actorSystem, RaftManager raftManager, IWAL walAdapter, ICommunication communication, int partitionId)
     {
         this.raftManager = raftManager;
@@ -33,31 +44,55 @@ public sealed class RaftPartition
         );
     }
 
+    /// <summary>
+    /// Request a vote from the partition.
+    /// </summary>
+    /// <param name="request"></param>
     public void RequestVote(RequestVotesRequest request)
     {
         raftActor.Send(new(RaftRequestType.RequestVote, request.Term, request.MaxLogId, request.Endpoint));
     }
 
+    /// <summary>
+    /// Vote to become leader in a partition.
+    /// </summary>
+    /// <param name="request"></param>
     public void Vote(VoteRequest request)
     {
         raftActor.Send(new(RaftRequestType.ReceiveVote, request.Term, 0, request.Endpoint));
     }
 
+    /// <summary>
+    /// Append logs to the partition.
+    /// </summary>
+    /// <param name="request"></param>
     public void AppendLogs(AppendLogsRequest request)
     {
         raftActor.Send(new(RaftRequestType.AppendLogs, request.Term, 0, request.Endpoint, request.Logs));
     }
 
+    /// <summary>
+    /// Replicate logs to the partition.
+    /// </summary>
+    /// <param name="message"></param>
     public void ReplicateLogs(string message)
     {
         raftActor.Send(new(RaftRequestType.ReplicateLogs, [new() { Message = message }]));
     }
 
+    /// <summary>
+    /// Replicate a checkpoint to the partition.
+    /// </summary>
     public void ReplicateCheckpoint()
     {
         raftActor.Send(new(RaftRequestType.ReplicateCheckpoint));
     }
 
+    /// <summary>
+    /// Obtain the state of the partition.
+    /// </summary>
+    /// <returns></returns>
+    /// <exception cref="RaftException"></exception>
     public async ValueTask<NodeState> GetState()
     {
         // Console.WriteLine("GetState {0} {1}", Leader, raftManager.LocalEndpoint);

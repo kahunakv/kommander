@@ -7,6 +7,10 @@ using Kommander.WAL;
 
 namespace Kommander;
 
+/// <summary>
+/// The actor functions as a state machine that allows switching between different
+/// states (follower, candidate, leader) and conducting elections without concurrency conflicts.
+/// </summary>
 public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 {
     private static readonly RaftRequest checkLeaderRequest = new(RaftRequestType.CheckLeader);
@@ -33,6 +37,14 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
     private bool restored;
 
+    /// <summary>
+    /// Constructor
+    /// </summary>
+    /// <param name="context"></param>
+    /// <param name="manager"></param>
+    /// <param name="partition"></param>
+    /// <param name="walAdapter"></param>
+    /// <param name="communication"></param>
     public RaftStateActor(
         IActorContextStruct<RaftStateActor, RaftRequest, RaftResponse> context, 
         RaftManager manager, 
@@ -61,6 +73,11 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         );
     }
 
+    /// <summary>
+    /// Entry point for the actor
+    /// </summary>
+    /// <param name="message"></param>
+    /// <returns></returns>
     public async Task<RaftResponse> Receive(RaftRequest message)
     {
         try
@@ -109,6 +126,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         return new(RaftResponseType.None);
     }
 
+    /// <summary>
+    /// un the entire content of the Write-Ahead Log on the partition to recover the initial state of the node.
+    /// This should only be done once during node startup.
+    /// </summary>
     private async ValueTask RestoreWal()
     {
         if (restored)
@@ -125,6 +146,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         currentTerm = (long)currentTermResponse.NextId;
     }
 
+    /// <summary>
+    /// Periodically, it checks the leadership status of the partition and, based on timeouts,
+    /// decides whether to start a new election process.
+    /// </summary>
     private async Task CheckClusterLeadership()
     {
         long currentTime = GetCurrentTime();
@@ -169,6 +194,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         await RequestVotes();
     }
 
+    /// <summary>
+    /// Requests votes to obtain leadership when a node becomes a candidate, reaching out to other known nodes in the cluster.
+    /// </summary>
+    /// <exception cref="RaftException"></exception>
     private async Task RequestVotes()
     {
         if (manager.Nodes.Count == 0)
@@ -192,6 +221,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         }
     }
 
+    /// <summary>
+    /// It sends a heartbeat message to the follower nodes to indicate that the leader node in the partition is still alive.
+    /// </summary>
     private async Task SendHearthbeat()
     {
         if (manager.Nodes.Count == 0)
@@ -205,6 +237,13 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         await Ping(currentTerm);
     }
 
+    /// <summary>
+    /// When another node requests our vote, it verifies that the term is valid and that the commitIndex is
+    /// higher than ours to ensure we don't elect outdated nodes as leaders.
+    /// </summary>
+    /// <param name="node"></param>
+    /// <param name="voteTerm"></param>
+    /// <param name="remoteMaxLogId"></param>
     private async Task Vote(RaftNode node, long voteTerm, ulong remoteMaxLogId)
     {
         if (votes.ContainsKey(voteTerm))
@@ -245,6 +284,11 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         await communication.Vote(manager, partition, node, request);
     }
 
+    /// <summary>
+    /// When a node receives a vote from another node, it verifies that the term is valid and that the node
+    /// </summary>
+    /// <param name="endpoint"></param>
+    /// <param name="voteTerm"></param>
     private async Task ReceivedVote(string endpoint, long voteTerm)
     {
         if (state == NodeState.Leader)
@@ -282,6 +326,12 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         await SendHearthbeat();
     }
 
+    /// <summary>
+    /// Appends logs to the Write-Ahead Log and updates the state of the node based on the leader's term.
+    /// </summary>
+    /// <param name="endpoint"></param>
+    /// <param name="leaderTerm"></param>
+    /// <param name="logs"></param>
     private void AppendLogs(string endpoint, long leaderTerm, List<RaftLog>? logs)
     {
         if (currentTerm > leaderTerm)
@@ -307,6 +357,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         }
     }
 
+    /// <summary>
+    /// Replicates logs to other nodes in the cluster when the node is the leader.
+    /// </summary>
+    /// <param name="logs"></param>
     private async Task ReplicateLogs(List<RaftLog>? logs)
     {
         if (logs is null)
@@ -323,6 +377,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         await AppendLogsToNodes(request);
     }
 
+    /// <summary>
+    /// Replicates the checkpoint to other nodes in the cluster when the node is the leader.
+    /// </summary>
     private void ReplicateCheckpoint()
     {
         if (state != NodeState.Leader)
@@ -331,12 +388,23 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         walActor.Send(new(RaftWALActionType.AppendCheckpoint, currentTerm));
     }
 
+    /// <summary>
+    /// Sets the number of votes for a given term.
+    /// </summary>
+    /// <param name="term"></param>
+    /// <param name="number"></param>
+    /// <returns></returns>
     private int SetVotes(long term, int number)
     {
         votes[term] = number;
         return number;
     }
 
+    /// <summary>
+    /// Increases the number of votes for a given term.
+    /// </summary>
+    /// <param name="term"></param>
+    /// <returns></returns>
     private int IncreaseVotes(long term)
     {
         if (votes.TryGetValue(term, out int numberVotes))
@@ -347,6 +415,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         return votes[term];
     }
     
+    /// <summary>
+    /// Pings the other nodes in the cluster to replicate logs when the node is the leader.
+    /// </summary>
+    /// <param name="term"></param>
     private async ValueTask Ping(long term)
     {
         if (state != NodeState.Leader)
@@ -357,6 +429,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         await AppendLogsToNodes(request);
     }
     
+    /// <summary>
+    /// Appends logs to the Write-Ahead Log and replicates them to other nodes in the cluster when the node is the leader.
+    /// </summary>
+    /// <param name="request"></param>
     private async Task AppendLogsToNodes(AppendLogsRequest request)
     {
         if (manager.Nodes.Count == 0)
@@ -375,11 +451,20 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         await Task.WhenAll(tasks);
     }
     
+    /// <summary>
+    /// Appends logs to a specific node in the cluster.
+    /// </summary>
+    /// <param name="node"></param>
+    /// <param name="request"></param>
     private async Task AppendLogToNode(RaftNode node, AppendLogsRequest request)
     {
         await communication.AppendLogToNode(manager, partition, node, request);
     }
 
+    /// <summary>
+    /// Obtains the current time in milliseconds.
+    /// </summary>
+    /// <returns></returns>
     private static long GetCurrentTime()
     {
         return ((DateTimeOffset)DateTime.UtcNow).ToUnixTimeMilliseconds();

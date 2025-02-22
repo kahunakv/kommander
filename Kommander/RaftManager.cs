@@ -8,6 +8,9 @@ using Nixie;
 
 namespace Kommander;
 
+/// <summary>
+/// Manages the Raft cluster.
+/// </summary>
 public sealed class RaftManager
 {
     internal readonly string LocalEndpoint;
