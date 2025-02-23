@@ -1,13 +1,15 @@
 using Kommander.Communication;
 using Kommander.Discovery;
 using Kommander.WAL;
+using Microsoft.Extensions.Logging;
+using Moq;
 using Nixie;
 
 namespace Kommander.Tests;
 
 public class TestThreeNodeCluster
 {
-    private static RaftManager GetNode1(InMemoryCommunication communication)
+    private static IRaft GetNode1(InMemoryCommunication communication)
     {
         ActorSystem actorSystem = new();
         
@@ -23,7 +25,8 @@ public class TestThreeNodeCluster
             config, 
             new StaticDiscovery([new("localhost:8002"), new("localhost:8003")]),
             new InMemoryWAL(),
-            communication
+            communication,
+            new Mock<ILogger<IRaft>>().Object
         );
 
         return node;
@@ -45,7 +48,8 @@ public class TestThreeNodeCluster
             config, 
             new StaticDiscovery([new("localhost:8001"), new("localhost:8003")]),
             new InMemoryWAL(),
-            communication
+            communication,
+            new Mock<ILogger<IRaft>>().Object
         );
 
         return node;
@@ -67,7 +71,8 @@ public class TestThreeNodeCluster
             config, 
             new StaticDiscovery([new("localhost:8001"), new("localhost:8002")]),
             new InMemoryWAL(),
-            communication
+            communication,
+            new Mock<ILogger<IRaft>>().Object
         );
 
         return node;
@@ -92,9 +97,9 @@ public class TestThreeNodeCluster
     {
         InMemoryCommunication communication = new();
         
-        RaftManager node1 = GetNode1(communication);
-        RaftManager node2 = GetNode2(communication);
-        RaftManager node3 = GetNode3(communication);
+        IRaft node1 = GetNode1(communication);
+        IRaft node2 = GetNode2(communication);
+        IRaft node3 = GetNode3(communication);
 
         await node1.JoinCluster();
         await node2.JoinCluster();
@@ -119,7 +124,7 @@ public class TestThreeNodeCluster
             await Task.Delay(1000);
         }
 
-        RaftManager? leader = await GetLeader([node1, node2, node3]);
+        IRaft? leader = await GetLeader([node1, node2, node3]);
         Assert.NotNull(leader);
     }
     
@@ -128,9 +133,9 @@ public class TestThreeNodeCluster
     {
         InMemoryCommunication communication = new();
         
-        RaftManager node1 = GetNode1(communication);
-        RaftManager node2 = GetNode2(communication);
-        RaftManager node3 = GetNode3(communication);
+        IRaft node1 = GetNode1(communication);
+        IRaft node2 = GetNode2(communication);
+        IRaft node3 = GetNode3(communication);
 
         await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster(), node3.JoinCluster()]);
 
@@ -153,16 +158,16 @@ public class TestThreeNodeCluster
             await Task.Delay(1000);
         }
 
-        RaftManager? leader = await GetLeader([node1, node2, node3]);
+        IRaft? leader = await GetLeader([node1, node2, node3]);
         Assert.NotNull(leader);
 
-        var r = await node1.WalAdapter.GetMaxLog(0);
+        long r = await node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(1, r);
     }
 
-    private static async Task<RaftManager?> GetLeader(RaftManager[] nodes)
+    private static async Task<IRaft?> GetLeader(IRaft[] nodes)
     {
-        foreach (RaftManager node in nodes)
+        foreach (IRaft node in nodes)
         {
             if (await node.AmILeader(0))
                 return node;

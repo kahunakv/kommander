@@ -11,8 +11,15 @@ public class SqliteWAL : IWAL
     private static readonly object _lock = new();
     
     private static SqliteConnection? connection;
+
+    private readonly string path;
     
-    private static void TryOpenDatabase()
+    public SqliteWAL(string path = ".")
+    {
+        this.path = path;
+    }
+    
+    private void TryOpenDatabase()
     {
         if (connection is not null)
             return;
@@ -21,8 +28,6 @@ public class SqliteWAL : IWAL
         {
             if (connection is not null)
                 return;
-
-            string path = ".";
             
             string connectionString = $"Data Source={path}/database.db";
             connection = new(connectionString);
@@ -137,12 +142,14 @@ public class SqliteWAL : IWAL
         using SqliteCommand insertCommand =  new(insertQuery, connection);
         
         insertCommand.Parameters.Clear();
+        
         insertCommand.Parameters.AddWithValue("@id", log.Id);
         insertCommand.Parameters.AddWithValue("@partitionId", partitionId);
         insertCommand.Parameters.AddWithValue("@term", log.Term);
         insertCommand.Parameters.AddWithValue("@type", log.Type);
         insertCommand.Parameters.AddWithValue("@message", log.Message);
         insertCommand.Parameters.AddWithValue("@time", log.Time);
+        
         insertCommand.ExecuteNonQuery();
     }
     

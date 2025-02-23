@@ -1,6 +1,9 @@
 
 namespace Kommander;
 
+/// <summary>
+/// Raft configuration
+/// </summary>
 public class RaftConfiguration
 {
     public string? Host { get; set; }

@@ -18,19 +18,19 @@ RaftConfiguration config = new()
 
 Console.WriteLine("Kommander! {0} {1}", config.Host, config.Port);
 
-ActorSystem aas = new();
+WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 
-RaftManager p = new(
-    aas, 
+builder.Services.AddSingleton<ActorSystem>(services => new(services, services.GetRequiredService<ILogger<IRaft>>()));
+
+builder.Services.AddSingleton<IRaft>(services => new RaftManager(
+    services.GetRequiredService<ActorSystem>(), 
     config, 
     new StaticDiscovery(arguments[3].Split(",").Select(x => new RaftNode(x)).ToList()),
     new SqliteWAL(),
-    new HttpCommunication()
-);
+    new HttpCommunication(),
+    services.GetRequiredService<ILogger<IRaft>>()
+));
 
-WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
-
-builder.Services.AddSingleton<RaftManager>(p);
 builder.Services.AddHostedService<InstrumentationService>();
 
 WebApplication app = builder.Build();

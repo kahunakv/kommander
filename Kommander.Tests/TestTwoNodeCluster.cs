@@ -2,13 +2,15 @@ using Kommander.Communication;
 using Kommander.Data;
 using Kommander.Discovery;
 using Kommander.WAL;
+using Microsoft.Extensions.Logging;
+using Moq;
 using Nixie;
 
 namespace Kommander.Tests;
 
 public class TestTwoNodeCluster
 {
-    private static RaftManager GetNode1(InMemoryCommunication communication)
+    private static IRaft GetNode1(InMemoryCommunication communication)
     {
         ActorSystem actorSystem = new();
         
@@ -24,13 +26,14 @@ public class TestTwoNodeCluster
             config, 
             new StaticDiscovery([new("localhost:8002")]),
             new InMemoryWAL(),
-            communication
+            communication,
+            new Mock<ILogger<IRaft>>().Object
         );
 
         return node;
     }
     
-    private static RaftManager GetNode2(InMemoryCommunication communication)
+    private static IRaft GetNode2(InMemoryCommunication communication)
     {
         ActorSystem actorSystem = new();
         
@@ -46,7 +49,8 @@ public class TestTwoNodeCluster
             config, 
             new StaticDiscovery([new("localhost:8001")]),
             new InMemoryWAL(),
-            communication
+            communication,
+            new Mock<ILogger<IRaft>>().Object
         );
 
         return node;
@@ -69,8 +73,8 @@ public class TestTwoNodeCluster
     {
         InMemoryCommunication communication = new();
         
-        RaftManager node1 = GetNode1(communication);
-        RaftManager node2 = GetNode2(communication);
+        IRaft node1 = GetNode1(communication);
+        IRaft node2 = GetNode2(communication);
 
         await node1.JoinCluster();
         await node2.JoinCluster();
@@ -98,8 +102,8 @@ public class TestTwoNodeCluster
     {
         InMemoryCommunication communication = new();
         
-        RaftManager node1 = GetNode1(communication);
-        RaftManager node2 = GetNode2(communication);
+        IRaft node1 = GetNode1(communication);
+        IRaft node2 = GetNode2(communication);
 
         await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster()]);
 
@@ -120,7 +124,7 @@ public class TestTwoNodeCluster
             await Task.Delay(1000);
         }
         
-        RaftManager? leader = await GetLeader([node1, node2]);
+        IRaft? leader = await GetLeader([node1, node2]);
         Assert.NotNull(leader);
     }
     
@@ -129,8 +133,8 @@ public class TestTwoNodeCluster
     {
         InMemoryCommunication communication = new();
         
-        RaftManager node1 = GetNode1(communication);
-        RaftManager node2 = GetNode2(communication);
+        IRaft node1 = GetNode1(communication);
+        IRaft node2 = GetNode2(communication);
 
         await node1.WalAdapter.Append(0, new() { Id = 1, Term = 1, Message = "Hello", Time = 0, Type = RaftLogType.Regular });
         await node1.WalAdapter.Append(0, new() { Id = 2, Term = 1, Message = "Hello", Time = 0, Type = RaftLogType.Regular });
@@ -154,7 +158,7 @@ public class TestTwoNodeCluster
             await Task.Delay(1000);
         }
         
-        RaftManager? leader = await GetLeader([node1, node2]);
+        IRaft? leader = await GetLeader([node1, node2]);
         Assert.NotNull(leader);
         
         Assert.Equal(node1.GetLocalEndpoint(), leader.GetLocalEndpoint());
@@ -171,8 +175,8 @@ public class TestTwoNodeCluster
     {
         InMemoryCommunication communication = new();
         
-        RaftManager node1 = GetNode1(communication);
-        RaftManager node2 = GetNode2(communication);
+        IRaft node1 = GetNode1(communication);
+        IRaft node2 = GetNode2(communication);
 
         await node1.WalAdapter.Append(0, new() { Id = 1, Term = 1, Message = "Hello", Time = 0, Type = RaftLogType.Regular });
         await node1.WalAdapter.Append(0, new() { Id = 2, Term = 1, Message = "Hello", Time = 0, Type = RaftLogType.Regular });
@@ -198,7 +202,7 @@ public class TestTwoNodeCluster
             await Task.Delay(1000);
         }
         
-        RaftManager? leader = await GetLeader([node1, node2]);
+        IRaft? leader = await GetLeader([node1, node2]);
         Assert.NotNull(leader);
         
         Assert.Equal(node1.GetLocalEndpoint(), leader.GetLocalEndpoint());
@@ -210,9 +214,9 @@ public class TestTwoNodeCluster
         Assert.Equal(2, maxNode2);
     }
     
-    private static async Task<RaftManager?> GetLeader(RaftManager[] nodes)
+    private static async Task<IRaft?> GetLeader(IRaft[] nodes)
     {
-        foreach (RaftManager node in nodes)
+        foreach (IRaft node in nodes)
         {
             if (await node.AmILeader(0))
                 return node;

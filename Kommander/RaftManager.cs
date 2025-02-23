@@ -11,7 +11,7 @@ namespace Kommander;
 /// <summary>
 /// Manages the Raft cluster.
 /// </summary>
-public sealed class RaftManager
+public sealed class RaftManager : IRaft
 {
     internal readonly string LocalEndpoint;
 
@@ -27,6 +27,8 @@ public sealed class RaftManager
 
     private readonly RaftPartition?[] partitions;
 
+    private readonly ILogger<IRaft> logger;
+
     internal List<RaftNode> Nodes { get; set; } = [];
 
     public IWAL WalAdapter => walAdapter;
@@ -35,18 +37,34 @@ public sealed class RaftManager
     
     public RaftConfiguration Configuration => configuration;
 
-    public event Action? OnRestoreStarted;
+    internal event Action? OnRestoreStarted;
 
-    public event Action? OnRestoreFinished;
+    internal event Action? OnRestoreFinished;
 
-    public event Func<string, Task<bool>>? OnReplicationReceived;
+    internal event Func<string, Task<bool>>? OnReplicationReceived;
     
-    public RaftManager(ActorSystem actorSystem, RaftConfiguration configuration, IDiscovery discovery, IWAL walAdapter, ICommunication communication)
+    /// <summary>
+    /// Constructor
+    /// </summary>
+    /// <param name="actorSystem"></param>
+    /// <param name="configuration"></param>
+    /// <param name="discovery"></param>
+    /// <param name="walAdapter"></param>
+    /// <param name="communication"></param>
+    public RaftManager(
+        ActorSystem actorSystem, 
+        RaftConfiguration configuration, 
+        IDiscovery discovery, 
+        IWAL walAdapter, 
+        ICommunication communication,
+        ILogger<IRaft> logger
+    )
     {
         this.actorSystem = actorSystem;
         this.configuration = configuration;
         this.walAdapter = walAdapter;
         this.communication = communication;
+        this.logger = logger;
         
         LocalEndpoint = string.Concat(configuration.Host, ":", configuration.Port);
         
@@ -55,17 +73,23 @@ public sealed class RaftManager
         clusterHandler = new(this, discovery);
     }
     
+    /// <summary>
+    /// Joins the cluster
+    /// </summary>
     public async Task JoinCluster()
     {
         if (partitions[0] is null)
         {
             for (int i = 0; i < configuration.MaxPartitions; i++)
-                partitions[i] = new(actorSystem, this, walAdapter, communication, i);
+                partitions[i] = new(actorSystem, this, walAdapter, communication, i, logger);
         }
 
         await clusterHandler.JoinCluster(configuration);
     }
 
+    /// <summary>
+    /// Updates the internal state of the nodes
+    /// </summary>
     public async Task UpdateNodes()
     {
         if (partitions[0] is null)
@@ -74,6 +98,12 @@ public sealed class RaftManager
         await clusterHandler.UpdateNodes();
     }
 
+    /// <summary>
+    /// Returns the raft partition for the given partition number
+    /// </summary>
+    /// <param name="partition"></param>
+    /// <returns></returns>
+    /// <exception cref="RaftException"></exception>
     private RaftPartition GetPartition(int partition)
     {
         if (partitions[partition] is null)
@@ -85,47 +115,80 @@ public sealed class RaftManager
         return partitions[partition]!;
     }
 
+    /// <summary>
+    /// Passes the request to the appropriate partition
+    /// </summary>
+    /// <param name="request"></param>
     public void RequestVote(RequestVotesRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
         partition.RequestVote(request);
     }
 
+    /// <summary>
+    /// Passes the request to the appropriate partition
+    /// </summary>
+    /// <param name="request"></param>
     public void Vote(VoteRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
         partition.Vote(request);
     }
 
+    /// <summary>
+    /// Append logs in the appropriate partition
+    /// Returns the index of the last log
+    /// </summary>
+    /// <param name="request"></param>
+    /// <returns></returns>
     public async Task<long> AppendLogs(AppendLogsRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
         return await partition.AppendLogs(request);
     }
 
+    /// <summary>
+    /// Replicate logs to the follower nodes
+    /// </summary>
+    /// <param name="partitionId"></param>
+    /// <param name="message"></param>
     public void ReplicateLogs(int partitionId, string message)
     {
         RaftPartition partition = GetPartition(partitionId);
         partition.ReplicateLogs(message);
     }
 
+    /// <summary>
+    /// Replicates a checkpoint to the follower nodes
+    /// </summary>
+    /// <param name="partitionId"></param>
     public void ReplicateCheckpoint(int partitionId)
     {
         RaftPartition partition = GetPartition(partitionId);
         partition.ReplicateCheckpoint();
     }
 
-    public void InvokeRestoreStarted()
+    /// <summary>
+    /// Calls the restore started event
+    /// </summary>
+    internal void InvokeRestoreStarted()
     {
         OnRestoreStarted?.Invoke();
     }
-
-    public void InvokeRestoreFinished()
+    
+    /// <summary>
+    /// Calls the restore finished event
+    /// </summary>
+    internal void InvokeRestoreFinished()
     {
         OnRestoreFinished?.Invoke();
     }
 
-    public async Task InvokeReplicationReceived(string? obj)
+    /// <summary>
+    /// Calls the replication received event
+    /// </summary>
+    /// <param name="obj"></param>
+    internal async Task InvokeReplicationReceived(string? obj)
     {
         if (obj is null)
             return;
@@ -137,11 +200,20 @@ public sealed class RaftManager
         }
     }
 
+    /// <summary>
+    /// Returns the local endpoint
+    /// </summary>
+    /// <returns></returns>
     public string GetLocalEndpoint()
     {
         return LocalEndpoint;
     }
-
+    
+    /// <summary>
+    /// Checks if the local node is the leader in the given partition
+    /// </summary>
+    /// <param name="partitionId"></param>
+    /// <returns></returns>
     public async ValueTask<bool> AmILeaderQuick(int partitionId)
     {
         if (partitions[0] is null)
@@ -169,6 +241,12 @@ public sealed class RaftManager
         return false;
     }
 
+    /// <summary>
+    /// Checks if the local node is the leader in the given partition
+    /// </summary>
+    /// <param name="partitionId"></param>
+    /// <returns></returns>
+    /// <exception cref="RaftException"></exception>
     public async ValueTask<bool> AmILeader(int partitionId)
     {
         if (partitions[0] is null)
@@ -186,10 +264,7 @@ public sealed class RaftManager
             {
                 NodeState response = await partition.GetState();
 
-                if (response == NodeState.Leader)
-                    return true;
-
-                return false;
+                return response == NodeState.Leader;
             }
             catch (AskTimeoutException e)
             {
@@ -200,6 +275,13 @@ public sealed class RaftManager
         throw new RaftException("Leader couldn't be found or is not decided");
     }
 
+    /// <summary>
+    /// Waits for the leader to be elected in the given partition
+    /// If the leader is already elected, it returns the leader
+    /// </summary>
+    /// <param name="partitionId"></param>
+    /// <returns></returns>
+    /// <exception cref="RaftException"></exception>
     public async ValueTask<string> WaitForLeader(int partitionId)
     {
         RaftPartition partition = GetPartition(partitionId);
@@ -234,6 +316,11 @@ public sealed class RaftManager
         throw new RaftException("Leader couldn't be found or is not decided");
     }
     
+    /// <summary>
+    /// Returns the number of the partition for the given partition key
+    /// </summary>
+    /// <param name="partitionKey"></param>
+    /// <returns></returns>
     public int GetPartitionKey(string partitionKey)
     {
         return HashUtils.ConsistentHash(partitionKey, configuration.MaxPartitions);

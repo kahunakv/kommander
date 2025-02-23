@@ -86,7 +86,7 @@ RaftManager node = new(
     new ActorSystem(), 
     config, 
     new StaticDiscovery([new("localhost:8002"), new("localhost:8003")]),
-    new SqliteWAL(),
+    new SqliteWAL(path: "./data"),
     new HTTPCommunication()
 );
 

@@ -29,7 +29,14 @@ public sealed class RaftPartition
     /// <param name="walAdapter"></param>
     /// <param name="communication"></param>
     /// <param name="partitionId"></param>
-    public RaftPartition(ActorSystem actorSystem, RaftManager raftManager, IWAL walAdapter, ICommunication communication, int partitionId)
+    public RaftPartition(
+        ActorSystem actorSystem, 
+        RaftManager raftManager, 
+        IWAL walAdapter, 
+        ICommunication communication, 
+        int partitionId,
+        ILogger<IRaft> logger
+    )
     {
         this.raftManager = raftManager;
         
@@ -40,7 +47,8 @@ public sealed class RaftPartition
             raftManager, 
             this,
             walAdapter,
-            communication
+            communication,
+            logger
         );
     }
 
