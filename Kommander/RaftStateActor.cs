@@ -3,6 +3,7 @@ using System.Diagnostics;
 using Nixie;
 using Kommander.Communication;
 using Kommander.Data;
+using Kommander.Time;
 using Kommander.WAL;
 
 namespace Kommander;
@@ -35,11 +36,11 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
     private long currentIndex;
 
-    private long lastHeartbeat = -1;
+    private HLCTimestamp lastHeartbeat = HLCTimestamp.Zero;
 
-    private long votingStartedAt = -1;
+    private HLCTimestamp votingStartedAt = HLCTimestamp.Zero;
 
-    private int electionTimeout = Random.Shared.Next(1000, 3000);
+    private TimeSpan electionTimeout = TimeSpan.FromMilliseconds(Random.Shared.Next(1000, 3000));
 
     private bool restored;
 
@@ -143,7 +144,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
 
         restored = true;
-        lastHeartbeat = GetCurrentTime();
+        lastHeartbeat = await manager.HybridLogicalClock.SendOrLocalEvent();
         Stopwatch stopWatch = Stopwatch.StartNew();
 
         RaftWALResponse currentCommitIndexResponse = await walActor.Ask(new(RaftWALActionType.Recover));
@@ -161,11 +162,11 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// </summary>
     private async Task CheckClusterLeadership()
     {
-        long currentTime = GetCurrentTime();
+        HLCTimestamp currentTime = await manager.HybridLogicalClock.SendOrLocalEvent();
 
         if (state == NodeState.Leader)
         {
-            if (lastHeartbeat > 0 && ((currentTime - lastHeartbeat) > 1500))
+            if (currentTime != HLCTimestamp.Zero && ((currentTime - lastHeartbeat) > TimeSpan.FromMilliseconds(1500)))
                 await SendHearthbeat();
             
             return;
@@ -173,26 +174,26 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         if (state == NodeState.Candidate)
         {
-            if (votingStartedAt > 0 && (currentTime - votingStartedAt) < 1500)
+            if (votingStartedAt != HLCTimestamp.Zero && (currentTime - votingStartedAt) < TimeSpan.FromMilliseconds(1500))
                 return;
             
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Voting concluded after {Elapsed}ms. No quorum available", manager.LocalEndpoint, partition.PartitionId, state, (currentTime - votingStartedAt));
             
             state = NodeState.Follower;
             lastHeartbeat = currentTime;
-            electionTimeout = Random.Shared.Next(1000, 3000);
+            electionTimeout = TimeSpan.FromMilliseconds(Random.Shared.Next(1000, 3000));
             return;
         }
 
         if (state == NodeState.Follower)
         {
-            if (lastHeartbeat > 0 && ((currentTime - lastHeartbeat) < electionTimeout))
+            if (lastHeartbeat != HLCTimestamp.Zero && ((currentTime - lastHeartbeat) < electionTimeout))
                 return;
         }
 
         partition.Leader = "";
         state = NodeState.Candidate;
-        votingStartedAt = GetCurrentTime();
+        votingStartedAt = currentTime;
         
         currentTerm++;
         
@@ -241,7 +242,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
 
-        lastHeartbeat = GetCurrentTime();
+        lastHeartbeat = await manager.HybridLogicalClock.SendOrLocalEvent();
 
         await Ping();
     }
@@ -284,7 +285,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
 
-        lastHeartbeat = GetCurrentTime();
+        lastHeartbeat = await manager.HybridLogicalClock.SendOrLocalEvent();
 
         logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Requested vote from {Endpoint} Term={Term}", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, voteTerm);
 
@@ -302,19 +303,19 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     {
         if (state == NodeState.Leader)
         {
-            Console.WriteLine("[{0}/{1}/{2}] Received vote but already declared as leader from {3} Term={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, voteTerm);
+            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received vote but already declared as leader from {3} Term={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, voteTerm);
             return;
         }
 
         if (state == NodeState.Follower)
         {
-            Console.WriteLine("[{0}/{1}/{2}] Received vote but we didn't ask for it from {3} Term={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, voteTerm);
+            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received vote but we didn't ask for it from {3} Term={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, voteTerm);
             return;
         }
 
         if (voteTerm < currentTerm)
         {
-            Console.WriteLine("[{0}/{1}/{2}] Received vote on previous term from {3} Term={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, voteTerm);
+            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received vote on previous term from {3} Term={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, voteTerm);
             return;
         }
 
@@ -323,14 +324,14 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         if (numberVotes < quorum)
         {
-            Console.WriteLine("[{0}/{1}/{2}] Received vote from {3} Term={4} Votes={5} Quorum={6}", manager.LocalEndpoint, partition.PartitionId, state, endpoint, voteTerm, numberVotes, quorum);
+            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {3} Term={4} Votes={5} Quorum={6}", manager.LocalEndpoint, partition.PartitionId, state, endpoint, voteTerm, numberVotes, quorum);
             return;
         }
 
         state = NodeState.Leader;
         partition.Leader = manager.LocalEndpoint;
 
-        Console.WriteLine("[{0}/{1}/{2}] Received vote from {3} and proclamed leader Term={4} Votes={5} Quorum={6}", manager.LocalEndpoint, partition.PartitionId, state, endpoint, voteTerm, numberVotes, quorum);
+        logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {3} and proclamed leader Term={4} Votes={5} Quorum={6}", manager.LocalEndpoint, partition.PartitionId, state, endpoint, voteTerm, numberVotes, quorum);
 
         await SendHearthbeat();
     }
@@ -348,7 +349,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         
         if (currentTerm > leaderTerm)
         {
-            Console.WriteLine("[{0}/{1}/{2}] Received logs from a leader {3} with old Term={4}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, leaderTerm);
+            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from a leader {Endpoint} with old Term={Term}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, leaderTerm);
             return commitedIndex;
         }
 
@@ -361,12 +362,12 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             }
 
             state = NodeState.Follower;
-            lastHeartbeat = GetCurrentTime();
+            lastHeartbeat = await manager.HybridLogicalClock.SendOrLocalEvent();
             currentTerm = leaderTerm;
 
             if (partition.Leader != endpoint)
             {
-                Console.WriteLine("[{0}/{1}/{2}] Leader is now {3} LeaderTerm={4}", manager.LocalEndpoint, partition.PartitionId, state, endpoint, leaderTerm);
+                logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Leader is now {Endpoint} LeaderTerm={Term}", manager.LocalEndpoint, partition.PartitionId, state, endpoint, leaderTerm);
                 partition.Leader = endpoint;
             }
         }
@@ -380,11 +381,19 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <param name="logs"></param>
     private async Task ReplicateLogs(List<RaftLog>? logs)
     {
-        if (logs is null)
+        if (logs is null || logs.Count == 0)
             return;
 
         if (state != NodeState.Leader)
             return;
+
+        HLCTimestamp currentTime = await manager.HybridLogicalClock.SendOrLocalEvent();
+
+        if (currentTime.L == 0)
+            throw new RaftException("wtf");
+
+        foreach (RaftLog log in logs)
+            log.Time = currentTime;
         
         // Append logs to the Write-Ahead Log
         RaftWALResponse appendResponse = await walActor.Ask(new(RaftWALActionType.Append, currentTerm, logs));
@@ -451,7 +460,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     {
         if (manager.Nodes.Count == 0)
         {
-            Console.WriteLine("[{0}/{1}/{2}] No other nodes availables to replicate logs", manager.LocalEndpoint, partition.PartitionId, state);
+            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] No other nodes availables to replicate logs", manager.LocalEndpoint, partition.PartitionId, state);
             return;
         }
 
@@ -485,16 +494,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         {
             lastCommitIndexes[node.Endpoint] = response.CommitedIndex;
             
-            Console.WriteLine("[{0}/{1}/{2}] Appended logs to {3} CommitedIndex={4}", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, response.CommitedIndex);
+            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Appended logs to {Endpoint} CommitedIndex={Index}", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, response.CommitedIndex);
         }
-    }
-
-    /// <summary>
-    /// Obtains the current time in milliseconds.
-    /// </summary>
-    /// <returns></returns>
-    private static long GetCurrentTime()
-    {
-        return ((DateTimeOffset)DateTime.UtcNow).ToUnixTimeMilliseconds();
     }
 }

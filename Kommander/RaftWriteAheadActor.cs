@@ -118,14 +118,11 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
     {
         if (appendLogs is null || appendLogs.Count == 0)
             return;
-        
-        long currentTime = GetCurrentTime();
 
         foreach (RaftLog log in appendLogs)
         {
             log.Id = commitIndex++;
             log.Term = term;
-            log.Time = currentTime;
             
             await walAdapter.Append(partition.PartitionId, log);
         }
@@ -193,14 +190,9 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             commitIndex = log.Id + 1;
         }
 
-        Collect(GetCurrentTime());
+        //Collect(GetCurrentTime());
 
         return commitIndex;
-    }
-
-    private static long GetCurrentTime()
-    {
-        return ((DateTimeOffset)DateTime.UtcNow).ToUnixTimeMilliseconds();
     }
     
     private async Task<List<RaftLog>> GetRange(long startLogIndex)

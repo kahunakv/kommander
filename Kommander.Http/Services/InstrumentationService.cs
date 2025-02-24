@@ -3,9 +3,9 @@ namespace Kommander.Services;
 
 public class InstrumentationService : BackgroundService //, IDisposable
 {
-    private readonly RaftManager raftManager;
+    private readonly IRaft raftManager;
 
-    public InstrumentationService(RaftManager raftManager)
+    public InstrumentationService(IRaft raftManager)
     {
         //_logger = logger;
         this.raftManager = raftManager;

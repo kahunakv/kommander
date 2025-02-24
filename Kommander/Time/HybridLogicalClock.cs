@@ -93,6 +93,39 @@ public sealed class HybridLogicalClock : IDisposable
             semaphore.Release();
         }
     }
+    
+    /// <summary>
+    /// Call this method when a receive event occurs `m` represents the message received,
+    /// which should contain its own timestamp
+    /// </summary>
+    /// <param name="m"></param>
+    /// <returns></returns>
+    public async Task<HLCTimestamp> ReceiveEvent(HLCTimestamp m)
+    {
+        try
+        {
+            await semaphore.WaitAsync();
+
+            long lPrime = l;
+
+            l = Math.Max(l, Math.Max(m.L, GetPhysicalTime()));
+
+            if (l == lPrime && l == m.L)
+                c = Math.Max(c, m.C) + 1;
+            else if (l == lPrime)
+                c += 1;
+            else if (l == m.L)
+                c = m.C + 1;
+            else
+                c = 0;
+
+            return new(l, c);
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    }
 
     private static long GetPhysicalTime()
     {

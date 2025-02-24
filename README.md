@@ -82,12 +82,14 @@ RaftConfiguration config = new()
 // - The node will use a static discovery mechanism to find other nodes in the cluster.
 // - The node will use a SQLite Write-Ahead Log (WAL) for log persistence.
 // - The node will use HTTP for communication with other nodes.
-RaftManager node = new(
+IRaft node = new RaftManager(
     new ActorSystem(), 
     config, 
     new StaticDiscovery([new("localhost:8002"), new("localhost:8003")]),
     new SqliteWAL(path: "./data"),
     new HTTPCommunication()
+    new HybridLogicalClock(),
+    logger
 );
 
 // Start the node and join the cluster.
@@ -99,9 +101,9 @@ if (await node.AmILeader(0))
 
 // Subscribe to the OnReplicationReceived event to receive log entries from other nodes
 // if the node is a follower
-node.OnReplicationReceived += (sender, e) =>
+node.OnReplicationReceived += (RaftLog log) =>
 {
-    Console.WriteLine($"Received log: {e.Message}");
+    Console.WriteLine($"Received log: {log.Message}");
 };
 
 ```

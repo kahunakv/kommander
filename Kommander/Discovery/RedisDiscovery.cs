@@ -14,8 +14,6 @@ public class RedisDiscovery : IDiscovery
 
     public List<RaftNode> GetNodes()
     {
-        long currentTime = RaftManager.GetCurrentTime();
-        
         /*RedisConnection connection = await GetConnection();
 
         await connection.BasicRetry(async database => await database.HashSetAsync(ClusterFormationKey, RaftManager.LocalEndpoint, currentTime));

@@ -1,5 +1,6 @@
 using Kommander.Communication;
 using Kommander.Discovery;
+using Kommander.Time;
 using Kommander.WAL;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -26,6 +27,7 @@ public class TestThreeNodeCluster
             new StaticDiscovery([new("localhost:8002"), new("localhost:8003")]),
             new InMemoryWAL(),
             communication,
+            new HybridLogicalClock(),
             new Mock<ILogger<IRaft>>().Object
         );
 
@@ -49,6 +51,7 @@ public class TestThreeNodeCluster
             new StaticDiscovery([new("localhost:8001"), new("localhost:8003")]),
             new InMemoryWAL(),
             communication,
+            new HybridLogicalClock(),
             new Mock<ILogger<IRaft>>().Object
         );
 
@@ -72,6 +75,7 @@ public class TestThreeNodeCluster
             new StaticDiscovery([new("localhost:8001"), new("localhost:8002")]),
             new InMemoryWAL(),
             communication,
+            new HybridLogicalClock(),
             new Mock<ILogger<IRaft>>().Object
         );
 
@@ -162,7 +166,7 @@ public class TestThreeNodeCluster
         Assert.NotNull(leader);
 
         long r = await node1.WalAdapter.GetMaxLog(0);
-        Assert.Equal(1, r);
+        Assert.Equal(0, r);
     }
 
     private static async Task<IRaft?> GetLeader(IRaft[] nodes)

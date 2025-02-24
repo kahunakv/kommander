@@ -3,6 +3,7 @@ using System.Diagnostics;
 using Kommander.Communication;
 using Kommander.Data;
 using Kommander.Discovery;
+using Kommander.Time;
 using Kommander.WAL;
 using Nixie;
 
@@ -22,6 +23,8 @@ public sealed class RaftManager : IRaft
     private readonly IWAL walAdapter;
 
     private readonly ICommunication communication;
+
+    private readonly HybridLogicalClock hybridLogicalClock;
     
     private readonly ClusterHandler clusterHandler;
 
@@ -37,12 +40,14 @@ public sealed class RaftManager : IRaft
     
     public RaftConfiguration Configuration => configuration;
 
+    public HybridLogicalClock HybridLogicalClock => hybridLogicalClock;
+
     internal event Action? OnRestoreStarted;
 
     internal event Action? OnRestoreFinished;
 
     internal event Func<string, Task<bool>>? OnReplicationReceived;
-    
+
     /// <summary>
     /// Constructor
     /// </summary>
@@ -51,20 +56,22 @@ public sealed class RaftManager : IRaft
     /// <param name="discovery"></param>
     /// <param name="walAdapter"></param>
     /// <param name="communication"></param>
-    public RaftManager(
-        ActorSystem actorSystem, 
-        RaftConfiguration configuration, 
-        IDiscovery discovery, 
-        IWAL walAdapter, 
+    /// <param name="hybridLogicalClock"></param>
+    /// <param name="logger"></param>
+    public RaftManager(ActorSystem actorSystem,
+        RaftConfiguration configuration,
+        IDiscovery discovery,
+        IWAL walAdapter,
         ICommunication communication,
-        ILogger<IRaft> logger
-    )
+        HybridLogicalClock hybridLogicalClock,
+        ILogger<IRaft> logger)
     {
         this.actorSystem = actorSystem;
         this.configuration = configuration;
         this.walAdapter = walAdapter;
         this.communication = communication;
         this.logger = logger;
+        this.hybridLogicalClock = hybridLogicalClock;
         
         LocalEndpoint = string.Concat(configuration.Host, ":", configuration.Port);
         
@@ -324,10 +331,5 @@ public sealed class RaftManager : IRaft
     public int GetPartitionKey(string partitionKey)
     {
         return HashUtils.ConsistentHash(partitionKey, configuration.MaxPartitions);
-    }
-
-    internal static long GetCurrentTime()
-    {
-        return ((DateTimeOffset)DateTime.UtcNow).ToUnixTimeMilliseconds();
     }
 }
