@@ -1,10 +1,12 @@
 
+using System.Text.Json.Serialization;
+
 namespace Kommander.Time;
 
 /// <summary>
 /// Represents a unique point in time given by the Hybrid Logical Clock (HLC)
 /// </summary>
-public record struct HLCTimestamp : IComparable<HLCTimestamp>
+public readonly record struct HLCTimestamp : IComparable<HLCTimestamp>
 {
     public static readonly HLCTimestamp Zero = new(0, 0);
 
@@ -12,6 +14,7 @@ public record struct HLCTimestamp : IComparable<HLCTimestamp>
 
     public uint C { get; }
 
+    [JsonConstructor]
     public HLCTimestamp(long l, uint c)
     {
         L = l;
@@ -51,4 +54,6 @@ public record struct HLCTimestamp : IComparable<HLCTimestamp>
     public static HLCTimestamp operator +(HLCTimestamp a, int b) => new(a.L + b, a.C);
 
     public static HLCTimestamp operator -(HLCTimestamp a, int b) => new(a.L - b, a.C);
+    
+    public static TimeSpan operator -(HLCTimestamp a, HLCTimestamp b) => TimeSpan.FromMilliseconds(a.L - b.L);
 }

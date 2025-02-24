@@ -23,14 +23,13 @@ WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddSingleton<ActorSystem>(services => new(services, services.GetRequiredService<ILogger<IRaft>>()));
 
-builder.Services.AddSingleton<HybridLogicalClock>();
-
 builder.Services.AddSingleton<IRaft>(services => new RaftManager(
     services.GetRequiredService<ActorSystem>(), 
     config, 
     new StaticDiscovery(arguments[3].Split(",").Select(x => new RaftNode(x)).ToList()),
     new SqliteWAL(),
     new HttpCommunication(),
+    new HybridLogicalClock(),
     services.GetRequiredService<ILogger<IRaft>>()
 ));
 

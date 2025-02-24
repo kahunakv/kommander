@@ -77,6 +77,13 @@ public sealed class RaftPartition
     /// <returns></returns>
     public async Task<long> AppendLogs(AppendLogsRequest request)
     {
+        // Make sure HLC clocks are synced
+        if (request.Logs is not null && request.Logs.Count > 0)
+        {
+            foreach (RaftLog log in request.Logs)
+                await raftManager.HybridLogicalClock.ReceiveEvent(log.Time);
+        }
+
         RaftResponse response = await raftActor.Ask(new(RaftRequestType.AppendLogs, request.Term, 0, request.Endpoint, request.Logs));
         return response.CurrentIndex;
     }
