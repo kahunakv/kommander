@@ -71,7 +71,8 @@ public class HttpCommunication : ICommunication
                 .PostStringAsync(payload)
                 .ReceiveJson<AppendLogsResponse>();
             
-            Console.WriteLine("[{0}/{1}] Logs replicated to {2}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint);
+            if (request.Logs is not null && request.Logs.Count > 0)
+                Console.WriteLine("[{0}/{1}] Logs replicated to {2}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint);
 
             return response;
         }
