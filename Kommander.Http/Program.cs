@@ -3,6 +3,7 @@ using Kommander;
 using Kommander.Communication;
 using Kommander.Discovery;
 using Kommander.Services;
+using Kommander.Time;
 using Kommander.WAL;
 
 using Nixie;
@@ -21,6 +22,8 @@ Console.WriteLine("Kommander! {0} {1}", config.Host, config.Port);
 WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddSingleton<ActorSystem>(services => new(services, services.GetRequiredService<ILogger<IRaft>>()));
+
+builder.Services.AddSingleton<HybridLogicalClock>();
 
 builder.Services.AddSingleton<IRaft>(services => new RaftManager(
     services.GetRequiredService<ActorSystem>(), 
