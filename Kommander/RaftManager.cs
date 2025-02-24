@@ -37,11 +37,20 @@ public sealed class RaftManager : IRaft
     
     public RaftConfiguration Configuration => configuration;
 
-    internal event Action? OnRestoreStarted;
+    /// <summary>
+    /// Event when the restore process starts
+    /// </summary>
+    public event Action? OnRestoreStarted;
 
-    internal event Action? OnRestoreFinished;
+    /// <summary>
+    /// Event when the restore process finishes
+    /// </summary>
+    public event Action? OnRestoreFinished;
 
-    internal event Func<string, Task<bool>>? OnReplicationReceived;
+    /// <summary>
+    /// Event when a replication log is received
+    /// </summary>
+    public event Func<string, Task<bool>>? OnReplicationReceived;
     
     /// <summary>
     /// Constructor
