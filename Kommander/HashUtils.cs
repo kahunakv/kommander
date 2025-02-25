@@ -1,17 +1,13 @@
 
+using Standart.Hash.xxHash;
+
 namespace Kommander;
 
-public class HashUtils
+public static class HashUtils
 {
-    public static int ConsistentHash(string value, int divisor)
+    public static long ConsistentHash(string value, int divisor)
     {
-        //uint computed = xxHash32.ComputeHash(value);
-
-        //BigInteger computedInteger = new(Math.Abs(computed));
-        //BigInteger bigDivisor = new(divisor);
-
-        //return (int)(computedInteger % bigDivisor);
-        
-        return Math.Abs(value.GetHashCode()) % divisor;
+        uint computed = xxHash32.ComputeHash(value);
+        return computed % divisor;
     }
 }
