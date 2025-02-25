@@ -15,7 +15,7 @@ try
     {
         Host = Dns.GetHostAddresses(Environment.GetEnvironmentVariable("PEER_HOST") ?? "localhost")[0].ToString(),
         Port = int.Parse(Environment.GetEnvironmentVariable("PEER_PORT") ?? "8004"),
-        MaxPartitions = 1
+        MaxPartitions = 3
     };
 
     List<RaftNode> nodes =
@@ -55,7 +55,7 @@ try
 
     app.MapGet("/", () => "Kommander Raft Node");
 
-    app.Run($"http://*:{config.Port}");
+    app.Run();
 }
 catch (Exception ex)
 {

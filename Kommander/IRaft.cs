@@ -60,21 +60,21 @@ public interface IRaft
     /// </summary>
     /// <param name="request"></param>
     /// <returns></returns>
-    public Task<long> AppendLogs(AppendLogsRequest request);
+    public Task<(RaftOperationStatus, long)> AppendLogs(AppendLogsRequest request);
 
     /// <summary>
     /// Replicate logs to the followers in the partition
     /// </summary>
     /// <param name="partitionId"></param>
     /// <param name="log"></param>
-    public Task ReplicateLogs(int partitionId, byte[] log);
+    public Task<(bool success, long commitLogId)> ReplicateLogs(int partitionId, byte[] log);
 
     /// <summary>
     /// Replicate logs to the followers in the partition
     /// </summary>
     /// <param name="partitionId"></param>
     /// <param name="logs"></param>
-    public Task ReplicateLogs(int partitionId, IEnumerable<byte[]> logs);
+    public Task<(bool success, long commitLogId)> ReplicateLogs(int partitionId, IEnumerable<byte[]> logs);
 
     /// <summary>
     /// Replicate a checkpoint to the followers in the partition    
@@ -108,4 +108,11 @@ public interface IRaft
     /// <param name="partitionId"></param>
     /// <returns></returns>
     public ValueTask<string> WaitForLeader(int partitionId);
+
+    /// <summary>
+    /// Returns the correct partition id according to the partition key
+    /// </summary>
+    /// <param name="partitionKey"></param>
+    /// <returns></returns>
+    public long GetPartitionKey(string partitionKey);
 }

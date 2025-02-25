@@ -3,6 +3,8 @@ namespace Kommander.Data;
 public readonly struct RaftResponse
 {
     public RaftResponseType Type { get; }
+    
+    public RaftOperationStatus Status { get; } = RaftOperationStatus.Success;
 
     public NodeState State { get; } = NodeState.Follower;
     
@@ -22,6 +24,13 @@ public readonly struct RaftResponse
     public RaftResponse(RaftResponseType type, long currentIndex)
     {
         Type = type;
+        CurrentIndex = currentIndex;
+    }
+    
+    public RaftResponse(RaftResponseType type, RaftOperationStatus status, long currentIndex)
+    {
+        Type = type;
+        Status = status;
         CurrentIndex = currentIndex;
     }
 }

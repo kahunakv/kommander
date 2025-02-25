@@ -9,7 +9,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>Kommander</PackageId>
-    <Version>0.0.7</Version>
+    <Version>0.1.0</Version>
     <Description>Distributed consensus with Raft for C#/.NET</Description>
     <Authors>Andres Gutierrez</Authors>
     <Company>Andres Gutierrez</Company>
@@ -35,6 +35,7 @@
     <PackageReference Include="Nixie" Version="1.0.9" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.2" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.2" />
+    <PackageReference Include="Standart.Hash.xxHash" Version="4.0.5" />
   </ItemGroup>
 
 </Project>

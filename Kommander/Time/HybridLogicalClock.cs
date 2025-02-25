@@ -52,6 +52,9 @@ public sealed class HybridLogicalClock : IDisposable
                 c++;
             else
                 c = 0;
+            
+            if (l == 0)
+                throw new RaftException("Corrupted HLC clock");
 
             return new(l, c);
         }
@@ -85,6 +88,9 @@ public sealed class HybridLogicalClock : IDisposable
                 c = m.C + 1;
             else
                 c = 0;
+            
+            if (l == 0)
+                throw new RaftException("Corrupted HLC clock");
 
             return new(l, c);
         }
@@ -118,6 +124,9 @@ public sealed class HybridLogicalClock : IDisposable
                 c = m.C + 1;
             else
                 c = 0;
+            
+            if (l == 0)
+                throw new RaftException("Corrupted HLC clock");
 
             return new(l, c);
         }

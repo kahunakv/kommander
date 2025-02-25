@@ -7,8 +7,11 @@ public static class HttpCommunicationExtensions
 {
     public static void MapRaftRoutes(this WebApplication app)
     {
-        app.MapPost("/v1/raft/append-logs", async (AppendLogsRequest request, IRaft raft) 
-            => new AppendLogsResponse(await raft.AppendLogs(request)));
+        app.MapPost("/v1/raft/append-logs", async (AppendLogsRequest request, IRaft raft) =>
+        {
+            (RaftOperationStatus status, long commitLogIndex) = await raft.AppendLogs(request);
+            return new AppendLogsResponse(status, commitLogIndex);
+        });
 
         app.MapPost("/v1/raft/request-vote", (RequestVotesRequest request, IRaft raft) =>
         {
@@ -20,6 +23,12 @@ public static class HttpCommunicationExtensions
         {
             raft.Vote(request);
             return new VoteResponse();
+        });
+        
+        app.MapGet("/v1/raft/get-leader/{partitionId}", async (int partitionId, IRaft raft) =>
+        {
+            string leader = await raft.WaitForLeader(partitionId);
+            return leader;
         });
     }
 }

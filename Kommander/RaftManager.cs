@@ -7,6 +7,7 @@ using Kommander.Time;
 using Kommander.WAL;
 using Nixie;
 // ReSharper disable ConvertToAutoProperty
+// ReSharper disable ConvertToAutoPropertyWhenPossible
 
 namespace Kommander;
 
@@ -158,7 +159,7 @@ public sealed class RaftManager : IRaft
     /// </summary>
     /// <param name="request"></param>
     /// <returns></returns>
-    public async Task<long> AppendLogs(AppendLogsRequest request)
+    public async Task<(RaftOperationStatus, long)> AppendLogs(AppendLogsRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
         return await partition.AppendLogs(request);
@@ -169,10 +170,10 @@ public sealed class RaftManager : IRaft
     /// </summary>
     /// <param name="partitionId"></param>
     /// <param name="log"></param>
-    public async Task ReplicateLogs(int partitionId, byte[] log)
+    public async Task<(bool success, long commitLogId)> ReplicateLogs(int partitionId, byte[] log)
     {
         RaftPartition partition = GetPartition(partitionId);
-        await partition.ReplicateLogs(log);
+        return await partition.ReplicateLogs(log);
     }
     
     /// <summary>
@@ -180,10 +181,10 @@ public sealed class RaftManager : IRaft
     /// </summary>
     /// <param name="partitionId"></param>
     /// <param name="logs"></param>
-    public async Task ReplicateLogs(int partitionId, IEnumerable<byte[]> logs)
+    public async Task<(bool success, long commitLogId)> ReplicateLogs(int partitionId, IEnumerable<byte[]> logs)
     {
         RaftPartition partition = GetPartition(partitionId);
-        await partition.ReplicateLogs(logs);
+        return await partition.ReplicateLogs(logs);
     }
 
     /// <summary>
@@ -263,7 +264,7 @@ public sealed class RaftManager : IRaft
         }
         catch (AskTimeoutException e)
         {
-            Console.WriteLine("AmILeaderQuick: {0}", e.Message);
+            logger.LogError("AmILeaderQuick: {Message}", e.Message);
         }
 
         return false;
@@ -280,8 +281,8 @@ public sealed class RaftManager : IRaft
         if (partitions[0] is null)
             return false;
 
-        RaftPartition partition = GetPartition(partitionId);
         Stopwatch stopwatch = Stopwatch.StartNew();
+        RaftPartition partition = GetPartition(partitionId);
 
         while (stopwatch.ElapsedMilliseconds < 60000)
         {
@@ -296,7 +297,7 @@ public sealed class RaftManager : IRaft
             }
             catch (AskTimeoutException e)
             {
-                Console.WriteLine("AmILeader: {0}", e.Message);
+                logger.LogError("AmILeader: {Message}", e.Message);
             }
         }
 
@@ -317,9 +318,6 @@ public sealed class RaftManager : IRaft
 
         while (stopwatch.ElapsedMilliseconds < 60000)
         {
-            if (!string.IsNullOrEmpty(partition.Leader))
-                return partition.Leader;
-
             try
             {
                 NodeState response = await partition.GetState();
@@ -329,7 +327,7 @@ public sealed class RaftManager : IRaft
 
                 if (string.IsNullOrEmpty(partition.Leader))
                 {
-                    await Task.Delay(500 + Random.Shared.Next(-50, 50));
+                    await Task.Delay(150 + Random.Shared.Next(-50, 50));
                     continue;
                 }
 
@@ -337,7 +335,7 @@ public sealed class RaftManager : IRaft
             }
             catch (AskTimeoutException e)
             {
-                Console.WriteLine("WaitForLeader: {0}", e.Message);
+                logger.LogError("WaitForLeader: {Message}", e.Message);
             }
         }
 
@@ -349,7 +347,7 @@ public sealed class RaftManager : IRaft
     /// </summary>
     /// <param name="partitionKey"></param>
     /// <returns></returns>
-    public int GetPartitionKey(string partitionKey)
+    public long GetPartitionKey(string partitionKey)
     {
         return HashUtils.ConsistentHash(partitionKey, configuration.MaxPartitions);
     }

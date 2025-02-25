@@ -30,10 +30,11 @@ public class InMemoryCommunication : ICommunication
     public async Task<AppendLogsResponse> AppendLogToNode(RaftManager manager, RaftPartition partition, RaftNode node, AppendLogsRequest request)
     {
         long commitedIndex = -1;
+        RaftOperationStatus status = RaftOperationStatus.Success;
         
         if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
-            commitedIndex = await targetNode.AppendLogs(request);
+            (status, commitedIndex) = await targetNode.AppendLogs(request);
         
-        return new(commitedIndex);
+        return new(status, commitedIndex);
     }
 }

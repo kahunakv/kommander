@@ -81,6 +81,6 @@ public class HttpCommunication : ICommunication
             Console.WriteLine("[{0}/{1}] {2}", manager.LocalEndpoint, partition.PartitionId, e.Message);
         }
 
-        return new(-1);
+        return new(RaftOperationStatus.Errored, -1);
     }
 }

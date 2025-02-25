@@ -75,7 +75,7 @@ public sealed class RaftPartition
     /// </summary>
     /// <param name="request"></param>
     /// <returns></returns>
-    public async Task<long> AppendLogs(AppendLogsRequest request)
+    public async Task<(RaftOperationStatus, long)> AppendLogs(AppendLogsRequest request)
     {
         // Make sure HLC clocks are synced
         if (request.Logs is not null && request.Logs.Count > 0)
@@ -85,41 +85,41 @@ public sealed class RaftPartition
         }
 
         RaftResponse response = await raftActor.Ask(new(RaftRequestType.AppendLogs, request.Term, 0, request.Endpoint, request.Logs));
-        return response.CurrentIndex;
+        return (response.Status, response.CurrentIndex);
     }
 
     /// <summary>
     /// Replicate logs to the partition.
     /// </summary>
     /// <param name="message"></param>
-    public async Task ReplicateLogs(byte[] message)
+    public async Task<(bool success, long commitLogId)> ReplicateLogs(byte[] message)
     {
         if (string.IsNullOrEmpty(Leader))
-            throw new RaftException("Leader is not set.");
+            return (false, -1);
         
         if (Leader != raftManager.LocalEndpoint)
-            throw new RaftException("Leader is not set.");
+            return (false, -1);
         
         RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, [new() { Log = message }]));
-        return;
+        return (true, response.CurrentIndex);
     }
     
     /// <summary>
     /// Replicate logs to the partition.
     /// </summary>
     /// <param name="message"></param>
-    public async Task ReplicateLogs(IEnumerable<byte[]> logs)
+    public async Task<(bool success, long commitLogId)> ReplicateLogs(IEnumerable<byte[]> logs)
     {
         if (string.IsNullOrEmpty(Leader))
-            throw new RaftException("Leader is not set.");
+            return (false, -1);
         
         if (Leader != raftManager.LocalEndpoint)
-            throw new RaftException("Leader is not set.");
+            return (false, -1);
 
         List<RaftLog> logsToReplicate = logs.Select(x => new RaftLog { Log = x }).ToList();
         
         RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate));
-        return;
+        return (true, response.CurrentIndex);
     }
 
     /// <summary>
@@ -143,15 +143,11 @@ public sealed class RaftPartition
     /// <exception cref="RaftException"></exception>
     public async ValueTask<NodeState> GetState()
     {
-        // Console.WriteLine("GetState {0} {1}", Leader, raftManager.LocalEndpoint);
-        
         if (!string.IsNullOrEmpty(Leader) && Leader == raftManager.LocalEndpoint)
             return NodeState.Leader;
 
         RaftResponse response = await raftActor.Ask(raftStateRequest, TimeSpan.FromSeconds(5));
         
-        // Console.WriteLine("GetState {0} {1} {2}", Leader, raftManager.LocalEndpoint, response.Type);
-
         if (response.Type == RaftResponseType.None)
             throw new RaftException("Unknown response (2)");
 
