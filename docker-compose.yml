@@ -1,0 +1,45 @@
+version: "3.8"
+
+services:
+  node1:
+    image: kommander:latest   
+    container_name: node1
+    environment:
+      - PEER_HOST=172.20.0.2
+      - PEER_PORT=8081    
+    ports:
+      - "8081:8004"
+    networks:
+      custom_net:
+        ipv4_address: 172.20.0.2
+
+  node2:
+    image: kommander:latest
+    container_name: node2
+    environment:
+      - PEER_HOST=node2
+      - PEER_PORT=8082
+    ports:
+      - "8082:8004"
+    networks:
+      custom_net:
+        ipv4_address: 172.20.0.3
+
+  node3:
+    image: kommander:latest
+    container_name: node3
+    environment:
+      - PEER_HOST=node3
+      - PEER_PORT=8083
+    ports:
+      - "8083:8004"
+    networks:
+      custom_net:
+        ipv4_address: 172.20.0.4
+
+networks:
+  custom_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
