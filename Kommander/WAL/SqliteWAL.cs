@@ -35,7 +35,7 @@ public class SqliteWAL : IWAL
 
             connection.Open();
 
-            const string createTableQuery = "CREATE TABLE IF NOT EXISTS logs (id INT, partitionId INT, term INT, type INT, message TEXT COLLATE BINARY, timeLogical INT, timeCounter INT, PRIMARY KEY(partitionId, id));";
+            const string createTableQuery = "CREATE TABLE IF NOT EXISTS logs (id INT, partitionId INT, term INT, type INT, log BLOB, timeLogical INT, timeCounter INT, PRIMARY KEY(partitionId, id));";
             using SqliteCommand command1 = new(createTableQuery, connection);
             command1.ExecuteNonQuery();
             
@@ -67,7 +67,7 @@ public class SqliteWAL : IWAL
         
         TryOpenDatabase();
         
-        const string query = "SELECT id, term, type, message, timeLogical, timeCounter FROM logs WHERE partitionId = @partitionId ORDER BY id ASC;";
+        const string query = "SELECT id, term, type, log, timeLogical, timeCounter FROM logs WHERE partitionId = @partitionId ORDER BY id ASC;";
         using SqliteCommand command = new(query, connection);
         command.Parameters.AddWithValue("@partitionId", partitionId);
         
@@ -80,7 +80,7 @@ public class SqliteWAL : IWAL
                 Id = reader.IsDBNull(0) ? 0 : reader.GetInt64(0),
                 Term = reader.IsDBNull(1) ? 0 : reader.GetInt64(1),
                 Type = reader.IsDBNull(2) ? RaftLogType.Regular : (RaftLogType)reader.GetInt32(2),
-                Message = reader.IsDBNull(3) ? "" : reader.GetString(3),
+                Log = reader.IsDBNull(3) ? [] : (byte[])reader[3],
                 Time = new(reader.IsDBNull(4) ? 0 : reader.GetInt64(4), reader.IsDBNull(5) ? 0 : (uint)reader.GetInt64(5))
             };
         }
@@ -92,7 +92,7 @@ public class SqliteWAL : IWAL
         
         TryOpenDatabase();
         
-        const string query = "SELECT id, term, type, message, timeLogical, timeCounter FROM logs WHERE partitionId = @partitionId AND id >= @startIndex ORDER BY id ASC;";
+        const string query = "SELECT id, term, type, log, timeLogical, timeCounter FROM logs WHERE partitionId = @partitionId AND id >= @startIndex ORDER BY id ASC;";
         using SqliteCommand command = new(query, connection);
         
         command.Parameters.AddWithValue("@partitionId", partitionId);
@@ -107,7 +107,7 @@ public class SqliteWAL : IWAL
                 Id = reader.IsDBNull(0) ? 0 : reader.GetInt64(0),
                 Term = reader.IsDBNull(1) ? 0 : reader.GetInt64(1),
                 Type = reader.IsDBNull(2) ? RaftLogType.Regular : (RaftLogType)reader.GetInt32(2),
-                Message = reader.IsDBNull(3) ? "" : reader.GetString(3),
+                Log = reader.IsDBNull(3) ? [] : (byte[])reader[3],
                 Time = new(reader.IsDBNull(4) ? 0 : reader.GetInt64(4), reader.IsDBNull(5) ? 0 : (uint)reader.GetInt64(5))
             };
         }
@@ -139,7 +139,7 @@ public class SqliteWAL : IWAL
         
         TryOpenDatabase();
         
-        const string insertQuery = "INSERT INTO logs (id, partitionId, term, type, message, timeLogical, timeCounter) VALUES (@id, @partitionId, @term, @type, @message, @timeLogical, @timeCounter);";
+        const string insertQuery = "INSERT INTO logs (id, partitionId, term, type, log, timeLogical, timeCounter) VALUES (@id, @partitionId, @term, @type, @log, @timeLogical, @timeCounter);";
         using SqliteCommand insertCommand =  new(insertQuery, connection);
         
         insertCommand.Parameters.Clear();
@@ -148,7 +148,7 @@ public class SqliteWAL : IWAL
         insertCommand.Parameters.AddWithValue("@partitionId", partitionId);
         insertCommand.Parameters.AddWithValue("@term", log.Term);
         insertCommand.Parameters.AddWithValue("@type", log.Type);
-        insertCommand.Parameters.AddWithValue("@message", log.Message);
+        insertCommand.Parameters.AddWithValue("@log", log.Log);
         insertCommand.Parameters.AddWithValue("@timeLogical", log.Time.L);
         insertCommand.Parameters.AddWithValue("@timeCounter", log.Time.C);
         

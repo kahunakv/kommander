@@ -1,4 +1,6 @@
 
+using System.Text;
+
 namespace Kommander.Services;
 
 public class InstrumentationService : BackgroundService //, IDisposable
@@ -22,7 +24,7 @@ public class InstrumentationService : BackgroundService //, IDisposable
             for (int i = 0; i < raftManager.Configuration.MaxPartitions ; i++)
             {
                 if (await raftManager.AmILeader(i))
-                    raftManager.ReplicateLogs(i, "Hello, World! " + DateTime.UtcNow);
+                    await raftManager.ReplicateLogs(i, Encoding.UTF8.GetBytes("Hello, World! " + DateTime.UtcNow));
             }
 
             await Task.Delay(3000, stoppingToken);

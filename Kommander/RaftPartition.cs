@@ -92,9 +92,34 @@ public sealed class RaftPartition
     /// Replicate logs to the partition.
     /// </summary>
     /// <param name="message"></param>
-    public void ReplicateLogs(string message)
+    public async Task ReplicateLogs(byte[] message)
     {
-        raftActor.Send(new(RaftRequestType.ReplicateLogs, [new() { Message = message }]));
+        if (string.IsNullOrEmpty(Leader))
+            throw new RaftException("Leader is not set.");
+        
+        if (Leader != raftManager.LocalEndpoint)
+            throw new RaftException("Leader is not set.");
+        
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, [new() { Log = message }]));
+        return;
+    }
+    
+    /// <summary>
+    /// Replicate logs to the partition.
+    /// </summary>
+    /// <param name="message"></param>
+    public async Task ReplicateLogs(IEnumerable<byte[]> logs)
+    {
+        if (string.IsNullOrEmpty(Leader))
+            throw new RaftException("Leader is not set.");
+        
+        if (Leader != raftManager.LocalEndpoint)
+            throw new RaftException("Leader is not set.");
+
+        List<RaftLog> logsToReplicate = logs.Select(x => new RaftLog { Log = x }).ToList();
+        
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate));
+        return;
     }
 
     /// <summary>
@@ -102,6 +127,12 @@ public sealed class RaftPartition
     /// </summary>
     public void ReplicateCheckpoint()
     {
+        if (string.IsNullOrEmpty(Leader))
+            throw new RaftException("Leader is not set.");
+        
+        if (Leader != raftManager.LocalEndpoint)
+            throw new RaftException("Leader is not set.");
+        
         raftActor.Send(new(RaftRequestType.ReplicateCheckpoint));
     }
 

@@ -16,5 +16,5 @@ public sealed class RaftLog
     
     public HLCTimestamp Time { get; set; }
     
-    public string? Message { get; set; }
+    public byte[]? Log { get; set; }
 }

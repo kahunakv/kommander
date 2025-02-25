@@ -103,7 +103,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             found = true;
             commitIndex = log.Id + 1;
 
-            await manager.InvokeReplicationReceived(log.Message);
+            await manager.InvokeReplicationReceived(log.Log);
         }
 
         if (!found)
@@ -185,7 +185,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             
             Console.WriteLine("[{0}/{1}] Applied log #{2}", manager.LocalEndpoint, partition.PartitionId, log.Id);
 
-            await manager.InvokeReplicationReceived(log.Message);
+            await manager.InvokeReplicationReceived(log.Log);
 
             commitIndex = log.Id + 1;
         }

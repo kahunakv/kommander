@@ -6,6 +6,7 @@ using Kommander.Discovery;
 using Kommander.Time;
 using Kommander.WAL;
 using Nixie;
+// ReSharper disable ConvertToAutoProperty
 
 namespace Kommander;
 
@@ -55,7 +56,7 @@ public sealed class RaftManager : IRaft
     /// <summary>
     /// Event when a replication log is received
     /// </summary>
-    public event Func<string, Task<bool>>? OnReplicationReceived;
+    public event Func<byte[], Task<bool>>? OnReplicationReceived;
     
     /// <summary>
     /// Constructor
@@ -167,11 +168,22 @@ public sealed class RaftManager : IRaft
     /// Replicate logs to the follower nodes
     /// </summary>
     /// <param name="partitionId"></param>
-    /// <param name="message"></param>
-    public void ReplicateLogs(int partitionId, string message)
+    /// <param name="log"></param>
+    public async Task ReplicateLogs(int partitionId, byte[] log)
     {
         RaftPartition partition = GetPartition(partitionId);
-        partition.ReplicateLogs(message);
+        await partition.ReplicateLogs(log);
+    }
+    
+    /// <summary>
+    /// Replicate logs to the follower nodes
+    /// </summary>
+    /// <param name="partitionId"></param>
+    /// <param name="logs"></param>
+    public async Task ReplicateLogs(int partitionId, IEnumerable<byte[]> logs)
+    {
+        RaftPartition partition = GetPartition(partitionId);
+        await partition.ReplicateLogs(logs);
     }
 
     /// <summary>
@@ -203,16 +215,16 @@ public sealed class RaftManager : IRaft
     /// <summary>
     /// Calls the replication received event
     /// </summary>
-    /// <param name="obj"></param>
-    internal async Task InvokeReplicationReceived(string? obj)
+    /// <param name="log"></param>
+    internal async Task InvokeReplicationReceived(byte[]? log)
     {
-        if (obj is null)
+        if (log is null)
             return;
 
         if (OnReplicationReceived != null)
         {
-            Func<string, Task<bool>> callback = OnReplicationReceived;
-            await callback(obj);
+            Func<byte[], Task<bool>> callback = OnReplicationReceived;
+            await callback(log);
         }
     }
 

@@ -40,7 +40,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
     private HLCTimestamp votingStartedAt = HLCTimestamp.Zero;
 
-    private TimeSpan electionTimeout = TimeSpan.FromMilliseconds(Random.Shared.Next(1000, 3000));
+    private TimeSpan electionTimeout = TimeSpan.FromMilliseconds(Random.Shared.Next(2000, 7000));
 
     private bool restored;
 
@@ -181,7 +181,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             
             state = NodeState.Follower;
             lastHeartbeat = currentTime;
-            electionTimeout = TimeSpan.FromMilliseconds(Random.Shared.Next(1000, 3000));
+            electionTimeout = TimeSpan.FromMilliseconds(Random.Shared.Next(2000, 7000));
             return;
         }
 
@@ -390,7 +390,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         HLCTimestamp currentTime = await manager.HybridLogicalClock.SendOrLocalEvent();
 
         if (currentTime.L == 0)
-            throw new RaftException("wtf");
+            throw new RaftException("Corrupted HLC clock");
 
         foreach (RaftLog log in logs)
             log.Time = currentTime;

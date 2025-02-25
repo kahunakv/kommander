@@ -29,7 +29,7 @@ public interface IRaft
     /// <summary>
     /// Event when a replication log is received
     /// </summary>
-    public event Func<string, Task<bool>>? OnReplicationReceived;
+    public event Func<byte[], Task<bool>>? OnReplicationReceived;
     
     /// <summary>
     /// Joins the Raft cluster
@@ -66,8 +66,15 @@ public interface IRaft
     /// Replicate logs to the followers in the partition
     /// </summary>
     /// <param name="partitionId"></param>
-    /// <param name="message"></param>
-    public void ReplicateLogs(int partitionId, string message);
+    /// <param name="log"></param>
+    public Task ReplicateLogs(int partitionId, byte[] log);
+
+    /// <summary>
+    /// Replicate logs to the followers in the partition
+    /// </summary>
+    /// <param name="partitionId"></param>
+    /// <param name="logs"></param>
+    public Task ReplicateLogs(int partitionId, IEnumerable<byte[]> logs);
 
     /// <summary>
     /// Replicate a checkpoint to the followers in the partition    
