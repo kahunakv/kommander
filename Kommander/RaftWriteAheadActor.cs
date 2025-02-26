@@ -19,17 +19,13 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
     private readonly IWAL walAdapter;
 
-    //private readonly ILogger<IRaft> logger;
+    private readonly ILogger<IRaft> logger;
 
     private bool recovered;
 
     private long commitIndex = 1;
 
     private ulong operations;
-
-    //private readonly SortedDictionary<ulong, RaftLog> logs = [];
-
-    //private readonly List<ulong> modifications = [];
 
     public RaftWriteAheadActor(
         IActorContextStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse> _, 
@@ -39,6 +35,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
     )
     {
         this.manager = manager;
+        this.logger = manager.Logger;
         this.partition = partition;
         this.walAdapter = walAdapter;
     }
@@ -54,13 +51,13 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 case RaftWALActionType.Append:
                     await Append(message.Term, message.Logs);
                     break;
+                
+                case RaftWALActionType.Update:
+                    return new(await Update(message.Logs));
 
                 case RaftWALActionType.AppendCheckpoint:
                     await AppendCheckpoint(message.Term);
                     break;
-
-                case RaftWALActionType.Update:
-                    return new(await Update(message.Logs));
                 
                 case RaftWALActionType.GetRange:
                     return new(await GetRange(message.CurrentIndex));
@@ -75,13 +72,13 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                     return new(await GetCurrentTerm());
                 
                 default:
-                    Console.WriteLine("[{0}/{1}] Unknown action type: {2}", manager.LocalEndpoint, partition.PartitionId, message.Type);
+                    logger.LogError("[{Endpoint}/{PartitionId}] Unknown action type: {Type}", manager.LocalEndpoint, partition.PartitionId, message.Type);
                     break;
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine("[{0}/{1}] {2}\n{3}", manager.LocalEndpoint, partition.PartitionId, ex.Message, ex.StackTrace);
+            logger.LogError("[{Endpoint}/{PartitionId}] {Message}\n{Stacktrace}", manager.LocalEndpoint, partition.PartitionId, ex.Message, ex.StackTrace);
         }
 
         return new();
@@ -174,7 +171,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         {
             if (log.Id != commitIndex)
             {
-                Console.WriteLine("[{0}/{1}] Log #{2} is not the expected #{3}", manager.LocalEndpoint, partition.PartitionId, log.Id, commitIndex);
+                logger.LogWarning("[{Endpoint}/{Partition}] Log #{Id} is not the expected #{CommitIndex}", manager.LocalEndpoint, partition.PartitionId, log.Id, commitIndex);
                 continue;
             }
             
@@ -183,7 +180,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             
             await walAdapter.AppendUpdate(partition.PartitionId, log);
             
-            Console.WriteLine("[{0}/{1}] Applied log #{2}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+            logger.LogInformation("[{Endpoint}/{Partition}] Applied log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
 
             await manager.InvokeReplicationReceived(log.Log);
 

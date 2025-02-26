@@ -1,5 +1,5 @@
 
-namespace Kommander.WAL.Data;
+namespace Kommander.Discovery.Data;
 
 public sealed class MulticastDiscoveryPayload
 {

@@ -82,6 +82,9 @@ public class TestTwoNodeCluster
 
         await node1.JoinCluster();
         await node2.JoinCluster();
+        
+        Assert.True(node1.Joined);
+        Assert.True(node2.Joined);
 
         await node1.UpdateNodes();
         await node2.UpdateNodes();
@@ -110,6 +113,9 @@ public class TestTwoNodeCluster
         IRaft node2 = GetNode2(communication);
 
         await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster()]);
+        
+        Assert.True(node1.Joined);
+        Assert.True(node2.Joined);
 
         await node1.UpdateNodes();
         await node2.UpdateNodes();
@@ -144,6 +150,9 @@ public class TestTwoNodeCluster
         await node1.WalAdapter.Append(0, new() { Id = 2, Term = 1, Log = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Regular });
 
         await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster()]);
+        
+        Assert.True(node1.Joined);
+        Assert.True(node2.Joined);
 
         await node1.UpdateNodes();
         await node2.UpdateNodes();
@@ -188,6 +197,9 @@ public class TestTwoNodeCluster
         await node2.WalAdapter.Append(0, new() { Id = 1, Term = 2, Log = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Regular });
 
         await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster()]);
+        
+        Assert.True(node1.Joined);
+        Assert.True(node2.Joined);
 
         await node1.UpdateNodes();
         await node2.UpdateNodes();

@@ -8,12 +8,29 @@ namespace Kommander;
 
 public interface IRaft
 {
+    /// <summary>
+    /// Whether the node has joined the Raft cluster
+    /// </summary>
+    public bool Joined { get; }
+    
+    /// <summary>
+    /// Current WAL adapter
+    /// </summary>
     public IWAL WalAdapter { get; }
     
+    /// <summary>
+    /// Current Communication adapter
+    /// </summary>
     public ICommunication Communication { get; }
     
+    /// <summary>
+    /// Current Raft configuration
+    /// </summary>
     public RaftConfiguration Configuration { get; }
 
+    /// <summary>
+    /// Hybrid Logical Clock
+    /// </summary>
     public HybridLogicalClock HybridLogicalClock { get; }
 
     /// <summary>
@@ -36,6 +53,12 @@ public interface IRaft
     /// </summary>
     /// <returns></returns>
     public Task JoinCluster();
+    
+    /// <summary>
+    /// Leaves the Raft cluster
+    /// </summary>
+    /// <returns></returns>
+    public Task LeaveCluster();
 
     /// <summary>
     /// Updates the active Raft cluster nodes

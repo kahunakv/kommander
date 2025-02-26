@@ -17,6 +17,8 @@ namespace Kommander;
 public sealed class RaftManager : IRaft
 {
     internal readonly string LocalEndpoint;
+    
+    internal readonly ILogger<IRaft> Logger;
 
     private readonly ActorSystem actorSystem;
 
@@ -32,16 +34,31 @@ public sealed class RaftManager : IRaft
 
     private readonly RaftPartition?[] partitions;
 
-    private readonly ILogger<IRaft> logger;
-
     internal List<RaftNode> Nodes { get; set; } = [];
 
+    /// <summary>
+    /// Whether the node has joined the Raft cluster
+    /// </summary>
+    public bool Joined => clusterHandler.Joined;
+
+    /// <summary>
+    /// Current WAL adapter
+    /// </summary>
     public IWAL WalAdapter => walAdapter;
     
+    /// <summary>
+    /// Current Communication adapter
+    /// </summary>
     public ICommunication Communication => communication;
     
+    /// <summary>
+    /// Current Raft configuration
+    /// </summary>
     public RaftConfiguration Configuration => configuration;
 
+    /// <summary>
+    /// Hybrid Logical Clock
+    /// </summary>
     public HybridLogicalClock HybridLogicalClock => hybridLogicalClock;
 
     /// <summary>
@@ -81,9 +98,9 @@ public sealed class RaftManager : IRaft
         this.configuration = configuration;
         this.walAdapter = walAdapter;
         this.communication = communication;
-        this.logger = logger;
         this.hybridLogicalClock = hybridLogicalClock;
         
+        Logger = logger;
         LocalEndpoint = string.Concat(configuration.Host, ":", configuration.Port);
         
         partitions = new RaftPartition[configuration.MaxPartitions];
@@ -99,10 +116,18 @@ public sealed class RaftManager : IRaft
         if (partitions[0] is null)
         {
             for (int i = 0; i < configuration.MaxPartitions; i++)
-                partitions[i] = new(actorSystem, this, walAdapter, communication, i, logger);
+                partitions[i] = new(actorSystem, this, walAdapter, communication, i, Logger);
         }
 
         await clusterHandler.JoinCluster(configuration);
+    }
+    
+    /// <summary>
+    /// Leaves the cluster
+    /// </summary>
+    public async Task LeaveCluster()
+    {
+        await clusterHandler.LeaveCluster(configuration);
     }
 
     /// <summary>
@@ -264,7 +289,7 @@ public sealed class RaftManager : IRaft
         }
         catch (AskTimeoutException e)
         {
-            logger.LogError("AmILeaderQuick: {Message}", e.Message);
+            Logger.LogError("AmILeaderQuick: {Message}", e.Message);
         }
 
         return false;
@@ -297,7 +322,7 @@ public sealed class RaftManager : IRaft
             }
             catch (AskTimeoutException e)
             {
-                logger.LogError("AmILeader: {Message}", e.Message);
+                Logger.LogError("AmILeader: {Message}", e.Message);
             }
         }
 
@@ -335,7 +360,7 @@ public sealed class RaftManager : IRaft
             }
             catch (AskTimeoutException e)
             {
-                logger.LogError("WaitForLeader: {Message}", e.Message);
+                Logger.LogError("WaitForLeader: {Message}", e.Message);
             }
         }
 

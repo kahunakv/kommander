@@ -3,8 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
-using Kommander.WAL.Data;
+using Kommander.Discovery.Data;
 
 namespace Kommander.Discovery;
 

@@ -17,7 +17,7 @@ public class SqliteWAL : IWAL
         this.path = path;
     }
     
-    private async Task TryOpenDatabase()
+    private async ValueTask TryOpenDatabase()
     {
         if (connection is not null)
             return;
@@ -95,24 +95,6 @@ public class SqliteWAL : IWAL
             };
         }
     }
-    
-    public async Task<bool> ExistLog(int partitionId, long id)
-    {
-        await TryOpenDatabase();
-        
-        const string query = "SELECT COUNT(*) AS cnt FROM logs WHERE partitionId = @partitionId AND id = @id";
-        await using SqliteCommand command = new(query, connection);
-        
-        command.Parameters.AddWithValue("@id", id);
-        command.Parameters.AddWithValue("@partitionId", partitionId);
-        
-        await using SqliteDataReader reader = await command.ExecuteReaderAsync();
-        
-        while (reader.Read())
-            return (reader.IsDBNull(0) ? 0 : reader.GetInt32(0)) > 0;
-
-        return false;
-    }
 
     public async Task Append(int partitionId, RaftLog log)
     {
@@ -131,7 +113,7 @@ public class SqliteWAL : IWAL
         insertCommand.Parameters.AddWithValue("@timeLogical", log.Time.L);
         insertCommand.Parameters.AddWithValue("@timeCounter", log.Time.C);
         
-        insertCommand.ExecuteNonQuery();
+        await insertCommand.ExecuteNonQueryAsync();
     }
     
     public async Task AppendUpdate(int partitionId, RaftLog log)

@@ -5,6 +5,8 @@ namespace Kommander;
 
 internal sealed class ClusterHandler
 {
+    public bool Joined { get; private set; }
+    
     private readonly RaftManager manager;
     
     private readonly IDiscovery discovery;
@@ -18,6 +20,13 @@ internal sealed class ClusterHandler
     public async Task JoinCluster(RaftConfiguration configuration)
     {
         await discovery.Register(configuration);
+        Joined = true;
+    }
+    
+    public async Task LeaveCluster(RaftConfiguration configuration)
+    {
+        await discovery.Register(configuration);
+        Joined = false;
     }
 
     public async Task UpdateNodes()

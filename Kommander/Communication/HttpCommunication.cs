@@ -25,7 +25,7 @@ public class HttpCommunication : ICommunication
         }
         catch (Exception e)
         {
-            Console.WriteLine("[{0}/{1}] {2}", manager.LocalEndpoint, partition.PartitionId, e.Message);
+            manager.Logger.LogError("[{Endpoint}/{Partition}] {Message}", manager.LocalEndpoint, partition.PartitionId, e.Message);
         }
         
         return new();
@@ -49,7 +49,7 @@ public class HttpCommunication : ICommunication
         }
         catch (Exception e)
         {
-            Console.WriteLine("[{0}/{1}] {2}", manager.LocalEndpoint, partition.PartitionId, e.Message);
+            manager.Logger.LogError("[{Endpoint}/{Partition}] {Message}", manager.LocalEndpoint, partition.PartitionId, e.Message);
         }
 
         return new();
@@ -72,13 +72,13 @@ public class HttpCommunication : ICommunication
                 .ReceiveJson<AppendLogsResponse>();
             
             if (request.Logs is not null && request.Logs.Count > 0)
-                Console.WriteLine("[{0}/{1}] Logs replicated to {2}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint);
+                manager.Logger.LogError("[{Endpoint}/{Partition}] Logs replicated to {RemoteEndpoint}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint);
 
             return response;
         }
         catch (Exception e)
         {
-            Console.WriteLine("[{0}/{1}] {2}", manager.LocalEndpoint, partition.PartitionId, e.Message);
+            manager.Logger.LogError("[{Endpoint}/{Partition}] {Message}", manager.LocalEndpoint, partition.PartitionId, e.Message);
         }
 
         return new(RaftOperationStatus.Errored, -1);
