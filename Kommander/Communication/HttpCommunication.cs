@@ -9,7 +9,7 @@ public class HttpCommunication : ICommunication
 {
     public async Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftPartition partition, RaftNode node, RequestVotesRequest request)
     {
-        string payload = JsonSerializer.Serialize(request); // , RaftJsonContext.Default.RequestVotesRequest
+        string payload = JsonSerializer.Serialize(request, RaftJsonContext.Default.RequestVotesRequest);
         
         try
         {
@@ -33,7 +33,7 @@ public class HttpCommunication : ICommunication
 
     public async Task<VoteResponse> Vote(RaftManager manager, RaftPartition partition, RaftNode node, VoteRequest request)
     {
-        string payload = JsonSerializer.Serialize(request); // , RaftJsonContext.Default.RequestVotesRequest
+        string payload = JsonSerializer.Serialize(request, RaftJsonContext.Default.VoteRequest);
         
         try
         {
@@ -57,7 +57,7 @@ public class HttpCommunication : ICommunication
 
     public async Task<AppendLogsResponse> AppendLogToNode(RaftManager manager, RaftPartition partition, RaftNode node, AppendLogsRequest request)
     {
-        string payload = JsonSerializer.Serialize(request); // , RaftJsonContext.Default.RequestVotesRequest
+        string payload = JsonSerializer.Serialize(request, RaftJsonContext.Default.AppendLogsRequest);
         
         try
         {

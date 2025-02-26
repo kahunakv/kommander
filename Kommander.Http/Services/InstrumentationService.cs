@@ -23,7 +23,7 @@ public class InstrumentationService : BackgroundService //, IDisposable
 
             for (int i = 0; i < raftManager.Configuration.MaxPartitions ; i++)
             {
-                if (await raftManager.AmILeader(i))
+                if (await raftManager.AmILeader(i, stoppingToken))
                     await raftManager.ReplicateLogs(i, Encoding.UTF8.GetBytes("Hello, World! " + DateTime.UtcNow));
             }
 

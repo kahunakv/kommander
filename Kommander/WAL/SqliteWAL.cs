@@ -8,7 +8,7 @@ public class SqliteWAL : IWAL
 {
     private static readonly SemaphoreSlim semaphore = new(1, 1);
     
-    private static SqliteConnection? connection;
+    private static readonly Dictionary<int, SqliteConnection> connections = new();
 
     private readonly string path;
     
@@ -17,19 +17,19 @@ public class SqliteWAL : IWAL
         this.path = path;
     }
     
-    private async ValueTask TryOpenDatabase()
+    private async ValueTask<SqliteConnection> TryOpenDatabase(int partitionId)
     {
-        if (connection is not null)
-            return;
+        if (connections.TryGetValue(partitionId, out SqliteConnection? connection))
+            return connection;
 
         try
         {
             await semaphore.WaitAsync();
 
-            if (connection is not null)
-                return;
+            if (connections.TryGetValue(partitionId, out connection))
+                return connection;
 
-            string connectionString = $"Data Source={path}/database.db";
+            string connectionString = $"Data Source={path}/raft{partitionId}.db";
             connection = new(connectionString);
 
             connection.Open();
@@ -41,6 +41,10 @@ public class SqliteWAL : IWAL
             const string pragmasQuery = "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA wal_checkpoint(FULL);";
             await using SqliteCommand command3 = new(pragmasQuery, connection);
             await command3.ExecuteNonQueryAsync();
+            
+            connections.Add(partitionId, connection);
+
+            return connection;
         }
         finally
         {
@@ -50,7 +54,7 @@ public class SqliteWAL : IWAL
     
     public async IAsyncEnumerable<RaftLog> ReadLogs(int partitionId)
     {
-        await TryOpenDatabase();
+        SqliteConnection connection = await TryOpenDatabase(partitionId);
         
         const string query = "SELECT id, term, type, log, timeLogical, timeCounter FROM logs WHERE partitionId = @partitionId ORDER BY id ASC;";
         await using SqliteCommand command = new(query, connection);
@@ -73,7 +77,7 @@ public class SqliteWAL : IWAL
     
     public async IAsyncEnumerable<RaftLog> ReadLogsRange(int partitionId, long startLogIndex)
     {
-        await TryOpenDatabase();
+        SqliteConnection connection = await TryOpenDatabase(partitionId);
         
         const string query = "SELECT id, term, type, log, timeLogical, timeCounter FROM logs WHERE partitionId = @partitionId AND id >= @startIndex ORDER BY id ASC;";
         await using SqliteCommand command = new(query, connection);
@@ -98,7 +102,7 @@ public class SqliteWAL : IWAL
 
     public async Task Append(int partitionId, RaftLog log)
     {
-        await TryOpenDatabase();
+        SqliteConnection connection = await TryOpenDatabase(partitionId);
         
         const string insertQuery = "INSERT INTO logs (id, partitionId, term, type, log, timeLogical, timeCounter) VALUES (@id, @partitionId, @term, @type, @log, @timeLogical, @timeCounter);";
         await using SqliteCommand insertCommand =  new(insertQuery, connection);
@@ -123,7 +127,7 @@ public class SqliteWAL : IWAL
     
     public async Task<long> GetMaxLog(int partitionId)
     {
-        await TryOpenDatabase();
+        SqliteConnection connection = await TryOpenDatabase(partitionId);
         
         const string query = "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId";
         await using SqliteCommand command = new(query, connection);
@@ -140,7 +144,7 @@ public class SqliteWAL : IWAL
     
     public async Task<long> GetCurrentTerm(int partitionId)
     {
-        await TryOpenDatabase();
+        SqliteConnection connection = await TryOpenDatabase(partitionId);
         
         const string query = "SELECT MAX(term) AS max FROM logs WHERE partitionId = @partitionId";
         await using SqliteCommand command = new(query, connection);

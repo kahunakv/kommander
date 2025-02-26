@@ -25,9 +25,9 @@ public static class HttpCommunicationExtensions
             return new VoteResponse();
         });
         
-        app.MapGet("/v1/raft/get-leader/{partitionId}", async (int partitionId, IRaft raft) =>
+        app.MapGet("/v1/raft/get-leader/{partitionId:int}", async (int partitionId, IRaft raft) =>
         {
-            string leader = await raft.WaitForLeader(partitionId);
+            string leader = await raft.WaitForLeader(partitionId, CancellationToken.None);
             return leader;
         });
     }

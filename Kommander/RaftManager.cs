@@ -296,12 +296,14 @@ public sealed class RaftManager : IRaft
     }
 
     /// <summary>
-    /// Checks if the local node is the leader in the given partition
+    /// Checks if the local node is the leader in the given partition 
     /// </summary>
     /// <param name="partitionId"></param>
+    /// <param name="cancellationToken"></param>
     /// <returns></returns>
+    /// <exception cref="OperationCanceledException"></exception>
     /// <exception cref="RaftException"></exception>
-    public async ValueTask<bool> AmILeader(int partitionId)
+    public async ValueTask<bool> AmILeader(int partitionId, CancellationToken cancellationToken)
     {
         if (partitions[0] is null)
             return false;
@@ -313,6 +315,9 @@ public sealed class RaftManager : IRaft
         {
             if (!string.IsNullOrEmpty(partition.Leader) && partition.Leader == LocalEndpoint)
                 return true;
+            
+            if (cancellationToken.IsCancellationRequested)
+                throw new OperationCanceledException();
 
             try
             {
@@ -331,18 +336,22 @@ public sealed class RaftManager : IRaft
 
     /// <summary>
     /// Waits for the leader to be elected in the given partition
-    /// If the leader is already elected, it returns the leader
+    /// If the leader is already elected, it returns the leader 
     /// </summary>
     /// <param name="partitionId"></param>
+    /// <param name="cancellationToken"></param>
     /// <returns></returns>
     /// <exception cref="RaftException"></exception>
-    public async ValueTask<string> WaitForLeader(int partitionId)
+    public async ValueTask<string> WaitForLeader(int partitionId, CancellationToken cancellationToken)
     {
         RaftPartition partition = GetPartition(partitionId);
         Stopwatch stopwatch = Stopwatch.StartNew();
 
         while (stopwatch.ElapsedMilliseconds < 60000)
         {
+            if (cancellationToken.IsCancellationRequested)
+                throw new OperationCanceledException();
+            
             try
             {
                 NodeState response = await partition.GetState();
@@ -352,7 +361,7 @@ public sealed class RaftManager : IRaft
 
                 if (string.IsNullOrEmpty(partition.Leader))
                 {
-                    await Task.Delay(150 + Random.Shared.Next(-50, 50));
+                    await Task.Delay(150 + Random.Shared.Next(-50, 50), cancellationToken);
                     continue;
                 }
 
@@ -372,8 +381,8 @@ public sealed class RaftManager : IRaft
     /// </summary>
     /// <param name="partitionKey"></param>
     /// <returns></returns>
-    public long GetPartitionKey(string partitionKey)
+    public int GetPartitionKey(string partitionKey)
     {
-        return HashUtils.ConsistentHash(partitionKey, configuration.MaxPartitions);
+        return (int)HashUtils.ConsistentHash(partitionKey, configuration.MaxPartitions);
     }
 }

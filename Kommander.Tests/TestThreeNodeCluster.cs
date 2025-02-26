@@ -122,7 +122,7 @@ public class TestThreeNodeCluster
 
         while (true)
         {
-            if (await node1.AmILeader(0) || await node2.AmILeader(0) || await node3.AmILeader(0))
+            if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
                 break;
             
             await Task.Delay(1000);
@@ -156,7 +156,7 @@ public class TestThreeNodeCluster
 
         while (true)
         {
-            if (await node1.AmILeader(0) || await node2.AmILeader(0) || await node3.AmILeader(0))
+            if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
                 break;
             
             await Task.Delay(1000);
@@ -173,7 +173,7 @@ public class TestThreeNodeCluster
     {
         foreach (IRaft node in nodes)
         {
-            if (await node.AmILeader(0))
+            if (await node.AmILeader(0, CancellationToken.None))
                 return node;
         }
 

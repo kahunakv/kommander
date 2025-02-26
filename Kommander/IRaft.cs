@@ -123,19 +123,19 @@ public interface IRaft
     /// </summary>
     /// <param name="partitionId"></param>
     /// <returns></returns>
-    public ValueTask<bool> AmILeader(int partitionId);
+    public ValueTask<bool> AmILeader(int partitionId, CancellationToken cancellationToken);
 
     /// <summary>
     /// Waits for the local node to check/become the leader in the given partition
     /// </summary>
     /// <param name="partitionId"></param>
     /// <returns></returns>
-    public ValueTask<string> WaitForLeader(int partitionId);
+    public ValueTask<string> WaitForLeader(int partitionId, CancellationToken cancellationToken);
 
     /// <summary>
     /// Returns the correct partition id according to the partition key
     /// </summary>
     /// <param name="partitionKey"></param>
     /// <returns></returns>
-    public long GetPartitionKey(string partitionKey);
+    public int GetPartitionKey(string partitionKey);
 }
