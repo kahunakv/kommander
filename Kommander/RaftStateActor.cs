@@ -103,8 +103,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                     return new(RaftResponseType.State, state);
 
                 case RaftRequestType.AppendLogs:
-                    (RaftOperationStatus status, long commitLogIndex) = await AppendLogs(message.Endpoint ?? "", message.Term, message.Logs);
-                    return new(RaftResponseType.None, status, commitLogIndex);
+                    {
+                        (RaftOperationStatus status, long commitLogIndex) = await AppendLogs(message.Endpoint ?? "", message.Term, message.Logs);
+                        return new(RaftResponseType.None, status, commitLogIndex);
+                    }
 
                 case RaftRequestType.RequestVote:
                     await Vote(new(message.Endpoint ?? ""), message.Term, message.MaxLogId);
@@ -115,8 +117,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                     break;
 
                 case RaftRequestType.ReplicateLogs:
-                    RaftOperationStatus response = await ReplicateLogs(message.Logs);
-                    return new(RaftResponseType.None, response, 0);
+                    {
+                        (RaftOperationStatus status, long commitId) = await ReplicateLogs(message.Logs);
+                        return new(RaftResponseType.None, status, commitId);
+                    }
 
                 case RaftRequestType.ReplicateCheckpoint:
                     await ReplicateCheckpoint();
@@ -355,6 +359,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         if (currentTerm > leaderTerm)
         {
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from a leader {Endpoint} with old Term={Term}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, leaderTerm);
+            
             return (RaftOperationStatus.LeaderInOldTerm, commitedIndex);
         }
 
@@ -384,13 +389,14 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// Replicates logs to other nodes in the cluster when the node is the leader.
     /// </summary>
     /// <param name="logs"></param>
-    private async Task<RaftOperationStatus> ReplicateLogs(List<RaftLog>? logs)
+    /// <returns></returns>
+    private async Task<(RaftOperationStatus, long commitId)> ReplicateLogs(List<RaftLog>? logs)
     {
         if (logs is null || logs.Count == 0)
-            return RaftOperationStatus.Success;
+            return (RaftOperationStatus.Success, -1);
 
         if (state != NodeState.Leader)
-            return RaftOperationStatus.NodeIsNotLeader;
+            return (RaftOperationStatus.NodeIsNotLeader, -1);
 
         HLCTimestamp currentTime = await manager.HybridLogicalClock.SendOrLocalEvent();
         
@@ -402,9 +408,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         currentIndex = appendResponse.NextId;
         
         // Replicate logs to other nodes in the cluster
-        await AppendLogsToNodes(false);
+        if (await AppendLogsToNodes(false))
+            return (RaftOperationStatus.Success, currentIndex);
 
-        return RaftOperationStatus.Success;
+        return (RaftOperationStatus.Errored, currentIndex);
     }
 
     /// <summary>
@@ -448,34 +455,41 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <summary>
     /// Pings the other nodes in the cluster to replicate logs when the node is the leader.
     /// </summary>
-    /// <param name="term"></param>
-    private async ValueTask Ping()
+    /// <returns></returns>
+    private async Task<bool> Ping()
     {
         if (state != NodeState.Leader)
-            return;
+            return false;
         
-        await AppendLogsToNodes(true);
+        return await AppendLogsToNodes(true);
     }
     
     /// <summary>
     /// Appends logs to the Write-Ahead Log and replicates them to other nodes in the cluster when the node is the leader.
     /// </summary>
-    private async Task AppendLogsToNodes(bool isPing)
+    /// <param name="isPing"></param>
+    /// <returns></returns>
+    private async Task<bool> AppendLogsToNodes(bool isPing)
     {
         if (manager.Nodes.Count == 0)
         {
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] No other nodes availables to replicate logs", manager.LocalEndpoint, partition.PartitionId, state);
-            return;
+            return false;
         }
 
         List<RaftNode> nodes = manager.Nodes;
 
-        List<Task> tasks = new(nodes.Count);
+        List<Task<RaftOperationStatus>> tasks = new(nodes.Count);
 
         foreach (RaftNode node in nodes)
             tasks.Add(AppendLogToNode(node, isPing));
 
-        await Task.WhenAll(tasks);
+        RaftOperationStatus[] responses = await Task.WhenAll(tasks);
+
+        int count = responses.Count(x => x == RaftOperationStatus.Success);
+        int quorum = Math.Min(2, (int)Math.Floor((manager.Nodes.Count + 1) / 2f));
+        
+        return count >= quorum;
     }
     
     /// <summary>
@@ -483,7 +497,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// </summary>
     /// <param name="node"></param>
     /// <param name="isPing"></param>
-    private async Task AppendLogToNode(RaftNode node, bool isPing)
+    private async Task<RaftOperationStatus> AppendLogToNode(RaftNode node, bool isPing)
     {
         AppendLogsRequest request;
         
@@ -496,7 +510,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
             RaftWALResponse getRangeResponse =  await walActor.Ask(new(RaftWALActionType.GetRange, currentTerm, lastCommitIndex));
             if (getRangeResponse.Logs is null)
-                return;
+                return RaftOperationStatus.Errored;
             
             request = new(partition.PartitionId, currentTerm, manager.LocalEndpoint, getRangeResponse.Logs);
         }
@@ -508,5 +522,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Appended logs to {Endpoint} CommitedIndex={Index}", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, response.CommitedIndex);
         }
+
+        return response.Status;
     }
 }

@@ -72,7 +72,7 @@ public class HttpCommunication : ICommunication
                 .ReceiveJson<AppendLogsResponse>();
             
             if (request.Logs is not null && request.Logs.Count > 0)
-                manager.Logger.LogError("[{Endpoint}/{Partition}] Logs replicated to {RemoteEndpoint}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint);
+                manager.Logger.LogInformation("[{Endpoint}/{Partition}] Logs replicated to {RemoteEndpoint}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint);
 
             return response;
         }

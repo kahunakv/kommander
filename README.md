@@ -15,6 +15,7 @@ Kommander is an open-source, distributed consensus library implemented in C# for
   Discover other nodes in the cluster using either:
   - **Registries:** Centralized or decentralized service registries.
   - **Multicast Discovery:** Automatic node discovery via multicast messages.
+  - **Static Discovery:** Manually configured list of known nodes.
 
 - **Persistent Log Replication:**
   Each node persists its log to disk to ensure data durability. Kommander utilizes a Write-Ahead Log (WAL) internally to safeguard against data loss.
@@ -24,8 +25,8 @@ Kommander is an open-source, distributed consensus library implemented in C# for
 
 - **Multiple Communication Protocols:**
   Achieve consensus and data replication over:
-  - **HTTP:** For RESTful interactions and easier integration with web services.
-  - **Plain TCP:** For low-latency and high-throughput scenarios.
+  - **HTTP/2:** For RESTful interactions and easier integration with web services.
+  - **gRPC:** For low-latency and high-throughput scenarios.
 
 ---
 
@@ -49,7 +50,7 @@ To install Kommander into your C#/.NET project, you can use the .NET CLI or the 
 #### Using .NET CLI
 
 ```shell
-dotnet add package Kommander --version 0.1.2
+dotnet add package Kommander --version 0.1.3
 ```
 
 ### Using NuGet Package Manager
@@ -57,7 +58,7 @@ dotnet add package Kommander --version 0.1.2
 Search for Kommander and install it from the NuGet package manager UI, or use the Package Manager Console:
 
 ```shell
-Install-Package Kommander -Version 0.1.2
+Install-Package Kommander -Version 0.1.3
 ```
 
 Or, using the NuGet Package Manager in Visual Studio, search for **Kommander** and install it.
@@ -86,11 +87,20 @@ IRaft node = new RaftManager(
     new ActorSystem(), 
     config, 
     new StaticDiscovery([new("localhost:8002"), new("localhost:8003")]),
-    new SqliteWAL(path: "./data"),
+    new SqliteWAL(path: "./data", version: "v1"),
     new HTTPCommunication()
     new HybridLogicalClock(),
     logger
 );
+
+// Subscribe to the OnReplicationReceived event to receive log entries from other nodes
+// if the node is a follower
+node.OnReplicationReceived += (RaftLog log) =>
+{
+    string message = Encoding.UTF8.GetString(log.Log);    
+    
+    Console.WriteLine($"Received log: {message}");
+};
 
 // Start the node and join the cluster.
 await node.JoinCluster();
@@ -98,13 +108,6 @@ await node.JoinCluster();
 // Check if the node is the leader of partition 0 and replicate a log entry.
 if (await node.AmILeader(0))
     await node.ReplicateLogs(0, "Kommander is awesome!");
-
-// Subscribe to the OnReplicationReceived event to receive log entries from other nodes
-// if the node is a follower
-node.OnReplicationReceived += (RaftLog log) =>
-{
-    Console.WriteLine($"Received log: {log.Message}");
-};
 
 ```
 

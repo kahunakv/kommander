@@ -12,9 +12,12 @@ public class SqliteWAL : IWAL
 
     private readonly string path;
     
-    public SqliteWAL(string path = ".")
+    private readonly string version;
+    
+    public SqliteWAL(string path = ".", string version = "1")
     {
         this.path = path;
+        this.version = version;
     }
     
     private async ValueTask<SqliteConnection> TryOpenDatabase(int partitionId)
@@ -29,7 +32,7 @@ public class SqliteWAL : IWAL
             if (connections.TryGetValue(partitionId, out connection))
                 return connection;
 
-            string connectionString = $"Data Source={path}/raft{partitionId}.db";
+            string connectionString = $"Data Source={path}/raft{partitionId}_{version}.db";
             connection = new(connectionString);
 
             connection.Open();
