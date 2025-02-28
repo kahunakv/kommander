@@ -146,8 +146,8 @@ public class TestTwoNodeCluster
         IRaft node1 = GetNode1(communication);
         IRaft node2 = GetNode2(communication);
 
-        await node1.WalAdapter.Append(0, new() { Id = 1, Term = 1, Log = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Regular });
-        await node1.WalAdapter.Append(0, new() { Id = 2, Term = 1, Log = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Regular });
+        await node1.WalAdapter.Append(0, new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Regular });
+        await node1.WalAdapter.Append(0, new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Regular });
 
         await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster()]);
         
@@ -191,10 +191,10 @@ public class TestTwoNodeCluster
         IRaft node1 = GetNode1(communication);
         IRaft node2 = GetNode2(communication);
 
-        await node1.WalAdapter.Append(0, new() { Id = 1, Term = 1, Log = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Regular });
-        await node1.WalAdapter.Append(0, new() { Id = 2, Term = 1, Log = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Regular });
+        await node1.WalAdapter.Append(0, new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Regular });
+        await node1.WalAdapter.Append(0, new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Regular });
         
-        await node2.WalAdapter.Append(0, new() { Id = 1, Term = 2, Log = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Regular });
+        await node2.WalAdapter.Append(0, new() { Id = 1, Term = 2, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Regular });
 
         await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster()]);
         

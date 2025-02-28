@@ -6,6 +6,7 @@ using Kommander.Discovery;
 using Kommander.Time;
 using Kommander.WAL;
 using Nixie;
+
 // ReSharper disable ConvertToAutoProperty
 // ReSharper disable ConvertToAutoPropertyWhenPossible
 
@@ -72,9 +73,14 @@ public sealed class RaftManager : IRaft
     public event Action? OnRestoreFinished;
 
     /// <summary>
+    /// Event when a replication log is now acknowledged by the application
+    /// </summary>
+    public event Action<RaftLog>? OnReplicationError;
+
+    /// <summary>
     /// Event when a replication log is received
     /// </summary>
-    public event Func<byte[], Task<bool>>? OnReplicationReceived;
+    public event Func<string, byte[], Task<bool>>? OnReplicationReceived;
     
     /// <summary>
     /// Constructor
@@ -191,35 +197,39 @@ public sealed class RaftManager : IRaft
     }
 
     /// <summary>
-    /// Replicate logs to the follower nodes
+    /// Replicate a single log to the follower nodes in the specified partition
     /// </summary>
     /// <param name="partitionId"></param>
-    /// <param name="log"></param>
-    public async Task<(bool success, long commitLogId)> ReplicateLogs(int partitionId, byte[] log)
+    /// <param name="type"></param>
+    /// <param name="data"></param>
+    /// <returns></returns>
+    public async Task<(bool success, long commitLogId)> ReplicateLogs(int partitionId, string type, byte[] data)
     {
         RaftPartition partition = GetPartition(partitionId);
-        return await partition.ReplicateLogs(log);
+        return await partition.ReplicateLogs(type, data);
     }
     
     /// <summary>
-    /// Replicate logs to the follower nodes
+    /// Replicate logs to the follower nodes in the specified partition
     /// </summary>
     /// <param name="partitionId"></param>
+    /// <param name="type"></param>
     /// <param name="logs"></param>
-    public async Task<(bool success, long commitLogId)> ReplicateLogs(int partitionId, IEnumerable<byte[]> logs)
+    /// <returns></returns>
+    public async Task<(bool success, long commitLogId)> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs)
     {
         RaftPartition partition = GetPartition(partitionId);
-        return await partition.ReplicateLogs(logs);
+        return await partition.ReplicateLogs(type, logs);
     }
 
     /// <summary>
     /// Replicates a checkpoint to the follower nodes
     /// </summary>
     /// <param name="partitionId"></param>
-    public void ReplicateCheckpoint(int partitionId)
+    public async Task<(bool success, long commitLogId)> ReplicateCheckpoint(int partitionId)
     {
         RaftPartition partition = GetPartition(partitionId);
-        partition.ReplicateCheckpoint();
+        return await partition.ReplicateCheckpoint();
     }
 
     /// <summary>
@@ -237,21 +247,39 @@ public sealed class RaftManager : IRaft
     {
         OnRestoreFinished?.Invoke();
     }
+    
+    /// <summary>
+    /// Calls when a replication error occurs
+    /// </summary>
+    /// <param name="log"></param>
+    internal void InvokeReplicationError(RaftLog log)
+    {
+        OnReplicationError?.Invoke(log);
+    }
 
     /// <summary>
     /// Calls the replication received event
     /// </summary>
+    /// <param name="type"></param>
     /// <param name="log"></param>
-    internal async Task InvokeReplicationReceived(byte[]? log)
+    /// <returns></returns>
+    internal async Task<bool> InvokeReplicationReceived(string? type, byte[]? log)
     {
+        if (type is null)
+            return false;
+        
         if (log is null)
-            return;
+            return false;
 
         if (OnReplicationReceived != null)
         {
-            Func<byte[], Task<bool>> callback = OnReplicationReceived;
-            await callback(log);
+            Func<string, byte[], Task<bool>> callback = OnReplicationReceived;
+            bool success = await callback(type, log);
+            if (!success)
+                return false;
         }
+
+        return true;
     }
 
     /// <summary>

@@ -49,15 +49,13 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             switch (message.Type)
             {
                 case RaftWALActionType.Append:
-                    await Append(message.Term, message.Logs);
-                    break;
+                    return new(await Append(message.Term, message.Logs));
                 
                 case RaftWALActionType.Update:
                     return new(await Update(message.Logs));
 
                 case RaftWALActionType.AppendCheckpoint:
-                    await AppendCheckpoint(message.Term);
-                    break;
+                    return new(await AppendCheckpoint(message.Term));
                 
                 case RaftWALActionType.GetRange:
                     return new(await GetRange(message.CurrentIndex));
@@ -87,7 +85,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
     private async ValueTask<long> Recover()
     {
         if (recovered)
-            return 0;
+            return -1;
 
         recovered = true;
 
@@ -100,21 +98,34 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             found = true;
             commitIndex = log.Id + 1;
 
-            await manager.InvokeReplicationReceived(log.Log);
+            try
+            {
+                if (log.Type == RaftLogType.Checkpoint) 
+                    continue;
+                
+                if (!await manager.InvokeReplicationReceived(log.LogType, log.LogData))
+                    manager.InvokeReplicationError(log);
+            }
+            catch (Exception ex)
+            {
+                manager.Logger.LogError("[{Endpoint}/{PartitionId}] {Message}\n{Stacktrace}", manager.LocalEndpoint, partition.PartitionId, ex.Message, ex.StackTrace);
+                
+                manager.InvokeReplicationError(log);
+            }
         }
 
         if (!found)
-            commitIndex = 1;
+            commitIndex = await GetMaxLog() + 1;
 
         manager.InvokeRestoreFinished();
 
         return commitIndex;
     }
 
-    private async Task Append(long term, List<RaftLog>? appendLogs)
+    private async Task<long> Append(long term, List<RaftLog>? appendLogs)
     {
         if (appendLogs is null || appendLogs.Count == 0)
-            return;
+            return -1;
 
         foreach (RaftLog log in appendLogs)
         {
@@ -123,6 +134,8 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             
             await walAdapter.Append(partition.PartitionId, log);
         }
+
+        return commitIndex;
     }
     
     private async Task<long> GetMaxLog()
@@ -135,26 +148,20 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         return await walAdapter.GetCurrentTerm(partition.PartitionId);
     }
 
-    private async Task AppendCheckpoint(long term)
+    private async Task<long> AppendCheckpoint(long term)
     {
-        /*RedisConnection connection = await GetConnection();
-
-        await connection.BasicRetry(async database => await database.KeyDeleteAsync(ClusterWalKeyPrefix + partition.PartitionId));
-
-        RaftLog log = new()
+        RaftLog checkPointLog = new()
         {
-            Id = nextId++,
+            Id = commitIndex++,
+            Term = term,
             Type = RaftLogType.Checkpoint,
-            Time = GetCurrentTime()
+            LogType = "",
+            LogData = []
         };
+        
+        await walAdapter.Append(partition.PartitionId, checkPointLog);
 
-        logs.Add(log.Id, log);
-
-        AppendLogsRequest request = new(partition.PartitionId, term, RaftManager.LocalEndpoint, [log]);
-        string payload = JsonSerializer.Serialize(request, RaftJsonContext.Default.AppendLogsRequest);
-        await AppendLogsToNodes(payload);*/
-
-        await Task.CompletedTask;
+        return commitIndex;
     }
 
     private async Task<long> Update(List<RaftLog>? updateLogs)
@@ -164,8 +171,6 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         
         if (updateLogs.Count == 0)
             return -1;
-        
-        //Console.WriteLine("Got {0} logs from the leader", updateLogs.Count);
 
         foreach (RaftLog log in updateLogs)
         {
@@ -175,14 +180,18 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 continue;
             }
             
-            //if (await walAdapter.ExistLog(partition.PartitionId, log.Id))
-            //    continue;
-            
             await walAdapter.AppendUpdate(partition.PartitionId, log);
-            
-            logger.LogInformation("[{Endpoint}/{Partition}] Applied log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
 
-            await manager.InvokeReplicationReceived(log.Log);
+            if (log.Type == RaftLogType.Regular)
+            {
+                logger.LogInformation("[{Endpoint}/{Partition}] Applied log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+                
+                if (!await manager.InvokeReplicationReceived(log.LogType, log.LogData))
+                    manager.InvokeReplicationError(log);
+            }
+
+            if (log.Type == RaftLogType.Checkpoint)
+                logger.LogInformation("[{Endpoint}/{Partition}] Applied checkpoint log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
 
             commitIndex = log.Id + 1;
         }

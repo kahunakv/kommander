@@ -123,8 +123,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                     }
 
                 case RaftRequestType.ReplicateCheckpoint:
-                    await ReplicateCheckpoint();
-                    break;
+                    {
+                        (RaftOperationStatus status, long commitId) = await ReplicateCheckpoint();
+                        return new(RaftResponseType.None, status, commitId);
+                    }
                 
                 default:
                     logger.LogError("Invalid message type: {Type}", message.Type);
@@ -417,12 +419,19 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <summary>
     /// Replicates the checkpoint to other nodes in the cluster when the node is the leader.
     /// </summary>
-    private async Task ReplicateCheckpoint()
+    private async Task<(RaftOperationStatus, long commitId)> ReplicateCheckpoint()
     {
         if (state != NodeState.Leader)
-            return;
+            return (RaftOperationStatus.NodeIsNotLeader, -1);
 
-        await walActor.Ask(new(RaftWALActionType.AppendCheckpoint, currentTerm));
+        RaftWALResponse appendResponse = await walActor.Ask(new(RaftWALActionType.AppendCheckpoint, currentTerm));
+        currentIndex = appendResponse.NextId;
+       
+        // Replicate logs to other nodes in the cluster
+        if (await AppendLogsToNodes(false))
+           return (RaftOperationStatus.Success, currentIndex);
+
+        return (RaftOperationStatus.Errored, currentIndex);
     }
 
     /// <summary>

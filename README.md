@@ -2,6 +2,9 @@
 
 Kommander is an open-source, distributed consensus library implemented in C# for the .NET platform. It leverages the Raft algorithm to provide a robust and reliable mechanism for leader election, log replication, and data consistency across clusters. Kommander is designed to be flexible and resilient, supporting multiple discovery mechanisms and communication protocols to suit various distributed system architectures.
 
+[![NuGet](https://img.shields.io/nuget/v/Kommander.svg?style=flat-square)](https://www.nuget.org/packages/Kommander)
+[![Nuget](https://img.shields.io/nuget/dt/Kommander)](https://www.nuget.org/packages/Kommander)
+
 **This is an alpha project please don't use it in production.**
 
 ---
@@ -50,7 +53,7 @@ To install Kommander into your C#/.NET project, you can use the .NET CLI or the 
 #### Using .NET CLI
 
 ```shell
-dotnet add package Kommander --version 0.1.3
+dotnet add package Kommander --version 0.1.8
 ```
 
 ### Using NuGet Package Manager
@@ -58,7 +61,7 @@ dotnet add package Kommander --version 0.1.3
 Search for Kommander and install it from the NuGet package manager UI, or use the Package Manager Console:
 
 ```shell
-Install-Package Kommander -Version 0.1.3
+Install-Package Kommander -Version 0.1.8
 ```
 
 Or, using the NuGet Package Manager in Visual Studio, search for **Kommander** and install it.
@@ -95,11 +98,11 @@ IRaft node = new RaftManager(
 
 // Subscribe to the OnReplicationReceived event to receive log entries from other nodes
 // if the node is a follower
-node.OnReplicationReceived += (RaftLog log) =>
+node.OnReplicationReceived += (string logType, byte[] logData) =>
 {
-    string message = Encoding.UTF8.GetString(log.Log);    
+    Console.WriteLine("Replication received: {0} {1}", logType, Encoding.UTF8.GetString(logData));
     
-    Console.WriteLine($"Received log: {message}");
+    return Task.FromResult(true);
 };
 
 // Start the node and join the cluster.

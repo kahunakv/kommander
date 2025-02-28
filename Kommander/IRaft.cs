@@ -42,11 +42,16 @@ public interface IRaft
     /// Event when the restore process finishes
     /// </summary>
     public event Action? OnRestoreFinished;
+    
+    /// <summary>
+    /// Event when a replication error occurs
+    /// </summary>
+    public event Action<RaftLog>? OnReplicationError;
 
     /// <summary>
     /// Event when a replication log is received
     /// </summary>
-    public event Func<byte[], Task<bool>>? OnReplicationReceived;
+    public event Func<string, byte[], Task<bool>>? OnReplicationReceived;
     
     /// <summary>
     /// Joins the Raft cluster
@@ -89,21 +94,25 @@ public interface IRaft
     /// Replicate logs to the followers in the partition
     /// </summary>
     /// <param name="partitionId"></param>
-    /// <param name="log"></param>
-    public Task<(bool success, long commitLogId)> ReplicateLogs(int partitionId, byte[] log);
+    /// <param name="type"></param>
+    /// <param name="data"></param>
+    /// <returns></returns>
+    public Task<(bool success, long commitLogId)> ReplicateLogs(int partitionId, string type, byte[] data);
 
     /// <summary>
     /// Replicate logs to the followers in the partition
     /// </summary>
     /// <param name="partitionId"></param>
+    /// <param name="type"></param>
     /// <param name="logs"></param>
-    public Task<(bool success, long commitLogId)> ReplicateLogs(int partitionId, IEnumerable<byte[]> logs);
+    /// <returns></returns>
+    public Task<(bool success, long commitLogId)> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs);
 
     /// <summary>
     /// Replicate a checkpoint to the followers in the partition    
     /// </summary>
     /// <param name="partitionId"></param>
-    public void ReplicateCheckpoint(int partitionId);
+    public Task<(bool success, long commitLogId)> ReplicateCheckpoint(int partitionId);
 
     /// <summary>
     /// Obtains the local endpoint

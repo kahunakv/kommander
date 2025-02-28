@@ -1,5 +1,6 @@
 
 using System.Net;
+using System.Text;
 using Kommander;
 using Kommander.Communication;
 using Kommander.Discovery;
@@ -37,17 +38,34 @@ try
     builder.Services.AddSingleton<ActorSystem>(services =>
         new(services, services.GetRequiredService<ILogger<IRaft>>()));
 
-    builder.Services.AddSingleton<IRaft>(services => new RaftManager(
-        services.GetRequiredService<ActorSystem>(),
-        config,
-        new StaticDiscovery(nodes),
-        new SqliteWAL(),
-        new HttpCommunication(),
-        new HybridLogicalClock(),
-        services.GetRequiredService<ILogger<IRaft>>()
-    ));
+    builder.Services.AddSingleton<IRaft>(services =>
+    {
+        RaftManager node = new RaftManager(
+            services.GetRequiredService<ActorSystem>(),
+            config,
+            new StaticDiscovery(nodes),
+            new SqliteWAL(path: "/app/data", version: "v3"),
+            new HttpCommunication(),
+            new HybridLogicalClock(),
+            services.GetRequiredService<ILogger<IRaft>>()
+        );
 
-    builder.Services.AddHostedService<InstrumentationService>();
+        node.OnReplicationError += log =>
+        {
+            Console.WriteLine("Replication error: {0} #{1}", log.LogType, log.Id);
+        };
+
+        node.OnReplicationReceived += (string logType, byte[] logData) =>
+        {
+            Console.WriteLine("Replication received: {0} {1}", logType, Encoding.UTF8.GetString(logData));
+            
+            return Task.FromResult(true);
+        };
+
+        return node;
+    });
+
+    builder.Services.AddHostedService<ReplicationService>();
 
     WebApplication app = builder.Build();
 

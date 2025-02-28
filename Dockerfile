@@ -18,9 +18,11 @@ EXPOSE 8004
 # copy the built program
 COPY --from=build-env /app .
 
+# install sqlite to debug the logs
+RUN apk add sqlite
+
 # when starting the container, run dotnet with the built dll
 ENTRYPOINT ["dotnet", "/app/Kommander.Http.dll"]
 
 # Swap entrypoints if the container is exploding and you want to keep it alive indefinitely so you can go look into it.
 #ENTRYPOINT ["tail", "-f", "/dev/null"]
-

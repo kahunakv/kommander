@@ -10,6 +10,8 @@ services:
       - ASPNETCORE_URLS=http://*:8081;http://*:8004
     ports:
       - "8081:8004"
+    volumes:
+      - node1-data:/app/data  
     networks:
       custom_net:
         ipv4_address: 172.20.0.2
@@ -23,6 +25,8 @@ services:
       - ASPNETCORE_URLS=http://*:8082;http://*:8004
     ports:
       - "8082:8004"
+    volumes:
+      - node2-data:/app/data    
     networks:
       custom_net:
         ipv4_address: 172.20.0.3
@@ -36,9 +40,16 @@ services:
       - ASPNETCORE_URLS=http://*:8083;http://*:8004
     ports:
       - "8083:8004"
+    volumes:
+      - node3-data:/app/data        
     networks:
       custom_net:
         ipv4_address: 172.20.0.4
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:          
 
 networks:
   custom_net:

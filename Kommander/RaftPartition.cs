@@ -89,10 +89,11 @@ public sealed class RaftPartition
     }
 
     /// <summary>
-    /// Replicate logs to the partition.
+    /// Replicate a single log to the partition.
     /// </summary>
-    /// <param name="message"></param>
-    public async Task<(bool success, long commitLogId)> ReplicateLogs(byte[] message)
+    /// <param name="log"></param>
+    /// <returns></returns>
+    public async Task<(bool success, long commitLogId)> ReplicateLogs(string type, byte[] data)
     {
         if (string.IsNullOrEmpty(Leader))
             return (false, -1);
@@ -100,15 +101,17 @@ public sealed class RaftPartition
         if (Leader != raftManager.LocalEndpoint)
             return (false, -1);
         
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, [new() { Log = message }]));
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, [new() { LogType = type, LogData = data }]));
         return (true, response.CurrentIndex);
     }
     
     /// <summary>
     /// Replicate logs to the partition.
     /// </summary>
-    /// <param name="message"></param>
-    public async Task<(bool success, long commitLogId)> ReplicateLogs(IEnumerable<byte[]> logs)
+    /// <param name="type"></param>
+    /// <param name="logs"></param>
+    /// <returns></returns>
+    public async Task<(bool success, long commitLogId)> ReplicateLogs(string type, IEnumerable<byte[]> logs)
     {
         if (string.IsNullOrEmpty(Leader))
             return (false, -1);
@@ -116,7 +119,7 @@ public sealed class RaftPartition
         if (Leader != raftManager.LocalEndpoint)
             return (false, -1);
 
-        List<RaftLog> logsToReplicate = logs.Select(x => new RaftLog { Log = x }).ToList();
+        List<RaftLog> logsToReplicate = logs.Select(data => new RaftLog { LogType = type, LogData = data }).ToList();
         
         RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate));
         return (true, response.CurrentIndex);
@@ -125,15 +128,16 @@ public sealed class RaftPartition
     /// <summary>
     /// Replicate a checkpoint to the partition.
     /// </summary>
-    public void ReplicateCheckpoint()
+    public async Task<(bool success, long commitLogId)>  ReplicateCheckpoint()
     {
         if (string.IsNullOrEmpty(Leader))
-            throw new RaftException("Leader is not set.");
+            return (false, -1);
         
         if (Leader != raftManager.LocalEndpoint)
-            throw new RaftException("Leader is not set.");
+            return (false, -1);
         
-        raftActor.Send(new(RaftRequestType.ReplicateCheckpoint));
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateCheckpoint));
+        return (true, response.CurrentIndex);
     }
 
     /// <summary>
