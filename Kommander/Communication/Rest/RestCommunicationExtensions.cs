@@ -1,11 +1,11 @@
 
 using Kommander.Data;
 
-namespace Kommander.Communication;
+namespace Kommander.Communication.Rest;
 
-public static class HttpCommunicationExtensions
+public static class RestCommunicationExtensions
 {
-    public static void MapRaftRoutes(this WebApplication app)
+    public static void MapRestRaftRoutes(this WebApplication app)
     {
         app.MapPost("/v1/raft/append-logs", async (AppendLogsRequest request, IRaft raft) =>
         {

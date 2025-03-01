@@ -4,6 +4,10 @@ using Microsoft.Data.Sqlite;
 
 namespace Kommander.WAL;
 
+/// <summary>
+/// Allows to use a SQLite database as a Write-Ahead Log (WAL) for Raft logs
+/// Each partition has its own database file
+/// </summary>
 public class SqliteWAL : IWAL
 {
     private static readonly SemaphoreSlim semaphore = new(1, 1);
@@ -196,7 +200,7 @@ public class SqliteWAL : IWAL
         return 0;
     }
     
-    private async Task<long> GetLastCheckpoint(SqliteConnection connection, int partitionId)
+    private static async Task<long> GetLastCheckpoint(SqliteConnection connection, int partitionId)
     {
         const string query = "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId AND type = @type";
         await using SqliteCommand command = new(query, connection);

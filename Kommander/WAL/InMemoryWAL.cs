@@ -2,6 +2,10 @@ using Kommander.Data;
 
 namespace Kommander.WAL;
 
+/// <summary>
+/// Keeps a log of all Raft operations in memory
+/// Useful for testing and debugging
+/// </summary>
 public class InMemoryWAL : IWAL
 {
     private readonly Dictionary<int, SortedDictionary<long, RaftLog>> logs = new();

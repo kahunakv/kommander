@@ -4,7 +4,7 @@ VisualStudioVersion = 17.5.2.0
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Kommander", "Kommander\Kommander.csproj", "{64534F25-27A1-555B-B436-A96FBA6DD593}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Kommander.Http", "Kommander.Http\Kommander.Http.csproj", "{A3A93F43-D36C-466C-8FE2-00D6157307DB}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Kommander.Server", "Kommander.Server\Kommander.Server.csproj", "{A3A93F43-D36C-466C-8FE2-00D6157307DB}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Kommander.Tests", "Kommander.Tests\Kommander.Tests.csproj", "{AC44B4FE-33FE-43C2-9518-BE726DFCBA84}"
 EndProject

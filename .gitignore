@@ -3,10 +3,10 @@
 Kommander/.idea
 Kommander/bin
 Kommander/obj
-Kommander.Http/.idea
-Kommander.Http/bin
-Kommander.Http/obj
-Kommander.Http/database*
+Kommander.Server/.idea
+Kommander.Server/bin
+Kommander.Server/obj
+Kommander.Server/database*
 Kommander.Tests/.idea
 Kommander.Tests/bin
 Kommander.Tests/obj

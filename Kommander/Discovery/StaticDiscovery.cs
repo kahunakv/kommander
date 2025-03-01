@@ -1,6 +1,9 @@
 
 namespace Kommander.Discovery;
 
+/// <summary>
+/// Allow discovery of other Raft nodes using a static list of nodes
+/// </summary>
 public class StaticDiscovery : IDiscovery
 {
     private readonly List<RaftNode> nodes;

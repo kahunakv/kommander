@@ -1,6 +1,9 @@
 
 namespace Kommander.Discovery;
 
+/// <summary>
+/// Allow discovery of other Raft nodes using Redis
+/// </summary>
 public class RedisDiscovery : IDiscovery
 {
     private const string ClusterFormationKey = "raft-matchmaker-cluster";

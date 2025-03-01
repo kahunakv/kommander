@@ -1,7 +1,11 @@
 using Kommander.Data;
 
-namespace Kommander.Communication;
+namespace Kommander.Communication.Memory;
 
+/// <summary>
+/// Allows to communicate with other nodes in the cluster via in-memory messages
+/// This allows to simulate the communication between nodes without the need of a network
+/// </summary>
 public class InMemoryCommunication : ICommunication
 {
     private Dictionary<string, IRaft> nodes = new();

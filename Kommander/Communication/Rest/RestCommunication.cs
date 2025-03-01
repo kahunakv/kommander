@@ -3,23 +3,28 @@ using System.Text.Json;
 using Flurl.Http;
 using Kommander.Data;
 
-namespace Kommander.Communication;
+namespace Kommander.Communication.Rest;
 
-public class HttpCommunication : ICommunication
+/// <summary>
+/// Allows for communication between Raft nodes using REST endpoints.
+/// </summary>
+public class RestCommunication : ICommunication
 {
     public async Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftPartition partition, RaftNode node, RequestVotesRequest request)
     {
-        string payload = JsonSerializer.Serialize(request, RaftJsonContext.Default.RequestVotesRequest);
+        RaftConfiguration configuration = manager.Configuration;
+        
+        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.RequestVotesRequest);
         
         try
         {
-            return await ("http://" + node.Endpoint)
-                .WithOAuthBearerToken("xxx")
+            return await (configuration.HttpScheme + node.Endpoint)
+                .WithOAuthBearerToken(configuration.HttpAuthBearerToken)
                 .AppendPathSegments("v1/raft/request-vote")
                 .WithHeader("Accept", "application/json")
                 .WithHeader("Content-Type", "application/json")
-                .WithTimeout(5)
-                .WithSettings(o => o.HttpVersion = "2.0")
+                .WithTimeout(configuration.HttpTimeout)
+                .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
                 .PostStringAsync(payload)
                 .ReceiveJson<RequestVotesResponse>();
         }
@@ -33,17 +38,19 @@ public class HttpCommunication : ICommunication
 
     public async Task<VoteResponse> Vote(RaftManager manager, RaftPartition partition, RaftNode node, VoteRequest request)
     {
-        string payload = JsonSerializer.Serialize(request, RaftJsonContext.Default.VoteRequest);
+        RaftConfiguration configuration = manager.Configuration;
+        
+        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.VoteRequest);
         
         try
         {
-            return await ("http://" + node.Endpoint)
-                .WithOAuthBearerToken("xxx")
+            return await (configuration.HttpScheme + node.Endpoint)
+                .WithOAuthBearerToken(configuration.HttpAuthBearerToken)
                 .AppendPathSegments("v1/raft/vote")
                 .WithHeader("Accept", "application/json")
                 .WithHeader("Content-Type", "application/json")
-                .WithTimeout(5)
-                .WithSettings(o => o.HttpVersion = "2.0")
+                .WithTimeout(configuration.HttpTimeout)
+                .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
                 .PostStringAsync(payload)
                 .ReceiveJson<VoteResponse>();
         }
@@ -57,17 +64,19 @@ public class HttpCommunication : ICommunication
 
     public async Task<AppendLogsResponse> AppendLogToNode(RaftManager manager, RaftPartition partition, RaftNode node, AppendLogsRequest request)
     {
-        string payload = JsonSerializer.Serialize(request, RaftJsonContext.Default.AppendLogsRequest);
+        RaftConfiguration configuration = manager.Configuration;
+        
+        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.AppendLogsRequest);
         
         try
         {
-            AppendLogsResponse? response = await ("http://" + node.Endpoint)
-                .WithOAuthBearerToken("x")
+            AppendLogsResponse? response = await (configuration.HttpScheme + node.Endpoint)
+                .WithOAuthBearerToken(configuration.HttpAuthBearerToken)
                 .AppendPathSegments("v1/raft/append-logs")
                 .WithHeader("Accept", "application/json")
                 .WithHeader("Content-Type", "application/json")
-                .WithTimeout(10)
-                .WithSettings(o => o.HttpVersion = "2.0")
+                .WithTimeout(configuration.HttpTimeout)
+                .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
                 .PostStringAsync(payload)
                 .ReceiveJson<AppendLogsResponse>();
             

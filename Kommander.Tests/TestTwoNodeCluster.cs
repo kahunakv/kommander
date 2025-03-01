@@ -1,5 +1,5 @@
 
-using Kommander.Communication;
+using Kommander.Communication.Memory;
 using Kommander.Data;
 using Kommander.Discovery;
 using Kommander.Time;

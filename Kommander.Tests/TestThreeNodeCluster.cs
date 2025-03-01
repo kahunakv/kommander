@@ -1,4 +1,5 @@
-using Kommander.Communication;
+
+using Kommander.Communication.Memory;
 using Kommander.Discovery;
 using Kommander.Time;
 using Kommander.WAL;

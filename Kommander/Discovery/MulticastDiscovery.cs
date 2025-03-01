@@ -7,6 +7,9 @@ using Kommander.Discovery.Data;
 
 namespace Kommander.Discovery;
 
+/// <summary>
+/// Allow discovery of other Raft nodes using multicast UDP messages
+/// </summary>
 public class MulticastDiscovery : IDiscovery
 {
     private static readonly IPAddress MulticastAddress = IPAddress.Parse("239.0.0.222");

@@ -3,6 +3,10 @@ using Kommander.Discovery;
 
 namespace Kommander;
 
+/// <summary>
+/// Manages the operations of joining and leaving a cluster.
+/// Keeps state about the current cluster and node status.
+/// </summary>
 internal sealed class ClusterHandler
 {
     public bool Joined { get; private set; }

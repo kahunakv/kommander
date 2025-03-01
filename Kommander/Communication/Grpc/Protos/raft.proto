@@ -1,0 +1,69 @@
+
+syntax = "proto3";
+
+service Rafter {
+  rpc Vote (GrpcVoteRequest) returns (GrpcVoteResponse);
+  rpc RequestVotes (GrpcRequestVotesRequest) returns (GrpcRequestVotesResponse);
+  rpc AppendLogs (GrpcAppendLogsRequest) returns (GrpcAppendLogsResponse);
+}
+
+message GrpcVoteRequest {
+  int32 Partition = 1;
+  int64 Term = 2;
+  string Endpoint = 3;
+}
+
+message GrpcVoteResponse {
+
+}
+
+message GrpcRequestVotesRequest {
+  int32 Partition = 1;
+  int64 Term = 2;
+  int64 MaxLogId = 3;
+  string Endpoint = 4;
+}
+
+message GrpcRequestVotesResponse {
+  
+}
+
+message GrpcAppendLogsRequest {
+  int32 Partition = 1;
+  int64 Term = 2;
+  string Endpoint = 3;
+  repeated GrpcRaftLog Logs = 4;
+}
+
+message GrpcAppendLogsResponse {
+  GrpcRaftOperationStatus Status = 1;
+  int64 CommitedIndex = 2;
+}
+
+message GrpcRaftLog {
+  int64 Id = 1;
+  GrpRaftLogType Type = 2;
+  int64 Term = 3;
+  int64 TimeLogical = 4;
+  uint32 TimeCounter = 5;
+  string LogType = 6;
+  bytes Data = 7;  
+}
+
+enum GrpRaftLogType {
+  REGULAR = 0;
+  CHECKPOINT = 1;
+}
+
+enum GrpcRaftOperationStatus {
+  SUCCESS = 0;
+  ERRORED = 1;
+  NODE_IS_NOT_LEADER = 2;
+  LEADER_IN_OLD_TERM = 3;
+}
+
+enum GrpcLockConsistency {
+  LOCK_CONSISTENCY_EPHEMERAL = 0;
+  LOCK_CONSISTENCY_CONSISTENT = 1;
+  LOCK_CONSISTENCY_REPLICATION_CONSISTENT = 2;
+}
