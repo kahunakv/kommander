@@ -7,6 +7,10 @@ Kommander.Server/.idea
 Kommander.Server/bin
 Kommander.Server/obj
 Kommander.Server/database*
+Kommander.Http/.idea
+Kommander.Http/bin
+Kommander.Http/obj
+Kommander.Http/database*
 Kommander.Tests/.idea
 Kommander.Tests/bin
 Kommander.Tests/obj

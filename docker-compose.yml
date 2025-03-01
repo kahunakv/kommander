@@ -1,6 +1,6 @@
 
 services:
-  node1:    
+  node1:
     build:
       context: . #current dir as build context
       args:
@@ -8,13 +8,13 @@ services:
         KOMMANDER_RAFT_PORT: 8082
         KOMMANDER_HTTP_PORTS: 8004 8081
         KOMMANDER_HTTPS_PORTS: 8005 8082
-        KOMMANDER_INITIAL_CLUSTER: 172.20.0.3:8084 172.20.0.4:8086      
+        KOMMANDER_INITIAL_CLUSTER: 172.20.0.3:8084 172.20.0.4:8086
     container_name: node1
     ports:
       - "8081:8004"
       - "8082:8005"
     volumes:
-      - node1-data:/app/data      
+      - node1-data:/app/data
     networks:
       custom_net:
         ipv4_address: 172.20.0.2
@@ -27,13 +27,13 @@ services:
         KOMMANDER_RAFT_PORT: 8084
         KOMMANDER_HTTP_PORTS: 8004 8083
         KOMMANDER_HTTPS_PORTS: 8005 8084
-        KOMMANDER_INITIAL_CLUSTER: 172.20.0.2:8082 172.20.0.4:8086     
-    container_name: node2    
+        KOMMANDER_INITIAL_CLUSTER: 172.20.0.2:8082 172.20.0.4:8086
+    container_name: node2
     ports:
       - "8083:8004"
       - "8084:8005"
     volumes:
-      - node2-data:/app/data      
+      - node2-data:/app/data
     networks:
       custom_net:
         ipv4_address: 172.20.0.3
@@ -46,13 +46,13 @@ services:
         KOMMANDER_RAFT_PORT: 8086
         KOMMANDER_HTTP_PORTS: 8004 8085
         KOMMANDER_HTTPS_PORTS: 8005 8086
-        KOMMANDER_INITIAL_CLUSTER: 172.20.0.2:8082 172.20.0.3:8086       
-    container_name: node3    
+        KOMMANDER_INITIAL_CLUSTER: 172.20.0.2:8082 172.20.0.3:8084
+    container_name: node3
     ports:
       - "8085:8004"
       - "8086:8005"
     volumes:
-      - node3-data:/app/data      
+      - node3-data:/app/data
     networks:
       custom_net:
         ipv4_address: 172.20.0.4
