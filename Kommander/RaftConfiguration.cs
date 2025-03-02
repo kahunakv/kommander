@@ -7,6 +7,11 @@ namespace Kommander;
 public class RaftConfiguration
 {
     /// <summary>
+    /// Unique node id
+    /// </summary>
+    public string? NodeId { get; set; }
+    
+    /// <summary>
     /// Host to identify the node within the cluster
     /// </summary>
     public string? Host { get; set; }

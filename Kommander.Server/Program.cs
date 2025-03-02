@@ -24,6 +24,7 @@ try
 {
     RaftConfiguration configuration = new()
     {
+        NodeId = string.IsNullOrEmpty(opts.RaftNodeId) ? Environment.MachineName : opts.RaftNodeId,
         Host = opts.RaftHost,
         Port = opts.RaftPort,
         MaxPartitions = opts.InitialClusterPartitions
@@ -34,8 +35,8 @@ try
     if (opts.InitialCluster is not null)
         nodes = [.. opts.InitialCluster.Select(k => new RaftNode(k))];
 
-    if (nodes.Count != 2)
-        throw new RaftException("Invalid number of nodes");
+    if (nodes.Count < 2)
+        throw new RaftException("Invalid number of nodes. Must be at least 2");
 
     Console.WriteLine("Kommander! {0} {1}", configuration.Host, configuration.Port);
 
@@ -50,7 +51,7 @@ try
             services.GetRequiredService<ActorSystem>(),
             configuration,
             new StaticDiscovery(nodes),
-            new SqliteWAL(path: opts.SqliteWalPath, version: opts.SqliteWalRevision),
+            new SqliteWAL(path: opts.SqliteWalPath, revision: opts.SqliteWalRevision),
             new GrpcCommunication(),
             new HybridLogicalClock(),
             services.GetRequiredService<ILogger<IRaft>>()

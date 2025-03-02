@@ -20,6 +20,15 @@ public sealed class KommanderCommandLineOptions
     [Option("https-certificate-password", Required = false, HelpText = "Password of the HTTPs certificate", Default = "")]
     public string HttpsCertificatePassword { get; set; } = "";
     
+    [Option("wal-adapter", Required = false, HelpText = "WAL adapter", Default = "rocksdb")]
+    public string WalAdapter { get; set; } = "";
+    
+    [Option("rocksdb-wal-path", Required = false, HelpText = "RocksDB WAL path")]
+    public string RocksDbWalPath { get; set; } = "";
+    
+    [Option("rocksdb-wal-revision", Required = false, HelpText = "RocksDB WAL revision")]
+    public string RocksDbWalRevision{ get; set; } = "";
+    
     [Option("sqlite-wal-path", Required = false, HelpText = "Sqlite WAL path")]
     public string SqliteWalPath { get; set; } = "";
     
@@ -31,6 +40,9 @@ public sealed class KommanderCommandLineOptions
 
     [Option("initial-cluster-partitions", Required = false, HelpText = "Initial cluster number of partitions", Default = 8)]
     public int InitialClusterPartitions { get; set; }
+    
+    [Option("raft-nodeid", Required = false, HelpText = "Raft unque node id")]
+    public string RaftNodeId { get; set; } = "";
     
     [Option("raft-host", Required = false, HelpText = "Host to listen for Raft consensus and replication requests", Default = "localhost")]
     public string RaftHost { get; set; } = "localhost";

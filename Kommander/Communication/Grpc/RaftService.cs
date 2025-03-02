@@ -40,7 +40,7 @@ public class RaftService : Rafter.RafterBase
         //if (request.Logs.Count > 0)
         //    logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got AppendLogs message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
         
-        (RaftOperationStatus status, long commitIndexId) = await raft.AppendLogs(new(request.Partition, request.Term, request.Endpoint, GetLogs(request.Logs)));
+        (RaftOperationStatus status, long commitIndexId) = await raft.AppendLogs(new(request.Partition, request.Term, new(request.TimePhysical, request.TimeCounter), request.Endpoint, GetLogs(request.Logs)));
         return new() { Status = (GrpcRaftOperationStatus)status, CommitedIndex = commitIndexId };
     }
 

@@ -261,7 +261,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         if (state != NodeState.Leader)
             return false;
         
-        return await AppendLogsToNodes(true);
+        return await AppendLogsToNodes(lastHeartbeat, true);
     }
 
     /// <summary>
@@ -424,7 +424,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         currentIndex = appendResponse.NextId;
         
         // Replicate logs to other nodes in the cluster
-        if (await AppendLogsToNodes(false))
+        if (await AppendLogsToNodes(currentTime, false))
             return (RaftOperationStatus.Success, currentIndex);
 
         return (RaftOperationStatus.Errored, currentIndex);
@@ -433,6 +433,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <summary>
     /// Replicates the checkpoint to other nodes in the cluster when the node is the leader.
     /// </summary>
+    /// <returns></returns>
     private async Task<(RaftOperationStatus, long commitId)> ReplicateCheckpoint()
     {
         if (state != NodeState.Leader)
@@ -440,9 +441,11 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         RaftWALResponse appendResponse = await walActor.Ask(new(RaftWALActionType.AppendCheckpoint, currentTerm));
         currentIndex = appendResponse.NextId;
+        
+        HLCTimestamp currentTime = await manager.HybridLogicalClock.SendOrLocalEvent();
        
         // Replicate logs to other nodes in the cluster
-        if (await AppendLogsToNodes(false))
+        if (await AppendLogsToNodes(currentTime, false))
            return (RaftOperationStatus.Success, currentIndex);
 
         return (RaftOperationStatus.Errored, currentIndex);
@@ -478,9 +481,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <summary>
     /// Appends logs to the Write-Ahead Log and replicates them to other nodes in the cluster when the node is the leader.
     /// </summary>
-    /// <param name="isPing"></param>
+    /// <param name="timestamp"></param> 
+    /// <param name="isHeathbeat"></param>
     /// <returns></returns>
-    private async Task<bool> AppendLogsToNodes(bool isPing)
+    private async Task<bool> AppendLogsToNodes(HLCTimestamp timestamp, bool isHeathbeat)
     {
         if (manager.Nodes.Count == 0)
         {
@@ -493,7 +497,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         List<Task<RaftOperationStatus>> tasks = new(nodes.Count);
 
         foreach (RaftNode node in nodes)
-            tasks.Add(AppendLogToNode(node, isPing));
+            tasks.Add(AppendLogToNode(node, timestamp, isHeathbeat));
 
         RaftOperationStatus[] responses = await Task.WhenAll(tasks);
 
@@ -507,13 +511,14 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// Appends logs to a specific node in the cluster.
     /// </summary>
     /// <param name="node"></param>
-    /// <param name="isPing"></param>
-    private async Task<RaftOperationStatus> AppendLogToNode(RaftNode node, bool isPing)
+    /// <param name="timestamp"></param>
+    /// <param name="isHeathbeat"></param>
+    private async Task<RaftOperationStatus> AppendLogToNode(RaftNode node, HLCTimestamp timestamp, bool isHeathbeat)
     {
         AppendLogsRequest request;
         
-        if (isPing)
-            request = new(partition.PartitionId, currentTerm, manager.LocalEndpoint, null);
+        if (isHeathbeat)
+            request = new(partition.PartitionId, currentTerm, timestamp, manager.LocalEndpoint, null);
         else
         {
             if (!lastCommitIndexes.TryGetValue(node.Endpoint, out long lastCommitIndex))
@@ -523,7 +528,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             if (getRangeResponse.Logs is null)
                 return RaftOperationStatus.Errored;
             
-            request = new(partition.PartitionId, currentTerm, manager.LocalEndpoint, getRangeResponse.Logs);
+            request = new(partition.PartitionId, currentTerm, timestamp, manager.LocalEndpoint, getRangeResponse.Logs);
         }
         
         AppendLogsResponse response = await communication.AppendLogToNode(manager, partition, node, request);

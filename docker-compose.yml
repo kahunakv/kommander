@@ -4,6 +4,7 @@ services:
     build:
       context: . #current dir as build context
       args:
+        KOMMANDER_RAFT_NODEID: node1
         KOMMANDER_RAFT_HOST: 172.20.0.2
         KOMMANDER_RAFT_PORT: 8082
         KOMMANDER_HTTP_PORTS: 8004 8081
@@ -23,6 +24,7 @@ services:
     build:
       context: . #current dir as build context
       args:
+        KOMMANDER_RAFT_NODEID: node2
         KOMMANDER_RAFT_HOST: 172.20.0.3
         KOMMANDER_RAFT_PORT: 8084
         KOMMANDER_HTTP_PORTS: 8004 8083
@@ -42,6 +44,7 @@ services:
     build:
       context: . #current dir as build context
       args:
+        KOMMANDER_RAFT_NODEID: node3
         KOMMANDER_RAFT_HOST: 172.20.0.4
         KOMMANDER_RAFT_PORT: 8086
         KOMMANDER_HTTP_PORTS: 8004 8085

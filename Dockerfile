@@ -23,12 +23,13 @@ COPY certs/development-certificate.pfx /app/certificate.pfx
 # install sqlite to debug
 RUN apt update && apt upgrade && apt-get -y install sqlite3
 
-ARG KOMMANDER_RAFT_HOST
+ARG KOMMANDER_RAFT_NODEID
 ARG KOMMANDER_RAFT_PORT
 ARG KOMMANDER_HTTP_PORTS
 ARG KOMMANDER_HTTPS_PORTS
 ARG KOMMANDER_INITIAL_CLUSTER
 
+ENV KOMMANDER_RAFT_NODEID="$KOMMANDER_RAFT_NODEID"
 ENV KOMMANDER_RAFT_HOST="$KOMMANDER_RAFT_HOST"
 ENV KOMMANDER_RAFT_PORT="$KOMMANDER_RAFT_PORT"
 ENV KOMMANDER_HTTP_PORTS="$KOMMANDER_HTTP_PORTS"
@@ -37,7 +38,7 @@ ENV KOMMANDER_INITIAL_CLUSTER="$KOMMANDER_INITIAL_CLUSTER"
 
 COPY --chmod=755 <<EOT /app/entrypoint.sh
 #!/usr/bin/env bash
-dotnet /app/Kommander.Server.dll --raft-host $KOMMANDER_RAFT_HOST --raft-port $KOMMANDER_RAFT_PORT --http-ports $KOMMANDER_HTTP_PORTS --https-ports $KOMMANDER_HTTPS_PORTS --https-certificate /app/certificate.pfx --initial-cluster $KOMMANDER_INITIAL_CLUSTER --sqlite-wal-path /app/data --sqlite-wal-revision v1
+dotnet /app/Kommander.Server.dll --raft-nodeid $KOMMANDER_RAFT_NODEID --raft-host $KOMMANDER_RAFT_HOST --raft-port $KOMMANDER_RAFT_PORT --http-ports $KOMMANDER_HTTP_PORTS --https-ports $KOMMANDER_HTTPS_PORTS --https-certificate /app/certificate.pfx --initial-cluster $KOMMANDER_INITIAL_CLUSTER --sqlite-wal-path /app/data --sqlite-wal-revision v1
 EOT
 
 # when starting the container, run dotnet with the built dll

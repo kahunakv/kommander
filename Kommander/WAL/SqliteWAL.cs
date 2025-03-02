@@ -16,12 +16,12 @@ public class SqliteWAL : IWAL
 
     private readonly string path;
     
-    private readonly string version;
+    private readonly string revision;
     
-    public SqliteWAL(string path = ".", string version = "1")
+    public SqliteWAL(string path = ".", string revision = "1")
     {
         this.path = path;
-        this.version = version;
+        this.revision = revision;
     }
     
     private async ValueTask<SqliteConnection> TryOpenDatabase(int partitionId)
@@ -36,7 +36,7 @@ public class SqliteWAL : IWAL
             if (connections.TryGetValue(partitionId, out connection))
                 return connection;
 
-            string connectionString = $"Data Source={path}/raft{partitionId}_{version}.db";
+            string connectionString = $"Data Source={path}/raft{partitionId}_{revision}.db";
             connection = new(connectionString);
 
             connection.Open();
@@ -49,7 +49,7 @@ public class SqliteWAL : IWAL
                 type INT, 
                 logType STRING, 
                 log BLOB, 
-                timeLogical INT, 
+                timePhysical INT, 
                 timeCounter INT, 
                 PRIMARY KEY(partitionId, id)
             );
@@ -58,7 +58,7 @@ public class SqliteWAL : IWAL
             await using SqliteCommand command1 = new(createTableQuery, connection);
             await command1.ExecuteNonQueryAsync();
             
-            const string pragmasQuery = "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA wal_checkpoint(FULL);";
+            const string pragmasQuery = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY;";
             await using SqliteCommand command3 = new(pragmasQuery, connection);
             await command3.ExecuteNonQueryAsync();
             
@@ -144,7 +144,7 @@ public class SqliteWAL : IWAL
     {
         SqliteConnection connection = await TryOpenDatabase(partitionId);
         
-        const string insertQuery = "INSERT INTO logs (id, partitionId, term, type, logType, log, timeLogical, timeCounter) VALUES (@id, @partitionId, @term, @type, @logType, @log, @timeLogical, @timeCounter);";
+        const string insertQuery = "INSERT INTO logs (id, partitionId, term, type, logType, log, timePhysical, timeCounter) VALUES (@id, @partitionId, @term, @type, @logType, @log, @timePhysical, @timeCounter);";
         await using SqliteCommand insertCommand =  new(insertQuery, connection);
         
         insertCommand.Parameters.Clear();
@@ -155,7 +155,7 @@ public class SqliteWAL : IWAL
         insertCommand.Parameters.AddWithValue("@type", log.Type);
         insertCommand.Parameters.AddWithValue("@logType", log.LogType);
         insertCommand.Parameters.AddWithValue("@log", log.LogData);
-        insertCommand.Parameters.AddWithValue("@timeLogical", log.Time.L);
+        insertCommand.Parameters.AddWithValue("@timePhysical", log.Time.L);
         insertCommand.Parameters.AddWithValue("@timeCounter", log.Time.C);
         
         await insertCommand.ExecuteNonQueryAsync();

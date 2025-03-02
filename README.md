@@ -59,7 +59,7 @@ To install Kommander into your C#/.NET project, you can use the .NET CLI or the 
 #### Using .NET CLI
 
 ```shell
-dotnet add package Kommander --version 0.2.1
+dotnet add package Kommander --version 0.2.4
 ```
 
 ### Using NuGet Package Manager
@@ -67,7 +67,7 @@ dotnet add package Kommander --version 0.2.1
 Search for Kommander and install it from the NuGet package manager UI, or use the Package Manager Console:
 
 ```shell
-Install-Package Kommander -Version 0.2.1
+Install-Package Kommander -Version 0.2.4
 ```
 
 Or, using the NuGet Package Manager in Visual Studio, search for **Kommander** and install it.
@@ -84,6 +84,7 @@ Below is a basic example demonstrating how to set up a simple Kommander node, jo
 RaftConfiguration config = new()
 {
     // Node will announce itself as localhost:8001
+    NodeId = "node1",
     Host = "localhost",
     Port = 8001,
     // Partitions allow nodes to be leaders/followers for different sets of data

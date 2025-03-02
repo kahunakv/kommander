@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package Kommander.WAL.Protos;
+
+message RaftLogMessage {
+  int32 partition = 1;
+  int64 id = 2;
+  int64 term = 3;
+  int32 type = 4;
+  string logType = 5;
+  bytes log = 6;
+  int64 timeLogical = 7;
+  uint32 timeCounter = 8;
+}

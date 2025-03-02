@@ -31,8 +31,10 @@ message GrpcRequestVotesResponse {
 message GrpcAppendLogsRequest {
   int32 Partition = 1;
   int64 Term = 2;
-  string Endpoint = 3;
-  repeated GrpcRaftLog Logs = 4;
+  int64 TimePhysical = 3;
+  uint32 TimeCounter = 4;
+  string Endpoint = 5;
+  repeated GrpcRaftLog Logs = 6;
 }
 
 message GrpcAppendLogsResponse {
@@ -44,7 +46,7 @@ message GrpcRaftLog {
   int64 Id = 1;
   GrpRaftLogType Type = 2;
   int64 Term = 3;
-  int64 TimeLogical = 4;
+  int64 TimePhysical = 4;
   uint32 TimeCounter = 5;
   string LogType = 6;
   bytes Data = 7;  
