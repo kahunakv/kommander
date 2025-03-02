@@ -19,7 +19,7 @@ public class RaftService : Rafter.RafterBase
     
     public override async Task<GrpcVoteResponse> Vote(GrpcVoteRequest request, ServerCallContext context)
     {
-        logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got Vote message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
+        //logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got Vote message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
         
         await raft.Vote(new(request.Partition, request.Term, request.Endpoint));
         
@@ -28,7 +28,7 @@ public class RaftService : Rafter.RafterBase
     
     public override async Task<GrpcRequestVotesResponse> RequestVotes(GrpcRequestVotesRequest request, ServerCallContext context)
     {
-        logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got RequestVotes message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
+        //logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got RequestVotes message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
         
         await raft.RequestVote(new(request.Partition, request.Term, request.MaxLogId, request.Endpoint));
         
@@ -37,8 +37,8 @@ public class RaftService : Rafter.RafterBase
     
     public override async Task<GrpcAppendLogsResponse> AppendLogs(GrpcAppendLogsRequest request, ServerCallContext context)
     {
-        if (request.Logs.Count > 0)
-            logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got AppendLogs message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
+        //if (request.Logs.Count > 0)
+        //    logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got AppendLogs message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
         
         (RaftOperationStatus status, long commitIndexId) = await raft.AppendLogs(new(request.Partition, request.Term, request.Endpoint, GetLogs(request.Logs)));
         return new() { Status = (GrpcRaftOperationStatus)status, CommitedIndex = commitIndexId };

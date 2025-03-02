@@ -91,9 +91,6 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     {
         try
         {
-            if (message.Type != RaftRequestType.CheckLeader && message.Type != RaftRequestType.AppendLogs)
-                logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] RaftStateActor: Received {Type} message", manager.LocalEndpoint, partition.PartitionId, state, message.Type);
-            
             await RestoreWal();
 
             switch (message.Type)
@@ -106,10 +103,11 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                     return new(RaftResponseType.State, state);
 
                 case RaftRequestType.AppendLogs:
-                    {
-                        (RaftOperationStatus status, long commitLogIndex) = await AppendLogs(message.Endpoint ?? "", message.Term, message.Logs);
-                        return new(RaftResponseType.None, status, commitLogIndex);
-                    }
+                {
+                    (RaftOperationStatus status, long commitLogIndex) =
+                        await AppendLogs(message.Endpoint ?? "", message.Term, message.Logs);
+                    return new(RaftResponseType.None, status, commitLogIndex);
+                }
 
                 case RaftRequestType.RequestVote:
                     await Vote(new(message.Endpoint ?? ""), message.Term, message.MaxLogId);
@@ -120,17 +118,17 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                     break;
 
                 case RaftRequestType.ReplicateLogs:
-                    {
-                        (RaftOperationStatus status, long commitId) = await ReplicateLogs(message.Logs);
-                        return new(RaftResponseType.None, status, commitId);
-                    }
+                {
+                    (RaftOperationStatus status, long commitId) = await ReplicateLogs(message.Logs);
+                    return new(RaftResponseType.None, status, commitId);
+                }
 
                 case RaftRequestType.ReplicateCheckpoint:
-                    {
-                        (RaftOperationStatus status, long commitId) = await ReplicateCheckpoint();
-                        return new(RaftResponseType.None, status, commitId);
-                    }
-                
+                {
+                    (RaftOperationStatus status, long commitId) = await ReplicateCheckpoint();
+                    return new(RaftResponseType.None, status, commitId);
+                }
+
                 default:
                     logger.LogError("Invalid message type: {Type}", message.Type);
                     break;
@@ -214,6 +212,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Voted to become leader after {LastHeartbeat}ms. Term={CurrentTerm}", manager.LocalEndpoint, partition.PartitionId, state, currentTime - lastHeartbeat, currentTerm);
 
                 await RequestVotes();
+                
+                logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Completed round to become leader Term={CurrentTerm}", manager.LocalEndpoint, partition.PartitionId, state, currentTerm);
                 break;
         }
     }
@@ -241,7 +241,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Asked {Endpoint} for votes on Term={CurrentTerm}", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, currentTerm);
             
-            await communication.RequestVotes(manager, partition, node, request);
+            _ = communication.RequestVotes(manager, partition, node, request);
         }
     }
 
@@ -304,11 +304,11 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         lastHeartbeat = await manager.HybridLogicalClock.SendOrLocalEvent();
 
-        logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Requested vote from {Endpoint} Term={Term}", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, voteTerm);
+        logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Requested vote from {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, voteTerm);
 
         VoteRequest request = new(partition.PartitionId, voteTerm, manager.LocalEndpoint);
         
-        await communication.Vote(manager, partition, node, request);
+        _ = communication.Vote(manager, partition, node, request);
     }
 
     /// <summary>

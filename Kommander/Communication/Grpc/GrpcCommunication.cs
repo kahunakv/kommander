@@ -1,4 +1,5 @@
 
+using System.Collections.Concurrent;
 using Google.Protobuf.Collections;
 using Grpc.Net.Client;
 using Kommander.Data;
@@ -11,6 +12,8 @@ namespace Kommander.Communication.Grpc;
 public class GrpcCommunication : ICommunication
 {
     private static readonly HttpClientHandler httpHandler = GetHandler();
+    
+    private readonly ConcurrentDictionary<string, GrpcChannel> channels = new();
     
     private static HttpClientHandler GetHandler()
     {
@@ -36,10 +39,14 @@ public class GrpcCommunication : ICommunication
     
     public async Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftPartition partition, RaftNode node, RequestVotesRequest request)
     {
-        manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Sent RequestVotes message to {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
-        
-        GrpcChannel channel = GrpcChannel.ForAddress($"https://{node.Endpoint}", new() { HttpHandler = httpHandler });
-        
+        //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Sent RequestVotes message to {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
+
+        if (!channels.TryGetValue(node.Endpoint, out GrpcChannel? channel))
+        {
+            channel = GrpcChannel.ForAddress($"https://{node.Endpoint}", new() { HttpHandler = httpHandler });
+            channels.TryAdd(node.Endpoint, channel);
+        }
+
         Rafter.RafterClient client = new(channel);
 
         GrpcRequestVotesRequest requestVotes = new()
@@ -51,15 +58,21 @@ public class GrpcCommunication : ICommunication
         };
         
         await client.RequestVotesAsync(requestVotes);
+        
+        //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got RequestVotes reply from {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
 
         return new();
     }
 
     public async Task<VoteResponse> Vote(RaftManager manager, RaftPartition partition, RaftNode node, VoteRequest request)
     {
-        manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Send Vote to {Node} message on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
+        //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Send Vote to {Node} message on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
         
-        GrpcChannel channel = GrpcChannel.ForAddress($"https://{node.Endpoint}", new() { HttpHandler = httpHandler });
+        if (!channels.TryGetValue(node.Endpoint, out GrpcChannel? channel))
+        {
+            channel = GrpcChannel.ForAddress($"https://{node.Endpoint}", new() { HttpHandler = httpHandler });
+            channels.TryAdd(node.Endpoint, channel);
+        }
         
         Rafter.RafterClient client = new(channel);
 
@@ -72,12 +85,18 @@ public class GrpcCommunication : ICommunication
         
         await client.VoteAsync(voteRequest);
         
+        //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got Vote reply from {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
+        
         return new();
     }
 
     public async Task<AppendLogsResponse> AppendLogToNode(RaftManager manager, RaftPartition partition, RaftNode node, AppendLogsRequest request)
     {
-        GrpcChannel channel = GrpcChannel.ForAddress($"https://{node.Endpoint}", new() { HttpHandler = httpHandler });
+        if (!channels.TryGetValue(node.Endpoint, out GrpcChannel? channel))
+        {
+            channel = GrpcChannel.ForAddress($"https://{node.Endpoint}", new() { HttpHandler = httpHandler });
+            channels.TryAdd(node.Endpoint, channel);
+        }
         
         Rafter.RafterClient client = new(channel);
 

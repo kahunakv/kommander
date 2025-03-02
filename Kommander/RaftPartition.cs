@@ -58,9 +58,25 @@ public sealed class RaftPartition
     /// <param name="request"></param>
     public async Task RequestVote(RequestVotesRequest request)
     {
-        Console.WriteLine("Sending RequestVote to RaftStateActor {0} {1} {2} {3}", RaftRequestType.RequestVote, request.Term, request.MaxLogId, request.Endpoint);
-        
-        await raftActor.Ask(new(RaftRequestType.RequestVote, request.Term, request.MaxLogId, request.Endpoint), TimeSpan.FromSeconds(5));
+        try
+        {
+            await raftActor.Ask(
+                new(RaftRequestType.RequestVote, request.Term, request.MaxLogId, request.Endpoint),
+                TimeSpan.FromSeconds(5)
+            );
+        }
+        catch (AskTimeoutException)
+        {
+            raftManager.Logger.LogWarning(
+                "[{LocalEndpoint}/{ParitionId}] Timeout RequestVote {Type} {Term} {MaxLogId} {Endpoint}",
+                raftManager.LocalEndpoint,
+                PartitionId,
+                RaftRequestType.RequestVote,
+                request.Term, 
+                request.MaxLogId, 
+                request.Endpoint
+            );
+        }
     }
 
     /// <summary>
@@ -69,9 +85,21 @@ public sealed class RaftPartition
     /// <param name="request"></param>
     public async Task Vote(VoteRequest request)
     {
-        Console.WriteLine("Sending Vote to RaftStateActor {0} {1} {2}", RaftRequestType.RequestVote, request.Term, request.Endpoint);
-        
-        await raftActor.Ask(new(RaftRequestType.ReceiveVote, request.Term, 0, request.Endpoint), TimeSpan.FromSeconds(5));
+        try
+        {
+            await raftActor.Ask(new(RaftRequestType.ReceiveVote, request.Term, 0, request.Endpoint), TimeSpan.FromSeconds(5));
+        }
+        catch (AskTimeoutException)
+        {
+            raftManager.Logger.LogWarning(
+                "[{LocalEndpoint}/{ParitionId}] Timeout Vote {Type} {Term} {Endpoint}",
+                raftManager.LocalEndpoint,
+                PartitionId,
+                RaftRequestType.RequestVote,
+                request.Term, 
+                request.Endpoint
+            );
+        }
     }
 
     /// <summary>
