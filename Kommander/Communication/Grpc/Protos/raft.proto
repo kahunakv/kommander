@@ -60,6 +60,7 @@ enum GrpcRaftOperationStatus {
   ERRORED = 1;
   NODE_IS_NOT_LEADER = 2;
   LEADER_IN_OLD_TERM = 3;
+  LEADER_IN_OUTDATED_TERM = 4;   
 }
 
 enum GrpcLockConsistency {

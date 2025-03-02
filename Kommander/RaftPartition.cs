@@ -56,18 +56,22 @@ public sealed class RaftPartition
     /// Request a vote from the partition.
     /// </summary>
     /// <param name="request"></param>
-    public void RequestVote(RequestVotesRequest request)
+    public async Task RequestVote(RequestVotesRequest request)
     {
-        raftActor.Send(new(RaftRequestType.RequestVote, request.Term, request.MaxLogId, request.Endpoint));
+        Console.WriteLine("Sending RequestVote to RaftStateActor {0} {1} {2} {3}", RaftRequestType.RequestVote, request.Term, request.MaxLogId, request.Endpoint);
+        
+        await raftActor.Ask(new(RaftRequestType.RequestVote, request.Term, request.MaxLogId, request.Endpoint), TimeSpan.FromSeconds(5));
     }
 
     /// <summary>
     /// Vote to become leader in a partition.
     /// </summary>
     /// <param name="request"></param>
-    public void Vote(VoteRequest request)
+    public async Task Vote(VoteRequest request)
     {
-        raftActor.Send(new(RaftRequestType.ReceiveVote, request.Term, 0, request.Endpoint));
+        Console.WriteLine("Sending Vote to RaftStateActor {0} {1} {2}", RaftRequestType.RequestVote, request.Term, request.Endpoint);
+        
+        await raftActor.Ask(new(RaftRequestType.ReceiveVote, request.Term, 0, request.Endpoint), TimeSpan.FromSeconds(5));
     }
 
     /// <summary>
@@ -101,7 +105,7 @@ public sealed class RaftPartition
         if (Leader != raftManager.LocalEndpoint)
             return (false, -1);
         
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, [new() { LogType = type, LogData = data }]));
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, [new() { LogType = type, LogData = data }]), TimeSpan.FromSeconds(5));
         return (true, response.CurrentIndex);
     }
     
@@ -121,7 +125,7 @@ public sealed class RaftPartition
 
         List<RaftLog> logsToReplicate = logs.Select(data => new RaftLog { LogType = type, LogData = data }).ToList();
         
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate));
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate), TimeSpan.FromSeconds(5));
         return (true, response.CurrentIndex);
     }
 
@@ -136,7 +140,7 @@ public sealed class RaftPartition
         if (Leader != raftManager.LocalEndpoint)
             return (false, -1);
         
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateCheckpoint));
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateCheckpoint), TimeSpan.FromSeconds(5));
         return (true, response.CurrentIndex);
     }
 

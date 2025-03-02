@@ -168,20 +168,20 @@ public sealed class RaftManager : IRaft
     /// Passes the request to the appropriate partition
     /// </summary>
     /// <param name="request"></param>
-    public void RequestVote(RequestVotesRequest request)
+    public async Task RequestVote(RequestVotesRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
-        partition.RequestVote(request);
+        await partition.RequestVote(request);
     }
 
     /// <summary>
     /// Passes the request to the appropriate partition
     /// </summary>
     /// <param name="request"></param>
-    public void Vote(VoteRequest request)
+    public async Task Vote(VoteRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
-        partition.Vote(request);
+        await partition.Vote(request);
     }
 
     /// <summary>
@@ -339,7 +339,7 @@ public sealed class RaftManager : IRaft
         Stopwatch stopwatch = Stopwatch.StartNew();
         RaftPartition partition = GetPartition(partitionId);
 
-        while (stopwatch.ElapsedMilliseconds < 60000)
+        while (stopwatch.ElapsedMilliseconds < 30000)
         {
             if (!string.IsNullOrEmpty(partition.Leader) && partition.Leader == LocalEndpoint)
                 return true;
@@ -375,7 +375,7 @@ public sealed class RaftManager : IRaft
         RaftPartition partition = GetPartition(partitionId);
         Stopwatch stopwatch = Stopwatch.StartNew();
 
-        while (stopwatch.ElapsedMilliseconds < 60000)
+        while (stopwatch.ElapsedMilliseconds < 30000)
         {
             if (cancellationToken.IsCancellationRequested)
                 throw new OperationCanceledException();

@@ -75,13 +75,13 @@ public interface IRaft
     /// Requests a votes from other nodes in the cluster
     /// </summary>
     /// <param name="request"></param>
-    public void RequestVote(RequestVotesRequest request);
+    public Task RequestVote(RequestVotesRequest request);
 
     /// <summary>
     /// Communicate a vote from a node in the cluster
     /// </summary>
     /// <param name="request"></param>
-    public void Vote(VoteRequest request);
+    public Task Vote(VoteRequest request);
 
     /// <summary>
     /// Append logs from the leader in a partition

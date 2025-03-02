@@ -6,5 +6,6 @@ public enum RaftOperationStatus
     Success,
     Errored,
     NodeIsNotLeader,
-    LeaderInOldTerm
+    LeaderInOldTerm,
+    LeaderInOutdatedTerm
 }

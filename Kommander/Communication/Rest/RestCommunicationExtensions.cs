@@ -13,22 +13,23 @@ public static class RestCommunicationExtensions
             return new AppendLogsResponse(status, commitLogIndex);
         });
 
-        app.MapPost("/v1/raft/request-vote", (RequestVotesRequest request, IRaft raft) =>
+        app.MapPost("/v1/raft/request-vote", async (RequestVotesRequest request, IRaft raft) =>
         {
-            raft.RequestVote(request);
+            await raft.RequestVote(request);
+            
             return new RequestVotesResponse();
         });
 
-        app.MapPost("/v1/raft/vote", (VoteRequest request, IRaft raft) =>
+        app.MapPost("/v1/raft/vote", async (VoteRequest request, IRaft raft) =>
         {
-            raft.Vote(request);
+            await raft.Vote(request);
+            
             return new VoteResponse();
         });
         
-        app.MapGet("/v1/raft/get-leader/{partitionId:int}", async (int partitionId, IRaft raft) =>
+        app.MapGet("/v1/raft/get-leader/{partitionId}", async (int partitionId, IRaft raft) =>
         {
-            string leader = await raft.WaitForLeader(partitionId, CancellationToken.None);
-            return leader;
+            return await raft.WaitForLeader(partitionId, CancellationToken.None);
         });
     }
 }

@@ -91,6 +91,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     {
         try
         {
+            if (message.Type != RaftRequestType.CheckLeader && message.Type != RaftRequestType.AppendLogs)
+                logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] RaftStateActor: Received {Type} message", manager.LocalEndpoint, partition.PartitionId, state, message.Type);
+            
             await RestoreWal();
 
             switch (message.Type)
@@ -245,17 +248,20 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <summary>
     /// It sends a heartbeat message to the follower nodes to indicate that the leader node in the partition is still alive.
     /// </summary>
-    private async Task SendHearthbeat()
+    private async Task<bool> SendHearthbeat()
     {
         if (manager.Nodes.Count == 0)
         {
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] No other nodes availables to send hearthbeat", manager.LocalEndpoint, partition.PartitionId, state);
-            return;
+            return false;
         }
 
         lastHeartbeat = await manager.HybridLogicalClock.SendOrLocalEvent();
 
-        await Ping();
+        if (state != NodeState.Leader)
+            return false;
+        
+        return await AppendLogsToNodes(true);
     }
 
     /// <summary>
@@ -331,7 +337,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         }
 
         int numberVotes = IncreaseVotes(voteTerm);
-        int quorum = Math.Min(2, (int)Math.Floor((manager.Nodes.Count + 1) / 2f));
+        int quorum = Math.Max(2, (int)Math.Floor((manager.Nodes.Count + 1) / 2f));
 
         if (numberVotes < quorum)
         {
@@ -371,6 +377,14 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             {
                 RaftWALResponse updateResponse = await walActor.Ask(new(RaftWALActionType.Update, currentTerm, logs));
                 commitedIndex = updateResponse.NextId;
+
+                if (commitedIndex > -1 && commitedIndex < currentIndex)
+                {
+                    logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from outdated leader {Endpoint} with old CommitedIndex={Index}. CurrentIndex={CurrentIndex} Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, commitedIndex, currentIndex);
+                    return (RaftOperationStatus.LeaderInOutdatedTerm, commitedIndex); 
+                }
+
+                currentIndex = commitedIndex;
             }
 
             state = NodeState.Follower;
@@ -462,18 +476,6 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     }
     
     /// <summary>
-    /// Pings the other nodes in the cluster to replicate logs when the node is the leader.
-    /// </summary>
-    /// <returns></returns>
-    private async Task<bool> Ping()
-    {
-        if (state != NodeState.Leader)
-            return false;
-        
-        return await AppendLogsToNodes(true);
-    }
-    
-    /// <summary>
     /// Appends logs to the Write-Ahead Log and replicates them to other nodes in the cluster when the node is the leader.
     /// </summary>
     /// <param name="isPing"></param>
@@ -495,8 +497,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         RaftOperationStatus[] responses = await Task.WhenAll(tasks);
 
-        int count = responses.Count(x => x == RaftOperationStatus.Success);
-        int quorum = Math.Min(2, (int)Math.Floor((manager.Nodes.Count + 1) / 2f));
+        int count = 1 + responses.Count(x => x == RaftOperationStatus.Success);
+        int quorum = Math.Max(2, (int)Math.Floor((manager.Nodes.Count + 1) / 2f));
         
         return count >= quorum;
     }
@@ -529,7 +531,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         {
             lastCommitIndexes[node.Endpoint] = response.CommitedIndex;
             
-            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Appended logs to {Endpoint} CommitedIndex={Index}", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, response.CommitedIndex);
+            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Appended logs to {Endpoint} CommitedIndex={Index}", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, response.CommitedIndex);
         }
 
         return response.Status;
