@@ -61,7 +61,7 @@ public class GrpcCommunication : ICommunication
             Endpoint = request.Endpoint
         };
         
-        await client.RequestVotesAsync(requestVotes);
+        await client.RequestVotesAsync(requestVotes).ConfigureAwait(false);
         
         //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got RequestVotes reply from {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
 
@@ -89,7 +89,7 @@ public class GrpcCommunication : ICommunication
             Endpoint = request.Endpoint
         };
         
-        await client.VoteAsync(voteRequest);
+        await client.VoteAsync(voteRequest).ConfigureAwait(false);
         
         //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got Vote reply from {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
         
@@ -117,7 +117,7 @@ public class GrpcCommunication : ICommunication
 
         grpcRequest.Logs.AddRange(GetLogs(request.Logs ?? []));
         
-        GrpcAppendLogsResponse? response = await client.AppendLogsAsync(grpcRequest);
+        GrpcAppendLogsResponse? response = await client.AppendLogsAsync(grpcRequest).ConfigureAwait(false);
         return new((RaftOperationStatus)response.Status, response.CommitedIndex);
     }
     

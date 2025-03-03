@@ -19,17 +19,19 @@ Kommander is an open-source, distributed consensus library implemented in C# for
   - **Registries:** Centralized or decentralized service registries.
   - **Multicast Discovery:** Automatic node discovery via multicast messages.
   - **Static Discovery:** Manually configured list of known nodes.
+ 
+- **Flexible Role Management:**
+    Nodes can serve as leaders and followers simultaneously across different partitions, enabling granular control over cluster responsibilities.
 
 - **Persistent Log Replication:**
-  Each node persists its log to disk to ensure data durability. Kommander utilizes a Write-Ahead Log (WAL) internally to safeguard against data loss.
-
-- **Flexible Role Management:**
-  Nodes can serve as leaders and followers simultaneously across different partitions, enabling granular control over cluster responsibilities.
+  Each node persists its log to disk to ensure data durability. Kommander utilizes a Write-Ahead Log (WAL) internally to safeguard against data loss:
+  - **RocksDB:** A high-performance, embedded key-value store optimized for fast storage and retrieval. (Default)
+  - **SQLite:** Lightweight, embedded database engine that provides transactional support and crash recovery.
 
 - **Multiple Communication Protocols:**
   Achieve consensus and data replication over:
-  - **HTTP/2:** For RESTful interactions and easier integration with web services.
-  - **gRPC:** For low-latency and high-throughput scenarios.
+  - **gRPC:** For low-latency and high-throughput scenarios (Default)
+  - **HTTP/2:** For RESTful interactions and easier debugging. 
 
 ---
 

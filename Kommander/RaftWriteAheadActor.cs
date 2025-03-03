@@ -50,25 +50,25 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             switch (message.Type)
             {
                 case RaftWALActionType.Append:
-                    return new(await Append(message.Term, message.Logs));
+                    return new(await Append(message.Term, message.Logs).ConfigureAwait(false));
                 
                 case RaftWALActionType.Update:
-                    return new(await Update(message.Logs));
+                    return new(await Update(message.Logs).ConfigureAwait(false));
 
                 case RaftWALActionType.AppendCheckpoint:
-                    return new(await AppendCheckpoint(message.Term, message.Timestamp));
+                    return new(await AppendCheckpoint(message.Term, message.Timestamp).ConfigureAwait(false));
                 
                 case RaftWALActionType.GetRange:
-                    return new(await GetRange(message.CurrentIndex));
+                    return new(await GetRange(message.CurrentIndex).ConfigureAwait(false));
 
                 case RaftWALActionType.Recover:
-                    return new(await Recover());
+                    return new(await Recover().ConfigureAwait(false));
                 
                 case RaftWALActionType.GetMaxLog:
-                    return new(await GetMaxLog());
+                    return new(await GetMaxLog().ConfigureAwait(false));
                 
                 case RaftWALActionType.GetCurrentTerm:
-                    return new(await GetCurrentTerm());
+                    return new(await GetCurrentTerm().ConfigureAwait(false));
                 
                 default:
                     logger.LogError("[{Endpoint}/{PartitionId}] Unknown action type: {Type}", manager.LocalEndpoint, partition.PartitionId, message.Type);
@@ -104,7 +104,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 if (log.Type == RaftLogType.Checkpoint) 
                     continue;
                 
-                if (!await manager.InvokeReplicationReceived(log.LogType, log.LogData))
+                if (!await manager.InvokeReplicationReceived(log.LogType, log.LogData).ConfigureAwait(false))
                     manager.InvokeReplicationError(log);
             }
             catch (Exception ex)
@@ -133,7 +133,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             log.Id = commitIndex++;
             log.Term = term;
             
-            await walAdapter.Append(partition.PartitionId, log);
+            await walAdapter.Append(partition.PartitionId, log).ConfigureAwait(false);
         }
 
         return commitIndex;
@@ -141,12 +141,12 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
     
     private async Task<long> GetMaxLog()
     {
-        return await walAdapter.GetMaxLog(partition.PartitionId);
+        return await walAdapter.GetMaxLog(partition.PartitionId).ConfigureAwait(false);
     }
     
     private async Task<long> GetCurrentTerm()
     {
-        return await walAdapter.GetCurrentTerm(partition.PartitionId);
+        return await walAdapter.GetCurrentTerm(partition.PartitionId).ConfigureAwait(false);
     }
 
     private async Task<long> AppendCheckpoint(long term, HLCTimestamp timestamp)
@@ -161,7 +161,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             LogData = []
         };
         
-        await walAdapter.Append(partition.PartitionId, checkPointLog);
+        await walAdapter.Append(partition.PartitionId, checkPointLog).ConfigureAwait(false);
 
         return commitIndex;
     }
@@ -182,13 +182,13 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 continue;
             }
             
-            await walAdapter.AppendUpdate(partition.PartitionId, log);
+            await walAdapter.AppendUpdate(partition.PartitionId, log).ConfigureAwait(false);
 
             if (log.Type == RaftLogType.Regular)
             {
                 logger.LogInformation("[{Endpoint}/{Partition}] Applied log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
                 
-                if (!await manager.InvokeReplicationReceived(log.LogType, log.LogData))
+                if (!await manager.InvokeReplicationReceived(log.LogType, log.LogData).ConfigureAwait(false))
                     manager.InvokeReplicationError(log);
             }
 

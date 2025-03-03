@@ -63,15 +63,14 @@ public sealed class RaftPartition
             await raftActor.Ask(
                 new(RaftRequestType.RequestVote, request.Term, request.MaxLogId, request.Time, request.Endpoint),
                 TimeSpan.FromSeconds(5)
-            );
+            ).ConfigureAwait(false);
         }
         catch (AskTimeoutException)
         {
             raftManager.Logger.LogWarning(
-                "[{LocalEndpoint}/{ParitionId}] Timeout RequestVote {Type} {Term} {MaxLogId} {Endpoint}",
+                "[{LocalEndpoint}/{ParitionId}] Timeout RequestVote {Term} {MaxLogId} {Endpoint}",
                 raftManager.LocalEndpoint,
                 PartitionId,
-                RaftRequestType.RequestVote,
                 request.Term, 
                 request.MaxLogId, 
                 request.Endpoint
@@ -90,15 +89,14 @@ public sealed class RaftPartition
             await raftActor.Ask(
                 new(RaftRequestType.ReceiveVote, request.Term, 0, request.Time, request.Endpoint), 
                 TimeSpan.FromSeconds(5)
-            );
+            ).ConfigureAwait(false);
         }
         catch (AskTimeoutException)
         {
             raftManager.Logger.LogWarning(
-                "[{LocalEndpoint}/{ParitionId}] Timeout Vote {Type} {Term} {Endpoint}",
+                "[{LocalEndpoint}/{ParitionId}] Timeout Vote {Term} {Endpoint}",
                 raftManager.LocalEndpoint,
                 PartitionId,
-                RaftRequestType.RequestVote,
                 request.Term, 
                 request.Endpoint
             );
@@ -116,10 +114,10 @@ public sealed class RaftPartition
         if (request.Logs is not null && request.Logs.Count > 0)
         {
             foreach (RaftLog log in request.Logs)
-                await raftManager.HybridLogicalClock.ReceiveEvent(log.Time);
+                await raftManager.HybridLogicalClock.ReceiveEvent(log.Time).ConfigureAwait(false);
         }
 
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.AppendLogs, request.Term, 0, request.Time, request.Endpoint, request.Logs));
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.AppendLogs, request.Term, 0, request.Time, request.Endpoint, request.Logs)).ConfigureAwait(false);
         return (response.Status, response.CurrentIndex);
     }
 
@@ -136,7 +134,7 @@ public sealed class RaftPartition
         if (Leader != raftManager.LocalEndpoint)
             return (false, -1);
         
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, [new() { LogType = type, LogData = data }]), TimeSpan.FromSeconds(5));
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, [new() { LogType = type, LogData = data }]), TimeSpan.FromSeconds(5)).ConfigureAwait(false);
         return (true, response.CurrentIndex);
     }
     
@@ -156,7 +154,7 @@ public sealed class RaftPartition
 
         List<RaftLog> logsToReplicate = logs.Select(data => new RaftLog { LogType = type, LogData = data }).ToList();
         
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate), TimeSpan.FromSeconds(5));
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate), TimeSpan.FromSeconds(5)).ConfigureAwait(false);
         return (true, response.CurrentIndex);
     }
 
@@ -171,7 +169,7 @@ public sealed class RaftPartition
         if (Leader != raftManager.LocalEndpoint)
             return (false, -1);
         
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateCheckpoint), TimeSpan.FromSeconds(5));
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateCheckpoint), TimeSpan.FromSeconds(5)).ConfigureAwait(false);
         return (true, response.CurrentIndex);
     }
 
@@ -185,7 +183,7 @@ public sealed class RaftPartition
         if (!string.IsNullOrEmpty(Leader) && Leader == raftManager.LocalEndpoint)
             return NodeState.Leader;
 
-        RaftResponse response = await raftActor.Ask(raftStateRequest, TimeSpan.FromSeconds(5));
+        RaftResponse response = await raftActor.Ask(raftStateRequest, TimeSpan.FromSeconds(5)).ConfigureAwait(false);
         
         if (response.Type == RaftResponseType.None)
             throw new RaftException("Unknown response (2)");

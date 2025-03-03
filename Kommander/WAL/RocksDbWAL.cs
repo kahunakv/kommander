@@ -41,10 +41,17 @@ public class RocksDbWAL : IWAL
         int shardId = partitionId % 32;
         ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
         
-        long maxId = await GetLastCheckpoint(partitionId, columnFamilyHandle).ConfigureAwait(false);
+        long lastCheckpoint = await GetLastCheckpoint(partitionId, columnFamilyHandle).ConfigureAwait(false);
 
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
-        iterator.SeekToFirst();  // Move to the first key
+        
+        if (lastCheckpoint <= 0)
+            iterator.SeekToFirst();  // Move to the first key
+        else
+        {
+            string index = lastCheckpoint.ToString("D20");
+            iterator.Seek(Encoding.UTF8.GetBytes(index));
+        }
 
         while (iterator.Valid())
         {
@@ -56,7 +63,7 @@ public class RocksDbWAL : IWAL
                 continue;
             }
 
-            if (message.Id < maxId)
+            if (message.Id < lastCheckpoint)
             {
                 iterator.Next();
                 continue;
@@ -84,7 +91,14 @@ public class RocksDbWAL : IWAL
         ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
         
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
-        iterator.SeekToFirst();  // Move to the first key
+        
+        if (startLogIndex <= 0)
+            iterator.SeekToFirst();  // Move to the first key
+        else
+        {
+            string index = startLogIndex.ToString("D20");
+            iterator.Seek(Encoding.UTF8.GetBytes(index));
+        }
 
         while (iterator.Valid())
         {
@@ -121,10 +135,9 @@ public class RocksDbWAL : IWAL
         int shardId = partitionId % 32;
         ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
         
-        string x = log.Id.ToString("D20");
-        Console.WriteLine($"Appending {x}");
+        string index = log.Id.ToString("D20");
         
-        db.Put(Encoding.UTF8.GetBytes(x), Serialize(new RaftLogMessage()
+        db.Put(Encoding.UTF8.GetBytes(index), Serialize(new RaftLogMessage()
         {
             Partition = partitionId,
             Id = log.Id,

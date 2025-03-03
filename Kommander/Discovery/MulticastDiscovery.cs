@@ -44,7 +44,7 @@ public class MulticastDiscovery : IDiscovery
             while (true)
             {
                 // Send the multicast message.
-                await udpClient.SendAsync(data, data.Length, multicastEndpoint);
+                await udpClient.SendAsync(data, data.Length, multicastEndpoint).ConfigureAwait(false);
                 Console.WriteLine($"Sent: {message}");
 
                 // Wait for a specified interval before sending the next announcement.
@@ -79,7 +79,7 @@ public class MulticastDiscovery : IDiscovery
 
             while (true)
             {
-                UdpReceiveResult result = await udpClient.ReceiveAsync();
+                UdpReceiveResult result = await udpClient.ReceiveAsync().ConfigureAwait(false);
                 string payloadMessage = Encoding.UTF8.GetString(result.Buffer);
                 
                 Console.WriteLine($"Received packet {result.Buffer.Length}");

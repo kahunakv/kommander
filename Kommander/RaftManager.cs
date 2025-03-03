@@ -171,7 +171,7 @@ public sealed class RaftManager : IRaft
     public async Task RequestVote(RequestVotesRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
-        await partition.RequestVote(request);
+        await partition.RequestVote(request).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -181,7 +181,7 @@ public sealed class RaftManager : IRaft
     public async Task Vote(VoteRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
-        await partition.Vote(request);
+        await partition.Vote(request).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -193,7 +193,7 @@ public sealed class RaftManager : IRaft
     public async Task<(RaftOperationStatus, long)> AppendLogs(AppendLogsRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
-        return await partition.AppendLogs(request);
+        return await partition.AppendLogs(request).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -206,7 +206,7 @@ public sealed class RaftManager : IRaft
     public async Task<(bool success, long commitLogId)> ReplicateLogs(int partitionId, string type, byte[] data)
     {
         RaftPartition partition = GetPartition(partitionId);
-        return await partition.ReplicateLogs(type, data);
+        return await partition.ReplicateLogs(type, data).ConfigureAwait(false);
     }
     
     /// <summary>
@@ -219,7 +219,7 @@ public sealed class RaftManager : IRaft
     public async Task<(bool success, long commitLogId)> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs)
     {
         RaftPartition partition = GetPartition(partitionId);
-        return await partition.ReplicateLogs(type, logs);
+        return await partition.ReplicateLogs(type, logs).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -229,7 +229,7 @@ public sealed class RaftManager : IRaft
     public async Task<(bool success, long commitLogId)> ReplicateCheckpoint(int partitionId)
     {
         RaftPartition partition = GetPartition(partitionId);
-        return await partition.ReplicateCheckpoint();
+        return await partition.ReplicateCheckpoint().ConfigureAwait(false);
     }
 
     /// <summary>
@@ -274,7 +274,7 @@ public sealed class RaftManager : IRaft
         if (OnReplicationReceived != null)
         {
             Func<string, byte[], Task<bool>> callback = OnReplicationReceived;
-            bool success = await callback(type, log);
+            bool success = await callback(type, log).ConfigureAwait(false);
             if (!success)
                 return false;
         }
@@ -308,7 +308,7 @@ public sealed class RaftManager : IRaft
 
         try
         {
-            NodeState response = await partition.GetState();
+            NodeState response = await partition.GetState().ConfigureAwait(false);
 
             if (response == NodeState.Leader)
                 return true;
@@ -349,7 +349,7 @@ public sealed class RaftManager : IRaft
 
             try
             {
-                NodeState response = await partition.GetState();
+                NodeState response = await partition.GetState().ConfigureAwait(false);
 
                 return response == NodeState.Leader;
             }
@@ -382,14 +382,14 @@ public sealed class RaftManager : IRaft
             
             try
             {
-                NodeState response = await partition.GetState();
+                NodeState response = await partition.GetState().ConfigureAwait(false);
 
                 if (response == NodeState.Leader)
                     return LocalEndpoint;
 
                 if (string.IsNullOrEmpty(partition.Leader))
                 {
-                    await Task.Delay(150 + Random.Shared.Next(-50, 50), cancellationToken);
+                    await Task.Delay(150 + Random.Shared.Next(-50, 50), cancellationToken).ConfigureAwait(false);
                     continue;
                 }
 

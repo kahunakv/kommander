@@ -26,7 +26,7 @@ public class RestCommunication : ICommunication
                 .WithTimeout(configuration.HttpTimeout)
                 .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
                 .PostStringAsync(payload)
-                .ReceiveJson<RequestVotesResponse>();
+                .ReceiveJson<RequestVotesResponse>().ConfigureAwait(false);
         }
         catch (Exception e)
         {
@@ -52,7 +52,7 @@ public class RestCommunication : ICommunication
                 .WithTimeout(configuration.HttpTimeout)
                 .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
                 .PostStringAsync(payload)
-                .ReceiveJson<VoteResponse>();
+                .ReceiveJson<VoteResponse>().ConfigureAwait(false);
         }
         catch (Exception e)
         {
@@ -78,7 +78,7 @@ public class RestCommunication : ICommunication
                 .WithTimeout(configuration.HttpTimeout)
                 .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
                 .PostStringAsync(payload)
-                .ReceiveJson<AppendLogsResponse>();
+                .ReceiveJson<AppendLogsResponse>().ConfigureAwait(false);
             
             if (request.Logs is not null && request.Logs.Count > 0)
                 manager.Logger.LogInformation("[{Endpoint}/{Partition}] Logs replicated to {RemoteEndpoint}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint);
