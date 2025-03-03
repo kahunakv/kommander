@@ -61,7 +61,7 @@ public sealed class RaftPartition
         try
         {
             await raftActor.Ask(
-                new(RaftRequestType.RequestVote, request.Term, request.MaxLogId, request.Endpoint),
+                new(RaftRequestType.RequestVote, request.Term, request.MaxLogId, request.Time, request.Endpoint),
                 TimeSpan.FromSeconds(5)
             );
         }
@@ -87,7 +87,10 @@ public sealed class RaftPartition
     {
         try
         {
-            await raftActor.Ask(new(RaftRequestType.ReceiveVote, request.Term, 0, request.Endpoint), TimeSpan.FromSeconds(5));
+            await raftActor.Ask(
+                new(RaftRequestType.ReceiveVote, request.Term, 0, request.Time, request.Endpoint), 
+                TimeSpan.FromSeconds(5)
+            );
         }
         catch (AskTimeoutException)
         {
@@ -116,7 +119,7 @@ public sealed class RaftPartition
                 await raftManager.HybridLogicalClock.ReceiveEvent(log.Time);
         }
 
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.AppendLogs, request.Term, 0, request.Endpoint, request.Logs));
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.AppendLogs, request.Term, 0, request.Time, request.Endpoint, request.Logs));
         return (response.Status, response.CurrentIndex);
     }
 

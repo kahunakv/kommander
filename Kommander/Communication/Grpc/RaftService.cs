@@ -21,7 +21,7 @@ public class RaftService : Rafter.RafterBase
     {
         //logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got Vote message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
         
-        await raft.Vote(new(request.Partition, request.Term, request.Endpoint));
+        await raft.Vote(new(request.Partition, request.Term, new(request.TimePhysical, request.TimeCounter), request.Endpoint));
         
         return new();
     }
@@ -30,7 +30,7 @@ public class RaftService : Rafter.RafterBase
     {
         //logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got RequestVotes message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
         
-        await raft.RequestVote(new(request.Partition, request.Term, request.MaxLogId, request.Endpoint));
+        await raft.RequestVote(new(request.Partition, request.Term, request.MaxLogId, new(request.TimePhysical, request.TimeCounter), request.Endpoint));
         
         return new();
     }
@@ -55,6 +55,7 @@ public class RaftService : Rafter.RafterBase
                 Id = requestLog.Id,
                 Term = requestLog.Term,
                 Type = requestLog.Type == GrpRaftLogType.Regular ? RaftLogType.Regular : RaftLogType.Checkpoint,
+                Time = new(requestLog.TimePhysical, requestLog.TimeCounter),
                 LogType = requestLog.LogType,
                 LogData = requestLog.Data.ToByteArray()
             });

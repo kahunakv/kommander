@@ -25,14 +25,14 @@ namespace Kommander.WAL.Protos {
       byte[] descriptorData = global::System.Convert.FromBase64String(
           string.Concat(
             "ChVyb2Nrc2RiX3JhZnRsb2cucHJvdG8SFEtvbW1hbmRlci5XQUwuUHJvdG9z",
-            "IpMBCg5SYWZ0TG9nTWVzc2FnZRIRCglwYXJ0aXRpb24YASABKAUSCgoCaWQY",
+            "IpQBCg5SYWZ0TG9nTWVzc2FnZRIRCglwYXJ0aXRpb24YASABKAUSCgoCaWQY",
             "AiABKAMSDAoEdGVybRgDIAEoAxIMCgR0eXBlGAQgASgFEg8KB2xvZ1R5cGUY",
-            "BSABKAkSCwoDbG9nGAYgASgMEhMKC3RpbWVMb2dpY2FsGAcgASgDEhMKC3Rp",
-            "bWVDb3VudGVyGAggASgNYgZwcm90bzM="));
+            "BSABKAkSCwoDbG9nGAYgASgMEhQKDHRpbWVQaHlzaWNhbBgHIAEoAxITCgt0",
+            "aW1lQ291bnRlchgIIAEoDWIGcHJvdG8z"));
       descriptor = pbr::FileDescriptor.FromGeneratedCode(descriptorData,
           new pbr::FileDescriptor[] { },
           new pbr::GeneratedClrTypeInfo(null, null, new pbr::GeneratedClrTypeInfo[] {
-            new pbr::GeneratedClrTypeInfo(typeof(global::Kommander.WAL.Protos.RaftLogMessage), global::Kommander.WAL.Protos.RaftLogMessage.Parser, new[]{ "Partition", "Id", "Term", "Type", "LogType", "Log", "TimeLogical", "TimeCounter" }, null, null, null, null)
+            new pbr::GeneratedClrTypeInfo(typeof(global::Kommander.WAL.Protos.RaftLogMessage), global::Kommander.WAL.Protos.RaftLogMessage.Parser, new[]{ "Partition", "Id", "Term", "Type", "LogType", "Log", "TimePhysical", "TimeCounter" }, null, null, null, null)
           }));
     }
     #endregion
@@ -80,7 +80,7 @@ namespace Kommander.WAL.Protos {
       type_ = other.type_;
       logType_ = other.logType_;
       log_ = other.log_;
-      timeLogical_ = other.timeLogical_;
+      timePhysical_ = other.timePhysical_;
       timeCounter_ = other.timeCounter_;
       _unknownFields = pb::UnknownFieldSet.Clone(other._unknownFields);
     }
@@ -163,15 +163,15 @@ namespace Kommander.WAL.Protos {
       }
     }
 
-    /// <summary>Field number for the "timeLogical" field.</summary>
-    public const int TimeLogicalFieldNumber = 7;
-    private long timeLogical_;
+    /// <summary>Field number for the "timePhysical" field.</summary>
+    public const int TimePhysicalFieldNumber = 7;
+    private long timePhysical_;
     [global::System.Diagnostics.DebuggerNonUserCodeAttribute]
     [global::System.CodeDom.Compiler.GeneratedCode("protoc", null)]
-    public long TimeLogical {
-      get { return timeLogical_; }
+    public long TimePhysical {
+      get { return timePhysical_; }
       set {
-        timeLogical_ = value;
+        timePhysical_ = value;
       }
     }
 
@@ -208,7 +208,7 @@ namespace Kommander.WAL.Protos {
       if (Type != other.Type) return false;
       if (LogType != other.LogType) return false;
       if (Log != other.Log) return false;
-      if (TimeLogical != other.TimeLogical) return false;
+      if (TimePhysical != other.TimePhysical) return false;
       if (TimeCounter != other.TimeCounter) return false;
       return Equals(_unknownFields, other._unknownFields);
     }
@@ -223,7 +223,7 @@ namespace Kommander.WAL.Protos {
       if (Type != 0) hash ^= Type.GetHashCode();
       if (LogType.Length != 0) hash ^= LogType.GetHashCode();
       if (Log.Length != 0) hash ^= Log.GetHashCode();
-      if (TimeLogical != 0L) hash ^= TimeLogical.GetHashCode();
+      if (TimePhysical != 0L) hash ^= TimePhysical.GetHashCode();
       if (TimeCounter != 0) hash ^= TimeCounter.GetHashCode();
       if (_unknownFields != null) {
         hash ^= _unknownFields.GetHashCode();
@@ -267,9 +267,9 @@ namespace Kommander.WAL.Protos {
         output.WriteRawTag(50);
         output.WriteBytes(Log);
       }
-      if (TimeLogical != 0L) {
+      if (TimePhysical != 0L) {
         output.WriteRawTag(56);
-        output.WriteInt64(TimeLogical);
+        output.WriteInt64(TimePhysical);
       }
       if (TimeCounter != 0) {
         output.WriteRawTag(64);
@@ -309,9 +309,9 @@ namespace Kommander.WAL.Protos {
         output.WriteRawTag(50);
         output.WriteBytes(Log);
       }
-      if (TimeLogical != 0L) {
+      if (TimePhysical != 0L) {
         output.WriteRawTag(56);
-        output.WriteInt64(TimeLogical);
+        output.WriteInt64(TimePhysical);
       }
       if (TimeCounter != 0) {
         output.WriteRawTag(64);
@@ -345,8 +345,8 @@ namespace Kommander.WAL.Protos {
       if (Log.Length != 0) {
         size += 1 + pb::CodedOutputStream.ComputeBytesSize(Log);
       }
-      if (TimeLogical != 0L) {
-        size += 1 + pb::CodedOutputStream.ComputeInt64Size(TimeLogical);
+      if (TimePhysical != 0L) {
+        size += 1 + pb::CodedOutputStream.ComputeInt64Size(TimePhysical);
       }
       if (TimeCounter != 0) {
         size += 1 + pb::CodedOutputStream.ComputeUInt32Size(TimeCounter);
@@ -381,8 +381,8 @@ namespace Kommander.WAL.Protos {
       if (other.Log.Length != 0) {
         Log = other.Log;
       }
-      if (other.TimeLogical != 0L) {
-        TimeLogical = other.TimeLogical;
+      if (other.TimePhysical != 0L) {
+        TimePhysical = other.TimePhysical;
       }
       if (other.TimeCounter != 0) {
         TimeCounter = other.TimeCounter;
@@ -431,7 +431,7 @@ namespace Kommander.WAL.Protos {
             break;
           }
           case 56: {
-            TimeLogical = input.ReadInt64();
+            TimePhysical = input.ReadInt64();
             break;
           }
           case 64: {
@@ -482,7 +482,7 @@ namespace Kommander.WAL.Protos {
             break;
           }
           case 56: {
-            TimeLogical = input.ReadInt64();
+            TimePhysical = input.ReadInt64();
             break;
           }
           case 64: {

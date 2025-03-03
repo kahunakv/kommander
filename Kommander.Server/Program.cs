@@ -13,6 +13,7 @@ using Kommander.Server;
 using Kommander.Services;
 using Kommander.Time;
 using Kommander.WAL;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
 
 ParserResult<KommanderCommandLineOptions> optsResult = Parser.Default.ParseArguments<KommanderCommandLineOptions>(args);
 
@@ -79,14 +80,21 @@ try
     builder.WebHost.ConfigureKestrel(options =>
     {
         if (opts.HttpPorts is null || !opts.HttpPorts.Any())
-            options.Listen(IPAddress.Any, 8004, _ => { });
+            options.Listen(IPAddress.Any, 8004, listenOptions =>
+            {
+                listenOptions.Protocols = HttpProtocols.Http1AndHttp2AndHttp3;
+            });
         else
             foreach (string port in opts.HttpPorts)
-                options.Listen(IPAddress.Any, int.Parse(port), _ => { });
+                options.Listen(IPAddress.Any, int.Parse(port), listenOptions =>
+                {
+                    listenOptions.Protocols = HttpProtocols.Http1AndHttp2AndHttp3;
+                });
 
         if (opts.HttpsPorts is null || !opts.HttpsPorts.Any())
             options.Listen(IPAddress.Any, 8005, listenOptions =>
             {
+                listenOptions.Protocols = HttpProtocols.Http1AndHttp2AndHttp3; 
                 listenOptions.UseHttps(opts.HttpsCertificate, opts.HttpsCertificatePassword);
             });
         else
@@ -95,6 +103,7 @@ try
             {
                 options.Listen(IPAddress.Any, int.Parse(port), listenOptions =>
                 {
+                    listenOptions.Protocols = HttpProtocols.Http1AndHttp2AndHttp3; 
                     listenOptions.UseHttps(opts.HttpsCertificate, opts.HttpsCertificatePassword);
                 });
             }

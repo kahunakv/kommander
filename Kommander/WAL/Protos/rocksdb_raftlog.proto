@@ -9,6 +9,6 @@ message RaftLogMessage {
   int32 type = 4;
   string logType = 5;
   bytes log = 6;
-  int64 timeLogical = 7;
+  int64 timePhysical = 7;
   uint32 timeCounter = 8;
 }

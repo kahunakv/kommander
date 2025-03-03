@@ -1,6 +1,7 @@
 ﻿
 using Nixie;
 using Kommander.Data;
+using Kommander.Time;
 using Kommander.WAL;
 
 namespace Kommander;
@@ -55,7 +56,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                     return new(await Update(message.Logs));
 
                 case RaftWALActionType.AppendCheckpoint:
-                    return new(await AppendCheckpoint(message.Term));
+                    return new(await AppendCheckpoint(message.Term, message.Timestamp));
                 
                 case RaftWALActionType.GetRange:
                     return new(await GetRange(message.CurrentIndex));
@@ -148,13 +149,14 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         return await walAdapter.GetCurrentTerm(partition.PartitionId);
     }
 
-    private async Task<long> AppendCheckpoint(long term)
+    private async Task<long> AppendCheckpoint(long term, HLCTimestamp timestamp)
     {
         RaftLog checkPointLog = new()
         {
             Id = commitIndex++,
             Term = term,
             Type = RaftLogType.Checkpoint,
+            Time = timestamp,
             LogType = "",
             LogData = []
         };

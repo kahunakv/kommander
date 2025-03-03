@@ -1,8 +1,10 @@
 
 using System.Collections.Concurrent;
+using System.Text;
 using Google.Protobuf.Collections;
 using Grpc.Net.Client;
 using Kommander.Data;
+using Kommander.Time;
 
 namespace Kommander.Communication.Grpc;
 
@@ -54,6 +56,8 @@ public class GrpcCommunication : ICommunication
             Partition = request.Partition,
             Term = request.Term,
             MaxLogId = request.MaxLogId,
+            TimePhysical = request.Time.L,
+            TimeCounter = request.Time.C,
             Endpoint = request.Endpoint
         };
         
@@ -80,6 +84,8 @@ public class GrpcCommunication : ICommunication
         {
             Partition = request.Partition,
             Term = request.Term,
+            TimePhysical = request.Time.L,
+            TimeCounter = request.Time.C,
             Endpoint = request.Endpoint
         };
         
@@ -104,6 +110,8 @@ public class GrpcCommunication : ICommunication
         {
             Partition = request.Partition,
             Term = request.Term,
+            TimePhysical = request.Time.L,
+            TimeCounter = request.Time.C,
             Endpoint = request.Endpoint
         };
 
@@ -125,8 +133,13 @@ public class GrpcCommunication : ICommunication
                 Term = requestLog.Term,
                 Type = requestLog.Type == RaftLogType.Regular ? GrpRaftLogType.Regular : GrpRaftLogType.Checkpoint,
                 LogType = requestLog.LogType,
+                TimePhysical = requestLog.Time.L,
+                TimeCounter = requestLog.Time.C,
                 Data = Google.Protobuf.ByteString.CopyFrom(requestLog.LogData)
             });
+            
+            if (requestLog.Time == HLCTimestamp.Zero)
+                Console.WriteLine("GetLogs {0} {1} {2} {3}", requestLog.Id, requestLog.Time, requestLog.Type, Encoding.UTF8.GetString(requestLog.LogData ?? []));
         }
 
         return logs;

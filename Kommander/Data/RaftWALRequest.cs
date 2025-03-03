@@ -1,4 +1,6 @@
 ﻿
+using Kommander.Time;
+
 namespace Kommander.Data;
 
 public readonly struct RaftWALRequest
@@ -8,6 +10,8 @@ public readonly struct RaftWALRequest
     public long Term { get; } = 0;
     
     public long CurrentIndex { get; } = 0;
+    
+    public HLCTimestamp Timestamp { get; } = HLCTimestamp.Zero;
 
     public List<RaftLog>? Logs { get; } = null;
 
@@ -16,16 +20,18 @@ public readonly struct RaftWALRequest
         Type = type;
     }
 
-    public RaftWALRequest(RaftWALActionType type, long term)
+    public RaftWALRequest(RaftWALActionType type, long term, HLCTimestamp timestamp)
     {
         Type = type;
         Term = term;
+        Timestamp = timestamp;
     }
 
-    public RaftWALRequest(RaftWALActionType type, long term, List<RaftLog> log)
+    public RaftWALRequest(RaftWALActionType type, long term, HLCTimestamp timestamp, List<RaftLog> log)
     {
         Type = type;
         Term = term;
+        Timestamp = timestamp;
         Logs = log;
     }
     

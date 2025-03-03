@@ -13,7 +13,7 @@ FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS runtime
 WORKDIR /app
 
 # expose the ports
-EXPOSE 8004 
+EXPOSE 8004
 EXPOSE 8005
 
 # copy the built program
@@ -24,6 +24,7 @@ COPY certs/development-certificate.pfx /app/certificate.pfx
 RUN apt update && apt upgrade && apt-get -y install sqlite3
 
 ARG KOMMANDER_RAFT_NODEID
+ARG KOMMANDER_RAFT_HOST
 ARG KOMMANDER_RAFT_PORT
 ARG KOMMANDER_HTTP_PORTS
 ARG KOMMANDER_HTTPS_PORTS
@@ -38,7 +39,8 @@ ENV KOMMANDER_INITIAL_CLUSTER="$KOMMANDER_INITIAL_CLUSTER"
 
 COPY --chmod=755 <<EOT /app/entrypoint.sh
 #!/usr/bin/env bash
-dotnet /app/Kommander.Server.dll --raft-nodeid $KOMMANDER_RAFT_NODEID --raft-host $KOMMANDER_RAFT_HOST --raft-port $KOMMANDER_RAFT_PORT --http-ports $KOMMANDER_HTTP_PORTS --https-ports $KOMMANDER_HTTPS_PORTS --https-certificate /app/certificate.pfx --initial-cluster $KOMMANDER_INITIAL_CLUSTER --sqlite-wal-path /app/data --sqlite-wal-revision v1
+echo "kommander --raft-nodeid $KOMMANDER_RAFT_NODEID --raft-host $KOMMANDER_RAFT_HOST --raft-port $KOMMANDER_RAFT_PORT --http-ports $KOMMANDER_HTTP_PORTS --https-ports $KOMMANDER_HTTPS_PORTS --https-certificate /app/certificate.pfx --initial-cluster $KOMMANDER_INITIAL_CLUSTER --sqlite-wal-path /app/data --sqlite-wal-revision v4"
+dotnet /app/Kommander.Server.dll --raft-nodeid $KOMMANDER_RAFT_NODEID --raft-host $KOMMANDER_RAFT_HOST --raft-port $KOMMANDER_RAFT_PORT --http-ports $KOMMANDER_HTTP_PORTS --https-ports $KOMMANDER_HTTPS_PORTS --https-certificate /app/certificate.pfx --initial-cluster $KOMMANDER_INITIAL_CLUSTER --sqlite-wal-path /app/data --sqlite-wal-revision v4
 EOT
 
 # when starting the container, run dotnet with the built dll

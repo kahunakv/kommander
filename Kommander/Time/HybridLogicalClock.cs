@@ -72,6 +72,9 @@ public sealed class HybridLogicalClock : IDisposable
     /// <returns></returns>
     public async Task<HLCTimestamp> ReceiveEvent(HLClockMessage m)
     {
+        if (m.L == 0)
+            throw new RaftException("Invalid HLC timestamp argument");
+        
         try
         {
             await semaphore.WaitAsync();
@@ -108,6 +111,9 @@ public sealed class HybridLogicalClock : IDisposable
     /// <returns></returns>
     public async Task<HLCTimestamp> ReceiveEvent(HLCTimestamp m)
     {
+        if (m.L == 0)
+            throw new RaftException("Invalid HLC timestamp argument");
+        
         try
         {
             await semaphore.WaitAsync();

@@ -81,7 +81,7 @@ public class SqliteWAL : IWAL
         //Console.WriteLine("#{0} Last checkpoint: {1}", partitionId, lastCheckpoint);
         
         const string query = """
-         SELECT id, term, type, logType, log, timeLogical, timeCounter 
+         SELECT id, term, type, logType, log, timePhysical, timeCounter 
          FROM logs 
          WHERE partitionId = @partitionId AND id > @lastCheckpoint 
          ORDER BY id ASC;
@@ -113,7 +113,7 @@ public class SqliteWAL : IWAL
         SqliteConnection connection = await TryOpenDatabase(partitionId);
         
         const string query = """
-         SELECT id, term, type, logType, log, timeLogical, timeCounter 
+         SELECT id, term, type, logType, log, timePhysical, timeCounter 
          FROM logs 
          WHERE partitionId = @partitionId AND id >= @startIndex 
          ORDER BY id ASC;
