@@ -29,6 +29,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     private readonly Dictionary<string, long> lastCommitIndexes = [];
 
     private readonly ILogger<IRaft> logger;
+    
+    private readonly Stopwatch stopwatch = Stopwatch.StartNew();
 
     private NodeState state = NodeState.Follower;
 
@@ -89,8 +91,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <returns></returns>
     public async Task<RaftResponse> Receive(RaftRequest message)
     {
-        Stopwatch stopwatch = Stopwatch.StartNew();
-
+        stopwatch.Restart();
+        
+        await File.AppendAllTextAsync($"/tmp/{partition.PartitionId}.txt", $"{message.Type}\n");
+        
         try
         {
             await RestoreWal();
@@ -143,6 +147,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         {
             if (stopwatch.ElapsedMilliseconds > 2500)
                 logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Slow message processing: {Type} Elapsed={Elapsed}ms", manager.LocalEndpoint, partition.PartitionId, state,  message.Type, stopwatch.ElapsedMilliseconds);
+            
+            await File.AppendAllTextAsync($"/tmp/{partition.PartitionId}.txt", $"{stopwatch.ElapsedMilliseconds} {message.Type}\n");
         }
 
         return new(RaftResponseType.None);
@@ -372,21 +378,24 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         
         if (currentTerm > leaderTerm)
         {
-            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from a leader {Endpoint} with old Term={Term}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, leaderTerm);
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from a leader {Endpoint} with old Term={Term}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, leaderTerm);
             
             return (RaftOperationStatus.LeaderInOldTerm, commitedIndex);
         }
 
         if (leaderTerm >= currentTerm)
         {
-            if (logs is not null)
+            if (logs is not null && logs.Count > 0)
             {
+                logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from leader {Endpoint} with Term={Term} Logs={Logs}", manager.LocalEndpoint, partition.PartitionId, state, endpoint, leaderTerm, logs.Count);
+                
                 RaftWALResponse updateResponse = await walActor.Ask(new(RaftWALActionType.Update, currentTerm, timestamp, logs));
                 commitedIndex = updateResponse.NextId;
 
                 if (commitedIndex > -1 && commitedIndex < currentIndex)
                 {
-                    logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from outdated leader {Endpoint} with old CommitedIndex={Index}. CurrentIndex={CurrentIndex} Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, commitedIndex, currentIndex);
+                    logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from outdated leader {Endpoint} with old CommitedIndex={Index}. CurrentIndex={CurrentIndex} Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, commitedIndex, currentIndex);
+                    
                     return (RaftOperationStatus.LeaderInOutdatedTerm, commitedIndex); 
                 }
 
@@ -399,7 +408,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
             if (partition.Leader != endpoint)
             {
-                logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Leader is now {Endpoint} LeaderTerm={Term}", manager.LocalEndpoint, partition.PartitionId, state, endpoint, leaderTerm);
+                logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Leader is now {Endpoint} LeaderTerm={Term}", manager.LocalEndpoint, partition.PartitionId, state, endpoint, leaderTerm);
+                
                 partition.Leader = endpoint;
             }
         }

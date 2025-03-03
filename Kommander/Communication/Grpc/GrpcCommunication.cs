@@ -137,9 +137,6 @@ public class GrpcCommunication : ICommunication
                 TimeCounter = requestLog.Time.C,
                 Data = Google.Protobuf.ByteString.CopyFrom(requestLog.LogData)
             });
-            
-            if (requestLog.Time == HLCTimestamp.Zero)
-                Console.WriteLine("GetLogs {0} {1} {2} {3}", requestLog.Id, requestLog.Time, requestLog.Type, Encoding.UTF8.GetString(requestLog.LogData ?? []));
         }
 
         return logs;
