@@ -23,13 +23,13 @@ internal sealed class ClusterHandler
 
     public async Task JoinCluster(RaftConfiguration configuration)
     {
-        await discovery.Register(configuration);
+        await discovery.Register(configuration).ConfigureAwait(false);
         Joined = true;
     }
     
     public async Task LeaveCluster(RaftConfiguration configuration)
     {
-        await discovery.Register(configuration);
+        await discovery.Register(configuration).ConfigureAwait(false);
         Joined = false;
     }
 

@@ -109,6 +109,8 @@ try
             }
         }
     });
+    
+    ThreadPool.SetMinThreads(1024, 512);
 
     WebApplication app = builder.Build();
 

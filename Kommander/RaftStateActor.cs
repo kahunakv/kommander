@@ -97,12 +97,12 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         
         try
         {
-            await RestoreWal();
+            await RestoreWal().ConfigureAwait(false);
 
             switch (message.Type)
             {
                 case RaftRequestType.CheckLeader:
-                    await CheckClusterLeadership();
+                    await CheckClusterLeadership().ConfigureAwait(false);
                     break;
 
                 case RaftRequestType.GetState:
@@ -110,27 +110,27 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
                 case RaftRequestType.AppendLogs:
                 {
-                    (RaftOperationStatus status, long commitLogIndex) = await AppendLogs(message.Endpoint ?? "", message.Term, message.Timestamp, message.Logs);
+                    (RaftOperationStatus status, long commitLogIndex) = await AppendLogs(message.Endpoint ?? "", message.Term, message.Timestamp, message.Logs).ConfigureAwait(false);;
                     return new(RaftResponseType.None, status, commitLogIndex);
                 }
 
                 case RaftRequestType.RequestVote:
-                    await Vote(new(message.Endpoint ?? ""), message.Term, message.MaxLogId, message.Timestamp);
+                    await Vote(new(message.Endpoint ?? ""), message.Term, message.MaxLogId, message.Timestamp).ConfigureAwait(false);;
                     break;
 
                 case RaftRequestType.ReceiveVote:
-                    await ReceivedVote(message.Endpoint ?? "", message.Term);
+                    await ReceivedVote(message.Endpoint ?? "", message.Term).ConfigureAwait(false);;
                     break;
 
                 case RaftRequestType.ReplicateLogs:
                 {
-                    (RaftOperationStatus status, long commitId) = await ReplicateLogs(message.Logs);
+                    (RaftOperationStatus status, long commitId) = await ReplicateLogs(message.Logs).ConfigureAwait(false);;
                     return new(RaftResponseType.None, status, commitId);
                 }
 
                 case RaftRequestType.ReplicateCheckpoint:
                 {
-                    (RaftOperationStatus status, long commitId) = await ReplicateCheckpoint();
+                    (RaftOperationStatus status, long commitId) = await ReplicateCheckpoint().ConfigureAwait(false);;
                     return new(RaftResponseType.None, status, commitId);
                 }
 
@@ -164,15 +164,15 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
 
         restored = true;
-        lastHeartbeat = await manager.HybridLogicalClock.SendOrLocalEvent();
+        lastHeartbeat = await manager.HybridLogicalClock.SendOrLocalEvent().ConfigureAwait(false);;
         Stopwatch stopWatch = Stopwatch.StartNew();
 
-        RaftWALResponse currentCommitIndexResponse = await walActor.Ask(new(RaftWALActionType.Recover));
+        RaftWALResponse currentCommitIndexResponse = await walActor.Ask(new(RaftWALActionType.Recover)).ConfigureAwait(false);;
         currentIndex = currentCommitIndexResponse.NextId;
         
         logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] WAL restored at #{NextId} in {ElapsedMs}ms", manager.LocalEndpoint, partition.PartitionId, state, currentCommitIndexResponse.NextId, stopWatch.ElapsedMilliseconds);
         
-        RaftWALResponse currentTermResponse = await walActor.Ask(new(RaftWALActionType.GetCurrentTerm));
+        RaftWALResponse currentTermResponse = await walActor.Ask(new(RaftWALActionType.GetCurrentTerm)).ConfigureAwait(false);;
         currentTerm = currentTermResponse.NextId;
     }
 
@@ -223,7 +223,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
                 logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Voted to become leader after {LastHeartbeat}ms. Term={CurrentTerm}", manager.LocalEndpoint, partition.PartitionId, state, currentTime - lastHeartbeat, currentTerm);
 
-                await RequestVotes(currentTime);
+                await RequestVotes(currentTime).ConfigureAwait(false);;
                 break;
         }
     }
@@ -241,7 +241,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
         
-        RaftWALResponse currentMaxLog = await walActor.Ask(new(RaftWALActionType.GetMaxLog));
+        RaftWALResponse currentMaxLog = await walActor.Ask(new(RaftWALActionType.GetMaxLog)).ConfigureAwait(false);;
 
         RequestVotesRequest request = new(partition.PartitionId, currentTerm, currentMaxLog.NextId, timestamp, manager.LocalEndpoint);
 
@@ -267,12 +267,12 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return false;
         }
 
-        lastHeartbeat = await manager.HybridLogicalClock.SendOrLocalEvent();
+        lastHeartbeat = await manager.HybridLogicalClock.SendOrLocalEvent().ConfigureAwait(false);;
 
         if (state != NodeState.Leader)
             return false;
         
-        return await AppendLogsToNodes(lastHeartbeat, true);
+        return await AppendLogsToNodes(lastHeartbeat, true).ConfigureAwait(false);;
     }
 
     /// <summary>
@@ -302,7 +302,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
         
-        RaftWALResponse localMaxId = await walActor.Ask(new(RaftWALActionType.GetMaxLog));
+        RaftWALResponse localMaxId = await walActor.Ask(new(RaftWALActionType.GetMaxLog)).ConfigureAwait(false);;
         if (localMaxId.NextId > remoteMaxLogId)
         {
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received request to vote on outdated log from {Endpoint} RemoteMaxId={RemoteId} LocalMaxId={MaxId}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, remoteMaxLogId, localMaxId.NextId);
@@ -313,7 +313,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
 
-        lastHeartbeat = await manager.HybridLogicalClock.ReceiveEvent(timestamp);
+        lastHeartbeat = await manager.HybridLogicalClock.ReceiveEvent(timestamp).ConfigureAwait(false);;
 
         logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Requested vote from {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, voteTerm);
 

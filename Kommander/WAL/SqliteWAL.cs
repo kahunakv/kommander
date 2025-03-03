@@ -56,11 +56,11 @@ public class SqliteWAL : IWAL
             """;
             
             await using SqliteCommand command1 = new(createTableQuery, connection);
-            await command1.ExecuteNonQueryAsync();
+            await command1.ExecuteNonQueryAsync().ConfigureAwait(false);
             
             const string pragmasQuery = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY;";
             await using SqliteCommand command3 = new(pragmasQuery, connection);
-            await command3.ExecuteNonQueryAsync();
+            await command3.ExecuteNonQueryAsync().ConfigureAwait(false);
             
             connections.Add(partitionId, connection);
 
@@ -74,9 +74,9 @@ public class SqliteWAL : IWAL
     
     public async IAsyncEnumerable<RaftLog> ReadLogs(int partitionId)
     {
-        SqliteConnection connection = await TryOpenDatabase(partitionId);
+        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
         
-        long lastCheckpoint = await GetLastCheckpoint(connection, partitionId);
+        long lastCheckpoint = await GetLastCheckpoint(connection, partitionId).ConfigureAwait(false);
         
         //Console.WriteLine("#{0} Last checkpoint: {1}", partitionId, lastCheckpoint);
         
@@ -92,7 +92,7 @@ public class SqliteWAL : IWAL
         command.Parameters.AddWithValue("@partitionId", partitionId);
         command.Parameters.AddWithValue("@lastCheckpoint", lastCheckpoint);
 
-        await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
         
         while (reader.Read())
         {
@@ -110,7 +110,7 @@ public class SqliteWAL : IWAL
     
     public async IAsyncEnumerable<RaftLog> ReadLogsRange(int partitionId, long startLogIndex)
     {
-        SqliteConnection connection = await TryOpenDatabase(partitionId);
+        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
         
         const string query = """
          SELECT id, term, type, logType, log, timePhysical, timeCounter 
@@ -124,7 +124,7 @@ public class SqliteWAL : IWAL
         command.Parameters.AddWithValue("@partitionId", partitionId);
         command.Parameters.AddWithValue("@startIndex", startLogIndex);
         
-        await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
         
         while (reader.Read())
         {
@@ -142,7 +142,7 @@ public class SqliteWAL : IWAL
 
     public async Task Append(int partitionId, RaftLog log)
     {
-        SqliteConnection connection = await TryOpenDatabase(partitionId);
+        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
         
         const string insertQuery = "INSERT INTO logs (id, partitionId, term, type, logType, log, timePhysical, timeCounter) VALUES (@id, @partitionId, @term, @type, @logType, @log, @timePhysical, @timeCounter);";
         await using SqliteCommand insertCommand =  new(insertQuery, connection);
@@ -158,12 +158,12 @@ public class SqliteWAL : IWAL
         insertCommand.Parameters.AddWithValue("@timePhysical", log.Time.L);
         insertCommand.Parameters.AddWithValue("@timeCounter", log.Time.C);
         
-        await insertCommand.ExecuteNonQueryAsync();
+        await insertCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
     }
     
     public async Task AppendUpdate(int partitionId, RaftLog log)
     {
-        await Append(partitionId, log);
+        await Append(partitionId, log).ConfigureAwait(false);
     }
     
     public async Task<long> GetMaxLog(int partitionId)
@@ -175,7 +175,7 @@ public class SqliteWAL : IWAL
         
         command.Parameters.AddWithValue("@partitionId", partitionId);
         
-        await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
         
         while (reader.Read())
             return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
@@ -192,7 +192,7 @@ public class SqliteWAL : IWAL
         
         command.Parameters.AddWithValue("@partitionId", partitionId);
         
-        await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
         
         while (reader.Read())
             return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);

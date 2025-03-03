@@ -25,29 +25,36 @@ public class RocksDbWAL : IWAL
             .SetCreateMissingColumnFamilies(true)
             .SetWalRecoveryMode(Recovery.AbsoluteConsistency);
         
-        /*ColumnFamilies columnFamilies = new()
+        ColumnFamilies columnFamilies = new()
         {
-            { "default", new() },
-            { "checkpoints", new() }
-        };*/
+            { "default", new() }
+        };
         
-        this.db = RocksDb.Open(dbOptions, $"{path}/{revision}");
-
-        //var handle = db.GetColumnFamily("default");
+        for (int i = 0; i < 32; i++)
+            columnFamilies.Add("shard" + i, new());
+        
+        this.db = RocksDb.Open(dbOptions, $"{path}/{revision}", columnFamilies);
     }
 
     public async IAsyncEnumerable<RaftLog> ReadLogs(int partitionId)
     {
-        Console.WriteLine($"Reading logs for partition {partitionId}");
+        int shardId = partitionId % 32;
+        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
         
-        long maxId = await GetLastCheckpoint(partitionId);
+        long maxId = await GetLastCheckpoint(partitionId, columnFamilyHandle).ConfigureAwait(false);
 
-        using Iterator? iterator = db.NewIterator();
+        using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         iterator.SeekToFirst();  // Move to the first key
 
         while (iterator.Valid())
         {
             RaftLogMessage message = Unserializer(iterator.Value());
+            
+            if (message.Partition != partitionId)
+            {
+                iterator.Next();
+                continue;
+            }
 
             if (message.Id < maxId)
             {
@@ -73,12 +80,21 @@ public class RocksDbWAL : IWAL
     {
         await Task.CompletedTask;
         
-        using Iterator? iterator = db.NewIterator();
+        int shardId = partitionId % 32;
+        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        
+        using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         iterator.SeekToFirst();  // Move to the first key
 
         while (iterator.Valid())
         {
             RaftLogMessage message = Unserializer(iterator.Value());
+            
+            if (message.Partition != partitionId)
+            {
+                iterator.Next();
+                continue;
+            }
 
             if (message.Id < startLogIndex)
             {
@@ -102,6 +118,9 @@ public class RocksDbWAL : IWAL
 
     public Task Append(int partitionId, RaftLog log)
     {
+        int shardId = partitionId % 32;
+        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        
         string x = log.Id.ToString("D20");
         Console.WriteLine($"Appending {x}");
         
@@ -115,39 +134,34 @@ public class RocksDbWAL : IWAL
             Log = ByteString.CopyFrom(log.LogData),
             TimePhysical = log.Time.L,
             TimeCounter = log.Time.C
-        }));
+        }), cf: columnFamilyHandle);
 
         return Task.CompletedTask;
     }
 
-    public Task AppendUpdate(int partitionId, RaftLog log)
+    public async Task AppendUpdate(int partitionId, RaftLog log)
     {
-        string x = log.Id.ToString("D20");
-        Console.WriteLine($"Appending {x}");
-        
-        db.Put(Encoding.UTF8.GetBytes(x), Serialize(new RaftLogMessage()
-        {
-            Partition = partitionId,
-            Id = log.Id,
-            Term = log.Term,
-            Type = (int)log.Type,
-            LogType = log.LogType,
-            Log = ByteString.CopyFrom(log.LogData),
-            TimePhysical = log.Time.L,
-            TimeCounter = log.Time.C
-        }));
-
-        return Task.CompletedTask;
+        await Append(partitionId, log).ConfigureAwait(false);
     }
 
     public Task<long> GetMaxLog(int partitionId)
     {
-        using Iterator? iterator = db.NewIterator();
+        int shardId = partitionId % 32;
+        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        
+        using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         iterator.SeekToLast();  // Move to the last key
 
         while (iterator.Valid())
         {
             RaftLogMessage message = Unserializer(iterator.Value());
+            
+            if (message.Partition != partitionId)
+            {
+                iterator.Next();
+                continue;
+            }
+            
             return Task.FromResult(message.Id);
         }
 
@@ -156,26 +170,42 @@ public class RocksDbWAL : IWAL
 
     public Task<long> GetCurrentTerm(int partitionId)
     {
-        using Iterator? iterator = db.NewIterator();
+        int shardId = partitionId % 32;
+        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        
+        using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         iterator.SeekToLast();  // Move to the last key
 
         while (iterator.Valid())
         {
             RaftLogMessage message = Unserializer(iterator.Value());
+            
+            if (message.Partition != partitionId)
+            {
+                iterator.Next();
+                continue;
+            }
+            
             return Task.FromResult(message.Term);
         }
 
         return Task.FromResult<long>(0);
     }
-    
-    public Task<long> GetLastCheckpoint(int partitionId)
+
+    private Task<long> GetLastCheckpoint(int partitionId, ColumnFamilyHandle? columnFamilyHandle)
     {
-        using Iterator? iterator = db.NewIterator();
+        using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         iterator.SeekToLast();  // Move to the last key
 
         while (iterator.Valid())
         {
             RaftLogMessage message = Unserializer(iterator.Value());
+            
+            if (message.Partition != partitionId)
+            {
+                iterator.Next();
+                continue;
+            }
             
             if (message.Type == (int)RaftLogType.Checkpoint)
                 return Task.FromResult(message.Id);
