@@ -3,11 +3,13 @@ namespace Kommander.Data;
 
 public enum RaftWALActionType
 {
-    Append = 0,
-    AppendCheckpoint = 1,
+    Propose = 0,
+    Commit = 1,
     Recover = 2,
-    Update = 3,
+    ProposeOrCommit = 3,
     GetMaxLog = 4,
     GetCurrentTerm = 5,
-    GetRange = 6
+    GetRange = 6,
+    GetCurrentCommitIndex = 7,
+    GetCurrentProposeIndex = 8
 }

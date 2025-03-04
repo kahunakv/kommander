@@ -48,7 +48,7 @@ message GrpcAppendLogsResponse {
 
 message GrpcRaftLog {
   int64 Id = 1;
-  GrpRaftLogType Type = 2;
+  GrpcRaftLogType Type = 2;
   int64 Term = 3;
   int64 TimePhysical = 4;
   uint32 TimeCounter = 5;
@@ -56,9 +56,11 @@ message GrpcRaftLog {
   bytes Data = 7;  
 }
 
-enum GrpRaftLogType {
-  REGULAR = 0;
-  CHECKPOINT = 1;
+enum GrpcRaftLogType {
+  PROPOSED = 0;
+  COMMITED = 1;
+  PROPOSED_CHECKPOINT = 2;
+  COMMITED_CHECKPOINT = 3;
 }
 
 enum GrpcRaftOperationStatus {

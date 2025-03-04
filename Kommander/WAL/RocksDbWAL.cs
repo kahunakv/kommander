@@ -132,10 +132,12 @@ public class RocksDbWAL : IWAL
         }
     }
 
-    public Task Append(int partitionId, RaftLog log)
+    public Task Propose(int partitionId, RaftLog log)
     {
         int shardId = partitionId % MaxShards;
         ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        
+        Console.WriteLine("Propossing log: {0} {1}", log.Id, log.Type);
         
         string index = log.Id.ToString("D20");
         
@@ -153,10 +155,29 @@ public class RocksDbWAL : IWAL
 
         return Task.CompletedTask;
     }
-
-    public async Task AppendUpdate(int partitionId, RaftLog log)
+    
+    public Task Commit(int partitionId, RaftLog log)
     {
-        await Append(partitionId, log).ConfigureAwait(false);
+        int shardId = partitionId % MaxShards;
+        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        
+        string index = log.Id.ToString("D20");
+        
+        Console.WriteLine("Committing log: {0} {1}", log.Id, log.Type);
+        
+        db.Put(Encoding.UTF8.GetBytes(index), Serialize(new()
+        {
+            Partition = partitionId,
+            Id = log.Id,
+            Term = log.Term,
+            Type = (int)log.Type,
+            LogType = log.LogType,
+            Log = ByteString.CopyFrom(log.LogData),
+            TimePhysical = log.Time.L,
+            TimeCounter = log.Time.C
+        }), cf: columnFamilyHandle);
+
+        return Task.CompletedTask;
     }
 
     public Task<long> GetMaxLog(int partitionId)
@@ -222,7 +243,7 @@ public class RocksDbWAL : IWAL
                 continue;
             }
             
-            if (message.Type == (int)RaftLogType.Checkpoint)
+            if (message.Type == (int)RaftLogType.CommitedCheckpoint)
                 return Task.FromResult(message.Id);
             
             iterator.Next();

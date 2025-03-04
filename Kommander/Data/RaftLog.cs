@@ -10,7 +10,7 @@ public sealed class RaftLog
 {
     public long Id { get; set; }
     
-    public RaftLogType Type { get; set; } = RaftLogType.Regular;
+    public RaftLogType Type { get; set; } = RaftLogType.Commited;
     
     public long Term { get; set; }
     

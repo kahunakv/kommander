@@ -1,5 +1,6 @@
 
 using System.Text;
+using Kommander.Data;
 
 namespace Kommander.Services;
 
@@ -30,15 +31,15 @@ public class ReplicationService : BackgroundService //, IDisposable
                         const string logType = "Greeting";
                         byte[] data = Encoding.UTF8.GetBytes("Hello, World! " + DateTime.UtcNow);
 
-                        for (int j = 0; j < 20; j++)
-                        {
-                            (bool success, long commitLogId) = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
+                        //for (int j = 0; j < 20; j++)
+                        //{
+                            (bool success, RaftOperationStatus status, long commitLogId) = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
                             if (success)
                                 Console.WriteLine("#1 Replicated log with id: {0}", commitLogId);
                             else
-                                Console.WriteLine("#1 Replicated failed");
+                                Console.WriteLine("#1 Replicated failed {0}", status);
 
-                            (success, commitLogId) = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
+                            /*(success, commitLogId) = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
                             if (success)
                                 Console.WriteLine("#2 Replicated log with id: {0}", commitLogId);
                             else
@@ -48,8 +49,8 @@ public class ReplicationService : BackgroundService //, IDisposable
                             if (success)
                                 Console.WriteLine("#3 Replicated log with id: {0}", commitLogId);
                             else
-                                Console.WriteLine("#3 Replicated failed");
-                        }
+                                Console.WriteLine("#3 Replicated failed");*/
+                        //}
 
                         await raftManager.ReplicateCheckpoint(i).ConfigureAwait(false);
                     }
@@ -60,7 +61,7 @@ public class ReplicationService : BackgroundService //, IDisposable
                 }
             }
 
-            await Task.Delay(20000, stoppingToken);
+            await Task.Delay(10000, stoppingToken);
         }
     }
 }

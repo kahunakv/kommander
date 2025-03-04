@@ -13,23 +13,15 @@ Kommander is an open-source, distributed consensus library implemented in C# for
 
 - **Raft Consensus Algorithm:**
   Implemented using the Raft protocol, which enables a cluster of nodes to maintain a replicated state machine by keeping a synchronized log across all nodes. For an in-depth explanation of Raft, see [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf) by Diego Ongaro and John Ousterhout.
-
-- **Distributed Cluster Discovery:**
-  Discover other nodes in the cluster using either:
+- **Distributed Cluster Discovery:** Discover other nodes in the cluster using either:
   - **Registries:** Centralized or decentralized service registries.
   - **Multicast Discovery:** Automatic node discovery via multicast messages.
   - **Static Discovery:** Manually configured list of known nodes.
- 
-- **Flexible Role Management:**
-    Nodes can serve as leaders and followers simultaneously across different partitions, enabling granular control over cluster responsibilities.
-
-- **Persistent Log Replication:**
-  Each node persists its log to disk to ensure data durability. Kommander utilizes a Write-Ahead Log (WAL) internally to safeguard against data loss:
+- **Flexible Role Management:** Nodes can serve as leaders and followers simultaneously across different partitions, enabling granular control over cluster responsibilities.
+- **Persistent Log Replication:** Each node persists its log to disk to ensure data durability. Kommander utilizes a Write-Ahead Log (WAL) internally to safeguard against data loss:
   - **RocksDB:** A high-performance, embedded key-value store optimized for fast storage and retrieval. (Default)
   - **SQLite:** Lightweight, embedded database engine that provides transactional support and crash recovery.
-
-- **Multiple Communication Protocols:**
-  Achieve consensus and data replication over:
+- **Multiple Communication Protocols:** Achieve consensus and data replication over:
   - **gRPC:** For low-latency and high-throughput scenarios (Default)
   - **HTTP/2:** For RESTful interactions and easier debugging. 
 

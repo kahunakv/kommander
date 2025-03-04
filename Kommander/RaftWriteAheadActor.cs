@@ -23,10 +23,12 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
     private readonly ILogger<IRaft> logger;
 
     private bool recovered;
+    
+    private long proposeIndex = 1;
 
     private long commitIndex = 1;
 
-    private ulong operations;
+    private long operations;
 
     public RaftWriteAheadActor(
         IActorContextStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse> _, 
@@ -49,14 +51,14 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
             switch (message.Type)
             {
-                case RaftWALActionType.Append:
-                    return new(await Append(message.Term, message.Logs).ConfigureAwait(false));
+                case RaftWALActionType.Propose:
+                    return new(await Propose(message.Term, message.Logs).ConfigureAwait(false));
                 
-                case RaftWALActionType.Update:
-                    return new(await Update(message.Logs).ConfigureAwait(false));
-
-                case RaftWALActionType.AppendCheckpoint:
-                    return new(await AppendCheckpoint(message.Term, message.Timestamp).ConfigureAwait(false));
+                case RaftWALActionType.Commit:
+                    return new(await Commit(message.Logs).ConfigureAwait(false));
+                
+                case RaftWALActionType.ProposeOrCommit:
+                    return new(await ProposeOrCommit(message.Logs).ConfigureAwait(false));
                 
                 case RaftWALActionType.GetRange:
                     return new(await GetRange(message.CurrentIndex).ConfigureAwait(false));
@@ -97,14 +99,23 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         await foreach (RaftLog log in walAdapter.ReadLogs(partition.PartitionId))
         {
             found = true;
-            commitIndex = log.Id + 1;
 
             try
             {
-                if (log.Type == RaftLogType.Checkpoint) 
-                    continue;
-                
-                if (!await manager.InvokeReplicationReceived(log.LogType, log.LogData).ConfigureAwait(false))
+                switch (log.Type)
+                {
+                    case RaftLogType.ProposedCheckpoint:
+                    case RaftLogType.Proposed:
+                        continue;
+                    
+                    case RaftLogType.Commited:
+                    case RaftLogType.CommitedCheckpoint:
+                        commitIndex = log.Id + 1;
+                        proposeIndex = log.Id + 1;
+                        break;
+                }
+
+                if (!await manager.InvokeReplicationRestored(log.LogType, log.LogData).ConfigureAwait(false))
                     manager.InvokeReplicationError(log);
             }
             catch (Exception ex)
@@ -123,17 +134,47 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         return commitIndex;
     }
 
-    private async Task<long> Append(long term, List<RaftLog>? appendLogs)
+    private async Task<long> Propose(long term, List<RaftLog>? appendLogs)
     {
         if (appendLogs is null || appendLogs.Count == 0)
             return -1;
 
         foreach (RaftLog log in appendLogs)
         {
-            log.Id = commitIndex++;
+            log.Id = proposeIndex++;
+            log.Type = RaftLogType.Proposed; 
             log.Term = term;
             
-            await walAdapter.Append(partition.PartitionId, log).ConfigureAwait(false);
+            await walAdapter.Propose(partition.PartitionId, log).ConfigureAwait(false);
+        }
+
+        return proposeIndex;
+    }
+    
+    private async Task<long> Commit(List<RaftLog>? appendLogs)
+    {
+        if (appendLogs is null || appendLogs.Count == 0)
+            return -1;
+
+        foreach (RaftLog log in appendLogs)
+        {
+            Console.WriteLine("{0} {1}", log.Id, log.Type);
+            
+            if (log.Type == RaftLogType.Proposed)
+            {
+                log.Type = RaftLogType.Commited;
+                commitIndex = log.Id + 1;
+                
+                await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
+            }
+
+            if (log.Type == RaftLogType.ProposedCheckpoint)
+            {
+                log.Type = RaftLogType.ProposedCheckpoint;
+                commitIndex = log.Id + 1;
+                
+                await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
+            }
         }
 
         return commitIndex;
@@ -149,53 +190,91 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         return await walAdapter.GetCurrentTerm(partition.PartitionId).ConfigureAwait(false);
     }
 
-    private async Task<long> AppendCheckpoint(long term, HLCTimestamp timestamp)
+    private async Task<long> ProposeOrCommit(List<RaftLog>? logs)
     {
-        RaftLog checkPointLog = new()
-        {
-            Id = commitIndex++,
-            Term = term,
-            Type = RaftLogType.Checkpoint,
-            Time = timestamp,
-            LogType = "",
-            LogData = []
-        };
-        
-        await walAdapter.Append(partition.PartitionId, checkPointLog).ConfigureAwait(false);
-
-        return commitIndex;
-    }
-
-    private async Task<long> Update(List<RaftLog>? updateLogs)
-    {
-        if (updateLogs is null)
-            return -1;
-        
-        if (updateLogs.Count == 0)
+        if (logs is null || logs.Count == 0)
             return -1;
 
-        foreach (RaftLog log in updateLogs)
-        {
-            if (log.Id != commitIndex)
-            {
-                logger.LogWarning("[{Endpoint}/{Partition}] Log #{Id} is not the expected #{CommitIndex}", manager.LocalEndpoint, partition.PartitionId, log.Id, commitIndex);
-                continue;
-            }
-            
-            await walAdapter.AppendUpdate(partition.PartitionId, log).ConfigureAwait(false);
+        bool allOutdated = true;
+        
+        RaftLog[] orderedLogs = logs.OrderBy(log => log.Id).ToArray();
 
-            if (log.Type == RaftLogType.Regular)
+        foreach (RaftLog log in orderedLogs)
+        {
+            switch (log.Type)
             {
-                logger.LogDebug("[{Endpoint}/{Partition}] Applied log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+                case RaftLogType.Proposed or RaftLogType.ProposedCheckpoint when log.Id != proposeIndex:
+                    logger.LogWarning(
+                        "[{Endpoint}/{Partition}] Proposed log #{Id} is not the expected #{ProposeIndex}",
+                        manager.LocalEndpoint, 
+                        partition.PartitionId, 
+                        log.Id, 
+                        commitIndex
+                    );
+                    continue;
                 
-                if (!await manager.InvokeReplicationReceived(log.LogType, log.LogData).ConfigureAwait(false))
-                    manager.InvokeReplicationError(log);
+                case RaftLogType.Commited or RaftLogType.CommitedCheckpoint when log.Id != commitIndex:
+                    logger.LogWarning(
+                        "[{Endpoint}/{Partition}] Commited log #{Id} is not the expected #{CommitIndex}",
+                        manager.LocalEndpoint, 
+                        partition.PartitionId, 
+                        log.Id, 
+                        commitIndex
+                    );
+                    continue;
+                
+                default:
+                    allOutdated = false;
+                    break;
             }
+        }
 
-            if (log.Type == RaftLogType.Checkpoint)
-                logger.LogDebug("[{Endpoint}/{Partition}] Applied checkpoint log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+        if (allOutdated)
+            return -1;
 
-            commitIndex = log.Id + 1;
+        foreach (RaftLog log in orderedLogs)
+        {
+            Console.WriteLine("ProposeOrCommit {0} {1}", log.Type, log.Id);
+            
+            switch (log.Type)
+            {
+                case RaftLogType.Proposed when log.Id >= proposeIndex:
+                    await walAdapter.Propose(partition.PartitionId, log).ConfigureAwait(false);
+                
+                    logger.LogDebug("[{Endpoint}/{Partition}] Proposed log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+
+                    proposeIndex = log.Id + 1;
+                    break;
+                
+                case RaftLogType.Commited when log.Id >= commitIndex:
+                {
+                    await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
+                
+                    logger.LogDebug("[{Endpoint}/{Partition}] Commited log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+                
+                    if (!await manager.InvokeReplicationReceived(log.LogType, log.LogData).ConfigureAwait(false))
+                        manager.InvokeReplicationError(log);
+                    
+                    commitIndex = log.Id + 1;
+                    break;
+                }
+                
+                case RaftLogType.ProposedCheckpoint when log.Id >= proposeIndex:
+                    await walAdapter.Propose(partition.PartitionId, log).ConfigureAwait(false);
+                
+                    logger.LogDebug("[{Endpoint}/{Partition}] Proposed checkpoint log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+                    
+                    proposeIndex = log.Id + 1;
+                    break;
+                
+                case RaftLogType.CommitedCheckpoint when log.Id >= commitIndex:
+                    await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
+                
+                    logger.LogDebug("[{Endpoint}/{Partition}] Commited checkpoint log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+                    
+                    commitIndex = log.Id + 1;                    
+                    break;
+            }
         }
 
         //Collect(GetCurrentTime());

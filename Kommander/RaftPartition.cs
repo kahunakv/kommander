@@ -124,18 +124,23 @@ public sealed class RaftPartition
     /// <summary>
     /// Replicate a single log to the partition.
     /// </summary>
-    /// <param name="log"></param>
+    /// <param name="type"></param>
+    /// <param name="data"></param>
     /// <returns></returns>
-    public async Task<(bool success, long commitLogId)> ReplicateLogs(string type, byte[] data)
+    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(string type, byte[] data)
     {
         if (string.IsNullOrEmpty(Leader))
-            return (false, -1);
+            return (false, RaftOperationStatus.NodeIsNotLeader, -1);
         
         if (Leader != raftManager.LocalEndpoint)
-            return (false, -1);
+            return (false, RaftOperationStatus.NodeIsNotLeader, -1);
         
         RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, [new() { LogType = type, LogData = data }]), TimeSpan.FromSeconds(5)).ConfigureAwait(false);
-        return (true, response.CurrentIndex);
+        
+        if (response.Status == RaftOperationStatus.Success)
+            return (true, response.Status, response.CurrentIndex);
+        
+        return (false, response.Status, response.CurrentIndex);
     }
     
     /// <summary>
@@ -144,18 +149,22 @@ public sealed class RaftPartition
     /// <param name="type"></param>
     /// <param name="logs"></param>
     /// <returns></returns>
-    public async Task<(bool success, long commitLogId)> ReplicateLogs(string type, IEnumerable<byte[]> logs)
+    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(string type, IEnumerable<byte[]> logs)
     {
         if (string.IsNullOrEmpty(Leader))
-            return (false, -1);
+            return (false, RaftOperationStatus.NodeIsNotLeader, -1);
         
         if (Leader != raftManager.LocalEndpoint)
-            return (false, -1);
+            return (false, RaftOperationStatus.NodeIsNotLeader, -1);
 
         List<RaftLog> logsToReplicate = logs.Select(data => new RaftLog { LogType = type, LogData = data }).ToList();
         
         RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate), TimeSpan.FromSeconds(5)).ConfigureAwait(false);
-        return (true, response.CurrentIndex);
+        
+        if (response.Status == RaftOperationStatus.Success)
+            return (true, response.Status, response.CurrentIndex);
+        
+        return (false, response.Status, response.CurrentIndex);
     }
 
     /// <summary>

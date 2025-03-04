@@ -3,6 +3,8 @@ namespace Kommander.Data;
 
 public enum RaftLogType
 {
-    Regular = 0,
-    Checkpoint = 1
+    Proposed = 0,
+    Commited = 1,
+    ProposedCheckpoint = 2,
+    CommitedCheckpoint = 3,
 }

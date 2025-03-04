@@ -29,7 +29,7 @@ public class RaftConfiguration
     /// <summary>
     /// Communication scheme when sending HTTP requests
     /// </summary>
-    public string? HttpScheme { get; set; } = "http://";
+    public string? HttpScheme { get; set; } = "https://";
 
     /// <summary>
     /// Authorization bearer token for HTTP requests

@@ -131,7 +131,7 @@ public class GrpcCommunication : ICommunication
             {
                 Id = requestLog.Id,
                 Term = requestLog.Term,
-                Type = requestLog.Type == RaftLogType.Regular ? GrpRaftLogType.Regular : GrpRaftLogType.Checkpoint,
+                Type = (GrpcRaftLogType)requestLog.Type,
                 LogType = requestLog.LogType,
                 TimePhysical = requestLog.Time.L,
                 TimeCounter = requestLog.Time.C,

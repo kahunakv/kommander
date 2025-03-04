@@ -100,7 +100,7 @@ public class SqliteWAL : IWAL
             {
                 Id = reader.IsDBNull(0) ? 0 : reader.GetInt64(0),
                 Term = reader.IsDBNull(1) ? 0 : reader.GetInt64(1),
-                Type = reader.IsDBNull(2) ? RaftLogType.Regular : (RaftLogType)reader.GetInt32(2),
+                Type = reader.IsDBNull(2) ? RaftLogType.Proposed : (RaftLogType)reader.GetInt32(2),
                 LogType = reader.IsDBNull(3) ? "" : reader.GetString(3),
                 LogData = reader.IsDBNull(4) ? []: (byte[])reader[4],
                 Time = new(reader.IsDBNull(5) ? 0 : reader.GetInt64(5), reader.IsDBNull(6) ? 0 : (uint)reader.GetInt64(6))
@@ -132,7 +132,7 @@ public class SqliteWAL : IWAL
             {
                 Id = reader.IsDBNull(0) ? 0 : reader.GetInt64(0),
                 Term = reader.IsDBNull(1) ? 0 : reader.GetInt64(1),
-                Type = reader.IsDBNull(2) ? RaftLogType.Regular : (RaftLogType)reader.GetInt32(2),
+                Type = reader.IsDBNull(2) ? RaftLogType.Proposed : (RaftLogType)reader.GetInt32(2),
                 LogType = reader.IsDBNull(3) ? "" : reader.GetString(3),
                 LogData = reader.IsDBNull(4) ? []: (byte[])reader[4],
                 Time = new(reader.IsDBNull(5) ? 0 : reader.GetInt64(5), reader.IsDBNull(6) ? 0 : (uint)reader.GetInt64(6))
@@ -140,7 +140,7 @@ public class SqliteWAL : IWAL
         }
     }
 
-    public async Task Append(int partitionId, RaftLog log)
+    public async Task Propose(int partitionId, RaftLog log)
     {
         SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
         
@@ -161,9 +161,20 @@ public class SqliteWAL : IWAL
         await insertCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
     }
     
-    public async Task AppendUpdate(int partitionId, RaftLog log)
+    public async Task Commit(int partitionId, RaftLog log)
     {
-        await Append(partitionId, log).ConfigureAwait(false);
+        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
+        
+        const string updateQuery = "UPDATE logs SET type = @type WHERE partitionId = @partitionId AND id = @id";
+        await using SqliteCommand updateCommand =  new(updateQuery, connection);
+        
+        updateCommand.Parameters.Clear();
+        
+        updateCommand.Parameters.AddWithValue("@id", log.Id);
+        updateCommand.Parameters.AddWithValue("@partitionId", partitionId);
+        updateCommand.Parameters.AddWithValue("@type", log.Type);
+        
+        await updateCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
     }
     
     public async Task<long> GetMaxLog(int partitionId)
@@ -206,7 +217,7 @@ public class SqliteWAL : IWAL
         await using SqliteCommand command = new(query, connection);
         
         command.Parameters.AddWithValue("@partitionId", partitionId);
-        command.Parameters.AddWithValue("@type", (int)RaftLogType.Checkpoint);
+        command.Parameters.AddWithValue("@type", (int)RaftLogType.CommitedCheckpoint);
         
         await using SqliteDataReader reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
         

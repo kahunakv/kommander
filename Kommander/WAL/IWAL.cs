@@ -9,9 +9,9 @@ public interface IWAL
 
     public IAsyncEnumerable<RaftLog> ReadLogsRange(int partitionId, long startLogIndex);
 
-    public Task Append(int partitionId, RaftLog log);
-
-    public Task AppendUpdate(int partitionId, RaftLog log);
+    public Task Propose(int partitionId, RaftLog log);
+    
+    public Task Commit(int partitionId, RaftLog log);
     
     public Task<long> GetMaxLog(int partitionId);
     

@@ -54,7 +54,7 @@ public class RaftService : Rafter.RafterBase
             {
                 Id = requestLog.Id,
                 Term = requestLog.Term,
-                Type = requestLog.Type == GrpRaftLogType.Regular ? RaftLogType.Regular : RaftLogType.Checkpoint,
+                Type = (RaftLogType)requestLog.Type,
                 Time = new(requestLog.TimePhysical, requestLog.TimeCounter),
                 LogType = requestLog.LogType,
                 LogData = requestLog.Data.ToByteArray()

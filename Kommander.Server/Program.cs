@@ -4,7 +4,7 @@ using Nixie;
 using System.Net;
 using System.Text;
 using CommandLine;
-
+using Flurl.Http;
 using Kommander;
 using Kommander.Communication.Grpc;
 using Kommander.Communication.Rest;
@@ -52,8 +52,8 @@ try
             services.GetRequiredService<ActorSystem>(),
             configuration,
             new StaticDiscovery(nodes),
-            new RocksDbWAL(path: opts.SqliteWalPath, revision: opts.SqliteWalRevision),
-            new GrpcCommunication(),
+            new SqliteWAL(path: opts.SqliteWalPath, revision: opts.SqliteWalRevision),
+            new RestCommunication(),
             new HybridLogicalClock(),
             services.GetRequiredService<ILogger<IRaft>>()
         );
@@ -111,6 +111,8 @@ try
     });
     
     ThreadPool.SetMinThreads(1024, 512);
+    
+    FlurlHttp.Clients.WithDefaults(x => x.ConfigureInnerHandler(ih => ih.ServerCertificateCustomValidationCallback = (a, b, c, d) => true));
 
     WebApplication app = builder.Build();
 

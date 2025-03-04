@@ -3,13 +3,13 @@ namespace Kommander.Data;
 
 public readonly struct RaftWALResponse
 {
-    public long NextId { get; }
+    public long Index { get; }
     
     public List<RaftLog>? Logs { get; }
     
-    public RaftWALResponse(long nextId)
+    public RaftWALResponse(long index)
     {
-        NextId = nextId;
+        Index = index;
     }
     
     public RaftWALResponse(List<RaftLog> logs)

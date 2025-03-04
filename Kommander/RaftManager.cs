@@ -76,6 +76,11 @@ public sealed class RaftManager : IRaft
     /// Event when a replication log is now acknowledged by the application
     /// </summary>
     public event Action<RaftLog>? OnReplicationError;
+    
+    /// <summary>
+    /// Event when a replication log is restored
+    /// </summary>
+    public event Func<string, byte[], Task<bool>>? OnReplicationRestored;
 
     /// <summary>
     /// Event when a replication log is received
@@ -203,7 +208,7 @@ public sealed class RaftManager : IRaft
     /// <param name="type"></param>
     /// <param name="data"></param>
     /// <returns></returns>
-    public async Task<(bool success, long commitLogId)> ReplicateLogs(int partitionId, string type, byte[] data)
+    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(int partitionId, string type, byte[] data)
     {
         RaftPartition partition = GetPartition(partitionId);
         return await partition.ReplicateLogs(type, data).ConfigureAwait(false);
@@ -216,7 +221,7 @@ public sealed class RaftManager : IRaft
     /// <param name="type"></param>
     /// <param name="logs"></param>
     /// <returns></returns>
-    public async Task<(bool success, long commitLogId)> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs)
+    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs)
     {
         RaftPartition partition = GetPartition(partitionId);
         return await partition.ReplicateLogs(type, logs).ConfigureAwait(false);
@@ -274,6 +279,31 @@ public sealed class RaftManager : IRaft
         if (OnReplicationReceived != null)
         {
             Func<string, byte[], Task<bool>> callback = OnReplicationReceived;
+            bool success = await callback(type, log).ConfigureAwait(false);
+            if (!success)
+                return false;
+        }
+
+        return true;
+    }
+    
+    /// <summary>
+    /// Calls the replication restored event
+    /// </summary>
+    /// <param name="type"></param>
+    /// <param name="log"></param>
+    /// <returns></returns>
+    internal async Task<bool> InvokeReplicationRestored(string? type, byte[]? log)
+    {
+        if (type is null)
+            return false;
+        
+        if (log is null)
+            return false;
+
+        if (OnReplicationRestored != null)
+        {
+            Func<string, byte[], Task<bool>> callback = OnReplicationRestored;
             bool success = await callback(type, log).ConfigureAwait(false);
             if (!success)
                 return false;
