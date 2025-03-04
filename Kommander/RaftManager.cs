@@ -125,7 +125,7 @@ public sealed class RaftManager : IRaft
                 partitions[i] = new(actorSystem, this, walAdapter, communication, i, Logger);
         }
 
-        await clusterHandler.JoinCluster(configuration);
+        await clusterHandler.JoinCluster(configuration).ConfigureAwait(false);
     }
     
     /// <summary>
@@ -133,7 +133,7 @@ public sealed class RaftManager : IRaft
     /// </summary>
     public async Task LeaveCluster()
     {
-        await clusterHandler.LeaveCluster(configuration);
+        await clusterHandler.LeaveCluster(configuration).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -144,7 +144,7 @@ public sealed class RaftManager : IRaft
         if (partitions[0] is null)
             return;
 
-        await clusterHandler.UpdateNodes();
+        await clusterHandler.UpdateNodes().ConfigureAwait(false);
     }
 
     /// <summary>
@@ -357,6 +357,8 @@ public sealed class RaftManager : IRaft
             {
                 Logger.LogError("AmILeader: {Message}", e.Message);
             }
+
+            await Task.Yield();
         }
 
         throw new RaftException("Leader couldn't be found or is not decided");

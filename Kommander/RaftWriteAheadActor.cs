@@ -186,14 +186,14 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
             if (log.Type == RaftLogType.Regular)
             {
-                logger.LogInformation("[{Endpoint}/{Partition}] Applied log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+                logger.LogDebug("[{Endpoint}/{Partition}] Applied log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
                 
                 if (!await manager.InvokeReplicationReceived(log.LogType, log.LogData).ConfigureAwait(false))
                     manager.InvokeReplicationError(log);
             }
 
             if (log.Type == RaftLogType.Checkpoint)
-                logger.LogInformation("[{Endpoint}/{Partition}] Applied checkpoint log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+                logger.LogDebug("[{Endpoint}/{Partition}] Applied checkpoint log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
 
             commitIndex = log.Id + 1;
         }

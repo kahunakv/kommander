@@ -81,7 +81,7 @@ public class RestCommunication : ICommunication
                 .ReceiveJson<AppendLogsResponse>().ConfigureAwait(false);
             
             if (request.Logs is not null && request.Logs.Count > 0)
-                manager.Logger.LogInformation("[{Endpoint}/{Partition}] Logs replicated to {RemoteEndpoint}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint);
+                manager.Logger.LogDebug("[{Endpoint}/{Partition}] Logs replicated to {RemoteEndpoint}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint);
 
             return response;
         }

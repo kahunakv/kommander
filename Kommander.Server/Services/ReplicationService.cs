@@ -25,7 +25,7 @@ public class ReplicationService : BackgroundService //, IDisposable
             {
                 try
                 {
-                    if (await raftManager.AmILeader(i, stoppingToken).ConfigureAwait(false))
+                    if (await raftManager.AmILeaderQuick(i).ConfigureAwait(false))
                     {
                         const string logType = "Greeting";
                         byte[] data = Encoding.UTF8.GetBytes("Hello, World! " + DateTime.UtcNow);

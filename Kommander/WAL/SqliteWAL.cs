@@ -31,7 +31,7 @@ public class SqliteWAL : IWAL
 
         try
         {
-            await semaphore.WaitAsync();
+            await semaphore.WaitAsync().ConfigureAwait(false);
 
             if (connections.TryGetValue(partitionId, out connection))
                 return connection;
@@ -208,7 +208,7 @@ public class SqliteWAL : IWAL
         command.Parameters.AddWithValue("@partitionId", partitionId);
         command.Parameters.AddWithValue("@type", (int)RaftLogType.Checkpoint);
         
-        await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
         
         while (reader.Read())
             return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);

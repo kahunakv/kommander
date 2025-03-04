@@ -182,7 +182,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// </summary>
     private async Task CheckClusterLeadership()
     {
-        HLCTimestamp currentTime = await manager.HybridLogicalClock.SendOrLocalEvent();
+        HLCTimestamp currentTime = await manager.HybridLogicalClock.SendOrLocalEvent().ConfigureAwait(false);
 
         switch (state)
         {
@@ -403,7 +403,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             }
 
             state = NodeState.Follower;
-            lastHeartbeat = await manager.HybridLogicalClock.ReceiveEvent(timestamp);
+            lastHeartbeat = await manager.HybridLogicalClock.ReceiveEvent(timestamp).ConfigureAwait(false);
             currentTerm = leaderTerm;
 
             if (partition.Leader != endpoint)
@@ -455,7 +455,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         if (state != NodeState.Leader)
             return (RaftOperationStatus.NodeIsNotLeader, -1);
         
-        HLCTimestamp currentTime = await manager.HybridLogicalClock.SendOrLocalEvent();
+        HLCTimestamp currentTime = await manager.HybridLogicalClock.SendOrLocalEvent().ConfigureAwait(false);
 
         RaftWALResponse appendResponse = await walActor.Ask(new(RaftWALActionType.AppendCheckpoint, currentTerm, currentTime)).ConfigureAwait(false);
         currentIndex = appendResponse.NextId;
