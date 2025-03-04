@@ -145,22 +145,27 @@ also increases network traffic and can lead to bottlenecks depending on the
 available hardware. Proper tuning of this parameter is essential to maintain
 a healthy cluster.
 
+- **Quorum**: A quorum is the minimum number of nodes required to reach a consensus in a Raft cluster. 
+For a cluster with N nodes, a quorum is defined as (N/2) + 1. This ensures that a majority of nodes 
+must agree on a decision before it is considered committed. Quorums are essential for maintaining 
+consistency and fault tolerance in distributed systems.
+
 - **Elections**: The Raft algorithm selects a leader for each partition.
 The remaining nodes become followers. If the leader node fails or becomes
 unreachable, a new election process is triggered to select a replacement.
 
 - **Leader**: Each partition designates a leader. The leader is responsible
 for handling requests assigned to its partition and replicating them to
-followers (replicas) until a quorum is reached. It maintains a local
+followers until a quorum is reached. It maintains a local
 copy of the logs.
 
-- **Followers (Replicas)**: Followers receive replication logs from
+- **Followers**: Followers receive replication logs from
 the leader and store local copies on their respective nodes. They
 continuously monitor the leader, and if it fails, they may nominate
 themselves as candidates in a new election for leadership.
 
 - **Logs**: Logs store any information that developers need to persist
-and replicate within the cluster.
+and replicate within certain partition in the cluster.
 
 - **Checkpoint**: Developers can determine when stored logs are secure
 and create a **log checkpoint**, which speeds up future recovery
@@ -181,6 +186,42 @@ handle leader elections, send heartbeats, and replicate logs.
 both of which offer distinct advantages and are widely familiar to developers.
 
 ---
+
+## Consensus Process
+
+Kommander relies on the following consensus algorithm to ensure that changes are applied consistently across all nodes. The commit phase is a critical part of this process. Here’s how it works:
+
+### 1. Log Entry Proposal and Replication
+- **Leader Receives a Client Request:** When a client sends a replication request, the leader node first creates a log entry for this operation.
+- **Appending to the Leader's Log:** The leader appends this log entry to its own log.
+- **Replicating the Log Entry:** The leader then sends this new log entry to all the follower nodes. Each follower 
+appends the entry to its own log but it isn’t applied to the state machine yet (OnReplicationReceived event).
+
+### 2. Achieving a Quorum
+- **Acknowledgment from Followers:** Each follower sends an acknowledgment back to the leader once they’ve safely stored the log entry.
+- **Quorum Requirement:** In Raft (and thus in Kommander), a log entry is not considered committed until a majority (a quorum) 
+of the nodes have acknowledged the entry. This majority rule ensures that the system can tolerate node failures while 
+still maintaining consistency.
+
+### 3. Committing the Log Entry
+- **Advancing the Commit Index:** Once the leader receives acknowledgments from a quorum of nodes, it marks the log entry 
+as committed by advancing its commit index. This commit index is a pointer indicating up to which log entries are safe to apply.
+- **Notifying the Followers:** The leader then informs the followers about the new commit index. Each follower, upon learning 
+that the entry is committed, will also update its commit index accordingly.
+
+### 4. Applying to the State Machine
+- **Execution of the Command:** With the log entry committed, every node (both the leader and the followers) 
+applies the corresponding operation to its local state machine. This step makes the change visible to clients.
+- **Ensuring Consistency:** By applying the same committed log entry on every node, Kommander guarantees that all 
+nodes remain consistent, even in the presence of failures.
+
+### Why the Commit Phase Is Important
+- **Data Consistency:** The commit phase ensures that a change isn’t applied until it has been safely 
+replicated to a majority of nodes, preventing inconsistencies.
+- **Fault Tolerance:** Even if some nodes fail, the fact that the entry is committed on a quorum means 
+that the system can recover without data loss.
+- **Linearizability:** This process guarantees that once a client is notified of a successful operation, 
+any subsequent read will reflect that change, maintaining strong consistency.
 
 ## Contributing
 
@@ -204,7 +245,5 @@ Kommander is licensed under the MIT License. See the [LICENSE](LICENSE) file for
 ## Community & Support
 
 - **GitHub Issues:** Report bugs or request features via our [GitHub Issues](https://github.com/your-repo/Kommander/issues) page.
--
----
 
-Harness the power of distributed consensus with Kommander and build resilient, high-availability systems on the .NET platform. Happy coding!
+---
