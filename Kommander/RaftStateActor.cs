@@ -203,6 +203,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 partition.Leader = "";
                 lastHeartbeat = currentTime;
                 electionTimeout += TimeSpan.FromMilliseconds(Random.Shared.Next(200, 1000));
+                lastCommitIndexes.Clear();
                 return;
             
             // if node is follower and leader is not sending hearthbeats, start election
@@ -371,30 +372,19 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <returns></returns>
     private async Task<(RaftOperationStatus, long)> AppendLogs(string endpoint, long leaderTerm, HLCTimestamp timestamp, List<RaftLog>? logs)
     {
-        long commitedIndex = -1;
-        
         if (currentTerm > leaderTerm)
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from a leader {Endpoint} with old Term={Term}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, state, endpoint, leaderTerm);
             
-            return (RaftOperationStatus.LeaderInOldTerm, commitedIndex);
+            return (RaftOperationStatus.LeaderInOldTerm, -1);
         }
 
         if (leaderTerm >= currentTerm)
         {
-            if (logs is not null && logs.Count > 0)
-            {
-                logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from leader {Endpoint} with Term={Term} Logs={Logs}", manager.LocalEndpoint, partition.PartitionId, state, endpoint, leaderTerm, logs.Count);
-
-                RaftWALResponse response = await walActor.Ask(new(RaftWALActionType.ProposeOrCommit, leaderTerm, timestamp, logs)).ConfigureAwait(false);
-                
-                if (response.Index < 0)
-                    return (RaftOperationStatus.LeaderInOutdatedTerm, commitedIndex); 
-            }
-
             state = NodeState.Follower;
             lastHeartbeat = await manager.HybridLogicalClock.ReceiveEvent(timestamp).ConfigureAwait(false);
             currentTerm = leaderTerm;
+            lastCommitIndexes.Clear();
 
             if (partition.Leader != endpoint)
             {
@@ -403,8 +393,20 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 partition.Leader = endpoint;
             }
         }
+        
+        if (logs is not null && logs.Count > 0)
+        {
+            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from leader {Endpoint} with Term={Term} Logs={Logs}", manager.LocalEndpoint, partition.PartitionId, state, endpoint, leaderTerm, logs.Count);
 
-        return (RaftOperationStatus.Success, commitedIndex);
+            RaftWALResponse response = await walActor.Ask(new(RaftWALActionType.ProposeOrCommit, leaderTerm, timestamp, logs)).ConfigureAwait(false);
+                
+            if (response.Index < 0)
+                return (RaftOperationStatus.LeaderInOutdatedTerm, -1);
+                
+            return (RaftOperationStatus.Success, response.Index);
+        }
+
+        return (RaftOperationStatus.Success, -1);
     }
 
     /// <summary>
@@ -435,13 +437,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             
             return (RaftOperationStatus.Errored, proposeResponse.Index);
         }
-        
-        Console.WriteLine("Trying to commit {0} [1]", proposeResponse.Index);
 
         // Commit logs to the Write-Ahead Log
         RaftWALResponse commitResponse = await walActor.Ask(new(RaftWALActionType.Commit, currentTerm, currentTime, logs)).ConfigureAwait(false);
-        
-        Console.WriteLine("Trying to commit {0} [2]", commitResponse.Index);
            
         if (!await CommitLogsToNodes(currentTime).ConfigureAwait(false))
             return (RaftOperationStatus.Errored, commitResponse.Index);
@@ -479,13 +477,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             
             return (RaftOperationStatus.Errored, proposeResponse.Index);
         }
-        
-        Console.WriteLine("Trying to checkpoint commit {0} [1]", proposeResponse.Index);
 
         // Commit logs to the Write-Ahead Log
         RaftWALResponse commitResponse = await walActor.Ask(new(RaftWALActionType.Commit, currentTerm, currentTime, checkpointLogs)).ConfigureAwait(false);
-        
-        Console.WriteLine("Trying to checkpoint commit {0} [2]", commitResponse.Index);
            
         if (!await CommitLogsToNodes(currentTime).ConfigureAwait(false))
             return (RaftOperationStatus.Errored, commitResponse.Index);
@@ -618,9 +612,6 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             RaftWALResponse getRangeResponse =  await walActor.Ask(new(RaftWALActionType.GetRange, currentTerm, lastCommitIndex)).ConfigureAwait(false);
             if (getRangeResponse.Logs is null)
                 return RaftOperationStatus.Errored;
-            
-            foreach (RaftLog log in getRangeResponse.Logs)
-                Console.WriteLine("AppendLogToNode {0} {1}", log.Id, log.Type);
             
             request = new(partition.PartitionId, currentTerm, timestamp, manager.LocalEndpoint, getRangeResponse.Logs);
         }

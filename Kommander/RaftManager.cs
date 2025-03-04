@@ -80,12 +80,12 @@ public sealed class RaftManager : IRaft
     /// <summary>
     /// Event when a replication log is restored
     /// </summary>
-    public event Func<string, byte[], Task<bool>>? OnReplicationRestored;
+    public event Func<RaftLog, Task<bool>>? OnReplicationRestored;
 
     /// <summary>
     /// Event when a replication log is received
     /// </summary>
-    public event Func<string, byte[], Task<bool>>? OnReplicationReceived;
+    public event Func<RaftLog, Task<bool>>? OnReplicationReceived;
     
     /// <summary>
     /// Constructor
@@ -265,21 +265,14 @@ public sealed class RaftManager : IRaft
     /// <summary>
     /// Calls the replication received event
     /// </summary>
-    /// <param name="type"></param>
     /// <param name="log"></param>
     /// <returns></returns>
-    internal async Task<bool> InvokeReplicationReceived(string? type, byte[]? log)
+    internal async Task<bool> InvokeReplicationReceived(RaftLog log)
     {
-        if (type is null)
-            return false;
-        
-        if (log is null)
-            return false;
-
         if (OnReplicationReceived != null)
         {
-            Func<string, byte[], Task<bool>> callback = OnReplicationReceived;
-            bool success = await callback(type, log).ConfigureAwait(false);
+            Func<RaftLog, Task<bool>> callback = OnReplicationReceived;
+            bool success = await callback(log).ConfigureAwait(false);
             if (!success)
                 return false;
         }
@@ -290,21 +283,14 @@ public sealed class RaftManager : IRaft
     /// <summary>
     /// Calls the replication restored event
     /// </summary>
-    /// <param name="type"></param>
     /// <param name="log"></param>
     /// <returns></returns>
-    internal async Task<bool> InvokeReplicationRestored(string? type, byte[]? log)
+    internal async Task<bool> InvokeReplicationRestored(RaftLog log)
     {
-        if (type is null)
-            return false;
-        
-        if (log is null)
-            return false;
-
         if (OnReplicationRestored != null)
         {
-            Func<string, byte[], Task<bool>> callback = OnReplicationRestored;
-            bool success = await callback(type, log).ConfigureAwait(false);
+            Func<RaftLog, Task<bool>> callback = OnReplicationRestored;
+            bool success = await callback(log).ConfigureAwait(false);
             if (!success)
                 return false;
         }

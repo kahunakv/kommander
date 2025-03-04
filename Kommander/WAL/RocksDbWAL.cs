@@ -137,8 +137,6 @@ public class RocksDbWAL : IWAL
         int shardId = partitionId % MaxShards;
         ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
         
-        Console.WriteLine("Propossing log: {0} {1}", log.Id, log.Type);
-        
         string index = log.Id.ToString("D20");
         
         db.Put(Encoding.UTF8.GetBytes(index), Serialize(new()
@@ -162,8 +160,6 @@ public class RocksDbWAL : IWAL
         ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
         
         string index = log.Id.ToString("D20");
-        
-        Console.WriteLine("Committing log: {0} {1}", log.Id, log.Type);
         
         db.Put(Encoding.UTF8.GetBytes(index), Serialize(new()
         {
@@ -243,7 +239,7 @@ public class RocksDbWAL : IWAL
                 continue;
             }
             
-            if (message.Type == (int)RaftLogType.CommitedCheckpoint)
+            if (message.Type == (int)RaftLogType.CommittedCheckpoint)
                 return Task.FromResult(message.Id);
             
             iterator.Next();

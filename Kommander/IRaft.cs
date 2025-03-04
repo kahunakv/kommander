@@ -47,11 +47,16 @@ public interface IRaft
     /// Event when a replication error occurs
     /// </summary>
     public event Action<RaftLog>? OnReplicationError;
+    
+    /// <summary>
+    /// Event when a replication log is restored
+    /// </summary>
+    public event Func<RaftLog, Task<bool>>? OnReplicationRestored;
 
     /// <summary>
     /// Event when a replication log is received
     /// </summary>
-    public event Func<string, byte[], Task<bool>>? OnReplicationReceived;
+    public event Func<RaftLog, Task<bool>>? OnReplicationReceived;
     
     /// <summary>
     /// Joins the Raft cluster

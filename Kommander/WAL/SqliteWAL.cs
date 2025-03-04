@@ -78,8 +78,6 @@ public class SqliteWAL : IWAL
         
         long lastCheckpoint = await GetLastCheckpoint(connection, partitionId).ConfigureAwait(false);
         
-        //Console.WriteLine("#{0} Last checkpoint: {1}", partitionId, lastCheckpoint);
-        
         const string query = """
          SELECT id, term, type, logType, log, timePhysical, timeCounter 
          FROM logs 
@@ -147,8 +145,6 @@ public class SqliteWAL : IWAL
         const string insertQuery = "INSERT INTO logs (id, partitionId, term, type, logType, log, timePhysical, timeCounter) VALUES (@id, @partitionId, @term, @type, @logType, @log, @timePhysical, @timeCounter);";
         await using SqliteCommand insertCommand =  new(insertQuery, connection);
         
-        insertCommand.Parameters.Clear();
-        
         insertCommand.Parameters.AddWithValue("@id", log.Id);
         insertCommand.Parameters.AddWithValue("@partitionId", partitionId);
         insertCommand.Parameters.AddWithValue("@term", log.Term);
@@ -167,8 +163,6 @@ public class SqliteWAL : IWAL
         
         const string updateQuery = "UPDATE logs SET type = @type WHERE partitionId = @partitionId AND id = @id";
         await using SqliteCommand updateCommand =  new(updateQuery, connection);
-        
-        updateCommand.Parameters.Clear();
         
         updateCommand.Parameters.AddWithValue("@id", log.Id);
         updateCommand.Parameters.AddWithValue("@partitionId", partitionId);
@@ -217,7 +211,7 @@ public class SqliteWAL : IWAL
         await using SqliteCommand command = new(query, connection);
         
         command.Parameters.AddWithValue("@partitionId", partitionId);
-        command.Parameters.AddWithValue("@type", (int)RaftLogType.CommitedCheckpoint);
+        command.Parameters.AddWithValue("@type", (int)RaftLogType.CommittedCheckpoint);
         
         await using SqliteDataReader reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
         

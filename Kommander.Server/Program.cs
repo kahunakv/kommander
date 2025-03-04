@@ -53,7 +53,7 @@ try
             configuration,
             new StaticDiscovery(nodes),
             new SqliteWAL(path: opts.SqliteWalPath, revision: opts.SqliteWalRevision),
-            new RestCommunication(),
+            new GrpcCommunication(),
             new HybridLogicalClock(),
             services.GetRequiredService<ILogger<IRaft>>()
         );
@@ -62,10 +62,17 @@ try
         {
             Console.WriteLine("Replication error: {0} #{1}", log.LogType, log.Id);
         };
-
-        node.OnReplicationReceived += (string logType, byte[] logData) =>
+        
+        node.OnReplicationRestored += log =>
         {
-            Console.WriteLine("Replication received: {0} {1}", logType, Encoding.UTF8.GetString(logData));
+            Console.WriteLine("Replication restored: {0} {1} {2}", log.Id, log.LogType, Encoding.UTF8.GetString(log.LogData ?? []));
+            
+            return Task.FromResult(true);
+        };
+
+        node.OnReplicationReceived += log =>
+        {
+            Console.WriteLine("Replication received: {0} {1} {2} {3}", log.Id, log.Type, log.LogType, Encoding.UTF8.GetString(log.LogData ?? []));
             
             return Task.FromResult(true);
         };
