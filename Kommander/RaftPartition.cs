@@ -135,7 +135,11 @@ public sealed class RaftPartition
         if (Leader != raftManager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, -1);
         
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, [new() { LogType = type, LogData = data }]), TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        RaftResponse response = await raftActor.Ask(new(
+            RaftRequestType.ReplicateLogs, 
+            [new() { Type = RaftLogType.Proposed, LogType = type, LogData = data }]), 
+            TimeSpan.FromSeconds(5)
+        ).ConfigureAwait(false);
         
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.CurrentIndex);
@@ -157,7 +161,7 @@ public sealed class RaftPartition
         if (Leader != raftManager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, -1);
 
-        List<RaftLog> logsToReplicate = logs.Select(data => new RaftLog { LogType = type, LogData = data }).ToList();
+        List<RaftLog> logsToReplicate = logs.Select(data => new RaftLog { Type = RaftLogType.Proposed, LogType = type, LogData = data }).ToList();
         
         RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate), TimeSpan.FromSeconds(5)).ConfigureAwait(false);
         

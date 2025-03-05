@@ -1,3 +1,4 @@
+
 namespace Kommander.Data;
 
 public readonly struct RaftResponse

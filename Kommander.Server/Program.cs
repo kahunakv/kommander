@@ -52,7 +52,7 @@ try
             services.GetRequiredService<ActorSystem>(),
             configuration,
             new StaticDiscovery(nodes),
-            new SqliteWAL(path: opts.SqliteWalPath, revision: opts.SqliteWalRevision),
+            new RocksDbWAL(path: opts.SqliteWalPath, revision: opts.SqliteWalRevision),
             new GrpcCommunication(),
             new HybridLogicalClock(),
             services.GetRequiredService<ILogger<IRaft>>()

@@ -423,10 +423,13 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return (RaftOperationStatus.NodeIsNotLeader, -1);
 
         HLCTimestamp currentTime = await manager.HybridLogicalClock.SendOrLocalEvent().ConfigureAwait(false);
-        
+
         foreach (RaftLog log in logs)
+        {
+            log.Type = RaftLogType.Proposed;
             log.Time = currentTime;
-        
+        }
+
         // Append proposal logs to the Write-Ahead Log
         RaftWALResponse proposeResponse = await walActor.Ask(new(RaftWALActionType.Propose, currentTerm, currentTime, logs)).ConfigureAwait(false);
         
@@ -617,11 +620,11 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         }
         
         AppendLogsResponse response = await communication.AppendLogToNode(manager, partition, node, request).ConfigureAwait(false);
-        if (response.CommitedIndex > 0)
+        if (response.CommittedIndex > 0)
         {
-            lastCommitIndexes[node.Endpoint] = response.CommitedIndex;
+            lastCommitIndexes[node.Endpoint] = response.CommittedIndex;
             
-            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Sent logs to {Endpoint} CommitedIndex={Index}", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, response.CommitedIndex);
+            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Sent logs to {Endpoint} CommitedIndex={Index}", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, response.CommittedIndex);
         }
 
         return response.Status;

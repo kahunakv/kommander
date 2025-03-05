@@ -9,7 +9,5 @@ public enum RaftWALActionType
     ProposeOrCommit = 3,
     GetMaxLog = 4,
     GetCurrentTerm = 5,
-    GetRange = 6,
-    GetCurrentCommitIndex = 7,
-    GetCurrentProposeIndex = 8
+    GetRange = 6
 }

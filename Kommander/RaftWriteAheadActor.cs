@@ -142,7 +142,6 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         foreach (RaftLog log in appendLogs)
         {
             log.Id = proposeIndex++;
-            log.Type = RaftLogType.Proposed; 
             log.Term = term;
             
             await walAdapter.Propose(partition.PartitionId, log).ConfigureAwait(false);
@@ -158,20 +157,21 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
         foreach (RaftLog log in appendLogs)
         {
-            if (log.Type == RaftLogType.Proposed)
+            switch (log.Type)
             {
-                log.Type = RaftLogType.Committed;
-                commitIndex = log.Id + 1;
+                case RaftLogType.Proposed:
+                    log.Type = RaftLogType.Committed;
+                    commitIndex = log.Id + 1;
                 
-                await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
-            }
-
-            if (log.Type == RaftLogType.ProposedCheckpoint)
-            {
-                log.Type = RaftLogType.CommittedCheckpoint;
-                commitIndex = log.Id + 1;
+                    await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
+                    break;
                 
-                await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
+                case RaftLogType.ProposedCheckpoint:
+                    log.Type = RaftLogType.CommittedCheckpoint;
+                    commitIndex = log.Id + 1;
+                
+                    await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
+                    break;
             }
         }
 
@@ -213,7 +213,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 
                 case RaftLogType.Committed or RaftLogType.CommittedCheckpoint when log.Id != commitIndex:
                     logger.LogWarning(
-                        "[{Endpoint}/{Partition}] Commited log #{Id} is not the expected #{CommitIndex}",
+                        "[{Endpoint}/{Partition}] Committed log #{Id} is not the expected #{CommitIndex}",
                         manager.LocalEndpoint, 
                         partition.PartitionId, 
                         log.Id, 

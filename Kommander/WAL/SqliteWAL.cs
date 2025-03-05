@@ -173,7 +173,7 @@ public class SqliteWAL : IWAL
     
     public async Task<long> GetMaxLog(int partitionId)
     {
-        SqliteConnection connection = await TryOpenDatabase(partitionId);
+        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
         
         const string query = "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId";
         await using SqliteCommand command = new(query, connection);
@@ -190,7 +190,7 @@ public class SqliteWAL : IWAL
     
     public async Task<long> GetCurrentTerm(int partitionId)
     {
-        SqliteConnection connection = await TryOpenDatabase(partitionId);
+        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
         
         const string query = "SELECT MAX(term) AS max FROM logs WHERE partitionId = @partitionId";
         await using SqliteCommand command = new(query, connection);
