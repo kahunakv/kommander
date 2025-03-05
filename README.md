@@ -53,7 +53,7 @@ To install Kommander into your C#/.NET project, you can use the .NET CLI or the 
 #### Using .NET CLI
 
 ```shell
-dotnet add package Kommander --version 0.2.4
+dotnet add package Kommander --version 0.3.0
 ```
 
 ### Using NuGet Package Manager
@@ -61,7 +61,7 @@ dotnet add package Kommander --version 0.2.4
 Search for Kommander and install it from the NuGet package manager UI, or use the Package Manager Console:
 
 ```shell
-Install-Package Kommander -Version 0.2.4
+Install-Package Kommander -Version 0.3.0
 ```
 
 Or, using the NuGet Package Manager in Visual Studio, search for **Kommander** and install it.
@@ -93,11 +93,11 @@ IRaft node = new RaftManager(
     // Node will use a static discovery mechanism to find other nodes in the cluster.
     new StaticDiscovery([new("localhost:8002"), new("localhost:8003")]),
 
-    // Node will use a SQLite Write-Ahead Log (WAL) per partition for log persistence.
-    new SqliteWAL(path: "./data", version: "v1"),
+    // Node will use a RocksDb Write-Ahead Log (WAL) per partition for log persistence.
+    new RocksDbWAL(path: "./data", version: "v1"),
 
-    // Node will use HTTP Rest endpoints for communication with other nodes.
-    new RestCommunication()
+    // Node will use gRPC endpoints for communication with other nodes.
+    new GrpcCommunication()
 
     // Node will use a new HybridLogicalClock for timestamping log entries.
     new HybridLogicalClock(),
@@ -106,9 +106,9 @@ IRaft node = new RaftManager(
 
 // Subscribe to the OnReplicationReceived event to receive log entries from other nodes
 // if the node is a follower
-node.OnReplicationReceived += (string logType, byte[] logData) =>
+node.OnReplicationReceived += (RaftLog log) =>
 {
-    Console.WriteLine("Replication received: {0} {1}", logType, Encoding.UTF8.GetString(logData));
+    Console.WriteLine("Replication received: {0} {1} {2}", log.Id, log.LogType, Encoding.UTF8.GetString(log.LogData));
 
     return Task.FromResult(true);
 };
@@ -118,7 +118,14 @@ await node.JoinCluster();
 
 // Check if the node is the leader of partition 0 and replicate a log entry.
 if (await node.AmILeader(0))
-    await node.ReplicateLogs(0, "Kommander is awesome!");
+{
+    (bool success, RaftOperationStatus status, long commitLogId) = await node.ReplicateLogs(0, "Kommander is awesome!");
+    
+    if (success)
+        Console.WriteLine("Replicated log with id: {0}", commitLogId);
+    else
+        Console.WriteLine("Replication failed {0}", status);
+}
 
 ```
 
@@ -130,7 +137,7 @@ Kommander supports advanced configurations including:
 - **Dynamic Partitioning:** Configure nodes to handle multiple partitions with distinct leader election processes.
 - **Security:** Integrate with your existing security framework to secure HTTP/TCP communications.
 
-For detailed configuration options, please refer to the [Documentation](docs/CONFIGURATION.md).
+For detailed configuration options, please refer to the [Documentation](https://github.com/andresgutierrez/kommander/wiki).
 
 ---
 

@@ -37,7 +37,7 @@ public class ReplicationService : BackgroundService //, IDisposable
                             if (success)
                                 Console.WriteLine("#1 Replicated log with id: {0}", commitLogId);
                             else
-                                Console.WriteLine("#1 Replicated failed {0}", status);
+                                Console.WriteLine("#1 Replication failed {0}", status);
 
                             /*(success, commitLogId) = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
                             if (success)
