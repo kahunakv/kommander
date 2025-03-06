@@ -60,17 +60,20 @@ public class TestTwoNodeCluster
         return node;
     }
     
-    /*[Fact]
+    [Fact]
     public async Task TestJoinCluster()
     {
         InMemoryCommunication communication = new();
         
-        RaftManager node1 = GetNode1(communication);
-        RaftManager node2 = GetNode2(communication);
+        IRaft node1 = GetNode1(communication);
+        IRaft node2 = GetNode2(communication);
 
         await node1.JoinCluster();
         await node2.JoinCluster();
-    }*/
+        
+        node1.ActorSystem.Dispose();
+        node2.ActorSystem.Dispose();
+    }
     
     [Fact]
     public async Task TestJoinClusterAndDecideLeader()
@@ -102,6 +105,9 @@ public class TestTwoNodeCluster
             
             await Task.Delay(1000);
         }
+        
+        node1.ActorSystem.Dispose();
+        node2.ActorSystem.Dispose();
     }
     
     [Fact]
@@ -136,6 +142,9 @@ public class TestTwoNodeCluster
         
         IRaft? leader = await GetLeader([node1, node2]);
         Assert.NotNull(leader);
+        
+        node1.ActorSystem.Dispose();
+        node2.ActorSystem.Dispose();
     }
     
     [Fact]
@@ -178,11 +187,18 @@ public class TestTwoNodeCluster
         
         Assert.Equal(node1.GetLocalEndpoint(), leader.GetLocalEndpoint());
         
+        List<IRaft> followers = await GetFollowers([node1, node2]);
+        Assert.NotEmpty(followers);
+        Assert.Single(followers);
+        
         long maxNode1 = await node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(2, maxNode1);
         
         long maxNode2 = await node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(2, maxNode2);
+        
+        node1.ActorSystem.Dispose();
+        node2.ActorSystem.Dispose();
     }
     
     [Fact]
@@ -228,11 +244,18 @@ public class TestTwoNodeCluster
         
         Assert.Equal(node1.GetLocalEndpoint(), leader.GetLocalEndpoint());
         
+        List<IRaft> followers = await GetFollowers([node1, node2]);
+        Assert.NotEmpty(followers);
+        Assert.Single(followers);
+        
         long maxNode1 = await node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(2, maxNode1);
         
         long maxNode2 = await node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(2, maxNode2);
+        
+        node1.ActorSystem.Dispose();
+        node2.ActorSystem.Dispose();
     }
     
     private static async Task<IRaft?> GetLeader(IRaft[] nodes)
@@ -244,5 +267,18 @@ public class TestTwoNodeCluster
         }
 
         return null;
+    }
+    
+    private static async Task<List<IRaft>> GetFollowers(IRaft[] nodes)
+    {
+        List<IRaft> followers = [];
+        
+        foreach (IRaft node in nodes)
+        {
+            if (!await node.AmILeader(0, CancellationToken.None))
+                followers.Add(node);
+        }
+
+        return followers;
     }
 }

@@ -87,7 +87,7 @@ public sealed class RaftPartition
         try
         {
             await raftActor.Ask(
-                new(RaftRequestType.ReceiveVote, request.Term, 0, request.Time, request.Endpoint), 
+                new(RaftRequestType.ReceiveVote, request.Term, request.MaxLogId, request.Time, request.Endpoint), 
                 TimeSpan.FromSeconds(5)
             ).ConfigureAwait(false);
         }
@@ -110,15 +110,31 @@ public sealed class RaftPartition
     /// <returns></returns>
     public async Task<(RaftOperationStatus, long)> AppendLogs(AppendLogsRequest request)
     {
-        // Make sure HLC clocks are synced
-        if (request.Logs is not null && request.Logs.Count > 0)
+        try
         {
-            foreach (RaftLog log in request.Logs)
-                await raftManager.HybridLogicalClock.ReceiveEvent(log.Time).ConfigureAwait(false);
+            RaftResponse response = await raftActor.Ask(new(
+                RaftRequestType.AppendLogs, 
+                request.Term, 
+                0, 
+                request.Time, 
+                request.Endpoint, 
+                request.Logs
+            ), TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            
+            return (response.Status, response.CurrentIndex);
+        }
+        catch (AskTimeoutException)
+        {
+            raftManager.Logger.LogWarning(
+                "[{LocalEndpoint}/{ParitionId}] Timeout AppendLogs {Term} {Endpoint}",
+                raftManager.LocalEndpoint,
+                PartitionId,
+                request.Term, 
+                request.Endpoint
+            );
         }
 
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.AppendLogs, request.Term, 0, request.Time, request.Endpoint, request.Logs)).ConfigureAwait(false);
-        return (response.Status, response.CurrentIndex);
+        return (RaftOperationStatus.Errored, -1);
     }
 
     /// <summary>

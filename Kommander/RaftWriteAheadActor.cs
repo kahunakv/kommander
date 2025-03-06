@@ -52,25 +52,31 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             switch (message.Type)
             {
                 case RaftWALActionType.Propose:
-                    return new(await Propose(message.Term, message.Logs).ConfigureAwait(false));
-                
+                {
+                    (RaftOperationStatus status, long newProposedIndex) = await Propose(message.Term, message.Logs).ConfigureAwait(false);
+                    return new(status, newProposedIndex);
+                }
+
                 case RaftWALActionType.Commit:
-                    return new(await Commit(message.Logs).ConfigureAwait(false));
-                
+                {
+                    (RaftOperationStatus status, long newCommitIndex) = await Commit(message.Logs).ConfigureAwait(false);
+                    return new(status, newCommitIndex);
+                }
+
                 case RaftWALActionType.ProposeOrCommit:
-                    return new(await ProposeOrCommit(message.Logs).ConfigureAwait(false));
+                    return new(RaftOperationStatus.Success, await ProposeOrCommit(message.Logs).ConfigureAwait(false));
                 
                 case RaftWALActionType.GetRange:
-                    return new(await GetRange(message.CurrentIndex).ConfigureAwait(false));
+                    return new(RaftOperationStatus.Success, await GetRange(message.CurrentIndex).ConfigureAwait(false));
 
                 case RaftWALActionType.Recover:
-                    return new(await Recover().ConfigureAwait(false));
+                    return new(RaftOperationStatus.Success, await Recover().ConfigureAwait(false));
                 
                 case RaftWALActionType.GetMaxLog:
-                    return new(await GetMaxLog().ConfigureAwait(false));
+                    return new(RaftOperationStatus.Success, await GetMaxLog().ConfigureAwait(false));
                 
                 case RaftWALActionType.GetCurrentTerm:
-                    return new(await GetCurrentTerm().ConfigureAwait(false));
+                    return new(RaftOperationStatus.Success, await GetCurrentTerm().ConfigureAwait(false));
                 
                 default:
                     logger.LogError("[{Endpoint}/{PartitionId}] Unknown action type: {Type}", manager.LocalEndpoint, partition.PartitionId, message.Type);
@@ -82,7 +88,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             logger.LogError("[{Endpoint}/{PartitionId}] {Message}\n{Stacktrace}", manager.LocalEndpoint, partition.PartitionId, ex.Message, ex.StackTrace);
         }
 
-        return new();
+        return new(RaftOperationStatus.Errored, -1);
     }
 
     private async ValueTask<long> Recover()
@@ -134,10 +140,10 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         return commitIndex;
     }
 
-    private async Task<long> Propose(long term, List<RaftLog>? appendLogs)
+    private async Task<(RaftOperationStatus, long)> Propose(long term, List<RaftLog>? appendLogs)
     {
         if (appendLogs is null || appendLogs.Count == 0)
-            return -1;
+            return (RaftOperationStatus.Success, -1);
 
         foreach (RaftLog log in appendLogs)
         {
@@ -147,13 +153,15 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             await walAdapter.Propose(partition.PartitionId, log).ConfigureAwait(false);
         }
 
-        return proposeIndex;
+        return (RaftOperationStatus.Success, proposeIndex);
     }
     
-    private async Task<long> Commit(List<RaftLog>? appendLogs)
+    private async Task<(RaftOperationStatus, long)> Commit(List<RaftLog>? appendLogs)
     {
         if (appendLogs is null || appendLogs.Count == 0)
-            return -1;
+            return (RaftOperationStatus.Success, -1);
+
+        long lastCommitIndex = -1;
 
         foreach (RaftLog log in appendLogs)
         {
@@ -162,6 +170,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 case RaftLogType.Proposed:
                     log.Type = RaftLogType.Committed;
                     commitIndex = log.Id + 1;
+                    lastCommitIndex = log.Id;
                 
                     await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
                     break;
@@ -169,13 +178,14 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 case RaftLogType.ProposedCheckpoint:
                     log.Type = RaftLogType.CommittedCheckpoint;
                     commitIndex = log.Id + 1;
+                    lastCommitIndex = log.Id;
                 
                     await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
                     break;
             }
         }
 
-        return commitIndex;
+        return (RaftOperationStatus.Success, lastCommitIndex);
     }
     
     private async Task<long> GetMaxLog()
@@ -201,17 +211,17 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         {
             switch (log.Type)
             {
-                case RaftLogType.Proposed or RaftLogType.ProposedCheckpoint when log.Id != proposeIndex:
+                case RaftLogType.Proposed or RaftLogType.ProposedCheckpoint when log.Id < proposeIndex:
                     logger.LogWarning(
                         "[{Endpoint}/{Partition}] Proposed log #{Id} is not the expected #{ProposeIndex}",
                         manager.LocalEndpoint, 
                         partition.PartitionId, 
                         log.Id, 
-                        commitIndex
+                        proposeIndex
                     );
-                    continue;
+                    break;
                 
-                case RaftLogType.Committed or RaftLogType.CommittedCheckpoint when log.Id != commitIndex:
+                case RaftLogType.Committed or RaftLogType.CommittedCheckpoint when log.Id < commitIndex:
                     logger.LogWarning(
                         "[{Endpoint}/{Partition}] Committed log #{Id} is not the expected #{CommitIndex}",
                         manager.LocalEndpoint, 
@@ -219,7 +229,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                         log.Id, 
                         commitIndex
                     );
-                    continue;
+                    break;
                 
                 default:
                     allOutdated = false;
@@ -228,13 +238,13 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         }
 
         if (allOutdated)
-            return -1;
+            return Math.Max(proposeIndex, commitIndex);
 
         foreach (RaftLog log in orderedLogs)
         {
             switch (log.Type)
             {
-                case RaftLogType.Proposed when log.Id >= proposeIndex:
+                case RaftLogType.Proposed when log.Id > proposeIndex:
                     await walAdapter.Propose(partition.PartitionId, log).ConfigureAwait(false);
                 
                     logger.LogDebug("[{Endpoint}/{Partition}] Proposed log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
@@ -242,7 +252,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                     proposeIndex = log.Id + 1;
                     break;
                 
-                case RaftLogType.Committed when log.Id >= commitIndex:
+                case RaftLogType.Committed when log.Id > commitIndex:
                 {
                     await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
                 
@@ -255,7 +265,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                     break;
                 }
                 
-                case RaftLogType.ProposedCheckpoint when log.Id >= proposeIndex:
+                case RaftLogType.ProposedCheckpoint when log.Id > proposeIndex:
                     await walAdapter.Propose(partition.PartitionId, log).ConfigureAwait(false);
                 
                     logger.LogDebug("[{Endpoint}/{Partition}] Proposed checkpoint log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
@@ -263,19 +273,17 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                     proposeIndex = log.Id + 1;
                     break;
                 
-                case RaftLogType.CommittedCheckpoint when log.Id >= commitIndex:
+                case RaftLogType.CommittedCheckpoint when log.Id > commitIndex:
                     await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
                 
                     logger.LogDebug("[{Endpoint}/{Partition}] Committed checkpoint log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
                     
-                    commitIndex = log.Id + 1;                    
+                    commitIndex = log.Id + 1;
                     break;
             }
         }
 
-        //Collect(GetCurrentTime());
-
-        return commitIndex;
+        return Math.Max(proposeIndex, commitIndex);
     }
     
     private async Task<List<RaftLog>> GetRange(long startLogIndex)

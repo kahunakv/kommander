@@ -19,6 +19,8 @@ public sealed class RaftManager : IRaft
 {
     internal readonly string LocalEndpoint;
     
+    internal readonly string LocalNodeId;
+    
     internal readonly ILogger<IRaft> Logger;
 
     private readonly ActorSystem actorSystem;
@@ -41,6 +43,11 @@ public sealed class RaftManager : IRaft
     /// Whether the node has joined the Raft cluster
     /// </summary>
     public bool Joined => clusterHandler.Joined;
+    
+    /// <summary>
+    /// Current Actor System
+    /// </summary>
+    public ActorSystem ActorSystem => actorSystem;
 
     /// <summary>
     /// Current WAL adapter
@@ -112,6 +119,8 @@ public sealed class RaftManager : IRaft
         this.hybridLogicalClock = hybridLogicalClock;
         
         Logger = logger;
+        
+        LocalNodeId = string.IsNullOrEmpty(this.configuration.NodeId) ? Environment.MachineName : this.configuration.NodeId;
         LocalEndpoint = string.Concat(configuration.Host, ":", configuration.Port);
         
         partitions = new RaftPartition[configuration.MaxPartitions];
@@ -305,6 +314,15 @@ public sealed class RaftManager : IRaft
     public string GetLocalEndpoint()
     {
         return LocalEndpoint;
+    }
+    
+    /// <summary>
+    /// Returns the local node id
+    /// </summary>
+    /// <returns></returns>
+    public string GetLocalNodeId()
+    {
+        return LocalNodeId;
     }
     
     /// <summary>

@@ -53,7 +53,7 @@ To install Kommander into your C#/.NET project, you can use the .NET CLI or the 
 #### Using .NET CLI
 
 ```shell
-dotnet add package Kommander --version 0.3.0
+dotnet add package Kommander --version 0.3.2
 ```
 
 ### Using NuGet Package Manager
@@ -61,7 +61,7 @@ dotnet add package Kommander --version 0.3.0
 Search for Kommander and install it from the NuGet package manager UI, or use the Package Manager Console:
 
 ```shell
-Install-Package Kommander -Version 0.3.0
+Install-Package Kommander -Version 0.3.2
 ```
 
 Or, using the NuGet Package Manager in Visual Studio, search for **Kommander** and install it.

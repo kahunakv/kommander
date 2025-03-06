@@ -10,9 +10,10 @@ service Rafter {
 message GrpcVoteRequest {
   int32 Partition = 1;
   int64 Term = 2;
-  int64 TimePhysical = 3;
-  uint32 TimeCounter = 4;
-  string Endpoint = 5;
+  int64 MaxLogId = 3;
+  int64 TimePhysical = 4;
+  uint32 TimeCounter = 5;
+  string Endpoint = 6;
 }
 
 message GrpcVoteResponse {

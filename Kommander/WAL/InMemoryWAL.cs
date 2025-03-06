@@ -37,6 +37,9 @@ public class InMemoryWAL : IWAL
 
     public Task Propose(int partitionId, RaftLog log)
     {
+        if (log.Type != RaftLogType.Proposed && log.Type != RaftLogType.ProposedCheckpoint)
+            throw new RaftException("Log must be proposed or proposed checkpoint");
+        
         if (logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
             partitionLogs.Add(log.Id, log);
         else
@@ -47,8 +50,11 @@ public class InMemoryWAL : IWAL
     
     public Task Commit(int partitionId, RaftLog log)
     {
+        if (log.Type != RaftLogType.Committed && log.Type != RaftLogType.CommittedCheckpoint)
+            throw new RaftException("Log must be committed or committed checkpoint");
+        
         if (logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
-            partitionLogs.Add(log.Id, log);
+            partitionLogs[log.Id] = log; // Always replace the log
         else
             logs.Add(partitionId, new() {{ log.Id, log }});
 

@@ -3,6 +3,7 @@ using Kommander.Data;
 using Kommander.WAL;
 using Kommander.Communication;
 using Kommander.Time;
+using Nixie;
 
 namespace Kommander;
 
@@ -12,6 +13,11 @@ public interface IRaft
     /// Whether the node has joined the Raft cluster
     /// </summary>
     public bool Joined { get; }
+    
+    /// <summary>
+    /// Current actor system
+    /// </summary>
+    public ActorSystem ActorSystem { get; }
     
     /// <summary>
     /// Current WAL adapter
@@ -124,6 +130,12 @@ public interface IRaft
     /// </summary>
     /// <returns></returns>
     public string GetLocalEndpoint();
+    
+    /// <summary>
+    /// Obtains the local node id
+    /// </summary>
+    /// <returns></returns>
+    public string GetLocalNodeId();
 
     /// <summary>
     /// Checks if the local node is the leader in the given partition
@@ -136,6 +148,7 @@ public interface IRaft
     /// Checks if the local node is the leader in the given partition
     /// </summary>
     /// <param name="partitionId"></param>
+    /// <param name="cancellationToken"></param>
     /// <returns></returns>
     public ValueTask<bool> AmILeader(int partitionId, CancellationToken cancellationToken);
 
@@ -143,6 +156,7 @@ public interface IRaft
     /// Waits for the local node to check/become the leader in the given partition
     /// </summary>
     /// <param name="partitionId"></param>
+    /// <param name="cancellationToken"></param>
     /// <returns></returns>
     public ValueTask<string> WaitForLeader(int partitionId, CancellationToken cancellationToken);
 

@@ -11,6 +11,8 @@ public class RocksDbWAL : IWAL
 {
     private const int MaxShards = 32;
     
+    private const int MaxNumberOfRangedEntries = 50;
+    
     private readonly RocksDb db;
     
     private readonly string path;
@@ -102,6 +104,8 @@ public class RocksDbWAL : IWAL
             iterator.Seek(Encoding.UTF8.GetBytes(index));
         }
 
+        int counter = 0;
+
         while (iterator.Valid())
         {
             RaftLogMessage message = Unserializer(iterator.Value());
@@ -129,6 +133,11 @@ public class RocksDbWAL : IWAL
             };
             
             iterator.Next();
+
+            counter++;
+
+            if (counter > MaxNumberOfRangedEntries)
+                break;
         }
     }
 

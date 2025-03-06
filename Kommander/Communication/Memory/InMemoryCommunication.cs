@@ -8,6 +8,10 @@ namespace Kommander.Communication.Memory;
 /// </summary>
 public class InMemoryCommunication : ICommunication
 {
+    private readonly Task<RequestVotesResponse> requestVoteResponse = Task.FromResult(new RequestVotesResponse());
+
+    private readonly Task<VoteResponse> voteResponse = Task.FromResult(new VoteResponse());
+    
     private Dictionary<string, IRaft> nodes = new();
     
     public void SetNodes(Dictionary<string, IRaft> nodes)
@@ -18,17 +22,17 @@ public class InMemoryCommunication : ICommunication
     public Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftPartition partition, RaftNode node, RequestVotesRequest request)
     {
         if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
-            targetNode.RequestVote(request);
+            _ = targetNode.RequestVote(request);
         
-        return Task.FromResult(new RequestVotesResponse());
+        return requestVoteResponse;
     }
 
     public Task<VoteResponse> Vote(RaftManager manager, RaftPartition partition, RaftNode node, VoteRequest request)
     {
         if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
-            targetNode.Vote(request);
+            _ = targetNode.Vote(request);
         
-        return Task.FromResult(new VoteResponse());
+        return voteResponse;
     }
 
     public async Task<AppendLogsResponse> AppendLogToNode(RaftManager manager, RaftPartition partition, RaftNode node, AppendLogsRequest request)

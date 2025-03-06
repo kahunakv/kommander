@@ -10,6 +10,8 @@ namespace Kommander.WAL;
 /// </summary>
 public class SqliteWAL : IWAL
 {
+    private const int MaxNumberOfRangedEntries = 50;
+    
     private static readonly SemaphoreSlim semaphore = new(1, 1);
     
     private static readonly Dictionary<int, SqliteConnection> connections = new();
@@ -108,6 +110,8 @@ public class SqliteWAL : IWAL
     
     public async IAsyncEnumerable<RaftLog> ReadLogsRange(int partitionId, long startLogIndex)
     {
+        int counter = 0;
+        
         SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
         
         const string query = """
@@ -135,6 +139,11 @@ public class SqliteWAL : IWAL
                 LogData = reader.IsDBNull(4) ? []: (byte[])reader[4],
                 Time = new(reader.IsDBNull(5) ? 0 : reader.GetInt64(5), reader.IsDBNull(6) ? 0 : (uint)reader.GetInt64(6))
             };
+            
+            counter++;
+
+            if (counter >= MaxNumberOfRangedEntries)
+                break;
         }
     }
 
