@@ -84,6 +84,7 @@ public class GrpcCommunication : ICommunication
         {
             Partition = request.Partition,
             Term = request.Term,
+            MaxLogId = request.MaxLogId,
             TimePhysical = request.Time.L,
             TimeCounter = request.Time.C,
             Endpoint = request.Endpoint

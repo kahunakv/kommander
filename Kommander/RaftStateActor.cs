@@ -226,7 +226,6 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 partition.Leader = "";
                 lastHeartbeat = currentTime;
                 electionTimeout += TimeSpan.FromMilliseconds(Random.Shared.Next(manager.Configuration.StartElectionTimeoutIncrement, manager.Configuration.EndElectionTimeoutIncrement));
-                Console.WriteLine("New election timeout {0}", electionTimeout);
                 lastCommitIndexes.Clear();
                 return;
             
@@ -413,8 +412,6 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         
         if (remoteMaxLogId > 0)
             lastCommitIndexes[endpoint] = remoteMaxLogId;
-        
-        Console.WriteLine("RemoteMaxLogId={0} {1}", endpoint, remoteMaxLogId);
 
         logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Proclamed leader Term={Term} Votes={Votes} Quorum={Quorum}/{Total}", manager.LocalEndpoint, partition.PartitionId, state, voteTerm, numberVotes, quorum, manager.Nodes.Count + 1);
     }
