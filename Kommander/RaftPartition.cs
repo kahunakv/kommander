@@ -11,7 +11,7 @@ namespace Kommander;
 /// </summary>
 public sealed class RaftPartition
 {
-    private static readonly RaftRequest raftStateRequest = new(RaftRequestType.GetState);
+    private static readonly RaftRequest RaftStateRequest = new(RaftRequestType.GetState);
 
     private readonly IActorRefStruct<RaftStateActor, RaftRequest, RaftResponse> raftActor;
 
@@ -94,7 +94,7 @@ public sealed class RaftPartition
         catch (AskTimeoutException)
         {
             raftManager.Logger.LogWarning(
-                "[{LocalEndpoint}/{ParitionId}] Timeout Vote {Term} {Endpoint}",
+                "[{LocalEndpoint}/{PartitionId}] Timeout Vote {Term} {Endpoint}",
                 raftManager.LocalEndpoint,
                 PartitionId,
                 request.Term, 
@@ -126,7 +126,7 @@ public sealed class RaftPartition
         catch (AskTimeoutException)
         {
             raftManager.Logger.LogWarning(
-                "[{LocalEndpoint}/{ParitionId}] Timeout AppendLogs {Term} {Endpoint}",
+                "[{LocalEndpoint}/{PartitionId}] Timeout AppendLogs {Term} {Endpoint}",
                 raftManager.LocalEndpoint,
                 PartitionId,
                 request.Term, 
@@ -212,7 +212,7 @@ public sealed class RaftPartition
         if (!string.IsNullOrEmpty(Leader) && Leader == raftManager.LocalEndpoint)
             return NodeState.Leader;
 
-        RaftResponse response = await raftActor.Ask(raftStateRequest, TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        RaftResponse response = await raftActor.Ask(RaftStateRequest, TimeSpan.FromSeconds(5)).ConfigureAwait(false);
         
         if (response.Type == RaftResponseType.None)
             throw new RaftException("Unknown response (2)");

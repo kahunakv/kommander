@@ -13,4 +13,14 @@ public static class HashUtils
         uint computed = xxHash32.ComputeHash(value);
         return computed % divisor;
     }
+    
+    public static int GetHashInRange(string input, int min, int max)
+    {
+        // Compute the hash value for the string.
+        uint hash = xxHash32.ComputeHash(input);
+        int range = max - min + 1;
+    
+        // Map the hash to the desired range.
+        return (int)((hash % range) + min);
+    }
 }

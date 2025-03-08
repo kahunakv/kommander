@@ -20,6 +20,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     private readonly RaftPartition partition;
 
     private readonly ICommunication communication;
+    
+    private readonly IActorRef<RaftResponderActor, RaftResponderRequest> responderActor;
 
     private readonly IActorRefStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse> walActor;
 
@@ -74,10 +76,22 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         //int x = GetHashInRange(manager.LocalNodeId, );
         //Console.WriteLine($"ElectionTimeout: {manager.LocalNodeId} {x}");
         
-        electionTimeout = TimeSpan.FromMilliseconds(Random.Shared.Next(manager.Configuration.StartElectionTimeout, manager.Configuration.EndElectionTimeout) );
+        electionTimeout = TimeSpan.FromMilliseconds(Random.Shared.Next(
+            manager.Configuration.StartElectionTimeout, 
+            manager.Configuration.EndElectionTimeout
+        ));
+
+        responderActor = context.ActorSystem.Spawn<RaftResponderActor, RaftResponderRequest>(
+            "raft-responder-" + partition.PartitionId,
+            this,
+            manager,
+            partition,
+            communication,
+            logger
+        );
         
         walActor = context.ActorSystem.SpawnStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse>(
-            "bra-wal-" + partition.PartitionId, 
+            "raft-wal-" + partition.PartitionId, 
             manager, 
             partition,
             walAdapter
@@ -90,16 +104,6 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             TimeSpan.FromMilliseconds(500),
             this.manager.Configuration.CheckLeaderInterval
         );
-    }
-    
-    private static int GetHashInRange(string input, int min, int max)
-    {
-        // Compute the hash value for the string.
-        uint hash = xxHash32.ComputeHash(input);
-        int range = max - min + 1;
-    
-        // Map the hash to the desired range.
-        return (int)((hash % range) + min);
     }
 
     /// <summary>
@@ -267,10 +271,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
         
-        RaftWALResponse currentMaxLog = await walActor.Ask(new(RaftWALActionType.GetMaxLog)).ConfigureAwait(false);;
+        RaftWALResponse currentMaxLog = await walActor.Ask(new(RaftWALActionType.GetMaxLog)).ConfigureAwait(false);
         
-        List<Task> tasks = new(manager.Nodes.Count);
-
         RequestVotesRequest request = new(partition.PartitionId, currentTerm, currentMaxLog.Index, timestamp, manager.LocalEndpoint);
 
         foreach (RaftNode node in manager.Nodes)
@@ -280,10 +282,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Asked {Endpoint} for votes on Term={CurrentTerm}", manager.LocalEndpoint, partition.PartitionId, state, node.Endpoint, currentTerm);
             
-            tasks.Add(communication.RequestVotes(manager, partition, node, request));
+            responderActor.Send(new(RaftResponderRequestType.X, request));
         }
-        
-        await Task.WhenAny(tasks).ConfigureAwait(false);
     }
 
     /// <summary>
