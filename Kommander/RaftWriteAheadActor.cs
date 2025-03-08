@@ -140,12 +140,14 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         return commitIndex;
     }
 
-    private async Task<(RaftOperationStatus, long)> Propose(long term, List<RaftLog>? appendLogs)
+    private async Task<(RaftOperationStatus, long)> Propose(long term, List<RaftLog>? logs)
     {
-        if (appendLogs is null || appendLogs.Count == 0)
+        if (logs is null || logs.Count == 0)
             return (RaftOperationStatus.Success, -1);
+        
+        RaftLog[] orderedLogs = logs.OrderBy(log => log.Id).ToArray();
 
-        foreach (RaftLog log in appendLogs)
+        foreach (RaftLog log in orderedLogs)
         {
             log.Id = proposeIndex++;
             log.Term = term;
@@ -156,14 +158,15 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         return (RaftOperationStatus.Success, proposeIndex);
     }
     
-    private async Task<(RaftOperationStatus, long)> Commit(List<RaftLog>? appendLogs)
+    private async Task<(RaftOperationStatus, long)> Commit(List<RaftLog>? logs)
     {
-        if (appendLogs is null || appendLogs.Count == 0)
+        if (logs is null || logs.Count == 0)
             return (RaftOperationStatus.Success, -1);
 
         long lastCommitIndex = -1;
+        RaftLog[] orderedLogs = logs.OrderBy(log => log.Id).ToArray();
 
-        foreach (RaftLog log in appendLogs)
+        foreach (RaftLog log in orderedLogs)
         {
             switch (log.Type)
             {
@@ -211,7 +214,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         {
             switch (log.Type)
             {
-                case RaftLogType.Proposed or RaftLogType.ProposedCheckpoint when log.Id < proposeIndex:
+                case RaftLogType.Proposed or RaftLogType.ProposedCheckpoint when log.Id < (proposeIndex - 1): 
                     logger.LogWarning(
                         "[{Endpoint}/{Partition}] Proposed log #{Id} is not the expected #{ProposeIndex}",
                         manager.LocalEndpoint, 
@@ -221,7 +224,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                     );
                     break;
                 
-                case RaftLogType.Committed or RaftLogType.CommittedCheckpoint when log.Id < commitIndex:
+                case RaftLogType.Committed or RaftLogType.CommittedCheckpoint when log.Id < (commitIndex - 1):
                     logger.LogWarning(
                         "[{Endpoint}/{Partition}] Committed log #{Id} is not the expected #{CommitIndex}",
                         manager.LocalEndpoint, 

@@ -506,10 +506,20 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         // Commit logs to the Write-Ahead Log
         RaftWALResponse commitResponse = await walActor.Ask(new(RaftWALActionType.Commit, currentTerm, currentTime, logs)).ConfigureAwait(false);
-           
-        if (!await CommitLogsToNodes(currentTime).ConfigureAwait(false))
+        if (commitResponse.Status != RaftOperationStatus.Success)
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't commit logs {CommitIndex}", manager.LocalEndpoint, partition.PartitionId, state, proposeResponse.Index);
+            
             return (RaftOperationStatus.Errored, commitResponse.Index);
-        
+        }
+
+        if (!await CommitLogsToNodes(currentTime).ConfigureAwait(false))
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't notify committed logs to followers", manager.LocalEndpoint, partition.PartitionId, state);
+            
+            return (RaftOperationStatus.Errored, commitResponse.Index);
+        }
+
         return (RaftOperationStatus.Success, commitResponse.Index);
     }
 
@@ -546,10 +556,20 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         // Commit logs to the Write-Ahead Log
         RaftWALResponse commitResponse = await walActor.Ask(new(RaftWALActionType.Commit, currentTerm, currentTime, checkpointLogs)).ConfigureAwait(false);
-           
-        if (!await CommitLogsToNodes(currentTime).ConfigureAwait(false))
+        if (commitResponse.Status != RaftOperationStatus.Success)
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't commit logs {CommitIndex}", manager.LocalEndpoint, partition.PartitionId, state, proposeResponse.Index);
+
             return (RaftOperationStatus.Errored, commitResponse.Index);
-        
+        }
+
+        if (!await CommitLogsToNodes(currentTime).ConfigureAwait(false))
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't notify committed logs to followers", manager.LocalEndpoint, partition.PartitionId, state);
+            
+            return (RaftOperationStatus.Errored, commitResponse.Index);
+        }
+
         return (RaftOperationStatus.Success, commitResponse.Index);
     }
 
@@ -709,6 +729,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             else
             {
                 long lastCommitIndex = lastCommitIndexes.GetValueOrDefault(node.Endpoint, 0);
+                
+                lastCommitIndex -= 3;
+                if (lastCommitIndex < 0)
+                    lastCommitIndex = 0;
                 
                 // Console.WriteLine("{0} {1}", node.Endpoint, lastCommitIndex);
 
