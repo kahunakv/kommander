@@ -3,5 +3,10 @@ namespace Kommander.Data;
 
 public enum RaftResponderRequestType
 {
-    X,
+    Vote,
+    RequestVotes,
+    AppendLogs,
+    CompleteAppendLogs,
+    RequestAcknowledgment,
+    Acknowledgment
 }

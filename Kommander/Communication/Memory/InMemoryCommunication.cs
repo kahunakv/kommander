@@ -12,6 +12,10 @@ public class InMemoryCommunication : ICommunication
 
     private readonly Task<VoteResponse> voteResponse = Task.FromResult(new VoteResponse());
     
+    private readonly Task<AppendLogsResponse> appendLogsResponse = Task.FromResult(new AppendLogsResponse());
+    
+    private readonly Task<CompleteAppendLogsResponse> completeAppendLogsResponse = Task.FromResult(new CompleteAppendLogsResponse());
+    
     private Dictionary<string, IRaft> nodes = new();
     
     public void SetNodes(Dictionary<string, IRaft> nodes)
@@ -22,7 +26,9 @@ public class InMemoryCommunication : ICommunication
     public Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftPartition partition, RaftNode node, RequestVotesRequest request)
     {
         if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
-            _ = targetNode.RequestVote(request);
+            targetNode.RequestVote(request);
+        else
+            Console.WriteLine("Unknown node: " + node.Endpoint);
         
         return requestVoteResponse;
     }
@@ -30,19 +36,30 @@ public class InMemoryCommunication : ICommunication
     public Task<VoteResponse> Vote(RaftManager manager, RaftPartition partition, RaftNode node, VoteRequest request)
     {
         if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
-            _ = targetNode.Vote(request);
+            targetNode.Vote(request);
+        else
+            Console.WriteLine("Unknown node: " + node.Endpoint);
         
         return voteResponse;
     }
 
-    public async Task<AppendLogsResponse> AppendLogToNode(RaftManager manager, RaftPartition partition, RaftNode node, AppendLogsRequest request)
+    public Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftPartition partition, RaftNode node, AppendLogsRequest request)
     {
-        long commitedIndex = -1;
-        RaftOperationStatus status = RaftOperationStatus.Success;
-        
         if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
-            (status, commitedIndex) = await targetNode.AppendLogs(request);
+            targetNode.AppendLogs(request);
+        else
+            Console.WriteLine("Unknown node: " + node.Endpoint);
         
-        return new(status, commitedIndex);
+        return appendLogsResponse;
+    }
+    
+    public Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftPartition partition, RaftNode node, CompleteAppendLogsRequest request)
+    {
+        if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
+            targetNode.CompleteAppendLogs(request);
+        else
+            Console.WriteLine("Unknown node: " + node.Endpoint);
+        
+        return completeAppendLogsResponse;
     }
 }

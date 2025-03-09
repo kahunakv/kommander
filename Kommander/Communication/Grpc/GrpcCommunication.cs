@@ -97,7 +97,7 @@ public class GrpcCommunication : ICommunication
         return new();
     }
 
-    public async Task<AppendLogsResponse> AppendLogToNode(RaftManager manager, RaftPartition partition, RaftNode node, AppendLogsRequest request)
+    public async Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftPartition partition, RaftNode node, AppendLogsRequest request)
     {
         if (!channels.TryGetValue(node.Endpoint, out GrpcChannel? channel))
         {
@@ -118,10 +118,37 @@ public class GrpcCommunication : ICommunication
 
         grpcRequest.Logs.AddRange(GetLogs(request.Logs ?? []));
         
-        GrpcAppendLogsResponse? response = await client.AppendLogsAsync(grpcRequest).ConfigureAwait(false);
-        return new((RaftOperationStatus)response.Status, response.CommitedIndex);
+        await client.AppendLogsAsync(grpcRequest).ConfigureAwait(false);
+        
+        return new();
     }
     
+    public async Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftPartition partition, RaftNode node, CompleteAppendLogsRequest request)
+    {
+        if (!channels.TryGetValue(node.Endpoint, out GrpcChannel? channel))
+        {
+            channel = GrpcChannel.ForAddress($"https://{node.Endpoint}", new() { HttpHandler = httpHandler });
+            channels.TryAdd(node.Endpoint, channel);
+        }
+        
+        Rafter.RafterClient client = new(channel);
+
+        GrpcCompleteAppendLogsRequest grpcRequest = new()
+        {
+            Partition = request.Partition,
+            Term = request.Term,
+            TimePhysical = request.Time.L,
+            TimeCounter = request.Time.C,
+            Endpoint = request.Endpoint,
+            Status = (GrpcRaftOperationStatus) request.Status,
+            CommitIndex = request.CommitIndex
+        };
+        
+        await client.CompleteAppendLogsAsync(grpcRequest).ConfigureAwait(false);
+        
+        return new();
+    }
+
     private static RepeatedField<GrpcRaftLog> GetLogs(List<RaftLog> requestLogs)
     {
         RepeatedField<GrpcRaftLog> logs = new();

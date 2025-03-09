@@ -9,5 +9,8 @@ public enum RaftRequestType
     ReceiveVote = 3,
     ReplicateLogs = 4,
     ReplicateCheckpoint = 5,
-    GetState = 6
+    GetState = 6,
+    CompleteAppendLogs = 7,
+    Acknowledgment = 8,
+    RequestAcknowledgment = 9
 }

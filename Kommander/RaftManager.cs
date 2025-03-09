@@ -104,13 +104,15 @@ public sealed class RaftManager : IRaft
     /// <param name="communication"></param>
     /// <param name="hybridLogicalClock"></param>
     /// <param name="logger"></param>
-    public RaftManager(ActorSystem actorSystem,
+    public RaftManager(
+        ActorSystem actorSystem,
         RaftConfiguration configuration,
         IDiscovery discovery,
         IWAL walAdapter,
         ICommunication communication,
         HybridLogicalClock hybridLogicalClock,
-        ILogger<IRaft> logger)
+        ILogger<IRaft> logger
+    )
     {
         this.actorSystem = actorSystem;
         this.configuration = configuration;
@@ -182,20 +184,20 @@ public sealed class RaftManager : IRaft
     /// Passes the request to the appropriate partition
     /// </summary>
     /// <param name="request"></param>
-    public async Task RequestVote(RequestVotesRequest request)
+    public void RequestVote(RequestVotesRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
-        await partition.RequestVote(request).ConfigureAwait(false);
+        partition.RequestVote(request);
     }
 
     /// <summary>
     /// Passes the request to the appropriate partition
     /// </summary>
     /// <param name="request"></param>
-    public async Task Vote(VoteRequest request)
+    public void Vote(VoteRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
-        await partition.Vote(request).ConfigureAwait(false);
+        partition.Vote(request);
     }
 
     /// <summary>
@@ -204,10 +206,21 @@ public sealed class RaftManager : IRaft
     /// </summary>
     /// <param name="request"></param>
     /// <returns></returns>
-    public async Task<(RaftOperationStatus, long)> AppendLogs(AppendLogsRequest request)
+    public void AppendLogs(AppendLogsRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
-        return await partition.AppendLogs(request).ConfigureAwait(false);
+        partition.AppendLogs(request);
+    }
+    
+    /// <summary>
+    /// Completes an append logs operation in the appropriate partition
+    /// </summary>
+    /// <param name="request"></param>
+    /// <returns></returns>
+    public void CompleteAppendLogs(CompleteAppendLogsRequest request)
+    {
+        RaftPartition partition = GetPartition(request.Partition);
+        partition.CompleteAppendLogs(request);
     }
 
     /// <summary>

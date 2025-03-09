@@ -86,20 +86,27 @@ public interface IRaft
     /// Requests a votes from other nodes in the cluster
     /// </summary>
     /// <param name="request"></param>
-    public Task RequestVote(RequestVotesRequest request);
+    public void RequestVote(RequestVotesRequest request);
 
     /// <summary>
     /// Communicate a vote from a node in the cluster
     /// </summary>
     /// <param name="request"></param>
-    public Task Vote(VoteRequest request);
+    public void Vote(VoteRequest request);
 
     /// <summary>
     /// Append logs from the leader in a partition
     /// </summary>
     /// <param name="request"></param>
     /// <returns></returns>
-    public Task<(RaftOperationStatus, long)> AppendLogs(AppendLogsRequest request);
+    public void AppendLogs(AppendLogsRequest request);
+    
+    /// <summary>
+    /// Report a complete logs operation to the leader
+    /// </summary>
+    /// <param name="request"></param>
+    /// <returns></returns>
+    public void CompleteAppendLogs(CompleteAppendLogsRequest request);
 
     /// <summary>
     /// Replicate logs to the followers in the partition

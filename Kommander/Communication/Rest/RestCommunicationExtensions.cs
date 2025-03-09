@@ -7,22 +7,22 @@ public static class RestCommunicationExtensions
 {
     public static void MapRestRaftRoutes(this WebApplication app)
     {
-        app.MapPost("/v1/raft/append-logs", async (AppendLogsRequest request, IRaft raft) =>
+        app.MapPost("/v1/raft/append-logs", (AppendLogsRequest request, IRaft raft) =>
         {
-            (RaftOperationStatus status, long commitLogIndex) = await raft.AppendLogs(request).ConfigureAwait(false);
-            return new AppendLogsResponse(status, commitLogIndex);
+            raft.AppendLogs(request);
+            return new AppendLogsResponse();
         });
 
-        app.MapPost("/v1/raft/request-vote", async (RequestVotesRequest request, IRaft raft) =>
+        app.MapPost("/v1/raft/request-vote", (RequestVotesRequest request, IRaft raft) =>
         {
-            await raft.RequestVote(request).ConfigureAwait(false);
+            raft.RequestVote(request);
             
             return new RequestVotesResponse();
         });
 
-        app.MapPost("/v1/raft/vote", async (VoteRequest request, IRaft raft) =>
+        app.MapPost("/v1/raft/vote", (VoteRequest request, IRaft raft) =>
         {
-            await raft.Vote(request).ConfigureAwait(false);
+            raft.Vote(request);
             
             return new VoteResponse();
         });

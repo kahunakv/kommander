@@ -5,7 +5,7 @@ using Kommander.Data;
 
 namespace Kommander;
 
-public class RaftResponderActor : IActor<RaftResponderRequest>
+public sealed class RaftResponderActor : IActor<RaftResponderRequest>
 {
     private readonly RaftManager manager;
     
@@ -14,19 +14,15 @@ public class RaftResponderActor : IActor<RaftResponderRequest>
     private readonly ICommunication communication;
 
     private readonly ILogger<IRaft> logger;
-
-    private readonly IActorRefStruct<RaftStateActor, RaftRequest, RaftResponse> raftStateActor;
     
     public RaftResponderActor(
-        IActorContext<RaftResponderActor, RaftResponderRequest> context,
-        IActorRefStruct<RaftStateActor, RaftRequest, RaftResponse> raftStateActor,
+        IActorContext<RaftResponderActor, RaftResponderRequest> _,
         RaftManager manager, 
         RaftPartition partition,
         ICommunication communication,
         ILogger<IRaft> logger
     )
     {
-        this.raftStateActor = raftStateActor;
         this.manager = manager;
         this.partition = partition;
         this.communication = communication;
@@ -35,25 +31,78 @@ public class RaftResponderActor : IActor<RaftResponderRequest>
 
     public async Task Receive(RaftResponderRequest message)
     {
-        switch (message.X)
+        try
         {
-            case RaftResponderRequestType.RequestVotes:
-                if (message.RequestVotesRequest is null)
-                    return;
+            switch (message.Type)
+            {
+                case RaftResponderRequestType.Vote:
+                    await Vote(message);
+                    break;
                 
-                List<Task> tasks = new(manager.Nodes.Count);
-
-                foreach (RaftNode node in manager.Nodes)
-                {
-                    if (node.Endpoint == manager.LocalEndpoint)
-                        throw new RaftException("Corrupted nodes");
-            
-                    logger.LogInformation("[{LocalEndpoint}/{PartitionId}] Asked {Endpoint} for votes on Term={CurrentTerm}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, currentTerm);
-            
-                    tasks.Add(communication.RequestVotes(manager, partition, node, message.RequestVotesRequest));
-                }
-        
-                await Task.WhenAny(tasks).ConfigureAwait(false);
+                case RaftResponderRequestType.AppendLogs:
+                    await AppendLogs(message);
+                    break;
+                
+                case RaftResponderRequestType.RequestVotes:
+                    await RequestVotes(message);
+                    break;
+                
+                case RaftResponderRequestType.CompleteAppendLogs:
+                    await CompleteAppendLogs(message);
+                    break;
+                
+                default:
+                    Console.WriteLine(message.Type);
+                    break;
+            }
         }
+        catch (Exception ex)
+        {
+            Console.WriteLine(ex);
+        }
+    }
+    
+    private async Task Vote(RaftResponderRequest message)
+    {
+        if (message.Node is null)
+            return;
+        
+        if (message.VoteRequest is null)
+            return;
+                
+        await communication.Vote(manager, partition, message.Node, message.VoteRequest);
+    }
+
+    private async Task RequestVotes(RaftResponderRequest message)
+    {
+        if (message.Node is null)
+            return;
+
+        if (message.RequestVotesRequest is null)
+            return;
+
+        await communication.RequestVotes(manager, partition, message.Node, message.RequestVotesRequest);
+    }
+
+    private async Task AppendLogs(RaftResponderRequest message)
+    {
+        if (message.Node is null)
+            return;
+        
+        if (message.AppendLogsRequest is null)
+            return;
+        
+        await communication.AppendLogs(manager, partition, message.Node, message.AppendLogsRequest).ConfigureAwait(false);
+    }
+    
+    private async Task CompleteAppendLogs(RaftResponderRequest message)
+    {
+        if (message.Node is null)
+            return;
+        
+        if (message.CompleteAppendLogsRequest is null)
+            return;
+        
+        await communication.CompleteAppendLogs(manager, partition, message.Node, message.CompleteAppendLogsRequest).ConfigureAwait(false);
     }
 }

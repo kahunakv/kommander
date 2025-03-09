@@ -7,6 +7,12 @@ namespace Kommander.Communication.Grpc;
 
 public class RaftService : Rafter.RafterBase
 {
+    private  static readonly Task<GrpcVoteResponse> voteResponse = Task.FromResult(new GrpcVoteResponse());
+
+    private static readonly Task<GrpcRequestVotesResponse> requestVoteResponse = Task.FromResult(new GrpcRequestVotesResponse());
+    
+    private static readonly Task<GrpcCompleteAppendLogsResponse> completeAppendLogsResponse = Task.FromResult(new GrpcCompleteAppendLogsResponse());
+    
     private readonly IRaft raft;
 
     private readonly ILogger<IRaft> logger;
@@ -17,50 +23,67 @@ public class RaftService : Rafter.RafterBase
         this.logger = logger;
     }
     
-    public override async Task<GrpcVoteResponse> Vote(GrpcVoteRequest request, ServerCallContext context)
+    public override Task<GrpcVoteResponse> Vote(GrpcVoteRequest request, ServerCallContext context)
     {
         //logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got Vote message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
-        
-        await raft.Vote(new(
-            request.Partition, 
-            request.Term, 
+
+        raft.Vote(new(
+            request.Partition,
+            request.Term,
             request.MaxLogId,
-            new(request.TimePhysical, request.TimeCounter), 
+            new(request.TimePhysical, request.TimeCounter),
             request.Endpoint
-        )).ConfigureAwait(false);
+        ));
         
-        return new();
+        return voteResponse;
     }
     
-    public override async Task<GrpcRequestVotesResponse> RequestVotes(GrpcRequestVotesRequest request, ServerCallContext context)
+    public override Task<GrpcRequestVotesResponse> RequestVotes(GrpcRequestVotesRequest request, ServerCallContext context)
     {
         //logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got RequestVotes message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
-        
-        await raft.RequestVote(new(
-            request.Partition, 
-            request.Term, 
-            request.MaxLogId, 
-            new(request.TimePhysical, request.TimeCounter), 
+
+        raft.RequestVote(new(
+            request.Partition,
+            request.Term,
+            request.MaxLogId,
+            new(request.TimePhysical, request.TimeCounter),
             request.Endpoint
-        )).ConfigureAwait(false);
+        ));
         
-        return new();
+        return requestVoteResponse;
     }
     
-    public override async Task<GrpcAppendLogsResponse> AppendLogs(GrpcAppendLogsRequest request, ServerCallContext context)
+    public override Task<GrpcAppendLogsResponse> AppendLogs(GrpcAppendLogsRequest request, ServerCallContext context)
     {
         //if (request.Logs.Count > 0)
         //    logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got AppendLogs message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
         
-        (RaftOperationStatus status, long commitIndexId) = await raft.AppendLogs(new(
+        raft.AppendLogs(new(
             request.Partition, 
             request.Term, 
             new(request.TimePhysical, request.TimeCounter), 
             request.Endpoint, 
             GetLogs(request.Logs)
-        )).ConfigureAwait(false);
+        ));
         
-        return new() { Status = (GrpcRaftOperationStatus)status, CommitedIndex = commitIndexId };
+        return Task.FromResult(new GrpcAppendLogsResponse());
+    }
+    
+    public override Task<GrpcCompleteAppendLogsResponse> CompleteAppendLogs(GrpcCompleteAppendLogsRequest request, ServerCallContext context)
+    {
+        //if (request.Logs.Count > 0)
+        //    logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got AppendLogs message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
+        
+        raft.CompleteAppendLogs(new(
+            request.Partition, 
+            request.Term, 
+            new(request.TimePhysical, request.TimeCounter), 
+            request.Endpoint,
+            (RaftOperationStatus)request.Status,
+            request.CommitIndex
+        ));
+        
+        return completeAppendLogsResponse;
     }
 
     private static List<RaftLog> GetLogs(RepeatedField<GrpcRaftLog> requestLogs)

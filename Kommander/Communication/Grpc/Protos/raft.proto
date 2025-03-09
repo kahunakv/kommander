@@ -5,6 +5,7 @@ service Rafter {
   rpc Vote (GrpcVoteRequest) returns (GrpcVoteResponse);
   rpc RequestVotes (GrpcRequestVotesRequest) returns (GrpcRequestVotesResponse);
   rpc AppendLogs (GrpcAppendLogsRequest) returns (GrpcAppendLogsResponse);
+  rpc CompleteAppendLogs (GrpcCompleteAppendLogsRequest) returns (GrpcCompleteAppendLogsResponse);
 }
 
 message GrpcVoteRequest {
@@ -43,8 +44,21 @@ message GrpcAppendLogsRequest {
 }
 
 message GrpcAppendLogsResponse {
-  GrpcRaftOperationStatus Status = 1;
-  int64 CommitedIndex = 2;
+  
+}
+
+message GrpcCompleteAppendLogsRequest {
+  int32 Partition = 1;
+  int64 Term = 2;
+  int64 TimePhysical = 3;
+  uint32 TimeCounter = 4;
+  string Endpoint = 5;
+  GrpcRaftOperationStatus Status = 6;
+  int64 CommitIndex = 7;
+}
+
+message GrpcCompleteAppendLogsResponse {
+
 }
 
 message GrpcRaftLog {
@@ -69,5 +83,5 @@ enum GrpcRaftOperationStatus {
   ERRORED = 1;
   NODE_IS_NOT_LEADER = 2;
   LEADER_IN_OLD_TERM = 3;
-  LEADER_IN_OUTDATED_TERM = 4;   
+  LEADER_ALREADY_ELECTED = 4;   
 }

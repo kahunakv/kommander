@@ -53,54 +53,21 @@ public sealed class RaftPartition
     }
 
     /// <summary>
-    /// Request a vote from the partition.
+    /// Enqueues a request a vote from the partition.
     /// </summary>
     /// <param name="request"></param>
-    public async Task RequestVote(RequestVotesRequest request)
+    public void RequestVote(RequestVotesRequest request)
     {
-        try
-        {
-            await raftActor.Ask(
-                new(RaftRequestType.RequestVote, request.Term, request.MaxLogId, request.Time, request.Endpoint),
-                TimeSpan.FromSeconds(5)
-            ).ConfigureAwait(false);
-        }
-        catch (AskTimeoutException)
-        {
-            raftManager.Logger.LogWarning(
-                "[{LocalEndpoint}/{ParitionId}] Timeout RequestVote {Term} {MaxLogId} {Endpoint}",
-                raftManager.LocalEndpoint,
-                PartitionId,
-                request.Term, 
-                request.MaxLogId, 
-                request.Endpoint
-            );
-        }
+        raftActor.Send(new(RaftRequestType.RequestVote, request.Term, request.MaxLogId, request.Time, request.Endpoint));
     }
 
     /// <summary>
-    /// Vote to become leader in a partition.
+    /// Enqueues a vote to become leader in a partition.
     /// </summary>
     /// <param name="request"></param>
-    public async Task Vote(VoteRequest request)
+    public void Vote(VoteRequest request)
     {
-        try
-        {
-            await raftActor.Ask(
-                new(RaftRequestType.ReceiveVote, request.Term, request.MaxLogId, request.Time, request.Endpoint), 
-                TimeSpan.FromSeconds(5)
-            ).ConfigureAwait(false);
-        }
-        catch (AskTimeoutException)
-        {
-            raftManager.Logger.LogWarning(
-                "[{LocalEndpoint}/{PartitionId}] Timeout Vote {Term} {Endpoint}",
-                raftManager.LocalEndpoint,
-                PartitionId,
-                request.Term, 
-                request.Endpoint
-            );
-        }
+        raftActor.Send(new(RaftRequestType.ReceiveVote, request.Term, request.MaxLogId, request.Time, request.Endpoint));
     }
 
     /// <summary>
@@ -108,33 +75,33 @@ public sealed class RaftPartition
     /// </summary>
     /// <param name="request"></param>
     /// <returns></returns>
-    public async Task<(RaftOperationStatus, long)> AppendLogs(AppendLogsRequest request)
+    public void AppendLogs(AppendLogsRequest request)
     {
-        try
-        {
-            RaftResponse response = await raftActor.Ask(new(
-                RaftRequestType.AppendLogs, 
-                request.Term, 
-                0, 
-                request.Time, 
-                request.Endpoint, 
-                request.Logs
-            ), TimeSpan.FromSeconds(5)).ConfigureAwait(false);
-            
-            return (response.Status, response.CurrentIndex);
-        }
-        catch (AskTimeoutException)
-        {
-            raftManager.Logger.LogWarning(
-                "[{LocalEndpoint}/{PartitionId}] Timeout AppendLogs {Term} {Endpoint}",
-                raftManager.LocalEndpoint,
-                PartitionId,
-                request.Term, 
-                request.Endpoint
-            );
-        }
-
-        return (RaftOperationStatus.Errored, -1);
+        raftActor.Ask(new(
+            RaftRequestType.AppendLogs,
+            request.Term,
+            0,
+            request.Time,
+            request.Endpoint,
+            request.Logs
+        ));
+    }
+    
+    /// <summary>
+    /// Complete the append logs request
+    /// </summary>
+    /// <param name="request"></param>
+    /// <returns></returns>
+    public void CompleteAppendLogs(CompleteAppendLogsRequest request)
+    {
+        raftActor.Ask(new(
+            RaftRequestType.CompleteAppendLogs,
+            request.Term,
+            request.CommitIndex,
+            request.Time,
+            request.Endpoint,
+            null
+        ));
     }
 
     /// <summary>
