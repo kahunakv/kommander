@@ -233,7 +233,13 @@ public sealed class RaftManager : IRaft
     public async Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(int partitionId, string type, byte[] data)
     {
         RaftPartition partition = GetPartition(partitionId);
-        return await partition.ReplicateLogs(type, data).ConfigureAwait(false);
+        
+        (bool success, RaftOperationStatus status, HLCTimestamp ticketId) = await partition.ReplicateLogs(type, data).ConfigureAwait(false);
+        
+        if (!success)
+            return (success, status, -1);
+
+        return await WaitForReplication(partition, ticketId);
     }
     
     /// <summary>
@@ -246,7 +252,13 @@ public sealed class RaftManager : IRaft
     public async Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs)
     {
         RaftPartition partition = GetPartition(partitionId);
-        return await partition.ReplicateLogs(type, logs).ConfigureAwait(false);
+        
+        (bool success, RaftOperationStatus status, HLCTimestamp ticketId) = await partition.ReplicateLogs(type, logs).ConfigureAwait(false);
+        
+        if (!success)
+            return (success, status, -1);
+        
+        return await WaitForReplication(partition, ticketId);
     }
 
     /// <summary>
@@ -256,7 +268,59 @@ public sealed class RaftManager : IRaft
     public async Task<(bool success, long commitLogId)> ReplicateCheckpoint(int partitionId)
     {
         RaftPartition partition = GetPartition(partitionId);
-        return await partition.ReplicateCheckpoint().ConfigureAwait(false);
+        
+        (bool success, long commitLogId) = await partition.ReplicateCheckpoint().ConfigureAwait(false);
+        
+        if (!success)
+            return (success, -1);
+
+        return (true, commitLogId);
+    }
+    
+    /// <summary>
+    /// Waits for the replication proposal to be completed in the given partition
+    /// </summary>
+    /// <param name="partition"></param>
+    /// <param name="ticketId"></param>
+    /// <returns></returns>
+    private async Task<(bool success, RaftOperationStatus status, long commitLogId)> WaitForReplication(RaftPartition partition, HLCTimestamp ticketId)
+    {
+        Stopwatch stopwatch = Stopwatch.StartNew();
+        
+        while (stopwatch.ElapsedMilliseconds < 30000)
+        {
+            if (!string.IsNullOrEmpty(partition.Leader) && partition.Leader != LocalEndpoint)
+                return (false, RaftOperationStatus.NodeIsNotLeader, -1);
+            
+            //if (cancellationToken.IsCancellationRequested)
+            //    throw new OperationCanceledException();
+
+            try
+            {
+                (RaftTicketState state, long commitId) = await partition.GetTicketState(ticketId).ConfigureAwait(false);
+                
+                switch (state)
+                {
+                    case RaftTicketState.NotFound:
+                        return (false, RaftOperationStatus.Errored, -1);
+                    
+                    case RaftTicketState.Committed:
+                        return (true, RaftOperationStatus.Success, commitId);
+                    
+                    case RaftTicketState.Proposed:
+                    default:
+                        break;
+                }
+            }
+            catch (AskTimeoutException e)
+            {
+                Logger.LogError("ReplicateLogs: {Message}", e.Message);
+            }
+
+            await Task.Yield();
+        }
+        
+        return (false, RaftOperationStatus.Errored, -1);
     }
 
     /// <summary>
@@ -355,9 +419,9 @@ public sealed class RaftManager : IRaft
 
         try
         {
-            NodeState response = await partition.GetState().ConfigureAwait(false);
+            RaftNodeState response = await partition.GetState().ConfigureAwait(false);
 
-            if (response == NodeState.Leader)
+            if (response == RaftNodeState.Leader)
                 return true;
 
             return false;
@@ -396,9 +460,9 @@ public sealed class RaftManager : IRaft
 
             try
             {
-                NodeState response = await partition.GetState().ConfigureAwait(false);
+                RaftNodeState response = await partition.GetState().ConfigureAwait(false);
 
-                return response == NodeState.Leader;
+                return response == RaftNodeState.Leader;
             }
             catch (AskTimeoutException e)
             {
@@ -431,9 +495,9 @@ public sealed class RaftManager : IRaft
             
             try
             {
-                NodeState response = await partition.GetState().ConfigureAwait(false);
+                RaftNodeState response = await partition.GetState().ConfigureAwait(false);
 
-                if (response == NodeState.Leader)
+                if (response == RaftNodeState.Leader)
                     return LocalEndpoint;
 
                 if (string.IsNullOrEmpty(partition.Leader))

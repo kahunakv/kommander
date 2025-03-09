@@ -280,6 +280,12 @@ public class TestThreeNodeCluster
         Assert.Equal(RaftOperationStatus.Success, response.status);
         Assert.Equal(1, response.commitLogId);
         
+        response = await leader.ReplicateLogs(0, "Greeting", "Hello World"u8.ToArray());
+        Assert.True(response.success);
+        
+        Assert.Equal(RaftOperationStatus.Success, response.status);
+        Assert.Equal(2, response.commitLogId);
+        
         node1.ActorSystem.Dispose();
         node2.ActorSystem.Dispose();
         node3.ActorSystem.Dispose();

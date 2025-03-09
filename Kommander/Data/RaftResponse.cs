@@ -1,4 +1,6 @@
 
+using Kommander.Time;
+
 namespace Kommander.Data;
 
 public readonly struct RaftResponse
@@ -7,14 +9,25 @@ public readonly struct RaftResponse
     
     public RaftOperationStatus Status { get; } = RaftOperationStatus.Success;
 
-    public NodeState State { get; } = NodeState.Follower;
+    public RaftNodeState NodeState { get; } = RaftNodeState.Follower;
     
-    public long CurrentIndex { get; } = 0;
+    public RaftTicketState TicketState { get; } = RaftTicketState.NotFound;
     
-    public RaftResponse(RaftResponseType type, NodeState state)
+    public long CommitIndex { get; } = 0;
+    
+    public HLCTimestamp TicketId { get; } = HLCTimestamp.Zero;
+    
+    public RaftResponse(RaftResponseType type, RaftNodeState nodeState)
     {
         Type = type;
-        State = state;
+        NodeState = nodeState;
+    }
+    
+    public RaftResponse(RaftResponseType type, RaftTicketState ticketState, long commitIndex)
+    {
+        Type = type;
+        TicketState = ticketState;
+        CommitIndex = commitIndex;
     }
     
     public RaftResponse(RaftResponseType type)
@@ -22,16 +35,17 @@ public readonly struct RaftResponse
         Type = type;
     }
     
-    public RaftResponse(RaftResponseType type, long currentIndex)
-    {
-        Type = type;
-        CurrentIndex = currentIndex;
-    }
-    
-    public RaftResponse(RaftResponseType type, RaftOperationStatus status, long currentIndex)
+    public RaftResponse(RaftResponseType type, RaftOperationStatus status, long commitIndex)
     {
         Type = type;
         Status = status;
-        CurrentIndex = currentIndex;
+        CommitIndex = commitIndex;
+    }
+    
+    public RaftResponse(RaftResponseType type, RaftOperationStatus status, HLCTimestamp ticketId)
+    {
+        Type = type;
+        Status = status;
+        TicketId = ticketId;
     }
 }

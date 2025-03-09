@@ -1,7 +1,7 @@
 ﻿
 namespace Kommander;
 
-public enum NodeState
+public enum RaftNodeState
 {
     Follower = 0,
     Candidate = 1,

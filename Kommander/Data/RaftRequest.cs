@@ -19,13 +19,22 @@ public readonly struct RaftRequest
     
     public RaftOperationStatus Status { get; }
 
-    public RaftRequest(RaftRequestType type, long term = -1, long commitIndex = 0, HLCTimestamp timestamp = default, string? endpoint = null, List<RaftLog>? logs = null)
+    public RaftRequest(
+        RaftRequestType type, 
+        long term = -1, 
+        long commitIndex = 0, 
+        HLCTimestamp timestamp = default, 
+        string? endpoint = null, 
+        RaftOperationStatus status = RaftOperationStatus.Success, 
+        List<RaftLog>? logs = null
+    )
     {
         Type = type;
         Term = term;
         CommitIndex = commitIndex;
         Timestamp = timestamp;
         Endpoint = endpoint;
+        Status = status;
         Logs = logs;
     }
 
@@ -35,10 +44,10 @@ public readonly struct RaftRequest
         Logs = logs;
     }
     
-    public RaftRequest(RaftRequestType type, RaftOperationStatus status)
+    public RaftRequest(RaftRequestType type, HLCTimestamp timestamp)
     {
         Type = type;
-        Status = status;
+        Timestamp = timestamp;
     }
 }
 

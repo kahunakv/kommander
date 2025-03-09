@@ -1,6 +1,7 @@
 
 using Kommander.Communication;
 using Kommander.Data;
+using Kommander.Time;
 using Kommander.WAL;
 using Nixie;
 
@@ -11,7 +12,7 @@ namespace Kommander;
 /// </summary>
 public sealed class RaftPartition
 {
-    private static readonly RaftRequest RaftStateRequest = new(RaftRequestType.GetState);
+    private static readonly RaftRequest RaftStateRequest = new(RaftRequestType.GetNodeState);
 
     private readonly IActorRefStruct<RaftStateActor, RaftRequest, RaftResponse> raftActor;
 
@@ -83,6 +84,7 @@ public sealed class RaftPartition
             0,
             request.Time,
             request.Endpoint,
+            RaftOperationStatus.Success,
             request.Logs
         ));
     }
@@ -100,6 +102,7 @@ public sealed class RaftPartition
             request.CommitIndex,
             request.Time,
             request.Endpoint,
+            request.Status,
             null
         ));
     }
@@ -110,24 +113,22 @@ public sealed class RaftPartition
     /// <param name="type"></param>
     /// <param name="data"></param>
     /// <returns></returns>
-    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(string type, byte[] data)
+    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, byte[] data)
     {
         if (string.IsNullOrEmpty(Leader))
-            return (false, RaftOperationStatus.NodeIsNotLeader, -1);
+            return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
         
         if (Leader != raftManager.LocalEndpoint)
-            return (false, RaftOperationStatus.NodeIsNotLeader, -1);
+            return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
+
+        List<RaftLog> logsToReplicate = [new() { Type = RaftLogType.Proposed, LogType = type, LogData = data }];
         
-        RaftResponse response = await raftActor.Ask(new(
-            RaftRequestType.ReplicateLogs, 
-            [new() { Type = RaftLogType.Proposed, LogType = type, LogData = data }]), 
-            TimeSpan.FromSeconds(5)
-        ).ConfigureAwait(false);
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate)).ConfigureAwait(false); 
         
         if (response.Status == RaftOperationStatus.Success)
-            return (true, response.Status, response.CurrentIndex);
+            return (true, response.Status, response.TicketId);
         
-        return (false, response.Status, response.CurrentIndex);
+        return (false, response.Status, HLCTimestamp.Zero);
     }
     
     /// <summary>
@@ -136,22 +137,22 @@ public sealed class RaftPartition
     /// <param name="type"></param>
     /// <param name="logs"></param>
     /// <returns></returns>
-    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(string type, IEnumerable<byte[]> logs)
+    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, IEnumerable<byte[]> logs)
     {
         if (string.IsNullOrEmpty(Leader))
-            return (false, RaftOperationStatus.NodeIsNotLeader, -1);
+            return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
         
         if (Leader != raftManager.LocalEndpoint)
-            return (false, RaftOperationStatus.NodeIsNotLeader, -1);
+            return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
 
         List<RaftLog> logsToReplicate = logs.Select(data => new RaftLog { Type = RaftLogType.Proposed, LogType = type, LogData = data }).ToList();
         
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate), TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate)).ConfigureAwait(false);
         
         if (response.Status == RaftOperationStatus.Success)
-            return (true, response.Status, response.CurrentIndex);
+            return (true, response.Status, response.TicketId);
         
-        return (false, response.Status, response.CurrentIndex);
+        return (false, response.Status, HLCTimestamp.Zero);
     }
 
     /// <summary>
@@ -166,7 +167,7 @@ public sealed class RaftPartition
             return (false, -1);
         
         RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateCheckpoint), TimeSpan.FromSeconds(5)).ConfigureAwait(false);
-        return (true, response.CurrentIndex);
+        return (true, response.CommitIndex);
     }
 
     /// <summary>
@@ -174,16 +175,32 @@ public sealed class RaftPartition
     /// </summary>
     /// <returns></returns>
     /// <exception cref="RaftException"></exception>
-    public async ValueTask<NodeState> GetState()
+    public async ValueTask<RaftNodeState> GetState()
     {
         if (!string.IsNullOrEmpty(Leader) && Leader == raftManager.LocalEndpoint)
-            return NodeState.Leader;
+            return RaftNodeState.Leader;
 
         RaftResponse response = await raftActor.Ask(RaftStateRequest, TimeSpan.FromSeconds(5)).ConfigureAwait(false);
         
-        if (response.Type == RaftResponseType.None)
+        if (response.Type != RaftResponseType.NodeState)
             throw new RaftException("Unknown response (2)");
 
-        return response.State;
+        return response.NodeState;
+    }
+    
+    /// <summary>
+    /// Obtain the ticket state by the specified ticketId
+    /// </summary>
+    /// <param name="ticketId"></param>
+    /// <returns></returns>
+    /// <exception cref="RaftException"></exception>
+    public async Task<(RaftTicketState state, long commitId)> GetTicketState(HLCTimestamp ticketId)
+    {
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.GetTicketState, ticketId), TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        
+        if (response.Type != RaftResponseType.TicketState)
+            throw new RaftException("Unknown response (2)");
+
+        return (response.TicketState, response.CommitIndex);
     }
 }

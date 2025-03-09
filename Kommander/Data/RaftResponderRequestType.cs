@@ -6,7 +6,5 @@ public enum RaftResponderRequestType
     Vote,
     RequestVotes,
     AppendLogs,
-    CompleteAppendLogs,
-    RequestAcknowledgment,
-    Acknowledgment
+    CompleteAppendLogs
 }
