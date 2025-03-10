@@ -265,16 +265,16 @@ public sealed class RaftManager : IRaft
     /// Replicates a checkpoint to the follower nodes
     /// </summary>
     /// <param name="partitionId"></param>
-    public async Task<(bool success, long commitLogId)> ReplicateCheckpoint(int partitionId)
+    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateCheckpoint(int partitionId)
     {
         RaftPartition partition = GetPartition(partitionId);
         
-        (bool success, long commitLogId) = await partition.ReplicateCheckpoint().ConfigureAwait(false);
+        (bool success, RaftOperationStatus status, HLCTimestamp ticketId) = await partition.ReplicateCheckpoint().ConfigureAwait(false);
         
         if (!success)
-            return (success, -1);
-
-        return (true, commitLogId);
+            return (success, status, -1);
+        
+        return await WaitForReplication(partition, ticketId);
     }
     
     /// <summary>

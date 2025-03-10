@@ -65,7 +65,7 @@ try
         
         node.OnReplicationRestored += log =>
         {
-            Console.WriteLine("Replication restored: {0} {1} {2}", log.Id, log.LogType, Encoding.UTF8.GetString(log.LogData ?? []));
+            Console.WriteLine("Replication restored: {0} {1} {2} {3}", log.Id, log.Type, log.LogType, Encoding.UTF8.GetString(log.LogData ?? []));
             
             return Task.FromResult(true);
         };

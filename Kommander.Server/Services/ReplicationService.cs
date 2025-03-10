@@ -31,37 +31,45 @@ public class ReplicationService : BackgroundService //, IDisposable
                         const string logType = "Greeting";
                         byte[] data = Encoding.UTF8.GetBytes("Hello, World! " + DateTime.UtcNow);
 
-                        //for (int j = 0; j < 20; j++)
-                        //{
-                            (bool success, RaftOperationStatus status, long commitLogId) = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
+                        bool success;
+                        RaftOperationStatus status;
+                        long commitLogId;
+
+                        for (int j = 0; j < 20; j++)
+                        {
+                            (success, status, commitLogId) = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
                             if (success)
                                 Console.WriteLine("#1 Replicated log with id: {0}", commitLogId);
                             else
                                 Console.WriteLine("#1 Replication failed {0}", status);
 
-                            /*(success, commitLogId) = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
+                            (success, status, commitLogId) = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
                             if (success)
                                 Console.WriteLine("#2 Replicated log with id: {0}", commitLogId);
                             else
-                                Console.WriteLine("#2 Replicated failed");
+                                Console.WriteLine("#2 Replication failed {0}", status);
 
-                            (success, commitLogId) = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
+                            (success, status, commitLogId) = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
                             if (success)
                                 Console.WriteLine("#3 Replicated log with id: {0}", commitLogId);
                             else
-                                Console.WriteLine("#3 Replicated failed");*/
-                        //}
+                                Console.WriteLine("#3 Replication failed {0}", status);
+                        }
 
-                        await raftManager.ReplicateCheckpoint(i).ConfigureAwait(false);
+                        (success, status, commitLogId) = await raftManager.ReplicateCheckpoint(i).ConfigureAwait(false);
+                        if (success)
+                            Console.WriteLine("#C Replicated checkpoint log with id: {0}", commitLogId);
+                        else
+                            Console.WriteLine("#C Replication checkpoint failed {0}", status);
                     }
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine("{0}# {1}", i, ex.Message);
+                    Console.WriteLine("ReplicationServiceException: {0}# {1}", i, ex.Message);
                 }
             }
 
-            await Task.Delay(10000, stoppingToken);
+            await Task.Delay(30000, stoppingToken);
         }
     }
 }

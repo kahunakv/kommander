@@ -158,16 +158,20 @@ public sealed class RaftPartition
     /// <summary>
     /// Replicate a checkpoint to the partition.
     /// </summary>
-    public async Task<(bool success, long commitLogId)>  ReplicateCheckpoint()
+    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)>  ReplicateCheckpoint()
     {
         if (string.IsNullOrEmpty(Leader))
-            return (false, -1);
+            return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
         
         if (Leader != raftManager.LocalEndpoint)
-            return (false, -1);
+            return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
         
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateCheckpoint), TimeSpan.FromSeconds(5)).ConfigureAwait(false);
-        return (true, response.CommitIndex);
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateCheckpoint)).ConfigureAwait(false);
+        
+        if (response.Status == RaftOperationStatus.Success)
+            return (true, response.Status, response.TicketId);
+        
+        return (false, response.Status, HLCTimestamp.Zero);
     }
 
     /// <summary>

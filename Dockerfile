@@ -22,7 +22,7 @@ COPY --from=build-env /app .
 COPY certs/development-certificate.pfx /app/certificate.pfx
 
 # install sqlite to debug
-RUN apt update && apt upgrade && apt-get -y install sqlite3
+# RUN apt update && apt upgrade && apt-get -y install sqlite3
 
 ARG KOMMANDER_RAFT_NODEID
 ARG KOMMANDER_RAFT_HOST

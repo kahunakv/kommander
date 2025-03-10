@@ -12,8 +12,6 @@ namespace Kommander;
 /// </summary>
 public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALResponse>
 {
-    private const int MaxLogEntries = 10000;
-
     private readonly RaftManager manager;
 
     private readonly RaftPartition partition;
@@ -121,7 +119,10 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                         break;
                 }
 
-                if (!await manager.InvokeReplicationRestored(log).ConfigureAwait(false))
+                if (log.Type != RaftLogType.Committed)
+                    continue;
+                
+                if (!await manager.InvokeReplicationReceived(log).ConfigureAwait(false))
                     manager.InvokeReplicationError(log);
             }
             catch (Exception ex)
@@ -215,23 +216,23 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             switch (log.Type)
             {
                 case RaftLogType.Proposed or RaftLogType.ProposedCheckpoint when log.Id < (proposeIndex - 1): 
-                    logger.LogWarning(
+                    /*logger.LogWarning(
                         "[{Endpoint}/{Partition}] Proposed log #{Id} is not the expected #{ProposeIndex}",
                         manager.LocalEndpoint, 
                         partition.PartitionId, 
                         log.Id, 
                         proposeIndex
-                    );
+                    );*/
                     break;
                 
                 case RaftLogType.Committed or RaftLogType.CommittedCheckpoint when log.Id < (commitIndex - 1):
-                    logger.LogWarning(
+                    /*logger.LogWarning(
                         "[{Endpoint}/{Partition}] Committed log #{Id} is not the expected #{CommitIndex}",
                         manager.LocalEndpoint, 
                         partition.PartitionId, 
                         log.Id, 
                         commitIndex
-                    );
+                    );*/
                     break;
                 
                 default:
@@ -241,13 +242,23 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         }
 
         if (allOutdated)
+        {
+            logger.LogWarning(
+                "[{Endpoint}/{Partition}] All replicated indexes are included already in the log Min={Min} Max={Max}",
+                manager.LocalEndpoint, 
+                partition.PartitionId,
+                logs.Min(log => log.Id),
+                logs.Max(log => log.Id)
+            );
+            
             return Math.Max(proposeIndex, commitIndex);
+        }
 
         foreach (RaftLog log in orderedLogs)
         {
             switch (log.Type)
             {
-                case RaftLogType.Proposed when log.Id > proposeIndex:
+                case RaftLogType.Proposed when log.Id >= proposeIndex:
                     await walAdapter.Propose(partition.PartitionId, log).ConfigureAwait(false);
                 
                     logger.LogDebug("[{Endpoint}/{Partition}] Proposed log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
@@ -255,7 +266,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                     proposeIndex = log.Id + 1;
                     break;
                 
-                case RaftLogType.Committed when log.Id > commitIndex:
+                case RaftLogType.Committed when log.Id >= commitIndex:
                 {
                     await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
                 
@@ -268,7 +279,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                     break;
                 }
                 
-                case RaftLogType.ProposedCheckpoint when log.Id > proposeIndex:
+                case RaftLogType.ProposedCheckpoint when log.Id >= proposeIndex:
                     await walAdapter.Propose(partition.PartitionId, log).ConfigureAwait(false);
                 
                     logger.LogDebug("[{Endpoint}/{Partition}] Proposed checkpoint log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
@@ -276,7 +287,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                     proposeIndex = log.Id + 1;
                     break;
                 
-                case RaftLogType.CommittedCheckpoint when log.Id > commitIndex:
+                case RaftLogType.CommittedCheckpoint when log.Id >= commitIndex:
                     await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
                 
                     logger.LogDebug("[{Endpoint}/{Partition}] Committed checkpoint log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);

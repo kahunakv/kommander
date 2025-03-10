@@ -119,9 +119,6 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         this.manager = manager;
         this.partition = partition;
         this.logger = logger;
-
-        //int x = GetHashInRange(manager.LocalNodeId, );
-        //Console.WriteLine($"ElectionTimeout: {manager.LocalNodeId} {x}");
         
         electionTimeout = TimeSpan.FromMilliseconds(Random.Shared.Next(
             manager.Configuration.StartElectionTimeout, 
@@ -207,8 +204,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
                 case RaftRequestType.ReplicateCheckpoint:
                 {
-                    (RaftOperationStatus status, long commitId) = await ReplicateCheckpoint().ConfigureAwait(false);
-                    return new(RaftResponseType.None, status, commitId);
+                    (RaftOperationStatus status, HLCTimestamp ticketId) = await ReplicateCheckpoint().ConfigureAwait(false);
+                    return new(RaftResponseType.None, status, ticketId);
                 }
 
                 default:
@@ -278,7 +275,13 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 return;
             
             case RaftNodeState.Candidate:
-                logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Voting concluded after {Elapsed}ms. No quorum available", manager.LocalEndpoint, partition.PartitionId, nodeState, (currentTime - votingStartedAt));
+                logger.LogInformation(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] Voting concluded after {Elapsed}ms. No quorum available", 
+                    manager.LocalEndpoint, 
+                    partition.PartitionId, 
+                    nodeState, 
+                    (currentTime - votingStartedAt).TotalMilliseconds
+                );
             
                 nodeState = RaftNodeState.Follower; 
                 partition.Leader = "";
@@ -286,6 +289,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 electionTimeout += TimeSpan.FromMilliseconds(Random.Shared.Next(manager.Configuration.StartElectionTimeoutIncrement, manager.Configuration.EndElectionTimeoutIncrement));
                 expectedLeaders.Clear();
                 lastCommitIndexes.Clear();
+                activeProposals.Clear();
                 return;
             
             // if node is follower and leader is not sending hearthbeats, start an election
@@ -307,7 +311,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         
                 IncreaseVotes(manager.LocalEndpoint, currentTerm);
 
-                logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Voted to become leader after {LastHeartbeat}ms. Term={CurrentTerm}", manager.LocalEndpoint, partition.PartitionId, nodeState, currentTime - lastHeartbeat, currentTerm);
+                logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Voted to become leader after {LastHeartbeat}ms. Term={CurrentTerm}", manager.LocalEndpoint, partition.PartitionId, nodeState, (currentTime - lastHeartbeat).TotalMilliseconds, currentTerm);
 
                 await RequestVotes(currentTime).ConfigureAwait(false);
                 break;
@@ -444,12 +448,6 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <param name="remoteMaxLogId"></param>
     private async Task ReceivedVote(string endpoint, long voteTerm, long remoteMaxLogId)
     {
-        if (nodeState == RaftNodeState.Leader)
-        {
-            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Node} but already declared as leader Term={Term}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, voteTerm);
-            return;
-        }
-
         if (nodeState == RaftNodeState.Follower)
         {
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Node} but we didn't ask for it Term={Term}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, voteTerm);
@@ -462,18 +460,47 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
         
+        if (nodeState == RaftNodeState.Leader)
+        {
+            lastCommitIndexes[endpoint] = remoteMaxLogId;
+            
+            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Node} but already declared as leader Term={Term}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, voteTerm);
+            return;
+        }
+        
         RaftWALResponse maxLogResponse = await walActor.Ask(new(RaftWALActionType.GetMaxLog)).ConfigureAwait(false);
 
         if (maxLogResponse.Index < remoteMaxLogId)
         {
-            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} but remote node is on a higher CommitId={CommitId} Local={LocalCommitId}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, remoteMaxLogId, maxLogResponse.Index);
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} but remote node is on a higher RemoteCommitId={CommitId} Local={LocalCommitId}. Ignoring...", 
+                manager.LocalEndpoint, 
+                partition.PartitionId, 
+                nodeState, 
+                endpoint, 
+                remoteMaxLogId, 
+                maxLogResponse.Index
+            );
             return;
         }
 
         int numberVotes = IncreaseVotes(endpoint, voteTerm);
         int quorum = Math.Max(2, (int)Math.Floor((manager.Nodes.Count + 1) / 2f));
+        lastCommitIndexes[endpoint] = remoteMaxLogId;
         
-        logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} Term={Term} Votes={Votes} Quorum={Quorum}/{Total}", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, voteTerm, numberVotes, quorum, manager.Nodes.Count + 1);
+        logger.LogInformation(
+            "[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} Term={Term} Votes={Votes} Quorum={Quorum}/{Total} RemoteCommitId={CommitId} Local={LocalCommitId}", 
+            manager.LocalEndpoint, 
+            partition.PartitionId, 
+            nodeState, 
+            endpoint, 
+            voteTerm, 
+            numberVotes, 
+            quorum, 
+            manager.Nodes.Count + 1, 
+            remoteMaxLogId, 
+            maxLogResponse.Index
+        );
 
         if (numberVotes < quorum)
             return;
@@ -481,7 +508,22 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         nodeState = RaftNodeState.Leader;
         partition.Leader = manager.LocalEndpoint;
 
-        logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} and proclamed leader Term={Term} Votes={Votes} Quorum={Quorum}/{Total}", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, voteTerm, numberVotes, quorum, manager.Nodes.Count + 1);
+        lastHeartbeat = await manager.HybridLogicalClock.SendOrLocalEvent();
+
+        logger.LogInformation(
+            "[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} and proclamed leader in {Elapsed}ms Term={Term} Votes={Votes} Quorum={Quorum}/{Total} RemoteCommitId={CommitId} Local={LocalCommitId}", 
+            manager.LocalEndpoint, 
+            partition.PartitionId, 
+            nodeState, 
+            endpoint, 
+            (lastHeartbeat - votingStartedAt).TotalMilliseconds, 
+            voteTerm, 
+            numberVotes, 
+            quorum, 
+            manager.Nodes.Count + 1,
+            remoteMaxLogId, 
+            maxLogResponse.Index
+        );
 
         await SendHearthbeat();
     }
@@ -522,6 +564,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 nodeState = RaftNodeState.Follower;
                 currentTerm = leaderTerm;
                 lastCommitIndexes.Clear();
+                activeProposals.Clear();
                 expectedLeaders.TryAdd(leaderTerm, endpoint);
             }
         }
@@ -639,10 +682,19 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// Replicates the checkpoint to other nodes in the cluster when the node is the leader.
     /// </summary>
     /// <returns></returns>
-    private async Task<(RaftOperationStatus, long commitId)> ReplicateCheckpoint()
+    private async Task<(RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateCheckpoint()
     {
         if (nodeState != RaftNodeState.Leader)
-            return (RaftOperationStatus.NodeIsNotLeader, -1);
+            return (RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
+        
+        List<RaftNode> nodes = manager.Nodes;
+        
+        if (nodes.Count == 0)
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] No quorum available to propose logs", manager.LocalEndpoint, partition.PartitionId, nodeState);
+            
+            return (RaftOperationStatus.Errored, HLCTimestamp.Zero);
+        }
         
         HLCTimestamp currentTime = await manager.HybridLogicalClock.SendOrLocalEvent().ConfigureAwait(false);
         
@@ -655,34 +707,40 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             LogType = "",
             LogData = []
         }];
-
+        
+        // Append proposal logs to the Write-Ahead Log
         RaftWALResponse proposeResponse = await walActor.Ask(new(RaftWALActionType.Propose, currentTerm, currentTime, checkpointLogs)).ConfigureAwait(false);
-       
-        // Replicate the checkpoint to other nodes in the cluster
-        /*if (!await ProposeLogsToNodes(currentTime).ConfigureAwait(false))
+        if (proposeResponse.Status != RaftOperationStatus.Success)
         {
-            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] No quorum available to commit checkpoint log {CommitIndex}", manager.LocalEndpoint, partition.PartitionId, state, proposeResponse.Index);
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't save proposed logs to local persistence", manager.LocalEndpoint, partition.PartitionId, nodeState);
             
-            return (RaftOperationStatus.Errored, proposeResponse.Index);
+            return (RaftOperationStatus.Errored, HLCTimestamp.Zero);
         }
 
-        // Commit logs to the Write-Ahead Log
-        RaftWALResponse commitResponse = await walActor.Ask(new(RaftWALActionType.Commit, currentTerm, currentTime, checkpointLogs)).ConfigureAwait(false);
-        if (commitResponse.Status != RaftOperationStatus.Success)
-        {
-            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't commit logs {CommitIndex}", manager.LocalEndpoint, partition.PartitionId, state, proposeResponse.Index);
+        RaftProposalQuorum proposalQuorum = new(checkpointLogs);
 
-            return (RaftOperationStatus.Errored, commitResponse.Index);
+        foreach (RaftNode node in nodes)
+        {
+            if (node.Endpoint == manager.LocalEndpoint)
+                throw new RaftException("Corrupted nodes");
+            
+            proposalQuorum.AddExpectedCompletion(node.Endpoint);
+            
+            await AppendLogToNode(node, currentTime, false);
         }
 
-        if (!await CommitLogsToNodes(currentTime).ConfigureAwait(false))
-        {
-            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't notify committed logs to followers", manager.LocalEndpoint, partition.PartitionId, state);
-            
-            return (RaftOperationStatus.Errored, commitResponse.Index);
-        }*/
+        activeProposals.TryAdd(currentTime, proposalQuorum);
+        
+        logger.LogInformation(
+            "[{LocalEndpoint}/{PartitionId}/{State}] Proposed checkpoint logs {Timestamp} Logs={Logs}", 
+            manager.LocalEndpoint, 
+            partition.PartitionId, 
+            nodeState, 
+            currentTime, 
+            checkpointLogs.Count
+        );
 
-        return (RaftOperationStatus.Success, -1);
+        return (RaftOperationStatus.Success, currentTime);
     }
 
     /// <summary>
@@ -739,10 +797,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <param name="timestamp"></param>
     /// <param name="status"></param>
     /// <param name="committedIndex"></param>
-    private async Task CompleteAppendLogs(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex)
+    private async ValueTask CompleteAppendLogs(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex)
     {
-        await Task.CompletedTask;
-
         if (committedIndex > 0)
         {
             lastCommitIndexes[endpoint] = committedIndex;

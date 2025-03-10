@@ -130,7 +130,7 @@ public interface IRaft
     /// Replicate a checkpoint to the followers in the partition    
     /// </summary>
     /// <param name="partitionId"></param>
-    public Task<(bool success, long commitLogId)> ReplicateCheckpoint(int partitionId);
+    public Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateCheckpoint(int partitionId);
 
     /// <summary>
     /// Obtains the local endpoint
