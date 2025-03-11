@@ -189,8 +189,13 @@ to followers to confirm its availability and health.
 
 - **Communication**: Nodes communicate with each other via RPCs to
 handle leader elections, send heartbeats, and replicate logs.
-**Kommander** supports communication using either **gRPC** or **REST/JSON**,
+**Kommander** supports communication using either **gRPC** or **Rest/Json**,
 both of which offer distinct advantages and are widely familiar to developers.
+
+- **Log Id**: Kommmander maintains a per partition 64-bit cluster-wide counter, 
+known as the log id, which increments each time a new proposal is added. 
+This revision functions as a global logical clock, ensuring a sequential order for all 
+updates to the partition log. Each new log id represents an incremental change. 
 
 ---
 

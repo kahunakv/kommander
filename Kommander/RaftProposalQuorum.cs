@@ -4,6 +4,8 @@ public sealed class RaftProposalQuorum
 {
     private readonly Dictionary<string, bool> nodes = [];
 
+    private bool completed;
+
     public List<string> Nodes => nodes.Keys.ToList();
 
     public List<RaftLog> Logs { get; }
@@ -27,7 +29,16 @@ public sealed class RaftProposalQuorum
     
     public bool HasQuorum()
     {
+        if (completed)
+            return true;
+        
         int quorum = Math.Max(2, (int)Math.Floor((nodes.Count + 1) / 2f));
-        return nodes.Values.Count(x => x) >= quorum;
+        if (nodes.Values.Count(x => x) >= quorum)
+        {
+            completed = true;
+            return true;
+        }
+
+        return false;
     }
 }

@@ -1,10 +1,8 @@
 
 using System.Collections.Concurrent;
-using System.Text;
 using Google.Protobuf.Collections;
 using Grpc.Net.Client;
 using Kommander.Data;
-using Kommander.Time;
 
 namespace Kommander.Communication.Grpc;
 
@@ -13,6 +11,14 @@ namespace Kommander.Communication.Grpc;
 /// </summary>
 public class GrpcCommunication : ICommunication
 {
+    private static readonly RequestVotesResponse requestVotesResponse = new();
+    
+    private static readonly VoteResponse voteResponse = new();
+    
+    private static readonly AppendLogsResponse appendLogsResponse = new();
+    
+    private static readonly CompleteAppendLogsResponse completeAppendLogsResponse = new();
+    
     private static readonly HttpClientHandler httpHandler = GetHandler();
     
     private readonly ConcurrentDictionary<string, GrpcChannel> channels = new();
@@ -65,7 +71,7 @@ public class GrpcCommunication : ICommunication
         
         //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got RequestVotes reply from {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
 
-        return new();
+        return requestVotesResponse;
     }
 
     public async Task<VoteResponse> Vote(RaftManager manager, RaftPartition partition, RaftNode node, VoteRequest request)
@@ -94,7 +100,7 @@ public class GrpcCommunication : ICommunication
         
         //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got Vote reply from {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
         
-        return new();
+        return voteResponse;
     }
 
     public async Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftPartition partition, RaftNode node, AppendLogsRequest request)
@@ -120,7 +126,7 @@ public class GrpcCommunication : ICommunication
         
         await client.AppendLogsAsync(grpcRequest).ConfigureAwait(false);
         
-        return new();
+        return appendLogsResponse;
     }
     
     public async Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftPartition partition, RaftNode node, CompleteAppendLogsRequest request)
@@ -146,7 +152,7 @@ public class GrpcCommunication : ICommunication
         
         await client.CompleteAppendLogsAsync(grpcRequest).ConfigureAwait(false);
         
-        return new();
+        return completeAppendLogsResponse;
     }
 
     private static RepeatedField<GrpcRaftLog> GetLogs(List<RaftLog> requestLogs)

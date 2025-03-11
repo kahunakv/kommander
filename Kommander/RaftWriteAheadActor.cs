@@ -134,7 +134,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         }
 
         if (!found)
-            commitIndex = await GetMaxLog() + 1;
+            commitIndex = await GetMaxLog().ConfigureAwait(false) + 1;
 
         manager.InvokeRestoreFinished();
 

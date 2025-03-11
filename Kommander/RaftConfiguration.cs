@@ -64,12 +64,12 @@ public class RaftConfiguration
     /// <summary>
     /// If followers hadn't received a heartbeat from the leader in this time, they will start an election
     /// </summary>
-    public int StartElectionTimeout { get; set; } = 1000;
+    public int StartElectionTimeout { get; set; } = 2000;
     
     /// <summary>
     /// If followers hadn't received a heartbeat from the leader in this time, they will start an election
     /// </summary>
-    public int EndElectionTimeout { get; set; } = 1500;
+    public int EndElectionTimeout { get; set; } = 3000;
     
     /// <summary>
     /// Increment election timeout by this value every time the node couldn't find quorum
