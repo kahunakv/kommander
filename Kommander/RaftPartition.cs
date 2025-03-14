@@ -10,9 +10,11 @@ namespace Kommander;
 /// <summary>
 /// Represents a partition in a Raft cluster.
 /// </summary>
-public sealed class RaftPartition
+public sealed class RaftPartition : IDisposable
 {
     private static readonly RaftRequest RaftStateRequest = new(RaftRequestType.GetNodeState);
+    
+    private readonly SemaphoreSlim semaphore = new(1, 1);
 
     private readonly IActorRefStruct<RaftStateActor, RaftRequest, RaftResponse> raftActor;
 
@@ -206,5 +208,10 @@ public sealed class RaftPartition
             throw new RaftException("Unknown response (2)");
 
         return (response.TicketState, response.CommitIndex);
+    }
+
+    public void Dispose()
+    {
+        semaphore.Dispose();
     }
 }

@@ -28,6 +28,8 @@ public sealed class RaftManager : IRaft
     private readonly RaftConfiguration configuration;
     
     private readonly IWAL walAdapter;
+    
+    private readonly IDiscovery discovery;
 
     private readonly ICommunication communication;
 
@@ -58,6 +60,16 @@ public sealed class RaftManager : IRaft
     /// Current Communication adapter
     /// </summary>
     public ICommunication Communication => communication;
+    
+    /// <summary>
+    /// Current Discovery adapter
+    /// </summary>
+    public IDiscovery Discovery => discovery;
+    
+    /// <summary>
+    /// 
+    /// </summary>
+    public ClusterHandler ClusterHandler => clusterHandler;
     
     /// <summary>
     /// Current Raft configuration
@@ -117,6 +129,7 @@ public sealed class RaftManager : IRaft
         this.actorSystem = actorSystem;
         this.configuration = configuration;
         this.walAdapter = walAdapter;
+        this.discovery = discovery;
         this.communication = communication;
         this.hybridLogicalClock = hybridLogicalClock;
         
@@ -233,8 +246,16 @@ public sealed class RaftManager : IRaft
     public async Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(int partitionId, string type, byte[] data)
     {
         RaftPartition partition = GetPartition(partitionId);
-        
-        (bool success, RaftOperationStatus status, HLCTimestamp ticketId) = await partition.ReplicateLogs(type, data).ConfigureAwait(false);
+
+        bool success;
+        HLCTimestamp ticketId;
+        RaftOperationStatus status;
+
+        do
+        {
+            (success, status, ticketId) = await partition.ReplicateLogs(type, data).ConfigureAwait(false);
+
+        } while (status == RaftOperationStatus.ActiveProposal);
         
         if (!success)
             return (success, status, -1);
@@ -253,7 +274,15 @@ public sealed class RaftManager : IRaft
     {
         RaftPartition partition = GetPartition(partitionId);
         
-        (bool success, RaftOperationStatus status, HLCTimestamp ticketId) = await partition.ReplicateLogs(type, logs).ConfigureAwait(false);
+        bool success;
+        HLCTimestamp ticketId;
+        RaftOperationStatus status;
+
+        do
+        {
+            (success, status, ticketId) = await partition.ReplicateLogs(type, logs).ConfigureAwait(false);
+
+        } while (status == RaftOperationStatus.ActiveProposal);
         
         if (!success)
             return (success, status, -1);
@@ -269,7 +298,15 @@ public sealed class RaftManager : IRaft
     {
         RaftPartition partition = GetPartition(partitionId);
         
-        (bool success, RaftOperationStatus status, HLCTimestamp ticketId) = await partition.ReplicateCheckpoint().ConfigureAwait(false);
+        bool success;
+        HLCTimestamp ticketId;
+        RaftOperationStatus status;
+
+        do
+        {
+            (success, status, ticketId) = await partition.ReplicateCheckpoint().ConfigureAwait(false);
+
+        } while (status == RaftOperationStatus.ActiveProposal);
         
         if (!success)
             return (success, status, -1);
