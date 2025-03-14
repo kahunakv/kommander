@@ -241,7 +241,7 @@ public class TestFaultyThreeNode
         
         Assert.NotEqual(leader.GetLocalEndpoint(), newLeader.GetLocalEndpoint());
         
-        followers = await GetFollowers(0,newFollowers);
+        followers = await GetFollowers(0, newFollowers);
         Assert.NotEmpty(followers);
         Assert.Single(followers);
 
@@ -269,7 +269,7 @@ public class TestFaultyThreeNode
 
         foreach (IRaft follower in followers)
         {
-            //Console.WriteLine("@ follower {0}", follower.GetLocalEndpoint());
+            Console.WriteLine("@ follower {0}", follower.GetLocalEndpoint());
             ((DynamicDiscovery)follower.Discovery).AddNode(new(newNode.GetLocalEndpoint()));
         }
 
