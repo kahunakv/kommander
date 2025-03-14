@@ -35,20 +35,24 @@ public sealed class RaftResponderActor : IActor<RaftResponderRequest>
         {
             switch (message.Type)
             {
-                case RaftResponderRequestType.Vote:
-                    await Vote(message);
-                    break;
-                
                 case RaftResponderRequestType.AppendLogs:
                     await AppendLogs(message);
+                    break;
+                
+                case RaftResponderRequestType.CompleteAppendLogs:
+                    await CompleteAppendLogs(message);
+                    break;
+                
+                case RaftResponderRequestType.Vote:
+                    await Vote(message);
                     break;
                 
                 case RaftResponderRequestType.RequestVotes:
                     await RequestVotes(message);
                     break;
                 
-                case RaftResponderRequestType.CompleteAppendLogs:
-                    await CompleteAppendLogs(message);
+                case RaftResponderRequestType.Handshake:
+                    await Handshake(message);
                     break;
                 
                 default:
@@ -60,6 +64,17 @@ public sealed class RaftResponderActor : IActor<RaftResponderRequest>
         {
             Console.WriteLine(ex);
         }
+    }
+    
+    private async Task Handshake(RaftResponderRequest message)
+    {
+        if (message.Node is null)
+            return;
+        
+        if (message.HandshakeRequest is null)
+            return;
+                
+        await communication.Handshake(manager, partition, message.Node, message.HandshakeRequest);
     }
     
     private async Task Vote(RaftResponderRequest message)

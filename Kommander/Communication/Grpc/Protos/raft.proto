@@ -2,10 +2,21 @@
 syntax = "proto3";
 
 service Rafter {
+  rpc Handshake (GrpcHandshakeRequest) returns (GrpcHandshakeResponse);
   rpc Vote (GrpcVoteRequest) returns (GrpcVoteResponse);
   rpc RequestVotes (GrpcRequestVotesRequest) returns (GrpcRequestVotesResponse);
   rpc AppendLogs (GrpcAppendLogsRequest) returns (GrpcAppendLogsResponse);
   rpc CompleteAppendLogs (GrpcCompleteAppendLogsRequest) returns (GrpcCompleteAppendLogsResponse);
+}
+
+message GrpcHandshakeRequest {
+  int32 Partition = 1;
+  int64 MaxLogId = 2;
+  string Endpoint = 3;
+}
+
+message GrpcHandshakeResponse {
+
 }
 
 message GrpcVoteRequest {

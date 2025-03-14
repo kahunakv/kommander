@@ -192,9 +192,19 @@ public sealed class RaftManager : IRaft
 
         return partitions[partition]!;
     }
+    
+    /// <summary>
+    /// Passes the Handshake to the appropriate partition
+    /// </summary>
+    /// <param name="request"></param>
+    public void Handshake(HandshakeRequest request)
+    {
+        RaftPartition partition = GetPartition(request.Partition);
+        partition.Handshake(request);
+    }
 
     /// <summary>
-    /// Passes the request to the appropriate partition
+    /// Passes the RequestVote to the appropriate partition
     /// </summary>
     /// <param name="request"></param>
     public void RequestVote(RequestVotesRequest request)

@@ -7,6 +7,8 @@ namespace Kommander.Communication.Grpc;
 
 public class RaftService : Rafter.RafterBase
 {
+    private  static readonly Task<GrpcHandshakeResponse> handshakeResponse = Task.FromResult(new GrpcHandshakeResponse());
+    
     private  static readonly Task<GrpcVoteResponse> voteResponse = Task.FromResult(new GrpcVoteResponse());
 
     private static readonly Task<GrpcRequestVotesResponse> requestVoteResponse = Task.FromResult(new GrpcRequestVotesResponse());
@@ -21,6 +23,19 @@ public class RaftService : Rafter.RafterBase
     {
         this.raft = raft;
         this.logger = logger;
+    }
+    
+    public override Task<GrpcHandshakeResponse> Handshake(GrpcHandshakeRequest request, ServerCallContext context)
+    {
+        //logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got Vote message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
+
+        raft.Handshake(new(
+            request.Partition,
+            request.MaxLogId,
+            request.Endpoint
+        ));
+        
+        return handshakeResponse;
     }
     
     public override Task<GrpcVoteResponse> Vote(GrpcVoteRequest request, ServerCallContext context)

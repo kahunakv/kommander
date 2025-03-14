@@ -89,6 +89,12 @@ public interface IRaft
     public Task UpdateNodes();
 
     /// <summary>
+    /// Passes the Handshake to the appropriate partition
+    /// </summary>
+    /// <param name="request"></param>
+    public void Handshake(HandshakeRequest request);
+
+    /// <summary>
     /// Requests a votes from other nodes in the cluster
     /// </summary>
     /// <param name="request"></param>

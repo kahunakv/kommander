@@ -10,6 +10,32 @@ namespace Kommander.Communication.Rest;
 /// </summary>
 public class RestCommunication : ICommunication
 {
+    public async Task<HandshakeResponse> Handshake(RaftManager manager, RaftPartition partition, RaftNode node, HandshakeRequest request)
+    {
+        RaftConfiguration configuration = manager.Configuration;
+        
+        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.HandshakeRequest);
+        
+        try
+        {
+            return await (configuration.HttpScheme + node.Endpoint)
+                .WithOAuthBearerToken(configuration.HttpAuthBearerToken)
+                .AppendPathSegments("v1/raft/handshake")
+                .WithHeader("Accept", "application/json")
+                .WithHeader("Content-Type", "application/json")
+                .WithTimeout(configuration.HttpTimeout)
+                .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
+                .PostStringAsync(payload)
+                .ReceiveJson<HandshakeResponse>().ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            manager.Logger.LogError("[{Endpoint}/{Partition}] Handshake: {Message}", manager.LocalEndpoint, partition.PartitionId, e.Message);
+        }
+        
+        return new();
+    }
+    
     public async Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftPartition partition, RaftNode node, RequestVotesRequest request)
     {
         RaftConfiguration configuration = manager.Configuration;

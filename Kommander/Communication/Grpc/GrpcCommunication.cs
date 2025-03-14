@@ -11,6 +11,10 @@ namespace Kommander.Communication.Grpc;
 /// </summary>
 public class GrpcCommunication : ICommunication
 {
+    private readonly ConcurrentDictionary<string, GrpcChannel> channels = new();
+    
+    private static readonly HandshakeResponse handshakeResponse = new();
+    
     private static readonly RequestVotesResponse requestVotesResponse = new();
     
     private static readonly VoteResponse voteResponse = new();
@@ -20,8 +24,6 @@ public class GrpcCommunication : ICommunication
     private static readonly CompleteAppendLogsResponse completeAppendLogsResponse = new();
     
     private static readonly HttpClientHandler httpHandler = GetHandler();
-    
-    private readonly ConcurrentDictionary<string, GrpcChannel> channels = new();
     
     private static HttpClientHandler GetHandler()
     {
@@ -44,16 +46,48 @@ public class GrpcCommunication : ICommunication
         
         return handler;
     }
+
+    /// <summary>
+    /// Sends a Handshake message to a node via gRPC
+    /// </summary>
+    /// <param name="manager"></param>
+    /// <param name="partition"></param>
+    /// <param name="node"></param>
+    /// <param name="request"></param>
+    /// <returns></returns>
+    public async Task<HandshakeResponse> Handshake(RaftManager manager, RaftPartition partition, RaftNode node, HandshakeRequest request)
+    {
+        GrpcChannel channel = GetChannel(node.Endpoint);
+
+        Rafter.RafterClient client = new(channel);
+
+        GrpcHandshakeRequest requestVotes = new()
+        {
+            Partition = request.Partition,
+            MaxLogId = request.MaxLogId,
+            Endpoint = request.Endpoint
+        };
+        
+        await client.HandshakeAsync(requestVotes).ConfigureAwait(false);
+        
+        //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got RequestVotes reply from {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
+
+        return handshakeResponse;
+    }
     
+    /// <summary>
+    /// Sends a RequestVotes message to a node via gRPC
+    /// </summary>
+    /// <param name="manager"></param>
+    /// <param name="partition"></param>
+    /// <param name="node"></param>
+    /// <param name="request"></param>
+    /// <returns></returns>
     public async Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftPartition partition, RaftNode node, RequestVotesRequest request)
     {
         //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Sent RequestVotes message to {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
 
-        if (!channels.TryGetValue(node.Endpoint, out GrpcChannel? channel))
-        {
-            channel = GrpcChannel.ForAddress($"https://{node.Endpoint}", new() { HttpHandler = httpHandler });
-            channels.TryAdd(node.Endpoint, channel);
-        }
+        GrpcChannel channel = GetChannel(node.Endpoint);
 
         Rafter.RafterClient client = new(channel);
 
@@ -74,15 +108,19 @@ public class GrpcCommunication : ICommunication
         return requestVotesResponse;
     }
 
+    /// <summary>
+    /// Sends a Vote message to a node via gRPC
+    /// </summary>
+    /// <param name="manager"></param>
+    /// <param name="partition"></param>
+    /// <param name="node"></param>
+    /// <param name="request"></param>
+    /// <returns></returns>
     public async Task<VoteResponse> Vote(RaftManager manager, RaftPartition partition, RaftNode node, VoteRequest request)
     {
         //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Send Vote to {Node} message on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
         
-        if (!channels.TryGetValue(node.Endpoint, out GrpcChannel? channel))
-        {
-            channel = GrpcChannel.ForAddress($"https://{node.Endpoint}", new() { HttpHandler = httpHandler });
-            channels.TryAdd(node.Endpoint, channel);
-        }
+        GrpcChannel channel = GetChannel(node.Endpoint);
         
         Rafter.RafterClient client = new(channel);
 
@@ -103,13 +141,17 @@ public class GrpcCommunication : ICommunication
         return voteResponse;
     }
 
+    /// <summary>
+    /// Sends an AppendLogs message to a node via gRPC
+    /// </summary>
+    /// <param name="manager"></param>
+    /// <param name="partition"></param>
+    /// <param name="node"></param>
+    /// <param name="request"></param>
+    /// <returns></returns>
     public async Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftPartition partition, RaftNode node, AppendLogsRequest request)
     {
-        if (!channels.TryGetValue(node.Endpoint, out GrpcChannel? channel))
-        {
-            channel = GrpcChannel.ForAddress($"https://{node.Endpoint}", new() { HttpHandler = httpHandler });
-            channels.TryAdd(node.Endpoint, channel);
-        }
+        GrpcChannel channel = GetChannel(node.Endpoint);
         
         Rafter.RafterClient client = new(channel);
 
@@ -129,13 +171,17 @@ public class GrpcCommunication : ICommunication
         return appendLogsResponse;
     }
     
+    /// <summary>
+    /// Sends a CompleteAppendLogs message to a node via gRPC
+    /// </summary>
+    /// <param name="manager"></param>
+    /// <param name="partition"></param>
+    /// <param name="node"></param>
+    /// <param name="request"></param>
+    /// <returns></returns>
     public async Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftPartition partition, RaftNode node, CompleteAppendLogsRequest request)
     {
-        if (!channels.TryGetValue(node.Endpoint, out GrpcChannel? channel))
-        {
-            channel = GrpcChannel.ForAddress($"https://{node.Endpoint}", new() { HttpHandler = httpHandler });
-            channels.TryAdd(node.Endpoint, channel);
-        }
+        GrpcChannel channel = GetChannel(node.Endpoint);
         
         Rafter.RafterClient client = new(channel);
 
@@ -174,5 +220,16 @@ public class GrpcCommunication : ICommunication
         }
 
         return logs;
+    }
+    
+    private GrpcChannel GetChannel(string endpoint)
+    {
+        if (!channels.TryGetValue(endpoint, out GrpcChannel? channel))
+        {
+            channel = GrpcChannel.ForAddress($"https://{endpoint}", new() { HttpHandler = httpHandler });
+            channels.TryAdd(endpoint, channel);
+        }
+        
+        return channel;
     }
 }

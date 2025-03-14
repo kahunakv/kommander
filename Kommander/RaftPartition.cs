@@ -46,7 +46,7 @@ public sealed class RaftPartition : IDisposable
         PartitionId = partitionId;
 
         raftActor = actorSystem.SpawnStruct<RaftStateActor, RaftRequest, RaftResponse>(
-            "bra-" + partitionId, 
+            "raft-partition-" + partitionId, 
             raftManager, 
             this,
             walAdapter,
@@ -56,7 +56,16 @@ public sealed class RaftPartition : IDisposable
     }
 
     /// <summary>
-    /// Enqueues a request a vote from the partition.
+    /// Enqueues a handshake message from the partition.
+    /// </summary>
+    /// <param name="request"></param>
+    public void Handshake(HandshakeRequest request)
+    {
+        raftActor.Send(new(RaftRequestType.ReceiveHandshake, 0, request.MaxLogId, HLCTimestamp.Zero, request.Endpoint));
+    }
+
+    /// <summary>
+    /// Enqueues a "request a vote" message from the partition.
     /// </summary>
     /// <param name="request"></param>
     public void RequestVote(RequestVotesRequest request)
@@ -65,7 +74,7 @@ public sealed class RaftPartition : IDisposable
     }
 
     /// <summary>
-    /// Enqueues a vote to become leader in a partition.
+    /// Enqueues a "vote to become leader" message in a partition.
     /// </summary>
     /// <param name="request"></param>
     public void Vote(VoteRequest request)

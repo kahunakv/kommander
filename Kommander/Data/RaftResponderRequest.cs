@@ -1,9 +1,11 @@
 
 namespace Kommander.Data;
 
-public class RaftResponderRequest
+public sealed class RaftResponderRequest
 {
     public RaftResponderRequestType Type { get; }
+    
+    public HandshakeRequest? HandshakeRequest { get; }
     
     public VoteRequest? VoteRequest { get; }
     
@@ -14,6 +16,13 @@ public class RaftResponderRequest
     public CompleteAppendLogsRequest? CompleteAppendLogsRequest { get; }
     
     public RaftNode? Node { get; }
+
+    public RaftResponderRequest(RaftResponderRequestType type, RaftNode node, HandshakeRequest request)
+    {
+        Type = type;
+        Node = node;
+        HandshakeRequest = request;
+    }
     
     public RaftResponderRequest(RaftResponderRequestType type, RaftNode node, VoteRequest request)
     {

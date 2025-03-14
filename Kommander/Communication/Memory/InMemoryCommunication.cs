@@ -1,3 +1,4 @@
+
 using Kommander.Data;
 
 namespace Kommander.Communication.Memory;
@@ -8,6 +9,8 @@ namespace Kommander.Communication.Memory;
 /// </summary>
 public class InMemoryCommunication : ICommunication
 {
+    private readonly Task<HandshakeResponse> handshakeResponse = Task.FromResult(new HandshakeResponse());
+    
     private readonly Task<RequestVotesResponse> requestVoteResponse = Task.FromResult(new RequestVotesResponse());
 
     private readonly Task<VoteResponse> voteResponse = Task.FromResult(new VoteResponse());
@@ -21,6 +24,16 @@ public class InMemoryCommunication : ICommunication
     public void SetNodes(Dictionary<string, IRaft> nodes)
     {
         this.nodes = nodes;
+    }
+
+    public Task<HandshakeResponse> Handshake(RaftManager manager, RaftPartition partition, RaftNode node, HandshakeRequest request)
+    {
+        if (manager.ClusterHandler.IsNode(node.Endpoint) && nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
+            targetNode.Handshake(request);
+        else
+            Console.WriteLine("Unknown node: " + node.Endpoint);
+        
+        return handshakeResponse;
     }
     
     public Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftPartition partition, RaftNode node, RequestVotesRequest request)
