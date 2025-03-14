@@ -3,6 +3,7 @@ using System.Diagnostics;
 using Nixie;
 using Kommander.Communication;
 using Kommander.Data;
+using Kommander.Diagnostics;
 using Kommander.Logging;
 using Kommander.Time;
 using Kommander.WAL;
@@ -196,7 +197,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 
                 case RaftRequestType.ReplicateLogs:
                 {
-                    (RaftOperationStatus status, HLCTimestamp ticketId) = await ReplicateLogs(message.Logs).ConfigureAwait(false);
+                    (RaftOperationStatus status, HLCTimestamp ticketId) = await ReplicateLogs(message.Logs, message.AutoCommit).ConfigureAwait(false);
                     return new(RaftResponseType.None, status, ticketId);
                 }
 
@@ -249,11 +250,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         restored = true;
         lastHeartbeat = await manager.HybridLogicalClock.SendOrLocalEvent().ConfigureAwait(false);
-        Stopwatch stopWatch = Stopwatch.StartNew();
 
         RaftWALResponse currentCommitIndexResponse = await walActor.Ask(new(RaftWALActionType.Recover)).ConfigureAwait(false);
         
-        logger.LogInfoWalRestored(manager.LocalEndpoint, partition.PartitionId, nodeState, currentCommitIndexResponse.Index, stopWatch.ElapsedMilliseconds);
+        logger.LogInfoWalRestored(manager.LocalEndpoint, partition.PartitionId, nodeState, currentCommitIndexResponse.Index, stopwatch.ElapsedMilliseconds);
         
         RaftWALResponse currentTermResponse = await walActor.Ask(new(RaftWALActionType.GetCurrentTerm)).ConfigureAwait(false);
         currentTerm = currentTermResponse.Index;
@@ -709,8 +709,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// Replicates logs to other nodes in the cluster when the node is the leader.
     /// </summary>
     /// <param name="logs"></param>
+    /// <param name="autoCommit"></param>
     /// <returns></returns>
-    private async Task<(RaftOperationStatus, HLCTimestamp ticketId)> ReplicateLogs(List<RaftLog>? logs)
+    /// <exception cref="RaftException"></exception>
+    private async Task<(RaftOperationStatus, HLCTimestamp ticketId)> ReplicateLogs(List<RaftLog>? logs, bool autoCommit)
     {
         if (logs is null || logs.Count == 0)
             return (RaftOperationStatus.Success, HLCTimestamp.Zero);
@@ -750,7 +752,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return (RaftOperationStatus.Errored, HLCTimestamp.Zero);
         }
 
-        RaftProposalQuorum proposalQuorum = new(logs);
+        RaftProposalQuorum proposalQuorum = new(logs, autoCommit);
 
         foreach (RaftNode node in nodes)
         {
@@ -814,7 +816,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return (RaftOperationStatus.Errored, HLCTimestamp.Zero);
         }
 
-        RaftProposalQuorum proposalQuorum = new(checkpointLogs);
+        RaftProposalQuorum proposalQuorum = new(checkpointLogs, true);
 
         foreach (RaftNode node in nodes)
         {
@@ -927,6 +929,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         
         logger.LogInfoProposalCompletedAt(manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp);
+
+        if (!proposal.AutoCommit)
+            return;
         
         RaftWALResponse commitResponse = await walActor.Ask(new(RaftWALActionType.Commit, currentTerm, timestamp, proposal.Logs)).ConfigureAwait(false);
         if (commitResponse.Status != RaftOperationStatus.Success)

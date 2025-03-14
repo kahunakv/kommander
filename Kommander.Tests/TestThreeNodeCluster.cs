@@ -309,6 +309,84 @@ public class TestThreeNodeCluster
     }
     
     [Fact]
+    public async Task TestJoinClusterAndProposeReplicateLogs()
+    {
+        InMemoryCommunication communication = new();
+        
+        IRaft node1 = GetNode1(communication, logger);
+        IRaft node2 = GetNode2(communication, logger);
+        IRaft node3 = GetNode3(communication, logger);
+
+        await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster(), node3.JoinCluster()]);
+
+        await node1.UpdateNodes();
+        await node2.UpdateNodes();
+        await node3.UpdateNodes();
+        
+        communication.SetNodes(new()
+        {
+            { "localhost:8001", node1 }, 
+            { "localhost:8002", node2 },
+            { "localhost:8003", node3 }
+        });
+
+        while (true)
+        {
+            if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
+                break;
+            
+            await Task.Delay(1000);
+        }
+
+        IRaft? leader = await GetLeader([node1, node2, node3]);
+        Assert.NotNull(leader);
+
+        List<IRaft> followers = await GetFollowers([node1, node2, node3]);
+        Assert.NotEmpty(followers);
+        Assert.Equal(2, followers.Count);
+        
+        byte[] data = "Hello World"u8.ToArray();
+        
+        leader.OnReplicationReceived += log =>
+        {
+            Assert.Equal("Greeting", log.LogType);;
+            Assert.Equal(data, log.LogData);
+            
+            Interlocked.Increment(ref totalLeaderReceived);
+            return Task.FromResult(true);
+        };
+        
+        foreach (IRaft follower in followers)
+            follower.OnReplicationReceived += _ =>
+            {
+                  Interlocked.Increment(ref totalFollowersReceived);
+                  return Task.FromResult(true);
+            };
+
+        long maxId = await node1.WalAdapter.GetMaxLog(0);
+        Assert.Equal(0, maxId);
+        
+        maxId = await node2.WalAdapter.GetMaxLog(0);
+        Assert.Equal(0, maxId);
+        
+        maxId = await node3.WalAdapter.GetMaxLog(0);
+        Assert.Equal(0, maxId);
+        
+        (bool success, RaftOperationStatus status, long proposedLogId) response = await leader.ReplicateLogs(0, "Greeting", data, false);
+        Assert.True(response.success);
+        
+        Assert.Equal(RaftOperationStatus.Success, response.status);
+        Assert.Equal(1, response.proposedLogId);
+        
+        Assert.Equal(0, totalFollowersReceived);
+        Assert.Equal(0, totalLeaderReceived);
+        
+        node1.ActorSystem.Dispose();
+        node2.ActorSystem.Dispose();
+        node3.ActorSystem.Dispose();
+    }
+    
+    [Fact]
     public async Task TestJoinClusterAndMultiReplicateLogs()
     {
         InMemoryCommunication communication = new();

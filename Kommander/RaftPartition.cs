@@ -123,8 +123,9 @@ public sealed class RaftPartition : IDisposable
     /// </summary>
     /// <param name="type"></param>
     /// <param name="data"></param>
+    /// <param name="autoCommit"></param>
     /// <returns></returns>
-    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, byte[] data)
+    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, byte[] data, bool autoCommit)
     {
         if (string.IsNullOrEmpty(Leader))
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
@@ -134,7 +135,7 @@ public sealed class RaftPartition : IDisposable
 
         List<RaftLog> logsToReplicate = [new() { Type = RaftLogType.Proposed, LogType = type, LogData = data }];
         
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate)).ConfigureAwait(false); 
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit)).ConfigureAwait(false); 
         
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
@@ -145,10 +146,11 @@ public sealed class RaftPartition : IDisposable
     /// <summary>
     /// Replicate logs to the partition.
     /// </summary>
-    /// <param name="type"></param>
-    /// <param name="logs"></param>
+    /// <param name="type">A string identifying the user log type</param>
+    /// <param name="logs">A list of logs to replicate</param>
+    /// <param name="autoCommit"></param>
     /// <returns></returns>
-    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, IEnumerable<byte[]> logs)
+    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, IEnumerable<byte[]> logs, bool autoCommit = true)
     {
         if (string.IsNullOrEmpty(Leader))
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
@@ -158,7 +160,7 @@ public sealed class RaftPartition : IDisposable
 
         List<RaftLog> logsToReplicate = logs.Select(data => new RaftLog { Type = RaftLogType.Proposed, LogType = type, LogData = data }).ToList();
         
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate)).ConfigureAwait(false);
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit)).ConfigureAwait(false);
         
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);

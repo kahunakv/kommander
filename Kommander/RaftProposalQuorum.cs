@@ -12,9 +12,12 @@ public sealed class RaftProposalQuorum
     
     public long LastLogIndex => Logs.Last().Id;
 
-    public RaftProposalQuorum(List<RaftLog> logs)
+    public bool AutoCommit { get; }
+
+    public RaftProposalQuorum(List<RaftLog> logs, bool autoCommit)
     {
         Logs = logs;
+        AutoCommit = autoCommit;
     }
     
     public void AddExpectedCompletion(string nodeId)

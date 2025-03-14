@@ -11,7 +11,7 @@ public sealed class DynamicDiscovery : IDiscovery
     
     public DynamicDiscovery(List<RaftNode> nodes)
     {
-        foreach (var node in nodes)
+        foreach (RaftNode node in nodes)
             this.nodes.Add(node.Endpoint, node);
     }
     

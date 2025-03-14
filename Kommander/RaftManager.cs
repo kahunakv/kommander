@@ -2,6 +2,7 @@
 using System.Diagnostics;
 using Kommander.Communication;
 using Kommander.Data;
+using Kommander.Diagnostics;
 using Kommander.Discovery;
 using Kommander.Time;
 using Kommander.WAL;
@@ -253,7 +254,7 @@ public sealed class RaftManager : IRaft
     /// <param name="type"></param>
     /// <param name="data"></param>
     /// <returns></returns>
-    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(int partitionId, string type, byte[] data)
+    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true)
     {
         RaftPartition partition = GetPartition(partitionId);
 
@@ -263,14 +264,14 @@ public sealed class RaftManager : IRaft
 
         do
         {
-            (success, status, ticketId) = await partition.ReplicateLogs(type, data).ConfigureAwait(false);
+            (success, status, ticketId) = await partition.ReplicateLogs(type, data, autoCommit).ConfigureAwait(false);
 
         } while (status == RaftOperationStatus.ActiveProposal);
         
         if (!success)
             return (success, status, -1);
 
-        return await WaitForReplication(partition, ticketId);
+        return await WaitForQuorum(partition, ticketId);
     }
     
     /// <summary>
@@ -279,8 +280,9 @@ public sealed class RaftManager : IRaft
     /// <param name="partitionId"></param>
     /// <param name="type"></param>
     /// <param name="logs"></param>
+    /// <param name="autoCommit"></param>
     /// <returns></returns>
-    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs)
+    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true)
     {
         RaftPartition partition = GetPartition(partitionId);
         
@@ -290,14 +292,14 @@ public sealed class RaftManager : IRaft
 
         do
         {
-            (success, status, ticketId) = await partition.ReplicateLogs(type, logs).ConfigureAwait(false);
+            (success, status, ticketId) = await partition.ReplicateLogs(type, logs, autoCommit).ConfigureAwait(false);
 
         } while (status == RaftOperationStatus.ActiveProposal);
         
         if (!success)
             return (success, status, -1);
         
-        return await WaitForReplication(partition, ticketId);
+        return await WaitForQuorum(partition, ticketId);
     }
 
     /// <summary>
@@ -321,7 +323,7 @@ public sealed class RaftManager : IRaft
         if (!success)
             return (success, status, -1);
         
-        return await WaitForReplication(partition, ticketId);
+        return await WaitForQuorum(partition, ticketId);
     }
     
     /// <summary>
@@ -330,11 +332,11 @@ public sealed class RaftManager : IRaft
     /// <param name="partition"></param>
     /// <param name="ticketId"></param>
     /// <returns></returns>
-    private async Task<(bool success, RaftOperationStatus status, long commitLogId)> WaitForReplication(RaftPartition partition, HLCTimestamp ticketId)
+    private async Task<(bool success, RaftOperationStatus status, long commitLogId)> WaitForQuorum(RaftPartition partition, HLCTimestamp ticketId)
     {
-        Stopwatch stopwatch = Stopwatch.StartNew();
+        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
         
-        while (stopwatch.ElapsedMilliseconds < 30000)
+        while (stopwatch.GetElapsedMilliseconds() < 30000)
         {
             if (!string.IsNullOrEmpty(partition.Leader) && partition.Leader != LocalEndpoint)
                 return (false, RaftOperationStatus.NodeIsNotLeader, -1);
@@ -494,10 +496,10 @@ public sealed class RaftManager : IRaft
         if (partitions[0] is null)
             return false;
 
-        Stopwatch stopwatch = Stopwatch.StartNew();
+        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
         RaftPartition partition = GetPartition(partitionId);
 
-        while (stopwatch.ElapsedMilliseconds < 30000)
+        while (stopwatch.GetElapsedMilliseconds() < 30000)
         {
             if (!string.IsNullOrEmpty(partition.Leader) && partition.Leader == LocalEndpoint)
                 return true;
@@ -533,9 +535,9 @@ public sealed class RaftManager : IRaft
     public async ValueTask<string> WaitForLeader(int partitionId, CancellationToken cancellationToken)
     {
         RaftPartition partition = GetPartition(partitionId);
-        Stopwatch stopwatch = Stopwatch.StartNew();
+        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
 
-        while (stopwatch.ElapsedMilliseconds < 30000)
+        while (stopwatch.GetElapsedMilliseconds() < 30000)
         {
             if (cancellationToken.IsCancellationRequested)
                 throw new OperationCanceledException();

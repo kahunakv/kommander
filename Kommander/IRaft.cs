@@ -126,8 +126,9 @@ public interface IRaft
     /// <param name="partitionId"></param>
     /// <param name="type"></param>
     /// <param name="data"></param>
+    /// <param name="autoCommit"></param>
     /// <returns></returns>
-    public Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(int partitionId, string type, byte[] data);
+    public Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true);
 
     /// <summary>
     /// Replicate logs to the followers in the partition
@@ -135,8 +136,9 @@ public interface IRaft
     /// <param name="partitionId"></param>
     /// <param name="type"></param>
     /// <param name="logs"></param>
+    /// <param name="autoCommit"></param>
     /// <returns></returns>
-    public Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs);
+    public Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true);
 
     /// <summary>
     /// Replicate a checkpoint to the followers in the partition    

@@ -18,6 +18,8 @@ public readonly struct RaftRequest
     public List<RaftLog>? Logs { get; } = null;
     
     public RaftOperationStatus Status { get; }
+    
+    public bool AutoCommit { get; } 
 
     public RaftRequest(
         RaftRequestType type, 
@@ -38,10 +40,11 @@ public readonly struct RaftRequest
         Logs = logs;
     }
 
-    public RaftRequest(RaftRequestType type, List<RaftLog> logs)
+    public RaftRequest(RaftRequestType type, List<RaftLog> logs, bool autoCommit)
     {
         Type = type;
         Logs = logs;
+        AutoCommit = autoCommit;
     }
     
     public RaftRequest(RaftRequestType type, HLCTimestamp timestamp)
