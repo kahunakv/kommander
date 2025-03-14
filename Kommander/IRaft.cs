@@ -2,6 +2,7 @@
 using Kommander.Data;
 using Kommander.WAL;
 using Kommander.Communication;
+using Kommander.Discovery;
 using Kommander.Time;
 using Nixie;
 
@@ -28,6 +29,11 @@ public interface IRaft
     /// Current Communication adapter
     /// </summary>
     public ICommunication Communication { get; }
+    
+    /// <summary>
+    /// Current Discovery adapter
+    /// </summary>
+    public IDiscovery Discovery { get; }
     
     /// <summary>
     /// Current Raft configuration

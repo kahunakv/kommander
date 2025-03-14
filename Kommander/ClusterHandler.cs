@@ -1,4 +1,5 @@
 
+using System.Text;
 using Kommander.Discovery;
 
 namespace Kommander;
@@ -7,7 +8,7 @@ namespace Kommander;
 /// Manages the operations of joining and leaving a cluster.
 /// Keeps state about the current cluster and node status.
 /// </summary>
-internal sealed class ClusterHandler
+public sealed class ClusterHandler
 {
     public bool Joined { get; private set; }
     
@@ -33,10 +34,33 @@ internal sealed class ClusterHandler
         Joined = false;
     }
 
-    public async Task UpdateNodes()
+    public Task UpdateNodes()
     {
         manager.Nodes = discovery.GetNodes();
 
-        await Task.CompletedTask;
+        //Console.WriteLine("---");
+        
+        StringBuilder builder = new StringBuilder();
+
+        foreach (RaftNode node in manager.Nodes)
+        {
+            builder.Append(node.Endpoint);
+            builder.Append(' ');
+        }
+
+        manager.Logger.LogInformation("[{Endpoint}] Nodes: {Nodes}", manager.LocalEndpoint, builder.ToString());
+
+        return Task.CompletedTask;
+    }
+
+    public bool IsNode(string endpoint)
+    {
+        foreach (RaftNode node in manager.Nodes)
+        {
+            if (node.Endpoint == endpoint)
+                return true;
+        }
+
+        return false;
     }
 }

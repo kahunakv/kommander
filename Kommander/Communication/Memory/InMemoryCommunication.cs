@@ -25,7 +25,7 @@ public class InMemoryCommunication : ICommunication
     
     public Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftPartition partition, RaftNode node, RequestVotesRequest request)
     {
-        if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
+        if (manager.ClusterHandler.IsNode(node.Endpoint) && nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
             targetNode.RequestVote(request);
         else
             Console.WriteLine("Unknown node: " + node.Endpoint);
@@ -35,7 +35,7 @@ public class InMemoryCommunication : ICommunication
 
     public Task<VoteResponse> Vote(RaftManager manager, RaftPartition partition, RaftNode node, VoteRequest request)
     {
-        if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
+        if (manager.ClusterHandler.IsNode(node.Endpoint) && nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
             targetNode.Vote(request);
         else
             Console.WriteLine("Unknown node: " + node.Endpoint);
@@ -45,7 +45,7 @@ public class InMemoryCommunication : ICommunication
 
     public Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftPartition partition, RaftNode node, AppendLogsRequest request)
     {
-        if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
+        if (manager.ClusterHandler.IsNode(node.Endpoint) && nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
             targetNode.AppendLogs(request);
         else
             Console.WriteLine("Unknown node: " + node.Endpoint);
@@ -55,7 +55,7 @@ public class InMemoryCommunication : ICommunication
     
     public Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftPartition partition, RaftNode node, CompleteAppendLogsRequest request)
     {
-        if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
+        if (manager.ClusterHandler.IsNode(node.Endpoint) && nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
             targetNode.CompleteAppendLogs(request);
         else
             Console.WriteLine("Unknown node: " + node.Endpoint);
