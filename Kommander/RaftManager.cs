@@ -254,7 +254,7 @@ public sealed class RaftManager : IRaft
     /// <param name="type"></param>
     /// <param name="data"></param>
     /// <returns></returns>
-    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true)
+    public async Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true)
     {
         RaftPartition partition = GetPartition(partitionId);
 
@@ -269,9 +269,9 @@ public sealed class RaftManager : IRaft
         } while (status == RaftOperationStatus.ActiveProposal);
         
         if (!success)
-            return (success, status, -1);
+            return new(success, status, ticketId, -1);
 
-        return await WaitForQuorum(partition, ticketId);
+        return await WaitForQuorum(partition, ticketId, autoCommit).ConfigureAwait(false);
     }
     
     /// <summary>
@@ -282,7 +282,7 @@ public sealed class RaftManager : IRaft
     /// <param name="logs"></param>
     /// <param name="autoCommit"></param>
     /// <returns></returns>
-    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true)
+    public async Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true)
     {
         RaftPartition partition = GetPartition(partitionId);
         
@@ -297,16 +297,29 @@ public sealed class RaftManager : IRaft
         } while (status == RaftOperationStatus.ActiveProposal);
         
         if (!success)
-            return (success, status, -1);
+            return new(success, status, ticketId, -1);
         
-        return await WaitForQuorum(partition, ticketId);
+        return await WaitForQuorum(partition, ticketId, autoCommit).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Commit logs and notify followers in the partition 
+    /// </summary>
+    /// <param name="partitionId"></param>
+    /// <param name="proposalIndex"></param>
+    /// <returns></returns>
+    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> CommitLogs(int partitionId, HLCTimestamp ticketId)
+    {
+        RaftPartition partition = GetPartition(partitionId);
+        
+        return await partition.CommitLogs(ticketId).ConfigureAwait(false);
     }
 
     /// <summary>
     /// Replicates a checkpoint to the follower nodes
     /// </summary>
     /// <param name="partitionId"></param>
-    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateCheckpoint(int partitionId)
+    public async Task<RaftReplicationResult> ReplicateCheckpoint(int partitionId)
     {
         RaftPartition partition = GetPartition(partitionId);
         
@@ -321,9 +334,9 @@ public sealed class RaftManager : IRaft
         } while (status == RaftOperationStatus.ActiveProposal);
         
         if (!success)
-            return (success, status, -1);
+            return new(success, status, ticketId, -1);
         
-        return await WaitForQuorum(partition, ticketId);
+        return await WaitForQuorum(partition, ticketId, true).ConfigureAwait(false);
     }
     
     /// <summary>
@@ -331,30 +344,31 @@ public sealed class RaftManager : IRaft
     /// </summary>
     /// <param name="partition"></param>
     /// <param name="ticketId"></param>
+    /// <param name="autoCommit"></param>
     /// <returns></returns>
-    private async Task<(bool success, RaftOperationStatus status, long commitLogId)> WaitForQuorum(RaftPartition partition, HLCTimestamp ticketId)
+    private async Task<RaftReplicationResult> WaitForQuorum(RaftPartition partition, HLCTimestamp ticketId, bool autoCommit)
     {
         ValueStopwatch stopwatch = ValueStopwatch.StartNew();
         
         while (stopwatch.GetElapsedMilliseconds() < 30000)
         {
             if (!string.IsNullOrEmpty(partition.Leader) && partition.Leader != LocalEndpoint)
-                return (false, RaftOperationStatus.NodeIsNotLeader, -1);
+                return new(false, RaftOperationStatus.NodeIsNotLeader, ticketId, -1);
             
             //if (cancellationToken.IsCancellationRequested)
             //    throw new OperationCanceledException();
 
             try
             {
-                (RaftTicketState state, long commitId) = await partition.GetTicketState(ticketId).ConfigureAwait(false);
+                (RaftTicketState state, long commitId) = await partition.GetTicketState(ticketId, autoCommit).ConfigureAwait(false);
                 
                 switch (state)
                 {
                     case RaftTicketState.NotFound:
-                        return (false, RaftOperationStatus.Errored, -1);
+                        return new(false, RaftOperationStatus.Errored, ticketId, -1);
                     
                     case RaftTicketState.Committed:
-                        return (true, RaftOperationStatus.Success, commitId);
+                        return new(true, RaftOperationStatus.Success, ticketId, commitId);
                     
                     case RaftTicketState.Proposed:
                     default:
@@ -369,7 +383,7 @@ public sealed class RaftManager : IRaft
             await Task.Yield();
         }
         
-        return (false, RaftOperationStatus.Errored, -1);
+        return new(false, RaftOperationStatus.Errored, ticketId, -1);
     }
 
     /// <summary>

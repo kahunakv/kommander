@@ -183,7 +183,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
                 case RaftRequestType.GetTicketState:
                 {
-                    (RaftTicketState ticketState, long commitIndex) = CheckTicketCompletion(message.Timestamp);
+                    (RaftTicketState ticketState, long commitIndex) = CheckTicketCompletion(message.Timestamp, message.AutoCommit);
                     return new(RaftResponseType.TicketState, ticketState, commitIndex);
                 }
 
@@ -205,6 +205,12 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 {
                     (RaftOperationStatus status, HLCTimestamp ticketId) = await ReplicateCheckpoint().ConfigureAwait(false);
                     return new(RaftResponseType.None, status, ticketId);
+                }
+                
+                case RaftRequestType.CommitLogs:
+                {
+                    (RaftOperationStatus status, long commitIndex) = await CommitLogs(message.Timestamp).ConfigureAwait(false);
+                    return new(RaftResponseType.None, status, commitIndex);
                 }
 
                 case RaftRequestType.RequestVote:
@@ -842,6 +848,40 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     }
 
     /// <summary>
+    /// Marks proposals as committed
+    /// </summary>
+    /// <param name="proposalIndex"></param>
+    /// <returns></returns>
+    private async Task<(RaftOperationStatus, long commitIndex)> CommitLogs(HLCTimestamp ticketId)
+    {
+        if (nodeState != RaftNodeState.Leader)
+            return (RaftOperationStatus.NodeIsNotLeader, 0);
+        
+        if (!activeProposals.TryGetValue(ticketId, out RaftProposalQuorum? proposal))
+            return (RaftOperationStatus.ProposalNotFound, 0);
+        
+        if (!proposal.HasQuorum())
+            return (RaftOperationStatus.Errored, 0);
+        
+        RaftWALResponse commitResponse = await walActor.Ask(new(RaftWALActionType.Commit, currentTerm, ticketId, proposal.Logs)).ConfigureAwait(false);
+        if (commitResponse.Status != RaftOperationStatus.Success)
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't commit logs {Timestamp}", manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId);
+
+            return (commitResponse.Status, 0);
+        }
+
+        HLCTimestamp currentTime = await manager.HybridLogicalClock.ReceiveEvent(ticketId);
+        
+        foreach (string node in proposal.Nodes)
+            await AppendLogToNode(new(node), currentTime, false);
+        
+        logger.LogInfoCommittedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId, proposal.Logs.Count);
+        
+        return (RaftOperationStatus.Success, commitResponse.Index);
+    }
+
+    /// <summary>
     /// Increases the number of votes for a given term.
     /// </summary>
     /// <param name="endpoint"></param>
@@ -953,15 +993,17 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// Checks whether a ticket has been completed or not.
     /// </summary>
     /// <param name="timestamp"></param>
+    /// <param name="autoCommit"></param>
     /// <returns></returns>
-    private (RaftTicketState state, long commitIndex) CheckTicketCompletion(HLCTimestamp timestamp)
+    private (RaftTicketState state, long commitIndex) CheckTicketCompletion(HLCTimestamp timestamp, bool autoCommit)
     {
         if (!activeProposals.TryGetValue(timestamp, out RaftProposalQuorum? proposal))
             return (RaftTicketState.NotFound, -1);
 
         if (proposal.HasQuorum())
         {
-            activeProposals.Remove(timestamp);
+            if (autoCommit)
+                activeProposals.Remove(timestamp);
             
             return (RaftTicketState.Committed, proposal.LastLogIndex);
         }

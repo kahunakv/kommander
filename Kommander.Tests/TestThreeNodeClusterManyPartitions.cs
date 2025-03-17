@@ -227,12 +227,12 @@ public sealed class TestThreeNodeClusterManyPartitions
 
         for (int i = 0; i < 100; i++)
         {
-            (bool success, RaftOperationStatus status, long commitLogId) response = await leader.ReplicateLogs(0, "Greeting", data);
+            RaftReplicationResult response = await leader.ReplicateLogs(0, "Greeting", data);
             
-            Assert.True(response.success);
-            Assert.Equal(RaftOperationStatus.Success, response.status);
+            Assert.True(response.Success);
+            Assert.Equal(RaftOperationStatus.Success, response.Status);
             
-            Assert.Equal(i + 1, response.commitLogId);
+            Assert.Equal(i + 1, response.CommitLogId);
         }
         
         maxId = await node1.WalAdapter.GetMaxLog(0);
@@ -330,15 +330,15 @@ public sealed class TestThreeNodeClusterManyPartitions
             leader = await GetLeader(i, [node1, node2, node3]);
             Assert.NotNull(leader);
             
-            (bool success, RaftOperationStatus status, long proposedLogId) response = await leader.ReplicateLogs(i, "Greeting", data, false);
+            RaftReplicationResult response = await leader.ReplicateLogs(i, "Greeting", data, false);
             
-            if (!response.success)
-                throw new Exception(response.status.ToString());
+            if (!response.Success)
+                throw new Exception(response.Status.ToString());
             
-            Assert.True(response.success);
+            Assert.True(response.Success);
 
-            Assert.Equal(RaftOperationStatus.Success, response.status);
-            Assert.Equal(1, response.proposedLogId);
+            Assert.Equal(RaftOperationStatus.Success, response.Status);
+            Assert.Equal(1, response.CommitLogId);
 
             Assert.Equal(0, totalFollowersReceived);
             Assert.Equal(0, totalLeaderReceived);

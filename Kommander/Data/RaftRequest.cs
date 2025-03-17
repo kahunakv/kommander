@@ -47,10 +47,11 @@ public readonly struct RaftRequest
         AutoCommit = autoCommit;
     }
     
-    public RaftRequest(RaftRequestType type, HLCTimestamp timestamp)
+    public RaftRequest(RaftRequestType type, HLCTimestamp timestamp, bool autoCommit)
     {
         Type = type;
         Timestamp = timestamp;
+        AutoCommit = autoCommit;
     }
 }
 

@@ -167,6 +167,27 @@ public sealed class RaftPartition : IDisposable
         
         return (false, response.Status, HLCTimestamp.Zero);
     }
+    
+    /// <summary>
+    /// Commit logs and notify followers in the partition
+    /// </summary>
+    /// <param name="proposalIndex"></param>
+    /// <returns></returns>
+    public async Task<(bool success, RaftOperationStatus status, long commitIndex)> CommitLogs(HLCTimestamp ticketId)
+    {
+        if (string.IsNullOrEmpty(Leader))
+            return (false, RaftOperationStatus.NodeIsNotLeader, 0);
+        
+        if (Leader != raftManager.LocalEndpoint)
+            return (false, RaftOperationStatus.NodeIsNotLeader, 0);
+        
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.CommitLogs, ticketId, false)).ConfigureAwait(false);
+        
+        if (response.Status == RaftOperationStatus.Success)
+            return (true, response.Status, response.CommitIndex);
+        
+        return (false, response.Status, 0);
+    }
 
     /// <summary>
     /// Replicate a checkpoint to the partition.
@@ -211,9 +232,9 @@ public sealed class RaftPartition : IDisposable
     /// <param name="ticketId"></param>
     /// <returns></returns>
     /// <exception cref="RaftException"></exception>
-    public async Task<(RaftTicketState state, long commitId)> GetTicketState(HLCTimestamp ticketId)
+    public async Task<(RaftTicketState state, long commitId)> GetTicketState(HLCTimestamp ticketId, bool autoCommit)
     {
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.GetTicketState, ticketId), TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.GetTicketState, ticketId, autoCommit), TimeSpan.FromSeconds(5)).ConfigureAwait(false);
         
         if (response.Type != RaftResponseType.TicketState)
             throw new RaftException("Unknown response (2)");

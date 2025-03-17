@@ -10,4 +10,5 @@ public enum RaftOperationStatus
     LeaderAlreadyElected = 4,
     LogsFromAnotherLeader = 5,
     ActiveProposal = 6,
+    ProposalNotFound = 7
 }

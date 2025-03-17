@@ -128,7 +128,7 @@ public interface IRaft
     /// <param name="data"></param>
     /// <param name="autoCommit"></param>
     /// <returns></returns>
-    public Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true);
+    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true);
 
     /// <summary>
     /// Replicate logs to the followers in the partition
@@ -138,13 +138,21 @@ public interface IRaft
     /// <param name="logs"></param>
     /// <param name="autoCommit"></param>
     /// <returns></returns>
-    public Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true);
+    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true);
 
     /// <summary>
     /// Replicate a checkpoint to the followers in the partition    
     /// </summary>
     /// <param name="partitionId"></param>
-    public Task<(bool success, RaftOperationStatus status, long commitLogId)> ReplicateCheckpoint(int partitionId);
+    public Task<RaftReplicationResult> ReplicateCheckpoint(int partitionId);
+    
+    /// <summary>
+    /// Commit logs and notify followers in the partition
+    /// </summary>
+    /// <param name="partitionId"></param>
+    /// <param name="ticketId"></param>
+    /// <returns></returns>
+    public Task<(bool success, RaftOperationStatus status, long commitLogId)> CommitLogs(int partitionId, HLCTimestamp ticketId);
 
     /// <summary>
     /// Obtains the local endpoint
