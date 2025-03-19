@@ -155,7 +155,7 @@ public class RocksDbWAL : IWAL
             Term = log.Term,
             Type = (int)log.Type,
             LogType = log.LogType,
-            Log = ByteString.CopyFrom(log.LogData),
+            Log = UnsafeByteOperations.UnsafeWrap(log.LogData),
             TimePhysical = log.Time.L,
             TimeCounter = log.Time.C
         }), cf: columnFamilyHandle);
@@ -177,7 +177,7 @@ public class RocksDbWAL : IWAL
             Term = log.Term,
             Type = (int)log.Type,
             LogType = log.LogType,
-            Log = ByteString.CopyFrom(log.LogData),
+            Log = UnsafeByteOperations.UnsafeWrap(log.LogData),
             TimePhysical = log.Time.L,
             TimeCounter = log.Time.C
         }), cf: columnFamilyHandle);

@@ -1,5 +1,7 @@
 
 using System.Collections.Concurrent;
+using System.Net.Security;
+using Google.Protobuf;
 using Google.Protobuf.Collections;
 using Grpc.Net.Client;
 using Kommander.Data;
@@ -23,27 +25,25 @@ public class GrpcCommunication : ICommunication
     
     private static readonly CompleteAppendLogsResponse completeAppendLogsResponse = new();
     
-    private static readonly HttpClientHandler httpHandler = GetHandler();
+    private static readonly SocketsHttpHandler httpHandler = GetHandler();
     
-    private static HttpClientHandler GetHandler()
+    private static SocketsHttpHandler GetHandler()
     {
-        HttpClientHandler handler = new();
-        
-        handler.ServerCertificateCustomValidationCallback = (httpRequestMessage, cert, cetChain, policyErrors) =>
+        SslClientAuthenticationOptions sslOptions = new()
         {
-            // Optionally, check for other policyErrors
-            if (policyErrors == System.Net.Security.SslPolicyErrors.None)
-                return true;
-
-            // Compare the certificate's thumbprint to our trusted thumbprint.
-            //if (cert is X509Certificate2 certificate && certificate.Thumbprint.Equals(trustedThumbprint, StringComparison.OrdinalIgnoreCase))
-            //{
-            return true;
-            //}
-
-            //return false;
+            RemoteCertificateValidationCallback = delegate { return true; }
         };
         
+        SocketsHttpHandler handler = new()
+        {
+            SslOptions = sslOptions,
+            ConnectTimeout = TimeSpan.FromSeconds(10),
+            PooledConnectionIdleTimeout = Timeout.InfiniteTimeSpan,
+            KeepAlivePingDelay = TimeSpan.FromSeconds(60),
+            KeepAlivePingTimeout = TimeSpan.FromSeconds(30),
+            EnableMultipleHttp2Connections = true
+        };
+
         return handler;
     }
 
@@ -215,7 +215,7 @@ public class GrpcCommunication : ICommunication
                 LogType = requestLog.LogType,
                 TimePhysical = requestLog.Time.L,
                 TimeCounter = requestLog.Time.C,
-                Data = Google.Protobuf.ByteString.CopyFrom(requestLog.LogData)
+                Data = UnsafeByteOperations.UnsafeWrap(requestLog.LogData)
             });
         }
 
