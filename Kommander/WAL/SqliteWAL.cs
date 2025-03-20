@@ -180,6 +180,20 @@ public class SqliteWAL : IWAL
         await updateCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
     }
     
+    public async Task Rollback(int partitionId, RaftLog log)
+    {
+        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
+        
+        const string updateQuery = "UPDATE logs SET type = @type WHERE partitionId = @partitionId AND id = @id";
+        await using SqliteCommand updateCommand =  new(updateQuery, connection);
+        
+        updateCommand.Parameters.AddWithValue("@id", log.Id);
+        updateCommand.Parameters.AddWithValue("@partitionId", partitionId);
+        updateCommand.Parameters.AddWithValue("@type", log.Type);
+        
+        await updateCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
+    }
+    
     public async Task<long> GetMaxLog(int partitionId)
     {
         SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);

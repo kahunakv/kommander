@@ -155,6 +155,14 @@ public interface IRaft
     public Task<(bool success, RaftOperationStatus status, long commitLogId)> CommitLogs(int partitionId, HLCTimestamp ticketId);
 
     /// <summary>
+    /// Rollback logs and notify followers in the partition
+    /// </summary>
+    /// <param name="partitionId"></param>
+    /// <param name="ticketId"></param>
+    /// <returns></returns>
+    public Task<(bool success, RaftOperationStatus status, long commitLogId)> RollbackLogs(int partitionId, HLCTimestamp ticketId);
+
+    /// <summary>
     /// Obtains the local endpoint
     /// </summary>
     /// <returns></returns>

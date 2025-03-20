@@ -28,6 +28,9 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Committed logs {Timestamp} Logs={Logs}")]
     public static partial void LogInfoCommittedLogs(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, HLCTimestamp timestamp, int logs);
     
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Rolled back logs {Timestamp} Logs={Logs}")]
+    public static partial void LogInfoRolledbackLogs(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, HLCTimestamp timestamp, int logs);
+    
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Asked {Endpoint} for votes on Term={CurrentTerm}")]
     public static partial void LogInfoAskedForVotes(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long currentTerm);
     

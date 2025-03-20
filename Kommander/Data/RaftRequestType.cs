@@ -12,6 +12,7 @@ public enum RaftRequestType
     ReplicateLogs,
     ReplicateCheckpoint,
     CommitLogs,
+    RollbackLogs,
     GetNodeState,
     GetTicketState
 }

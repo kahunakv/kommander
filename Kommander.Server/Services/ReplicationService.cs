@@ -37,26 +37,26 @@ public class ReplicationService : BackgroundService //, IDisposable
                         {
                             result = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
                             if (result.Success)
-                                Console.WriteLine("#1 Replicated log with id: {0}", result.CommitLogId);
+                                Console.WriteLine("#1 Replicated log with id: {0}", result.LogIndex);
                             else
                                 Console.WriteLine("#1 Replication failed {0}", result.Status);
 
                             result = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
                             if (result.Success)
-                                Console.WriteLine("#2 Replicated log with id: {0}", result.CommitLogId);
+                                Console.WriteLine("#2 Replicated log with id: {0}", result.LogIndex);
                             else
                                 Console.WriteLine("#2 Replication failed {0}", result.Status);
 
                             result = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
                             if (result.Success)
-                                Console.WriteLine("#3 Replicated log with id: {0}", result.CommitLogId);
+                                Console.WriteLine("#3 Replicated log with id: {0}", result.LogIndex);
                             else
                                 Console.WriteLine("#3 Replication failed {0}", result.Status);
                         }
 
                         result = await raftManager.ReplicateCheckpoint(i).ConfigureAwait(false);
                         if (result.Success)
-                            Console.WriteLine("#C Replicated checkpoint log with id: {0}", result.CommitLogId);
+                            Console.WriteLine("#C Replicated checkpoint log with id: {0}", result.LogIndex);
                         else
                             Console.WriteLine("#C Replication checkpoint failed {0}", result.Status);
                     }

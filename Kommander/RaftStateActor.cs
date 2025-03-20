@@ -212,6 +212,12 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                     (RaftOperationStatus status, long commitIndex) = await CommitLogs(message.Timestamp).ConfigureAwait(false);
                     return new(RaftResponseType.None, status, commitIndex);
                 }
+                
+                case RaftRequestType.RollbackLogs:
+                {
+                    (RaftOperationStatus status, long commitIndex) = await RollbackLogs(message.Timestamp).ConfigureAwait(false);
+                    return new(RaftResponseType.None, status, commitIndex);
+                }
 
                 case RaftRequestType.RequestVote:
                     await Vote(new(message.Endpoint ?? ""), message.Term, message.CommitIndex, message.Timestamp).ConfigureAwait(false);
@@ -850,7 +856,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <summary>
     /// Marks proposals as committed
     /// </summary>
-    /// <param name="proposalIndex"></param>
+    /// <param name="ticketId"></param>
     /// <returns></returns>
     private async Task<(RaftOperationStatus, long commitIndex)> CommitLogs(HLCTimestamp ticketId)
     {
@@ -877,6 +883,44 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             await AppendLogToNode(new(node), currentTime, false);
         
         logger.LogInfoCommittedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId, proposal.Logs.Count);
+        
+        activeProposals.Remove(ticketId);
+        
+        return (RaftOperationStatus.Success, commitResponse.Index);
+    }
+    
+    /// <summary>
+    /// Marks proposals as rolled back
+    /// </summary>
+    /// <param name="ticketId"></param>
+    /// <returns></returns>
+    private async Task<(RaftOperationStatus, long commitIndex)> RollbackLogs(HLCTimestamp ticketId)
+    {
+        if (nodeState != RaftNodeState.Leader)
+            return (RaftOperationStatus.NodeIsNotLeader, 0);
+        
+        if (!activeProposals.TryGetValue(ticketId, out RaftProposalQuorum? proposal))
+            return (RaftOperationStatus.ProposalNotFound, 0);
+        
+        if (!proposal.HasQuorum())
+            return (RaftOperationStatus.Errored, 0);
+        
+        RaftWALResponse commitResponse = await walActor.Ask(new(RaftWALActionType.Rollback, currentTerm, ticketId, proposal.Logs)).ConfigureAwait(false);
+        if (commitResponse.Status != RaftOperationStatus.Success)
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't rollback logs {Timestamp}", manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId);
+
+            return (commitResponse.Status, 0);
+        }
+
+        HLCTimestamp currentTime = await manager.HybridLogicalClock.ReceiveEvent(ticketId);
+        
+        foreach (string node in proposal.Nodes)
+            await AppendLogToNode(new(node), currentTime, false);
+        
+        logger.LogInfoRolledbackLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId, proposal.Logs.Count);
+        
+        activeProposals.Remove(ticketId);
         
         return (RaftOperationStatus.Success, commitResponse.Index);
     }

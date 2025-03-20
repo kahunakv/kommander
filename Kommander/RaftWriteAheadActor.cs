@@ -60,6 +60,12 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                     (RaftOperationStatus status, long newCommitIndex) = await Commit(message.Logs).ConfigureAwait(false);
                     return new(status, newCommitIndex);
                 }
+                
+                case RaftWALActionType.Rollback:
+                {
+                    (RaftOperationStatus status, long newCommitIndex) = await Rollback(message.Logs).ConfigureAwait(false);
+                    return new(status, newCommitIndex);
+                }
 
                 case RaftWALActionType.ProposeOrCommit:
                     return new(RaftOperationStatus.Success, await ProposeOrCommit(message.Logs).ConfigureAwait(false));
@@ -110,6 +116,8 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 {
                     case RaftLogType.ProposedCheckpoint:
                     case RaftLogType.Proposed:
+                    case RaftLogType.RolledBack:
+                    case RaftLogType.RolledBackCheckpoint:
                         continue;
                     
                     case RaftLogType.Committed:
@@ -192,6 +200,34 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         return (RaftOperationStatus.Success, lastCommitIndex);
     }
     
+    private async Task<(RaftOperationStatus, long)> Rollback(List<RaftLog>? logs)
+    {
+        if (logs is null || logs.Count == 0)
+            return (RaftOperationStatus.Success, -1);
+        
+        RaftLog[] orderedLogs = logs.OrderBy(log => log.Id).ToArray();
+
+        foreach (RaftLog log in orderedLogs)
+        {
+            switch (log.Type)
+            {
+                case RaftLogType.Proposed:
+                    log.Type = RaftLogType.RolledBack;
+                
+                    await walAdapter.Rollback(partition.PartitionId, log).ConfigureAwait(false);
+                    break;
+                
+                case RaftLogType.ProposedCheckpoint:
+                    log.Type = RaftLogType.RolledBackCheckpoint;
+                
+                    await walAdapter.Rollback(partition.PartitionId, log).ConfigureAwait(false);
+                    break;
+            }
+        }
+
+        return (RaftOperationStatus.Success, -1);
+    }
+    
     private async Task<long> GetMaxLog()
     {
         return await walAdapter.GetMaxLog(partition.PartitionId).ConfigureAwait(false);
@@ -251,7 +287,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 logs.Max(log => log.Id)
             );
             
-            return Math.Max(proposeIndex, commitIndex);
+            return Math.Min(proposeIndex, commitIndex);
         }
 
         foreach (RaftLog log in orderedLogs)

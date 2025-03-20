@@ -60,6 +60,19 @@ public class InMemoryWAL : IWAL
 
         return Task.CompletedTask;
     }
+    
+    public Task Rollback(int partitionId, RaftLog log)
+    {
+        if (log.Type != RaftLogType.RolledBack && log.Type != RaftLogType.RolledBackCheckpoint)
+            throw new RaftException("Log must be rolledback or rolledback checkpoint");
+        
+        if (logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+            partitionLogs[log.Id] = log; // Always replace the log
+        else
+            logs.Add(partitionId, new() {{ log.Id, log }});
+
+        return Task.CompletedTask;
+    }
 
     public Task<long> GetMaxLog(int partitionId)
     {

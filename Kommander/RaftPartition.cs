@@ -171,7 +171,7 @@ public sealed class RaftPartition : IDisposable
     /// <summary>
     /// Commit logs and notify followers in the partition
     /// </summary>
-    /// <param name="proposalIndex"></param>
+    /// <param name="ticketId"></param>
     /// <returns></returns>
     public async Task<(bool success, RaftOperationStatus status, long commitIndex)> CommitLogs(HLCTimestamp ticketId)
     {
@@ -184,7 +184,28 @@ public sealed class RaftPartition : IDisposable
         RaftResponse response = await raftActor.Ask(new(RaftRequestType.CommitLogs, ticketId, false)).ConfigureAwait(false);
         
         if (response.Status == RaftOperationStatus.Success)
-            return (true, response.Status, response.CommitIndex);
+            return (true, response.Status, response.LogIndex);
+        
+        return (false, response.Status, 0);
+    }
+    
+    /// <summary>
+    /// Rollback logs and notify followers in the partition
+    /// </summary>
+    /// <param name="ticketId"></param>
+    /// <returns></returns>
+    public async Task<(bool success, RaftOperationStatus status, long commitIndex)> RollbackLogs(HLCTimestamp ticketId)
+    {
+        if (string.IsNullOrEmpty(Leader))
+            return (false, RaftOperationStatus.NodeIsNotLeader, 0);
+        
+        if (Leader != raftManager.LocalEndpoint)
+            return (false, RaftOperationStatus.NodeIsNotLeader, 0);
+        
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.RollbackLogs, ticketId, false)).ConfigureAwait(false);
+        
+        if (response.Status == RaftOperationStatus.Success)
+            return (true, response.Status, response.LogIndex);
         
         return (false, response.Status, 0);
     }
@@ -239,7 +260,7 @@ public sealed class RaftPartition : IDisposable
         if (response.Type != RaftResponseType.TicketState)
             throw new RaftException("Unknown response (2)");
 
-        return (response.TicketState, response.CommitIndex);
+        return (response.TicketState, response.LogIndex);
     }
 
     public void Dispose()

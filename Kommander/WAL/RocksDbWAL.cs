@@ -184,6 +184,28 @@ public class RocksDbWAL : IWAL
 
         return Task.CompletedTask;
     }
+    
+    public Task Rollback(int partitionId, RaftLog log)
+    {
+        int shardId = partitionId % MaxShards;
+        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        
+        string index = log.Id.ToString("D20");
+        
+        db.Put(Encoding.UTF8.GetBytes(index), Serialize(new()
+        {
+            Partition = partitionId,
+            Id = log.Id,
+            Term = log.Term,
+            Type = (int)log.Type,
+            LogType = log.LogType,
+            Log = UnsafeByteOperations.UnsafeWrap(log.LogData),
+            TimePhysical = log.Time.L,
+            TimeCounter = log.Time.C
+        }), cf: columnFamilyHandle);
+
+        return Task.CompletedTask;
+    }
 
     public Task<long> GetMaxLog(int partitionId)
     {

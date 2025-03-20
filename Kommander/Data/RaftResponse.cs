@@ -13,7 +13,7 @@ public readonly struct RaftResponse
     
     public RaftTicketState TicketState { get; } = RaftTicketState.NotFound;
     
-    public long CommitIndex { get; } = 0;
+    public long LogIndex { get; } = 0;
     
     public HLCTimestamp TicketId { get; } = HLCTimestamp.Zero;
     
@@ -23,11 +23,11 @@ public readonly struct RaftResponse
         NodeState = nodeState;
     }
     
-    public RaftResponse(RaftResponseType type, RaftTicketState ticketState, long commitIndex)
+    public RaftResponse(RaftResponseType type, RaftTicketState ticketState, long logIndex)
     {
         Type = type;
         TicketState = ticketState;
-        CommitIndex = commitIndex;
+        LogIndex = logIndex;
     }
     
     public RaftResponse(RaftResponseType type)
@@ -35,11 +35,11 @@ public readonly struct RaftResponse
         Type = type;
     }
     
-    public RaftResponse(RaftResponseType type, RaftOperationStatus status, long commitIndex)
+    public RaftResponse(RaftResponseType type, RaftOperationStatus status, long logIndex)
     {
         Type = type;
         Status = status;
-        CommitIndex = commitIndex;
+        LogIndex = logIndex;
     }
     
     public RaftResponse(RaftResponseType type, RaftOperationStatus status, HLCTimestamp ticketId)

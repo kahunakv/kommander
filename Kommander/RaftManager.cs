@@ -314,6 +314,19 @@ public sealed class RaftManager : IRaft
         
         return await partition.CommitLogs(ticketId).ConfigureAwait(false);
     }
+    
+    /// <summary>
+    /// Rollback logs and notify followers in the partition 
+    /// </summary>
+    /// <param name="partitionId"></param>
+    /// <param name="proposalIndex"></param>
+    /// <returns></returns>
+    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> RollbackLogs(int partitionId, HLCTimestamp ticketId)
+    {
+        RaftPartition partition = GetPartition(partitionId);
+        
+        return await partition.RollbackLogs(ticketId).ConfigureAwait(false);
+    }
 
     /// <summary>
     /// Replicates a checkpoint to the follower nodes

@@ -7,4 +7,6 @@ public enum RaftLogType
     Committed = 1,
     ProposedCheckpoint = 2,
     CommittedCheckpoint = 3,
+    RolledBack = 4,
+    RolledBackCheckpoint = 5
 }

@@ -232,7 +232,7 @@ public sealed class TestThreeNodeClusterManyPartitions
             Assert.True(response.Success);
             Assert.Equal(RaftOperationStatus.Success, response.Status);
             
-            Assert.Equal(i + 1, response.CommitLogId);
+            Assert.Equal(i + 1, response.LogIndex);
         }
         
         maxId = await node1.WalAdapter.GetMaxLog(0);
@@ -338,7 +338,7 @@ public sealed class TestThreeNodeClusterManyPartitions
             Assert.True(response.Success);
 
             Assert.Equal(RaftOperationStatus.Success, response.Status);
-            Assert.Equal(1, response.CommitLogId);
+            Assert.Equal(1, response.LogIndex);
 
             Assert.Equal(0, totalFollowersReceived);
             Assert.Equal(0, totalLeaderReceived);

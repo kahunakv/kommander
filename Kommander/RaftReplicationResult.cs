@@ -11,13 +11,13 @@ public readonly struct RaftReplicationResult
     
     public HLCTimestamp TicketId { get; }
 
-    public long CommitLogId { get; }
+    public long LogIndex { get; }
     
-    public RaftReplicationResult(bool success, RaftOperationStatus status, HLCTimestamp ticketId, long commitLogId)
+    public RaftReplicationResult(bool success, RaftOperationStatus status, HLCTimestamp ticketId, long logIndex)
     {
         Success = success;
         Status = status;
         TicketId = ticketId;
-        CommitLogId = commitLogId;
+        LogIndex = logIndex;
     }
 }

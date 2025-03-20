@@ -13,6 +13,8 @@ public interface IWAL
     
     public Task Commit(int partitionId, RaftLog log);
     
+    public Task Rollback(int partitionId, RaftLog log);
+    
     public Task<long> GetMaxLog(int partitionId);
     
     public Task<long> GetCurrentTerm(int partitionId);
