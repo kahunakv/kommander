@@ -327,7 +327,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         
                 IncreaseVotes(manager.LocalEndpoint, currentTerm);
 
-                logger.LogInfoVotedToBecomeLeader(manager.LocalEndpoint, partition.PartitionId, nodeState, (currentTime - lastHeartbeat).TotalMilliseconds, currentTerm);
+                logger.LogWarnVotedToBecomeLeader(manager.LocalEndpoint, partition.PartitionId, nodeState, (currentTime - lastHeartbeat).TotalMilliseconds, currentTerm);
 
                 await RequestVotes(currentTime).ConfigureAwait(false);
                 break;

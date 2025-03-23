@@ -279,6 +279,7 @@ public class GrpcCommunication : ICommunication
                     TimePhysical = appendLogsRequest.Time.L,
                     TimeCounter = appendLogsRequest.Time.C,
                     Endpoint = appendLogsRequest.Endpoint,
+                    Status = (GrpcRaftOperationStatus) appendLogsRequest.Status,
                     CommitIndex = appendLogsRequest.CommitIndex
                 };
 

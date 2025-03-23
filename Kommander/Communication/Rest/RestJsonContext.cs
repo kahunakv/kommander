@@ -11,6 +11,7 @@ namespace Kommander.Communication;
 [JsonSerializable(typeof(RequestVotesRequest))]
 [JsonSerializable(typeof(VoteRequest))]
 [JsonSerializable(typeof(CompleteAppendLogsRequest))]
+[JsonSerializable(typeof(CompleteAppendLogsBatchRequest))]
 [JsonSerializable(typeof(HandshakeRequest))]
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
 public sealed partial class RestJsonContext : JsonSerializerContext

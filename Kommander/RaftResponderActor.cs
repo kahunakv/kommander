@@ -31,7 +31,7 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
         {
             if (messages.Count > 1 && AreAllAppendLogs(messages))
             {
-                Console.WriteLine("Got block of {0} append messages", messages.Count);
+                //Console.WriteLine("Got block of {0} append messages", messages.Count);
                 
                 List<AppendLogsRequest> newMessages = new(messages.Count);
 
@@ -44,7 +44,7 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
             
             if (messages.Count > 1 && AreAllCompleteLogs(messages))
             {
-                Console.WriteLine("Got block of {0} complete messages", messages.Count);
+                //Console.WriteLine("Got block of {0} complete messages", messages.Count);
                 
                 List<CompleteAppendLogsRequest> newMessages = new(messages.Count);
 
@@ -54,41 +54,45 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
                 await communication.CompleteAppendLogsBatch(manager, messages[0].Node!, new() { CompleteLogs = newMessages }).ConfigureAwait(false);
                 return;
             }
+
+            List<Task> tasks = new(messages.Count);
             
             foreach (RaftResponderRequest message in messages)
             {
                 switch (message.Type)
                 {
                     case RaftResponderRequestType.AppendLogs:
-                        await AppendLogs(message);
+                        tasks.Add(AppendLogs(message));
                         break;
 
                     case RaftResponderRequestType.CompleteAppendLogs:
-                        await CompleteAppendLogs(message);
+                        tasks.Add(CompleteAppendLogs(message));
                         break;
 
                     case RaftResponderRequestType.Vote:
-                        await Vote(message);
+                        tasks.Add(Vote(message));
                         break;
 
                     case RaftResponderRequestType.RequestVotes:
-                        await RequestVotes(message);
+                        tasks.Add(RequestVotes(message));
                         break;
 
                     case RaftResponderRequestType.Handshake:
-                        await Handshake(message);
+                        tasks.Add(Handshake(message));
                         break;
 
                     case RaftResponderRequestType.TryBatch:
                     default:
-                        Console.WriteLine(message.Type);
+                        logger.LogError("Unsupported message {Type}", message.Type);
                         break;
-                }
+                }                
             }
+
+            await Task.WhenAll(tasks).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            Console.WriteLine(ex);
+            logger.LogError("Exception {Type}", ex.Message);
         }
     }
 

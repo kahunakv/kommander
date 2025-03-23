@@ -49,7 +49,7 @@ public class RaftConfiguration
     /// <summary>
     /// Interval to send pings to other nodes from the leader
     /// </summary>
-    public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromMilliseconds(1000);
+    public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromMilliseconds(500);
     
     /// <summary>
     /// Wait time for the leader to receive votes from other nodes
@@ -64,12 +64,12 @@ public class RaftConfiguration
     /// <summary>
     /// If followers hadn't received a heartbeat from the leader in this time, they will start an election
     /// </summary>
-    public int StartElectionTimeout { get; set; } = 1500;
+    public int StartElectionTimeout { get; set; } = 2000;
     
     /// <summary>
     /// If followers hadn't received a heartbeat from the leader in this time, they will start an election
     /// </summary>
-    public int EndElectionTimeout { get; set; } = 2500;
+    public int EndElectionTimeout { get; set; } = 4000;
     
     /// <summary>
     /// Increment election timeout by this value every time the node couldn't find quorum

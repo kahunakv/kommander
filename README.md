@@ -25,7 +25,7 @@ Kommander is an open-source, distributed consensus library implemented in C# for
   - **gRPC:** For low-latency and high-throughput scenarios (Default)
   - **HTTP/2:** For RESTful interactions and easier debugging. 
 - **Optimizations**: Kommander is designed for performance and scalability, with optimizations such as:
-  - **Hybrid Logical Clocks:** A logical clock that combines the best of both logical and physical clocks to provide a more accurate and efficient timestamping mechanism.
+  - **Hybrid Logical Clocks:** A hybrid clock that combines coarsely-synchronized physical clocks with Lamport Clocks to track causal relationships to provide a more accurate and efficient timestamping mechanism.
   - **Batch Replication:** Replicate multiple log entries in a single batch to reduce network overhead and improve throughput.
 
 ---
@@ -56,7 +56,7 @@ To install Kommander into your C#/.NET project, you can use the .NET CLI or the 
 #### Using .NET CLI
 
 ```shell
-dotnet add package Kommander --version 0.5.4
+dotnet add package Kommander
 ```
 
 ### Using NuGet Package Manager
@@ -64,7 +64,7 @@ dotnet add package Kommander --version 0.5.4
 Search for Kommander and install it from the NuGet package manager UI, or use the Package Manager Console:
 
 ```shell
-Install-Package Kommander -Version 0.5.4
+Install-Package Kommander
 ```
 
 Or, using the NuGet Package Manager in Visual Studio, search for **Kommander** and install it.

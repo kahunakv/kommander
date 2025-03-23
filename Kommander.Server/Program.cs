@@ -53,7 +53,7 @@ try
             configuration,
             new StaticDiscovery(nodes),
             new RocksDbWAL(path: opts.SqliteWalPath, revision: opts.SqliteWalRevision),
-            new GrpcCommunication(),
+            new RestCommunication(),
             new HybridLogicalClock(),
             services.GetRequiredService<ILogger<IRaft>>()
         );
