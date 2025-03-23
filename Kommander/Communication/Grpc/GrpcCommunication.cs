@@ -23,6 +23,8 @@ public class GrpcCommunication : ICommunication
     
     private static readonly AppendLogsResponse appendLogsResponse = new();
     
+    private static readonly AppendLogsBatchResponse appendLogsBatchResponse = new();
+    
     private static readonly CompleteAppendLogsResponse completeAppendLogsResponse = new();
     
     private static readonly SocketsHttpHandler httpHandler = GetHandler();
@@ -55,7 +57,7 @@ public class GrpcCommunication : ICommunication
     /// <param name="node"></param>
     /// <param name="request"></param>
     /// <returns></returns>
-    public async Task<HandshakeResponse> Handshake(RaftManager manager, RaftPartition partition, RaftNode node, HandshakeRequest request)
+    public async Task<HandshakeResponse> Handshake(RaftManager manager, RaftNode node, HandshakeRequest request)
     {
         GrpcChannel channel = GetChannel(node.Endpoint);
 
@@ -83,7 +85,7 @@ public class GrpcCommunication : ICommunication
     /// <param name="node"></param>
     /// <param name="request"></param>
     /// <returns></returns>
-    public async Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftPartition partition, RaftNode node, RequestVotesRequest request)
+    public async Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftNode node, RequestVotesRequest request)
     {
         //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Sent RequestVotes message to {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
 
@@ -116,7 +118,7 @@ public class GrpcCommunication : ICommunication
     /// <param name="node"></param>
     /// <param name="request"></param>
     /// <returns></returns>
-    public async Task<VoteResponse> Vote(RaftManager manager, RaftPartition partition, RaftNode node, VoteRequest request)
+    public async Task<VoteResponse> Vote(RaftManager manager, RaftNode node, VoteRequest request)
     {
         //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Send Vote to {Node} message on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
         
@@ -149,7 +151,7 @@ public class GrpcCommunication : ICommunication
     /// <param name="node"></param>
     /// <param name="request"></param>
     /// <returns></returns>
-    public async Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftPartition partition, RaftNode node, AppendLogsRequest request)
+    public async Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftNode node, AppendLogsRequest request)
     {
         GrpcChannel channel = GetChannel(node.Endpoint);
         
@@ -172,6 +174,47 @@ public class GrpcCommunication : ICommunication
     }
     
     /// <summary>
+    /// Sends a batch of AppendLogs message to a node via gRPC
+    /// </summary>
+    /// <param name="manager"></param>
+    /// <param name="node"></param>
+    /// <param name="requests"></param>
+    /// <returns></returns>
+    public async Task<AppendLogsBatchResponse> AppendLogsBatch(RaftManager manager, RaftNode node, AppendLogsBatchRequest request)
+    {
+        GrpcChannel channel = GetChannel(node.Endpoint);
+        
+        Rafter.RafterClient client = new(channel);
+        
+        GrpcAppendLogsBatchRequest batchRequest = new();
+
+        if (request.AppendLogs is not null)
+        {
+            RepeatedField<GrpcAppendLogsRequest> grpcRequests = new();
+            
+            foreach (AppendLogsRequest appendLogsRequest in request.AppendLogs)
+            {
+                GrpcAppendLogsRequest grpcRequest = new()
+                {
+                    Partition = appendLogsRequest.Partition,
+                    Term = appendLogsRequest.Term,
+                    TimePhysical = appendLogsRequest.Time.L,
+                    TimeCounter = appendLogsRequest.Time.C,
+                    Endpoint = appendLogsRequest.Endpoint
+                };
+
+                grpcRequests.Add(grpcRequest);
+            }
+            
+            batchRequest.AppendLogs.AddRange(grpcRequests);
+        }
+        
+        await client.AppendLogsBatchAsync(batchRequest).ConfigureAwait(false);
+        
+        return appendLogsBatchResponse;
+    }
+    
+    /// <summary>
     /// Sends a CompleteAppendLogs message to a node via gRPC
     /// </summary>
     /// <param name="manager"></param>
@@ -179,7 +222,7 @@ public class GrpcCommunication : ICommunication
     /// <param name="node"></param>
     /// <param name="request"></param>
     /// <returns></returns>
-    public async Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftPartition partition, RaftNode node, CompleteAppendLogsRequest request)
+    public async Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftNode node, CompleteAppendLogsRequest request)
     {
         GrpcChannel channel = GetChannel(node.Endpoint);
         

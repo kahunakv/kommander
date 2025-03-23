@@ -10,7 +10,7 @@ namespace Kommander.Communication.Rest;
 /// </summary>
 public class RestCommunication : ICommunication
 {
-    public async Task<HandshakeResponse> Handshake(RaftManager manager, RaftPartition partition, RaftNode node, HandshakeRequest request)
+    public async Task<HandshakeResponse> Handshake(RaftManager manager, RaftNode node, HandshakeRequest request)
     {
         RaftConfiguration configuration = manager.Configuration;
         
@@ -30,13 +30,13 @@ public class RestCommunication : ICommunication
         }
         catch (Exception e)
         {
-            manager.Logger.LogError("[{Endpoint}/{Partition}] Handshake: {Message}", manager.LocalEndpoint, partition.PartitionId, e.Message);
+            manager.Logger.LogError("[{Endpoint}/{Partition}] Handshake: {Message}", manager.LocalEndpoint, request.Partition, e.Message);
         }
         
         return new();
     }
     
-    public async Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftPartition partition, RaftNode node, RequestVotesRequest request)
+    public async Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftNode node, RequestVotesRequest request)
     {
         RaftConfiguration configuration = manager.Configuration;
         
@@ -56,13 +56,13 @@ public class RestCommunication : ICommunication
         }
         catch (Exception e)
         {
-            manager.Logger.LogError("[{Endpoint}/{Partition}] RequestVotes: {Message}", manager.LocalEndpoint, partition.PartitionId, e.Message);
+            manager.Logger.LogError("[{Endpoint}/{Partition}] RequestVotes: {Message}", manager.LocalEndpoint, request.Partition, e.Message);
         }
         
         return new();
     }
 
-    public async Task<VoteResponse> Vote(RaftManager manager, RaftPartition partition, RaftNode node, VoteRequest request)
+    public async Task<VoteResponse> Vote(RaftManager manager, RaftNode node, VoteRequest request)
     {
         RaftConfiguration configuration = manager.Configuration;
         
@@ -82,13 +82,13 @@ public class RestCommunication : ICommunication
         }
         catch (Exception e)
         {
-            manager.Logger.LogError("[{Endpoint}/{Partition}] Vote: {Message}", manager.LocalEndpoint, partition.PartitionId, e.Message);
+            manager.Logger.LogError("[{Endpoint}/{Partition}] Vote: {Message}", manager.LocalEndpoint, request.Partition, e.Message);
         }
 
         return new();
     }
 
-    public async Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftPartition partition, RaftNode node, CompleteAppendLogsRequest request)
+    public async Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftNode node, CompleteAppendLogsRequest request)
     {
         RaftConfiguration configuration = manager.Configuration;
         
@@ -110,13 +110,13 @@ public class RestCommunication : ICommunication
         }
         catch (Exception e)
         {
-            manager.Logger.LogError("[{Endpoint}/{Partition}] CompleteAppendLogs: {Message}", manager.LocalEndpoint, partition.PartitionId, e.Message);
+            manager.Logger.LogError("[{Endpoint}/{Partition}] CompleteAppendLogs: {Message}", manager.LocalEndpoint, request.Partition, e.Message);
         }
 
         return new();
     }
 
-    public async Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftPartition partition, RaftNode node, AppendLogsRequest request)
+    public async Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftNode node, AppendLogsRequest request)
     {
         RaftConfiguration configuration = manager.Configuration;
         
@@ -135,13 +135,41 @@ public class RestCommunication : ICommunication
                 .ReceiveJson<AppendLogsResponse>().ConfigureAwait(false);
             
             if (request.Logs is not null && request.Logs.Count > 0)
-                manager.Logger.LogDebug("[{Endpoint}/{Partition}] Logs replicated to {RemoteEndpoint}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint);
+                manager.Logger.LogDebug("[{Endpoint}/{Partition}] Logs replicated to {RemoteEndpoint}", manager.LocalEndpoint, request.Partition, node.Endpoint);
 
             return response;
         }
         catch (Exception e)
         {
-            manager.Logger.LogError("[{Endpoint}/{Partition}] AppendLogs: {Message}", manager.LocalEndpoint, partition.PartitionId, e.Message);
+            manager.Logger.LogError("[{Endpoint}/{Partition}] AppendLogs: {Message}", manager.LocalEndpoint, request.Partition, e.Message);
+        }
+
+        return new();
+    }
+    
+    public async Task<AppendLogsBatchResponse> AppendLogsBatch(RaftManager manager, RaftNode node, AppendLogsBatchRequest request)
+    {
+        RaftConfiguration configuration = manager.Configuration;
+        
+        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.AppendLogsRequest);
+        
+        try
+        {
+            AppendLogsBatchResponse? response = await (configuration.HttpScheme + node.Endpoint)
+                .WithOAuthBearerToken(configuration.HttpAuthBearerToken)
+                .AppendPathSegments("v1/raft/append-logs-batch")
+                .WithHeader("Accept", "application/json")
+                .WithHeader("Content-Type", "application/json")
+                .WithTimeout(configuration.HttpTimeout)
+                .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
+                .PostStringAsync(payload)
+                .ReceiveJson<AppendLogsBatchResponse>().ConfigureAwait(false);
+
+            return response;
+        }
+        catch (Exception e)
+        {
+            manager.Logger.LogError("[{Endpoint}/{Partition}] AppendLogsBatch: {Message}", manager.LocalEndpoint, request.AppendLogs?[0].Partition, e.Message);
         }
 
         return new();

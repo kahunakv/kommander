@@ -262,6 +262,14 @@ public sealed class RaftPartition : IDisposable
 
         return (response.TicketState, response.LogIndex);
     }
+    
+    /// <summary>
+    /// Sends a CheckLeader message to the raft state actor to check for leader changes
+    /// </summary>
+    public void CheckLeader()
+    {
+        raftActor.Send(new(RaftRequestType.CheckLeader));
+    }
 
     public void Dispose()
     {

@@ -60,7 +60,7 @@ public class SqliteWAL : IWAL
             await using SqliteCommand command1 = new(createTableQuery, connection);
             await command1.ExecuteNonQueryAsync().ConfigureAwait(false);
             
-            const string pragmasQuery = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY;";
+            const string pragmasQuery = "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY;";
             await using SqliteCommand command3 = new(pragmasQuery, connection);
             await command3.ExecuteNonQueryAsync().ConfigureAwait(false);
             

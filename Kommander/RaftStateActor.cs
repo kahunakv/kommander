@@ -146,14 +146,6 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             partition,
             walAdapter
         );
-
-        context.ActorSystem.StartPeriodicTimerStruct(
-            context.Self,
-            "check-election",
-            new(RaftRequestType.CheckLeader),
-            TimeSpan.FromMilliseconds(500),
-            this.manager.Configuration.CheckLeaderInterval
-        );
     }
 
     /// <summary>
@@ -679,12 +671,12 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 return;
             }
         }
+        
+        lastHeartbeat = await manager.HybridLogicalClock.ReceiveEvent(timestamp).ConfigureAwait(false);
 
         if (logs is not null && logs.Count > 0)
         {
             logger.LogDebugSendingVote(manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm, logs.Count);
-            
-            lastHeartbeat = await manager.HybridLogicalClock.ReceiveEvent(timestamp).ConfigureAwait(false);
 
             RaftWALResponse response = await walActor.Ask(new(RaftWALActionType.ProposeOrCommit, leaderTerm, timestamp, logs)).ConfigureAwait(false);
             
@@ -705,10 +697,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 new(endpoint), 
                 new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, timestamp, manager.LocalEndpoint, RaftOperationStatus.Success, response.Index)
             ));
+            
             return;
         }
-        
-        lastHeartbeat = await manager.HybridLogicalClock.ReceiveEvent(timestamp).ConfigureAwait(false);
         
         responderActor.Send(new(
             RaftResponderRequestType.CompleteAppendLogs, 
@@ -968,6 +959,12 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
             request = new(partition.PartitionId, currentTerm, timestamp, manager.LocalEndpoint, getRangeResponse.Logs);
         }
+
+        /*if (request.Logs is null || request.Logs.Count == 0)
+        {
+            manager.ResponseBatcherActor.Send(new(RaftResponderRequestType.AppendLogs, node, request));
+            return;
+        }*/
         
         responderActor.Send(new(RaftResponderRequestType.AppendLogs, node, request));
     }

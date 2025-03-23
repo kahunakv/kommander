@@ -15,6 +15,10 @@ public class RaftService : Rafter.RafterBase
     
     private static readonly Task<GrpcCompleteAppendLogsResponse> completeAppendLogsResponse = Task.FromResult(new GrpcCompleteAppendLogsResponse());
     
+    private static readonly Task<GrpcAppendLogsResponse> appendLogsResponse = Task.FromResult(new GrpcAppendLogsResponse());
+    
+    private static readonly Task<GrpcAppendLogsBatchResponse> appendLogsBatchResponse = Task.FromResult(new GrpcAppendLogsBatchResponse());
+    
     private readonly IRaft raft;
 
     private readonly ILogger<IRaft> logger;
@@ -81,7 +85,26 @@ public class RaftService : Rafter.RafterBase
             GetLogs(request.Logs)
         ));
         
-        return Task.FromResult(new GrpcAppendLogsResponse());
+        return appendLogsResponse;
+    }
+    
+    public override Task<GrpcAppendLogsBatchResponse> AppendLogsBatch(GrpcAppendLogsBatchRequest request, ServerCallContext context)
+    {
+        //if (request.Logs.Count > 0)
+        //    logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got AppendLogs message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
+
+        foreach (GrpcAppendLogsRequest? req in request.AppendLogs)
+        {
+            raft.AppendLogs(new(
+                req.Partition,
+                req.Term,
+                new(req.TimePhysical, req.TimeCounter),
+                req.Endpoint,
+                GetLogs(req.Logs)
+            ));
+        }
+
+        return appendLogsBatchResponse;
     }
     
     public override Task<GrpcCompleteAppendLogsResponse> CompleteAppendLogs(GrpcCompleteAppendLogsRequest request, ServerCallContext context)

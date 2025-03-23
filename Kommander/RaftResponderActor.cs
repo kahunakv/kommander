@@ -74,7 +74,7 @@ public sealed class RaftResponderActor : IActor<RaftResponderRequest>
         if (message.HandshakeRequest is null)
             return;
                 
-        await communication.Handshake(manager, partition, message.Node, message.HandshakeRequest);
+        await communication.Handshake(manager, message.Node, message.HandshakeRequest);
     }
     
     private async Task Vote(RaftResponderRequest message)
@@ -85,7 +85,7 @@ public sealed class RaftResponderActor : IActor<RaftResponderRequest>
         if (message.VoteRequest is null)
             return;
                 
-        await communication.Vote(manager, partition, message.Node, message.VoteRequest);
+        await communication.Vote(manager, message.Node, message.VoteRequest);
     }
 
     private async Task RequestVotes(RaftResponderRequest message)
@@ -96,7 +96,7 @@ public sealed class RaftResponderActor : IActor<RaftResponderRequest>
         if (message.RequestVotesRequest is null)
             return;
 
-        await communication.RequestVotes(manager, partition, message.Node, message.RequestVotesRequest);
+        await communication.RequestVotes(manager, message.Node, message.RequestVotesRequest);
     }
 
     private async Task AppendLogs(RaftResponderRequest message)
@@ -107,7 +107,7 @@ public sealed class RaftResponderActor : IActor<RaftResponderRequest>
         if (message.AppendLogsRequest is null)
             return;
         
-        await communication.AppendLogs(manager, partition, message.Node, message.AppendLogsRequest).ConfigureAwait(false);
+        await communication.AppendLogs(manager, message.Node, message.AppendLogsRequest).ConfigureAwait(false);
     }
     
     private async Task CompleteAppendLogs(RaftResponderRequest message)
@@ -118,6 +118,6 @@ public sealed class RaftResponderActor : IActor<RaftResponderRequest>
         if (message.CompleteAppendLogsRequest is null)
             return;
         
-        await communication.CompleteAppendLogs(manager, partition, message.Node, message.CompleteAppendLogsRequest).ConfigureAwait(false);
+        await communication.CompleteAppendLogs(manager, message.Node, message.CompleteAppendLogsRequest).ConfigureAwait(false);
     }
 }

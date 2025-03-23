@@ -7,5 +7,6 @@ public enum RaftResponderRequestType
     Vote,
     RequestVotes,
     AppendLogs,
-    CompleteAppendLogs
+    CompleteAppendLogs,
+    TryBatch
 }
