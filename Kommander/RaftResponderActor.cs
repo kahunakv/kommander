@@ -8,8 +8,6 @@ namespace Kommander;
 public sealed class RaftResponderActor : IActor<RaftResponderRequest>
 {
     private readonly RaftManager manager;
-    
-    private readonly RaftPartition partition;
 
     private readonly ICommunication communication;
 
@@ -18,13 +16,11 @@ public sealed class RaftResponderActor : IActor<RaftResponderRequest>
     public RaftResponderActor(
         IActorContext<RaftResponderActor, RaftResponderRequest> _,
         RaftManager manager, 
-        RaftPartition partition,
         ICommunication communication,
         ILogger<IRaft> logger
     )
     {
         this.manager = manager;
-        this.partition = partition;
         this.communication = communication;
         this.logger = logger;
     }

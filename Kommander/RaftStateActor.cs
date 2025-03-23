@@ -17,6 +17,11 @@ namespace Kommander;
 public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 {
     /// <summary>
+    /// Reference to the actor context
+    /// </summary>
+    private readonly IActorContextStruct<RaftStateActor, RaftRequest, RaftResponse> context;
+    
+    /// <summary>
     /// Reference to the raft manager
     /// </summary>
     private readonly RaftManager manager;
@@ -25,11 +30,16 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// Reference to the raft partition
     /// </summary>
     private readonly RaftPartition partition;
-    
+
     /// <summary>
-    /// Reference to the responder actor
+    /// Reference to the communication layer
     /// </summary>
-    private readonly IActorRef<RaftResponderActor, RaftResponderRequest> responderActor;
+    private readonly ICommunication communication;
+
+    /// <summary>
+    /// Reference to the responder actor per endpoint
+    /// </summary>
+    private readonly Dictionary<string, IActorRef<RaftResponderActor, RaftResponderRequest>> responderActors = [];
 
     /// <summary>
     /// Reference to the WAL actor
@@ -123,22 +133,16 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         ILogger<IRaft> logger
     )
     {
+        this.context = context;
         this.manager = manager;
         this.partition = partition;
+        this.communication = communication;
         this.logger = logger;
         
         electionTimeout = TimeSpan.FromMilliseconds(Random.Shared.Next(
             manager.Configuration.StartElectionTimeout, 
             manager.Configuration.EndElectionTimeout
         ));
-
-        responderActor = context.ActorSystem.Spawn<RaftResponderActor, RaftResponderRequest>(
-            "raft-responder-" + partition.PartitionId,
-            manager,
-            partition,
-            communication,
-            logger
-        );
         
         walActor = context.ActorSystem.SpawnStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse>(
             "raft-wal-" + partition.PartitionId, 
@@ -388,7 +392,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             
             logger.LogInfoAskedForVotes(manager.LocalEndpoint, partition.PartitionId, nodeState, node.Endpoint, currentTerm);
             
-            responderActor.Send(new(RaftResponderRequestType.RequestVotes, node, request));
+            EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.RequestVotes, node, request));
         }
     }
 
@@ -462,8 +466,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 throw new RaftException("Corrupted nodes");
             
             logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Sending handshake to {Node} #{Number}", manager.LocalEndpoint, partition.PartitionId, nodeState, node.Endpoint, ++number);
-        
-            responderActor.Send(new(RaftResponderRequestType.Handshake, node, request));
+            
+            EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Handshake, node, request));
         }
     }
 
@@ -523,7 +527,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         VoteRequest request = new(partition.PartitionId, voteTerm, localMaxId.Index, timestamp, manager.LocalEndpoint);
         
-        responderActor.Send(new(RaftResponderRequestType.Vote, node, request));
+        EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Vote, node, request));
     }
 
     /// <summary>
@@ -632,11 +636,12 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from a leader {Endpoint} with old Term={Term}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm);
             
-            responderActor.Send(new(
+            EnqueueResponse(endpoint, new(
                 RaftResponderRequestType.CompleteAppendLogs, 
                 new(endpoint), 
                 new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, timestamp, manager.LocalEndpoint, RaftOperationStatus.LeaderInOldTerm, -1)
             ));
+            
             return;
         }
         
@@ -663,7 +668,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             {
                 logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from another leader {Endpoint} (current leader {CurrentLeader}) Term={Term}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, expectedLeader, leaderTerm);
                 
-                responderActor.Send(new(
+                EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs, 
                     new(endpoint), 
                     new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, timestamp, manager.LocalEndpoint, RaftOperationStatus.LogsFromAnotherLeader, -1)
@@ -684,7 +689,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             {
                 logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't append logs from leader {Endpoint} with Term={Term} Logs={Logs}", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm, logs.Count);
                 
-                responderActor.Send(new(
+                EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs, 
                     new(endpoint), 
                     new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, timestamp, manager.LocalEndpoint, response.Status, -1)
@@ -692,7 +697,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 return;
             }
             
-            responderActor.Send(new(
+            EnqueueResponse(endpoint, new(
                 RaftResponderRequestType.CompleteAppendLogs, 
                 new(endpoint), 
                 new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, timestamp, manager.LocalEndpoint, RaftOperationStatus.Success, response.Index)
@@ -701,7 +706,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
         
-        responderActor.Send(new(
+        EnqueueResponse(endpoint, new(
             RaftResponderRequestType.CompleteAppendLogs, 
             new(endpoint), 
             new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, lastHeartbeat, manager.LocalEndpoint, RaftOperationStatus.Success, -1)
@@ -966,7 +971,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }*/
         
-        responderActor.Send(new(RaftResponderRequestType.AppendLogs, node, request));
+        EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.AppendLogs, node, request));
     }
 
     /// <summary>
@@ -1050,5 +1055,22 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         }
 
         return (RaftTicketState.Proposed, -1);
+    }
+
+    private void EnqueueResponse(string endpoint, RaftResponderRequest request)
+    {
+        if (!responderActors.TryGetValue(endpoint, out IActorRef<RaftResponderActor, RaftResponderRequest>? responderActor))
+        {
+            responderActor = context.ActorSystem.Spawn<RaftResponderActor, RaftResponderRequest>(
+                string.Concat("raft-responder-", partition.PartitionId, "-", endpoint),
+                manager,
+                communication,
+                logger
+            );
+            
+            responderActors.Add(endpoint, responderActor);
+        }
+        
+        responderActor.Send(request);
     }
 }

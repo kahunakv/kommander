@@ -41,14 +41,10 @@ public sealed class RaftManager : IRaft
     private readonly RaftPartition?[] partitions;
 
     private readonly IActorRef<RaftLeaderSupervisor, RaftLeaderSupervisorRequest> leaderSupervisorActor;
-    
-    private readonly IActorRef<RaftResponseBatcherActor, RaftResponseBatcherRequest> responseBatcherActor;
 
     internal List<RaftNode> Nodes { get; set; } = [];
     
     internal RaftPartition?[] Partitions => partitions;
-    
-    internal IActorRef<RaftResponseBatcherActor, RaftResponseBatcherRequest> ResponseBatcherActor => responseBatcherActor;
 
     /// <summary>
     /// Whether the node has joined the Raft cluster
@@ -152,7 +148,6 @@ public sealed class RaftManager : IRaft
         clusterHandler = new(this, discovery);
         
         leaderSupervisorActor = actorSystem.Spawn<RaftLeaderSupervisor, RaftLeaderSupervisorRequest>("raft-leader-supervisor", this, Logger);
-        responseBatcherActor = actorSystem.Spawn<RaftResponseBatcherActor, RaftResponseBatcherRequest>("raft-node-health-supervisor", this, communication, Logger);
     }
     
     /// <summary>
