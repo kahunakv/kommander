@@ -19,6 +19,8 @@ public class RaftService : Rafter.RafterBase
     
     private static readonly Task<GrpcAppendLogsBatchResponse> appendLogsBatchResponse = Task.FromResult(new GrpcAppendLogsBatchResponse());
     
+    private static readonly Task<GrpcCompleteAppendLogsBatchResponse> completeAppendLogsBatchResponse = Task.FromResult(new GrpcCompleteAppendLogsBatchResponse());
+    
     private readonly IRaft raft;
 
     private readonly ILogger<IRaft> logger;
@@ -122,6 +124,26 @@ public class RaftService : Rafter.RafterBase
         ));
         
         return completeAppendLogsResponse;
+    }
+    
+    public override Task<GrpcCompleteAppendLogsBatchResponse> CompleteAppendLogsBatch(GrpcCompleteAppendLogsBatchRequest request, ServerCallContext context)
+    {
+        //if (request.Logs.Count > 0)
+        //    logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got AppendLogs message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
+
+        foreach (GrpcCompleteAppendLogsRequest? req in request.CompleteLogs)
+        {
+            raft.CompleteAppendLogs(new(
+                req.Partition,
+                req.Term,
+                new(req.TimePhysical, req.TimeCounter),
+                req.Endpoint,
+                (RaftOperationStatus)req.Status,
+                req.CommitIndex
+            ));
+        }
+
+        return completeAppendLogsBatchResponse;
     }
 
     private static List<RaftLog> GetLogs(RepeatedField<GrpcRaftLog> requestLogs)

@@ -174,4 +174,32 @@ public class RestCommunication : ICommunication
 
         return new();
     }
+    
+    public async Task<CompleteAppendLogsBatchResponse> CompleteAppendLogsBatch(RaftManager manager, RaftNode node, CompleteAppendLogsBatchRequest request)
+    {
+        RaftConfiguration configuration = manager.Configuration;
+        
+        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.AppendLogsRequest);
+        
+        try
+        {
+            CompleteAppendLogsBatchResponse? response = await (configuration.HttpScheme + node.Endpoint)
+                .WithOAuthBearerToken(configuration.HttpAuthBearerToken)
+                .AppendPathSegments("v1/raft/complete-append-logs-batch")
+                .WithHeader("Accept", "application/json")
+                .WithHeader("Content-Type", "application/json")
+                .WithTimeout(configuration.HttpTimeout)
+                .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
+                .PostStringAsync(payload)
+                .ReceiveJson<CompleteAppendLogsBatchResponse>().ConfigureAwait(false);
+
+            return response;
+        }
+        catch (Exception e)
+        {
+            manager.Logger.LogError("[{Endpoint}/{Partition}] CompleteAppendLogsBatch: {Message}", manager.LocalEndpoint, request.CompleteLogs?[0].Partition, e.Message);
+        }
+
+        return new();
+    }
 }

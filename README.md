@@ -24,6 +24,9 @@ Kommander is an open-source, distributed consensus library implemented in C# for
 - **Multiple Communication Protocols:** Achieve consensus and data replication over:
   - **gRPC:** For low-latency and high-throughput scenarios (Default)
   - **HTTP/2:** For RESTful interactions and easier debugging. 
+- **Optimizations**: Kommander is designed for performance and scalability, with optimizations such as:
+  - **Hybrid Logical Clocks:** A logical clock that combines the best of both logical and physical clocks to provide a more accurate and efficient timestamping mechanism.
+  - **Batch Replication:** Replicate multiple log entries in a single batch to reduce network overhead and improve throughput.
 
 ---
 
@@ -53,7 +56,7 @@ To install Kommander into your C#/.NET project, you can use the .NET CLI or the 
 #### Using .NET CLI
 
 ```shell
-dotnet add package Kommander --version 0.5.1
+dotnet add package Kommander --version 0.5.4
 ```
 
 ### Using NuGet Package Manager
@@ -61,7 +64,7 @@ dotnet add package Kommander --version 0.5.1
 Search for Kommander and install it from the NuGet package manager UI, or use the Package Manager Console:
 
 ```shell
-Install-Package Kommander -Version 0.5.1
+Install-Package Kommander -Version 0.5.4
 ```
 
 Or, using the NuGet Package Manager in Visual Studio, search for **Kommander** and install it.
@@ -143,8 +146,8 @@ For detailed configuration options, please refer to the [Documentation](https://
 
 ### **Basic Concepts**
 
-- **Partitions**: A Raft cluster can have multiple partitions within its dataset.
-Each partition elects its own leader and followers, allowing each node in the
+- **Partitions**: A Raft cluster can have multiple partitions (sometimes called regions or tablets) 
+within its dataset. Each partition elects its own leader and followers, allowing each node in the
 cluster to act as both a leader and a follower across different partitions.
 Having multiple partitions can improve the cluster's throughput by reducing
 contention and enabling more operations to run concurrently. However, it
@@ -195,7 +198,14 @@ both of which offer distinct advantages and are widely familiar to developers.
 - **Log Id**: Kommmander maintains a per partition 64-bit cluster-wide counter, 
 known as the log id, which increments each time a new proposal is added. 
 This revision functions as a global logical clock, ensuring a sequential order for all 
-updates to the partition log. Each new log id represents an incremental change. 
+updates to the partition log. Each new log id represents an incremental change.
+
+- **Replication**: The leader replicates logs to followers, ensuring that all nodes
+remain consistent and up-to-date. Once a quorum of nodes acknowledges the log entry, 
+it is considered committed and can be applied to the state machine.
+
+- **Proposals**: Clients send requests to the leader to propose changes to the cluster.
+If proposed changes are accepted by a quorum of nodes, the commit process is initiated.
 
 ---
 

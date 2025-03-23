@@ -7,6 +7,7 @@ namespace Kommander.Communication;
 /// Generates JSON serialization via source code generation for the specified types.
 /// </summary>
 [JsonSerializable(typeof(AppendLogsRequest))]
+[JsonSerializable(typeof(AppendLogsBatchRequest))]
 [JsonSerializable(typeof(RequestVotesRequest))]
 [JsonSerializable(typeof(VoteRequest))]
 [JsonSerializable(typeof(CompleteAppendLogsRequest))]

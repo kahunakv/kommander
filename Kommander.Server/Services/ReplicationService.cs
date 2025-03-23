@@ -21,53 +21,60 @@ public class ReplicationService : BackgroundService //, IDisposable
         while (true)
         {
             await raftManager.UpdateNodes().ConfigureAwait(false);
+            
+            List<Task> tasks = new(raftManager.Configuration.MaxPartitions);
 
-            for (int i = 0; i < raftManager.Configuration.MaxPartitions ; i++)
+            for (int i = 0; i < raftManager.Configuration.MaxPartitions; i++)
+                tasks.Add(ReplicateToPartition(i));
+            
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+
+            await Task.Delay(20000, stoppingToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task ReplicateToPartition(int i)
+    {
+        try
+        {
+            if (await raftManager.AmILeaderQuick(i).ConfigureAwait(false))
             {
-                try
+                const string logType = "Greeting";
+                byte[] data = Encoding.UTF8.GetBytes("Hello, World! " + DateTime.UtcNow);
+
+                RaftReplicationResult result;
+
+                for (int j = 0; j < 20; j++)
                 {
-                    if (await raftManager.AmILeaderQuick(i).ConfigureAwait(false))
-                    {
-                        const string logType = "Greeting";
-                        byte[] data = Encoding.UTF8.GetBytes("Hello, World! " + DateTime.UtcNow);
+                    result = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
+                    if (result.Success)
+                        Console.WriteLine("#1 Replicated log with id: {0}", result.LogIndex);
+                    else
+                        Console.WriteLine("#1 Replication failed {0}", result.Status);
 
-                        RaftReplicationResult result;
+                    result = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
+                    if (result.Success)
+                        Console.WriteLine("#2 Replicated log with id: {0}", result.LogIndex);
+                    else
+                        Console.WriteLine("#2 Replication failed {0}", result.Status);
 
-                        for (int j = 0; j < 20; j++)
-                        {
-                            result = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
-                            if (result.Success)
-                                Console.WriteLine("#1 Replicated log with id: {0}", result.LogIndex);
-                            else
-                                Console.WriteLine("#1 Replication failed {0}", result.Status);
-
-                            result = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
-                            if (result.Success)
-                                Console.WriteLine("#2 Replicated log with id: {0}", result.LogIndex);
-                            else
-                                Console.WriteLine("#2 Replication failed {0}", result.Status);
-
-                            result = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
-                            if (result.Success)
-                                Console.WriteLine("#3 Replicated log with id: {0}", result.LogIndex);
-                            else
-                                Console.WriteLine("#3 Replication failed {0}", result.Status);
-                        }
-
-                        result = await raftManager.ReplicateCheckpoint(i).ConfigureAwait(false);
-                        if (result.Success)
-                            Console.WriteLine("#C Replicated checkpoint log with id: {0}", result.LogIndex);
-                        else
-                            Console.WriteLine("#C Replication checkpoint failed {0}", result.Status);
-                    }
+                    result = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
+                    if (result.Success)
+                        Console.WriteLine("#3 Replicated log with id: {0}", result.LogIndex);
+                    else
+                        Console.WriteLine("#3 Replication failed {0}", result.Status);
                 }
-                catch (Exception ex)
-                {
-                    Console.WriteLine("ReplicationServiceException: {0}# {1}", i, ex.Message);
-                }
+
+                result = await raftManager.ReplicateCheckpoint(i).ConfigureAwait(false);
+                if (result.Success)
+                    Console.WriteLine("#C Replicated checkpoint log with id: {0}", result.LogIndex);
+                else
+                    Console.WriteLine("#C Replication checkpoint failed {0}", result.Status);
             }
-
-            await Task.Delay(30000, stoppingToken);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("ReplicationServiceException: {0}# {1}", i, ex.Message);
         }
     }
 }

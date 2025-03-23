@@ -8,6 +8,7 @@ service Rafter {
   rpc AppendLogs (GrpcAppendLogsRequest) returns (GrpcAppendLogsResponse);
   rpc AppendLogsBatch (GrpcAppendLogsBatchRequest) returns (GrpcAppendLogsBatchResponse);
   rpc CompleteAppendLogs (GrpcCompleteAppendLogsRequest) returns (GrpcCompleteAppendLogsResponse);
+  rpc CompleteAppendLogsBatch (GrpcCompleteAppendLogsBatchRequest) returns (GrpcCompleteAppendLogsBatchResponse);
 }
 
 message GrpcHandshakeRequest {
@@ -78,6 +79,14 @@ message GrpcCompleteAppendLogsRequest {
 }
 
 message GrpcCompleteAppendLogsResponse {
+
+}
+
+message GrpcCompleteAppendLogsBatchRequest {
+  repeated GrpcCompleteAppendLogsRequest CompleteLogs = 1;
+}
+
+message GrpcCompleteAppendLogsBatchResponse {
 
 }
 

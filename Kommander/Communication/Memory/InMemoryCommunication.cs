@@ -21,6 +21,8 @@ public class InMemoryCommunication : ICommunication
     
     private readonly Task<AppendLogsBatchResponse> appendLogsBatchResponse = Task.FromResult(new AppendLogsBatchResponse());
     
+    private readonly Task<CompleteAppendLogsBatchResponse> completeAppendLogsBatchResponse = Task.FromResult(new CompleteAppendLogsBatchResponse());
+    
     private Dictionary<string, IRaft> nodes = new();
     
     public void SetNodes(Dictionary<string, IRaft> nodes)
@@ -76,14 +78,8 @@ public class InMemoryCommunication : ICommunication
             {
                 if (request.AppendLogs is not null)
                 {
-                    var guid = Guid.NewGuid().ToString();
-                    
                     foreach (AppendLogsRequest appendLogsRequest in request.AppendLogs)
-                    {
-                        //Console.WriteLine("{0} {1} {2}", guid, appendLogsRequest.Endpoint, appendLogsRequest.Partition);
-                        
                         targetNode.AppendLogs(appendLogsRequest);
-                    }
                 }
             }
             else
@@ -105,5 +101,28 @@ public class InMemoryCommunication : ICommunication
             Console.WriteLine("CompleteAppendLogs Unknown node: " + node.Endpoint);
         
         return completeAppendLogsResponse;
+    }
+    
+    public Task<CompleteAppendLogsBatchResponse> CompleteAppendLogsBatch(RaftManager manager, RaftNode node, CompleteAppendLogsBatchRequest request)
+    {
+        if (manager.ClusterHandler.IsNode(node.Endpoint))
+        {
+            if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
+            {
+                if (request.CompleteLogs is not null)
+                {
+                    foreach (CompleteAppendLogsRequest appendLogsRequest in request.CompleteLogs)
+                        targetNode.CompleteAppendLogs(appendLogsRequest);
+                }
+            }
+            else
+            {
+                Console.WriteLine("CompleteAppendLogsBatch Unknown node: " + node.Endpoint + " [2]");
+            }
+        }
+        else
+            Console.WriteLine("CompleteAppendLogsBatch Unknown node: " + node.Endpoint + " [1]");
+        
+        return completeAppendLogsBatchResponse;
     }
 }

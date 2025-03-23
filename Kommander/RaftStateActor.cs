@@ -37,11 +37,6 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     private readonly ICommunication communication;
 
     /// <summary>
-    /// Reference to the responder actor per endpoint
-    /// </summary>
-    private readonly Dictionary<string, IActorRef<RaftResponderActor, RaftResponderRequest>> responderActors = [];
-
-    /// <summary>
     /// Reference to the WAL actor
     /// </summary>
     private readonly IActorRefStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse> walActor;
@@ -392,7 +387,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             
             logger.LogInfoAskedForVotes(manager.LocalEndpoint, partition.PartitionId, nodeState, node.Endpoint, currentTerm);
             
-            EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.RequestVotes, node, request));
+            manager.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.RequestVotes, node, request));
         }
     }
 
@@ -467,7 +462,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             
             logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Sending handshake to {Node} #{Number}", manager.LocalEndpoint, partition.PartitionId, nodeState, node.Endpoint, ++number);
             
-            EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Handshake, node, request));
+            manager.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Handshake, node, request));
         }
     }
 
@@ -527,7 +522,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         VoteRequest request = new(partition.PartitionId, voteTerm, localMaxId.Index, timestamp, manager.LocalEndpoint);
         
-        EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Vote, node, request));
+        manager.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Vote, node, request));
     }
 
     /// <summary>
@@ -636,7 +631,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from a leader {Endpoint} with old Term={Term}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm);
             
-            EnqueueResponse(endpoint, new(
+            manager.EnqueueResponse(endpoint, new(
                 RaftResponderRequestType.CompleteAppendLogs, 
                 new(endpoint), 
                 new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, timestamp, manager.LocalEndpoint, RaftOperationStatus.LeaderInOldTerm, -1)
@@ -668,7 +663,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             {
                 logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from another leader {Endpoint} (current leader {CurrentLeader}) Term={Term}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, expectedLeader, leaderTerm);
                 
-                EnqueueResponse(endpoint, new(
+                manager.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs, 
                     new(endpoint), 
                     new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, timestamp, manager.LocalEndpoint, RaftOperationStatus.LogsFromAnotherLeader, -1)
@@ -689,7 +684,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             {
                 logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't append logs from leader {Endpoint} with Term={Term} Logs={Logs}", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm, logs.Count);
                 
-                EnqueueResponse(endpoint, new(
+                manager.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs, 
                     new(endpoint), 
                     new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, timestamp, manager.LocalEndpoint, response.Status, -1)
@@ -697,7 +692,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 return;
             }
             
-            EnqueueResponse(endpoint, new(
+            manager.EnqueueResponse(endpoint, new(
                 RaftResponderRequestType.CompleteAppendLogs, 
                 new(endpoint), 
                 new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, timestamp, manager.LocalEndpoint, RaftOperationStatus.Success, response.Index)
@@ -706,7 +701,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
         
-        EnqueueResponse(endpoint, new(
+        manager.EnqueueResponse(endpoint, new(
             RaftResponderRequestType.CompleteAppendLogs, 
             new(endpoint), 
             new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, lastHeartbeat, manager.LocalEndpoint, RaftOperationStatus.Success, -1)
@@ -971,7 +966,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }*/
         
-        EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.AppendLogs, node, request));
+        manager.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.AppendLogs, node, request));
     }
 
     /// <summary>
@@ -1055,22 +1050,5 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         }
 
         return (RaftTicketState.Proposed, -1);
-    }
-
-    private void EnqueueResponse(string endpoint, RaftResponderRequest request)
-    {
-        if (!responderActors.TryGetValue(endpoint, out IActorRef<RaftResponderActor, RaftResponderRequest>? responderActor))
-        {
-            responderActor = context.ActorSystem.Spawn<RaftResponderActor, RaftResponderRequest>(
-                string.Concat("raft-responder-", partition.PartitionId, "-", endpoint),
-                manager,
-                communication,
-                logger
-            );
-            
-            responderActors.Add(endpoint, responderActor);
-        }
-        
-        responderActor.Send(request);
     }
 }

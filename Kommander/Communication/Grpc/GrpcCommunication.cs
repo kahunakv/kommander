@@ -27,12 +27,15 @@ public class GrpcCommunication : ICommunication
     
     private static readonly CompleteAppendLogsResponse completeAppendLogsResponse = new();
     
+    private static readonly CompleteAppendLogsBatchResponse completeAppendLogsBatchResponse = new();
+    
     private static readonly SocketsHttpHandler httpHandler = GetHandler();
     
     private static SocketsHttpHandler GetHandler()
     {
         SslClientAuthenticationOptions sslOptions = new()
         {
+            // @todo proper certificate validation
             RemoteCertificateValidationCallback = delegate { return true; }
         };
         
@@ -166,7 +169,8 @@ public class GrpcCommunication : ICommunication
             Endpoint = request.Endpoint
         };
 
-        grpcRequest.Logs.AddRange(GetLogs(request.Logs ?? []));
+        if (request.Logs is not null)
+            grpcRequest.Logs.AddRange(GetLogs(request.Logs ?? []));
         
         await client.AppendLogsAsync(grpcRequest).ConfigureAwait(false);
         
@@ -202,6 +206,9 @@ public class GrpcCommunication : ICommunication
                     TimeCounter = appendLogsRequest.Time.C,
                     Endpoint = appendLogsRequest.Endpoint
                 };
+                
+                if (appendLogsRequest.Logs is not null)
+                    grpcRequest.Logs.AddRange(GetLogs(appendLogsRequest.Logs));
 
                 grpcRequests.Add(grpcRequest);
             }
@@ -242,6 +249,48 @@ public class GrpcCommunication : ICommunication
         await client.CompleteAppendLogsAsync(grpcRequest).ConfigureAwait(false);
         
         return completeAppendLogsResponse;
+    }
+    
+    /// <summary>
+    /// Sends a batch of AppendLogs message to a node via gRPC
+    /// </summary>
+    /// <param name="manager"></param>
+    /// <param name="node"></param>
+    /// <param name="requests"></param>
+    /// <returns></returns>
+    public async Task<CompleteAppendLogsBatchResponse> CompleteAppendLogsBatch(RaftManager manager, RaftNode node, CompleteAppendLogsBatchRequest request)
+    {
+        GrpcChannel channel = GetChannel(node.Endpoint);
+        
+        Rafter.RafterClient client = new(channel);
+        
+        GrpcCompleteAppendLogsBatchRequest batchRequest = new();
+
+        if (request.CompleteLogs is not null)
+        {
+            RepeatedField<GrpcCompleteAppendLogsRequest> grpcRequests = new();
+            
+            foreach (CompleteAppendLogsRequest appendLogsRequest in request.CompleteLogs)
+            {
+                GrpcCompleteAppendLogsRequest grpcRequest = new()
+                {
+                    Partition = appendLogsRequest.Partition,
+                    Term = appendLogsRequest.Term,
+                    TimePhysical = appendLogsRequest.Time.L,
+                    TimeCounter = appendLogsRequest.Time.C,
+                    Endpoint = appendLogsRequest.Endpoint,
+                    CommitIndex = appendLogsRequest.CommitIndex
+                };
+
+                grpcRequests.Add(grpcRequest);
+            }
+            
+            batchRequest.CompleteLogs.AddRange(grpcRequests);
+        }
+        
+        await client.CompleteAppendLogsBatchAsync(batchRequest).ConfigureAwait(false);
+        
+        return completeAppendLogsBatchResponse;
     }
 
     private static RepeatedField<GrpcRaftLog> GetLogs(List<RaftLog> requestLogs)
