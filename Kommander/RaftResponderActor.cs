@@ -38,7 +38,7 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
                 foreach (RaftResponderRequest message in messages)
                     newMessages.Add(message.AppendLogsRequest!);
                 
-                await communication.AppendLogsBatch(manager, messages[0].Node!, new() { AppendLogs = newMessages }).ConfigureAwait(false);
+                _ = communication.AppendLogsBatch(manager, messages[0].Node!, new() { AppendLogs = newMessages }).ConfigureAwait(false);
                 return;
             }
             
@@ -51,34 +51,32 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
                 foreach (RaftResponderRequest message in messages)
                     newMessages.Add(message.CompleteAppendLogsRequest!);
                 
-                await communication.CompleteAppendLogsBatch(manager, messages[0].Node!, new() { CompleteLogs = newMessages }).ConfigureAwait(false);
+                _ = communication.CompleteAppendLogsBatch(manager, messages[0].Node!, new() { CompleteLogs = newMessages }).ConfigureAwait(false);
                 return;
             }
-
-            List<Task> tasks = new(messages.Count);
             
             foreach (RaftResponderRequest message in messages)
             {
                 switch (message.Type)
                 {
                     case RaftResponderRequestType.AppendLogs:
-                        tasks.Add(AppendLogs(message));
+                        _ = AppendLogs(message);
                         break;
 
                     case RaftResponderRequestType.CompleteAppendLogs:
-                        tasks.Add(CompleteAppendLogs(message));
+                        _ = CompleteAppendLogs(message);
                         break;
 
                     case RaftResponderRequestType.Vote:
-                        tasks.Add(Vote(message));
+                        _ = Vote(message);
                         break;
 
                     case RaftResponderRequestType.RequestVotes:
-                        tasks.Add(RequestVotes(message));
+                        _ = RequestVotes(message);
                         break;
 
                     case RaftResponderRequestType.Handshake:
-                        tasks.Add(Handshake(message));
+                        _ = Handshake(message);
                         break;
 
                     case RaftResponderRequestType.TryBatch:
@@ -88,7 +86,9 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
                 }                
             }
 
-            await Task.WhenAll(tasks).ConfigureAwait(false);
+            //await Task.WhenAll(tasks).ConfigureAwait(false);
+
+            await Task.CompletedTask;
         }
         catch (Exception ex)
         {
