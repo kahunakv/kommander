@@ -29,66 +29,69 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
     {
         try
         {
-            if (messages.Count > 1 && AreAllAppendLogs(messages))
+            if (messages.Count > 1)
             {
-                //Console.WriteLine("Got block of {0} append messages", messages.Count);
-                
-                List<AppendLogsRequest> newMessages = new(messages.Count);
+                if (AreAllAppendLogs(messages))
+                {
+                    //Console.WriteLine("Got block of {0} append messages", messages.Count);
 
-                foreach (RaftResponderRequest message in messages)
-                    newMessages.Add(message.AppendLogsRequest!);
-                
-                _ = communication.AppendLogsBatch(manager, messages[0].Node!, new() { AppendLogs = newMessages }).ConfigureAwait(false);
-                return;
-            }
-            
-            if (messages.Count > 1 && AreAllCompleteLogs(messages))
-            {
-                //Console.WriteLine("Got block of {0} complete messages", messages.Count);
-                
-                List<CompleteAppendLogsRequest> newMessages = new(messages.Count);
+                    List<AppendLogsRequest> newMessages = new(messages.Count);
 
-                foreach (RaftResponderRequest message in messages)
-                    newMessages.Add(message.CompleteAppendLogsRequest!);
+                    foreach (RaftResponderRequest message in messages)
+                        newMessages.Add(message.AppendLogsRequest!);
+
+                    await communication.AppendLogsBatch(manager, messages[0].Node!, new() { AppendLogs = newMessages }).ConfigureAwait(false);
+                    return;
+                }
                 
-                _ = communication.CompleteAppendLogsBatch(manager, messages[0].Node!, new() { CompleteLogs = newMessages }).ConfigureAwait(false);
-                return;
+                if (AreAllCompleteLogs(messages))
+                {
+                    //Console.WriteLine("Got block of {0} complete messages", messages.Count);
+                
+                    List<CompleteAppendLogsRequest> newMessages = new(messages.Count);
+
+                    foreach (RaftResponderRequest message in messages)
+                        newMessages.Add(message.CompleteAppendLogsRequest!);
+                
+                    await communication.CompleteAppendLogsBatch(manager, messages[0].Node!, new() { CompleteLogs = newMessages }).ConfigureAwait(false);
+                    return;
+                }
             }
+
+            List<Task> tasks = [];
             
             foreach (RaftResponderRequest message in messages)
             {
                 switch (message.Type)
                 {
                     case RaftResponderRequestType.AppendLogs:
-                        _ = AppendLogs(message);
+                        tasks.Add(AppendLogs(message));
                         break;
 
                     case RaftResponderRequestType.CompleteAppendLogs:
-                        _ = CompleteAppendLogs(message);
+                        tasks.Add(CompleteAppendLogs(message));
                         break;
 
                     case RaftResponderRequestType.Vote:
-                        _ = Vote(message);
+                        tasks.Add(Vote(message));
                         break;
 
                     case RaftResponderRequestType.RequestVotes:
-                        _ = RequestVotes(message);
+                        tasks.Add(RequestVotes(message));
                         break;
 
                     case RaftResponderRequestType.Handshake:
-                        _ = Handshake(message);
+                        tasks.Add(Handshake(message));
                         break;
 
                     case RaftResponderRequestType.TryBatch:
                     default:
                         logger.LogError("Unsupported message {Type}", message.Type);
                         break;
-                }                
+                }            
             }
-
-            //await Task.WhenAll(tasks).ConfigureAwait(false);
-
-            await Task.CompletedTask;
+            
+            await Task.WhenAll(tasks).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

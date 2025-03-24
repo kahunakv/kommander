@@ -13,7 +13,9 @@ namespace Kommander.Communication.Grpc;
 /// </summary>
 public class GrpcCommunication : ICommunication
 {
-    private readonly ConcurrentDictionary<string, GrpcChannel> channels = new();
+    private readonly ConcurrentDictionary<string, List<GrpcChannel>> channels = new();
+    
+    private int channelIndex;
     
     private static readonly HandshakeResponse handshakeResponse = new();
     
@@ -317,12 +319,20 @@ public class GrpcCommunication : ICommunication
     
     private GrpcChannel GetChannel(string endpoint)
     {
-        if (!channels.TryGetValue(endpoint, out GrpcChannel? channel))
+        if (!channels.TryGetValue(endpoint, out List<GrpcChannel>? grpcChannels))
         {
-            channel = GrpcChannel.ForAddress($"https://{endpoint}", new() { HttpHandler = httpHandler });
-            channels.TryAdd(endpoint, channel);
+            grpcChannels = new(5);
+            
+            for (int i = 0; i < 5; i++)
+                grpcChannels.Add(GrpcChannel.ForAddress($"https://{endpoint}", new() { HttpHandler = httpHandler }));
+            
+            channels.TryAdd(endpoint, grpcChannels);
         }
+
+        int nextIndex = Interlocked.Increment(ref channelIndex);
+        if (nextIndex < 0)
+            nextIndex = -nextIndex;
         
-        return channel;
+        return grpcChannels[nextIndex % 5];
     }
 }

@@ -252,7 +252,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
 
         restored = true;
-        lastHeartbeat = await manager.HybridLogicalClock.SendOrLocalEvent().ConfigureAwait(false);
+        lastHeartbeat = await manager.HybridLogicalClock.TrySendOrLocalEvent().ConfigureAwait(false);
 
         RaftWALResponse currentCommitIndexResponse = await walActor.Ask(new(RaftWALActionType.Recover)).ConfigureAwait(false);
         
@@ -270,7 +270,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// </summary>
     private async Task CheckPartitionLeadership()
     {
-        HLCTimestamp currentTime = await manager.HybridLogicalClock.SendOrLocalEvent().ConfigureAwait(false);
+        HLCTimestamp currentTime = await manager.HybridLogicalClock.TrySendOrLocalEvent().ConfigureAwait(false);
 
         switch (nodeState)
         {
@@ -387,7 +387,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             
             logger.LogInfoAskedForVotes(manager.LocalEndpoint, partition.PartitionId, nodeState, node.Endpoint, currentTerm);
             
-            manager.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.RequestVotes, node, request));
+            partition.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.RequestVotes, node, request));
         }
     }
 
@@ -404,7 +404,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
 
-        lastHeartbeat = await manager.HybridLogicalClock.SendOrLocalEvent().ConfigureAwait(false);
+        lastHeartbeat = await manager.HybridLogicalClock.TrySendOrLocalEvent().ConfigureAwait(false);
 
         if (nodeState != RaftNodeState.Leader && nodeState != RaftNodeState.Candidate)
             return;
@@ -462,7 +462,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             
             logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Sending handshake to {Node} #{Number}", manager.LocalEndpoint, partition.PartitionId, nodeState, node.Endpoint, ++number);
             
-            manager.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Handshake, node, request));
+            partition.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Handshake, node, request));
         }
     }
 
@@ -522,7 +522,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         VoteRequest request = new(partition.PartitionId, voteTerm, localMaxId.Index, timestamp, manager.LocalEndpoint);
         
-        manager.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Vote, node, request));
+        partition.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Vote, node, request));
     }
 
     /// <summary>
@@ -596,7 +596,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         nodeState = RaftNodeState.Leader;
         partition.Leader = manager.LocalEndpoint;
 
-        lastHeartbeat = await manager.HybridLogicalClock.SendOrLocalEvent().ConfigureAwait(false);
+        lastHeartbeat = await manager.HybridLogicalClock.TrySendOrLocalEvent().ConfigureAwait(false);
 
         logger.LogInformation(
             "[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} and proclamed leader in {Elapsed}ms Term={Term} Votes={Votes} Quorum={Quorum}/{Total} RemoteCommitId={CommitId} Local={LocalCommitId}", 
@@ -631,7 +631,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from a leader {Endpoint} with old Term={Term}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm);
             
-            manager.EnqueueResponse(endpoint, new(
+            partition.EnqueueResponse(endpoint, new(
                 RaftResponderRequestType.CompleteAppendLogs, 
                 new(endpoint), 
                 new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, timestamp, manager.LocalEndpoint, RaftOperationStatus.LeaderInOldTerm, -1)
@@ -663,7 +663,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             {
                 logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from another leader {Endpoint} (current leader {CurrentLeader}) Term={Term}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, expectedLeader, leaderTerm);
                 
-                manager.EnqueueResponse(endpoint, new(
+                partition.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs, 
                     new(endpoint), 
                     new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, timestamp, manager.LocalEndpoint, RaftOperationStatus.LogsFromAnotherLeader, -1)
@@ -684,7 +684,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             {
                 logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't append logs from leader {Endpoint} with Term={Term} Logs={Logs}", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm, logs.Count);
                 
-                manager.EnqueueResponse(endpoint, new(
+                partition.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs, 
                     new(endpoint), 
                     new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, timestamp, manager.LocalEndpoint, response.Status, -1)
@@ -692,7 +692,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 return;
             }
             
-            manager.EnqueueResponse(endpoint, new(
+            partition.EnqueueResponse(endpoint, new(
                 RaftResponderRequestType.CompleteAppendLogs, 
                 new(endpoint), 
                 new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, timestamp, manager.LocalEndpoint, RaftOperationStatus.Success, response.Index)
@@ -701,7 +701,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
         
-        manager.EnqueueResponse(endpoint, new(
+        partition.EnqueueResponse(endpoint, new(
             RaftResponderRequestType.CompleteAppendLogs, 
             new(endpoint), 
             new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, lastHeartbeat, manager.LocalEndpoint, RaftOperationStatus.Success, -1)
@@ -798,6 +798,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return (RaftOperationStatus.Errored, HLCTimestamp.Zero);
         }
         
+        // We need a proper HLC sequence to determine the order of the logs
         HLCTimestamp currentTime = await manager.HybridLogicalClock.SendOrLocalEvent().ConfigureAwait(false);
         
         List<RaftLog> checkpointLogs = [new()
@@ -966,7 +967,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }*/
         
-        manager.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.AppendLogs, node, request));
+        partition.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.AppendLogs, node, request));
     }
 
     /// <summary>

@@ -9,6 +9,8 @@ namespace Kommander.WAL;
 
 public class RocksDbWAL : IWAL
 {
+    private static readonly WriteOptions DefaultWriteOptions = new WriteOptions().SetSync(true);
+    
     private const int MaxShards = 32;
     
     private const int MaxNumberOfRangedEntries = 50;
@@ -158,7 +160,7 @@ public class RocksDbWAL : IWAL
             Log = UnsafeByteOperations.UnsafeWrap(log.LogData),
             TimePhysical = log.Time.L,
             TimeCounter = log.Time.C
-        }), cf: columnFamilyHandle);
+        }), cf: columnFamilyHandle, DefaultWriteOptions);
 
         return Task.CompletedTask;
     }
@@ -180,7 +182,7 @@ public class RocksDbWAL : IWAL
             Log = UnsafeByteOperations.UnsafeWrap(log.LogData),
             TimePhysical = log.Time.L,
             TimeCounter = log.Time.C
-        }), cf: columnFamilyHandle);
+        }), cf: columnFamilyHandle, DefaultWriteOptions);
 
         return Task.CompletedTask;
     }
@@ -202,7 +204,7 @@ public class RocksDbWAL : IWAL
             Log = UnsafeByteOperations.UnsafeWrap(log.LogData),
             TimePhysical = log.Time.L,
             TimeCounter = log.Time.C
-        }), cf: columnFamilyHandle);
+        }), cf: columnFamilyHandle, DefaultWriteOptions);
 
         return Task.CompletedTask;
     }

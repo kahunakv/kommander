@@ -42,8 +42,6 @@ public sealed class RaftManager : IRaft
     private readonly RaftPartition?[] partitions;
 
     private readonly IActorRef<RaftLeaderSupervisor, RaftLeaderSupervisorRequest> leaderSupervisorActor;
-    
-    private readonly ConcurrentDictionary<string, IActorAggregateRef<RaftResponderActor, RaftResponderRequest>> responderActors = [];
 
     /// <summary>
     /// Allows to retrieve the list of known nodes within the Raft cluster
@@ -616,22 +614,5 @@ public sealed class RaftManager : IRaft
     public int GetPartitionKey(string partitionKey)
     {
         return (int)HashUtils.ConsistentHash(partitionKey, configuration.MaxPartitions);
-    }
-    
-    internal void EnqueueResponse(string endpoint, RaftResponderRequest request)
-    {
-        if (!responderActors.TryGetValue(endpoint, out IActorAggregateRef<RaftResponderActor, RaftResponderRequest>? responderActor))
-        {
-            responderActor = actorSystem.SpawnAggregate<RaftResponderActor, RaftResponderRequest>(
-                string.Concat("raft-responder-", endpoint),
-                this,
-                communication,
-                Logger
-            );
-            
-            responderActors.TryAdd(endpoint, responderActor);
-        }
-        
-        responderActor.Send(request);
     }
 }

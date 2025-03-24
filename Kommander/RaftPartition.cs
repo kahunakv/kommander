@@ -1,4 +1,5 @@
 
+using System.Collections.Concurrent;
 using Kommander.Communication;
 using Kommander.Data;
 using Kommander.Time;
@@ -13,12 +14,18 @@ namespace Kommander;
 public sealed class RaftPartition : IDisposable
 {
     private static readonly RaftRequest RaftStateRequest = new(RaftRequestType.GetNodeState);
+
+    private readonly ActorSystem actorSystem;
+
+    private readonly ICommunication communication;
     
     private readonly SemaphoreSlim semaphore = new(1, 1);
 
     private readonly IActorRefStruct<RaftStateActor, RaftRequest, RaftResponse> raftActor;
+    
+    private readonly ConcurrentDictionary<string, IActorAggregateRef<RaftResponderActor, RaftResponderRequest>> responderActors = [];
 
-    private readonly RaftManager raftManager;
+    private readonly RaftManager manager;
 
     internal string Leader { get; set; } = "";
 
@@ -28,26 +35,28 @@ public sealed class RaftPartition : IDisposable
     /// Constructor
     /// </summary>
     /// <param name="actorSystem"></param>
-    /// <param name="raftManager"></param>
+    /// <param name="manager"></param>
     /// <param name="walAdapter"></param>
     /// <param name="communication"></param>
     /// <param name="partitionId"></param>
     public RaftPartition(
         ActorSystem actorSystem, 
-        RaftManager raftManager, 
+        RaftManager manager, 
         IWAL walAdapter, 
         ICommunication communication, 
         int partitionId,
         ILogger<IRaft> logger
     )
     {
-        this.raftManager = raftManager;
+        this.actorSystem = actorSystem;
+        this.manager = manager;
+        this.communication = communication;
         
         PartitionId = partitionId;
 
         raftActor = actorSystem.SpawnStruct<RaftStateActor, RaftRequest, RaftResponse>(
             "raft-partition-" + partitionId, 
-            raftManager, 
+            manager, 
             this,
             walAdapter,
             communication,
@@ -130,7 +139,7 @@ public sealed class RaftPartition : IDisposable
         if (string.IsNullOrEmpty(Leader))
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
         
-        if (Leader != raftManager.LocalEndpoint)
+        if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
 
         List<RaftLog> logsToReplicate = [new() { Type = RaftLogType.Proposed, LogType = type, LogData = data }];
@@ -155,7 +164,7 @@ public sealed class RaftPartition : IDisposable
         if (string.IsNullOrEmpty(Leader))
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
         
-        if (Leader != raftManager.LocalEndpoint)
+        if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
 
         List<RaftLog> logsToReplicate = logs.Select(data => new RaftLog { Type = RaftLogType.Proposed, LogType = type, LogData = data }).ToList();
@@ -178,7 +187,7 @@ public sealed class RaftPartition : IDisposable
         if (string.IsNullOrEmpty(Leader))
             return (false, RaftOperationStatus.NodeIsNotLeader, 0);
         
-        if (Leader != raftManager.LocalEndpoint)
+        if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, 0);
         
         RaftResponse response = await raftActor.Ask(new(RaftRequestType.CommitLogs, ticketId, false)).ConfigureAwait(false);
@@ -199,7 +208,7 @@ public sealed class RaftPartition : IDisposable
         if (string.IsNullOrEmpty(Leader))
             return (false, RaftOperationStatus.NodeIsNotLeader, 0);
         
-        if (Leader != raftManager.LocalEndpoint)
+        if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, 0);
         
         RaftResponse response = await raftActor.Ask(new(RaftRequestType.RollbackLogs, ticketId, false)).ConfigureAwait(false);
@@ -218,7 +227,7 @@ public sealed class RaftPartition : IDisposable
         if (string.IsNullOrEmpty(Leader))
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
         
-        if (Leader != raftManager.LocalEndpoint)
+        if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
         
         RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateCheckpoint)).ConfigureAwait(false);
@@ -236,7 +245,7 @@ public sealed class RaftPartition : IDisposable
     /// <exception cref="RaftException"></exception>
     public async ValueTask<RaftNodeState> GetState()
     {
-        if (!string.IsNullOrEmpty(Leader) && Leader == raftManager.LocalEndpoint)
+        if (!string.IsNullOrEmpty(Leader) && Leader == manager.LocalEndpoint)
             return RaftNodeState.Leader;
 
         RaftResponse response = await raftActor.Ask(RaftStateRequest, TimeSpan.FromSeconds(5)).ConfigureAwait(false);
@@ -269,6 +278,23 @@ public sealed class RaftPartition : IDisposable
     public void CheckLeader()
     {
         raftActor.Send(new(RaftRequestType.CheckLeader));
+    }
+    
+    internal void EnqueueResponse(string endpoint, RaftResponderRequest request)
+    {
+        if (!responderActors.TryGetValue(endpoint, out IActorAggregateRef<RaftResponderActor, RaftResponderRequest>? responderActor))
+        {
+            responderActor = actorSystem.SpawnAggregate<RaftResponderActor, RaftResponderRequest>(
+                string.Concat("raft-responder-", PartitionId, "-", endpoint),
+                manager,
+                communication,
+                manager.Logger
+            );
+            
+            responderActors.TryAdd(endpoint, responderActor);
+        }
+        
+        responderActor.Send(request);
     }
 
     public void Dispose()

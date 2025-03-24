@@ -36,6 +36,48 @@ public sealed class HybridLogicalClock : IDisposable
 
     /// <summary>
     /// Call this method when a send or local event occurs
+    /// It doesn't updates the global physical clock if the semaphore is locked
+    /// It relaxes the HLC to allow repeated counters for the same physical time
+    /// It doesn't allow to drift the physical clock backwards
+    /// </summary>
+    /// <returns></returns>
+    public async ValueTask<HLCTimestamp> TrySendOrLocalEvent()
+    {
+        if (semaphore.CurrentCount <= 0)
+        {
+            long cl = GetPhysicalTime();
+            if (cl < l)
+                return new(l, c + 1); // optimistically increment the counter
+            
+            return new(cl, 0);
+        }
+
+        try
+        {
+            await semaphore.WaitAsync().ConfigureAwait(false);
+
+            long lPrime = l;
+
+            l = Math.Max(l, GetPhysicalTime());
+
+            if (l == lPrime)
+                c++;
+            else
+                c = 0;
+            
+            if (l == 0)
+                throw new RaftException("Corrupted HLC clock");
+
+            return new(l, c);
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    }
+    
+    /// <summary>
+    /// Call this method when a send or local event occurs
     /// </summary>
     /// <returns></returns>
     public async Task<HLCTimestamp> SendOrLocalEvent()

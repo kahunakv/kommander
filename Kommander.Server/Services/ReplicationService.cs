@@ -75,11 +75,11 @@ public class ReplicationService : BackgroundService //, IDisposable
                         Console.WriteLine("{0} #3 Replication failed {1}", i, result.Status);*/
                 }
 
-                /*result = await raftManager.ReplicateCheckpoint(i).ConfigureAwait(false);
+                result = await raftManager.ReplicateCheckpoint(i).ConfigureAwait(false);
                 if (result.Success)
                     Console.WriteLine("#C Replicated checkpoint log with id: {0}", result.LogIndex);
                 else
-                    Console.WriteLine("#C Replication checkpoint failed {0}", result.Status);*/
+                    Console.WriteLine("#C Replication checkpoint failed {0}", result.Status);
             }
         }
         catch (Exception ex)
