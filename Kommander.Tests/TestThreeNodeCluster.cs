@@ -201,13 +201,13 @@ public class TestThreeNodeCluster
         Assert.NotEmpty(followers);
         Assert.Equal(2, followers.Count);
 
-        long maxId = await node1.WalAdapter.GetMaxLog(0);
+        long maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node2.WalAdapter.GetMaxLog(0);
+        maxId = node2.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node3.WalAdapter.GetMaxLog(0);
+        maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
         node1.ActorSystem.Dispose();
@@ -270,13 +270,13 @@ public class TestThreeNodeCluster
                   return Task.FromResult(true);
             };
 
-        long maxId = await node1.WalAdapter.GetMaxLog(0);
+        long maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node2.WalAdapter.GetMaxLog(0);
+        maxId = node2.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node3.WalAdapter.GetMaxLog(0);
+        maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
         RaftReplicationResult response = await leader.ReplicateLogs(0, "Greeting", data);
@@ -291,13 +291,13 @@ public class TestThreeNodeCluster
         Assert.Equal(RaftOperationStatus.Success, response.Status);
         Assert.Equal(2, response.LogIndex);
         
-        maxId = await node1.WalAdapter.GetMaxLog(0);
+        maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(2, maxId);
         
-        maxId = await node2.WalAdapter.GetMaxLog(0);
+        maxId = node2.WalAdapter.GetMaxLog(0);
         Assert.Equal(2, maxId);
         
-        maxId = await node3.WalAdapter.GetMaxLog(0);
+        maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(2, maxId);
         
         Assert.Equal(4, totalFollowersReceived);
@@ -363,13 +363,13 @@ public class TestThreeNodeCluster
                   return Task.FromResult(true);
             };
 
-        long maxId = await node1.WalAdapter.GetMaxLog(0);
+        long maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node2.WalAdapter.GetMaxLog(0);
+        maxId = node2.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node3.WalAdapter.GetMaxLog(0);
+        maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
         RaftReplicationResult response = await leader.ReplicateLogs(0, "Greeting", data, false);
@@ -441,13 +441,13 @@ public class TestThreeNodeCluster
                   return Task.FromResult(true);
             };
 
-        long maxId = await node1.WalAdapter.GetMaxLog(0);
+        long maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node2.WalAdapter.GetMaxLog(0);
+        maxId = node2.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node3.WalAdapter.GetMaxLog(0);
+        maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
         RaftReplicationResult response = await leader.ReplicateLogs(0, "Greeting", data, false);
@@ -526,13 +526,13 @@ public class TestThreeNodeCluster
                   return Task.FromResult(true);
             };
 
-        long maxId = await node1.WalAdapter.GetMaxLog(0);
+        long maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node2.WalAdapter.GetMaxLog(0);
+        maxId = node2.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node3.WalAdapter.GetMaxLog(0);
+        maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
         RaftReplicationResult response = await leader.ReplicateLogs(0, "Greeting", data, false);
@@ -611,13 +611,13 @@ public class TestThreeNodeCluster
                 return Task.FromResult(true);
             };
 
-        long maxId = await node1.WalAdapter.GetMaxLog(0);
+        long maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node2.WalAdapter.GetMaxLog(0);
+        maxId = node2.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node3.WalAdapter.GetMaxLog(0);
+        maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
 
         for (int i = 0; i < 100; i++)
@@ -630,13 +630,13 @@ public class TestThreeNodeCluster
             Assert.Equal(i + 1, response.LogIndex);
         }
         
-        maxId = await node1.WalAdapter.GetMaxLog(0);
+        maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(100, maxId);
         
-        maxId = await node2.WalAdapter.GetMaxLog(0);
+        maxId = node2.WalAdapter.GetMaxLog(0);
         Assert.Equal(100, maxId);
         
-        maxId = await node3.WalAdapter.GetMaxLog(0);
+        maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(100, maxId);
         
         Assert.Equal(200, totalFollowersReceived);
@@ -701,13 +701,13 @@ public class TestThreeNodeCluster
                 return Task.FromResult(true);
             };
 
-        long maxId = await node1.WalAdapter.GetMaxLog(0);
+        long maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node2.WalAdapter.GetMaxLog(0);
+        maxId = node2.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node3.WalAdapter.GetMaxLog(0);
+        maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
 
         List<byte[]> multiLogs =
@@ -729,13 +729,13 @@ public class TestThreeNodeCluster
         Assert.Equal(RaftOperationStatus.Success, response.Status);
         Assert.Equal(6, response.LogIndex);
         
-        maxId = await node1.WalAdapter.GetMaxLog(0);
+        maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(6, maxId);
         
-        maxId = await node2.WalAdapter.GetMaxLog(0);
+        maxId = node2.WalAdapter.GetMaxLog(0);
         Assert.Equal(6, maxId);
         
-        maxId = await node3.WalAdapter.GetMaxLog(0);
+        maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(6, maxId);
         
         Assert.Equal(12, totalFollowersReceived);
@@ -761,7 +761,7 @@ public class TestThreeNodeCluster
         {
             foreach (IRaft node in new List<IRaft> { node1, node2, node3 })
             {
-                await node.WalAdapter.Propose(0,
+                node.WalAdapter.Propose(0,
                     new()
                     {
                         Id = i + 1,
@@ -771,7 +771,7 @@ public class TestThreeNodeCluster
                         Type = RaftLogType.Proposed
                     });
 
-                await node.WalAdapter.Commit(0,
+                node.WalAdapter.Commit(0,
                     new()
                     {
                         Id = i + 1,
@@ -811,13 +811,13 @@ public class TestThreeNodeCluster
         Assert.NotEmpty(followers);
         Assert.Equal(2, followers.Count);
 
-        long maxId = await node1.WalAdapter.GetMaxLog(0);
+        long maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(10, maxId);
         
-        maxId = await node2.WalAdapter.GetMaxLog(0);
+        maxId = node2.WalAdapter.GetMaxLog(0);
         Assert.Equal(10, maxId);
         
-        maxId = await node3.WalAdapter.GetMaxLog(0);
+        maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(10, maxId);
         
         node1.ActorSystem.Dispose();
@@ -840,7 +840,7 @@ public class TestThreeNodeCluster
         {
             foreach (IRaft node in new List<IRaft> { node1, node2 })
             {
-                await node.WalAdapter.Propose(0,
+                node.WalAdapter.Propose(0,
                     new()
                     {
                         Id = i + 1,
@@ -850,7 +850,7 @@ public class TestThreeNodeCluster
                         Type = RaftLogType.Proposed
                     });
 
-                await node.WalAdapter.Commit(0,
+                node.WalAdapter.Commit(0,
                     new()
                     {
                         Id = i + 1,
@@ -864,7 +864,7 @@ public class TestThreeNodeCluster
 
         for (int i = 0; i < 25; i++)
         {
-            await node3.WalAdapter.Propose(0,
+            node3.WalAdapter.Propose(0,
                 new()
                 {
                     Id = i + 1,
@@ -874,7 +874,7 @@ public class TestThreeNodeCluster
                     Type = RaftLogType.Proposed
                 });
 
-            await node3.WalAdapter.Commit(0,
+            node3.WalAdapter.Commit(0,
                 new()
                 {
                     Id = i + 1,
@@ -915,13 +915,13 @@ public class TestThreeNodeCluster
         Assert.NotEmpty(followers);
         Assert.Equal(2, followers.Count);
 
-        long maxId = await node1.WalAdapter.GetMaxLog(0);
+        long maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(10, maxId);
         
-        maxId = await node2.WalAdapter.GetMaxLog(0);
+        maxId = node2.WalAdapter.GetMaxLog(0);
         Assert.Equal(10, maxId);
         
-        maxId = await node3.WalAdapter.GetMaxLog(0);
+        maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(25, maxId);
         
         node1.ActorSystem.Dispose();

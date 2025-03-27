@@ -8,139 +8,235 @@ namespace Kommander.WAL;
 /// </summary>
 public class InMemoryWAL : IWAL
 {
+    private readonly ReaderWriterLock readerWriterLock = new();
+    
     private readonly Dictionary<int, SortedDictionary<long, RaftLog>> allLogs = new();
     
-    public async IAsyncEnumerable<RaftLog> ReadLogs(int partitionId)
+    public List<RaftLog> ReadLogs(int partitionId)
     {
-        await Task.CompletedTask;
-        
-        if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+        try
         {
-            foreach (KeyValuePair<long, RaftLog> keyValue in partitionLogs)
-                yield return keyValue.Value;
-        }
-    }
+            readerWriterLock.AcquireReaderLock(TimeSpan.FromMilliseconds(5000));
+            
+            List<RaftLog> result = [];
 
-    public async IAsyncEnumerable<RaftLog> ReadLogsRange(int partitionId, long startLogIndex)
-    {
-        await Task.CompletedTask;
-        
-        if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
-        {
-            foreach (KeyValuePair<long, RaftLog> keyValue in partitionLogs)
+            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
             {
-                if (keyValue.Key >= startLogIndex)
-                    yield return keyValue.Value;
+                foreach (KeyValuePair<long, RaftLog> keyValue in partitionLogs)
+                    result.Add(keyValue.Value);
             }
+
+            return result;
+        }
+        finally
+        {
+            readerWriterLock.ReleaseReaderLock();    
         }
     }
 
-    public Task Propose(int partitionId, RaftLog log)
+    public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex)
+    {
+        try
+        {
+            readerWriterLock.AcquireReaderLock(TimeSpan.FromMilliseconds(5000));
+        
+            List<RaftLog> result = [];
+            
+            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+            {
+                foreach (KeyValuePair<long, RaftLog> keyValue in partitionLogs)
+                {
+                    if (keyValue.Key >= startLogIndex)
+                        result.Add(keyValue.Value);
+                }
+            }
+
+            return result;
+        }
+        finally
+        {
+            readerWriterLock.ReleaseReaderLock();    
+        }
+    }
+
+    public RaftOperationStatus Propose(int partitionId, RaftLog log)
     {
         if (log.Type != RaftLogType.Proposed && log.Type != RaftLogType.ProposedCheckpoint)
             throw new RaftException("Log must be proposed or proposed checkpoint");
-        
-        if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
-            partitionLogs.Add(log.Id, log);
-        else
-            allLogs.Add(partitionId, new() {{ log.Id, log }});
-        
-        return Task.CompletedTask;
-    }
-    
-    public Task Commit(int partitionId, RaftLog log)
-    {
-        if (log.Type != RaftLogType.Committed && log.Type != RaftLogType.CommittedCheckpoint)
-            throw new RaftException("Log must be committed or committed checkpoint");
-        
-        if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
-            partitionLogs[log.Id] = log; // Always replace the log
-        else
-            allLogs.Add(partitionId, new() {{ log.Id, log }});
 
-        return Task.CompletedTask;
+        try
+        {
+            readerWriterLock.AcquireWriterLock(TimeSpan.FromMilliseconds(5000));
+
+            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+                partitionLogs.Add(log.Id, log);
+            else
+                allLogs.Add(partitionId, new() { { log.Id, log } });
+
+            return RaftOperationStatus.Success;
+        }
+        finally
+        {
+            readerWriterLock.ReleaseWriterLock();
+        }
     }
     
-    public Task Rollback(int partitionId, RaftLog log)
+    public RaftOperationStatus Commit(int partitionId, RaftLog log)
+    {
+        try
+        {
+            readerWriterLock.AcquireWriterLock(TimeSpan.FromMilliseconds(5000));
+
+            if (log.Type != RaftLogType.Committed && log.Type != RaftLogType.CommittedCheckpoint)
+                throw new RaftException("Log must be committed or committed checkpoint");
+
+            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+                partitionLogs[log.Id] = log; // Always replace the log
+            else
+                allLogs.Add(partitionId, new() { { log.Id, log } });
+
+            return RaftOperationStatus.Success;
+        }
+        finally
+        {
+            readerWriterLock.ReleaseWriterLock();
+        }
+    }
+    
+    public RaftOperationStatus Rollback(int partitionId, RaftLog log)
     {
         if (log.Type != RaftLogType.RolledBack && log.Type != RaftLogType.RolledBackCheckpoint)
             throw new RaftException("Log must be rolledback or rolledback checkpoint");
-        
-        if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
-            partitionLogs[log.Id] = log; // Always replace the log
-        else
-            allLogs.Add(partitionId, new() {{ log.Id, log }});
 
-        return Task.CompletedTask;
+        try
+        {
+            readerWriterLock.AcquireWriterLock(TimeSpan.FromMilliseconds(5000));
+
+            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+                partitionLogs[log.Id] = log; // Always replace the log
+            else
+                allLogs.Add(partitionId, new() { { log.Id, log } });
+
+            return RaftOperationStatus.Success;
+        }
+        finally
+        {
+            readerWriterLock.ReleaseWriterLock();
+        }
     }
 
-    public Task ProposeMany(int partitionId, List<RaftLog> logs)
+    public RaftOperationStatus ProposeMany(int partitionId, List<RaftLog> logs)
     {
-        foreach (RaftLog log in logs)
+        try
         {
-            if (log.Type != RaftLogType.Proposed && log.Type != RaftLogType.ProposedCheckpoint)
-                throw new RaftException("Log must be proposed or proposed checkpoint");
+            readerWriterLock.AcquireWriterLock(TimeSpan.FromMilliseconds(5000));
+
+            foreach (RaftLog log in logs)
+            {
+                if (log.Type != RaftLogType.Proposed && log.Type != RaftLogType.ProposedCheckpoint)
+                    throw new RaftException("Log must be proposed or proposed checkpoint");
+
+                if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+                    partitionLogs.Add(log.Id, log);
+                else
+                    allLogs.Add(partitionId, new() { { log.Id, log } });
+            }
+
+            return RaftOperationStatus.Success;
+        }
+        finally
+        {
+            readerWriterLock.ReleaseWriterLock();
+        }
+    }
+
+    public RaftOperationStatus CommitMany(int partitionId, List<RaftLog> logs)
+    {
+        try
+        {
+            readerWriterLock.AcquireWriterLock(TimeSpan.FromMilliseconds(5000));
+
+            foreach (RaftLog log in logs)
+            {
+                if (log.Type != RaftLogType.Committed && log.Type != RaftLogType.CommittedCheckpoint)
+                    throw new RaftException("Log must be committed or committed checkpoint");
+
+                if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+                    partitionLogs[log.Id] = log;
+                else
+                    allLogs.Add(partitionId, new() { { log.Id, log } });
+            }
+
+            return RaftOperationStatus.Success;
+        }
+        finally
+        {
+            readerWriterLock.ReleaseWriterLock();
+        }
+    }
+
+    public RaftOperationStatus RollbackMany(int partitionId, List<RaftLog> logs)
+    {
+        try
+        {
+            readerWriterLock.AcquireWriterLock(TimeSpan.FromMilliseconds(5000));
+
+            foreach (RaftLog log in logs)
+            {
+                if (log.Type != RaftLogType.RolledBack && log.Type != RaftLogType.RolledBackCheckpoint)
+                    throw new RaftException("Log must be rolledback or rolledback checkpoint");
+
+                if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+                    partitionLogs[log.Id] = log;
+                else
+                    allLogs.Add(partitionId, new() { { log.Id, log } });
+            }
+
+            return RaftOperationStatus.Success;
+        }
+        finally
+        {
+            readerWriterLock.ReleaseWriterLock();
+        }
+    }
+
+    public long GetMaxLog(int partitionId)
+    {
+        try
+        {
+            readerWriterLock.AcquireReaderLock(TimeSpan.FromMilliseconds(5000));
         
             if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
-                partitionLogs.Add(log.Id, log);
-            else
-                allLogs.Add(partitionId, new() {{ log.Id, log }});
+            {
+                if (partitionLogs.Count > 0)
+                    return partitionLogs.Keys.Max();
+            }
+
+            return 0;
         }
-        
-        return Task.CompletedTask;
+        finally
+        {
+            readerWriterLock.ReleaseReaderLock();
+        }
     }
 
-    public Task CommitMany(int partitionId, List<RaftLog> logs)
+    public long GetCurrentTerm(int partitionId)
     {
-        foreach (RaftLog log in logs)
+        try
         {
-            if (log.Type != RaftLogType.Committed && log.Type != RaftLogType.CommittedCheckpoint)
-                throw new RaftException("Log must be committed or committed checkpoint");
-        
+            readerWriterLock.AcquireReaderLock(TimeSpan.FromMilliseconds(5000));
+
             if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
-                partitionLogs.Add(log.Id, log);
-            else
-                allLogs.Add(partitionId, new() {{ log.Id, log }});
-        }
-        
-        return Task.CompletedTask;
-    }
+            {
+                if (partitionLogs.Count > 0)
+                    return partitionLogs[partitionLogs.Keys.Max()].Term;
+            }
 
-    public Task RollbackMany(int partitionId, List<RaftLog> logs)
-    {
-        foreach (RaftLog log in logs)
+            return 0;
+        }
+        finally
         {
-            if (log.Type != RaftLogType.RolledBack && log.Type != RaftLogType.RolledBackCheckpoint)
-                throw new RaftException("Log must be rolledback or rolledback checkpoint");
-        
-            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
-                partitionLogs.Add(log.Id, log);
-            else
-                allLogs.Add(partitionId, new() {{ log.Id, log }});
+            readerWriterLock.ReleaseReaderLock();
         }
-        
-        return Task.CompletedTask;
-    }
-
-    public Task<long> GetMaxLog(int partitionId)
-    {
-        if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
-        {
-            if (partitionLogs.Count > 0)
-                return Task.FromResult(partitionLogs.Keys.Max());
-        }
-
-        return Task.FromResult<long>(0);
-    }
-
-    public Task<long> GetCurrentTerm(int partitionId)
-    {
-        if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
-        {
-            if (partitionLogs.Count > 0)
-                return Task.FromResult(partitionLogs[partitionLogs.Keys.Max()].Term);
-        }
-
-        return Task.FromResult<long>(0);
     }
 }

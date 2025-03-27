@@ -70,7 +70,10 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 }
 
                 case RaftWALActionType.ProposeOrCommit:
-                    return new(RaftOperationStatus.Success, await ProposeOrCommit(message.Logs).ConfigureAwait(false));
+                {
+                    (RaftOperationStatus status, long newCommitIndex) = await ProposeOrCommit(message.Logs).ConfigureAwait(false);
+                    return new(status, newCommitIndex);
+                }
                 
                 case RaftWALActionType.GetRange:
                     return new(RaftOperationStatus.Success, await GetRange(message.CurrentIndex).ConfigureAwait(false));
@@ -108,7 +111,9 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
         bool found = false;
 
-        await foreach (RaftLog log in walAdapter.ReadLogs(partition.PartitionId))
+        List<RaftLog> logs = await manager.ReadThreadPool.EnqueueTask(() => walAdapter.ReadLogs(partition.PartitionId));
+
+        foreach (RaftLog log in logs)
         {
             found = true;
 
@@ -127,12 +132,15 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                         commitIndex = log.Id + 1;
                         proposeIndex = log.Id + 1;
                         break;
+                    
+                    default:
+                        throw new NotImplementedException();
                 }
 
                 if (log.Type != RaftLogType.Committed)
                     continue;
                 
-                if (!await manager.InvokeReplicationReceived(log).ConfigureAwait(false))
+                if (!await manager.InvokeReplicationRestored(log).ConfigureAwait(false))
                     manager.InvokeReplicationError(log);
             }
             catch (Exception ex)
@@ -161,7 +169,9 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             log.Id = proposeIndex++;
             log.Term = term;
             
-            await walAdapter.Propose(partition.PartitionId, log).ConfigureAwait(false);
+            RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Propose(partition.PartitionId, log));
+            if (status != RaftOperationStatus.Success)
+                return (status, -1);
         }
 
         return (RaftOperationStatus.Success, proposeIndex);
@@ -179,19 +189,36 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             switch (log.Type)
             {
                 case RaftLogType.Proposed:
+                {
                     log.Type = RaftLogType.Committed;
+
+                    RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Commit(partition.PartitionId, log));
+                    if (status != RaftOperationStatus.Success)
+                        return (status, -1);
+
                     commitIndex = log.Id + 1;
                     lastCommitIndex = log.Id;
-                
-                    await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
-                    break;
-                
+                }
+                break;
+
                 case RaftLogType.ProposedCheckpoint:
+                {
                     log.Type = RaftLogType.CommittedCheckpoint;
+
+                    RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Commit(partition.PartitionId, log));
+                    if (status != RaftOperationStatus.Success)
+                        return (status, -1);
+
                     commitIndex = log.Id + 1;
                     lastCommitIndex = log.Id;
-                
-                    await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
+                }
+                break;
+
+                case RaftLogType.Committed:
+                case RaftLogType.CommittedCheckpoint:
+                case RaftLogType.RolledBack:
+                case RaftLogType.RolledBackCheckpoint:
+                default:
                     break;
             }
         }
@@ -209,16 +236,24 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             switch (log.Type)
             {
                 case RaftLogType.Proposed:
+                {
                     log.Type = RaftLogType.RolledBack;
-                
-                    await walAdapter.Rollback(partition.PartitionId, log).ConfigureAwait(false);
-                    break;
-                
+
+                    RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Rollback(partition.PartitionId, log));
+                    if (status != RaftOperationStatus.Success)
+                        return (status, -1);
+                }
+                break;
+
                 case RaftLogType.ProposedCheckpoint:
+                {
                     log.Type = RaftLogType.RolledBackCheckpoint;
-                
-                    await walAdapter.Rollback(partition.PartitionId, log).ConfigureAwait(false);
-                    break;
+
+                    RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Rollback(partition.PartitionId, log));
+                    if (status != RaftOperationStatus.Success)
+                        return (status, -1);
+                }
+                break;
             }
         }
 
@@ -227,18 +262,18 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
     
     private async Task<long> GetMaxLog()
     {
-        return await walAdapter.GetMaxLog(partition.PartitionId).ConfigureAwait(false);
+        return await manager.ReadThreadPool.EnqueueTask(() => walAdapter.GetMaxLog(partition.PartitionId));
     }
     
     private async Task<long> GetCurrentTerm()
     {
-        return await walAdapter.GetCurrentTerm(partition.PartitionId).ConfigureAwait(false);
+        return await manager.ReadThreadPool.EnqueueTask(() => walAdapter.GetCurrentTerm(partition.PartitionId));
     }
 
-    private async Task<long> ProposeOrCommit(List<RaftLog>? logs)
+    private async Task<(RaftOperationStatus, long)> ProposeOrCommit(List<RaftLog>? logs)
     {
         if (logs is null || logs.Count == 0)
-            return -1;
+            return (RaftOperationStatus.Success, -1);
 
         bool allOutdated = true;
         
@@ -284,7 +319,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 logs.Max(log => log.Id)
             );
             
-            return Math.Min(proposeIndex, commitIndex);
+            return (RaftOperationStatus.Success, Math.Min(proposeIndex, commitIndex));
         }
         
         plan.Clear();
@@ -371,30 +406,35 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 } 
                 break;
 
-                //default:
-                //    throw new NotImplementedException();
+                default:
+                    break;
             }
         }
+
+        RaftOperationStatus status = RaftOperationStatus.Success;
         
         foreach (KeyValuePair<RaftLogAction, List<RaftLog>> keyValue in plan)
         {
             switch (keyValue.Key)
             {
                 case RaftLogAction.Propose:
-                    await walAdapter.ProposeMany(partition.PartitionId, keyValue.Value).ConfigureAwait(false);
+                    status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.ProposeMany(partition.PartitionId, keyValue.Value)).ConfigureAwait(false);
                     break;
                 
                 case RaftLogAction.Commit:
-                    await walAdapter.CommitMany(partition.PartitionId, keyValue.Value).ConfigureAwait(false);
+                    status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.CommitMany(partition.PartitionId, keyValue.Value)).ConfigureAwait(false);
                     break;
                 
                 case RaftLogAction.Rollback:
-                    await walAdapter.RollbackMany(partition.PartitionId, keyValue.Value).ConfigureAwait(false);
+                    status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.RollbackMany(partition.PartitionId, keyValue.Value)).ConfigureAwait(false);
                     break;
                 
                 default:
                     throw new NotImplementedException();
             }
+
+            if (status != RaftOperationStatus.Success)
+                return (status, Math.Max(proposeIndex, commitIndex));
         }
 
         if (plan.TryGetValue(RaftLogAction.Commit, out List<RaftLog>? actions))
@@ -409,17 +449,12 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             }
         }
 
-        return Math.Max(proposeIndex, commitIndex);
+        return (status, Math.Max(proposeIndex, commitIndex));
     }
     
     private async Task<List<RaftLog>> GetRange(long startLogIndex)
     {
-        List<RaftLog> logs = new(8);
-        
-        await foreach (RaftLog log in walAdapter.ReadLogsRange(partition.PartitionId, startLogIndex))
-            logs.Add(log);
-
-        return logs;
+        return await manager.ReadThreadPool.EnqueueTask(() => walAdapter.ReadLogsRange(partition.PartitionId, startLogIndex));
     }
 
     private void Collect(long currentTime)

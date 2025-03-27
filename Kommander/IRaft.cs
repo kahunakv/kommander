@@ -1,10 +1,12 @@
 
+using Nixie;
+
 using Kommander.Data;
 using Kommander.WAL;
 using Kommander.Communication;
 using Kommander.Discovery;
 using Kommander.Time;
-using Nixie;
+using IOThreadPool = Kommander.WAL.IO.ThreadPool;
 
 namespace Kommander;
 
@@ -44,6 +46,16 @@ public interface IRaft
     /// Hybrid Logical Clock
     /// </summary>
     public HybridLogicalClock HybridLogicalClock { get; }
+    
+    /// <summary>
+    /// Read I/O thread pool
+    /// </summary>
+    public IOThreadPool ReadThreadPool { get; }
+    
+    /// <summary>
+    /// Write I/O thread pool
+    /// </summary>
+    public IOThreadPool WriteThreadPool { get; }
 
     /// <summary>
     /// Event when the restore process starts
