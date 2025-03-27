@@ -1,21 +1,28 @@
 using Kommander.Time;
 
-namespace Kommander.Tests.HLC;
+namespace Kommander.Tests;
 
 public class TestHLC
 {
     [Fact]
-    public void AddX()
+    public void TestAddOperation()
     {
-        var x = new HLCTimestamp(GetCurrentTime(), 0);
+        HLCTimestamp x = new(GetCurrentTime(), 0);
+        HLCTimestamp p = x + 90000;
         
-        var p = x + 90000;
-        
-        Console.WriteLine(DateTime.UtcNow);
-        Console.WriteLine(DateTimeOffset.FromUnixTimeMilliseconds(p.L).UtcDateTime);
+        Assert.True(p > x);
     }
     
-    public long GetCurrentTime()
+    [Fact]
+    public void TestAddOperation2()
+    {
+        HLCTimestamp x = new(GetCurrentTime(), 0);
+        HLCTimestamp p = x + TimeSpan.FromMilliseconds(10000);
+        
+        Assert.True(p > x);
+    }
+    
+    private static long GetCurrentTime()
     {
         return ((DateTimeOffset)DateTime.UtcNow).ToUnixTimeMilliseconds();
     }

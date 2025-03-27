@@ -189,6 +189,14 @@ public sealed class RaftManager : IRaft
 
         await clusterHandler.UpdateNodes().ConfigureAwait(false);
     }
+    
+    /// <summary>
+    /// Returns a list of nodes in the cluster
+    /// </summary>
+    public IList<RaftNode> GetNodes()
+    {
+        return Nodes;
+    }
 
     /// <summary>
     /// Returns the raft partition for the given partition number

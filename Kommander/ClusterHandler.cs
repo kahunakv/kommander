@@ -38,17 +38,18 @@ public sealed class ClusterHandler
     {
         manager.Nodes = discovery.GetNodes();
 
-        //Console.WriteLine("---");
-        
-        StringBuilder builder = new StringBuilder();
-
-        foreach (RaftNode node in manager.Nodes)
+        if (manager.Logger.IsEnabled(LogLevel.Debug))
         {
-            builder.Append(node.Endpoint);
-            builder.Append(' ');
-        }
+            StringBuilder builder = new();
 
-        manager.Logger.LogInformation("[{Endpoint}] Nodes: {Nodes}", manager.LocalEndpoint, builder.ToString());
+            foreach (RaftNode node in manager.Nodes)
+            {
+                builder.Append(node.Endpoint);
+                builder.Append(' ');
+            }
+
+            manager.Logger.LogDebug("[{Endpoint}] Nodes: {Nodes}", manager.LocalEndpoint, builder.ToString());
+        }
 
         return Task.CompletedTask;
     }

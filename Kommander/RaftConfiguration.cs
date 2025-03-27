@@ -59,7 +59,7 @@ public class RaftConfiguration
     /// <summary>
     /// Interval to perform leader election actions
     /// </summary>
-    public TimeSpan CheckLeaderInterval { get; set; } = TimeSpan.FromMilliseconds(100);
+    public TimeSpan CheckLeaderInterval { get; set; } = TimeSpan.FromMilliseconds(250);
 
     /// <summary>
     /// If followers hadn't received a heartbeat from the leader in this time, they will start an election
@@ -85,5 +85,5 @@ public class RaftConfiguration
     /// If the per-partition raft state machine takes more than this value to process a message it will show a log
     /// Slow processing of messages might indicate a performance issue
     /// </summary>
-    public int SlowRaftStateMachineLog { get; set; } = 2500;
+    public int SlowRaftStateMachineLog { get; set; } = 500;
 }

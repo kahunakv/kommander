@@ -629,7 +629,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     {
         if (currentTerm > leaderTerm)
         {
-            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from a leader {Endpoint} with old Term={Term}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm);
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from a leader {Endpoint} with old ReceivedTerm={Term} CurrentTerm={CurrentTerm}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm, currentTerm);
             
             partition.EnqueueResponse(endpoint, new(
                 RaftResponderRequestType.CompleteAppendLogs, 

@@ -13,6 +13,26 @@ public static class HashUtils
         uint computed = xxHash32.ComputeHash(value);
         return computed % divisor;
     }
+
+    public static long PrefixedHash(string value, char separator, int divisor)
+    {
+        int pointer = value.IndexOf(separator);
+        if (pointer == -1)
+            return ConsistentHash(value, divisor);
+        
+        string prefix = value[..pointer];
+        return ConsistentHash(prefix, divisor);
+    }
+    
+    public static long InversePrefixedHash(string value, char separator, int divisor)
+    {
+        int pointer = value.LastIndexOf(separator);
+        if (pointer == -1)
+            return ConsistentHash(value, divisor);
+        
+        string prefix = value[..pointer];
+        return ConsistentHash(prefix, divisor);
+    }
     
     public static int GetHashInRange(string input, int min, int max)
     {

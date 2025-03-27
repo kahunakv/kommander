@@ -9,7 +9,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>Kommander</PackageId>
-    <Version>0.5.7</Version>
+    <Version>0.5.10</Version>
     <Description>Distributed consensus with Raft for C#/.NET</Description>
     <Authors>Andres Gutierrez</Authors>
     <Company>Andres Gutierrez</Company>
@@ -20,6 +20,7 @@
     <RepositoryUrl>https://github.com/andresgutierrez/kommander</RepositoryUrl>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageTags>raft;consensus;paxos;distributed consensus;leader election</PackageTags>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>

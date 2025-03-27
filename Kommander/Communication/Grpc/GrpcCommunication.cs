@@ -13,6 +13,8 @@ namespace Kommander.Communication.Grpc;
 /// </summary>
 public class GrpcCommunication : ICommunication
 {
+    private const int MaxChannels = 5;
+    
     private readonly ConcurrentDictionary<string, List<GrpcChannel>> channels = new();
     
     private int channelIndex;
@@ -296,13 +298,11 @@ public class GrpcCommunication : ICommunication
         return completeAppendLogsBatchResponse;
     }
 
-    private static RepeatedField<GrpcRaftLog> GetLogs(List<RaftLog> requestLogs)
+    private static IEnumerable<GrpcRaftLog> GetLogs(List<RaftLog> requestLogs)
     {
-        RepeatedField<GrpcRaftLog> logs = new();
-
         foreach (RaftLog? requestLog in requestLogs)
         {
-            logs.Add(new GrpcRaftLog
+            yield return new()
             {
                 Id = requestLog.Id,
                 Term = requestLog.Term,
@@ -311,19 +311,17 @@ public class GrpcCommunication : ICommunication
                 TimePhysical = requestLog.Time.L,
                 TimeCounter = requestLog.Time.C,
                 Data = UnsafeByteOperations.UnsafeWrap(requestLog.LogData)
-            });
+            };
         }
-
-        return logs;
     }
     
     private GrpcChannel GetChannel(string endpoint)
     {
         if (!channels.TryGetValue(endpoint, out List<GrpcChannel>? grpcChannels))
         {
-            grpcChannels = new(5);
+            grpcChannels = new(MaxChannels);
             
-            for (int i = 0; i < 5; i++)
+            for (int i = 0; i < MaxChannels; i++)
                 grpcChannels.Add(GrpcChannel.ForAddress($"https://{endpoint}", new() { HttpHandler = httpHandler }));
             
             channels.TryAdd(endpoint, grpcChannels);
@@ -333,6 +331,6 @@ public class GrpcCommunication : ICommunication
         if (nextIndex < 0)
             nextIndex = -nextIndex;
         
-        return grpcChannels[nextIndex % 5];
+        return grpcChannels[nextIndex % MaxChannels];
     }
 }

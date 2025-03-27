@@ -153,10 +153,8 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
     {
         if (logs is null || logs.Count == 0)
             return (RaftOperationStatus.Success, -1);
-        
-        RaftLog[] orderedLogs = logs.OrderBy(log => log.Id).ToArray();
 
-        foreach (RaftLog log in orderedLogs)
+        foreach (RaftLog log in logs.OrderBy(log => log.Id))
         {
             log.Id = proposeIndex++;
             log.Term = term;
@@ -173,9 +171,8 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             return (RaftOperationStatus.Success, -1);
 
         long lastCommitIndex = -1;
-        RaftLog[] orderedLogs = logs.OrderBy(log => log.Id).ToArray();
 
-        foreach (RaftLog log in orderedLogs)
+        foreach (RaftLog log in logs.OrderBy(log => log.Id))
         {
             switch (log.Type)
             {
@@ -204,10 +201,8 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
     {
         if (logs is null || logs.Count == 0)
             return (RaftOperationStatus.Success, -1);
-        
-        RaftLog[] orderedLogs = logs.OrderBy(log => log.Id).ToArray();
 
-        foreach (RaftLog log in orderedLogs)
+        foreach (RaftLog log in logs.OrderBy(log => log.Id))
         {
             switch (log.Type)
             {

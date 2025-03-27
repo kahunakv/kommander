@@ -89,6 +89,12 @@ public interface IRaft
     public Task UpdateNodes();
 
     /// <summary>
+    /// Returns all the visible nodes by the local node
+    /// </summary>
+    /// <returns></returns>
+    public IList<RaftNode> GetNodes();
+
+    /// <summary>
     /// Passes the Handshake to the appropriate partition
     /// </summary>
     /// <param name="request"></param>
