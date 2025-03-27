@@ -43,6 +43,8 @@ public sealed class RaftManager : IRaft
 
     private readonly IActorRef<RaftLeaderSupervisor, RaftLeaderSupervisorRequest> leaderSupervisorActor;
 
+    private readonly ConcurrentDictionary<string, HLCTimestamp> lastActivity = new();
+
     /// <summary>
     /// Allows to retrieve the list of known nodes within the Raft cluster
     /// </summary>
@@ -188,6 +190,22 @@ public sealed class RaftManager : IRaft
             return;
 
         await clusterHandler.UpdateNodes().ConfigureAwait(false);
+    }
+
+    internal HLCTimestamp GetLastNodeActivity(string nodeId)
+    {
+        if (lastActivity.TryGetValue(nodeId, out HLCTimestamp lastTimestamp))
+            return lastTimestamp;
+        
+        return HLCTimestamp.Zero;
+    }
+    
+    internal void UpdateLastNodeActivity(string nodeId, HLCTimestamp lastTimestamp)
+    {
+        if (lastActivity.ContainsKey(nodeId))
+            lastActivity[nodeId] = lastTimestamp;
+        else
+            lastActivity.TryAdd(nodeId, lastTimestamp);
     }
     
     /// <summary>
@@ -384,7 +402,7 @@ public sealed class RaftManager : IRaft
     {
         ValueStopwatch stopwatch = ValueStopwatch.StartNew();
         
-        while (stopwatch.GetElapsedMilliseconds() < 30000)
+        while (stopwatch.GetElapsedMilliseconds() < 10000)
         {
             if (!string.IsNullOrEmpty(partition.Leader) && partition.Leader != LocalEndpoint)
                 return new(false, RaftOperationStatus.NodeIsNotLeader, ticketId, -1);
@@ -399,7 +417,7 @@ public sealed class RaftManager : IRaft
                 switch (state)
                 {
                     case RaftTicketState.NotFound:
-                        return new(false, RaftOperationStatus.Errored, ticketId, -1);
+                        return new(false, RaftOperationStatus.ReplicationFailed, ticketId, -1);
                     
                     case RaftTicketState.Committed:
                         return new(true, RaftOperationStatus.Success, ticketId, commitId);
@@ -414,10 +432,10 @@ public sealed class RaftManager : IRaft
                 Logger.LogError("ReplicateLogs: {Message}", e.Message);
             }
 
-            await Task.Yield();
+            await Task.Delay(1);
         }
         
-        return new(false, RaftOperationStatus.Errored, ticketId, -1);
+        return new(false, RaftOperationStatus.ProposalTimeout, ticketId, -1);
     }
 
     /// <summary>
@@ -547,7 +565,7 @@ public sealed class RaftManager : IRaft
         ValueStopwatch stopwatch = ValueStopwatch.StartNew();
         RaftPartition partition = GetPartition(partitionId);
 
-        while (stopwatch.GetElapsedMilliseconds() < 30000)
+        while (stopwatch.GetElapsedMilliseconds() < 10000)
         {
             if (!string.IsNullOrEmpty(partition.Leader) && partition.Leader == LocalEndpoint)
                 return true;
@@ -566,7 +584,7 @@ public sealed class RaftManager : IRaft
                 Logger.LogError("AmILeader: {Message}", e.Message);
             }
 
-            await Task.Yield();
+            await Task.Delay(1, cancellationToken);
         }
 
         throw new RaftException("Leader couldn't be found or is not decided");

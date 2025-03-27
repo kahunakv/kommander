@@ -10,5 +10,7 @@ public enum RaftOperationStatus
     LeaderAlreadyElected = 4,
     LogsFromAnotherLeader = 5,
     ActiveProposal = 6,
-    ProposalNotFound = 7
+    ProposalNotFound = 7,
+    ProposalTimeout = 8,
+    ReplicationFailed = 9
 }
