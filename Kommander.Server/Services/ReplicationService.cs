@@ -62,7 +62,7 @@ public class ReplicationService : BackgroundService //, IDisposable
                     
                     stopwatch.Restart();
 
-                    result = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
+                    result = await raftManager.ReplicateLogs(i, logType, [data, data, data, data, data, data, data, data]).ConfigureAwait(false);
                     if (result.Success)
                         Console.WriteLine("{0} #2 Replicated log with id: {1} {2}ms", i, result.LogIndex, stopwatch.ElapsedMilliseconds);
                     else

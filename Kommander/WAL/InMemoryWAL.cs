@@ -8,13 +8,13 @@ namespace Kommander.WAL;
 /// </summary>
 public class InMemoryWAL : IWAL
 {
-    private readonly Dictionary<int, SortedDictionary<long, RaftLog>> logs = new();
+    private readonly Dictionary<int, SortedDictionary<long, RaftLog>> allLogs = new();
     
     public async IAsyncEnumerable<RaftLog> ReadLogs(int partitionId)
     {
         await Task.CompletedTask;
         
-        if (logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+        if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
         {
             foreach (KeyValuePair<long, RaftLog> keyValue in partitionLogs)
                 yield return keyValue.Value;
@@ -25,7 +25,7 @@ public class InMemoryWAL : IWAL
     {
         await Task.CompletedTask;
         
-        if (logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+        if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
         {
             foreach (KeyValuePair<long, RaftLog> keyValue in partitionLogs)
             {
@@ -40,10 +40,10 @@ public class InMemoryWAL : IWAL
         if (log.Type != RaftLogType.Proposed && log.Type != RaftLogType.ProposedCheckpoint)
             throw new RaftException("Log must be proposed or proposed checkpoint");
         
-        if (logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+        if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
             partitionLogs.Add(log.Id, log);
         else
-            logs.Add(partitionId, new() {{ log.Id, log }});
+            allLogs.Add(partitionId, new() {{ log.Id, log }});
         
         return Task.CompletedTask;
     }
@@ -53,10 +53,10 @@ public class InMemoryWAL : IWAL
         if (log.Type != RaftLogType.Committed && log.Type != RaftLogType.CommittedCheckpoint)
             throw new RaftException("Log must be committed or committed checkpoint");
         
-        if (logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+        if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
             partitionLogs[log.Id] = log; // Always replace the log
         else
-            logs.Add(partitionId, new() {{ log.Id, log }});
+            allLogs.Add(partitionId, new() {{ log.Id, log }});
 
         return Task.CompletedTask;
     }
@@ -66,17 +66,65 @@ public class InMemoryWAL : IWAL
         if (log.Type != RaftLogType.RolledBack && log.Type != RaftLogType.RolledBackCheckpoint)
             throw new RaftException("Log must be rolledback or rolledback checkpoint");
         
-        if (logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+        if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
             partitionLogs[log.Id] = log; // Always replace the log
         else
-            logs.Add(partitionId, new() {{ log.Id, log }});
+            allLogs.Add(partitionId, new() {{ log.Id, log }});
 
+        return Task.CompletedTask;
+    }
+
+    public Task ProposeMany(int partitionId, List<RaftLog> logs)
+    {
+        foreach (RaftLog log in logs)
+        {
+            if (log.Type != RaftLogType.Proposed && log.Type != RaftLogType.ProposedCheckpoint)
+                throw new RaftException("Log must be proposed or proposed checkpoint");
+        
+            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+                partitionLogs.Add(log.Id, log);
+            else
+                allLogs.Add(partitionId, new() {{ log.Id, log }});
+        }
+        
+        return Task.CompletedTask;
+    }
+
+    public Task CommitMany(int partitionId, List<RaftLog> logs)
+    {
+        foreach (RaftLog log in logs)
+        {
+            if (log.Type != RaftLogType.Committed && log.Type != RaftLogType.CommittedCheckpoint)
+                throw new RaftException("Log must be committed or committed checkpoint");
+        
+            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+                partitionLogs.Add(log.Id, log);
+            else
+                allLogs.Add(partitionId, new() {{ log.Id, log }});
+        }
+        
+        return Task.CompletedTask;
+    }
+
+    public Task RollbackMany(int partitionId, List<RaftLog> logs)
+    {
+        foreach (RaftLog log in logs)
+        {
+            if (log.Type != RaftLogType.RolledBack && log.Type != RaftLogType.RolledBackCheckpoint)
+                throw new RaftException("Log must be rolledback or rolledback checkpoint");
+        
+            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+                partitionLogs.Add(log.Id, log);
+            else
+                allLogs.Add(partitionId, new() {{ log.Id, log }});
+        }
+        
         return Task.CompletedTask;
     }
 
     public Task<long> GetMaxLog(int partitionId)
     {
-        if (logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+        if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
         {
             if (partitionLogs.Count > 0)
                 return Task.FromResult(partitionLogs.Keys.Max());
@@ -87,7 +135,7 @@ public class InMemoryWAL : IWAL
 
     public Task<long> GetCurrentTerm(int partitionId)
     {
-        if (logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+        if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
         {
             if (partitionLogs.Count > 0)
                 return Task.FromResult(partitionLogs[partitionLogs.Keys.Max()].Term);

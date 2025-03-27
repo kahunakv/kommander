@@ -15,6 +15,12 @@ public interface IWAL
     
     public Task Rollback(int partitionId, RaftLog log);
     
+    public Task ProposeMany(int partitionId, List<RaftLog> logs);
+    
+    public Task CommitMany(int partitionId, List<RaftLog> logs);
+    
+    public Task RollbackMany(int partitionId, List<RaftLog> logs);
+    
     public Task<long> GetMaxLog(int partitionId);
     
     public Task<long> GetCurrentTerm(int partitionId);

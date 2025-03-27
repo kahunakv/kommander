@@ -10,7 +10,7 @@ namespace Kommander.WAL;
 /// </summary>
 public class SqliteWAL : IWAL
 {
-    private const int MaxNumberOfRangedEntries = 50;
+    private const int MaxNumberOfRangedEntries = 100;
     
     private static readonly SemaphoreSlim semaphore = new(1, 1);
     
@@ -193,7 +193,76 @@ public class SqliteWAL : IWAL
         
         await updateCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
     }
-    
+
+    public async Task ProposeMany(int partitionId, List<RaftLog> logs)
+    {
+        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
+        
+        const string insertQuery = "INSERT INTO logs (id, partitionId, term, type, logType, log, timePhysical, timeCounter) VALUES (@id, @partitionId, @term, @type, @logType, @log, @timePhysical, @timeCounter);";
+
+        foreach (RaftLog log in logs)
+        {
+            await using SqliteCommand insertCommand = new(insertQuery, connection);
+
+            insertCommand.Parameters.AddWithValue("@id", log.Id);
+            insertCommand.Parameters.AddWithValue("@partitionId", partitionId);
+            insertCommand.Parameters.AddWithValue("@term", log.Term);
+            insertCommand.Parameters.AddWithValue("@type", log.Type);
+            insertCommand.Parameters.AddWithValue("@logType", log.LogType);
+            insertCommand.Parameters.AddWithValue("@log", log.LogData);
+            insertCommand.Parameters.AddWithValue("@timePhysical", log.Time.L);
+            insertCommand.Parameters.AddWithValue("@timeCounter", log.Time.C);
+
+            await insertCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
+        }
+    }
+
+    public async Task CommitMany(int partitionId, List<RaftLog> logs)
+    {
+        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
+        
+        const string insertQuery = "INSERT INTO logs (id, partitionId, term, type, logType, log, timePhysical, timeCounter) VALUES (@id, @partitionId, @term, @type, @logType, @log, @timePhysical, @timeCounter);";
+
+        foreach (RaftLog log in logs)
+        {
+            await using SqliteCommand insertCommand = new(insertQuery, connection);
+
+            insertCommand.Parameters.AddWithValue("@id", log.Id);
+            insertCommand.Parameters.AddWithValue("@partitionId", partitionId);
+            insertCommand.Parameters.AddWithValue("@term", log.Term);
+            insertCommand.Parameters.AddWithValue("@type", log.Type);
+            insertCommand.Parameters.AddWithValue("@logType", log.LogType);
+            insertCommand.Parameters.AddWithValue("@log", log.LogData);
+            insertCommand.Parameters.AddWithValue("@timePhysical", log.Time.L);
+            insertCommand.Parameters.AddWithValue("@timeCounter", log.Time.C);
+
+            await insertCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
+        }
+    }
+
+    public async Task RollbackMany(int partitionId, List<RaftLog> logs)
+    {
+        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
+        
+        const string insertQuery = "INSERT INTO logs (id, partitionId, term, type, logType, log, timePhysical, timeCounter) VALUES (@id, @partitionId, @term, @type, @logType, @log, @timePhysical, @timeCounter);";
+
+        foreach (RaftLog log in logs)
+        {
+            await using SqliteCommand insertCommand = new(insertQuery, connection);
+
+            insertCommand.Parameters.AddWithValue("@id", log.Id);
+            insertCommand.Parameters.AddWithValue("@partitionId", partitionId);
+            insertCommand.Parameters.AddWithValue("@term", log.Term);
+            insertCommand.Parameters.AddWithValue("@type", log.Type);
+            insertCommand.Parameters.AddWithValue("@logType", log.LogType);
+            insertCommand.Parameters.AddWithValue("@log", log.LogData);
+            insertCommand.Parameters.AddWithValue("@timePhysical", log.Time.L);
+            insertCommand.Parameters.AddWithValue("@timeCounter", log.Time.C);
+
+            await insertCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
+        }
+    }
+
     public async Task<long> GetMaxLog(int partitionId)
     {
         SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);

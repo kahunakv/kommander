@@ -19,6 +19,8 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
     private readonly IWAL walAdapter;
 
     private readonly ILogger<IRaft> logger;
+    
+    private readonly Dictionary<RaftLogAction, List<RaftLog>> plan = new();
 
     private bool recovered;
     
@@ -284,47 +286,126 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             
             return Math.Min(proposeIndex, commitIndex);
         }
+        
+        plan.Clear();
 
         foreach (RaftLog log in orderedLogs)
         {
             switch (log.Type)
             {
                 case RaftLogType.Proposed when log.Id >= proposeIndex:
-                    await walAdapter.Propose(partition.PartitionId, log).ConfigureAwait(false);
-                
+                {
+                    if (plan.TryGetValue(RaftLogAction.Propose, out List<RaftLog>? proposeActions))
+                        proposeActions.Add(log);
+                    else
+                        plan.Add(RaftLogAction.Propose, [log]);
+
                     logger.LogDebug("[{Endpoint}/{Partition}] Proposed log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
 
                     proposeIndex = log.Id + 1;
-                    break;
-                
+                }
+                break;
+
+                case RaftLogType.RolledBack when log.Id >= commitIndex:
+                {
+                    if (plan.TryGetValue(RaftLogAction.Rollback, out List<RaftLog>? rollbackActions))
+                        rollbackActions.Add(log);
+                    else
+                        plan.Add(RaftLogAction.Rollback, [log]);
+
+                    logger.LogDebug("[{Endpoint}/{Partition}] Rolledback log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+
+                    commitIndex = log.Id + 1;
+                }
+                break;    
+
                 case RaftLogType.Committed when log.Id >= commitIndex:
                 {
-                    await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
+                    if (plan.TryGetValue(RaftLogAction.Commit, out List<RaftLog>? commitActions))
+                        commitActions.Add(log);
+                    else
+                        plan.Add(RaftLogAction.Commit, [log]);
                 
                     logger.LogDebug("[{Endpoint}/{Partition}] Committed log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
-                
-                    if (!await manager.InvokeReplicationReceived(log).ConfigureAwait(false))
-                        manager.InvokeReplicationError(log);
                     
                     commitIndex = log.Id + 1;
-                    break;
                 }
-                
+                break;    
+
                 case RaftLogType.ProposedCheckpoint when log.Id >= proposeIndex:
-                    await walAdapter.Propose(partition.PartitionId, log).ConfigureAwait(false);
-                
+                {
+                    if (plan.TryGetValue(RaftLogAction.Propose, out List<RaftLog>? proposeActions))
+                        proposeActions.Add(log);
+                    else
+                        plan.Add(RaftLogAction.Propose, [log]);
+
                     logger.LogDebug("[{Endpoint}/{Partition}] Proposed checkpoint log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
-                    
+
                     proposeIndex = log.Id + 1;
-                    break;
-                
-                case RaftLogType.CommittedCheckpoint when log.Id >= commitIndex:
-                    await walAdapter.Commit(partition.PartitionId, log).ConfigureAwait(false);
-                
-                    logger.LogDebug("[{Endpoint}/{Partition}] Committed checkpoint log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
-                    
+                } 
+                break;
+
+                case RaftLogType.RolledBackCheckpoint when log.Id >= commitIndex:
+                {
+                    if (plan.TryGetValue(RaftLogAction.Rollback, out List<RaftLog>? rollbackActions))
+                        rollbackActions.Add(log);
+                    else
+                        plan.Add(RaftLogAction.Rollback, [log]);
+
+                    logger.LogDebug("[{Endpoint}/{Partition}] Rolled back checkpoint log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+
                     commitIndex = log.Id + 1;
+                } 
+                break;
+
+                case RaftLogType.CommittedCheckpoint when log.Id >= commitIndex:
+                {
+                    if (plan.TryGetValue(RaftLogAction.Commit, out List<RaftLog>? commitActions))
+                        commitActions.Add(log);
+                    else
+                        plan.Add(RaftLogAction.Commit, [log]);
+
+                    logger.LogDebug("[{Endpoint}/{Partition}] Committed checkpoint log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+
+                    commitIndex = log.Id + 1;
+                } 
+                break;
+
+                //default:
+                //    throw new NotImplementedException();
+            }
+        }
+        
+        foreach (KeyValuePair<RaftLogAction, List<RaftLog>> keyValue in plan)
+        {
+            switch (keyValue.Key)
+            {
+                case RaftLogAction.Propose:
+                    await walAdapter.ProposeMany(partition.PartitionId, keyValue.Value).ConfigureAwait(false);
                     break;
+                
+                case RaftLogAction.Commit:
+                    await walAdapter.CommitMany(partition.PartitionId, keyValue.Value).ConfigureAwait(false);
+                    break;
+                
+                case RaftLogAction.Rollback:
+                    await walAdapter.RollbackMany(partition.PartitionId, keyValue.Value).ConfigureAwait(false);
+                    break;
+                
+                default:
+                    throw new NotImplementedException();
+            }
+        }
+
+        if (plan.TryGetValue(RaftLogAction.Commit, out List<RaftLog>? actions))
+        {
+            foreach (RaftLog log in actions)
+            {
+                if (log.Type != RaftLogType.Committed)
+                    continue;
+                
+                if (!await manager.InvokeReplicationReceived(log).ConfigureAwait(false))
+                    manager.InvokeReplicationError(log);
             }
         }
 

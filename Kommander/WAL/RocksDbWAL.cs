@@ -11,9 +11,9 @@ public class RocksDbWAL : IWAL
 {
     private static readonly WriteOptions DefaultWriteOptions = new WriteOptions().SetSync(true);
     
-    private const int MaxShards = 32;
+    private const int MaxShards = 16;
     
-    private const int MaxNumberOfRangedEntries = 50;
+    private const int MaxNumberOfRangedEntries = 100;
     
     private readonly RocksDb db;
     
@@ -206,6 +206,96 @@ public class RocksDbWAL : IWAL
             TimeCounter = log.Time.C
         }), cf: columnFamilyHandle, DefaultWriteOptions);
 
+        return Task.CompletedTask;
+    }
+
+    public Task ProposeMany(int partitionId, List<RaftLog> logs)
+    {
+        int shardId = partitionId % MaxShards;
+        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        
+        using WriteBatch writeBatch = new();
+        
+        foreach (RaftLog log in logs)
+        {
+            string index = log.Id.ToString("D20");
+        
+            writeBatch.Put(Encoding.UTF8.GetBytes(index), Serialize(new()
+            {
+                Partition = partitionId,
+                Id = log.Id,
+                Term = log.Term,
+                Type = (int)log.Type,
+                LogType = log.LogType,
+                Log = UnsafeByteOperations.UnsafeWrap(log.LogData),
+                TimePhysical = log.Time.L,
+                TimeCounter = log.Time.C
+            }), cf: columnFamilyHandle);
+        }
+        
+        db.Write(writeBatch, DefaultWriteOptions);
+        
+        return Task.CompletedTask;
+    }
+
+    public Task CommitMany(int partitionId, List<RaftLog> logs)
+    {
+        if (logs.Count == 0)
+            return Task.CompletedTask;
+        
+        int shardId = partitionId % MaxShards;
+        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        
+        using WriteBatch writeBatch = new();
+        
+        foreach (RaftLog log in logs)
+        {
+            string index = log.Id.ToString("D20");
+
+            writeBatch.Put(Encoding.UTF8.GetBytes(index), Serialize(new()
+            {
+                Partition = partitionId,
+                Id = log.Id,
+                Term = log.Term,
+                Type = (int)log.Type,
+                LogType = log.LogType,
+                Log = UnsafeByteOperations.UnsafeWrap(log.LogData),
+                TimePhysical = log.Time.L,
+                TimeCounter = log.Time.C
+            }), cf: columnFamilyHandle);
+        }
+        
+        db.Write(writeBatch, DefaultWriteOptions);
+        
+        return Task.CompletedTask;
+    }
+
+    public Task RollbackMany(int partitionId, List<RaftLog> logs)
+    {
+        int shardId = partitionId % MaxShards;
+        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        
+        using WriteBatch writeBatch = new();
+
+        foreach (RaftLog log in logs)
+        {
+            string index = log.Id.ToString("D20");
+
+            writeBatch.Put(Encoding.UTF8.GetBytes(index), Serialize(new()
+            {
+                Partition = partitionId,
+                Id = log.Id,
+                Term = log.Term,
+                Type = (int)log.Type,
+                LogType = log.LogType,
+                Log = UnsafeByteOperations.UnsafeWrap(log.LogData),
+                TimePhysical = log.Time.L,
+                TimeCounter = log.Time.C
+            }), cf: columnFamilyHandle);
+        }
+        
+        db.Write(writeBatch, DefaultWriteOptions);
+        
         return Task.CompletedTask;
     }
 
