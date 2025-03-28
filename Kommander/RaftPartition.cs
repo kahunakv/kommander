@@ -79,7 +79,13 @@ public sealed class RaftPartition : IDisposable
     /// <param name="request"></param>
     public void RequestVote(RequestVotesRequest request)
     {
-        raftActor.Send(new(RaftRequestType.RequestVote, request.Term, request.MaxLogId, request.Time, request.Endpoint));
+        raftActor.Send(new(
+            RaftRequestType.RequestVote, 
+            request.Term, 
+            request.MaxLogId, 
+            request.Time, 
+            request.Endpoint
+        ));
     }
 
     /// <summary>
@@ -88,7 +94,13 @@ public sealed class RaftPartition : IDisposable
     /// <param name="request"></param>
     public void Vote(VoteRequest request)
     {
-        raftActor.Send(new(RaftRequestType.ReceiveVote, request.Term, request.MaxLogId, request.Time, request.Endpoint));
+        raftActor.Send(new(
+            RaftRequestType.ReceiveVote, 
+            request.Term, 
+            request.MaxLogId, 
+            request.Time, 
+            request.Endpoint
+        ));
     }
 
     /// <summary>

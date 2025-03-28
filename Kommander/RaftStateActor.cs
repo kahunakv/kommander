@@ -305,10 +305,26 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 return;
             
             case RaftNodeState.Follower:
-
-                // don't start a new election if we recently voted
+                
+                // Don't start a new election if we recently voted
                 if ((lastVotation != HLCTimestamp.Zero && ((currentTime - lastVotation) < (electionTimeout * 2))))
                     return;
+
+                // Other partitions may have received pings about the partition leader
+                // however, due to delays in processing messages in the state machine,
+                // those messages might not have been processed yet.
+                // By taking those pings into account, an unnecessary re-election can be avoided.
+                
+                string expectedLeader = expectedLeaders.GetValueOrDefault(currentTerm, "");
+                if (!string.IsNullOrEmpty(expectedLeader))
+                {
+                    HLCTimestamp lastKnownHeartbeat = manager.GetLastNodeActivity(expectedLeader);
+                    
+                    if (lastKnownHeartbeat != HLCTimestamp.Zero && ((currentTime - lastKnownHeartbeat) < electionTimeout))
+                        return;
+                }
+                
+                // make sure we are up to date with the logs
                 
                 if (await AmIOutdated().ConfigureAwait(false))
                 {
@@ -640,7 +656,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
         
-        //validate if we voted in the current term and we expect a different leader
+        // Validate if we voted in the current term and we expect a different leader
         string expectedLeader = expectedLeaders.GetValueOrDefault(leaderTerm, "");
 
         if (endpoint == expectedLeader || string.IsNullOrEmpty(expectedLeader))
@@ -673,6 +689,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         }
         
         lastHeartbeat = await manager.HybridLogicalClock.ReceiveEvent(timestamp).ConfigureAwait(false);
+        
+        manager.UpdateLastNodeActivity(expectedLeader, lastHeartbeat);
 
         if (logs is not null && logs.Count > 0)
         {
