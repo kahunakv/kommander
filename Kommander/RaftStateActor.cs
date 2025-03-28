@@ -694,7 +694,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         if (logs is not null && logs.Count > 0)
         {
-            logger.LogDebugSendingVote(manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm, logs.Count);
+            logger.LogDebugReceivedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm, logs.Count);
 
             RaftWALResponse response = await walActor.Ask(new(RaftWALActionType.ProposeOrCommit, leaderTerm, timestamp, logs)).ConfigureAwait(false);
             
@@ -787,7 +787,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         activeProposals.TryAdd(currentTime, proposalQuorum);
         
-        logger.LogInfoProposedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, currentTime, logs.Count);
+        logger.LogInfoProposedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, currentTime, string.Join(',', logs.Select(x => x.Id.ToString()).ToList()));
 
         return (RaftOperationStatus.Success, currentTime);
     }
@@ -875,10 +875,14 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         
         if (!activeProposals.TryGetValue(ticketId, out RaftProposalQuorum? proposal))
             return (RaftOperationStatus.ProposalNotFound, 0);
-        
+
         if (!proposal.HasQuorum())
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Trying to commit log {Timestamp} without quorum...", manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId);
+            
             return (RaftOperationStatus.Errored, 0);
-        
+        }
+
         RaftWALResponse commitResponse = await walActor.Ask(new(RaftWALActionType.Commit, currentTerm, ticketId, proposal.Logs)).ConfigureAwait(false);
         if (commitResponse.Status != RaftOperationStatus.Success)
         {
@@ -1022,17 +1026,23 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         if (!activeProposals.TryGetValue(timestamp, out RaftProposalQuorum? proposal))
             return;
-        
+
         proposal.MarkCompleted(endpoint);
 
         if (!proposal.HasQuorum())
+        {
+            logger.LogInfoProposalPartiallyCompletedAt(manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp);
             return;
-        
+        }
+
         logger.LogInfoProposalCompletedAt(manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp);
 
         if (!proposal.AutoCommit)
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Proposal {Timestamp} doesn't have auto-commit", manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp);
             return;
-        
+        }
+
         RaftWALResponse commitResponse = await walActor.Ask(new(RaftWALActionType.Commit, currentTerm, timestamp, proposal.Logs)).ConfigureAwait(false);
         if (commitResponse.Status != RaftOperationStatus.Success)
         {
@@ -1063,8 +1073,12 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         if (proposal.HasQuorum())
         {
             if (autoCommit)
+            {
+                logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Removed proposal {Timestamp}", manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp);
+                
                 activeProposals.Remove(timestamp);
-            
+            }
+
             return (RaftTicketState.Committed, proposal.LastLogIndex);
         }
 

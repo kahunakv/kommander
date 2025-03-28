@@ -38,7 +38,7 @@ public sealed class ClusterHandler
     {
         manager.Nodes = discovery.GetNodes();
 
-        if (manager.Logger.IsEnabled(LogLevel.Debug))
+        /*if (manager.Logger.IsEnabled(LogLevel.Debug))
         {
             StringBuilder builder = new();
 
@@ -49,7 +49,7 @@ public sealed class ClusterHandler
             }
 
             manager.Logger.LogDebug("[{Endpoint}] Nodes: {Nodes}", manager.LocalEndpoint, builder.ToString());
-        }
+        }*/
 
         return Task.CompletedTask;
     }

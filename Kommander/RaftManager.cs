@@ -1,13 +1,14 @@
 
 using Nixie;
 
+using System.Collections.Concurrent;
+
 using Kommander.Communication;
 using Kommander.Data;
 using Kommander.Diagnostics;
 using Kommander.Discovery;
 using Kommander.Time;
 using Kommander.WAL;
-using Kommander.WAL.IO;
 using ThreadPool = Kommander.WAL.IO.ThreadPool;
 
 // ReSharper disable MemberCanBePrivate.Global
@@ -17,7 +18,7 @@ using ThreadPool = Kommander.WAL.IO.ThreadPool;
 namespace Kommander;
 
 /// <summary>
-/// Manages the Raft cluster.
+/// Identifies a Raft node in the cluster
 /// </summary>
 public sealed class RaftManager : IRaft
 {
