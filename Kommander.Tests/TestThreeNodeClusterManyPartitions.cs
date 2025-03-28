@@ -213,13 +213,13 @@ public sealed class TestThreeNodeClusterManyPartitions
                   return Task.FromResult(true);
             };
 
-        long maxId = await node1.WalAdapter.GetMaxLog(0);
+        long maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node2.WalAdapter.GetMaxLog(0);
+        maxId = node2.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node3.WalAdapter.GetMaxLog(0);
+        maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
 
         byte[] data = "Hello World"u8.ToArray();
@@ -234,13 +234,13 @@ public sealed class TestThreeNodeClusterManyPartitions
             Assert.Equal(i + 1, response.LogIndex);
         }
         
-        maxId = await node1.WalAdapter.GetMaxLog(0);
+        maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(100, maxId);
         
-        maxId = await node2.WalAdapter.GetMaxLog(0);
+        maxId = node2.WalAdapter.GetMaxLog(0);
         Assert.Equal(100, maxId);
         
-        maxId = await node3.WalAdapter.GetMaxLog(0);
+        maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(100, maxId);
         
         Assert.Equal(200, totalFollowersReceived);
@@ -315,13 +315,13 @@ public sealed class TestThreeNodeClusterManyPartitions
                   return Task.FromResult(true);
             };
 
-        long maxId = await node1.WalAdapter.GetMaxLog(0);
+        long maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node2.WalAdapter.GetMaxLog(0);
+        maxId = node2.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
         
-        maxId = await node3.WalAdapter.GetMaxLog(0);
+        maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
 
         for (int i = 0; i < partitions; i++)

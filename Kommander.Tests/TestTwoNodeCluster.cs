@@ -155,10 +155,10 @@ public class TestTwoNodeCluster
         IRaft node1 = GetNode1(communication);
         IRaft node2 = GetNode2(communication);
 
-        await node1.WalAdapter.Propose(0, new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Proposed });
-        await node1.WalAdapter.Propose(0, new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Proposed });
-        await node1.WalAdapter.Commit(0, new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed });
-        await node1.WalAdapter.Commit(0, new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed });
+        node1.WalAdapter.Propose(0, new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Proposed });
+        node1.WalAdapter.Propose(0, new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Proposed });
+        node1.WalAdapter.Commit(0, new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed });
+        node1.WalAdapter.Commit(0, new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed });
 
         await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster()]);
         
@@ -191,10 +191,10 @@ public class TestTwoNodeCluster
         Assert.NotEmpty(followers);
         Assert.Single(followers);
         
-        long maxNode1 = await node1.WalAdapter.GetMaxLog(0);
+        long maxNode1 = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(2, maxNode1);
         
-        long maxNode2 = await node1.WalAdapter.GetMaxLog(0);
+        long maxNode2 = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(2, maxNode2);
         
         node1.ActorSystem.Dispose();
@@ -209,13 +209,13 @@ public class TestTwoNodeCluster
         IRaft node1 = GetNode1(communication);
         IRaft node2 = GetNode2(communication);
         
-        await node1.WalAdapter.Propose(0, new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Proposed });
-        await node1.WalAdapter.Propose(0, new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Proposed });
-        await node1.WalAdapter.Commit(0, new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed });
-        await node1.WalAdapter.Commit(0, new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed });
+        node1.WalAdapter.Propose(0, new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Proposed });
+        node1.WalAdapter.Propose(0, new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Proposed });
+        node1.WalAdapter.Commit(0, new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed });
+        node1.WalAdapter.Commit(0, new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed });
         
-        await node2.WalAdapter.Propose(0, new() { Id = 1, Term = 2, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Proposed });
-        await node2.WalAdapter.Commit(0, new() { Id = 1, Term = 2, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed });
+        node2.WalAdapter.Propose(0, new() { Id = 1, Term = 2, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Proposed });
+        node2.WalAdapter.Commit(0, new() { Id = 1, Term = 2, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed });
 
         await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster()]);
         
@@ -248,10 +248,10 @@ public class TestTwoNodeCluster
         Assert.NotEmpty(followers);
         Assert.Single(followers);
         
-        long maxNode1 = await node1.WalAdapter.GetMaxLog(0);
+        long maxNode1 = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(2, maxNode1);
         
-        long maxNode2 = await node1.WalAdapter.GetMaxLog(0);
+        long maxNode2 = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(2, maxNode2);
         
         node1.ActorSystem.Dispose();

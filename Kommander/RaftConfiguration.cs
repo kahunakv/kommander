@@ -86,4 +86,14 @@ public class RaftConfiguration
     /// Slow processing of messages might indicate a performance issue
     /// </summary>
     public int SlowRaftStateMachineLog { get; set; } = 500;
+    
+    /// <summary>
+    /// Number of background threads used for I/O read operations
+    /// </summary>
+    public int ReadIOThreads { get; set; } = 4;
+    
+    /// <summary>
+    /// Number of background threads used for I/O write operations
+    /// </summary>
+    public int WriteIOThreads { get; set; } = 4;
 }

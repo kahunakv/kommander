@@ -1,14 +1,16 @@
 
-using System.Collections.Concurrent;
-using System.Diagnostics;
+using Nixie;
+
 using Kommander.Communication;
 using Kommander.Data;
 using Kommander.Diagnostics;
 using Kommander.Discovery;
 using Kommander.Time;
 using Kommander.WAL;
-using Nixie;
+using Kommander.WAL.IO;
+using ThreadPool = Kommander.WAL.IO.ThreadPool;
 
+// ReSharper disable MemberCanBePrivate.Global
 // ReSharper disable ConvertToAutoProperty
 // ReSharper disable ConvertToAutoPropertyWhenPossible
 
@@ -41,6 +43,10 @@ public sealed class RaftManager : IRaft
 
     private readonly RaftPartition?[] partitions;
 
+    private readonly ThreadPool readThreadPool;
+    
+    private readonly ThreadPool writeThreadPool;
+
     private readonly IActorRef<RaftLeaderSupervisor, RaftLeaderSupervisorRequest> leaderSupervisorActor;
 
     private readonly ConcurrentDictionary<string, HLCTimestamp> lastActivity = new();
@@ -54,6 +60,16 @@ public sealed class RaftManager : IRaft
     /// Allows to retreive the list of partitions
     /// </summary>
     internal RaftPartition?[] Partitions => partitions;
+    
+    /// <summary>
+    /// Read I/O thread pool
+    /// </summary>
+    public ThreadPool ReadThreadPool => readThreadPool;
+    
+    /// <summary>
+    /// Write I/O thread pool
+    /// </summary>
+    public ThreadPool WriteThreadPool => writeThreadPool;
 
     /// <summary>
     /// Whether the node has joined the Raft cluster
@@ -157,6 +173,9 @@ public sealed class RaftManager : IRaft
         clusterHandler = new(this, discovery);
         
         leaderSupervisorActor = actorSystem.Spawn<RaftLeaderSupervisor, RaftLeaderSupervisorRequest>("raft-leader-supervisor", this, Logger);
+
+        readThreadPool = new(logger, configuration.ReadIOThreads);
+        writeThreadPool = new(logger, configuration.WriteIOThreads);
     }
     
     /// <summary>
@@ -166,6 +185,9 @@ public sealed class RaftManager : IRaft
     {
         if (partitions[0] is null)
         {
+            readThreadPool.Start();
+            writeThreadPool.Start();
+            
             for (int i = 0; i < configuration.MaxPartitions; i++)
                 partitions[i] = new(actorSystem, this, walAdapter, communication, i, Logger);
         }
@@ -179,6 +201,9 @@ public sealed class RaftManager : IRaft
     public async Task LeaveCluster()
     {
         await clusterHandler.LeaveCluster(configuration).ConfigureAwait(false);
+        
+        readThreadPool.Stop();
+        writeThreadPool.Stop();
     }
 
     /// <summary>

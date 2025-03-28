@@ -26,14 +26,14 @@ public class SqliteWAL : IWAL
         this.revision = revision;
     }
     
-    private async ValueTask<SqliteConnection> TryOpenDatabase(int partitionId)
+    private SqliteConnection TryOpenDatabase(int partitionId)
     {
         if (connections.TryGetValue(partitionId, out SqliteConnection? connection))
             return connection;
 
         try
         {
-            await semaphore.WaitAsync().ConfigureAwait(false);
+            semaphore.Wait();
 
             if (connections.TryGetValue(partitionId, out connection))
                 return connection;
@@ -57,12 +57,12 @@ public class SqliteWAL : IWAL
             );
             """;
             
-            await using SqliteCommand command1 = new(createTableQuery, connection);
-            await command1.ExecuteNonQueryAsync().ConfigureAwait(false);
+            using SqliteCommand command1 = new(createTableQuery, connection);
+            command1.ExecuteNonQuery();
             
             const string pragmasQuery = "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY;";
-            await using SqliteCommand command3 = new(pragmasQuery, connection);
-            await command3.ExecuteNonQueryAsync().ConfigureAwait(false);
+            using SqliteCommand command3 = new(pragmasQuery, connection);
+            command3.ExecuteNonQuery();
             
             connections.Add(partitionId, connection);
 
@@ -74,11 +74,13 @@ public class SqliteWAL : IWAL
         }
     }
     
-    public async IAsyncEnumerable<RaftLog> ReadLogs(int partitionId)
+    public List<RaftLog> ReadLogs(int partitionId)
     {
-        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
+        List<RaftLog> result = [];
         
-        long lastCheckpoint = await GetLastCheckpoint(connection, partitionId).ConfigureAwait(false);
+        SqliteConnection connection = TryOpenDatabase(partitionId);
+        
+        long lastCheckpoint = GetLastCheckpoint(connection, partitionId);
         
         const string query = """
          SELECT id, term, type, logType, log, timePhysical, timeCounter 
@@ -87,16 +89,16 @@ public class SqliteWAL : IWAL
          ORDER BY id ASC;
          """;
         
-        await using SqliteCommand command = new(query, connection);
+        using SqliteCommand command = new(query, connection);
         
         command.Parameters.AddWithValue("@partitionId", partitionId);
         command.Parameters.AddWithValue("@lastCheckpoint", lastCheckpoint);
 
-        await using SqliteDataReader reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
+        using SqliteDataReader reader = command.ExecuteReader();
         
         while (reader.Read())
         {
-            yield return new()
+            result.Add(new()
             {
                 Id = reader.IsDBNull(0) ? 0 : reader.GetInt64(0),
                 Term = reader.IsDBNull(1) ? 0 : reader.GetInt64(1),
@@ -104,15 +106,19 @@ public class SqliteWAL : IWAL
                 LogType = reader.IsDBNull(3) ? "" : reader.GetString(3),
                 LogData = reader.IsDBNull(4) ? []: (byte[])reader[4],
                 Time = new(reader.IsDBNull(5) ? 0 : reader.GetInt64(5), reader.IsDBNull(6) ? 0 : (uint)reader.GetInt64(6))
-            };
+            });
         }
+        
+        return result;
     }
     
-    public async IAsyncEnumerable<RaftLog> ReadLogsRange(int partitionId, long startLogIndex)
+    public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex)
     {
+        List<RaftLog> result = [];
+        
         int counter = 0;
         
-        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
+        SqliteConnection connection = TryOpenDatabase(partitionId);
         
         const string query = """
          SELECT id, term, type, logType, log, timePhysical, timeCounter 
@@ -121,16 +127,16 @@ public class SqliteWAL : IWAL
          ORDER BY id ASC;
          """;
         
-        await using SqliteCommand command = new(query, connection);
+        using SqliteCommand command = new(query, connection);
         
         command.Parameters.AddWithValue("@partitionId", partitionId);
         command.Parameters.AddWithValue("@startIndex", startLogIndex);
         
-        await using SqliteDataReader reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
+        using SqliteDataReader reader = command.ExecuteReader();
         
         while (reader.Read())
         {
-            yield return new()
+            result.Add(new()
             {
                 Id = reader.IsDBNull(0) ? 0 : reader.GetInt64(0),
                 Term = reader.IsDBNull(1) ? 0 : reader.GetInt64(1),
@@ -138,21 +144,23 @@ public class SqliteWAL : IWAL
                 LogType = reader.IsDBNull(3) ? "" : reader.GetString(3),
                 LogData = reader.IsDBNull(4) ? []: (byte[])reader[4],
                 Time = new(reader.IsDBNull(5) ? 0 : reader.GetInt64(5), reader.IsDBNull(6) ? 0 : (uint)reader.GetInt64(6))
-            };
+            });
             
             counter++;
 
             if (counter >= MaxNumberOfRangedEntries)
                 break;
         }
+        
+        return result;
     }
 
-    public async Task Propose(int partitionId, RaftLog log)
+    public RaftOperationStatus Propose(int partitionId, RaftLog log)
     {
-        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
+        SqliteConnection connection = TryOpenDatabase(partitionId);
         
         const string insertQuery = "INSERT INTO logs (id, partitionId, term, type, logType, log, timePhysical, timeCounter) VALUES (@id, @partitionId, @term, @type, @logType, @log, @timePhysical, @timeCounter);";
-        await using SqliteCommand insertCommand =  new(insertQuery, connection);
+        using SqliteCommand insertCommand =  new(insertQuery, connection);
         
         insertCommand.Parameters.AddWithValue("@id", log.Id);
         insertCommand.Parameters.AddWithValue("@partitionId", partitionId);
@@ -163,46 +171,52 @@ public class SqliteWAL : IWAL
         insertCommand.Parameters.AddWithValue("@timePhysical", log.Time.L);
         insertCommand.Parameters.AddWithValue("@timeCounter", log.Time.C);
         
-        await insertCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
+        insertCommand.ExecuteNonQuery();
+        
+        return RaftOperationStatus.Success;
     }
     
-    public async Task Commit(int partitionId, RaftLog log)
+    public RaftOperationStatus Commit(int partitionId, RaftLog log)
     {
-        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
+        SqliteConnection connection = TryOpenDatabase(partitionId);
         
         const string updateQuery = "UPDATE logs SET type = @type WHERE partitionId = @partitionId AND id = @id";
-        await using SqliteCommand updateCommand =  new(updateQuery, connection);
+        using SqliteCommand updateCommand =  new(updateQuery, connection);
         
         updateCommand.Parameters.AddWithValue("@id", log.Id);
         updateCommand.Parameters.AddWithValue("@partitionId", partitionId);
         updateCommand.Parameters.AddWithValue("@type", log.Type);
         
-        await updateCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
+        updateCommand.ExecuteNonQuery();
+
+        return RaftOperationStatus.Success;
     }
     
-    public async Task Rollback(int partitionId, RaftLog log)
+    public RaftOperationStatus Rollback(int partitionId, RaftLog log)
     {
-        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
+        SqliteConnection connection = TryOpenDatabase(partitionId);
         
         const string updateQuery = "UPDATE logs SET type = @type WHERE partitionId = @partitionId AND id = @id";
-        await using SqliteCommand updateCommand =  new(updateQuery, connection);
+        using SqliteCommand updateCommand =  new(updateQuery, connection);
         
         updateCommand.Parameters.AddWithValue("@id", log.Id);
         updateCommand.Parameters.AddWithValue("@partitionId", partitionId);
         updateCommand.Parameters.AddWithValue("@type", log.Type);
         
-        await updateCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
+        updateCommand.ExecuteNonQuery();
+        
+        return RaftOperationStatus.Success;
     }
 
-    public async Task ProposeMany(int partitionId, List<RaftLog> logs)
+    public RaftOperationStatus ProposeMany(int partitionId, List<RaftLog> logs)
     {
-        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
+        SqliteConnection connection = TryOpenDatabase(partitionId);
         
         const string insertQuery = "INSERT INTO logs (id, partitionId, term, type, logType, log, timePhysical, timeCounter) VALUES (@id, @partitionId, @term, @type, @logType, @log, @timePhysical, @timeCounter);";
 
         foreach (RaftLog log in logs)
         {
-            await using SqliteCommand insertCommand = new(insertQuery, connection);
+            using SqliteCommand insertCommand = new(insertQuery, connection);
 
             insertCommand.Parameters.AddWithValue("@id", log.Id);
             insertCommand.Parameters.AddWithValue("@partitionId", partitionId);
@@ -213,19 +227,21 @@ public class SqliteWAL : IWAL
             insertCommand.Parameters.AddWithValue("@timePhysical", log.Time.L);
             insertCommand.Parameters.AddWithValue("@timeCounter", log.Time.C);
 
-            await insertCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
+            insertCommand.ExecuteNonQuery();
         }
+        
+        return RaftOperationStatus.Success;
     }
 
-    public async Task CommitMany(int partitionId, List<RaftLog> logs)
+    public RaftOperationStatus CommitMany(int partitionId, List<RaftLog> logs)
     {
-        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
+        SqliteConnection connection = TryOpenDatabase(partitionId);
         
         const string insertQuery = "INSERT INTO logs (id, partitionId, term, type, logType, log, timePhysical, timeCounter) VALUES (@id, @partitionId, @term, @type, @logType, @log, @timePhysical, @timeCounter);";
 
         foreach (RaftLog log in logs)
         {
-            await using SqliteCommand insertCommand = new(insertQuery, connection);
+            using SqliteCommand insertCommand = new(insertQuery, connection);
 
             insertCommand.Parameters.AddWithValue("@id", log.Id);
             insertCommand.Parameters.AddWithValue("@partitionId", partitionId);
@@ -236,19 +252,21 @@ public class SqliteWAL : IWAL
             insertCommand.Parameters.AddWithValue("@timePhysical", log.Time.L);
             insertCommand.Parameters.AddWithValue("@timeCounter", log.Time.C);
 
-            await insertCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
+            insertCommand.ExecuteNonQuery();
         }
+
+        return RaftOperationStatus.Success;
     }
 
-    public async Task RollbackMany(int partitionId, List<RaftLog> logs)
+    public RaftOperationStatus RollbackMany(int partitionId, List<RaftLog> logs)
     {
-        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
+        SqliteConnection connection = TryOpenDatabase(partitionId);
         
         const string insertQuery = "INSERT INTO logs (id, partitionId, term, type, logType, log, timePhysical, timeCounter) VALUES (@id, @partitionId, @term, @type, @logType, @log, @timePhysical, @timeCounter);";
 
         foreach (RaftLog log in logs)
         {
-            await using SqliteCommand insertCommand = new(insertQuery, connection);
+            using SqliteCommand insertCommand = new(insertQuery, connection);
 
             insertCommand.Parameters.AddWithValue("@id", log.Id);
             insertCommand.Parameters.AddWithValue("@partitionId", partitionId);
@@ -259,20 +277,22 @@ public class SqliteWAL : IWAL
             insertCommand.Parameters.AddWithValue("@timePhysical", log.Time.L);
             insertCommand.Parameters.AddWithValue("@timeCounter", log.Time.C);
 
-            await insertCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
+            insertCommand.ExecuteNonQuery();
         }
+
+        return RaftOperationStatus.Success;
     }
 
-    public async Task<long> GetMaxLog(int partitionId)
+    public long GetMaxLog(int partitionId)
     {
-        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
+        SqliteConnection connection = TryOpenDatabase(partitionId);
         
         const string query = "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId";
-        await using SqliteCommand command = new(query, connection);
+        using SqliteCommand command = new(query, connection);
         
         command.Parameters.AddWithValue("@partitionId", partitionId);
         
-        await using SqliteDataReader reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
+        using SqliteDataReader reader = command.ExecuteReader();
         
         while (reader.Read())
             return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
@@ -280,16 +300,16 @@ public class SqliteWAL : IWAL
         return 0;
     }
     
-    public async Task<long> GetCurrentTerm(int partitionId)
+    public long GetCurrentTerm(int partitionId)
     {
-        SqliteConnection connection = await TryOpenDatabase(partitionId).ConfigureAwait(false);
+        SqliteConnection connection = TryOpenDatabase(partitionId);
         
         const string query = "SELECT MAX(term) AS max FROM logs WHERE partitionId = @partitionId";
-        await using SqliteCommand command = new(query, connection);
+        using SqliteCommand command = new(query, connection);
         
         command.Parameters.AddWithValue("@partitionId", partitionId);
         
-        await using SqliteDataReader reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
+        using SqliteDataReader reader = command.ExecuteReader();
         
         while (reader.Read())
             return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
@@ -297,15 +317,15 @@ public class SqliteWAL : IWAL
         return 0;
     }
     
-    private static async Task<long> GetLastCheckpoint(SqliteConnection connection, int partitionId)
+    private static long GetLastCheckpoint(SqliteConnection connection, int partitionId)
     {
         const string query = "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId AND type = @type";
-        await using SqliteCommand command = new(query, connection);
+        using SqliteCommand command = new(query, connection);
         
         command.Parameters.AddWithValue("@partitionId", partitionId);
         command.Parameters.AddWithValue("@type", (int)RaftLogType.CommittedCheckpoint);
         
-        await using SqliteDataReader reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
+        using SqliteDataReader reader = command.ExecuteReader();
         
         while (reader.Read())
             return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
