@@ -409,14 +409,14 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         if (nodeState != RaftNodeState.Leader && nodeState != RaftNodeState.Candidate)
             return;
 
-        int number = 0;
+        //int number = 0;
         
         foreach (RaftNode node in nodes)
         {
             if (node.Endpoint == manager.LocalEndpoint)
                 throw new RaftException("Corrupted nodes");
             
-            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Sending heartbeat to {Node} #{Number}", manager.LocalEndpoint, partition.PartitionId, nodeState, node.Endpoint, ++number);
+            //logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Sending heartbeat to {Node} #{Number}", manager.LocalEndpoint, partition.PartitionId, nodeState, node.Endpoint, ++number);
             
             await AppendLogToNode(node, lastHeartbeat, true).ConfigureAwait(false);
         }
