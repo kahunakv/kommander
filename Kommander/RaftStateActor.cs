@@ -694,7 +694,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         if (logs is not null && logs.Count > 0)
         {
-            logger.LogDebugReceivedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm, logs.Count);
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebugReceivedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm, timestamp, string.Join(',', logs.Select(x => x.Id.ToString()).ToList()));
 
             RaftWALResponse response = await walActor.Ask(new(RaftWALActionType.ProposeOrCommit, leaderTerm, timestamp, logs)).ConfigureAwait(false);
             
@@ -782,12 +783,13 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             
             proposalQuorum.AddExpectedCompletion(node.Endpoint);
             
-            await AppendLogToNode(node, currentTime, false);
+            await AppendLogToNode(node, currentTime, false).ConfigureAwait(false);
         }
 
         activeProposals.TryAdd(currentTime, proposalQuorum);
         
-        logger.LogInfoProposedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, currentTime, string.Join(',', logs.Select(x => x.Id.ToString()).ToList()));
+        if (logger.IsEnabled(LogLevel.Information))
+            logger.LogInfoProposedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, currentTime, string.Join(',', logs.Select(x => x.Id.ToString()).ToList()));
 
         return (RaftOperationStatus.Success, currentTime);
     }
@@ -891,10 +893,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return (commitResponse.Status, 0);
         }
 
-        HLCTimestamp currentTime = await manager.HybridLogicalClock.ReceiveEvent(ticketId);
+        HLCTimestamp currentTime = await manager.HybridLogicalClock.ReceiveEvent(ticketId).ConfigureAwait(false);
         
         foreach (string node in proposal.Nodes)
-            await AppendLogToNode(new(node), currentTime, false);
+            await AppendLogToNode(new(node), currentTime, false).ConfigureAwait(false);
         
         logger.LogInfoCommittedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId, proposal.Logs.Count);
         
@@ -927,10 +929,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return (commitResponse.Status, 0);
         }
 
-        HLCTimestamp currentTime = await manager.HybridLogicalClock.ReceiveEvent(ticketId);
+        HLCTimestamp currentTime = await manager.HybridLogicalClock.ReceiveEvent(ticketId).ConfigureAwait(false);
         
         foreach (string node in proposal.Nodes)
-            await AppendLogToNode(new(node), currentTime, false);
+            await AppendLogToNode(new(node), currentTime, false).ConfigureAwait(false);
         
         logger.LogInfoRolledbackLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId, proposal.Logs.Count);
         
@@ -971,16 +973,22 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         else
         {
             long lastCommitIndex = lastCommitIndexes.GetValueOrDefault(node.Endpoint, 0);
-            
+
             lastCommitIndex -= 3;
             if (lastCommitIndex < 0)
                 lastCommitIndex = 0;
 
             RaftWALResponse getRangeResponse = await walActor.Ask(new(RaftWALActionType.GetRange, currentTerm, lastCommitIndex)).ConfigureAwait(false);
             if (getRangeResponse.Logs is null)
+            {
+                logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Failed to get logs range {Timestamp} From={From}", manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp, lastCommitIndex);
+
                 return;
+            }
 
             request = new(partition.PartitionId, currentTerm, timestamp, manager.LocalEndpoint, getRangeResponse.Logs);
+
+            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Enqueued entries for {Endpoint} {Timestamp} From={From} Logs={Logs}", manager.LocalEndpoint, partition.PartitionId, nodeState, node.Endpoint, timestamp, lastCommitIndex, string.Join(',', getRangeResponse.Logs.Select(x => x.Id.ToString()).ToList()));
         }
 
         /*if (request.Logs is null || request.Logs.Count == 0)
@@ -988,7 +996,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             manager.ResponseBatcherActor.Send(new(RaftResponderRequestType.AppendLogs, node, request));
             return;
         }*/
-        
+
         partition.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.AppendLogs, node, request));
     }
 
@@ -1006,19 +1014,20 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             lastCommitIndexes[endpoint] = committedIndex;
             startCommitIndexes[endpoint] = committedIndex;
 
-            logger.LogInfoSuccessfullySentLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, committedIndex);
+            logger.LogInfoSuccessfullyCompletedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, timestamp, committedIndex);
         }
 
         if (status != RaftOperationStatus.Success)
         {
             logger.LogWarning(
-                "[{LocalEndpoint}/{PartitionId}/{State}] Got {Status} from {Endpoint} Timestamp={Timestamp}",
+                "[{LocalEndpoint}/{PartitionId}/{State}] Got {Status} from {Endpoint} Timestamp={Timestamp} CommittedIndex={CommittedIndex}",
                 manager.LocalEndpoint,
                 partition.PartitionId,
                 nodeState,
                 status,
                 endpoint,
-                timestamp
+                timestamp,
+                committedIndex
             );
 
             return;
@@ -1051,10 +1060,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
 
-        HLCTimestamp currentTime = await manager.HybridLogicalClock.ReceiveEvent(timestamp);
+        HLCTimestamp currentTime = await manager.HybridLogicalClock.ReceiveEvent(timestamp).ConfigureAwait(false);
         
         foreach (string node in proposal.Nodes)
-            await AppendLogToNode(new(node), currentTime, false);
+            await AppendLogToNode(new(node), currentTime, false).ConfigureAwait(false);
         
         logger.LogInfoCommittedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp, proposal.Logs.Count);
     }
