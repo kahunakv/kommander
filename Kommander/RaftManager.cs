@@ -192,6 +192,11 @@ public sealed class RaftManager : IRaft
         await clusterHandler.UpdateNodes().ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Obtains the last activity known of a specific node on any partitions
+    /// </summary>
+    /// <param name="nodeId"></param>
+    /// <returns></returns>
     internal HLCTimestamp GetLastNodeActivity(string nodeId)
     {
         if (lastActivity.TryGetValue(nodeId, out HLCTimestamp lastTimestamp))
@@ -200,6 +205,11 @@ public sealed class RaftManager : IRaft
         return HLCTimestamp.Zero;
     }
     
+    /// <summary>
+    /// Updates the last activity known of a specific node on any partitions
+    /// </summary>
+    /// <param name="nodeId"></param>
+    /// <param name="lastTimestamp"></param>
     internal void UpdateLastNodeActivity(string nodeId, HLCTimestamp lastTimestamp)
     {
         if (lastActivity.ContainsKey(nodeId))
@@ -305,6 +315,9 @@ public sealed class RaftManager : IRaft
         {
             (success, status, ticketId) = await partition.ReplicateLogs(type, data, autoCommit).ConfigureAwait(false);
 
+            if (status == RaftOperationStatus.ActiveProposal)
+                await Task.Delay(1).ConfigureAwait(false);
+            
         } while (status == RaftOperationStatus.ActiveProposal);
         
         if (!success)
@@ -332,6 +345,9 @@ public sealed class RaftManager : IRaft
         do
         {
             (success, status, ticketId) = await partition.ReplicateLogs(type, logs, autoCommit).ConfigureAwait(false);
+            
+            if (status == RaftOperationStatus.ActiveProposal)
+                await Task.Delay(1).ConfigureAwait(false);
 
         } while (status == RaftOperationStatus.ActiveProposal);
         
@@ -382,6 +398,9 @@ public sealed class RaftManager : IRaft
         do
         {
             (success, status, ticketId) = await partition.ReplicateCheckpoint().ConfigureAwait(false);
+            
+            if (status == RaftOperationStatus.ActiveProposal)
+                await Task.Delay(1).ConfigureAwait(false);
 
         } while (status == RaftOperationStatus.ActiveProposal);
         

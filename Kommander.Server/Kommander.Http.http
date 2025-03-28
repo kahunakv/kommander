@@ -1,6 +1,6 @@
-@Lux.Http_HostAddress = http://localhost:5096
+@Kommander.Http_HostAddress = http://localhost:5096
 
-GET {{Lux.Http_HostAddress}}/v1/raft//
+GET {{Kommander.Http_HostAddress}}/v1/raft/
 Accept: application/json
 
 ###

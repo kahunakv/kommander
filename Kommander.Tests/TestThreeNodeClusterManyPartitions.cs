@@ -1,5 +1,4 @@
 
-using Grpc.Core;
 using Kommander.Communication.Memory;
 using Kommander.Data;
 using Kommander.Discovery;
@@ -339,6 +338,109 @@ public sealed class TestThreeNodeClusterManyPartitions
 
             Assert.Equal(RaftOperationStatus.Success, response.Status);
             Assert.Equal(1, response.LogIndex);
+
+            Assert.Equal(0, totalFollowersReceived);
+            Assert.Equal(0, totalLeaderReceived);
+        }
+
+        node1.ActorSystem.Dispose();
+        node2.ActorSystem.Dispose();
+        node3.ActorSystem.Dispose();
+    }
+    
+    [Theory]
+    [InlineData(4)]
+    [InlineData(8)]
+    public async Task TestJoinClusterAndProposeReplicateLogsRace(int partitions)
+    {
+        InMemoryCommunication communication = new();
+        
+        IRaft node1 = GetNode1(communication, partitions, logger);
+        IRaft node2 = GetNode2(communication, partitions, logger);
+        IRaft node3 = GetNode3(communication, partitions, logger);
+
+        await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster(), node3.JoinCluster()]);
+
+        await node1.UpdateNodes();
+        await node2.UpdateNodes();
+        await node3.UpdateNodes();
+        
+        communication.SetNodes(new()
+        {
+            { "localhost:8001", node1 }, 
+            { "localhost:8002", node2 },
+            { "localhost:8003", node3 }
+        });
+
+        for (int i = 0; i < partitions; i++)
+        {
+            while (true)
+            {
+                bool result = await node1.AmILeader(i, CancellationToken.None) ||
+                              await node2.AmILeader(i, CancellationToken.None) ||
+                              await node3.AmILeader(i, CancellationToken.None);
+
+                if (result)
+                    break;
+                
+                await Task.Delay(500);
+            }
+        }
+
+        IRaft? leader = await GetLeader(0, [node1, node2, node3]);
+        Assert.NotNull(leader);
+
+        List<IRaft> followers = await GetFollowers([node1, node2, node3]);
+        Assert.NotEmpty(followers);
+        Assert.Equal(2, followers.Count);
+        
+        byte[] data = "Hello World"u8.ToArray();
+        
+        leader.OnReplicationReceived += log =>
+        {
+            Assert.Equal("Greeting", log.LogType);;
+            Assert.Equal(data, log.LogData);
+            
+            Interlocked.Increment(ref totalLeaderReceived);
+            return Task.FromResult(true);
+        };
+        
+        foreach (IRaft follower in followers)
+            follower.OnReplicationReceived += _ =>
+            {
+                  Interlocked.Increment(ref totalFollowersReceived);
+                  return Task.FromResult(true);
+            };
+
+        long maxId = await node1.WalAdapter.GetMaxLog(0);
+        Assert.Equal(0, maxId);
+        
+        maxId = await node2.WalAdapter.GetMaxLog(0);
+        Assert.Equal(0, maxId);
+        
+        maxId = await node3.WalAdapter.GetMaxLog(0);
+        Assert.Equal(0, maxId);
+
+        for (int i = 0; i < partitions; i++)
+        {
+            leader = await GetLeader(i, [node1, node2, node3]);
+            Assert.NotNull(leader);
+
+            RaftReplicationResult[] responses = await Task.WhenAll(
+                leader.ReplicateLogs(i, "Greeting", data, false),
+                leader.ReplicateLogs(i, "Greeting", data, false),
+                leader.ReplicateLogs(i, "Greeting", data, false)
+            );
+
+            foreach (RaftReplicationResult response in responses)
+            {
+                if (!response.Success)
+                    throw new Exception(response.Status.ToString());
+
+                Assert.True(response.Success);
+
+                Assert.Equal(RaftOperationStatus.Success, response.Status);
+            }
 
             Assert.Equal(0, totalFollowersReceived);
             Assert.Equal(0, totalLeaderReceived);
