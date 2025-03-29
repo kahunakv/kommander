@@ -80,7 +80,7 @@ public interface IRaft
     /// <summary>
     /// Event when a replication log is received
     /// </summary>
-    public event Func<RaftLog, Task<bool>>? OnReplicationReceived;
+    public event Func<int, RaftLog, Task<bool>>? OnReplicationReceived;
     
     /// <summary>
     /// Joins the Raft cluster

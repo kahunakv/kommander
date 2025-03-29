@@ -260,7 +260,7 @@ public sealed class RaftPartition : IDisposable
         if (!string.IsNullOrEmpty(Leader) && Leader == manager.LocalEndpoint)
             return RaftNodeState.Leader;
 
-        RaftResponse response = await raftActor.Ask(RaftStateRequest, TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        RaftResponse response = await raftActor.Ask(RaftStateRequest).ConfigureAwait(false);
         
         if (response.Type != RaftResponseType.NodeState)
             throw new RaftException("Unknown response (2)");
@@ -276,7 +276,7 @@ public sealed class RaftPartition : IDisposable
     /// <exception cref="RaftException"></exception>
     public async Task<(RaftTicketState state, long commitId)> GetTicketState(HLCTimestamp ticketId, bool autoCommit)
     {
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.GetTicketState, ticketId, autoCommit), TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        RaftResponse response = await raftActor.Ask(new(RaftRequestType.GetTicketState, ticketId, autoCommit)).ConfigureAwait(false);
         
         if (response.Type != RaftResponseType.TicketState)
             throw new RaftException("Unknown response (2)");

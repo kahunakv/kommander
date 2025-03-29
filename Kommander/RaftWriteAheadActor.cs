@@ -311,7 +311,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
         if (allOutdated)
         {
-            logger.LogWarning(
+            /*logger.LogWarning(
                 "[{Endpoint}/{Partition}] All replicated indexes are included already in the log Min={Min} Max={Max}",
                 manager.LocalEndpoint, 
                 partition.PartitionId,
@@ -319,7 +319,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 logs.Max(log => log.Id)
             );
             
-            return (RaftOperationStatus.Success, Math.Min(proposeIndex, commitIndex));
+            return (RaftOperationStatus.Success, Math.Min(proposeIndex, commitIndex));*/
         }
         
         plan.Clear();
@@ -328,7 +328,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         {
             switch (log.Type)
             {
-                case RaftLogType.Proposed when log.Id >= proposeIndex:
+                case RaftLogType.Proposed: /* when log.Id >= proposeIndex: */
                 {
                     if (plan.TryGetValue(RaftLogAction.Propose, out List<RaftLog>? proposeActions))
                         proposeActions.Add(log);
@@ -341,7 +341,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 }
                 break;
 
-                case RaftLogType.RolledBack when log.Id >= commitIndex:
+                case RaftLogType.RolledBack: /* when log.Id >= proposeIndex: */
                 {
                     if (plan.TryGetValue(RaftLogAction.Rollback, out List<RaftLog>? rollbackActions))
                         rollbackActions.Add(log);
@@ -354,7 +354,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 }
                 break;    
 
-                case RaftLogType.Committed when log.Id >= commitIndex:
+                case RaftLogType.Committed: /* when log.Id >= commitIndex: */
                 {
                     if (plan.TryGetValue(RaftLogAction.Commit, out List<RaftLog>? commitActions))
                         commitActions.Add(log);
@@ -367,7 +367,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 }
                 break;    
 
-                case RaftLogType.ProposedCheckpoint when log.Id >= proposeIndex:
+                case RaftLogType.ProposedCheckpoint: /* when log.Id >= proposeIndex: */
                 {
                     if (plan.TryGetValue(RaftLogAction.Propose, out List<RaftLog>? proposeActions))
                         proposeActions.Add(log);
@@ -380,7 +380,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 } 
                 break;
 
-                case RaftLogType.RolledBackCheckpoint when log.Id >= commitIndex:
+                case RaftLogType.RolledBackCheckpoint: /* when log.Id >= commitIndex: */
                 {
                     if (plan.TryGetValue(RaftLogAction.Rollback, out List<RaftLog>? rollbackActions))
                         rollbackActions.Add(log);
@@ -393,7 +393,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 } 
                 break;
 
-                case RaftLogType.CommittedCheckpoint when log.Id >= commitIndex:
+                case RaftLogType.CommittedCheckpoint: /* when log.Id >= commitIndex:*/
                 {
                     if (plan.TryGetValue(RaftLogAction.Commit, out List<RaftLog>? commitActions))
                         commitActions.Add(log);
@@ -444,7 +444,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 if (log.Type != RaftLogType.Committed)
                     continue;
                 
-                if (!await manager.InvokeReplicationReceived(log).ConfigureAwait(false))
+                if (!await manager.InvokeReplicationReceived(partition.PartitionId, log).ConfigureAwait(false))
                     manager.InvokeReplicationError(log);
             }
         }

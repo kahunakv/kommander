@@ -200,14 +200,14 @@ public sealed class TestThreeNodeClusterManyPartitions
         Assert.NotEmpty(followers);
         Assert.Equal(2, followers.Count);
         
-        leader.OnReplicationReceived += _ =>
+        leader.OnReplicationReceived +=  (partitionId, log) =>
         {
             Interlocked.Increment(ref totalLeaderReceived);
             return Task.FromResult(true);
         };
         
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += _ =>
+            follower.OnReplicationReceived += (_, _) =>
             {
                   Interlocked.Increment(ref totalFollowersReceived);
                   return Task.FromResult(true);
@@ -299,7 +299,7 @@ public sealed class TestThreeNodeClusterManyPartitions
         
         byte[] data = "Hello World"u8.ToArray();
         
-        leader.OnReplicationReceived += log =>
+        leader.OnReplicationReceived +=  (partitionId, log) =>
         {
             Assert.Equal("Greeting", log.LogType);;
             Assert.Equal(data, log.LogData);
@@ -309,7 +309,7 @@ public sealed class TestThreeNodeClusterManyPartitions
         };
         
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += _ =>
+            follower.OnReplicationReceived += (_, _) =>
             {
                   Interlocked.Increment(ref totalFollowersReceived);
                   return Task.FromResult(true);
@@ -396,7 +396,7 @@ public sealed class TestThreeNodeClusterManyPartitions
         
         byte[] data = "Hello World"u8.ToArray();
         
-        leader.OnReplicationReceived += log =>
+        leader.OnReplicationReceived +=  (partitionId, log) =>
         {
             Assert.Equal("Greeting", log.LogType);;
             Assert.Equal(data, log.LogData);
@@ -406,7 +406,7 @@ public sealed class TestThreeNodeClusterManyPartitions
         };
         
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += _ =>
+            follower.OnReplicationReceived += (_, _) =>
             {
                   Interlocked.Increment(ref totalFollowersReceived);
                   return Task.FromResult(true);
@@ -502,7 +502,7 @@ public sealed class TestThreeNodeClusterManyPartitions
         
         byte[] data = "Hello World"u8.ToArray();
         
-        leader.OnReplicationReceived += log =>
+        leader.OnReplicationReceived += (partitionId, log) =>
         {
             Assert.Equal("Greeting", log.LogType);;
             Assert.Equal(data, log.LogData);
@@ -512,7 +512,7 @@ public sealed class TestThreeNodeClusterManyPartitions
         };
         
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += _ =>
+            follower.OnReplicationReceived += (_, _) =>
             {
                   Interlocked.Increment(ref totalFollowersReceived);
                   return Task.FromResult(true);
@@ -614,7 +614,7 @@ public sealed class TestThreeNodeClusterManyPartitions
         
         byte[] data = "Hello World"u8.ToArray();
         
-        leader.OnReplicationReceived += log =>
+        leader.OnReplicationReceived += (partitionId, log) =>
         {
             Assert.Equal("Greeting", log.LogType);;
             Assert.Equal(data, log.LogData);
@@ -624,7 +624,7 @@ public sealed class TestThreeNodeClusterManyPartitions
         };
         
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += _ =>
+            follower.OnReplicationReceived += (_, _) =>
             {
                   Interlocked.Increment(ref totalFollowersReceived);
                   return Task.FromResult(true);

@@ -135,7 +135,7 @@ public sealed class RaftManager : IRaft
     /// <summary>
     /// Event when a replication log is received
     /// </summary>
-    public event Func<RaftLog, Task<bool>>? OnReplicationReceived;
+    public event Func<int, RaftLog, Task<bool>>? OnReplicationReceived;
     
     /// <summary>
     /// Constructor
@@ -513,12 +513,12 @@ public sealed class RaftManager : IRaft
     /// </summary>
     /// <param name="log"></param>
     /// <returns></returns>
-    internal async Task<bool> InvokeReplicationReceived(RaftLog log)
+    internal async Task<bool> InvokeReplicationReceived(int partitionId, RaftLog log)
     {
         if (OnReplicationReceived != null)
         {
-            Func<RaftLog, Task<bool>> callback = OnReplicationReceived;
-            bool success = await callback(log).ConfigureAwait(false);
+            Func<int, RaftLog, Task<bool>> callback = OnReplicationReceived;
+            bool success = await callback(partitionId, log).ConfigureAwait(false);
             if (!success)
                 return false;
         }

@@ -254,7 +254,7 @@ public class TestThreeNodeCluster
         
         byte[] data = "Hello World"u8.ToArray();
         
-        leader.OnReplicationReceived += log =>
+        leader.OnReplicationReceived += (partitionId, log) =>
         {
             Assert.Equal("Greeting", log.LogType);;
             Assert.Equal(data, log.LogData);
@@ -264,7 +264,7 @@ public class TestThreeNodeCluster
         };
         
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += _ =>
+            follower.OnReplicationReceived += (_, _) =>
             {
                   Interlocked.Increment(ref totalFollowersReceived);
                   return Task.FromResult(true);
@@ -347,7 +347,7 @@ public class TestThreeNodeCluster
         
         byte[] data = "Hello World"u8.ToArray();
         
-        leader.OnReplicationReceived += log =>
+        leader.OnReplicationReceived += (partitionId, log) =>
         {
             Assert.Equal("Greeting", log.LogType);;
             Assert.Equal(data, log.LogData);
@@ -357,7 +357,7 @@ public class TestThreeNodeCluster
         };
         
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += _ =>
+            follower.OnReplicationReceived += (_, _) =>
             {
                   Interlocked.Increment(ref totalFollowersReceived);
                   return Task.FromResult(true);
@@ -425,7 +425,7 @@ public class TestThreeNodeCluster
         
         byte[] data = "Hello World"u8.ToArray();
         
-        leader.OnReplicationReceived += log =>
+        leader.OnReplicationReceived += (partitionId, log) =>
         {
             Assert.Equal("Greeting", log.LogType);;
             Assert.Equal(data, log.LogData);
@@ -435,7 +435,7 @@ public class TestThreeNodeCluster
         };
         
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += _ =>
+            follower.OnReplicationReceived += (_, _) =>
             {
                   Interlocked.Increment(ref totalFollowersReceived);
                   return Task.FromResult(true);
@@ -510,7 +510,7 @@ public class TestThreeNodeCluster
         
         byte[] data = "Hello World"u8.ToArray();
         
-        leader.OnReplicationReceived += log =>
+        leader.OnReplicationReceived += (partitionId, log) =>
         {
             Assert.Equal("Greeting", log.LogType);;
             Assert.Equal(data, log.LogData);
@@ -520,7 +520,7 @@ public class TestThreeNodeCluster
         };
         
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += _ =>
+            follower.OnReplicationReceived += (_, _) =>
             {
                   Interlocked.Increment(ref totalFollowersReceived);
                   return Task.FromResult(true);
@@ -595,7 +595,7 @@ public class TestThreeNodeCluster
 
         byte[] data = "Hello World"u8.ToArray();
         
-        leader.OnReplicationReceived += log =>
+        leader.OnReplicationReceived += (partitionId, log) =>
         {
             Assert.Equal("Greeting", log.LogType);;
             Assert.Equal(data, log.LogData);
@@ -605,7 +605,7 @@ public class TestThreeNodeCluster
         };
         
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += _ =>
+            follower.OnReplicationReceived += (_, _) =>
             {
                 Interlocked.Increment(ref totalFollowersReceived);
                 return Task.FromResult(true);
@@ -686,7 +686,7 @@ public class TestThreeNodeCluster
         
         byte[] data = "Hello World"u8.ToArray();
         
-        leader.OnReplicationReceived += log =>
+        leader.OnReplicationReceived += (partitionId, log) =>
         {
             Assert.Equal("Greeting", log.LogType);;
             
@@ -695,7 +695,7 @@ public class TestThreeNodeCluster
         };
         
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += _ =>
+            follower.OnReplicationReceived += (_, _) =>
             {
                 Interlocked.Increment(ref totalFollowersReceived);
                 return Task.FromResult(true);

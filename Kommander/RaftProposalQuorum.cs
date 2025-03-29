@@ -6,6 +6,8 @@ public sealed class RaftProposalQuorum
     private readonly Dictionary<string, bool> nodes = [];
 
     private bool completed;
+    
+    public RaftProposalState State { get; private set; }
 
     public List<string> Nodes => nodes.Keys.ToList();
 
@@ -17,18 +19,25 @@ public sealed class RaftProposalQuorum
 
     public RaftProposalQuorum(List<RaftLog> logs, bool autoCommit)
     {
+        State = RaftProposalState.Incomplete;
+        
         Logs = logs;
         AutoCommit = autoCommit;
     }
     
-    public void AddExpectedCompletion(string nodeId)
+    public void AddExpectedNodeCompletion(string nodeId)
     {
         nodes.Add(nodeId, false);
     }
     
-    public void MarkCompleted(string nodeId)
+    public void MarkNodeCompleted(string nodeId)
     {
         nodes[nodeId] = true;
+    }
+
+    public void SetState(RaftProposalState state)
+    {
+        State = state;
     }
     
     public bool HasQuorum()

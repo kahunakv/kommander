@@ -70,9 +70,9 @@ try
             return Task.FromResult(true);
         };
 
-        node.OnReplicationReceived += log =>
+        node.OnReplicationReceived += (partitionId, log) =>
         {
-            Console.WriteLine("Replication received: {0} {1} {2} {3}", log.Id, log.Type, log.LogType, Encoding.UTF8.GetString(log.LogData ?? []));
+            Console.WriteLine("{0}: Replication received: {1} {2} {3} {4}", partitionId, log.Id, log.Type, log.LogType, Encoding.UTF8.GetString(log.LogData ?? []));
             
             return Task.FromResult(true);
         };
