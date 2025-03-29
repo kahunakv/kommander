@@ -21,6 +21,8 @@ public class RocksDbWAL : IWAL
     
     private readonly string revision;
     
+    private readonly Dictionary<int, ColumnFamilyHandle> families = new();
+    
     public RocksDbWAL(string path, string revision)
     {
         this.path = path;
@@ -39,15 +41,26 @@ public class RocksDbWAL : IWAL
         for (int i = 0; i < MaxShards; i++)
             columnFamilies.Add("shard" + i, new());
         
-        this.db = RocksDb.Open(dbOptions, $"{path}/{revision}", columnFamilies);
+        db = RocksDb.Open(dbOptions, $"{path}/{revision}", columnFamilies);
+    }
+    
+    private ColumnFamilyHandle GetColumnFamily(int partitionId)
+    {
+        if (!families.TryGetValue(partitionId, out ColumnFamilyHandle? columnFamily))
+        {
+            int shardId = partitionId % MaxShards;
+            columnFamily = db.GetColumnFamily("shard" + shardId);
+            families.Add(partitionId, columnFamily);
+        }
+        
+        return columnFamily;
     }
 
     public List<RaftLog> ReadLogs(int partitionId)
     {
         List<RaftLog> result = [];
         
-        int shardId = partitionId % MaxShards;
-        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
         
         long lastCheckpoint = GetLastCheckpoint(partitionId, columnFamilyHandle);
 
@@ -97,8 +110,7 @@ public class RocksDbWAL : IWAL
     {
         List<RaftLog> result = [];
         
-        int shardId = partitionId % MaxShards;
-        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        ColumnFamilyHandle? columnFamilyHandle = GetColumnFamily(partitionId);
         
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         
@@ -151,8 +163,7 @@ public class RocksDbWAL : IWAL
 
     public RaftOperationStatus Propose(int partitionId, RaftLog log)
     {
-        int shardId = partitionId % MaxShards;
-        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
         
         string index = log.Id.ToString("D20");
         
@@ -173,8 +184,7 @@ public class RocksDbWAL : IWAL
     
     public RaftOperationStatus Commit(int partitionId, RaftLog log)
     {
-        int shardId = partitionId % MaxShards;
-        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
         
         string index = log.Id.ToString("D20");
         
@@ -195,8 +205,7 @@ public class RocksDbWAL : IWAL
     
     public RaftOperationStatus Rollback(int partitionId, RaftLog log)
     {
-        int shardId = partitionId % MaxShards;
-        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
         
         string index = log.Id.ToString("D20");
         
@@ -217,8 +226,7 @@ public class RocksDbWAL : IWAL
 
     public RaftOperationStatus ProposeMany(int partitionId, List<RaftLog> logs)
     {
-        int shardId = partitionId % MaxShards;
-        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
         
         using WriteBatch writeBatch = new();
         
@@ -249,8 +257,7 @@ public class RocksDbWAL : IWAL
         if (logs.Count == 0)
             return RaftOperationStatus.Success;
         
-        int shardId = partitionId % MaxShards;
-        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
         
         using WriteBatch writeBatch = new();
         
@@ -278,8 +285,7 @@ public class RocksDbWAL : IWAL
 
     public RaftOperationStatus RollbackMany(int partitionId, List<RaftLog> logs)
     {
-        int shardId = partitionId % MaxShards;
-        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
         
         using WriteBatch writeBatch = new();
 
@@ -307,8 +313,7 @@ public class RocksDbWAL : IWAL
 
     public long GetMaxLog(int partitionId)
     {
-        int shardId = partitionId % MaxShards;
-        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
         
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         iterator.SeekToLast();  // Move to the last key
@@ -331,8 +336,7 @@ public class RocksDbWAL : IWAL
 
     public long GetCurrentTerm(int partitionId)
     {
-        int shardId = partitionId % MaxShards;
-        ColumnFamilyHandle? columnFamilyHandle = db.GetColumnFamily("shard" + shardId);
+        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
         
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         iterator.SeekToLast();  // Move to the last key
