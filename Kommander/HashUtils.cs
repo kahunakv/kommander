@@ -1,4 +1,5 @@
 
+using System.Text;
 using Standart.Hash.xxHash;
 
 namespace Kommander;
@@ -8,36 +9,45 @@ namespace Kommander;
 /// </summary>
 public static class HashUtils
 {
-    public static long StaticHash(string value, int numberBuckets)
+    public static long StaticHash(string key, int buckets)
     {
-        uint computed = xxHash32.ComputeHash(value);
-        return computed % numberBuckets;
+        if (buckets <= 0)
+            throw new ArgumentException("buckets must be greater than zero", nameof(buckets));
+        
+        uint computed = xxHash32.ComputeHash(key);
+        return computed % buckets;
     }
 
-    public static long PrefixedHash(string value, char separator, int divisor)
+    public static long PrefixedHash(string key, char separator, int buckets)
     {
-        int pointer = value.IndexOf(separator);
-        if (pointer == -1)
-            return ConsistentHash(value, divisor);
+        if (buckets <= 0)
+            throw new ArgumentException("buckets must be greater than zero", nameof(buckets));
         
-        string prefix = value[..pointer];
-        return ConsistentHash(prefix, divisor);
+        int pointer = key.IndexOf(separator);
+        if (pointer == -1)
+            return ConsistentHash(key, buckets);
+        
+        string prefix = key[..pointer];
+        return ConsistentHash(prefix, buckets);
     }
     
-    public static long InversePrefixedHash(string value, char separator, int divisor)
+    public static long InversePrefixedHash(string key, char separator, int buckets)
     {
-        int pointer = value.LastIndexOf(separator);
-        if (pointer == -1)
-            return ConsistentHash(value, divisor);
+        if (buckets <= 0)
+            throw new ArgumentException("buckets must be greater than zero", nameof(buckets));
         
-        string prefix = value[..pointer];
-        return ConsistentHash(prefix, divisor);
+        int pointer = key.LastIndexOf(separator);
+        if (pointer == -1)
+            return ConsistentHash(key, buckets);
+        
+        string prefix = key[..pointer];
+        return ConsistentHash(prefix, buckets);
     }
     
-    public static int GetHashInRange(string input, int min, int max)
+    public static int GetHashInRange(string key, int min, int max)
     {
         // Compute the hash value for the string.
-        uint hash = xxHash32.ComputeHash(input);
+        uint hash = xxHash32.ComputeHash(key);
         int range = max - min + 1;
     
         // Map the hash to the desired range.
@@ -49,22 +59,21 @@ public static class HashUtils
     /// This minimizes key remapping when the number of buckets changes.
     /// </summary>
     /// <param name="key">The key to hash.</param>
-    /// <param name="numberOfBuckets">The total number of buckets.</param>
+    /// <param name="buckets">The total number of buckets.</param>
     /// <returns>The selected bucket index.</returns>
-    public static int ConsistentHash(string key, int numberOfBuckets)
+    public static int ConsistentHash(string key, int buckets)
     {
-        if (numberOfBuckets <= 0)
-            throw new ArgumentException("numberOfBuckets must be greater than zero", nameof(numberOfBuckets));
+        if (buckets <= 0)
+            throw new ArgumentException("numberOfBuckets must be greater than zero", nameof(buckets));
 
         int bestBucket = -1;
         uint bestHash = 0;
+        byte[] keyBytes = Encoding.UTF8.GetBytes(key);
 
         // Evaluate every bucket to see which gives the highest hash score
-        for (int bucket = 0; bucket < numberOfBuckets; bucket++)
+        for (int bucket = 0; bucket < buckets; bucket++)
         {
-            // Combine the key with the bucket identifier to produce a unique hash per bucket
-            string combinedKey = $"{key}:{bucket}";
-            uint hash = xxHash32.ComputeHash(combinedKey);
+            uint hash = xxHash32.ComputeHash(keyBytes, bucket);
 
             if (bucket == 0 || hash > bestHash)
             {
