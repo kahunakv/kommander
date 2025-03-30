@@ -2,6 +2,7 @@
 using Nixie;
 using Kommander.Communication;
 using Kommander.Data;
+using Kommander.Support;
 
 namespace Kommander;
 
@@ -58,40 +59,36 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
                 }
             }
 
-            List<Task> tasks = [];
-            
-            foreach (RaftResponderRequest message in messages)
+            await messages.ForEachAsync(5, async message =>
             {
                 switch (message.Type)
                 {
                     case RaftResponderRequestType.AppendLogs:
-                        tasks.Add(AppendLogs(message));
+                        await AppendLogs(message);
                         break;
 
                     case RaftResponderRequestType.CompleteAppendLogs:
-                        tasks.Add(CompleteAppendLogs(message));
+                        await CompleteAppendLogs(message);
                         break;
 
                     case RaftResponderRequestType.Vote:
-                        tasks.Add(Vote(message));
+                        await Vote(message);
                         break;
 
                     case RaftResponderRequestType.RequestVotes:
-                        tasks.Add(RequestVotes(message));
+                        await RequestVotes(message);
                         break;
 
                     case RaftResponderRequestType.Handshake:
-                        tasks.Add(Handshake(message));
+                        await Handshake(message);
                         break;
 
                     case RaftResponderRequestType.TryBatch:
                     default:
                         logger.LogError("Unsupported message {Type}", message.Type);
                         break;
-                }            
-            }
-            
-            await Task.WhenAll(tasks).ConfigureAwait(false);
+                }
+            }).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

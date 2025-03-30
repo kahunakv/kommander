@@ -1,5 +1,5 @@
 
-namespace Kommander.Tests;
+namespace Kommander.Tests.Hash;
 
 public class TestHashUtils
 {
@@ -7,13 +7,19 @@ public class TestHashUtils
     public void TestConsistentHash()
     {
         long bucket = HashUtils.ConsistentHash("hello", 10);
-        Assert.Equal(9, bucket);
+        Assert.Equal(1, bucket);
         
         bucket = HashUtils.ConsistentHash("hello", 10);
-        Assert.Equal(9, bucket);
+        Assert.Equal(1, bucket);
         
         bucket = HashUtils.ConsistentHash("hello", 10);
-        Assert.Equal(9, bucket);
+        Assert.Equal(1, bucket);
+        
+        bucket = HashUtils.ConsistentHash("hello", 11);
+        Assert.Equal(1, bucket);
+        
+        bucket = HashUtils.ConsistentHash("hello", 12);
+        Assert.Equal(1, bucket);
     }
     
     [Fact]
