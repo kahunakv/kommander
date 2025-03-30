@@ -54,4 +54,10 @@
     </Protobuf>
   </ItemGroup>
 
+  <ItemGroup>
+    <Protobuf Include="WAL\Protos\rocksdb_raftlog.proto">
+      <Generator>MSBuild:Compile</Generator>
+    </Protobuf>
+  </ItemGroup>
+
 </Project>

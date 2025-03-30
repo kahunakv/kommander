@@ -199,12 +199,16 @@ public sealed class RaftManager : IRaft
     /// <summary>
     /// Leaves the cluster
     /// </summary>
-    public async Task LeaveCluster()
+    /// <param name="disposeActorSystem"></param>
+    public async Task LeaveCluster(bool disposeActorSystem = false)
     {
         await clusterHandler.LeaveCluster(configuration).ConfigureAwait(false);
         
         readThreadPool.Stop();
         writeThreadPool.Stop();
+        
+        if (disposeActorSystem)
+            ActorSystem.Dispose();
     }
 
     /// <summary>
@@ -518,7 +522,8 @@ public sealed class RaftManager : IRaft
         if (OnReplicationReceived != null)
         {
             Func<int, RaftLog, Task<bool>> callback = OnReplicationReceived;
-            bool success = await callback(partitionId, log).ConfigureAwait(false);
+            
+            bool success = await callback(partitionId, log);
             if (!success)
                 return false;
         }
@@ -536,6 +541,7 @@ public sealed class RaftManager : IRaft
         if (OnReplicationRestored != null)
         {
             Func<RaftLog, Task<bool>> callback = OnReplicationRestored;
+            
             bool success = await callback(log).ConfigureAwait(false);
             if (!success)
                 return false;

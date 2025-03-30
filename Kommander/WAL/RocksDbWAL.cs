@@ -110,7 +110,7 @@ public class RocksDbWAL : IWAL
     {
         List<RaftLog> result = [];
         
-        ColumnFamilyHandle? columnFamilyHandle = GetColumnFamily(partitionId);
+        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
         
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         
@@ -147,7 +147,7 @@ public class RocksDbWAL : IWAL
                 Type = (RaftLogType)message.Type,
                 Time = new(message.TimePhysical, message.TimeCounter),
                 LogType = message.LogType,
-                LogData = message.Log.ToByteArray(),
+                LogData = message.Log?.ToByteArray(),
             });
             
             iterator.Next();
@@ -163,152 +163,242 @@ public class RocksDbWAL : IWAL
 
     public RaftOperationStatus Propose(int partitionId, RaftLog log)
     {
-        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-        
-        string index = log.Id.ToString("D20");
-        
-        db.Put(Encoding.UTF8.GetBytes(index), Serialize(new()
+        try 
         {
-            Partition = partitionId,
-            Id = log.Id,
-            Term = log.Term,
-            Type = (int)log.Type,
-            LogType = log.LogType,
-            Log = UnsafeByteOperations.UnsafeWrap(log.LogData),
-            TimePhysical = log.Time.L,
-            TimeCounter = log.Time.C
-        }), cf: columnFamilyHandle, DefaultWriteOptions);
-
-        return RaftOperationStatus.Success;
-    }
-    
-    public RaftOperationStatus Commit(int partitionId, RaftLog log)
-    {
-        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-        
-        string index = log.Id.ToString("D20");
-        
-        db.Put(Encoding.UTF8.GetBytes(index), Serialize(new()
-        {
-            Partition = partitionId,
-            Id = log.Id,
-            Term = log.Term,
-            Type = (int)log.Type,
-            LogType = log.LogType,
-            Log = UnsafeByteOperations.UnsafeWrap(log.LogData),
-            TimePhysical = log.Time.L,
-            TimeCounter = log.Time.C
-        }), cf: columnFamilyHandle, DefaultWriteOptions);
-
-        return RaftOperationStatus.Success;
-    }
-    
-    public RaftOperationStatus Rollback(int partitionId, RaftLog log)
-    {
-        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-        
-        string index = log.Id.ToString("D20");
-        
-        db.Put(Encoding.UTF8.GetBytes(index), Serialize(new()
-        {
-            Partition = partitionId,
-            Id = log.Id,
-            Term = log.Term,
-            Type = (int)log.Type,
-            LogType = log.LogType,
-            Log = UnsafeByteOperations.UnsafeWrap(log.LogData),
-            TimePhysical = log.Time.L,
-            TimeCounter = log.Time.C
-        }), cf: columnFamilyHandle, DefaultWriteOptions);
-
-        return RaftOperationStatus.Success;
-    }
-
-    public RaftOperationStatus ProposeMany(int partitionId, List<RaftLog> logs)
-    {
-        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-        
-        using WriteBatch writeBatch = new();
-        
-        foreach (RaftLog log in logs)
-        {
+            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+            
             string index = log.Id.ToString("D20");
-        
-            writeBatch.Put(Encoding.UTF8.GetBytes(index), Serialize(new()
+
+            RaftLogMessage message = new()
             {
                 Partition = partitionId,
                 Id = log.Id,
                 Term = log.Term,
                 Type = (int)log.Type,
-                LogType = log.LogType,
-                Log = UnsafeByteOperations.UnsafeWrap(log.LogData),
                 TimePhysical = log.Time.L,
                 TimeCounter = log.Time.C
-            }), cf: columnFamilyHandle);
-        }
-        
-        db.Write(writeBatch, DefaultWriteOptions);
+            };
 
-        return RaftOperationStatus.Success;
+            if (log.LogType != null)
+                message.LogType = log.LogType;
+            
+            if (log.LogData != null)
+                message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
+            
+            db.Put(Encoding.UTF8.GetBytes(index), Serialize(message), cf: columnFamilyHandle, DefaultWriteOptions);
+
+            return RaftOperationStatus.Success;
+        } 
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error during proposal: {ex.Message}\n{ex.StackTrace}");
+                    
+            return RaftOperationStatus.Errored;
+        }
+    }
+    
+    public RaftOperationStatus Commit(int partitionId, RaftLog log)
+    {
+        try 
+        {
+            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+            
+            string index = log.Id.ToString("D20");
+            
+            RaftLogMessage message = new()
+            {
+                Partition = partitionId,
+                Id = log.Id,
+                Term = log.Term,
+                Type = (int)log.Type,
+                TimePhysical = log.Time.L,
+                TimeCounter = log.Time.C
+            };
+            
+            if (log.LogType != null)
+                message.LogType = log.LogType;
+            
+            if (log.LogData != null)
+                message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
+            
+            db.Put(Encoding.UTF8.GetBytes(index), Serialize(message), cf: columnFamilyHandle, DefaultWriteOptions);
+
+            return RaftOperationStatus.Success;
+        } 
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error during commit: {ex.Message}\n{ex.StackTrace}");
+                    
+            return RaftOperationStatus.Errored;
+        }
+    }
+    
+    public RaftOperationStatus Rollback(int partitionId, RaftLog log)
+    {
+        try
+        {
+            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+            
+            string index = log.Id.ToString("D20");
+            
+            RaftLogMessage message = new()
+            {
+                Partition = partitionId,
+                Id = log.Id,
+                Term = log.Term,
+                Type = (int)log.Type,
+                TimePhysical = log.Time.L,
+                TimeCounter = log.Time.C
+            };
+            
+            if (log.LogType != null)
+                message.LogType = log.LogType;
+            
+            if (log.LogData != null)
+                message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
+            
+            db.Put(Encoding.UTF8.GetBytes(index), Serialize(message), cf: columnFamilyHandle, DefaultWriteOptions);
+
+            return RaftOperationStatus.Success;
+        } 
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error during rollback: {ex.Message}");
+                
+            return RaftOperationStatus.Errored;
+        }
+    }
+
+    public RaftOperationStatus ProposeMany(int partitionId, List<RaftLog> logs)
+    {
+        try
+        {
+            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+            
+            using WriteBatch writeBatch = new();
+            
+            foreach (RaftLog log in logs)
+            {
+                string index = log.Id.ToString("D20");
+                
+                RaftLogMessage message = new()
+                {
+                    Partition = partitionId,
+                    Id = log.Id,
+                    Term = log.Term,
+                    Type = (int)log.Type,
+                    TimePhysical = log.Time.L,
+                    TimeCounter = log.Time.C
+                };
+                
+                if (log.LogType != null)
+                    message.LogType = log.LogType;
+            
+                if (log.LogData != null)
+                    message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
+            
+                writeBatch.Put(Encoding.UTF8.GetBytes(index), Serialize(message), cf: columnFamilyHandle);
+            }
+            
+            db.Write(writeBatch, DefaultWriteOptions);
+
+            return RaftOperationStatus.Success;
+        } 
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error during proposal: {ex.Message}");
+                    
+            return RaftOperationStatus.Errored;
+        }
     }
 
     public RaftOperationStatus CommitMany(int partitionId, List<RaftLog> logs)
     {
         if (logs.Count == 0)
             return RaftOperationStatus.Success;
-        
-        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-        
-        using WriteBatch writeBatch = new();
-        
-        foreach (RaftLog log in logs)
+
+        try
         {
-            string index = log.Id.ToString("D20");
+            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
-            writeBatch.Put(Encoding.UTF8.GetBytes(index), Serialize(new()
+            using WriteBatch writeBatch = new();
+
+            foreach (RaftLog log in logs)
             {
-                Partition = partitionId,
-                Id = log.Id,
-                Term = log.Term,
-                Type = (int)log.Type,
-                LogType = log.LogType,
-                Log = UnsafeByteOperations.UnsafeWrap(log.LogData),
-                TimePhysical = log.Time.L,
-                TimeCounter = log.Time.C
-            }), cf: columnFamilyHandle);
-        }
-        
-        db.Write(writeBatch, DefaultWriteOptions);
+                string index = log.Id.ToString("D20");
+                
+                RaftLogMessage message = new()
+                {
+                    Partition = partitionId,
+                    Id = log.Id,
+                    Term = log.Term,
+                    Type = (int)log.Type,
+                    TimePhysical = log.Time.L,
+                    TimeCounter = log.Time.C
+                };
+                
+                if (log.LogType != null)
+                    message.LogType = log.LogType;
+            
+                if (log.LogData != null)
+                    message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
 
-        return RaftOperationStatus.Success;
+                writeBatch.Put(Encoding.UTF8.GetBytes(index), Serialize(message), cf: columnFamilyHandle);
+            }
+
+            db.Write(writeBatch, DefaultWriteOptions);
+
+            return RaftOperationStatus.Success;
+        } 
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error during commit: {ex.Message}");
+            
+            return RaftOperationStatus.Errored;
+        }
     }
 
     public RaftOperationStatus RollbackMany(int partitionId, List<RaftLog> logs)
     {
-        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-        
-        using WriteBatch writeBatch = new();
-
-        foreach (RaftLog log in logs)
+        try
         {
-            string index = log.Id.ToString("D20");
+            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+            
+            using WriteBatch writeBatch = new();
 
-            writeBatch.Put(Encoding.UTF8.GetBytes(index), Serialize(new()
+            foreach (RaftLog log in logs)
             {
-                Partition = partitionId,
-                Id = log.Id,
-                Term = log.Term,
-                Type = (int)log.Type,
-                LogType = log.LogType,
-                Log = UnsafeByteOperations.UnsafeWrap(log.LogData),
-                TimePhysical = log.Time.L,
-                TimeCounter = log.Time.C
-            }), cf: columnFamilyHandle);
-        }
-        
-        db.Write(writeBatch, DefaultWriteOptions);
+                string index = log.Id.ToString("D20");
+                
+                RaftLogMessage message = new()
+                {
+                    Partition = partitionId,
+                    Id = log.Id,
+                    Term = log.Term,
+                    Type = (int)log.Type,
+                    TimePhysical = log.Time.L,
+                    TimeCounter = log.Time.C
+                };
+                
+                if (log.LogType != null)
+                    message.LogType = log.LogType;
+            
+                if (log.LogData != null)
+                    message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
 
-        return RaftOperationStatus.Success;
+                writeBatch.Put(Encoding.UTF8.GetBytes(index), Serialize(message), cf: columnFamilyHandle);
+            }
+            
+            db.Write(writeBatch, DefaultWriteOptions);
+
+            return RaftOperationStatus.Success;
+        } 
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error during rollback: {ex.Message}");
+                
+            return RaftOperationStatus.Errored;
+        }
     }
 
     public long GetMaxLog(int partitionId)

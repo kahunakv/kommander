@@ -701,7 +701,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             
             if (response.Status != RaftOperationStatus.Success)
             {
-                logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't append logs from leader {Endpoint} with Term={Term} Logs={Logs}", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm, logs.Count);
+                logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't append logs from leader {Endpoint} with Term={Term} Status={Status} Logs={Logs}", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm, response.Status, logs.Count);
                 
                 partition.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs, 

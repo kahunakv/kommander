@@ -87,12 +87,13 @@ public interface IRaft
     /// </summary>
     /// <returns></returns>
     public Task JoinCluster();
-    
+
     /// <summary>
     /// Leaves the Raft cluster
     /// </summary>
+    /// <param name="disposeActorSystem"></param>
     /// <returns></returns>
-    public Task LeaveCluster();
+    public Task LeaveCluster(bool disposeActorSystem = false);
 
     /// <summary>
     /// Updates the active Raft cluster nodes

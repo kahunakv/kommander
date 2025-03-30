@@ -83,22 +83,29 @@ public class ThreadPool
             
             workerThreads[i] = new(() =>
             {
-                foreach (Action task in taskQueue.GetConsumingEnumerable(cancellationTokenSource.Token))
+                try
                 {
-                    try
+                    foreach (Action task in taskQueue.GetConsumingEnumerable(cancellationTokenSource.Token))
                     {
-                        // Execute the task
-                        task();
+                        try
+                        {
+                            // Execute the task
+                            task();
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            // Optional: Log or handle unexpected exceptions
+                            logger.LogError("Worker {WorkerId} encountered an error: {Exception}", workerId, ex.Message);
+                        }
                     }
-                    catch (OperationCanceledException)
-                    {
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        // Optional: Log or handle unexpected exceptions
-                        logger.LogError("Worker {WorkerId} encountered an error: {Exception}", workerId, ex.Message);
-                    }
+                }
+                catch (OperationCanceledException ex)
+                {
+                    logger.LogDebug("Worker {WorkerId} stopped: {Exception}", workerId, ex.Message);
                 }
             })
             {

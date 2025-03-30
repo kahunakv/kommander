@@ -149,7 +149,7 @@ public class TestThreeNodeCluster
             if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
                 break;
             
-            await Task.Delay(1000);
+            await Task.Delay(100);
         }
 
         IRaft? leader = await GetLeader([node1, node2, node3]);
@@ -191,7 +191,7 @@ public class TestThreeNodeCluster
             if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
                 break;
             
-            await Task.Delay(1000);
+            await Task.Delay(100);
         }
 
         IRaft? leader = await GetLeader([node1, node2, node3]);
@@ -242,7 +242,7 @@ public class TestThreeNodeCluster
             if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
                 break;
             
-            await Task.Delay(1000);
+            await Task.Delay(100);
         }
 
         IRaft? leader = await GetLeader([node1, node2, node3]);
@@ -335,7 +335,7 @@ public class TestThreeNodeCluster
             if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
                 break;
             
-            await Task.Delay(1000);
+            await Task.Delay(100);
         }
 
         IRaft? leader = await GetLeader([node1, node2, node3]);
@@ -413,7 +413,7 @@ public class TestThreeNodeCluster
             if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
                 break;
             
-            await Task.Delay(1000);
+            await Task.Delay(100);
         }
 
         IRaft? leader = await GetLeader([node1, node2, node3]);
@@ -425,20 +425,20 @@ public class TestThreeNodeCluster
         
         byte[] data = "Hello World"u8.ToArray();
         
-        leader.OnReplicationReceived += (partitionId, log) =>
+        leader.OnReplicationReceived += (_, _) =>
         {
-            Assert.Equal("Greeting", log.LogType);;
-            Assert.Equal(data, log.LogData);
-            
             Interlocked.Increment(ref totalLeaderReceived);
             return Task.FromResult(true);
         };
         
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += (_, _) =>
+            follower.OnReplicationReceived += (partitionId, log) =>
             {
-                  Interlocked.Increment(ref totalFollowersReceived);
-                  return Task.FromResult(true);
+                Assert.Equal("Greeting", log.LogType);
+                Assert.Equal(data, log.LogData);
+
+                Interlocked.Increment(ref totalFollowersReceived);
+                return Task.FromResult(true);
             };
 
         long maxId = node1.WalAdapter.GetMaxLog(0);
@@ -462,6 +462,8 @@ public class TestThreeNodeCluster
         (bool success, RaftOperationStatus status, long commitLogId) = await leader.CommitLogs(0, response.TicketId);
         Assert.True(success);
         Assert.Equal(RaftOperationStatus.Success, status);
+
+        await Task.Delay(200);
         
         Assert.Equal(2, totalFollowersReceived);
         Assert.Equal(0, totalLeaderReceived);
@@ -498,7 +500,7 @@ public class TestThreeNodeCluster
             if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
                 break;
             
-            await Task.Delay(1000);
+            await Task.Delay(100);
         }
 
         IRaft? leader = await GetLeader([node1, node2, node3]);
@@ -548,6 +550,8 @@ public class TestThreeNodeCluster
         Assert.True(success);
         Assert.Equal(RaftOperationStatus.Success, status);
         
+        await Task.Delay(200);
+        
         Assert.Equal(0, totalFollowersReceived);
         Assert.Equal(0, totalLeaderReceived);
         
@@ -583,7 +587,7 @@ public class TestThreeNodeCluster
             if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
                 break;
             
-            await Task.Delay(1000);
+            await Task.Delay(100);
         }
 
         IRaft? leader = await GetLeader([node1, node2, node3]);
@@ -639,6 +643,8 @@ public class TestThreeNodeCluster
         maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(100, maxId);
         
+        await Task.Delay(200);
+        
         Assert.Equal(200, totalFollowersReceived);
         Assert.Equal(0, totalLeaderReceived);
         
@@ -674,7 +680,7 @@ public class TestThreeNodeCluster
             if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
                 break;
             
-            await Task.Delay(1000);
+            await Task.Delay(100);
         }
 
         IRaft? leader = await GetLeader([node1, node2, node3]);
@@ -737,6 +743,8 @@ public class TestThreeNodeCluster
         
         maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(6, maxId);
+        
+        await Task.Delay(200);
         
         Assert.Equal(12, totalFollowersReceived);
         Assert.Equal(0, totalLeaderReceived);
@@ -801,7 +809,7 @@ public class TestThreeNodeCluster
             if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
                 break;
             
-            await Task.Delay(1000);
+            await Task.Delay(100);
         }
 
         IRaft? leader = await GetLeader([node1, node2, node3]);
@@ -903,7 +911,7 @@ public class TestThreeNodeCluster
             if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
                 break;
             
-            await Task.Delay(1000);
+            await Task.Delay(100);
         }
 
         IRaft? leader = await GetLeader([node1, node2, node3]);

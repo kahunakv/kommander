@@ -7,8 +7,8 @@ message RaftLogMessage {
   int64 id = 2;
   int64 term = 3;
   int32 type = 4;
-  string logType = 5;
-  bytes log = 6;
+  optional string logType = 5;
+  optional bytes log = 6;
   int64 timePhysical = 7;
   uint32 timeCounter = 8;
 }

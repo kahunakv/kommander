@@ -7,19 +7,19 @@ using Kommander.Time;
 using Kommander.WAL;
 using Microsoft.Extensions.Logging;
 using Nixie;
+// ReSharper disable AccessToModifiedClosure
 
 namespace Kommander.Tests;
 
 [SuppressMessage("Performance", "CA1859:Use concrete types when possible for improved performance")]
-public class TestThreeNodeClusterSqlite
+public class TestThreeNodeClusterRocksDb
 {
     private readonly ILogger<IRaft> logger;
     
-    private int totalLeaderReceived;
-
-    private int totalFollowersReceived;
+    //private int totalLeaderReceived;
+    //private int totalFollowersReceived;
     
-    public TestThreeNodeClusterSqlite()
+    public TestThreeNodeClusterRocksDb()
     {
         ILoggerFactory loggerFactory1 = LoggerFactory.Create(builder =>
         {
@@ -49,7 +49,7 @@ public class TestThreeNodeClusterSqlite
             actorSystem, 
             config, 
             new StaticDiscovery([new("localhost:8002"), new("localhost:8003")]),
-            new SqliteWAL("/tmp", Guid.NewGuid().ToString()),
+            new RocksDbWAL("/tmp", Guid.NewGuid().ToString()),
             communication,
             new HybridLogicalClock(),
             logger
@@ -74,7 +74,7 @@ public class TestThreeNodeClusterSqlite
             actorSystem, 
             config, 
             new StaticDiscovery([new("localhost:8001"), new("localhost:8003")]),
-            new SqliteWAL("/tmp", Guid.NewGuid().ToString()),
+            new RocksDbWAL("/tmp", Guid.NewGuid().ToString()),
             communication,
             new HybridLogicalClock(),
             logger
@@ -99,7 +99,7 @@ public class TestThreeNodeClusterSqlite
             actorSystem, 
             config, 
             new StaticDiscovery([new("localhost:8001"), new("localhost:8002")]),
-            new SqliteWAL("/tmp", Guid.NewGuid().ToString()),
+            new RocksDbWAL("/tmp", Guid.NewGuid().ToString()),
             communication,
             new HybridLogicalClock(),
             logger
@@ -255,22 +255,32 @@ public class TestThreeNodeClusterSqlite
         Assert.Equal(2, followers.Count);
         
         byte[] data = "Hello World"u8.ToArray();
+
+        int totalLeaderReceived = 0;
+        int totalFollowersReceived = 0;
         
-        leader.OnReplicationReceived += (partitionId, log) =>
+        leader.OnReplicationReceived += (_, _) =>
         {
-            Assert.Equal("Greeting", log.LogType);;
-            Assert.Equal(data, log.LogData);
-            
-            Interlocked.Increment(ref totalLeaderReceived);
+            totalLeaderReceived++;
             return Task.FromResult(true);
         };
-        
+
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += (_, _) =>
+        {
+            Console.Error.WriteLine(follower.GetHashCode());
+            
+            follower.OnReplicationReceived += (_, log) =>
             {
-                  Interlocked.Increment(ref totalFollowersReceived);
-                  return Task.FromResult(true);
+                totalFollowersReceived++;
+
+                return Task.FromResult(true);
             };
+            
+            follower.OnReplicationError += _ =>
+            {
+                Console.Error.WriteLine("ERROR");
+            };
+        }
 
         long maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
@@ -301,6 +311,8 @@ public class TestThreeNodeClusterSqlite
         
         maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(2, maxId);
+
+        await Task.Delay(100);
         
         Assert.Equal(4, totalFollowersReceived);
         Assert.Equal(0, totalLeaderReceived);
@@ -349,21 +361,26 @@ public class TestThreeNodeClusterSqlite
         
         byte[] data = "Hello World"u8.ToArray();
         
-        leader.OnReplicationReceived += (partitionId, log) =>
+        int totalLeaderReceived = 0;
+        int totalFollowersReceived = 0;
+        
+        leader.OnReplicationReceived += (_, _) =>
         {
-            Assert.Equal("Greeting", log.LogType);;
-            Assert.Equal(data, log.LogData);
-            
             Interlocked.Increment(ref totalLeaderReceived);
             return Task.FromResult(true);
         };
-        
+
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += (_, _) =>
+        {
+            follower.OnReplicationReceived += (_, log) =>
             {
-                  Interlocked.Increment(ref totalFollowersReceived);
-                  return Task.FromResult(true);
+                Assert.Equal("Greeting", log.LogType);;
+                Assert.Equal(data, log.LogData);
+                
+                Interlocked.Increment(ref totalFollowersReceived);
+                return Task.FromResult(true);
             };
+        }
 
         long maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
@@ -379,6 +396,8 @@ public class TestThreeNodeClusterSqlite
         
         Assert.Equal(RaftOperationStatus.Success, response.Status);
         Assert.Equal(1, response.LogIndex);
+        
+        await Task.Delay(100);
         
         Assert.Equal(0, totalFollowersReceived);
         Assert.Equal(0, totalLeaderReceived);
@@ -427,21 +446,26 @@ public class TestThreeNodeClusterSqlite
         
         byte[] data = "Hello World"u8.ToArray();
         
+        int totalLeaderReceived = 0;
+        int totalFollowersReceived = 0;
+        
         leader.OnReplicationReceived += (_, _) =>
         {
             Interlocked.Increment(ref totalLeaderReceived);
             return Task.FromResult(true);
         };
-        
+
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += (partitionId, log) =>
+        {
+            follower.OnReplicationReceived += (_, log) =>
             {
                 Assert.Equal("Greeting", log.LogType);;
                 Assert.Equal(data, log.LogData);
-
+                
                 Interlocked.Increment(ref totalFollowersReceived);
                 return Task.FromResult(true);
             };
+        }
 
         long maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
@@ -465,7 +489,7 @@ public class TestThreeNodeClusterSqlite
         Assert.True(success);
         Assert.Equal(RaftOperationStatus.Success, status);
         
-        await Task.Delay(200);
+        await Task.Delay(100);
         
         Assert.Equal(2, totalFollowersReceived);
         Assert.Equal(0, totalLeaderReceived);
@@ -514,21 +538,27 @@ public class TestThreeNodeClusterSqlite
         
         byte[] data = "Hello World"u8.ToArray();
         
-        leader.OnReplicationReceived += (partitionId, log) =>
+        int totalLeaderReceived = 0;
+        int totalFollowersReceived = 0;
+        
+        leader.OnReplicationReceived += (_, _) =>
         {
-            Assert.Equal("Greeting", log.LogType);;
-            Assert.Equal(data, log.LogData);
-            
             Interlocked.Increment(ref totalLeaderReceived);
             return Task.FromResult(true);
         };
-        
+
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += (_, _) =>
+        {
+            follower.OnReplicationReceived += (_, log) =>
             {
-                  Interlocked.Increment(ref totalFollowersReceived);
-                  return Task.FromResult(true);
+                Assert.Equal("Greeting", log.LogType);;
+                Assert.Equal(data, log.LogData);
+                
+                totalFollowersReceived++;
+                
+                return Task.FromResult(true);
             };
+        }
 
         long maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
@@ -552,7 +582,7 @@ public class TestThreeNodeClusterSqlite
         Assert.True(success);
         Assert.Equal(RaftOperationStatus.Success, status);
         
-        await Task.Delay(200);
+        await Task.Delay(100);
         
         Assert.Equal(0, totalFollowersReceived);
         Assert.Equal(0, totalLeaderReceived);
@@ -601,21 +631,27 @@ public class TestThreeNodeClusterSqlite
 
         byte[] data = "Hello World"u8.ToArray();
         
+        int totalLeaderReceived = 0;
+        int totalFollowersReceived = 0;
+        
         leader.OnReplicationReceived += (_, _) =>
         {
             Interlocked.Increment(ref totalLeaderReceived);
             return Task.FromResult(true);
         };
-        
+
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += (partitionId, log) =>
+        {
+            follower.OnReplicationReceived += (_, log) =>
             {
                 Assert.Equal("Greeting", log.LogType);;
                 Assert.Equal(data, log.LogData);
                 
                 Interlocked.Increment(ref totalFollowersReceived);
+                
                 return Task.FromResult(true);
             };
+        }
 
         long maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
@@ -645,7 +681,7 @@ public class TestThreeNodeClusterSqlite
         maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(100, maxId);
         
-        await Task.Delay(200);
+        await Task.Delay(100);
         
         Assert.Equal(200, totalFollowersReceived);
         Assert.Equal(0, totalLeaderReceived);
@@ -694,20 +730,27 @@ public class TestThreeNodeClusterSqlite
         
         byte[] data = "Hello World"u8.ToArray();
         
+        int totalLeaderReceived = 0;
+        int totalFollowersReceived = 0;
+        
         leader.OnReplicationReceived += (_, _) =>
         {
             Interlocked.Increment(ref totalLeaderReceived);
             return Task.FromResult(true);
         };
-        
+
         foreach (IRaft follower in followers)
-            follower.OnReplicationReceived += (partitionId, log) =>
+        {
+            follower.OnReplicationReceived += (_, log) =>
             {
-                Assert.Equal("Greeting", log.LogType);
-                
+                Assert.Equal("Greeting", log.LogType);;
+                //Assert.Equal(data, log.LogData);
+
                 Interlocked.Increment(ref totalFollowersReceived);
+                
                 return Task.FromResult(true);
             };
+        }
 
         long maxId = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(0, maxId);
@@ -830,9 +873,9 @@ public class TestThreeNodeClusterSqlite
         maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(10, maxId);
         
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        node1.ActorSystem.Dispose();
+        node2.ActorSystem.Dispose();
+        node3.ActorSystem.Dispose();
     }
     
     [Fact]
@@ -934,9 +977,9 @@ public class TestThreeNodeClusterSqlite
         maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(25, maxId);
         
-        node1.ActorSystem.Dispose();
-        node2.ActorSystem.Dispose();
-        node3.ActorSystem.Dispose();
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+        await node3.LeaveCluster(true);
     }
 
     private static async Task<IRaft?> GetLeader(IRaft[] nodes)
