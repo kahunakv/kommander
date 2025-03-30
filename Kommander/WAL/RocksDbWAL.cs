@@ -35,7 +35,8 @@ public class RocksDbWAL : IWAL
         
         ColumnFamilies columnFamilies = new()
         {
-            { "default", new() }
+            { "default", new() },
+            { "metadata", new() }
         };
         
         for (int i = 0; i < MaxShards; i++)
@@ -469,6 +470,24 @@ public class RocksDbWAL : IWAL
         }
 
         return -1;
+    }
+    
+    public string? GetMetaData(string key)
+    {
+        ColumnFamilyHandle? metaDataColumnFamily = db.GetColumnFamily("metadata");
+
+        byte[] value = db.Get(Encoding.UTF8.GetBytes(key), cf: metaDataColumnFamily);
+        
+        return value is not null ? Encoding.UTF8.GetString(value) : null;
+    }
+
+    public bool SetMetaData(string key, string value)
+    {
+        ColumnFamilyHandle? metaDataColumnFamily = db.GetColumnFamily("metadata");
+
+        db.Put(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), cf: metaDataColumnFamily);
+
+        return true;
     }
     
     private static byte[] Serialize(RaftLogMessage message)

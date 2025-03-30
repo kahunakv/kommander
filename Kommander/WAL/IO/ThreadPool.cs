@@ -43,6 +43,9 @@ public class ThreadPool
     /// <returns></returns>
     public Task<T> EnqueueTask<T>(Func<T> syncOperation)
     {
+        if (!started)
+            throw new RaftException("Thread pool not started");
+        
         // Create a TaskCompletionSource to provide async notification
         TaskCompletionSource<T> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -105,7 +108,7 @@ public class ThreadPool
                 }
                 catch (OperationCanceledException ex)
                 {
-                    logger.LogDebug("Worker {WorkerId} stopped: {Exception}", workerId, ex.Message);
+                    logger.LogTrace("Worker {WorkerId} stopped: {Exception}", workerId, ex.Message);
                 }
             })
             {

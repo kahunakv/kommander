@@ -27,13 +27,13 @@ public class ReplicationService : BackgroundService //, IDisposable
         
         await Task.Delay(30000, stoppingToken).ConfigureAwait(false);
         
-        List<Task> tasks = new(raftManager.Configuration.MaxPartitions * 2);
+        List<Task> tasks = new(raftManager.Configuration.InitialPartitions * 2);
         
         while (true)
         {
             tasks.Clear();
             
-            for (int i = 0; i < raftManager.Configuration.MaxPartitions; i++)
+            for (int i = 0; i < raftManager.Configuration.InitialPartitions; i++)
             {
                 tasks.Add(ReplicateToPartition(i));
                 tasks.Add(ReplicateToPartition(i));

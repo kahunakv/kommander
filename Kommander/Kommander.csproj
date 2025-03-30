@@ -60,4 +60,10 @@
     </Protobuf>
   </ItemGroup>
 
+  <ItemGroup>
+    <Protobuf Include="System\Protos\raft_system.proto">
+      <Generator>MSBuild:Compile</Generator>
+    </Protobuf>
+  </ItemGroup>
+
 </Project>

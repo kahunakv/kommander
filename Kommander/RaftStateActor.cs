@@ -298,6 +298,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 expectedLeaders.Clear();
                 lastCommitIndexes.Clear();
                 activeProposals.Clear();
+                
+                await manager.InvokeLeaderChanged(partition.PartitionId, "");
                 return;
             
             // if node is follower and leader is not sending hearthbeats, start an election
@@ -338,6 +340,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 expectedLeaders.Clear();
                 nodeState = RaftNodeState.Candidate;
                 votingStartedAt = currentTime;
+                
+                await manager.InvokeLeaderChanged(partition.PartitionId, "");
         
                 currentTerm++;
         
@@ -629,6 +633,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             maxLogResponse.Index
         );
 
+        await manager.InvokeLeaderChanged(partition.PartitionId, manager.LocalEndpoint);
+
         await SendHearthbeat().ConfigureAwait(false);
     }
 
@@ -671,6 +677,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 lastCommitIndexes.Clear();
                 activeProposals.Clear();
                 expectedLeaders.TryAdd(leaderTerm, endpoint);
+                
+                await manager.InvokeLeaderChanged(partition.PartitionId, endpoint);
             }
         }
         else

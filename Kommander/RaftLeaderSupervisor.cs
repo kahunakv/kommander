@@ -37,8 +37,10 @@ public sealed class RaftLeaderSupervisor : IActor<RaftLeaderSupervisorRequest>
 
     public Task Receive(RaftLeaderSupervisorRequest message)
     {
-        foreach (RaftPartition? partition in manager.Partitions)
-            partition?.CheckLeader();
+        manager.SystemPartition?.CheckLeader();
+        
+        foreach ((int _, RaftPartition? partition) in manager.Partitions)
+            partition.CheckLeader();
         
         return Task.CompletedTask;
     }

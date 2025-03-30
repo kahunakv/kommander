@@ -24,7 +24,7 @@ public class RaftConfiguration
     /// <summary>
     /// Number of initial partitions to create
     /// </summary>
-    public int MaxPartitions { get; set; } = 1;
+    public int InitialPartitions { get; set; } = 1;
 
     /// <summary>
     /// Communication scheme when sending HTTP requests

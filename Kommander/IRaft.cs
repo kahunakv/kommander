@@ -60,27 +60,32 @@ public interface IRaft
     /// <summary>
     /// Event when the restore process starts
     /// </summary>
-    public event Action? OnRestoreStarted;        
+    public event Action<int>? OnRestoreStarted;        
 
     /// <summary>
     /// Event when the restore process finishes
     /// </summary>
-    public event Action? OnRestoreFinished;
+    public event Action<int>? OnRestoreFinished;
     
     /// <summary>
     /// Event when a replication error occurs
     /// </summary>
-    public event Action<RaftLog>? OnReplicationError;
+    public event Action<int, RaftLog>? OnReplicationError;
     
     /// <summary>
     /// Event when a replication log is restored
     /// </summary>
-    public event Func<RaftLog, Task<bool>>? OnReplicationRestored;
+    public event Func<int, RaftLog, Task<bool>>? OnReplicationRestored;
 
     /// <summary>
     /// Event when a replication log is received
     /// </summary>
     public event Func<int, RaftLog, Task<bool>>? OnReplicationReceived;
+    
+    /// <summary>
+    /// Event called when a leader is elected on certain partition
+    /// </summary>
+    public event Func<int, string, Task<bool>>? OnLeaderChanged;
     
     /// <summary>
     /// Joins the Raft cluster
@@ -146,8 +151,9 @@ public interface IRaft
     /// <param name="type"></param>
     /// <param name="data"></param>
     /// <param name="autoCommit"></param>
+    /// <param name="cancellationToken"></param>
     /// <returns></returns>
-    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true);
+    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Replicate logs to the followers in the partition
@@ -156,14 +162,17 @@ public interface IRaft
     /// <param name="type"></param>
     /// <param name="logs"></param>
     /// <param name="autoCommit"></param>
+    /// <param name="cancellationToken"></param>
     /// <returns></returns>
-    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true);
+    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Replicate a checkpoint to the followers in the partition    
+    /// Replicate a checkpoint to the followers in the partition
     /// </summary>
     /// <param name="partitionId"></param>
-    public Task<RaftReplicationResult> ReplicateCheckpoint(int partitionId);
+    /// <param name="cancellationToken"></param>
+    /// <returns></returns>
+    public Task<RaftReplicationResult> ReplicateCheckpoint(int partitionId, CancellationToken cancellationToken = default);
     
     /// <summary>
     /// Commit logs and notify followers in the partition

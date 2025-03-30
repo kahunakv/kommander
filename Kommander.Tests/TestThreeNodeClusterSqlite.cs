@@ -42,7 +42,7 @@ public class TestThreeNodeClusterSqlite
             NodeId = "node1",
             Host = "localhost",
             Port = 8001,
-            MaxPartitions = 1
+            InitialPartitions = 1
         };
         
         RaftManager node = new(
@@ -67,7 +67,7 @@ public class TestThreeNodeClusterSqlite
             NodeId = "node2",
             Host = "localhost",
             Port = 8002,
-            MaxPartitions = 1
+            InitialPartitions = 1
         };
         
         RaftManager node = new(
@@ -92,7 +92,7 @@ public class TestThreeNodeClusterSqlite
             NodeId = "node3",
             Host = "localhost",
             Port = 8003,
-            MaxPartitions = 1
+            InitialPartitions = 1
         };
         
         RaftManager node = new(
@@ -301,6 +301,8 @@ public class TestThreeNodeClusterSqlite
         
         maxId = node3.WalAdapter.GetMaxLog(0);
         Assert.Equal(2, maxId);
+
+        await Task.Delay(200);
         
         Assert.Equal(4, totalFollowersReceived);
         Assert.Equal(0, totalLeaderReceived);

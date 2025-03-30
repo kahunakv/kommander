@@ -40,7 +40,7 @@ public sealed class TestThreeNodeClusterManyPartitions
             NodeId = "node1",
             Host = "localhost",
             Port = 8001,
-            MaxPartitions = partitions
+            InitialPartitions = partitions
         };
         
         RaftManager node = new(
@@ -65,7 +65,7 @@ public sealed class TestThreeNodeClusterManyPartitions
             NodeId = "node2",
             Host = "localhost",
             Port = 8002,
-            MaxPartitions = partitions
+            InitialPartitions = partitions
         };
         
         RaftManager node = new(
@@ -90,7 +90,7 @@ public sealed class TestThreeNodeClusterManyPartitions
             NodeId = "node3",
             Host = "localhost",
             Port = 8003,
-            MaxPartitions = partitions
+            InitialPartitions = partitions
         };
         
         RaftManager node = new(

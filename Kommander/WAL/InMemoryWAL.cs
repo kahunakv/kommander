@@ -1,3 +1,4 @@
+
 using Kommander.Data;
 
 namespace Kommander.WAL;
@@ -9,6 +10,8 @@ namespace Kommander.WAL;
 public class InMemoryWAL : IWAL
 {
     private readonly ReaderWriterLock readerWriterLock = new();
+    
+    private readonly Dictionary<string, string> allConfigs = new();
     
     private readonly Dictionary<int, SortedDictionary<long, RaftLog>> allLogs = new();
     
@@ -238,5 +241,25 @@ public class InMemoryWAL : IWAL
         {
             readerWriterLock.ReleaseReaderLock();
         }
+    }
+
+    public string? GetMetaData(string key)
+    {
+        try
+        {
+            readerWriterLock.AcquireReaderLock(TimeSpan.FromMilliseconds(5000));
+
+            return allConfigs.GetValueOrDefault(key);
+        }
+        finally
+        {
+            readerWriterLock.ReleaseReaderLock();
+        }
+    }
+
+    public bool SetMetaData(string key, string value)
+    {
+        allConfigs[key] = value;
+        return true;
     }
 }

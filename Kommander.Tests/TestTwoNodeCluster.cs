@@ -1,26 +1,43 @@
 
+using System.Diagnostics.CodeAnalysis;
 using Kommander.Communication.Memory;
 using Kommander.Data;
 using Kommander.Discovery;
 using Kommander.Time;
 using Kommander.WAL;
 using Microsoft.Extensions.Logging;
-using Moq;
 using Nixie;
 
 namespace Kommander.Tests;
 
+[SuppressMessage("Performance", "CA1859:Use concrete types when possible for improved performance")]
 public class TestTwoNodeCluster
 {
-    private static IRaft GetNode1(InMemoryCommunication communication)
+    private readonly ILogger<IRaft> logger;
+    
+    public TestTwoNodeCluster()
     {
-        ActorSystem actorSystem = new();
+        ILoggerFactory loggerFactory1 = LoggerFactory.Create(builder =>
+        {
+            builder
+                //.AddFilter("Kommander.IRaft", LogLevel.Debug)
+                //.AddFilter("Kommander", LogLevel.Debug)
+                .SetMinimumLevel(LogLevel.Debug)
+                .AddConsole();
+        });
+
+        logger = loggerFactory1.CreateLogger<IRaft>();
+    }
+    
+    private static IRaft GetNode1(InMemoryCommunication communication, ILogger<IRaft> logger)
+    {
+        ActorSystem actorSystem = new(logger: logger);
         
         RaftConfiguration config = new()
         {
             Host = "localhost",
             Port = 8001,
-            MaxPartitions = 1
+            InitialPartitions = 1
         };
         
         RaftManager node = new(
@@ -30,21 +47,21 @@ public class TestTwoNodeCluster
             new InMemoryWAL(),
             communication,
             new HybridLogicalClock(),
-            new Mock<ILogger<IRaft>>().Object
+            logger
         );
 
         return node;
     }
     
-    private static IRaft GetNode2(InMemoryCommunication communication)
+    private static IRaft GetNode2(InMemoryCommunication communication, ILogger<IRaft> logger)
     {
-        ActorSystem actorSystem = new();
+        ActorSystem actorSystem = new(logger: logger);
         
         RaftConfiguration config = new()
         {
             Host = "localhost",
             Port = 8002,
-            MaxPartitions = 1
+            InitialPartitions = 1
         };
         
         RaftManager node = new(
@@ -54,7 +71,7 @@ public class TestTwoNodeCluster
             new InMemoryWAL(),
             communication,
             new HybridLogicalClock(),
-            new Mock<ILogger<IRaft>>().Object
+            logger
         );
 
         return node;
@@ -65,14 +82,14 @@ public class TestTwoNodeCluster
     {
         InMemoryCommunication communication = new();
         
-        IRaft node1 = GetNode1(communication);
-        IRaft node2 = GetNode2(communication);
+        IRaft node1 = GetNode1(communication, logger);
+        IRaft node2 = GetNode2(communication, logger);
 
         await node1.JoinCluster();
         await node2.JoinCluster();
         
-        node1.ActorSystem.Dispose();
-        node2.ActorSystem.Dispose();
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
     }
     
     [Fact]
@@ -80,8 +97,8 @@ public class TestTwoNodeCluster
     {
         InMemoryCommunication communication = new();
         
-        IRaft node1 = GetNode1(communication);
-        IRaft node2 = GetNode2(communication);
+        IRaft node1 = GetNode1(communication, logger);
+        IRaft node2 = GetNode2(communication, logger);
 
         await node1.JoinCluster();
         await node2.JoinCluster();
@@ -103,11 +120,13 @@ public class TestTwoNodeCluster
             if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None))
                 break;
             
-            await Task.Delay(1000);
+            await Task.Delay(100);
         }
+
+        await Task.Delay(2000);
         
-        node1.ActorSystem.Dispose();
-        node2.ActorSystem.Dispose();
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
     }
     
     [Fact]
@@ -115,8 +134,8 @@ public class TestTwoNodeCluster
     {
         InMemoryCommunication communication = new();
         
-        IRaft node1 = GetNode1(communication);
-        IRaft node2 = GetNode2(communication);
+        IRaft node1 = GetNode1(communication, logger);
+        IRaft node2 = GetNode2(communication, logger);
 
         await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster()]);
         
@@ -137,14 +156,14 @@ public class TestTwoNodeCluster
             if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None))
                 break;
             
-            await Task.Delay(1000);
+            await Task.Delay(100);
         }
         
         IRaft? leader = await GetLeader([node1, node2]);
         Assert.NotNull(leader);
         
-        node1.ActorSystem.Dispose();
-        node2.ActorSystem.Dispose();
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
     }
     
     [Fact]
@@ -152,8 +171,8 @@ public class TestTwoNodeCluster
     {
         InMemoryCommunication communication = new();
         
-        IRaft node1 = GetNode1(communication);
-        IRaft node2 = GetNode2(communication);
+        IRaft node1 = GetNode1(communication, logger);
+        IRaft node2 = GetNode2(communication, logger);
 
         node1.WalAdapter.Propose(0, new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Proposed });
         node1.WalAdapter.Propose(0, new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Proposed });
@@ -179,7 +198,7 @@ public class TestTwoNodeCluster
             if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None))
                 break;
             
-            await Task.Delay(1000);
+            await Task.Delay(100);
         }
         
         IRaft? leader = await GetLeader([node1, node2]);
@@ -197,8 +216,8 @@ public class TestTwoNodeCluster
         long maxNode2 = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(2, maxNode2);
         
-        node1.ActorSystem.Dispose();
-        node2.ActorSystem.Dispose();
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
     }
     
     [Fact]
@@ -206,8 +225,8 @@ public class TestTwoNodeCluster
     {
         InMemoryCommunication communication = new();
         
-        IRaft node1 = GetNode1(communication);
-        IRaft node2 = GetNode2(communication);
+        IRaft node1 = GetNode1(communication, logger);
+        IRaft node2 = GetNode2(communication, logger);
         
         node1.WalAdapter.Propose(0, new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Proposed });
         node1.WalAdapter.Propose(0, new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Proposed });
@@ -236,7 +255,7 @@ public class TestTwoNodeCluster
             if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None))
                 break;
             
-            await Task.Delay(1000);
+            await Task.Delay(100);
         }
         
         IRaft? leader = await GetLeader([node1, node2]);
@@ -254,8 +273,8 @@ public class TestTwoNodeCluster
         long maxNode2 = node1.WalAdapter.GetMaxLog(0);
         Assert.Equal(2, maxNode2);
         
-        node1.ActorSystem.Dispose();
-        node2.ActorSystem.Dispose();
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
     }
     
     private static async Task<IRaft?> GetLeader(IRaft[] nodes)

@@ -1,4 +1,5 @@
 
+using System.Diagnostics.CodeAnalysis;
 using Nixie;
 using Kommander.Communication.Memory;
 using Kommander.Data;
@@ -9,6 +10,7 @@ using Microsoft.Extensions.Logging;
 
 namespace Kommander.Tests;
 
+[SuppressMessage("Performance", "CA1859:Use concrete types when possible for improved performance")]
 public class TestThreeNodeCluster
 {
     private readonly ILogger<IRaft> logger;
@@ -40,7 +42,7 @@ public class TestThreeNodeCluster
             NodeId = "node1",
             Host = "localhost",
             Port = 8001,
-            MaxPartitions = 1
+            InitialPartitions = 1
         };
         
         RaftManager node = new(
@@ -65,7 +67,7 @@ public class TestThreeNodeCluster
             NodeId = "node2",
             Host = "localhost",
             Port = 8002,
-            MaxPartitions = 1
+            InitialPartitions = 1
         };
         
         RaftManager node = new(
@@ -90,7 +92,7 @@ public class TestThreeNodeCluster
             NodeId = "node3",
             Host = "localhost",
             Port = 8003,
-            MaxPartitions = 1
+            InitialPartitions = 1
         };
         
         RaftManager node = new(
@@ -159,9 +161,9 @@ public class TestThreeNodeCluster
         Assert.NotEmpty(followers);
         Assert.Equal(2, followers.Count);
 
-        node1.ActorSystem.Dispose();
-        node2.ActorSystem.Dispose();
-        node3.ActorSystem.Dispose();
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+        await node3.LeaveCluster(true);
     }
     
     [Fact]
@@ -188,7 +190,7 @@ public class TestThreeNodeCluster
 
         while (true)
         {
-            if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
+            if (await node1.AmILeader(1, CancellationToken.None) || await node2.AmILeader(1, CancellationToken.None) || await node3.AmILeader(1, CancellationToken.None))
                 break;
             
             await Task.Delay(100);
@@ -201,18 +203,20 @@ public class TestThreeNodeCluster
         Assert.NotEmpty(followers);
         Assert.Equal(2, followers.Count);
 
+        await Task.Delay(500);
+
         long maxId = node1.WalAdapter.GetMaxLog(0);
-        Assert.Equal(0, maxId);
+        Assert.Equal(1, maxId);
         
         maxId = node2.WalAdapter.GetMaxLog(0);
-        Assert.Equal(0, maxId);
+        Assert.Equal(1, maxId);
         
         maxId = node3.WalAdapter.GetMaxLog(0);
-        Assert.Equal(0, maxId);
+        Assert.Equal(1, maxId);
         
-        node1.ActorSystem.Dispose();
-        node2.ActorSystem.Dispose();
-        node3.ActorSystem.Dispose();
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+        await node3.LeaveCluster(true);
     }
     
     [Fact]
@@ -303,9 +307,9 @@ public class TestThreeNodeCluster
         Assert.Equal(4, totalFollowersReceived);
         Assert.Equal(0, totalLeaderReceived);
         
-        node1.ActorSystem.Dispose();
-        node2.ActorSystem.Dispose();
-        node3.ActorSystem.Dispose();
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+        await node3.LeaveCluster(true);
     }
     
     [Fact]
@@ -381,9 +385,9 @@ public class TestThreeNodeCluster
         Assert.Equal(0, totalFollowersReceived);
         Assert.Equal(0, totalLeaderReceived);
         
-        node1.ActorSystem.Dispose();
-        node2.ActorSystem.Dispose();
-        node3.ActorSystem.Dispose();
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+        await node3.LeaveCluster(true);
     }
     
     [Fact]

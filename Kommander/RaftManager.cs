@@ -1,15 +1,17 @@
 
 using Nixie;
-
 using System.Collections.Concurrent;
 
 using Kommander.Communication;
 using Kommander.Data;
 using Kommander.Diagnostics;
 using Kommander.Discovery;
+using Kommander.System;
 using Kommander.Time;
 using Kommander.WAL;
+
 using ThreadPool = Kommander.WAL.IO.ThreadPool;
+// ReSharper disable ConvertToAutoPropertyWithPrivateSetter
 
 // ReSharper disable MemberCanBePrivate.Global
 // ReSharper disable ConvertToAutoProperty
@@ -42,11 +44,15 @@ public sealed class RaftManager : IRaft
     
     private readonly ClusterHandler clusterHandler;
 
-    private readonly RaftPartition?[] partitions;
+    private RaftPartition? systemPartition = null;
+
+    private readonly Dictionary<int, RaftPartition> partitions = [];
 
     private readonly ThreadPool readThreadPool;
     
     private readonly ThreadPool writeThreadPool;
+    
+    private readonly IActorRef<RaftSystemActor, RaftSystemRequest> systemActor;
 
     private readonly IActorRef<RaftLeaderSupervisor, RaftLeaderSupervisorRequest> leaderSupervisorActor;
 
@@ -56,11 +62,16 @@ public sealed class RaftManager : IRaft
     /// Allows to retrieve the list of known nodes within the Raft cluster
     /// </summary>
     internal List<RaftNode> Nodes { get; set; } = [];
+
+    /// <summary>
+    /// Returns the system partition
+    /// </summary>
+    internal RaftPartition? SystemPartition => systemPartition;
     
     /// <summary>
-    /// Allows to retreive the list of partitions
+    /// Returns the user partitions
     /// </summary>
-    internal RaftPartition?[] Partitions => partitions;
+    internal Dictionary<int, RaftPartition> Partitions => partitions;
     
     /// <summary>
     /// Read I/O thread pool
@@ -115,27 +126,32 @@ public sealed class RaftManager : IRaft
     /// <summary>
     /// Event when the restore process starts
     /// </summary>
-    public event Action? OnRestoreStarted;        
+    public event Action<int>? OnRestoreStarted;        
 
     /// <summary>
     /// Event when the restore process finishes
     /// </summary>
-    public event Action? OnRestoreFinished;
+    public event Action<int>? OnRestoreFinished;
 
     /// <summary>
     /// Event when a replication log is now acknowledged by the application
     /// </summary>
-    public event Action<RaftLog>? OnReplicationError;
+    public event Action<int, RaftLog>? OnReplicationError;
     
     /// <summary>
     /// Event when a replication log is restored
     /// </summary>
-    public event Func<RaftLog, Task<bool>>? OnReplicationRestored;
+    public event Func<int, RaftLog, Task<bool>>? OnReplicationRestored;
 
     /// <summary>
     /// Event when a replication log is received
     /// </summary>
     public event Func<int, RaftLog, Task<bool>>? OnReplicationReceived;
+
+    /// <summary>
+    /// Event called when a leader is elected on certain partition
+    /// </summary>
+    public event Func<int, string, Task<bool>>? OnLeaderChanged; 
     
     /// <summary>
     /// Constructor
@@ -168,34 +184,104 @@ public sealed class RaftManager : IRaft
         
         LocalNodeId = string.IsNullOrEmpty(this.configuration.NodeId) ? Environment.MachineName : this.configuration.NodeId;
         LocalEndpoint = string.Concat(configuration.Host, ":", configuration.Port);
-        
-        partitions = new RaftPartition[configuration.MaxPartitions];
 
         clusterHandler = new(this, discovery);
         
+        systemActor = actorSystem.Spawn<RaftSystemActor, RaftSystemRequest>("raft-system", this, Logger);
         leaderSupervisorActor = actorSystem.Spawn<RaftLeaderSupervisor, RaftLeaderSupervisorRequest>("raft-leader-supervisor", this, Logger);
 
         readThreadPool = new(logger, configuration.ReadIOThreads);
         writeThreadPool = new(logger, configuration.WriteIOThreads);
+
+        OnReplicationRestored += OnSystemReplicationRestored;
+        OnReplicationReceived += OnSystemReplicationReceived;
+        OnLeaderChanged += OnSystemLeaderChanged;
+        OnRestoreFinished += OnSystemRestoreFinished;
+    }
+
+    private async Task<bool> OnSystemLeaderChanged(int partitionId, string node)
+    {
+        await Task.CompletedTask;
+        
+        if (partitionId != RaftSystemConfig.SystemPartition)
+            return true;
+
+        systemActor.Send(new(RaftSystemRequestType.LeaderChanged, node));
+        return true;
+    }
+
+    private async Task<bool> OnSystemReplicationRestored(int partitionId, RaftLog log)
+    {
+        await Task.CompletedTask;
+        
+        if (partitionId != RaftSystemConfig.SystemPartition)
+            return true;
+
+        if (log.LogType != RaftSystemConfig.RaftLogType)
+            return true;
+        
+        if (log.LogData is null)
+            return true;
+        
+        systemActor.Send(new(RaftSystemRequestType.ConfigRestored, log.LogData));
+        
+        return true;
     }
     
+    private async Task<bool> OnSystemReplicationReceived(int partitionId, RaftLog log)
+    {
+        await Task.CompletedTask;
+        
+        if (partitionId != RaftSystemConfig.SystemPartition)
+            return true;
+
+        if (log.LogType != RaftSystemConfig.RaftLogType)
+            return true;
+        
+        if (log.LogData is null)
+            return true;
+        
+        systemActor.Send(new(RaftSystemRequestType.ConfigReplicated, log.LogData));
+        
+        return true;
+    }
+
+    private void OnSystemRestoreFinished(int partitionId)
+    {
+        if (partitionId != RaftSystemConfig.SystemPartition)
+            return;
+        
+        systemActor.Send(new(RaftSystemRequestType.RestoreCompleted));
+    }
+
     /// <summary>
     /// Joins the cluster
     /// </summary>
     public async Task JoinCluster()
     {
-        if (partitions[0] is null)
+        // Registers itself at the discovery service
+        await clusterHandler.JoinCluster(configuration).ConfigureAwait(false);
+        
+        if (systemPartition is null)
         {
             readThreadPool.Start();
             writeThreadPool.Start();
             
-            for (int i = 0; i < configuration.MaxPartitions; i++)
-                partitions[i] = new(actorSystem, this, walAdapter, communication, i, Logger);
+            // Add system partition
+            systemPartition = new(actorSystem, this, walAdapter, communication, RaftSystemConfig.SystemPartition, Logger);
         }
-
-        await clusterHandler.JoinCluster(configuration).ConfigureAwait(false);
     }
-    
+
+    /// <summary>
+    /// Start the user partitions
+    /// </summary>
+    /// <param name="ranges"></param>
+    internal void StartUserPartitions(List<RaftPartitionRange> ranges)
+    {
+        foreach (RaftPartitionRange range in ranges)
+            partitions.Add(range.PartitionId, new(actorSystem, this, walAdapter, communication, range.PartitionId, Logger));
+    }
+
     /// <summary>
     /// Leaves the cluster
     /// </summary>
@@ -216,7 +302,7 @@ public sealed class RaftManager : IRaft
     /// </summary>
     public async Task UpdateNodes()
     {
-        if (partitions[0] is null)
+        if (systemPartition is null && partitions.Count == 0)
             return;
 
         await clusterHandler.UpdateNodes().ConfigureAwait(false);
@@ -229,10 +315,7 @@ public sealed class RaftManager : IRaft
     /// <returns></returns>
     internal HLCTimestamp GetLastNodeActivity(string nodeId)
     {
-        if (lastActivity.TryGetValue(nodeId, out HLCTimestamp lastTimestamp))
-            return lastTimestamp;
-        
-        return HLCTimestamp.Zero;
+        return lastActivity.TryGetValue(nodeId, out HLCTimestamp lastTimestamp) ? lastTimestamp : HLCTimestamp.Zero;
     }
     
     /// <summary>
@@ -259,18 +342,26 @@ public sealed class RaftManager : IRaft
     /// <summary>
     /// Returns the raft partition for the given partition number
     /// </summary>
-    /// <param name="partition"></param>
+    /// <param name="partitionId"></param>
     /// <returns></returns>
     /// <exception cref="RaftException"></exception>
-    private RaftPartition GetPartition(int partition)
+    private RaftPartition GetPartition(int partitionId)
     {
-        if (partitions[partition] is null)
-            throw new RaftException("It has not yet joined the cluster.");
+        if (partitionId == RaftSystemConfig.SystemPartition)
+        {
+            if (systemPartition is null)
+                throw new RaftException("System partition not initialized.");
+            
+            return systemPartition;
+        }
+        
+        //if (partitionId < 0 || partitionId > partitions.Count)
+        //    throw new RaftException("Invalid partition: " + partitionId);
+        
+        if (!partitions.TryGetValue(partitionId, out RaftPartition? partition))
+            throw new RaftException("Invalid partition: " + partitionId);
 
-        if (partition < 0 || partition >= partitions.Length)
-            throw new RaftException("Invalid partition.");
-
-        return partitions[partition]!;
+        return partition;
     }
     
     /// <summary>
@@ -325,6 +416,39 @@ public sealed class RaftManager : IRaft
         RaftPartition partition = GetPartition(request.Partition);
         partition.CompleteAppendLogs(request);
     }
+    
+    /// <summary>
+    /// Replicate a single log to the follower nodes in the system partition
+    /// </summary>
+    /// <param name="partitionId"></param>
+    /// <param name="type"></param>
+    /// <param name="data"></param>
+    /// <param name="autoCommit"></param>
+    /// <param name="cancellationToken"></param>
+    /// <returns></returns>
+    internal async Task<RaftReplicationResult> ReplicateSystemLogs(string type, byte[] data, bool autoCommit = true, CancellationToken cancellationToken = default)
+    {
+        if (systemPartition is null)
+            throw new RaftException("System partition not initialized.");
+
+        bool success;
+        HLCTimestamp ticketId;
+        RaftOperationStatus status;
+
+        do
+        {
+            (success, status, ticketId) = await systemPartition.ReplicateLogs(type, data, autoCommit).ConfigureAwait(false);
+
+            if (status == RaftOperationStatus.ActiveProposal)
+                await Task.Delay(1, cancellationToken).ConfigureAwait(false);
+            
+        } while (status == RaftOperationStatus.ActiveProposal);
+        
+        if (!success)
+            return new(success, status, ticketId, -1);
+
+        return await WaitForQuorum(systemPartition, ticketId, autoCommit, cancellationToken).ConfigureAwait(false);
+    }
 
     /// <summary>
     /// Replicate a single log to the follower nodes in the specified partition
@@ -332,8 +456,10 @@ public sealed class RaftManager : IRaft
     /// <param name="partitionId"></param>
     /// <param name="type"></param>
     /// <param name="data"></param>
+    /// <param name="autoCommit"></param>
+    /// <param name="cancellationToken"></param>
     /// <returns></returns>
-    public async Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true)
+    public async Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, CancellationToken cancellationToken = default)
     {
         RaftPartition partition = GetPartition(partitionId);
 
@@ -346,14 +472,14 @@ public sealed class RaftManager : IRaft
             (success, status, ticketId) = await partition.ReplicateLogs(type, data, autoCommit).ConfigureAwait(false);
 
             if (status == RaftOperationStatus.ActiveProposal)
-                await Task.Delay(1).ConfigureAwait(false);
+                await Task.Delay(1, cancellationToken).ConfigureAwait(false);
             
         } while (status == RaftOperationStatus.ActiveProposal);
         
         if (!success)
             return new(success, status, ticketId, -1);
 
-        return await WaitForQuorum(partition, ticketId, autoCommit).ConfigureAwait(false);
+        return await WaitForQuorum(partition, ticketId, autoCommit, cancellationToken).ConfigureAwait(false);
     }
     
     /// <summary>
@@ -363,8 +489,9 @@ public sealed class RaftManager : IRaft
     /// <param name="type"></param>
     /// <param name="logs"></param>
     /// <param name="autoCommit"></param>
+    /// <param name="cancellationToken"></param>
     /// <returns></returns>
-    public async Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true)
+    public async Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true, CancellationToken cancellationToken = default)
     {
         RaftPartition partition = GetPartition(partitionId);
         
@@ -374,17 +501,18 @@ public sealed class RaftManager : IRaft
 
         do
         {
-            (success, status, ticketId) = await partition.ReplicateLogs(type, logs, autoCommit).ConfigureAwait(false);
+            // ReSharper disable once PossibleMultipleEnumeration
+            (success, status, ticketId) = await partition.ReplicateLogs(type, logs.ToList(), autoCommit).ConfigureAwait(false);
             
             if (status == RaftOperationStatus.ActiveProposal)
-                await Task.Delay(1).ConfigureAwait(false);
+                await Task.Delay(1, cancellationToken).ConfigureAwait(false);
 
         } while (status == RaftOperationStatus.ActiveProposal);
         
         if (!success)
             return new(success, status, ticketId, -1);
         
-        return await WaitForQuorum(partition, ticketId, autoCommit).ConfigureAwait(false);
+        return await WaitForQuorum(partition, ticketId, autoCommit, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -417,7 +545,9 @@ public sealed class RaftManager : IRaft
     /// Replicates a checkpoint to the follower nodes
     /// </summary>
     /// <param name="partitionId"></param>
-    public async Task<RaftReplicationResult> ReplicateCheckpoint(int partitionId)
+    /// <param name="cancellationToken"></param>
+    /// <returns></returns>
+    public async Task<RaftReplicationResult> ReplicateCheckpoint(int partitionId, CancellationToken cancellationToken = default)
     {
         RaftPartition partition = GetPartition(partitionId);
         
@@ -430,14 +560,14 @@ public sealed class RaftManager : IRaft
             (success, status, ticketId) = await partition.ReplicateCheckpoint().ConfigureAwait(false);
             
             if (status == RaftOperationStatus.ActiveProposal)
-                await Task.Delay(1).ConfigureAwait(false);
+                await Task.Delay(1, cancellationToken).ConfigureAwait(false);
 
         } while (status == RaftOperationStatus.ActiveProposal);
         
         if (!success)
             return new(success, status, ticketId, -1);
         
-        return await WaitForQuorum(partition, ticketId, true).ConfigureAwait(false);
+        return await WaitForQuorum(partition, ticketId, true, cancellationToken).ConfigureAwait(false);
     }
     
     /// <summary>
@@ -446,8 +576,9 @@ public sealed class RaftManager : IRaft
     /// <param name="partition"></param>
     /// <param name="ticketId"></param>
     /// <param name="autoCommit"></param>
+    /// <param name="cancellationToken"></param>
     /// <returns></returns>
-    private async Task<RaftReplicationResult> WaitForQuorum(RaftPartition partition, HLCTimestamp ticketId, bool autoCommit)
+    private async Task<RaftReplicationResult> WaitForQuorum(RaftPartition partition, HLCTimestamp ticketId, bool autoCommit, CancellationToken cancellationToken)
     {
         ValueStopwatch stopwatch = ValueStopwatch.StartNew();
         
@@ -481,7 +612,7 @@ public sealed class RaftManager : IRaft
                 Logger.LogError("ReplicateLogs: {Message}", e.Message);
             }
 
-            await Task.Delay(1);
+            await Task.Delay(1, cancellationToken);
         }
         
         return new(false, RaftOperationStatus.ProposalTimeout, ticketId, -1);
@@ -490,31 +621,47 @@ public sealed class RaftManager : IRaft
     /// <summary>
     /// Calls the restore started event
     /// </summary>
-    internal void InvokeRestoreStarted()
+    /// <param name="partitionId"></param>
+    internal void InvokeRestoreStarted(int partitionId)
     {
-        OnRestoreStarted?.Invoke();
+        if (OnRestoreStarted != null)
+        {
+            Action<int>? callback = OnRestoreStarted;
+            callback?.Invoke(partitionId);
+        }
     }
     
     /// <summary>
     /// Calls the restore finished event
     /// </summary>
-    internal void InvokeRestoreFinished()
+    /// <param name="partitionId"></param>
+    internal void InvokeRestoreFinished(int partitionId)
     {
-        OnRestoreFinished?.Invoke();
+        if (OnRestoreFinished != null)
+        {
+            Action<int>? callback = OnRestoreFinished;
+            callback?.Invoke(partitionId);
+        }
     }
     
     /// <summary>
     /// Calls when a replication error occurs
     /// </summary>
+    /// <param name="partitionId"></param>
     /// <param name="log"></param>
-    internal void InvokeReplicationError(RaftLog log)
+    internal void InvokeReplicationError(int partitionId, RaftLog log)
     {
-        OnReplicationError?.Invoke(log);
+        if (OnReplicationError != null)
+        {
+            Action<int, RaftLog>? callback = OnReplicationError;
+            callback?.Invoke(partitionId, log);
+        }
     }
 
     /// <summary>
     /// Calls the replication received event
     /// </summary>
+    /// <param name="partitionId"></param>
     /// <param name="log"></param>
     /// <returns></returns>
     internal async Task<bool> InvokeReplicationReceived(int partitionId, RaftLog log)
@@ -534,15 +681,36 @@ public sealed class RaftManager : IRaft
     /// <summary>
     /// Calls the replication restored event
     /// </summary>
+    /// <param name="partitionId"></param>
     /// <param name="log"></param>
     /// <returns></returns>
-    internal async Task<bool> InvokeReplicationRestored(RaftLog log)
+    internal async Task<bool> InvokeReplicationRestored(int partitionId, RaftLog log)
     {
         if (OnReplicationRestored != null)
         {
-            Func<RaftLog, Task<bool>> callback = OnReplicationRestored;
+            Func<int, RaftLog, Task<bool>> callback = OnReplicationRestored;
             
-            bool success = await callback(log).ConfigureAwait(false);
+            bool success = await callback(partitionId, log).ConfigureAwait(false);
+            if (!success)
+                return false;
+        }
+
+        return true;
+    }
+    
+    /// <summary>
+    /// Calls the leader changed event
+    /// </summary>
+    /// <param name="partitionId"></param>
+    /// <param name="node"></param>
+    /// <returns></returns>
+    internal async Task<bool> InvokeLeaderChanged(int partitionId, string node)
+    {
+        if (OnLeaderChanged != null)
+        {
+            Func<int, string, Task<bool>> callback = OnLeaderChanged;
+            
+            bool success = await callback(partitionId, node).ConfigureAwait(false);
             if (!success)
                 return false;
         }
@@ -575,7 +743,7 @@ public sealed class RaftManager : IRaft
     /// <returns></returns>
     public async ValueTask<bool> AmILeaderQuick(int partitionId)
     {
-        if (partitions[0] is null)
+        if (systemPartition is null || partitions.Count == 0)
             return false;
 
         RaftPartition partition = GetPartition(partitionId);
@@ -587,10 +755,7 @@ public sealed class RaftManager : IRaft
         {
             RaftNodeState response = await partition.GetState().ConfigureAwait(false);
 
-            if (response == RaftNodeState.Leader)
-                return true;
-
-            return false;
+            return response == RaftNodeState.Leader;
         }
         catch (AskTimeoutException e)
         {
@@ -610,19 +775,22 @@ public sealed class RaftManager : IRaft
     /// <exception cref="RaftException"></exception>
     public async ValueTask<bool> AmILeader(int partitionId, CancellationToken cancellationToken)
     {
-        if (partitions[0] is null)
+        if (systemPartition is null)
             return false;
 
-        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
+        if (partitions.Count == 0)
+            return false;
+        
         RaftPartition partition = GetPartition(partitionId);
+
+        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
 
         while (stopwatch.GetElapsedMilliseconds() < 10000)
         {
             if (!string.IsNullOrEmpty(partition.Leader) && partition.Leader == LocalEndpoint)
                 return true;
             
-            if (cancellationToken.IsCancellationRequested)
-                throw new OperationCanceledException();
+            cancellationToken.ThrowIfCancellationRequested();
 
             try
             {
@@ -654,11 +822,10 @@ public sealed class RaftManager : IRaft
         RaftPartition partition = GetPartition(partitionId);
         ValueStopwatch stopwatch = ValueStopwatch.StartNew();
 
-        while (stopwatch.GetElapsedMilliseconds() < 30000)
+        while (stopwatch.GetElapsedMilliseconds() < 10000)
         {
-            if (cancellationToken.IsCancellationRequested)
-                throw new OperationCanceledException();
-            
+            cancellationToken.ThrowIfCancellationRequested();
+
             try
             {
                 RaftNodeState response = await partition.GetState().ConfigureAwait(false);
@@ -690,9 +857,9 @@ public sealed class RaftManager : IRaft
     /// <returns></returns>
     public int GetPartitionKey(string partitionKey)
     {
-        int partitionId = HashUtils.ConsistentHash(partitionKey, configuration.MaxPartitions);
+        int partitionId = HashUtils.ConsistentHash(partitionKey, configuration.InitialPartitions);
         
-        if (partitionId < 0 || partitionId >= configuration.MaxPartitions)
+        if (partitionId < 0 || partitionId >= configuration.InitialPartitions)
             throw new RaftException("Invalid partition: " + partitionId);
 
         return partitionId;

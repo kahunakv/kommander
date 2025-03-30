@@ -24,4 +24,8 @@ public interface IWAL
     public long GetMaxLog(int partitionId);
     
     public long GetCurrentTerm(int partitionId);
+
+    public string? GetMetaData(string key);
+    
+    public bool SetMetaData(string key, string value);
 }

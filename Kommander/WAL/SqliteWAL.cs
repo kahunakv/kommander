@@ -19,6 +19,8 @@ public class SqliteWAL : IWAL
     private readonly string path;
 
     private readonly string revision;
+    
+    private SqliteConnection? metaDataConnection;
 
     public SqliteWAL(string path = ".", string revision = "1")
     {
@@ -69,6 +71,47 @@ public class SqliteWAL : IWAL
             connections.Add(partitionId, (readerWriterLock, connection));
 
             return (readerWriterLock, connection);
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    }
+    
+    private SqliteConnection TryOpenMetaDataDatabase()
+    {
+        if (metaDataConnection is not null)
+            return metaDataConnection;
+
+        try
+        {
+            semaphore.Wait();
+
+            if (metaDataConnection is not null)
+                return metaDataConnection;
+
+            string connectionString = $"Data Source={path}/raft_metadata_{revision}.db";
+            SqliteConnection connection = new(connectionString);
+
+            connection.Open();
+
+            const string createTableQuery = """
+            CREATE TABLE IF NOT EXISTS metadata (
+                key STRING PRIMARY KEY
+                value STRING
+            );
+            """;
+
+            using SqliteCommand command1 = new(createTableQuery, connection);
+            command1.ExecuteNonQuery();
+
+            const string pragmasQuery = "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;";
+            using SqliteCommand command3 = new(pragmasQuery, connection);
+            command3.ExecuteNonQuery();
+
+            metaDataConnection = connection;
+
+            return connection;
         }
         finally
         {
@@ -586,5 +629,46 @@ public class SqliteWAL : IWAL
             return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
 
         return -1;
+    }
+    
+    public string? GetMetaData(string key)
+    {
+        SqliteConnection connection = TryOpenMetaDataDatabase();
+        
+        const string query = "SELECT value FROM metadata WHERE key = @key";
+        using SqliteCommand command = new(query, connection);
+
+        command.Parameters.AddWithValue("@key", key);
+
+        using SqliteDataReader reader = command.ExecuteReader();
+
+        while (reader.Read())
+            return reader.IsDBNull(0) ? null : reader.GetString(0);
+
+        return null;
+    }
+
+    public bool SetMetaData(string key, string value)
+    {
+        SqliteConnection connection = TryOpenMetaDataDatabase();
+        
+        const string insertOrReplaceSql = """
+          INSERT INTO metadata (key, value)
+          VALUES (@key, @value)
+          ON CONFLICT(key) DO UPDATE SET value=@value;
+          """;
+        
+        using SqliteCommand insertOrReplaceCommand = new(insertOrReplaceSql, connection);
+
+        insertOrReplaceCommand.Parameters.AddWithValue("@key", key);
+        
+        if (string.IsNullOrEmpty(value))
+            insertOrReplaceCommand.Parameters.AddWithValue("@log", "");
+        else
+            insertOrReplaceCommand.Parameters.AddWithValue("@log", value);
+
+        insertOrReplaceCommand.ExecuteNonQuery();
+
+        return true;
     }
 }

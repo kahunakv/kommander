@@ -36,7 +36,7 @@ public class TestFaultyThreeNode
             NodeId = "node1",
             Host = "localhost",
             Port = 8001,
-            MaxPartitions = 1
+            InitialPartitions = 1
         };
         
         RaftManager node = new(
@@ -61,7 +61,7 @@ public class TestFaultyThreeNode
             NodeId = "node2",
             Host = "localhost",
             Port = 8002,
-            MaxPartitions = 1
+            InitialPartitions = 1
         };
         
         RaftManager node = new(
@@ -86,7 +86,7 @@ public class TestFaultyThreeNode
             NodeId = "node3",
             Host = "localhost",
             Port = 8003,
-            MaxPartitions = 1
+            InitialPartitions = 1
         };
         
         RaftManager node = new(

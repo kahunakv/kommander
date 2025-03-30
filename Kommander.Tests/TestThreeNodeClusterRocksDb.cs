@@ -42,7 +42,7 @@ public class TestThreeNodeClusterRocksDb
             NodeId = "node1",
             Host = "localhost",
             Port = 8001,
-            MaxPartitions = 1
+            InitialPartitions = 1
         };
         
         RaftManager node = new(
@@ -67,7 +67,7 @@ public class TestThreeNodeClusterRocksDb
             NodeId = "node2",
             Host = "localhost",
             Port = 8002,
-            MaxPartitions = 1
+            InitialPartitions = 1
         };
         
         RaftManager node = new(
@@ -92,7 +92,7 @@ public class TestThreeNodeClusterRocksDb
             NodeId = "node3",
             Host = "localhost",
             Port = 8003,
-            MaxPartitions = 1
+            InitialPartitions = 1
         };
         
         RaftManager node = new(
@@ -276,7 +276,7 @@ public class TestThreeNodeClusterRocksDb
                 return Task.FromResult(true);
             };
             
-            follower.OnReplicationError += _ =>
+            follower.OnReplicationError += (_, log) =>
             {
                 Console.Error.WriteLine("ERROR");
             };

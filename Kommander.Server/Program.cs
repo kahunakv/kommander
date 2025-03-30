@@ -28,7 +28,7 @@ try
         NodeId = string.IsNullOrEmpty(opts.RaftNodeId) ? Environment.MachineName : opts.RaftNodeId,
         Host = opts.RaftHost,
         Port = opts.RaftPort,
-        MaxPartitions = opts.InitialClusterPartitions
+        InitialPartitions = opts.InitialClusterPartitions
     };
 
     List<RaftNode> nodes = [];
@@ -58,14 +58,14 @@ try
             services.GetRequiredService<ILogger<IRaft>>()
         );
 
-        node.OnReplicationError += log =>
+        node.OnReplicationError += (partitionId, log) =>
         {
-            Console.WriteLine("Replication error: {0} #{1}", log.LogType, log.Id);
+            Console.WriteLine("{0}: Replication error: {0} #{1}", partitionId, log.LogType, log.Id);
         };
         
-        node.OnReplicationRestored += log =>
+        node.OnReplicationRestored += (partitionId, log) =>
         {
-            Console.WriteLine("Replication restored: {0} {1} {2} {3}", log.Id, log.Type, log.LogType, Encoding.UTF8.GetString(log.LogData ?? []));
+            Console.WriteLine("{0}: Replication restored: {0} {1} {2} {3} {4}", partitionId, log.Id, log.Type, log.LogType, Encoding.UTF8.GetString(log.LogData ?? []));
             
             return Task.FromResult(true);
         };

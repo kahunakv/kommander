@@ -107,7 +107,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
         recovered = true;
 
-        manager.InvokeRestoreStarted();
+        manager.InvokeRestoreStarted(partition.PartitionId);
 
         bool found = false;
 
@@ -140,21 +140,21 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                 if (log.Type != RaftLogType.Committed)
                     continue;
                 
-                if (!await manager.InvokeReplicationRestored(log).ConfigureAwait(false))
-                    manager.InvokeReplicationError(log);
+                if (!await manager.InvokeReplicationRestored(partition.PartitionId, log).ConfigureAwait(false))
+                    manager.InvokeReplicationError(partition.PartitionId, log);
             }
             catch (Exception ex)
             {
                 manager.Logger.LogError("[{Endpoint}/{PartitionId}] {Message}\n{Stacktrace}", manager.LocalEndpoint, partition.PartitionId, ex.Message, ex.StackTrace);
                 
-                manager.InvokeReplicationError(log);
+                manager.InvokeReplicationError(partition.PartitionId, log);
             }
         }
 
         if (!found)
             commitIndex = await GetMaxLog().ConfigureAwait(false) + 1;
 
-        manager.InvokeRestoreFinished();
+        manager.InvokeRestoreFinished(partition.PartitionId);
 
         return commitIndex;
     }
@@ -445,7 +445,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
                     continue;
                 
                 if (!await manager.InvokeReplicationReceived(partition.PartitionId, log).ConfigureAwait(false))
-                    manager.InvokeReplicationError(log);
+                    manager.InvokeReplicationError(partition.PartitionId, log);
             }
         }
 
