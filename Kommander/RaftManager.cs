@@ -690,6 +690,11 @@ public sealed class RaftManager : IRaft
     /// <returns></returns>
     public int GetPartitionKey(string partitionKey)
     {
-        return (int)HashUtils.ConsistentHash(partitionKey, configuration.MaxPartitions);
+        int partitionId = HashUtils.ConsistentHash(partitionKey, configuration.MaxPartitions);
+        
+        if (partitionId < 0 || partitionId >= configuration.MaxPartitions)
+            throw new RaftException("Invalid partition: " + partitionId);
+
+        return partitionId;
     }
 }

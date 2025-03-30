@@ -55,33 +55,50 @@ public static class HashUtils
     }
     
     /// <summary>
-    /// Returns a bucket index (0 to numberOfBuckets-1) using rendezvous hashing.
-    /// This minimizes key remapping when the number of buckets changes.
+    /// Returns a bucket index (0 to numBuckets-1) using Jump Consistent Hash.
+    /// This version is optimized for many buckets and uses fixed seeds to ensure
+    /// consistency across runs.
     /// </summary>
     /// <param name="key">The key to hash.</param>
-    /// <param name="buckets">The total number of buckets.</param>
+    /// <param name="numBuckets">The total number of buckets.</param>
     /// <returns>The selected bucket index.</returns>
-    public static int ConsistentHash(string key, int buckets)
+    public static int ConsistentHash(string key, int numBuckets)
     {
-        if (buckets <= 0)
-            throw new ArgumentException("numberOfBuckets must be greater than zero", nameof(buckets));
-
-        int bestBucket = -1;
-        uint bestHash = 0;
+        if (numBuckets <= 0)
+            throw new ArgumentException("numBuckets must be greater than 0", nameof(numBuckets));
+        
+        // Convert key to bytes once.
         byte[] keyBytes = Encoding.UTF8.GetBytes(key);
 
-        // Evaluate every bucket to see which gives the highest hash score
-        for (int bucket = 0; bucket < buckets; bucket++)
-        {
-            uint hash = xxHash32.ComputeHash(keyBytes, bucket);
+        // Use two fixed seeds to produce two 32-bit hashes.
+        const uint seed1 = 0xAAAAAAAA;
+        const uint seed2 = 0x55555555;
 
-            if (bucket == 0 || hash > bestHash)
-            {
-                bestHash = hash;
-                bestBucket = bucket;
-            }
+        ulong hash1 = xxHash32.ComputeHash(keyBytes, seed1);
+        // Use the ArraySegment overload with a fixed seed for consistency.
+        ulong hash2 = xxHash32.ComputeHash(new ArraySegment<byte>(keyBytes), seed2);
+
+        // Combine the two 32-bit hashes to form a 64-bit hash.
+        ulong combinedHash = ((ulong)hash1 << 32) | hash2;
+
+        return JumpConsistentHash(combinedHash, numBuckets);
+    }
+
+    /// <summary>
+    /// Implements the Jump Consistent Hash algorithm.
+    /// </summary>
+    /// <param name="key">The 64-bit hash key.</param>
+    /// <param name="numBuckets">The total number of buckets.</param>
+    /// <returns>The selected bucket index.</returns>
+    private static int JumpConsistentHash(ulong key, int numBuckets)
+    {
+        long b = -1, j = 0;
+        while (j < numBuckets)
+        {
+            b = j;
+            key = key * 2862933555777941757UL + 1;
+            j = (long)((b + 1) * (2147483648.0 / ((double)((key >> 33) + 1))));
         }
-        
-        return bestBucket;
+        return (int)b;
     }
 }
