@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace Kommander.Time;
 
 /// <summary>
@@ -26,164 +28,150 @@ namespace Kommander.Time;
 /// </summary>
 /// <see cref="https://cse.buffalo.edu/~demirbas/publications/hlc.pdf"/>
 /// <see cref="https://raw.githubusercontent.com/camusdb/camusdb/refs/heads/main/CamusDB.Core/Util/Time/HybridLogicalClock.cs"/>
+/// <summary>
+
 public sealed class HybridLogicalClock : IDisposable
 {
-    private long l; // logical clock
-
-    private uint c;  // counter
-
-    private readonly SemaphoreSlim semaphore = new(1, 1);
-
-    /// <summary>
-    /// Call this method when a send or local event occurs
-    /// It doesn't updates the global physical clock if the semaphore is locked
-    /// It relaxes the HLC to allow repeated counters for the same physical time
-    /// It doesn't allow to drift the physical clock backwards
-    /// </summary>
-    /// <returns></returns>
-    public async ValueTask<HLCTimestamp> TrySendOrLocalEvent()
+    // Immutable state holder for the clock.
+    private sealed class ClockState
     {
-        if (semaphore.CurrentCount <= 0)
+        public readonly long L;  // Logical (or physical) clock value
+        public readonly uint C;  // Counter
+
+        public ClockState(long l, uint c)
         {
-            long cl = GetPhysicalTime();
-            if (cl < l)
-                return new(l, c + 1); // optimistically increment the counter
-            
-            return new(cl, 0);
-        }
-
-        try
-        {
-            await semaphore.WaitAsync().ConfigureAwait(false);
-
-            long lPrime = l;
-
-            l = Math.Max(l, GetPhysicalTime());
-
-            if (l == lPrime)
-                c++;
-            else
-                c = 0;
-            
-            if (l == 0)
-                throw new RaftException("Corrupted HLC clock");
-
-            return new(l, c);
-        }
-        finally
-        {
-            semaphore.Release();
+            L = l;
+            C = c;
         }
     }
-    
-    /// <summary>
-    /// Call this method when a send or local event occurs
-    /// </summary>
-    /// <returns></returns>
-    public async Task<HLCTimestamp> SendOrLocalEvent()
+
+    // The clock state is stored as an atomic reference.
+    private ClockState _state;
+
+    public HybridLogicalClock()
     {
-        try
+        long initialTime = GetPhysicalTime();
+        _state = new(initialTime, 0);
+    }
+
+    /// <summary>
+    /// Handles a send or local event by updating the clock state atomically.
+    /// </summary>
+    public HLCTimestamp SendOrLocalEvent()
+    {
+        while (true)
         {
-            await semaphore.WaitAsync().ConfigureAwait(false);
+            ClockState current = _state;
+            long physicalTime = GetPhysicalTime();
+            long newL = Math.Max(current.L, physicalTime);
+            uint newC = (newL == current.L) ? current.C + 1 : 0;
 
-            long lPrime = l;
-
-            l = Math.Max(l, GetPhysicalTime());
-
-            if (l == lPrime)
-                c++;
-            else
-                c = 0;
-            
-            if (l == 0)
+            if (newL == 0)
                 throw new RaftException("Corrupted HLC clock");
 
-            return new(l, c);
-        }
-        finally
-        {
-            semaphore.Release();
+            ClockState newState = new(newL, newC);
+            
+            // Try to atomically update the state.
+            if (Interlocked.CompareExchange(ref _state, newState, current) == current)
+                return new(newL, newC);
+            
+            // Otherwise, another thread has updated the state; try again.
         }
     }
 
     /// <summary>
-    /// Call this method when a receive event occurs `m` represents the message received,
-    /// which should contain its own timestamp
+    /// If it succeeds, it returns the new timestamp and updates the global clock. If it fails, it immediately
+    /// reads the latest state and computes a timestamp that is guaranteed to be higher than
+    /// the current state even though it does not update the state itself.
     /// </summary>
-    /// <param name="m"></param>
-    /// <returns></returns>
-    public async Task<HLCTimestamp> ReceiveEvent(HLClockMessage m)
+    public HLCTimestamp TrySendOrLocalEvent()
+    {
+        // Read the current state.
+        ClockState current = _state;
+        long physicalTime = GetPhysicalTime();
+        long candidateL = Math.Max(current.L, physicalTime);
+        uint candidateC = (candidateL == current.L) ? current.C + 1 : 0;
+        ClockState candidate = new(candidateL, candidateC);
+
+        // Attempt one CAS update.
+        if (Interlocked.CompareExchange(ref _state, candidate, current) == current)
+            return new(candidateL, candidateC); // Successfully updated state.
+        
+        // CAS failed; get the latest state and compute a timestamp that's higher.
+        ClockState updatedState = _state; // Read the updated state.
+        long newL = Math.Max(updatedState.L, physicalTime);
+        uint newC = (newL == updatedState.L) ? updatedState.C + 1 : 0;
+        return new(newL, newC);
+    }
+
+    /// <summary>
+    /// Handles a receive event given a message timestamp.
+    /// </summary>
+    public HLCTimestamp ReceiveEvent(HLClockMessage m)
     {
         if (m.L == 0)
             throw new RaftException("Invalid HLC timestamp argument");
-        
-        try
+
+        while (true)
         {
-            await semaphore.WaitAsync().ConfigureAwait(false);
+            ClockState current = _state;
+            long physicalTime = GetPhysicalTime();
+            long newL = Math.Max(current.L, Math.Max(m.L, physicalTime));
+            uint newC;
 
-            long lPrime = l;
-
-            l = Math.Max(l, Math.Max(m.L, GetPhysicalTime()));
-
-            if (l == lPrime && l == m.L)
-                c = Math.Max(c, m.C) + 1;
-            else if (l == lPrime)
-                c += 1;
-            else if (l == m.L)
-                c = m.C + 1;
+            if (newL == current.L && newL == m.L)
+                newC = Math.Max(current.C, m.C) + 1;
+            else if (newL == current.L)
+                newC = current.C + 1;
+            else if (newL == m.L)
+                newC = m.C + 1;
             else
-                c = 0;
-            
-            if (l == 0)
+                newC = 0;
+
+            if (newL == 0)
                 throw new RaftException("Corrupted HLC clock");
 
-            return new(l, c);
-        }
-        finally
-        {
-            semaphore.Release();
+            ClockState newState = new(newL, newC);
+            
+            if (Interlocked.CompareExchange(ref _state, newState, current) == current)
+                return new(newL, newC);
         }
     }
-    
+
     /// <summary>
-    /// Call this method when a receive event occurs `m` represents the message received,
-    /// which should contain its own timestamp
+    /// Handles a receive event given a timestamp.
     /// </summary>
-    /// <param name="m"></param>
-    /// <returns></returns>
-    public async Task<HLCTimestamp> ReceiveEvent(HLCTimestamp m)
+    public HLCTimestamp ReceiveEvent(HLCTimestamp m)
     {
         if (m.L == 0)
             throw new RaftException("Invalid HLC timestamp argument");
-        
-        try
+
+        while (true)
         {
-            await semaphore.WaitAsync().ConfigureAwait(false);
+            ClockState current = _state;
+            long physicalTime = GetPhysicalTime();
+            long newL = Math.Max(current.L, Math.Max(m.L, physicalTime));
+            uint newC;
 
-            long lPrime = l;
-
-            l = Math.Max(l, Math.Max(m.L, GetPhysicalTime()));
-
-            if (l == lPrime && l == m.L)
-                c = Math.Max(c, m.C) + 1;
-            else if (l == lPrime)
-                c += 1;
-            else if (l == m.L)
-                c = m.C + 1;
+            if (newL == current.L && newL == m.L)
+                newC = Math.Max(current.C, m.C) + 1;
+            else if (newL == current.L)
+                newC = current.C + 1;
+            else if (newL == m.L)
+                newC = m.C + 1;
             else
-                c = 0;
-            
-            if (l == 0)
+                newC = 0;
+
+            if (newL == 0)
                 throw new RaftException("Corrupted HLC clock");
 
-            return new(l, c);
-        }
-        finally
-        {
-            semaphore.Release();
+            ClockState newState = new(newL, newC);
+            if (Interlocked.CompareExchange(ref _state, newState, current) == current)
+                return new(newL, newC);
         }
     }
-
+    
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static long GetPhysicalTime()
     {
         return DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -191,6 +179,6 @@ public sealed class HybridLogicalClock : IDisposable
 
     public void Dispose()
     {
-        semaphore.Dispose();
+        // No disposable resources need to be released here.
     }
 }

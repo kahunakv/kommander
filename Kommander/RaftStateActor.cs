@@ -252,7 +252,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
 
         restored = true;
-        lastHeartbeat = await manager.HybridLogicalClock.TrySendOrLocalEvent().ConfigureAwait(false);
+        lastHeartbeat = manager.HybridLogicalClock.TrySendOrLocalEvent();
 
         RaftWALResponse currentCommitIndexResponse = await walActor.Ask(new(RaftWALActionType.Recover)).ConfigureAwait(false);
         
@@ -270,7 +270,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// </summary>
     private async Task CheckPartitionLeadership()
     {
-        HLCTimestamp currentTime = await manager.HybridLogicalClock.TrySendOrLocalEvent().ConfigureAwait(false);
+        HLCTimestamp currentTime = manager.HybridLogicalClock.TrySendOrLocalEvent();
 
         switch (nodeState)
         {
@@ -278,7 +278,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             case RaftNodeState.Leader:
             {
                 if (currentTime != HLCTimestamp.Zero && ((currentTime - lastHeartbeat) >= manager.Configuration.HeartbeatInterval))
-                    await SendHearthbeat().ConfigureAwait(false);
+                    SendHearthbeat();
             
                 return;
             }
@@ -414,7 +414,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <summary>
     /// Sends a heartbeat message to follower nodes to indicate that the leader node in the partition is still alive.
     /// </summary>
-    private async Task SendHearthbeat()
+    private void SendHearthbeat()
     {
         List<RaftNode> nodes = manager.Nodes;
         
@@ -424,7 +424,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
 
-        lastHeartbeat = await manager.HybridLogicalClock.TrySendOrLocalEvent().ConfigureAwait(false);
+        lastHeartbeat = manager.HybridLogicalClock.TrySendOrLocalEvent();
 
         if (nodeState != RaftNodeState.Leader && nodeState != RaftNodeState.Candidate)
             return;
@@ -514,7 +514,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
 
-        string? expectedLeader = expectedLeaders.GetValueOrDefault(voteTerm, "");
+        string expectedLeader = expectedLeaders.GetValueOrDefault(voteTerm, "");
         
         if (!string.IsNullOrEmpty(expectedLeader))
         {
@@ -522,7 +522,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
         
-        RaftWALResponse localMaxId = await walActor.Ask(new(RaftWALActionType.GetMaxLog)).ConfigureAwait(false);;
+        RaftWALResponse localMaxId = await walActor.Ask(new(RaftWALActionType.GetMaxLog)).ConfigureAwait(false);
         if (localMaxId.Index > remoteMaxLogId)
         {
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received request to vote on outdated log from {Endpoint} RemoteMaxId={RemoteId} LocalMaxId={MaxId}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, nodeState, node.Endpoint, remoteMaxLogId, localMaxId.Index);
@@ -533,7 +533,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
         
-        lastHeartbeat = await manager.HybridLogicalClock.ReceiveEvent(timestamp).ConfigureAwait(false);
+        lastHeartbeat = manager.HybridLogicalClock.ReceiveEvent(timestamp);
         lastVotation = lastHeartbeat;
         
         expectedLeaders.Add(voteTerm, node.Endpoint);
@@ -616,7 +616,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         nodeState = RaftNodeState.Leader;
         partition.Leader = manager.LocalEndpoint;
 
-        lastHeartbeat = await manager.HybridLogicalClock.TrySendOrLocalEvent().ConfigureAwait(false);
+        lastHeartbeat = manager.HybridLogicalClock.TrySendOrLocalEvent();
 
         logger.LogInformation(
             "[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} and proclamed leader in {Elapsed}ms Term={Term} Votes={Votes} Quorum={Quorum}/{Total} RemoteCommitId={CommitId} Local={LocalCommitId}", 
@@ -635,7 +635,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         await manager.InvokeLeaderChanged(partition.PartitionId, manager.LocalEndpoint);
 
-        await SendHearthbeat().ConfigureAwait(false);
+        SendHearthbeat();
     }
 
     /// <summary>
@@ -696,7 +696,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             }
         }
         
-        lastHeartbeat = await manager.HybridLogicalClock.ReceiveEvent(timestamp).ConfigureAwait(false);
+        lastHeartbeat = manager.HybridLogicalClock.ReceiveEvent(timestamp);
         
         manager.UpdateLastNodeActivity(expectedLeader, lastHeartbeat);
 
@@ -768,7 +768,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return (RaftOperationStatus.Errored, HLCTimestamp.Zero);
         }
         
-        HLCTimestamp currentTime = await manager.HybridLogicalClock.SendOrLocalEvent().ConfigureAwait(false);
+        HLCTimestamp currentTime = manager.HybridLogicalClock.SendOrLocalEvent();
 
         foreach (RaftLog log in logs)
         {
@@ -786,6 +786,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         }
 
         RaftProposalQuorum proposalQuorum = new(logs, autoCommit);
+        
+        // Mark itself as completed
+        proposalQuorum.MarkNodeCompleted(manager.LocalEndpoint);
 
         foreach (RaftNode node in nodes)
         {
@@ -829,8 +832,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return (RaftOperationStatus.Errored, HLCTimestamp.Zero);
         }
         
-        // We need a proper HLC sequence to determine the order of the logs
-        HLCTimestamp currentTime = await manager.HybridLogicalClock.SendOrLocalEvent().ConfigureAwait(false);
+        // We need a proper HLC sequence to determine a consistent order of the logs
+        HLCTimestamp currentTime = manager.HybridLogicalClock.SendOrLocalEvent();
         
         List<RaftLog> checkpointLogs = [new()
         {
@@ -985,7 +988,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         if (votes.TryGetValue(term, out HashSet<string>? votesPerEndpoint))
             votesPerEndpoint.Add(endpoint);
         else
-            votes[term] = [endpoint];;
+            votes[term] = [endpoint];
 
         return votes[term].Count;
     }
@@ -1001,7 +1004,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         AppendLogsRequest request;
 
         if (logs is null || logs.Count == 0)
-            request = new(partition.PartitionId, currentTerm, timestamp, manager.LocalEndpoint, null);
+            request = new(partition.PartitionId, currentTerm, timestamp, manager.LocalEndpoint);
         else
         {
             /*long lastCommitIndex = lastCommitIndexes.GetValueOrDefault(node.Endpoint, 0);
