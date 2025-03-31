@@ -33,9 +33,26 @@ public sealed class RaftLeaderSupervisor : IActor<RaftLeaderSupervisorRequest>
             TimeSpan.FromMilliseconds(2500),
             manager.Configuration.CheckLeaderInterval
         );
+        
+        context.ActorSystem.StartPeriodicTimer(
+            context.Self,
+            "update-nodes",
+            new(RaftLeaderSupervisorRequestType.UpdateNodes),
+            TimeSpan.FromMilliseconds(2500),
+            manager.Configuration.UpdateNodesInterval
+        );
     }
 
-    public Task Receive(RaftLeaderSupervisorRequest message)
+    public async Task Receive(RaftLeaderSupervisorRequest message)
+    {
+        if (message.Type == RaftLeaderSupervisorRequestType.CheckLeader)
+            await CheckLeader();
+        
+        if (message.Type == RaftLeaderSupervisorRequestType.UpdateNodes)
+            await UpdateNodes();
+    }
+
+    private Task CheckLeader()
     {
         manager.SystemPartition?.CheckLeader();
         
@@ -43,5 +60,11 @@ public sealed class RaftLeaderSupervisor : IActor<RaftLeaderSupervisorRequest>
             partition.CheckLeader();
         
         return Task.CompletedTask;
+    }
+    
+    private async Task UpdateNodes()
+    {
+        if (manager.Joined)
+            await manager.UpdateNodes();
     }
 }

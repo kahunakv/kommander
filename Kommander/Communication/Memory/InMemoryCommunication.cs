@@ -32,10 +32,15 @@ public class InMemoryCommunication : ICommunication
 
     public Task<HandshakeResponse> Handshake(RaftManager manager, RaftNode node, HandshakeRequest request)
     {
-        if (manager.ClusterHandler.IsNode(node.Endpoint) && nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
-            targetNode.Handshake(request);
+        if (manager.ClusterHandler.IsNode(node.Endpoint))
+        {
+            if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
+                targetNode.Handshake(request);
+            else
+                Console.WriteLine("{0} Handshake Unknown node: {1} [1]", manager.LocalEndpoint, node.Endpoint);
+        }
         else
-            Console.WriteLine("Handshake Unknown node: " + node.Endpoint);
+            Console.WriteLine("{0} Handshake Unknown node: {1} [2]", manager.LocalEndpoint, node.Endpoint);
         
         return handshakeResponse;
     }

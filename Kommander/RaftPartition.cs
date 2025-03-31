@@ -29,7 +29,11 @@ public sealed class RaftPartition : IDisposable
 
     internal string Leader { get; set; } = "";
 
-    internal int PartitionId { get; }
+    public int PartitionId { get; }
+    
+    public int StartRange { get; }
+    
+    public int EndRange { get; }
 
     /// <summary>
     /// Constructor
@@ -45,6 +49,8 @@ public sealed class RaftPartition : IDisposable
         IWAL walAdapter, 
         ICommunication communication, 
         int partitionId,
+        int startRange,
+        int endRange,
         ILogger<IRaft> logger
     )
     {
@@ -53,6 +59,8 @@ public sealed class RaftPartition : IDisposable
         this.communication = communication;
         
         PartitionId = partitionId;
+        StartRange = startRange;
+        EndRange = endRange;
 
         raftActor = actorSystem.SpawnStruct<RaftStateActor, RaftRequest, RaftResponse>(
             "raft-partition-" + partitionId, 

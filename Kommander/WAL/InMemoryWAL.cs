@@ -137,7 +137,7 @@ public class InMemoryWAL : IWAL
             foreach (RaftLog log in logs)
             {
                 if (log.Type != RaftLogType.Proposed && log.Type != RaftLogType.ProposedCheckpoint)
-                    throw new RaftException("Log must be proposed or proposed checkpoint");
+                    throw new RaftException("Log must be proposed or proposed checkpoint: " + log.Type);
 
                 if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
                     partitionLogs.Add(log.Id, log);

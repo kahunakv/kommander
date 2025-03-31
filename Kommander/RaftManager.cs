@@ -74,6 +74,11 @@ public sealed class RaftManager : IRaft
     internal Dictionary<int, RaftPartition> Partitions => partitions;
     
     /// <summary>
+    /// Whether the node is fully initialized or not
+    /// </summary>
+    public bool IsInitialized { get; private set; } = false;
+    
+    /// <summary>
     /// Read I/O thread pool
     /// </summary>
     public ThreadPool ReadThreadPool => readThreadPool;
@@ -268,8 +273,20 @@ public sealed class RaftManager : IRaft
             writeThreadPool.Start();
             
             // Add system partition
-            systemPartition = new(actorSystem, this, walAdapter, communication, RaftSystemConfig.SystemPartition, Logger);
+            systemPartition = new(
+                actorSystem, 
+                this, 
+                walAdapter, 
+                communication, 
+                RaftSystemConfig.SystemPartition,
+                0,
+                0,
+                Logger
+            );
         }
+
+        while (!IsInitialized)
+            await Task.Delay(1000).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -279,7 +296,21 @@ public sealed class RaftManager : IRaft
     internal void StartUserPartitions(List<RaftPartitionRange> ranges)
     {
         foreach (RaftPartitionRange range in ranges)
-            partitions.Add(range.PartitionId, new(actorSystem, this, walAdapter, communication, range.PartitionId, Logger));
+            partitions.Add(
+                range.PartitionId, 
+                new(
+                    actorSystem, 
+                    this, 
+                    walAdapter, 
+                    communication, 
+                    range.PartitionId, 
+                    range.StartRange, 
+                    range.EndRange, 
+                    Logger
+                )
+            );
+
+        IsInitialized = true;
     }
 
     /// <summary>
@@ -371,6 +402,7 @@ public sealed class RaftManager : IRaft
     public void Handshake(HandshakeRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
+        
         partition.Handshake(request);
     }
 
@@ -381,6 +413,7 @@ public sealed class RaftManager : IRaft
     public void RequestVote(RequestVotesRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
+        
         partition.RequestVote(request);
     }
 
@@ -391,6 +424,7 @@ public sealed class RaftManager : IRaft
     public void Vote(VoteRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
+        
         partition.Vote(request);
     }
 
@@ -403,6 +437,7 @@ public sealed class RaftManager : IRaft
     public void AppendLogs(AppendLogsRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
+        
         partition.AppendLogs(request);
     }
     
@@ -414,6 +449,7 @@ public sealed class RaftManager : IRaft
     public void CompleteAppendLogs(CompleteAppendLogsRequest request)
     {
         RaftPartition partition = GetPartition(request.Partition);
+        
         partition.CompleteAppendLogs(request);
     }
     
@@ -461,6 +497,9 @@ public sealed class RaftManager : IRaft
     /// <returns></returns>
     public async Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, CancellationToken cancellationToken = default)
     {
+        if (partitionId == RaftSystemConfig.SystemPartition)
+            throw new RaftException("System partition cannot be used from userland");
+        
         RaftPartition partition = GetPartition(partitionId);
 
         bool success;
@@ -493,6 +532,9 @@ public sealed class RaftManager : IRaft
     /// <returns></returns>
     public async Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true, CancellationToken cancellationToken = default)
     {
+        if (partitionId == RaftSystemConfig.SystemPartition)
+            throw new RaftException("System partition cannot be used from userland");
+        
         RaftPartition partition = GetPartition(partitionId);
         
         bool success;
@@ -743,7 +785,7 @@ public sealed class RaftManager : IRaft
     /// <returns></returns>
     public async ValueTask<bool> AmILeaderQuick(int partitionId)
     {
-        if (systemPartition is null || partitions.Count == 0)
+        if (!IsInitialized)
             return false;
 
         RaftPartition partition = GetPartition(partitionId);
@@ -775,10 +817,7 @@ public sealed class RaftManager : IRaft
     /// <exception cref="RaftException"></exception>
     public async ValueTask<bool> AmILeader(int partitionId, CancellationToken cancellationToken)
     {
-        if (systemPartition is null)
-            return false;
-
-        if (partitions.Count == 0)
+        if (!IsInitialized)
             return false;
         
         RaftPartition partition = GetPartition(partitionId);
@@ -820,6 +859,7 @@ public sealed class RaftManager : IRaft
     public async ValueTask<string> WaitForLeader(int partitionId, CancellationToken cancellationToken)
     {
         RaftPartition partition = GetPartition(partitionId);
+        
         ValueStopwatch stopwatch = ValueStopwatch.StartNew();
 
         while (stopwatch.GetElapsedMilliseconds() < 10000)
@@ -857,11 +897,14 @@ public sealed class RaftManager : IRaft
     /// <returns></returns>
     public int GetPartitionKey(string partitionKey)
     {
-        int partitionId = HashUtils.ConsistentHash(partitionKey, configuration.InitialPartitions);
-        
-        if (partitionId < 0 || partitionId >= configuration.InitialPartitions)
-            throw new RaftException("Invalid partition: " + partitionId);
+        int rangeId = (int)HashUtils.SimpleHash(partitionKey);
 
-        return partitionId;
+        foreach (KeyValuePair<int, RaftPartition> partition in partitions)
+        {
+            if (partition.Value.StartRange <= rangeId && partition.Value.EndRange >= rangeId)
+                return partition.Key;
+        }
+        
+        throw new RaftException("Couldnt find partition range for: " + partitionKey);
     }
 }

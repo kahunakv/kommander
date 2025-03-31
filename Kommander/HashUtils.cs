@@ -9,6 +9,11 @@ namespace Kommander;
 /// </summary>
 public static class HashUtils
 {
+    public static uint SimpleHash(string key)
+    {
+        return xxHash32.ComputeHash(key);
+    }
+    
     public static long StaticHash(string key, int buckets)
     {
         if (buckets <= 0)

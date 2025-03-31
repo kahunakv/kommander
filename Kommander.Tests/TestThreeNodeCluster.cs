@@ -130,21 +130,17 @@ public class TestThreeNodeCluster
         IRaft node1 = GetNode1(communication, logger);
         IRaft node2 = GetNode2(communication, logger);
         IRaft node3 = GetNode3(communication, logger);
+        
+        communication.SetNodes(new()
+        {
+            { "localhost:8001", node1 },
+            { "localhost:8002", node2 },
+            { "localhost:8003", node3 }
+        });
 
         await node1.JoinCluster();
         await node2.JoinCluster();
         await node3.JoinCluster();
-
-        await node1.UpdateNodes();
-        await node2.UpdateNodes();
-        await node3.UpdateNodes();
-        
-        communication.SetNodes(new()
-        {
-            { "localhost:8001", node1 }, 
-            { "localhost:8002", node2 },
-            { "localhost:8003", node3 }
-        });
 
         while (true)
         {
@@ -174,12 +170,6 @@ public class TestThreeNodeCluster
         IRaft node1 = GetNode1(communication, logger);
         IRaft node2 = GetNode2(communication, logger);
         IRaft node3 = GetNode3(communication, logger);
-
-        await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster(), node3.JoinCluster()]);
-
-        await node1.UpdateNodes();
-        await node2.UpdateNodes();
-        await node3.UpdateNodes();
         
         communication.SetNodes(new()
         {
@@ -187,6 +177,8 @@ public class TestThreeNodeCluster
             { "localhost:8002", node2 },
             { "localhost:8003", node3 }
         });
+
+        await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster(), node3.JoinCluster()]);
 
         while (true)
         {
@@ -205,14 +197,14 @@ public class TestThreeNodeCluster
 
         await Task.Delay(500);
 
-        long maxId = node1.WalAdapter.GetMaxLog(0);
-        Assert.Equal(1, maxId);
+        long maxId = node1.WalAdapter.GetMaxLog(1);
+        Assert.Equal(0, maxId);
         
-        maxId = node2.WalAdapter.GetMaxLog(0);
-        Assert.Equal(1, maxId);
+        maxId = node2.WalAdapter.GetMaxLog(1);
+        Assert.Equal(0, maxId);
         
-        maxId = node3.WalAdapter.GetMaxLog(0);
-        Assert.Equal(1, maxId);
+        maxId = node3.WalAdapter.GetMaxLog(1);
+        Assert.Equal(0, maxId);
         
         await node1.LeaveCluster(true);
         await node2.LeaveCluster(true);
@@ -227,12 +219,6 @@ public class TestThreeNodeCluster
         IRaft node1 = GetNode1(communication, logger);
         IRaft node2 = GetNode2(communication, logger);
         IRaft node3 = GetNode3(communication, logger);
-
-        await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster(), node3.JoinCluster()]);
-
-        await node1.UpdateNodes();
-        await node2.UpdateNodes();
-        await node3.UpdateNodes();
         
         communication.SetNodes(new()
         {
@@ -241,9 +227,11 @@ public class TestThreeNodeCluster
             { "localhost:8003", node3 }
         });
 
+        await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster(), node3.JoinCluster()]);
+
         while (true)
         {
-            if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
+            if (await node1.AmILeader(1, CancellationToken.None) || await node2.AmILeader(1, CancellationToken.None) || await node3.AmILeader(1, CancellationToken.None))
                 break;
             
             await Task.Delay(100);
@@ -295,13 +283,13 @@ public class TestThreeNodeCluster
         Assert.Equal(RaftOperationStatus.Success, response.Status);
         Assert.Equal(2, response.LogIndex);
         
-        maxId = node1.WalAdapter.GetMaxLog(0);
+        maxId = node1.WalAdapter.GetMaxLog(1);
         Assert.Equal(2, maxId);
         
-        maxId = node2.WalAdapter.GetMaxLog(0);
+        maxId = node2.WalAdapter.GetMaxLog(1);
         Assert.Equal(2, maxId);
         
-        maxId = node3.WalAdapter.GetMaxLog(0);
+        maxId = node3.WalAdapter.GetMaxLog(1);
         Assert.Equal(2, maxId);
         
         Assert.Equal(4, totalFollowersReceived);
@@ -336,7 +324,7 @@ public class TestThreeNodeCluster
 
         while (true)
         {
-            if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
+            if (await node1.AmILeader(1, CancellationToken.None) || await node2.AmILeader(1, CancellationToken.None) || await node3.AmILeader(1, CancellationToken.None))
                 break;
             
             await Task.Delay(100);
@@ -414,7 +402,7 @@ public class TestThreeNodeCluster
 
         while (true)
         {
-            if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
+            if (await node1.AmILeader(1, CancellationToken.None) || await node2.AmILeader(1, CancellationToken.None) || await node3.AmILeader(1, CancellationToken.None))
                 break;
             
             await Task.Delay(100);
@@ -501,7 +489,7 @@ public class TestThreeNodeCluster
 
         while (true)
         {
-            if (await node1.AmILeader(0, CancellationToken.None) || await node2.AmILeader(0, CancellationToken.None) || await node3.AmILeader(0, CancellationToken.None))
+            if (await node1.AmILeader(1, CancellationToken.None) || await node2.AmILeader(1, CancellationToken.None) || await node3.AmILeader(1, CancellationToken.None))
                 break;
             
             await Task.Delay(100);
@@ -550,7 +538,7 @@ public class TestThreeNodeCluster
         Assert.Equal(0, totalFollowersReceived);
         Assert.Equal(0, totalLeaderReceived);
 
-        (bool success, RaftOperationStatus status, long commitLogId) = await leader.RollbackLogs(0, response.TicketId);
+        (bool success, RaftOperationStatus status, long _) = await leader.RollbackLogs(0, response.TicketId);
         Assert.True(success);
         Assert.Equal(RaftOperationStatus.Success, status);
         

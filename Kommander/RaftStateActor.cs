@@ -995,8 +995,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// </summary>
     /// <param name="node"></param>
     /// <param name="timestamp"></param>
-    /// <param name="isHearthbeat"></param>
-    /// <returns></returns>
+    /// <param name="logs"></param>
     private void AppendLogToNode(RaftNode node, HLCTimestamp timestamp, List<RaftLog>? logs)
     {
         AppendLogsRequest request;

@@ -55,12 +55,17 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
 
                 if (systemMessage.Key == "partitions")
                 {
-                    List<RaftPartitionRange>? partList = JsonSerializer.Deserialize<List<RaftPartitionRange>>(systemMessage.Value);
-                    
-                    foreach (RaftPartitionRange range in partList!)
+                    List<RaftPartitionRange>? initialRanges = JsonSerializer.Deserialize<List<RaftPartitionRange>>(systemMessage.Value);
+                    if (initialRanges is null)
                     {
-                        Console.WriteLine("{0} {1} {2}", range.PartitionId, range.StartRange, range.EndRange);
+                        logger.LogError("Failed to parse partition ranges: {Partitions}", systemMessage.Value);
+                        return;
                     }
+                    
+                    foreach (RaftPartitionRange range in initialRanges)
+                        Console.WriteLine("{0} {1} {2}", range.PartitionId, range.StartRange, range.EndRange);
+
+                    manager.StartUserPartitions(initialRanges);
                 }
             }
             break;
@@ -103,13 +108,16 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
 
         if (result.Status != RaftOperationStatus.Success)
         {
-            Console.WriteLine("Failed to replicate initial partitions {0} {1}", result.Status, result.LogIndex);
+            logger.LogDebug("Failed to replicate initial partitions {Status} {LogIndex}", result.Status, result.LogIndex);
             return;
         }
         
-        Console.WriteLine("Succesfully replicated initial partitions {0} {1}", result.Status, result.LogIndex);
+        logger.LogDebug("Succesfully replicated initial partitions {Status} {LogIndex}", result.Status, result.LogIndex);
         
         manager.StartUserPartitions(initialRanges);
+        
+        foreach (RaftPartitionRange range in initialRanges)
+            Console.WriteLine("{0} {1} {2}", range.PartitionId, range.StartRange, range.EndRange);
     }
 
     private static List<RaftPartitionRange> DivideIntoRanges(int numberOfRanges)

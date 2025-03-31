@@ -60,6 +60,11 @@ public class RaftConfiguration
     /// Interval to perform leader election actions
     /// </summary>
     public TimeSpan CheckLeaderInterval { get; set; } = TimeSpan.FromMilliseconds(250);
+    
+    /// <summary>
+    /// Interval to report liveness to the node registry
+    /// </summary>
+    public TimeSpan UpdateNodesInterval { get; set; } = TimeSpan.FromMilliseconds(5000);
 
     /// <summary>
     /// If followers hadn't received a heartbeat from the leader in this time, they will start an election
