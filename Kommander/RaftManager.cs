@@ -897,7 +897,7 @@ public sealed class RaftManager : IRaft
     /// <returns></returns>
     public int GetPartitionKey(string partitionKey)
     {
-        int rangeId = (int)HashUtils.SimpleHash(partitionKey);
+        int rangeId = Math.Abs((int)HashUtils.SimpleHash(partitionKey));
 
         foreach (KeyValuePair<int, RaftPartition> partition in partitions)
         {

@@ -63,7 +63,7 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
                     }
                     
                     foreach (RaftPartitionRange range in initialRanges)
-                        Console.WriteLine("{0} {1} {2}", range.PartitionId, range.StartRange, range.EndRange);
+                        Console.Error.WriteLine("{0} {1} {2}", range.PartitionId, range.StartRange, range.EndRange);
 
                     manager.StartUserPartitions(initialRanges);
                 }
@@ -117,7 +117,7 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
         manager.StartUserPartitions(initialRanges);
         
         foreach (RaftPartitionRange range in initialRanges)
-            Console.WriteLine("{0} {1} {2}", range.PartitionId, range.StartRange, range.EndRange);
+            Console.Error.WriteLine("{0} {1} {2}", range.PartitionId, range.StartRange, range.EndRange);
     }
 
     private static List<RaftPartitionRange> DivideIntoRanges(int numberOfRanges)
@@ -126,32 +126,27 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
         
         List<RaftPartitionRange> ranges = [];
         
-        // total values is int.MaxValue (2147483647)
-        const int total = int.MaxValue;
+        // Total number of values from 0 to int.MaxValue inclusive is int.MaxValue + 1
+        const long totalCount = (long)int.MaxValue + 1;
+        long baseRangeSize = totalCount / numberOfRanges;
+        long remainder = totalCount % numberOfRanges;
         
-        // Use long for intermediate arithmetic to avoid overflow
-        long baseRangeSize = (long)total / numberOfRanges;
-        long remainder = (long)total % numberOfRanges;
-        
-        // previousEnd will mark the boundary of the previous range.
-        long previousEnd = 0;
+        long currentStart = 0;
         
         for (int i = 0; i < numberOfRanges; i++)
         {
-            // Distribute the remainder evenly among the first 'remainder' ranges.
+            // Distribute any extra numbers among the first 'remainder' ranges.
             long currentRangeSize = baseRangeSize + (i < remainder ? 1 : 0);
             
-            // Define the range as (previousEnd, previousEnd + currentRangeSize)
-            // meaning that valid numbers in the range are > previousEnd and < previousEnd + currentRangeSize.
-            long start = previousEnd;
-            long end = start + currentRangeSize;
+            // Calculate the inclusive end value for this range.
+            long currentEnd = currentStart + currentRangeSize - 1;
             
-            // Casting back to int is safe because end will never exceed int.MaxValue.
-            ranges.Add(new() { PartitionId = monotonicId++, StartRange = (int)start, EndRange = (int)end });
+            // Casting back to int is safe because currentEnd will not exceed int.MaxValue.
+            ranges.Add(new() { PartitionId = monotonicId++, StartRange = (int)currentStart, EndRange = (int)currentEnd });
             
-            previousEnd = end;
+            // Next range starts immediately after the current range's end.
+            currentStart = currentEnd + 1;
         }
-        
         return ranges;
     }
     

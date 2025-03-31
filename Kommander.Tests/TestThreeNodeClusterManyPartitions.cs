@@ -87,7 +87,12 @@ public sealed class TestThreeNodeClusterManyPartitions
 
         for (int i = 0; i < 100; i++)
         {
-            RaftReplicationResult response = await leader.ReplicateLogs(1, "Greeting", data, cancellationToken: TestContext.Current.CancellationToken);
+            RaftReplicationResult response = await leader.ReplicateLogs(
+                1, 
+                "Greeting", 
+                data, 
+                cancellationToken: TestContext.Current.CancellationToken
+            );
             
             //Assert.True(response.Success);
             Assert.Equal(RaftOperationStatus.Success, response.Status);
