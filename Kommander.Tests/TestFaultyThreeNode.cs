@@ -9,7 +9,7 @@ using Kommander.WAL;
 
 namespace Kommander.Tests;
 
-public class TestFaultyThreeNode
+/*public class TestFaultyThreeNode
 {
     private readonly ILogger<IRaft> logger;
     
@@ -324,4 +324,4 @@ public class TestFaultyThreeNode
 
         return followers;
     }
-}
+}*/

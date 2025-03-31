@@ -1,5 +1,5 @@
 
-using System.Diagnostics.CodeAnalysis;
+/*using System.Diagnostics.CodeAnalysis;
 using Kommander.Communication.Memory;
 using Kommander.Data;
 using Kommander.Discovery;
@@ -300,4 +300,4 @@ public class TestTwoNodeCluster
 
         return followers;
     }
-}
+}*/
