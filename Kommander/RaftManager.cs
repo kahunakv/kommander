@@ -905,6 +905,6 @@ public sealed class RaftManager : IRaft
                 return partition.Key;
         }
         
-        throw new RaftException("Couldnt find partition range for: " + partitionKey);
+        throw new RaftException("Couldn't find partition range for: " + partitionKey + " " + rangeId);
     }
 }

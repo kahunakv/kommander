@@ -48,19 +48,21 @@ try
 
     builder.Services.AddSingleton<IRaft>(services =>
     {
+        ILogger<IRaft> logger = services.GetRequiredService<ILogger<IRaft>>();
+        
         RaftManager node = new(
             services.GetRequiredService<ActorSystem>(),
             configuration,
             new StaticDiscovery(nodes),
-            new RocksDbWAL(path: opts.SqliteWalPath, revision: opts.SqliteWalRevision),
+            new RocksDbWAL(path: opts.SqliteWalPath, revision: opts.SqliteWalRevision, logger),
             new RestCommunication(),
             new HybridLogicalClock(),
-            services.GetRequiredService<ILogger<IRaft>>()
+            logger
         );
 
         node.OnReplicationError += (partitionId, log) =>
         {
-            Console.WriteLine("{0}: Replication error: {0} #{1}", partitionId, log.LogType, log.Id);
+            Console.Error.WriteLine("{0}: Replication error: {1} #{2}", partitionId, log.LogType, log.Id);
         };
         
         node.OnReplicationRestored += (partitionId, log) =>

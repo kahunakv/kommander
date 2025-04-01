@@ -123,7 +123,13 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
                 logger.LogDebug("Failed to replicate initial partitions {Status} {LogIndex}", result.Status, result.LogIndex);
                 
                 await Task.Delay(5000);
-                continue;
+                
+                if (i <= 8)
+                    continue;
+                
+                logger.LogError("Cannot continue without initial partitions {Status} {LogIndex}", result.Status, result.LogIndex);
+                Environment.Exit(1);
+                return;
             }
 
             logger.LogInformation("Succesfully replicated initial partitions {Status} {LogIndex}", result.Status, result.LogIndex);

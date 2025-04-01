@@ -25,7 +25,11 @@ public interface IWAL
     
     public long GetCurrentTerm(int partitionId);
 
+    public long GetLastCheckpoint(int partitionId);
+
     public string? GetMetaData(string key);
     
     public bool SetMetaData(string key, string value);
+    
+    public RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, uint compactNumberEntries);
 }

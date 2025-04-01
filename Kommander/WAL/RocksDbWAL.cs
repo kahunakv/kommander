@@ -10,6 +10,8 @@ namespace Kommander.WAL;
 public class RocksDbWAL : IWAL
 {
     private static readonly WriteOptions DefaultWriteOptions = new WriteOptions().SetSync(true);
+
+    private const string FormatVersion = "1.0.0";
     
     private const int MaxShards = 16;
     
@@ -23,10 +25,13 @@ public class RocksDbWAL : IWAL
     
     private readonly Dictionary<int, ColumnFamilyHandle> families = new();
     
-    public RocksDbWAL(string path, string revision)
+    private readonly ILogger<IRaft> logger;
+    
+    public RocksDbWAL(string path, string revision, ILogger<IRaft> logger)
     {
         this.path = path;
         this.revision = revision;
+        this.logger = logger;
 
         DbOptions dbOptions = new DbOptions()
             .SetCreateIfMissing(true)
@@ -41,8 +46,15 @@ public class RocksDbWAL : IWAL
         
         for (int i = 0; i < MaxShards; i++)
             columnFamilies.Add("shard" + i, new());
+
+        string completePath = $"{path}/{revision}";
         
-        db = RocksDb.Open(dbOptions, $"{path}/{revision}", columnFamilies);
+        bool firstTime = Directory.Exists(completePath);
+        
+        db = RocksDb.Open(dbOptions, completePath, columnFamilies);
+        
+        if (firstTime)
+            SetMetaData("version", FormatVersion);
     }
     
     private ColumnFamilyHandle GetColumnFamily(int partitionId)
@@ -63,7 +75,7 @@ public class RocksDbWAL : IWAL
         
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
         
-        long lastCheckpoint = GetLastCheckpoint(partitionId, columnFamilyHandle);
+        long lastCheckpoint = GetLastCheckpointInternal(partitionId, columnFamilyHandle);
 
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         
@@ -192,7 +204,7 @@ public class RocksDbWAL : IWAL
         } 
         catch (Exception ex)
         {
-            Console.WriteLine($"Error during proposal: {ex.Message}\n{ex.StackTrace}");
+            logger.LogError("Error during proposal: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
                     
             return RaftOperationStatus.Errored;
         }
@@ -228,7 +240,7 @@ public class RocksDbWAL : IWAL
         } 
         catch (Exception ex)
         {
-            Console.WriteLine($"Error during commit: {ex.Message}\n{ex.StackTrace}");
+            logger.LogError("Error during commit: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
                     
             return RaftOperationStatus.Errored;
         }
@@ -264,7 +276,7 @@ public class RocksDbWAL : IWAL
         } 
         catch (Exception ex)
         {
-            Console.WriteLine($"Error during rollback: {ex.Message}");
+            logger.LogError("Error during rollback: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
                 
             return RaftOperationStatus.Errored;
         }
@@ -307,7 +319,7 @@ public class RocksDbWAL : IWAL
         } 
         catch (Exception ex)
         {
-            Console.WriteLine($"Error during proposal: {ex.Message}");
+            logger.LogError("Error during proposal: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
                     
             return RaftOperationStatus.Errored;
         }
@@ -353,7 +365,7 @@ public class RocksDbWAL : IWAL
         } 
         catch (Exception ex)
         {
-            Console.WriteLine($"Error during commit: {ex.Message}");
+            logger.LogError("Error during commit: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
             
             return RaftOperationStatus.Errored;
         }
@@ -396,7 +408,7 @@ public class RocksDbWAL : IWAL
         } 
         catch (Exception ex)
         {
-            Console.WriteLine($"Error during rollback: {ex.Message}");
+            logger.LogError("Error during rollback: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
                 
             return RaftOperationStatus.Errored;
         }
@@ -447,8 +459,15 @@ public class RocksDbWAL : IWAL
 
         return 0;
     }
+    
+    public long GetLastCheckpoint(int partitionId)
+    {
+        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+        
+        return GetLastCheckpointInternal(partitionId, columnFamilyHandle);
+    }
 
-    private long GetLastCheckpoint(int partitionId, ColumnFamilyHandle? columnFamilyHandle)
+    private long GetLastCheckpointInternal(int partitionId, ColumnFamilyHandle columnFamilyHandle)
     {
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         iterator.SeekToLast();  // Move to the last key
@@ -488,6 +507,60 @@ public class RocksDbWAL : IWAL
         db.Put(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), cf: metaDataColumnFamily);
 
         return true;
+    }
+
+    public RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, uint compactNumberEntries)
+    {
+        try
+        {
+            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+
+            HashSet<string> logsToRemove = new((int)compactNumberEntries);
+
+            using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
+            iterator.SeekToFirst(); // Move to the last key
+
+            while (iterator.Valid())
+            {
+                RaftLogMessage message = Unserializer(iterator.Value());
+
+                if (message.Partition != partitionId)
+                {
+                    iterator.Next();
+                    continue;
+                }
+
+                if (message.Id < lastCheckpoint)
+                {
+                    logsToRemove.Add(iterator.StringKey());
+
+                    if (logsToRemove.Count >= compactNumberEntries)
+                        break;
+                }
+
+                iterator.Next();
+            }
+
+            if (logsToRemove.Count > 0)
+            {
+                using WriteBatch writeBatch = new();
+
+                foreach (string log in logsToRemove)
+                    writeBatch.Delete(Encoding.UTF8.GetBytes(log), cf: columnFamilyHandle);
+
+                db.Write(writeBatch); // No need to be synchronous here
+                
+                logger.LogDebug("Removed {Count} from WAL for partition {PartitionId}", logsToRemove.Count, partitionId);
+            }
+            
+            return RaftOperationStatus.Success;
+        } 
+        catch (Exception ex)
+        {
+            logger.LogError("Error during compact: {Message}", ex.Message);
+                
+            return RaftOperationStatus.Errored;
+        }
     }
     
     private static byte[] Serialize(RaftLogMessage message)

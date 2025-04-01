@@ -45,11 +45,26 @@ public sealed class RaftLeaderSupervisor : IActor<RaftLeaderSupervisorRequest>
 
     public async Task Receive(RaftLeaderSupervisorRequest message)
     {
-        if (message.Type == RaftLeaderSupervisorRequestType.CheckLeader)
-            await CheckLeader();
-        
-        if (message.Type == RaftLeaderSupervisorRequestType.UpdateNodes)
-            await UpdateNodes();
+        try
+        {
+            switch (message.Type)
+            {
+                case RaftLeaderSupervisorRequestType.CheckLeader:
+                    await CheckLeader();
+                    break;
+
+                case RaftLeaderSupervisorRequestType.UpdateNodes:
+                    await UpdateNodes();
+                    break;
+
+                default:
+                    throw new RaftException("Unknown RaftLeaderSupervisorRequestType");
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogError("RaftLeaderSupervisor: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
+        }
     }
 
     private Task CheckLeader()

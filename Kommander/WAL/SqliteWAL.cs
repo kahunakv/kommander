@@ -21,11 +21,14 @@ public class SqliteWAL : IWAL
     private readonly string revision;
     
     private SqliteConnection? metaDataConnection;
+    
+    private readonly ILogger<IRaft> logger;
 
-    public SqliteWAL(string path = ".", string revision = "1")
+    public SqliteWAL(string path, string revision, ILogger<IRaft> logger)
     {
         this.path = path;
         this.revision = revision;
+        this.logger = logger;
     }
 
     private (ReaderWriterLock, SqliteConnection) TryOpenDatabase(int partitionId)
@@ -40,7 +43,9 @@ public class SqliteWAL : IWAL
             if (connections.TryGetValue(partitionId, out connTuple))
                 return connTuple;
 
-            string connectionString = $"Data Source={path}/raft{partitionId}_{revision}.db";
+            string completePath = $"{path}/raft{partitionId}_{revision}.db";
+
+            string connectionString = $"Data Source={completePath}";
             SqliteConnection connection = new(connectionString);
 
             connection.Open();
@@ -89,8 +94,11 @@ public class SqliteWAL : IWAL
 
             if (metaDataConnection is not null)
                 return metaDataConnection;
+            
+            string completePath = $"{path}/raft_metadata_{revision}.db";
+            bool firstTime = !File.Exists(completePath);
 
-            string connectionString = $"Data Source={path}/raft_metadata_{revision}.db";
+            string connectionString = $"Data Source={completePath}";
             SqliteConnection connection = new(connectionString);
 
             connection.Open();
@@ -129,7 +137,7 @@ public class SqliteWAL : IWAL
 
             List<RaftLog> result = [];
 
-            long lastCheckpoint = GetLastCheckpoint(connection, partitionId);
+            long lastCheckpoint = GetLastCheckpointInternal(connection, partitionId);
 
             const string query = """
              SELECT id, term, type, logType, log, timePhysical, timeCounter
@@ -268,7 +276,7 @@ public class SqliteWAL : IWAL
         } 
         catch (Exception ex)
         {
-            Console.WriteLine($"Error during proposal: {ex.Message}\n{ex.StackTrace}");
+            logger.LogError("Error during proposal: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
                                         
             return RaftOperationStatus.Errored;
         }
@@ -302,7 +310,7 @@ public class SqliteWAL : IWAL
         } 
         catch (Exception ex)
         {
-            Console.WriteLine($"Error during commit: {ex.Message}\n{ex.StackTrace}");
+            logger.LogError("Error during commit: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
                                     
             return RaftOperationStatus.Errored;
         }
@@ -336,7 +344,7 @@ public class SqliteWAL : IWAL
         } 
         catch (Exception ex)
         {
-            Console.WriteLine($"Error during rollback: {ex.Message}\n{ex.StackTrace}");
+            logger.LogError("Error during rollback: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
                                 
             return RaftOperationStatus.Errored;
         }
@@ -407,7 +415,7 @@ public class SqliteWAL : IWAL
         } 
         catch (Exception ex)
         {
-            Console.WriteLine($"Error during propose: {ex.Message}\n{ex.StackTrace}");
+            logger.LogError("Error during proposal: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
                             
             return RaftOperationStatus.Errored;
         }
@@ -478,7 +486,7 @@ public class SqliteWAL : IWAL
         } 
         catch (Exception ex)
         {
-            Console.WriteLine($"Error during commit: {ex.Message}\n{ex.StackTrace}");
+            logger.LogError("Error during commit: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
                         
             return RaftOperationStatus.Errored;
         }
@@ -549,7 +557,7 @@ public class SqliteWAL : IWAL
         } 
         catch (Exception ex)
         {
-            Console.WriteLine($"Error during rollback: {ex.Message}");
+            logger.LogError("Error during rollback: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
                     
             return RaftOperationStatus.Errored;
         }
@@ -584,7 +592,8 @@ public class SqliteWAL : IWAL
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error during GetMaxLog: {ex.Message}\n{ex.StackTrace}");
+            logger.LogError("Error during GetMaxLog: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
+            
             return 0;
         }
     }
@@ -614,8 +623,24 @@ public class SqliteWAL : IWAL
             readerWriterLock.ReleaseReaderLock();
         }
     }
+    
+    public long GetLastCheckpoint(int partitionId)
+    {
+        (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
 
-    private static long GetLastCheckpoint(SqliteConnection connection, int partitionId)
+        try
+        {
+            readerWriterLock.AcquireReaderLock(TimeSpan.FromSeconds(10));
+
+            return GetLastCheckpointInternal(connection, partitionId);
+        }
+        finally
+        {
+            readerWriterLock.ReleaseReaderLock();
+        }
+    }
+
+    private static long GetLastCheckpointInternal(SqliteConnection connection, int partitionId)
     {
         const string query = "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId AND type = @type";
         using SqliteCommand command = new(query, connection);
@@ -629,6 +654,82 @@ public class SqliteWAL : IWAL
             return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
 
         return -1;
+    }
+
+    public RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, uint compactNumberEntries)
+    {
+        (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+
+        try
+        {
+            readerWriterLock.AcquireReaderLock(TimeSpan.FromSeconds(10));
+
+            List<long> logs = [];
+
+            const string query = """
+                 SELECT id
+                 FROM logs
+                 WHERE partitionId = @partitionId AND id < @lastCheckpoint
+                 ORDER BY id ASC
+                 LIMIT @limit;
+                 """;
+
+            using SqliteCommand command = new(query, connection);
+
+            command.Parameters.AddWithValue("@partitionId", partitionId);
+            command.Parameters.AddWithValue("@lastCheckpoint", lastCheckpoint);
+            command.Parameters.AddWithValue("@limit", compactNumberEntries);
+
+            using SqliteDataReader reader = command.ExecuteReader();
+
+            while (reader.Read())
+                logs.Add(reader.IsDBNull(0) ? 0 : reader.GetInt64(0));
+
+            if (logs.Count > 0)
+            {
+                using SqliteTransaction transaction = connection.BeginTransaction();
+
+                try
+                {
+                    const string deleteSql = "DELETE FROM logs WHERE partitionId = @partitionId AND id = @id";
+
+                    foreach (long log in logs)
+                    {
+                        using SqliteCommand deleteCommand = new(deleteSql, connection);
+
+                        deleteCommand.Transaction = transaction;
+
+                        deleteCommand.Parameters.AddWithValue("@partitionId", partitionId);
+                        deleteCommand.Parameters.AddWithValue("@id", log);
+
+                        deleteCommand.ExecuteNonQuery();
+                    }
+
+                    transaction.Commit();
+                    
+                    logger.LogDebug("Removed {Count} from WAL for partition {PartitionId}", logs.Count, partitionId);
+
+                    return RaftOperationStatus.Success;
+                }
+                catch
+                {
+                    transaction.Rollback();
+                    throw;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogError("Error during compact: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
+            
+            return RaftOperationStatus.Errored;
+        }
+        finally
+        {
+            readerWriterLock.ReleaseReaderLock();
+        }
+        
+        return RaftOperationStatus.Success;
     }
     
     public string? GetMetaData(string key)

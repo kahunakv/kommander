@@ -14,6 +14,13 @@ public class InMemoryWAL : IWAL
     private readonly Dictionary<string, string> allConfigs = new();
     
     private readonly Dictionary<int, SortedDictionary<long, RaftLog>> allLogs = new();
+
+    private readonly ILogger<IRaft> logger;
+    
+    public InMemoryWAL(ILogger<IRaft> logger)
+    {
+        this.logger = logger;
+    }
     
     public List<RaftLog> ReadLogs(int partitionId)
     {
@@ -243,6 +250,11 @@ public class InMemoryWAL : IWAL
         }
     }
 
+    public long GetLastCheckpoint(int partitionId)
+    {
+        return -1;
+    }
+
     public string? GetMetaData(string key)
     {
         try
@@ -261,5 +273,10 @@ public class InMemoryWAL : IWAL
     {
         allConfigs[key] = value;
         return true;
+    }
+
+    public RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, uint compactNumberEntries)
+    {
+        return RaftOperationStatus.Success;
     }
 }

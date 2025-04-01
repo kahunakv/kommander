@@ -21,6 +21,10 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
     private readonly ILogger<IRaft> logger;
     
     private readonly Dictionary<RaftLogAction, List<RaftLog>> plan = new();
+    
+    private readonly uint compactEveryOperations;
+    
+    private readonly uint compactNumberEntries;
 
     private bool recovered;
     
@@ -28,7 +32,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
     private long commitIndex = 1;
 
-    private long operations;
+    private uint operations;
 
     public RaftWriteAheadActor(
         IActorContextStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse> _, 
@@ -41,13 +45,17 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         this.logger = manager.Logger;
         this.partition = partition;
         this.walAdapter = walAdapter;
+        
+        this.compactEveryOperations = manager.Configuration.CompactEveryOperations;
+        this.compactNumberEntries = manager.Configuration.CompactNumberEntries; 
     }
 
     public async Task<RaftWALResponse> Receive(RaftWALRequest message)
     {
         try
         {
-            operations++;
+            if (operations++ % compactEveryOperations != 0)
+                await Compact();
 
             switch (message.Type)
             {
@@ -457,74 +465,17 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         return await manager.ReadThreadPool.EnqueueTask(() => walAdapter.ReadLogsRange(partition.PartitionId, startLogIndex));
     }
 
-    private void Collect(long currentTime)
+    private async Task Compact()
     {
-        /*if (logs.Count < MaxLogEntries)
-            return;
+        long lastCheckpoint = await manager.ReadThreadPool.EnqueueTask(() => walAdapter.GetLastCheckpoint(partition.PartitionId));
 
-        if (operations % 500 != 0)
-            return;
-
-        modifications.Clear();
-
-        foreach (KeyValuePair<ulong, RaftLog> keyValue in logs)
+        if (lastCheckpoint > 0)
         {
-            RaftLog raftLog = keyValue.Value;
-
-            if (raftLog.Time > 0 && (currentTime - raftLog.Time) > 1800)
-                modifications.Add(keyValue.Key);
+            logger.LogInformation("[{Endpoint}/{Partition}] Compactation process started LastCheckpoint={LastCheckpoint}", manager.LocalEndpoint, partition.PartitionId, lastCheckpoint);
+            
+            await manager.WriteThreadPool.EnqueueTask(() =>
+                walAdapter.CompactLogsOlderThan(partition.PartitionId, lastCheckpoint, compactNumberEntries
+                ));
         }
-
-        if (modifications.Count == 0)
-            return;
-
-        foreach (ulong index in modifications)
-            logs.Remove(index);*/
-    }
-
-    private async Task Compact(long currentTime)
-    {
-        if (operations % 500 != 0)
-            return;
-
-        /*RedisConnection connection = await GetConnection();
-
-        string key = ClusterWalKeyPrefix + partition.PartitionId;
-
-        long length = await connection.BasicRetry(async database => await database.ListLengthAsync(key));
-
-        if (length < MaxLogEntries)
-            return;
-
-        RedisValue[] values = await connection.BasicRetry(async database => await database.ListRangeAsync(ClusterWalKeyPrefix + partition.PartitionId, 0, 1024));
-
-        int oldest = 0;
-
-        foreach (RedisValue value in values)
-        {
-            byte[]? data = (byte[]?)value;
-            if (data is null)
-                continue;
-
-            RaftLog? raftLog = MessagePackSerializer.Deserialize<RaftLog>(data);
-            if (raftLog is null)
-                continue;
-
-            if (raftLog.Time > 0 && (currentTime - raftLog.Time) > 1800)
-                oldest++;
-        }
-
-        if (oldest == 0)
-            return;
-
-        // logger.LogWarning("[{LocalEndpoint}/{PartitionId}] Compacting log at #{Oldest}", RaftManager.LocalEndpoint, partition.PartitionId, oldest);
-
-        await connection.BasicRetry(async database =>
-        {
-            await database.ListTrimAsync(key, 0, oldest - 1);
-            return Task.CompletedTask;
-        });*/
-
-        await Task.CompletedTask;
     }
 }
