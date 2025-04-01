@@ -1,6 +1,7 @@
+
 using Kommander.Time;
 
-namespace Kommander.Tests;
+namespace Kommander.Tests.Time;
 
 public class TestHLC
 {
@@ -20,6 +21,19 @@ public class TestHLC
         HLCTimestamp p = x + TimeSpan.FromMilliseconds(10000);
         
         Assert.True(p > x);
+    }
+    
+    [Fact]
+    public void TestHLC1()
+    {
+        HybridLogicalClock clock = new();
+        
+        Dictionary<HLCTimestamp, bool> hlc = new();
+        
+        for (int i = 0; i < 100; i++)
+            hlc.Add(clock.SendOrLocalEvent(), true);
+            
+        Assert.Equal(100, hlc.Count);
     }
     
     private static long GetCurrentTime()

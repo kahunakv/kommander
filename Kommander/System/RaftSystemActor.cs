@@ -53,20 +53,7 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
 
                 systemConfiguration[systemMessage.Key] = systemMessage.Value;
 
-                if (systemMessage.Key == "partitions")
-                {
-                    List<RaftPartitionRange>? initialRanges = JsonSerializer.Deserialize<List<RaftPartitionRange>>(systemMessage.Value);
-                    if (initialRanges is null)
-                    {
-                        logger.LogError("Failed to parse partition ranges: {Partitions}", systemMessage.Value);
-                        return;
-                    }
-                    
-                    foreach (RaftPartitionRange range in initialRanges)
-                        Console.Error.WriteLine("{0} {1} {2}", range.PartitionId, range.StartRange, range.EndRange);
-
-                    manager.StartUserPartitions(initialRanges);
-                }
+                InitializePartitions();
             }
             break;
 
@@ -75,12 +62,35 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
                 
                 if (manager.LocalEndpoint == leaderNode)
                     await TrySetInitialPartitions();
+                else
+                    InitializePartitions();
                 
                 break;
             
             case RaftSystemRequestType.RestoreCompleted:
                 break;
         }
+    }
+
+    private void InitializePartitions()
+    {
+        if (!systemConfiguration.TryGetValue("partitions", out string? partitions))
+        {
+            logger.LogWarning("Failed to get partitions from system configuration");
+            return;
+        }
+        
+        List<RaftPartitionRange>? initialRanges = JsonSerializer.Deserialize<List<RaftPartitionRange>>(partitions);
+        if (initialRanges is null)
+        {
+            logger.LogError("Failed to parse partition ranges: {Partitions}", partitions);
+            return;
+        }
+                
+        // foreach (RaftPartitionRange range in initialRanges)
+        //     Console.Error.WriteLine("{0} {1} {2}", range.PartitionId, range.StartRange, range.EndRange);
+
+        manager.StartUserPartitions(initialRanges);
     }
 
     private async Task TrySetInitialPartitions()
@@ -99,32 +109,38 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
             Value = JsonSerializer.Serialize(initialRanges)
         };
 
-        RaftReplicationResult result = await manager.ReplicateSystemLogs(
-            RaftSystemConfig.RaftLogType, 
-            Serialize(message),
-            true, 
-            CancellationToken.None
-        );
-
-        if (result.Status != RaftOperationStatus.Success)
+        for (int i = 0; i < 10; i++)
         {
-            logger.LogDebug("Failed to replicate initial partitions {Status} {LogIndex}", result.Status, result.LogIndex);
-            return;
+            RaftReplicationResult result = await manager.ReplicateSystemLogs(
+                RaftSystemConfig.RaftLogType,
+                Serialize(message),
+                true,
+                CancellationToken.None
+            );
+
+            if (result.Status != RaftOperationStatus.Success)
+            {
+                logger.LogDebug("Failed to replicate initial partitions {Status} {LogIndex}", result.Status, result.LogIndex);
+                
+                await Task.Delay(5000);
+                continue;
+            }
+
+            logger.LogInformation("Succesfully replicated initial partitions {Status} {LogIndex}", result.Status, result.LogIndex);
+            break;
         }
-        
-        logger.LogDebug("Succesfully replicated initial partitions {Status} {LogIndex}", result.Status, result.LogIndex);
-        
+
         manager.StartUserPartitions(initialRanges);
         
-        foreach (RaftPartitionRange range in initialRanges)
-            Console.Error.WriteLine("{0} {1} {2}", range.PartitionId, range.StartRange, range.EndRange);
+        // foreach (RaftPartitionRange range in initialRanges)
+        //     Console.Error.WriteLine("{0} {1} {2}", range.PartitionId, range.StartRange, range.EndRange);
     }
 
     private static List<RaftPartitionRange> DivideIntoRanges(int numberOfRanges)
     {
         int monotonicId = RaftSystemConfig.SystemPartition + 1;
         
-        List<RaftPartitionRange> ranges = [];
+        List<RaftPartitionRange> ranges = new(numberOfRanges);
         
         // Total number of values from 0 to int.MaxValue inclusive is int.MaxValue + 1
         const long totalCount = (long)int.MaxValue + 1;
@@ -147,6 +163,7 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
             // Next range starts immediately after the current range's end.
             currentStart = currentEnd + 1;
         }
+        
         return ranges;
     }
     
@@ -162,13 +179,4 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
         using MemoryStream memoryStream = new(serializedData);
         return RaftSystemMessage.Parser.ParseFrom(memoryStream);
     }
-}
-
-public class RaftPartitionRange
-{
-    public int PartitionId { get; set; }
-    
-    public int StartRange { get; set; }
-    
-    public int EndRange { get; set; }
 }
