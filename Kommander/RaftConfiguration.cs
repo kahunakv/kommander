@@ -105,10 +105,10 @@ public class RaftConfiguration
     /// <summary>
     /// Compact every partition WAL every Nth operations
     /// </summary>
-    public uint CompactEveryOperations { get; set; } = 10000;
+    public int CompactEveryOperations { get; set; } = 10000;
     
     /// <summary>
     /// Number of entries to old entries to remove from the WAL in every compaction 
     /// </summary>
-    public uint CompactNumberEntries { get; set; } = 100;
+    public int CompactNumberEntries { get; set; } = 100;
 }

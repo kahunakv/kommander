@@ -23,9 +23,9 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
     
     private readonly Dictionary<RaftLogAction, List<RaftLog>> plan = new();
     
-    private readonly uint compactEveryOperations;
+    private readonly int compactEveryOperations;
     
-    private readonly uint compactNumberEntries;
+    private readonly int compactNumberEntries;
 
     private bool recovered;
     
@@ -33,7 +33,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
     private long commitIndex = 1;
 
-    private uint operations;
+    private int operations;
 
     public RaftWriteAheadActor(
         IActorContextStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse> _, 
@@ -48,15 +48,20 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         this.walAdapter = walAdapter;
         
         this.compactEveryOperations = manager.Configuration.CompactEveryOperations;
-        this.compactNumberEntries = manager.Configuration.CompactNumberEntries; 
+        this.compactNumberEntries = manager.Configuration.CompactNumberEntries;
+        this.operations = compactEveryOperations;
     }
 
     public async Task<RaftWALResponse> Receive(RaftWALRequest message)
     {
         try
         {
-            if (operations++ % compactEveryOperations != 0)
+            if (--operations == 0)
+            {
                 await Compact();
+                
+                operations = compactEveryOperations;
+            }
 
             switch (message.Type)
             {

@@ -514,7 +514,7 @@ public class RocksDbWAL : IWAL
         return true;
     }
 
-    public RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, uint compactNumberEntries)
+    public RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
     {
         try
         {

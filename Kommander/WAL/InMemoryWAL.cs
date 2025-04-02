@@ -275,7 +275,7 @@ public class InMemoryWAL : IWAL
         return true;
     }
 
-    public RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, uint compactNumberEntries)
+    public RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
     {
         return RaftOperationStatus.Success;
     }
