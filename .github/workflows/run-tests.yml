@@ -21,14 +21,5 @@ jobs:
           dotnet-version: |
             8.0.x
             9.0.x
-      - name: Install dotCover
-        run: dotnet tool install JetBrains.dotCover.CommandLineTools -g
       - name: Run Tests
-        run: (cd Kommander.Tests && dotnet dotcover cover-dotnet --Output=KommanderCoverageReport.html --ReportType=HTML -- test)
-      - name: Archive code coverage results
-        uses: actions/upload-artifact@v4
-        with:
-          name: code-coverage-report
-          path: |
-            Kommander.Tests/KommanderCoverageReport
-            Kommander.Tests/KommanderCoverageReport.html
+        run: (cd Kommander.Tests && dotnet test -l "console;verbosity=detailed")      
