@@ -24,7 +24,7 @@ jobs:
       - name: Install dotCover
         run: dotnet tool install JetBrains.dotCover.CommandLineTools -g
       - name: Run Tests
-        run: (cd Kommander.Tests && dotnet dotcover test --dcOutput=KommanderCoverageReport.html --dcReportType=HTML)
+        run: (cd Kommander.Tests && dotnet dotcover cover-dotnet --Output=KommanderCoverageReport.html --ReportType=HTML -- test)
       - name: Archive code coverage results
         uses: actions/upload-artifact@v4
         with:
