@@ -22,7 +22,7 @@ jobs:
             8.0.x
             9.0.x
       - name: Install dotCover
-        run: dotnet tool install JetBrains.dotCover.GlobalTool -g
+        run: dotnet tool install JetBrains.dotCover.CommandLineTools -g
       - name: Run Tests
         run: (cd Kommander.Tests && dotnet dotcover test --dcOutput=KommanderCoverageReport.html --dcReportType=HTML)
       - name: Archive code coverage results
