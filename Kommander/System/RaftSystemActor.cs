@@ -9,6 +9,8 @@ namespace Kommander.System;
 
 public class RaftSystemActor : IActor<RaftSystemRequest>
 {
+    private const int MaxRetries = 10;
+    
     private readonly Dictionary<string, string> systemConfiguration = new();
     
     private readonly RaftManager manager;
@@ -29,29 +31,37 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
 
     public async Task Receive(RaftSystemRequest message)
     {
-        await Task.CompletedTask;
-        
         switch (message.Type)
         {
             case RaftSystemRequestType.ConfigRestored:
             {
                 if (message.LogData is null)
+                {
+                    logger.LogWarning("Restored message is null");
                     return;
+                }
 
                 RaftSystemMessage systemMessage = Unserializer(message.LogData);
 
                 systemConfiguration[systemMessage.Key] = systemMessage.Value;
+                
+                logger.LogInformation("Restored system configuration: {Key}", systemMessage.Key);
             }
             break;
 
             case RaftSystemRequestType.ConfigReplicated:
             {
                 if (message.LogData is null)
+                {
+                    logger.LogWarning("Replication message is null");
                     return;
+                }
 
                 RaftSystemMessage systemMessage = Unserializer(message.LogData);
 
                 systemConfiguration[systemMessage.Key] = systemMessage.Value;
+                
+                logger.LogInformation("Replicated system configuration: {Key}", systemMessage.Key);
 
                 InitializePartitions();
             }
@@ -61,20 +71,27 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
                 leaderNode = message.LeaderNode;
                 
                 if (manager.LocalEndpoint == leaderNode)
-                    await TrySetInitialPartitions();
+                    await TrySetInitialPartitions().ConfigureAwait(false);
                 else
                     InitializePartitions();
                 
                 break;
             
+            case RaftSystemRequestType.SplitPartition:
+                await TrySplitPartition(message.PartitionId).ConfigureAwait(false);
+                break;
+            
             case RaftSystemRequestType.RestoreCompleted:
                 break;
+            
+            default:
+                throw new ArgumentOutOfRangeException();
         }
     }
 
     private void InitializePartitions()
     {
-        if (!systemConfiguration.TryGetValue("partitions", out string? partitions))
+        if (!systemConfiguration.TryGetValue(RaftSystemConfigKeys.Partitions, out string? partitions))
         {
             logger.LogWarning("Failed to get partitions from system configuration");
             return;
@@ -95,21 +112,28 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
 
     private async Task TrySetInitialPartitions()
     {
-        if (systemConfiguration.TryGetValue("partitions", out string? partitions))
+        List<RaftPartitionRange>? initialRanges;
+        
+        if (systemConfiguration.TryGetValue(RaftSystemConfigKeys.Partitions, out string? partitions))
         {
-            JsonSerializer.Deserialize<List<RaftPartitionRange>>(partitions);
-            return;
+            initialRanges = JsonSerializer.Deserialize<List<RaftPartitionRange>>(partitions);
+
+            if (initialRanges is not null)
+            {
+                manager.StartUserPartitions(initialRanges);
+                return;
+            }
         }
         
-        List<RaftPartitionRange> initialRanges = DivideIntoRanges(manager.Configuration.InitialPartitions);
+        initialRanges = DivideIntoRanges(manager.Configuration.InitialPartitions);
 
         RaftSystemMessage message = new()
         {
-            Key = "partitions",
+            Key = RaftSystemConfigKeys.Partitions,
             Value = JsonSerializer.Serialize(initialRanges)
         };
 
-        for (int i = 0; i < 10; i++)
+        for (int i = 0; i < MaxRetries; i++)
         {
             RaftReplicationResult result = await manager.ReplicateSystemLogs(
                 RaftSystemConfig.RaftLogType,
@@ -120,13 +144,15 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
 
             if (result.Status != RaftOperationStatus.Success)
             {
-                logger.LogDebug("Failed to replicate initial partitions {Status} {LogIndex}", result.Status, result.LogIndex);
-                
-                await Task.Delay(5000);
-                
-                if (i <= 8)
-                    continue;
-                
+                logger.LogWarning("Failed to replicate initial partitions {Status} {LogIndex} Retry={Retry}", result.Status, result.LogIndex, i);
+
+                if (result.Status != RaftOperationStatus.Success)
+                {
+                    await Task.Delay(5000);
+                    if (i <= 8)
+                        continue;
+                }
+
                 logger.LogError("Cannot continue without initial partitions {Status} {LogIndex}", result.Status, result.LogIndex);
                 Environment.Exit(1);
                 return;
@@ -140,6 +166,82 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
         
         // foreach (RaftPartitionRange range in initialRanges)
         //     Console.Error.WriteLine("{0} {1} {2}", range.PartitionId, range.StartRange, range.EndRange);
+    }
+    
+    private async Task TrySplitPartition(int partitionId)
+    {
+        if (!systemConfiguration.TryGetValue(RaftSystemConfigKeys.Partitions, out string? partitions))
+        {
+            logger.LogError("TrySplitPartition: Failed to get partitions from system configuration");
+            return;
+        }
+        
+        List<RaftPartitionRange>? initialRanges = JsonSerializer.Deserialize<List<RaftPartitionRange>>(partitions);
+        if (initialRanges is null)
+        {
+            logger.LogError("TrySplitPartition: Failed to parse partition ranges {Partitions}", partitions);
+            return;
+        }
+        
+        RaftPartitionRange? partitionRange = initialRanges.FirstOrDefault(range => range.PartitionId == partitionId);
+        if (partitionRange is null)
+        {
+            logger.LogError("TrySplitPartition: Couldn't find partition range {Partition}", partitionId);
+            return;
+        }
+        
+        RaftPartitionRange? nextPartition = initialRanges.MaxBy(range => range.PartitionId);
+        if (nextPartition is null)
+        {
+            logger.LogError("TrySplitPartition: Couldn't find next partition");
+            return;
+        }
+        
+        int midPoint = partitionRange.StartRange + (partitionRange.EndRange - partitionRange.StartRange) / 2;
+        
+        RaftPartitionRange newRange = new()
+        {
+            PartitionId = nextPartition.PartitionId + 1,
+            StartRange = midPoint + 1,
+            EndRange = partitionRange.EndRange
+        };
+        
+        initialRanges.Add(newRange);
+        
+        RaftSystemMessage message = new()
+        {
+            Key = RaftSystemConfigKeys.Partitions,
+            Value = JsonSerializer.Serialize(initialRanges)
+        };
+
+        for (int i = 0; i < MaxRetries; i++)
+        {
+            RaftReplicationResult result = await manager.ReplicateSystemLogs(
+                RaftSystemConfig.RaftLogType,
+                Serialize(message),
+                true,
+                CancellationToken.None
+            );
+
+            if (result.Status != RaftOperationStatus.Success)
+            {
+                logger.LogWarning("Failed to replicate partitions {Status} {LogIndex} Retry={Retry}", result.Status, result.LogIndex, i);
+
+                if (result.Status != RaftOperationStatus.NodeIsNotLeader)
+                {
+                    await Task.Delay(5000);
+                    if (i <= 8)
+                        continue;
+                }
+                
+                return;
+            }
+
+            logger.LogInformation("Succesfully replicated new partitions {Status} {LogIndex}", result.Status, result.LogIndex);
+            break;
+        }
+
+        manager.StartUserPartitions(initialRanges);
     }
 
     private static List<RaftPartitionRange> DivideIntoRanges(int numberOfRanges)

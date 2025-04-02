@@ -7,4 +7,5 @@ public enum RaftSystemRequestType
     RestoreCompleted,
     ConfigRestored,
     ConfigReplicated,
+    SplitPartition
 }

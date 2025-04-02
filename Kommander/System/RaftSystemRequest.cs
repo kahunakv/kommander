@@ -7,6 +7,8 @@ public sealed class RaftSystemRequest
 {
     public RaftSystemRequestType Type { get; }
     
+    public int PartitionId { get; }
+    
     public string? LeaderNode { get; }
 
     public byte[]? LogData { get; }
@@ -26,5 +28,11 @@ public sealed class RaftSystemRequest
     {
         Type = type;
         LeaderNode = leaderNode;
+    }
+    
+    public RaftSystemRequest(RaftSystemRequestType type, int partitionId)
+    {
+        Type = type;
+        PartitionId = partitionId;
     }
 }

@@ -49,7 +49,7 @@ public class RocksDbWAL : IWAL
 
         string completePath = $"{path}/{revision}";
         
-        bool firstTime = Directory.Exists(completePath);
+        bool firstTime = !Directory.Exists(completePath);
         
         db = RocksDb.Open(dbOptions, completePath, columnFamilies);
         
@@ -76,6 +76,8 @@ public class RocksDbWAL : IWAL
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
         
         long lastCheckpoint = GetLastCheckpointInternal(partitionId, columnFamilyHandle);
+        
+        // Console.WriteLine($"Last checkpoint {partitionId} {lastCheckpoint}");
 
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         
@@ -102,6 +104,9 @@ public class RocksDbWAL : IWAL
                 iterator.Next();
                 continue;
             }
+
+            //if (partitionId == 1)
+            //    Console.WriteLine("{0} {1}", iterator.StringKey(), message.Id);
 
             result.Add(new()
             {

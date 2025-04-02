@@ -28,12 +28,12 @@ public sealed class RaftPartition : IDisposable
     private readonly RaftManager manager;
 
     internal string Leader { get; set; } = "";
-
+    
     public int PartitionId { get; }
     
-    public int StartRange { get; }
+    public int StartRange { get; internal set; }
     
-    public int EndRange { get; }
+    public int EndRange { get; internal set; }
 
     /// <summary>
     /// Constructor

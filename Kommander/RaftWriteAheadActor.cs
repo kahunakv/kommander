@@ -1,6 +1,7 @@
 ﻿
 using Nixie;
 using Kommander.Data;
+using Kommander.System;
 using Kommander.Time;
 using Kommander.WAL;
 
@@ -147,9 +148,17 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
                 if (log.Type != RaftLogType.Committed)
                     continue;
-                
-                if (!await manager.InvokeReplicationRestored(partition.PartitionId, log).ConfigureAwait(false))
-                    manager.InvokeReplicationError(partition.PartitionId, log);
+
+                if (partition.PartitionId == RaftSystemConfig.SystemPartition)
+                {
+                    if (!await manager.InvokeSystemLogRestored(partition.PartitionId, log).ConfigureAwait(false))
+                        manager.InvokeReplicationError(partition.PartitionId, log);
+                }
+                else
+                {
+                    if (!await manager.InvokeLogRestored(partition.PartitionId, log).ConfigureAwait(false))
+                        manager.InvokeReplicationError(partition.PartitionId, log);
+                }
             }
             catch (Exception ex)
             {
@@ -162,7 +171,10 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         if (!found)
             commitIndex = await GetMaxLog().ConfigureAwait(false) + 1;
 
-        manager.InvokeRestoreFinished(partition.PartitionId);
+        if (partition.PartitionId == RaftSystemConfig.SystemPartition)
+            manager.InvokeSystemRestoreFinished(partition.PartitionId);
+        else
+            manager.InvokeRestoreFinished(partition.PartitionId);
 
         return commitIndex;
     }
@@ -451,9 +463,17 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             {
                 if (log.Type != RaftLogType.Committed)
                     continue;
-                
-                if (!await manager.InvokeReplicationReceived(partition.PartitionId, log).ConfigureAwait(false))
-                    manager.InvokeReplicationError(partition.PartitionId, log);
+
+                if (partition.PartitionId == RaftSystemConfig.SystemPartition)
+                {
+                    if (!await manager.InvokeSystemReplicationReceived(partition.PartitionId, log).ConfigureAwait(false))
+                        manager.InvokeReplicationError(partition.PartitionId, log);
+                }
+                else
+                {
+                    if (!await manager.InvokeReplicationReceived(partition.PartitionId, log).ConfigureAwait(false))
+                        manager.InvokeReplicationError(partition.PartitionId, log);
+                }
             }
         }
 
@@ -469,13 +489,13 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
     {
         long lastCheckpoint = await manager.ReadThreadPool.EnqueueTask(() => walAdapter.GetLastCheckpoint(partition.PartitionId));
 
-        if (lastCheckpoint > 0)
-        {
-            logger.LogInformation("[{Endpoint}/{Partition}] Compactation process started LastCheckpoint={LastCheckpoint}", manager.LocalEndpoint, partition.PartitionId, lastCheckpoint);
-            
-            await manager.WriteThreadPool.EnqueueTask(() =>
-                walAdapter.CompactLogsOlderThan(partition.PartitionId, lastCheckpoint, compactNumberEntries
-                ));
-        }
+        if (lastCheckpoint <= 0)
+            return;
+        
+        logger.LogInformation("[{Endpoint}/{Partition}] Compaction process started LastCheckpoint={LastCheckpoint}", manager.LocalEndpoint, partition.PartitionId, lastCheckpoint);
+        
+        await manager.WriteThreadPool.EnqueueTask(() =>
+            walAdapter.CompactLogsOlderThan(partition.PartitionId, lastCheckpoint, compactNumberEntries
+        ));
     }
 }

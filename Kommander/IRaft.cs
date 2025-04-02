@@ -75,7 +75,7 @@ public interface IRaft
     /// <summary>
     /// Event when a replication log is restored
     /// </summary>
-    public event Func<int, RaftLog, Task<bool>>? OnReplicationRestored;
+    public event Func<int, RaftLog, Task<bool>>? OnLogRestored;
 
     /// <summary>
     /// Event when a replication log is received

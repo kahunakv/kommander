@@ -49,6 +49,9 @@ public class ReplicationService : BackgroundService //, IDisposable
             string key = Guid.NewGuid().ToString();
             
             int partitionId = raft.GetPartitionKey(key);
+            
+            if (partitionId == 0)
+                throw new Exception("System partition");
 
             if (!await raft.AmILeader(partitionId, CancellationToken.None).ConfigureAwait(false))
                 return;
