@@ -9,17 +9,17 @@ namespace Kommander;
 /// </summary>
 public static class HashUtils
 {
-    public static uint SimpleHash(string key)
+    public static ulong SimpleHash(string key)
     {
-        return xxHash32.ComputeHash(key);
+        return xxHash64.ComputeHash(key);
     }
     
-    public static long StaticHash(string key, int buckets)
+    public static ulong StaticHash(string key, ulong buckets)
     {
         if (buckets <= 0)
             throw new ArgumentException("buckets must be greater than zero", nameof(buckets));
         
-        uint computed = xxHash32.ComputeHash(key);
+        ulong computed = xxHash64.ComputeHash(key);
         return computed % buckets;
     }
 
@@ -49,14 +49,14 @@ public static class HashUtils
         return ConsistentHash(prefix, buckets);
     }
     
-    public static int GetHashInRange(string key, int min, int max)
+    public static ulong GetHashInRange(string key, ulong min, ulong max)
     {
         // Compute the hash value for the string.
-        uint hash = xxHash32.ComputeHash(key);
-        int range = max - min + 1;
+        ulong hash = xxHash64.ComputeHash(key);
+        ulong range = max - min + 1;
     
         // Map the hash to the desired range.
-        return (int)((hash % range) + min);
+        return ((hash % range) + min);
     }
     
     /// <summary>
