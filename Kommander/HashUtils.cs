@@ -36,6 +36,26 @@ public static class HashUtils
         return ConsistentHash(prefix, buckets);
     }
     
+    public static ulong PrefixedStaticHash(string key, char separator)
+    {
+        int pointer = key.IndexOf(separator);
+        if (pointer == -1)
+            return SimpleHash(key);
+        
+        string prefix = key[..pointer];
+        return SimpleHash(prefix);
+    }
+    
+    public static ulong InversePrefixedStaticHash(string key, char separator)
+    {
+        int pointer = key.LastIndexOf(separator);
+        if (pointer == -1)
+            return SimpleHash(key);
+        
+        string prefix = key[..pointer];
+        return SimpleHash(prefix);
+    }
+    
     public static long InversePrefixedHash(string key, char separator, int buckets)
     {
         if (buckets <= 0)
