@@ -1,5 +1,5 @@
 
-namespace Kommander.Support;
+namespace Kommander.Support.Parallelization;
 
 public static class ParalellizationExtensions
 {

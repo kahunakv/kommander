@@ -2,7 +2,7 @@
 using Nixie;
 using Kommander.Communication;
 using Kommander.Data;
-using Kommander.Support;
+using Kommander.Support.Parallelization;
 
 namespace Kommander;
 
@@ -64,23 +64,23 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
                 switch (message.Type)
                 {
                     case RaftResponderRequestType.AppendLogs:
-                        await AppendLogs(message);
+                        await AppendLogs(message).ConfigureAwait(false);
                         break;
 
                     case RaftResponderRequestType.CompleteAppendLogs:
-                        await CompleteAppendLogs(message);
+                        await CompleteAppendLogs(message).ConfigureAwait(false);
                         break;
 
                     case RaftResponderRequestType.Vote:
-                        await Vote(message);
+                        await Vote(message).ConfigureAwait(false);
                         break;
 
                     case RaftResponderRequestType.RequestVotes:
-                        await RequestVotes(message);
+                        await RequestVotes(message).ConfigureAwait(false);
                         break;
 
                     case RaftResponderRequestType.Handshake:
-                        await Handshake(message);
+                        await Handshake(message).ConfigureAwait(false);
                         break;
 
                     case RaftResponderRequestType.TryBatch:
@@ -126,7 +126,7 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
         if (message.HandshakeRequest is null)
             return;
                 
-        await communication.Handshake(manager, message.Node, message.HandshakeRequest);
+        await communication.Handshake(manager, message.Node, message.HandshakeRequest).ConfigureAwait(false);
     }
     
     private async Task Vote(RaftResponderRequest message)
@@ -137,7 +137,7 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
         if (message.VoteRequest is null)
             return;
                 
-        await communication.Vote(manager, message.Node, message.VoteRequest);
+        await communication.Vote(manager, message.Node, message.VoteRequest).ConfigureAwait(false);
     }
 
     private async Task RequestVotes(RaftResponderRequest message)
@@ -148,7 +148,7 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
         if (message.RequestVotesRequest is null)
             return;
 
-        await communication.RequestVotes(manager, message.Node, message.RequestVotesRequest);
+        await communication.RequestVotes(manager, message.Node, message.RequestVotesRequest).ConfigureAwait(false);
     }
 
     private async Task AppendLogs(RaftResponderRequest message)

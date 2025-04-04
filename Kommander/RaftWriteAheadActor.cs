@@ -1,6 +1,7 @@
 ﻿
 using Nixie;
 using Kommander.Data;
+using Kommander.Support.Collections;
 using Kommander.System;
 using Kommander.Time;
 using Kommander.WAL;
@@ -21,7 +22,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
     private readonly ILogger<IRaft> logger;
     
-    private readonly Dictionary<RaftLogAction, List<RaftLog>> plan = new();
+    private readonly SmallDictionary<RaftLogAction, List<RaftLog>> plan = new(3);
     
     private readonly int compactEveryOperations;
     
@@ -347,7 +348,9 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             return (RaftOperationStatus.Success, Math.Min(proposeIndex, commitIndex));*/
         }
         
-        plan.Clear();
+        // Reuse internal lists
+        foreach (KeyValuePair<RaftLogAction, List<RaftLog>> keyValue in plan)
+            keyValue.Value.Clear();
 
         foreach (RaftLog log in orderedLogs)
         {
@@ -440,18 +443,23 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         
         foreach (KeyValuePair<RaftLogAction, List<RaftLog>> keyValue in plan)
         {
+            status = RaftOperationStatus.Success;
+            
             switch (keyValue.Key)
             {
                 case RaftLogAction.Propose:
-                    status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.ProposeMany(partition.PartitionId, keyValue.Value)).ConfigureAwait(false);
+                    if (keyValue.Value.Count > 0)
+                        status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.ProposeMany(partition.PartitionId, keyValue.Value)).ConfigureAwait(false);
                     break;
                 
                 case RaftLogAction.Commit:
-                    status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.CommitMany(partition.PartitionId, keyValue.Value)).ConfigureAwait(false);
+                    if (keyValue.Value.Count > 0)
+                        status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.CommitMany(partition.PartitionId, keyValue.Value)).ConfigureAwait(false);
                     break;
                 
                 case RaftLogAction.Rollback:
-                    status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.RollbackMany(partition.PartitionId, keyValue.Value)).ConfigureAwait(false);
+                    if (keyValue.Value.Count > 0)
+                        status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.RollbackMany(partition.PartitionId, keyValue.Value)).ConfigureAwait(false);
                     break;
                 
                 default:
@@ -487,12 +495,12 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
     
     private async Task<List<RaftLog>> GetRange(long startLogIndex)
     {
-        return await manager.ReadThreadPool.EnqueueTask(() => walAdapter.ReadLogsRange(partition.PartitionId, startLogIndex));
+        return await manager.ReadThreadPool.EnqueueTask(() => walAdapter.ReadLogsRange(partition.PartitionId, startLogIndex)).ConfigureAwait(false);
     }
 
     private async Task Compact()
     {
-        long lastCheckpoint = await manager.ReadThreadPool.EnqueueTask(() => walAdapter.GetLastCheckpoint(partition.PartitionId));
+        long lastCheckpoint = await manager.ReadThreadPool.EnqueueTask(() => walAdapter.GetLastCheckpoint(partition.PartitionId)).ConfigureAwait(false);
 
         if (lastCheckpoint <= 0)
             return;
@@ -501,6 +509,6 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         
         await manager.WriteThreadPool.EnqueueTask(() =>
             walAdapter.CompactLogsOlderThan(partition.PartitionId, lastCheckpoint, compactNumberEntries
-        ));
+        )).ConfigureAwait(false);
     }
 }

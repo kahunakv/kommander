@@ -1111,7 +1111,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         if (!proposal.AutoCommit)
         {
-            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Proposal {Timestamp} doesn't have auto-commit", manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp);
+            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Proposal {Timestamp} doesn't have auto-commit", manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp);
             return;
         }
 
