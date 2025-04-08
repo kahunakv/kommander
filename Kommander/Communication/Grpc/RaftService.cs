@@ -1,4 +1,5 @@
 
+using System.Runtime.InteropServices;
 using Google.Protobuf.Collections;
 using Grpc.Core;
 using Kommander.Data;
@@ -152,15 +153,21 @@ public class RaftService : Rafter.RafterBase
 
         foreach (GrpcRaftLog? requestLog in requestLogs)
         {
-            logs.Add(new()
+            RaftLog raftLog = new()
             {
                 Id = requestLog.Id,
                 Term = requestLog.Term,
                 Type = (RaftLogType)requestLog.Type,
                 Time = new(requestLog.TimePhysical, requestLog.TimeCounter),
-                LogType = requestLog.LogType,
-                LogData = requestLog.Data.ToByteArray()
-            });
+                LogType = requestLog.LogType
+            };
+            
+            if (MemoryMarshal.TryGetArray(requestLog.Data.Memory, out ArraySegment<byte> segment))
+                raftLog.LogData = segment.Array;
+            else
+                raftLog.LogData = requestLog.Data.ToByteArray();
+            
+            logs.Add(raftLog);
         }
 
         return logs;

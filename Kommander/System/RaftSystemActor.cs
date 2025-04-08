@@ -85,7 +85,7 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
                 break;
             
             default:
-                throw new ArgumentOutOfRangeException();
+                throw new NotImplementedException();
         }
     }
 

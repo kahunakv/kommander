@@ -1,17 +1,23 @@
 
+using System.Runtime.InteropServices;
 using System.Text;
 using Google.Protobuf;
 using Kommander.Data;
 using Kommander.WAL.Protos;
+using Microsoft.IO;
 using RocksDbSharp;
 
 namespace Kommander.WAL;
 
 public class RocksDbWAL : IWAL
 {
+    private static readonly RecyclableMemoryStreamManager streamManager = new();
+    
     private static readonly WriteOptions DefaultWriteOptions = new WriteOptions().SetSync(true);
 
     private const string FormatVersion = "1.0.0";
+
+    private const int MaxMessageSize = 1024;
     
     private const int MaxShards = 16;
     
@@ -86,7 +92,11 @@ public class RocksDbWAL : IWAL
         else
         {
             string index = lastCheckpoint.ToString("D20");
-            iterator.Seek(Encoding.UTF8.GetBytes(index));
+            
+            Span<byte> buffer = stackalloc byte[Encoding.UTF8.GetByteCount(index)];
+            Encoding.UTF8.GetBytes(index.AsSpan(), buffer);
+            
+            iterator.Seek(index);
         }
 
         while (iterator.Valid())
@@ -108,15 +118,24 @@ public class RocksDbWAL : IWAL
             //if (partitionId == 1)
             //    Console.WriteLine("{0} {1}", iterator.StringKey(), message.Id);
 
-            result.Add(new()
+            RaftLog raftLog = new()
             {
                 Id = message.Id,
                 Term = message.Term,
                 Type = (RaftLogType)message.Type,
                 Time = new(message.TimePhysical, message.TimeCounter),
-                LogType = message.LogType,
-                LogData = message.Log.ToByteArray(),
-            });
+                LogType = message.LogType
+            };
+            
+            if (message.Log is not null)
+            {
+                if (MemoryMarshal.TryGetArray(message.Log.Memory, out ArraySegment<byte> segment))
+                    raftLog.LogData = segment.Array;
+                else
+                    raftLog.LogData = message.Log.ToByteArray();
+            }
+
+            result.Add(raftLog);
             
             iterator.Next();
         }
@@ -137,7 +156,11 @@ public class RocksDbWAL : IWAL
         else
         {
             string index = startLogIndex.ToString("D20");
-            iterator.Seek(Encoding.UTF8.GetBytes(index));
+            
+            Span<byte> buffer = stackalloc byte[Encoding.UTF8.GetByteCount(index)];
+            Encoding.UTF8.GetBytes(index.AsSpan(), buffer);
+            
+            iterator.Seek(buffer);
         }
 
         int counter = 0;
@@ -158,15 +181,24 @@ public class RocksDbWAL : IWAL
                 continue;
             }
 
-            result.Add(new()
+            RaftLog raftLog = new()
             {
                 Id = message.Id,
                 Term = message.Term,
                 Type = (RaftLogType)message.Type,
                 Time = new(message.TimePhysical, message.TimeCounter),
-                LogType = message.LogType,
-                LogData = message.Log?.ToByteArray(),
-            });
+                LogType = message.LogType
+            };
+
+            if (message.Log is not null)
+            {
+                if (MemoryMarshal.TryGetArray(message.Log.Memory, out ArraySegment<byte> segment))
+                    raftLog.LogData = segment.Array;
+                else
+                    raftLog.LogData = message.Log.ToByteArray();
+            }
+
+            result.Add(raftLog);
             
             iterator.Next();
 
@@ -203,7 +235,10 @@ public class RocksDbWAL : IWAL
             if (log.LogData != null)
                 message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
             
-            db.Put(Encoding.UTF8.GetBytes(index), Serialize(message), cf: columnFamilyHandle, DefaultWriteOptions);
+            Span<byte> buffer = stackalloc byte[Encoding.UTF8.GetByteCount(index)];
+            Encoding.UTF8.GetBytes(index.AsSpan(), buffer);
+            
+            db.Put(buffer, Serialize(message), cf: columnFamilyHandle, DefaultWriteOptions);
 
             return RaftOperationStatus.Success;
         } 
@@ -239,7 +274,10 @@ public class RocksDbWAL : IWAL
             if (log.LogData != null)
                 message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
             
-            db.Put(Encoding.UTF8.GetBytes(index), Serialize(message), cf: columnFamilyHandle, DefaultWriteOptions);
+            Span<byte> buffer = stackalloc byte[Encoding.UTF8.GetByteCount(index)];
+            Encoding.UTF8.GetBytes(index.AsSpan(), buffer);
+            
+            db.Put(buffer, Serialize(message), cf: columnFamilyHandle, DefaultWriteOptions);
 
             return RaftOperationStatus.Success;
         } 
@@ -275,7 +313,10 @@ public class RocksDbWAL : IWAL
             if (log.LogData != null)
                 message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
             
-            db.Put(Encoding.UTF8.GetBytes(index), Serialize(message), cf: columnFamilyHandle, DefaultWriteOptions);
+            Span<byte> buffer = stackalloc byte[Encoding.UTF8.GetByteCount(index)];
+            Encoding.UTF8.GetBytes(index.AsSpan(), buffer);
+            
+            db.Put(buffer, Serialize(message), cf: columnFamilyHandle, DefaultWriteOptions);
 
             return RaftOperationStatus.Success;
         } 
@@ -520,7 +561,7 @@ public class RocksDbWAL : IWAL
         {
             ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
-            HashSet<string> logsToRemove = new((int)compactNumberEntries);
+            HashSet<string> logsToRemove = new(compactNumberEntries);
 
             using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
             iterator.SeekToFirst(); // Move to the last key
@@ -570,14 +611,27 @@ public class RocksDbWAL : IWAL
     
     private static byte[] Serialize(RaftLogMessage message)
     {
-        using MemoryStream memoryStream = new();
+        if (!message.Log.IsEmpty && message.Log.Length >= MaxMessageSize)
+        {
+            using RecyclableMemoryStream recyclableMemoryStream = streamManager.GetStream();
+            message.WriteTo((Stream)recyclableMemoryStream);
+            return recyclableMemoryStream.ToArray();
+        }
+        
+        using MemoryStream memoryStream = streamManager.GetStream();
         message.WriteTo(memoryStream);
         return memoryStream.ToArray();
     }
 
-    private static RaftLogMessage Unserializer(byte[] serializedData)
+    private static RaftLogMessage Unserializer(ReadOnlySpan<byte> serializedData)
     {
-        using MemoryStream memoryStream = new(serializedData);
+        if (serializedData.Length >= MaxMessageSize)
+        {
+            using RecyclableMemoryStream recyclableMemoryStream = streamManager.GetStream(serializedData);
+            return RaftLogMessage.Parser.ParseFrom(recyclableMemoryStream);
+        }
+        
+        using MemoryStream memoryStream = streamManager.GetStream(serializedData);
         return RaftLogMessage.Parser.ParseFrom(memoryStream);
     }
 }

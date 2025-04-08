@@ -449,16 +449,26 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             {
                 case RaftLogAction.Propose:
                     if (keyValue.Value.Count > 0)
-                        status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.ProposeMany(partition.PartitionId, keyValue.Value)).ConfigureAwait(false);
+                    {
+                        if (keyValue.Value.Count == 1)
+                            status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Propose(partition.PartitionId, keyValue.Value[0])).ConfigureAwait(false);
+                        else
+                            status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.ProposeMany(partition.PartitionId, keyValue.Value)).ConfigureAwait(false);
+                    }
+
                     break;
                 
                 case RaftLogAction.Commit:
-                    if (keyValue.Value.Count > 0)
+                    if (keyValue.Value.Count == 1)
+                        status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Commit(partition.PartitionId, keyValue.Value[0])).ConfigureAwait(false);
+                    else
                         status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.CommitMany(partition.PartitionId, keyValue.Value)).ConfigureAwait(false);
                     break;
                 
                 case RaftLogAction.Rollback:
-                    if (keyValue.Value.Count > 0)
+                    if (keyValue.Value.Count == 1)
+                        status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Rollback(partition.PartitionId, keyValue.Value[0])).ConfigureAwait(false);
+                    else
                         status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.RollbackMany(partition.PartitionId, keyValue.Value)).ConfigureAwait(false);
                     break;
                 
