@@ -10,12 +10,12 @@ public class ThreadPool
     /// <summary>
     /// Whether the thread pool has started
     /// </summary>
-    private bool started = false;
+    private bool started;
     
     /// <summary>
     /// Thread-safe queue to store tasks
     /// </summary>
-    private readonly BlockingCollection<Action> taskQueue;
+    private BlockingCollection<Action>? taskQueue;
     
     // Number of worker threads in the pool
     private readonly int workerCount;
@@ -45,6 +45,9 @@ public class ThreadPool
     {
         if (!started)
             throw new RaftException("Thread pool not started");
+        
+        if (taskQueue is null)
+            throw new RaftException("Thread pool is disposed");
         
         // Create a TaskCompletionSource to provide async notification
         TaskCompletionSource<T> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -88,6 +91,12 @@ public class ThreadPool
             {
                 try
                 {
+                    if (taskQueue is null)
+                    {
+                        logger.LogTrace("Worker {WorkerId} is stopped", workerId);
+                        return;
+                    }
+                    
                     foreach (Action task in taskQueue.GetConsumingEnumerable(cancellationTokenSource.Token))
                     {
                         try
@@ -133,6 +142,8 @@ public class ThreadPool
             thread.Join();
 
         // Complete the task queue
-        taskQueue.Dispose();
+        taskQueue?.Dispose();
+
+        taskQueue = null;
     }
 }

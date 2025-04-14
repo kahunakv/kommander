@@ -1,4 +1,3 @@
-
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -13,7 +12,7 @@ namespace Kommander.Discovery;
 public class MulticastDiscovery : IDiscovery
 {
     private static readonly IPAddress MulticastAddress = IPAddress.Parse("239.0.0.222");
-    
+
     private const int Port = 1900;
 
     private readonly Dictionary<string, bool> nodes = new();
@@ -23,7 +22,7 @@ public class MulticastDiscovery : IDiscovery
         try
         {
             using UdpClient udpClient = new();
-            
+
             // Allow multicast loopback so the sender can receive its own messages if needed.
             udpClient.MulticastLoopback = true;
 
@@ -36,7 +35,7 @@ public class MulticastDiscovery : IDiscovery
                 Host = configuration.Host,
                 Port = configuration.Port
             };
-            
+
             // Construct your discovery message.
             string message = JsonSerializer.Serialize(payload); //$"Hello from node {Environment.MachineName} at {DateTime.Now}";
             byte[] data = Encoding.UTF8.GetBytes(message);
@@ -81,7 +80,7 @@ public class MulticastDiscovery : IDiscovery
             {
                 UdpReceiveResult result = await udpClient.ReceiveAsync().ConfigureAwait(false);
                 string payloadMessage = Encoding.UTF8.GetString(result.Buffer);
-                
+
                 Console.WriteLine($"Received packet {result.Buffer.Length}");
 
                 string host = result.RemoteEndPoint.Address.ToString();
@@ -112,25 +111,25 @@ public class MulticastDiscovery : IDiscovery
         }
     }
 
-    public async Task Register(RaftConfiguration configuration)
+    public Task Register(RaftConfiguration configuration)
     {
         _ = Task.WhenAll(
             StartBroadcasting(configuration),
             StartListening(configuration)
         );
 
-        await Task.CompletedTask;
+        return Task.CompletedTask;
     }
-    
-    public async Task UpdateNodes()
+
+    public Task UpdateNodes()
     {
-        await Task.CompletedTask;
+        return Task.CompletedTask;
     }
 
     public List<RaftNode> GetNodes()
     {
         List<string> rn = nodes.Keys.ToList();
-        
+
         return rn.Select(x => new RaftNode(x)).ToList();
     }
 }
