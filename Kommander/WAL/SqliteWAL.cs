@@ -96,7 +96,7 @@ public class SqliteWAL : IWAL
                 return metaDataConnection;
             
             string completePath = $"{path}/raft_metadata_{revision}.db";
-            bool firstTime = !File.Exists(completePath);
+            //bool firstTime = !File.Exists(completePath);
 
             string connectionString = $"Data Source={completePath}";
             SqliteConnection connection = new(connectionString);
@@ -113,7 +113,7 @@ public class SqliteWAL : IWAL
             using SqliteCommand command1 = new(createTableQuery, connection);
             command1.ExecuteNonQuery();
 
-            const string pragmasQuery = "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;";
+            const string pragmasQuery = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;";
             using SqliteCommand command3 = new(pragmasQuery, connection);
             command3.ExecuteNonQuery();
 

@@ -231,4 +231,11 @@ public interface IRaft
     /// <param name="partitionKey"></param>
     /// <returns></returns>
     public int GetPartitionKey(string partitionKey);
+
+    /// <summary>
+    /// Returns the correct partition id according to a prefix key
+    /// </summary>
+    /// <param name="prefixPartitionKey"></param>
+    /// <returns></returns>
+    public int GetPrefixPartitionKey(string prefixPartitionKey);
 }
