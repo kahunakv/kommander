@@ -35,6 +35,33 @@ public class TestHLC
             
         Assert.Equal(100, hlc.Count);
     }
+
+    [Fact]
+    public void TestHLCCompare()
+    {
+        HLCTimestamp t1 = new(1744147995701, 1);
+        HLCTimestamp t2 = new(1744147995701, 2);
+        
+        Assert.Equal(-1, t1.CompareTo(t2));
+    }
+    
+    [Fact]
+    public void TestHLCCompare2()
+    {
+        HLCTimestamp t1 = new(1744147995701, 1);
+        HLCTimestamp t2 = new(1744147995701, 1);
+        
+        Assert.Equal(0, t1.CompareTo(t2));
+    }
+    
+    [Fact]
+    public void TestHLCCompare3()
+    {
+        HLCTimestamp t1 = new(1744147995701, 2);
+        HLCTimestamp t2 = new(1744147995701, 1);
+        
+        Assert.Equal(1, t1.CompareTo(t2));
+    }
     
     private static long GetCurrentTime()
     {

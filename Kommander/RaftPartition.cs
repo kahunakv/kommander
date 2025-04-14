@@ -242,7 +242,7 @@ public sealed class RaftPartition : IDisposable
     /// <summary>
     /// Replicate a checkpoint to the partition.
     /// </summary>
-    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)>  ReplicateCheckpoint()
+    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateCheckpoint()
     {
         if (string.IsNullOrEmpty(Leader))
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);

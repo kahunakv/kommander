@@ -122,11 +122,11 @@ public class InMemoryCommunication : ICommunication
             }
             else
             {
-                Console.WriteLine("CompleteAppendLogsBatch Unknown node: " + node.Endpoint + " [2]");
+                Console.WriteLine("CompleteAppendLogsBatch Unknown node: {0} [2]", node.Endpoint);
             }
         }
         else
-            Console.WriteLine("CompleteAppendLogsBatch Unknown node: " + node.Endpoint + " [1]");
+            Console.WriteLine("CompleteAppendLogsBatch Unknown node: {0} [1]", node.Endpoint);
         
         return completeAppendLogsBatchResponse;
     }

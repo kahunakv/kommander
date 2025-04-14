@@ -100,6 +100,9 @@ public class TestHashUtils
         
         bucket = HashUtils.InversePrefixedStaticHash("hello/foo/200", '/');
         Assert.Equal(11459500365492880529UL, bucket);
+        
+        bucket = HashUtils.SimpleHash("hello/foo");
+        Assert.Equal(11459500365492880529UL, bucket);
     }
     
     [Fact]

@@ -990,4 +990,24 @@ public sealed class RaftManager : IRaft
 
         throw new RaftException("Couldn't find partition range for: " + partitionKey + " " + rangeId);
     }
+    
+    /// <summary>
+    /// Returns the number of the partition for the given partition key
+    /// </summary>
+    /// <param name="partitionKey"></param>
+    /// <returns></returns>
+    public int GetPrefixPartitionKey(string prefixPartitionKey)
+    {
+        int rangeId = (int)HashUtils.SimpleHash(prefixPartitionKey);
+        if (rangeId < 0)
+            rangeId = -rangeId;
+
+        foreach (KeyValuePair<int, RaftPartition> partition in partitions)
+        {
+            if (partition.Value.StartRange <= rangeId && partition.Value.EndRange >= rangeId)
+                return partition.Key;
+        }
+        
+        throw new RaftException("Couldn't find partition range for: " + prefixPartitionKey + " " + rangeId);
+    }
 }

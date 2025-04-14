@@ -1,4 +1,5 @@
 
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Text;
 using Google.Protobuf;
@@ -13,7 +14,7 @@ public class RocksDbWAL : IWAL
 {
     private static readonly RecyclableMemoryStreamManager streamManager = new();
     
-    private static readonly WriteOptions DefaultWriteOptions = new WriteOptions().SetSync(true);
+    private static readonly WriteOptions DefaultWriteOptions = new WriteOptions().SetSync(false);
 
     private const string FormatVersion = "1.0.0";
 
@@ -29,7 +30,7 @@ public class RocksDbWAL : IWAL
     
     private readonly string revision;
     
-    private readonly Dictionary<int, ColumnFamilyHandle> families = new();
+    private readonly ConcurrentDictionary<int, Lazy<ColumnFamilyHandle>> families = new();
     
     private readonly ILogger<IRaft> logger;
     
@@ -65,14 +66,17 @@ public class RocksDbWAL : IWAL
     
     private ColumnFamilyHandle GetColumnFamily(int partitionId)
     {
-        if (!families.TryGetValue(partitionId, out ColumnFamilyHandle? columnFamily))
+        Lazy<ColumnFamilyHandle> lazy = families.GetOrAdd(partitionId, GetColumnFamilyHandle);
+        return lazy.Value;
+    }
+
+    private Lazy<ColumnFamilyHandle> GetColumnFamilyHandle(int arg)
+    {
+        return new(() =>
         {
-            int shardId = partitionId % MaxShards;
-            columnFamily = db.GetColumnFamily("shard" + shardId);
-            families.Add(partitionId, columnFamily);
-        }
-        
-        return columnFamily;
+            int shardId = arg % MaxShards;
+            return db.GetColumnFamily("shard" + shardId);
+        });
     }
 
     public List<RaftLog> ReadLogs(int partitionId)
@@ -356,7 +360,7 @@ public class RocksDbWAL : IWAL
                 if (log.LogData != null)
                     message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
             
-                writeBatch.Put(Encoding.UTF8.GetBytes(index), Serialize(message), cf: columnFamilyHandle);
+                PutToBatch(writeBatch, index, message, columnFamilyHandle);
             }
             
             db.Write(writeBatch, DefaultWriteOptions);
@@ -402,7 +406,7 @@ public class RocksDbWAL : IWAL
                 if (log.LogData != null)
                     message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
 
-                writeBatch.Put(Encoding.UTF8.GetBytes(index), Serialize(message), cf: columnFamilyHandle);
+                PutToBatch(writeBatch, index, message, columnFamilyHandle);
             }
 
             db.Write(writeBatch, DefaultWriteOptions);
@@ -445,7 +449,7 @@ public class RocksDbWAL : IWAL
                 if (log.LogData != null)
                     message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
 
-                writeBatch.Put(Encoding.UTF8.GetBytes(index), Serialize(message), cf: columnFamilyHandle);
+                PutToBatch(writeBatch, index, message, columnFamilyHandle);
             }
             
             db.Write(writeBatch, DefaultWriteOptions);
@@ -458,6 +462,14 @@ public class RocksDbWAL : IWAL
                 
             return RaftOperationStatus.Errored;
         }
+    }
+
+    private static void PutToBatch(WriteBatch writeBatch, string index, RaftLogMessage message, ColumnFamilyHandle columnFamilyHandle)
+    {
+        Span<byte> buffer = stackalloc byte[Encoding.UTF8.GetByteCount(index)];
+        Encoding.UTF8.GetBytes(index.AsSpan(), buffer);
+        
+        writeBatch.Put(buffer, Serialize(message), cf: columnFamilyHandle);
     }
 
     public long GetMaxLog(int partitionId)
