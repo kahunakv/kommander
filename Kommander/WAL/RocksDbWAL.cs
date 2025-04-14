@@ -14,7 +14,7 @@ public class RocksDbWAL : IWAL
 {
     private static readonly RecyclableMemoryStreamManager streamManager = new();
     
-    private static readonly WriteOptions DefaultWriteOptions = new WriteOptions().SetSync(true);
+    private static readonly WriteOptions DefaultWriteOptions = new WriteOptions().SetSync(false);
 
     private const string FormatVersion = "1.0.0";
 
