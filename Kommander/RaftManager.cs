@@ -56,6 +56,8 @@ public sealed class RaftManager : IRaft, IDisposable
     private readonly IActorRef<RaftLeaderSupervisor, RaftLeaderSupervisorRequest> leaderSupervisorActor;
 
     private readonly ConcurrentDictionary<string, HLCTimestamp> lastActivity = new();
+    
+    private readonly ConcurrentDictionary<string, IActorAggregateRef<RaftResponderActor, RaftResponderRequest>> responderActors = [];
 
     /// <summary>
     /// Allows to retrieve the list of known nodes within the Raft cluster
@@ -1009,6 +1011,24 @@ public sealed class RaftManager : IRaft, IDisposable
         }
         
         throw new RaftException("Couldn't find partition range for: " + prefixPartitionKey + " " + rangeId);
+    }
+    
+    internal void EnqueueResponse(string endpoint, RaftResponderRequest request)
+    {
+        if (!responderActors.TryGetValue(endpoint, out IActorAggregateRef<RaftResponderActor, RaftResponderRequest>? responderActor))
+        {
+            responderActor = actorSystem.SpawnAggregate<RaftResponderActor, RaftResponderRequest>(
+                string.Concat("raft-responder-", endpoint),
+                this,
+                new RaftNode(endpoint),
+                communication,
+                Logger
+            );
+            
+            responderActors.TryAdd(endpoint, responderActor);
+        }
+        
+        responderActor.Send(request);
     }
 
     public void Dispose()

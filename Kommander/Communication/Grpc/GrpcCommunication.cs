@@ -25,7 +25,9 @@ public class GrpcCommunication : ICommunication
     
     private static readonly CompleteAppendLogsResponse completeAppendLogsResponse = new();
     
-    private static readonly CompleteAppendLogsBatchResponse completeAppendLogsBatchResponse = new();            
+    private static readonly CompleteAppendLogsBatchResponse completeAppendLogsBatchResponse = new();
+
+    private static readonly BatchRequestsResponse batchRequestsResponse = new();
 
     /// <summary>
     /// Sends a Handshake message to a node via gRPC
@@ -295,38 +297,114 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)
     {
+        if (request.Requests is null)
+            return new();
+        
         GrpcChannel channel = SharedChannels.GetChannel(node.Endpoint);
         
         Rafter.RafterClient client = new(channel);
         
-        GrpcAppendLogsBatchRequest batchRequest = new();
-
-        /*if (request.AppendLogs is not null)
-        {
-            RepeatedField<GrpcAppendLogsRequest> grpcRequests = new();
+        RepeatedField<GrpcBatchRequestsRequestItem> items = new();
             
-            foreach (AppendLogsRequest appendLogsRequest in request.AppendLogs)
+        foreach (BatchRequestsRequestItem requestItem in request.Requests)
+        {
+            GrpcBatchRequestsRequestItem item = new()
             {
-                GrpcAppendLogsRequest grpcRequest = new()
+                Type = (GrpcBatchRequestsRequestType) requestItem.Type
+            };
+            
+            items.Add(item);
+
+            if (requestItem.Handshake is not null)
+            {
+                GrpcHandshakeRequest handshake = new()
                 {
-                    Partition = appendLogsRequest.Partition,
-                    Term = appendLogsRequest.Term,
-                    TimePhysical = appendLogsRequest.Time.L,
-                    TimeCounter = appendLogsRequest.Time.C,
-                    Endpoint = appendLogsRequest.Endpoint
+                    Partition = requestItem.Handshake.Partition,
+                    MaxLogId = requestItem.Handshake.MaxLogId,
+                    Endpoint = requestItem.Handshake.Endpoint
                 };
                 
-                if (appendLogsRequest.Logs is not null)
-                    grpcRequest.Logs.AddRange(GetLogs(appendLogsRequest.Logs));
+                item.Handshake = handshake;
 
-                grpcRequests.Add(grpcRequest);
+                continue;
             }
             
-            batchRequest.AppendLogs.AddRange(grpcRequests);
+            if (requestItem.Vote is not null)
+            {
+                GrpcVoteRequest voteRequest = new()
+                {
+                    Partition = requestItem.Vote.Partition,
+                    Term = requestItem.Vote.Term,
+                    MaxLogId = requestItem.Vote.MaxLogId,
+                    TimePhysical = requestItem.Vote.Time.L,
+                    TimeCounter = requestItem.Vote.Time.C,
+                    Endpoint = requestItem.Vote.Endpoint
+                };
+                
+                item.Vote = voteRequest;
+                
+                continue;
+            }
+            
+            if (requestItem.RequestVotes is not null)
+            {
+                GrpcRequestVotesRequest requestVotes = new()
+                {
+                    Partition = requestItem.RequestVotes.Partition,
+                    Term = requestItem.RequestVotes.Term,
+                    MaxLogId = requestItem.RequestVotes.MaxLogId,
+                    TimePhysical = requestItem.RequestVotes.Time.L,
+                    TimeCounter = requestItem.RequestVotes.Time.C,
+                    Endpoint = requestItem.RequestVotes.Endpoint
+                };
+                
+                item.RequestVotes = requestVotes;
+                
+                continue;
+            }
+
+            if (requestItem.AppendLogs is not null)
+            {
+                GrpcAppendLogsRequest appendRequest = new()
+                {
+                    Partition = requestItem.AppendLogs.Partition,
+                    Term = requestItem.AppendLogs.Term,
+                    TimePhysical = requestItem.AppendLogs.Time.L,
+                    TimeCounter = requestItem.AppendLogs.Time.C,
+                    Endpoint = requestItem.AppendLogs.Endpoint
+                };
+
+                if (requestItem.AppendLogs.Logs is not null)
+                    appendRequest.Logs.AddRange(GetLogs(requestItem.AppendLogs.Logs));
+                
+                item.AppendLogs = appendRequest;
+                
+                continue;
+            }
+            
+            if (requestItem.CompleteAppendLogs is not null)
+            {
+                GrpcCompleteAppendLogsRequest completeRequest = new()
+                {
+                    Partition = requestItem.CompleteAppendLogs.Partition,
+                    Term = requestItem.CompleteAppendLogs.Term,
+                    TimePhysical = requestItem.CompleteAppendLogs.Time.L,
+                    TimeCounter = requestItem.CompleteAppendLogs.Time.C,
+                    Endpoint = requestItem.CompleteAppendLogs.Endpoint,
+                    Status = (GrpcRaftOperationStatus) requestItem.CompleteAppendLogs.Status,
+                    CommitIndex = requestItem.CompleteAppendLogs.CommitIndex
+                };
+                
+                item.CompleteAppendLogs = completeRequest;
+            }
         }
         
-        await client.AppendLogsBatchAsync(batchRequest).ConfigureAwait(false);*/
+        GrpcBatchRequestsRequest batchRequests = new();
         
-        return appendLogsBatchResponse;
+        batchRequests.Requests.AddRange(items);
+        
+        await client.BatchRequestsAsync(batchRequests).ConfigureAwait(false);
+        
+        return batchRequestsResponse;
     }
 }

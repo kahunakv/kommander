@@ -55,7 +55,7 @@ try
             configuration,
             new StaticDiscovery(nodes),
             new RocksDbWAL(path: opts.SqliteWalPath, revision: opts.SqliteWalRevision, logger),
-            new RestCommunication(),
+            new GrpcCommunication(),
             new HybridLogicalClock(),
             logger
         );

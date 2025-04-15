@@ -23,6 +23,8 @@ public class InMemoryCommunication : ICommunication
     
     private readonly Task<CompleteAppendLogsBatchResponse> completeAppendLogsBatchResponse = Task.FromResult(new CompleteAppendLogsBatchResponse());
     
+    private readonly Task<BatchRequestsResponse> batchRequestsResponse = Task.FromResult(new BatchRequestsResponse());
+    
     private Dictionary<string, IRaft> nodes = new();
     
     public void SetNodes(Dictionary<string, IRaft> nodes)
@@ -129,5 +131,54 @@ public class InMemoryCommunication : ICommunication
             Console.WriteLine("CompleteAppendLogsBatch Unknown node: {0} [1]", node.Endpoint);
         
         return completeAppendLogsBatchResponse;
+    }
+
+    public Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)
+    {
+        if (manager.ClusterHandler.IsNode(node.Endpoint))
+        {
+            if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
+            {
+                if (request.Requests is not null)
+                {
+                    foreach (BatchRequestsRequestItem item in request.Requests)
+                    {
+                        switch (item.Type)
+                        {
+                            case BatchRequestsRequestType.Handshake:
+                                targetNode.Handshake(item.Handshake!);
+                                break;
+                            
+                            case BatchRequestsRequestType.Vote:
+                                targetNode.Vote(item.Vote!);
+                                break;
+                            
+                            case BatchRequestsRequestType.RequestVote:
+                                targetNode.RequestVote(item.RequestVotes!);
+                                break;
+                            
+                            case BatchRequestsRequestType.AppendLogs:
+                                targetNode.AppendLogs(item.AppendLogs!);
+                                break;
+                            
+                            case BatchRequestsRequestType.CompleteAppendLogs:
+                                targetNode.CompleteAppendLogs(item.CompleteAppendLogs!);
+                                break;
+                            
+                            default:
+                                throw new ArgumentOutOfRangeException();
+                        }
+                    }
+                }
+            }
+            else
+            {
+                Console.WriteLine("CompleteAppendLogsBatch Unknown node: {0} [2]", node.Endpoint);
+            }
+        }
+        else
+            Console.WriteLine("CompleteAppendLogsBatch Unknown node: {0} [1]", node.Endpoint);
+
+        return batchRequestsResponse;
     }
 }

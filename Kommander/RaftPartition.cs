@@ -22,8 +22,6 @@ public sealed class RaftPartition : IDisposable
     private readonly SemaphoreSlim semaphore = new(1, 1);
 
     private readonly IActorRefStruct<RaftStateActor, RaftRequest, RaftResponse> raftActor;
-    
-    private readonly ConcurrentDictionary<string, IActorAggregateRef<RaftResponderActor, RaftResponderRequest>> responderActors = [];
 
     private readonly RaftManager manager;
 
@@ -298,23 +296,6 @@ public sealed class RaftPartition : IDisposable
     public void CheckLeader()
     {
         raftActor.Send(new(RaftRequestType.CheckLeader));
-    }
-    
-    internal void EnqueueResponse(string endpoint, RaftResponderRequest request)
-    {
-        if (!responderActors.TryGetValue(endpoint, out IActorAggregateRef<RaftResponderActor, RaftResponderRequest>? responderActor))
-        {
-            responderActor = actorSystem.SpawnAggregate<RaftResponderActor, RaftResponderRequest>(
-                string.Concat("raft-responder-", PartitionId, "-", endpoint),
-                manager,
-                communication,
-                manager.Logger
-            );
-            
-            responderActors.TryAdd(endpoint, responderActor);
-        }
-        
-        responderActor.Send(request);
     }
 
     public void Dispose()

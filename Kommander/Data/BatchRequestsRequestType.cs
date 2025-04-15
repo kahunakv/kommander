@@ -1,6 +1,10 @@
 namespace Kommander.Data;
 
-public class BatchRequestsRequestType
+public enum BatchRequestsRequestType
 {
-    
+    Handshake,
+    Vote,
+    RequestVote,
+    AppendLogs,
+    CompleteAppendLogs
 }

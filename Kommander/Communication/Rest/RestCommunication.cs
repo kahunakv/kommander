@@ -202,4 +202,9 @@ public class RestCommunication : ICommunication
 
         return new();
     }
+
+    public Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)
+    {
+        throw new NotImplementedException();
+    }
 }

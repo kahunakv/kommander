@@ -1,4 +1,6 @@
 
+#pragma warning disable CA1051
+
 using System.Collections;
 
 namespace Kommander.Support.Collections;
@@ -33,7 +35,7 @@ public sealed class SmallDictionary<TKey, TValue> : IEnumerable<KeyValuePair<TKe
 {
     private readonly SmallBucket<TKey, TValue?>[] buckets;
 
-    public int Count { get; private set; } = 0;
+    public int Count { get; private set; }
     
     public SmallDictionary(int capacity)
     {
@@ -194,3 +196,5 @@ public sealed class SmallDictionary<TKey, TValue> : IEnumerable<KeyValuePair<TKe
         return GetEnumerator();
     }
 }
+
+#pragma warning restore CA1051

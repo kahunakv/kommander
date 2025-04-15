@@ -178,26 +178,64 @@ public class RaftService : Rafter.RafterBase
         //if (request.Logs.Count > 0)
         //    logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got AppendLogs message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
 
-        if (request.Handshake is { } handshakeRequest)
+        foreach (GrpcBatchRequestsRequestItem? requestItem in request.Requests)
         {
-            raft.Handshake(new(
-                handshakeRequest.Partition,
-                handshakeRequest.MaxLogId,
-                handshakeRequest.Endpoint
-            ));
+            switch (requestItem)
+            {
+                case { Type: GrpcBatchRequestsRequestType.Handshake, Handshake: { } handshakeRequest }:
+                    raft.Handshake(new(
+                        handshakeRequest.Partition,
+                        handshakeRequest.MaxLogId,
+                        handshakeRequest.Endpoint
+                    ));
+                    break;
+                
+                case { Type: GrpcBatchRequestsRequestType.Vote, Vote: { } voteRequest }:
+                    raft.Vote(new(
+                        voteRequest.Partition,
+                        voteRequest.Term,
+                        voteRequest.MaxLogId,
+                        new(voteRequest.TimePhysical, voteRequest.TimeCounter),
+                        voteRequest.Endpoint
+                    ));
+                    break;
+                
+                case { Type: GrpcBatchRequestsRequestType.RequestVotes, RequestVotes: { } requestVoteRequest }:
+                    raft.RequestVote(new(
+                        requestVoteRequest.Partition,
+                        requestVoteRequest.Term,
+                        requestVoteRequest.MaxLogId,
+                        new(requestVoteRequest.TimePhysical, requestVoteRequest.TimeCounter),
+                        requestVoteRequest.Endpoint
+                    ));
+                    break;
+                
+                case { Type: GrpcBatchRequestsRequestType.AppendLogs, AppendLogs: { } appendLogsRequest }:
+                    raft.AppendLogs(new(
+                        appendLogsRequest.Partition, 
+                        appendLogsRequest.Term, 
+                        new(appendLogsRequest.TimePhysical, appendLogsRequest.TimeCounter), 
+                        appendLogsRequest.Endpoint, 
+                        GetLogs(appendLogsRequest.Logs)
+                    ));
+                    break;
+                
+                case { Type: GrpcBatchRequestsRequestType.CompleteAppendLogs, CompleteAppendLogs: { } completeAppendLogsRequest }:
+                    raft.CompleteAppendLogs(new(
+                        completeAppendLogsRequest.Partition, 
+                        completeAppendLogsRequest.Term, 
+                        new(completeAppendLogsRequest.TimePhysical, completeAppendLogsRequest.TimeCounter), 
+                        completeAppendLogsRequest.Endpoint,
+                        (RaftOperationStatus)completeAppendLogsRequest.Status,
+                        completeAppendLogsRequest.CommitIndex
+                    ));
+                    break;
+                
+                default:
+                    throw new NotImplementedException($"Unknown grpc request type {requestItem.GetType()}");
+            }
         }
         
-        if (request.Vote is { } voteRequest)
-        {
-            raft.Vote(new(
-                voteRequest.Partition,
-                voteRequest.Term,
-                voteRequest.MaxLogId,
-                new(voteRequest.TimePhysical, voteRequest.TimeCounter),
-                voteRequest.Endpoint
-            ));
-        }
-
-        return new();
+        return Task.FromResult<GrpcBatchRequestsResponse>(new());
     }
 }

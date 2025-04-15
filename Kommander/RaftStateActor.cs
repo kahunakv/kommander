@@ -1,4 +1,5 @@
 ﻿
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using Nixie;
 using Kommander.Communication;
@@ -407,7 +408,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             
             logger.LogInfoAskedForVotes(manager.LocalEndpoint, partition.PartitionId, nodeState, node.Endpoint, currentTerm);
             
-            partition.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.RequestVotes, node, request));
+            manager.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.RequestVotes, node, request));
         }
     }
 
@@ -482,7 +483,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             
             logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Sending handshake to {Node} #{Number}", manager.LocalEndpoint, partition.PartitionId, nodeState, node.Endpoint, ++number);
             
-            partition.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Handshake, node, request));
+            manager.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Handshake, node, request));
         }
     }
 
@@ -542,7 +543,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         VoteRequest request = new(partition.PartitionId, voteTerm, localMaxId.Index, timestamp, manager.LocalEndpoint);
         
-        partition.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Vote, node, request));
+        manager.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Vote, node, request));
     }
 
     /// <summary>
@@ -653,7 +654,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from a leader {Endpoint} with old ReceivedTerm={Term} CurrentTerm={CurrentTerm}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm, currentTerm);
             
-            partition.EnqueueResponse(endpoint, new(
+            manager.EnqueueResponse(endpoint, new(
                 RaftResponderRequestType.CompleteAppendLogs, 
                 new(endpoint), 
                 new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, timestamp, manager.LocalEndpoint, RaftOperationStatus.LeaderInOldTerm, -1)
@@ -687,7 +688,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             {
                 logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from another leader {Endpoint} (current leader {CurrentLeader}) Term={Term}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, expectedLeader, leaderTerm);
                 
-                partition.EnqueueResponse(endpoint, new(
+                manager.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs, 
                     new(endpoint), 
                     new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, timestamp, manager.LocalEndpoint, RaftOperationStatus.LogsFromAnotherLeader, -1)
@@ -711,7 +712,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             {
                 logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't append logs from leader {Endpoint} with Term={Term} Status={Status} Logs={Logs}", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm, response.Status, logs.Count);
                 
-                partition.EnqueueResponse(endpoint, new(
+                manager.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs, 
                     new(endpoint), 
                     new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, timestamp, manager.LocalEndpoint, response.Status, -1)
@@ -721,7 +722,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             
             foreach (HLCTimestamp logTimestamp in logs.Select(x => x.Time).Distinct())
             {
-                partition.EnqueueResponse(endpoint, new(
+                manager.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs, 
                     new(endpoint), 
                     new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, logTimestamp, manager.LocalEndpoint, RaftOperationStatus.Success, response.Index)
@@ -731,7 +732,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
         
-        partition.EnqueueResponse(endpoint, new(
+        manager.EnqueueResponse(endpoint, new(
             RaftResponderRequestType.CompleteAppendLogs, 
             new(endpoint), 
             new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, lastHeartbeat, manager.LocalEndpoint, RaftOperationStatus.Success, -1)
@@ -1048,7 +1049,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }*/
 
-        partition.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.AppendLogs, node, request));
+        manager.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.AppendLogs, node, request));
     }
 
     /// <summary>

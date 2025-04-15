@@ -13,15 +13,19 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
     private readonly ICommunication communication;
 
     private readonly ILogger<IRaft> logger;
+
+    private readonly RaftNode node;
     
     public RaftResponderActor(
         IActorAggregateContext<RaftResponderActor, RaftResponderRequest> _,
         RaftManager manager, 
+        RaftNode node,
         ICommunication communication,
         ILogger<IRaft> logger
     )
     {
         this.manager = manager;
+        this.node = node;
         this.communication = communication;
         this.logger = logger;
     }
@@ -30,65 +34,44 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
     {
         try
         {
-            if (messages.Count > 1)
-            {
-                if (AreAllAppendLogs(messages))
-                {
-                    //Console.WriteLine("Got block of {0} append messages", messages.Count);
-
-                    List<AppendLogsRequest> newMessages = new(messages.Count);
-
-                    foreach (RaftResponderRequest message in messages)
-                        newMessages.Add(message.AppendLogsRequest!);
-
-                    await communication.AppendLogsBatch(manager, messages[0].Node!, new() { AppendLogs = newMessages }).ConfigureAwait(false);
-                    return;
-                }
-                
-                if (AreAllCompleteLogs(messages))
-                {
-                    //Console.WriteLine("Got block of {0} complete messages", messages.Count);
-                
-                    List<CompleteAppendLogsRequest> newMessages = new(messages.Count);
-
-                    foreach (RaftResponderRequest message in messages)
-                        newMessages.Add(message.CompleteAppendLogsRequest!);
-                
-                    await communication.CompleteAppendLogsBatch(manager, messages[0].Node!, new() { CompleteLogs = newMessages }).ConfigureAwait(false);
-                    return;
-                }
-            }
-
-            await messages.ForEachAsync(5, async message =>
+            List<BatchRequestsRequestItem> request = [];
+            
+            foreach (RaftResponderRequest message in messages)
             {
                 switch (message.Type)
                 {
-                    case RaftResponderRequestType.AppendLogs:
-                        await AppendLogs(message).ConfigureAwait(false);
-                        break;
-
-                    case RaftResponderRequestType.CompleteAppendLogs:
-                        await CompleteAppendLogs(message).ConfigureAwait(false);
-                        break;
-
-                    case RaftResponderRequestType.Vote:
-                        await Vote(message).ConfigureAwait(false);
-                        break;
-
-                    case RaftResponderRequestType.RequestVotes:
-                        await RequestVotes(message).ConfigureAwait(false);
-                        break;
-
                     case RaftResponderRequestType.Handshake:
-                        await Handshake(message).ConfigureAwait(false);
+                        request.Add(new() { Type = BatchRequestsRequestType.Handshake, Handshake = message.HandshakeRequest });
                         break;
-
+                    
+                    case RaftResponderRequestType.Vote:
+                        request.Add(new() { Type = BatchRequestsRequestType.Vote, Vote = message.VoteRequest });
+                        break;
+                    
+                    case RaftResponderRequestType.RequestVotes:
+                        request.Add(new() { Type = BatchRequestsRequestType.RequestVote, RequestVotes = message.RequestVotesRequest });
+                        break;
+                    
+                    case RaftResponderRequestType.AppendLogs:
+                        request.Add(new() { Type = BatchRequestsRequestType.AppendLogs, AppendLogs = message.AppendLogsRequest });
+                        break;
+                    
+                    case RaftResponderRequestType.CompleteAppendLogs:
+                        request.Add(new() { Type = BatchRequestsRequestType.CompleteAppendLogs, CompleteAppendLogs = message.CompleteAppendLogsRequest });
+                        break;
+                    
                     case RaftResponderRequestType.TryBatch:
                     default:
-                        logger.LogError("Unsupported message {Type}", message.Type);
-                        break;
+                        throw new NotImplementedException();
                 }
-            }).ConfigureAwait(false);
+            }
+            
+            if (request.Count > 10)
+                logger.LogDebug("Sending block of {Count} messages", request.Count);
+            
+            _ = communication.BatchRequests(manager, node, new() { Requests = request }).ConfigureAwait(false);
+
+            await Task.Delay(1);
         }
         catch (Exception ex)
         {

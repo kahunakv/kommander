@@ -1,6 +1,6 @@
 namespace Kommander.Data;
 
-public class BatchRequestsRequest
+public sealed class BatchRequestsRequest
 {
-    
+    public List<BatchRequestsRequestItem>? Requests { get; set; }
 }
