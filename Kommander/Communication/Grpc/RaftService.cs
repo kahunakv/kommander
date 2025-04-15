@@ -172,4 +172,32 @@ public class RaftService : Rafter.RafterBase
 
         return logs;
     }
+    
+    public override Task<GrpcBatchRequestsResponse> BatchRequests(GrpcBatchRequestsRequest request, ServerCallContext context)
+    {
+        //if (request.Logs.Count > 0)
+        //    logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got AppendLogs message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
+
+        if (request.Handshake is { } handshakeRequest)
+        {
+            raft.Handshake(new(
+                handshakeRequest.Partition,
+                handshakeRequest.MaxLogId,
+                handshakeRequest.Endpoint
+            ));
+        }
+        
+        if (request.Vote is { } voteRequest)
+        {
+            raft.Vote(new(
+                voteRequest.Partition,
+                voteRequest.Term,
+                voteRequest.MaxLogId,
+                new(voteRequest.TimePhysical, voteRequest.TimeCounter),
+                voteRequest.Endpoint
+            ));
+        }
+
+        return new();
+    }
 }

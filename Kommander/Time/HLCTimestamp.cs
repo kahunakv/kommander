@@ -63,5 +63,9 @@ public readonly record struct HLCTimestamp : IComparable<HLCTimestamp>
     
     public static bool operator >(HLCTimestamp a, HLCTimestamp b) => a.CompareTo(b) > 0;
     
+    public static bool operator >=(HLCTimestamp a, HLCTimestamp b) => a.CompareTo(b) >= 0;
+    
+    public static bool operator <=(HLCTimestamp a, HLCTimestamp b) => a.CompareTo(b) >= 0;
+    
     public static bool operator <(HLCTimestamp a, HLCTimestamp b) => a.CompareTo(b) < 0;
 }

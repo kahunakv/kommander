@@ -9,6 +9,21 @@ service Rafter {
   rpc AppendLogsBatch (GrpcAppendLogsBatchRequest) returns (GrpcAppendLogsBatchResponse);
   rpc CompleteAppendLogs (GrpcCompleteAppendLogsRequest) returns (GrpcCompleteAppendLogsResponse);
   rpc CompleteAppendLogsBatch (GrpcCompleteAppendLogsBatchRequest) returns (GrpcCompleteAppendLogsBatchResponse);
+  rpc BatchRequests (GrpcBatchRequestsRequest) returns (GrpcBatchRequestsResponse);
+}
+
+message GrpcBatchRequestsRequest
+{
+  optional GrpcHandshakeRequest Handshake = 2;
+  optional GrpcVoteRequest Vote = 3;
+  optional GrpcRequestVotesRequest RequestVotes = 4;
+  optional GrpcAppendLogsRequest AppendLogs = 5;
+  optional GrpcCompleteAppendLogsRequest CompleteAppendLogs = 6;
+}
+
+message GrpcBatchRequestsResponse
+{
+  
 }
 
 message GrpcHandshakeRequest {

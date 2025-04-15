@@ -43,7 +43,7 @@ public sealed class RaftManager : IRaft, IDisposable
 
     private readonly ClusterHandler clusterHandler;
 
-    private RaftPartition? systemPartition = null;
+    private RaftPartition? systemPartition;
 
     private readonly Dictionary<int, RaftPartition> partitions = [];
 
@@ -75,7 +75,7 @@ public sealed class RaftManager : IRaft, IDisposable
     /// <summary>
     /// Whether the node is fully initialized or not
     /// </summary>
-    public bool IsInitialized { get; private set; } = false;
+    public bool IsInitialized { get; private set; }
 
     /// <summary>
     /// Read I/O thread pool
