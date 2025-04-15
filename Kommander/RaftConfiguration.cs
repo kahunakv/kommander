@@ -90,7 +90,13 @@ public class RaftConfiguration
     /// If the per-partition raft state machine takes more than this value to process a message it will show a log
     /// Slow processing of messages might indicate a performance issue
     /// </summary>
-    public int SlowRaftStateMachineLog { get; set; } = 500;
+    public int SlowRaftStateMachineLog { get; set; } = 50;
+    
+    /// <summary>
+    /// If the per-partition raft state machine takes more than this value to process a message it will show a log
+    /// Slow processing of messages might indicate a performance issue
+    /// </summary>
+    public int SlowRaftWALMachineLog { get; set; } = 25;
     
     /// <summary>
     /// Number of background threads used for I/O read operations

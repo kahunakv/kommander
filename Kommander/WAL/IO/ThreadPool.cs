@@ -3,7 +3,7 @@ using System.Collections.Concurrent;
 
 namespace Kommander.WAL.IO;
 
-public class ThreadPool
+public class ThreadPool : IDisposable
 {
     private readonly ILogger<IRaft> logger;
 
@@ -145,5 +145,11 @@ public class ThreadPool
         taskQueue?.Dispose();
 
         taskQueue = null;
+    }
+
+    public void Dispose()
+    {
+        taskQueue?.Dispose();
+        cancellationTokenSource.Dispose();
     }
 }

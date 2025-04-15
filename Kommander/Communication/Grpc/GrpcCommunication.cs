@@ -12,13 +12,7 @@ namespace Kommander.Communication.Grpc;
 /// Allows for communication between Raft nodes using gRPC messages
 /// </summary>
 public class GrpcCommunication : ICommunication
-{
-    private const int MaxChannels = 5;
-    
-    private readonly ConcurrentDictionary<string, List<GrpcChannel>> channels = new();
-    
-    private int channelIndex;
-    
+{    
     private static readonly HandshakeResponse handshakeResponse = new();
     
     private static readonly RequestVotesResponse requestVotesResponse = new();
@@ -31,30 +25,7 @@ public class GrpcCommunication : ICommunication
     
     private static readonly CompleteAppendLogsResponse completeAppendLogsResponse = new();
     
-    private static readonly CompleteAppendLogsBatchResponse completeAppendLogsBatchResponse = new();
-    
-    private static readonly SocketsHttpHandler httpHandler = GetHandler();
-    
-    private static SocketsHttpHandler GetHandler()
-    {
-        SslClientAuthenticationOptions sslOptions = new()
-        {
-            // @todo proper certificate validation
-            RemoteCertificateValidationCallback = delegate { return true; }
-        };
-        
-        SocketsHttpHandler handler = new()
-        {
-            SslOptions = sslOptions,
-            ConnectTimeout = TimeSpan.FromSeconds(10),
-            PooledConnectionIdleTimeout = Timeout.InfiniteTimeSpan,
-            KeepAlivePingDelay = TimeSpan.FromSeconds(60),
-            KeepAlivePingTimeout = TimeSpan.FromSeconds(30),
-            EnableMultipleHttp2Connections = true
-        };
-
-        return handler;
-    }
+    private static readonly CompleteAppendLogsBatchResponse completeAppendLogsBatchResponse = new();            
 
     /// <summary>
     /// Sends a Handshake message to a node via gRPC
@@ -66,7 +37,7 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<HandshakeResponse> Handshake(RaftManager manager, RaftNode node, HandshakeRequest request)
     {
-        GrpcChannel channel = GetChannel(node.Endpoint);
+        GrpcChannel channel = SharedChannels.GetChannel(node.Endpoint);
 
         Rafter.RafterClient client = new(channel);
 
@@ -96,7 +67,7 @@ public class GrpcCommunication : ICommunication
     {
         //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Sent RequestVotes message to {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
 
-        GrpcChannel channel = GetChannel(node.Endpoint);
+        GrpcChannel channel = SharedChannels.GetChannel(node.Endpoint);
 
         Rafter.RafterClient client = new(channel);
 
@@ -129,7 +100,7 @@ public class GrpcCommunication : ICommunication
     {
         //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Send Vote to {Node} message on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
         
-        GrpcChannel channel = GetChannel(node.Endpoint);
+        GrpcChannel channel = SharedChannels.GetChannel(node.Endpoint);
         
         Rafter.RafterClient client = new(channel);
 
@@ -160,7 +131,7 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftNode node, AppendLogsRequest request)
     {
-        GrpcChannel channel = GetChannel(node.Endpoint);
+        GrpcChannel channel = SharedChannels.GetChannel(node.Endpoint);
         
         Rafter.RafterClient client = new(channel);
 
@@ -190,7 +161,7 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<AppendLogsBatchResponse> AppendLogsBatch(RaftManager manager, RaftNode node, AppendLogsBatchRequest request)
     {
-        GrpcChannel channel = GetChannel(node.Endpoint);
+        GrpcChannel channel = SharedChannels.GetChannel(node.Endpoint);
         
         Rafter.RafterClient client = new(channel);
         
@@ -235,7 +206,7 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftNode node, CompleteAppendLogsRequest request)
     {
-        GrpcChannel channel = GetChannel(node.Endpoint);
+        GrpcChannel channel = SharedChannels.GetChannel(node.Endpoint);
         
         Rafter.RafterClient client = new(channel);
 
@@ -264,7 +235,7 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<CompleteAppendLogsBatchResponse> CompleteAppendLogsBatch(RaftManager manager, RaftNode node, CompleteAppendLogsBatchRequest request)
     {
-        GrpcChannel channel = GetChannel(node.Endpoint);
+        GrpcChannel channel = SharedChannels.GetChannel(node.Endpoint);
         
         Rafter.RafterClient client = new(channel);
         
@@ -313,24 +284,5 @@ public class GrpcCommunication : ICommunication
                 Data = UnsafeByteOperations.UnsafeWrap(requestLog.LogData)
             };
         }
-    }
-    
-    private GrpcChannel GetChannel(string endpoint)
-    {
-        if (!channels.TryGetValue(endpoint, out List<GrpcChannel>? grpcChannels))
-        {
-            grpcChannels = new(MaxChannels);
-            
-            for (int i = 0; i < MaxChannels; i++)
-                grpcChannels.Add(GrpcChannel.ForAddress($"https://{endpoint}", new() { HttpHandler = httpHandler }));
-            
-            channels.TryAdd(endpoint, grpcChannels);
-        }
-
-        int nextIndex = Interlocked.Increment(ref channelIndex);
-        if (nextIndex < 0)
-            nextIndex = -nextIndex;
-        
-        return grpcChannels[nextIndex % MaxChannels];
-    }
+    }       
 }

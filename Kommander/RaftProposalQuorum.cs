@@ -1,4 +1,6 @@
 
+using Kommander.Time;
+
 namespace Kommander.Data;
 
 public sealed class RaftProposalQuorum
@@ -16,13 +18,16 @@ public sealed class RaftProposalQuorum
     public long LastLogIndex => Logs.Last().Id;
 
     public bool AutoCommit { get; }
+    
+    public HLCTimestamp StartTimestamp { get; }
 
-    public RaftProposalQuorum(List<RaftLog> logs, bool autoCommit)
+    public RaftProposalQuorum(List<RaftLog> logs, bool autoCommit, HLCTimestamp startTimestamp)
     {
         State = RaftProposalState.Incomplete;
         
         Logs = logs;
         AutoCommit = autoCommit;
+        StartTimestamp = startTimestamp;
     }
     
     public void AddExpectedNodeCompletion(string nodeId)

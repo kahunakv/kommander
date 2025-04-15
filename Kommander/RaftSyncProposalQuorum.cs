@@ -7,7 +7,7 @@ namespace Kommander;
 /// <summary>
 /// 
 /// </summary>
-public class RaftSyncProposalQuorum
+public class RaftSyncProposalQuorum : IDisposable, IAsyncDisposable
 {
     private int completionCount;
     
@@ -102,5 +102,16 @@ public class RaftSyncProposalQuorum
         
         // Dispose timer resources (if not already disposed).
         timer.Dispose();
+    }
+
+    public void Dispose()
+    {
+        timer?.Dispose();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (timer != null) 
+            await timer.DisposeAsync();
     }
 }

@@ -1,4 +1,5 @@
 ﻿
+using System.Diagnostics;
 using Nixie;
 using Kommander.Data;
 using Kommander.Support.Collections;
@@ -35,6 +36,8 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
     private long commitIndex = 1;
 
     private int operations;
+        
+    private readonly Stopwatch stopwatch = Stopwatch.StartNew();
 
     public RaftWriteAheadActor(
         IActorContextStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse> _, 
@@ -55,6 +58,8 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
     public async Task<RaftWALResponse> Receive(RaftWALRequest message)
     {
+        stopwatch.Restart();
+        
         try
         {
             if (--operations == 0)
@@ -110,6 +115,13 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         catch (Exception ex)
         {
             logger.LogError("[{Endpoint}/{PartitionId}] {Message}\n{Stacktrace}", manager.LocalEndpoint, partition.PartitionId, ex.Message, ex.StackTrace);
+        }
+        finally
+        {
+            if (stopwatch.ElapsedMilliseconds > manager.Configuration.SlowRaftWALMachineLog)
+                logger.LogWarning("[{LocalEndpoint}/{PartitionId}] Slow WAL message processing: {Type} Elapsed={Elapsed}ms", manager.LocalEndpoint, partition.PartitionId, message.Type, stopwatch.ElapsedMilliseconds);
+            
+            //await File.AppendAllTextAsync($"/tmp/{partition.PartitionId}.txt", $"{stopwatch.ElapsedMilliseconds} {message.Type}\n");
         }
 
         return new(RaftOperationStatus.Errored, -1);

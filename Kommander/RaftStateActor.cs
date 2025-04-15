@@ -785,7 +785,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return (RaftOperationStatus.Errored, HLCTimestamp.Zero);
         }
 
-        RaftProposalQuorum proposalQuorum = new(logs, autoCommit);
+        RaftProposalQuorum proposalQuorum = new(logs, autoCommit, currentTime);
         
         // Mark itself as completed
         proposalQuorum.MarkNodeCompleted(manager.LocalEndpoint);
@@ -854,7 +854,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return (RaftOperationStatus.Errored, HLCTimestamp.Zero);
         }
 
-        RaftProposalQuorum proposalQuorum = new(checkpointLogs, true);
+        RaftProposalQuorum proposalQuorum = new(checkpointLogs, true, currentTime);
 
         foreach (RaftNode node in nodes)
         {
@@ -868,7 +868,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         activeProposals.TryAdd(currentTime, proposalQuorum);
         
-        logger.LogInfoProposedCheckpointLogs( 
+        logger.LogInfoProposedCheckpointLogs(
             manager.LocalEndpoint, 
             partition.PartitionId, 
             nodeState, 
@@ -916,13 +916,19 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         
         proposal.SetState(RaftProposalState.Committed);
 
-        //HLCTimestamp currentTime = await manager.HybridLogicalClock.ReceiveEvent(ticketId).ConfigureAwait(false);
+        HLCTimestamp currentTime = manager.HybridLogicalClock.TrySendOrLocalEvent();
         
         foreach (string node in proposal.Nodes)
             AppendLogToNode(new(node), ticketId, proposal.Logs);
         
         if (logger.IsEnabled(LogLevel.Debug))
-            logger.LogDebugCommittedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId, string.Join(',', proposal.Logs.Select(x => x.Id.ToString())));
+            logger.LogDebugCommittedLogs(
+                manager.LocalEndpoint, 
+                partition.PartitionId, 
+                nodeState, ticketId, 
+                string.Join(',', proposal.Logs.Select(x => x.Id.ToString())),
+                (currentTime - proposal.StartTimestamp).TotalMilliseconds                
+            );
         
         //activeProposals.Remove(ticketId);
         
@@ -1054,6 +1060,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <param name="committedIndex"></param>
     private async ValueTask CompleteAppendLogs(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex)
     {
+        HLCTimestamp currentTime = manager.HybridLogicalClock.TrySendOrLocalEvent();
+        
         if (committedIndex > 0)
         {
             if (lastCommitIndexes.TryGetValue(endpoint, out long currentIndex))
@@ -1072,7 +1080,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             else
                 startCommitIndexes[endpoint] = committedIndex;
 
-            logger.LogInfoSuccessfullyCompletedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, timestamp, committedIndex);
+            logger.LogInfoSuccessfullyCompletedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, timestamp, committedIndex, (currentTime - timestamp).TotalMilliseconds);
         }
 
         if (status != RaftOperationStatus.Success)
@@ -1095,17 +1103,17 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         
         if (proposal.State != RaftProposalState.Incomplete)
-            return;
+            return;        
 
         proposal.MarkNodeCompleted(endpoint);
 
         if (!proposal.HasQuorum())
         {
-            logger.LogInfoProposalPartiallyCompletedAt(manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp);
+            logger.LogInfoProposalPartiallyCompletedAt(manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp, (currentTime - proposal.StartTimestamp).TotalMilliseconds);
             return;
         }
         
-        logger.LogInfoProposalCompletedAt(manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp);
+        logger.LogInfoProposalCompletedAt(manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp, (currentTime - proposal.StartTimestamp).TotalMilliseconds);
 
         proposal.SetState(RaftProposalState.Completed);
 
@@ -1114,6 +1122,8 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Proposal {Timestamp} doesn't have auto-commit", manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp);
             return;
         }
+
+        currentTime = manager.HybridLogicalClock.TrySendOrLocalEvent();
 
         RaftWALResponse commitResponse = await walActor.Ask(new(RaftWALActionType.Commit, currentTerm, timestamp, proposal.Logs)).ConfigureAwait(false);
         if (commitResponse.Status != RaftOperationStatus.Success)
@@ -1129,7 +1139,14 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             AppendLogToNode(new(node), timestamp, proposal.Logs);
         
         if (logger.IsEnabled(LogLevel.Debug))
-            logger.LogDebugCommittedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp, string.Join(',', proposal.Logs.Select(x => x.Id.ToString())));
+            logger.LogDebugCommittedLogs(
+                manager.LocalEndpoint, 
+                partition.PartitionId, 
+                nodeState, 
+                timestamp, 
+                string.Join(',', proposal.Logs.Select(x => x.Id.ToString())), 
+                (currentTime - proposal.StartTimestamp).TotalMilliseconds
+            );
     }
     
     /// <summary>

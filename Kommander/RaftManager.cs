@@ -21,7 +21,7 @@ namespace Kommander;
 /// <summary>
 /// Identifies a Raft node in the cluster
 /// </summary>
-public sealed class RaftManager : IRaft
+public sealed class RaftManager : IRaft, IDisposable
 {
     internal readonly string LocalEndpoint;
 
@@ -1009,5 +1009,12 @@ public sealed class RaftManager : IRaft
         }
         
         throw new RaftException("Couldn't find partition range for: " + prefixPartitionKey + " " + rangeId);
+    }
+
+    public void Dispose()
+    {
+        actorSystem.Dispose();
+        hybridLogicalClock.Dispose();
+        systemPartition?.Dispose();
     }
 }

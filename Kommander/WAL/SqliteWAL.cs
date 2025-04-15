@@ -8,7 +8,7 @@ namespace Kommander.WAL;
 /// Allows to use a SQLite database as a Write-Ahead Log (WAL) for Raft logs
 /// Each partition has its own database file
 /// </summary>
-public class SqliteWAL : IWAL
+public class SqliteWAL : IWAL, IDisposable
 {
     private const int MaxNumberOfRangedEntries = 100;
 
@@ -771,5 +771,11 @@ public class SqliteWAL : IWAL
         insertOrReplaceCommand.ExecuteNonQuery();
 
         return true;
+    }
+
+    public void Dispose()
+    {
+        semaphore.Dispose();
+        metaDataConnection?.Dispose();
     }
 }
