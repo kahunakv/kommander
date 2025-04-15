@@ -7,9 +7,9 @@ public static class RestCommunicationExtensions
 {
     public static void MapRestRaftRoutes(this WebApplication app)
     {
-        app.MapPost("/v1/raft/handshake", (HandshakeRequest request, IRaft raft) =>
+        app.MapPost("/v1/raft/handshake", async (HandshakeRequest request, IRaft raft) =>
         {
-            raft.Handshake(request);
+            await raft.Handshake(request);
             return new HandshakeResponse();
         });
         

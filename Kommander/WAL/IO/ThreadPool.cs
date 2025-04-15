@@ -8,64 +8,95 @@ public class ThreadPool : IDisposable
     private readonly ILogger<IRaft> logger;
 
     /// <summary>
-    /// Whether the thread pool has started
+    /// Indicates whether the thread pool has started.
     /// </summary>
     private bool started;
-    
+
     /// <summary>
-    /// Thread-safe queue to store tasks
+    /// An array of task queues. One queue per worker thread.
     /// </summary>
-    private BlockingCollection<Action>? taskQueue;
-    
-    // Number of worker threads in the pool
+    private BlockingCollection<Action>[]? taskQueues;
+
+    /// <summary>
+    /// Number of worker threads in the pool.
+    /// </summary>
     private readonly int workerCount;
-    
-    // Cancellation support
+
+    /// <summary>
+    /// Cancellation support.
+    /// </summary>
     private readonly CancellationTokenSource cancellationTokenSource;
-    
-    // Threads for processing tasks
-    private readonly Thread[] workerThreads;
+
+    /// <summary>
+    /// Threads for processing tasks.
+    /// </summary>
+    private readonly Thread[] workerThreads;    
 
     public ThreadPool(ILogger<IRaft> logger, int workerCount)
     {
         this.logger = logger;
         this.workerCount = workerCount;
-        taskQueue = new();
-        cancellationTokenSource = new();
-        workerThreads = new Thread[this.workerCount];
+        this.cancellationTokenSource = new();
+        this.workerThreads = new Thread[this.workerCount];
+
+        // Create one BlockingCollection per worker thread.
+        this.taskQueues = new BlockingCollection<Action>[workerCount];
+        
+        for (int i = 0; i < workerCount; i++)        
+            taskQueues[i] = new();        
     }
 
     /// <summary>
-    /// Allows to enqueue a read operation on the thread poool
+    /// Enqueues a task for execution using round-robin scheduling on thread-specific queues.
     /// </summary>
-    /// <param name="syncOperation"></param>
-    /// <typeparam name="T"></typeparam>
-    /// <returns></returns>
+    /// <typeparam name="T">The result type of the task.</typeparam>
+    /// <param name="syncOperation">A synchronous function to execute.</param>
+    /// <returns>A Task that will complete when the operation has executed.</returns>
     public Task<T> EnqueueTask<T>(Func<T> syncOperation)
     {
         if (!started)
             throw new RaftException("Thread pool not started");
-        
-        if (taskQueue is null)
+
+        if (taskQueues is null)
             throw new RaftException("Thread pool is disposed");
-        
-        // Create a TaskCompletionSource to provide async notification
+
+        // Create a TaskCompletionSource to observe the result asynchronously.
         TaskCompletionSource<T> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        // Enqueue the task
-        taskQueue.Add(() =>
+        // Find the queue with the fewest tasks.
+        int minIndex = 0;
+        int minCount = taskQueues[0].Count;  // This is thread-safe snapshot.
+
+        if (minCount > 0)
+        {
+            for (int i = 1; i < workerCount; i++)
+            {
+                int currentCount = taskQueues[i].Count;
+                if (currentCount < minCount)
+                {
+                    minCount = currentCount;
+                    minIndex = i;
+
+                    if (currentCount == 0) // the queue is empty
+                        break;
+                }
+            }
+        }
+
+        // Enqueue the task into the least busy queue.
+        BlockingCollection<Action> selectedQueue = taskQueues[minIndex];               
+
+        // Enqueue the task on the selected queue.
+        selectedQueue.Add(() =>
         {
             try
             {
-                // Execute the synchronous operation
+                // Execute the synchronous operation.
                 T result = syncOperation();
-                
-                // Set the result on the task completion source
                 tcs.TrySetResult(result);
             }
             catch (Exception ex)
             {
-                // Handle any exceptions
                 tcs.TrySetException(ex);
             }
         });
@@ -74,7 +105,7 @@ public class ThreadPool : IDisposable
     }
 
     /// <summary>
-    /// Creates the worker threads and starts processing tasks
+    /// Starts the worker threads. Each thread processes tasks from its own dedicated queue.
     /// </summary>
     public void Start()
     {
@@ -82,26 +113,29 @@ public class ThreadPool : IDisposable
             return;
 
         started = true;
-        
+
         for (int i = 0; i < workerCount; i++)
         {
             int workerId = i;
-            
-            workerThreads[i] = new(() =>
+
+            // Each thread processes its own task queue.
+            workerThreads[i] = new Thread(() =>
             {
+                // Each thread gets its own queue by index.
+                BlockingCollection<Action>? workerQueue = taskQueues?[workerId];
+                if (workerQueue is null)
+                {
+                    logger.LogTrace("Worker {WorkerId} has no assigned queue and is stopping.", workerId);
+                    return;
+                }
+
                 try
                 {
-                    if (taskQueue is null)
-                    {
-                        logger.LogTrace("Worker {WorkerId} is stopped", workerId);
-                        return;
-                    }
-                    
-                    foreach (Action task in taskQueue.GetConsumingEnumerable(cancellationTokenSource.Token))
+                    // Process tasks until cancellation is signaled.
+                    foreach (Action task in workerQueue.GetConsumingEnumerable(cancellationTokenSource.Token))
                     {
                         try
                         {
-                            // Execute the task
                             task();
                         }
                         catch (OperationCanceledException)
@@ -110,7 +144,7 @@ public class ThreadPool : IDisposable
                         }
                         catch (Exception ex)
                         {
-                            // Optional: Log or handle unexpected exceptions
+                            // Log any unexpected exceptions.
                             logger.LogError("Worker {WorkerId} encountered an error: {Exception}", workerId, ex.Message);
                         }
                     }
@@ -130,26 +164,38 @@ public class ThreadPool : IDisposable
     }
 
     /// <summary>
-    /// Stops the thread pool
+    /// Stops the thread pool by cancelling tasks and disposing the queues.
     /// </summary>
     public void Stop()
     {
-        // Signal cancellation
+        // Signal cancellation.
         cancellationTokenSource.Cancel();
-        
-        // Wait for all threads to complete
+
+        // Wait for all worker threads to finish.
         foreach (Thread thread in workerThreads)
             thread.Join();
 
-        // Complete the task queue
-        taskQueue?.Dispose();
-
-        taskQueue = null;
+        // Dispose of each per-thread queue.
+        if (taskQueues != null)
+        {
+            foreach (var queue in taskQueues)
+            {
+                queue.Dispose();
+            }
+            taskQueues = null;
+        }
     }
 
     public void Dispose()
     {
-        taskQueue?.Dispose();
         cancellationTokenSource.Dispose();
+        
+        if (taskQueues != null)
+        {
+            foreach (BlockingCollection<Action> queue in taskQueues)            
+                queue.Dispose();
+            
+            taskQueues = null;
+        }
     }
 }

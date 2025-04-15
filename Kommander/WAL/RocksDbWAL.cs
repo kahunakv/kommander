@@ -43,6 +43,7 @@ public class RocksDbWAL : IWAL
         DbOptions dbOptions = new DbOptions()
             .SetCreateIfMissing(true)
             .SetCreateMissingColumnFamilies(true)
+            .SetAllowConcurrentMemtableWrite(true)
             .SetWalRecoveryMode(Recovery.AbsoluteConsistency);
         
         ColumnFamilies columnFamilies = new()

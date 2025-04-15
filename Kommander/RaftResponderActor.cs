@@ -8,6 +8,8 @@ namespace Kommander;
 
 public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
 {
+    private const int MinExpectedBatchSize = 10;
+    
     private readonly RaftManager manager;
 
     private readonly ICommunication communication;
@@ -108,7 +110,8 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
             
             _ = communication.BatchRequests(manager, node, new() { Requests = request }).ConfigureAwait(false);
 
-            await Task.Delay(1);
+            if (request.Count < MinExpectedBatchSize)
+                await Task.Delay(1); // force a big batch next time
         }
         catch (Exception ex)
         {

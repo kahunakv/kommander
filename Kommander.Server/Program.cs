@@ -119,7 +119,7 @@ try
         }
     });
     
-    ThreadPool.SetMinThreads(1024, 512);
+    ThreadPool.SetMinThreads(128, 128);
     
     FlurlHttp.Clients.WithDefaults(x => x.ConfigureInnerHandler(ih => ih.ServerCertificateCustomValidationCallback = (a, b, c, d) => true));
 

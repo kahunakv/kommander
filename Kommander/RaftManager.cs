@@ -368,10 +368,13 @@ public sealed class RaftManager : IRaft, IDisposable
     /// <param name="nodeId"></param>
     /// <param name="lastTimestamp"></param>
     internal void UpdateLastNodeActivity(string nodeId, HLCTimestamp lastTimestamp)
-    {
-        if (lastActivity.ContainsKey(nodeId))
-            lastActivity[nodeId] = lastTimestamp;
-        else
+    {                
+        if (lastActivity.TryGetValue(nodeId, out HLCTimestamp currentTimestamp))
+        {
+            if (lastTimestamp > currentTimestamp)
+                lastActivity[nodeId] = lastTimestamp;
+        }
+        else        
             lastActivity.TryAdd(nodeId, lastTimestamp);
     }
     
@@ -392,9 +395,12 @@ public sealed class RaftManager : IRaft, IDisposable
     /// <param name="lastTimestamp"></param>
     internal void UpdateLastHeartbeat(string nodeId, HLCTimestamp lastTimestamp)
     {
-        if (lastHearthBeat.ContainsKey(nodeId))
-            lastHearthBeat[nodeId] = lastTimestamp;
-        else
+        if (lastHearthBeat.TryGetValue(nodeId, out HLCTimestamp currentTimestamp))
+        {
+            if (lastTimestamp > currentTimestamp)
+                lastHearthBeat[nodeId] = lastTimestamp;
+        }
+        else        
             lastHearthBeat.TryAdd(nodeId, lastTimestamp);
     }
 
@@ -435,8 +441,11 @@ public sealed class RaftManager : IRaft, IDisposable
     /// Passes the Handshake to the appropriate partition
     /// </summary>
     /// <param name="request"></param>
-    public void Handshake(HandshakeRequest request)
-    {
+    public async Task Handshake(HandshakeRequest request)
+    {                
+        while (!IsInitialized)
+            await Task.Delay(100);
+        
         RaftPartition partition = GetPartition(request.Partition);
 
         partition.Handshake(request);

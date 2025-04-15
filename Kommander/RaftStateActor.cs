@@ -279,7 +279,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             case RaftNodeState.Leader:
             {
                 if (currentTime != HLCTimestamp.Zero && ((currentTime - lastHeartbeat) >= manager.Configuration.HeartbeatInterval))
-                    SendHearthbeat();
+                    SendHearthbeat(false);
             
                 return;
             }
@@ -322,9 +322,12 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 if (!string.IsNullOrEmpty(expectedLeader))
                 {
                     HLCTimestamp lastKnownHeartbeat = manager.GetLastNodeActivity(expectedLeader);
-                    
+
                     if (lastKnownHeartbeat != HLCTimestamp.Zero && ((currentTime - lastKnownHeartbeat) < electionTimeout))
+                    {
+                        lastHeartbeat = lastKnownHeartbeat;
                         return;
+                    }
                 }
                 
                 // make sure we are up to date with the logs
@@ -415,7 +418,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <summary>
     /// Sends a heartbeat message to follower nodes to indicate that the leader node in the partition is still alive.
     /// </summary>
-    private void SendHearthbeat()
+    /// <param name="force"></param>
+    /// <exception cref="RaftException"></exception>
+    private void SendHearthbeat(bool force)
     {
         List<RaftNode> nodes = manager.Nodes;
         
@@ -437,11 +442,14 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             if (node.Endpoint == manager.LocalEndpoint)
                 throw new RaftException("Corrupted nodes");
 
-            HLCTimestamp lastHearthBeatToNode = manager.GetLastNodeHearthbeat(node.Endpoint);
-            
-            if (lastHearthBeatToNode != HLCTimestamp.Zero && ((lastHeartbeat - lastHearthBeatToNode) <= manager.Configuration.RecentHeartbeat))
-                continue;
-            
+            if (!force)
+            {
+                HLCTimestamp lastHearthBeatToNode = manager.GetLastNodeHearthbeat(node.Endpoint);
+
+                if (lastHearthBeatToNode != HLCTimestamp.Zero && ((lastHeartbeat - lastHearthBeatToNode) <= manager.Configuration.RecentHeartbeat))
+                    continue;
+            }
+
             manager.UpdateLastHeartbeat(node.Endpoint, lastHeartbeat);
             
             //logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Sending heartbeat to {Node} #{Number}", manager.LocalEndpoint, partition.PartitionId, nodeState, node.Endpoint, ++number);
@@ -643,7 +651,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         await manager.InvokeLeaderChanged(partition.PartitionId, manager.LocalEndpoint);
 
-        SendHearthbeat();
+        SendHearthbeat(true);
     }
 
     /// <summary>
@@ -1111,7 +1119,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         
         if (proposal.State != RaftProposalState.Incomplete)
-            return;        
+            return;
 
         proposal.MarkNodeCompleted(endpoint);
 

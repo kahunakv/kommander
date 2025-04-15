@@ -6,10 +6,8 @@ using Kommander.Data;
 
 namespace Kommander.Communication.Grpc;
 
-public class RaftService : Rafter.RafterBase
-{
-    private  static readonly Task<GrpcHandshakeResponse> handshakeResponse = Task.FromResult(new GrpcHandshakeResponse());
-    
+public sealed class RaftService : Rafter.RafterBase
+{        
     private  static readonly Task<GrpcVoteResponse> voteResponse = Task.FromResult(new GrpcVoteResponse());
 
     private static readonly Task<GrpcRequestVotesResponse> requestVoteResponse = Task.FromResult(new GrpcRequestVotesResponse());
@@ -32,17 +30,17 @@ public class RaftService : Rafter.RafterBase
         this.logger = logger;
     }
     
-    public override Task<GrpcHandshakeResponse> Handshake(GrpcHandshakeRequest request, ServerCallContext context)
+    public override async Task<GrpcHandshakeResponse> Handshake(GrpcHandshakeRequest request, ServerCallContext context)
     {
         //logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got Vote message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
-
-        raft.Handshake(new(
+                
+        await raft.Handshake(new(
             request.Partition,
             request.MaxLogId,
             request.Endpoint
         ));
         
-        return handshakeResponse;
+        return new();
     }
     
     public override Task<GrpcVoteResponse> Vote(GrpcVoteRequest request, ServerCallContext context)
@@ -173,7 +171,7 @@ public class RaftService : Rafter.RafterBase
         return logs;
     }
     
-    public override Task<GrpcBatchRequestsResponse> BatchRequests(GrpcBatchRequestsRequest request, ServerCallContext context)
+    public override async Task<GrpcBatchRequestsResponse> BatchRequests(GrpcBatchRequestsRequest request, ServerCallContext context)
     {
         //if (request.Logs.Count > 0)
         //    logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got AppendLogs message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
@@ -183,7 +181,8 @@ public class RaftService : Rafter.RafterBase
             switch (requestItem)
             {
                 case { Type: GrpcBatchRequestsRequestType.Handshake, Handshake: { } handshakeRequest }:
-                    raft.Handshake(new(
+                                        
+                    await raft.Handshake(new(
                         handshakeRequest.Partition,
                         handshakeRequest.MaxLogId,
                         handshakeRequest.Endpoint
@@ -236,6 +235,6 @@ public class RaftService : Rafter.RafterBase
             }
         }
         
-        return Task.FromResult<GrpcBatchRequestsResponse>(new());
+        return new();
     }
 }
