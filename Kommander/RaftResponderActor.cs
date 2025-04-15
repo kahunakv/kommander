@@ -34,6 +34,42 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
     {
         try
         {
+            if (messages.Count == 1)
+            {
+                RaftResponderRequest message = messages.First();
+                
+                switch (message.Type)
+                {
+                    case RaftResponderRequestType.AppendLogs:
+                        _ = AppendLogs(message).ConfigureAwait(false);
+                        break;
+
+                    case RaftResponderRequestType.CompleteAppendLogs:
+                        _ = CompleteAppendLogs(message).ConfigureAwait(false);
+                        break;
+
+                    case RaftResponderRequestType.Vote:
+                        _ = Vote(message).ConfigureAwait(false);
+                        break;
+
+                    case RaftResponderRequestType.RequestVotes:
+                        _ = RequestVotes(message).ConfigureAwait(false);
+                        break;
+
+                    case RaftResponderRequestType.Handshake:
+                        _ = Handshake(message).ConfigureAwait(false);
+                        break;
+
+                    case RaftResponderRequestType.TryBatch:
+                    default:
+                        logger.LogError("Unsupported message {Type}", message.Type);
+                        break;
+                }
+                
+                await Task.Delay(1);
+                return;
+            }
+            
             List<BatchRequestsRequestItem> request = [];
             
             foreach (RaftResponderRequest message in messages)
@@ -62,12 +98,13 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
                     
                     case RaftResponderRequestType.TryBatch:
                     default:
-                        throw new NotImplementedException();
+                        logger.LogError("Unsupported message {Type}", message.Type);
+                        break;
                 }
             }
             
-            if (request.Count > 10)
-                logger.LogDebug("Sending block of {Count} messages", request.Count);
+            //if (request.Count > 10)
+            //    logger.LogDebug("Sending block of {Count} messages", request.Count);
             
             _ = communication.BatchRequests(manager, node, new() { Requests = request }).ConfigureAwait(false);
 

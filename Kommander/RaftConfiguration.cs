@@ -52,6 +52,11 @@ public class RaftConfiguration
     public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromMilliseconds(500);
     
     /// <summary>
+    /// If any partition sends a heartbeat to a node within this range, it will be considered as a recent heartbeat
+    /// </summary>
+    public TimeSpan RecentHeartbeat { get; set; } = TimeSpan.FromMilliseconds(100);
+    
+    /// <summary>
     /// Wait time for the leader to receive votes from other nodes
     /// </summary>
     public TimeSpan VotingTimeout { get; set; } = TimeSpan.FromMilliseconds(1500);

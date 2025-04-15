@@ -134,8 +134,8 @@ public sealed class TestThreeNodeClusterManyPartitions
         //Assert.Equal(200, totalFollowersReceived);
         //Assert.Equal(0, totalLeaderReceived);
 
-        if (totalLeaderReceived > (entries + (entries / 50)))
-            await File.AppendAllTextAsync("/tmp/u.txt", string.Join(",", logsReceived) + "\n", cancellationToken: TestContext.Current.CancellationToken);
+        //if (totalLeaderReceived > (entries + (entries / 50)))
+        //    await File.AppendAllTextAsync("/tmp/u.txt", string.Join(",", logsReceived) + "\n", cancellationToken: TestContext.Current.CancellationToken);
         
         await node1.LeaveCluster(true);
         await node2.LeaveCluster(true);

@@ -57,6 +57,8 @@ public sealed class RaftManager : IRaft, IDisposable
 
     private readonly ConcurrentDictionary<string, HLCTimestamp> lastActivity = new();
     
+    private readonly ConcurrentDictionary<string, HLCTimestamp> lastHearthBeat = new();
+    
     private readonly ConcurrentDictionary<string, IActorAggregateRef<RaftResponderActor, RaftResponderRequest>> responderActors = [];
 
     /// <summary>
@@ -371,6 +373,29 @@ public sealed class RaftManager : IRaft, IDisposable
             lastActivity[nodeId] = lastTimestamp;
         else
             lastActivity.TryAdd(nodeId, lastTimestamp);
+    }
+    
+    /// <summary>
+    /// Obtains the last heathbeat sent to a specific node on any partitions
+    /// </summary>
+    /// <param name="nodeId"></param>
+    /// <returns></returns>
+    internal HLCTimestamp GetLastNodeHearthbeat(string nodeId)
+    {
+        return lastHearthBeat.TryGetValue(nodeId, out HLCTimestamp lastTimestamp) ? lastTimestamp : HLCTimestamp.Zero;
+    }
+    
+    /// <summary>
+    /// Updates the last heathbeat sent to a node
+    /// </summary>
+    /// <param name="nodeId"></param>
+    /// <param name="lastTimestamp"></param>
+    internal void UpdateLastHeartbeat(string nodeId, HLCTimestamp lastTimestamp)
+    {
+        if (lastHearthBeat.ContainsKey(nodeId))
+            lastHearthBeat[nodeId] = lastTimestamp;
+        else
+            lastHearthBeat.TryAdd(nodeId, lastTimestamp);
     }
 
     /// <summary>

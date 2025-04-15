@@ -436,6 +436,13 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         {
             if (node.Endpoint == manager.LocalEndpoint)
                 throw new RaftException("Corrupted nodes");
+
+            HLCTimestamp lastHearthBeatToNode = manager.GetLastNodeHearthbeat(node.Endpoint);
+            
+            if (lastHearthBeatToNode != HLCTimestamp.Zero && ((lastHeartbeat - lastHearthBeatToNode) <= manager.Configuration.RecentHeartbeat))
+                continue;
+            
+            manager.UpdateLastHeartbeat(node.Endpoint, lastHeartbeat);
             
             //logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Sending heartbeat to {Node} #{Number}", manager.LocalEndpoint, partition.PartitionId, nodeState, node.Endpoint, ++number);
             
