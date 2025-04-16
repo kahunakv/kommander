@@ -562,6 +562,82 @@ public class SqliteWAL : IWAL, IDisposable
             return RaftOperationStatus.Errored;
         }
     }
+    
+    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs)
+    {
+        try
+        {
+            const string insertOrReplaceSql = """
+              INSERT INTO logs (id, partitionId, term, type, logType, log, timePhysical, timeCounter)
+              VALUES (@id, @partitionId, @term, @type, @logType, @log, @timePhysical, @timeCounter)
+              ON CONFLICT(partitionId, id) DO UPDATE SET term=@term, type=@type, logType=@logType,
+              log=@log, timePhysical=@timePhysical, timeCounter=@timeCounter;
+              """;
+            
+            foreach ((int partitionId, List<RaftLog> raftLogs) item in logs)
+            {
+                (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(item.partitionId);
+
+                try
+                {
+                    readerWriterLock.AcquireWriterLock(TimeSpan.FromSeconds(10));
+
+                    using SqliteTransaction transaction = connection.BeginTransaction();
+
+                    try
+                    {
+                        foreach (RaftLog log in item.raftLogs)
+                        {
+                            using SqliteCommand insertOrReplaceCommand = new(insertOrReplaceSql, connection);
+
+                            insertOrReplaceCommand.Transaction = transaction;
+
+                            insertOrReplaceCommand.Parameters.AddWithValue("@id", log.Id);
+                            insertOrReplaceCommand.Parameters.AddWithValue("@partitionId", item.partitionId);
+                            insertOrReplaceCommand.Parameters.AddWithValue("@term", log.Term);
+                            insertOrReplaceCommand.Parameters.AddWithValue("@type", log.Type);
+
+                            if (log.LogType is null)
+                                insertOrReplaceCommand.Parameters.AddWithValue("@logType", 0);
+                            else
+                                insertOrReplaceCommand.Parameters.AddWithValue("@logType", log.LogType);
+
+                            if (log.LogData is null)
+                                insertOrReplaceCommand.Parameters.AddWithValue("@log", "");
+                            else
+                                insertOrReplaceCommand.Parameters.AddWithValue("@log", log.LogData);
+
+                            insertOrReplaceCommand.Parameters.AddWithValue("@timePhysical", log.Time.L);
+                            insertOrReplaceCommand.Parameters.AddWithValue("@timeCounter", log.Time.C);
+
+                            insertOrReplaceCommand.ExecuteNonQuery();
+                        }
+
+                        transaction.Commit();
+
+                        return RaftOperationStatus.Success;
+                    }
+                    catch
+                    {
+                        transaction.Rollback();
+                        throw;
+                    }
+                }
+                finally
+                {
+                    readerWriterLock.ReleaseWriterLock();
+                }
+            }
+        } 
+        catch (Exception ex)
+        {
+            logger.LogError("Error during rollback: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
+                    
+            return RaftOperationStatus.Errored;
+        }
+
+        return RaftOperationStatus.Success;
+    }
 
     public long GetMaxLog(int partitionId)
     {
@@ -775,7 +851,12 @@ public class SqliteWAL : IWAL, IDisposable
 
     public void Dispose()
     {
+        GC.SuppressFinalize(this);
+        
         semaphore.Dispose();
         metaDataConnection?.Dispose();
+        
+        foreach (KeyValuePair<int, (ReaderWriterLock, SqliteConnection)> conn in connections)
+            conn.Value.Item2.Dispose();
     }
 }

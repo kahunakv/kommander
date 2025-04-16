@@ -203,8 +203,31 @@ public class RestCommunication : ICommunication
         return new();
     }
 
-    public Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)
+    public async Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)
     {
-        throw new NotImplementedException();
+        RaftConfiguration configuration = manager.Configuration;
+        
+        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.CompleteAppendLogsBatchRequest);
+        
+        try
+        {
+            BatchRequestsResponse? response = await (configuration.HttpScheme + node.Endpoint)
+                .WithOAuthBearerToken(configuration.HttpAuthBearerToken)
+                .AppendPathSegments("v1/raft/batch-requests")
+                .WithHeader("Accept", "application/json")
+                .WithHeader("Content-Type", "application/json")
+                .WithTimeout(configuration.HttpTimeout)
+                .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
+                .PostStringAsync(payload)
+                .ReceiveJson<BatchRequestsResponse>().ConfigureAwait(false);
+
+            return response;
+        }
+        catch (Exception e)
+        {
+            manager.Logger.LogError("[{Endpoint}] BatchRequestsResponse: {Message}", manager.LocalEndpoint, e.Message);
+        }
+
+        return new();
     }
 }

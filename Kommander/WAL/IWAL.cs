@@ -20,6 +20,8 @@ public interface IWAL
     public RaftOperationStatus CommitMany(int partitionId, List<RaftLog> logs);
     
     public RaftOperationStatus RollbackMany(int partitionId, List<RaftLog> logs);
+
+    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs);
     
     public long GetMaxLog(int partitionId);
     
@@ -32,4 +34,6 @@ public interface IWAL
     public bool SetMetaData(string key, string value);
     
     public RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries);
+
+    public void Dispose();
 }

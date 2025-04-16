@@ -47,6 +47,43 @@ public static class RestCommunicationExtensions
 
             return new CompleteAppendLogsBatchResponse();
         });
+        
+        app.MapPost("/v1/raft/batch-requests", async (BatchRequestsRequest request, IRaft raft) =>
+        {
+            if (request.Requests is not null)
+            {
+                foreach (BatchRequestsRequestItem item in request.Requests)
+                {
+                    switch (item.Type)
+                    {
+                        case BatchRequestsRequestType.Handshake:
+                            await raft.Handshake(item.Handshake!);
+                            break;
+                        
+                        case BatchRequestsRequestType.Vote:
+                            raft.Vote(item.Vote!);
+                            break;
+                        
+                        case BatchRequestsRequestType.RequestVote:
+                            raft.RequestVote(item.RequestVotes!);
+                            break;
+                        
+                        case BatchRequestsRequestType.AppendLogs:
+                            raft.AppendLogs(item.AppendLogs!);
+                            break;
+                        
+                        case BatchRequestsRequestType.CompleteAppendLogs:
+                            raft.CompleteAppendLogs(item.CompleteAppendLogs!);
+                            break;
+                        
+                        default:
+                            throw new ArgumentOutOfRangeException();
+                    }
+                }
+            }
+
+            return new CompleteAppendLogsBatchResponse();
+        });
 
         app.MapPost("/v1/raft/request-vote", (RequestVotesRequest request, IRaft raft) =>
         {

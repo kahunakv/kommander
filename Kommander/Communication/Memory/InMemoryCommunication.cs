@@ -133,7 +133,7 @@ public class InMemoryCommunication : ICommunication
         return completeAppendLogsBatchResponse;
     }
 
-    public Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)
+    public async Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)
     {
         if (manager.ClusterHandler.IsNode(node.Endpoint))
         {
@@ -146,7 +146,7 @@ public class InMemoryCommunication : ICommunication
                         switch (item.Type)
                         {
                             case BatchRequestsRequestType.Handshake:
-                                targetNode.Handshake(item.Handshake!);
+                                await targetNode.Handshake(item.Handshake!);
                                 break;
                             
                             case BatchRequestsRequestType.Vote:
@@ -179,6 +179,6 @@ public class InMemoryCommunication : ICommunication
         else
             Console.WriteLine("CompleteAppendLogsBatch Unknown node: {0} [1]", node.Endpoint);
 
-        return batchRequestsResponse;
+        return new();
     }
 }

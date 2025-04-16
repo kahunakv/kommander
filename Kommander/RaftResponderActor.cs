@@ -36,6 +36,8 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
     {
         try
         {
+            // logger.LogDebug("Sending block of {Count} messages", messages.Count);
+            
             if (messages.Count == 1)
             {
                 RaftResponderRequest message = messages.First();
@@ -72,7 +74,7 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
                 return;
             }
             
-            List<BatchRequestsRequestItem> request = [];
+            List<BatchRequestsRequestItem> request = new(messages.Count);
             
             foreach (RaftResponderRequest message in messages)
             {
@@ -104,9 +106,6 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
                         break;
                 }
             }
-            
-            //if (request.Count > 10)
-            //    logger.LogDebug("Sending block of {Count} messages", request.Count);
             
             _ = communication.BatchRequests(manager, node, new() { Requests = request }).ConfigureAwait(false);
 

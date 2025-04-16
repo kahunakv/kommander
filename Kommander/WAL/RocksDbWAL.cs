@@ -10,7 +10,7 @@ using RocksDbSharp;
 
 namespace Kommander.WAL;
 
-public class RocksDbWAL : IWAL
+public class RocksDbWAL : IWAL, IDisposable
 {
     private static readonly RecyclableMemoryStreamManager streamManager = new();
     
@@ -472,6 +472,87 @@ public class RocksDbWAL : IWAL
         
         writeBatch.Put(buffer, Serialize(message), cf: columnFamilyHandle);
     }
+    
+    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs)
+    {
+        try
+        {
+            Dictionary<ColumnFamilyHandle, Dictionary<int, List<RaftLog>>> plan = new();
+            
+            foreach ((int partitionId, List<RaftLog> raftLog) log in logs)
+            {
+                ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(log.partitionId);
+
+                if (plan.TryGetValue(columnFamilyHandle, out Dictionary<int, List<RaftLog>>? raftLogsPerPartition))
+                {
+                    if (raftLogsPerPartition.TryGetValue(log.partitionId, out List<RaftLog>? raftLogs))
+                        raftLogs.AddRange(log.raftLog);
+                    else
+                    {
+                        List<RaftLog> p = new(log.raftLog.Count);
+                        p.AddRange(log.raftLog);
+                        raftLogsPerPartition.Add(log.partitionId, p);
+                    }
+                }
+                else
+                {
+                    List<RaftLog> p = new(log.raftLog.Count);
+                    p.AddRange(log.raftLog);
+                    raftLogsPerPartition = new() { { log.partitionId, p } };
+                    plan.Add(columnFamilyHandle, raftLogsPerPartition);
+                }
+            }
+            
+            foreach (KeyValuePair<ColumnFamilyHandle, Dictionary<int, List<RaftLog>>> kvp in plan)
+            {
+                Dictionary<int, List<RaftLog>> raftLogs = kvp.Value;
+                
+                using WriteBatch writeBatch = new();
+
+                //int count = 0;
+
+                foreach (KeyValuePair<int, List<RaftLog>> kv in raftLogs)
+                {
+                    foreach (RaftLog log in kv.Value)
+                    {
+                        string index = log.Id.ToString("D20");
+
+                        RaftLogMessage message = new()
+                        {
+                            Partition = kv.Key,
+                            Id = log.Id,
+                            Term = log.Term,
+                            Type = (int)log.Type,
+                            TimePhysical = log.Time.L,
+                            TimeCounter = log.Time.C
+                        };
+
+                        if (log.LogType != null)
+                            message.LogType = log.LogType;
+
+                        if (log.LogData != null)
+                            message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
+
+                        PutToBatch(writeBatch, index, message, kvp.Key);
+
+                        //count++;
+                    }
+                }
+
+                //Console.WriteLine("Batch of {0}", count);
+                
+                db.Write(writeBatch, DefaultWriteOptions);
+            }
+
+            return RaftOperationStatus.Success;
+        } 
+        catch (Exception ex)
+        {
+            logger.LogError("Error during write: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
+                    
+            return RaftOperationStatus.Errored;
+        }
+    }
 
     public long GetMaxLog(int partitionId)
     {
@@ -646,5 +727,12 @@ public class RocksDbWAL : IWAL
         
         using MemoryStream memoryStream = streamManager.GetStream(serializedData);
         return RaftLogMessage.Parser.ParseFrom(memoryStream);
+    }
+
+    public void Dispose()
+    {
+        GC.SuppressFinalize(this);
+        
+        db.Dispose();
     }
 }

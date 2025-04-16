@@ -43,6 +43,8 @@ public sealed class RaftManager : IRaft, IDisposable
 
     private readonly ClusterHandler clusterHandler;
 
+    private readonly RaftBatcher raftBatcher;
+
     private RaftPartition? systemPartition;
 
     private readonly Dictionary<int, RaftPartition> partitions = [];
@@ -130,6 +132,11 @@ public sealed class RaftManager : IRaft, IDisposable
     /// Hybrid Logical Clock
     /// </summary>
     public HybridLogicalClock HybridLogicalClock => hybridLogicalClock;
+    
+    /// <summary>
+    /// 
+    /// </summary>
+    internal RaftBatcher RaftBatcher => raftBatcher;
 
     /// <summary>
     /// Event when the restore process starts
@@ -220,6 +227,8 @@ public sealed class RaftManager : IRaft, IDisposable
         OnSystemReplicationReceived += SystemReplicationReceived;
         OnSystemRestoreFinished += SystemRestoreFinished;
         OnLeaderChanged += SystemLeaderChanged;
+
+        raftBatcher = new(this);
     }
 
     private Task<bool> SystemLeaderChanged(int partitionId, string node)
@@ -338,7 +347,7 @@ public sealed class RaftManager : IRaft, IDisposable
         writeThreadPool.Stop();
 
         if (disposeActorSystem)
-            ActorSystem.Dispose();
+            Dispose();
     }
 
     /// <summary>
@@ -1070,5 +1079,6 @@ public sealed class RaftManager : IRaft, IDisposable
         actorSystem.Dispose();
         hybridLogicalClock.Dispose();
         systemPartition?.Dispose();
+        walAdapter.Dispose();
     }
 }

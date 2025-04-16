@@ -119,7 +119,7 @@ public class ThreadPool : IDisposable
             int workerId = i;
 
             // Each thread processes its own task queue.
-            workerThreads[i] = new Thread(() =>
+            workerThreads[i] = new(() =>
             {
                 // Each thread gets its own queue by index.
                 BlockingCollection<Action>? workerQueue = taskQueues?[workerId];
@@ -178,16 +178,17 @@ public class ThreadPool : IDisposable
         // Dispose of each per-thread queue.
         if (taskQueues != null)
         {
-            foreach (var queue in taskQueues)
-            {
+            foreach (BlockingCollection<Action> queue in taskQueues)
                 queue.Dispose();
-            }
+            
             taskQueues = null;
         }
     }
 
     public void Dispose()
     {
+        GC.SuppressFinalize(this);
+        
         cancellationTokenSource.Dispose();
         
         if (taskQueues != null)

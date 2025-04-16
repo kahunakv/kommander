@@ -23,7 +23,8 @@ public class RaftSyncProposalQuorum : IDisposable, IAsyncDisposable
     /// Gets the task that will complete when at least two SetCompleted calls have been made,
     /// or will fault after 5 seconds if fewer than two completions occur.
     /// </summary>
-    public Task Task {
+    public Task Task 
+    {
         get
         {
             if (tcs is null)

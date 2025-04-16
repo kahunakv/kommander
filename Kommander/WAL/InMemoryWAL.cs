@@ -7,7 +7,7 @@ namespace Kommander.WAL;
 /// Keeps a log of all Raft operations in memory
 /// Useful for testing and debugging
 /// </summary>
-public class InMemoryWAL : IWAL
+public class InMemoryWAL : IWAL, IDisposable
 {
     private readonly ReaderWriterLock readerWriterLock = new();
     
@@ -210,6 +210,31 @@ public class InMemoryWAL : IWAL
         }
     }
 
+    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs)
+    {
+        try
+        {
+            readerWriterLock.AcquireWriterLock(TimeSpan.FromMilliseconds(5000));
+
+            foreach ((int partitionId, List<RaftLog> raftLogs) item in logs)
+            {
+                foreach (RaftLog log in item.raftLogs)
+                {
+                    if (allLogs.TryGetValue(item.partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+                        partitionLogs[log.Id] = log;
+                    else
+                        allLogs.Add(item.partitionId, new() { { log.Id, log } });
+                }
+            }
+
+            return RaftOperationStatus.Success;
+        }
+        finally
+        {
+            readerWriterLock.ReleaseWriterLock();
+        }
+    }
+
     public long GetMaxLog(int partitionId)
     {
         try
@@ -278,5 +303,12 @@ public class InMemoryWAL : IWAL
     public RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
     {
         return RaftOperationStatus.Success;
+    }
+
+    public void Dispose()
+    {
+        GC.SuppressFinalize(this);
+        
+        // TODO release managed resources here
     }
 }
