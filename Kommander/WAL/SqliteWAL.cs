@@ -302,8 +302,6 @@ public class SqliteWAL : IWAL, IDisposable
                     readerWriterLock.ReleaseWriterLock();
                 }
             }
-            
-            return RaftOperationStatus.Success;
         } 
         catch (Exception ex)
         {

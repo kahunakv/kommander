@@ -82,8 +82,18 @@ internal sealed class RaftBatcher
             logs.Add(request.Request);
 
         RaftOperationStatus response = await manager.WriteThreadPool.EnqueueTask(() => manager.WalAdapter.Write(logs));
+
+        if (response == RaftOperationStatus.Success)
+        {
+            foreach (RaftBatcherItem request in requests)
+                request.Promise.TrySetResult(response);
+
+            return;
+        }
+        
+        Exception ex = new("Write failed");
         
         foreach (RaftBatcherItem request in requests)
-            request.Promise.TrySetResult(response);
+            request.Promise.TrySetException(ex);
     }
 }

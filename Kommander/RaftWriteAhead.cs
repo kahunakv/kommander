@@ -14,7 +14,7 @@ namespace Kommander;
 /// This actor is responsible for controlling concurrency
 /// when accessing the replicated log persisted on disk.
 /// </summary>
-public sealed class RaftWriteAheadActor : IActor<RaftWALRequest, RaftWALResponse>
+public sealed class RaftWriteAhead
 {
     private readonly RaftManager manager;
 
@@ -40,12 +40,7 @@ public sealed class RaftWriteAheadActor : IActor<RaftWALRequest, RaftWALResponse
         
     private readonly Stopwatch stopwatch = Stopwatch.StartNew();
 
-    public RaftWriteAheadActor(
-        IActorContext<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse> _, 
-        RaftManager manager, 
-        RaftPartition partition,
-        IWAL walAdapter
-    )
+    public RaftWriteAhead(RaftManager manager, RaftPartition partition, IWAL walAdapter)
     {
         this.manager = manager;
         this.logger = manager.Logger;
@@ -57,78 +52,7 @@ public sealed class RaftWriteAheadActor : IActor<RaftWALRequest, RaftWALResponse
         this.operations = compactEveryOperations;
     }
 
-    public async Task<RaftWALResponse?> Receive(RaftWALRequest message)
-    {
-        stopwatch.Restart();
-        
-        try
-        {
-            if (--operations == 0)
-            {
-                await Compact();
-                
-                operations = compactEveryOperations;
-            }
-
-            switch (message.Type)
-            {
-                case RaftWALActionType.Propose:
-                {
-                    (RaftOperationStatus status, long newProposedIndex) = await Propose(message.Term, message.Logs).ConfigureAwait(false);
-                    return new(status, newProposedIndex);
-                }
-
-                case RaftWALActionType.Commit:
-                {
-                    (RaftOperationStatus status, long newCommitIndex) = await Commit(message.Logs).ConfigureAwait(false);
-                    return new(status, newCommitIndex);
-                }
-                
-                case RaftWALActionType.Rollback:
-                {
-                    (RaftOperationStatus status, long newCommitIndex) = await Rollback(message.Logs).ConfigureAwait(false);
-                    return new(status, newCommitIndex);
-                }
-
-                case RaftWALActionType.ProposeOrCommit:
-                {
-                    (RaftOperationStatus status, long newCommitIndex) = await ProposeOrCommit(message.Logs).ConfigureAwait(false);
-                    return new(status, newCommitIndex);
-                }
-                
-                case RaftWALActionType.GetRange:
-                    return new(RaftOperationStatus.Success, await GetRange(message.CurrentIndex).ConfigureAwait(false));
-
-                case RaftWALActionType.Recover:
-                    return new(RaftOperationStatus.Success, await Recover().ConfigureAwait(false));
-                
-                case RaftWALActionType.GetMaxLog:
-                    return new(RaftOperationStatus.Success, await GetMaxLog().ConfigureAwait(false));
-                
-                case RaftWALActionType.GetCurrentTerm:
-                    return new(RaftOperationStatus.Success, await GetCurrentTerm().ConfigureAwait(false));
-                
-                default:
-                    logger.LogError("[{Endpoint}/{PartitionId}] Unknown action type: {Type}", manager.LocalEndpoint, partition.PartitionId, message.Type);
-                    break;
-            }
-        }
-        catch (Exception ex)
-        {
-            logger.LogError("[{Endpoint}/{PartitionId}] {Message}\n{Stacktrace}", manager.LocalEndpoint, partition.PartitionId, ex.Message, ex.StackTrace);
-        }
-        finally
-        {
-            if (stopwatch.ElapsedMilliseconds > manager.Configuration.SlowRaftWALMachineLog)
-                logger.LogWarning("[{LocalEndpoint}/{PartitionId}] Slow WAL message processing: {Type} Elapsed={Elapsed}ms", manager.LocalEndpoint, partition.PartitionId, message.Type, stopwatch.ElapsedMilliseconds);
-            
-            //await File.AppendAllTextAsync($"/tmp/{partition.PartitionId}.txt", $"{stopwatch.ElapsedMilliseconds} {message.Type}\n");
-        }
-
-        return new(RaftOperationStatus.Errored, -1);
-    }
-
-    private async ValueTask<long> Recover()
+    public async ValueTask<long> Recover()
     {
         if (recovered)
             return -1;
@@ -198,7 +122,7 @@ public sealed class RaftWriteAheadActor : IActor<RaftWALRequest, RaftWALResponse
         return commitIndex;
     }
 
-    private async Task<(RaftOperationStatus, long)> Propose(long term, List<RaftLog>? logs)
+    public async Task<(RaftOperationStatus, long)> Propose(long term, List<RaftLog>? logs)
     {
         if (logs is null || logs.Count == 0)
             return (RaftOperationStatus.Success, -1);
@@ -219,7 +143,7 @@ public sealed class RaftWriteAheadActor : IActor<RaftWALRequest, RaftWALResponse
         return (RaftOperationStatus.Success, proposeIndex);
     }
     
-    private async Task<(RaftOperationStatus, long)> Commit(List<RaftLog>? logs)
+    public async Task<(RaftOperationStatus, long)> Commit(List<RaftLog>? logs)
     {
         if (logs is null || logs.Count == 0)
             return (RaftOperationStatus.Success, -1);
@@ -269,7 +193,7 @@ public sealed class RaftWriteAheadActor : IActor<RaftWALRequest, RaftWALResponse
         return (RaftOperationStatus.Success, lastCommitIndex);
     }
     
-    private async Task<(RaftOperationStatus, long)> Rollback(List<RaftLog>? logs)
+    public async Task<(RaftOperationStatus, long)> Rollback(List<RaftLog>? logs)
     {
         if (logs is null || logs.Count == 0)
             return (RaftOperationStatus.Success, -1);
@@ -304,17 +228,17 @@ public sealed class RaftWriteAheadActor : IActor<RaftWALRequest, RaftWALResponse
         return (RaftOperationStatus.Success, -1);
     }
     
-    private async Task<long> GetMaxLog()
+    public async Task<long> GetMaxLog()
     {
         return await manager.ReadThreadPool.EnqueueTask(() => walAdapter.GetMaxLog(partition.PartitionId));
     }
     
-    private async Task<long> GetCurrentTerm()
+    public async Task<long> GetCurrentTerm()
     {
         return await manager.ReadThreadPool.EnqueueTask(() => walAdapter.GetCurrentTerm(partition.PartitionId));
     }
 
-    private async Task<(RaftOperationStatus, long)> ProposeOrCommit(List<RaftLog>? logs)
+    public async Task<(RaftOperationStatus, long)> ProposeOrCommit(List<RaftLog>? logs)
     {
         if (logs is null || logs.Count == 0)
             return (RaftOperationStatus.Success, -1);
@@ -538,12 +462,12 @@ public sealed class RaftWriteAheadActor : IActor<RaftWALRequest, RaftWALResponse
         return (status, Math.Max(proposeIndex, commitIndex));
     }
     
-    private async Task<List<RaftLog>> GetRange(long startLogIndex)
+    public async Task<List<RaftLog>> GetRange(long startLogIndex)
     {
         return await manager.ReadThreadPool.EnqueueTask(() => walAdapter.ReadLogsRange(partition.PartitionId, startLogIndex)).ConfigureAwait(false);
     }
 
-    private async Task Compact()
+    public async Task Compact()
     {
         long lastCheckpoint = await manager.ReadThreadPool.EnqueueTask(() => walAdapter.GetLastCheckpoint(partition.PartitionId)).ConfigureAwait(false);
 
