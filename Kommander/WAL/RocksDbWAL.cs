@@ -14,7 +14,7 @@ public class RocksDbWAL : IWAL, IDisposable
 {
     private static readonly RecyclableMemoryStreamManager streamManager = new();
     
-    private static readonly WriteOptions DefaultWriteOptions = new WriteOptions().SetSync(false);
+    private static readonly WriteOptions DefaultWriteOptions = new WriteOptions().SetSync(true);
 
     private const string FormatVersion = "1.0.0";
 
@@ -108,13 +108,7 @@ public class RocksDbWAL : IWAL, IDisposable
         {
             RaftLogMessage message = Unserializer(iterator.Value());
             
-            if (message.Partition != partitionId)
-            {
-                iterator.Next();
-                continue;
-            }
-
-            if (message.Id < lastCheckpoint)
+            if (message.Partition != partitionId || message.Id < lastCheckpoint)
             {
                 iterator.Next();
                 continue;
@@ -241,9 +235,9 @@ public class RocksDbWAL : IWAL, IDisposable
                 }
                 else
                 {
-                    List<RaftLog> p = new(log.raftLog.Count);
-                    p.AddRange(log.raftLog);
-                    raftLogsPerPartition = new() { { log.partitionId, p } };
+                    List<RaftLog> raftLogs = new(log.raftLog.Count);
+                    raftLogs.AddRange(log.raftLog);
+                    raftLogsPerPartition = new() { { log.partitionId, raftLogs } };
                     plan.Add(columnFamilyHandle, raftLogsPerPartition);
                 }
             }

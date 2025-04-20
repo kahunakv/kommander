@@ -241,13 +241,11 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
         }
         finally
         {
-            /*foreach (KeyValuePair<RaftStatePriority, Dictionary<RaftRequestType, List<ActorMessageReply<RaftRequest, RaftResponse>>>> pkv in plan)
+            foreach (KeyValuePair<RaftStatePriority, Dictionary<RaftRequestType, List<ActorMessageReply<RaftRequest, RaftResponse>>>> pkv in plan)
             {
                 foreach (KeyValuePair<RaftRequestType, List<ActorMessageReply<RaftRequest, RaftResponse>>> tkv in pkv.Value)
                     tkv.Value.Clear();
-            }*/
-            
-            plan.Clear();
+            }
         }
     }
 

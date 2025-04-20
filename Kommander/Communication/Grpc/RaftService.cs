@@ -176,7 +176,7 @@ public sealed class RaftService : Rafter.RafterBase
         //if (request.Logs.Count > 0)
         //    logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got AppendLogs message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
 
-        foreach (GrpcBatchRequestsRequestItem? requestItem in request.Requests)
+        foreach (GrpcBatchRequestsRequestItem requestItem in request.Requests)
         {
             switch (requestItem)
             {
