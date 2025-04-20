@@ -14,7 +14,7 @@ namespace Kommander;
 /// This actor is responsible for controlling concurrency
 /// when accessing the replicated log persisted on disk.
 /// </summary>
-public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALResponse>
+public sealed class RaftWriteAheadActor : IActor<RaftWALRequest, RaftWALResponse>
 {
     private readonly RaftManager manager;
 
@@ -41,7 +41,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
     private readonly Stopwatch stopwatch = Stopwatch.StartNew();
 
     public RaftWriteAheadActor(
-        IActorContextStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse> _, 
+        IActorContext<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse> _, 
         RaftManager manager, 
         RaftPartition partition,
         IWAL walAdapter
@@ -57,7 +57,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
         this.operations = compactEveryOperations;
     }
 
-    public async Task<RaftWALResponse> Receive(RaftWALRequest message)
+    public async Task<RaftWALResponse?> Receive(RaftWALRequest message)
     {
         stopwatch.Restart();
         
@@ -376,7 +376,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
             {
                 case RaftLogType.Proposed: /* when log.Id >= proposeIndex: */
                 {
-                    if (plan.TryGetValue(RaftLogAction.Propose, out List<RaftLog>? proposeActions))
+                    if (plan.TryGetValue(RaftLogAction.Propose, out List<RaftLog> proposeActions))
                         proposeActions.Add(log);
                     else
                         plan.Add(RaftLogAction.Propose, [log]);
@@ -389,7 +389,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
                 case RaftLogType.RolledBack: /* when log.Id >= proposeIndex: */
                 {
-                    if (plan.TryGetValue(RaftLogAction.Rollback, out List<RaftLog>? rollbackActions))
+                    if (plan.TryGetValue(RaftLogAction.Rollback, out List<RaftLog> rollbackActions))
                         rollbackActions.Add(log);
                     else
                         plan.Add(RaftLogAction.Rollback, [log]);
@@ -402,7 +402,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
                 case RaftLogType.Committed: /* when log.Id >= commitIndex: */
                 {
-                    if (plan.TryGetValue(RaftLogAction.Commit, out List<RaftLog>? commitActions))
+                    if (plan.TryGetValue(RaftLogAction.Commit, out List<RaftLog> commitActions))
                         commitActions.Add(log);
                     else
                         plan.Add(RaftLogAction.Commit, [log]);
@@ -415,7 +415,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
                 case RaftLogType.ProposedCheckpoint: /* when log.Id >= proposeIndex: */
                 {
-                    if (plan.TryGetValue(RaftLogAction.Propose, out List<RaftLog>? proposeActions))
+                    if (plan.TryGetValue(RaftLogAction.Propose, out List<RaftLog> proposeActions))
                         proposeActions.Add(log);
                     else
                         plan.Add(RaftLogAction.Propose, [log]);
@@ -428,7 +428,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
                 case RaftLogType.RolledBackCheckpoint: /* when log.Id >= commitIndex: */
                 {
-                    if (plan.TryGetValue(RaftLogAction.Rollback, out List<RaftLog>? rollbackActions))
+                    if (plan.TryGetValue(RaftLogAction.Rollback, out List<RaftLog> rollbackActions))
                         rollbackActions.Add(log);
                     else
                         plan.Add(RaftLogAction.Rollback, [log]);
@@ -441,7 +441,7 @@ public sealed class RaftWriteAheadActor : IActorStruct<RaftWALRequest, RaftWALRe
 
                 case RaftLogType.CommittedCheckpoint: /* when log.Id >= commitIndex:*/
                 {
-                    if (plan.TryGetValue(RaftLogAction.Commit, out List<RaftLog>? commitActions))
+                    if (plan.TryGetValue(RaftLogAction.Commit, out List<RaftLog> commitActions))
                         commitActions.Add(log);
                     else
                         plan.Add(RaftLogAction.Commit, [log]);

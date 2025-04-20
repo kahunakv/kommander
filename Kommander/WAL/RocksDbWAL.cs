@@ -20,7 +20,7 @@ public class RocksDbWAL : IWAL, IDisposable
 
     private const int MaxMessageSize = 1024;
     
-    private const int MaxShards = 16;
+    private const int MaxShards = 8;
     
     private const int MaxNumberOfRangedEntries = 100;
     
@@ -174,13 +174,7 @@ public class RocksDbWAL : IWAL, IDisposable
         {
             RaftLogMessage message = Unserializer(iterator.Value());
             
-            if (message.Partition != partitionId)
-            {
-                iterator.Next();
-                continue;
-            }
-
-            if (message.Id < startLogIndex)
+            if (message.Partition != partitionId || message.Id < startLogIndex)
             {
                 iterator.Next();
                 continue;
@@ -216,255 +210,6 @@ public class RocksDbWAL : IWAL, IDisposable
         return result;
     }
 
-    public RaftOperationStatus Propose(int partitionId, RaftLog log)
-    {
-        try 
-        {
-            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-            
-            string index = log.Id.ToString("D20");
-
-            RaftLogMessage message = new()
-            {
-                Partition = partitionId,
-                Id = log.Id,
-                Term = log.Term,
-                Type = (int)log.Type,
-                TimePhysical = log.Time.L,
-                TimeCounter = log.Time.C
-            };
-
-            if (log.LogType != null)
-                message.LogType = log.LogType;
-            
-            if (log.LogData != null)
-                message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
-            
-            Span<byte> buffer = stackalloc byte[Encoding.UTF8.GetByteCount(index)];
-            Encoding.UTF8.GetBytes(index.AsSpan(), buffer);
-            
-            db.Put(buffer, Serialize(message), cf: columnFamilyHandle, DefaultWriteOptions);
-
-            return RaftOperationStatus.Success;
-        } 
-        catch (Exception ex)
-        {
-            logger.LogError("Error during proposal: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
-                    
-            return RaftOperationStatus.Errored;
-        }
-    }
-    
-    public RaftOperationStatus Commit(int partitionId, RaftLog log)
-    {
-        try 
-        {
-            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-            
-            string index = log.Id.ToString("D20");
-            
-            RaftLogMessage message = new()
-            {
-                Partition = partitionId,
-                Id = log.Id,
-                Term = log.Term,
-                Type = (int)log.Type,
-                TimePhysical = log.Time.L,
-                TimeCounter = log.Time.C
-            };
-            
-            if (log.LogType != null)
-                message.LogType = log.LogType;
-            
-            if (log.LogData != null)
-                message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
-            
-            Span<byte> buffer = stackalloc byte[Encoding.UTF8.GetByteCount(index)];
-            Encoding.UTF8.GetBytes(index.AsSpan(), buffer);
-            
-            db.Put(buffer, Serialize(message), cf: columnFamilyHandle, DefaultWriteOptions);
-
-            return RaftOperationStatus.Success;
-        } 
-        catch (Exception ex)
-        {
-            logger.LogError("Error during commit: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
-                    
-            return RaftOperationStatus.Errored;
-        }
-    }
-    
-    public RaftOperationStatus Rollback(int partitionId, RaftLog log)
-    {
-        try
-        {
-            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-            
-            string index = log.Id.ToString("D20");
-            
-            RaftLogMessage message = new()
-            {
-                Partition = partitionId,
-                Id = log.Id,
-                Term = log.Term,
-                Type = (int)log.Type,
-                TimePhysical = log.Time.L,
-                TimeCounter = log.Time.C
-            };
-            
-            if (log.LogType != null)
-                message.LogType = log.LogType;
-            
-            if (log.LogData != null)
-                message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
-            
-            Span<byte> buffer = stackalloc byte[Encoding.UTF8.GetByteCount(index)];
-            Encoding.UTF8.GetBytes(index.AsSpan(), buffer);
-            
-            db.Put(buffer, Serialize(message), cf: columnFamilyHandle, DefaultWriteOptions);
-
-            return RaftOperationStatus.Success;
-        } 
-        catch (Exception ex)
-        {
-            logger.LogError("Error during rollback: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
-                
-            return RaftOperationStatus.Errored;
-        }
-    }
-
-    public RaftOperationStatus ProposeMany(int partitionId, List<RaftLog> logs)
-    {
-        try
-        {
-            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-            
-            using WriteBatch writeBatch = new();
-            
-            foreach (RaftLog log in logs)
-            {
-                string index = log.Id.ToString("D20");
-                
-                RaftLogMessage message = new()
-                {
-                    Partition = partitionId,
-                    Id = log.Id,
-                    Term = log.Term,
-                    Type = (int)log.Type,
-                    TimePhysical = log.Time.L,
-                    TimeCounter = log.Time.C
-                };
-                
-                if (log.LogType != null)
-                    message.LogType = log.LogType;
-            
-                if (log.LogData != null)
-                    message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
-            
-                PutToBatch(writeBatch, index, message, columnFamilyHandle);
-            }
-            
-            db.Write(writeBatch, DefaultWriteOptions);
-
-            return RaftOperationStatus.Success;
-        } 
-        catch (Exception ex)
-        {
-            logger.LogError("Error during proposal: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
-                    
-            return RaftOperationStatus.Errored;
-        }
-    }
-
-    public RaftOperationStatus CommitMany(int partitionId, List<RaftLog> logs)
-    {
-        if (logs.Count == 0)
-            return RaftOperationStatus.Success;
-
-        try
-        {
-            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-
-            using WriteBatch writeBatch = new();
-
-            foreach (RaftLog log in logs)
-            {
-                string index = log.Id.ToString("D20");
-                
-                RaftLogMessage message = new()
-                {
-                    Partition = partitionId,
-                    Id = log.Id,
-                    Term = log.Term,
-                    Type = (int)log.Type,
-                    TimePhysical = log.Time.L,
-                    TimeCounter = log.Time.C
-                };
-                
-                if (log.LogType != null)
-                    message.LogType = log.LogType;
-            
-                if (log.LogData != null)
-                    message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
-
-                PutToBatch(writeBatch, index, message, columnFamilyHandle);
-            }
-
-            db.Write(writeBatch, DefaultWriteOptions);
-
-            return RaftOperationStatus.Success;
-        } 
-        catch (Exception ex)
-        {
-            logger.LogError("Error during commit: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
-            
-            return RaftOperationStatus.Errored;
-        }
-    }
-
-    public RaftOperationStatus RollbackMany(int partitionId, List<RaftLog> logs)
-    {
-        try
-        {
-            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-            
-            using WriteBatch writeBatch = new();
-
-            foreach (RaftLog log in logs)
-            {
-                string index = log.Id.ToString("D20");
-                
-                RaftLogMessage message = new()
-                {
-                    Partition = partitionId,
-                    Id = log.Id,
-                    Term = log.Term,
-                    Type = (int)log.Type,
-                    TimePhysical = log.Time.L,
-                    TimeCounter = log.Time.C
-                };
-                
-                if (log.LogType != null)
-                    message.LogType = log.LogType;
-            
-                if (log.LogData != null)
-                    message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
-
-                PutToBatch(writeBatch, index, message, columnFamilyHandle);
-            }
-            
-            db.Write(writeBatch, DefaultWriteOptions);
-
-            return RaftOperationStatus.Success;
-        } 
-        catch (Exception ex)
-        {
-            logger.LogError("Error during rollback: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
-                
-            return RaftOperationStatus.Errored;
-        }
-    }
-
     private static void PutToBatch(WriteBatch writeBatch, string index, RaftLogMessage message, ColumnFamilyHandle columnFamilyHandle)
     {
         Span<byte> buffer = stackalloc byte[Encoding.UTF8.GetByteCount(index)];
@@ -489,9 +234,9 @@ public class RocksDbWAL : IWAL, IDisposable
                         raftLogs.AddRange(log.raftLog);
                     else
                     {
-                        List<RaftLog> p = new(log.raftLog.Count);
-                        p.AddRange(log.raftLog);
-                        raftLogsPerPartition.Add(log.partitionId, p);
+                        raftLogs = new(log.raftLog.Count);
+                        raftLogs.AddRange(log.raftLog);
+                        raftLogsPerPartition.Add(log.partitionId, raftLogs);
                     }
                 }
                 else

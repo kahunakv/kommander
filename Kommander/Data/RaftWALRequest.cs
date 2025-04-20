@@ -3,17 +3,17 @@ using Kommander.Time;
 
 namespace Kommander.Data;
 
-public readonly struct RaftWALRequest
+public sealed class RaftWALRequest
 {
     public RaftWALActionType Type { get; }
 
-    public long Term { get; } = 0;
+    public long Term { get; }
     
-    public long CurrentIndex { get; } = 0;
+    public long CurrentIndex { get; }
     
     public HLCTimestamp Timestamp { get; } = HLCTimestamp.Zero;
 
-    public List<RaftLog>? Logs { get; } = null;
+    public List<RaftLog>? Logs { get; }
 
     public RaftWALRequest(RaftWALActionType type)
     {

@@ -9,18 +9,6 @@ public interface IWAL
 
     public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex);
 
-    public RaftOperationStatus Propose(int partitionId, RaftLog log);
-    
-    public RaftOperationStatus Commit(int partitionId, RaftLog log);
-    
-    public RaftOperationStatus Rollback(int partitionId, RaftLog log);
-    
-    public RaftOperationStatus ProposeMany(int partitionId, List<RaftLog> logs);
-    
-    public RaftOperationStatus CommitMany(int partitionId, List<RaftLog> logs);
-    
-    public RaftOperationStatus RollbackMany(int partitionId, List<RaftLog> logs);
-
     public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs);
     
     public long GetMaxLog(int partitionId);

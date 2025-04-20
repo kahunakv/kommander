@@ -61,7 +61,7 @@ public sealed class RaftManager : IRaft, IDisposable
     
     private readonly ConcurrentDictionary<string, HLCTimestamp> lastHearthBeat = new();
     
-    private readonly ConcurrentDictionary<string, IActorAggregateRef<RaftResponderActor, RaftResponderRequest>> responderActors = [];
+    private readonly ConcurrentDictionary<string, IActorRefAggregate<RaftResponderActor, RaftResponderRequest>> responderActors = [];
 
     /// <summary>
     /// Allows to retrieve the list of known nodes within the Raft cluster
@@ -1058,7 +1058,7 @@ public sealed class RaftManager : IRaft, IDisposable
     
     internal void EnqueueResponse(string endpoint, RaftResponderRequest request)
     {
-        if (!responderActors.TryGetValue(endpoint, out IActorAggregateRef<RaftResponderActor, RaftResponderRequest>? responderActor))
+        if (!responderActors.TryGetValue(endpoint, out IActorRefAggregate<RaftResponderActor, RaftResponderRequest>? responderActor))
         {
             responderActor = actorSystem.SpawnAggregate<RaftResponderActor, RaftResponderRequest>(
                 string.Concat("raft-responder-", endpoint),

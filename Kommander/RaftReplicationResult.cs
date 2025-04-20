@@ -1,9 +1,10 @@
+
 using Kommander.Data;
 using Kommander.Time;
 
 namespace Kommander;
 
-public readonly struct RaftReplicationResult
+public sealed class RaftReplicationResult
 {
     public bool Success { get; }
     

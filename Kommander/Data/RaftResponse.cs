@@ -3,7 +3,7 @@ using Kommander.Time;
 
 namespace Kommander.Data;
 
-public readonly struct RaftResponse
+public sealed class RaftResponse
 {
     public RaftResponseType Type { get; }
     
@@ -13,7 +13,7 @@ public readonly struct RaftResponse
     
     public RaftTicketState TicketState { get; } = RaftTicketState.NotFound;
     
-    public long LogIndex { get; } = 0;
+    public long LogIndex { get; }
     
     public HLCTimestamp TicketId { get; } = HLCTimestamp.Zero;
     

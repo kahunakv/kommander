@@ -3,19 +3,19 @@ using Kommander.Time;
 
 namespace Kommander.Data;
 
-public readonly struct RaftRequest
+public sealed class RaftRequest
 {
     public RaftRequestType Type { get; }
 
     public long Term { get; } = -1;
     
-    public long CommitIndex { get; } = 0;
+    public long CommitIndex { get; }
     
     public HLCTimestamp Timestamp { get; }
 
-    public string? Endpoint { get; } = null; 
+    public string? Endpoint { get; } 
 
-    public List<RaftLog>? Logs { get; } = null;
+    public List<RaftLog>? Logs { get; }
     
     public RaftOperationStatus Status { get; }
     

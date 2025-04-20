@@ -1,7 +1,7 @@
 
 namespace Kommander.Data;
 
-internal readonly struct RaftBatcherItem
+public sealed class RaftBatcherItem
 {
     /// <summary>
     /// List of logs to store

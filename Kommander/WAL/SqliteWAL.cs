@@ -208,8 +208,7 @@ public class SqliteWAL : IWAL, IDisposable
                     Type = reader.IsDBNull(2) ? RaftLogType.Proposed : (RaftLogType)reader.GetInt32(2),
                     LogType = reader.IsDBNull(3) ? "" : reader.GetString(3),
                     LogData = reader.IsDBNull(4) ? [] : (byte[])reader[4],
-                    Time = new(reader.IsDBNull(5) ? 0 : reader.GetInt64(5),
-                        reader.IsDBNull(6) ? 0 : (uint)reader.GetInt64(6))
+                    Time = new(reader.IsDBNull(5) ? 0 : reader.GetInt64(5), reader.IsDBNull(6) ? 0 : (uint)reader.GetInt64(6))
                 });
 
                 counter++;
@@ -225,346 +224,23 @@ public class SqliteWAL : IWAL, IDisposable
             readerWriterLock.ReleaseReaderLock();
         }
     }
-
-    public RaftOperationStatus Propose(int partitionId, RaftLog log)
-    {
-        try
-        {
-            (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
-
-            try
-            {
-                readerWriterLock.AcquireWriterLock(TimeSpan.FromSeconds(10));
-                
-                // @todo review
-
-                const string insertOrReplaceQuery = """
-                    INSERT INTO logs (id, partitionId, term, type, logType, log, timePhysical, timeCounter)
-                    VALUES (@id, @partitionId, @term, @type, @logType, @log, @timePhysical, @timeCounter)
-                    ON CONFLICT(partitionId, id) DO UPDATE SET term=@term, type=@type, logType=@logType,
-                    log=@log, timePhysical=@timePhysical, timeCounter=@timeCounter;
-                    """;
-
-                using SqliteCommand insertOrReplaceCommand = new(insertOrReplaceQuery, connection);
-
-                insertOrReplaceCommand.Parameters.AddWithValue("@id", log.Id);
-                insertOrReplaceCommand.Parameters.AddWithValue("@partitionId", partitionId);
-                insertOrReplaceCommand.Parameters.AddWithValue("@term", log.Term);
-                insertOrReplaceCommand.Parameters.AddWithValue("@type", log.Type);
-
-                if (log.LogType is null)
-                    insertOrReplaceCommand.Parameters.AddWithValue("@logType", 0);
-                else
-                    insertOrReplaceCommand.Parameters.AddWithValue("@logType", log.LogType);
-
-                if (log.LogData is null)
-                    insertOrReplaceCommand.Parameters.AddWithValue("@log", "");
-                else
-                    insertOrReplaceCommand.Parameters.AddWithValue("@log", log.LogData);
-
-                insertOrReplaceCommand.Parameters.AddWithValue("@timePhysical", log.Time.L);
-                insertOrReplaceCommand.Parameters.AddWithValue("@timeCounter", log.Time.C);
-
-                insertOrReplaceCommand.ExecuteNonQuery();
-
-                return RaftOperationStatus.Success;
-            }
-            finally
-            {
-                readerWriterLock.ReleaseWriterLock();
-            }
-        } 
-        catch (Exception ex)
-        {
-            logger.LogError("Error during proposal: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
-                                        
-            return RaftOperationStatus.Errored;
-        }
-    }
-
-    public RaftOperationStatus Commit(int partitionId, RaftLog log)
-    {
-        try
-        {
-            (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
-
-            try
-            {
-                readerWriterLock.AcquireWriterLock(TimeSpan.FromSeconds(10));
-
-                const string updateQuery = "UPDATE logs SET type = @type WHERE partitionId = @partitionId AND id = @id";
-                using SqliteCommand updateCommand = new(updateQuery, connection);
-
-                updateCommand.Parameters.AddWithValue("@id", log.Id);
-                updateCommand.Parameters.AddWithValue("@partitionId", partitionId);
-                updateCommand.Parameters.AddWithValue("@type", log.Type);
-
-                updateCommand.ExecuteNonQuery();
-
-                return RaftOperationStatus.Success;
-            } 
-            finally
-            {
-                readerWriterLock.ReleaseWriterLock();
-            }
-        } 
-        catch (Exception ex)
-        {
-            logger.LogError("Error during commit: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
-                                    
-            return RaftOperationStatus.Errored;
-        }
-    }
-
-    public RaftOperationStatus Rollback(int partitionId, RaftLog log)
-    {
-        try
-        {
-            (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
-
-            try
-            {
-                readerWriterLock.AcquireWriterLock(TimeSpan.FromSeconds(10));
-
-                const string updateQuery = "UPDATE logs SET type = @type WHERE partitionId = @partitionId AND id = @id";
-                using SqliteCommand updateCommand = new(updateQuery, connection);
-
-                updateCommand.Parameters.AddWithValue("@id", log.Id);
-                updateCommand.Parameters.AddWithValue("@partitionId", partitionId);
-                updateCommand.Parameters.AddWithValue("@type", log.Type);
-
-                updateCommand.ExecuteNonQuery();
-
-                return RaftOperationStatus.Success;
-            } 
-            finally
-            {
-                readerWriterLock.ReleaseWriterLock();
-            }
-        } 
-        catch (Exception ex)
-        {
-            logger.LogError("Error during rollback: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
-                                
-            return RaftOperationStatus.Errored;
-        }
-    }
-
-    public RaftOperationStatus ProposeMany(int partitionId, List<RaftLog> logs)
-    {
-        try
-        {
-            (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
-
-            try
-            {
-                readerWriterLock.AcquireWriterLock(TimeSpan.FromSeconds(10));
-
-                const string insertOrReplaceSql = """
-                   INSERT INTO logs (id, partitionId, term, type, logType, log, timePhysical, timeCounter)
-                   VALUES (@id, @partitionId, @term, @type, @logType, @log, @timePhysical, @timeCounter)
-                   ON CONFLICT(partitionId, id) DO UPDATE SET term=@term, type=@type, logType=@logType,
-                   log=@log, timePhysical=@timePhysical, timeCounter=@timeCounter;
-                   """;
-                
-                using SqliteTransaction transaction = connection.BeginTransaction();
-
-                try
-                {
-                    foreach (RaftLog log in logs)
-                    {
-                        using SqliteCommand insertOrReplaceCommand = new(insertOrReplaceSql, connection);
-
-                        insertOrReplaceCommand.Transaction = transaction;
-
-                        insertOrReplaceCommand.Parameters.AddWithValue("@id", log.Id);
-                        insertOrReplaceCommand.Parameters.AddWithValue("@partitionId", partitionId);
-                        insertOrReplaceCommand.Parameters.AddWithValue("@term", log.Term);
-                        insertOrReplaceCommand.Parameters.AddWithValue("@type", log.Type);
-                        
-                        if (log.LogType is null)
-                            insertOrReplaceCommand.Parameters.AddWithValue("@logType", 0);
-                        else
-                            insertOrReplaceCommand.Parameters.AddWithValue("@logType", log.LogType);
-                        
-                        if (log.LogData is null)
-                            insertOrReplaceCommand.Parameters.AddWithValue("@log", "");
-                        else
-                            insertOrReplaceCommand.Parameters.AddWithValue("@log", log.LogData);
-                        
-                        insertOrReplaceCommand.Parameters.AddWithValue("@timePhysical", log.Time.L);
-                        insertOrReplaceCommand.Parameters.AddWithValue("@timeCounter", log.Time.C);
-
-                        insertOrReplaceCommand.ExecuteNonQuery();
-                    }
-                    
-                    transaction.Commit();
-
-                    return RaftOperationStatus.Success;
-                } 
-                catch
-                {
-                    transaction.Rollback();
-                    throw;
-                }
-            } 
-            finally
-            {
-                readerWriterLock.ReleaseWriterLock();
-            }  
-        } 
-        catch (Exception ex)
-        {
-            logger.LogError("Error during proposal: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
-                            
-            return RaftOperationStatus.Errored;
-        }
-    }
-
-    public RaftOperationStatus CommitMany(int partitionId, List<RaftLog> logs)
-    {
-        try
-        {
-            (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
-
-            try
-            {
-                readerWriterLock.AcquireWriterLock(TimeSpan.FromSeconds(10));
-
-                const string insertOrReplaceSql = """
-                   INSERT INTO logs (id, partitionId, term, type, logType, log, timePhysical, timeCounter)
-                   VALUES (@id, @partitionId, @term, @type, @logType, @log, @timePhysical, @timeCounter)
-                   ON CONFLICT(partitionId, id) DO UPDATE SET term=@term, type=@type, logType=@logType,
-                   log=@log, timePhysical=@timePhysical, timeCounter=@timeCounter;
-                   """;
-
-                using SqliteTransaction transaction = connection.BeginTransaction();
-
-                try
-                {
-                    foreach (RaftLog log in logs)
-                    {
-                        using SqliteCommand insertOrReplaceCommand = new(insertOrReplaceSql, connection);
-
-                        insertOrReplaceCommand.Transaction = transaction;
-
-                        insertOrReplaceCommand.Parameters.AddWithValue("@id", log.Id);
-                        insertOrReplaceCommand.Parameters.AddWithValue("@partitionId", partitionId);
-                        insertOrReplaceCommand.Parameters.AddWithValue("@term", log.Term);
-                        insertOrReplaceCommand.Parameters.AddWithValue("@type", log.Type);
-                        
-                        if (log.LogType is null)
-                            insertOrReplaceCommand.Parameters.AddWithValue("@logType", 0);
-                        else
-                            insertOrReplaceCommand.Parameters.AddWithValue("@logType", log.LogType);
-                        
-                        if (log.LogData is null)
-                            insertOrReplaceCommand.Parameters.AddWithValue("@log", "");
-                        else
-                            insertOrReplaceCommand.Parameters.AddWithValue("@log", log.LogData);
-                        
-                        insertOrReplaceCommand.Parameters.AddWithValue("@timePhysical", log.Time.L);
-                        insertOrReplaceCommand.Parameters.AddWithValue("@timeCounter", log.Time.C);
-
-                        insertOrReplaceCommand.ExecuteNonQuery();
-                    }
-
-                    transaction.Commit();
-
-                    return RaftOperationStatus.Success;
-                } 
-                catch
-                {
-                    transaction.Rollback();
-                    throw;
-                }
-            } 
-            finally
-            {
-                readerWriterLock.ReleaseWriterLock();
-            }  
-        } 
-        catch (Exception ex)
-        {
-            logger.LogError("Error during commit: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
-                        
-            return RaftOperationStatus.Errored;
-        }
-    }
-
-    public RaftOperationStatus RollbackMany(int partitionId, List<RaftLog> logs)
-    {
-        try
-        {
-            (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
-
-            try
-            {
-                readerWriterLock.AcquireWriterLock(TimeSpan.FromSeconds(10));
-                
-                const string insertOrReplaceSql = """
-                  INSERT INTO logs (id, partitionId, term, type, logType, log, timePhysical, timeCounter)
-                  VALUES (@id, @partitionId, @term, @type, @logType, @log, @timePhysical, @timeCounter)
-                  ON CONFLICT(partitionId, id) DO UPDATE SET term=@term, type=@type, logType=@logType,
-                  log=@log, timePhysical=@timePhysical, timeCounter=@timeCounter;
-                  """;
-                
-                using SqliteTransaction transaction = connection.BeginTransaction();
-
-                try
-                {
-                    foreach (RaftLog log in logs)
-                    {
-                        using SqliteCommand insertOrReplaceCommand = new(insertOrReplaceSql, connection);
-
-                        insertOrReplaceCommand.Transaction = transaction;
-
-                        insertOrReplaceCommand.Parameters.AddWithValue("@id", log.Id);
-                        insertOrReplaceCommand.Parameters.AddWithValue("@partitionId", partitionId);
-                        insertOrReplaceCommand.Parameters.AddWithValue("@term", log.Term);
-                        insertOrReplaceCommand.Parameters.AddWithValue("@type", log.Type);
-                        
-                        if (log.LogType is null)
-                            insertOrReplaceCommand.Parameters.AddWithValue("@logType", 0);
-                        else
-                            insertOrReplaceCommand.Parameters.AddWithValue("@logType", log.LogType);
-                        
-                        if (log.LogData is null)
-                            insertOrReplaceCommand.Parameters.AddWithValue("@log", "");
-                        else
-                            insertOrReplaceCommand.Parameters.AddWithValue("@log", log.LogData);
-                        
-                        insertOrReplaceCommand.Parameters.AddWithValue("@timePhysical", log.Time.L);
-                        insertOrReplaceCommand.Parameters.AddWithValue("@timeCounter", log.Time.C);
-
-                        insertOrReplaceCommand.ExecuteNonQuery();
-                    }
-
-                    transaction.Commit();
-
-                    return RaftOperationStatus.Success;
-                } 
-                catch
-                {
-                    transaction.Rollback();
-                    throw;
-                }
-            } 
-            finally
-            {
-                readerWriterLock.ReleaseWriterLock();
-            }
-        } 
-        catch (Exception ex)
-        {
-            logger.LogError("Error during rollback: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
-                    
-            return RaftOperationStatus.Errored;
-        }
-    }
     
     public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs)
     {
+        Dictionary<int, List<RaftLog>> plan = new();
+
+        foreach ((int partitionId, List<RaftLog> raftLogs) log in logs)
+        {
+            if (plan.TryGetValue(log.partitionId, out List<RaftLog>? raftLogs))
+                raftLogs.AddRange(log.raftLogs);
+            else
+            {
+                List<RaftLog> planLogs = [];
+                planLogs.AddRange(log.raftLogs);
+                plan.Add(log.partitionId, planLogs);
+            }
+        }
+        
         try
         {
             const string insertOrReplaceSql = """
@@ -574,9 +250,9 @@ public class SqliteWAL : IWAL, IDisposable
               log=@log, timePhysical=@timePhysical, timeCounter=@timeCounter;
               """;
             
-            foreach ((int partitionId, List<RaftLog> raftLogs) item in logs)
+            foreach (KeyValuePair<int, List<RaftLog>> kv in plan)
             {
-                (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(item.partitionId);
+                (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(kv.Key);
 
                 try
                 {
@@ -586,14 +262,14 @@ public class SqliteWAL : IWAL, IDisposable
 
                     try
                     {
-                        foreach (RaftLog log in item.raftLogs)
+                        foreach (RaftLog log in kv.Value)
                         {
                             using SqliteCommand insertOrReplaceCommand = new(insertOrReplaceSql, connection);
 
                             insertOrReplaceCommand.Transaction = transaction;
 
                             insertOrReplaceCommand.Parameters.AddWithValue("@id", log.Id);
-                            insertOrReplaceCommand.Parameters.AddWithValue("@partitionId", item.partitionId);
+                            insertOrReplaceCommand.Parameters.AddWithValue("@partitionId", kv.Key);
                             insertOrReplaceCommand.Parameters.AddWithValue("@term", log.Term);
                             insertOrReplaceCommand.Parameters.AddWithValue("@type", log.Type);
 
@@ -614,8 +290,6 @@ public class SqliteWAL : IWAL, IDisposable
                         }
 
                         transaction.Commit();
-
-                        return RaftOperationStatus.Success;
                     }
                     catch
                     {
@@ -628,6 +302,8 @@ public class SqliteWAL : IWAL, IDisposable
                     readerWriterLock.ReleaseWriterLock();
                 }
             }
+            
+            return RaftOperationStatus.Success;
         } 
         catch (Exception ex)
         {
@@ -743,12 +419,12 @@ public class SqliteWAL : IWAL, IDisposable
             List<long> logs = [];
 
             const string query = """
-                 SELECT id
-                 FROM logs
-                 WHERE partitionId = @partitionId AND id < @lastCheckpoint
-                 ORDER BY id ASC
-                 LIMIT @limit;
-                 """;
+             SELECT id
+             FROM logs
+             WHERE partitionId = @partitionId AND id < @lastCheckpoint
+             ORDER BY id ASC
+             LIMIT @limit;
+             """;
 
             using SqliteCommand command = new(query, connection);
 

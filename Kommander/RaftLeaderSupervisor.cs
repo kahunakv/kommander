@@ -71,7 +71,7 @@ public sealed class RaftLeaderSupervisor : IActor<RaftLeaderSupervisorRequest>
     {
         manager.SystemPartition?.CheckLeader();
         
-        foreach ((int _, RaftPartition? partition) in manager.Partitions)
+        foreach ((int _, RaftPartition partition) in manager.Partitions)
             partition.CheckLeader();
         
         return Task.CompletedTask;

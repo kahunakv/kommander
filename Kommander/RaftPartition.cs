@@ -1,10 +1,9 @@
 
-using System.Collections.Concurrent;
+using Nixie;
 using Kommander.Communication;
 using Kommander.Data;
 using Kommander.Time;
 using Kommander.WAL;
-using Nixie;
 
 namespace Kommander;
 
@@ -21,7 +20,7 @@ public sealed class RaftPartition : IDisposable
     
     private readonly SemaphoreSlim semaphore = new(1, 1);
 
-    private readonly IActorRefStruct<RaftStateActor, RaftRequest, RaftResponse> raftActor;
+    private readonly IActorRefAggregate<RaftStateActor, RaftRequest, RaftResponse> raftActor;
 
     private readonly RaftManager manager;
 
@@ -60,7 +59,7 @@ public sealed class RaftPartition : IDisposable
         StartRange = startRange;
         EndRange = endRange;
 
-        raftActor = actorSystem.SpawnStruct<RaftStateActor, RaftRequest, RaftResponse>(
+        raftActor = actorSystem.SpawnAggregate<RaftStateActor, RaftRequest, RaftResponse>(
             "raft-partition-" + partitionId, 
             manager, 
             this,
@@ -76,7 +75,13 @@ public sealed class RaftPartition : IDisposable
     /// <param name="request"></param>
     public void Handshake(HandshakeRequest request)
     {
-        raftActor.Send(new(RaftRequestType.ReceiveHandshake, 0, request.MaxLogId, HLCTimestamp.Zero, request.Endpoint));
+        raftActor.Send(new(
+            RaftRequestType.ReceiveHandshake, 
+            0, 
+            request.MaxLogId, 
+            HLCTimestamp.Zero, 
+            request.Endpoint
+        ));
     }
 
     /// <summary>
@@ -162,7 +167,10 @@ public sealed class RaftPartition : IDisposable
 
         List<RaftLog> logsToReplicate = [new() { Type = RaftLogType.Proposed, LogType = type, LogData = data }];
         
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit)).ConfigureAwait(false); 
+        RaftResponse? response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit)).ConfigureAwait(false);
+        
+        if (response is null)
+            return (false, RaftOperationStatus.Errored, HLCTimestamp.Zero);
         
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
@@ -187,7 +195,10 @@ public sealed class RaftPartition : IDisposable
 
         List<RaftLog> logsToReplicate = logs.Select(data => new RaftLog { Type = RaftLogType.Proposed, LogType = type, LogData = data }).ToList();
         
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit)).ConfigureAwait(false);
+        RaftResponse? response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit)).ConfigureAwait(false);
+        
+        if (response is null)
+            return (false, RaftOperationStatus.Errored, HLCTimestamp.Zero);
         
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
@@ -208,7 +219,10 @@ public sealed class RaftPartition : IDisposable
         if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, 0);
         
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.CommitLogs, ticketId, false)).ConfigureAwait(false);
+        RaftResponse? response = await raftActor.Ask(new(RaftRequestType.CommitLogs, ticketId, false)).ConfigureAwait(false);
+        
+        if (response is null)
+            return (false, RaftOperationStatus.Errored, 0);
         
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.LogIndex);
@@ -229,7 +243,10 @@ public sealed class RaftPartition : IDisposable
         if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, 0);
         
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.RollbackLogs, ticketId, false)).ConfigureAwait(false);
+        RaftResponse? response = await raftActor.Ask(new(RaftRequestType.RollbackLogs, ticketId, false)).ConfigureAwait(false);
+        
+        if (response is null)
+            return (false, RaftOperationStatus.Errored, 0);
         
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.LogIndex);
@@ -248,7 +265,10 @@ public sealed class RaftPartition : IDisposable
         if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
         
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.ReplicateCheckpoint)).ConfigureAwait(false);
+        RaftResponse? response = await raftActor.Ask(new(RaftRequestType.ReplicateCheckpoint)).ConfigureAwait(false);
+        
+        if (response is null)
+            return (false, RaftOperationStatus.Errored, HLCTimestamp.Zero);
         
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
@@ -266,7 +286,10 @@ public sealed class RaftPartition : IDisposable
         if (!string.IsNullOrEmpty(Leader) && Leader == manager.LocalEndpoint)
             return RaftNodeState.Leader;
 
-        RaftResponse response = await raftActor.Ask(RaftStateRequest).ConfigureAwait(false);
+        RaftResponse? response = await raftActor.Ask(RaftStateRequest).ConfigureAwait(false);
+        
+        if (response is null)
+            throw new RaftException("Unknown response (1)");
         
         if (response.Type != RaftResponseType.NodeState)
             throw new RaftException("Unknown response (2)");
@@ -282,7 +305,10 @@ public sealed class RaftPartition : IDisposable
     /// <exception cref="RaftException"></exception>
     public async Task<(RaftTicketState state, long commitId)> GetTicketState(HLCTimestamp ticketId, bool autoCommit)
     {
-        RaftResponse response = await raftActor.Ask(new(RaftRequestType.GetTicketState, ticketId, autoCommit)).ConfigureAwait(false);
+        RaftResponse? response = await raftActor.Ask(new(RaftRequestType.GetTicketState, ticketId, autoCommit)).ConfigureAwait(false);
+        
+        if (response is null)
+            throw new RaftException("Unknown response (1)");
         
         if (response.Type != RaftResponseType.TicketState)
             throw new RaftException("Unknown response (2)");

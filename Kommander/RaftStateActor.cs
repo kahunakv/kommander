@@ -1,10 +1,8 @@
 ﻿
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using Nixie;
 using Kommander.Communication;
 using Kommander.Data;
-using Kommander.Diagnostics;
 using Kommander.Logging;
 using Kommander.Time;
 using Kommander.WAL;
@@ -15,12 +13,12 @@ namespace Kommander;
 /// The actor functions as a state machine that allows switching between different
 /// states (follower, candidate, leader) and conducting elections without concurrency conflicts.
 /// </summary>
-public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
+public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
 {
     /// <summary>
     /// Reference to the actor context
     /// </summary>
-    private readonly IActorContextStruct<RaftStateActor, RaftRequest, RaftResponse> context;
+    private readonly IActorAggregateContext<RaftStateActor, RaftRequest, RaftResponse> context;
     
     /// <summary>
     /// Reference to the raft manager
@@ -40,7 +38,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <summary>
     /// Reference to the WAL actor
     /// </summary>
-    private readonly IActorRefStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse> walActor;
+    private readonly IActorRef<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse> walActor;
 
     /// <summary>
     /// Track votes per term
@@ -121,7 +119,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// <param name="walAdapter"></param>
     /// <param name="communication"></param>
     public RaftStateActor(
-        IActorContextStruct<RaftStateActor, RaftRequest, RaftResponse> context, 
+        IActorAggregateContext<RaftStateActor, RaftRequest, RaftResponse> context, 
         RaftManager manager, 
         RaftPartition partition,
         IWAL walAdapter,
@@ -140,7 +138,7 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             manager.Configuration.EndElectionTimeout
         ));
         
-        walActor = context.ActorSystem.SpawnStruct<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse>(
+        walActor = context.ActorSystem.Spawn<RaftWriteAheadActor, RaftWALRequest, RaftWALResponse>(
             "raft-wal-" + partition.PartitionId, 
             manager, 
             partition,
@@ -153,94 +151,130 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
     /// </summary>
     /// <param name="message"></param>
     /// <returns></returns>
-    public async Task<RaftResponse> Receive(RaftRequest message)
+    public async Task Receive(List<ActorMessageReply<RaftRequest, RaftResponse>> messages)
     {
-        stopwatch.Restart();
-        
         //Console.WriteLine("[{0}/{1}/{2}] Processing:{3}", manager.LocalEndpoint, partition.PartitionId, state, message.Type);
         //await File.AppendAllTextAsync($"/tmp/{partition.PartitionId}.txt", $"{message.Type}\n");
         
-        try
+        await RestoreWal().ConfigureAwait(false);
+
+        foreach (ActorMessageReply<RaftRequest, RaftResponse> message in messages)
         {
-            await RestoreWal().ConfigureAwait(false);
-
-            switch (message.Type)
+            stopwatch.Restart();
+            
+            RaftRequest request = message.Request;
+            
+            try
             {
-                case RaftRequestType.CheckLeader:
-                    await CheckPartitionLeadership().ConfigureAwait(false);
-                    break;
-
-                case RaftRequestType.GetNodeState:
-                    return new(RaftResponseType.NodeState, nodeState);
-
-                case RaftRequestType.GetTicketState:
+                switch (request.Type)
                 {
-                    (RaftTicketState ticketState, long commitIndex) = CheckTicketCompletion(message.Timestamp, message.AutoCommit);
-                    return new(RaftResponseType.TicketState, ticketState, commitIndex);
+                    case RaftRequestType.CheckLeader:
+                        await CheckPartitionLeadership().ConfigureAwait(false);
+                        break;
+
+                    case RaftRequestType.GetNodeState:
+                    {
+                        message.Promise.TrySetResult(new(RaftResponseType.NodeState, nodeState));
+                        break;
+                    }
+
+                    case RaftRequestType.GetTicketState:
+                    {
+                        (RaftTicketState ticketState, long commitIndex) = CheckTicketCompletion(request.Timestamp, request.AutoCommit);
+                        message.Promise.TrySetResult(new(RaftResponseType.TicketState, ticketState, commitIndex));
+                        break;
+                    }
+
+                    case RaftRequestType.AppendLogs:
+                        await AppendLogs(request.Endpoint ?? "", request.Term, request.Timestamp, request.Logs).ConfigureAwait(false);
+                        break;
+
+                    case RaftRequestType.CompleteAppendLogs:
+                        await CompleteAppendLogs(request.Endpoint ?? "", request.Timestamp, request.Status, request.CommitIndex).ConfigureAwait(false);
+                        break;
+
+                    case RaftRequestType.ReplicateLogs:
+                    {
+                        (RaftOperationStatus status, HLCTimestamp ticketId) = await ReplicateLogs(request.Logs, request.AutoCommit).ConfigureAwait(false);
+                        message.Promise.TrySetResult(new(RaftResponseType.None, status, ticketId));
+                        break;
+                    }
+
+                    case RaftRequestType.ReplicateCheckpoint:
+                    {
+                        (RaftOperationStatus status, HLCTimestamp ticketId) = await ReplicateCheckpoint().ConfigureAwait(false);
+                        message.Promise.TrySetResult(new(RaftResponseType.None, status, ticketId));
+                        break;
+                    }
+
+                    case RaftRequestType.CommitLogs:
+                    {
+                        (RaftOperationStatus status, long commitIndex) = await CommitLogs(request.Timestamp).ConfigureAwait(false);
+                        message.Promise.TrySetResult(new(RaftResponseType.None, status, commitIndex));
+                        break;
+                    }
+
+                    case RaftRequestType.RollbackLogs:
+                    {
+                        (RaftOperationStatus status, long commitIndex) = await RollbackLogs(request.Timestamp).ConfigureAwait(false);
+                        message.Promise.TrySetResult(new(RaftResponseType.None, status, commitIndex));
+                        break;
+                    }
+
+                    case RaftRequestType.RequestVote:
+                        await Vote(new(request.Endpoint ?? ""), request.Term, request.CommitIndex, request.Timestamp).ConfigureAwait(false);
+                        break;
+
+                    case RaftRequestType.ReceiveVote:
+                        await ReceivedVote(request.Endpoint ?? "", request.Term, request.CommitIndex).ConfigureAwait(false);
+                        break;
+
+                    case RaftRequestType.ReceiveHandshake:
+                        ReceiveHandshake(request.Endpoint ?? "", request.CommitIndex);
+                        break;
+
+                    default:
+                        logger.LogError(
+                            "[{LocalEndpoint}/{PartitionId}/{State}] Invalid message type: {Type}",
+                            manager.LocalEndpoint, 
+                            partition.PartitionId, 
+                            nodeState, 
+                            request.Type
+                        );
+                        break;
                 }
 
-                case RaftRequestType.AppendLogs:
-                    await AppendLogs(message.Endpoint ?? "", message.Term, message.Timestamp, message.Logs).ConfigureAwait(false);
-                    break;
+                message.Promise.TrySetResult(new(RaftResponseType.None));
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] {Name} {Message} {StackTrace}",
+                    manager.LocalEndpoint, 
+                    partition.PartitionId, 
+                    nodeState, 
+                    ex.GetType().Name, 
+                    ex.Message,
+                    ex.StackTrace
+                );
+            }
+            finally
+            {
+                if (stopwatch.ElapsedMilliseconds > manager.Configuration.SlowRaftStateMachineLog)
+                    logger.LogWarning(
+                        "[{LocalEndpoint}/{PartitionId}/{State}] Slow message processing: {Type} Elapsed={Elapsed}ms",
+                        manager.LocalEndpoint, 
+                        partition.PartitionId, 
+                        nodeState, 
+                        request.Type,
+                        stopwatch.ElapsedMilliseconds
+                    );
 
-                case RaftRequestType.CompleteAppendLogs:
-                    await CompleteAppendLogs(message.Endpoint ?? "", message.Timestamp, message.Status, message.CommitIndex).ConfigureAwait(false);
-                    break;
-                
-                case RaftRequestType.ReplicateLogs:
-                {
-                    (RaftOperationStatus status, HLCTimestamp ticketId) = await ReplicateLogs(message.Logs, message.AutoCommit).ConfigureAwait(false);
-                    return new(RaftResponseType.None, status, ticketId);
-                }
-
-                case RaftRequestType.ReplicateCheckpoint:
-                {
-                    (RaftOperationStatus status, HLCTimestamp ticketId) = await ReplicateCheckpoint().ConfigureAwait(false);
-                    return new(RaftResponseType.None, status, ticketId);
-                }
-                
-                case RaftRequestType.CommitLogs:
-                {
-                    (RaftOperationStatus status, long commitIndex) = await CommitLogs(message.Timestamp).ConfigureAwait(false);
-                    return new(RaftResponseType.None, status, commitIndex);
-                }
-                
-                case RaftRequestType.RollbackLogs:
-                {
-                    (RaftOperationStatus status, long commitIndex) = await RollbackLogs(message.Timestamp).ConfigureAwait(false);
-                    return new(RaftResponseType.None, status, commitIndex);
-                }
-
-                case RaftRequestType.RequestVote:
-                    await Vote(new(message.Endpoint ?? ""), message.Term, message.CommitIndex, message.Timestamp).ConfigureAwait(false);
-                    break;
-
-                case RaftRequestType.ReceiveVote:
-                    await ReceivedVote(message.Endpoint ?? "", message.Term, message.CommitIndex).ConfigureAwait(false);
-                    break;
-                
-                case RaftRequestType.ReceiveHandshake:
-                    ReceiveHandshake(message.Endpoint ?? "", message.CommitIndex);
-                    break;
-
-                default:
-                    logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Invalid message type: {Type}", manager.LocalEndpoint, partition.PartitionId, nodeState, message.Type);
-                    break;
+                //await File.AppendAllTextAsync($"/tmp/{partition.PartitionId}.txt", $"{stopwatch.ElapsedMilliseconds} {message.Type}\n");
             }
         }
-        catch (Exception ex)
-        {
-            logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] {Name} {Message} {StackTrace}", manager.LocalEndpoint, partition.PartitionId, nodeState, ex.GetType().Name, ex.Message, ex.StackTrace);
-        }
-        finally
-        {
-            if (stopwatch.ElapsedMilliseconds > manager.Configuration.SlowRaftStateMachineLog)
-                logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Slow message processing: {Type} Elapsed={Elapsed}ms", manager.LocalEndpoint, partition.PartitionId, nodeState,  message.Type, stopwatch.ElapsedMilliseconds);
-            
-            //await File.AppendAllTextAsync($"/tmp/{partition.PartitionId}.txt", $"{stopwatch.ElapsedMilliseconds} {message.Type}\n");
-        }
 
-        return new(RaftResponseType.None);
+        //return new(RaftResponseType.None);
     }
 
     /// <summary>
@@ -255,11 +289,16 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         restored = true;
         lastHeartbeat = manager.HybridLogicalClock.TrySendOrLocalEvent();
 
-        RaftWALResponse currentCommitIndexResponse = await walActor.Ask(new(RaftWALActionType.Recover)).ConfigureAwait(false);
+        RaftWALResponse? currentCommitIndexResponse = await walActor.Ask(new(RaftWALActionType.Recover)).ConfigureAwait(false);
+        if (currentCommitIndexResponse is null)
+            return;
         
         logger.LogInfoWalRestored(manager.LocalEndpoint, partition.PartitionId, nodeState, currentCommitIndexResponse.Index, stopwatch.ElapsedMilliseconds);
         
-        RaftWALResponse currentTermResponse = await walActor.Ask(new(RaftWALActionType.GetCurrentTerm)).ConfigureAwait(false);
+        RaftWALResponse? currentTermResponse = await walActor.Ask(new(RaftWALActionType.GetCurrentTerm)).ConfigureAwait(false);
+        if (currentTermResponse is null)
+            return;
+        
         currentTerm = currentTermResponse.Index;
 
         await SendHandshake().ConfigureAwait(false);
@@ -380,7 +419,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
                 maxIndex = startCommitIndex.Value;
         }
         
-        RaftWALResponse localMaxId = await walActor.Ask(new(RaftWALActionType.GetMaxLog)).ConfigureAwait(false);
+        RaftWALResponse? localMaxId = await walActor.Ask(new(RaftWALActionType.GetMaxLog)).ConfigureAwait(false);
+        if (localMaxId is null)
+            return true;
 
         return localMaxId.Index < maxIndex;
     }
@@ -400,7 +441,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
         
-        RaftWALResponse currentMaxLog = await walActor.Ask(new(RaftWALActionType.GetMaxLog)).ConfigureAwait(false);
+        RaftWALResponse? currentMaxLog = await walActor.Ask(new(RaftWALActionType.GetMaxLog)).ConfigureAwait(false);
+        if (currentMaxLog is null)
+            return;
         
         RequestVotesRequest request = new(partition.PartitionId, currentTerm, currentMaxLog.Index, timestamp, manager.LocalEndpoint);
 
@@ -485,7 +528,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
         
-        RaftWALResponse localMaxId = await walActor.Ask(new(RaftWALActionType.GetMaxLog)).ConfigureAwait(false);
+        RaftWALResponse? localMaxId = await walActor.Ask(new(RaftWALActionType.GetMaxLog)).ConfigureAwait(false);
+        if (localMaxId is null)
+            return;
         
         HandshakeRequest request = new(partition.PartitionId, localMaxId.Index, manager.LocalEndpoint);
         
@@ -538,7 +583,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
         
-        RaftWALResponse localMaxId = await walActor.Ask(new(RaftWALActionType.GetMaxLog)).ConfigureAwait(false);
+        RaftWALResponse? localMaxId = await walActor.Ask(new(RaftWALActionType.GetMaxLog)).ConfigureAwait(false);
+        if (localMaxId is null)
+            return;
+        
         if (localMaxId.Index > remoteMaxLogId)
         {
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received request to vote on outdated log from {Endpoint} RemoteMaxId={RemoteId} LocalMaxId={MaxId}. Ignoring...", manager.LocalEndpoint, partition.PartitionId, nodeState, node.Endpoint, remoteMaxLogId, localMaxId.Index);
@@ -590,7 +638,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return;
         }
         
-        RaftWALResponse maxLogResponse = await walActor.Ask(new(RaftWALActionType.GetMaxLog)).ConfigureAwait(false);
+        RaftWALResponse? maxLogResponse = await walActor.Ask(new(RaftWALActionType.GetMaxLog)).ConfigureAwait(false);
+        if (maxLogResponse is null)
+            return;
 
         if (maxLogResponse.Index < remoteMaxLogId)
         {
@@ -721,7 +771,9 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             if (logger.IsEnabled(LogLevel.Debug))
                 logger.LogDebugReceivedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, leaderTerm, timestamp, string.Join(',', logs.Select(x => x.Id.ToString())));
 
-            RaftWALResponse response = await walActor.Ask(new(RaftWALActionType.ProposeOrCommit, leaderTerm, timestamp, logs)).ConfigureAwait(false);
+            RaftWALResponse? response = await walActor.Ask(new(RaftWALActionType.ProposeOrCommit, leaderTerm, timestamp, logs)).ConfigureAwait(false);
+            if (response is null)
+                return;
             
             if (response.Status != RaftOperationStatus.Success)
             {
@@ -793,7 +845,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         }
 
         // Append proposal logs to the Write-Ahead Log
-        RaftWALResponse proposeResponse = await walActor.Ask(new(RaftWALActionType.Propose, currentTerm, currentTime, logs)).ConfigureAwait(false);
+        RaftWALResponse? proposeResponse = await walActor.Ask(new(RaftWALActionType.Propose, currentTerm, currentTime, logs)).ConfigureAwait(false);
+        if (proposeResponse is null)
+            return (RaftOperationStatus.Errored, HLCTimestamp.Zero);
+        
         if (proposeResponse.Status != RaftOperationStatus.Success)
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't save proposed logs to local persistence", manager.LocalEndpoint, partition.PartitionId, nodeState);
@@ -862,7 +917,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
         }];
         
         // Append proposal logs to the Write-Ahead Log
-        RaftWALResponse proposeResponse = await walActor.Ask(new(RaftWALActionType.Propose, currentTerm, currentTime, checkpointLogs)).ConfigureAwait(false);
+        RaftWALResponse? proposeResponse = await walActor.Ask(new(RaftWALActionType.Propose, currentTerm, currentTime, checkpointLogs)).ConfigureAwait(false);
+        if (proposeResponse is null)
+            return (RaftOperationStatus.Errored, HLCTimestamp.Zero);
+        
         if (proposeResponse.Status != RaftOperationStatus.Success)
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't save proposed logs to local persistence", manager.LocalEndpoint, partition.PartitionId, nodeState);
@@ -922,7 +980,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return (RaftOperationStatus.Errored, 0);
         }
 
-        RaftWALResponse commitResponse = await walActor.Ask(new(RaftWALActionType.Commit, currentTerm, ticketId, proposal.Logs)).ConfigureAwait(false);
+        RaftWALResponse? commitResponse = await walActor.Ask(new(RaftWALActionType.Commit, currentTerm, ticketId, proposal.Logs)).ConfigureAwait(false);
+        if (commitResponse is null)
+            return (RaftOperationStatus.Errored, 0);
+        
         if (commitResponse.Status != RaftOperationStatus.Success)
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't commit proposal {Timestamp}", manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId);
@@ -978,7 +1039,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
             return (RaftOperationStatus.Errored, 0);
         }
         
-        RaftWALResponse commitResponse = await walActor.Ask(new(RaftWALActionType.Rollback, currentTerm, ticketId, proposal.Logs)).ConfigureAwait(false);
+        RaftWALResponse? commitResponse = await walActor.Ask(new(RaftWALActionType.Rollback, currentTerm, ticketId, proposal.Logs)).ConfigureAwait(false);
+        if (commitResponse is null)
+            return (RaftOperationStatus.Errored, 0);
+        
         if (commitResponse.Status != RaftOperationStatus.Success)
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't rollback proposal {Timestamp}", manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId);
@@ -1141,7 +1205,10 @@ public sealed class RaftStateActor : IActorStruct<RaftRequest, RaftResponse>
 
         currentTime = manager.HybridLogicalClock.TrySendOrLocalEvent();
 
-        RaftWALResponse commitResponse = await walActor.Ask(new(RaftWALActionType.Commit, currentTerm, timestamp, proposal.Logs)).ConfigureAwait(false);
+        RaftWALResponse? commitResponse = await walActor.Ask(new(RaftWALActionType.Commit, currentTerm, timestamp, proposal.Logs)).ConfigureAwait(false);
+        if (commitResponse is null)
+            return;
+        
         if (commitResponse.Status != RaftOperationStatus.Success)
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't commit proposal {Timestamp}", manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp);

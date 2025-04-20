@@ -1,7 +1,7 @@
 
 namespace Kommander.Data;
 
-public readonly struct RaftWALResponse
+public sealed class RaftWALResponse
 {
     public RaftOperationStatus Status { get; }
     

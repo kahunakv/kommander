@@ -54,7 +54,7 @@ internal sealed class RaftBatcher
             {
                 do
                 {
-                    while (inbox.TryDequeue(out RaftBatcherItem message))
+                    while (inbox.TryDequeue(out RaftBatcherItem? message))
                         messages.Add(message);
 
                     if (messages.Count > 0)
