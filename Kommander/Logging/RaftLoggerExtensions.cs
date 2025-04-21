@@ -43,4 +43,10 @@ public static partial class RaftLoggerExtensions
     
     [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Received logs from leader {Endpoint} with Term={Term} Timestamp={Timestamp} Logs={Logs}")]
     public static partial void LogDebugReceivedLogs(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long term, HLCTimestamp timestamp, string logs);
+    
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{Endpoint}/{PartitionId}] Committed log #{Id}")]
+    public static partial void LogDebugCommittedLogs(this ILogger<IRaft> logger, string endpoint, int partitionId, long id);
+    
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{Endpoint}/{PartitionId}] Proposed log #{Id}")]
+    public static partial void LogDebugProposedLogs(this ILogger<IRaft> logger, string endpoint, int partitionId, long id);
 }

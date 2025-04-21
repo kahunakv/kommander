@@ -2,7 +2,6 @@
 using Nixie;
 using Kommander.Communication;
 using Kommander.Data;
-using Kommander.Support.Parallelization;
 
 namespace Kommander;
 
@@ -36,8 +35,6 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
     {
         try
         {
-            // logger.LogDebug("Sending block of {Count} messages", messages.Count);
-            
             if (messages.Count == 1)
             {
                 RaftResponderRequest message = messages.First();
@@ -45,23 +42,23 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
                 switch (message.Type)
                 {
                     case RaftResponderRequestType.AppendLogs:
-                        _ = AppendLogs(message).ConfigureAwait(false);
+                        await AppendLogs(message).ConfigureAwait(false);
                         break;
 
                     case RaftResponderRequestType.CompleteAppendLogs:
-                        _ = CompleteAppendLogs(message).ConfigureAwait(false);
+                        await CompleteAppendLogs(message).ConfigureAwait(false);
                         break;
 
                     case RaftResponderRequestType.Vote:
-                        _ = Vote(message).ConfigureAwait(false);
+                        await Vote(message).ConfigureAwait(false);
                         break;
 
                     case RaftResponderRequestType.RequestVotes:
-                        _ = RequestVotes(message).ConfigureAwait(false);
+                        await RequestVotes(message).ConfigureAwait(false);
                         break;
 
                     case RaftResponderRequestType.Handshake:
-                        _ = Handshake(message).ConfigureAwait(false);
+                        await Handshake(message).ConfigureAwait(false);
                         break;
 
                     case RaftResponderRequestType.TryBatch:
@@ -73,6 +70,8 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
                 await Task.Delay(1);
                 return;
             }
+            
+            logger.LogDebug("Sending block of {Count} messages", messages.Count);
             
             List<BatchRequestsRequestItem> request = new(messages.Count);
             
@@ -107,37 +106,15 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
                 }
             }
             
-            _ = communication.BatchRequests(manager, node, new() { Requests = request }).ConfigureAwait(false);
+            await communication.BatchRequests(manager, node, new() { Requests = request }).ConfigureAwait(false);
 
             if (request.Count < MinExpectedBatchSize)
-                await Task.Delay(1); // force a big batch next time
+                await Task.Delay(1); // force a big batch next time*/
         }
         catch (Exception ex)
         {
-            logger.LogError("Exception {Type}", ex.Message);
+            logger.LogError("Exception {Type} {Message}\n{StackTrace}", ex.GetType().Name, ex.Message, ex.StackTrace);
         }
-    }
-
-    private static bool AreAllAppendLogs(List<RaftResponderRequest> messages)
-    {
-        foreach (RaftResponderRequest message in messages)
-        {
-            if (message.Type != RaftResponderRequestType.AppendLogs)
-                return false;
-        }
-
-        return true;
-    }
-    
-    private static bool AreAllCompleteLogs(List<RaftResponderRequest> messages)
-    {
-        foreach (RaftResponderRequest message in messages)
-        {
-            if (message.Type != RaftResponderRequestType.CompleteAppendLogs)
-                return false;
-        }
-
-        return true;
     }
 
     private async Task Handshake(RaftResponderRequest message)

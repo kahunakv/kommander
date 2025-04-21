@@ -4,6 +4,7 @@ using Nixie;
 using System.Diagnostics;
 
 using Kommander.Data;
+using Kommander.Logging;
 using Kommander.Support.Collections;
 using Kommander.System;
 using Kommander.WAL;
@@ -305,7 +306,7 @@ public sealed class RaftWriteAhead
                     else
                         plan.Add(RaftLogAction.Propose, [log]);
 
-                    logger.LogDebug("[{Endpoint}/{Partition}] Proposed log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+                    logger.LogDebugProposedLogs(manager.LocalEndpoint, partition.PartitionId, log.Id);
 
                     proposeIndex = log.Id + 1;
                 }
@@ -331,7 +332,7 @@ public sealed class RaftWriteAhead
                     else
                         plan.Add(RaftLogAction.Commit, [log]);
                 
-                    logger.LogDebug("[{Endpoint}/{Partition}] Committed log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+                    logger.LogDebugCommittedLogs(manager.LocalEndpoint, partition.PartitionId, log.Id);
                     
                     commitIndex = log.Id + 1;
                 }

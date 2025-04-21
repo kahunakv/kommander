@@ -1,5 +1,6 @@
 
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using Kommander.Data;
 
 namespace Kommander;
@@ -13,6 +14,8 @@ internal sealed class RaftBatcher
     private readonly List<RaftBatcherItem> messages = [];
     
     private int processing = 1;
+    
+    private readonly Stopwatch stopwatch = new();
 
     public RaftBatcher(RaftManager manager)
     {
@@ -70,18 +73,27 @@ internal sealed class RaftBatcher
         }
         catch (Exception ex)
         {
-            manager.Logger.LogError("[{Actor}] {Exception}: {Message}\n{StackTrace}", manager.LocalEndpoint, ex.GetType().Name, ex.Message, ex.StackTrace);
+            manager.Logger.LogError("[{Endpoint}] {Exception}: {Message}\n{StackTrace}", manager.LocalEndpoint, ex.GetType().Name, ex.Message, ex.StackTrace);
         }
     }
 
     private async Task Receive(List<RaftBatcherItem> requests)
     {
-        List<(int, List<RaftLog>)> logs = new(requests.Count);
+        int count = 0;
         
+        stopwatch.Restart();
+        
+        List<(int, List<RaftLog>)> logs = new(requests.Count);
+
         foreach (RaftBatcherItem request in requests)
+        {
             logs.Add(request.Request);
+            count += request.Request.Item2.Count;
+        }
 
         RaftOperationStatus response = await manager.WriteThreadPool.EnqueueTask(() => manager.WalAdapter.Write(logs));
+        
+        manager.Logger.LogDebug("[{Endpoint}] Write of {Batch} took {Elapsed}ms", manager.LocalEndpoint, logs.Count, stopwatch.ElapsedMilliseconds);
 
         if (response == RaftOperationStatus.Success)
         {

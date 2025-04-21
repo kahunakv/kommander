@@ -233,7 +233,7 @@ public sealed class RaftManager : IRaft, IDisposable
 
     private Task<bool> SystemLeaderChanged(int partitionId, string node)
     {
-        if (!IsInitialized && partitions.Count >= 1)
+        /*if (!IsInitialized && partitions.Count >= 1)
         {
             bool isInitialized = true;
 
@@ -247,7 +247,7 @@ public sealed class RaftManager : IRaft, IDisposable
             }
             
             IsInitialized = isInitialized;
-        }
+        }*/
 
         if (partitionId != RaftSystemConfig.SystemPartition)
             return Task.FromResult(true);
@@ -347,6 +347,8 @@ public sealed class RaftManager : IRaft, IDisposable
                 );
             }
         }
+        
+        IsInitialized = true;
     }
 
     /// <summary>

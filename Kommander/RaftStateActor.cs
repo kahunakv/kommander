@@ -1167,10 +1167,15 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
         proposal.SetState(RaftProposalState.Committed);
 
         HLCTimestamp currentTime = manager.HybridLogicalClock.TrySendOrLocalEvent();
-        
+
         foreach (string node in proposal.Nodes)
+        {
+            if (node == manager.LocalEndpoint)
+                continue;
+            
             AppendLogToNode(new(node), ticketId, proposal.Logs);
-        
+        }
+
         if (logger.IsEnabled(LogLevel.Debug))
             logger.LogDebugCommittedLogs(
                 manager.LocalEndpoint, 
@@ -1222,10 +1227,15 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
         }
         
         proposal.SetState(RaftProposalState.RolledBack);
-        
+
         foreach (string node in proposal.Nodes)
+        {
+            if (node == manager.LocalEndpoint)
+                continue;
+            
             AppendLogToNode(new(node), ticketId, proposal.Logs); //.ConfigureAwait(false);
-        
+        }
+
         if (logger.IsEnabled(LogLevel.Debug))
             logger.LogDebugRolledbackLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId, string.Join(',', proposal.Logs.Select(x => x.Id.ToString())));
         
@@ -1386,10 +1396,15 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
         }
         
         proposal.SetState(RaftProposalState.Committed);
-        
+
         foreach (string node in proposal.Nodes)
+        {
+            if (node == manager.LocalEndpoint)
+                continue;
+            
             AppendLogToNode(new(node), timestamp, proposal.Logs);
-        
+        }
+
         if (logger.IsEnabled(LogLevel.Debug))
             logger.LogDebugCommittedLogs(
                 manager.LocalEndpoint, 

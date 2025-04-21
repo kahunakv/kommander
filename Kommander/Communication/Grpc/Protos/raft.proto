@@ -6,30 +6,8 @@ service Rafter {
     rpc Vote (GrpcVoteRequest) returns (GrpcVoteResponse);
     rpc RequestVotes (GrpcRequestVotesRequest) returns (GrpcRequestVotesResponse);
     rpc AppendLogs (GrpcAppendLogsRequest) returns (GrpcAppendLogsResponse);
-    rpc AppendLogsBatch (GrpcAppendLogsBatchRequest) returns (GrpcAppendLogsBatchResponse);
     rpc CompleteAppendLogs (GrpcCompleteAppendLogsRequest) returns (GrpcCompleteAppendLogsResponse);
-    rpc CompleteAppendLogsBatch (GrpcCompleteAppendLogsBatchRequest) returns (GrpcCompleteAppendLogsBatchResponse);
-    rpc BatchRequests (GrpcBatchRequestsRequest) returns (GrpcBatchRequestsResponse);
-}
-
-message GrpcBatchRequestsRequest
-{
-    repeated GrpcBatchRequestsRequestItem Requests = 1;
-}
-
-message GrpcBatchRequestsRequestItem
-{
-    GrpcBatchRequestsRequestType Type = 1;
-    optional GrpcHandshakeRequest Handshake = 2;
-    optional GrpcVoteRequest Vote = 3;
-    optional GrpcRequestVotesRequest RequestVotes = 4;
-    optional GrpcAppendLogsRequest AppendLogs = 5;
-    optional GrpcCompleteAppendLogsRequest CompleteAppendLogs = 6;
-}
-
-message GrpcBatchRequestsResponse
-{
-    
+    rpc BatchRequests (stream GrpcBatchRequestsRequest) returns (stream GrpcBatchRequestsResponse);
 }
 
 message GrpcHandshakeRequest {
@@ -81,14 +59,6 @@ message GrpcAppendLogsResponse {
 
 }
 
-message GrpcAppendLogsBatchRequest {
-  repeated GrpcAppendLogsRequest AppendLogs = 1; 
-}
-
-message GrpcAppendLogsBatchResponse {
-
-}
-
 message GrpcCompleteAppendLogsRequest {
   int32 Partition = 1;
   int64 Term = 2;
@@ -103,14 +73,6 @@ message GrpcCompleteAppendLogsResponse {
 
 }
 
-message GrpcCompleteAppendLogsBatchRequest {
-  repeated GrpcCompleteAppendLogsRequest CompleteLogs = 1;
-}
-
-message GrpcCompleteAppendLogsBatchResponse {
-
-}
-
 message GrpcRaftLog {
   int64 Id = 1;
   GrpcRaftLogType Type = 2;
@@ -121,12 +83,36 @@ message GrpcRaftLog {
   bytes Data = 7;  
 }
 
+message GrpcBatchRequestsRequest
+{
+  repeated GrpcBatchRequestsRequestItem Requests = 1;
+}
+
+message GrpcBatchRequestsRequestItem
+{
+  GrpcBatchRequestsRequestType Type = 1;
+  int32 RequestId = 2;
+  oneof payload {
+    GrpcHandshakeRequest Handshake = 3;
+    GrpcVoteRequest Vote = 4;
+    GrpcRequestVotesRequest RequestVotes = 5;
+    GrpcAppendLogsRequest AppendLogs = 6;
+    GrpcCompleteAppendLogsRequest CompleteAppendLogs = 7;
+  }
+}
+
+message GrpcBatchRequestsResponse
+{
+  int32 RequestId = 1;
+}
+
 enum GrpcBatchRequestsRequestType {
-  HANDSHAKE = 0;
-  VOTE = 1;
-  REQUEST_VOTES = 2;
-  APPEND_LOGS = 3;
-  COMPLETE_APPEND_LOGS = 4;
+  PING = 0;
+  HANDSHAKE = 1;
+  VOTE = 2;
+  REQUEST_VOTES = 3;
+  APPEND_LOGS = 4;
+  COMPLETE_APPEND_LOGS = 5;
 }
 
 enum GrpcRaftLogType {

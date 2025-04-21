@@ -211,6 +211,38 @@ public class RocksDbWAL : IWAL, IDisposable
     {
         try
         {
+            if (logs is [{ Item2.Count: 1 } _]) // fast path
+            {
+                RaftLog log = logs[0].Item2[0];
+                int partitionId = logs[0].Item1;
+                
+                RaftLogMessage message = new()
+                {
+                    Partition = partitionId,
+                    Id = log.Id,
+                    Term = log.Term,
+                    Type = (int)log.Type,
+                    TimePhysical = log.Time.L,
+                    TimeCounter = log.Time.C
+                };
+
+                if (log.LogType != null)
+                    message.LogType = log.LogType;
+
+                if (log.LogData != null)
+                    message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
+
+                Span<byte> buffer = stackalloc byte[IdWidth];
+                
+                ToDecimalBytes(buffer, message.Id);
+                
+                ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+                
+                db.Put(buffer, Serialize(message), columnFamilyHandle);
+                
+                return RaftOperationStatus.Success;
+            }
+            
             Dictionary<ColumnFamilyHandle, Dictionary<int, List<RaftLog>>> plan = new();
             
             foreach ((int partitionId, List<RaftLog> raftLog) log in logs)
@@ -237,12 +269,10 @@ public class RocksDbWAL : IWAL, IDisposable
                 }
             }
             
-            foreach (KeyValuePair<ColumnFamilyHandle, Dictionary<int, List<RaftLog>>> kvp in plan)
+            using WriteBatch writeBatch = new();
+            
+            foreach ((ColumnFamilyHandle key, Dictionary<int, List<RaftLog>> raftLogs) in plan)
             {
-                Dictionary<int, List<RaftLog>> raftLogs = kvp.Value;
-                
-                using WriteBatch writeBatch = new();
-
                 //int count = 0;
 
                 foreach (KeyValuePair<int, List<RaftLog>> kv in raftLogs)
@@ -265,16 +295,16 @@ public class RocksDbWAL : IWAL, IDisposable
                         if (log.LogData != null)
                             message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
 
-                        PutToBatch(writeBatch, message, kvp.Key);
+                        PutToBatch(writeBatch, message, key);
 
                         //count++;
                     }
                 }
 
                 //Console.WriteLine("Batch of {0}", count);
-                
-                db.Write(writeBatch, DefaultWriteOptions);
             }
+            
+            db.Write(writeBatch, DefaultWriteOptions);
 
             return RaftOperationStatus.Success;
         } 

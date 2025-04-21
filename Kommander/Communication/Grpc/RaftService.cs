@@ -16,10 +16,6 @@ public sealed class RaftService : Rafter.RafterBase
     
     private static readonly Task<GrpcAppendLogsResponse> appendLogsResponse = Task.FromResult(new GrpcAppendLogsResponse());
     
-    private static readonly Task<GrpcAppendLogsBatchResponse> appendLogsBatchResponse = Task.FromResult(new GrpcAppendLogsBatchResponse());
-    
-    private static readonly Task<GrpcCompleteAppendLogsBatchResponse> completeAppendLogsBatchResponse = Task.FromResult(new GrpcCompleteAppendLogsBatchResponse());
-    
     private readonly IRaft raft;
 
     private readonly ILogger<IRaft> logger;
@@ -89,25 +85,6 @@ public sealed class RaftService : Rafter.RafterBase
         return appendLogsResponse;
     }
     
-    public override Task<GrpcAppendLogsBatchResponse> AppendLogsBatch(GrpcAppendLogsBatchRequest request, ServerCallContext context)
-    {
-        //if (request.Logs.Count > 0)
-        //    logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got AppendLogs message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
-
-        foreach (GrpcAppendLogsRequest? req in request.AppendLogs)
-        {
-            raft.AppendLogs(new(
-                req.Partition,
-                req.Term,
-                new(req.TimePhysical, req.TimeCounter),
-                req.Endpoint,
-                GetLogs(req.Logs)
-            ));
-        }
-
-        return appendLogsBatchResponse;
-    }
-    
     public override Task<GrpcCompleteAppendLogsResponse> CompleteAppendLogs(GrpcCompleteAppendLogsRequest request, ServerCallContext context)
     {
         //if (request.Logs.Count > 0)
@@ -123,26 +100,6 @@ public sealed class RaftService : Rafter.RafterBase
         ));
         
         return completeAppendLogsResponse;
-    }
-    
-    public override Task<GrpcCompleteAppendLogsBatchResponse> CompleteAppendLogsBatch(GrpcCompleteAppendLogsBatchRequest request, ServerCallContext context)
-    {
-        //if (request.Logs.Count > 0)
-        //    logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got AppendLogs message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
-
-        foreach (GrpcCompleteAppendLogsRequest? req in request.CompleteLogs)
-        {
-            raft.CompleteAppendLogs(new(
-                req.Partition,
-                req.Term,
-                new(req.TimePhysical, req.TimeCounter),
-                req.Endpoint,
-                (RaftOperationStatus)req.Status,
-                req.CommitIndex
-            ));
-        }
-
-        return completeAppendLogsBatchResponse;
     }
 
     private static List<RaftLog> GetLogs(RepeatedField<GrpcRaftLog> requestLogs)
@@ -171,70 +128,113 @@ public sealed class RaftService : Rafter.RafterBase
         return logs;
     }
     
-    public override async Task<GrpcBatchRequestsResponse> BatchRequests(GrpcBatchRequestsRequest request, ServerCallContext context)
+    public override async Task BatchRequests(
+        IAsyncStreamReader<GrpcBatchRequestsRequest> requestStream,
+        IServerStreamWriter<GrpcBatchRequestsResponse> responseStream, 
+        ServerCallContext context
+    )
     {
-        //if (request.Logs.Count > 0)
-        //    logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got AppendLogs message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
-
-        foreach (GrpcBatchRequestsRequestItem requestItem in request.Requests)
+        if (raft is null)
+            throw new InvalidOperationException("Raft is null");
+        
+        GrpcBatchRequestsResponse response = new() { RequestId = 0 };
+        
+        await foreach (GrpcBatchRequestsRequest message in requestStream.ReadAllAsync())
         {
-            switch (requestItem)
+            //GrpcBatchClientRequestsRequest message = requestStream.Current;
+            
+            //Console.WriteLine($"Client sent: {message.Type}");
+
+            foreach (GrpcBatchRequestsRequestItem request in message.Requests)
             {
-                case { Type: GrpcBatchRequestsRequestType.Handshake, Handshake: { } handshakeRequest }:
-                                        
-                    await raft.Handshake(new(
-                        handshakeRequest.Partition,
-                        handshakeRequest.MaxLogId,
-                        handshakeRequest.Endpoint
-                    ));
-                    break;
-                
-                case { Type: GrpcBatchRequestsRequestType.Vote, Vote: { } voteRequest }:
-                    raft.Vote(new(
-                        voteRequest.Partition,
-                        voteRequest.Term,
-                        voteRequest.MaxLogId,
-                        new(voteRequest.TimePhysical, voteRequest.TimeCounter),
-                        voteRequest.Endpoint
-                    ));
-                    break;
-                
-                case { Type: GrpcBatchRequestsRequestType.RequestVotes, RequestVotes: { } requestVoteRequest }:
-                    raft.RequestVote(new(
-                        requestVoteRequest.Partition,
-                        requestVoteRequest.Term,
-                        requestVoteRequest.MaxLogId,
-                        new(requestVoteRequest.TimePhysical, requestVoteRequest.TimeCounter),
-                        requestVoteRequest.Endpoint
-                    ));
-                    break;
-                
-                case { Type: GrpcBatchRequestsRequestType.AppendLogs, AppendLogs: { } appendLogsRequest }:
-                    raft.AppendLogs(new(
-                        appendLogsRequest.Partition, 
-                        appendLogsRequest.Term, 
-                        new(appendLogsRequest.TimePhysical, appendLogsRequest.TimeCounter), 
-                        appendLogsRequest.Endpoint, 
-                        GetLogs(appendLogsRequest.Logs)
-                    ));
-                    break;
-                
-                case { Type: GrpcBatchRequestsRequestType.CompleteAppendLogs, CompleteAppendLogs: { } completeAppendLogsRequest }:
-                    raft.CompleteAppendLogs(new(
-                        completeAppendLogsRequest.Partition, 
-                        completeAppendLogsRequest.Term, 
-                        new(completeAppendLogsRequest.TimePhysical, completeAppendLogsRequest.TimeCounter), 
-                        completeAppendLogsRequest.Endpoint,
-                        (RaftOperationStatus)completeAppendLogsRequest.Status,
-                        completeAppendLogsRequest.CommitIndex
-                    ));
-                    break;
-                
-                default:
-                    throw new NotImplementedException($"Unknown grpc request type {requestItem.GetType()}");
+                try
+                {
+                    switch (request.Type)
+                    {
+                        case GrpcBatchRequestsRequestType.Handshake:
+                        {
+                            GrpcHandshakeRequest handshake = request.Handshake!;
+
+                            await raft.Handshake(new(
+                                handshake.Partition,
+                                handshake.MaxLogId,
+                                handshake.Endpoint
+                            ));
+                            break;
+                        }
+
+                        case GrpcBatchRequestsRequestType.RequestVotes:
+                        {
+                            GrpcRequestVotesRequest requestVotes = request.RequestVotes!;
+                            
+                            if (requestVotes is null)
+                                throw new InvalidOperationException("requestVotes is null");
+
+                            raft.RequestVote(new(
+                                requestVotes.Partition,
+                                requestVotes.Term,
+                                requestVotes.MaxLogId,
+                                new(requestVotes.TimePhysical, requestVotes.TimeCounter),
+                                requestVotes.Endpoint
+                            ));
+                            break;
+                        }
+
+                        case GrpcBatchRequestsRequestType.Vote:
+                        {
+                            GrpcVoteRequest voteRequest = request.Vote!;
+
+                            raft.Vote(new(
+                                voteRequest.Partition,
+                                voteRequest.Term,
+                                voteRequest.MaxLogId,
+                                new(voteRequest.TimePhysical, voteRequest.TimeCounter),
+                                voteRequest.Endpoint
+                            ));
+                            break;
+                        }
+
+                        case GrpcBatchRequestsRequestType.AppendLogs:
+                        {
+                            GrpcAppendLogsRequest appendLogsRequest = request.AppendLogs!;
+
+                            raft.AppendLogs(new(
+                                appendLogsRequest.Partition,
+                                appendLogsRequest.Term,
+                                new(appendLogsRequest.TimePhysical, appendLogsRequest.TimeCounter),
+                                appendLogsRequest.Endpoint,
+                                GetLogs(appendLogsRequest.Logs)
+                            ));
+                            break;
+                        }
+
+                        case GrpcBatchRequestsRequestType.CompleteAppendLogs:
+                        {
+                            GrpcCompleteAppendLogsRequest completeAppendLogsRequest = request.CompleteAppendLogs!;
+
+                            raft.CompleteAppendLogs(new(
+                                completeAppendLogsRequest.Partition,
+                                completeAppendLogsRequest.Term,
+                                new(completeAppendLogsRequest.TimePhysical, completeAppendLogsRequest.TimeCounter),
+                                completeAppendLogsRequest.Endpoint,
+                                (RaftOperationStatus)completeAppendLogsRequest.Status,
+                                completeAppendLogsRequest.CommitIndex
+                            ));
+
+                            break;
+                        }
+
+                        case GrpcBatchRequestsRequestType.Ping:
+                            break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError("Exception {Type} {Message}\n{StackTrace}", ex.GetType().Name, ex.Message, ex.StackTrace);
+                }
+
+                await responseStream.WriteAsync(response);
             }
         }
-        
-        return new();
     }
 }

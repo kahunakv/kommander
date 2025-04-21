@@ -9,21 +9,15 @@ namespace Kommander.Communication.Memory;
 /// </summary>
 public class InMemoryCommunication : ICommunication
 {
-    private readonly Task<HandshakeResponse> handshakeResponse = Task.FromResult(new HandshakeResponse());
+    private static readonly Task<HandshakeResponse> handshakeResponse = Task.FromResult(new HandshakeResponse());
     
-    private readonly Task<RequestVotesResponse> requestVoteResponse = Task.FromResult(new RequestVotesResponse());
+    private static readonly Task<RequestVotesResponse> requestVoteResponse = Task.FromResult(new RequestVotesResponse());
 
-    private readonly Task<VoteResponse> voteResponse = Task.FromResult(new VoteResponse());
+    private static readonly Task<VoteResponse> voteResponse = Task.FromResult(new VoteResponse());
     
-    private readonly Task<AppendLogsResponse> appendLogsResponse = Task.FromResult(new AppendLogsResponse());
+    private static readonly Task<AppendLogsResponse> appendLogsResponse = Task.FromResult(new AppendLogsResponse());
     
-    private readonly Task<CompleteAppendLogsResponse> completeAppendLogsResponse = Task.FromResult(new CompleteAppendLogsResponse());
-    
-    private readonly Task<AppendLogsBatchResponse> appendLogsBatchResponse = Task.FromResult(new AppendLogsBatchResponse());
-    
-    private readonly Task<CompleteAppendLogsBatchResponse> completeAppendLogsBatchResponse = Task.FromResult(new CompleteAppendLogsBatchResponse());
-    
-    private readonly Task<BatchRequestsResponse> batchRequestsResponse = Task.FromResult(new BatchRequestsResponse());
+    private static readonly Task<CompleteAppendLogsResponse> completeAppendLogsResponse = Task.FromResult(new CompleteAppendLogsResponse());
     
     private Dictionary<string, IRaft> nodes = new();
     
@@ -76,29 +70,6 @@ public class InMemoryCommunication : ICommunication
         
         return appendLogsResponse;
     }
-
-    public Task<AppendLogsBatchResponse> AppendLogsBatch(RaftManager manager, RaftNode node, AppendLogsBatchRequest request)
-    {
-        if (manager.ClusterHandler.IsNode(node.Endpoint))
-        {
-            if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
-            {
-                if (request.AppendLogs is not null)
-                {
-                    foreach (AppendLogsRequest appendLogsRequest in request.AppendLogs)
-                        targetNode.AppendLogs(appendLogsRequest);
-                }
-            }
-            else
-            {
-                Console.WriteLine("AppendLogsBatch Unknown node: " + node.Endpoint + " [2]");
-            }
-        }
-        else
-            Console.WriteLine("AppendLogsBatch Unknown node: " + node.Endpoint + " [1]");
-        
-        return appendLogsBatchResponse;
-    }
     
     public Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftNode node, CompleteAppendLogsRequest request)
     {
@@ -108,29 +79,6 @@ public class InMemoryCommunication : ICommunication
             Console.WriteLine("CompleteAppendLogs Unknown node: " + node.Endpoint);
         
         return completeAppendLogsResponse;
-    }
-    
-    public Task<CompleteAppendLogsBatchResponse> CompleteAppendLogsBatch(RaftManager manager, RaftNode node, CompleteAppendLogsBatchRequest request)
-    {
-        if (manager.ClusterHandler.IsNode(node.Endpoint))
-        {
-            if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
-            {
-                if (request.CompleteLogs is not null)
-                {
-                    foreach (CompleteAppendLogsRequest appendLogsRequest in request.CompleteLogs)
-                        targetNode.CompleteAppendLogs(appendLogsRequest);
-                }
-            }
-            else
-            {
-                Console.WriteLine("CompleteAppendLogsBatch Unknown node: {0} [2]", node.Endpoint);
-            }
-        }
-        else
-            Console.WriteLine("CompleteAppendLogsBatch Unknown node: {0} [1]", node.Endpoint);
-        
-        return completeAppendLogsBatchResponse;
     }
 
     public async Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)

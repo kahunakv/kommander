@@ -1,9 +1,7 @@
 
-using System.Collections.Concurrent;
-using System.Net.Security;
 using Google.Protobuf;
 using Google.Protobuf.Collections;
-using Grpc.Net.Client;
+using Grpc.Core;
 using Kommander.Data;
 
 namespace Kommander.Communication.Grpc;
@@ -21,13 +19,11 @@ public class GrpcCommunication : ICommunication
     
     private static readonly AppendLogsResponse appendLogsResponse = new();
     
-    private static readonly AppendLogsBatchResponse appendLogsBatchResponse = new();
-    
     private static readonly CompleteAppendLogsResponse completeAppendLogsResponse = new();
-    
-    private static readonly CompleteAppendLogsBatchResponse completeAppendLogsBatchResponse = new();
 
     private static readonly BatchRequestsResponse batchRequestsResponse = new();
+    
+    private static readonly SemaphoreSlim semaphore = new(1, 1);
 
     /// <summary>
     /// Sends a Handshake message to a node via gRPC
@@ -39,20 +35,34 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<HandshakeResponse> Handshake(RaftManager manager, RaftNode node, HandshakeRequest request)
     {
-        GrpcChannel channel = SharedChannels.GetChannel(node.Endpoint);
+        AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming = SharedChannels.GetStreaming(node.Endpoint);
 
-        Rafter.RafterClient client = new(channel);
-
-        GrpcHandshakeRequest requestVotes = new()
+        GrpcHandshakeRequest handshake = new()
         {
             Partition = request.Partition,
             MaxLogId = request.MaxLogId,
             Endpoint = request.Endpoint
         };
+
+        GrpcBatchRequestsRequestItem requestItem = new()
+        {
+            Type = GrpcBatchRequestsRequestType.Handshake,
+            Handshake = handshake
+        };
         
-        await client.HandshakeAsync(requestVotes).ConfigureAwait(false);
-        
-        //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got RequestVotes reply from {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
+        GrpcBatchRequestsRequest batchRequests = new();
+        batchRequests.Requests.Add(requestItem);
+
+        try
+        {
+            await semaphore.WaitAsync();
+            
+            await streaming.RequestStream.WriteAsync(batchRequests);
+        } 
+        finally
+        {
+            semaphore.Release();
+        }
 
         return handshakeResponse;
     }
@@ -67,11 +77,7 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftNode node, RequestVotesRequest request)
     {
-        //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Sent RequestVotes message to {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
-
-        GrpcChannel channel = SharedChannels.GetChannel(node.Endpoint);
-
-        Rafter.RafterClient client = new(channel);
+        AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming = SharedChannels.GetStreaming(node.Endpoint);
 
         GrpcRequestVotesRequest requestVotes = new()
         {
@@ -83,9 +89,25 @@ public class GrpcCommunication : ICommunication
             Endpoint = request.Endpoint
         };
         
-        await client.RequestVotesAsync(requestVotes).ConfigureAwait(false);
-        
-        //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got RequestVotes reply from {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
+        GrpcBatchRequestsRequestItem requestItem = new()
+        {
+            Type = GrpcBatchRequestsRequestType.RequestVotes,
+            RequestVotes = requestVotes
+        };
+
+        GrpcBatchRequestsRequest batchRequests = new();
+        batchRequests.Requests.Add(requestItem);
+
+        try
+        {
+            await semaphore.WaitAsync();
+            
+            await streaming.RequestStream.WriteAsync(batchRequests);
+        } 
+        finally
+        {
+            semaphore.Release();
+        }
 
         return requestVotesResponse;
     }
@@ -100,11 +122,7 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<VoteResponse> Vote(RaftManager manager, RaftNode node, VoteRequest request)
     {
-        //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Send Vote to {Node} message on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
-        
-        GrpcChannel channel = SharedChannels.GetChannel(node.Endpoint);
-        
-        Rafter.RafterClient client = new(channel);
+        AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming = SharedChannels.GetStreaming(node.Endpoint);
 
         GrpcVoteRequest voteRequest = new()
         {
@@ -116,9 +134,25 @@ public class GrpcCommunication : ICommunication
             Endpoint = request.Endpoint
         };
         
-        await client.VoteAsync(voteRequest).ConfigureAwait(false);
-        
-        //manager.Logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got Vote reply from {Endpoint} on Term={Term}", manager.LocalEndpoint, partition.PartitionId, node.Endpoint, request.Term);
+        GrpcBatchRequestsRequestItem requestItem = new()
+        {
+            Type = GrpcBatchRequestsRequestType.Vote,
+            Vote = voteRequest
+        };
+
+        GrpcBatchRequestsRequest batchRequests = new();
+        batchRequests.Requests.Add(requestItem);
+
+        try
+        {
+            await semaphore.WaitAsync();
+            
+            await streaming.RequestStream.WriteAsync(batchRequests);
+        } 
+        finally
+        {
+            semaphore.Release();
+        }
         
         return voteResponse;
     }
@@ -133,11 +167,9 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftNode node, AppendLogsRequest request)
     {
-        GrpcChannel channel = SharedChannels.GetChannel(node.Endpoint);
-        
-        Rafter.RafterClient client = new(channel);
+        AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming = SharedChannels.GetStreaming(node.Endpoint);
 
-        GrpcAppendLogsRequest grpcRequest = new()
+        GrpcAppendLogsRequest appendLogsRequest = new()
         {
             Partition = request.Partition,
             Term = request.Term,
@@ -147,55 +179,29 @@ public class GrpcCommunication : ICommunication
         };
 
         if (request.Logs is not null)
-            grpcRequest.Logs.AddRange(GetLogs(request.Logs ?? []));
+            appendLogsRequest.Logs.AddRange(GetLogs(request.Logs ?? []));
         
-        await client.AppendLogsAsync(grpcRequest).ConfigureAwait(false);
-        
-        return appendLogsResponse;
-    }
-    
-    /// <summary>
-    /// Sends a batch of AppendLogs message to a node via gRPC
-    /// </summary>
-    /// <param name="manager"></param>
-    /// <param name="node"></param>
-    /// <param name="requests"></param>
-    /// <returns></returns>
-    public async Task<AppendLogsBatchResponse> AppendLogsBatch(RaftManager manager, RaftNode node, AppendLogsBatchRequest request)
-    {
-        GrpcChannel channel = SharedChannels.GetChannel(node.Endpoint);
-        
-        Rafter.RafterClient client = new(channel);
-        
-        GrpcAppendLogsBatchRequest batchRequest = new();
-
-        if (request.AppendLogs is not null)
+        GrpcBatchRequestsRequestItem requestItem = new()
         {
-            RepeatedField<GrpcAppendLogsRequest> grpcRequests = new();
-            
-            foreach (AppendLogsRequest appendLogsRequest in request.AppendLogs)
-            {
-                GrpcAppendLogsRequest grpcRequest = new()
-                {
-                    Partition = appendLogsRequest.Partition,
-                    Term = appendLogsRequest.Term,
-                    TimePhysical = appendLogsRequest.Time.L,
-                    TimeCounter = appendLogsRequest.Time.C,
-                    Endpoint = appendLogsRequest.Endpoint
-                };
-                
-                if (appendLogsRequest.Logs is not null)
-                    grpcRequest.Logs.AddRange(GetLogs(appendLogsRequest.Logs));
+            Type = GrpcBatchRequestsRequestType.AppendLogs,
+            AppendLogs = appendLogsRequest
+        };
 
-                grpcRequests.Add(grpcRequest);
-            }
+        GrpcBatchRequestsRequest batchRequests = new();
+        batchRequests.Requests.Add(requestItem);
+
+        try
+        {
+            await semaphore.WaitAsync();
             
-            batchRequest.AppendLogs.AddRange(grpcRequests);
+            await streaming.RequestStream.WriteAsync(batchRequests);
+        } 
+        finally
+        {
+            semaphore.Release();
         }
         
-        await client.AppendLogsBatchAsync(batchRequest).ConfigureAwait(false);
-        
-        return appendLogsBatchResponse;
+        return appendLogsResponse;
     }
     
     /// <summary>
@@ -208,11 +214,9 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftNode node, CompleteAppendLogsRequest request)
     {
-        GrpcChannel channel = SharedChannels.GetChannel(node.Endpoint);
-        
-        Rafter.RafterClient client = new(channel);
+        AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming = SharedChannels.GetStreaming(node.Endpoint);
 
-        GrpcCompleteAppendLogsRequest grpcRequest = new()
+        GrpcCompleteAppendLogsRequest completeAppendLogsRequest = new()
         {
             Partition = request.Partition,
             Term = request.Term,
@@ -223,70 +227,28 @@ public class GrpcCommunication : ICommunication
             CommitIndex = request.CommitIndex
         };
         
-        await client.CompleteAppendLogsAsync(grpcRequest).ConfigureAwait(false);
+        GrpcBatchRequestsRequestItem requestItem = new()
+        {
+            Type = GrpcBatchRequestsRequestType.CompleteAppendLogs,
+            CompleteAppendLogs = completeAppendLogsRequest
+        };
+
+        GrpcBatchRequestsRequest batchRequests = new();
+        batchRequests.Requests.Add(requestItem);
+
+        try
+        {
+            await semaphore.WaitAsync();
+            
+            await streaming.RequestStream.WriteAsync(batchRequests);
+        } 
+        finally
+        {
+            semaphore.Release();
+        }
         
         return completeAppendLogsResponse;
     }
-    
-    /// <summary>
-    /// Sends a batch of AppendLogs message to a node via gRPC
-    /// </summary>
-    /// <param name="manager"></param>
-    /// <param name="node"></param>
-    /// <param name="requests"></param>
-    /// <returns></returns>
-    public async Task<CompleteAppendLogsBatchResponse> CompleteAppendLogsBatch(RaftManager manager, RaftNode node, CompleteAppendLogsBatchRequest request)
-    {
-        GrpcChannel channel = SharedChannels.GetChannel(node.Endpoint);
-        
-        Rafter.RafterClient client = new(channel);
-        
-        GrpcCompleteAppendLogsBatchRequest batchRequest = new();
-
-        if (request.CompleteLogs is not null)
-        {
-            RepeatedField<GrpcCompleteAppendLogsRequest> grpcRequests = new();
-            
-            foreach (CompleteAppendLogsRequest appendLogsRequest in request.CompleteLogs)
-            {
-                GrpcCompleteAppendLogsRequest grpcRequest = new()
-                {
-                    Partition = appendLogsRequest.Partition,
-                    Term = appendLogsRequest.Term,
-                    TimePhysical = appendLogsRequest.Time.L,
-                    TimeCounter = appendLogsRequest.Time.C,
-                    Endpoint = appendLogsRequest.Endpoint,
-                    Status = (GrpcRaftOperationStatus) appendLogsRequest.Status,
-                    CommitIndex = appendLogsRequest.CommitIndex
-                };
-
-                grpcRequests.Add(grpcRequest);
-            }
-            
-            batchRequest.CompleteLogs.AddRange(grpcRequests);
-        }
-        
-        await client.CompleteAppendLogsBatchAsync(batchRequest).ConfigureAwait(false);
-        
-        return completeAppendLogsBatchResponse;
-    }
-
-    private static IEnumerable<GrpcRaftLog> GetLogs(List<RaftLog> requestLogs)
-    {
-        foreach (RaftLog? requestLog in requestLogs)
-        {
-            yield return new()
-            {
-                Id = requestLog.Id,
-                Term = requestLog.Term,
-                Type = (GrpcRaftLogType)requestLog.Type,
-                LogType = requestLog.LogType,
-                TimePhysical = requestLog.Time.L,
-                TimeCounter = requestLog.Time.C,
-                Data = UnsafeByteOperations.UnsafeWrap(requestLog.LogData)
-            };
-        }
-    } 
     
     /// <summary>
     /// Sends a batch of AppendLogs message to a node via gRPC
@@ -300,9 +262,7 @@ public class GrpcCommunication : ICommunication
         if (request.Requests is null)
             return new();
         
-        GrpcChannel channel = SharedChannels.GetChannel(node.Endpoint);
-        
-        Rafter.RafterClient client = new(channel);
+        AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming = SharedChannels.GetStreaming(node.Endpoint);
         
         RepeatedField<GrpcBatchRequestsRequestItem> items = new();
             
@@ -325,7 +285,6 @@ public class GrpcCommunication : ICommunication
                 };
                 
                 item.Handshake = handshake;
-
                 continue;
             }
             
@@ -342,7 +301,6 @@ public class GrpcCommunication : ICommunication
                 };
                 
                 item.Vote = voteRequest;
-                
                 continue;
             }
             
@@ -359,7 +317,6 @@ public class GrpcCommunication : ICommunication
                 };
                 
                 item.RequestVotes = requestVotes;
-                
                 continue;
             }
 
@@ -378,7 +335,6 @@ public class GrpcCommunication : ICommunication
                     appendRequest.Logs.AddRange(GetLogs(requestItem.AppendLogs.Logs));
                 
                 item.AppendLogs = appendRequest;
-                
                 continue;
             }
             
@@ -403,8 +359,34 @@ public class GrpcCommunication : ICommunication
         
         batchRequests.Requests.AddRange(items);
         
-        await client.BatchRequestsAsync(batchRequests).ConfigureAwait(false);
+        try
+        {
+            await semaphore.WaitAsync();
+            
+            await streaming.RequestStream.WriteAsync(batchRequests);
+        } 
+        finally
+        {
+            semaphore.Release();
+        }
         
         return batchRequestsResponse;
     }
+    
+    private static IEnumerable<GrpcRaftLog> GetLogs(List<RaftLog> requestLogs)
+    {
+        foreach (RaftLog requestLog in requestLogs)
+        {
+            yield return new()
+            {
+                Id = requestLog.Id,
+                Term = requestLog.Term,
+                Type = (GrpcRaftLogType)requestLog.Type,
+                LogType = requestLog.LogType,
+                TimePhysical = requestLog.Time.L,
+                TimeCounter = requestLog.Time.C,
+                Data = UnsafeByteOperations.UnsafeWrap(requestLog.LogData)
+            };
+        }
+    } 
 }

@@ -146,62 +146,6 @@ public class RestCommunication : ICommunication
 
         return new();
     }
-    
-    public async Task<AppendLogsBatchResponse> AppendLogsBatch(RaftManager manager, RaftNode node, AppendLogsBatchRequest request)
-    {
-        RaftConfiguration configuration = manager.Configuration;
-        
-        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.AppendLogsBatchRequest);
-        
-        try
-        {
-            AppendLogsBatchResponse? response = await (configuration.HttpScheme + node.Endpoint)
-                .WithOAuthBearerToken(configuration.HttpAuthBearerToken)
-                .AppendPathSegments("v1/raft/append-logs-batch")
-                .WithHeader("Accept", "application/json")
-                .WithHeader("Content-Type", "application/json")
-                .WithTimeout(configuration.HttpTimeout)
-                .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
-                .PostStringAsync(payload)
-                .ReceiveJson<AppendLogsBatchResponse>().ConfigureAwait(false);
-
-            return response;
-        }
-        catch (Exception e)
-        {
-            manager.Logger.LogError("[{Endpoint}/{Partition}] AppendLogsBatch: {Message}", manager.LocalEndpoint, request.AppendLogs?[0].Partition, e.Message);
-        }
-
-        return new();
-    }
-    
-    public async Task<CompleteAppendLogsBatchResponse> CompleteAppendLogsBatch(RaftManager manager, RaftNode node, CompleteAppendLogsBatchRequest request)
-    {
-        RaftConfiguration configuration = manager.Configuration;
-        
-        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.CompleteAppendLogsBatchRequest);
-        
-        try
-        {
-            CompleteAppendLogsBatchResponse? response = await (configuration.HttpScheme + node.Endpoint)
-                .WithOAuthBearerToken(configuration.HttpAuthBearerToken)
-                .AppendPathSegments("v1/raft/complete-append-logs-batch")
-                .WithHeader("Accept", "application/json")
-                .WithHeader("Content-Type", "application/json")
-                .WithTimeout(configuration.HttpTimeout)
-                .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
-                .PostStringAsync(payload)
-                .ReceiveJson<CompleteAppendLogsBatchResponse>().ConfigureAwait(false);
-
-            return response;
-        }
-        catch (Exception e)
-        {
-            manager.Logger.LogError("[{Endpoint}/{Partition}] CompleteAppendLogsBatch: {Message}", manager.LocalEndpoint, request.CompleteLogs?[0].Partition, e.Message);
-        }
-
-        return new();
-    }
 
     public async Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)
     {

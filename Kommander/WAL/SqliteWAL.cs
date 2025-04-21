@@ -259,32 +259,43 @@ public class SqliteWAL : IWAL, IDisposable
                     readerWriterLock.AcquireWriterLock(TimeSpan.FromSeconds(10));
 
                     using SqliteTransaction transaction = connection.BeginTransaction();
+                    
+                    using SqliteCommand insertOrReplaceCommand = new(insertOrReplaceSql, connection);
+
+                    insertOrReplaceCommand.Transaction = transaction;
+
+                    insertOrReplaceCommand.Parameters.Add("@id", SqliteType.Integer);
+                    insertOrReplaceCommand.Parameters.Add("@partitionId", SqliteType.Integer);
+                    insertOrReplaceCommand.Parameters.Add("@term", SqliteType.Integer);
+                    insertOrReplaceCommand.Parameters.Add("@type", SqliteType.Integer);
+                    insertOrReplaceCommand.Parameters.Add("@logType", SqliteType.Text);
+                    insertOrReplaceCommand.Parameters.Add("@log", SqliteType.Blob);
+                    insertOrReplaceCommand.Parameters.Add("@timePhysical", SqliteType.Integer);
+                    insertOrReplaceCommand.Parameters.Add("@timeCounter", SqliteType.Integer);
+                    
+                    insertOrReplaceCommand.Prepare();
 
                     try
                     {
                         foreach (RaftLog log in kv.Value)
                         {
-                            using SqliteCommand insertOrReplaceCommand = new(insertOrReplaceSql, connection);
-
-                            insertOrReplaceCommand.Transaction = transaction;
-
-                            insertOrReplaceCommand.Parameters.AddWithValue("@id", log.Id);
-                            insertOrReplaceCommand.Parameters.AddWithValue("@partitionId", kv.Key);
-                            insertOrReplaceCommand.Parameters.AddWithValue("@term", log.Term);
-                            insertOrReplaceCommand.Parameters.AddWithValue("@type", log.Type);
+                            insertOrReplaceCommand.Parameters["@id"].Value = log.Id;
+                            insertOrReplaceCommand.Parameters["@partitionId"].Value = kv.Key;
+                            insertOrReplaceCommand.Parameters["@term"].Value = log.Term;
+                            insertOrReplaceCommand.Parameters["@type"].Value = log.Type;
 
                             if (log.LogType is null)
-                                insertOrReplaceCommand.Parameters.AddWithValue("@logType", 0);
+                                insertOrReplaceCommand.Parameters["@logType"].Value = 0;
                             else
-                                insertOrReplaceCommand.Parameters.AddWithValue("@logType", log.LogType);
+                                insertOrReplaceCommand.Parameters["@logType"].Value = log.LogType;
 
                             if (log.LogData is null)
-                                insertOrReplaceCommand.Parameters.AddWithValue("@log", "");
+                                insertOrReplaceCommand.Parameters["@log"].Value = "";
                             else
-                                insertOrReplaceCommand.Parameters.AddWithValue("@log", log.LogData);
+                                insertOrReplaceCommand.Parameters["@log"].Value = log.LogData;
 
-                            insertOrReplaceCommand.Parameters.AddWithValue("@timePhysical", log.Time.L);
-                            insertOrReplaceCommand.Parameters.AddWithValue("@timeCounter", log.Time.C);
+                            insertOrReplaceCommand.Parameters["@timePhysical"].Value = log.Time.L;
+                            insertOrReplaceCommand.Parameters["@timeCounter"].Value = log.Time.C;
 
                             insertOrReplaceCommand.ExecuteNonQuery();
                         }
