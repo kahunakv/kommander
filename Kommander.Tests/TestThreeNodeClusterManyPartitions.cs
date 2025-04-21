@@ -470,7 +470,9 @@ public sealed class TestThreeNodeClusterManyPartitions
             Port = 8001,
             InitialPartitions = partitions,
             CompactEveryOperations = 100,
-            CompactNumberEntries = 50
+            CompactNumberEntries = 50,
+            StartElectionTimeout = 500,
+            EndElectionTimeout = 1000,
         };
         
         RaftManager node = new(

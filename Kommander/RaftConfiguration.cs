@@ -111,7 +111,7 @@ public class RaftConfiguration
     /// <summary>
     /// Number of background threads used for I/O write operations
     /// </summary>
-    public int WriteIOThreads { get; set; } = 8;
+    public int WriteIOThreads { get; set; } = 4;
 
     /// <summary>
     /// Compact every partition WAL every Nth operations

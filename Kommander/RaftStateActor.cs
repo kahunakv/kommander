@@ -213,8 +213,13 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
             {
                 foreach (KeyValuePair<RaftRequestType, List<ActorMessageReply<RaftRequest, RaftResponse>>> tkv in midMessages)
                 {
-                    if (tkv.Value.Count > 0)
-                        await ExecuteActions(tkv.Value);
+                    if (tkv.Value.Count == 0)
+                        continue;
+                    
+                    if (tkv is { Key: RaftRequestType.ReplicateLogs, Value.Count: >= 2 })
+                        await ReplicateLogsBatch(tkv.Value);
+                    else
+                        await ExecuteActions(tkv.Value);                    
                 }
             }
 
@@ -222,8 +227,10 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
             {
                 foreach (KeyValuePair<RaftRequestType, List<ActorMessageReply<RaftRequest, RaftResponse>>> tkv in lowMessages)
                 {
-                    if (tkv.Value.Count > 0)
-                        await ExecuteActions(tkv.Value);
+                    if (tkv.Value.Count == 0)
+                        continue;
+                    
+                    await ExecuteActions(tkv.Value);
                 }
             }
         }
@@ -265,7 +272,7 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
                 {
                     case RaftRequestType.CheckLeader:
                         await CheckPartitionLeadership().ConfigureAwait(false);
-                        message.Promise.TrySetResult(new(RaftResponseType.None));
+                        message.Promise.TrySetResult(RaftResponseStatic.NoneResponse);
                         break;
 
                     case RaftRequestType.GetNodeState:
@@ -283,12 +290,12 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
 
                     case RaftRequestType.AppendLogs:
                         await AppendLogs(request.Endpoint ?? "", request.Term, request.Timestamp, request.Logs).ConfigureAwait(false);
-                        message.Promise.TrySetResult(new(RaftResponseType.None));
+                        message.Promise.TrySetResult(RaftResponseStatic.NoneResponse);
                         break;
 
                     case RaftRequestType.CompleteAppendLogs:
                         await CompleteAppendLogs(request.Endpoint ?? "", request.Timestamp, request.Status, request.CommitIndex).ConfigureAwait(false);
-                        message.Promise.TrySetResult(new(RaftResponseType.None));
+                        message.Promise.TrySetResult(RaftResponseStatic.NoneResponse);
                         break;
 
                     case RaftRequestType.ReplicateLogs:
@@ -321,17 +328,17 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
 
                     case RaftRequestType.RequestVote:
                         await Vote(new(request.Endpoint ?? ""), request.Term, request.CommitIndex, request.Timestamp).ConfigureAwait(false);
-                        message.Promise.TrySetResult(new(RaftResponseType.None));
+                        message.Promise.TrySetResult(RaftResponseStatic.NoneResponse);
                         break;
 
                     case RaftRequestType.ReceiveVote:
                         await ReceivedVote(request.Endpoint ?? "", request.Term, request.CommitIndex).ConfigureAwait(false);
-                        message.Promise.TrySetResult(new(RaftResponseType.None));
+                        message.Promise.TrySetResult(RaftResponseStatic.NoneResponse);
                         break;
 
                     case RaftRequestType.ReceiveHandshake:
                         ReceiveHandshake(request.Endpoint ?? "", request.CommitIndex);
-                        message.Promise.TrySetResult(new(RaftResponseType.None));
+                        message.Promise.TrySetResult(RaftResponseStatic.NoneResponse);
                         break;
 
                     default:
@@ -343,7 +350,7 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
                             request.Type
                         );
                         
-                        message.Promise.TrySetResult(new(RaftResponseType.None));
+                        message.Promise.TrySetResult(RaftResponseStatic.NoneResponse);
                         break;
                 }
             }
@@ -548,7 +555,7 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
     /// <returns></returns>
     private async Task<bool> AmIOutdated()
     {
-        // if we don't have info about other nodes, we can't be outdated
+        // if we don't have info about other nodes, we can't be outdated?
         if (startCommitIndexes.Count == 0)
             return false;
 
@@ -1004,6 +1011,49 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
             logger.LogDebugProposedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, currentTime, string.Join(',', logs.Select(x => x.Id.ToString())));
 
         return (RaftOperationStatus.Success, currentTime);
+    }
+    
+    /// <summary>
+    /// Puts together a plan to replicate logs to other nodes in the cluster when the node is the leader.
+    /// </summary>
+    /// <param name="logs"></param>
+    /// <param name="autoCommit"></param>
+    /// <returns></returns>
+    /// <exception cref="RaftException"></exception>
+    private async Task ReplicateLogsBatch(List<ActorMessageReply<RaftRequest, RaftResponse>> messages)
+    {
+        Dictionary<bool, List<RaftLog>> logsPlan = new();
+        
+        foreach (ActorMessageReply<RaftRequest, RaftResponse> message in messages)
+        {
+            RaftRequest request = message.Request;
+
+            if (logsPlan.TryGetValue(request.AutoCommit, out List<RaftLog>? logs))
+            {
+                if (request.Logs is not null && request.Logs.Count > 0)
+                    logs.AddRange(request.Logs);
+            }
+            else
+            {
+                if (request.Logs is not null && request.Logs.Count > 0)
+                {
+                    logs = [];
+                    logs.AddRange(request.Logs);
+                    logsPlan.Add(request.AutoCommit, logs);
+                }
+            }
+        }
+
+        foreach (KeyValuePair<bool, List<RaftLog>> kv in logsPlan)
+        {            
+            (RaftOperationStatus status, HLCTimestamp ticketId) = await ReplicateLogs(kv.Value, kv.Key);            
+            
+            foreach (ActorMessageReply<RaftRequest, RaftResponse> message in messages)
+            {
+                if (message.Request.AutoCommit == kv.Key)
+                    message.Promise.TrySetResult(new(RaftResponseType.None, status, ticketId));            
+            }            
+        }
     }
 
     /// <summary>

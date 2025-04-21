@@ -24,6 +24,8 @@ public class RocksDbWAL : IWAL, IDisposable
     
     private const int MaxNumberOfRangedEntries = 100;
     
+    private const int IdWidth = 20;
+    
     private readonly RocksDb db;
     
     private readonly string path;
@@ -96,12 +98,11 @@ public class RocksDbWAL : IWAL, IDisposable
             iterator.SeekToFirst();  // Move to the first key
         else
         {
-            string index = lastCheckpoint.ToString("D20");
+            Span<byte> buffer = stackalloc byte[IdWidth];
             
-            Span<byte> buffer = stackalloc byte[Encoding.UTF8.GetByteCount(index)];
-            Encoding.UTF8.GetBytes(index.AsSpan(), buffer);
-            
-            iterator.Seek(index);
+            ToDecimalBytes(buffer, lastCheckpoint);
+           
+            iterator.Seek(buffer);
         }
 
         while (iterator.Valid())
@@ -154,10 +155,12 @@ public class RocksDbWAL : IWAL, IDisposable
             iterator.SeekToFirst();  // Move to the first key
         else
         {
-            string index = startLogIndex.ToString("D20");
+            Span<byte> buffer = stackalloc byte[IdWidth];
             
-            Span<byte> buffer = stackalloc byte[Encoding.UTF8.GetByteCount(index)];
-            Encoding.UTF8.GetBytes(index.AsSpan(), buffer);
+            ToDecimalBytes(buffer, startLogIndex);
+            
+            //Span<byte> buffer = stackalloc byte[Encoding.UTF8.GetByteCount(index)];
+            //Encoding.UTF8.GetBytes(index.AsSpan(), buffer);
             
             iterator.Seek(buffer);
         }
@@ -202,15 +205,7 @@ public class RocksDbWAL : IWAL, IDisposable
         }
 
         return result;
-    }
-
-    private static void PutToBatch(WriteBatch writeBatch, string index, RaftLogMessage message, ColumnFamilyHandle columnFamilyHandle)
-    {
-        Span<byte> buffer = stackalloc byte[Encoding.UTF8.GetByteCount(index)];
-        Encoding.UTF8.GetBytes(index.AsSpan(), buffer);
-        
-        writeBatch.Put(buffer, Serialize(message), cf: columnFamilyHandle);
-    }
+    }    
     
     public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs)
     {
@@ -253,9 +248,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 foreach (KeyValuePair<int, List<RaftLog>> kv in raftLogs)
                 {
                     foreach (RaftLog log in kv.Value)
-                    {
-                        string index = log.Id.ToString("D20");
-
+                    {                                               
                         RaftLogMessage message = new()
                         {
                             Partition = kv.Key,
@@ -272,7 +265,7 @@ public class RocksDbWAL : IWAL, IDisposable
                         if (log.LogData != null)
                             message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
 
-                        PutToBatch(writeBatch, index, message, kvp.Key);
+                        PutToBatch(writeBatch, message, kvp.Key);
 
                         //count++;
                     }
@@ -291,6 +284,15 @@ public class RocksDbWAL : IWAL, IDisposable
                     
             return RaftOperationStatus.Errored;
         }
+    }
+    
+    private static void PutToBatch(WriteBatch writeBatch, RaftLogMessage message, ColumnFamilyHandle columnFamilyHandle)
+    {
+        Span<byte> buffer = stackalloc byte[IdWidth];
+                
+        ToDecimalBytes(buffer, message.Id);
+        
+        writeBatch.Put(buffer, Serialize(message), cf: columnFamilyHandle);
     }
 
     public long GetMaxLog(int partitionId)
@@ -394,7 +396,7 @@ public class RocksDbWAL : IWAL, IDisposable
         {
             ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
-            HashSet<string> logsToRemove = new(compactNumberEntries);
+            HashSet<byte[]> logsToRemove = new(compactNumberEntries);
 
             using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
             iterator.SeekToFirst(); // Move to the last key
@@ -411,7 +413,7 @@ public class RocksDbWAL : IWAL, IDisposable
 
                 if (message.Id < lastCheckpoint)
                 {
-                    logsToRemove.Add(iterator.StringKey());
+                    logsToRemove.Add(iterator.Key());
 
                     if (logsToRemove.Count >= compactNumberEntries)
                         break;
@@ -424,8 +426,8 @@ public class RocksDbWAL : IWAL, IDisposable
             {
                 using WriteBatch writeBatch = new();
 
-                foreach (string log in logsToRemove)
-                    writeBatch.Delete(Encoding.UTF8.GetBytes(log), cf: columnFamilyHandle);
+                foreach (byte[] log in logsToRemove)
+                    writeBatch.Delete(log, cf: columnFamilyHandle);
 
                 db.Write(writeBatch); // No need to be synchronous here
                 
@@ -466,6 +468,22 @@ public class RocksDbWAL : IWAL, IDisposable
         
         using MemoryStream memoryStream = streamManager.GetStream(serializedData);
         return RaftLogMessage.Parser.ParseFrom(memoryStream);
+    }
+    
+    private static void ToDecimalBytes(Span<byte> result, long value)
+    {        
+        // 1) Pre‑fill with ASCII '0'
+        for (int i = 0; i < IdWidth; i++)
+            result[i] = (byte)'0';
+
+        // 2) Write digits right‑to‑left
+        int pos = IdWidth - 1;
+        do
+        {
+            result[pos--] = (byte)('0' + (value % 10));
+            value /= 10;
+        }
+        while (value > 0);        
     }
 
     public void Dispose()
