@@ -69,7 +69,13 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
 
             case RaftSystemRequestType.LeaderChanged:
                 leaderNode = message.LeaderNode;
-                
+
+                if (string.IsNullOrEmpty(leaderNode))
+                {
+                    logger.LogInformation("Waiting for leader on system partition...");                    
+                    return;
+                }
+
                 if (manager.LocalEndpoint == leaderNode)
                     await TrySetInitialPartitions().ConfigureAwait(false);
                 else
@@ -93,14 +99,14 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
     {
         if (!systemConfiguration.TryGetValue(RaftSystemConfigKeys.Partitions, out string? partitions))
         {
-            logger.LogWarning("Failed to get partitions from system configuration");
+            logger.LogWarning("InitializePartitions: Failed to get partitions from system configuration");
             return;
         }
         
         List<RaftPartitionRange>? initialRanges = JsonSerializer.Deserialize<List<RaftPartitionRange>>(partitions);
         if (initialRanges is null)
         {
-            logger.LogError("Failed to parse partition ranges: {Partitions}", partitions);
+            logger.LogError("InitializePartitions: Failed to parse partition ranges: {Partitions}", partitions);
             return;
         }
                 

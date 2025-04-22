@@ -258,11 +258,12 @@ public sealed class RaftManager : IRaft, IDisposable
 
     private Task<bool> SystemLogRestored(int partitionId, RaftLog log)
     {
-        if (log.LogType != RaftSystemConfig.RaftLogType)
+        if (log.LogType != RaftSystemConfig.RaftLogType || log.LogData is null)
+        {
+            Logger.LogError("Invalid log type: {LogType} in system partition", log.LogType);
+            
             return Task.FromResult(true);
-
-        if (log.LogData is null)
-            return Task.FromResult(true);
+        }
 
         systemActor.Send(new(RaftSystemRequestType.ConfigRestored, log.LogData));
 
@@ -271,11 +272,12 @@ public sealed class RaftManager : IRaft, IDisposable
 
     private Task<bool> SystemReplicationReceived(int partitionId, RaftLog log)
     {
-        if (log.LogType != RaftSystemConfig.RaftLogType)
+        if (log.LogType != RaftSystemConfig.RaftLogType || log.LogData is null)
+        {
+            Logger.LogError("Invalid log type: {LogType} in system partition", log.LogType);
+            
             return Task.FromResult(true);
-
-        if (log.LogData is null)
-            return Task.FromResult(true);
+        }
 
         systemActor.Send(new(RaftSystemRequestType.ConfigReplicated, log.LogData));
 
