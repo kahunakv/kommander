@@ -30,7 +30,7 @@ public class ReplicationService : BackgroundService //, IDisposable
         {
             tasks.Clear();
             
-            for (int i = 1; i < 20; i++)
+            for (int i = 1; i < raft.Configuration.InitialPartitions; i++)
             {
                 tasks.Add(ReplicateToPartition(i));
                 tasks.Add(ReplicateToPartition(i));
@@ -56,10 +56,11 @@ public class ReplicationService : BackgroundService //, IDisposable
             if (!await raft.AmILeader(partitionId, CancellationToken.None).ConfigureAwait(false))
                 return;
             
-            const string logType = "Greeting";
+            RaftReplicationResult result;
+            
+            /*const string logType = "Greeting";
             byte[] data = Encoding.UTF8.GetBytes("Hello, World! " + key);
             
-            RaftReplicationResult result;
             ValueStopwatch stopwatch = ValueStopwatch.StartNew();
 
             for (int j = 0; j < 20; j++)
@@ -82,14 +83,14 @@ public class ReplicationService : BackgroundService //, IDisposable
                 if (result.Success)
                     Console.WriteLine("{0} #3 Replicated log with id: {1}", i, result.LogIndex);
                 else
-                    Console.WriteLine("{0} #3 Replication failed {1}", i, result.Status);*/
-            }
+                    Console.WriteLine("{0} #3 Replication failed {1}", i, result.Status);
+            }*/
 
             result = await raft.ReplicateCheckpoint(partitionId).ConfigureAwait(false);
             if (result.Success)
-                Console.WriteLine("#C Replicated checkpoint log with id: {0}", result.LogIndex);
+                Console.WriteLine("#{0} Replicated checkpoint log with id: {1}", partitionId, result.LogIndex);
             else
-                Console.WriteLine("#C Replication checkpoint failed {0}", result.Status);
+                Console.WriteLine("#{0} Replication checkpoint failed {1}", partitionId, result.Status);
         }
         catch (Exception ex)
         {

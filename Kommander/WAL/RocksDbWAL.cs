@@ -90,7 +90,7 @@ public class RocksDbWAL : IWAL, IDisposable
         
         long lastCheckpoint = GetLastCheckpointInternal(partitionId, columnFamilyHandle);
         
-        // Console.WriteLine($"Last checkpoint {partitionId} {lastCheckpoint}");
+        Console.WriteLine($"Last checkpoint {partitionId} {lastCheckpoint}");
 
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         
@@ -338,7 +338,7 @@ public class RocksDbWAL : IWAL, IDisposable
             
             if (message.Partition != partitionId)
             {
-                iterator.Next();
+                iterator.Prev();
                 continue;
             }
             
@@ -361,7 +361,7 @@ public class RocksDbWAL : IWAL, IDisposable
             
             if (message.Partition != partitionId)
             {
-                iterator.Next();
+                iterator.Prev();
                 continue;
             }
             
@@ -387,16 +387,19 @@ public class RocksDbWAL : IWAL, IDisposable
         {
             RaftLogMessage message = Unserializer(iterator.Value());
             
+            //if (partitionId == 6)
+            //    Console.WriteLine("{0} {1} {2} {3} {4}", partitionId, message.Partition, message.Type, iterator.StringKey(), message.Id);
+            
             if (message.Partition != partitionId)
             {
-                iterator.Next();
+                iterator.Prev();
                 continue;
             }
             
             if (message.Type == (int)RaftLogType.CommittedCheckpoint)
                 return message.Id;
             
-            iterator.Next();
+            iterator.Prev();
         }
 
         return -1;

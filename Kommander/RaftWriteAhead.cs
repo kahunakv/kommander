@@ -65,6 +65,9 @@ public sealed class RaftWriteAhead
         bool found = false;
 
         List<RaftLog> logs = await manager.ReadThreadPool.EnqueueTask(() => walAdapter.ReadLogs(partition.PartitionId));
+        
+        if (logs.Count > 0)
+            manager.Logger.LogInformation("[{Endpoint}/{Partition}] Recovered {LogsCount} logs", manager.LocalEndpoint, partition.PartitionId, logs.Count);
 
         foreach (RaftLog log in logs)
         {

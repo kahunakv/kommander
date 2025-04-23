@@ -4,6 +4,7 @@ using Nixie;
 using Kommander.Communication;
 using Kommander.Data;
 using Kommander.Logging;
+using Kommander.System;
 using Kommander.Time;
 using Kommander.WAL;
 
@@ -629,7 +630,7 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
             if (node.Endpoint == manager.LocalEndpoint)
                 throw new RaftException("Corrupted nodes");
 
-            if (!force)
+            if (partition.PartitionId != RaftSystemConfig.SystemPartition && !force)
             {
                 HLCTimestamp lastHearthBeatToNode = manager.GetLastNodeHearthbeat(node.Endpoint);
 
