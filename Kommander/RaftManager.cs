@@ -470,7 +470,7 @@ public sealed class RaftManager : IRaft, IDisposable
     /// <param name="request"></param>
     public async Task Handshake(HandshakeRequest request)
     {                
-        while (!IsInitialized)
+        while (request.Partition != RaftSystemConfig.SystemPartition && !IsInitialized)
             await Task.Delay(100);
         
         RaftPartition partition = GetPartition(request.Partition);
