@@ -93,7 +93,7 @@ internal sealed class RaftBatcher
 
         RaftOperationStatus response = await manager.WriteThreadPool.EnqueueTask(() => manager.WalAdapter.Write(logs));
         
-        manager.Logger.LogDebug("[{Endpoint}] Write of {Batch} took {Elapsed}ms", manager.LocalEndpoint, logs.Count, stopwatch.ElapsedMilliseconds);
+        manager.Logger.LogDebug("[{Endpoint}] Write of {Batch} took {Elapsed}ms", manager.LocalEndpoint, count, stopwatch.ElapsedMilliseconds);
 
         if (response == RaftOperationStatus.Success)
         {

@@ -6,11 +6,23 @@ using Grpc.Core;
 
 namespace Kommander.Communication.Grpc;
 
+public sealed class GrpcInterSharedStreaming
+{
+    public SemaphoreSlim Semaphore { get; } = new(1, 1);
+    
+    public AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> Streaming { get; }
+    
+    public GrpcInterSharedStreaming(AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming)
+    {
+        Streaming = streaming;
+    }
+}
+
 public static class SharedChannels
 {
     private static readonly ConcurrentDictionary<string, Lazy<List<GrpcChannel>>> channels = new();
     
-    private static readonly ConcurrentDictionary<string, Lazy<List<AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse>>>> streamings = new();
+    private static readonly ConcurrentDictionary<string, Lazy<List<GrpcInterSharedStreaming>>> streamings = new();
     
     public static GrpcChannel GetChannel(string url)
     {
@@ -34,21 +46,21 @@ public static class SharedChannels
         return urlChannelsLazy.Value;
     }
     
-    public static AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> GetStreaming(string url)
+    public static GrpcInterSharedStreaming GetStreaming(string url)
     {
-        Lazy<List<AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse>>> lazyStreaming = streamings.GetOrAdd(url, CreateStreaming);
+        Lazy<List<GrpcInterSharedStreaming>> lazyStreaming = streamings.GetOrAdd(url, CreateStreaming);
         
-        List<AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse>> streamingList = lazyStreaming.Value;
+        List<GrpcInterSharedStreaming> streamingList = lazyStreaming.Value;
         
         return streamingList[Random.Shared.Next(0, streamingList.Count)];
     }
 
-    private static Lazy<List<AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse>>> CreateStreaming(string url)
+    private static Lazy<List<GrpcInterSharedStreaming>> CreateStreaming(string url)
     {
         return new(() => CreateAsyncDuplexStreamingCallInternal(url));
     }
 
-    private static List<AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse>> CreateAsyncDuplexStreamingCallInternal(string url)
+    private static List<GrpcInterSharedStreaming> CreateAsyncDuplexStreamingCallInternal(string url)
     {
         if (!url.StartsWith("https://") && !url.StartsWith("http://"))
             url = "https://" + url;
@@ -57,7 +69,7 @@ public static class SharedChannels
 
         List<GrpcChannel> urlChannels = urlChannelsLazy.Value;
         
-        List<AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse>> streamingList = new(4);
+        List<GrpcInterSharedStreaming> streamingList = new(4);
 
         for (int i = 0; i < 4; i++)
         {
@@ -65,9 +77,9 @@ public static class SharedChannels
 
             AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming = client.BatchRequests();
 
-            Task readTask = Task.Run(() => ListenForEvents(streaming));
+            _ = ListenForEvents(streaming);
             
-            streamingList.Add(streaming);
+            streamingList.Add(new(streaming));
         }
 
         return streamingList;
@@ -75,10 +87,17 @@ public static class SharedChannels
 
     private static async Task ListenForEvents(AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming)
     {
-        // ReSharper disable once AccessToDisposedClosure
-        await foreach (GrpcBatchRequestsResponse response in streaming.ResponseStream.ReadAllAsync())
+        try
         {
-            //Console.WriteLine(response.RequestId);
+            // ReSharper disable once AccessToDisposedClosure
+            await foreach (GrpcBatchRequestsResponse response in streaming.ResponseStream.ReadAllAsync())
+            {
+                //Console.WriteLine(response.RequestId);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("ListenForEvents: {0}: {1}", ex.GetType().Name, ex.Message);
         }
     }
 

@@ -23,7 +23,7 @@ public class GrpcCommunication : ICommunication
 
     private static readonly BatchRequestsResponse batchRequestsResponse = new();
     
-    private static readonly SemaphoreSlim semaphore = new(1, 1);
+    //private static readonly SemaphoreSlim semaphore = new(1, 1);
 
     /// <summary>
     /// Sends a Handshake message to a node via gRPC
@@ -35,7 +35,7 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<HandshakeResponse> Handshake(RaftManager manager, RaftNode node, HandshakeRequest request)
     {
-        AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming = SharedChannels.GetStreaming(node.Endpoint);
+        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(node.Endpoint);
 
         GrpcHandshakeRequest handshake = new()
         {
@@ -55,13 +55,13 @@ public class GrpcCommunication : ICommunication
 
         try
         {
-            await semaphore.WaitAsync();
+            await streaming.Semaphore.WaitAsync();
             
-            await streaming.RequestStream.WriteAsync(batchRequests);
+            await streaming.Streaming.RequestStream.WriteAsync(batchRequests);
         } 
         finally
         {
-            semaphore.Release();
+            streaming.Semaphore.Release();
         }
 
         return handshakeResponse;
@@ -77,7 +77,7 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftNode node, RequestVotesRequest request)
     {
-        AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming = SharedChannels.GetStreaming(node.Endpoint);
+        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(node.Endpoint);
 
         GrpcRequestVotesRequest requestVotes = new()
         {
@@ -100,13 +100,13 @@ public class GrpcCommunication : ICommunication
 
         try
         {
-            await semaphore.WaitAsync();
+            await streaming.Semaphore.WaitAsync();
             
-            await streaming.RequestStream.WriteAsync(batchRequests);
+            await streaming.Streaming.RequestStream.WriteAsync(batchRequests);
         } 
         finally
         {
-            semaphore.Release();
+            streaming.Semaphore.Release();
         }
 
         return requestVotesResponse;
@@ -122,7 +122,7 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<VoteResponse> Vote(RaftManager manager, RaftNode node, VoteRequest request)
     {
-        AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming = SharedChannels.GetStreaming(node.Endpoint);
+        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(node.Endpoint);
 
         GrpcVoteRequest voteRequest = new()
         {
@@ -145,13 +145,13 @@ public class GrpcCommunication : ICommunication
 
         try
         {
-            await semaphore.WaitAsync();
+            await streaming.Semaphore.WaitAsync();
             
-            await streaming.RequestStream.WriteAsync(batchRequests);
+            await streaming.Streaming.RequestStream.WriteAsync(batchRequests);
         } 
         finally
         {
-            semaphore.Release();
+            streaming.Semaphore.Release();
         }
         
         return voteResponse;
@@ -167,7 +167,7 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftNode node, AppendLogsRequest request)
     {
-        AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming = SharedChannels.GetStreaming(node.Endpoint);
+        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(node.Endpoint);
 
         GrpcAppendLogsRequest appendLogsRequest = new()
         {
@@ -192,13 +192,13 @@ public class GrpcCommunication : ICommunication
 
         try
         {
-            await semaphore.WaitAsync();
+            await streaming.Semaphore.WaitAsync();
             
-            await streaming.RequestStream.WriteAsync(batchRequests);
+            await streaming.Streaming.RequestStream.WriteAsync(batchRequests);
         } 
         finally
         {
-            semaphore.Release();
+            streaming.Semaphore.Release();
         }
         
         return appendLogsResponse;
@@ -214,7 +214,7 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftNode node, CompleteAppendLogsRequest request)
     {
-        AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming = SharedChannels.GetStreaming(node.Endpoint);
+        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(node.Endpoint);
 
         GrpcCompleteAppendLogsRequest completeAppendLogsRequest = new()
         {
@@ -238,13 +238,13 @@ public class GrpcCommunication : ICommunication
 
         try
         {
-            await semaphore.WaitAsync();
+            await streaming.Semaphore.WaitAsync();
             
-            await streaming.RequestStream.WriteAsync(batchRequests);
+            await streaming.Streaming.RequestStream.WriteAsync(batchRequests);
         } 
         finally
         {
-            semaphore.Release();
+            streaming.Semaphore.Release();
         }
         
         return completeAppendLogsResponse;
@@ -262,7 +262,7 @@ public class GrpcCommunication : ICommunication
         if (request.Requests is null)
             return new();
         
-        AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming = SharedChannels.GetStreaming(node.Endpoint);
+        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(node.Endpoint);
         
         RepeatedField<GrpcBatchRequestsRequestItem> items = new();
             
@@ -361,13 +361,13 @@ public class GrpcCommunication : ICommunication
         
         try
         {
-            await semaphore.WaitAsync();
+            await streaming.Semaphore.WaitAsync();
             
-            await streaming.RequestStream.WriteAsync(batchRequests);
+            await streaming.Streaming.RequestStream.WriteAsync(batchRequests);
         } 
         finally
         {
-            semaphore.Release();
+            streaming.Semaphore.Release();
         }
         
         return batchRequestsResponse;

@@ -35,10 +35,25 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
     {
         try
         {
+            _ = SendBatch(messages.ToList()).ConfigureAwait(false);
+
+            if (messages.Count < MinExpectedBatchSize)
+                await Task.Delay(1); // force a big batch next time*/
+        }
+        catch (Exception ex)
+        {
+            logger.LogError("Exception {Type} {Message}\n{StackTrace}", ex.GetType().Name, ex.Message, ex.StackTrace);
+        }
+    }
+
+    private async Task SendBatch(List<RaftResponderRequest> messages)
+    {
+        try
+        {
             if (messages.Count == 1)
             {
                 RaftResponderRequest message = messages.First();
-                
+
                 switch (message.Type)
                 {
                     case RaftResponderRequestType.AppendLogs:
@@ -66,15 +81,14 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
                         logger.LogError("Unsupported message {Type}", message.Type);
                         break;
                 }
-                
-                await Task.Delay(1);
+
                 return;
             }
-            
+
             logger.LogDebug("Sending block of {Count} messages", messages.Count);
-            
+
             List<BatchRequestsRequestItem> request = new(messages.Count);
-            
+
             foreach (RaftResponderRequest message in messages)
             {
                 switch (message.Type)
@@ -82,38 +96,35 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
                     case RaftResponderRequestType.Handshake:
                         request.Add(new() { Type = BatchRequestsRequestType.Handshake, Handshake = message.HandshakeRequest });
                         break;
-                    
+
                     case RaftResponderRequestType.Vote:
                         request.Add(new() { Type = BatchRequestsRequestType.Vote, Vote = message.VoteRequest });
                         break;
-                    
+
                     case RaftResponderRequestType.RequestVotes:
                         request.Add(new() { Type = BatchRequestsRequestType.RequestVote, RequestVotes = message.RequestVotesRequest });
                         break;
-                    
+
                     case RaftResponderRequestType.AppendLogs:
                         request.Add(new() { Type = BatchRequestsRequestType.AppendLogs, AppendLogs = message.AppendLogsRequest });
                         break;
-                    
+
                     case RaftResponderRequestType.CompleteAppendLogs:
                         request.Add(new() { Type = BatchRequestsRequestType.CompleteAppendLogs, CompleteAppendLogs = message.CompleteAppendLogsRequest });
                         break;
-                    
+
                     case RaftResponderRequestType.TryBatch:
                     default:
                         logger.LogError("Unsupported message {Type}", message.Type);
                         break;
                 }
             }
-            
-            await communication.BatchRequests(manager, node, new() { Requests = request }).ConfigureAwait(false);
 
-            if (request.Count < MinExpectedBatchSize)
-                await Task.Delay(1); // force a big batch next time*/
+            await communication.BatchRequests(manager, node, new() { Requests = request }).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            logger.LogError("Exception {Type} {Message}\n{StackTrace}", ex.GetType().Name, ex.Message, ex.StackTrace);
+            logger.LogError("SendBatch {Type} {Message}\n{StackTrace}", ex.GetType().Name, ex.Message, ex.StackTrace);
         }
     }
 
