@@ -6,6 +6,20 @@ using Kommander.Data;
 
 namespace Kommander.Communication.Grpc;
 
+/// <summary>
+/// The RaftService class is a gRPC service implementation responsible for handling Raft protocol-related operations.
+/// </summary>
+/// <remarks>
+/// This class provides methods for handling various Raft-related requests, such as voting, requesting votes, appending logs,
+/// and performing handshake operations. It interacts with an <see cref="IRaft"/> instance for executing the protocol logic
+/// and uses a logger for debugging purposes.
+/// </remarks>
+/// <example>
+/// This service can be mapped to a gRPC server using the provided GrpcCommunicationExtensions class.
+/// </example>
+/// <threadsafety>
+/// This class is thread-safe for all operations.
+/// </threadsafety>
 public sealed class RaftService : Rafter.RafterBase
 {        
     private  static readonly Task<GrpcVoteResponse> voteResponse = Task.FromResult(new GrpcVoteResponse());
@@ -25,7 +39,13 @@ public sealed class RaftService : Rafter.RafterBase
         this.raft = raft;
         this.logger = logger;
     }
-    
+
+    /// <summary>
+    /// Handles a handshake request by delegating to the IRaft implementation, using the details provided in the request.
+    /// </summary>
+    /// <param name="request">The handshake request containing the partition ID, maximum log ID, and endpoint details.</param>
+    /// <param name="context">The server call context associated with the gRPC request.</param>
+    /// <returns>A task representing the asynchronous operation, with a result of type GrpcHandshakeResponse.</returns>
     public override async Task<GrpcHandshakeResponse> Handshake(GrpcHandshakeRequest request, ServerCallContext context)
     {
         //logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got Vote message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
@@ -38,7 +58,13 @@ public sealed class RaftService : Rafter.RafterBase
         
         return new();
     }
-    
+
+    /// <summary>
+    /// Processes a vote request by delegating the operation to the IRaft implementation, using the provided request details.
+    /// </summary>
+    /// <param name="request">The gRPC vote request containing details such as partition ID, term, maximum log ID, timestamp, and endpoint.</param>
+    /// <param name="context">The server call context associated with the gRPC request.</param>
+    /// <returns>A task representing the asynchronous operation, with a result of type GrpcVoteResponse.</returns>
     public override Task<GrpcVoteResponse> Vote(GrpcVoteRequest request, ServerCallContext context)
     {
         //logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got Vote message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
@@ -53,7 +79,13 @@ public sealed class RaftService : Rafter.RafterBase
         
         return voteResponse;
     }
-    
+
+    /// <summary>
+    /// Handles a request to vote as part of the Raft consensus algorithm, delegating to the IRaft implementation with the provided details.
+    /// </summary>
+    /// <param name="request">The vote request containing the partition ID, term, maximum log ID, timestamp details, and endpoint information.</param>
+    /// <param name="context">The server call context associated with the gRPC request.</param>
+    /// <returns>A task that represents the asynchronous operation, returning a response of type GrpcRequestVotesResponse.</returns>
     public override Task<GrpcRequestVotesResponse> RequestVotes(GrpcRequestVotesRequest request, ServerCallContext context)
     {
         //logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got RequestVotes message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
@@ -68,7 +100,13 @@ public sealed class RaftService : Rafter.RafterBase
         
         return requestVoteResponse;
     }
-    
+
+    /// <summary>
+    /// Processes an AppendLogs request by delegating the logs and associated metadata to the IRaft implementation.
+    /// </summary>
+    /// <param name="request">The AppendLogs request containing partition information, term, timestamp, endpoint, and log entries.</param>
+    /// <param name="context">The server call context associated with the gRPC request.</param>
+    /// <returns>A task representing the asynchronous operation, with a result of type GrpcAppendLogsResponse.</returns>
     public override Task<GrpcAppendLogsResponse> AppendLogs(GrpcAppendLogsRequest request, ServerCallContext context)
     {
         //if (request.Logs.Count > 0)

@@ -5,18 +5,39 @@ using Kommander.Data;
 
 namespace Kommander;
 
+/// <summary>
+/// The RaftBatcher class is responsible for batching and managing the delivery of messages
+/// to the Raft actors system. It provides an asynchronous mechanism to enqueue and process
+/// messages for Raft operations.
+/// </summary>
 internal sealed class RaftBatcher
 {
     private readonly RaftManager manager;
-    
+
+    /// <summary>
+    /// Represents a thread-safe queue used to store pending RaftBatcherItem objects for asynchronous processing.
+    /// Utilized within the RaftBatcher to manage messages enqueued for delivery to the Raft actor system.
+    /// The queue ensures proper batching and sequencing of Raft operations while supporting concurrent access.
+    /// This variable is central to the message delivery mechanism of the RaftBatcher.
+    /// </summary>
     private readonly ConcurrentQueue<RaftBatcherItem> inbox = new();
     
     private readonly List<RaftBatcherItem> messages = [];
-    
+
+    /// <summary>
+    /// Represents the state of processing for the inbox queue of the RaftBatcher.
+    /// Used as a flag to indicate whether the message delivery mechanism is active or idle.
+    /// A value of 1 typically indicates that processing is idle, while a value of 0 indicates that it is active.
+    /// This variable is updated atomically using interlocked operations to ensure thread safety
+    /// during concurrent message processing.
+    /// </summary>
     private int processing = 1;
-    
+
     private readonly Stopwatch stopwatch = new();
 
+    /// <summary>
+    /// Constructor
+    /// </summary>
     public RaftBatcher(RaftManager manager)
     {
         this.manager = manager;
@@ -77,6 +98,13 @@ internal sealed class RaftBatcher
         }
     }
 
+    /// <summary>
+    /// Processes a batch of Raft batcher requests by writing their associated logs to the write-ahead log (WAL)
+    /// and resolving or rejecting their respective promises based on the operation's success.
+    /// </summary>
+    /// <param name="requests">A list of <see cref="RaftBatcherItem"/> objects containing the requests to process
+    /// and their associated promises.</param>
+    /// <returns>A <see cref="Task"/> that represents the asynchronous operation.</returns>
     private async Task Receive(List<RaftBatcherItem> requests)
     {
         int count = 0;

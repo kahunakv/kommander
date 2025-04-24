@@ -10,6 +10,9 @@ using IOThreadPool = Kommander.WAL.IO.ThreadPool;
 
 namespace Kommander;
 
+/// <summary>
+/// Represents a Raft interface for distributed consensus and coordination.
+/// </summary>
 public interface IRaft
 {
     /// <summary>

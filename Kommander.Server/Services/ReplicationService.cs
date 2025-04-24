@@ -24,7 +24,7 @@ public class ReplicationService : BackgroundService //, IDisposable
         
         await raft.JoinCluster().ConfigureAwait(false);
         
-        List<Task> tasks = new(40);
+        /*List<Task> tasks = new(40);
         
         while (true)
         {
@@ -39,7 +39,7 @@ public class ReplicationService : BackgroundService //, IDisposable
             await Task.WhenAll(tasks).ConfigureAwait(false);
 
             await Task.Delay(20000, stoppingToken).ConfigureAwait(false);
-        }
+        }*/
     }
 
     private async Task ReplicateToPartition(int i)

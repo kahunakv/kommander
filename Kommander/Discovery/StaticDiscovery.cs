@@ -2,7 +2,9 @@
 namespace Kommander.Discovery;
 
 /// <summary>
-/// Allow discovery of other Raft nodes using a static list of nodes
+/// StaticDiscovery is an implementation of the IDiscovery interface that provides a static list
+/// of Raft nodes to be used in a Raft distributed cluster. This class is used in scenarios where the nodes
+/// in the cluster are predefined and do not change dynamically at runtime.
 /// </summary>
 public class StaticDiscovery : IDiscovery
 {

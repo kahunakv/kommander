@@ -54,11 +54,13 @@ public sealed class SmallDictionary<TKey, TValue> : IEnumerable<KeyValuePair<TKe
         
         for (int i = 0; i < buckets.Length; i++)
         {
-            if (!buckets[i].IsNotEmpty)
+            ref SmallBucket<TKey, TValue?> bucket = ref buckets[i];
+            
+            if (!bucket.IsNotEmpty)
             {
-                buckets[i].IsNotEmpty = true;
-                buckets[i].Key = key;
-                buckets[i].Value = value;
+                bucket.IsNotEmpty = true;
+                bucket.Key = key;
+                bucket.Value = value;
                 Count++;
                 return;
             }
@@ -80,12 +82,31 @@ public sealed class SmallDictionary<TKey, TValue> : IEnumerable<KeyValuePair<TKe
             Count--;
         }
     }
-    
+
+    /// <summary>
+    /// Attempts to add the specified key and value to the dictionary.
+    /// </summary>
+    /// <param name="key">
+    /// The key of the element to add. Must not be null.
+    /// </param>
+    /// <param name="value">
+    /// The value of the element to add.
+    /// </param>
+    /// <returns>
+    /// Returns true if the key and value were successfully added to the dictionary;
+    /// otherwise, false if the key already exists in the dictionary.
+    /// </returns>
+    /// <exception cref="ArgumentNullException">
+    /// Thrown when the key is null.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// Thrown when the dictionary has insufficient capacity to add the element.
+    /// </exception>
     public bool TryAdd(TKey key, TValue value)
     {
         if (key == null)
             throw new ArgumentNullException(nameof(key));
-        
+
         // Check if key already exists
         int existingIndex = FindBucketIndex(key);
         if (existingIndex >= 0)
@@ -93,11 +114,13 @@ public sealed class SmallDictionary<TKey, TValue> : IEnumerable<KeyValuePair<TKe
         
         for (int i = 0; i < buckets.Length; i++)
         {
-            if (!buckets[i].IsNotEmpty)
+            ref SmallBucket<TKey, TValue?> bucket = ref buckets[i];
+            
+            if (!bucket.IsNotEmpty)
             {
-                buckets[i].IsNotEmpty = true;
-                buckets[i].Key = key;
-                buckets[i].Value = value;
+                bucket.IsNotEmpty = true;
+                bucket.Key = key;
+                bucket.Value = value;
                 return true;
             }
         }
@@ -119,8 +142,17 @@ public sealed class SmallDictionary<TKey, TValue> : IEnumerable<KeyValuePair<TKe
         
         return -1;
     }
-    
-    // Indexer for getting and setting values
+
+    /// <summary>
+    /// Gets or sets the value associated with the specified key in the dictionary.
+    /// Throws a <see cref="KeyNotFoundException"/> if the key does not exist when getting a value.
+    /// Replaces the existing value or adds a new key-value pair when setting a value.
+    /// </summary>
+    /// <param name="key">The key of the value to get or set.</param>
+    /// <returns>The value associated with the specified key.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when the key is null.</exception>
+    /// <exception cref="KeyNotFoundException">Thrown when trying to get a value for a nonexistent key.</exception>
+    /// <exception cref="ArgumentException">Thrown when trying to add a duplicate key.</exception>
     public TValue this[TKey key]
     {
         get
@@ -152,8 +184,24 @@ public sealed class SmallDictionary<TKey, TValue> : IEnumerable<KeyValuePair<TKe
     {
         return FindBucketIndex(key) >= 0;
     }
-    
-    // Try to get a value by key
+
+    /// <summary>
+    /// Attempts to retrieve the value associated with the specified key.
+    /// </summary>
+    /// <param name="key">
+    /// The key of the value to retrieve. Must not be null.
+    /// </param>
+    /// <param name="value">
+    /// When this method returns, contains the value associated with the specified key
+    /// if the key is found; otherwise, the default value for the type of the value parameter.
+    /// This parameter is passed uninitialized.
+    /// </param>
+    /// <returns>
+    /// Returns true if the key is found in the dictionary; otherwise, false.
+    /// </returns>
+    /// <exception cref="ArgumentNullException">
+    /// Thrown when the key is null.
+    /// </exception>
     public bool TryGetValue(TKey key, out TValue value)
     {
         int index = FindBucketIndex(key);
@@ -167,10 +215,16 @@ public sealed class SmallDictionary<TKey, TValue> : IEnumerable<KeyValuePair<TKe
         return false;
     }
 
+    /// <summary>
+    /// Calculates the number of non-empty buckets in the dictionary.
+    /// </summary>
+    /// <returns>
+    /// The number of buckets that contain at least one element.
+    /// </returns>
     public int GetCount()
     {
         int counter = 0;
-        
+
         for (int i = 0; i < buckets.Length; i++)
         {
             if (buckets[i].IsNotEmpty)

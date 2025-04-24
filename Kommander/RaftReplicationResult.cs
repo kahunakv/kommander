@@ -4,6 +4,9 @@ using Kommander.Time;
 
 namespace Kommander;
 
+/// <summary>
+/// Represents the result of a Raft log replication operation in a distributed system.
+/// </summary>
 public sealed class RaftReplicationResult
 {
     public bool Success { get; }

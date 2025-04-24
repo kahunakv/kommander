@@ -19,7 +19,9 @@ using ThreadPool = Kommander.WAL.IO.ThreadPool;
 namespace Kommander;
 
 /// <summary>
-/// Identifies a Raft node in the cluster
+/// The RaftManager class is responsible for managing the Raft distributed consensus algorithm.
+/// It coordinates cluster nodes, handles log replication, voting processes, and partition management
+/// associated with a Raft-based architecture.
 /// </summary>
 public sealed class RaftManager : IRaft, IDisposable
 {
@@ -61,7 +63,7 @@ public sealed class RaftManager : IRaft, IDisposable
     
     private readonly ConcurrentDictionary<string, HLCTimestamp> lastHearthBeat = new();
     
-    private readonly ConcurrentDictionary<string, IActorRefAggregate<RaftResponderActor, RaftResponderRequest>> responderActors = [];
+    private readonly ConcurrentDictionary<string, Lazy<IActorRefAggregate<RaftResponderActor, RaftResponderRequest>>> responderActors = [];
 
     /// <summary>
     /// Allows to retrieve the list of known nodes within the Raft cluster
@@ -1076,20 +1078,25 @@ public sealed class RaftManager : IRaft, IDisposable
     
     internal void EnqueueResponse(string endpoint, RaftResponderRequest request)
     {
-        if (!responderActors.TryGetValue(endpoint, out IActorRefAggregate<RaftResponderActor, RaftResponderRequest>? responderActor))
-        {
-            responderActor = actorSystem.SpawnAggregate<RaftResponderActor, RaftResponderRequest>(
-                string.Concat("raft-responder-", endpoint),
-                this,
-                new RaftNode(endpoint),
-                communication,
-                Logger
-            );
-            
-            responderActors.TryAdd(endpoint, responderActor);
-        }
-        
+        Lazy<IActorRefAggregate<RaftResponderActor, RaftResponderRequest>> responderActorLazy = responderActors.GetOrAdd(endpoint, GetOrCreateResponderActor);
+        IActorRefAggregate<RaftResponderActor, RaftResponderRequest> responderActor = responderActorLazy.Value;        
         responderActor.Send(request);
+    }
+
+    private Lazy<IActorRefAggregate<RaftResponderActor, RaftResponderRequest>> GetOrCreateResponderActor(string endpoint)
+    {
+        return new(() => CreateResponderActor(endpoint));
+    }
+
+    public IActorRefAggregate<RaftResponderActor, RaftResponderRequest> CreateResponderActor(string endpoint)
+    {
+        return actorSystem.SpawnAggregate<RaftResponderActor, RaftResponderRequest>(
+            string.Concat("raft-responder-", endpoint),
+            this,
+            new RaftNode(endpoint),
+            communication,
+            Logger
+        );
     }
 
     public void Dispose()

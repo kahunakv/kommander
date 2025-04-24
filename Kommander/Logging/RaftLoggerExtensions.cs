@@ -3,6 +3,10 @@ using Kommander.Time;
 
 namespace Kommander.Logging;
 
+/// <summary>
+/// Provides extension methods for logging various Raft-specific events in a high-performant way
+/// in implementations of the <see cref="IRaft"/> interface using the <see cref="ILogger{TCategoryName}"/> framework.
+/// </summary>
 public static partial class RaftLoggerExtensions
 {
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] WAL restored at #{NextId} in {ElapsedMs}ms")]

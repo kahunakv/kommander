@@ -3,6 +3,11 @@ using Kommander.Time;
 
 namespace Kommander.Data;
 
+/// <summary>
+/// Represents a response in the Raft state actor.
+/// Encapsulates various details about the state and results of Raft operations,
+/// such as operation status, node state, log index, ticket state, and more.
+/// </summary>
 public sealed class RaftResponse
 {
     public RaftResponseType Type { get; }

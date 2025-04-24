@@ -7,6 +7,15 @@ using Kommander.Data;
 
 namespace Kommander.System;
 
+/// <summary>
+/// The RaftSystemActor is a background actor responsible for handling a system partition
+/// It processes requests related to Raft events, such as configuration replication, leader changes, member changes,
+/// partition splitting and restoration operations.
+/// </summary>
+/// <typeparam name="RaftSystemRequest">
+/// The type of message that this actor handles.
+/// </typeparam>
+/// <seealso cref="IActor{RaftSystemRequest}"/>
 public class RaftSystemActor : IActor<RaftSystemRequest>
 {
     private const int MaxRetries = 10;
@@ -29,6 +38,14 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
         this.logger = logger;
     }
 
+    /// <summary>
+    /// Handles various request types pertaining to the Raft system, such as leader changes,
+    /// configuration restoration or replication, and partition handling.
+    /// </summary>
+    /// <param name="message">The request message of type <see cref="RaftSystemRequest"/> containing details
+    /// about the operation to perform, including its type, partition information, and leader node.</param>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    /// <exception cref="NotImplementedException">Thrown if the provided message type is not implemented.</exception>
     public async Task Receive(RaftSystemRequest message)
     {
         switch (message.Type)
@@ -95,6 +112,13 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
         }
     }
 
+    /// <summary>
+    /// Initializes the user partitions in the system by retrieving and deserializing
+    /// partition configuration from the system configuration. If the configuration
+    /// is invalid or deserialization fails, logs the corresponding errors.
+    /// </summary>
+    /// <exception cref="JsonException">Thrown when the partition configuration cannot be parsed.</exception>
+    /// <exception cref="KeyNotFoundException">Thrown when the partition key is missing in the system configuration.</exception>
     private void InitializePartitions()
     {
         if (!systemConfiguration.TryGetValue(RaftSystemConfigKeys.Partitions, out string? partitions))
@@ -116,6 +140,13 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
         manager.StartUserPartitions(initialRanges);
     }
 
+    /// <summary>
+    /// Attempts to set the initial partitions for the Raft system by dividing the configured number of partitions
+    /// into ranges and replicating the system logs across the cluster.
+    /// </summary>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    /// <exception cref="JsonException">Thrown if the serialization of the partitions fails.</exception>
+    /// <exception cref="InvalidOperationException">Thrown if the replication of system logs does not succeed after max retry attempts.</exception>
     private async Task TrySetInitialPartitions()
     {
         List<RaftPartitionRange>? initialRanges;
@@ -173,7 +204,14 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
         // foreach (RaftPartitionRange range in initialRanges)
         //     Console.Error.WriteLine("{0} {1} {2}", range.PartitionId, range.StartRange, range.EndRange);
     }
-    
+
+    /// <summary>
+    /// Attempts to split an existing partition into two new partitions by recalculating range boundaries.
+    /// Updates the system configuration with the modified partition details.
+    /// </summary>
+    /// <param name="partitionId">The identifier of the partition to be split.</param>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    /// <exception cref="InvalidOperationException">Thrown if partition ranges cannot be retrieved or updated due to invalid configuration.</exception>
     private async Task TrySplitPartition(int partitionId)
     {
         if (!systemConfiguration.TryGetValue(RaftSystemConfigKeys.Partitions, out string? partitions))
@@ -250,6 +288,14 @@ public class RaftSystemActor : IActor<RaftSystemRequest>
         manager.StartUserPartitions(initialRanges);
     }
 
+    /// <summary>
+    /// Divides the range of integers from 0 to <see cref="int.MaxValue"/> into a specified number of
+    /// partitions, ensuring each partition has a nearly equal range size with any remainder distributed
+    /// among the initial partitions.
+    /// </summary>
+    /// <param name="numberOfRanges">The number of partitions to divide the range into. Must be greater than 0.</param>
+    /// <returns>A list of <see cref="RaftPartitionRange"/> objects representing the partitioned ranges,
+    /// each containing its corresponding partition ID, start range, and end range values.</returns>
     private static List<RaftPartitionRange> DivideIntoRanges(int numberOfRanges)
     {
         int monotonicId = RaftSystemConfig.SystemPartition + 1;

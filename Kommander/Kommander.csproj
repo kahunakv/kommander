@@ -9,7 +9,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>Kommander</PackageId>
-    <Version>0.8.14</Version>
+    <Version>0.9.0</Version>
     <Description>Distributed consensus with Raft for C#/.NET</Description>
     <Authors>Andres Gutierrez</Authors>
     <Company>Andres Gutierrez</Company>

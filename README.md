@@ -5,7 +5,9 @@ Kommander is an open-source, distributed consensus library implemented in C# for
 [![NuGet](https://img.shields.io/nuget/v/Kommander.svg?style=flat-square)](https://www.nuget.org/packages/Kommander)
 [![Nuget](https://img.shields.io/nuget/dt/Kommander)](https://www.nuget.org/packages/Kommander)
 
-**This is an alpha project please don't use it in production.**
+> [!WARNING]
+> **BETA SOFTWARE**
+> Kommander is under heavy development and some features may be unstable!
 
 ---
 

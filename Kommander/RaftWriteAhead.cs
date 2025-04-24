@@ -1,6 +1,4 @@
 ﻿
-using Nixie;
-
 using System.Diagnostics;
 
 using Kommander.Data;
@@ -12,8 +10,9 @@ using Kommander.WAL;
 namespace Kommander;
 
 /// <summary>
-/// This actor is responsible for controlling concurrency
-/// when accessing the replicated log persisted on disk.
+/// Manages the write-ahead log (WAL) for a Raft partition. Provides functionality for
+/// recovering logs, proposing new operations, committing or rolling back changes,
+/// and managing Raft log compaction.
 /// </summary>
 public sealed class RaftWriteAhead
 {
@@ -41,6 +40,12 @@ public sealed class RaftWriteAhead
         
     private readonly Stopwatch stopwatch = Stopwatch.StartNew();
 
+    /// <summary>
+    /// Constructor
+    /// </summary>
+    /// <param name="manager"></param>
+    /// <param name="partition"></param>
+    /// <param name="walAdapter"></param>
     public RaftWriteAhead(RaftManager manager, RaftPartition partition, IWAL walAdapter)
     {
         this.manager = manager;
@@ -53,6 +58,16 @@ public sealed class RaftWriteAhead
         this.operations = compactEveryOperations;
     }
 
+    /// <summary>
+    /// Recovers the state of the Raft log for a specific partition by reading persisted logs from the Write-Ahead Log (WAL).
+    /// This method ensures recovery is only executed once and updates the commit index upon completion.
+    /// </summary>
+    /// <returns>
+    /// The updated commit index after recovery is completed. Returns -1 if the recovery has already been performed.
+    /// </returns>
+    /// <exception cref="Exception">
+    /// Thrown if an error occurs during log recovery or processing.
+    /// </exception>
     public async ValueTask<long> Recover()
     {
         if (recovered)
@@ -126,6 +141,24 @@ public sealed class RaftWriteAhead
         return commitIndex;
     }
 
+    /// <summary>
+    /// Proposes a batch of logs in the current term for processing by the Raft consensus protocol.
+    /// Logs are assigned unique indices and associated with the current term, then enqueued for replication.
+    /// </summary>
+    /// <param name="term">
+    /// The current term in the Raft consensus protocol used to associate with the logs.
+    /// </param>
+    /// <param name="logs">
+    /// A list of logs to be proposed. If the list is null or empty, the method will return immediately with a success status and no index update.
+    /// </param>
+    /// <returns>
+    /// A tuple containing the operation status and the index of the last proposed log.
+    /// If the proposal succeeds, the status will be <see cref="RaftOperationStatus.Success"/> and the index will reflect the latest proposed index.
+    /// If the operation fails, the status will indicate the specific error, and the index will return as -1.
+    /// </returns>
+    /// <exception cref="Exception">
+    /// May be thrown for unexpected errors during the proposal process or queuing for replication.
+    /// </exception>
     public async Task<(RaftOperationStatus, long)> Propose(long term, List<RaftLog>? logs)
     {
         if (logs is null || logs.Count == 0)
@@ -146,7 +179,19 @@ public sealed class RaftWriteAhead
 
         return (RaftOperationStatus.Success, proposeIndex);
     }
-    
+
+    /// <summary>
+    /// Commits a list of Raft log entries by updating their type to indicate they are committed.
+    /// Processes the logs in ascending order of their IDs and updates the commit index.
+    /// </summary>
+    /// <param name="logs">
+    /// A list of Raft log entries to commit. If null or empty, the method returns success with a commit index of -1.
+    /// </param>
+    /// <returns>
+    /// A tuple containing the operation status and the last committed log index.
+    /// The operation status is an instance of <see cref="RaftOperationStatus"/> indicating success or failure.
+    /// If the operation fails, the commit index will be -1.
+    /// </returns>
     public async Task<(RaftOperationStatus, long)> Commit(List<RaftLog>? logs)
     {
         if (logs is null || logs.Count == 0)
@@ -196,7 +241,19 @@ public sealed class RaftWriteAhead
 
         return (RaftOperationStatus.Success, lastCommitIndex);
     }
-    
+
+    /// <summary>
+    /// Rolls back a list of Raft logs by updating their types to indicate a rollback operation
+    /// and processing them through the Write-Ahead Log (WAL) adapter.
+    /// </summary>
+    /// <param name="logs">
+    /// A list of Raft logs to be rolled back. If the list is null or empty, no rollback is performed.
+    /// </param>
+    /// <returns>
+    /// A tuple containing the operation status and the index of the last processed log:
+    /// - <see cref="RaftOperationStatus.Success"/> and -1 if the rollback is completed successfully or no logs were provided.
+    /// - The relevant <see cref="RaftOperationStatus"/> and -1 in case of an error.
+    /// </returns>
     public async Task<(RaftOperationStatus, long)> Rollback(List<RaftLog>? logs)
     {
         if (logs is null || logs.Count == 0)
@@ -231,17 +288,48 @@ public sealed class RaftWriteAhead
 
         return (RaftOperationStatus.Success, -1);
     }
-    
+
+    /// <summary>
+    /// Retrieves the highest log index recorded in the Write-Ahead Log (WAL) for a specific partition.
+    /// This method queries the WAL adapter and returns the maximum log index for the partition.
+    /// </summary>
+    /// <returns>
+    /// The maximum log index currently recorded for the specified partition.
+    /// </returns>
     public async Task<long> GetMaxLog()
     {
         return await manager.ReadThreadPool.EnqueueTask(() => walAdapter.GetMaxLog(partition.PartitionId));
     }
-    
+
+    /// <summary>
+    /// Retrieves the current term of the Raft log for the specified partition.
+    /// This term represents the latest term recognized by the Write-Ahead Log (WAL).
+    /// </summary>
+    /// <returns>
+    /// A task that represents the asynchronous operation. The task result contains the current term of the Raft log.
+    /// </returns>
     public async Task<long> GetCurrentTerm()
     {
         return await manager.ReadThreadPool.EnqueueTask(() => walAdapter.GetCurrentTerm(partition.PartitionId));
     }
 
+    /// <summary>
+    /// Processes a list of Raft log entries by proposing or committing them based on their type and ID.
+    /// This method validates the logs, ensures ordering, handles outdated logs, and performs necessary actions
+    /// such as proposing, committing, or skipping logs as required. This is typically used by replica nodes.
+    /// </summary>
+    /// <param name="logs">
+    /// A list of Raft log entries to be processed. The logs can be of various types, including proposed or committed logs.
+    /// If the list is null or empty, no operations are performed, and a success status with an index of -1 is returned.
+    /// </param>
+    /// <returns>
+    /// A tuple containing the operation status and the highest index reached during the process.
+    /// The operation status indicates whether the process succeeded, encountered errors, or other specific conditions.
+    /// The index represents the maximum of the propose or commit index after processing.
+    /// </returns>
+    /// <exception cref="NotImplementedException">
+    /// Thrown if execution reaches functionality that has not yet been implemented.
+    /// </exception>
     public async Task<(RaftOperationStatus, long)> ProposeOrCommit(List<RaftLog>? logs)
     {
         if (logs is null || logs.Count == 0)
@@ -465,12 +553,38 @@ public sealed class RaftWriteAhead
 
         return (status, Math.Max(proposeIndex, commitIndex));
     }
-    
+
+    /// <summary>
+    /// Retrieves a range of log entries from the Write-Ahead Log (WAL) starting from the specified log index.
+    /// </summary>
+    /// <param name="startLogIndex">
+    /// The index of the first log entry to be retrieved. Only log entries from this index onward will be returned.
+    /// </param>
+    /// <returns>
+    /// A task that represents the asynchronous operation. The task result contains a list of <see cref="RaftLog"/> objects
+    /// corresponding to the logs retrieved from the specified range.
+    /// </returns>
+    /// <exception cref="RaftException">
+    /// Thrown if the thread pool is not started or disposed while attempting to retrieve logs asynchronously.
+    /// </exception>
     public async Task<List<RaftLog>> GetRange(long startLogIndex)
     {
         return await manager.ReadThreadPool.EnqueueTask(() => walAdapter.ReadLogsRange(partition.PartitionId, startLogIndex)).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Executes the log compaction process for the partition managed by this instance.
+    /// This method removes logs older than a specified checkpoint to reduce
+    /// storage requirements while maintaining the integrity of the state machine.
+    /// </summary>
+    /// <returns>
+    /// A task representing the asynchronous compaction operation.
+    /// The returned task completes once the compaction process has finished.
+    /// </returns>
+    /// <exception cref="RaftException">
+    /// Thrown if the thread pool is not started or has been disposed,
+    /// or if an error occurs during the log compaction process.
+    /// </exception>
     public async Task Compact()
     {
         long lastCheckpoint = await manager.ReadThreadPool.EnqueueTask(() => walAdapter.GetLastCheckpoint(partition.PartitionId)).ConfigureAwait(false);
