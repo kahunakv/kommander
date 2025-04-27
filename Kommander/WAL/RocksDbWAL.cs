@@ -90,7 +90,7 @@ public class RocksDbWAL : IWAL, IDisposable
         
         long lastCheckpoint = GetLastCheckpointInternal(partitionId, columnFamilyHandle);
         
-        Console.WriteLine($"Last checkpoint {partitionId} {lastCheckpoint}");
+        //Console.WriteLine($"Last checkpoint {partitionId} {lastCheckpoint}");
 
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         

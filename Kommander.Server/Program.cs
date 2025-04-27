@@ -25,7 +25,7 @@ try
 {
     RaftConfiguration configuration = new()
     {
-        NodeId = string.IsNullOrEmpty(opts.RaftNodeId) ? Environment.MachineName : opts.RaftNodeId,
+        NodeName = string.IsNullOrEmpty(opts.RaftNodeId) ? Environment.MachineName : opts.RaftNodeId,
         Host = opts.RaftHost,
         Port = opts.RaftPort,
         InitialPartitions = opts.InitialClusterPartitions
@@ -67,7 +67,7 @@ try
         
         node.OnLogRestored += (partitionId, log) =>
         {
-            Console.WriteLine("{0}: Log restored: {0} {1} {2} {3} {4}", partitionId, log.Id, log.Type, log.LogType, Encoding.UTF8.GetString(log.LogData ?? []));
+            // Console.WriteLine("{0}: Log restored: {0} {1} {2} {3} {4}", partitionId, log.Id, log.Type, log.LogType, Encoding.UTF8.GetString(log.LogData ?? []));
             
             return Task.FromResult(true);
         };

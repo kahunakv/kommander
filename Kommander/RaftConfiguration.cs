@@ -9,7 +9,7 @@ public class RaftConfiguration
     /// <summary>
     /// Unique node id
     /// </summary>
-    public string? NodeId { get; set; }
+    public string? NodeName { get; set; }
     
     /// <summary>
     /// Host to identify the node within the cluster
