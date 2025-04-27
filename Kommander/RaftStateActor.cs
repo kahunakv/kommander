@@ -338,7 +338,7 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
                         break;
 
                     case RaftRequestType.ReceiveHandshake:
-                        ReceiveHandshake(request.Endpoint ?? "", request.CommitIndex);
+                        ReceiveHandshake((int)request.Term, request.Endpoint ?? "", request.CommitIndex);
                         message.Promise.TrySetResult(RaftResponseStatic.NoneResponse);
                         break;
 
@@ -647,14 +647,23 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
     }
     
     /// <summary>
-    /// After the partition startups a handshake we send a handshake to the other nodes to
-    /// verify if we have the most recent logs. 
+    /// After the partition startup a handshake is sent to the other nodes to
+    /// verify if we have the most recent logs and the node id is unique
     /// </summary>
+    /// <param name="remoteNodeId"></param>
     /// <param name="endpoint"></param>
     /// <param name="remoteMaxLogId"></param>
-    private void ReceiveHandshake(string endpoint, long remoteMaxLogId)
+    private void ReceiveHandshake(int remoteNodeId, string endpoint, long remoteMaxLogId)
     {
-        logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received handshake from {Endpoint}. WAL log at {Index}.", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, remoteMaxLogId);
+        if (manager.LocalNodeId == remoteNodeId)
+        {
+            logger.LogCritical("[{LocalEndpoint}/{PartitionId}/{State}] Same node id was found in the cluster {NodeId} {RemoteNodeId}", manager.LocalEndpoint, partition.PartitionId, nodeState, manager.LocalNodeId, remoteNodeId);
+            
+            Environment.Exit(1);
+            return;
+        }
+        
+        logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received handshake from {Endpoint}/{RemoteNodeId}. WAL log at {Index}.", manager.LocalEndpoint, partition.PartitionId, nodeState, endpoint, remoteNodeId, remoteMaxLogId);
         
         startCommitIndexes[endpoint] = remoteMaxLogId;
     }
@@ -675,7 +684,7 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
         
         long localMaxId = await walActor.GetMaxLog().ConfigureAwait(false);
         
-        HandshakeRequest request = new(partition.PartitionId, localMaxId, manager.LocalEndpoint);
+        HandshakeRequest request = new(manager.LocalNodeId, partition.PartitionId, localMaxId, manager.LocalEndpoint);
         
         int number = 0;
         

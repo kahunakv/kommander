@@ -39,6 +39,7 @@ public class GrpcCommunication : ICommunication
 
         GrpcHandshakeRequest handshake = new()
         {
+            NodeId = request.NodeId,
             Partition = request.Partition,
             MaxLogId = request.MaxLogId,
             Endpoint = request.Endpoint
@@ -279,6 +280,7 @@ public class GrpcCommunication : ICommunication
             {
                 GrpcHandshakeRequest handshake = new()
                 {
+                    NodeId = requestItem.Handshake.NodeId,
                     Partition = requestItem.Handshake.Partition,
                     MaxLogId = requestItem.Handshake.MaxLogId,
                     Endpoint = requestItem.Handshake.Endpoint

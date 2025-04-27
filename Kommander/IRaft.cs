@@ -208,7 +208,13 @@ public interface IRaft
     /// Obtains the local node id
     /// </summary>
     /// <returns></returns>
-    public string GetLocalNodeId();
+    public int GetLocalNodeId();
+    
+    /// <summary>
+    /// Obtains the local node name
+    /// </summary>
+    /// <returns></returns>
+    public string GetLocalNodeName();
 
     /// <summary>
     /// Checks if the local node is the leader in the given partition

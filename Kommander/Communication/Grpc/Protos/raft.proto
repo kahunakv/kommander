@@ -11,9 +11,10 @@ service Rafter {
 }
 
 message GrpcHandshakeRequest {
-    int32 Partition = 1;
-    int64 MaxLogId = 2;
-    string Endpoint = 3;
+    int32 NodeId = 1;
+    int32 Partition = 2;
+    int64 MaxLogId = 3;
+    string Endpoint = 4;
 }
 
 message GrpcHandshakeResponse {

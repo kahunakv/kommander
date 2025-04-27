@@ -218,7 +218,7 @@ public sealed class RaftManager : IRaft, IDisposable
 
         LocalEndpoint = string.Concat(configuration.Host, ":", configuration.Port);
         LocalNodeName = string.IsNullOrEmpty(this.configuration.NodeName) ? Environment.MachineName : this.configuration.NodeName;
-        LocalNodeId = HashUtils.SimpleHash(LocalNodeName);
+        LocalNodeId = HashUtils.SmallSimpleHash(LocalNodeName);
 
         clusterHandler = new(this, discovery);
 
@@ -897,12 +897,21 @@ public sealed class RaftManager : IRaft, IDisposable
     {
         return LocalEndpoint;
     }
+    
+    /// <summary>
+    /// Returns the local node id
+    /// </summary>
+    /// <returns></returns>
+    public int GetLocalNodeId()
+    {
+        return LocalNodeId;
+    }
 
     /// <summary>
     /// Returns the local node id
     /// </summary>
     /// <returns></returns>
-    public string GetLocalNodeId()
+    public string GetLocalNodeName()
     {
         return LocalNodeName;
     }

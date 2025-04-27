@@ -51,6 +51,7 @@ public sealed class RaftService : Rafter.RafterBase
         //logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got Vote message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
                 
         await raft.Handshake(new(
+            request.NodeId,
             request.Partition,
             request.MaxLogId,
             request.Endpoint
@@ -197,6 +198,7 @@ public sealed class RaftService : Rafter.RafterBase
                                 GrpcHandshakeRequest handshake = request.Handshake!;
 
                                 await raft.Handshake(new(
+                                    handshake.NodeId,
                                     handshake.Partition,
                                     handshake.MaxLogId,
                                     handshake.Endpoint

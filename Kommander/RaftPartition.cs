@@ -79,7 +79,7 @@ public sealed class RaftPartition : IDisposable
     {
         raftActor.Send(new(
             RaftRequestType.ReceiveHandshake, 
-            0, 
+            request.NodeId, 
             request.MaxLogId, 
             HLCTimestamp.Zero, 
             request.Endpoint

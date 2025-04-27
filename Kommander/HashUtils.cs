@@ -10,6 +10,16 @@ namespace Kommander;
 public static class HashUtils
 {
     /// <summary>
+    /// Computes a simple hash value for the given key using the xxHash32 algorithm.
+    /// </summary>
+    /// <param name="key">The input string to compute the hash for.</param>
+    /// <returns>The computed hash value as a 32-bit integer.</returns>
+    public static int SmallSimpleHash(string key)
+    {
+        return (int)xxHash32.ComputeHash(key);
+    }
+    
+    /// <summary>
     /// Computes a hash value for the given key using xxHash64 algorithm.
     /// </summary>
     /// <param name="key">The input string to compute the hash for.</param>
