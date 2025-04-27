@@ -1,6 +1,9 @@
 
 namespace Kommander.Support.Parallelization;
 
+/// <summary>
+/// Provides extension methods for parallelizing asynchronous operations on various enumerable types.
+/// </summary>
 public static class ParalellizationExtensions
 {
     public static async Task ForEachAsync<T>(this IEnumerable<T> enumerable, int maxDegreeOfParallelism, Func<T, Task> body)

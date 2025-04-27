@@ -3,6 +3,9 @@ using Kommander.Data;
 
 namespace Kommander.Communication;
 
+/// <summary>
+/// Represents an abstraction for handling communication between Raft nodes.
+/// </summary>
 public interface ICommunication
 {
     public Task<HandshakeResponse> Handshake(RaftManager manager, RaftNode node, HandshakeRequest request);

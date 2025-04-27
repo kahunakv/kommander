@@ -8,7 +8,9 @@ using Kommander.WAL;
 namespace Kommander;
 
 /// <summary>
-/// Represents a partition in a Raft cluster.
+/// Represents a partition in a Raft system. This class is responsible for managing
+/// the lifecycle and operational aspects of a Raft partition, including log replication,
+/// voting processes, and state management.
 /// </summary>
 public sealed class RaftPartition : IDisposable
 {
@@ -151,12 +153,14 @@ public sealed class RaftPartition : IDisposable
     }
 
     /// <summary>
-    /// Replicate a single log to the partition.
+    /// Replicates logs to the cluster, ensuring log consistency according to the Raft consensus algorithm.
+    /// (Replicates a single log to the partition)
     /// </summary>
-    /// <param name="type"></param>
-    /// <param name="data"></param>
-    /// <param name="autoCommit"></param>
-    /// <returns></returns>
+    /// <param name="type">The type of the log entry to be replicated.</param>
+    /// <param name="data">The byte array containing the data of the log entry.</param>
+    /// <param name="autoCommit">A boolean value indicating whether the log should be committed automatically upon replication success.</param>
+    /// <returns>A task that represents the asynchronous operation, containing a tuple with a boolean indicating success,
+    /// a <see cref="RaftOperationStatus"/> indicating the result status, and an <see cref="HLCTimestamp"/> representing the ticket ID for the log entry.</returns>
     public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, byte[] data, bool autoCommit)
     {
         if (string.IsNullOrEmpty(Leader))
@@ -177,14 +181,14 @@ public sealed class RaftPartition : IDisposable
         
         return (false, response.Status, HLCTimestamp.Zero);
     }
-    
+
     /// <summary>
-    /// Replicate logs to the partition.
+    /// Replicates logs across the Raft cluster.
     /// </summary>
-    /// <param name="type">A string identifying the user log type</param>
-    /// <param name="logs">A list of logs to replicate</param>
-    /// <param name="autoCommit"></param>
-    /// <returns></returns>
+    /// <param name="type">The type of the logs to be replicated, identified by a string.</param>
+    /// <param name="logs">A collection of log entries, each represented as a byte array, to be replicated.</param>
+    /// <param name="autoCommit">A boolean indicating whether the logs should be automatically committed after replication.</param>
+    /// <returns>A tuple containing a boolean indicating success, the status of the operation as a <see cref="RaftOperationStatus"/> value, and the <see cref="HLCTimestamp"/> ticket ID of the operation.</returns>
     public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, IEnumerable<byte[]> logs, bool autoCommit = true)
     {
         if (string.IsNullOrEmpty(Leader))
@@ -205,12 +209,12 @@ public sealed class RaftPartition : IDisposable
         
         return (false, response.Status, HLCTimestamp.Zero);
     }
-    
+
     /// <summary>
-    /// Commit logs and notify followers in the partition
+    /// Commits logs for the specified ticket identifier if the current node is the leader and notifies followers.
     /// </summary>
-    /// <param name="ticketId"></param>
-    /// <returns></returns>
+    /// <param name="ticketId">The logical timestamp associated with the logs to be committed.</param>
+    /// <returns>A tuple containing a boolean indicating success, the status of the operation as <see cref="RaftOperationStatus"/>, and the commit index of the logs.</returns>
     public async Task<(bool success, RaftOperationStatus status, long commitIndex)> CommitLogs(HLCTimestamp ticketId)
     {
         if (string.IsNullOrEmpty(Leader))
@@ -229,12 +233,13 @@ public sealed class RaftPartition : IDisposable
         
         return (false, response.Status, 0);
     }
-    
+
     /// <summary>
-    /// Rollback logs and notify followers in the partition
+    /// Attempts to roll back logs to a specific timestamp for the current Raft partition.
+    /// This operation can only be performed by the leader node of the partition.
     /// </summary>
-    /// <param name="ticketId"></param>
-    /// <returns></returns>
+    /// <param name="ticketId">The timestamp indicating the point to roll back the logs to.</param>
+    /// <returns>A tuple indicating the success of the operation, the operation status, and the commit index.</returns>
     public async Task<(bool success, RaftOperationStatus status, long commitIndex)> RollbackLogs(HLCTimestamp ticketId)
     {
         if (string.IsNullOrEmpty(Leader))
@@ -255,8 +260,12 @@ public sealed class RaftPartition : IDisposable
     }
 
     /// <summary>
-    /// Replicate a checkpoint to the partition.
+    /// Attempts to replicate a checkpoint across the Raft cluster in the specified partition
+    /// Checkpoints must be added to the Raft Log when the leader has replicated the logs to an external store.
     /// </summary>
+    /// <returns>
+    /// A tuple containing a boolean indicating success, the status of the operation, and the associated HLCTimestamp for the checkpoint.
+    /// </returns>
     public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateCheckpoint()
     {
         if (string.IsNullOrEmpty(Leader))
@@ -277,10 +286,12 @@ public sealed class RaftPartition : IDisposable
     }
 
     /// <summary>
-    /// Obtain the state of the partition.
+    /// Retrieves the current state of the Raft node.
     /// </summary>
-    /// <returns></returns>
-    /// <exception cref="RaftException"></exception>
+    /// <returns>The current state of the node as <see cref="RaftNodeState"/>.</returns>
+    /// <exception cref="RaftException">
+    /// Thrown if the response is invalid or cannot determine the node state.
+    /// </exception>
     public async ValueTask<RaftNodeState> GetState()
     {
         if (!string.IsNullOrEmpty(Leader) && Leader == manager.LocalEndpoint)
@@ -296,13 +307,15 @@ public sealed class RaftPartition : IDisposable
 
         return response.NodeState;
     }
-    
+
     /// <summary>
-    /// Obtain the ticket state by the specified ticketId
+    /// Retrieves the state of a ticket and its associated commit ID from the Raft partition.
+    /// Proposals produce a ticket ID that can be used to track the state of the proposal.
     /// </summary>
-    /// <param name="ticketId"></param>
-    /// <returns></returns>
-    /// <exception cref="RaftException"></exception>
+    /// <param name="ticketId">The unique identifier of the ticket based on a hybrid logical clock timestamp.</param>
+    /// <param name="autoCommit">A flag indicating whether the ticket should be automatically committed if not found in a final state.</param>
+    /// <returns>A tuple containing the state of the ticket (<see cref="RaftTicketState"/>) and the commit ID as a long value.</returns>
+    /// <exception cref="RaftException">Thrown when an unexpected or unknown response is received from the Raft actor.</exception>
     public async Task<(RaftTicketState state, long commitId)> GetTicketState(HLCTimestamp ticketId, bool autoCommit)
     {
         RaftResponse? response = await raftActor.Ask(new(RaftRequestType.GetTicketState, ticketId, autoCommit)).ConfigureAwait(false);

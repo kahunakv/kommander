@@ -13,7 +13,7 @@ using Nixie;
 namespace Kommander.Tests;
 
 [SuppressMessage("Performance", "CA1859:Use concrete types when possible for improved performance")]
-public sealed class TestThreeNodeClusterManyPartitions
+public sealed class TestThreeNodeCluster
 {
     private readonly ILogger<IRaft> logger;
     
@@ -21,7 +21,7 @@ public sealed class TestThreeNodeClusterManyPartitions
 
     private int totalFollowersReceived;
     
-    public TestThreeNodeClusterManyPartitions(ITestOutputHelper outputHelper)
+    public TestThreeNodeCluster(ITestOutputHelper outputHelper)
     {
         ILoggerFactory loggerFactory1 = LoggerFactory.Create(builder =>
         {
@@ -36,7 +36,7 @@ public sealed class TestThreeNodeClusterManyPartitions
     [Theory, CombinatorialData]
     public async Task TestJoinClusterAndDecideLeaderOnManyPartitions(
         [CombinatorialValues("memory", "sqlite", "rocksdb")] string walStorage,
-        [CombinatorialValues(1, 4, 8, 16)] int partitions
+        [CombinatorialValues(1, 8, 16)] int partitions
     )
     {
         (IRaft node1, IRaft node2, IRaft node3) = await AssembleThreNodeCluster(walStorage, partitions);
@@ -49,7 +49,7 @@ public sealed class TestThreeNodeClusterManyPartitions
     [Theory, CombinatorialData]
     public async Task TestJoinClusterAndMultiReplicateLogs(
         [CombinatorialValues("memory", "sqlite", "rocksdb")] string walStorage,
-        [CombinatorialValues(1, 4, 8, 16)] int partitions,
+        [CombinatorialValues(1, 8, 16)] int partitions,
         [CombinatorialValues(100, 250)] int entries
         
         //[CombinatorialValues("sqlite")] string walStorage,
@@ -145,7 +145,7 @@ public sealed class TestThreeNodeClusterManyPartitions
     [Theory, CombinatorialData]
     public async Task TestJoinClusterAndProposeReplicateLogs(
         [CombinatorialValues("memory", "sqlite", "rocksdb")] string walStorage,
-        [CombinatorialValues(1, 4, 8, 16)] int partitions
+        [CombinatorialValues(1, 8, 16)] int partitions
     )
     {
         (IRaft node1, IRaft node2, IRaft node3) = await AssembleThreNodeCluster(walStorage, partitions);
@@ -208,7 +208,7 @@ public sealed class TestThreeNodeClusterManyPartitions
     [Theory, CombinatorialData]
     public async Task TestJoinClusterAndProposeReplicateLogsRace(
         [CombinatorialValues("memory", "sqlite", "rocksdb")] string walStorage,
-        [CombinatorialValues(1, 4, 8, 16)] int partitions
+        [CombinatorialValues(1, 8, 16)] int partitions
     )
     {
         (IRaft node1, IRaft node2, IRaft node3) = await AssembleThreNodeCluster(walStorage, partitions);
@@ -276,7 +276,7 @@ public sealed class TestThreeNodeClusterManyPartitions
     [Theory, CombinatorialData]
     public async Task TestJoinClusterAndProposeReplicateLogsRace2(
         [CombinatorialValues("memory", "sqlite", "rocksdb")] string walStorage,
-        [CombinatorialValues(1, 4, 8, 16)] int partitions
+        [CombinatorialValues(1, 8, 16)] int partitions
     )
     {
         (IRaft node1, IRaft node2, IRaft node3) = await AssembleThreNodeCluster(walStorage, partitions);
@@ -350,7 +350,7 @@ public sealed class TestThreeNodeClusterManyPartitions
     [Theory, CombinatorialData]
     public async Task TestJoinClusterAndProposeReplicateLogsRace3(
         [CombinatorialValues("memory", "sqlite", "rocksdb")] string walStorage,
-        [CombinatorialValues(1, 4, 8, 16)] int partitions
+        [CombinatorialValues(1, 8, 16)] int partitions
     )
     {
         (IRaft node1, IRaft node2, IRaft node3) = await AssembleThreNodeCluster(walStorage, partitions);

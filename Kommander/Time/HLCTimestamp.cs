@@ -21,6 +21,16 @@ public readonly record struct HLCTimestamp : IComparable<HLCTimestamp>
         C = c;
     }
 
+    /// <summary>
+    /// Compares the current instance of <see cref="HLCTimestamp"/> with another instance and determines their relative order.
+    /// </summary>
+    /// <param name="other">The <see cref="HLCTimestamp"/> instance to compare with the current instance.</param>
+    /// <returns>
+    /// A signed integer that indicates the relative order of the instances being compared.
+    /// - Returns 0 if the current instance is equal to <paramref name="other"/>.
+    /// - Returns -1 if the current instance is less than <paramref name="other"/>.
+    /// - Returns 1 if the current instance is greater than <paramref name="other"/>.
+    /// </returns>
     public int CompareTo(HLCTimestamp other)
     {
         if (L == other.L)

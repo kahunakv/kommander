@@ -5,7 +5,9 @@
 namespace Kommander;
 
 /// <summary>
-/// 
+/// Represents a mechanism for managing quorum synchronization in a distributed system
+/// using the Raft consensus algorithm. This class tracks the completion of proposals
+/// and determines if a sufficient quorum has been reached within a given timeout period.
 /// </summary>
 public class RaftSyncProposalQuorum : IDisposable, IAsyncDisposable
 {

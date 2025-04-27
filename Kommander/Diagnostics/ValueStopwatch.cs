@@ -3,6 +3,16 @@ using System.Diagnostics;
 
 namespace Kommander.Diagnostics;
 
+/// <summary>
+/// A high-performance, allocation-free stopwatch that provides functionality to measure elapsed time
+/// without relying on heap allocations. Designed to be used in latency-critical or performance-sensitive
+/// scenarios where frequent timing operations are required.
+/// </summary>
+/// <remarks>
+/// The <see cref="ValueStopwatch"/> is a value type and provides accurate timing information by utilizing
+/// the high-resolution timestamp obtained from <see cref="System.Diagnostics.Stopwatch"/>. It is meant to
+/// function as a lightweight alternative to the standard <see cref="Stopwatch"/> class for specific use cases.
+/// </remarks>
 public readonly struct ValueStopwatch
 {
     private static readonly double TimestampToTicks = TimeSpan.TicksPerSecond / (double)Stopwatch.Frequency;
