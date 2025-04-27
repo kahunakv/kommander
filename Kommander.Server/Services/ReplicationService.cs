@@ -1,7 +1,5 @@
 
-using System.Diagnostics;
 using System.Text;
-using Kommander.Data;
 using Kommander.Diagnostics;
 
 namespace Kommander.Services;
@@ -24,7 +22,7 @@ public class ReplicationService : BackgroundService //, IDisposable
         
         await raft.JoinCluster().ConfigureAwait(false);
         
-        /*List<Task> tasks = new(40);
+        List<Task> tasks = new(40);
         
         while (true)
         {
@@ -39,7 +37,7 @@ public class ReplicationService : BackgroundService //, IDisposable
             await Task.WhenAll(tasks).ConfigureAwait(false);
 
             await Task.Delay(20000, stoppingToken).ConfigureAwait(false);
-        }*/
+        }
     }
 
     private async Task ReplicateToPartition(int i)
@@ -58,7 +56,7 @@ public class ReplicationService : BackgroundService //, IDisposable
             
             RaftReplicationResult result;
             
-            /*const string logType = "Greeting";
+            const string logType = "Greeting";
             byte[] data = Encoding.UTF8.GetBytes("Hello, World! " + key);
             
             ValueStopwatch stopwatch = ValueStopwatch.StartNew();
@@ -79,12 +77,12 @@ public class ReplicationService : BackgroundService //, IDisposable
                 else
                     Console.WriteLine("{0} #2 Replication failed {1} {2}ms", partitionId, result.Status, stopwatch.GetElapsedMilliseconds());
 
-                /*result = await raftManager.ReplicateLogs(i, logType, data).ConfigureAwait(false);
+                /*result = await raft.ReplicateLogs(i, logType, data).ConfigureAwait(false);
                 if (result.Success)
                     Console.WriteLine("{0} #3 Replicated log with id: {1}", i, result.LogIndex);
                 else
-                    Console.WriteLine("{0} #3 Replication failed {1}", i, result.Status);
-            }*/
+                    Console.WriteLine("{0} #3 Replication failed {1}", i, result.Status);*/
+            }
 
             result = await raft.ReplicateCheckpoint(partitionId).ConfigureAwait(false);
             if (result.Success)

@@ -85,6 +85,7 @@ public class GrpcCommunication : ICommunication
             Partition = request.Partition,
             Term = request.Term,
             MaxLogId = request.MaxLogId,
+            TimeNode = request.Time.N,
             TimePhysical = request.Time.L,
             TimeCounter = request.Time.C,
             Endpoint = request.Endpoint
@@ -130,6 +131,7 @@ public class GrpcCommunication : ICommunication
             Partition = request.Partition,
             Term = request.Term,
             MaxLogId = request.MaxLogId,
+            TimeNode = request.Time.N,
             TimePhysical = request.Time.L,
             TimeCounter = request.Time.C,
             Endpoint = request.Endpoint
@@ -174,6 +176,7 @@ public class GrpcCommunication : ICommunication
         {
             Partition = request.Partition,
             Term = request.Term,
+            TimeNode = request.Time.N,
             TimePhysical = request.Time.L,
             TimeCounter = request.Time.C,
             Endpoint = request.Endpoint
@@ -221,6 +224,7 @@ public class GrpcCommunication : ICommunication
         {
             Partition = request.Partition,
             Term = request.Term,
+            TimeNode = request.Time.N,
             TimePhysical = request.Time.L,
             TimeCounter = request.Time.C,
             Endpoint = request.Endpoint,
@@ -297,6 +301,7 @@ public class GrpcCommunication : ICommunication
                     Partition = requestItem.Vote.Partition,
                     Term = requestItem.Vote.Term,
                     MaxLogId = requestItem.Vote.MaxLogId,
+                    TimeNode = requestItem.Vote.Time.N,
                     TimePhysical = requestItem.Vote.Time.L,
                     TimeCounter = requestItem.Vote.Time.C,
                     Endpoint = requestItem.Vote.Endpoint
@@ -313,6 +318,7 @@ public class GrpcCommunication : ICommunication
                     Partition = requestItem.RequestVotes.Partition,
                     Term = requestItem.RequestVotes.Term,
                     MaxLogId = requestItem.RequestVotes.MaxLogId,
+                    TimeNode = requestItem.RequestVotes.Time.N,
                     TimePhysical = requestItem.RequestVotes.Time.L,
                     TimeCounter = requestItem.RequestVotes.Time.C,
                     Endpoint = requestItem.RequestVotes.Endpoint
@@ -328,6 +334,7 @@ public class GrpcCommunication : ICommunication
                 {
                     Partition = requestItem.AppendLogs.Partition,
                     Term = requestItem.AppendLogs.Term,
+                    TimeNode = requestItem.AppendLogs.Time.N,
                     TimePhysical = requestItem.AppendLogs.Time.L,
                     TimeCounter = requestItem.AppendLogs.Time.C,
                     Endpoint = requestItem.AppendLogs.Endpoint
@@ -346,6 +353,7 @@ public class GrpcCommunication : ICommunication
                 {
                     Partition = requestItem.CompleteAppendLogs.Partition,
                     Term = requestItem.CompleteAppendLogs.Term,
+                    TimeNode = requestItem.CompleteAppendLogs.Time.N,
                     TimePhysical = requestItem.CompleteAppendLogs.Time.L,
                     TimeCounter = requestItem.CompleteAppendLogs.Time.C,
                     Endpoint = requestItem.CompleteAppendLogs.Endpoint,
@@ -385,6 +393,7 @@ public class GrpcCommunication : ICommunication
                 Term = requestLog.Term,
                 Type = (GrpcRaftLogType)requestLog.Type,
                 LogType = requestLog.LogType,
+                TimeNode = requestLog.Time.N,
                 TimePhysical = requestLog.Time.L,
                 TimeCounter = requestLog.Time.C,
                 Data = UnsafeByteOperations.UnsafeWrap(requestLog.LogData)

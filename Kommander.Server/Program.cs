@@ -25,7 +25,8 @@ try
 {
     RaftConfiguration configuration = new()
     {
-        NodeName = string.IsNullOrEmpty(opts.RaftNodeId) ? Environment.MachineName : opts.RaftNodeId,
+        NodeName = string.IsNullOrEmpty(opts.RaftNodeName) ? Environment.MachineName : opts.RaftNodeName,
+        NodeId = opts.RaftNodeId,
         Host = opts.RaftHost,
         Port = opts.RaftPort,
         InitialPartitions = opts.InitialClusterPartitions

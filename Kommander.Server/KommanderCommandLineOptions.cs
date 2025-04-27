@@ -41,8 +41,11 @@ public sealed class KommanderCommandLineOptions
     [Option("initial-cluster-partitions", Required = false, HelpText = "Initial cluster number of partitions", Default = 16)]
     public int InitialClusterPartitions { get; set; }
 
+    [Option("raft-nodename", Required = false, HelpText = "Raft unique node name")]
+    public string RaftNodeName { get; set; } = "";
+
     [Option("raft-nodeid", Required = false, HelpText = "Raft unique node id")]
-    public string RaftNodeId { get; set; } = "";
+    public int RaftNodeId { get; set; } = 0;
 
     [Option("raft-host", Required = false, HelpText = "Host to listen for Raft consensus and replication requests", Default = "localhost")]
     public string RaftHost { get; set; } = "localhost";

@@ -57,7 +57,7 @@ public sealed class HybridLogicalClock : IDisposable
     /// <summary>
     /// Handles a send or local event by updating the clock state atomically.
     /// </summary>
-    public HLCTimestamp SendOrLocalEvent()
+    public HLCTimestamp SendOrLocalEvent(int nodeId)
     {
         while (true)
         {
@@ -73,7 +73,7 @@ public sealed class HybridLogicalClock : IDisposable
             
             // Try to atomically update the state.
             if (Interlocked.CompareExchange(ref _state, newState, current) == current)
-                return new(newL, newC);
+                return new(nodeId, newL, newC);
             
             // Otherwise, another thread has updated the state; try again.
         }
@@ -84,7 +84,7 @@ public sealed class HybridLogicalClock : IDisposable
     /// reads the latest state and computes a timestamp that is guaranteed to be higher than
     /// the current state even though it does not update the state itself.
     /// </summary>
-    public HLCTimestamp TrySendOrLocalEvent()
+    public HLCTimestamp TrySendOrLocalEvent(int nodeId)
     {
         // Read the current state.
         ClockState current = _state;
@@ -95,19 +95,19 @@ public sealed class HybridLogicalClock : IDisposable
 
         // Attempt one CAS update.
         if (Interlocked.CompareExchange(ref _state, candidate, current) == current)
-            return new(candidateL, candidateC); // Successfully updated state.
+            return new(nodeId, candidateL, candidateC); // Successfully updated state.
         
         // CAS failed; get the latest state and compute a timestamp that's higher.
         ClockState updatedState = _state; // Read the updated state.
         long newL = Math.Max(updatedState.L, physicalTime);
         uint newC = (newL == updatedState.L) ? updatedState.C + 1 : 0;
-        return new(newL, newC);
+        return new(nodeId, newL, newC);
     }
 
     /// <summary>
     /// Handles a receive event given a message timestamp.
     /// </summary>
-    public HLCTimestamp ReceiveEvent(HLClockMessage m)
+    public HLCTimestamp ReceiveEvent(int nodeId, HLClockMessage m)
     {
         if (m.L == 0)
             throw new RaftException("Invalid HLC timestamp argument");
@@ -134,14 +134,14 @@ public sealed class HybridLogicalClock : IDisposable
             ClockState newState = new(newL, newC);
             
             if (Interlocked.CompareExchange(ref _state, newState, current) == current)
-                return new(newL, newC);
+                return new(nodeId, newL, newC);
         }
     }
 
     /// <summary>
     /// Handles a receive event given a timestamp.
     /// </summary>
-    public HLCTimestamp ReceiveEvent(HLCTimestamp m)
+    public HLCTimestamp ReceiveEvent(int nodeId, HLCTimestamp m)
     {
         if (m.L == 0)
             throw new RaftException("Invalid HLC timestamp argument");
@@ -167,7 +167,7 @@ public sealed class HybridLogicalClock : IDisposable
 
             ClockState newState = new(newL, newC);
             if (Interlocked.CompareExchange(ref _state, newState, current) == current)
-                return new(newL, newC);
+                return new(nodeId, newL, newC);
         }
     }
     

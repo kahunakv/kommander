@@ -466,6 +466,7 @@ public sealed class TestThreeNodeCluster
         RaftConfiguration config = new()
         {
             NodeName = "node1",
+            NodeId = 1,
             Host = "localhost",
             Port = 8001,
             InitialPartitions = partitions,
@@ -497,6 +498,7 @@ public sealed class TestThreeNodeCluster
         RaftConfiguration config = new()
         {
             NodeName = "node2",
+            NodeId = 2,
             Host = "localhost",
             Port = 8002,
             InitialPartitions = partitions,
@@ -526,6 +528,7 @@ public sealed class TestThreeNodeCluster
         RaftConfiguration config = new()
         {
             NodeName = "node3",
+            NodeId = 3,
             Host = "localhost",
             Port = 8003,
             InitialPartitions = partitions,

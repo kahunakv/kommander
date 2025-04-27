@@ -25,9 +25,10 @@ message GrpcVoteRequest {
     int32 Partition = 1;
     int64 Term = 2;
     int64 MaxLogId = 3;
-    int64 TimePhysical = 4;
-    uint32 TimeCounter = 5;
-    string Endpoint = 6;
+    int32 TimeNode = 4;
+    int64 TimePhysical = 5;
+    uint32 TimeCounter = 6;
+    string Endpoint = 7;
 }
 
 message GrpcVoteResponse {
@@ -38,9 +39,10 @@ message GrpcRequestVotesRequest {
     int32 Partition = 1;
     int64 Term = 2;
     int64 MaxLogId = 3;
-    int64 TimePhysical = 4;
-    uint32 TimeCounter = 5;
-    string Endpoint = 6;
+    int32 TimeNode = 4;
+    int64 TimePhysical = 5;
+    uint32 TimeCounter = 6;
+    string Endpoint = 7;
 }
 
 message GrpcRequestVotesResponse {
@@ -50,10 +52,11 @@ message GrpcRequestVotesResponse {
 message GrpcAppendLogsRequest {
   int32 Partition = 1;
   int64 Term = 2;
-  int64 TimePhysical = 3;
-  uint32 TimeCounter = 4;
-  string Endpoint = 5;
-  repeated GrpcRaftLog Logs = 6;
+  int32 TimeNode = 3;
+  int64 TimePhysical = 4;
+  uint32 TimeCounter = 5;
+  string Endpoint = 6;
+  repeated GrpcRaftLog Logs = 7;
 }
 
 message GrpcAppendLogsResponse {
@@ -63,11 +66,12 @@ message GrpcAppendLogsResponse {
 message GrpcCompleteAppendLogsRequest {
   int32 Partition = 1;
   int64 Term = 2;
-  int64 TimePhysical = 3;
-  uint32 TimeCounter = 4;
-  string Endpoint = 5;
-  GrpcRaftOperationStatus Status = 6;
-  int64 CommitIndex = 7;
+  int32 TimeNode = 3;
+  int64 TimePhysical = 4;
+  uint32 TimeCounter = 5;
+  string Endpoint = 6;
+  GrpcRaftOperationStatus Status = 7;
+  int64 CommitIndex = 8;
 }
 
 message GrpcCompleteAppendLogsResponse {
@@ -78,10 +82,11 @@ message GrpcRaftLog {
   int64 Id = 1;
   GrpcRaftLogType Type = 2;
   int64 Term = 3;
-  int64 TimePhysical = 4;
-  uint32 TimeCounter = 5;
-  string LogType = 6;
-  bytes Data = 7;  
+  int32 TimeNode = 4;
+  int64 TimePhysical = 5;
+  uint32 TimeCounter = 6;
+  string LogType = 7;
+  bytes Data = 8;  
 }
 
 message GrpcBatchRequestsRequest

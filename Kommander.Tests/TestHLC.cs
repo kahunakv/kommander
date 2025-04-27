@@ -10,7 +10,7 @@ public class TestHLC
     [Fact]
     public void TestAddOperation()
     {
-        HLCTimestamp x = new(GetCurrentTime(), 0);
+        HLCTimestamp x = new(0, GetCurrentTime(), 0);
         HLCTimestamp p = x + 90000;
         
         Assert.True(p > x);
@@ -19,7 +19,7 @@ public class TestHLC
     [Fact]
     public void TestAddOperation2()
     {
-        HLCTimestamp x = new(GetCurrentTime(), 0);
+        HLCTimestamp x = new(0, GetCurrentTime(), 0);
         HLCTimestamp p = x + TimeSpan.FromMilliseconds(10000);
         
         Assert.True(p > x);
@@ -33,7 +33,7 @@ public class TestHLC
         Dictionary<HLCTimestamp, bool> hlc = new();
         
         for (int i = 0; i < 100; i++)
-            hlc.Add(clock.SendOrLocalEvent(), true);
+            hlc.Add(clock.SendOrLocalEvent(0), true);
             
         Assert.Equal(100, hlc.Count);
     }
@@ -41,8 +41,8 @@ public class TestHLC
     [Fact]
     public void TestHLCCompare()
     {
-        HLCTimestamp t1 = new(1744147995701, 1);
-        HLCTimestamp t2 = new(1744147995701, 2);
+        HLCTimestamp t1 = new(0, 1744147995701, 1);
+        HLCTimestamp t2 = new(0, 1744147995701, 2);
         
         Assert.Equal(-1, t1.CompareTo(t2));
     }
@@ -50,8 +50,8 @@ public class TestHLC
     [Fact]
     public void TestHLCCompare2()
     {
-        HLCTimestamp t1 = new(1744147995701, 1);
-        HLCTimestamp t2 = new(1744147995701, 1);
+        HLCTimestamp t1 = new(0, 1744147995701, 1);
+        HLCTimestamp t2 = new(0, 1744147995701, 1);
         
         Assert.Equal(0, t1.CompareTo(t2));
     }
@@ -59,8 +59,8 @@ public class TestHLC
     [Fact]
     public void TestHLCCompare3()
     {
-        HLCTimestamp t1 = new(1744147995701, 2);
-        HLCTimestamp t2 = new(1744147995701, 1);
+        HLCTimestamp t1 = new(0, 1744147995701, 2);
+        HLCTimestamp t2 = new(0, 1744147995701, 1);
         
         Assert.Equal(1, t1.CompareTo(t2));
     }

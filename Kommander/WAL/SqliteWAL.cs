@@ -58,6 +58,7 @@ public class SqliteWAL : IWAL, IDisposable
                 type INT,
                 logType STRING,
                 log BLOB,
+                timeNode INT,
                 timePhysical INT,
                 timeCounter INT,
                 PRIMARY KEY(partitionId, id)
@@ -140,7 +141,7 @@ public class SqliteWAL : IWAL, IDisposable
             long lastCheckpoint = GetLastCheckpointInternal(connection, partitionId);
 
             const string query = """
-             SELECT id, term, type, logType, log, timePhysical, timeCounter
+             SELECT id, term, type, logType, log, timeNode, timePhysical, timeCounter
              FROM logs
              WHERE partitionId = @partitionId AND id > @lastCheckpoint
              ORDER BY id ASC;
@@ -162,8 +163,11 @@ public class SqliteWAL : IWAL, IDisposable
                     Type = reader.IsDBNull(2) ? RaftLogType.Proposed : (RaftLogType)reader.GetInt32(2),
                     LogType = reader.IsDBNull(3) ? "" : reader.GetString(3),
                     LogData = reader.IsDBNull(4) ? [] : (byte[])reader[4],
-                    Time = new(reader.IsDBNull(5) ? 0 : reader.GetInt64(5),
-                        reader.IsDBNull(6) ? 0 : (uint)reader.GetInt64(6))
+                    Time = new(
+                        reader.IsDBNull(5) ? 0 : reader.GetInt32(5), 
+                        reader.IsDBNull(6) ? 0 : reader.GetInt64(6),
+                        reader.IsDBNull(7) ? 0 : (uint)reader.GetInt64(7)
+                    )
                 });
             }
 
@@ -186,7 +190,7 @@ public class SqliteWAL : IWAL, IDisposable
             int counter = 0;
 
             const string query = """
-             SELECT id, term, type, logType, log, timePhysical, timeCounter
+             SELECT id, term, type, logType, log, timeNode, timePhysical, timeCounter
              FROM logs
              WHERE partitionId = @partitionId AND id >= @startIndex
              ORDER BY id ASC;
@@ -208,7 +212,11 @@ public class SqliteWAL : IWAL, IDisposable
                     Type = reader.IsDBNull(2) ? RaftLogType.Proposed : (RaftLogType)reader.GetInt32(2),
                     LogType = reader.IsDBNull(3) ? "" : reader.GetString(3),
                     LogData = reader.IsDBNull(4) ? [] : (byte[])reader[4],
-                    Time = new(reader.IsDBNull(5) ? 0 : reader.GetInt64(5), reader.IsDBNull(6) ? 0 : (uint)reader.GetInt64(6))
+                    Time = new(
+                        reader.IsDBNull(5) ? 0 : reader.GetInt32(5), 
+                        reader.IsDBNull(6) ? 0 : reader.GetInt64(6),
+                        reader.IsDBNull(7) ? 0 : (uint)reader.GetInt64(7)
+                    )
                 });
 
                 counter++;
@@ -244,10 +252,10 @@ public class SqliteWAL : IWAL, IDisposable
         try
         {
             const string insertOrReplaceSql = """
-              INSERT INTO logs (id, partitionId, term, type, logType, log, timePhysical, timeCounter)
-              VALUES (@id, @partitionId, @term, @type, @logType, @log, @timePhysical, @timeCounter)
+              INSERT INTO logs (id, partitionId, term, type, logType, log, timeNode, timePhysical, timeCounter)
+              VALUES (@id, @partitionId, @term, @type, @logType, @log, @timeNode, @timePhysical, @timeCounter)
               ON CONFLICT(partitionId, id) DO UPDATE SET term=@term, type=@type, logType=@logType,
-              log=@log, timePhysical=@timePhysical, timeCounter=@timeCounter;
+              log=@log, timeNode=@timeNode, timePhysical=@timePhysical, timeCounter=@timeCounter;
               """;
             
             foreach (KeyValuePair<int, List<RaftLog>> kv in plan)
@@ -270,6 +278,7 @@ public class SqliteWAL : IWAL, IDisposable
                     insertOrReplaceCommand.Parameters.Add("@type", SqliteType.Integer);
                     insertOrReplaceCommand.Parameters.Add("@logType", SqliteType.Text);
                     insertOrReplaceCommand.Parameters.Add("@log", SqliteType.Blob);
+                    insertOrReplaceCommand.Parameters.Add("@timeNode", SqliteType.Integer);
                     insertOrReplaceCommand.Parameters.Add("@timePhysical", SqliteType.Integer);
                     insertOrReplaceCommand.Parameters.Add("@timeCounter", SqliteType.Integer);
                     
@@ -294,6 +303,7 @@ public class SqliteWAL : IWAL, IDisposable
                             else
                                 insertOrReplaceCommand.Parameters["@log"].Value = log.LogData;
 
+                            insertOrReplaceCommand.Parameters["@timeNode"].Value = log.Time.N;
                             insertOrReplaceCommand.Parameters["@timePhysical"].Value = log.Time.L;
                             insertOrReplaceCommand.Parameters["@timeCounter"].Value = log.Time.C;
 
@@ -316,7 +326,7 @@ public class SqliteWAL : IWAL, IDisposable
         } 
         catch (Exception ex)
         {
-            logger.LogError("Error during rollback: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
+            logger.LogError("Error during write: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
                     
             return RaftOperationStatus.Errored;
         }

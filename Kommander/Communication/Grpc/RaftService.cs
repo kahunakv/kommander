@@ -74,7 +74,7 @@ public sealed class RaftService : Rafter.RafterBase
             request.Partition,
             request.Term,
             request.MaxLogId,
-            new(request.TimePhysical, request.TimeCounter),
+            new(request.TimeNode, request.TimePhysical, request.TimeCounter),
             request.Endpoint
         ));
         
@@ -95,7 +95,7 @@ public sealed class RaftService : Rafter.RafterBase
             request.Partition,
             request.Term,
             request.MaxLogId,
-            new(request.TimePhysical, request.TimeCounter),
+            new(request.TimeNode, request.TimePhysical, request.TimeCounter),
             request.Endpoint
         ));
         
@@ -116,7 +116,7 @@ public sealed class RaftService : Rafter.RafterBase
         raft.AppendLogs(new(
             request.Partition, 
             request.Term, 
-            new(request.TimePhysical, request.TimeCounter), 
+            new(request.TimeNode, request.TimePhysical, request.TimeCounter), 
             request.Endpoint, 
             GetLogs(request.Logs)
         ));
@@ -132,7 +132,7 @@ public sealed class RaftService : Rafter.RafterBase
         raft.CompleteAppendLogs(new(
             request.Partition, 
             request.Term, 
-            new(request.TimePhysical, request.TimeCounter), 
+            new(request.TimeNode, request.TimePhysical, request.TimeCounter), 
             request.Endpoint,
             (RaftOperationStatus)request.Status,
             request.CommitIndex
@@ -152,7 +152,7 @@ public sealed class RaftService : Rafter.RafterBase
                 Id = requestLog.Id,
                 Term = requestLog.Term,
                 Type = (RaftLogType)requestLog.Type,
-                Time = new(requestLog.TimePhysical, requestLog.TimeCounter),
+                Time = new(requestLog.TimeNode, requestLog.TimePhysical, requestLog.TimeCounter),
                 LogType = requestLog.LogType
             };
             
@@ -217,7 +217,7 @@ public sealed class RaftService : Rafter.RafterBase
                                     requestVotes.Partition,
                                     requestVotes.Term,
                                     requestVotes.MaxLogId,
-                                    new(requestVotes.TimePhysical, requestVotes.TimeCounter),
+                                    new(requestVotes.TimeNode, requestVotes.TimePhysical, requestVotes.TimeCounter),
                                     requestVotes.Endpoint
                                 ));
                                 break;
@@ -231,7 +231,7 @@ public sealed class RaftService : Rafter.RafterBase
                                     voteRequest.Partition,
                                     voteRequest.Term,
                                     voteRequest.MaxLogId,
-                                    new(voteRequest.TimePhysical, voteRequest.TimeCounter),
+                                    new(voteRequest.TimeNode, voteRequest.TimePhysical, voteRequest.TimeCounter),
                                     voteRequest.Endpoint
                                 ));
                                 break;
@@ -244,7 +244,7 @@ public sealed class RaftService : Rafter.RafterBase
                                 raft.AppendLogs(new(
                                     appendLogsRequest.Partition,
                                     appendLogsRequest.Term,
-                                    new(appendLogsRequest.TimePhysical, appendLogsRequest.TimeCounter),
+                                    new(appendLogsRequest.TimeNode, appendLogsRequest.TimePhysical, appendLogsRequest.TimeCounter),
                                     appendLogsRequest.Endpoint,
                                     GetLogs(appendLogsRequest.Logs)
                                 ));
@@ -258,7 +258,7 @@ public sealed class RaftService : Rafter.RafterBase
                                 raft.CompleteAppendLogs(new(
                                     completeAppendLogsRequest.Partition,
                                     completeAppendLogsRequest.Term,
-                                    new(completeAppendLogsRequest.TimePhysical, completeAppendLogsRequest.TimeCounter),
+                                    new(completeAppendLogsRequest.TimeNode, completeAppendLogsRequest.TimePhysical, completeAppendLogsRequest.TimeCounter),
                                     completeAppendLogsRequest.Endpoint,
                                     (RaftOperationStatus)completeAppendLogsRequest.Status,
                                     completeAppendLogsRequest.CommitIndex

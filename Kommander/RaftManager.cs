@@ -218,7 +218,7 @@ public sealed class RaftManager : IRaft, IDisposable
 
         LocalEndpoint = string.Concat(configuration.Host, ":", configuration.Port);
         LocalNodeName = string.IsNullOrEmpty(this.configuration.NodeName) ? Environment.MachineName : this.configuration.NodeName;
-        LocalNodeId = HashUtils.SmallSimpleHash(LocalNodeName);
+        LocalNodeId = this.configuration.NodeId > 0 ? this.configuration.NodeId : HashUtils.SmallSimpleHash(LocalNodeName);
 
         clusterHandler = new(this, discovery);
 
@@ -1013,7 +1013,7 @@ public sealed class RaftManager : IRaft, IDisposable
 
                 if (string.IsNullOrEmpty(partition.Leader))
                 {
-                    await Task.Delay(150 + Random.Shared.Next(-50, 50), cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(100 + Random.Shared.Next(-50, 50), cancellationToken).ConfigureAwait(false);
                     continue;
                 }
 

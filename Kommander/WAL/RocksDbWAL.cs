@@ -123,7 +123,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 Id = message.Id,
                 Term = message.Term,
                 Type = (RaftLogType)message.Type,
-                Time = new(message.TimePhysical, message.TimeCounter),
+                Time = new(message.TimeNode, message.TimePhysical, message.TimeCounter),
                 LogType = message.LogType
             };
             
@@ -182,7 +182,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 Id = message.Id,
                 Term = message.Term,
                 Type = (RaftLogType)message.Type,
-                Time = new(message.TimePhysical, message.TimeCounter),
+                Time = new(message.TimeNode, message.TimePhysical, message.TimeCounter),
                 LogType = message.LogType
             };
 
@@ -222,6 +222,7 @@ public class RocksDbWAL : IWAL, IDisposable
                     Id = log.Id,
                     Term = log.Term,
                     Type = (int)log.Type,
+                    TimeNode = log.Time.N,
                     TimePhysical = log.Time.L,
                     TimeCounter = log.Time.C
                 };
@@ -285,6 +286,7 @@ public class RocksDbWAL : IWAL, IDisposable
                             Id = log.Id,
                             Term = log.Term,
                             Type = (int)log.Type,
+                            TimeNode = log.Time.N,
                             TimePhysical = log.Time.L,
                             TimeCounter = log.Time.C
                         };

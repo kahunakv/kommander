@@ -8,15 +8,18 @@ namespace Kommander.Time;
 /// </summary>
 public readonly record struct HLCTimestamp : IComparable<HLCTimestamp>
 {
-    public static readonly HLCTimestamp Zero = new(0, 0);
+    public static readonly HLCTimestamp Zero = new(0, 0, 0);
+    
+    public int N { get; }
 
     public long L { get; }
 
     public uint C { get; }
 
     [JsonConstructor]
-    public HLCTimestamp(long l, uint c)
+    public HLCTimestamp(int n, long l, uint c)
     {
+        N = n;
         L = l;
         C = c;
     }
@@ -33,16 +36,19 @@ public readonly record struct HLCTimestamp : IComparable<HLCTimestamp>
     /// </returns>
     public int CompareTo(HLCTimestamp other)
     {
-        if (L == other.L)
+        if (N == other.N)
         {
-            if (C == other.C)
-                return 0;
+            if (L == other.L)
+            {
+                if (C == other.C)
+                    return 0;
 
-            if (C < other.C)
-                return -1;
+                if (C < other.C)
+                    return -1;
 
-            if (C > other.C)
-                return 1;
+                if (C > other.C)
+                    return 1;
+            }
         }
 
         if (L < other.L)
@@ -53,21 +59,21 @@ public readonly record struct HLCTimestamp : IComparable<HLCTimestamp>
 
     public bool IsNull()
     {
-        return L == 0 && C == 0;
+        return N ==0 && L == 0 && C == 0;
     }
 
     public override string ToString()
     {
-        return $"HLC({L}:{C})";
+        return $"HLC({N}:{L}:{C})";
     }
 
-    public static HLCTimestamp operator +(HLCTimestamp a, int b) => new(a.L + b, a.C);
+    public static HLCTimestamp operator +(HLCTimestamp a, int b) => new(a.N, a.L + b, a.C);
     
-    public static HLCTimestamp operator +(HLCTimestamp a, TimeSpan b) => new(a.L + (long)b.TotalMilliseconds, a.C);
+    public static HLCTimestamp operator +(HLCTimestamp a, TimeSpan b) => new(a.N, a.L + (long)b.TotalMilliseconds, a.C);
 
-    public static HLCTimestamp operator -(HLCTimestamp a, int b) => new(a.L - b, a.C);
+    public static HLCTimestamp operator -(HLCTimestamp a, int b) => new(a.N, a.L - b, a.C);
     
-    public static HLCTimestamp operator -(HLCTimestamp a, TimeSpan b) => new(a.L - (long)b.TotalMilliseconds, a.C);
+    public static HLCTimestamp operator -(HLCTimestamp a, TimeSpan b) => new(a.N, a.L - (long)b.TotalMilliseconds, a.C);
     
     public static TimeSpan operator -(HLCTimestamp a, HLCTimestamp b) => TimeSpan.FromMilliseconds(a.L - b.L);
     

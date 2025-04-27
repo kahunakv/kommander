@@ -111,6 +111,7 @@ public class TestFiveNodeCluster
         RaftConfiguration config = new()
         {
             NodeName = "node1",
+            NodeId = 1,
             Host = "localhost",
             Port = 8001,
             InitialPartitions = partitions,
@@ -142,6 +143,7 @@ public class TestFiveNodeCluster
         RaftConfiguration config = new()
         {
             NodeName = "node2",
+            NodeId = 2,
             Host = "localhost",
             Port = 8002,
             InitialPartitions = partitions,
@@ -171,6 +173,7 @@ public class TestFiveNodeCluster
         RaftConfiguration config = new()
         {
             NodeName = "node3",
+            NodeId = 3,
             Host = "localhost",
             Port = 8003,
             InitialPartitions = partitions,
@@ -200,6 +203,7 @@ public class TestFiveNodeCluster
         RaftConfiguration config = new()
         {
             NodeName = "node4",
+            NodeId = 4,
             Host = "localhost",
             Port = 8004,
             InitialPartitions = partitions,
@@ -229,6 +233,7 @@ public class TestFiveNodeCluster
         RaftConfiguration config = new()
         {
             NodeName = "node5",
+            NodeId = 5,
             Host = "localhost",
             Port = 8005,
             InitialPartitions = partitions,
