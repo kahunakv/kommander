@@ -10,20 +10,59 @@ namespace Kommander;
 /// </summary>
 public sealed class RaftProposalQuorum
 {
+    /// <summary>
+    /// Stores the mapping of node IDs to their completion status within the Raft proposal quorum.
+    /// Each node ID represents a participant in the distributed consensus process, and its associated
+    /// completion status (`true` or `false`) indicates whether the node has completed its part
+    /// of the proposal.
+    /// </summary>
     private readonly Dictionary<string, bool> nodes = [];
 
+    /// <summary>
+    /// Indicates whether the Raft proposal has been successfully completed
+    /// by achieving a sufficient quorum of node completions. Once set to `true`,
+    /// it signifies that the distributed consensus process for the current proposal
+    /// has been finalized.
+    /// </summary>
     private bool completed;
-    
+
+    /// <summary>
+    /// Represents the current state of the Raft proposal quorum.
+    /// The state can denote whether the proposal is incomplete, completed,
+    /// committed, or rolled back, based on the progression and outcome
+    /// of the distributed consensus process.
+    /// </summary>
     public RaftProposalState State { get; private set; }
 
     public List<string> Nodes => nodes.Keys.ToList();
 
+    /// <summary>
+    /// Contains the collection of Raft logs associated with the proposal within the quorum.
+    /// Each log entry represents an operation or state in the consensus process, consisting of
+    /// an identifier, term, timestamp, data, and other relevant metadata.
+    /// </summary>
     public List<RaftLog> Logs { get; private set; }
-       
+
+    /// <summary>
+    /// Indicates whether the logs in the current Raft proposal quorum should be automatically committed upon achieving a quorum.
+    /// If set to true, the system will automatically commit the logs, bypassing any additional manual steps. This property
+    /// helps streamline the log commitment process in scenarios where automatic completion is preferred.
+    /// </summary>
     public bool AutoCommit { get; private set; }
-    
+
+    /// <summary>
+    /// Indicates the hybrid logical clock (HLC) timestamp that represents the starting point
+    /// of the Raft proposal quorum operation. This timestamp is used to measure the elapsed
+    /// time of the quorum process and track proposal-related timing for consistency and diagnostics.
+    /// </summary>
     public HLCTimestamp StartTimestamp { get; private set; }
-    
+
+    /// <summary>
+    /// Retrieves the index of the last log entry within the proposal quorum.
+    /// This index serves as a reference to the most recently added log entry
+    /// maintained in the quorum, typically reflecting progress in the log replication process
+    /// during distributed consensus.
+    /// </summary>
     public long LastLogIndex => Logs.Last().Id;
 
     /// <summary>

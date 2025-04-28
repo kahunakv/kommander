@@ -16,7 +16,7 @@ public sealed class RaftResponse
 
     public RaftNodeState NodeState { get; } = RaftNodeState.Follower;
     
-    public RaftTicketState TicketState { get; } = RaftTicketState.NotFound;
+    public RaftProposalTicketState ProposalTicketState { get; } = RaftProposalTicketState.NotFound;
     
     public long LogIndex { get; }
     
@@ -28,10 +28,10 @@ public sealed class RaftResponse
         NodeState = nodeState;
     }
     
-    public RaftResponse(RaftResponseType type, RaftTicketState ticketState, long logIndex)
+    public RaftResponse(RaftResponseType type, RaftProposalTicketState proposalTicketState, long logIndex)
     {
         Type = type;
-        TicketState = ticketState;
+        ProposalTicketState = proposalTicketState;
         LogIndex = logIndex;
     }
     

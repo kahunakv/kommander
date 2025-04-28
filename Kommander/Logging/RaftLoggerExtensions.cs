@@ -53,4 +53,7 @@ public static partial class RaftLoggerExtensions
     
     [LoggerMessage(Level = LogLevel.Debug, Message = "[{Endpoint}/{PartitionId}] Proposed log #{Id}")]
     public static partial void LogDebugProposedLogs(this ILogger<IRaft> logger, string endpoint, int partitionId, long id);
+    
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{Endpoint}] Write of {Batch} took {Elapsed}ms")]
+    public static partial void LogDebugWriteOf(this ILogger<IRaft> logger, string endpoint, int batch, long elapsed);
 }

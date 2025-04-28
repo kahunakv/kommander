@@ -10,20 +10,65 @@ namespace Kommander.WAL;
 /// </summary>
 public class SqliteWAL : IWAL, IDisposable
 {
+    /// <summary>
+    /// Represents the maximum number of ranged log entries that can be read in a single call.
+    /// This constant is used to limit the number of Raft log entries retrieved from the SQLite Write-Ahead Log (WAL)
+    /// during operations like reading a range of logs. It ensures that the operation retrieves a reasonable number
+    /// of entries to prevent excessive memory usage or prolonged database operations.
+    /// </summary>
     private const int MaxNumberOfRangedEntries = 100;
 
+    /// <summary>
+    /// Provides synchronization to ensure thread-safe operations when accessing or modifying the SQLite Write-Ahead Log (WAL).
+    /// This semaphore is used to manage concurrent access to database resources, particularly during critical sections
+    /// such as opening connections or executing commands. It enforces sequential execution in scenarios where resource
+    /// contention could occur, thus preventing race conditions or data corruption.
+    /// </summary>
     private readonly SemaphoreSlim semaphore = new(1, 1);
 
+    /// <summary>
+    /// Maps partition IDs to their corresponding resources,
+    /// specifically a tuple containing a <see cref="ReaderWriterLock"/>
+    /// for thread-safe access and a <see cref="SqliteConnection"/> for database operations.
+    /// This structure is used to manage and store active connections to each partition's SQLite
+    /// Write-Ahead Log (WAL) file, enabling synchronization and efficient database access.
+    /// </summary>
     private readonly Dictionary<int, (ReaderWriterLock, SqliteConnection)> connections = new();
 
+    /// <summary>
+    /// Represents the base directory path used for database file storage in the SQLite Write-Ahead Log (WAL).
+    /// This variable is utilized to construct the file paths for partitioned Raft log databases and metadata files.
+    /// It serves as the root directory for all WAL-related database operations, ensuring proper file organization
+    /// and retrieval during Raft consensus operations.
+    /// </summary>
     private readonly string path;
 
+    /// <summary>
+    /// Represents the revision identifier used to differentiate database files associated with the Write-Ahead Log (WAL).
+    /// This variable is part of the internal implementation of the SqliteWAL class and is used to construct file paths
+    /// for Raft logs and metadata databases. The revision ensures that multiple independent instances of WAL can operate
+    /// without conflicting, even if they share the same base directory.
+    /// </summary>
     private readonly string revision;
-    
+
+    /// <summary>
+    /// Represents a connection to the SQLite database used for storing metadata for the Write-Ahead Log (WAL).
+    /// This connection is responsible for managing the metadata table, executing SQL commands related to metadata storage,
+    /// and ensuring thread-safety when interacting with the metadata database.
+    /// </summary>
     private SqliteConnection? metaDataConnection;
-    
+
+    /// <summary>
+    /// Represents the logger instance used for recording messages, errors, and debug information
+    /// related to the operation of the SQLite Write-Ahead Log (WAL) for Raft logs.
+    /// This logger provides diagnostic information for tracking issues, debugging,
+    /// and monitoring activities in the WAL implementation.
+    /// </summary>
     private readonly ILogger<IRaft> logger;
 
+    /// <summary>
+    /// Represents a Write-Ahead Log (WAL) implementation using SQLite as the storage backend.
+    /// </summary>
     public SqliteWAL(string path, string revision, ILogger<IRaft> logger)
     {
         this.path = path;
@@ -31,6 +76,11 @@ public class SqliteWAL : IWAL, IDisposable
         this.logger = logger;
     }
 
+    /// <summary>
+    /// Attempts to open or retrieve an existing SQLite database connection and its associated reader-writer lock for the specified partition.
+    /// </summary>
+    /// <param name="partitionId">The unique identifier of the partition for which the database connection is to be retrieved or opened.</param>
+    /// <returns>A tuple containing a <see cref="ReaderWriterLock"/> and a <see cref="SqliteConnection"/> associated with the specified partition.</returns>
     private (ReaderWriterLock, SqliteConnection) TryOpenDatabase(int partitionId)
     {
         if (connections.TryGetValue(partitionId, out (ReaderWriterLock readerWriterLock, SqliteConnection connection) connTuple))
@@ -83,7 +133,14 @@ public class SqliteWAL : IWAL, IDisposable
             semaphore.Release();
         }
     }
-    
+
+    /// <summary>
+    /// Attempts to open and initialize the metadata database associated with the Write-Ahead Log (WAL).
+    /// Ensures the database file exists, applies necessary configurations, and sets up required tables.
+    /// </summary>
+    /// <returns>
+    /// A SqliteConnection object that represents an open connection to the metadata database.
+    /// </returns>
     private SqliteConnection TryOpenMetaDataDatabase()
     {
         if (metaDataConnection is not null)
@@ -128,6 +185,11 @@ public class SqliteWAL : IWAL, IDisposable
         }
     }
 
+    /// <summary>
+    /// Reads logs from the specified partition starting from the last checkpoint.
+    /// </summary>
+    /// <param name="partitionId">The identifier of the partition to read logs from.</param>
+    /// <returns>A list of <see cref="RaftLog"/> containing the logs retrieved from the partition.</returns>
     public List<RaftLog> ReadLogs(int partitionId)
     {
         (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
@@ -179,6 +241,12 @@ public class SqliteWAL : IWAL, IDisposable
         }
     }
 
+    /// <summary>
+    /// Reads a range of Raft logs starting from a specified log index for a given partition.
+    /// </summary>
+    /// <param name="partitionId">The identifier of the partition from which logs should be read.</param>
+    /// <param name="startLogIndex">The starting log index from which logs will be retrieved.</param>
+    /// <returns>A list of <see cref="RaftLog"/> objects representing the logs in the specified range.</returns>
     public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex)
     {
         (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
@@ -232,7 +300,19 @@ public class SqliteWAL : IWAL, IDisposable
             readerWriterLock.ReleaseReaderLock();
         }
     }
-    
+
+    /// <summary>
+    /// Writes a collection of logs to a SQLite-backed Write-Ahead Log (WAL) system,
+    /// grouping them by partition ID and ensuring efficient upserts for replication and consistency.
+    /// </summary>
+    /// <param name="logs">
+    /// A list of tuples where each tuple contains a partition ID and a list of RaftLog entries
+    /// associated with that partition.
+    /// </param>
+    /// <returns>
+    /// Returns a <see cref="RaftOperationStatus"/> indicating the outcome of the write operation.
+    /// Success is returned upon successful completion, while specific statuses convey errors or failures.
+    /// </returns>
     public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs)
     {
         Dictionary<int, List<RaftLog>> plan = new();
@@ -334,6 +414,11 @@ public class SqliteWAL : IWAL, IDisposable
         return RaftOperationStatus.Success;
     }
 
+    /// <summary>
+    /// Retrieves the highest log identifier from the logs for a specific partition.
+    /// </summary>
+    /// <param name="partitionId">The unique identifier of the partition from which the maximum log identifier is retrieved.</param>
+    /// <returns>The highest log identifier for the specified partition. Returns 0 if no logs are found or an error occurs.</returns>
     public long GetMaxLog(int partitionId)
     {
         try
@@ -369,6 +454,11 @@ public class SqliteWAL : IWAL, IDisposable
         }
     }
 
+    /// <summary>
+    /// Retrieves the current term of the Raft log for the specified partition.
+    /// </summary>
+    /// <param name="partitionId">The identifier of the partition for which the current term is to be retrieved.</param>
+    /// <returns>The current term of the Raft log for the specified partition, or 0 if no logs are present.</returns>
     public long GetCurrentTerm(int partitionId)
     {
         (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
@@ -394,7 +484,12 @@ public class SqliteWAL : IWAL, IDisposable
             readerWriterLock.ReleaseReaderLock();
         }
     }
-    
+
+    /// <summary>
+    /// Retrieves the last recorded checkpoint for the specified log partition.
+    /// </summary>
+    /// <param name="partitionId">The ID of the log partition for which to get the last checkpoint.</param>
+    /// <returns>Returns the log index of the last checkpoint within the specified partition.</returns>
     public long GetLastCheckpoint(int partitionId)
     {
         (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
@@ -411,6 +506,12 @@ public class SqliteWAL : IWAL, IDisposable
         }
     }
 
+    /// <summary>
+    /// Retrieves the last committed checkpoint ID from the SQLite logs table for the specified partition.
+    /// </summary>
+    /// <param name="connection">The SQLite database connection used to execute the query.</param>
+    /// <param name="partitionId">The identifier of the partition for which the last checkpoint ID is retrieved.</param>
+    /// <returns>The ID of the last committed checkpoint. Returns 0 if no committed checkpoints are found, or -1 in case of errors.</returns>
     private static long GetLastCheckpointInternal(SqliteConnection connection, int partitionId)
     {
         const string query = "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId AND type = @type";
@@ -427,6 +528,16 @@ public class SqliteWAL : IWAL, IDisposable
         return -1;
     }
 
+    /// <summary>
+    /// Compacts logs in the SQLite database that are older than the specified checkpoint and within the specified limit.
+    /// </summary>
+    /// <param name="partitionId">The identifier of the partition whose logs are to be compacted.</param>
+    /// <param name="lastCheckpoint">The checkpoint ID indicating the upper bound for compaction. Logs with IDs less than this value will be compacted.</param>
+    /// <param name="compactNumberEntries">The maximum number of log entries to be compacted in a single operation.</param>
+    /// <returns>
+    /// A <see cref="RaftOperationStatus"/> value indicating the outcome of the operation:
+    /// Success if the compaction succeeds, Errored if an error occurs during the operation, or other applicable status codes.
+    /// </returns>
     public RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
     {
         (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
@@ -502,7 +613,12 @@ public class SqliteWAL : IWAL, IDisposable
         
         return RaftOperationStatus.Success;
     }
-    
+
+    /// <summary>
+    /// Retrieves a metadata value associated with the specified key from the SQLite metadata store.
+    /// </summary>
+    /// <param name="key">The key for which the metadata value is to be retrieved.</param>
+    /// <returns>The metadata value associated with the specified key, or null if the key does not exist or the value is null.</returns>
     public string? GetMetaData(string key)
     {
         SqliteConnection connection = TryOpenMetaDataDatabase();
@@ -520,15 +636,21 @@ public class SqliteWAL : IWAL, IDisposable
         return null;
     }
 
+    /// <summary>
+    /// Updates or sets the metadata associated with the specified key in the SQLite database.
+    /// </summary>
+    /// <param name="key">The key identifying the metadata to be updated or added.</param>
+    /// <param name="value">The value to be assigned to the specified key.</param>
+    /// <returns>Returns <c>true</c> if the metadata update or insertion was successful.</returns>
     public bool SetMetaData(string key, string value)
     {
         SqliteConnection connection = TryOpenMetaDataDatabase();
-        
+
         const string insertOrReplaceSql = """
-          INSERT INTO metadata (key, value)
-          VALUES (@key, @value)
-          ON CONFLICT(key) DO UPDATE SET value=@value;
-          """;
+                                          INSERT INTO metadata (key, value)
+                                          VALUES (@key, @value)
+                                          ON CONFLICT(key) DO UPDATE SET value=@value;
+                                          """;
         
         using SqliteCommand insertOrReplaceCommand = new(insertOrReplaceSql, connection);
 

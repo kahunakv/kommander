@@ -23,7 +23,16 @@ public sealed class RaftWriteAhead
     private readonly IWAL walAdapter;
 
     private readonly ILogger<IRaft> logger;
-    
+
+    /// <summary>
+    /// A private dictionary to store and manage collections of <see cref="RaftLog"/> objects
+    /// categorized by their respective actions (<see cref="RaftLogAction"/>). This dictionary
+    /// is utilized to track operations such as propose, commit, and rollback for logs during
+    /// the write-ahead process in the Raft consensus algorithm.
+    ///
+    /// By grouping logs based on their actions we can enqueue the write operations in the
+    /// persistence (rocksdb or sqlite) in a more efficient way.
+    /// </summary>
     private readonly SmallDictionary<RaftLogAction, List<RaftLog>> plan = new(3);
     
     private readonly int compactEveryOperations;
