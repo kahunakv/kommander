@@ -1,7 +1,8 @@
 
+using Kommander.Data;
 using Kommander.Time;
 
-namespace Kommander.Data;
+namespace Kommander;
 
 /// <summary>
 /// Represents a quorum for a Raft proposal, managing state and node completions
@@ -17,18 +18,23 @@ public sealed class RaftProposalQuorum
 
     public List<string> Nodes => nodes.Keys.ToList();
 
-    public List<RaftLog> Logs { get; }
+    public List<RaftLog> Logs { get; private set; }
+       
+    public bool AutoCommit { get; private set; }
+    
+    public HLCTimestamp StartTimestamp { get; private set; }
     
     public long LastLogIndex => Logs.Last().Id;
 
-    public bool AutoCommit { get; }
-    
-    public HLCTimestamp StartTimestamp { get; }
-
+    /// <summary>
+    /// Represents a quorum for a Raft proposal. The quorum is responsible for managing
+    /// proposal-specific details such as the logs associated with the proposal,
+    /// whether the proposal is set to auto-commit, and its initial timestamp.
+    /// </summary>
     public RaftProposalQuorum(List<RaftLog> logs, bool autoCommit, HLCTimestamp startTimestamp)
     {
         State = RaftProposalState.Incomplete;
-        
+
         Logs = logs;
         AutoCommit = autoCommit;
         StartTimestamp = startTimestamp;
@@ -86,5 +92,27 @@ public sealed class RaftProposalQuorum
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Resets the Raft proposal quorum to its initial state using the provided logs, auto-commit setting,
+    /// and start timestamp.
+    /// </summary>
+    /// <param name="logs">The collection of Raft logs to associate with the quorum.</param>
+    /// <param name="autoCommit">A boolean flag indicating whether the proposal should be auto-committed.</param>
+    /// <param name="startTimestamp">The timestamp marking the start of the proposal.</param>
+    public void Reset(List<RaftLog> logs, bool autoCommit, HLCTimestamp startTimestamp)
+    {
+        State = RaftProposalState.Incomplete;        
+        completed = false;
+        Logs = logs;
+        AutoCommit = autoCommit;
+        StartTimestamp = startTimestamp;        
+    }
+
+    public void Clear()
+    {
+        Logs.Clear();
+        nodes.Clear();
     }
 }

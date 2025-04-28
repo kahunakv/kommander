@@ -1,6 +1,4 @@
 
-using System.Runtime.CompilerServices;
-using Kommander.Data;
 using Kommander.Time;
 
 namespace Kommander.Tests.Time;
@@ -65,6 +63,16 @@ public class TestHLC
         Assert.Equal(1, t1.CompareTo(t2));
     }
     
+    [Fact]
+    public void TestHLCCompare4()
+    {
+        HLCTimestamp t1 = new(3, 1745805885489, 11);
+        HLCTimestamp t2 = new(2, 1745805885489, 3);
+        
+        Assert.Equal(1, t1.CompareTo(t2));
+        Assert.Equal(-1, t2.CompareTo(t1));
+    }     
+   
     private static long GetCurrentTime()
     {
         return ((DateTimeOffset)DateTime.UtcNow).ToUnixTimeMilliseconds();

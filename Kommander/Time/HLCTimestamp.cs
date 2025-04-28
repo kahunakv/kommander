@@ -51,6 +51,13 @@ public readonly record struct HLCTimestamp : IComparable<HLCTimestamp>
             }
         }
 
+        if (L == other.L)
+        {
+            if (C > other.C)
+                return 1;            
+            return -1;
+        }
+        
         if (L < other.L)
             return -1;
 

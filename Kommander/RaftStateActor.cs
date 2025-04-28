@@ -974,13 +974,31 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
 
         if (nodeState != RaftNodeState.Leader)
             return (RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
-
-        /*foreach (KeyValuePair<HLCTimestamp, RaftProposalQuorum> proposal in activeProposals)
-        {
-            if (!proposal.Value.HasQuorum())
-                return (RaftOperationStatus.ActiveProposal, HLCTimestamp.Zero);
-        }*/
         
+        HLCTimestamp currentTime = manager.HybridLogicalClock.SendOrLocalEvent(manager.LocalNodeId);
+
+        // Try to clear and reuse expired proposals
+        if (activeProposals.Count > 5)
+        {
+            TimeSpan range = TimeSpan.FromSeconds(30);
+            Dictionary<HLCTimestamp, RaftProposalQuorum> tickets = new();            
+
+            foreach (KeyValuePair<HLCTimestamp, RaftProposalQuorum> proposal in activeProposals)
+            {
+                if (proposal.Value.HasQuorum() && currentTime - proposal.Value.StartTimestamp > range)
+                    tickets.Add(proposal.Key, proposal.Value);
+            }
+
+            if (tickets.Count > 0)
+            {
+                foreach (KeyValuePair<HLCTimestamp, RaftProposalQuorum> kv in tickets)
+                {
+                    RaftProposalQuorumPool.Return(kv.Value);
+                    activeProposals.Remove(kv.Key);
+                }                               
+            }
+        }
+
         List<RaftNode> nodes = manager.Nodes;
         
         if (nodes.Count == 0)
@@ -988,9 +1006,7 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] No quorum available to propose logs", manager.LocalEndpoint, partition.PartitionId, nodeState);
             
             return (RaftOperationStatus.Errored, HLCTimestamp.Zero);
-        }
-        
-        HLCTimestamp currentTime = manager.HybridLogicalClock.SendOrLocalEvent(manager.LocalNodeId);
+        }               
 
         foreach (RaftLog log in logs)
         {
@@ -1008,7 +1024,7 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
             return (RaftOperationStatus.Errored, HLCTimestamp.Zero);
         }
 
-        RaftProposalQuorum proposalQuorum = new(logs, autoCommit, currentTime);
+        RaftProposalQuorum proposalQuorum = RaftProposalQuorumPool.Rent(logs, autoCommit, currentTime); // new(logs, autoCommit, currentTime);
         
         // Mark itself as completed
         proposalQuorum.MarkNodeCompleted(manager.LocalEndpoint);
@@ -1023,7 +1039,8 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
             AppendLogToNode(node, currentTime, logs);
         }
 
-        activeProposals.TryAdd(currentTime, proposalQuorum);
+        if (!activeProposals.TryAdd(currentTime, proposalQuorum))
+            return (RaftOperationStatus.Errored, HLCTimestamp.Zero);
         
         if (logger.IsEnabled(LogLevel.Debug))
             logger.LogDebugProposedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, currentTime, string.Join(',', logs.Select(x => x.Id.ToString())));
@@ -1121,7 +1138,7 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
             return (RaftOperationStatus.Errored, HLCTimestamp.Zero);
         }
 
-        RaftProposalQuorum proposalQuorum = new(checkpointLogs, true, currentTime);
+        RaftProposalQuorum proposalQuorum = RaftProposalQuorumPool.Rent(checkpointLogs, true, currentTime);
 
         foreach (RaftNode node in nodes)
         {
@@ -1203,6 +1220,7 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
                 (currentTime - proposal.StartTimestamp).TotalMilliseconds                
             );
         
+        //RaftProposalQuorumPool.Return(proposal);
         //activeProposals.Remove(ticketId);
         
         return (RaftOperationStatus.Success, commitResponse.Index);
@@ -1255,8 +1273,14 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
         }
 
         if (logger.IsEnabled(LogLevel.Debug))
-            logger.LogDebugRolledbackLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId, string.Join(',', proposal.Logs.Select(x => x.Id.ToString())));
+            logger.LogDebugRolledbackLogs(
+                manager.LocalEndpoint, 
+                partition.PartitionId, 
+                nodeState, ticketId, 
+                string.Join(',', proposal.Logs.Select(x => x.Id.ToString()))
+            );
         
+        //RaftProposalQuorumPool.Return(proposal);
         //activeProposals.Remove(ticketId);
         
         return (RaftOperationStatus.Success, commitResponse.Index);
