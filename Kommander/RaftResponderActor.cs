@@ -1,6 +1,7 @@
 
 using Nixie;
 using Kommander.Communication;
+using Kommander.Communication.Grpc;
 using Kommander.Data;
 using Microsoft.Extensions.Logging;
 
@@ -88,40 +89,48 @@ public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
 
             logger.LogDebug("Sending block of {Count} messages", messages.Count);
 
-            List<BatchRequestsRequestItem> request = new(messages.Count);
+            List<BatchRequestsRequestItem> requestItems = GrpcCommunicationPool.RentListBatchRequestsRequestItem(messages.Count);
 
-            foreach (RaftResponderRequest message in messages)
+            try
             {
-                switch (message.Type)
+
+                foreach (RaftResponderRequest message in messages)
                 {
-                    case RaftResponderRequestType.Handshake:
-                        request.Add(new() { Type = BatchRequestsRequestType.Handshake, Handshake = message.HandshakeRequest });
-                        break;
+                    switch (message.Type)
+                    {
+                        case RaftResponderRequestType.Handshake:
+                            requestItems.Add(new() { Type = BatchRequestsRequestType.Handshake, Handshake = message.HandshakeRequest });
+                            break;
 
-                    case RaftResponderRequestType.Vote:
-                        request.Add(new() { Type = BatchRequestsRequestType.Vote, Vote = message.VoteRequest });
-                        break;
+                        case RaftResponderRequestType.Vote:
+                            requestItems.Add(new() { Type = BatchRequestsRequestType.Vote, Vote = message.VoteRequest });
+                            break;
 
-                    case RaftResponderRequestType.RequestVotes:
-                        request.Add(new() { Type = BatchRequestsRequestType.RequestVote, RequestVotes = message.RequestVotesRequest });
-                        break;
+                        case RaftResponderRequestType.RequestVotes:
+                            requestItems.Add(new() { Type = BatchRequestsRequestType.RequestVote, RequestVotes = message.RequestVotesRequest });
+                            break;
 
-                    case RaftResponderRequestType.AppendLogs:
-                        request.Add(new() { Type = BatchRequestsRequestType.AppendLogs, AppendLogs = message.AppendLogsRequest });
-                        break;
+                        case RaftResponderRequestType.AppendLogs:
+                            requestItems.Add(new() { Type = BatchRequestsRequestType.AppendLogs, AppendLogs = message.AppendLogsRequest });
+                            break;
 
-                    case RaftResponderRequestType.CompleteAppendLogs:
-                        request.Add(new() { Type = BatchRequestsRequestType.CompleteAppendLogs, CompleteAppendLogs = message.CompleteAppendLogsRequest });
-                        break;
+                        case RaftResponderRequestType.CompleteAppendLogs:
+                            requestItems.Add(new() { Type = BatchRequestsRequestType.CompleteAppendLogs, CompleteAppendLogs = message.CompleteAppendLogsRequest });
+                            break;
 
-                    case RaftResponderRequestType.TryBatch:
-                    default:
-                        logger.LogError("Unsupported message {Type}", message.Type);
-                        break;
+                        case RaftResponderRequestType.TryBatch:
+                        default:
+                            logger.LogError("Unsupported message {Type}", message.Type);
+                            break;
+                    }
                 }
-            }
 
-            await communication.BatchRequests(manager, node, new() { Requests = request }).ConfigureAwait(false);
+                await communication.BatchRequests(manager, node, new() { Requests = requestItems }).ConfigureAwait(false);
+            }
+            finally
+            {
+                GrpcCommunicationPool.Return(requestItems);
+            }
         }
         catch (Exception ex)
         {

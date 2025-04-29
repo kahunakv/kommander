@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using Kommander.Data;
 using Microsoft.Extensions.Logging;
+using Kommander.Logging;
 
 namespace Kommander;
 
@@ -79,7 +80,7 @@ internal sealed class RaftBatcher
             {
                 do
                 {
-                    while (inbox.TryDequeue(out RaftBatcherItem? message))
+                    while (inbox.TryDequeue(out RaftBatcherItem message))
                         messages.Add(message);
 
                     if (messages.Count > 0)
@@ -112,29 +113,36 @@ internal sealed class RaftBatcher
         
         stopwatch.Restart();
         
-        List<(int, List<RaftLog>)> logs = new(requests.Count);
+        List<(int, List<RaftLog>)> logs = RaftBatcherPool.RentRaftLogsPlan(requests.Count);
 
-        foreach (RaftBatcherItem request in requests)
-        {
-            logs.Add(request.Request);
-            count += request.Request.Item2.Count;
-        }
-
-        RaftOperationStatus response = await manager.WriteThreadPool.EnqueueTask(() => manager.WalAdapter.Write(logs));
-        
-        manager.Logger.LogDebug("[{Endpoint}] Write of {Batch} took {Elapsed}ms", manager.LocalEndpoint, count, stopwatch.ElapsedMilliseconds);
-
-        if (response == RaftOperationStatus.Success)
+        try
         {
             foreach (RaftBatcherItem request in requests)
-                request.Promise.TrySetResult(response);
+            {
+                logs.Add(request.Request);
+                count += request.Request.Item2.Count;
+            }
 
-            return;
+            RaftOperationStatus response = await manager.WriteThreadPool.EnqueueTask(() => manager.WalAdapter.Write(logs));
+
+            manager.Logger.LogDebugWriteOf(manager.LocalEndpoint, count, stopwatch.ElapsedMilliseconds);
+
+            if (response == RaftOperationStatus.Success)
+            {
+                foreach (RaftBatcherItem request in requests)
+                    request.Promise.TrySetResult(response);
+
+                return;
+            }
+
+            Exception ex = new("Write failed");
+
+            foreach (RaftBatcherItem request in requests)
+                request.Promise.TrySetException(ex);
         }
-        
-        Exception ex = new("Write failed");
-        
-        foreach (RaftBatcherItem request in requests)
-            request.Promise.TrySetException(ex);
+        finally
+        {
+            RaftBatcherPool.Return(logs);
+        }
     }
 }

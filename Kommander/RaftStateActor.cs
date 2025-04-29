@@ -285,7 +285,7 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
 
                     case RaftRequestType.GetTicketState:
                     {
-                        (RaftTicketState ticketState, long commitIndex) = CheckTicketCompletion(request.Timestamp, request.AutoCommit);
+                        (RaftProposalTicketState ticketState, long commitIndex) = CheckTicketCompletion(request.Timestamp);
                         message.Promise.TrySetResult(new(RaftResponseType.TicketState, ticketState, commitIndex));
                         break;
                     }
@@ -386,7 +386,13 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
             }
         }
     }
-    
+
+    /// <summary>
+    /// Adds a message to the specified priority bucket and request type within the plan.
+    /// </summary>
+    /// <param name="plan">A dictionary grouping messages by priority and request type.</param>
+    /// <param name="priority">The priority level to which the message should be added.</param>
+    /// <param name="message">The message to be added to the appropriate bucket in the plan.</param>
     private static void AddToPriority(
         Dictionary<RaftStatePriority, Dictionary<RaftRequestType, List<ActorMessageReply<RaftRequest, RaftResponse>>>> plan, 
         RaftStatePriority priority,
@@ -410,6 +416,12 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
         }
     }
 
+    /// <summary>
+    /// Adds a single message to the specified priority bucket within the provided plan.
+    /// </summary>
+    /// <param name="plan">The dictionary containing messages categorized by priority and request type.</param>
+    /// <param name="priority">The priority level under which the message should be grouped.</param>
+    /// <param name="message">The message to be added to the corresponding priority bucket.</param>
     private static void AddToPrioritySingle(
         Dictionary<RaftStatePriority, Dictionary<RaftRequestType, List<ActorMessageReply<RaftRequest, RaftResponse>>>> plan, 
         RaftStatePriority priority,
@@ -553,6 +565,7 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
 
     /// <summary>
     /// Compares the current log id with the log id of the other nodes in the partition to determine if the node is outdated.
+    /// An outdated node cannot become leader
     /// </summary>
     /// <returns></returns>
     private async Task<bool> AmIOutdated()
@@ -761,11 +774,12 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
     }
 
     /// <summary>
-    /// When a node receives a vote from another node, it verifies that the term is valid and that the node
+    /// Processes a vote received in the Raft consensus protocol.
     /// </summary>
-    /// <param name="endpoint"></param>
-    /// <param name="voteTerm"></param>
-    /// <param name="remoteMaxLogId"></param>
+    /// <param name="endpoint">The identifier of the remote node sending the vote.</param>
+    /// <param name="voteTerm">The term associated with the received vote.</param>
+    /// <param name="remoteMaxLogId">The highest log ID from the remote node.</param>
+    /// <returns>A task that represents the asynchronous operation.</returns>
     private async Task ReceivedVote(string endpoint, long voteTerm, long remoteMaxLogId)
     {
         if (nodeState == RaftNodeState.Follower)
@@ -828,6 +842,7 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
         if (numberVotes < quorum)
             return;
         
+        // Here quorum was achieved and we can mark ourselves as leader in the partition
         nodeState = RaftNodeState.Leader;
         partition.Leader = manager.LocalEndpoint;
 
@@ -1460,28 +1475,19 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
     }
     
     /// <summary>
-    /// Checks whether a ticket has been completed or not.
+    /// Checks whether a proposal has been completed/committed or not.
     /// </summary>
     /// <param name="timestamp"></param>
     /// <param name="autoCommit"></param>
     /// <returns></returns>
-    private (RaftTicketState state, long commitIndex) CheckTicketCompletion(HLCTimestamp timestamp, bool autoCommit)
+    private (RaftProposalTicketState state, long commitIndex) CheckTicketCompletion(HLCTimestamp timestamp)
     {
         if (!activeProposals.TryGetValue(timestamp, out RaftProposalQuorum? proposal))
-            return (RaftTicketState.NotFound, -1);
+            return (RaftProposalTicketState.NotFound, -1);
 
-        if (proposal.HasQuorum())
-        {
-            if (autoCommit)
-            {
-                logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Removed proposal {Timestamp}", manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp);
-                
-                //activeProposals.Remove(timestamp);
-            }
+        if (proposal is { AutoCommit: false, State: RaftProposalState.Completed } or { AutoCommit: true, State: RaftProposalState.Committed } or { AutoCommit: false, State: RaftProposalState.Committed })
+            return (RaftProposalTicketState.Committed, proposal.LastLogIndex);
 
-            return (RaftTicketState.Committed, proposal.LastLogIndex);
-        }
-
-        return (RaftTicketState.Proposed, -1);
+        return (RaftProposalTicketState.Proposed, -1);
     }
 }

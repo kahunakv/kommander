@@ -599,15 +599,21 @@ public sealed class RaftManager : IRaft, IDisposable
     }
 
     /// <summary>
-    /// Replicate logs to the follower nodes in the specified partition
+    /// Replicates logs across a Raft partition.
     /// </summary>
-    /// <param name="partitionId"></param>
-    /// <param name="type"></param>
-    /// <param name="logs"></param>
-    /// <param name="autoCommit"></param>
-    /// <param name="cancellationToken"></param>
-    /// <returns></returns>
-    public async Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true, CancellationToken cancellationToken = default)
+    /// <param name="partitionId">The identifier of the partition where logs are to be replicated.</param>
+    /// <param name="type">The type of the operation being performed.</param>
+    /// <param name="logs">A collection of logs to be replicated.</param>
+    /// <param name="autoCommit">Indicates whether the logs should be automatically committed after proposal replication.</param>
+    /// <param name="cancellationToken">A token to signal the cancellation of the operation.</param>
+    /// <returns>A task representing the asynchronous operation, with a result of type <see cref="RaftReplicationResult"/>.</returns>
+    public async Task<RaftReplicationResult> ReplicateLogs(
+        int partitionId,
+        string type,
+        IEnumerable<byte[]> logs,
+        bool autoCommit = true,
+        CancellationToken cancellationToken = default
+    )
     {
         if (partitionId == RaftSystemConfig.SystemPartition)
             throw new RaftException("System partition cannot be used from userland");
@@ -710,17 +716,17 @@ public sealed class RaftManager : IRaft, IDisposable
 
             try
             {
-                (RaftTicketState state, long commitId) = await partition.GetTicketState(ticketId, autoCommit).ConfigureAwait(false);
+                (RaftProposalTicketState state, long commitId) = await partition.GetTicketState(ticketId, autoCommit).ConfigureAwait(false);
 
                 switch (state)
                 {
-                    case RaftTicketState.NotFound:
+                    case RaftProposalTicketState.NotFound:
                         return new(false, RaftOperationStatus.ReplicationFailed, ticketId, -1);
 
-                    case RaftTicketState.Committed:
+                    case RaftProposalTicketState.Committed:
                         return new(true, RaftOperationStatus.Success, ticketId, commitId);
 
-                    case RaftTicketState.Proposed:
+                    case RaftProposalTicketState.Proposed:
                     default:
                         break;
                 }

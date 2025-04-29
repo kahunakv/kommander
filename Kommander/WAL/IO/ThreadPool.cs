@@ -4,6 +4,12 @@ using Microsoft.Extensions.Logging;
 
 namespace Kommander.WAL.IO;
 
+/// <summary>
+/// A ThreadPool implementation that manages multiple worker threads and distributes tasks among them
+/// using thread-specific queues. Used to prevent thread starvation in the TPL managed thread pool.
+///
+/// Read and Write operations are scheduled on separate thread pools.
+/// </summary>
 public class ThreadPool : IDisposable
 {
     private readonly ILogger<IRaft> logger;

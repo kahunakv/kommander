@@ -315,9 +315,9 @@ public sealed class RaftPartition : IDisposable
     /// </summary>
     /// <param name="ticketId">The unique identifier of the ticket based on a hybrid logical clock timestamp.</param>
     /// <param name="autoCommit">A flag indicating whether the ticket should be automatically committed if not found in a final state.</param>
-    /// <returns>A tuple containing the state of the ticket (<see cref="RaftTicketState"/>) and the commit ID as a long value.</returns>
+    /// <returns>A tuple containing the state of the ticket (<see cref="RaftProposalTicketState"/>) and the commit ID as a long value.</returns>
     /// <exception cref="RaftException">Thrown when an unexpected or unknown response is received from the Raft actor.</exception>
-    public async Task<(RaftTicketState state, long commitId)> GetTicketState(HLCTimestamp ticketId, bool autoCommit)
+    public async Task<(RaftProposalTicketState state, long commitId)> GetTicketState(HLCTimestamp ticketId, bool autoCommit)
     {
         RaftResponse? response = await raftActor.Ask(new(RaftRequestType.GetTicketState, ticketId, autoCommit)).ConfigureAwait(false);
         
@@ -327,7 +327,7 @@ public sealed class RaftPartition : IDisposable
         if (response.Type != RaftResponseType.TicketState)
             throw new RaftException("Unknown response (2)");
 
-        return (response.TicketState, response.LogIndex);
+        return (response.ProposalTicketState, response.LogIndex);
     }
     
     /// <summary>
