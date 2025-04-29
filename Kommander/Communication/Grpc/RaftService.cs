@@ -1,8 +1,9 @@
 
-using System.Runtime.InteropServices;
-using Google.Protobuf.Collections;
 using Grpc.Core;
 using Kommander.Data;
+using Google.Protobuf.Collections;
+using Microsoft.Extensions.Logging;
+using System.Runtime.InteropServices;
 
 namespace Kommander.Communication.Grpc;
 

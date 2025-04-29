@@ -8,7 +8,7 @@ using Kommander.Discovery;
 using Kommander.System;
 using Kommander.Time;
 using Kommander.WAL;
-
+using Microsoft.Extensions.Logging;
 using ThreadPool = Kommander.WAL.IO.ThreadPool;
 // ReSharper disable ConvertToAutoPropertyWithPrivateSetter
 

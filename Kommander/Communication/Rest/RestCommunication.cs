@@ -2,6 +2,7 @@
 using System.Text.Json;
 using Flurl.Http;
 using Kommander.Data;
+using Microsoft.Extensions.Logging;
 
 namespace Kommander.Communication.Rest;
 

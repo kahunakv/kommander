@@ -2,6 +2,7 @@
 using Nixie;
 using Kommander.Communication;
 using Kommander.Data;
+using Microsoft.Extensions.Logging;
 
 namespace Kommander;
 

@@ -1,4 +1,6 @@
 
+using Microsoft.AspNetCore.Builder;
+
 namespace Kommander.Communication.Grpc;
 
 public static class GrpcCommunicationExtensions

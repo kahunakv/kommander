@@ -1,6 +1,7 @@
 
 using Kommander.Data;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Logging;
 
 namespace Kommander.WAL;
 

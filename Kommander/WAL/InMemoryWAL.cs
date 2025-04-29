@@ -1,5 +1,6 @@
 
 using Kommander.Data;
+using Microsoft.Extensions.Logging;
 
 namespace Kommander.WAL;
 

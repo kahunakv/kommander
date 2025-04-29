@@ -1,5 +1,6 @@
 
 using Kommander.Data;
+using Microsoft.AspNetCore.Builder;
 
 namespace Kommander.Communication.Rest;
 

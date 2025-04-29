@@ -6,6 +6,7 @@ using Kommander.Logging;
 using Kommander.Support.Collections;
 using Kommander.System;
 using Kommander.WAL;
+using Microsoft.Extensions.Logging;
 
 namespace Kommander;
 

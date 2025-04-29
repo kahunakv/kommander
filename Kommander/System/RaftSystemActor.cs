@@ -3,7 +3,8 @@ using Nixie;
 using System.Text.Json;
 using Kommander.System.Protos;
 using Google.Protobuf;
-using Kommander.Data;   
+using Kommander.Data;
+using Microsoft.Extensions.Logging;
 
 namespace Kommander.System;
 

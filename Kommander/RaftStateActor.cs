@@ -7,6 +7,7 @@ using Kommander.Logging;
 using Kommander.System;
 using Kommander.Time;
 using Kommander.WAL;
+using Microsoft.Extensions.Logging;
 
 namespace Kommander;
 

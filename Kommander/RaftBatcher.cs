@@ -2,6 +2,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using Kommander.Data;
+using Microsoft.Extensions.Logging;
 
 namespace Kommander;
 

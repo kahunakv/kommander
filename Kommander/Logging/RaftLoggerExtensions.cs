@@ -1,11 +1,12 @@
 
 using Kommander.Time;
+using Microsoft.Extensions.Logging;
 
 namespace Kommander.Logging;
 
 /// <summary>
 /// Provides extension methods for logging various Raft-specific events in a high-performant way
-/// in implementations of the <see cref="IRaft"/> interface using the <see cref="ILogger{TCategoryName}"/> framework.
+/// in implementations of the <see cref="IRaft"/> interface using the <see cref="ILogger"/> framework.
 /// </summary>
 public static partial class RaftLoggerExtensions
 {

@@ -4,6 +4,7 @@ using Kommander.Communication;
 using Kommander.Data;
 using Kommander.Time;
 using Kommander.WAL;
+using Microsoft.Extensions.Logging;
 
 namespace Kommander;
 

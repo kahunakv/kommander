@@ -1,12 +1,13 @@
 
-using System.Collections.Concurrent;
-using System.Runtime.InteropServices;
 using System.Text;
 using Google.Protobuf;
 using Kommander.Data;
 using Kommander.WAL.Protos;
 using Microsoft.IO;
 using RocksDbSharp;
+using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
+using Microsoft.Extensions.Logging;
 
 namespace Kommander.WAL;
 
