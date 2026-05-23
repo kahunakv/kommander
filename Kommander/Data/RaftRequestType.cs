@@ -14,5 +14,6 @@ public enum RaftRequestType
     CommitLogs,
     RollbackLogs,
     GetNodeState,
-    GetTicketState
+    GetTicketState,
+    WriteOperationCompleted
 }

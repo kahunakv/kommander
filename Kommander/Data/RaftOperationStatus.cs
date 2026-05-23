@@ -12,5 +12,6 @@ public enum RaftOperationStatus
     ActiveProposal = 6,
     ProposalNotFound = 7,
     ProposalTimeout = 8,
-    ReplicationFailed = 9
+    ReplicationFailed = 9,
+    Pending = 10,
 }

@@ -1,3 +1,4 @@
+
 using Nixie;
 using System.Collections.Concurrent;
 
@@ -10,8 +11,9 @@ using Kommander.Time;
 using Kommander.WAL;
 using Microsoft.Extensions.Logging;
 using ThreadPool = Kommander.WAL.IO.ThreadPool;
-// ReSharper disable ConvertToAutoPropertyWithPrivateSetter
+using MessageThreadPool = Kommander.WAL.IO.MessageThreadPool;
 
+// ReSharper disable ConvertToAutoPropertyWithPrivateSetter
 // ReSharper disable MemberCanBePrivate.Global
 // ReSharper disable ConvertToAutoProperty
 // ReSharper disable ConvertToAutoPropertyWhenPossible
@@ -47,7 +49,7 @@ public sealed class RaftManager : IRaft, IDisposable
 
     private readonly ClusterHandler clusterHandler;
 
-    private readonly RaftBatcher raftBatcher;
+    //private readonly RaftBatcher raftBatcher;
 
     private RaftPartition? systemPartition;
 
@@ -55,7 +57,9 @@ public sealed class RaftManager : IRaft, IDisposable
 
     private readonly ThreadPool readThreadPool;
 
-    private readonly ThreadPool writeThreadPool;
+    //private readonly ThreadPool writeThreadPool;
+    
+    private readonly MessageThreadPool writeThreadPool;
 
     private readonly IActorRef<RaftSystemActor, RaftSystemRequest> systemActor;
 
@@ -95,7 +99,7 @@ public sealed class RaftManager : IRaft, IDisposable
     /// <summary>
     /// Write I/O thread pool
     /// </summary>
-    public ThreadPool WriteThreadPool => writeThreadPool;
+    public MessageThreadPool WriteThreadPool => writeThreadPool;
 
     /// <summary>
     /// Whether the node has joined the Raft cluster
@@ -140,7 +144,7 @@ public sealed class RaftManager : IRaft, IDisposable
     /// <summary>
     /// 
     /// </summary>
-    internal RaftBatcher RaftBatcher => raftBatcher;
+    //internal RaftBatcher RaftBatcher => raftBatcher;
 
     /// <summary>
     /// Event when the restore process starts
@@ -226,14 +230,14 @@ public sealed class RaftManager : IRaft, IDisposable
         leaderSupervisorActor = actorSystem.Spawn<RaftLeaderSupervisor, RaftLeaderSupervisorRequest>("raft-leader-supervisor", this, Logger);
 
         readThreadPool = new(logger, configuration.ReadIOThreads);
-        writeThreadPool = new(logger, configuration.WriteIOThreads);
+        writeThreadPool = new(walAdapter, logger, configuration.WriteIOThreads);
 
         OnSystemLogRestored += SystemLogRestored;
         OnSystemReplicationReceived += SystemReplicationReceived;
         OnSystemRestoreFinished += SystemRestoreFinished;
         OnLeaderChanged += SystemLeaderChanged;
 
-        raftBatcher = new(this);
+        //raftBatcher = new(this);
     }
 
     private Task<bool> SystemLeaderChanged(int partitionId, string node)
@@ -1106,7 +1110,7 @@ public sealed class RaftManager : IRaft, IDisposable
         return new(() => CreateResponderActor(endpoint));
     }
 
-    public IActorRefAggregate<RaftResponderActor, RaftResponderRequest> CreateResponderActor(string endpoint)
+    private IActorRefAggregate<RaftResponderActor, RaftResponderRequest> CreateResponderActor(string endpoint)
     {
         return actorSystem.SpawnAggregate<RaftResponderActor, RaftResponderRequest>(
             string.Concat("raft-responder-", endpoint),

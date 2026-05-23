@@ -7,7 +7,7 @@ using Microsoft.Extensions.Logging;
 
 namespace Kommander;
 
-public sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
+internal sealed class RaftResponderActor : IActorAggregate<RaftResponderRequest>
 {
     private const int MinExpectedBatchSize = 10;
     

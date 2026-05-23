@@ -1,12 +1,11 @@
 ﻿
-using System.Diagnostics;
-
 using Kommander.Data;
 using Kommander.Logging;
 using Kommander.Support.Collections;
 using Kommander.System;
 using Kommander.WAL;
 using Microsoft.Extensions.Logging;
+using Nixie;
 
 namespace Kommander;
 
@@ -18,6 +17,8 @@ namespace Kommander;
 public sealed class RaftWriteAhead
 {
     private readonly RaftManager manager;
+
+    private readonly ActorRefAggregate<RaftStateActor, RaftRequest, RaftResponse> actor;
 
     private readonly RaftPartition partition;
 
@@ -47,18 +48,19 @@ public sealed class RaftWriteAhead
     private long commitIndex = 1;
 
     private int operations;
-        
-    private readonly Stopwatch stopwatch = Stopwatch.StartNew();
 
     /// <summary>
     /// Constructor
     /// </summary>
     /// <param name="manager"></param>
+    /// <param name="actor"></param>
+    /// <param name="contextSelf"></param>
     /// <param name="partition"></param>
     /// <param name="walAdapter"></param>
-    public RaftWriteAhead(RaftManager manager, RaftPartition partition, IWAL walAdapter)
+    public RaftWriteAhead(RaftManager manager, ActorRefAggregate<RaftStateActor, RaftRequest, RaftResponse> actor, RaftPartition partition, IWAL walAdapter)
     {
         this.manager = manager;
+        this.actor = actor;
         this.logger = manager.Logger;
         this.partition = partition;
         this.walAdapter = walAdapter;
@@ -155,11 +157,12 @@ public sealed class RaftWriteAhead
     /// Proposes a batch of logs in the current term for processing by the Raft consensus protocol.
     /// Logs are assigned unique indices and associated with the current term, then enqueued for replication.
     /// </summary>
+    /// <param name="contextSelf"></param>
     /// <param name="term">
-    /// The current term in the Raft consensus protocol used to associate with the logs.
+    ///     The current term in the Raft consensus protocol used to associate with the logs.
     /// </param>
     /// <param name="logs">
-    /// A list of logs to be proposed. If the list is null or empty, the method will return immediately with a success status and no index update.
+    ///     A list of logs to be proposed. If the list is null or empty, the method will return immediately with a success status and no index update.
     /// </param>
     /// <returns>
     /// A tuple containing the operation status and the index of the last proposed log.
@@ -182,12 +185,16 @@ public sealed class RaftWriteAhead
             //RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Propose(partition.PartitionId, log));
         }
         
-        RaftOperationStatus status = await manager.RaftBatcher.Enqueue((partition.PartitionId, logs)).ConfigureAwait(false);
+        /*RaftOperationStatus status = await manager.RaftBatcher.Enqueue((partition.PartitionId, logs)).ConfigureAwait(false);
             
         if (status != RaftOperationStatus.Success)
             return (status, -1);
 
-        return (RaftOperationStatus.Success, proposeIndex);
+        return (RaftOperationStatus.Success, proposeIndex);*/
+        
+        manager.WriteThreadPool.EnqueueTask(new(actor, (partition.PartitionId, logs)));
+        
+        return (RaftOperationStatus.Pending, proposeIndex);
     }
 
     /// <summary>
@@ -597,7 +604,9 @@ public sealed class RaftWriteAhead
     /// </exception>
     public async Task Compact()
     {
-        long lastCheckpoint = await manager.ReadThreadPool.EnqueueTask(() => walAdapter.GetLastCheckpoint(partition.PartitionId)).ConfigureAwait(false);
+        long lastCheckpoint = await manager.ReadThreadPool.EnqueueTask(() => 
+            walAdapter.GetLastCheckpoint(partition.PartitionId)
+        ).ConfigureAwait(false);
 
         if (lastCheckpoint <= 0)
             return;
