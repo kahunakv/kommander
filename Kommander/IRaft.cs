@@ -7,6 +7,7 @@ using Kommander.Communication;
 using Kommander.Discovery;
 using Kommander.Time;
 using IOThreadPool = Kommander.WAL.IO.ThreadPool;
+using MessageThreadPool = Kommander.WAL.IO.MessageThreadPool;
 
 namespace Kommander;
 
@@ -58,7 +59,7 @@ public interface IRaft
     /// <summary>
     /// Write I/O thread pool
     /// </summary>
-    public IOThreadPool WriteThreadPool { get; }
+    public MessageThreadPool WriteThreadPool { get; }
     
     /// <summary>
     /// Whether the Raft partitions are initialized or not

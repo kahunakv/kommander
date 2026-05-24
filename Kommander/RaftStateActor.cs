@@ -7,6 +7,7 @@ using Kommander.Logging;
 using Kommander.System;
 using Kommander.Time;
 using Kommander.WAL;
+using Kommander.WAL.Data;
 using Microsoft.Extensions.Logging;
 
 namespace Kommander;
@@ -66,6 +67,8 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
     /// 
     /// </summary>
     private readonly Dictionary<HLCTimestamp, RaftProposalQuorum> activeProposals = [];
+
+    private readonly Dictionary<long, PendingWalOperation> pendingWalOperations = [];
     
     /// <summary>
     /// Enqueued actions in the actor are divided and aggregated into priorities
@@ -116,6 +119,15 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
     /// Whether the WAL is restored or not
     /// </summary>
     private bool restored;
+
+    private sealed class PendingWalOperation
+    {
+        public ActorMessageReply<RaftRequest, RaftResponse>? Message { get; init; }
+
+        public RaftProposalQuorum? Proposal { get; init; }
+
+        public HLCTimestamp TicketId { get; init; }
+    }
 
     /// <summary>
     /// Constructor
@@ -194,6 +206,7 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
                     case RaftRequestType.ReplicateCheckpoint:
                     case RaftRequestType.CommitLogs:
                     case RaftRequestType.RollbackLogs:
+                    case RaftRequestType.WriteOperationCompleted:
                         AddToPriority(plan, RaftStatePriority.Mid, message);
                         break;
 
@@ -291,8 +304,7 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
                     }
 
                     case RaftRequestType.AppendLogs:
-                        await AppendLogs(request.Endpoint ?? "", request.Term, request.Timestamp, request.Logs).ConfigureAwait(false);
-                        message.Promise.TrySetResult(RaftResponseStatic.NoneResponse);
+                        await StartAppendLogs(message).ConfigureAwait(false);
                         break;
 
                     case RaftRequestType.CompleteAppendLogs:
@@ -302,31 +314,32 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
 
                     case RaftRequestType.ReplicateLogs:
                     {
-                        (RaftOperationStatus status, HLCTimestamp ticketId) = await ReplicateLogs(request.Logs, request.AutoCommit).ConfigureAwait(false);
-                        message.Promise.TrySetResult(new(RaftResponseType.None, status, ticketId));
+                        await StartReplicateLogs(message).ConfigureAwait(false);
                         break;
                     }
 
                     case RaftRequestType.ReplicateCheckpoint:
                     {
-                        (RaftOperationStatus status, HLCTimestamp ticketId) = await ReplicateCheckpoint().ConfigureAwait(false);
-                        message.Promise.TrySetResult(new(RaftResponseType.None, status, ticketId));
+                        await StartReplicateCheckpoint(message).ConfigureAwait(false);
                         break;
                     }
 
                     case RaftRequestType.CommitLogs:
                     {
-                        (RaftOperationStatus status, long commitIndex) = await CommitLogs(request.Timestamp).ConfigureAwait(false);
-                        message.Promise.TrySetResult(new(RaftResponseType.None, status, commitIndex));
+                        await StartCommitLogs(message).ConfigureAwait(false);
                         break;
                     }
 
                     case RaftRequestType.RollbackLogs:
                     {
-                        (RaftOperationStatus status, long commitIndex) = await RollbackLogs(request.Timestamp).ConfigureAwait(false);
-                        message.Promise.TrySetResult(new(RaftResponseType.None, status, commitIndex));
+                        await StartRollbackLogs(message).ConfigureAwait(false);
                         break;
                     }
+
+                    case RaftRequestType.WriteOperationCompleted:
+                        await CompleteWalOperation(request.WalOperation, request.Status).ConfigureAwait(false);
+                        message.Promise.TrySetResult(RaftResponseStatic.NoneResponse);
+                        break;
 
                     case RaftRequestType.RequestVote:
                         await Vote(new(request.Endpoint ?? ""), request.Term, request.CommitIndex, request.Timestamp).ConfigureAwait(false);
@@ -877,7 +890,19 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
     /// <param name="timestamp"></param>
     /// <param name="logs"></param>
     /// <returns></returns>
-    private async Task AppendLogs(string endpoint, long leaderTerm, HLCTimestamp timestamp, List<RaftLog>? logs)
+    private Task StartAppendLogs(ActorMessageReply<RaftRequest, RaftResponse> message)
+    {
+        RaftRequest request = message.Request;
+        return AppendLogs(request.Endpoint ?? "", request.Term, request.Timestamp, request.Logs, message);
+    }
+
+    private async Task AppendLogs(
+        string endpoint,
+        long leaderTerm,
+        HLCTimestamp timestamp,
+        List<RaftLog>? logs,
+        ActorMessageReply<RaftRequest, RaftResponse>? pendingMessage = null
+    )
     {
         if (currentTerm > leaderTerm)
         {
@@ -943,7 +968,13 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
                     string.Join(',', logs.Select(x => x.Id.ToString()))
                 );
             
-            await walHandler.ProposeOrCommit(logs).ConfigureAwait(false);
+            WALWriteOperation? operation = walHandler.EnqueueProposeOrCommit(logs, timestamp, endpoint, leaderTerm);
+
+            if (operation is not null)
+            {
+                pendingWalOperations[operation.OperationId] = new() { Message = pendingMessage };
+                return;
+            }
 
             /*(RaftOperationStatus Status, long Index) response = await walHandler.ProposeOrCommit(logs).ConfigureAwait(false);
             
@@ -974,8 +1005,10 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
         manager.EnqueueResponse(endpoint, new(
             RaftResponderRequestType.CompleteAppendLogs, 
             new(endpoint), 
-            new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, lastHeartbeat, manager.LocalEndpoint, RaftOperationStatus.Success, -1)
+            new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, timestamp, manager.LocalEndpoint, RaftOperationStatus.Success, -1)
         ));
+
+        pendingMessage?.Promise.TrySetResult(RaftResponseStatic.NoneResponse);
     }
 
     /// <summary>
@@ -985,7 +1018,21 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
     /// <param name="autoCommit"></param>
     /// <returns></returns>
     /// <exception cref="RaftException"></exception>
-    private async Task<(RaftOperationStatus, HLCTimestamp ticketId)> ReplicateLogs(List<RaftLog>? logs, bool autoCommit)
+    private Task StartReplicateLogs(ActorMessageReply<RaftRequest, RaftResponse> message)
+    {
+        (RaftOperationStatus status, HLCTimestamp ticketId) = ReplicateLogs(message.Request.Logs, message.Request.AutoCommit, message);
+
+        if (status != RaftOperationStatus.Pending)
+            message.Promise.TrySetResult(new(RaftResponseType.None, status, ticketId));
+
+        return Task.CompletedTask;
+    }
+
+    private (RaftOperationStatus, HLCTimestamp ticketId) ReplicateLogs(
+        List<RaftLog>? logs,
+        bool autoCommit,
+        ActorMessageReply<RaftRequest, RaftResponse>? pendingMessage = null
+    )
     {
         if (logs is null || logs.Count == 0)
             return (RaftOperationStatus.Success, HLCTimestamp.Zero);
@@ -1032,7 +1079,12 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
             log.Time = currentTime;
         }
         
-        await walHandler.Propose(currentTerm, logs).ConfigureAwait(false);
+        WALWriteOperation operation = walHandler.EnqueuePropose(currentTerm, logs, currentTime, autoCommit);
+        pendingWalOperations[operation.OperationId] = new()
+        {
+            Message = pendingMessage,
+            TicketId = currentTime
+        };
         
         return (RaftOperationStatus.Pending, currentTime);
 
@@ -1103,15 +1155,11 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
 
         foreach (KeyValuePair<bool, List<RaftLog>> kv in logsPlan)
         {   
-            /*(RaftOperationStatus status, HLCTimestamp ticketId) = await ReplicateLogs(kv.Value, kv.Key);            
-            
             foreach (ActorMessageReply<RaftRequest, RaftResponse> message in messages)
             {
                 if (message.Request.AutoCommit == kv.Key)
-                    message.Promise.TrySetResult(new(RaftResponseType.None, status, ticketId));            
-            }*/
-            
-            
+                    await StartReplicateLogs(message).ConfigureAwait(false);
+            }
         }
     }
 
@@ -1119,7 +1167,19 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
     /// Replicates the checkpoint to other nodes in the cluster when the node is the leader.
     /// </summary>
     /// <returns></returns>
-    private async Task<(RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateCheckpoint()
+    private Task StartReplicateCheckpoint(ActorMessageReply<RaftRequest, RaftResponse> message)
+    {
+        (RaftOperationStatus status, HLCTimestamp ticketId) = ReplicateCheckpoint(message);
+
+        if (status != RaftOperationStatus.Pending)
+            message.Promise.TrySetResult(new(RaftResponseType.None, status, ticketId));
+
+        return Task.CompletedTask;
+    }
+
+    private (RaftOperationStatus status, HLCTimestamp ticketId) ReplicateCheckpoint(
+        ActorMessageReply<RaftRequest, RaftResponse>? pendingMessage = null
+    )
     {
         if (nodeState != RaftNodeState.Leader)
             return (RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
@@ -1152,7 +1212,14 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
             LogData = []
         }];
 
-        await walHandler.Propose(currentTerm, checkpointLogs).ConfigureAwait(false);
+        WALWriteOperation operation = walHandler.EnqueuePropose(currentTerm, checkpointLogs, currentTime, true);
+        pendingWalOperations[operation.OperationId] = new()
+        {
+            Message = pendingMessage,
+            TicketId = currentTime
+        };
+
+        return (RaftOperationStatus.Pending, currentTime);
         
         // Append proposal logs to the Write-Ahead Log
         /*(RaftOperationStatus Status, long) proposeResponse = await walHandler.Propose(context.Self, currentTerm, checkpointLogs).ConfigureAwait(false);
@@ -1194,7 +1261,20 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
     /// </summary>
     /// <param name="ticketId"></param>
     /// <returns></returns>
-    private async Task<(RaftOperationStatus, long commitIndex)> CommitLogs(HLCTimestamp ticketId)
+    private Task StartCommitLogs(ActorMessageReply<RaftRequest, RaftResponse> message)
+    {
+        (RaftOperationStatus status, long commitIndex) = CommitLogs(message.Request.Timestamp, message);
+
+        if (status != RaftOperationStatus.Pending)
+            message.Promise.TrySetResult(new(RaftResponseType.None, status, commitIndex));
+
+        return Task.CompletedTask;
+    }
+
+    private (RaftOperationStatus, long commitIndex) CommitLogs(
+        HLCTimestamp ticketId,
+        ActorMessageReply<RaftRequest, RaftResponse>? pendingMessage = null
+    )
     {
         if (nodeState != RaftNodeState.Leader)
             return (RaftOperationStatus.NodeIsNotLeader, 0);
@@ -1216,40 +1296,15 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
             return (RaftOperationStatus.Errored, 0);
         }
 
-        (RaftOperationStatus Status, long Index) commitResponse = await walHandler.Commit(proposal.Logs).ConfigureAwait(false);
-        
-        if (commitResponse.Status != RaftOperationStatus.Success)
+        WALWriteOperation operation = walHandler.EnqueueCommit(proposal.Logs);
+        pendingWalOperations[operation.OperationId] = new()
         {
-            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't commit proposal {Timestamp}", manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId);
+            Message = pendingMessage,
+            Proposal = proposal,
+            TicketId = ticketId
+        };
 
-            return (commitResponse.Status, 0);
-        }
-        
-        proposal.SetState(RaftProposalState.Committed);
-
-        HLCTimestamp currentTime = manager.HybridLogicalClock.TrySendOrLocalEvent(manager.LocalNodeId);
-
-        foreach (string node in proposal.Nodes)
-        {
-            if (node == manager.LocalEndpoint)
-                continue;
-            
-            AppendLogToNode(new(node), ticketId, proposal.Logs);
-        }
-
-        if (logger.IsEnabled(LogLevel.Debug))
-            logger.LogDebugCommittedLogs(
-                manager.LocalEndpoint, 
-                partition.PartitionId, 
-                nodeState, ticketId, 
-                string.Join(',', proposal.Logs.Select(x => x.Id.ToString())),
-                (currentTime - proposal.StartTimestamp).TotalMilliseconds                
-            );
-        
-        //RaftProposalQuorumPool.Return(proposal);
-        //activeProposals.Remove(ticketId);
-        
-        return (RaftOperationStatus.Success, commitResponse.Index);
+        return (RaftOperationStatus.Pending, operation.LogIndex);
     }
     
     /// <summary>
@@ -1257,7 +1312,20 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
     /// </summary>
     /// <param name="ticketId"></param>
     /// <returns></returns>
-    private async Task<(RaftOperationStatus, long commitIndex)> RollbackLogs(HLCTimestamp ticketId)
+    private Task StartRollbackLogs(ActorMessageReply<RaftRequest, RaftResponse> message)
+    {
+        (RaftOperationStatus status, long commitIndex) = RollbackLogs(message.Request.Timestamp, message);
+
+        if (status != RaftOperationStatus.Pending)
+            message.Promise.TrySetResult(new(RaftResponseType.None, status, commitIndex));
+
+        return Task.CompletedTask;
+    }
+
+    private (RaftOperationStatus, long commitIndex) RollbackLogs(
+        HLCTimestamp ticketId,
+        ActorMessageReply<RaftRequest, RaftResponse>? pendingMessage = null
+    )
     {
         if (nodeState != RaftNodeState.Leader)
             return (RaftOperationStatus.NodeIsNotLeader, 0);
@@ -1279,37 +1347,15 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
             return (RaftOperationStatus.Errored, 0);
         }
         
-        (RaftOperationStatus Status, long Index) commitResponse = await walHandler.Rollback(proposal.Logs).ConfigureAwait(false);
-        
-        if (commitResponse.Status != RaftOperationStatus.Success)
+        WALWriteOperation operation = walHandler.EnqueueRollback(proposal.Logs);
+        pendingWalOperations[operation.OperationId] = new()
         {
-            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't rollback proposal {Timestamp}", manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId);
+            Message = pendingMessage,
+            Proposal = proposal,
+            TicketId = ticketId
+        };
 
-            return (commitResponse.Status, 0);
-        }
-        
-        proposal.SetState(RaftProposalState.RolledBack);
-
-        foreach (string node in proposal.Nodes)
-        {
-            if (node == manager.LocalEndpoint)
-                continue;
-            
-            AppendLogToNode(new(node), ticketId, proposal.Logs); //.ConfigureAwait(false);
-        }
-
-        if (logger.IsEnabled(LogLevel.Debug))
-            logger.LogDebugRolledbackLogs(
-                manager.LocalEndpoint, 
-                partition.PartitionId, 
-                nodeState, ticketId, 
-                string.Join(',', proposal.Logs.Select(x => x.Id.ToString()))
-            );
-        
-        //RaftProposalQuorumPool.Return(proposal);
-        //activeProposals.Remove(ticketId);
-        
-        return (RaftOperationStatus.Success, commitResponse.Index);
+        return (RaftOperationStatus.Pending, operation.LogIndex);
     }
 
     /// <summary>
@@ -1387,7 +1433,7 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
     /// <param name="timestamp"></param>
     /// <param name="status"></param>
     /// <param name="committedIndex"></param>
-    private async ValueTask CompleteAppendLogs(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex)
+    private ValueTask CompleteAppendLogs(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex)
     {
         HLCTimestamp currentTime = manager.HybridLogicalClock.TrySendOrLocalEvent(manager.LocalNodeId);
         
@@ -1425,21 +1471,21 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
                 committedIndex
             );
 
-            return;
+            return ValueTask.CompletedTask;
         }
 
         if (!activeProposals.TryGetValue(timestamp, out RaftProposalQuorum? proposal))
-            return;
+            return ValueTask.CompletedTask;
         
         if (proposal.State != RaftProposalState.Incomplete)
-            return;
+            return ValueTask.CompletedTask;
 
         proposal.MarkNodeCompleted(endpoint);
 
         if (!proposal.HasQuorum())
         {
             logger.LogInfoProposalPartiallyCompletedAt(manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp, (currentTime - proposal.StartTimestamp).TotalMilliseconds);
-            return;
+            return ValueTask.CompletedTask;
         }
         
         logger.LogInfoProposalCompletedAt(manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp, (currentTime - proposal.StartTimestamp).TotalMilliseconds);
@@ -1449,39 +1495,191 @@ public sealed class RaftStateActor : IActorAggregate<RaftRequest, RaftResponse>
         if (!proposal.AutoCommit)
         {
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Proposal {Timestamp} doesn't have auto-commit", manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp);
-            return;
+            return ValueTask.CompletedTask;
         }
 
-        currentTime = manager.HybridLogicalClock.TrySendOrLocalEvent(manager.LocalNodeId);
-
-        (RaftOperationStatus Status, long) commitResponse = await walHandler.Commit(proposal.Logs).ConfigureAwait(false);
-        
-        if (commitResponse.Status != RaftOperationStatus.Success)
+        WALWriteOperation operation = walHandler.EnqueueCommit(proposal.Logs);
+        pendingWalOperations[operation.OperationId] = new()
         {
-            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't commit proposal {Timestamp}", manager.LocalEndpoint, partition.PartitionId, nodeState, timestamp);
+            Proposal = proposal,
+            TicketId = timestamp
+        };
 
+        return ValueTask.CompletedTask;
+    }
+
+    private async Task CompleteWalOperation(WALWriteOperation? operation, RaftOperationStatus status)
+    {
+        if (operation is null)
+            return;
+
+        pendingWalOperations.Remove(operation.OperationId, out PendingWalOperation? pending);
+
+        switch (operation.Type)
+        {
+            case WALWriteOperationType.LeaderPropose:
+                CompleteLeaderPropose(operation, status, pending);
+                break;
+
+            case WALWriteOperationType.LeaderCommit:
+                CompleteLeaderCommit(operation, status, pending);
+                break;
+
+            case WALWriteOperationType.LeaderRollback:
+                CompleteLeaderRollback(operation, status, pending);
+                break;
+
+            case WALWriteOperationType.FollowerAppend:
+                await CompleteFollowerAppend(operation, status, pending).ConfigureAwait(false);
+                break;
+
+            case WALWriteOperationType.Compaction:
+            default:
+                pending?.Message?.Promise.TrySetResult(RaftResponseStatic.NoneResponse);
+                break;
+        }
+    }
+
+    private void CompleteLeaderPropose(WALWriteOperation operation, RaftOperationStatus status, PendingWalOperation? pending)
+    {
+        HLCTimestamp ticketId = pending?.TicketId ?? operation.Timestamp;
+
+        if (status != RaftOperationStatus.Success)
+        {
+            pending?.Message?.Promise.TrySetResult(new(RaftResponseType.None, status, ticketId));
             return;
         }
-        
+
+        RaftProposalQuorum proposalQuorum = RaftProposalQuorumPool.Rent(operation.Logs.Item2, operation.AutoCommit, ticketId);
+        proposalQuorum.MarkNodeCompleted(manager.LocalEndpoint);
+
+        foreach (RaftNode node in manager.Nodes)
+        {
+            if (node.Endpoint == manager.LocalEndpoint)
+                throw new RaftException("Corrupted nodes");
+
+            proposalQuorum.AddExpectedNodeCompletion(node.Endpoint);
+            AppendLogToNode(node, ticketId, operation.Logs.Item2);
+        }
+
+        if (!activeProposals.TryAdd(ticketId, proposalQuorum))
+        {
+            pending?.Message?.Promise.TrySetResult(new(RaftResponseType.None, RaftOperationStatus.Errored, HLCTimestamp.Zero));
+            return;
+        }
+
+        if (logger.IsEnabled(LogLevel.Debug))
+            logger.LogDebugProposedLogs(manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId, string.Join(',', operation.Logs.Item2.Select(x => x.Id.ToString())));
+
+        pending?.Message?.Promise.TrySetResult(new(RaftResponseType.None, RaftOperationStatus.Success, ticketId));
+    }
+
+    private void CompleteLeaderCommit(WALWriteOperation operation, RaftOperationStatus status, PendingWalOperation? pending)
+    {
+        RaftProposalQuorum? proposal = pending?.Proposal;
+        HLCTimestamp ticketId = pending?.TicketId ?? operation.Timestamp;
+
+        if (status != RaftOperationStatus.Success || proposal is null)
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't commit proposal {Timestamp}", manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId);
+            pending?.Message?.Promise.TrySetResult(new(RaftResponseType.None, status, 0));
+            return;
+        }
+
         proposal.SetState(RaftProposalState.Committed);
+        HLCTimestamp currentTime = manager.HybridLogicalClock.TrySendOrLocalEvent(manager.LocalNodeId);
 
         foreach (string node in proposal.Nodes)
         {
             if (node == manager.LocalEndpoint)
                 continue;
-            
-            AppendLogToNode(new(node), timestamp, proposal.Logs);
+
+            AppendLogToNode(new(node), ticketId, proposal.Logs);
         }
 
         if (logger.IsEnabled(LogLevel.Debug))
             logger.LogDebugCommittedLogs(
-                manager.LocalEndpoint, 
-                partition.PartitionId, 
-                nodeState, 
-                timestamp, 
-                string.Join(',', proposal.Logs.Select(x => x.Id.ToString())), 
+                manager.LocalEndpoint,
+                partition.PartitionId,
+                nodeState,
+                ticketId,
+                string.Join(',', proposal.Logs.Select(x => x.Id.ToString())),
                 (currentTime - proposal.StartTimestamp).TotalMilliseconds
             );
+
+        pending?.Message?.Promise.TrySetResult(new(RaftResponseType.None, RaftOperationStatus.Success, operation.LogIndex));
+    }
+
+    private void CompleteLeaderRollback(WALWriteOperation operation, RaftOperationStatus status, PendingWalOperation? pending)
+    {
+        RaftProposalQuorum? proposal = pending?.Proposal;
+        HLCTimestamp ticketId = pending?.TicketId ?? operation.Timestamp;
+
+        if (status != RaftOperationStatus.Success || proposal is null)
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't rollback proposal {Timestamp}", manager.LocalEndpoint, partition.PartitionId, nodeState, ticketId);
+            pending?.Message?.Promise.TrySetResult(new(RaftResponseType.None, status, 0));
+            return;
+        }
+
+        proposal.SetState(RaftProposalState.RolledBack);
+
+        foreach (string node in proposal.Nodes)
+        {
+            if (node == manager.LocalEndpoint)
+                continue;
+
+            AppendLogToNode(new(node), ticketId, proposal.Logs);
+        }
+
+        if (logger.IsEnabled(LogLevel.Debug))
+            logger.LogDebugRolledbackLogs(
+                manager.LocalEndpoint,
+                partition.PartitionId,
+                nodeState,
+                ticketId,
+                string.Join(',', proposal.Logs.Select(x => x.Id.ToString()))
+            );
+
+        pending?.Message?.Promise.TrySetResult(new(RaftResponseType.None, RaftOperationStatus.Success, operation.LogIndex));
+    }
+
+    private async Task CompleteFollowerAppend(WALWriteOperation operation, RaftOperationStatus status, PendingWalOperation? pending)
+    {
+        string endpoint = operation.Endpoint ?? "";
+        long leaderTerm = operation.Term;
+        long committedIndex = status == RaftOperationStatus.Success ? operation.LogIndex : -1;
+
+        if (status == RaftOperationStatus.Success)
+        {
+            foreach (RaftLog log in operation.Logs.Item2)
+            {
+                if (log.Type != RaftLogType.Committed)
+                    continue;
+
+                if (partition.PartitionId == RaftSystemConfig.SystemPartition)
+                {
+                    if (!await manager.InvokeSystemReplicationReceived(partition.PartitionId, log).ConfigureAwait(false))
+                        manager.InvokeReplicationError(partition.PartitionId, log);
+                }
+                else
+                {
+                    if (!await manager.InvokeReplicationReceived(partition.PartitionId, log).ConfigureAwait(false))
+                        manager.InvokeReplicationError(partition.PartitionId, log);
+                }
+            }
+        }
+
+        if (!string.IsNullOrEmpty(endpoint))
+        {
+            manager.EnqueueResponse(endpoint, new(
+                RaftResponderRequestType.CompleteAppendLogs,
+                new(endpoint),
+                new CompleteAppendLogsRequest(partition.PartitionId, leaderTerm, operation.Timestamp, manager.LocalEndpoint, status, committedIndex)
+            ));
+        }
+
+        pending?.Message?.Promise.TrySetResult(RaftResponseStatic.NoneResponse);
     }
     
     /// <summary>

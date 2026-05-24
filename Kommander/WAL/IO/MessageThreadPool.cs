@@ -1,12 +1,15 @@
 
 using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
+using Kommander.Data;
 using Kommander.WAL.Data;
 
 namespace Kommander.WAL.IO;
 
 public class MessageThreadPool : IDisposable
 {
+    private const int MaxBatchSize = 256;
+
     private readonly IWAL walAdapter;
     
     private readonly ILogger<IRaft> logger;
@@ -65,56 +68,10 @@ public class MessageThreadPool : IDisposable
         if (taskQueues is null)
             throw new RaftException("Thread pool is disposed");
 
-        // Create a TaskCompletionSource to observe the result asynchronously.
-        //TaskCompletionSource<T> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        int queueIndex = Math.Abs(operation.Logs.Item1 % workerCount);
+        BlockingCollection<WALWriteOperation> selectedQueue = taskQueues[queueIndex];
 
-        // Find the queue with the fewest tasks.
-        int minIndex = 0;
-        int minCount = taskQueues[0].Count;  // This is thread-safe snapshot.
-
-        if (minCount > 0)
-        {
-            for (int i = 1; i < workerCount; i++)
-            {
-                int currentCount = taskQueues[i].Count;
-                if (currentCount < minCount)
-                {
-                    minCount = currentCount;
-                    minIndex = i;
-
-                    if (currentCount == 0) // the queue is empty
-                        break;
-                }
-            }
-        }
-
-        // Enqueue the task into the least busy queue.
-        BlockingCollection<WALWriteOperation> selectedQueue = taskQueues[minIndex];               
-
-        // Enqueue the task on the selected queue.
-        /*selectedQueue.Add(() =>
-        {
-            try
-            {
-                // Execute the synchronous operation.
-                //T result = syncOperation();
-                RaftOperationStatus t = syncOperation();
-                
-                actor.Send(new(
-                    RaftRequestType.WriteOperationCompleted,
-                    id
-                ));
-                
-                //tcs.TrySetResult(result);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("{0}", ex.Message);
-                //tcs.TrySetException(ex);
-            }
-        });*/
-
-        //return tcs.Task;
+        selectedQueue.Add(operation, cancellationTokenSource.Token);
     }
 
     /// <summary>
@@ -147,10 +104,21 @@ public class MessageThreadPool : IDisposable
                     // Process tasks until cancellation is signaled.
                     foreach (WALWriteOperation task in workerQueue.GetConsumingEnumerable(cancellationTokenSource.Token))
                     {
+                        List<WALWriteOperation> operations = [task];
+
                         try
                         {
-                            //task();
-                            walAdapter.Write([task.Logs]);
+                            while (operations.Count < MaxBatchSize && workerQueue.TryTake(out WALWriteOperation? next))
+                                operations.Add(next);
+
+                            List<(int, List<RaftLog>)> logs = new(operations.Count);
+                            foreach (WALWriteOperation operation in operations)
+                                logs.Add(operation.Logs);
+
+                            RaftOperationStatus status = walAdapter.Write(logs);
+
+                            foreach (WALWriteOperation operation in operations)
+                                operation.Actor.Send(new(RaftRequestType.WriteOperationCompleted, operation, status));
                         }
                         catch (OperationCanceledException)
                         {
@@ -160,6 +128,9 @@ public class MessageThreadPool : IDisposable
                         {
                             // Log any unexpected exceptions.
                             logger.LogError("Worker {WorkerId} encountered an error: {Exception}", workerId, ex.Message);
+
+                            foreach (WALWriteOperation operation in operations)
+                                operation.Actor.Send(new(RaftRequestType.WriteOperationCompleted, operation, RaftOperationStatus.Errored));
                         }
                     }
                 }

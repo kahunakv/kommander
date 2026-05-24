@@ -1,5 +1,6 @@
 ﻿
 using Kommander.Time;
+using Kommander.WAL.Data;
 
 namespace Kommander.Data;
 
@@ -20,6 +21,8 @@ public sealed class RaftRequest
     public RaftOperationStatus Status { get; }
     
     public bool AutoCommit { get; } 
+
+    public WALWriteOperation? WalOperation { get; }
 
     public RaftRequest(
         RaftRequestType type, 
@@ -53,5 +56,17 @@ public sealed class RaftRequest
         Timestamp = timestamp;
         AutoCommit = autoCommit;
     }
-}
 
+    public RaftRequest(RaftRequestType type, WALWriteOperation walOperation, RaftOperationStatus status)
+    {
+        Type = type;
+        WalOperation = walOperation;
+        Status = status;
+        Timestamp = walOperation.Timestamp;
+        Endpoint = walOperation.Endpoint;
+        Term = walOperation.Term;
+        AutoCommit = walOperation.AutoCommit;
+        CommitIndex = walOperation.LogIndex;
+        Logs = walOperation.Logs.Item2;
+    }
+}
