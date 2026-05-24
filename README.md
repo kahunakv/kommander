@@ -1,273 +1,564 @@
-# 🔱 Kommander (Raft Consensus)
+# Kommander (Raft Consensus)
 
-Kommander is an open-source, distributed consensus library implemented in C# for the .NET platform. It leverages the Raft algorithm to provide a robust and reliable mechanism for leader election, log replication, and data consistency across clusters. Kommander is designed to be flexible and resilient, supporting multiple discovery mechanisms and communication protocols to suit various distributed system architectures.
+Kommander is an open-source distributed consensus library for C#/.NET. It uses the Raft protocol to provide leader election, partitioned log replication, durable write-ahead logging, and cluster coordination for replicated services.
+
+Kommander is designed to keep the consensus core separate from storage, discovery, and transport concerns. Applications can choose RocksDB, SQLite, or in-memory WAL implementations; static, dynamic, or multicast discovery; and gRPC, REST/JSON, or in-memory communication depending on their deployment and testing needs.
 
 [![NuGet](https://img.shields.io/nuget/v/Kommander.svg?style=flat-square)](https://www.nuget.org/packages/Kommander)
-[![Nuget](https://img.shields.io/nuget/dt/Kommander)](https://www.nuget.org/packages/Kommander)
+[![NuGet](https://img.shields.io/nuget/dt/Kommander)](https://www.nuget.org/packages/Kommander)
 
 > [!WARNING]
-> **BETA SOFTWARE**
-> Kommander is under heavy development and some features may be unstable!
-
----
+> Kommander is beta software. APIs and operational behavior may still change between releases.
 
 ## Features
 
-- **Raft Consensus Algorithm:**
-  Implemented using the Raft protocol, which enables a cluster of nodes to maintain a replicated state machine by keeping a synchronized log across all nodes. For an in-depth explanation of Raft, see [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf) by Diego Ongaro and John Ousterhout.
-- **Distributed Cluster Discovery:** Discover other nodes in the cluster using either:
-  - **Registries:** Centralized or decentralized service registries.
-  - **Multicast Discovery:** Automatic node discovery via multicast messages.
-  - **Static Discovery:** Manually configured list of known nodes.
-- **Flexible Role Management:** Nodes can serve as leaders and followers simultaneously across different partitions, enabling granular control over cluster responsibilities.
-- **Persistent Log Replication:** Each node persists its log to disk to ensure data durability. Kommander utilizes a Write-Ahead Log (WAL) internally to safeguard against data loss:
-  - **RocksDB:** A high-performance, embedded key-value store optimized for fast storage and retrieval. (Default)
-  - **SQLite:** Lightweight, embedded database engine that provides transactional support and crash recovery.
-- **Multiple Communication Protocols:** Achieve consensus and data replication over:
-  - **gRPC:** For low-latency and high-throughput scenarios (Default)
-  - **HTTP/2:** For RESTful interactions and easier debugging. 
-- **Optimizations**: Kommander is designed for performance and scalability, with optimizations such as:
-  - **Hybrid Logical Clocks:** A hybrid clock that combines coarsely-synchronized physical clocks with Lamport Clocks to track causal relationships to provide a more accurate and efficient timestamping mechanism.
-  - **Batch Replication:** Replicate multiple log entries in a single batch to reduce network overhead and improve throughput.
+- **Raft consensus algorithm:** Per-partition leader election, quorum-based proposal replication, commits, rollbacks, checkpoints, and leader change notifications.
+- **Partitioned replication:** Nodes can lead some partitions and follow others, allowing application data to be distributed across independent Raft groups. Partition `0` is reserved for replicated system configuration; application partitions start at `1`.
+- **Durable write-ahead logging:** Built-in WAL adapters for RocksDB and SQLite persist proposed, committed, rolled-back, and checkpoint entries before state-machine callbacks run.
+- **Testing-friendly in-memory components:** `InMemoryWAL`, `InMemoryCommunication`, and focused test utilities support fast local simulations without external infrastructure.
+- **Cluster discovery options:** Static discovery for fixed clusters, dynamic discovery for application-managed membership lists, and multicast discovery for local-network discovery.
+- **Transport choices:** gRPC for networked clusters, REST/JSON for HTTP-based integration and debugging, and in-memory communication for tests.
+- **Batch replication:** Replicate multiple log entries in a single proposal to reduce coordination overhead.
+- **Manual proposal control:** Use automatic commits for the common path, or disable auto-commit and explicitly call `CommitLogs` or `RollbackLogs`.
+- **Hybrid logical clocks:** Proposal tickets use HLC timestamps to preserve causality across physical time and logical counters.
+- **Dedicated I/O workers:** Synchronous WAL operations are processed through configurable read and write thread pools to avoid blocking actor execution.
+- **Application callbacks:** Restore, replication, replication-error, and leadership events let applications rebuild and advance their own state machines.
+- **ASP.NET Core integration:** Route extensions expose Raft gRPC and REST endpoints from an existing web host.
 
----
+## About Raft And Kommander
 
-## About Raft and Kommander
+Raft is a consensus protocol that helps a cluster of nodes maintain a replicated state machine by synchronizing a durable log. A leader receives proposed changes, writes them locally, replicates them to followers, and commits them after a quorum acknowledges the proposal.
 
-Raft is a consensus protocol that helps a cluster of nodes maintain a
-replicated state machine by synchronizing a replicated log. This log
-ensures that each node's state remains consistent across the cluster.
-Kommander implements the core Raft algorithm, providing a minimalistic
-design that focuses solely on the essential components of the protocol.
-By separating storage, messaging serialization, and network transport
-from the consensus logic, Kommander offers flexibility, determinism,
-and improved performance.
+Kommander implements this model with partitioned Raft groups. Each partition elects its own leader, so a node can be the leader for one partition and a follower for another. This improves throughput when workloads can be routed by key while preserving ordered replication inside each partition.
 
----
+The library keeps storage, discovery, and communication pluggable. That separation lets applications use the same Raft behavior with different persistence engines, network transports, and cluster discovery strategies.
 
-## Getting Started
+## Packages And Targets
 
-### Prerequisites
+Kommander targets `.NET 8.0`.
 
-- [.NET 8.0 SDK](https://dotnet.microsoft.com/download/dotnet/9.0) or higher
-
-### Installation
-
-To install Kommander into your C#/.NET project, you can use the .NET CLI or the NuGet Package Manager.
-
-#### Using .NET CLI
+Install from NuGet:
 
 ```shell
 dotnet add package Kommander
 ```
 
-### Using NuGet Package Manager
+Or with the NuGet Package Manager Console:
 
-Search for Kommander and install it from the NuGet package manager UI, or use the Package Manager Console:
-
-```shell
+```powershell
 Install-Package Kommander
 ```
 
-Or, using the NuGet Package Manager in Visual Studio, search for **Kommander** and install it.
+## Concepts
 
----
+**Node:** A running `RaftManager` instance. Each node has a local endpoint built from `RaftConfiguration.Host` and `RaftConfiguration.Port`.
 
-## Usage
+**Partition:** A separately elected Raft group. Partition `0` is reserved for Kommander system configuration. Application data should use user partitions, which start at `1`.
 
-Below is a basic example demonstrating how to set up a simple Kommander node, join a cluster, and start the consensus process.
+**Leader:** The node currently allowed to accept proposals for a partition.
+
+**Follower:** A node that receives and persists append-log requests from a partition leader.
+
+**Proposal:** A set of log entries written by the leader and replicated to followers. A proposal is complete after quorum acknowledgment.
+
+**Commit:** The durable state transition that marks proposed logs as committed. `ReplicateLogs` auto-commits by default; callers can disable that and call `CommitLogs` or `RollbackLogs` explicitly.
+
+**Checkpoint:** A special replicated log entry used to mark a stable point in a partition log.
+
+**WAL:** The write-ahead log used to persist proposed, committed, rolled-back, and checkpoint entries.
+
+## Quick Start
+
+This example creates one node using static discovery, RocksDB storage, and gRPC communication. In a real cluster, run one `RaftManager` per node with a unique host/port and a discovery list containing the other nodes.
 
 ```csharp
+using System.Text;
+using Kommander;
+using Kommander.Communication.Grpc;
+using Kommander.Data;
+using Kommander.Discovery;
+using Kommander.Time;
+using Kommander.WAL;
+using Microsoft.Extensions.Logging;
+using Nixie;
 
-// Identify the node configuration, including the host, port, and the maximum number of partitions.
-RaftConfiguration config = new()
+ILoggerFactory loggerFactory = LoggerFactory.Create(builder => builder.AddConsole());
+ILogger<IRaft> logger = loggerFactory.CreateLogger<IRaft>();
+
+RaftConfiguration configuration = new()
 {
-    // Node will announce itself as localhost:8001
-    NodeId = "node1",
+    NodeName = "node-1",
+    NodeId = 1,
     Host = "localhost",
     Port = 8001,
-    // Partitions allow nodes to be leaders/followers for different sets of data
-    MaxPartitions = 3
+    InitialPartitions = 8
 };
 
-// Create a Raft node with the specified configuration.
-IRaft node = new RaftManager(
-    new ActorSystem(),
-    config,
-
-    // Node will use a static discovery mechanism to find other nodes in the cluster.
-    new StaticDiscovery([new("localhost:8002"), new("localhost:8003")]),
-
-    // Node will use a RocksDb Write-Ahead Log (WAL) per partition for log persistence.
-    new RocksDbWAL(path: "./data", version: "v1"),
-
-    // Node will use gRPC endpoints for communication with other nodes.
-    new GrpcCommunication()
-
-    // Node will use a new HybridLogicalClock for timestamping log entries.
+IRaft raft = new RaftManager(
+    new ActorSystem(logger: logger),
+    configuration,
+    new StaticDiscovery([
+        new RaftNode("localhost:8002"),
+        new RaftNode("localhost:8003")
+    ]),
+    new RocksDbWAL(path: "./data", revision: "node-1", logger),
+    new GrpcCommunication(),
     new HybridLogicalClock(),
     logger
 );
 
-// Subscribe to the OnReplicationReceived event to receive log entries from other nodes
-// if the node is a follower
-node.OnReplicationReceived += (RaftLog log) =>
+raft.OnReplicationReceived += (partitionId, log) =>
 {
-    Console.WriteLine("Replication received: {0} {1} {2}", log.Id, log.LogType, Encoding.UTF8.GetString(log.LogData));
-
+    string payload = Encoding.UTF8.GetString(log.LogData ?? []);
+    Console.WriteLine($"{partitionId}: {log.Id} {log.Type} {log.LogType} {payload}");
     return Task.FromResult(true);
 };
 
-// Start the node and join the cluster.
-await node.JoinCluster();
+await raft.JoinCluster();
 
-// Check if the node is the leader of partition 0 and replicate a log entry.
-if (await node.AmILeader(0))
+int partitionId = 1;
+using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(10));
+
+if (await raft.AmILeader(partitionId, timeout.Token))
 {
-    (bool success, RaftOperationStatus status, long commitLogId) = await node.ReplicateLogs(0, "Kommander is awesome!");
-    
-    if (success)
-        Console.WriteLine("Replicated log with id: {0}", commitLogId);
-    else
-        Console.WriteLine("Replication failed {0}", status);
+    RaftReplicationResult result = await raft.ReplicateLogs(
+        partitionId,
+        "Greeting",
+        Encoding.UTF8.GetBytes("Hello from Kommander"),
+        cancellationToken: timeout.Token
+    );
+
+    Console.WriteLine(result.Success
+        ? $"Committed log #{result.LogIndex}"
+        : $"Replication failed: {result.Status}");
 }
 
+await raft.LeaveCluster(disposeActorSystem: true);
 ```
 
-### Advanced Configuration
+## Hosting gRPC Or REST Endpoints
 
-Kommander supports advanced configurations including:
+When using network transports, each process must expose matching Raft endpoints.
 
-- **Custom Log Storage:** Implement your own storage engine by extending the log replication modules.
-- **Dynamic Partitioning:** Configure nodes to handle multiple partitions with distinct leader election processes.
-- **Security:** Integrate with your existing security framework to secure HTTP/TCP communications.
+For gRPC:
 
-For detailed configuration options, please refer to the [Documentation](https://github.com/andresgutierrez/kommander/wiki).
+```csharp
+using Kommander.Communication.Grpc;
 
----
+WebApplication app = builder.Build();
+app.MapGrpcRaftRoutes();
+app.Run();
+```
 
-### **Basic Concepts**
+For REST/JSON:
 
-- **Partitions**: A Raft cluster can have multiple partitions (sometimes called regions or tablets) 
-within its dataset. Each partition elects its own leader and followers, allowing each node in the
-cluster to act as both a leader and a follower across different partitions.
-Having multiple partitions can improve the cluster's throughput by reducing
-contention and enabling more operations to run concurrently. However, it
-also increases network traffic and can lead to bottlenecks depending on the
-available hardware. Proper tuning of this parameter is essential to maintain
-a healthy cluster.
+```csharp
+using Kommander.Communication.Rest;
 
-- **Quorum**: A quorum is the minimum number of nodes required to reach a consensus in a Raft cluster. 
-For a cluster with N nodes, a quorum is defined as (N/2) + 1. This ensures that a majority of nodes 
-must agree on a decision before it is considered committed. Quorums are essential for maintaining 
-consistency and fault tolerance in distributed systems.
+WebApplication app = builder.Build();
+app.MapRestRaftRoutes();
+app.Run();
+```
 
-- **Elections**: The Raft algorithm selects a leader for each partition.
-The remaining nodes become followers. If the leader node fails or becomes
-unreachable, a new election process is triggered to select a replacement.
+The sample server in `Kommander.Server` maps both gRPC and REST endpoints and starts the cluster from command-line options.
 
-- **Leader**: Each partition designates a leader. The leader is responsible
-for handling requests assigned to its partition and replicating them to
-followers until a quorum is reached. It maintains a local
-copy of the logs.
+## Creating A Node
 
-- **Followers**: Followers receive replication logs from
-the leader and store local copies on their respective nodes. They
-continuously monitor the leader, and if it fails, they may nominate
-themselves as candidates in a new election for leadership.
+`RaftManager` is the main implementation of `IRaft`:
 
-- **Logs**: Logs store any information that developers need to persist
-and replicate within certain partition in the cluster.
+```csharp
+IRaft raft = new RaftManager(
+    actorSystem,
+    configuration,
+    discovery,
+    walAdapter,
+    communication,
+    new HybridLogicalClock(),
+    logger
+);
+```
 
-- **Checkpoint**: Developers can determine when stored logs are secure
-and create a **log checkpoint**, which speeds up future recovery
-processes and simplifies the addition of new nodes to the cluster.
+Use a unique `NodeId` when you can. If `NodeId` is `0`, Kommander derives one from `NodeName`.
 
-- **Write-Ahead Log (WAL)**: Logs are immediately written to disk
-in the most durable and consistent manner possible before being
-replicated to other nodes or notifying the application of a newly
-arrived log. This ensures data recovery in the event of node
-failures or crashes.
+## IRaft API Surface
 
-- **Heartbeat**: The leader continuously sends heartbeat signals
-to followers to confirm its availability and health.
+| Area | Members |
+| --- | --- |
+| Lifecycle | `JoinCluster`, `LeaveCluster`, `UpdateNodes` |
+| Cluster state | `Joined`, `IsInitialized`, `GetNodes`, `GetLocalEndpoint`, `GetLocalNodeId`, `GetLocalNodeName` |
+| Leadership | `AmILeaderQuick`, `AmILeader`, `WaitForLeader` |
+| Replication | `ReplicateLogs`, `ReplicateCheckpoint`, `CommitLogs`, `RollbackLogs` |
+| Partition routing | `GetPartitionKey`, `GetPrefixPartitionKey` |
+| Transport entry points | `Handshake`, `RequestVote`, `Vote`, `AppendLogs`, `CompleteAppendLogs` |
+| Components | `ActorSystem`, `WalAdapter`, `Communication`, `Discovery`, `Configuration`, `HybridLogicalClock`, `ReadThreadPool`, `WriteThreadPool` |
+| Events | `OnRestoreStarted`, `OnRestoreFinished`, `OnReplicationError`, `OnLogRestored`, `OnReplicationReceived`, `OnLeaderChanged` |
 
-- **Communication**: Nodes communicate with each other via RPCs to
-handle leader elections, send heartbeats, and replicate logs.
-**Kommander** supports communication using either **gRPC** or **Rest/Json**,
-both of which offer distinct advantages and are widely familiar to developers.
+The transport entry points are intended for communication adapters and HTTP/gRPC endpoint handlers, not normal application writes.
 
-- **Log Id**: Kommmander maintains a per partition 64-bit cluster-wide counter, 
-known as the log id, which increments each time a new proposal is added. 
-This revision functions as a global logical clock, ensuring a sequential order for all 
-updates to the partition log. Each new log id represents an incremental change.
+## Configuration
 
-- **Replication**: The leader replicates logs to followers, ensuring that all nodes
-remain consistent and up-to-date. Once a quorum of nodes acknowledges the log entry, 
-it is considered committed and can be applied to the state machine.
+| Property | Default | Description |
+| --- | ---: | --- |
+| `NodeName` | machine name | Stable node name used when deriving a node id. |
+| `NodeId` | `0` | Integer node id. `0` means derive from `NodeName`. |
+| `Host` | `null` | Host advertised as part of the node endpoint. |
+| `Port` | `0` | Port advertised as part of the node endpoint. |
+| `InitialPartitions` | `1` | Number of initial user partitions. Partition `0` is reserved. |
+| `HttpScheme` | `https://` | Scheme used by `RestCommunication`. |
+| `HttpAuthBearerToken` | empty | Bearer token attached by `RestCommunication`. |
+| `HttpTimeout` | `5` | REST request timeout in seconds. |
+| `HttpVersion` | `2.0` | REST HTTP version. |
+| `HeartbeatInterval` | `500 ms` | Leader heartbeat interval. |
+| `RecentHeartbeat` | `100 ms` | Cross-partition recent-heartbeat window. |
+| `VotingTimeout` | `1500 ms` | Candidate vote wait timeout. |
+| `CheckLeaderInterval` | `250 ms` | Leader election supervision interval. |
+| `UpdateNodesInterval` | `5000 ms` | Discovery refresh interval. |
+| `StartElectionTimeout` | `2000 ms` | Lower election timeout bound. |
+| `EndElectionTimeout` | `4000 ms` | Upper election timeout bound. |
+| `StartElectionTimeoutIncrement` | `100 ms` | Lower timeout backoff increment. |
+| `EndElectionTimeoutIncrement` | `200 ms` | Upper timeout backoff increment. |
+| `SlowRaftStateMachineLog` | `50 ms` | Slow actor message warning threshold. |
+| `SlowRaftWALMachineLog` | `25 ms` | Slow WAL warning threshold. |
+| `ReadIOThreads` | `8` | Dedicated synchronous WAL read workers. |
+| `WriteIOThreads` | `4` | Dedicated synchronous WAL write workers. |
+| `CompactEveryOperations` | `10000` | Configured compaction interval value. WAL adapters expose compaction, but callers should verify scheduling behavior before relying on automatic compaction. |
+| `CompactNumberEntries` | `100` | Max entries to remove when compaction is invoked. |
 
-- **Proposals**: Clients send requests to the leader to propose changes to the cluster.
-If proposed changes are accepted by a quorum of nodes, the commit process is initiated.
+## Replicating Logs
 
----
+Replicate a single entry:
 
-## Consensus Process
+```csharp
+RaftReplicationResult result = await raft.ReplicateLogs(
+    partitionId: 1,
+    type: "OrderCreated",
+    data: payload,
+    cancellationToken: cancellationToken
+);
+```
 
-Kommander relies on the following consensus algorithm to ensure that changes are applied consistently across all nodes. The commit phase is a critical part of this process. Here’s how it works:
+Replicate multiple entries in one proposal:
 
-### 1. Log Entry Proposal and Replication
-- **Leader Receives a Client Request:** When a client sends a replication request, the leader node first creates a log entry for this operation.
-- **Appending to the Leader's Log:** The leader appends this log entry to its own log.
-- **Replicating the Log Entry:** The leader then sends this new log entry to all the follower nodes. Each follower 
-appends the entry to its own log but it isn’t applied to the state machine yet (OnReplicationReceived event).
+```csharp
+RaftReplicationResult result = await raft.ReplicateLogs(
+    partitionId: 1,
+    type: "OrderEvent",
+    logs: new[] { createdPayload, paidPayload, shippedPayload },
+    cancellationToken: cancellationToken
+);
+```
 
-### 2. Achieving a Quorum
-- **Acknowledgment from Followers:** Each follower sends an acknowledgment back to the leader once they’ve safely stored the log entry.
-- **Quorum Requirement:** In Raft (and thus in Kommander), a log entry is not considered committed until a majority (a quorum) 
-of the nodes have acknowledged the entry. This majority rule ensures that the system can tolerate node failures while 
-still maintaining consistency.
+`RaftReplicationResult` contains:
 
-### 3. Committing the Log Entry
-- **Advancing the Commit Index:** Once the leader receives acknowledgments from a quorum of nodes, it marks the log entry 
-as committed by advancing its commit index. This commit index is a pointer indicating up to which log entries are safe to apply.
-- **Notifying the Followers:** The leader then informs the followers about the new commit index. Each follower, upon learning 
-that the entry is committed, will also update its commit index accordingly.
+| Property | Description |
+| --- | --- |
+| `Success` | `true` when the operation completed successfully. |
+| `Status` | Detailed `RaftOperationStatus`. |
+| `TicketId` | Hybrid logical clock timestamp that identifies the proposal. |
+| `LogIndex` | Last log index assigned to the proposal. |
 
-### 4. Applying to the State Machine
-- **Execution of the Command:** With the log entry committed, every node (both the leader and the followers) 
-applies the corresponding operation to its local state machine. This step makes the change visible to clients.
-- **Ensuring Consistency:** By applying the same committed log entry on every node, Kommander guarantees that all 
-nodes remain consistent, even in the presence of failures.
+## Manual Commit And Rollback
 
-### Why the Commit Phase Is Important
-- **Data Consistency:** The commit phase ensures that a change isn’t applied until it has been safely 
-replicated to a majority of nodes, preventing inconsistencies.
-- **Fault Tolerance:** Even if some nodes fail, the fact that the entry is committed on a quorum means 
-that the system can recover without data loss.
-- **Linearizability:** This process guarantees that once a client is notified of a successful operation, 
-any subsequent read will reflect that change, maintaining strong consistency.
+`ReplicateLogs` auto-commits by default. Set `autoCommit: false` to stop after quorum proposal completion, then commit or roll back explicitly:
+
+```csharp
+RaftReplicationResult proposal = await raft.ReplicateLogs(
+    partitionId: 1,
+    type: "PaymentReserved",
+    data: payload,
+    autoCommit: false,
+    cancellationToken: cancellationToken
+);
+
+if (proposal.Success)
+{
+    (bool committed, RaftOperationStatus status, long commitLogId) =
+        await raft.CommitLogs(1, proposal.TicketId);
+}
+```
+
+Rollback uses the same ticket:
+
+```csharp
+(bool rolledBack, RaftOperationStatus status, long rollbackLogId) =
+    await raft.RollbackLogs(1, proposal.TicketId);
+```
+
+## Checkpoints
+
+Replicate a checkpoint for a user partition:
+
+```csharp
+RaftReplicationResult checkpoint = await raft.ReplicateCheckpoint(1, cancellationToken);
+```
+
+Checkpoint entries use `RaftLogType.ProposedCheckpoint`, `CommittedCheckpoint`, or `RolledBackCheckpoint` internally.
+
+## Leadership APIs
+
+```csharp
+bool quick = await raft.AmILeaderQuick(1);
+bool leader = await raft.AmILeader(1, cancellationToken);
+string endpoint = await raft.WaitForLeader(1, cancellationToken);
+```
+
+`AmILeaderQuick` checks cached partition state. `AmILeader` waits up to the internal leadership timeout. `WaitForLeader` returns the elected leader endpoint or throws `RaftException`.
+
+## Operation Status Values
+
+`RaftOperationStatus` describes why an operation succeeded, failed, or is still in progress:
+
+| Status | Meaning |
+| --- | --- |
+| `Success` | Operation completed successfully. |
+| `Errored` | Operation failed with an internal error. |
+| `NodeIsNotLeader` | The local node is not leader for the requested partition. |
+| `LeaderInOldTerm` | A request came from a leader with an old term. |
+| `LeaderAlreadyElected` | A leader was already known for the term. |
+| `LogsFromAnotherLeader` | A follower received logs from a node other than the expected leader. |
+| `ActiveProposal` | Another proposal is still active. |
+| `ProposalNotFound` | The supplied proposal ticket was not found. |
+| `ProposalTimeout` | The proposal did not complete in time. |
+| `ReplicationFailed` | Replication failed before commit. |
+| `Pending` | Internal state used while asynchronous work is in progress. |
+
+## Partition Routing
+
+Use partition helpers to map application keys to user partitions:
+
+```csharp
+int partition = raft.GetPartitionKey("tenant-42/order-1001");
+int prefixPartition = raft.GetPrefixPartitionKey("tenant-42");
+```
+
+`GetPartitionKey` uses the prefix before the last `/` separator. `GetPrefixPartitionKey` hashes the complete string provided.
+
+Partition `0` is reserved for system configuration. Do not call public replication APIs with partition `0`; `RaftManager` rejects userland writes to the system partition.
+
+## Events
+
+Subscribe before `JoinCluster` if you need restore callbacks.
+
+```csharp
+raft.OnRestoreStarted += partitionId => { };
+raft.OnRestoreFinished += partitionId => { };
+
+raft.OnLogRestored += (partitionId, log) =>
+{
+    // Rebuild application state from committed WAL entries.
+    return Task.FromResult(true);
+};
+
+raft.OnReplicationReceived += (partitionId, log) =>
+{
+    // Apply committed replicated entries to the application state machine.
+    return Task.FromResult(true);
+};
+
+raft.OnReplicationError += (partitionId, log) => { };
+
+raft.OnLeaderChanged += (partitionId, leaderEndpoint) =>
+{
+    return Task.FromResult(true);
+};
+```
+
+System partition events also exist on `RaftManager` for internal configuration replication, but they are not part of `IRaft`.
+
+## WAL Adapters
+
+Kommander persists Raft logs through `IWAL`.
+
+| Adapter | Use case |
+| --- | --- |
+| `RocksDbWAL` | Durable production-oriented storage backed by RocksDB. |
+| `SqliteWAL` | Durable embedded storage backed by SQLite. |
+| `InMemoryWAL` | Tests and simulations only. Data is lost when the process exits. |
+
+RocksDB:
+
+```csharp
+IWAL wal = new RocksDbWAL("./data", "node-1", logger);
+```
+
+SQLite:
+
+```csharp
+IWAL wal = new SqliteWAL("./data", "node-1", logger);
+```
+
+In-memory:
+
+```csharp
+IWAL wal = new InMemoryWAL(logger);
+```
+
+Custom adapters implement:
+
+```csharp
+public interface IWAL
+{
+    List<RaftLog> ReadLogs(int partitionId);
+    List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex);
+    RaftOperationStatus Write(List<(int partitionId, List<RaftLog> logs)> logs);
+    long GetMaxLog(int partitionId);
+    long GetCurrentTerm(int partitionId);
+    long GetLastCheckpoint(int partitionId);
+    string? GetMetaData(string key);
+    bool SetMetaData(string key, string value);
+    RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries);
+    void Dispose();
+}
+```
+
+## Communication Adapters
+
+| Adapter | Use case |
+| --- | --- |
+| `GrpcCommunication` | Networked clusters using gRPC streaming. |
+| `RestCommunication` | Networked clusters using REST/JSON endpoints. |
+| `InMemoryCommunication` | Unit tests and in-process simulations. |
+
+For `RestCommunication`, configure `HttpScheme`, `HttpAuthBearerToken`, `HttpTimeout`, and `HttpVersion` on `RaftConfiguration`.
+
+Custom transports implement `ICommunication`.
+
+## Discovery Adapters
+
+| Adapter | Use case |
+| --- | --- |
+| `StaticDiscovery` | Fixed cluster membership. |
+| `DynamicDiscovery` | Mutable in-memory node list controlled by the application. |
+| `MulticastDiscovery` | UDP multicast discovery on local networks. |
+
+`RedisDiscovery` is present in source as a placeholder and returns no nodes in this release. Do not use it for cluster formation.
+
+Custom discovery providers implement:
+
+```csharp
+public interface IDiscovery
+{
+    Task Register(RaftConfiguration configuration);
+    List<RaftNode> GetNodes();
+}
+```
+
+## Dynamic Partitions
+
+Initial user partitions are replicated through the reserved system partition and then started on every node. If you keep a concrete `RaftManager` reference, you can request a partition split:
+
+```csharp
+RaftManager manager = /* created node */;
+await manager.SplitPartition(partitionId);
+```
+
+The caller must be initialized, the target partition cannot be partition `0`, and the local node must be leader for the target partition.
+
+## Utilities
+
+Kommander also exposes a small set of utility APIs used by the library and available to callers.
+
+### Hashing
+
+`HashUtils` provides xxHash-based helpers and jump consistent hashing:
+
+```csharp
+int nodeId = HashUtils.SmallSimpleHash("node-1");
+ulong hash = HashUtils.SimpleHash("tenant-42");
+ulong bucket = HashUtils.StaticHash("tenant-42", buckets: 128);
+long prefixed = HashUtils.PrefixedHash("tenant-42/order-1", '/', buckets: 128);
+long inversePrefixed = HashUtils.InversePrefixedHash("tenant-42/order-1", '/', buckets: 128);
+int consistent = HashUtils.ConsistentHash("tenant-42", numBuckets: 128);
+```
+
+### Hybrid Logical Clocks
+
+`HybridLogicalClock` and `HLCTimestamp` are used by proposals and exposed in replication results:
+
+```csharp
+HybridLogicalClock clock = new();
+HLCTimestamp timestamp = clock.SendOrLocalEvent(nodeId: 1);
+```
+
+### Parallelization Extensions
+
+`Kommander.Support.Parallelization` contains `ForEachAsync` extensions for `IEnumerable<T>`, `IAsyncEnumerable<T>`, `List<T>`, arrays, and `HashSet<T>`:
+
+```csharp
+using Kommander.Support.Parallelization;
+
+await items.ForEachAsync(maxDegreeOfParallelism: 8, async item =>
+{
+    await Process(item);
+});
+```
+
+### SmallDictionary
+
+`SmallDictionary<TKey, TValue>` is a fixed-capacity, non-thread-safe dictionary optimized for very small maps.
+
+## ASP.NET Core Sample Server
+
+`Kommander.Server` is a runnable ASP.NET Core host that:
+
+- creates a `RaftManager`;
+- uses `StaticDiscovery`;
+- uses `RocksDbWAL`;
+- uses `GrpcCommunication`;
+- maps REST and gRPC Raft routes;
+- starts a background replication service.
+
+Important command-line options:
+
+| Option | Description |
+| --- | --- |
+| `--initial-cluster` | Other node endpoints for static discovery. |
+| `--initial-cluster-partitions` | Initial user partition count. |
+| `--raft-nodename` | Stable node name. |
+| `--raft-nodeid` | Integer node id. |
+| `--raft-host` | Host advertised for Raft traffic. |
+| `--raft-port` | Port advertised for Raft traffic. |
+| `--http-ports` | HTTP ports to bind. |
+| `--https-ports` | HTTPS ports to bind. |
+| `--https-certificate` | HTTPS certificate path. |
+| `--https-certificate-password` | HTTPS certificate password. |
+| `--wal-adapter` | Parsed option with default `rocksdb`; the current server construction path always creates `RocksDbWAL`. |
+| `--rocksdb-wal-path` | Parsed RocksDB WAL path option. Not used by the current server construction path. |
+| `--rocksdb-wal-revision` | Parsed RocksDB WAL revision option. Not used by the current server construction path. |
+| `--sqlite-wal-path` | WAL path currently passed to `RocksDbWAL`. |
+| `--sqlite-wal-revision` | WAL revision currently passed to `RocksDbWAL`. |
+
+The current server construction path uses `RocksDbWAL` with the configured SQLite path/revision option names. Prefer constructing your own host if you need exact storage-option naming.
+
+## Testing
+
+Build:
+
+```shell
+dotnet build Kommander.sln
+```
+
+Run tests:
+
+```shell
+dotnet test Kommander.Tests/Kommander.Tests.csproj
+```
+
+Useful focused slices:
+
+```shell
+dotnet test Kommander.Tests/Kommander.Tests.csproj --filter FullyQualifiedName~TestSmallDictionary
+dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "FullyQualifiedName~TestThreeNodeCluster.TestJoinClusterAndProposeReplicateLogs"
+dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "FullyQualifiedName~TestThreeNodeCluster.TestJoinClusterAndMultiReplicateLogs"
+```
+
+## Current Limitations
+
+- Cluster membership is discovery-driven; there is no public membership-change API on `IRaft`.
+- Partition `0` is reserved and not available for application replication.
+- `RedisDiscovery` is not implemented in this release.
+- The sample server is a demonstration host, not a complete production deployment template.
 
 ## Contributing
 
-We welcome contributions to Kommander! If you’d like to contribute, please follow these steps:
-
-1. Fork the repository.
-2. Create a new branch for your feature or bug fix.
-3. Write tests and ensure all tests pass.
-4. Submit a pull request with a clear description of your changes.
-
-For more details, see our [CONTRIBUTING.md](CONTRIBUTING.md).
-
----
-
-## License
-
-Kommander is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
----
-
-## Community & Support
-
-- **GitHub Issues:** Report bugs or request features via our [GitHub Issues](https://github.com/your-repo/Kommander/issues) page.
-
----
+See [CONTRIBUTING.md](CONTRIBUTING.md).
