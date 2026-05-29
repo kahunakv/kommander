@@ -159,7 +159,7 @@ internal sealed class RaftTransportDispatcher : IDisposable
                 return;
             }
 
-            logger.LogDebug(
+            logger.LogTrace(
                 "[RaftTransportDispatcher/{Endpoint}] Sending batch of {Count} messages",
                 node.Endpoint, messages.Count);
 

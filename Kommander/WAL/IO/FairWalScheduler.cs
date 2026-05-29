@@ -234,13 +234,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             int partitionId;
             try
             {
-                if (!_readyPartitions.TryTake(out partitionId, millisecondsTimeout: 5, token))
-                {
-                    // Check if we should exit: stopping AND no pending work.
-                    if (token.IsCancellationRequested && !HasPendingWork())
-                        break;
-                    continue;
-                }
+                partitionId = _readyPartitions.Take(token);
             }
             catch (OperationCanceledException)
             {
@@ -291,7 +285,11 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         }
 
         if (batch.Count == 0)
+        {
+            lock (state.Lock)
+                state.InFlight = false;
             return;
+        }
 
         // Execute the WAL write outside the partition lock so other partitions
         // are not blocked by this I/O.  Only one worker can be here for a given
@@ -383,23 +381,6 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             if (shouldProcess)
                 ProcessPartition(kv.Key, batch);
         }
-    }
-
-    private bool HasPendingWork()
-    {
-        if (_readyPartitions.Count > 0)
-            return true;
-
-        foreach (KeyValuePair<int, PartitionState> kv in _partitions)
-        {
-            lock (kv.Value.Lock)
-            {
-                if (kv.Value.Ops.Count > 0)
-                    return true;
-            }
-        }
-
-        return false;
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────

@@ -216,12 +216,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
             int partitionId;
             try
             {
-                if (!_readyPartitions.TryTake(out partitionId, millisecondsTimeout: 5, token))
-                {
-                    if (token.IsCancellationRequested && !HasPendingWork())
-                        break;
-                    continue;
-                }
+                partitionId = _readyPartitions.Take(token);
             }
             catch (OperationCanceledException)
             {
@@ -263,6 +258,13 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
             //   a second worker could start on the same partition concurrently.
             state.Scheduled = false;
             state.InFlight  = true;
+        }
+
+        if (batch.Count == 0)
+        {
+            lock (state.Lock)
+                state.InFlight = false;
+            return;
         }
 
         foreach (Action work in batch)
@@ -323,23 +325,6 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
             if (shouldProcess)
                 ProcessPartition(kv.Key, batch);
         }
-    }
-
-    private bool HasPendingWork()
-    {
-        if (_readyPartitions.Count > 0)
-            return true;
-
-        foreach (KeyValuePair<int, PartitionState> kv in _partitions)
-        {
-            lock (kv.Value.Lock)
-            {
-                if (kv.Value.Ops.Count > 0)
-                    return true;
-            }
-        }
-
-        return false;
     }
 
     // ── IDisposable ────────────────────────────────────────────────────────

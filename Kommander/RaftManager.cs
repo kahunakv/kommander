@@ -24,6 +24,9 @@ namespace Kommander;
 /// </summary>
 public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 {
+    private static readonly TimeSpan ProposalRetryDelay = TimeSpan.FromMilliseconds(10);
+    private static readonly TimeSpan ProposalStatusPollDelay = TimeSpan.FromMilliseconds(10);
+
     internal readonly string LocalEndpoint;
 
     internal readonly string LocalNodeName;
@@ -395,7 +398,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// </summary>
     public async Task UpdateNodes()
     {
-        if (systemPartition is null && partitions.Count == 0)
+        if (systemPartition is null && partitions.IsEmpty)
             return;
 
         await clusterHandler.UpdateNodes().ConfigureAwait(false);
@@ -580,7 +583,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             (success, status, ticketId) = await systemPartition.ReplicateLogs(type, data, autoCommit).ConfigureAwait(false);
 
             if (status == RaftOperationStatus.ActiveProposal)
-                await Task.Delay(1, cancellationToken).ConfigureAwait(false);
+                await Task.Delay(ProposalRetryDelay, cancellationToken).ConfigureAwait(false);
 
         } while (status == RaftOperationStatus.ActiveProposal);
 
@@ -615,7 +618,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             (success, status, ticketId) = await partition.ReplicateLogs(type, data, autoCommit).ConfigureAwait(false);
 
             if (status == RaftOperationStatus.ActiveProposal)
-                await Task.Delay(1, cancellationToken).ConfigureAwait(false);
+                await Task.Delay(ProposalRetryDelay, cancellationToken).ConfigureAwait(false);
 
         } while (status == RaftOperationStatus.ActiveProposal);
 
@@ -657,7 +660,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             (success, status, ticketId) = await partition.ReplicateLogs(type, logs.ToList(), autoCommit).ConfigureAwait(false);
 
             if (status == RaftOperationStatus.ActiveProposal)
-                await Task.Delay(1, cancellationToken).ConfigureAwait(false);
+                await Task.Delay(ProposalRetryDelay, cancellationToken).ConfigureAwait(false);
 
         } while (status == RaftOperationStatus.ActiveProposal);
 
@@ -712,7 +715,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             (success, status, ticketId) = await partition.ReplicateCheckpoint().ConfigureAwait(false);
 
             if (status == RaftOperationStatus.ActiveProposal)
-                await Task.Delay(1, cancellationToken).ConfigureAwait(false);
+                await Task.Delay(ProposalRetryDelay, cancellationToken).ConfigureAwait(false);
 
         } while (status == RaftOperationStatus.ActiveProposal);
 
@@ -763,7 +766,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 Logger.LogError("ReplicateLogs: {Message}", e.Message);
             }
 
-            await Task.Delay(1, cancellationToken);
+            await Task.Delay(ProposalStatusPollDelay, cancellationToken).ConfigureAwait(false);
         }
 
         return new(false, RaftOperationStatus.ProposalTimeout, ticketId, -1);
@@ -1013,7 +1016,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 Logger.LogError("AmILeader: {Message}", e.Message);
             }
 
-            await Task.Delay(1, cancellationToken);
+            await Task.Delay(ProposalStatusPollDelay, cancellationToken).ConfigureAwait(false);
         }
 
         throw new RaftException("Leader couldn't be found or is not decided");

@@ -252,8 +252,7 @@ public sealed class RaftPartitionExecutor : IDisposable
         {
             try
             {
-                // Wait for work (5 ms timeout so we can re-check stop on a quiet cluster).
-                _workAvailable.Wait(5, token);
+                _workAvailable.Wait(token);
             }
             catch (OperationCanceledException)
             {
