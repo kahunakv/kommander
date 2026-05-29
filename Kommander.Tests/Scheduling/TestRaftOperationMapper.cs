@@ -50,6 +50,12 @@ public class TestRaftOperationMapper
         Assert.Equal(RaftOperationKind.Client, RaftOperationMapper.GetKind(type));
     }
 
+    [Fact]
+    public void GetKind_DrainBarrier_ReturnsMaintenance()
+    {
+        Assert.Equal(RaftOperationKind.Maintenance, RaftOperationMapper.GetKind(RaftRequestType.DrainBarrier));
+    }
+
     // ── GetKind: unknown value ────────────────────────────────────────────────
 
     [Fact]
@@ -75,6 +81,7 @@ public class TestRaftOperationMapper
     [InlineData(RaftRequestType.RollbackLogs, RaftOperationPriority.Client)]
     [InlineData(RaftRequestType.GetNodeState, RaftOperationPriority.Client)]
     [InlineData(RaftRequestType.GetTicketState, RaftOperationPriority.Client)]
+    [InlineData(RaftRequestType.DrainBarrier, RaftOperationPriority.Maintenance)]
     public void GetPriority_KnownType_ReturnsExpectedWeight(RaftRequestType type, RaftOperationPriority expected)
     {
         Assert.Equal(expected, RaftOperationMapper.GetPriority(type));
@@ -151,6 +158,7 @@ public class TestRaftOperationMapper
     [InlineData(RaftRequestType.ReceiveVote, RaftStatePriority.High)]
     [InlineData(RaftRequestType.GetNodeState, RaftStatePriority.Low)]
     [InlineData(RaftRequestType.GetTicketState, RaftStatePriority.Low)]
+    [InlineData(RaftRequestType.DrainBarrier, RaftStatePriority.Low)]
     [InlineData(RaftRequestType.AppendLogs, RaftStatePriority.Mid)]
     [InlineData(RaftRequestType.CompleteAppendLogs, RaftStatePriority.Mid)]
     [InlineData(RaftRequestType.ReplicateLogs, RaftStatePriority.Mid)]

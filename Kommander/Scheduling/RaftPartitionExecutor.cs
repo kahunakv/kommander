@@ -176,6 +176,18 @@ public sealed class RaftPartitionExecutor : IDisposable
     }
 
     /// <summary>
+    /// Enqueues a maintenance barrier and completes when the executor has processed
+    /// all currently reachable higher-priority work ahead of that barrier.
+    /// </summary>
+    public Task DrainAsync(CancellationToken cancellationToken = default)
+    {
+        if (!_started || _stopping)
+            return Task.CompletedTask;
+
+        return Ask(new RaftRequest(RaftRequestType.DrainBarrier), cancellationToken);
+    }
+
+    /// <summary>
     /// Stops the executor.
     ///
     /// <para>Any operations that are already queued will be processed up to the point
@@ -396,6 +408,10 @@ public sealed class RaftPartitionExecutor : IDisposable
 
                 case RaftRequestType.WriteOperationCompleted:
                     await _stateMachine.CompleteWalOperationAsync(request.WalCompletion).ConfigureAwait(false);
+                    op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
+                    break;
+
+                case RaftRequestType.DrainBarrier:
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
                     break;
 

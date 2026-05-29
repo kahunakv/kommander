@@ -366,6 +366,9 @@ private volatile int _startRange;
         executor.Stop();
     }
 
+    internal Task DrainAsync(CancellationToken cancellationToken = default) =>
+        executor.DrainAsync(cancellationToken);
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)

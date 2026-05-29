@@ -365,15 +365,20 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     {
         await clusterHandler.LeaveCluster(configuration).ConfigureAwait(false);
 
-        // Stop in the correct order: timer first (no new work injected), then executor
-        // threads (which may flush WAL completions through the schedulers), then the
-        // I/O schedulers themselves.  Dispose the timer service here so its Timer
-        // instances are released immediately; RaftTimerService.Dispose() is idempotent
-        // and safe to call again from RaftManager.Dispose() if that path is taken.
+        // Stop in the correct order: timer first (no new work injected), drain
+        // partition queues, stop shared I/O schedulers while partition executors are
+        // still alive so WAL completions can be posted back, drain those completions,
+        // then stop executor threads. RaftTimerService.Dispose() is idempotent and
+        // safe to call again from RaftManager.Dispose() if that path is taken.
         timerService.Dispose();
 
-        // Stop partitions first so their executor threads finish emitting responses
-        // before the dispatcher channels are completed.
+        await DrainPartitions(CancellationToken.None).ConfigureAwait(false);
+
+        readScheduler.Stop();
+        walScheduler.Stop();
+
+        await DrainPartitions(CancellationToken.None).ConfigureAwait(false);
+
         foreach (RaftPartition partition in partitions.Values)
             partition.Stop();
 
@@ -386,11 +391,22 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         // Stop system coordinator channel — no more system events will be produced.
         systemCoordinator.Stop();
 
-        readScheduler.Stop();
-        walScheduler.Stop();
-
         if (dispose)
             Dispose();
+    }
+
+    private async Task DrainPartitions(CancellationToken cancellationToken)
+    {
+        List<Task> drainTasks = new(partitions.Count + 1);
+
+        foreach (RaftPartition partition in partitions.Values)
+            drainTasks.Add(partition.DrainAsync(cancellationToken));
+
+        if (systemPartition is not null)
+            drainTasks.Add(systemPartition.DrainAsync(cancellationToken));
+
+        if (drainTasks.Count > 0)
+            await Task.WhenAll(drainTasks).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1136,8 +1152,17 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         //    Timer instances are released without waiting for GC.
         timerService.Dispose();
 
-        // 2. Stop and dispose all partition executors first so their executor threads
-        //    finish emitting outbound responses before the dispatcher is stopped.
+        // 2. Drain partition queues before stopping shared schedulers. Then stop the
+        //    I/O schedulers while executors are still alive, so accepted WAL work can
+        //    post completions back into the owning executor. Drain once more to process
+        //    those completion messages before executor threads are joined.
+        DrainPartitions(CancellationToken.None).GetAwaiter().GetResult();
+
+        readScheduler.Stop();
+        walScheduler.Stop();
+
+        DrainPartitions(CancellationToken.None).GetAwaiter().GetResult();
+
         foreach (RaftPartition partition in partitions.Values)
             partition.Dispose();
 
@@ -1150,10 +1175,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         // Dispose the system coordinator after the dispatcher (no more system events).
         systemCoordinator.Dispose();
 
-        // 4. Stop and dispose I/O schedulers now that no executor is running.
-        readScheduler.Stop();
+        // 4. Dispose I/O schedulers after they have already been stopped above.
         readScheduler.Dispose();
-        walScheduler.Stop();
         walScheduler.Dispose();
 
         // 4. Dispose remaining shared resources.

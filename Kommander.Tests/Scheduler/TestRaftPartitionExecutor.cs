@@ -283,6 +283,26 @@ public sealed class TestRaftPartitionExecutor
             "No operations were processed before Stop().");
     }
 
+    [Fact]
+    public async Task DrainAsync_WaitsForPreviouslyQueuedOperations()
+    {
+        const int opCount = 25;
+
+        var (executor, _) = BuildExecutor(partitionId: 6);
+
+        for (int i = 0; i < opCount; i++)
+            executor.Post(new RaftRequest(RaftRequestType.CheckLeader));
+
+        await executor.DrainAsync(TestContext.Current.CancellationToken)
+            .WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.True(
+            executor.TotalProcessed >= opCount + 1,
+            $"Drain barrier completed before prior operations were processed. TotalProcessed={executor.TotalProcessed}.");
+
+        executor.Stop();
+    }
+
     /// <summary>
     /// Posting after Stop() must throw <see cref="InvalidOperationException"/>.
     /// </summary>

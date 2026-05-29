@@ -45,6 +45,7 @@ public static class RaftOperationMapper
             RaftRequestType.RollbackLogs         => RaftOperationKind.Client,
             RaftRequestType.GetNodeState         => RaftOperationKind.Client,
             RaftRequestType.GetTicketState       => RaftOperationKind.Client,
+            RaftRequestType.DrainBarrier         => RaftOperationKind.Maintenance,
 
             _ => throw new ArgumentOutOfRangeException(nameof(requestType), requestType, "Unrecognised RaftRequestType"),
         };
@@ -101,7 +102,8 @@ public static class RaftOperationMapper
             RaftRequestType.ReceiveVote => RaftStatePriority.High,
 
             RaftRequestType.GetNodeState or
-            RaftRequestType.GetTicketState => RaftStatePriority.Low,
+            RaftRequestType.GetTicketState or
+            RaftRequestType.DrainBarrier => RaftStatePriority.Low,
 
             RaftRequestType.AppendLogs or
             RaftRequestType.CompleteAppendLogs or
