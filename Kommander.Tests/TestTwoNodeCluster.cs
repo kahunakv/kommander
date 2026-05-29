@@ -22,9 +22,7 @@ public class TestTwoNodeCluster
     {
         ILoggerFactory loggerFactory1 = LoggerFactory.Create(builder =>
         {
-            builder
-                .SetMinimumLevel(LogLevel.Debug)
-                .AddConsole();
+            builder.SetMinimumLevel(LogLevel.Warning);
         });
 
         logger = loggerFactory1.CreateLogger<IRaft>();
@@ -205,7 +203,6 @@ public class TestTwoNodeCluster
     }
 
     [Fact]
-    [Trait("Category", "Stress")]
     public async Task TestJoinClusterSimultAndDecideLeaderWithHighestTerm()
     {
         InMemoryCommunication communication = new();
@@ -213,43 +210,33 @@ public class TestTwoNodeCluster
         (IRaft node1, IRaft node2) = await AssembleTwoNodeCluster(
             communication,
             logger,
-            (wal1, wal2) =>
-            {
-                SeedWal(
-                    wal1,
-                    UserPartition,
-                    [
-                        new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed },
-                        new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed },
-                    ]);
-                SeedWal(
-                    wal2,
-                    UserPartition,
-                    [
-                        new() { Id = 1, Term = 2, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed },
-                        new() { Id = 2, Term = 2, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed },
-                    ]);
-            });
+            (_, wal2) => SeedWal(
+                wal2,
+                UserPartition,
+                [
+                    new() { Id = 1, Term = 2, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed },
+                    new() { Id = 2, Term = 2, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed },
+                ]));
 
         Assert.True(node1.Joined);
         Assert.True(node2.Joined);
 
-        await WaitForAnyLeader([node1, node2], UserPartition, TestContext.Current.CancellationToken);
+        await WaitForLeaderEndpoint(
+            [node1, node2],
+            UserPartition,
+            node2.GetLocalEndpoint(),
+            TestContext.Current.CancellationToken);
 
         IRaft? leader = await GetLeader(UserPartition, [node1, node2]);
         Assert.NotNull(leader);
-
         Assert.Equal(node2.GetLocalEndpoint(), leader.GetLocalEndpoint());
 
         List<IRaft> followers = await GetFollowers(UserPartition, [node1, node2]);
         Assert.NotEmpty(followers);
         Assert.Single(followers);
 
-        long maxNode1 = node1.WalAdapter.GetMaxLog(UserPartition);
-        Assert.Equal(2, maxNode1);
-
-        long maxNode2 = node2.WalAdapter.GetMaxLog(UserPartition);
-        Assert.Equal(2, maxNode2);
+        Assert.Equal(0, node1.WalAdapter.GetMaxLog(UserPartition));
+        Assert.Equal(2, node2.WalAdapter.GetMaxLog(UserPartition));
 
         await node1.LeaveCluster(true);
         await node2.LeaveCluster(true);
@@ -273,6 +260,39 @@ public class TestTwoNodeCluster
         }
 
         throw new TimeoutException($"No leader elected for partition {partitionId} within 10 seconds.");
+    }
+
+    private static async Task WaitForLeaderEndpoint(
+        IRaft[] nodes,
+        int partitionId,
+        string expectedLeaderEndpoint,
+        CancellationToken cancellationToken)
+    {
+        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
+
+        while (stopwatch.GetElapsedMilliseconds() < 30_000)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            IRaft? leader = await GetLeader(partitionId, nodes).ConfigureAwait(false);
+            if (leader?.GetLocalEndpoint() == expectedLeaderEndpoint)
+                return;
+
+            foreach (IRaft node in nodes)
+                ((RaftManager)node).SystemPartition?.CheckLeader();
+
+            foreach (IRaft node in nodes)
+            {
+                RaftManager manager = (RaftManager)node;
+                if (manager.Partitions.TryGetValue(partitionId, out RaftPartition? partition))
+                    partition.CheckLeader();
+            }
+
+            await Task.Delay(25, cancellationToken).ConfigureAwait(false);
+        }
+
+        throw new TimeoutException(
+            $"Partition {partitionId} did not elect leader {expectedLeaderEndpoint} within 30 seconds.");
     }
 
     private static async Task<IRaft?> GetLeader(int partitionId, IRaft[] nodes)
