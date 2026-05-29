@@ -7,7 +7,6 @@ using Kommander.Time;
 using Kommander.WAL;
 using Kommander.WAL.Data;
 using Microsoft.Extensions.Logging;
-using Nixie;
 
 namespace Kommander;
 
@@ -20,7 +19,7 @@ public sealed class RaftWriteAhead
 {
     private readonly RaftManager manager;
 
-    private readonly ActorRefAggregate<RaftStateActor, RaftRequest, RaftResponse> actor;
+    private readonly Action<RaftWalCompletion> onComplete;
 
     private readonly RaftPartition partition;
 
@@ -57,14 +56,17 @@ public sealed class RaftWriteAhead
     /// Constructor
     /// </summary>
     /// <param name="manager"></param>
-    /// <param name="actor"></param>
-    /// <param name="contextSelf"></param>
+    /// <param name="onComplete">
+    /// Callback invoked by the scheduler when a WAL write completes (or errors).
+    /// Must not block; the owning partition executor routes the completion back
+    /// to <see cref="RaftPartitionStateMachine.CompleteWalOperationAsync"/>.
+    /// </param>
     /// <param name="partition"></param>
     /// <param name="walAdapter"></param>
-    public RaftWriteAhead(RaftManager manager, ActorRefAggregate<RaftStateActor, RaftRequest, RaftResponse> actor, RaftPartition partition, IWAL walAdapter)
+    public RaftWriteAhead(RaftManager manager, Action<RaftWalCompletion> onComplete, RaftPartition partition, IWAL walAdapter)
     {
         this.manager = manager;
-        this.actor = actor;
+        this.onComplete = onComplete;
         this.logger = manager.Logger;
         this.partition = partition;
         this.walAdapter = walAdapter;
@@ -95,7 +97,7 @@ public sealed class RaftWriteAhead
 
         bool found = false;
 
-        List<RaftLog> logs = await manager.ReadThreadPool.EnqueueTask(() => walAdapter.ReadLogs(partition.PartitionId));
+        List<RaftLog> logs = await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () => walAdapter.ReadLogs(partition.PartitionId));
         
         if (logs.Count > 0)
             manager.Logger.LogInformation("[{Endpoint}/{Partition}] Recovered {LogsCount} logs", manager.LocalEndpoint, partition.PartitionId, logs.Count);
@@ -188,14 +190,22 @@ public sealed class RaftWriteAhead
 
     public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp timestamp, bool autoCommit)
     {
-        foreach (RaftLog log in logs.OrderBy(log => log.Id))
+        RaftLog[] ordered = logs.OrderBy(log => log.Id).ToArray();
+
+        // Snapshot mutable state before mutation so we can roll back atomically if
+        // the scheduler rejects the operation (e.g. BackpressureExceededException).
+        long savedProposeIndex = proposeIndex;
+        long[] savedIds   = Array.ConvertAll(ordered, l => l.Id);
+        long[] savedTerms = Array.ConvertAll(ordered, l => l.Term);
+
+        foreach (RaftLog log in ordered)
         {
             log.Id = proposeIndex++;
             log.Term = term;
         }
 
         WALWriteOperation operation = new(
-            actor,
+            onComplete,
             Interlocked.Increment(ref walOperationSequence),
             WALWriteOperationType.LeaderPropose,
             (partition.PartitionId, logs),
@@ -205,7 +215,21 @@ public sealed class RaftWriteAhead
             logIndex: proposeIndex
         );
 
-        manager.WriteThreadPool.EnqueueTask(operation);
+        try
+        {
+            manager.WalScheduler.Enqueue(operation);
+        }
+        catch
+        {
+            // Restore all mutations so the caller observes no state change.
+            proposeIndex = savedProposeIndex;
+            for (int i = 0; i < ordered.Length; i++)
+            {
+                ordered[i].Id   = savedIds[i];
+                ordered[i].Term = savedTerms[i];
+            }
+            throw;
+        }
 
         return operation;
     }
@@ -228,8 +252,11 @@ public sealed class RaftWriteAhead
             return (RaftOperationStatus.Success, -1);
 
         long lastCommitIndex = -1;
+        long savedCommitIndex = commitIndex;
+        RaftLog[] ordered = logs.OrderBy(log => log.Id).ToArray();
+        RaftLogType[] savedTypes = Array.ConvertAll(ordered, l => l.Type);
 
-        foreach (RaftLog log in logs.OrderBy(log => log.Id))
+        foreach (RaftLog log in ordered)
         {
             switch (log.Type)
             {
@@ -263,17 +290,29 @@ public sealed class RaftWriteAhead
                     break;
             }
         }
-        
-        WALWriteOperation operation = EnqueueCommitPrepared(logs, lastCommitIndex);
 
-        return await Task.FromResult((RaftOperationStatus.Pending, operation.LogIndex));
+        try
+        {
+            WALWriteOperation operation = EnqueueCommitPrepared(logs, lastCommitIndex);
+            return await Task.FromResult((RaftOperationStatus.Pending, operation.LogIndex));
+        }
+        catch
+        {
+            commitIndex = savedCommitIndex;
+            for (int i = 0; i < ordered.Length; i++)
+                ordered[i].Type = savedTypes[i];
+            throw;
+        }
     }
 
     public WALWriteOperation EnqueueCommit(List<RaftLog> logs)
     {
         long lastCommitIndex = -1;
+        long savedCommitIndex = commitIndex;
+        RaftLog[] ordered = logs.OrderBy(log => log.Id).ToArray();
+        RaftLogType[] savedTypes = Array.ConvertAll(ordered, l => l.Type);
 
-        foreach (RaftLog log in logs.OrderBy(log => log.Id))
+        foreach (RaftLog log in ordered)
         {
             switch (log.Type)
             {
@@ -291,20 +330,30 @@ public sealed class RaftWriteAhead
             }
         }
 
-        return EnqueueCommitPrepared(logs, lastCommitIndex);
+        try
+        {
+            return EnqueueCommitPrepared(logs, lastCommitIndex);
+        }
+        catch
+        {
+            commitIndex = savedCommitIndex;
+            for (int i = 0; i < ordered.Length; i++)
+                ordered[i].Type = savedTypes[i];
+            throw;
+        }
     }
 
     private WALWriteOperation EnqueueCommitPrepared(List<RaftLog> logs, long lastCommitIndex)
     {
         WALWriteOperation operation = new(
-            actor,
+            onComplete,
             Interlocked.Increment(ref walOperationSequence),
             WALWriteOperationType.LeaderCommit,
             (partition.PartitionId, logs),
             logIndex: lastCommitIndex
         );
 
-        manager.WriteThreadPool.EnqueueTask(operation);
+        manager.WalScheduler.Enqueue(operation);
 
         return operation;
     }
@@ -326,7 +375,10 @@ public sealed class RaftWriteAhead
         if (logs is null || logs.Count == 0)
             return (RaftOperationStatus.Success, -1);
 
-        foreach (RaftLog log in logs.OrderBy(log => log.Id))
+        RaftLog[] ordered = logs.OrderBy(log => log.Id).ToArray();
+        RaftLogType[] savedTypes = Array.ConvertAll(ordered, l => l.Type);
+
+        foreach (RaftLog log in ordered)
         {
             switch (log.Type)
             {
@@ -347,15 +399,26 @@ public sealed class RaftWriteAhead
                 break;
             }
         }
-        
-        WALWriteOperation operation = EnqueueRollbackPrepared(logs);
 
-        return await Task.FromResult((RaftOperationStatus.Pending, operation.LogIndex));
+        try
+        {
+            WALWriteOperation operation = EnqueueRollbackPrepared(logs);
+            return await Task.FromResult((RaftOperationStatus.Pending, operation.LogIndex));
+        }
+        catch
+        {
+            for (int i = 0; i < ordered.Length; i++)
+                ordered[i].Type = savedTypes[i];
+            throw;
+        }
     }
 
     public WALWriteOperation EnqueueRollback(List<RaftLog> logs)
     {
-        foreach (RaftLog log in logs.OrderBy(log => log.Id))
+        RaftLog[] ordered = logs.OrderBy(log => log.Id).ToArray();
+        RaftLogType[] savedTypes = Array.ConvertAll(ordered, l => l.Type);
+
+        foreach (RaftLog log in ordered)
         {
             switch (log.Type)
             {
@@ -369,19 +432,28 @@ public sealed class RaftWriteAhead
             }
         }
 
-        return EnqueueRollbackPrepared(logs);
+        try
+        {
+            return EnqueueRollbackPrepared(logs);
+        }
+        catch
+        {
+            for (int i = 0; i < ordered.Length; i++)
+                ordered[i].Type = savedTypes[i];
+            throw;
+        }
     }
 
     private WALWriteOperation EnqueueRollbackPrepared(List<RaftLog> logs)
     {
         WALWriteOperation operation = new(
-            actor,
+            onComplete,
             Interlocked.Increment(ref walOperationSequence),
             WALWriteOperationType.LeaderRollback,
             (partition.PartitionId, logs)
         );
 
-        manager.WriteThreadPool.EnqueueTask(operation);
+        manager.WalScheduler.Enqueue(operation);
 
         return operation;
     }
@@ -395,7 +467,7 @@ public sealed class RaftWriteAhead
     /// </returns>
     public async Task<long> GetMaxLog()
     {
-        return await manager.ReadThreadPool.EnqueueTask(() => walAdapter.GetMaxLog(partition.PartitionId));
+        return await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () => walAdapter.GetMaxLog(partition.PartitionId));
     }
 
     /// <summary>
@@ -407,7 +479,7 @@ public sealed class RaftWriteAhead
     /// </returns>
     public async Task<long> GetCurrentTerm()
     {
-        return await manager.ReadThreadPool.EnqueueTask(() => walAdapter.GetCurrentTerm(partition.PartitionId));
+        return await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () => walAdapter.GetCurrentTerm(partition.PartitionId));
     }
 
     /// <summary>
@@ -479,6 +551,11 @@ public sealed class RaftWriteAhead
             return (RaftOperationStatus.Success, Math.Min(proposeIndex, commitIndex));*/
         }
         
+        // Snapshot mutable counters before the mutation loop so that a backpressure
+        // rejection from WalScheduler.Enqueue can be rolled back atomically.
+        long savedProposeIndex = proposeIndex;
+        long savedCommitIndex  = commitIndex;
+
         // Reuse internal lists
         foreach (KeyValuePair<RaftLogAction, List<RaftLog>> keyValue in plan)
             keyValue.Value.Clear();
@@ -582,7 +659,7 @@ public sealed class RaftWriteAhead
             return null;
 
         WALWriteOperation operation = new(
-            actor,
+            onComplete,
             Interlocked.Increment(ref walOperationSequence),
             WALWriteOperationType.FollowerAppend,
             (partition.PartitionId, logsToWrite),
@@ -592,7 +669,16 @@ public sealed class RaftWriteAhead
             logIndex: logsToWrite.Max(log => log.Id)
         );
 
-        manager.WriteThreadPool.EnqueueTask(operation);
+        try
+        {
+            manager.WalScheduler.Enqueue(operation);
+        }
+        catch
+        {
+            proposeIndex = savedProposeIndex;
+            commitIndex  = savedCommitIndex;
+            throw;
+        }
 
         return operation;
     }
@@ -620,7 +706,7 @@ public sealed class RaftWriteAhead
     /// </exception>
     public async Task<List<RaftLog>> GetRange(long startLogIndex)
     {
-        return await manager.ReadThreadPool.EnqueueTask(() => walAdapter.ReadLogsRange(partition.PartitionId, startLogIndex)).ConfigureAwait(false);
+        return await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () => walAdapter.ReadLogsRange(partition.PartitionId, startLogIndex)).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -638,7 +724,7 @@ public sealed class RaftWriteAhead
     /// </exception>
     public async Task Compact()
     {
-        long lastCheckpoint = await manager.ReadThreadPool.EnqueueTask(() => 
+        long lastCheckpoint = await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () => 
             walAdapter.GetLastCheckpoint(partition.PartitionId)
         ).ConfigureAwait(false);
 
@@ -647,7 +733,7 @@ public sealed class RaftWriteAhead
         
         logger.LogInformation("[{Endpoint}/{Partition}] Compaction process started LastCheckpoint={LastCheckpoint}", manager.LocalEndpoint, partition.PartitionId, lastCheckpoint);
         
-        await manager.ReadThreadPool.EnqueueTask(() =>
+        await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () =>
             walAdapter.CompactLogsOlderThan(partition.PartitionId, lastCheckpoint, compactNumberEntries
         )).ConfigureAwait(false);
     }

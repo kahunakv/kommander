@@ -1,7 +1,6 @@
 
-using Nixie;
-using Kommander.Communication;
 using Kommander.Data;
+using Kommander.Scheduling;
 using Kommander.Time;
 using Kommander.WAL;
 using Microsoft.Extensions.Logging;
@@ -17,59 +16,94 @@ public sealed class RaftPartition : IDisposable
 {
     private static readonly RaftRequest RaftStateRequest = new(RaftRequestType.GetNodeState);
 
-    private readonly ActorSystem actorSystem;
+    /// <summary>
+    /// Relay sink that breaks the circular dependency between
+    /// <see cref="RaftPartitionStateMachine"/> (needs a sink at construction) and
+    /// <see cref="RaftPartitionExecutor"/> (needs the state machine at construction).
+    /// The executor reference is injected after both objects are created.
+    /// </summary>
+    private sealed class PartitionReplySink : IRaftOperationReplySink
+    {
+        internal RaftPartitionExecutor? Executor;
 
-    private readonly ICommunication communication;
-    
+        public void TryComplete(ulong correlationId, RaftResponse response)
+            => Executor?.DeliverReply(correlationId, response);
+    }
+
     private readonly SemaphoreSlim semaphore = new(1, 1);
 
-    private readonly IActorRefAggregate<RaftStateActor, RaftRequest, RaftResponse> raftActor;
+    private readonly RaftPartitionExecutor executor;
 
     private readonly RaftManager manager;
 
+    private int _disposed;
+
     internal string Leader { get; set; } = "";
     
+private volatile int _startRange;
+    private volatile int _endRange;
+
     public int PartitionId { get; }
-    
-    public int StartRange { get; internal set; }
-    
-    public int EndRange { get; internal set; }
+
+    public int StartRange
+    {
+        get => _startRange;
+        internal set => _startRange = value;
+    }
+
+    public int EndRange
+    {
+        get => _endRange;
+        internal set => _endRange = value;
+    }
 
     /// <summary>
     /// Constructor
     /// </summary>
-    /// <param name="actorSystem"></param>
     /// <param name="manager"></param>
     /// <param name="walAdapter"></param>
-    /// <param name="communication"></param>
     /// <param name="partitionId"></param>
+    /// <param name="startRange"></param>
+    /// <param name="endRange"></param>
+    /// <param name="logger"></param>
     public RaftPartition(
-        ActorSystem actorSystem, 
         RaftManager manager, 
         IWAL walAdapter, 
-        ICommunication communication, 
         int partitionId,
         int startRange,
         int endRange,
         ILogger<IRaft> logger
     )
     {
-        this.actorSystem = actorSystem;
         this.manager = manager;
-        this.communication = communication;
         
         PartitionId = partitionId;
         StartRange = startRange;
         EndRange = endRange;
 
-        raftActor = actorSystem.SpawnAggregate<RaftStateActor, RaftRequest, RaftResponse>(
-            "raft-partition-" + partitionId, 
-            manager, 
+        // Break the circular dependency: state machine needs a reply sink; executor needs the
+        // state machine. We wire the executor reference into the sink after both are created.
+        PartitionReplySink replySink = new();
+
+        // The WAL completion callback posts back to the executor. The closure captures
+        // 'executor' which is assigned below, before Start() launches the worker thread,
+        // so it is always non-null when any callback fires during normal operation.
+        RaftPartitionExecutor? executorRef = null;
+        RaftWriteAhead walHandler = new(
+            manager,
+            completion => executorRef!.Post(new RaftRequest(RaftRequestType.WriteOperationCompleted, completion)),
             this,
-            walAdapter,
-            communication,
-            logger
+            walAdapter
         );
+
+        IRaftPartitionHost host = new RaftPartitionHostAdapter(manager, this);
+        IRaftWalFacade wal = new RaftWalFacadeAdapter(walHandler);
+        RaftPartitionStateMachine stateMachine = new(host, wal, replySink, logger);
+
+        executor = new RaftPartitionExecutor(stateMachine, partitionId, slowThresholdMs: 500, logger);
+        executorRef = executor;
+        replySink.Executor = executor;
+        executor.Start();
     }
 
     /// <summary>
@@ -78,7 +112,7 @@ public sealed class RaftPartition : IDisposable
     /// <param name="request"></param>
     public void Handshake(HandshakeRequest request)
     {
-        raftActor.Send(new(
+        executor.Post(new(
             RaftRequestType.ReceiveHandshake, 
             request.NodeId, 
             request.MaxLogId, 
@@ -93,7 +127,7 @@ public sealed class RaftPartition : IDisposable
     /// <param name="request"></param>
     public void RequestVote(RequestVotesRequest request)
     {
-        raftActor.Send(new(
+        executor.Post(new(
             RaftRequestType.RequestVote, 
             request.Term, 
             request.MaxLogId, 
@@ -108,7 +142,7 @@ public sealed class RaftPartition : IDisposable
     /// <param name="request"></param>
     public void Vote(VoteRequest request)
     {
-        raftActor.Send(new(
+        executor.Post(new(
             RaftRequestType.ReceiveVote, 
             request.Term, 
             request.MaxLogId, 
@@ -124,7 +158,7 @@ public sealed class RaftPartition : IDisposable
     /// <returns></returns>
     public void AppendLogs(AppendLogsRequest request)
     {
-        raftActor.Ask(new(
+        executor.Post(new(
             RaftRequestType.AppendLogs,
             request.Term,
             0,
@@ -142,7 +176,7 @@ public sealed class RaftPartition : IDisposable
     /// <returns></returns>
     public void CompleteAppendLogs(CompleteAppendLogsRequest request)
     {
-        raftActor.Ask(new(
+        executor.Post(new(
             RaftRequestType.CompleteAppendLogs,
             request.Term,
             request.CommitIndex,
@@ -172,10 +206,7 @@ public sealed class RaftPartition : IDisposable
 
         List<RaftLog> logsToReplicate = [new() { Type = RaftLogType.Proposed, LogType = type, LogData = data }];
         
-        RaftResponse? response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit)).ConfigureAwait(false);
-        
-        if (response is null)
-            return (false, RaftOperationStatus.Errored, HLCTimestamp.Zero);
+        RaftResponse response = await executor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit)).ConfigureAwait(false);
         
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
@@ -200,10 +231,7 @@ public sealed class RaftPartition : IDisposable
 
         List<RaftLog> logsToReplicate = logs.Select(data => new RaftLog { Type = RaftLogType.Proposed, LogType = type, LogData = data }).ToList();
         
-        RaftResponse? response = await raftActor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit)).ConfigureAwait(false);
-        
-        if (response is null)
-            return (false, RaftOperationStatus.Errored, HLCTimestamp.Zero);
+        RaftResponse response = await executor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit)).ConfigureAwait(false);
         
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
@@ -224,10 +252,7 @@ public sealed class RaftPartition : IDisposable
         if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, 0);
         
-        RaftResponse? response = await raftActor.Ask(new(RaftRequestType.CommitLogs, ticketId, false)).ConfigureAwait(false);
-        
-        if (response is null)
-            return (false, RaftOperationStatus.Errored, 0);
+        RaftResponse response = await executor.Ask(new(RaftRequestType.CommitLogs, ticketId, false)).ConfigureAwait(false);
         
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.LogIndex);
@@ -249,10 +274,7 @@ public sealed class RaftPartition : IDisposable
         if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, 0);
         
-        RaftResponse? response = await raftActor.Ask(new(RaftRequestType.RollbackLogs, ticketId, false)).ConfigureAwait(false);
-        
-        if (response is null)
-            return (false, RaftOperationStatus.Errored, 0);
+        RaftResponse response = await executor.Ask(new(RaftRequestType.RollbackLogs, ticketId, false)).ConfigureAwait(false);
         
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.LogIndex);
@@ -275,10 +297,7 @@ public sealed class RaftPartition : IDisposable
         if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
         
-        RaftResponse? response = await raftActor.Ask(new(RaftRequestType.ReplicateCheckpoint)).ConfigureAwait(false);
-        
-        if (response is null)
-            return (false, RaftOperationStatus.Errored, HLCTimestamp.Zero);
+        RaftResponse response = await executor.Ask(new(RaftRequestType.ReplicateCheckpoint)).ConfigureAwait(false);
         
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
@@ -298,7 +317,7 @@ public sealed class RaftPartition : IDisposable
         if (!string.IsNullOrEmpty(Leader) && Leader == manager.LocalEndpoint)
             return RaftNodeState.Leader;
 
-        RaftResponse? response = await raftActor.Ask(RaftStateRequest).ConfigureAwait(false);
+        RaftResponse? response = await executor.Ask(RaftStateRequest).ConfigureAwait(false);
         
         if (response is null)
             throw new RaftException("Unknown response (1)");
@@ -319,7 +338,7 @@ public sealed class RaftPartition : IDisposable
     /// <exception cref="RaftException">Thrown when an unexpected or unknown response is received from the Raft actor.</exception>
     public async Task<(RaftProposalTicketState state, long commitId)> GetTicketState(HLCTimestamp ticketId, bool autoCommit)
     {
-        RaftResponse? response = await raftActor.Ask(new(RaftRequestType.GetTicketState, ticketId, autoCommit)).ConfigureAwait(false);
+        RaftResponse? response = await executor.Ask(new(RaftRequestType.GetTicketState, ticketId, autoCommit)).ConfigureAwait(false);
         
         if (response is null)
             throw new RaftException("Unknown response (1)");
@@ -335,11 +354,25 @@ public sealed class RaftPartition : IDisposable
     /// </summary>
     public void CheckLeader()
     {
-        raftActor.Send(new(RaftRequestType.CheckLeader));
+        executor.Post(new(RaftRequestType.CheckLeader));
+    }
+
+    /// <summary>
+    /// Stops the partition's executor thread without releasing resources.
+    /// Safe to call multiple times. Call <see cref="Dispose"/> to release all resources.
+    /// </summary>
+    public void Stop()
+    {
+        executor.Stop();
     }
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
         semaphore.Dispose();
+        executor.Stop();
+        executor.Dispose();
     }
 }

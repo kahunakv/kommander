@@ -21,7 +21,8 @@ Kommander is designed to keep the consensus core separate from storage, discover
 - **Batch replication:** Replicate multiple log entries in a single proposal to reduce coordination overhead.
 - **Manual proposal control:** Use automatic commits for the common path, or disable auto-commit and explicitly call `CommitLogs` or `RollbackLogs`.
 - **Hybrid logical clocks:** Proposal tickets use HLC timestamps to preserve causality across physical time and logical counters.
-- **Dedicated I/O workers:** Synchronous WAL operations are processed through configurable read and write thread pools to avoid blocking actor execution.
+- **Actorless partition executors:** Each partition is driven by an explicit serial executor instead of an actor, making ownership and blocking boundaries easier to reason about.
+- **Fair I/O schedulers:** Synchronous WAL reads and writes are processed through configurable fair schedulers so storage work does not block partition state transitions.
 - **Application callbacks:** Restore, replication, replication-error, and leadership events let applications rebuild and advance their own state machines.
 - **ASP.NET Core integration:** Route extensions expose Raft gRPC and REST endpoints from an existing web host.
 
@@ -80,7 +81,6 @@ using Kommander.Discovery;
 using Kommander.Time;
 using Kommander.WAL;
 using Microsoft.Extensions.Logging;
-using Nixie;
 
 ILoggerFactory loggerFactory = LoggerFactory.Create(builder => builder.AddConsole());
 ILogger<IRaft> logger = loggerFactory.CreateLogger<IRaft>();
@@ -95,7 +95,6 @@ RaftConfiguration configuration = new()
 };
 
 IRaft raft = new RaftManager(
-    new ActorSystem(logger: logger),
     configuration,
     new StaticDiscovery([
         new RaftNode("localhost:8002"),
@@ -133,7 +132,7 @@ if (await raft.AmILeader(partitionId, timeout.Token))
         : $"Replication failed: {result.Status}");
 }
 
-await raft.LeaveCluster(disposeActorSystem: true);
+await raft.LeaveCluster(dispose: true);
 ```
 
 ## Hosting gRPC Or REST Endpoints
@@ -168,7 +167,6 @@ The sample server in `Kommander.Server` maps both gRPC and REST endpoints and st
 
 ```csharp
 IRaft raft = new RaftManager(
-    actorSystem,
     configuration,
     discovery,
     walAdapter,
@@ -190,7 +188,7 @@ Use a unique `NodeId` when you can. If `NodeId` is `0`, Kommander derives one fr
 | Replication | `ReplicateLogs`, `ReplicateCheckpoint`, `CommitLogs`, `RollbackLogs` |
 | Partition routing | `GetPartitionKey`, `GetPrefixPartitionKey` |
 | Transport entry points | `Handshake`, `RequestVote`, `Vote`, `AppendLogs`, `CompleteAppendLogs` |
-| Components | `ActorSystem`, `WalAdapter`, `Communication`, `Discovery`, `Configuration`, `HybridLogicalClock`, `ReadThreadPool`, `WriteThreadPool` |
+| Components | `WalAdapter`, `Communication`, `Discovery`, `Configuration`, `HybridLogicalClock`, `ReadScheduler`, `WalScheduler` |
 | Events | `OnRestoreStarted`, `OnRestoreFinished`, `OnReplicationError`, `OnLogRestored`, `OnReplicationReceived`, `OnLeaderChanged` |
 
 The transport entry points are intended for communication adapters and HTTP/gRPC endpoint handlers, not normal application writes.
@@ -212,15 +210,16 @@ The transport entry points are intended for communication adapters and HTTP/gRPC
 | `RecentHeartbeat` | `100 ms` | Cross-partition recent-heartbeat window. |
 | `VotingTimeout` | `1500 ms` | Candidate vote wait timeout. |
 | `CheckLeaderInterval` | `250 ms` | Leader election supervision interval. |
+| `TimerInitialDelay` | `2500 ms` | Initial delay before periodic Raft timers start. Tests can lower this to speed up elections. |
 | `UpdateNodesInterval` | `5000 ms` | Discovery refresh interval. |
 | `StartElectionTimeout` | `2000 ms` | Lower election timeout bound. |
 | `EndElectionTimeout` | `4000 ms` | Upper election timeout bound. |
 | `StartElectionTimeoutIncrement` | `100 ms` | Lower timeout backoff increment. |
 | `EndElectionTimeoutIncrement` | `200 ms` | Upper timeout backoff increment. |
-| `SlowRaftStateMachineLog` | `50 ms` | Slow actor message warning threshold. |
+| `SlowRaftStateMachineLog` | `50 ms` | Slow partition state-machine operation warning threshold. |
 | `SlowRaftWALMachineLog` | `25 ms` | Slow WAL warning threshold. |
-| `ReadIOThreads` | `8` | Dedicated synchronous WAL read workers. |
-| `WriteIOThreads` | `4` | Dedicated synchronous WAL write workers. |
+| `ReadIOThreads` | `8` | Fair scheduler workers for synchronous WAL reads. |
+| `WriteIOThreads` | `4` | Fair scheduler workers for synchronous WAL writes. |
 | `CompactEveryOperations` | `10000` | Configured compaction interval value. WAL adapters expose compaction, but callers should verify scheduling behavior before relying on automatic compaction. |
 | `CompactNumberEntries` | `100` | Max entries to remove when compaction is invoked. |
 
@@ -541,21 +540,28 @@ dotnet build Kommander.sln
 Run tests:
 
 ```shell
-dotnet test Kommander.Tests/Kommander.Tests.csproj
+dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category!=Stress"
+```
+
+Cluster stress tests are kept available but are excluded from the normal test lane because they intentionally run heavier race scenarios:
+
+```shell
+dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category=Stress"
 ```
 
 Useful focused slices:
 
 ```shell
 dotnet test Kommander.Tests/Kommander.Tests.csproj --filter FullyQualifiedName~TestSmallDictionary
-dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "FullyQualifiedName~TestThreeNodeCluster.TestJoinClusterAndProposeReplicateLogs"
-dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "FullyQualifiedName~TestThreeNodeCluster.TestJoinClusterAndMultiReplicateLogs"
+dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category!=Stress&FullyQualifiedName~TestTwoNodeCluster"
+dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category!=Stress&FullyQualifiedName~TestThreeNodeCluster"
 ```
 
 ## Current Limitations
 
 - Cluster membership is discovery-driven; there is no public membership-change API on `IRaft`.
 - Partition `0` is reserved and not available for application replication.
+- The Nixie actor runtime has been removed from the production library. Existing code that passed an `ActorSystem` to `RaftManager` must use the new constructor shown above.
 - `RedisDiscovery` is not implemented in this release.
 - The sample server is a demonstration host, not a complete production deployment template.
 

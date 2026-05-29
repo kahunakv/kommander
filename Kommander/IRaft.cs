@@ -1,13 +1,10 @@
 
-using Nixie;
-
 using Kommander.Data;
 using Kommander.WAL;
+using Kommander.WAL.IO;
 using Kommander.Communication;
 using Kommander.Discovery;
 using Kommander.Time;
-using IOThreadPool = Kommander.WAL.IO.ThreadPool;
-using MessageThreadPool = Kommander.WAL.IO.MessageThreadPool;
 
 namespace Kommander;
 
@@ -20,11 +17,6 @@ public interface IRaft
     /// Whether the node has joined the Raft cluster
     /// </summary>
     public bool Joined { get; }
-    
-    /// <summary>
-    /// Current actor system
-    /// </summary>
-    public ActorSystem ActorSystem { get; }
     
     /// <summary>
     /// Current WAL adapter
@@ -52,14 +44,14 @@ public interface IRaft
     public HybridLogicalClock HybridLogicalClock { get; }
     
     /// <summary>
-    /// Read I/O thread pool
+    /// Fair read scheduler for partition-tagged synchronous WAL reads.
     /// </summary>
-    public IOThreadPool ReadThreadPool { get; }
+    public IRaftReadScheduler ReadScheduler { get; }
     
     /// <summary>
-    /// Write I/O thread pool
+    /// WAL write scheduler.
     /// </summary>
-    public MessageThreadPool WriteThreadPool { get; }
+    public IRaftWalScheduler WalScheduler { get; }
     
     /// <summary>
     /// Whether the Raft partitions are initialized or not
@@ -105,9 +97,9 @@ public interface IRaft
     /// <summary>
     /// Leaves the Raft cluster
     /// </summary>
-    /// <param name="disposeActorSystem"></param>
+    /// <param name="dispose">If true, also disposes the manager</param>
     /// <returns></returns>
-    public Task LeaveCluster(bool disposeActorSystem = false);
+    public Task LeaveCluster(bool dispose = false);
 
     /// <summary>
     /// Updates the active Raft cluster nodes

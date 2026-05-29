@@ -1,5 +1,4 @@
 
-using Nixie;
 using System.Collections.Concurrent;
 
 using Kommander.Communication;
@@ -9,10 +8,8 @@ using Kommander.Discovery;
 using Kommander.System;
 using Kommander.Time;
 using Kommander.WAL;
+using Kommander.WAL.IO;
 using Microsoft.Extensions.Logging;
-using ThreadPool = Kommander.WAL.IO.ThreadPool;
-using MessageThreadPool = Kommander.WAL.IO.MessageThreadPool;
-
 // ReSharper disable ConvertToAutoPropertyWithPrivateSetter
 // ReSharper disable MemberCanBePrivate.Global
 // ReSharper disable ConvertToAutoProperty
@@ -25,7 +22,7 @@ namespace Kommander;
 /// It coordinates cluster nodes, handles log replication, voting processes, and partition management
 /// associated with a Raft-based architecture.
 /// </summary>
-public sealed class RaftManager : IRaft, IDisposable
+public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 {
     internal readonly string LocalEndpoint;
 
@@ -34,8 +31,6 @@ public sealed class RaftManager : IRaft, IDisposable
     internal readonly int LocalNodeId;
 
     internal readonly ILogger<IRaft> Logger;
-
-    private readonly ActorSystem actorSystem;
 
     private readonly RaftConfiguration configuration;
 
@@ -53,23 +48,23 @@ public sealed class RaftManager : IRaft, IDisposable
 
     private RaftPartition? systemPartition;
 
-    private readonly Dictionary<int, RaftPartition> partitions = [];
+    private readonly ConcurrentDictionary<int, RaftPartition> partitions = new();
 
-    private readonly ThreadPool readThreadPool;
+    private readonly FairReadScheduler readScheduler;
 
-    //private readonly ThreadPool writeThreadPool;
-    
-    private readonly MessageThreadPool writeThreadPool;
+    private readonly FairWalScheduler walScheduler;
 
-    private readonly IActorRef<RaftSystemActor, RaftSystemRequest> systemActor;
+    private readonly RaftSystemCoordinator systemCoordinator;
 
-    private readonly IActorRef<RaftLeaderSupervisor, RaftLeaderSupervisorRequest> leaderSupervisorActor;
+    private readonly RaftTimerService timerService;
+
+    private int _disposed;
 
     private readonly ConcurrentDictionary<string, HLCTimestamp> lastActivity = new();
     
     private readonly ConcurrentDictionary<string, HLCTimestamp> lastHearthBeat = new();
     
-    private readonly ConcurrentDictionary<string, Lazy<IActorRefAggregate<RaftResponderActor, RaftResponderRequest>>> responderActors = [];
+    private readonly Communication.RaftTransportDispatcher transportDispatcher;
 
     /// <summary>
     /// Allows to retrieve the list of known nodes within the Raft cluster
@@ -84,7 +79,9 @@ public sealed class RaftManager : IRaft, IDisposable
     /// <summary>
     /// Returns the user partitions
     /// </summary>
-    internal Dictionary<int, RaftPartition> Partitions => partitions;
+    internal ConcurrentDictionary<int, RaftPartition> Partitions => partitions;
+
+    internal RaftSystemCoordinator SystemCoordinator => systemCoordinator;
 
     /// <summary>
     /// Whether the node is fully initialized or not
@@ -92,24 +89,22 @@ public sealed class RaftManager : IRaft, IDisposable
     public bool IsInitialized { get; private set; }
 
     /// <summary>
-    /// Read I/O thread pool
+    /// Fair read scheduler. Dispatches partition-tagged synchronous WAL reads
+    /// to dedicated worker threads with fair, bounded per-partition queues.
     /// </summary>
-    public ThreadPool ReadThreadPool => readThreadPool;
+    public IRaftReadScheduler ReadScheduler => readScheduler;
 
     /// <summary>
-    /// Write I/O thread pool
+    /// WAL write scheduler. Submits partition-tagged WAL commands to the
+    /// <see cref="FairWalScheduler"/> and delivers completions via
+    /// <see cref="WAL.Data.RaftWalCompletion"/> callbacks.
     /// </summary>
-    public MessageThreadPool WriteThreadPool => writeThreadPool;
+    public IRaftWalScheduler WalScheduler => walScheduler;
 
     /// <summary>
     /// Whether the node has joined the Raft cluster
     /// </summary>
     public bool Joined => clusterHandler.Joined;
-
-    /// <summary>
-    /// Current Actor System
-    /// </summary>
-    public ActorSystem ActorSystem => actorSystem;
 
     /// <summary>
     /// Current WAL adapter
@@ -194,7 +189,6 @@ public sealed class RaftManager : IRaft, IDisposable
     /// <summary>
     /// Constructor
     /// </summary>
-    /// <param name="actorSystem"></param>
     /// <param name="configuration"></param>
     /// <param name="discovery"></param>
     /// <param name="walAdapter"></param>
@@ -202,7 +196,6 @@ public sealed class RaftManager : IRaft, IDisposable
     /// <param name="hybridLogicalClock"></param>
     /// <param name="logger"></param>
     public RaftManager(
-        ActorSystem actorSystem,
         RaftConfiguration configuration,
         IDiscovery discovery,
         IWAL walAdapter,
@@ -211,7 +204,6 @@ public sealed class RaftManager : IRaft, IDisposable
         ILogger<IRaft> logger
     )
     {
-        this.actorSystem = actorSystem;
         this.configuration = configuration;
         this.walAdapter = walAdapter;
         this.discovery = discovery;
@@ -226,11 +218,14 @@ public sealed class RaftManager : IRaft, IDisposable
 
         clusterHandler = new(this, discovery);
 
-        systemActor = actorSystem.Spawn<RaftSystemActor, RaftSystemRequest>("raft-system", this, Logger);
-        leaderSupervisorActor = actorSystem.Spawn<RaftLeaderSupervisor, RaftLeaderSupervisorRequest>("raft-leader-supervisor", this, Logger);
+        systemCoordinator = new RaftSystemCoordinator(this, Logger);
+        timerService = new RaftTimerService(this, Logger, configuration);
+        timerService.Start();
 
-        readThreadPool = new(logger, configuration.ReadIOThreads);
-        writeThreadPool = new(walAdapter, logger, configuration.WriteIOThreads);
+        transportDispatcher = new Communication.RaftTransportDispatcher(this, communication, Logger);
+
+        readScheduler = new(logger, configuration.ReadIOThreads);
+        walScheduler = new(walAdapter, logger, configuration.WriteIOThreads);
 
         OnSystemLogRestored += SystemLogRestored;
         OnSystemReplicationReceived += SystemReplicationReceived;
@@ -261,7 +256,7 @@ public sealed class RaftManager : IRaft, IDisposable
         if (partitionId != RaftSystemConfig.SystemPartition)
             return Task.FromResult(true);
 
-        systemActor.Send(new(RaftSystemRequestType.LeaderChanged, node));
+        systemCoordinator.Send(new(RaftSystemRequestType.LeaderChanged, node));
         return Task.FromResult(true);
     }
 
@@ -274,7 +269,7 @@ public sealed class RaftManager : IRaft, IDisposable
             return Task.FromResult(true);
         }
 
-        systemActor.Send(new(RaftSystemRequestType.ConfigRestored, log.LogData));
+        systemCoordinator.Send(new(RaftSystemRequestType.ConfigRestored, log.LogData));
 
         return Task.FromResult(true);
     }
@@ -288,14 +283,14 @@ public sealed class RaftManager : IRaft, IDisposable
             return Task.FromResult(true);
         }
 
-        systemActor.Send(new(RaftSystemRequestType.ConfigReplicated, log.LogData));
+        systemCoordinator.Send(new(RaftSystemRequestType.ConfigReplicated, log.LogData));
 
         return Task.FromResult(true);
     }
 
     private void SystemRestoreFinished(int partitionId)
     {
-        systemActor.Send(new(RaftSystemRequestType.RestoreCompleted));
+        systemCoordinator.Send(new(RaftSystemRequestType.RestoreCompleted));
     }
 
     /// <summary>
@@ -308,15 +303,13 @@ public sealed class RaftManager : IRaft, IDisposable
 
         if (systemPartition is null)
         {
-            readThreadPool.Start();
-            writeThreadPool.Start();
+            readScheduler.Start();
+            walScheduler.Start();
 
             // Add system partition
             systemPartition = new(
-                actorSystem,
                 this,
                 walAdapter,
-                communication,
                 RaftSystemConfig.SystemPartition,
                 0,
                 0,
@@ -338,18 +331,17 @@ public sealed class RaftManager : IRaft, IDisposable
         {
             if (partitions.TryGetValue(range.PartitionId, out RaftPartition? partition))
             {
+                // Volatile writes — visible to any thread already holding a reference.
                 partition.StartRange = range.StartRange;
                 partition.EndRange = range.EndRange;
             }
             else
             {
-                partitions.Add(
+                partitions.TryAdd(
                     range.PartitionId,
                     new(
-                        actorSystem,
                         this,
                         walAdapter,
-                        communication,
                         range.PartitionId,
                         range.StartRange,
                         range.EndRange,
@@ -358,22 +350,43 @@ public sealed class RaftManager : IRaft, IDisposable
                 );
             }
         }
-        
+
         IsInitialized = true;
     }
 
     /// <summary>
     /// Leaves the cluster
     /// </summary>
-    /// <param name="disposeActorSystem"></param>
-    public async Task LeaveCluster(bool disposeActorSystem = false)
+    /// <param name="dispose">If true, also disposes the manager</param>
+    public async Task LeaveCluster(bool dispose = false)
     {
         await clusterHandler.LeaveCluster(configuration).ConfigureAwait(false);
 
-        readThreadPool.Stop();
-        writeThreadPool.Stop();
+        // Stop in the correct order: timer first (no new work injected), then executor
+        // threads (which may flush WAL completions through the schedulers), then the
+        // I/O schedulers themselves.  Dispose the timer service here so its Timer
+        // instances are released immediately; RaftTimerService.Dispose() is idempotent
+        // and safe to call again from RaftManager.Dispose() if that path is taken.
+        timerService.Dispose();
 
-        if (disposeActorSystem)
+        // Stop partitions first so their executor threads finish emitting responses
+        // before the dispatcher channels are completed.
+        foreach (RaftPartition partition in partitions.Values)
+            partition.Stop();
+
+        systemPartition?.Stop();
+
+        // Complete dispatcher channels now that no executor thread is producing more
+        // outbound messages; workers drain the remaining buffered items then exit.
+        transportDispatcher.Stop();
+
+        // Stop system coordinator channel — no more system events will be produced.
+        systemCoordinator.Stop();
+
+        readScheduler.Stop();
+        walScheduler.Stop();
+
+        if (dispose)
             Dispose();
     }
 
@@ -387,6 +400,16 @@ public sealed class RaftManager : IRaft, IDisposable
 
         await clusterHandler.UpdateNodes().ConfigureAwait(false);
     }
+
+    // ── IRaftTimerHost ─────────────────────────────────────────────────────
+
+    RaftPartition? Scheduling.IRaftTimerHost.SystemPartition => systemPartition;
+
+    IEnumerable<RaftPartition> Scheduling.IRaftTimerHost.GetUserPartitions() => partitions.Values;
+
+    Task Scheduling.IRaftTimerHost.UpdateNodes() => UpdateNodes();
+
+    // ──────────────────────────────────────────────────────────────────────
 
     /// <summary>
     /// Obtains the last activity known of a specific node on any partitions
@@ -735,7 +758,7 @@ public sealed class RaftManager : IRaft, IDisposable
                         break;
                 }
             }
-            catch (AskTimeoutException e)
+            catch (Exception e) when (e is not OperationCanceledException)
             {
                 Logger.LogError("ReplicateLogs: {Message}", e.Message);
             }
@@ -947,7 +970,7 @@ public sealed class RaftManager : IRaft, IDisposable
 
             return response == RaftNodeState.Leader;
         }
-        catch (AskTimeoutException e)
+        catch (Exception e) when (e is not OperationCanceledException)
         {
             Logger.LogError("AmILeaderQuick: {Message}", e.Message);
         }
@@ -985,7 +1008,7 @@ public sealed class RaftManager : IRaft, IDisposable
 
                 return response == RaftNodeState.Leader;
             }
-            catch (AskTimeoutException e)
+            catch (Exception e) when (e is not OperationCanceledException)
             {
                 Logger.LogError("AmILeader: {Message}", e.Message);
             }
@@ -1029,7 +1052,7 @@ public sealed class RaftManager : IRaft, IDisposable
 
                 return partition.Leader;
             }
-            catch (AskTimeoutException e)
+            catch (Exception e) when (e is not OperationCanceledException)
             {
                 Logger.LogError("WaitForLeader: {Message}", e.Message);
             }
@@ -1055,7 +1078,7 @@ public sealed class RaftManager : IRaft, IDisposable
         if (!await AmILeader(partitionId, CancellationToken.None).ConfigureAwait(false))
             throw new RaftException("Split cannot be initiated by follower");
 
-        systemActor.Send(new(RaftSystemRequestType.SplitPartition, partitionId));
+        systemCoordinator.Send(new(RaftSystemRequestType.SplitPartition, partitionId));
     }
 
     /// <summary>
@@ -1098,34 +1121,40 @@ public sealed class RaftManager : IRaft, IDisposable
         throw new RaftException("Couldn't find partition range for: " + prefixPartitionKey + " " + rangeId);
     }
     
-    internal void EnqueueResponse(string endpoint, RaftResponderRequest request)
-    {
-        Lazy<IActorRefAggregate<RaftResponderActor, RaftResponderRequest>> responderActorLazy = responderActors.GetOrAdd(endpoint, GetOrCreateResponderActor);
-        IActorRefAggregate<RaftResponderActor, RaftResponderRequest> responderActor = responderActorLazy.Value;        
-        responderActor.Send(request);
-    }
-
-    private Lazy<IActorRefAggregate<RaftResponderActor, RaftResponderRequest>> GetOrCreateResponderActor(string endpoint)
-    {
-        return new(() => CreateResponderActor(endpoint));
-    }
-
-    private IActorRefAggregate<RaftResponderActor, RaftResponderRequest> CreateResponderActor(string endpoint)
-    {
-        return actorSystem.SpawnAggregate<RaftResponderActor, RaftResponderRequest>(
-            string.Concat("raft-responder-", endpoint),
-            this,
-            new RaftNode(endpoint),
-            communication,
-            Logger
-        );
-    }
+    internal void EnqueueResponse(string endpoint, RaftResponderRequest request) =>
+        transportDispatcher.Enqueue(endpoint, request);
 
     public void Dispose()
     {
-        actorSystem.Dispose();
-        hybridLogicalClock.Dispose();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
+        // 1. Stop and dispose the timer so no new work is injected and both
+        //    Timer instances are released without waiting for GC.
+        timerService.Dispose();
+
+        // 2. Stop and dispose all partition executors first so their executor threads
+        //    finish emitting outbound responses before the dispatcher is stopped.
+        foreach (RaftPartition partition in partitions.Values)
+            partition.Dispose();
+
         systemPartition?.Dispose();
+
+        // 3. Dispose the transport dispatcher now that all partition executors have
+        //    stopped; workers drain buffered responses then are hard-aborted.
+        transportDispatcher.Dispose();
+
+        // Dispose the system coordinator after the dispatcher (no more system events).
+        systemCoordinator.Dispose();
+
+        // 4. Stop and dispose I/O schedulers now that no executor is running.
+        readScheduler.Stop();
+        readScheduler.Dispose();
+        walScheduler.Stop();
+        walScheduler.Dispose();
+
+        // 4. Dispose remaining shared resources.
+        hybridLogicalClock.Dispose();
         walAdapter.Dispose();
     }
 }

@@ -70,6 +70,11 @@ public class RaftConfiguration
     /// Interval to perform leader election actions
     /// </summary>
     public TimeSpan CheckLeaderInterval { get; set; } = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>
+    /// Initial delay before periodic Raft timers start firing.
+    /// </summary>
+    public TimeSpan TimerInitialDelay { get; set; } = TimeSpan.FromMilliseconds(2500);
     
     /// <summary>
     /// Interval to report liveness to the node registry

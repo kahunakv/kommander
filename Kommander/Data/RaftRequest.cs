@@ -24,6 +24,15 @@ public sealed class RaftRequest
 
     public WALWriteOperation? WalOperation { get; }
 
+    /// <summary>
+    /// Full WAL completion envelope.  Set when <see cref="Type"/> is
+    /// <see cref="RaftRequestType.WriteOperationCompleted"/>.
+    /// Carries partition, term, and log-range fencing metadata that
+    /// <see cref="RaftPartitionStateMachine.CompleteWalOperationAsync"/> validates
+    /// before processing the completion.
+    /// </summary>
+    public RaftWalCompletion? WalCompletion { get; }
+
     public RaftRequest(
         RaftRequestType type, 
         long term = -1, 
@@ -68,5 +77,28 @@ public sealed class RaftRequest
         AutoCommit = walOperation.AutoCommit;
         CommitIndex = walOperation.LogIndex;
         Logs = walOperation.Logs.Item2;
+    }
+
+    /// <summary>
+    /// Constructs a <see cref="RaftRequestType.WriteOperationCompleted"/> request that
+    /// carries the full <see cref="RaftWalCompletion"/> envelope so that the partition
+    /// executor can validate partition, term, and log-range fencing metadata before
+    /// advancing state.
+    /// </summary>
+    public RaftRequest(RaftRequestType type, RaftWalCompletion completion)
+    {
+        Type = type;
+        WalCompletion = completion;
+        WalOperation = completion.Operation;
+        Status = completion.Status;
+        if (completion.Operation is { } op)
+        {
+            Timestamp = op.Timestamp;
+            Endpoint = op.Endpoint;
+            Term = op.Term;
+            AutoCommit = op.AutoCommit;
+            CommitIndex = op.LogIndex;
+            Logs = op.Logs.Item2;
+        }
     }
 }

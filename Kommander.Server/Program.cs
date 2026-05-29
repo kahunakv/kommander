@@ -1,6 +1,4 @@
 
-using Nixie;
-
 using System.Net;
 using System.Text;
 using CommandLine;
@@ -44,15 +42,11 @@ try
 
     WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 
-    builder.Services.AddSingleton<ActorSystem>(services =>
-        new(services, services.GetRequiredService<ILogger<IRaft>>()));
-
     builder.Services.AddSingleton<IRaft>(services =>
     {
         ILogger<IRaft> logger = services.GetRequiredService<ILogger<IRaft>>();
         
         RaftManager node = new(
-            services.GetRequiredService<ActorSystem>(),
             configuration,
             new StaticDiscovery(nodes),
             new RocksDbWAL(path: opts.SqliteWalPath, revision: opts.SqliteWalRevision, logger),

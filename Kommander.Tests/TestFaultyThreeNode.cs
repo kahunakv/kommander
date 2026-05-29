@@ -1,5 +1,4 @@
 
-using Nixie;
 using Microsoft.Extensions.Logging;
 
 using Kommander.Communication.Memory;
@@ -29,8 +28,6 @@ namespace Kommander.Tests;
     
     private static IRaft GetNode1(InMemoryCommunication communication, ILogger<IRaft> logger)
     {
-        ActorSystem actorSystem = new(logger: logger);
-        
         RaftConfiguration config = new()
         {
             NodeId = "node1",
@@ -40,7 +37,6 @@ namespace Kommander.Tests;
         };
         
         RaftManager node = new(
-            actorSystem, 
             config, 
             new DynamicDiscovery([new("localhost:8002"), new("localhost:8003")]),
             new InMemoryWAL(),
@@ -54,8 +50,6 @@ namespace Kommander.Tests;
     
     private static RaftManager GetNode2(InMemoryCommunication communication, ILogger<IRaft> logger)
     {
-        ActorSystem actorSystem = new(logger: logger);
-        
         RaftConfiguration config = new()
         {
             NodeId = "node2",
@@ -65,7 +59,6 @@ namespace Kommander.Tests;
         };
         
         RaftManager node = new(
-            actorSystem, 
             config, 
             new DynamicDiscovery([new("localhost:8001"), new("localhost:8003")]),
             new InMemoryWAL(),
@@ -79,8 +72,6 @@ namespace Kommander.Tests;
     
     private static RaftManager GetNode3(InMemoryCommunication communication, ILogger<IRaft> logger)
     {
-        ActorSystem actorSystem = new(logger: logger);
-        
         RaftConfiguration config = new()
         {
             NodeId = "node3",
@@ -90,7 +81,6 @@ namespace Kommander.Tests;
         };
         
         RaftManager node = new(
-            actorSystem, 
             config, 
             new DynamicDiscovery([new("localhost:8001"), new("localhost:8002")]),
             new InMemoryWAL(),
@@ -141,7 +131,7 @@ namespace Kommander.Tests;
         Assert.NotEmpty(followers);
         Assert.Equal(2, followers.Count);
         
-        leader.ActorSystem.Dispose();
+        ((IDisposable)leader).Dispose();
 
         RaftNode nodeToRemove = new(leader.GetLocalEndpoint());
         
@@ -167,8 +157,8 @@ namespace Kommander.Tests;
         
         Assert.NotEqual(leader.GetLocalEndpoint(), newLeader.GetLocalEndpoint());
 
-        node1.ActorSystem.Dispose();
-        node2.ActorSystem.Dispose();
+        ((IDisposable)node1).Dispose();
+        ((IDisposable)node2).Dispose();
     }
     
     [Fact]
@@ -210,7 +200,7 @@ namespace Kommander.Tests;
         Assert.NotEmpty(followers);
         Assert.Equal(2, followers.Count);
         
-        leader.ActorSystem.Dispose();
+        ((IDisposable)leader).Dispose();
 
         RaftNode nodeToRemove = new(leader.GetLocalEndpoint());
         
@@ -291,8 +281,8 @@ namespace Kommander.Tests;
         Assert.NotEmpty(followers);
         Assert.Equal(2, followers.Count);
 
-        node1.ActorSystem.Dispose();
-        node2.ActorSystem.Dispose();
+        ((IDisposable)node1).Dispose();
+        ((IDisposable)node2).Dispose();
     }
     
     private static async Task<IRaft?> GetLeader(int partitionId, IRaft[] nodes)
