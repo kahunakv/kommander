@@ -37,7 +37,7 @@ public class RocksDbWAL : IWAL, IDisposable
     /// This constant is used to ensure compatibility by identifying the version of the metadata structure
     /// and log format maintained within the storage system.
     /// </summary>
-    private const string FormatVersion = "1.0.0";
+    private const string FormatVersion = "2.0.0";
 
     /// <summary>
     /// Represents the maximum allowable size, in bytes, for a serialized message
@@ -73,6 +73,19 @@ public class RocksDbWAL : IWAL, IDisposable
     /// This shouldn't be changed without a proper migration plan, as it would break the ordering of the logs.
     /// </summary>
     private const int IdWidth = 20;
+
+    /// <summary>
+    /// Specifies the fixed width, in bytes, used for encoding partition IDs into
+    /// RocksDB keys. The width keeps all keys for a partition contiguous and
+    /// lexicographically sorted by log ID within that partition.
+    /// </summary>
+    private const int PartitionIdWidth = 10;
+
+    private const int LogKeyWidth = PartitionIdWidth + 1 + IdWidth;
+
+    private const byte LogKeySeparator = (byte)':';
+
+    private const byte PartitionUpperBoundSeparator = (byte)';';
 
     /// <summary>
     /// Represents a RocksDB instance used as the underlying storage engine
@@ -119,6 +132,19 @@ public class RocksDbWAL : IWAL, IDisposable
         
         if (firstTime)
             SetMetaData("version", FormatVersion);
+        else
+        {
+            string? currentVersion = GetMetaData("version");
+
+            if (!string.Equals(currentVersion, FormatVersion, StringComparison.Ordinal))
+            {
+                db.Dispose();
+                throw new InvalidOperationException(
+                    $"RocksDB WAL format version '{currentVersion ?? "<missing>"}' is not compatible with '{FormatVersion}'. " +
+                    "Create a fresh WAL directory or migrate the existing data before opening it."
+                );
+            }
+        }
     }
 
     /// <summary>
@@ -176,19 +202,16 @@ public class RocksDbWAL : IWAL, IDisposable
 
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         
-        if (lastCheckpoint <= 0)
-            iterator.SeekToFirst();  // Move to the first key
-        else
-        {
-            Span<byte> buffer = stackalloc byte[IdWidth];
-            
-            ToDecimalBytes(buffer, lastCheckpoint);
-           
-            iterator.Seek(buffer);
-        }
+        long startLogId = Math.Max(0, lastCheckpoint);
+        Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+        BuildLogKey(seekKey, partitionId, startLogId);
+        iterator.Seek(seekKey);
 
         while (iterator.Valid())
         {
+            if (!KeyBelongsToPartition(iterator.Key(), partitionId))
+                break;
+
             RaftLogMessage message = Unserializer(iterator.Value());
             
             if (message.Partition != partitionId || message.Id < lastCheckpoint)
@@ -247,24 +270,17 @@ public class RocksDbWAL : IWAL, IDisposable
         
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         
-        if (startLogIndex <= 0)
-            iterator.SeekToFirst();  // Move to the first key
-        else
-        {
-            Span<byte> buffer = stackalloc byte[IdWidth];
-            
-            ToDecimalBytes(buffer, startLogIndex);
-            
-            //Span<byte> buffer = stackalloc byte[Encoding.UTF8.GetByteCount(index)];
-            //Encoding.UTF8.GetBytes(index.AsSpan(), buffer);
-            
-            iterator.Seek(buffer);
-        }
+        Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+        BuildLogKey(seekKey, partitionId, Math.Max(0, startLogIndex));
+        iterator.Seek(seekKey);
 
         int counter = 0;
 
         while (iterator.Valid())
         {
+            if (!KeyBelongsToPartition(iterator.Key(), partitionId))
+                break;
+
             RaftLogMessage message = Unserializer(iterator.Value());
             
             if (message.Partition != partitionId || message.Id < startLogIndex)
@@ -341,13 +357,12 @@ public class RocksDbWAL : IWAL, IDisposable
                 if (log.LogData != null)
                     message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
 
-                Span<byte> buffer = stackalloc byte[IdWidth];
-                
-                ToDecimalBytes(buffer, message.Id);
+                Span<byte> buffer = stackalloc byte[LogKeyWidth];
+                BuildLogKey(buffer, partitionId, message.Id);
                 
                 ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
                 
-                db.Put(buffer, Serialize(message), columnFamilyHandle);
+                db.Put(buffer, Serialize(message), columnFamilyHandle, DefaultWriteOptions);
                 
                 return RaftOperationStatus.Success;
             }
@@ -440,9 +455,8 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </param>
     private static void PutToBatch(WriteBatch writeBatch, RaftLogMessage message, ColumnFamilyHandle columnFamilyHandle)
     {
-        Span<byte> buffer = stackalloc byte[IdWidth];
-                
-        ToDecimalBytes(buffer, message.Id);
+        Span<byte> buffer = stackalloc byte[LogKeyWidth];
+        BuildLogKey(buffer, message.Partition, message.Id);
         
         writeBatch.Put(buffer, Serialize(message), cf: columnFamilyHandle);
     }
@@ -461,9 +475,9 @@ public class RocksDbWAL : IWAL, IDisposable
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
         
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
-        iterator.SeekToLast();  // Move to the last key
+        SeekToLastPartitionKey(iterator, partitionId);
 
-        while (iterator.Valid())
+        while (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId))
         {
             RaftLogMessage message = Unserializer(iterator.Value());
             
@@ -493,9 +507,9 @@ public class RocksDbWAL : IWAL, IDisposable
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
         
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
-        iterator.SeekToLast();  // Move to the last key
+        SeekToLastPartitionKey(iterator, partitionId);
 
-        while (iterator.Valid())
+        while (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId))
         {
             RaftLogMessage message = Unserializer(iterator.Value());
             
@@ -542,9 +556,9 @@ public class RocksDbWAL : IWAL, IDisposable
     private long GetLastCheckpointInternal(int partitionId, ColumnFamilyHandle columnFamilyHandle)
     {
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
-        iterator.SeekToLast();  // Move to the last key
+        SeekToLastPartitionKey(iterator, partitionId);
 
-        while (iterator.Valid())
+        while (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId))
         {
             RaftLogMessage message = Unserializer(iterator.Value());
             
@@ -626,12 +640,14 @@ public class RocksDbWAL : IWAL, IDisposable
         {
             ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
-            HashSet<byte[]> logsToRemove = new(compactNumberEntries);
+            List<byte[]> logsToRemove = new(compactNumberEntries);
 
             using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
-            iterator.SeekToFirst(); // Move to the last key
+            Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+            BuildLogKey(seekKey, partitionId, 0);
+            iterator.Seek(seekKey);
 
-            while (iterator.Valid())
+            while (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId))
             {
                 RaftLogMessage message = Unserializer(iterator.Value());
 
@@ -648,6 +664,10 @@ public class RocksDbWAL : IWAL, IDisposable
                     if (logsToRemove.Count >= compactNumberEntries)
                         break;
                 }
+                else
+                {
+                    break;
+                }
 
                 iterator.Next();
             }
@@ -659,7 +679,8 @@ public class RocksDbWAL : IWAL, IDisposable
                 foreach (byte[] log in logsToRemove)
                     writeBatch.Delete(log, cf: columnFamilyHandle);
 
-                db.Write(writeBatch); // No need to be synchronous here
+                // Compaction only removes already superseded history; it does not acknowledge new Raft appends.
+                db.Write(writeBatch);
                 
                 logger.LogDebug("Removed {Count} from WAL for partition {PartitionId}", logsToRemove.Count, partitionId);
             }
@@ -709,6 +730,47 @@ public class RocksDbWAL : IWAL, IDisposable
         return RaftLogMessage.Parser.ParseFrom(memoryStream);
     }
 
+    private static void BuildLogKey(Span<byte> result, int partitionId, long logId)
+    {
+        if (result.Length != LogKeyWidth)
+            throw new ArgumentException($"RocksDB WAL log keys must be {LogKeyWidth} bytes.", nameof(result));
+
+        ToDecimalBytes(result[..PartitionIdWidth], partitionId);
+        result[PartitionIdWidth] = LogKeySeparator;
+        ToDecimalBytes(result[(PartitionIdWidth + 1)..], logId);
+    }
+
+    private static void BuildPartitionUpperBoundKey(Span<byte> result, int partitionId)
+    {
+        if (result.Length != PartitionIdWidth + 1)
+            throw new ArgumentException($"RocksDB WAL partition upper-bound keys must be {PartitionIdWidth + 1} bytes.", nameof(result));
+
+        ToDecimalBytes(result[..PartitionIdWidth], partitionId);
+        result[PartitionIdWidth] = PartitionUpperBoundSeparator;
+    }
+
+    private static bool KeyBelongsToPartition(ReadOnlySpan<byte> key, int partitionId)
+    {
+        Span<byte> prefix = stackalloc byte[PartitionIdWidth + 1];
+        ToDecimalBytes(prefix[..PartitionIdWidth], partitionId);
+        prefix[PartitionIdWidth] = LogKeySeparator;
+
+        return key.StartsWith(prefix);
+    }
+
+    private static void SeekToLastPartitionKey(Iterator iterator, int partitionId)
+    {
+        Span<byte> upperBoundKey = stackalloc byte[PartitionIdWidth + 1];
+        BuildPartitionUpperBoundKey(upperBoundKey, partitionId);
+
+        iterator.Seek(upperBoundKey);
+
+        if (iterator.Valid())
+            iterator.Prev();
+        else
+            iterator.SeekToLast();
+    }
+
     /// <summary>
     /// Converts the specified long value into its decimal representation as a sequence of ASCII bytes
     /// and stores it into the provided span buffer. The resulting buffer is left-padded with '0'
@@ -726,11 +788,11 @@ public class RocksDbWAL : IWAL, IDisposable
     private static void ToDecimalBytes(Span<byte> result, long value)
     {
         // 1) Pre‑fill with ASCII '0'
-        for (int i = 0; i < IdWidth; i++)
+        for (int i = 0; i < result.Length; i++)
             result[i] = (byte)'0';
 
         // 2) Write digits right‑to‑left
-        int pos = IdWidth - 1;
+        int pos = result.Length - 1;
         do
         {
             result[pos--] = (byte)('0' + (value % 10));

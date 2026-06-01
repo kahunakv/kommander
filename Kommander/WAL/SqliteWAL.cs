@@ -164,7 +164,7 @@ public class SqliteWAL : IWAL, IDisposable
 
             const string createTableQuery = """
             CREATE TABLE IF NOT EXISTS metadata (
-                key STRING PRIMARY KEY
+                key STRING PRIMARY KEY,
                 value STRING
             );
             """;
@@ -375,7 +375,7 @@ public class SqliteWAL : IWAL, IDisposable
                             insertOrReplaceCommand.Parameters["@type"].Value = log.Type;
 
                             if (log.LogType is null)
-                                insertOrReplaceCommand.Parameters["@logType"].Value = 0;
+                                insertOrReplaceCommand.Parameters["@logType"].Value = DBNull.Value;
                             else
                                 insertOrReplaceCommand.Parameters["@logType"].Value = log.LogType;
 
@@ -542,63 +542,49 @@ public class SqliteWAL : IWAL, IDisposable
     public RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
     {
         (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+        bool writerLockHeld = false;
 
         try
         {
-            readerWriterLock.AcquireReaderLock(TimeSpan.FromSeconds(10));
+            readerWriterLock.AcquireWriterLock(TimeSpan.FromSeconds(10));
+            writerLockHeld = true;
 
-            List<long> logs = [];
+            using SqliteTransaction transaction = connection.BeginTransaction();
 
-            const string query = """
-             SELECT id
-             FROM logs
-             WHERE partitionId = @partitionId AND id < @lastCheckpoint
-             ORDER BY id ASC
-             LIMIT @limit;
-             """;
-
-            using SqliteCommand command = new(query, connection);
-
-            command.Parameters.AddWithValue("@partitionId", partitionId);
-            command.Parameters.AddWithValue("@lastCheckpoint", lastCheckpoint);
-            command.Parameters.AddWithValue("@limit", compactNumberEntries);
-
-            using SqliteDataReader reader = command.ExecuteReader();
-
-            while (reader.Read())
-                logs.Add(reader.IsDBNull(0) ? 0 : reader.GetInt64(0));
-
-            if (logs.Count > 0)
+            try
             {
-                using SqliteTransaction transaction = connection.BeginTransaction();
+                const string deleteSql = """
+                 DELETE FROM logs
+                 WHERE partitionId = @partitionId
+                   AND id IN (
+                     SELECT id
+                     FROM logs
+                     WHERE partitionId = @partitionId AND id < @lastCheckpoint
+                     ORDER BY id ASC
+                     LIMIT @limit
+                   );
+                 """;
 
-                try
-                {
-                    const string deleteSql = "DELETE FROM logs WHERE partitionId = @partitionId AND id = @id";
+                using SqliteCommand deleteCommand = new(deleteSql, connection);
 
-                    foreach (long log in logs)
-                    {
-                        using SqliteCommand deleteCommand = new(deleteSql, connection);
+                deleteCommand.Transaction = transaction;
+                deleteCommand.Parameters.AddWithValue("@partitionId", partitionId);
+                deleteCommand.Parameters.AddWithValue("@lastCheckpoint", lastCheckpoint);
+                deleteCommand.Parameters.AddWithValue("@limit", compactNumberEntries);
 
-                        deleteCommand.Transaction = transaction;
+                int removed = deleteCommand.ExecuteNonQuery();
 
-                        deleteCommand.Parameters.AddWithValue("@partitionId", partitionId);
-                        deleteCommand.Parameters.AddWithValue("@id", log);
+                transaction.Commit();
 
-                        deleteCommand.ExecuteNonQuery();
-                    }
+                if (removed > 0)
+                    logger.LogDebug("Removed {Count} from WAL for partition {PartitionId}", removed, partitionId);
 
-                    transaction.Commit();
-                    
-                    logger.LogDebug("Removed {Count} from WAL for partition {PartitionId}", logs.Count, partitionId);
-
-                    return RaftOperationStatus.Success;
-                }
-                catch
-                {
-                    transaction.Rollback();
-                    throw;
-                }
+                return RaftOperationStatus.Success;
+            }
+            catch
+            {
+                transaction.Rollback();
+                throw;
             }
         }
         catch (Exception ex)
@@ -609,10 +595,9 @@ public class SqliteWAL : IWAL, IDisposable
         }
         finally
         {
-            readerWriterLock.ReleaseReaderLock();
+            if (writerLockHeld)
+                readerWriterLock.ReleaseWriterLock();
         }
-        
-        return RaftOperationStatus.Success;
     }
 
     /// <summary>
@@ -658,9 +643,9 @@ public class SqliteWAL : IWAL, IDisposable
         insertOrReplaceCommand.Parameters.AddWithValue("@key", key);
         
         if (string.IsNullOrEmpty(value))
-            insertOrReplaceCommand.Parameters.AddWithValue("@log", "");
+            insertOrReplaceCommand.Parameters.AddWithValue("@value", "");
         else
-            insertOrReplaceCommand.Parameters.AddWithValue("@log", value);
+            insertOrReplaceCommand.Parameters.AddWithValue("@value", value);
 
         insertOrReplaceCommand.ExecuteNonQuery();
 
