@@ -84,7 +84,9 @@ public sealed class TestRocksDbWAL
             Assert.Equal(83, wal.GetCurrentTerm(8));
             Assert.Equal(-1, wal.GetLastCheckpoint(8));
 
-            Assert.Equal(RaftOperationStatus.Success, wal.CompactLogsOlderThan(8, lastCheckpoint: 3, compactNumberEntries: 10));
+            (RaftOperationStatus compactStatus, int removed) = wal.CompactLogsOlderThan(8, lastCheckpoint: 3, compactNumberEntries: 10);
+            Assert.Equal(RaftOperationStatus.Success, compactStatus);
+            Assert.Equal(2, removed);
 
             Assert.Equal([1, 3], wal.ReadLogsRange(0, 1).Select(log => log.Id));
             RaftLog remainingPartition8Log = Assert.Single(wal.ReadLogsRange(8, 1));

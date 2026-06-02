@@ -1,4 +1,5 @@
 ﻿
+using System.Threading;
 using Kommander.Data;
 using Kommander.Logging;
 using Kommander.Support.Collections;
@@ -42,6 +43,8 @@ public sealed class RaftWriteAhead
     
     private readonly int compactNumberEntries;
 
+    private readonly int maxEntriesPerCompaction;
+
     private bool recovered;
     
     private long proposeIndex = 1;
@@ -51,6 +54,13 @@ public sealed class RaftWriteAhead
     private int operations;
 
     private long walOperationSequence;
+
+    private int compactionInFlight;
+
+    // Test-only handle for WaitForCompactionIdleAsync; not a production synchronization point.
+    private Task? compactionPassTask;
+
+    private int compactionPassCount;
 
     /// <summary>
     /// Constructor
@@ -72,8 +82,28 @@ public sealed class RaftWriteAhead
         this.walAdapter = walAdapter;
         
         this.compactEveryOperations = manager.Configuration.CompactEveryOperations;
-        this.compactNumberEntries = manager.Configuration.CompactNumberEntries;
-        this.operations = compactEveryOperations;
+        this.compactNumberEntries = manager.Configuration.GetEffectiveCompactNumberEntries();
+        this.maxEntriesPerCompaction = manager.Configuration.GetEffectiveMaxEntriesPerCompaction();
+        this.operations = compactEveryOperations > 0 ? compactEveryOperations : 0;
+    }
+
+    /// <summary>
+    /// Called after a commit or follower-append WAL operation persists successfully.
+    /// Each operation decrements the counter by one (not per log entry in the batch).
+    /// When the counter reaches zero, starts a compaction pass without waiting for it.
+    /// </summary>
+    public void NotifyCommitted()
+    {
+        if (compactEveryOperations <= 0)
+            return;
+
+        int remaining = Interlocked.Decrement(ref operations);
+
+        if (remaining <= 0)
+        {
+            Interlocked.Exchange(ref operations, compactEveryOperations);
+            Compact();
+        }
     }
 
     /// <summary>
@@ -710,31 +740,93 @@ public sealed class RaftWriteAhead
     }
 
     /// <summary>
-    /// Executes the log compaction process for the partition managed by this instance.
-    /// This method removes logs older than a specified checkpoint to reduce
-    /// storage requirements while maintaining the integrity of the state machine.
+    /// Starts log compaction for this partition if no pass is already running.
+    /// Returns immediately without waiting for the pass to finish.
     /// </summary>
-    /// <returns>
-    /// A task representing the asynchronous compaction operation.
-    /// The returned task completes once the compaction process has finished.
-    /// </returns>
-    /// <exception cref="RaftException">
-    /// Thrown if the thread pool is not started or has been disposed,
-    /// or if an error occurs during the log compaction process.
-    /// </exception>
-    public async Task Compact()
+    public void Compact()
     {
-        long lastCheckpoint = await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () => 
-            walAdapter.GetLastCheckpoint(partition.PartitionId)
-        ).ConfigureAwait(false);
-
-        if (lastCheckpoint <= 0)
+        if (Interlocked.CompareExchange(ref compactionInFlight, 1, 0) != 0)
             return;
-        
-        logger.LogInformation("[{Endpoint}/{Partition}] Compaction process started LastCheckpoint={LastCheckpoint}", manager.LocalEndpoint, partition.PartitionId, lastCheckpoint);
-        
-        await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () =>
-            walAdapter.CompactLogsOlderThan(partition.PartitionId, lastCheckpoint, compactNumberEntries
-        )).ConfigureAwait(false);
+
+        compactionPassTask = RunCompactionPassAsync();
+    }
+
+    /// <summary>
+    /// Waits for the in-flight compaction pass to complete. For tests only.
+    /// </summary>
+    internal Task WaitForCompactionIdleAsync() => compactionPassTask ?? Task.CompletedTask;
+
+    /// <summary>
+    /// Number of compaction passes that actually started. For tests only.
+    /// </summary>
+    internal int CompactionPassCount => Volatile.Read(ref compactionPassCount);
+
+    private async Task RunCompactionPassAsync()
+    {
+        Interlocked.Increment(ref compactionPassCount);
+
+        try
+        {
+            long lastCheckpoint = await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () =>
+                walAdapter.GetLastCheckpoint(partition.PartitionId)
+            ).ConfigureAwait(false);
+
+            if (lastCheckpoint <= 0)
+                return;
+
+            logger.LogInformation("[{Endpoint}/{Partition}] Compaction process started LastCheckpoint={LastCheckpoint}", manager.LocalEndpoint, partition.PartitionId, lastCheckpoint);
+
+            // Scheduled on ReadScheduler, not WalScheduler — see docs/adr/0003-wal-compaction-scheduling.md.
+            // All drain batches run inside a single scheduled task — no yield between
+            // batches. The pass cap bounds total work; re-enqueueing per batch would
+            // interleave reads for this partition if read latency during compaction matters.
+            int removedTotal = await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () =>
+            {
+                int total = 0;
+
+                while (true)
+                {
+                    (RaftOperationStatus status, int removed) = walAdapter.CompactLogsOlderThan(
+                        partition.PartitionId,
+                        lastCheckpoint,
+                        compactNumberEntries);
+
+                    if (status != RaftOperationStatus.Success)
+                        break;
+
+                    if (removed <= 0)
+                        break;
+
+                    total += removed;
+
+                    if (removed < compactNumberEntries)
+                        break;
+
+                    if (total >= maxEntriesPerCompaction)
+                        break;
+                }
+
+                return total;
+            }).ConfigureAwait(false);
+
+            logger.LogInformation(
+                "[{Endpoint}/{Partition}] Compaction finished Removed={RemovedTotal} LastCheckpoint={LastCheckpoint}",
+                manager.LocalEndpoint,
+                partition.PartitionId,
+                removedTotal,
+                lastCheckpoint);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(
+                ex,
+                "[{Endpoint}/{Partition}] Compaction failed",
+                manager.LocalEndpoint,
+                partition.PartitionId);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref compactionInFlight, 0);
+        }
     }
 }

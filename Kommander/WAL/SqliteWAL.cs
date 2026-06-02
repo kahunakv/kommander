@@ -536,10 +536,9 @@ public class SqliteWAL : IWAL, IDisposable
     /// <param name="lastCheckpoint">The checkpoint ID indicating the upper bound for compaction. Logs with IDs less than this value will be compacted.</param>
     /// <param name="compactNumberEntries">The maximum number of log entries to be compacted in a single operation.</param>
     /// <returns>
-    /// A <see cref="RaftOperationStatus"/> value indicating the outcome of the operation:
-    /// Success if the compaction succeeds, Errored if an error occurs during the operation, or other applicable status codes.
+    /// A tuple of <see cref="RaftOperationStatus"/> and the number of entries removed.
     /// </returns>
-    public RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
+    public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
     {
         (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
         bool writerLockHeld = false;
@@ -579,7 +578,7 @@ public class SqliteWAL : IWAL, IDisposable
                 if (removed > 0)
                     logger.LogDebug("Removed {Count} from WAL for partition {PartitionId}", removed, partitionId);
 
-                return RaftOperationStatus.Success;
+                return (RaftOperationStatus.Success, removed);
             }
             catch
             {
@@ -591,7 +590,7 @@ public class SqliteWAL : IWAL, IDisposable
         {
             logger.LogError("Error during compact: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
             
-            return RaftOperationStatus.Errored;
+            return (RaftOperationStatus.Errored, 0);
         }
         finally
         {

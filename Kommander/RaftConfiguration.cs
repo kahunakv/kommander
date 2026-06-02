@@ -124,12 +124,38 @@ public class RaftConfiguration
     public int WriteIOThreads { get; set; } = 4;
 
     /// <summary>
-    /// Compact every partition WAL every Nth operations
+    /// Committed operations between automatic WAL compaction triggers per partition.
+    /// Set to 0 or a negative value to disable automatic compaction.
     /// </summary>
     public int CompactEveryOperations { get; set; } = 10000;
     
     /// <summary>
-    /// Number of entries to old entries to remove from the WAL in every compaction 
+    /// Maximum number of log entries removed per <c>CompactLogsOlderThan</c> call during compaction.
+    /// Values below 1 are treated as 1 at use time.
     /// </summary>
     public int CompactNumberEntries { get; set; } = 100;
+
+    /// <summary>
+    /// Upper bound on entries removed per triggered compaction pass before yielding.
+    /// Must be greater than or equal to <see cref="CompactNumberEntries"/>.
+    /// </summary>
+    public int MaxEntriesPerCompaction { get; set; } = 5000;
+
+    /// <summary>
+    /// Returns <see cref="CompactNumberEntries"/> clamped to at least 1 when misconfigured.
+    /// </summary>
+    public int GetEffectiveCompactNumberEntries() =>
+        CompactNumberEntries >= 1 ? CompactNumberEntries : 1;
+
+    /// <summary>
+    /// Returns <see cref="MaxEntriesPerCompaction"/> clamped to at least
+    /// <see cref="GetEffectiveCompactNumberEntries"/> when misconfigured.
+    /// </summary>
+    public int GetEffectiveMaxEntriesPerCompaction()
+    {
+        int batchSize = GetEffectiveCompactNumberEntries();
+        return MaxEntriesPerCompaction >= batchSize
+            ? MaxEntriesPerCompaction
+            : batchSize;
+    }
 }

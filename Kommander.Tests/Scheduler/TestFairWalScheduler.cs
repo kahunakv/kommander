@@ -314,7 +314,7 @@ public sealed class TestFairWalScheduler
         public long GetLastCheckpoint(int partitionId) => -1;
         public string? GetMetaData(string key) => null;
         public bool SetMetaData(string key, string value) => true;
-        public RaftOperationStatus CompactLogsOlderThan(int p, long lc, int n) => RaftOperationStatus.Success;
+        public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int p, long lc, int n) => (RaftOperationStatus.Success, 0);
         public void Dispose() { }
     }
 
@@ -338,7 +338,7 @@ public sealed class TestFairWalScheduler
         public long GetLastCheckpoint(int partitionId) => -1;
         public string? GetMetaData(string key) => null;
         public bool SetMetaData(string key, string value) => true;
-        public RaftOperationStatus CompactLogsOlderThan(int p, long lc, int n) => RaftOperationStatus.Success;
+        public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int p, long lc, int n) => (RaftOperationStatus.Success, 0);
         public void Dispose() { _gate.Dispose(); }
     }
 
@@ -355,7 +355,7 @@ public sealed class TestFairWalScheduler
         public long GetLastCheckpoint(int partitionId) => -1;
         public string? GetMetaData(string key) => null;
         public bool SetMetaData(string key, string value) => true;
-        public RaftOperationStatus CompactLogsOlderThan(int p, long lc, int n) => RaftOperationStatus.Success;
+        public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int p, long lc, int n) => (RaftOperationStatus.Success, 0);
         public void Dispose() { }
     }
 }

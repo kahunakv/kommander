@@ -15,6 +15,7 @@ Kommander is designed to keep the consensus core separate from storage, discover
 - **Raft consensus algorithm:** Per-partition leader election, quorum-based proposal replication, commits, rollbacks, checkpoints, and leader change notifications.
 - **Partitioned replication:** Nodes can lead some partitions and follow others, allowing application data to be distributed across independent Raft groups. Partition `0` is reserved for replicated system configuration; application partitions start at `1`.
 - **Durable write-ahead logging:** Built-in WAL adapters for RocksDB and SQLite persist proposed, committed, rolled-back, and checkpoint entries before state-machine callbacks run.
+- **Automatic WAL compaction:** Committed-operation counters trigger bounded per-partition compaction so removable history below the last committed checkpoint does not grow without bound.
 - **Testing-friendly in-memory components:** `InMemoryWAL`, `InMemoryCommunication`, and focused test utilities support fast local simulations without external infrastructure.
 - **Cluster discovery options:** Static discovery for fixed clusters, dynamic discovery for application-managed membership lists, and multicast discovery for local-network discovery.
 - **Transport choices:** gRPC for networked clusters, REST/JSON for HTTP-based integration and debugging, and in-memory communication for tests.
@@ -37,6 +38,8 @@ The library keeps storage, discovery, and communication pluggable. That separati
 ## Packages And Targets
 
 Kommander targets `.NET 8.0`.
+
+Current package version in this tree: `0.10.7`.
 
 Install from NuGet:
 
@@ -220,8 +223,9 @@ The transport entry points are intended for communication adapters and HTTP/gRPC
 | `SlowRaftWALMachineLog` | `25 ms` | Slow WAL warning threshold. |
 | `ReadIOThreads` | `8` | Fair scheduler workers for synchronous WAL reads. |
 | `WriteIOThreads` | `4` | Fair scheduler workers for synchronous WAL writes. |
-| `CompactEveryOperations` | `10000` | Configured compaction interval value. WAL adapters expose compaction, but callers should verify scheduling behavior before relying on automatic compaction. |
-| `CompactNumberEntries` | `100` | Max entries to remove when compaction is invoked. |
+| `CompactEveryOperations` | `10000` | Successfully persisted commit/follower-append operations between automatic WAL compaction triggers per partition. Set to `0` or below to disable automatic compaction. |
+| `CompactNumberEntries` | `100` | Max entries removed per adapter compaction batch. Values below `1` are treated as `1`. |
+| `MaxEntriesPerCompaction` | `5000` | Upper bound on entries removed by one triggered compaction pass before yielding. Values below `CompactNumberEntries` are clamped up. |
 
 ## Replicating Logs
 
@@ -374,6 +378,16 @@ Kommander persists Raft logs through `IWAL`.
 | `SqliteWAL` | Durable embedded storage backed by SQLite. |
 | `InMemoryWAL` | Tests and simulations only. Data is lost when the process exits. |
 
+### WAL Durability And Compaction
+
+RocksDB WAL keys include both partition id and log id, so partitions that share an internal RocksDB shard can safely store overlapping log indexes. This uses RocksDB WAL format `2.0.0`; existing RocksDB WAL directories from the old id-only key format must be recreated or migrated before opening them with this release.
+
+Acknowledged RocksDB append writes use synchronous write options in both the single-entry and batched paths. SQLite uses `PRAGMA synchronous=FULL` for partition WAL databases.
+
+Automatic compaction runs per partition after `CompactEveryOperations` successfully persisted commit/follower-append operations. A pass reads the last committed checkpoint and removes entries with ids below that checkpoint in batches of `CompactNumberEntries`, capped by `MaxEntriesPerCompaction`. Compaction runs through the partition-aware read scheduler; adapter-level locks still serialize SQLite deletes with writes.
+
+Compaction only removes history older than the last committed checkpoint. If an application never replicates checkpoints, there is little or nothing eligible to compact.
+
 RocksDB:
 
 ```csharp
@@ -405,7 +419,10 @@ public interface IWAL
     long GetLastCheckpoint(int partitionId);
     string? GetMetaData(string key);
     bool SetMetaData(string key, string value);
-    RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries);
+    (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(
+        int partitionId,
+        long lastCheckpoint,
+        int compactNumberEntries);
     void Dispose();
 }
 ```
@@ -553,6 +570,7 @@ Useful focused slices:
 
 ```shell
 dotnet test Kommander.Tests/Kommander.Tests.csproj --filter FullyQualifiedName~TestSmallDictionary
+dotnet test Kommander.Tests/Kommander.Tests.csproj --filter FullyQualifiedName~Kommander.Tests.WAL
 dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category!=Stress&FullyQualifiedName~TestTwoNodeCluster"
 dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category!=Stress&FullyQualifiedName~TestThreeNodeCluster"
 ```
@@ -561,6 +579,8 @@ dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category!=Stress&Fu
 
 - Cluster membership is discovery-driven; there is no public membership-change API on `IRaft`.
 - Partition `0` is reserved and not available for application replication.
+- RocksDB WAL format `2.0.0` is not compatible with pre-`0.10.7` id-only RocksDB WAL keys. Start with a fresh data directory or migrate existing keys.
+- WAL compaction is checkpoint-driven. Historical entries below the last committed checkpoint are removable; uncheckpointed history is retained.
 - The Nixie actor runtime has been removed from the production library. Existing code that passed an `ActorSystem` to `RaftManager` must use the new constructor shown above.
 - `RedisDiscovery` is not implemented in this release.
 - The sample server is a demonstration host, not a complete production deployment template.

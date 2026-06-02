@@ -632,9 +632,9 @@ public class RocksDbWAL : IWAL, IDisposable
     /// The maximum number of entries to process during the compaction operation.
     /// </param>
     /// <returns>
-    /// A <see cref="RaftOperationStatus"/> indicating the result of the compaction operation.
+    /// A tuple of <see cref="RaftOperationStatus"/> and the number of entries removed.
     /// </returns>
-    public RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
+    public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
     {
         try
         {
@@ -672,7 +672,9 @@ public class RocksDbWAL : IWAL, IDisposable
                 iterator.Next();
             }
 
-            if (logsToRemove.Count > 0)
+            int removed = logsToRemove.Count;
+
+            if (removed > 0)
             {
                 using WriteBatch writeBatch = new();
 
@@ -682,16 +684,16 @@ public class RocksDbWAL : IWAL, IDisposable
                 // Compaction only removes already superseded history; it does not acknowledge new Raft appends.
                 db.Write(writeBatch);
                 
-                logger.LogDebug("Removed {Count} from WAL for partition {PartitionId}", logsToRemove.Count, partitionId);
+                logger.LogDebug("Removed {Count} from WAL for partition {PartitionId}", removed, partitionId);
             }
             
-            return RaftOperationStatus.Success;
+            return (RaftOperationStatus.Success, removed);
         } 
         catch (Exception ex)
         {
             logger.LogError("Error during compact: {Message}", ex.Message);
                 
-            return RaftOperationStatus.Errored;
+            return (RaftOperationStatus.Errored, 0);
         }
     }
     

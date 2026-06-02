@@ -29,4 +29,6 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
 
     public WALWriteOperation? EnqueueProposeOrCommit(List<RaftLog>? logs, HLCTimestamp timestamp = default, string? endpoint = null, long term = -1) =>
         wal.EnqueueProposeOrCommit(logs, timestamp, endpoint, term);
+
+    public void NotifyCommitted() => wal.NotifyCommitted();
 }

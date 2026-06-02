@@ -21,7 +21,7 @@ public interface IWAL
     
     public bool SetMetaData(string key, string value);
     
-    public RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries);
+    public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries);
 
     public void Dispose();
 }

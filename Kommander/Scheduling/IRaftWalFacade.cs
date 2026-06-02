@@ -27,4 +27,10 @@ public interface IRaftWalFacade
     WALWriteOperation EnqueueRollback(List<RaftLog> logs);
 
     WALWriteOperation? EnqueueProposeOrCommit(List<RaftLog>? logs, HLCTimestamp timestamp = default, string? endpoint = null, long term = -1);
+
+    /// <summary>
+    /// Signals that a commit/append WAL operation persisted successfully, for
+    /// automatic compaction triggering.
+    /// </summary>
+    void NotifyCommitted();
 }

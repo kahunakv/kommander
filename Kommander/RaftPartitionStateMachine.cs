@@ -1313,6 +1313,8 @@ public sealed class RaftPartitionStateMachine
                 (currentTime - proposal.StartTimestamp).TotalMilliseconds
             );
 
+        wal.NotifyCommitted();
+
         CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, operation.LogIndex));
     }
 
@@ -1374,6 +1376,8 @@ public sealed class RaftPartitionStateMachine
                         host.InvokeReplicationError(host.PartitionId, log);
                 }
             }
+
+            wal.NotifyCommitted();
         }
 
         if (!string.IsNullOrEmpty(endpoint))

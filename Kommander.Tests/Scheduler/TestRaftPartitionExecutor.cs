@@ -85,6 +85,8 @@ public sealed class TestRaftPartitionExecutor
         public WALWriteOperation? EnqueueProposeOrCommit(List<RaftLog>? logs, HLCTimestamp timestamp = default, string? endpoint = null, long term = -1)
             => MakeNoOpOperation();
 
+        public void NotifyCommitted() { }
+
         private static WALWriteOperation MakeNoOpOperation()
             => new(
                 _ => { },           // no-op completion callback

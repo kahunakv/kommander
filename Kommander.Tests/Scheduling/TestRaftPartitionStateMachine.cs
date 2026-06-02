@@ -120,6 +120,8 @@ public class TestRaftPartitionStateMachine
 
         public WALWriteOperation? EnqueueProposeOrCommit(List<RaftLog>? logs, HLCTimestamp timestamp = default, string? endpoint = null, long term = -1) =>
             logs is null ? null : EnqueuePropose(term, logs, timestamp, autoCommit: false);
+
+        public void NotifyCommitted() { }
     }
 
     private sealed class CapturingReplySink : IRaftOperationReplySink

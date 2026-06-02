@@ -160,9 +160,37 @@ public class InMemoryWAL : IWAL, IDisposable
         return true;
     }
 
-    public RaftOperationStatus CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
+    public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
     {
-        return RaftOperationStatus.Success;
+        try
+        {
+            readerWriterLock.AcquireWriterLock(TimeSpan.FromMilliseconds(5000));
+
+            if (!allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+                return (RaftOperationStatus.Success, 0);
+
+            List<long> toRemove = [];
+
+            foreach (long id in partitionLogs.Keys)
+            {
+                if (id >= lastCheckpoint)
+                    break;
+
+                toRemove.Add(id);
+
+                if (toRemove.Count >= compactNumberEntries)
+                    break;
+            }
+
+            foreach (long id in toRemove)
+                partitionLogs.Remove(id);
+
+            return (RaftOperationStatus.Success, toRemove.Count);
+        }
+        finally
+        {
+            readerWriterLock.ReleaseWriterLock();
+        }
     }
 
     public void Dispose()

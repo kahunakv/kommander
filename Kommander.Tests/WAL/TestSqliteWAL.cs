@@ -88,7 +88,9 @@ public sealed class TestSqliteWAL
                 )
             );
 
-            Assert.Equal(RaftOperationStatus.Success, wal.CompactLogsOlderThan(7, lastCheckpoint: 5, compactNumberEntries: 2));
+            (RaftOperationStatus status, int removed) = wal.CompactLogsOlderThan(7, lastCheckpoint: 5, compactNumberEntries: 2);
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Assert.Equal(2, removed);
 
             Assert.Equal([3, 4, 5], wal.ReadLogs(7).Select(log => log.Id));
         }
@@ -122,10 +124,8 @@ public sealed class TestSqliteWAL
 
                 tasks.Add(Task.Run(() =>
                 {
-                    Assert.Equal(
-                        RaftOperationStatus.Success,
-                        wal.CompactLogsOlderThan(3, lastCheckpoint: id, compactNumberEntries: 5)
-                    );
+                    (RaftOperationStatus status, _) = wal.CompactLogsOlderThan(3, lastCheckpoint: id, compactNumberEntries: 5);
+                    Assert.Equal(RaftOperationStatus.Success, status);
                 }, TestContext.Current.CancellationToken));
             }
 
