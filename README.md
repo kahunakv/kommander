@@ -382,7 +382,7 @@ Kommander persists Raft logs through `IWAL`.
 
 RocksDB WAL keys include both partition id and log id, so partitions that share an internal RocksDB shard can safely store overlapping log indexes. This uses RocksDB WAL format `2.0.0`; existing RocksDB WAL directories from the old id-only key format must be recreated or migrated before opening them with this release.
 
-Acknowledged RocksDB append writes use synchronous write options in both the single-entry and batched paths. SQLite uses `PRAGMA synchronous=FULL` for partition WAL databases.
+Acknowledged RocksDB append writes use synchronous write options in both the single-entry and batched paths by default. SQLite uses `PRAGMA synchronous=FULL` for partition WAL databases by default. For CI or benchmark scenarios where crash durability is not being tested, both durable adapters can be constructed with `syncWrites: false`; this improves write throughput but acknowledged writes may be lost on process or machine crash.
 
 Automatic compaction runs per partition after `CompactEveryOperations` successfully persisted commit/follower-append operations. A pass reads the last committed checkpoint and removes entries with ids below that checkpoint in batches of `CompactNumberEntries`, capped by `MaxEntriesPerCompaction`. Compaction runs through the partition-aware read scheduler; adapter-level locks still serialize SQLite deletes with writes.
 
@@ -394,10 +394,22 @@ RocksDB:
 IWAL wal = new RocksDbWAL("./data", "node-1", logger);
 ```
 
+RocksDB with fsync disabled for tests:
+
+```csharp
+IWAL wal = new RocksDbWAL("./data", "node-1", logger, syncWrites: false);
+```
+
 SQLite:
 
 ```csharp
 IWAL wal = new SqliteWAL("./data", "node-1", logger);
+```
+
+SQLite with synchronous writes disabled for tests:
+
+```csharp
+IWAL wal = new SqliteWAL("./data", "node-1", logger, syncWrites: false);
 ```
 
 In-memory:

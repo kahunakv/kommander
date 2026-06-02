@@ -140,6 +140,28 @@ public class InMemoryWAL : IWAL, IDisposable
         return -1;
     }
 
+    public int CountPersistedLogs(int partitionId)
+    {
+        try
+        {
+            readerWriterLock.AcquireReaderLock(TimeSpan.FromMilliseconds(5000));
+
+            if (!allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+                return 0;
+
+            return partitionLogs.Count;
+        }
+        finally
+        {
+            readerWriterLock.ReleaseReaderLock();
+        }
+    }
+
+    public int CountRemovableLogs(int partitionId)
+    {
+        return 0;
+    }
+
     public string? GetMetaData(string key)
     {
         try

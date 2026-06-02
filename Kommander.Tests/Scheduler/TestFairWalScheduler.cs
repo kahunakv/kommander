@@ -312,6 +312,8 @@ public sealed class TestFairWalScheduler
         public long GetMaxLog(int partitionId) => 0;
         public long GetCurrentTerm(int partitionId) => 0;
         public long GetLastCheckpoint(int partitionId) => -1;
+        public int CountPersistedLogs(int partitionId) => 0;
+        public int CountRemovableLogs(int partitionId) => 0;
         public string? GetMetaData(string key) => null;
         public bool SetMetaData(string key, string value) => true;
         public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int p, long lc, int n) => (RaftOperationStatus.Success, 0);
@@ -336,6 +338,8 @@ public sealed class TestFairWalScheduler
         public long GetMaxLog(int partitionId) => 0;
         public long GetCurrentTerm(int partitionId) => 0;
         public long GetLastCheckpoint(int partitionId) => -1;
+        public int CountPersistedLogs(int partitionId) => 0;
+        public int CountRemovableLogs(int partitionId) => 0;
         public string? GetMetaData(string key) => null;
         public bool SetMetaData(string key, string value) => true;
         public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int p, long lc, int n) => (RaftOperationStatus.Success, 0);
@@ -353,6 +357,8 @@ public sealed class TestFairWalScheduler
         public long GetMaxLog(int partitionId) => 0;
         public long GetCurrentTerm(int partitionId) => 0;
         public long GetLastCheckpoint(int partitionId) => -1;
+        public int CountPersistedLogs(int partitionId) => 0;
+        public int CountRemovableLogs(int partitionId) => 0;
         public string? GetMetaData(string key) => null;
         public bool SetMetaData(string key, string value) => true;
         public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int p, long lc, int n) => (RaftOperationStatus.Success, 0);

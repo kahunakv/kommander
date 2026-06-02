@@ -67,14 +67,19 @@ public class SqliteWAL : IWAL, IDisposable
     /// </summary>
     private readonly ILogger<IRaft> logger;
 
+    private readonly bool syncWrites;
+
+    internal bool SyncWritesEnabled => syncWrites;
+
     /// <summary>
     /// Represents a Write-Ahead Log (WAL) implementation using SQLite as the storage backend.
     /// </summary>
-    public SqliteWAL(string path, string revision, ILogger<IRaft> logger)
+    public SqliteWAL(string path, string revision, ILogger<IRaft> logger, bool syncWrites = true)
     {
         this.path = path;
         this.revision = revision;
         this.logger = logger;
+        this.syncWrites = syncWrites;
     }
 
     /// <summary>
@@ -119,7 +124,8 @@ public class SqliteWAL : IWAL, IDisposable
             using SqliteCommand command1 = new(createTableQuery, connection);
             command1.ExecuteNonQuery();
 
-            const string pragmasQuery = "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY;";
+            string synchronousMode = syncWrites ? "FULL" : "OFF";
+            string pragmasQuery = $"PRAGMA journal_mode=WAL; PRAGMA synchronous={synchronousMode}; PRAGMA temp_store=MEMORY;";
             using SqliteCommand command3 = new(pragmasQuery, connection);
             command3.ExecuteNonQuery();
             
@@ -254,6 +260,8 @@ public class SqliteWAL : IWAL, IDisposable
 
         try
         {
+            readerWriterLock.AcquireReaderLock(TimeSpan.FromSeconds(10));
+
             List<RaftLog> result = [];
 
             int counter = 0;
@@ -527,6 +535,56 @@ public class SqliteWAL : IWAL, IDisposable
             return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
 
         return -1;
+    }
+
+    /// <inheritdoc/>
+    public int CountPersistedLogs(int partitionId)
+    {
+        (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+
+        try
+        {
+            readerWriterLock.AcquireReaderLock(TimeSpan.FromSeconds(10));
+
+            const string query = "SELECT COUNT(*) FROM logs WHERE partitionId = @partitionId";
+            using SqliteCommand command = new(query, connection);
+            command.Parameters.AddWithValue("@partitionId", partitionId);
+            return Convert.ToInt32(command.ExecuteScalar());
+        }
+        finally
+        {
+            readerWriterLock.ReleaseReaderLock();
+        }
+    }
+
+    /// <inheritdoc/>
+    public int CountRemovableLogs(int partitionId)
+    {
+        long lastCheckpoint = GetLastCheckpoint(partitionId);
+
+        if (lastCheckpoint <= 0)
+            return 0;
+
+        (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+
+        try
+        {
+            readerWriterLock.AcquireReaderLock(TimeSpan.FromSeconds(10));
+
+            const string query = """
+             SELECT COUNT(*)
+             FROM logs
+             WHERE partitionId = @partitionId AND id < @lastCheckpoint;
+             """;
+            using SqliteCommand command = new(query, connection);
+            command.Parameters.AddWithValue("@partitionId", partitionId);
+            command.Parameters.AddWithValue("@lastCheckpoint", lastCheckpoint);
+            return Convert.ToInt32(command.ExecuteScalar());
+        }
+        finally
+        {
+            readerWriterLock.ReleaseReaderLock();
+        }
     }
 
     /// <summary>

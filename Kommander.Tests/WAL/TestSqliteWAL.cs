@@ -61,6 +61,36 @@ public sealed class TestSqliteWAL
     }
 
     [Fact]
+    public void SyncWritesCanBeDisabledForTestWal()
+    {
+        const int partitionId = 4;
+        string path = CreateTempWalPath();
+
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false);
+
+            Assert.False(wal.SyncWritesEnabled);
+
+            Assert.Equal(
+                RaftOperationStatus.Success,
+                wal.Write(
+                    new List<(int, List<RaftLog>)>
+                    {
+                        (partitionId, [CreateLog(id: 1)])
+                    }
+                )
+            );
+
+            Assert.Equal(1, Assert.Single(wal.ReadLogs(partitionId)).Id);
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    [Fact]
     public void CompactLogsOlderThanDeletesOnlyBoundedOlderLogs()
     {
         string path = CreateTempWalPath();

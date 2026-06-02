@@ -30,7 +30,9 @@ public class RocksDbWAL : IWAL, IDisposable
     /// This ensures data integrity by guaranteeing that write operations are fully persisted to disk
     /// before returning, at the potential cost of reduced write performance.
     /// </summary>
-    private static readonly WriteOptions DefaultWriteOptions = new WriteOptions().SetSync(true);
+    private static readonly WriteOptions SynchronousWriteOptions = new WriteOptions().SetSync(true);
+
+    private static readonly WriteOptions NonSynchronousWriteOptions = new WriteOptions().SetSync(false);
 
     /// <summary>
     /// Specifies the version of the format used for the RocksDb Write-Ahead Log (WAL) implementation.
@@ -102,12 +104,20 @@ public class RocksDbWAL : IWAL, IDisposable
     private readonly ConcurrentDictionary<int, Lazy<ColumnFamilyHandle>> families = new();
     
     private readonly ILogger<IRaft> logger;
+
+    private readonly WriteOptions writeOptions;
+
+    private readonly bool syncWrites;
+
+    internal bool SyncWritesEnabled => syncWrites;
     
-    public RocksDbWAL(string path, string revision, ILogger<IRaft> logger)
+    public RocksDbWAL(string path, string revision, ILogger<IRaft> logger, bool syncWrites = true)
     {
         this.path = path;
         this.revision = revision;
         this.logger = logger;
+        this.syncWrites = syncWrites;
+        this.writeOptions = syncWrites ? SynchronousWriteOptions : NonSynchronousWriteOptions;
 
         DbOptions dbOptions = new DbOptions()
             .SetCreateIfMissing(true)
@@ -312,7 +322,7 @@ public class RocksDbWAL : IWAL, IDisposable
 
             counter++;
 
-            if (counter > MaxNumberOfRangedEntries)
+            if (counter >= MaxNumberOfRangedEntries)
                 break;
         }
 
@@ -362,7 +372,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 
                 ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
                 
-                db.Put(buffer, Serialize(message), columnFamilyHandle, DefaultWriteOptions);
+                db.Put(buffer, Serialize(message), columnFamilyHandle, writeOptions);
                 
                 return RaftOperationStatus.Success;
             }
@@ -429,7 +439,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 //Console.WriteLine("Batch of {0}", count);
             }
             
-            db.Write(writeBatch, DefaultWriteOptions);
+            db.Write(writeBatch, writeOptions);
 
             return RaftOperationStatus.Success;
         } 
@@ -539,6 +549,68 @@ public class RocksDbWAL : IWAL, IDisposable
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
         
         return GetLastCheckpointInternal(partitionId, columnFamilyHandle);
+    }
+
+    /// <inheritdoc/>
+    public int CountPersistedLogs(int partitionId)
+    {
+        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+
+        using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
+        Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+        BuildLogKey(seekKey, partitionId, 0);
+        iterator.Seek(seekKey);
+
+        int count = 0;
+
+        while (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId))
+        {
+            RaftLogMessage message = Unserializer(iterator.Value());
+
+            if (message.Partition == partitionId)
+                count++;
+
+            iterator.Next();
+        }
+
+        return count;
+    }
+
+    /// <inheritdoc/>
+    public int CountRemovableLogs(int partitionId)
+    {
+        long lastCheckpoint = GetLastCheckpoint(partitionId);
+
+        if (lastCheckpoint <= 0)
+            return 0;
+
+        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+
+        using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
+        Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+        BuildLogKey(seekKey, partitionId, 0);
+        iterator.Seek(seekKey);
+
+        int count = 0;
+
+        while (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId))
+        {
+            RaftLogMessage message = Unserializer(iterator.Value());
+
+            if (message.Partition != partitionId)
+            {
+                iterator.Next();
+                continue;
+            }
+
+            if (message.Id >= lastCheckpoint)
+                break;
+
+            count++;
+            iterator.Next();
+        }
+
+        return count;
     }
 
     /// <summary>

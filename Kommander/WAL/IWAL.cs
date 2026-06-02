@@ -17,6 +17,18 @@ public interface IWAL
 
     public long GetLastCheckpoint(int partitionId);
 
+    /// <summary>
+    /// Returns the total number of persisted log rows for the partition.
+    /// Unlike <see cref="ReadLogsRange"/>, this is not capped by a range limit.
+    /// </summary>
+    public int CountPersistedLogs(int partitionId);
+
+    /// <summary>
+    /// Returns the number of persisted log rows with id strictly below the partition's
+    /// last committed checkpoint. Returns 0 when no checkpoint exists.
+    /// </summary>
+    public int CountRemovableLogs(int partitionId);
+
     public string? GetMetaData(string key);
     
     public bool SetMetaData(string key, string value);

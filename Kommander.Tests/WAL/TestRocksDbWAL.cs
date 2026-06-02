@@ -7,6 +7,36 @@ namespace Kommander.Tests.WAL;
 public sealed class TestRocksDbWAL
 {
     [Fact]
+    public void SyncWritesCanBeDisabledForTestWal()
+    {
+        string path = CreateTempWalPath();
+
+        try
+        {
+            using RocksDbWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false);
+
+            Assert.False(wal.SyncWritesEnabled);
+
+            RaftOperationStatus status = wal.Write(
+                new List<(int, List<RaftLog>)>
+                {
+                    (2, [CreateLog(2, id: 1, term: 20)])
+                }
+            );
+
+            Assert.Equal(RaftOperationStatus.Success, status);
+
+            RaftLog log = Assert.Single(wal.ReadLogs(2));
+            Assert.Equal(1, log.Id);
+            Assert.Equal(20, log.Term);
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    [Fact]
     public void ReadLogsKeepsOverlappingIdsForPartitionsSharingShard()
     {
         string path = CreateTempWalPath();

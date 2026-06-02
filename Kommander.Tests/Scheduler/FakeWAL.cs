@@ -138,6 +138,13 @@ public sealed class FakeWAL : IWAL
     public long GetLastCheckpoint(int partitionId) => -1;
 
     /// <inheritdoc/>
+    public int CountPersistedLogs(int partitionId) =>
+        _logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? dict) ? dict.Count : 0;
+
+    /// <inheritdoc/>
+    public int CountRemovableLogs(int partitionId) => 0;
+
+    /// <inheritdoc/>
     public string? GetMetaData(string key) => _meta.GetValueOrDefault(key);
 
     /// <inheritdoc/>
