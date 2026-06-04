@@ -18,7 +18,9 @@ message GrpcHandshakeRequest {
 }
 
 message GrpcHandshakeResponse {
-
+    int32 NodeId = 1;
+    int64 MaxLogId = 2;
+    string Endpoint = 3;
 }
 
 message GrpcVoteRequest {
@@ -104,6 +106,8 @@ message GrpcBatchRequestsRequestItem
     GrpcRequestVotesRequest RequestVotes = 5;
     GrpcAppendLogsRequest AppendLogs = 6;
     GrpcCompleteAppendLogsRequest CompleteAppendLogs = 7;
+    GrpcStepDownNoticeRequest StepDownNotice = 8;
+    GrpcTransferLeadershipRequest TransferLeadership = 9;
   }
 }
 
@@ -119,6 +123,27 @@ enum GrpcBatchRequestsRequestType {
   REQUEST_VOTES = 3;
   APPEND_LOGS = 4;
   COMPLETE_APPEND_LOGS = 5;
+  STEP_DOWN_NOTICE = 6;
+  TRANSFER_LEADERSHIP = 7;
+}
+
+message GrpcStepDownNoticeRequest {
+  int32 Partition = 1;
+  int64 Term = 2;
+  int32 TimeNode = 3;
+  int64 TimePhysical = 4;
+  uint32 TimeCounter = 5;
+  string Endpoint = 6;
+}
+
+message GrpcTransferLeadershipRequest {
+  int32 Partition = 1;
+  int64 Term = 2;
+  int32 TimeNode = 3;
+  int64 TimePhysical = 4;
+  uint32 TimeCounter = 5;
+  string Endpoint = 6;
+  string TargetEndpoint = 7;
 }
 
 enum GrpcRaftLogType {

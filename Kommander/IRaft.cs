@@ -1,4 +1,5 @@
 
+using System.ComponentModel;
 using Kommander.Data;
 using Kommander.WAL;
 using Kommander.WAL.IO;
@@ -231,6 +232,65 @@ public interface IRaft
     /// <param name="cancellationToken"></param>
     /// <returns></returns>
     public ValueTask<string> WaitForLeader(int partitionId, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Waits until the same non-empty leader endpoint has remained stable for at
+    /// least the requested duration.
+    /// </summary>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public ValueTask<string> WaitForLeaderStableAsync(
+        int partitionId,
+        TimeSpan minStableFor,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Test hook that asks the local node to become leader for a partition if it can
+    /// satisfy the normal Raft log freshness and quorum rules.
+    /// </summary>
+    /// <remarks>
+    /// This method is intended for deterministic tests only. It is not a production
+    /// leadership-transfer API and must not be exposed through network transports.
+    /// </remarks>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public Task<RaftOperationStatus> ForceLeaderForTestingAsync(
+        int partitionId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Test hook that makes the local leader voluntarily step down for a partition
+    /// while keeping the node online so it can vote and replicate as a follower.
+    /// </summary>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public Task<RaftOperationStatus> StepDownAsync(
+        int partitionId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Test hook that transfers leadership for a partition from the local leader to
+    /// a specific up-to-date target endpoint.
+    /// </summary>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public Task<RaftOperationStatus> TransferLeadershipAsync(
+        int partitionId,
+        string targetEndpoint,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Test hook that pauses periodic outbound heartbeats for a partition without
+    /// blocking other Raft traffic.
+    /// </summary>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public Task<RaftOperationStatus> SuspendHeartbeatsAsync(
+        int partitionId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Test hook that resumes periodic outbound heartbeats for a partition.
+    /// </summary>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public Task<RaftOperationStatus> ResumeHeartbeatsAsync(
+        int partitionId,
+        CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Returns the correct partition id according to the partition key

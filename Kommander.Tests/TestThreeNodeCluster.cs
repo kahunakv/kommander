@@ -275,6 +275,37 @@ public sealed class TestThreeNodeCluster
         await node3.LeaveCluster(true);
     }
 
+    [Fact]
+    public async Task WaitForLeaderStableAsync_LeaderChange_ResetsStabilityTimer()
+    {
+        (IRaft node1, IRaft node2, IRaft node3) = await AssembleThreNodeCluster("memory", 1);
+
+        string initialLeader = await node1.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        IRaft leaderNode = new[] { node1, node2, node3 }
+            .Single(node => node.GetLocalEndpoint() == initialLeader);
+
+        RaftOperationStatus status = await leaderNode.StepDownAsync(
+            1,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(RaftOperationStatus.Success, status);
+
+        string nextLeader = await node2.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        Assert.NotEqual(initialLeader, nextLeader);
+
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+        await node3.LeaveCluster(true);
+    }
+
     [Theory]
     [Trait("Category", "Stress")]
     [InlineData("memory", 8)]

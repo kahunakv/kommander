@@ -25,10 +25,17 @@ public static class RaftOperationMapper
             // ── Control ──────────────────────────────────────────────────────────────
             // Leader liveness checks, handshakes, and all election traffic must never
             // be starved by replication or client work.
-            RaftRequestType.CheckLeader       => RaftOperationKind.Control,
-            RaftRequestType.ReceiveHandshake  => RaftOperationKind.Control,
-            RaftRequestType.RequestVote       => RaftOperationKind.Control,
-            RaftRequestType.ReceiveVote       => RaftOperationKind.Control,
+            RaftRequestType.CheckLeader           => RaftOperationKind.Control,
+            RaftRequestType.ForceLeaderForTesting => RaftOperationKind.Control,
+            RaftRequestType.StepDown              => RaftOperationKind.Control,
+            RaftRequestType.TransferLeadership    => RaftOperationKind.Control,
+            RaftRequestType.SuspendHeartbeats     => RaftOperationKind.Control,
+            RaftRequestType.ResumeHeartbeats      => RaftOperationKind.Control,
+            RaftRequestType.ReceiveStepDownNotice => RaftOperationKind.Control,
+            RaftRequestType.ReceiveTransferLeadership => RaftOperationKind.Control,
+            RaftRequestType.ReceiveHandshake      => RaftOperationKind.Control,
+            RaftRequestType.RequestVote           => RaftOperationKind.Control,
+            RaftRequestType.ReceiveVote           => RaftOperationKind.Control,
 
             // ── Replication ───────────────────────────────────────────────────────────
             // Cross-node log exchange and WAL completion callbacks.
@@ -97,6 +104,13 @@ public static class RaftOperationMapper
         requestType switch
         {
             RaftRequestType.CheckLeader or
+            RaftRequestType.ForceLeaderForTesting or
+            RaftRequestType.StepDown or
+            RaftRequestType.TransferLeadership or
+            RaftRequestType.SuspendHeartbeats or
+            RaftRequestType.ResumeHeartbeats or
+            RaftRequestType.ReceiveStepDownNotice or
+            RaftRequestType.ReceiveTransferLeadership or
             RaftRequestType.ReceiveHandshake or
             RaftRequestType.RequestVote or
             RaftRequestType.ReceiveVote => RaftStatePriority.High,

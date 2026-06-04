@@ -39,7 +39,7 @@ The library keeps storage, discovery, and communication pluggable. That separati
 
 Kommander targets `.NET 8.0`.
 
-Current package version in this tree: `0.10.7`.
+Current package version in this tree: `0.10.9`.
 
 Install from NuGet:
 

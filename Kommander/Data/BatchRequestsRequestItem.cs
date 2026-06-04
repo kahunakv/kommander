@@ -10,6 +10,10 @@ public sealed class BatchRequestsRequestItem
     public VoteRequest? Vote { get; set; }
     
     public RequestVotesRequest? RequestVotes { get; set; }
+
+    public StepDownNoticeRequest? StepDownNotice { get; set; }
+
+    public TransferLeadershipRequest? TransferLeadership { get; set; }
     
     public AppendLogsRequest? AppendLogs { get; set; }
     

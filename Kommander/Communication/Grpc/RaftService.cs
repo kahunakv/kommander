@@ -57,7 +57,18 @@ public sealed class RaftService : Rafter.RafterBase
             request.MaxLogId,
             request.Endpoint
         ));
-        
+
+        if (raft is RaftManager manager)
+        {
+            HandshakeResponse response = manager.GetHandshakeResponse(request.Partition);
+            return new()
+            {
+                NodeId = response.NodeId,
+                MaxLogId = response.MaxLogId,
+                Endpoint = response.Endpoint
+            };
+        }
+
         return new();
     }
 
@@ -234,6 +245,39 @@ public sealed class RaftService : Rafter.RafterBase
                                     voteRequest.MaxLogId,
                                     new(voteRequest.TimeNode, voteRequest.TimePhysical, voteRequest.TimeCounter),
                                     voteRequest.Endpoint
+                                ));
+                                break;
+                            }
+
+                            case GrpcBatchRequestsRequestType.StepDownNotice:
+                            {
+                                if (raft is not RaftManager manager)
+                                    throw new InvalidOperationException("raft is not a RaftManager");
+
+                                GrpcStepDownNoticeRequest stepDownNotice = request.StepDownNotice!;
+
+                                manager.StepDownNotice(new(
+                                    stepDownNotice.Partition,
+                                    stepDownNotice.Term,
+                                    new(stepDownNotice.TimeNode, stepDownNotice.TimePhysical, stepDownNotice.TimeCounter),
+                                    stepDownNotice.Endpoint
+                                ));
+                                break;
+                            }
+
+                            case GrpcBatchRequestsRequestType.TransferLeadership:
+                            {
+                                if (raft is not RaftManager transferManager)
+                                    throw new InvalidOperationException("raft is not a RaftManager");
+
+                                GrpcTransferLeadershipRequest transferLeadership = request.TransferLeadership!;
+
+                                transferManager.TransferLeadership(new(
+                                    transferLeadership.Partition,
+                                    transferLeadership.Term,
+                                    new(transferLeadership.TimeNode, transferLeadership.TimePhysical, transferLeadership.TimeCounter),
+                                    transferLeadership.Endpoint,
+                                    transferLeadership.TargetEndpoint
                                 ));
                                 break;
                             }

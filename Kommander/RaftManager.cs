@@ -1,5 +1,6 @@
 
 using System.Collections.Concurrent;
+using System.ComponentModel;
 
 using Kommander.Communication;
 using Kommander.Data;
@@ -529,6 +530,12 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         partition.Handshake(request);
     }
 
+    internal HandshakeResponse GetHandshakeResponse(int partitionId)
+    {
+        long maxLogId = walAdapter.GetMaxLog(partitionId);
+        return new(LocalNodeId, maxLogId, LocalEndpoint);
+    }
+
     /// <summary>
     /// Passes the RequestVote to the appropriate partition
     /// </summary>
@@ -549,6 +556,20 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         RaftPartition partition = GetPartition(request.Partition);
 
         partition.Vote(request);
+    }
+
+    internal void StepDownNotice(StepDownNoticeRequest request)
+    {
+        RaftPartition partition = GetPartition(request.Partition);
+
+        partition.StepDownNotice(request);
+    }
+
+    internal void TransferLeadership(TransferLeadershipRequest request)
+    {
+        RaftPartition partition = GetPartition(request.Partition);
+
+        partition.TransferLeadership(request);
     }
 
     /// <summary>
@@ -1023,7 +1044,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
             try
             {
-                RaftNodeState response = await partition.GetState().ConfigureAwait(false);
+                RaftNodeState response = await partition.GetState(cancellationToken).ConfigureAwait(false);
 
                 return response == RaftNodeState.Leader;
             }
@@ -1058,7 +1079,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
             try
             {
-                RaftNodeState response = await partition.GetState().ConfigureAwait(false);
+                RaftNodeState response = await partition.GetState(cancellationToken).ConfigureAwait(false);
 
                 if (response == RaftNodeState.Leader)
                     return LocalEndpoint;
@@ -1078,6 +1099,267 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         }
 
         throw new RaftException("Leader couldn't be found or is not decided");
+    }
+
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public ValueTask<string> WaitForLeaderStableAsync(
+        int partitionId,
+        TimeSpan minStableFor,
+        CancellationToken cancellationToken = default)
+    {
+        if (!IsInitialized)
+            throw new RaftException("Raft manager is not initialized");
+
+        return GetPartition(partitionId).WaitForLeaderStableAsync(minStableFor, cancellationToken);
+    }
+
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public async Task<RaftOperationStatus> ForceLeaderForTestingAsync(
+        int partitionId,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Joined || !IsInitialized)
+            return RaftOperationStatus.Errored;
+
+        RaftPartition partition;
+
+        try
+        {
+            partition = GetPartition(partitionId);
+        }
+        catch (RaftException)
+        {
+            return RaftOperationStatus.Errored;
+        }
+
+        RaftOperationStatus status = await partition.ForceLeaderForTestingAsync(cancellationToken).ConfigureAwait(false);
+        if (status != RaftOperationStatus.Pending)
+            return status;
+
+        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
+
+        while (stopwatch.GetElapsedMilliseconds() < 10000)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (!string.IsNullOrEmpty(partition.Leader))
+            {
+                if (partition.Leader == LocalEndpoint)
+                    return RaftOperationStatus.Success;
+
+                return RaftOperationStatus.LeaderAlreadyElected;
+            }
+
+            try
+            {
+                RaftNodeState nodeState = await partition.GetState(cancellationToken).ConfigureAwait(false);
+                if (nodeState == RaftNodeState.Leader)
+                    return RaftOperationStatus.Success;
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                Logger.LogWarning("ForceLeaderForTestingAsync: {Message}", e.Message);
+            }
+
+            await Task.Delay(ProposalStatusPollDelay, cancellationToken).ConfigureAwait(false);
+        }
+
+        return RaftOperationStatus.Pending;
+    }
+
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public async Task<RaftOperationStatus> StepDownAsync(
+        int partitionId,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Joined || !IsInitialized)
+            return RaftOperationStatus.Errored;
+
+        RaftPartition partition;
+
+        try
+        {
+            partition = GetPartition(partitionId);
+        }
+        catch (RaftException)
+        {
+            return RaftOperationStatus.Errored;
+        }
+
+        RaftOperationStatus status = await partition.StepDownAsync(cancellationToken).ConfigureAwait(false);
+        if (status != RaftOperationStatus.Pending)
+            return status;
+
+        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
+
+        while (stopwatch.GetElapsedMilliseconds() < 10000)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (!string.IsNullOrEmpty(partition.Leader))
+            {
+                if (partition.Leader == LocalEndpoint)
+                {
+                    await Task.Delay(ProposalStatusPollDelay, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+
+                return RaftOperationStatus.Success;
+            }
+
+            try
+            {
+                RaftNodeState nodeState = await partition.GetState(cancellationToken).ConfigureAwait(false);
+                if (nodeState != RaftNodeState.Leader && !string.IsNullOrEmpty(partition.Leader) && partition.Leader != LocalEndpoint)
+                    return RaftOperationStatus.Success;
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                Logger.LogWarning("StepDownAsync: {Message}", e.Message);
+            }
+
+            await Task.Delay(ProposalStatusPollDelay, cancellationToken).ConfigureAwait(false);
+        }
+
+        return RaftOperationStatus.Pending;
+    }
+
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public async Task<RaftOperationStatus> TransferLeadershipAsync(
+        int partitionId,
+        string targetEndpoint,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Joined || !IsInitialized)
+            return RaftOperationStatus.Errored;
+
+        RaftPartition partition;
+
+        try
+        {
+            partition = GetPartition(partitionId);
+        }
+        catch (RaftException)
+        {
+            return RaftOperationStatus.Errored;
+        }
+
+        RaftOperationStatus status = await partition.TransferLeadershipAsync(targetEndpoint, cancellationToken).ConfigureAwait(false);
+        if (status == RaftOperationStatus.ReplicationFailed)
+            status = await RetryTransferLeadershipAfterProbeAsync(partition, partitionId, targetEndpoint, cancellationToken).ConfigureAwait(false);
+
+        if (status != RaftOperationStatus.Pending)
+            return status;
+
+        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
+
+        while (stopwatch.GetElapsedMilliseconds() < 10000)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (!string.IsNullOrEmpty(partition.Leader))
+            {
+                if (partition.Leader == targetEndpoint)
+                    return RaftOperationStatus.Success;
+
+                if (partition.Leader != LocalEndpoint)
+                    return RaftOperationStatus.LeaderAlreadyElected;
+            }
+
+            try
+            {
+                RaftNodeState nodeState = await partition.GetState(cancellationToken).ConfigureAwait(false);
+                if (nodeState != RaftNodeState.Leader && partition.Leader == targetEndpoint)
+                    return RaftOperationStatus.Success;
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                Logger.LogWarning("TransferLeadershipAsync: {Message}", e.Message);
+            }
+
+            await Task.Delay(ProposalStatusPollDelay, cancellationToken).ConfigureAwait(false);
+        }
+
+        return RaftOperationStatus.Pending;
+    }
+
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public async Task<RaftOperationStatus> SuspendHeartbeatsAsync(
+        int partitionId,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Joined || !IsInitialized)
+            return RaftOperationStatus.Errored;
+
+        try
+        {
+            return await GetPartition(partitionId).SuspendHeartbeatsAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (RaftException)
+        {
+            return RaftOperationStatus.Errored;
+        }
+    }
+
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public async Task<RaftOperationStatus> ResumeHeartbeatsAsync(
+        int partitionId,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Joined || !IsInitialized)
+            return RaftOperationStatus.Errored;
+
+        try
+        {
+            return await GetPartition(partitionId).ResumeHeartbeatsAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (RaftException)
+        {
+            return RaftOperationStatus.Errored;
+        }
+    }
+
+    private async Task<RaftOperationStatus> RetryTransferLeadershipAfterProbeAsync(
+        RaftPartition partition,
+        int partitionId,
+        string targetEndpoint,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(targetEndpoint) || targetEndpoint == LocalEndpoint)
+            return RaftOperationStatus.ReplicationFailed;
+
+        RaftNode? targetNode = Nodes.FirstOrDefault(node => node.Endpoint == targetEndpoint);
+        if (targetNode is null)
+            return RaftOperationStatus.ReplicationFailed;
+
+        HandshakeResponse response;
+
+        try
+        {
+            response = await communication.Handshake(this, targetNode, new HandshakeRequest(
+                LocalNodeId,
+                partitionId,
+                walAdapter.GetMaxLog(partitionId),
+                LocalEndpoint)).ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            Logger.LogWarning("TransferLeadershipAsync probe: {Message}", e.Message);
+            return RaftOperationStatus.ReplicationFailed;
+        }
+
+        if (string.IsNullOrEmpty(response.Endpoint))
+            response = new HandshakeResponse(response.NodeId, response.MaxLogId, targetEndpoint);
+
+        partition.Handshake(new HandshakeRequest(
+            response.NodeId,
+            partitionId,
+            response.MaxLogId,
+            response.Endpoint));
+
+        await partition.DrainAsync(cancellationToken).ConfigureAwait(false);
+
+        return await partition.TransferLeadershipAsync(targetEndpoint, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>

@@ -184,6 +184,14 @@ internal sealed class RaftTransportDispatcher : IDisposable
                             items.Add(new() { Type = BatchRequestsRequestType.RequestVote, RequestVotes = msg.RequestVotesRequest });
                             break;
 
+                        case RaftResponderRequestType.StepDownNotice:
+                            items.Add(new() { Type = BatchRequestsRequestType.StepDownNotice, StepDownNotice = msg.StepDownNoticeRequest });
+                            break;
+
+                        case RaftResponderRequestType.TransferLeadership:
+                            items.Add(new() { Type = BatchRequestsRequestType.TransferLeadership, TransferLeadership = msg.TransferLeadershipRequest });
+                            break;
+
                         case RaftResponderRequestType.AppendLogs:
                             items.Add(new() { Type = BatchRequestsRequestType.AppendLogs, AppendLogs = msg.AppendLogsRequest });
                             break;
@@ -227,6 +235,34 @@ internal sealed class RaftTransportDispatcher : IDisposable
                 RaftResponderRequestType.RequestVotes
                     when message.Node is not null && message.RequestVotesRequest is not null
                     => communication.RequestVotes(manager, message.Node, message.RequestVotesRequest),
+
+                RaftResponderRequestType.StepDownNotice
+                    when message.Node is not null && message.StepDownNoticeRequest is not null
+                    => communication.BatchRequests(manager, message.Node, new BatchRequestsRequest
+                    {
+                        Requests =
+                        [
+                            new BatchRequestsRequestItem
+                            {
+                                Type = BatchRequestsRequestType.StepDownNotice,
+                                StepDownNotice = message.StepDownNoticeRequest
+                            }
+                        ]
+                    }),
+
+                RaftResponderRequestType.TransferLeadership
+                    when message.Node is not null && message.TransferLeadershipRequest is not null
+                    => communication.BatchRequests(manager, message.Node, new BatchRequestsRequest
+                    {
+                        Requests =
+                        [
+                            new BatchRequestsRequestItem
+                            {
+                                Type = BatchRequestsRequestType.TransferLeadership,
+                                TransferLeadership = message.TransferLeadershipRequest
+                            }
+                        ]
+                    }),
 
                 RaftResponderRequestType.AppendLogs
                     when message.Node is not null && message.AppendLogsRequest is not null

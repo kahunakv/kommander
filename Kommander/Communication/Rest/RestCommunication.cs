@@ -152,7 +152,7 @@ public class RestCommunication : ICommunication
     {
         RaftConfiguration configuration = manager.Configuration;
         
-        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.CompleteAppendLogsBatchRequest);
+        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.BatchRequestsRequest);
         
         try
         {

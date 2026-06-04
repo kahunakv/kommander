@@ -11,6 +11,8 @@ public static class RestCommunicationExtensions
         app.MapPost("/v1/raft/handshake", async (HandshakeRequest request, IRaft raft) =>
         {
             await raft.Handshake(request);
+            if (raft is RaftManager manager)
+                return manager.GetHandshakeResponse(request.Partition);
             return new HandshakeResponse();
         });
         
@@ -67,6 +69,16 @@ public static class RestCommunicationExtensions
                         
                         case BatchRequestsRequestType.RequestVote:
                             raft.RequestVote(item.RequestVotes!);
+                            break;
+
+                        case BatchRequestsRequestType.StepDownNotice:
+                            if (raft is RaftManager manager)
+                                manager.StepDownNotice(item.StepDownNotice!);
+                            break;
+
+                        case BatchRequestsRequestType.TransferLeadership:
+                            if (raft is RaftManager transferManager)
+                                transferManager.TransferLeadership(item.TransferLeadership!);
                             break;
                         
                         case BatchRequestsRequestType.AppendLogs:

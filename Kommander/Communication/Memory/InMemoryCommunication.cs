@@ -31,7 +31,11 @@ public class InMemoryCommunication : ICommunication
         if (manager.ClusterHandler.IsNode(node.Endpoint))
         {
             if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
+            {
                 targetNode.Handshake(request);
+                if (targetNode is RaftManager targetManager)
+                    return Task.FromResult(targetManager.GetHandshakeResponse(request.Partition));
+            }
             else
                 Console.WriteLine("{0} Handshake Unknown node: {1} [1]", manager.LocalEndpoint, node.Endpoint);
         }
@@ -103,6 +107,16 @@ public class InMemoryCommunication : ICommunication
                             
                             case BatchRequestsRequestType.RequestVote:
                                 targetNode.RequestVote(item.RequestVotes!);
+                                break;
+
+                            case BatchRequestsRequestType.StepDownNotice:
+                                if (targetNode is RaftManager targetManager)
+                                    targetManager.StepDownNotice(item.StepDownNotice!);
+                                break;
+
+                            case BatchRequestsRequestType.TransferLeadership:
+                                if (targetNode is RaftManager transferManager)
+                                    transferManager.TransferLeadership(item.TransferLeadership!);
                                 break;
                             
                             case BatchRequestsRequestType.AppendLogs:

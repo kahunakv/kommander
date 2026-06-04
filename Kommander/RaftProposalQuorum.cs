@@ -123,7 +123,9 @@ public sealed class RaftProposalQuorum
         if (completed)
             return true;
         
-        int quorum = Math.Max(2, (int)Math.Floor((nodes.Count + 1) / 2f));
+        // nodes includes the local leader, so the standard Raft majority is
+        // floor(N / 2) + 1 for the full cluster size.
+        int quorum = (nodes.Count / 2) + 1;
         if (nodes.Values.Count(x => x) >= quorum)
         {
             completed = true;

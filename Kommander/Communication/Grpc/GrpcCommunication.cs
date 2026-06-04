@@ -10,9 +10,7 @@ namespace Kommander.Communication.Grpc;
 /// Allows for communication between Raft nodes using gRPC messages
 /// </summary>
 public class GrpcCommunication : ICommunication
-{    
-    private static readonly HandshakeResponse handshakeResponse = new();
-    
+{
     private static readonly RequestVotesResponse requestVotesResponse = new();
     
     private static readonly VoteResponse voteResponse = new();
@@ -35,7 +33,7 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<HandshakeResponse> Handshake(RaftManager manager, RaftNode node, HandshakeRequest request)
     {
-        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(node.Endpoint);
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(node.Endpoint));
 
         GrpcHandshakeRequest handshake = new()
         {
@@ -45,27 +43,8 @@ public class GrpcCommunication : ICommunication
             Endpoint = request.Endpoint
         };
 
-        GrpcBatchRequestsRequestItem requestItem = new()
-        {
-            Type = GrpcBatchRequestsRequestType.Handshake,
-            Handshake = handshake
-        };
-        
-        GrpcBatchRequestsRequest batchRequests = new();
-        batchRequests.Requests.Add(requestItem);
-
-        try
-        {
-            await streaming.Semaphore.WaitAsync();
-            
-            await streaming.Streaming.RequestStream.WriteAsync(batchRequests);
-        } 
-        finally
-        {
-            streaming.Semaphore.Release();
-        }
-
-        return handshakeResponse;
+        GrpcHandshakeResponse response = await client.HandshakeAsync(handshake).ResponseAsync.ConfigureAwait(false);
+        return new(response.NodeId, response.MaxLogId, response.Endpoint);
     }
     
     /// <summary>
@@ -335,6 +314,39 @@ public class GrpcCommunication : ICommunication
                 };
                 
                 item.RequestVotes = requestVotes;
+                continue;
+            }
+
+            if (requestItem.StepDownNotice is not null)
+            {
+                GrpcStepDownNoticeRequest stepDownNotice = new()
+                {
+                    Partition = requestItem.StepDownNotice.Partition,
+                    Term = requestItem.StepDownNotice.Term,
+                    TimeNode = requestItem.StepDownNotice.Time.N,
+                    TimePhysical = requestItem.StepDownNotice.Time.L,
+                    TimeCounter = requestItem.StepDownNotice.Time.C,
+                    Endpoint = requestItem.StepDownNotice.Endpoint
+                };
+
+                item.StepDownNotice = stepDownNotice;
+                continue;
+            }
+
+            if (requestItem.TransferLeadership is not null)
+            {
+                GrpcTransferLeadershipRequest transferLeadership = new()
+                {
+                    Partition = requestItem.TransferLeadership.Partition,
+                    Term = requestItem.TransferLeadership.Term,
+                    TimeNode = requestItem.TransferLeadership.Time.N,
+                    TimePhysical = requestItem.TransferLeadership.Time.L,
+                    TimeCounter = requestItem.TransferLeadership.Time.C,
+                    Endpoint = requestItem.TransferLeadership.Endpoint,
+                    TargetEndpoint = requestItem.TransferLeadership.TargetEndpoint
+                };
+
+                item.TransferLeadership = transferLeadership;
                 continue;
             }
 

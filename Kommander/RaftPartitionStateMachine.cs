@@ -33,6 +33,7 @@ public sealed class RaftPartitionStateMachine
     private HLCTimestamp lastVotation = HLCTimestamp.Zero;
     private HLCTimestamp votingStartedAt = HLCTimestamp.Zero;
     private TimeSpan electionTimeout;
+    private bool heartbeatsSuspendedForTesting;
     private bool restored;
 
     public RaftNodeState NodeState => nodeState;
@@ -124,58 +125,256 @@ public sealed class RaftPartitionStateMachine
                 return;
             
             case RaftNodeState.Follower:
-                
-                // Don't start a new election if we recently voted
-                if ((lastVotation != HLCTimestamp.Zero && ((currentTime - lastVotation) < (electionTimeout * 2))))
-                    return;
-
-                // Other partitions may have received pings about the partition leader
-                // however, due to delays in processing messages in the state machine,
-                // those messages might not have been processed yet.
-                // By taking those pings into account, an unnecessary re-election can be avoided.
-                
-                string expectedLeader = expectedLeaders.GetValueOrDefault(currentTerm, "");
-                if (!string.IsNullOrEmpty(expectedLeader))
-                {
-                    HLCTimestamp lastKnownHeartbeat = host.GetLastNodeActivity(expectedLeader);
-
-                    if (lastKnownHeartbeat != HLCTimestamp.Zero && ((currentTime - lastKnownHeartbeat) < electionTimeout))
-                    {
-                        lastHeartbeat = lastKnownHeartbeat;
-                        return;
-                    }
-                }
-                
-                // make sure we are up to date with the logs
-                
-                if (await AmIOutdatedAsync().ConfigureAwait(false))
-                {
-                    electionTimeout += TimeSpan.FromMilliseconds(Random.Shared.Next(host.Configuration.StartElectionTimeoutIncrement, host.Configuration.EndElectionTimeoutIncrement));
-                    
-                    logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] We're outdated, cannot become leader...", host.LocalEndpoint, host.PartitionId, nodeState);
-                    break;
-                }
-                
-                nodeState = RaftNodeState.Candidate;
-                host.Leader = "";
-                expectedLeaders.Clear();
-                votingStartedAt = currentTime;
-                
-                await host.InvokeLeaderChanged(host.PartitionId, "");
-        
-                currentTerm++;
-        
-                IncreaseVotes(host.LocalEndpoint, currentTerm);
-
-                logger.LogWarnVotedToBecomeLeader(host.LocalEndpoint, host.PartitionId, nodeState, (currentTime - lastHeartbeat).TotalMilliseconds, currentTerm);
-
-                await RequestVotesAsync(currentTime).ConfigureAwait(false);
+                await StartElectionAsync(currentTime, ignoreRecentVoteCooldown: false).ConfigureAwait(false);
                 break;
             
             default:
                 logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Unknown node state. Term={CurrentTerm}", host.LocalEndpoint, host.PartitionId, nodeState, currentTerm);
                 break;
         }
+    }
+
+    public async Task StepDownAsync(ulong? replyCorrelationId)
+    {
+        if (nodeState != RaftNodeState.Leader || host.Leader != host.LocalEndpoint)
+        {
+            CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, 0L));
+            return;
+        }
+
+        HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        RaftNode? stepDownTarget = SelectStepDownTarget();
+
+        nodeState = RaftNodeState.Follower;
+        host.Leader = "";
+        lastHeartbeat = currentTime;
+        lastVotation = currentTime;
+        votingStartedAt = HLCTimestamp.Zero;
+        expectedLeaders.Clear();
+        lastCommitIndexes.Clear();
+        activeProposals.Clear();
+
+        await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
+
+        if (stepDownTarget is not null)
+        {
+            host.EnqueueResponse(stepDownTarget.Endpoint, new(
+                RaftResponderRequestType.StepDownNotice,
+                stepDownTarget,
+                new StepDownNoticeRequest(host.PartitionId, currentTerm, currentTime, host.LocalEndpoint)));
+        }
+
+        CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Pending, 0L));
+    }
+
+    public async Task TransferLeadershipAsync(string targetEndpoint, ulong? replyCorrelationId)
+    {
+        if (nodeState != RaftNodeState.Leader || host.Leader != host.LocalEndpoint)
+        {
+            CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, 0L));
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(targetEndpoint))
+        {
+            CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Errored, 0L));
+            return;
+        }
+
+        if (targetEndpoint == host.LocalEndpoint)
+        {
+            CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.LeaderAlreadyElected, 0L));
+            return;
+        }
+
+        RaftNode? targetNode = host.Nodes.FirstOrDefault(node => node.Endpoint == targetEndpoint);
+        if (targetNode is null)
+        {
+            CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Errored, 0L));
+            return;
+        }
+
+        long localMaxLogId = await wal.GetMaxLogAsync().ConfigureAwait(false);
+        long targetMaxLogId = GetKnownRemoteMaxLogId(targetEndpoint);
+        if (targetMaxLogId < localMaxLogId)
+        {
+            CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.ReplicationFailed, 0L));
+            return;
+        }
+
+        HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        long targetTerm = currentTerm + 1;
+
+        nodeState = RaftNodeState.Follower;
+        host.Leader = "";
+        lastHeartbeat = currentTime;
+        lastVotation = currentTime;
+        votingStartedAt = HLCTimestamp.Zero;
+        expectedLeaders.Clear();
+        expectedLeaders[targetTerm] = targetEndpoint;
+        lastCommitIndexes.Clear();
+        activeProposals.Clear();
+
+        await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
+
+        host.EnqueueResponse(targetNode.Endpoint, new(
+            RaftResponderRequestType.TransferLeadership,
+            targetNode,
+            new TransferLeadershipRequest(host.PartitionId, currentTerm, currentTime, host.LocalEndpoint, targetEndpoint)));
+
+        CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Pending, 0L));
+    }
+
+    public Task SuspendHeartbeatsAsync(ulong? replyCorrelationId)
+    {
+        if (nodeState != RaftNodeState.Leader || host.Leader != host.LocalEndpoint)
+        {
+            CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, 0L));
+            return Task.CompletedTask;
+        }
+
+        heartbeatsSuspendedForTesting = true;
+        CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, 0L));
+        return Task.CompletedTask;
+    }
+
+    public Task ResumeHeartbeatsAsync(ulong? replyCorrelationId)
+    {
+        heartbeatsSuspendedForTesting = false;
+
+        if (nodeState == RaftNodeState.Leader && host.Leader == host.LocalEndpoint)
+            SendHeartbeat(true);
+
+        CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, 0L));
+        return Task.CompletedTask;
+    }
+
+    public void ResetTestingState()
+    {
+        heartbeatsSuspendedForTesting = false;
+    }
+
+    private RaftNode? SelectStepDownTarget()
+    {
+        RaftNode? selected = null;
+        long selectedCommitIndex = long.MinValue;
+
+        foreach (RaftNode node in host.Nodes)
+        {
+            if (node.Endpoint == host.LocalEndpoint)
+                continue;
+
+            long commitIndex = lastCommitIndexes.GetValueOrDefault(
+                node.Endpoint,
+                startCommitIndexes.GetValueOrDefault(node.Endpoint, 0));
+
+            if (selected is null ||
+                commitIndex > selectedCommitIndex ||
+                (commitIndex == selectedCommitIndex &&
+                 string.CompareOrdinal(node.Endpoint, selected.Endpoint) < 0))
+            {
+                selected = node;
+                selectedCommitIndex = commitIndex;
+            }
+        }
+
+        return selected;
+    }
+
+    public async Task ReceiveStepDownNoticeAsync(StepDownNoticeRequest request)
+    {
+        if (currentTerm > request.Term)
+            return;
+
+        if (!string.IsNullOrEmpty(host.Leader) && host.Leader != request.Endpoint)
+            return;
+
+        HLCTimestamp currentTime = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, request.Time);
+
+        nodeState = RaftNodeState.Follower;
+        host.Leader = "";
+        currentTerm = Math.Max(currentTerm, request.Term);
+        votingStartedAt = HLCTimestamp.Zero;
+        expectedLeaders.Clear();
+        lastCommitIndexes.Clear();
+        activeProposals.Clear();
+        lastHeartbeat = HLCTimestamp.Zero;
+
+        await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
+        await StartElectionAsync(currentTime, ignoreRecentVoteCooldown: true).ConfigureAwait(false);
+    }
+
+    public async Task ReceiveTransferLeadershipAsync(TransferLeadershipRequest request)
+    {
+        if (request.TargetEndpoint != host.LocalEndpoint)
+            return;
+
+        if (currentTerm > request.Term)
+            return;
+
+        if (!string.IsNullOrEmpty(host.Leader) && host.Leader != request.Endpoint)
+            return;
+
+        HLCTimestamp currentTime = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, request.Time);
+
+        nodeState = RaftNodeState.Follower;
+        host.Leader = "";
+        currentTerm = Math.Max(currentTerm, request.Term);
+        votingStartedAt = HLCTimestamp.Zero;
+        expectedLeaders.Clear();
+        lastCommitIndexes.Clear();
+        activeProposals.Clear();
+        lastHeartbeat = HLCTimestamp.Zero;
+
+        await StartElectionAsync(currentTime, ignoreRecentVoteCooldown: true).ConfigureAwait(false);
+    }
+
+    public async Task ForceLeaderForTestingAsync(ulong? replyCorrelationId)
+    {
+        if (nodeState == RaftNodeState.Leader && host.Leader == host.LocalEndpoint)
+        {
+            CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, 0L));
+            return;
+        }
+
+        if (await AmIOutdatedAsync().ConfigureAwait(false))
+        {
+            CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.ReplicationFailed, 0L));
+            return;
+        }
+
+        HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+
+        expectedLeaders.Clear();
+        lastCommitIndexes.Clear();
+        votes.Clear();
+        activeProposals.Clear();
+
+        nodeState = RaftNodeState.Candidate;
+        host.Leader = "";
+        votingStartedAt = currentTime;
+        lastHeartbeat = currentTime;
+        currentTerm++;
+
+        IncreaseVotes(host.LocalEndpoint, currentTerm);
+
+        await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
+
+        if (host.Nodes.Count == 0)
+        {
+            nodeState = RaftNodeState.Leader;
+            host.Leader = host.LocalEndpoint;
+            lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+
+            await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
+            SendHeartbeat(true);
+
+            CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, 0L));
+            return;
+        }
+
+        await RequestVotesAsync(currentTime).ConfigureAwait(false);
+        CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Pending, 0L));
     }
 
     /// <summary>
@@ -200,6 +399,66 @@ public sealed class RaftPartitionStateMachine
         long localMaxId = await wal.GetMaxLogAsync().ConfigureAwait(false);
         
         return localMaxId < maxIndex;
+    }
+
+    private long GetKnownRemoteMaxLogId(string endpoint) =>
+        Math.Max(
+            lastCommitIndexes.GetValueOrDefault(endpoint, -1),
+            startCommitIndexes.GetValueOrDefault(endpoint, -1));
+
+    private async Task StartElectionAsync(HLCTimestamp currentTime, bool ignoreRecentVoteCooldown)
+    {
+        if (!ignoreRecentVoteCooldown)
+        {
+            if ((lastVotation != HLCTimestamp.Zero && ((currentTime - lastVotation) < (electionTimeout * 2))))
+                return;
+
+            string expectedLeader = expectedLeaders.GetValueOrDefault(currentTerm, "");
+            if (!string.IsNullOrEmpty(expectedLeader))
+            {
+                HLCTimestamp lastKnownHeartbeat = host.GetLastNodeActivity(expectedLeader);
+
+                if (lastKnownHeartbeat != HLCTimestamp.Zero && ((currentTime - lastKnownHeartbeat) < electionTimeout))
+                {
+                    lastHeartbeat = lastKnownHeartbeat;
+                    return;
+                }
+            }
+        }
+
+        if (await AmIOutdatedAsync().ConfigureAwait(false))
+        {
+            electionTimeout += TimeSpan.FromMilliseconds(Random.Shared.Next(host.Configuration.StartElectionTimeoutIncrement, host.Configuration.EndElectionTimeoutIncrement));
+
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] We're outdated, cannot become leader...", host.LocalEndpoint, host.PartitionId, nodeState);
+            return;
+        }
+
+        nodeState = RaftNodeState.Candidate;
+        host.Leader = "";
+        expectedLeaders.Clear();
+        votingStartedAt = currentTime;
+
+        await host.InvokeLeaderChanged(host.PartitionId, "");
+
+        currentTerm++;
+
+        IncreaseVotes(host.LocalEndpoint, currentTerm);
+
+        logger.LogWarnVotedToBecomeLeader(host.LocalEndpoint, host.PartitionId, nodeState, (currentTime - lastHeartbeat).TotalMilliseconds, currentTerm);
+
+        if (host.Nodes.Count == 0)
+        {
+            nodeState = RaftNodeState.Leader;
+            host.Leader = host.LocalEndpoint;
+            lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+
+            await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
+            SendHeartbeat(true);
+            return;
+        }
+
+        await RequestVotesAsync(currentTime).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -239,6 +498,9 @@ public sealed class RaftPartitionStateMachine
     /// <exception cref="RaftException"></exception>
     private void SendHeartbeat(bool force)
     {
+        if (!force && heartbeatsSuspendedForTesting)
+            return;
+
         IReadOnlyList<RaftNode> nodes = host.Nodes;
         
         if (nodes.Count == 0)
@@ -358,7 +620,7 @@ public sealed class RaftPartitionStateMachine
 
         string expectedLeader = expectedLeaders.GetValueOrDefault(voteTerm, "");
         
-        if (!string.IsNullOrEmpty(expectedLeader))
+        if (!string.IsNullOrEmpty(expectedLeader) && expectedLeader != node.Endpoint)
         {
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received request to vote from {Endpoint} but we already voted for {ExpectedLeader}. Ignoring...", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, expectedLeader);
             return;
@@ -379,7 +641,7 @@ public sealed class RaftPartitionStateMachine
         lastHeartbeat = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, timestamp);
         lastVotation = lastHeartbeat;
         
-        expectedLeaders.Add(voteTerm, node.Endpoint);
+        expectedLeaders[voteTerm] = node.Endpoint;
 
         logger.LogInfoSendingVote(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
 
@@ -435,7 +697,7 @@ public sealed class RaftPartitionStateMachine
         }
 
         int numberVotes = IncreaseVotes(endpoint, voteTerm);
-        int quorum = Math.Max(2, (int)Math.Floor((host.Nodes.Count + 1) / 2f));
+        int quorum = Math.Max(2, ((host.Nodes.Count + 1) / 2) + 1);
         
         lastCommitIndexes[endpoint] = remoteMaxLogId;
         startCommitIndexes[endpoint] = remoteMaxLogId;

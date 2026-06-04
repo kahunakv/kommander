@@ -10,6 +10,10 @@ public sealed class RaftResponderRequest
     public VoteRequest? VoteRequest { get; }
     
     public RequestVotesRequest? RequestVotesRequest { get; }
+
+    public StepDownNoticeRequest? StepDownNoticeRequest { get; }
+
+    public TransferLeadershipRequest? TransferLeadershipRequest { get; }
     
     public AppendLogsRequest? AppendLogsRequest { get; }
     
@@ -36,6 +40,20 @@ public sealed class RaftResponderRequest
         Type = type;
         Node = node;
         RequestVotesRequest = request;
+    }
+
+    public RaftResponderRequest(RaftResponderRequestType type, RaftNode node, StepDownNoticeRequest request)
+    {
+        Type = type;
+        Node = node;
+        StepDownNoticeRequest = request;
+    }
+
+    public RaftResponderRequest(RaftResponderRequestType type, RaftNode node, TransferLeadershipRequest request)
+    {
+        Type = type;
+        Node = node;
+        TransferLeadershipRequest = request;
     }
     
     public RaftResponderRequest(RaftResponderRequestType type, RaftNode node, AppendLogsRequest request)

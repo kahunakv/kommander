@@ -6,6 +6,8 @@ public enum RaftResponderRequestType
     Handshake,
     Vote,
     RequestVotes,
+    StepDownNotice,
+    TransferLeadership,
     AppendLogs,
     CompleteAppendLogs,
     TryBatch

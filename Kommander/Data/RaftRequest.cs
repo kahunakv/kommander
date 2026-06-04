@@ -17,6 +17,10 @@ public sealed class RaftRequest
     public string? Endpoint { get; } 
 
     public List<RaftLog>? Logs { get; }
+
+    public StepDownNoticeRequest? StepDownNotice { get; }
+
+    public TransferLeadershipRequest? TransferLeadership { get; }
     
     public RaftOperationStatus Status { get; }
     
@@ -64,6 +68,24 @@ public sealed class RaftRequest
         Type = type;
         Timestamp = timestamp;
         AutoCommit = autoCommit;
+    }
+
+    public RaftRequest(RaftRequestType type, StepDownNoticeRequest stepDownNotice)
+    {
+        Type = type;
+        StepDownNotice = stepDownNotice;
+        Term = stepDownNotice.Term;
+        Timestamp = stepDownNotice.Time;
+        Endpoint = stepDownNotice.Endpoint;
+    }
+
+    public RaftRequest(RaftRequestType type, TransferLeadershipRequest transferLeadership)
+    {
+        Type = type;
+        TransferLeadership = transferLeadership;
+        Term = transferLeadership.Term;
+        Timestamp = transferLeadership.Time;
+        Endpoint = transferLeadership.Endpoint;
     }
 
     public RaftRequest(RaftRequestType type, WALWriteOperation walOperation, RaftOperationStatus status)

@@ -161,6 +161,57 @@ public class TestTwoNodeCluster
     }
 
     [Fact]
+    public async Task WaitForLeaderStableAsync_ReturnsStableLeaderEndpoint()
+    {
+        InMemoryCommunication communication = new();
+
+        (IRaft node1, IRaft node2) = await AssembleTwoNodeCluster(communication, logger);
+
+        string stableLeader1 = await node1.WaitForLeaderStableAsync(
+            UserPartition,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+        string stableLeader2 = await node2.WaitForLeaderStableAsync(
+            UserPartition,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        Assert.False(string.IsNullOrEmpty(stableLeader1));
+        Assert.Equal(stableLeader1, stableLeader2);
+        Assert.True(
+            stableLeader1 == node1.GetLocalEndpoint() || stableLeader1 == node2.GetLocalEndpoint(),
+            $"Unexpected leader endpoint '{stableLeader1}'.");
+
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+    }
+
+    [Fact]
+    public async Task GetState_PreCanceledToken_ThrowsOperationCanceledException()
+    {
+        InMemoryCommunication communication = new();
+
+        (IRaft node1, IRaft node2) = await AssembleTwoNodeCluster(communication, logger);
+
+        string stableLeader = await node1.WaitForLeaderStableAsync(
+            UserPartition,
+            TimeSpan.FromMilliseconds(100),
+            TestContext.Current.CancellationToken);
+
+        IRaft follower = stableLeader == node1.GetLocalEndpoint() ? node2 : node1;
+        RaftPartition partition = ((RaftManager)follower).Partitions[UserPartition];
+
+        using CancellationTokenSource cts = new();
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+            await partition.GetState(cts.Token));
+
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+    }
+
+    [Fact]
     public async Task TestJoinClusterSimultAndDecideLeaderWithHighestWal()
     {
         InMemoryCommunication communication = new();

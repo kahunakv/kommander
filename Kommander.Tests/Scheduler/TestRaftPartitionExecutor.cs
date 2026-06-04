@@ -40,7 +40,9 @@ public sealed class TestRaftPartitionExecutor
         public int LocalNodeId => 1;
         public RaftConfiguration Configuration => _config;
         public HybridLogicalClock HybridLogicalClock { get; } = new();
-        public IReadOnlyList<RaftNode> Nodes => Array.Empty<RaftNode>();
+        public IReadOnlyList<RaftNode> NodesOverride { get; set; } = Array.Empty<RaftNode>();
+        public List<(string Endpoint, RaftResponderRequest Request)> EnqueuedResponses { get; } = [];
+        public IReadOnlyList<RaftNode> Nodes => NodesOverride;
 
         public StubHost(int partitionId = 0) => PartitionId = partitionId;
 
@@ -48,7 +50,7 @@ public sealed class TestRaftPartitionExecutor
         public HLCTimestamp GetLastNodeHearthbeat(string endpoint) => HLCTimestamp.Zero;
         public void UpdateLastHeartbeat(string endpoint, HLCTimestamp timestamp) { }
         public void UpdateLastNodeActivity(string endpoint, HLCTimestamp timestamp) { }
-        public void EnqueueResponse(string endpoint, RaftResponderRequest request) { }
+        public void EnqueueResponse(string endpoint, RaftResponderRequest request) => EnqueuedResponses.Add((endpoint, request));
         public Task InvokeLeaderChanged(int partitionId, string leader) => Task.CompletedTask;
         public Task<bool> InvokeReplicationReceived(int partitionId, RaftLog log) => Task.FromResult(false);
         public Task<bool> InvokeSystemReplicationReceived(int partitionId, RaftLog log) => Task.FromResult(false);
@@ -107,7 +109,7 @@ public sealed class TestRaftPartitionExecutor
 
     // ── Helpers ────────────────────────────────────────────────────────────
 
-    private static (RaftPartitionExecutor executor, RaftPartitionStateMachine sm) BuildExecutor(
+    private static (RaftPartitionExecutor executor, RaftPartitionStateMachine sm, StubHost host) BuildExecutor(
         int partitionId = 0,
         IRaftWalFacade? wal = null,
         IRaftOperationReplySink? sink = null)
@@ -119,7 +121,7 @@ public sealed class TestRaftPartitionExecutor
         RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
         RaftPartitionExecutor executor = new(sm, partitionId, slowThresholdMs: 0, NullLogger<IRaft>.Instance);
         executor.Start();
-        return (executor, sm);
+        return (executor, sm, host);
     }
 
     // ── Tests ──────────────────────────────────────────────────────────────
@@ -152,7 +154,7 @@ public sealed class TestRaftPartitionExecutor
 
         // For this test we rely purely on the executor's serialization guarantee:
         // we post from many threads simultaneously and check the total-processed count.
-        var (executor, _) = BuildExecutor(partitionId: 0);
+        var (executor, _, _) = BuildExecutor(partitionId: 0);
 
         CountdownEvent done = new(threadCount * postsPerThread);
 
@@ -212,7 +214,7 @@ public sealed class TestRaftPartitionExecutor
         const int clientOps = 20;
         const int controlOps = 5;
 
-        var (executor, _) = BuildExecutor(partitionId: 1);
+        var (executor, _, _) = BuildExecutor(partitionId: 1);
 
         // Post a mix of client and control operations.
         for (int i = 0; i < clientOps; i++)
@@ -247,7 +249,7 @@ public sealed class TestRaftPartitionExecutor
     [Fact]
     public async Task Ask_GetNodeState_ReturnsNodeStateResponse()
     {
-        var (executor, _) = BuildExecutor(partitionId: 2);
+        var (executor, _, _) = BuildExecutor(partitionId: 2);
 
         RaftResponse response = await executor.Ask(new RaftRequest(RaftRequestType.GetNodeState));
 
@@ -266,7 +268,7 @@ public sealed class TestRaftPartitionExecutor
     {
         const int opCount = 100;
 
-        var (executor, _) = BuildExecutor(partitionId: 3);
+        var (executor, _, _) = BuildExecutor(partitionId: 3);
 
         // Fill the queues with fire-and-forget ops.
         for (int i = 0; i < opCount; i++)
@@ -290,7 +292,7 @@ public sealed class TestRaftPartitionExecutor
     {
         const int opCount = 25;
 
-        var (executor, _) = BuildExecutor(partitionId: 6);
+        var (executor, _, _) = BuildExecutor(partitionId: 6);
 
         for (int i = 0; i < opCount; i++)
             executor.Post(new RaftRequest(RaftRequestType.CheckLeader));
@@ -311,11 +313,38 @@ public sealed class TestRaftPartitionExecutor
     [Fact]
     public void Post_AfterStop_ThrowsInvalidOperationException()
     {
-        var (executor, _) = BuildExecutor(partitionId: 4);
+        var (executor, _, _) = BuildExecutor(partitionId: 4);
         executor.Stop();
 
         Assert.Throws<InvalidOperationException>(() =>
             executor.Post(new RaftRequest(RaftRequestType.CheckLeader)));
+    }
+
+    [Fact]
+    public async Task Stop_ResetTestingState_ClearsSuspendedHeartbeatsFlag()
+    {
+        var (executor, sm, host) = BuildExecutor(partitionId: 7);
+
+        host.Leader = host.LocalEndpoint;
+        host.Configuration.HeartbeatInterval = TimeSpan.FromMilliseconds(1);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: 41);
+        host.NodesOverride = [new("node-b")];
+        host.EnqueuedResponses.Clear();
+
+        await sm.SuspendHeartbeatsAsync(replyCorrelationId: 42);
+
+        executor.Stop();
+        executor.ResetTestingState();
+
+        await Task.Delay(10);
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.Collection(host.EnqueuedResponses, message =>
+        {
+            Assert.Equal("node-b", message.Endpoint);
+            Assert.Equal(RaftResponderRequestType.AppendLogs, message.Request.Type);
+        });
     }
 
     /// <summary>

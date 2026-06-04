@@ -1,9 +1,11 @@
 
 using Kommander.Data;
+using Kommander.Diagnostics;
 using Kommander.Scheduling;
 using Kommander.Time;
 using Kommander.WAL;
 using Microsoft.Extensions.Logging;
+using System.Diagnostics;
 
 namespace Kommander;
 
@@ -38,9 +40,25 @@ public sealed class RaftPartition : IDisposable
 
     private int _disposed;
 
-    internal string Leader { get; set; } = "";
-    
-private volatile int _startRange;
+    private string _leader = "";
+    private long _leaderChangedTicks = Stopwatch.GetTimestamp();
+
+    internal string Leader
+    {
+        get => _leader;
+        set
+        {
+            if (string.Equals(_leader, value, StringComparison.Ordinal))
+                return;
+
+            _leader = value;
+            Interlocked.Exchange(ref _leaderChangedTicks, Stopwatch.GetTimestamp());
+        }
+    }
+
+    internal long LeaderChangedTicks => Interlocked.Read(ref _leaderChangedTicks);
+
+    private volatile int _startRange;
     private volatile int _endRange;
 
     public int PartitionId { get; }
@@ -149,6 +167,16 @@ private volatile int _startRange;
             request.Time, 
             request.Endpoint
         ));
+    }
+
+    public void StepDownNotice(StepDownNoticeRequest request)
+    {
+        executor.Post(new(RaftRequestType.ReceiveStepDownNotice, request));
+    }
+
+    public void TransferLeadership(TransferLeadershipRequest request)
+    {
+        executor.Post(new(RaftRequestType.ReceiveTransferLeadership, request));
     }
 
     /// <summary>
@@ -301,8 +329,81 @@ private volatile int _startRange;
         
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
-        
+
         return (false, response.Status, HLCTimestamp.Zero);
+    }
+
+    public async Task<RaftOperationStatus> ForceLeaderForTestingAsync(CancellationToken cancellationToken = default)
+    {
+        RaftResponse response = await executor.Ask(new(RaftRequestType.ForceLeaderForTesting), cancellationToken).ConfigureAwait(false);
+        return response.Status;
+    }
+
+    public async Task<RaftOperationStatus> StepDownAsync(CancellationToken cancellationToken = default)
+    {
+        RaftResponse response = await executor.Ask(new(RaftRequestType.StepDown), cancellationToken).ConfigureAwait(false);
+        return response.Status;
+    }
+
+    public async Task<RaftOperationStatus> TransferLeadershipAsync(
+        string targetEndpoint,
+        CancellationToken cancellationToken = default)
+    {
+        RaftResponse response = await executor.Ask(
+            new(RaftRequestType.TransferLeadership, endpoint: targetEndpoint),
+            cancellationToken).ConfigureAwait(false);
+        return response.Status;
+    }
+
+    public async Task<RaftOperationStatus> SuspendHeartbeatsAsync(CancellationToken cancellationToken = default)
+    {
+        RaftResponse response = await executor.Ask(new(RaftRequestType.SuspendHeartbeats), cancellationToken).ConfigureAwait(false);
+        return response.Status;
+    }
+
+    public async Task<RaftOperationStatus> ResumeHeartbeatsAsync(CancellationToken cancellationToken = default)
+    {
+        RaftResponse response = await executor.Ask(new(RaftRequestType.ResumeHeartbeats), cancellationToken).ConfigureAwait(false);
+        return response.Status;
+    }
+
+    internal async ValueTask<string> WaitForLeaderStableAsync(
+        TimeSpan minStableFor,
+        CancellationToken cancellationToken = default)
+    {
+        TimeSpan requiredStableFor = minStableFor <= TimeSpan.Zero ? TimeSpan.Zero : minStableFor;
+
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            string leader = Leader;
+
+            if (string.IsNullOrEmpty(leader))
+            {
+                try
+                {
+                    if (await GetState(cancellationToken).ConfigureAwait(false) == RaftNodeState.Leader)
+                        leader = manager.LocalEndpoint;
+                }
+                catch (Exception e) when (e is not OperationCanceledException)
+                {
+                    manager.Logger.LogWarning("WaitForLeaderStableAsync: {Message}", e.Message);
+                }
+            }
+
+            if (!string.IsNullOrEmpty(leader))
+            {
+                if (requiredStableFor == TimeSpan.Zero)
+                    return leader;
+
+                TimeSpan stableFor = ValueStopwatch.GetElapsedTime(LeaderChangedTicks, Stopwatch.GetTimestamp());
+                if (stableFor >= requiredStableFor)
+                    return leader;
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(10), cancellationToken).ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -312,12 +413,14 @@ private volatile int _startRange;
     /// <exception cref="RaftException">
     /// Thrown if the response is invalid or cannot determine the node state.
     /// </exception>
-    public async ValueTask<RaftNodeState> GetState()
+    public ValueTask<RaftNodeState> GetState() => GetState(CancellationToken.None);
+
+    public async ValueTask<RaftNodeState> GetState(CancellationToken cancellationToken)
     {
         if (!string.IsNullOrEmpty(Leader) && Leader == manager.LocalEndpoint)
             return RaftNodeState.Leader;
 
-        RaftResponse? response = await executor.Ask(RaftStateRequest).ConfigureAwait(false);
+        RaftResponse? response = await executor.Ask(RaftStateRequest, cancellationToken).ConfigureAwait(false);
         
         if (response is null)
             throw new RaftException("Unknown response (1)");
@@ -364,6 +467,7 @@ private volatile int _startRange;
     public void Stop()
     {
         executor.Stop();
+        executor.ResetTestingState();
     }
 
     internal Task DrainAsync(CancellationToken cancellationToken = default) =>
@@ -376,6 +480,7 @@ private volatile int _startRange;
 
         semaphore.Dispose();
         executor.Stop();
+        executor.ResetTestingState();
         executor.Dispose();
     }
 }

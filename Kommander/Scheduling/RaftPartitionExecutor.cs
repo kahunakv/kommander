@@ -203,6 +203,11 @@ public sealed class RaftPartitionExecutor : IDisposable
         _worker.Join();
     }
 
+    public void ResetTestingState()
+    {
+        _stateMachine.ResetTestingState();
+    }
+
     // ── Internal helpers ───────────────────────────────────────────────────
 
     private void ThrowIfNotReady()
@@ -356,6 +361,36 @@ public sealed class RaftPartitionExecutor : IDisposable
             {
                 case RaftRequestType.CheckLeader:
                     await _stateMachine.CheckPartitionLeadershipAsync().ConfigureAwait(false);
+                    op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
+                    break;
+
+                case RaftRequestType.ForceLeaderForTesting:
+                    await _stateMachine.ForceLeaderForTestingAsync(RegisterReply(op)).ConfigureAwait(false);
+                    break;
+
+                case RaftRequestType.StepDown:
+                    await _stateMachine.StepDownAsync(RegisterReply(op)).ConfigureAwait(false);
+                    break;
+
+                case RaftRequestType.TransferLeadership:
+                    await _stateMachine.TransferLeadershipAsync(request.Endpoint ?? "", RegisterReply(op)).ConfigureAwait(false);
+                    break;
+
+                case RaftRequestType.SuspendHeartbeats:
+                    await _stateMachine.SuspendHeartbeatsAsync(RegisterReply(op)).ConfigureAwait(false);
+                    break;
+
+                case RaftRequestType.ResumeHeartbeats:
+                    await _stateMachine.ResumeHeartbeatsAsync(RegisterReply(op)).ConfigureAwait(false);
+                    break;
+
+                case RaftRequestType.ReceiveStepDownNotice:
+                    await _stateMachine.ReceiveStepDownNoticeAsync(request.StepDownNotice!).ConfigureAwait(false);
+                    op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
+                    break;
+
+                case RaftRequestType.ReceiveTransferLeadership:
+                    await _stateMachine.ReceiveTransferLeadershipAsync(request.TransferLeadership!).ConfigureAwait(false);
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
                     break;
 
