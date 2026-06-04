@@ -212,6 +212,121 @@ public class TestTwoNodeCluster
     }
 
     [Fact]
+    public async Task WaitForLeaderStableAsync_EmptyLeader_CanceledToken_ThrowsPromptly()
+    {
+        InMemoryCommunication communication = new();
+
+        (IRaft node1, IRaft node2) = await AssembleTwoNodeCluster(communication, logger);
+
+        string stableLeader = await node1.WaitForLeaderStableAsync(
+            UserPartition,
+            TimeSpan.FromMilliseconds(100),
+            TestContext.Current.CancellationToken);
+
+        IRaft follower = stableLeader == node1.GetLocalEndpoint() ? node2 : node1;
+        RaftPartition partition = ((RaftManager)follower).Partitions[UserPartition];
+        partition.Leader = "";
+
+        using CancellationTokenSource cts = new();
+        await cts.CancelAsync();
+
+        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+            await follower.WaitForLeaderStableAsync(
+                UserPartition,
+                TimeSpan.FromMilliseconds(100),
+                cts.Token));
+
+        Assert.True(
+            stopwatch.GetElapsedMilliseconds() < 250,
+            $"Cancellation took too long: {stopwatch.GetElapsedMilliseconds()}ms");
+
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+    }
+
+    [Fact]
+    public async Task ForceLeaderForTestingAsync_Node2_BecomesLeader_AndReplicates()
+    {
+        InMemoryCommunication communication = new();
+
+        (IRaft node1, IRaft node2) = await AssembleTwoNodeCluster(communication, logger);
+
+        string stableLeader = await node1.WaitForLeaderStableAsync(
+            UserPartition,
+            TimeSpan.FromMilliseconds(100),
+            TestContext.Current.CancellationToken);
+
+        if (stableLeader == node1.GetLocalEndpoint())
+        {
+            RaftOperationStatus stepDownStatus = await node1.StepDownAsync(
+                UserPartition,
+                TestContext.Current.CancellationToken);
+
+            Assert.Equal(RaftOperationStatus.Success, stepDownStatus);
+        }
+
+        RaftOperationStatus forceStatus = await node2.ForceLeaderForTestingAsync(
+            UserPartition,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(RaftOperationStatus.Success, forceStatus);
+
+        string node2Leader = await node1.WaitForLeaderStableAsync(
+            UserPartition,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(node2.GetLocalEndpoint(), node2Leader);
+
+        RaftReplicationResult response = await node2.ReplicateLogs(
+            UserPartition,
+            "Greeting",
+            "Hello World"u8.ToArray(),
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        Assert.True(response.Success);
+        Assert.Equal(RaftOperationStatus.Success, response.Status);
+
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+    }
+
+    [Fact]
+    public async Task ForceLeaderForTestingAsync_StaleNode_ReturnsReplicationFailed()
+    {
+        InMemoryCommunication communication = new();
+
+        (IRaft node1, IRaft node2) = await AssembleTwoNodeCluster(
+            communication,
+            logger,
+            (wal1, _) => SeedWal(
+                wal1,
+                UserPartition,
+                [
+                    new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed },
+                    new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed },
+                ]));
+
+        string stableLeader = await node1.WaitForLeaderStableAsync(
+            UserPartition,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(node1.GetLocalEndpoint(), stableLeader);
+
+        RaftOperationStatus forceStatus = await node2.ForceLeaderForTestingAsync(
+            UserPartition,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(RaftOperationStatus.ReplicationFailed, forceStatus);
+
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+    }
+
+    [Fact]
     public async Task TestJoinClusterSimultAndDecideLeaderWithHighestWal()
     {
         InMemoryCommunication communication = new();

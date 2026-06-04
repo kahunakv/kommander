@@ -306,6 +306,142 @@ public sealed class TestThreeNodeCluster
         await node3.LeaveCluster(true);
     }
 
+    [Fact]
+    public async Task TransferLeadershipAsync_TargetBecomesStableLeader_AndProposalSucceeds()
+    {
+        (IRaft node1, IRaft node2, IRaft node3) = await AssembleThreNodeCluster("memory", 1);
+
+        IRaft[] nodes = [node1, node2, node3];
+        string initialLeader = await node1.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        string targetEndpoint = initialLeader != node2.GetLocalEndpoint()
+            ? node2.GetLocalEndpoint()
+            : node3.GetLocalEndpoint();
+
+        IRaft leaderNode = GetNodeByEndpoint(nodes, initialLeader);
+        IRaft targetNode = GetNodeByEndpoint(nodes, targetEndpoint);
+
+        RaftOperationStatus transferStatus = await leaderNode.TransferLeadershipAsync(
+            1,
+            targetEndpoint,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(RaftOperationStatus.Success, transferStatus);
+
+        string stableLeader = await targetNode.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(targetEndpoint, stableLeader);
+
+        RaftReplicationResult response = await targetNode.ReplicateLogs(
+            1,
+            "Greeting",
+            "Hello World"u8.ToArray(),
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        Assert.True(response.Success);
+        Assert.Equal(RaftOperationStatus.Success, response.Status);
+
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+        await node3.LeaveCluster(true);
+    }
+
+    [Fact]
+    public async Task TransferLeadershipAsync_StaleTarget_ReturnsReplicationFailed()
+    {
+        (IRaft node1, IRaft node2, IRaft node3) = await AssembleThreNodeCluster(
+            "memory",
+            1,
+            (wal1, _, _) => SeedWal(
+                wal1,
+                1,
+                [
+                    new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed },
+                    new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed },
+                ]));
+
+        string stableLeader = await node1.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(node1.GetLocalEndpoint(), stableLeader);
+
+        RaftOperationStatus transferStatus = await node1.TransferLeadershipAsync(
+            1,
+            node2.GetLocalEndpoint(),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(RaftOperationStatus.ReplicationFailed, transferStatus);
+
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+        await node3.LeaveCluster(true);
+    }
+
+    [Fact]
+    public async Task SuspendHeartbeatsAsync_FollowersElectNewLeader_ResumeDoesNotCreateSplitBrain()
+    {
+        (IRaft node1, IRaft node2, IRaft node3) = await AssembleThreNodeCluster("memory", 1);
+
+        IRaft[] nodes = [node1, node2, node3];
+        string initialLeader = await node1.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        IRaft initialLeaderNode = GetNodeByEndpoint(nodes, initialLeader);
+
+        RaftOperationStatus suspendStatus = await initialLeaderNode.SuspendHeartbeatsAsync(
+            1,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(RaftOperationStatus.Success, suspendStatus);
+
+        string newLeader = await WaitForDifferentStableLeader(
+            nodes,
+            1,
+            initialLeader,
+            TestContext.Current.CancellationToken);
+
+        Assert.NotEqual(initialLeader, newLeader);
+        Assert.False(await initialLeaderNode.AmILeaderQuick(1));
+
+        RaftOperationStatus resumeStatus = await initialLeaderNode.ResumeHeartbeatsAsync(
+            1,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(RaftOperationStatus.Success, resumeStatus);
+
+        string node1Leader = await node1.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+        string node2Leader = await node2.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+        string node3Leader = await node3.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(newLeader, node1Leader);
+        Assert.Equal(newLeader, node2Leader);
+        Assert.Equal(newLeader, node3Leader);
+        Assert.Equal(1, await CountLeaders(nodes, 1));
+
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+        await node3.LeaveCluster(true);
+    }
+
     [Theory]
     [Trait("Category", "Stress")]
     [InlineData("memory", 8)]
@@ -465,13 +601,18 @@ public sealed class TestThreeNodeCluster
         await node3.LeaveCluster(true);
     }
 
-    private async Task<(IRaft, IRaft, IRaft)> AssembleThreNodeCluster(string walStorage, int partitions)
+    private async Task<(IRaft, IRaft, IRaft)> AssembleThreNodeCluster(
+        string walStorage,
+        int partitions,
+        Action<IWAL, IWAL, IWAL>? seedWal = null)
     {
         InMemoryCommunication communication = new();
 
         IRaft node1 = GetNode1(communication, walStorage, partitions, logger);
         IRaft node2 = GetNode2(communication, walStorage, partitions, logger);
         IRaft node3 = GetNode3(communication, walStorage, partitions, logger);
+
+        seedWal?.Invoke(node1.WalAdapter, node2.WalAdapter, node3.WalAdapter);
 
         communication.SetNodes(new()
         {
@@ -506,10 +647,56 @@ public sealed class TestThreeNodeCluster
                     return;
             }
 
-            await Task.Delay(25, cancellationToken).ConfigureAwait(false);
+            await Task.Delay(25, cancellationToken);
         }
 
         throw new TimeoutException($"No leader elected for partition {partitionId} within 15 seconds.");
+    }
+
+    private static async Task<string> WaitForDifferentStableLeader(
+        IRaft[] nodes,
+        int partitionId,
+        string previousLeader,
+        CancellationToken cancellationToken)
+    {
+        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
+
+        while (stopwatch.GetElapsedMilliseconds() < 15_000)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            foreach (IRaft node in nodes)
+            {
+                string leader = await node.WaitForLeaderStableAsync(
+                    partitionId,
+                    TimeSpan.FromMilliseconds(150),
+                    cancellationToken);
+
+                if (leader != previousLeader)
+                    return leader;
+            }
+
+            await Task.Delay(25, cancellationToken).ConfigureAwait(false);
+        }
+
+        throw new TimeoutException(
+            $"Partition {partitionId} did not change leaders from {previousLeader} within 15 seconds.");
+    }
+
+    private static IRaft GetNodeByEndpoint(IRaft[] nodes, string endpoint) =>
+        nodes.Single(node => node.GetLocalEndpoint() == endpoint);
+
+    private static async Task<int> CountLeaders(IRaft[] nodes, int partitionId)
+    {
+        int leaders = 0;
+
+        foreach (IRaft node in nodes)
+        {
+            if (await node.AmILeaderQuick(partitionId))
+                leaders++;
+        }
+
+        return leaders;
     }
 
     private static IRaft GetNode1(InMemoryCommunication communication, string walStorage, int partitions, ILogger<IRaft> logger)
@@ -651,4 +838,7 @@ public sealed class TestThreeNodeCluster
 
         return followers;
     }
+
+    private static void SeedWal(IWAL wal, int partitionId, List<RaftLog> logs) =>
+        Assert.Equal(RaftOperationStatus.Success, wal.Write([(partitionId, logs)]));
 }
