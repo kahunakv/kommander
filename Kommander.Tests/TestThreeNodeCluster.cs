@@ -442,6 +442,104 @@ public sealed class TestThreeNodeCluster
         await node3.LeaveCluster(true);
     }
 
+    [Fact]
+    public async Task GetActiveNodes_LeaderPerspective_ReturnsReachableFollowers()
+    {
+        (IRaft node1, IRaft node2, IRaft node3) = await AssembleThreNodeCluster("memory", 1);
+
+        IRaft[] nodes = [node1, node2, node3];
+        string leaderEndpoint = await node1.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        IRaft leader = GetNodeByEndpoint(nodes, leaderEndpoint);
+        string[] followerEndpoints = nodes
+            .Where(node => node.GetLocalEndpoint() != leaderEndpoint)
+            .Select(node => node.GetLocalEndpoint())
+            .OrderBy(endpoint => endpoint, StringComparer.Ordinal)
+            .ToArray();
+
+        await WaitForConditionAsync(
+            () =>
+            {
+                IReadOnlyList<string> activeNodes = leader.GetActiveNodes(TimeSpan.FromMilliseconds(1500));
+                return activeNodes.Count == followerEndpoints.Length &&
+                    followerEndpoints.All(endpoint => activeNodes.Contains(endpoint, StringComparer.Ordinal));
+            },
+            TestContext.Current.CancellationToken);
+
+        IReadOnlyList<string> active = leader.GetActiveNodes(TimeSpan.FromMilliseconds(1500));
+
+        Assert.Equal(followerEndpoints, active);
+
+        foreach (string followerEndpoint in followerEndpoints)
+            Assert.True(leader.GetLastNodeActivity(followerEndpoint) > HLCTimestamp.Zero);
+
+        Assert.Equal(HLCTimestamp.Zero, leader.GetLastNodeActivity("localhost:9999"));
+
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+        await node3.LeaveCluster(true);
+    }
+
+    [Fact]
+    public async Task GetActiveNodes_UnreachableFollower_DropsAfterWindow()
+    {
+        (IRaft node1, IRaft node2, IRaft node3, Dictionary<string, IRaft> network) = await AssembleThreNodeClusterWithNetwork("memory", 1);
+
+        IRaft[] nodes = [node1, node2, node3];
+        string leaderEndpoint = await node1.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        IRaft leader = GetNodeByEndpoint(nodes, leaderEndpoint);
+        string isolatedFollower = nodes
+            .Select(node => node.GetLocalEndpoint())
+            .First(endpoint => endpoint != leaderEndpoint);
+        string healthyFollower = nodes
+            .Select(node => node.GetLocalEndpoint())
+            .First(endpoint => endpoint != leaderEndpoint && endpoint != isolatedFollower);
+
+        await WaitForConditionAsync(
+            () =>
+            {
+                IReadOnlyList<string> activeNodes = leader.GetActiveNodes(TimeSpan.FromMilliseconds(1500));
+                return activeNodes.Contains(isolatedFollower, StringComparer.Ordinal) &&
+                    activeNodes.Contains(healthyFollower, StringComparer.Ordinal);
+            },
+            TestContext.Current.CancellationToken);
+
+        // Cleanly remove the isolated follower from the cluster. Unlike dropping it from the
+        // in-memory routing table (which leaves it able to campaign and churn leadership), a
+        // graceful leave stops it participating entirely, so the remaining two nodes keep a stable
+        // leader. The leader simply stops hearing from the removed node, so it must drop out of
+        // GetActiveNodes once the liveness window elapses, while the healthy follower remains.
+        IRaft isolatedNode = GetNodeByEndpoint(nodes, isolatedFollower);
+        await isolatedNode.LeaveCluster(true);
+        network.Remove(isolatedFollower);
+
+        await WaitForConditionAsync(
+            () =>
+            {
+                IReadOnlyList<string> activeNodes = leader.GetActiveNodes(TimeSpan.FromMilliseconds(1500));
+                return !activeNodes.Contains(isolatedFollower, StringComparer.Ordinal) &&
+                    activeNodes.Contains(healthyFollower, StringComparer.Ordinal);
+            },
+            TestContext.Current.CancellationToken,
+            timeoutMs: 15_000);
+
+        IReadOnlyList<string> active = leader.GetActiveNodes(TimeSpan.FromMilliseconds(1500));
+
+        Assert.DoesNotContain(isolatedFollower, active);
+        Assert.Contains(healthyFollower, active);
+        Assert.True(leader.GetLastNodeActivity(isolatedFollower) > HLCTimestamp.Zero);
+
+        await leader.LeaveCluster(true);
+        await GetNodeByEndpoint(nodes, healthyFollower).LeaveCluster(true);
+    }
+
     [Theory]
     [Trait("Category", "Stress")]
     [InlineData("memory", 8)]
@@ -606,6 +704,19 @@ public sealed class TestThreeNodeCluster
         int partitions,
         Action<IWAL, IWAL, IWAL>? seedWal = null)
     {
+        (IRaft node1, IRaft node2, IRaft node3, _) = await AssembleThreNodeClusterWithNetwork(
+            walStorage,
+            partitions,
+            seedWal);
+
+        return (node1, node2, node3);
+    }
+
+    private async Task<(IRaft, IRaft, IRaft, Dictionary<string, IRaft>)> AssembleThreNodeClusterWithNetwork(
+        string walStorage,
+        int partitions,
+        Action<IWAL, IWAL, IWAL>? seedWal = null)
+    {
         InMemoryCommunication communication = new();
 
         IRaft node1 = GetNode1(communication, walStorage, partitions, logger);
@@ -614,12 +725,14 @@ public sealed class TestThreeNodeCluster
 
         seedWal?.Invoke(node1.WalAdapter, node2.WalAdapter, node3.WalAdapter);
 
-        communication.SetNodes(new()
+        Dictionary<string, IRaft> network = new()
         {
             { "localhost:8001", node1 },
             { "localhost:8002", node2 },
             { "localhost:8003", node3 }
-        });
+        };
+
+        communication.SetNodes(network);
 
         await node1.UpdateNodes();
         await node2.UpdateNodes();
@@ -630,7 +743,7 @@ public sealed class TestThreeNodeCluster
         for (int i = 1; i <= partitions; i++)
             await WaitForAnyLeader([node1, node2, node3], i, TestContext.Current.CancellationToken);
 
-        return (node1, node2, node3);
+        return (node1, node2, node3, network);
     }
 
     private static async Task WaitForAnyLeader(IRaft[] nodes, int partitionId, CancellationToken cancellationToken)
@@ -697,6 +810,26 @@ public sealed class TestThreeNodeCluster
         }
 
         return leaders;
+    }
+
+    private static async Task WaitForConditionAsync(
+        Func<bool> condition,
+        CancellationToken cancellationToken,
+        int timeoutMs = 15_000)
+    {
+        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
+
+        while (stopwatch.GetElapsedMilliseconds() < timeoutMs)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (condition())
+                return;
+
+            await Task.Delay(25, cancellationToken).ConfigureAwait(false);
+        }
+
+        throw new TimeoutException($"Condition not satisfied within {timeoutMs}ms.");
     }
 
     private static IRaft GetNode1(InMemoryCommunication communication, string walStorage, int partitions, ILogger<IRaft> logger)

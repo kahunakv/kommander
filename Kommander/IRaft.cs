@@ -115,6 +115,20 @@ public interface IRaft
     public IList<RaftNode> GetNodes();
 
     /// <summary>
+    /// Last time the local node observed activity from the specified endpoint.
+    /// For a leader, this is the last append response received from that follower.
+    /// For a follower, this is the last append received from the leader.
+    /// Returns <see cref="HLCTimestamp.Zero"/> if the endpoint has never been seen.
+    /// </summary>
+    public HLCTimestamp GetLastNodeActivity(string endpoint);
+
+    /// <summary>
+    /// Returns the non-local endpoints the local node has observed activity from
+    /// within the requested window.
+    /// </summary>
+    public IReadOnlyList<string> GetActiveNodes(TimeSpan within);
+
+    /// <summary>
     /// Passes the Handshake to the appropriate partition
     /// </summary>
     /// <param name="request"></param>

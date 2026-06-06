@@ -1314,7 +1314,10 @@ public sealed class RaftPartitionStateMachine
     /// <param name="committedIndex"></param>
     public ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex)
     {
-        HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        HLCTimestamp currentTime = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, timestamp);
+
+        if (endpoint != host.LocalEndpoint)
+            host.UpdateLastNodeActivity(endpoint, currentTime);
         
         if (committedIndex > 0)
         {

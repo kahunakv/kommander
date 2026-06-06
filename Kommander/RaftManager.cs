@@ -434,11 +434,11 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <summary>
     /// Obtains the last activity known of a specific node on any partitions
     /// </summary>
-    /// <param name="nodeId"></param>
+    /// <param name="endpoint"></param>
     /// <returns></returns>
-    internal HLCTimestamp GetLastNodeActivity(string nodeId)
+    public HLCTimestamp GetLastNodeActivity(string endpoint)
     {
-        return lastActivity.TryGetValue(nodeId, out HLCTimestamp lastTimestamp) ? lastTimestamp : HLCTimestamp.Zero;
+        return lastActivity.TryGetValue(endpoint, out HLCTimestamp lastTimestamp) ? lastTimestamp : HLCTimestamp.Zero;
     }
 
     /// <summary>
@@ -489,6 +489,27 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     public IList<RaftNode> GetNodes()
     {
         return Nodes;
+    }
+
+    /// <summary>
+    /// Returns the non-local endpoints observed within the requested liveness window.
+    /// </summary>
+    public IReadOnlyList<string> GetActiveNodes(TimeSpan within)
+    {
+        HLCTimestamp now = hybridLogicalClock.TrySendOrLocalEvent(LocalNodeId);
+        List<string> active = [];
+
+        foreach ((string endpoint, HLCTimestamp lastSeen) in lastActivity)
+        {
+            if (endpoint == LocalEndpoint)
+                continue;
+
+            if ((now - lastSeen) <= within)
+                active.Add(endpoint);
+        }
+
+        active.Sort(StringComparer.Ordinal);
+        return active;
     }
 
     /// <summary>
