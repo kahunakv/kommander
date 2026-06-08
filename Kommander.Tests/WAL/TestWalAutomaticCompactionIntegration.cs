@@ -218,7 +218,9 @@ public sealed class TestWalAutomaticCompactionIntegration
                     partition,
                     wal);
 
-                long commitIndex = await recoveryWriteAhead.Recover().ConfigureAwait(true);
+                IReadOnlyList<RaftLog> restoredLogs = await recoveryWriteAhead.LoadRestoreLogsAsync().ConfigureAwait(true);
+                await recoveryWriteAhead.CompleteRestoreAsync(restoredLogs).ConfigureAwait(true);
+                long commitIndex = await recoveryWriteAhead.GetMaxLog().ConfigureAwait(true) + 1;
 
                 Assert.True(commitIndex > lastCheckpoint);
 

@@ -107,30 +107,39 @@ public sealed class RaftWriteAhead
     }
 
     /// <summary>
-    /// Recovers the state of the Raft log for a specific partition by reading persisted logs from the Write-Ahead Log (WAL).
-    /// This method ensures recovery is only executed once and updates the commit index upon completion.
+    /// Phase 1 of the nonblocking restore: reads all persisted log entries from WAL
+    /// storage through the I/O scheduler.  Returns the raw list so the caller can
+    /// deliver it back to the partition executor for replay under the single-owner
+    /// guarantee (correctness rule 1).
     /// </summary>
-    /// <returns>
-    /// The updated commit index after recovery is completed. Returns -1 if the recovery has already been performed.
-    /// </returns>
-    /// <exception cref="Exception">
-    /// Thrown if an error occurs during log recovery or processing.
-    /// </exception>
-    public async ValueTask<long> Recover()
+    public async ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync()
     {
         if (recovered)
-            return -1;
+            return Array.Empty<RaftLog>();
+
+        List<RaftLog> logs = await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () => walAdapter.ReadLogs(partition.PartitionId)).ConfigureAwait(false);
+
+        if (logs.Count > 0)
+            manager.Logger.LogInformation("[{Endpoint}/{Partition}] Recovered {LogsCount} logs", manager.LocalEndpoint, partition.PartitionId, logs.Count);
+
+        return logs;
+    }
+
+    /// <summary>
+    /// Phase 2 of the nonblocking restore: replays the loaded log entries by invoking
+    /// the application replication callbacks and updating the WAL commit index.
+    /// Must be called on the partition executor thread (single-owner guarantee).
+    /// </summary>
+    public async ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs)
+    {
+        if (recovered)
+            return;
 
         recovered = true;
 
         manager.InvokeRestoreStarted(partition.PartitionId);
 
         bool found = false;
-
-        List<RaftLog> logs = await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () => walAdapter.ReadLogs(partition.PartitionId));
-        
-        if (logs.Count > 0)
-            manager.Logger.LogInformation("[{Endpoint}/{Partition}] Recovered {LogsCount} logs", manager.LocalEndpoint, partition.PartitionId, logs.Count);
 
         foreach (RaftLog log in logs)
         {
@@ -145,13 +154,13 @@ public sealed class RaftWriteAhead
                     case RaftLogType.RolledBack:
                     case RaftLogType.RolledBackCheckpoint:
                         continue;
-                    
+
                     case RaftLogType.Committed:
                     case RaftLogType.CommittedCheckpoint:
                         commitIndex = log.Id + 1;
                         proposeIndex = log.Id + 1;
                         break;
-                    
+
                     default:
                         throw new NotImplementedException();
                 }
@@ -173,7 +182,7 @@ public sealed class RaftWriteAhead
             catch (Exception ex)
             {
                 manager.Logger.LogError("[{Endpoint}/{PartitionId}] {Message}\n{Stacktrace}", manager.LocalEndpoint, partition.PartitionId, ex.Message, ex.StackTrace);
-                
+
                 manager.InvokeReplicationError(partition.PartitionId, log);
             }
         }
@@ -185,8 +194,6 @@ public sealed class RaftWriteAhead
             manager.InvokeSystemRestoreFinished(partition.PartitionId);
         else
             manager.InvokeRestoreFinished(partition.PartitionId);
-
-        return commitIndex;
     }
 
     /// <summary>

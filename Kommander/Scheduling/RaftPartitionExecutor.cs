@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using Kommander.Data;
+using Kommander.Diagnostics;
 using Kommander.Scheduling;
 using Kommander.WAL;
 using Kommander.WAL.Data;
@@ -111,6 +113,19 @@ public sealed class RaftPartitionExecutor : IDisposable
     // Batch scratch list to avoid per-drain allocations.
     private readonly List<PendingOperation> _drainBatch = new(256);
 
+    // ── Restore state ──────────────────────────────────────────────────────
+
+    // Set to true once the RestoreLogsLoaded event has been fully processed by
+    // the worker thread.  Client proposals are rejected with RestoreInProgress
+    // until this flag is true.  Volatile so producers see the update promptly.
+    private volatile bool _restoreCompleted;
+
+    // Completes when Phase 2 of the restore (log replay) finishes on the worker
+    // thread.  Faulted if either phase fails.  Callers that need to know restore
+    // is done before issuing client ops can await this task.
+    private readonly TaskCompletionSource _restoreTcs =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     // ── Observability ──────────────────────────────────────────────────────
 
     private long _totalProcessed;
@@ -142,6 +157,20 @@ public sealed class RaftPartitionExecutor : IDisposable
     /// 0 or negative means the queue is unbounded.
     /// </summary>
     public int ClientQueueCapacity => _maxClientQueueDepth;
+
+    /// <summary>
+    /// True once Phase 2 of the partition restore (log replay) has completed on
+    /// the executor thread.  Client proposals are rejected with
+    /// <see cref="RaftOperationStatus.RestoreInProgress"/> until this is true.
+    /// </summary>
+    public bool IsRestored => _restoreCompleted;
+
+    /// <summary>
+    /// A task that completes when the partition restore finishes successfully,
+    /// or faults if either restore phase fails.  Await this before issuing client
+    /// operations when you need a hard guarantee that restore is complete.
+    /// </summary>
+    public Task RestoreTask => _restoreTcs.Task;
 
     /// <summary>Id of the partition owned by this executor.</summary>
     public int PartitionId => _partitionId;
@@ -194,6 +223,8 @@ public sealed class RaftPartitionExecutor : IDisposable
             IsBackground = true,
             Name = $"RaftPartitionExecutor-{partitionId}",
         };
+
+        KommanderMetrics.RegisterExecutor(this);
     }
 
     // ── Public API ─────────────────────────────────────────────────────────
@@ -284,6 +315,19 @@ public sealed class RaftPartitionExecutor : IDisposable
     {
         RaftOperationKind kind = RaftOperationMapper.GetKind(request.Type);
 
+        // Restore gate: reject client proposals until Phase 2 of the partition restore
+        // has completed.  Control, replication, and maintenance ops are allowed through
+        // so that heartbeats, election traffic, and the RestoreLogsLoaded event itself
+        // can be processed while the restore is in progress.
+        if (kind == RaftOperationKind.Client && !_restoreCompleted)
+        {
+            Interlocked.Increment(ref _totalClientRejected);
+            KommanderMetrics.ExecutorRejectionsTotal.Add(1,
+                new KeyValuePair<string, object?>("partition_id", _partitionId));
+            reply?.TrySetResult(RaftResponseStatic.RestoreInProgressResponse);
+            return;
+        }
+
         // Admission control: reject client proposals when the queue is full.
         // Control, replication, and maintenance queues are never bounded so
         // control-plane traffic cannot be starved (non-negotiable correctness rule 6).
@@ -300,6 +344,8 @@ public sealed class RaftPartitionExecutor : IDisposable
             {
                 Interlocked.Decrement(ref _clientQueueDepth);
                 Interlocked.Increment(ref _totalClientRejected);
+                KommanderMetrics.ExecutorRejectionsTotal.Add(1,
+                    new KeyValuePair<string, object?>("partition_id", _partitionId));
                 _logger.LogWarning(
                     "[RaftPartitionExecutor/{PartitionId}] Client queue full ({Depth}/{Capacity}); rejecting {Type}",
                     _partitionId, after - 1, _maxClientQueueDepth, request.Type);
@@ -341,30 +387,11 @@ public sealed class RaftPartitionExecutor : IDisposable
     {
         CancellationToken token = _cts.Token;
 
-        // Restore WAL on first run (mirrors actor adapter behaviour).
-        // We do this synchronously on the worker thread so it blocks new operations
-        // until restore completes, satisfying correctness rule 8.
-        try
-        {
-            _stateMachine.RestoreWalAsync().AsTask().GetAwaiter().GetResult();
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(
-                "[RaftPartitionExecutor/{PartitionId}] WAL restore failed; partition will not process operations: {Message}\n{StackTrace}",
-                _partitionId, ex.Message, ex.StackTrace);
-
-            // Mark the executor as stopped so Post/Ask immediately throw rather
-            // than enqueuing onto a worker that has already exited.
-            _stopping = true;
-            _cts.Cancel();
-
-            // Abort: cancel all already-enqueued operations and exit the worker so
-            // nothing runs against unrestored state.
-            DrainAll();
-            CancelPendingReplies();
-            return;
-        }
+        // Phase 1 of nonblocking restore: kick off WAL log loading on the I/O
+        // scheduler (thread pool).  The task posts RestoreLogsLoaded back to this
+        // executor when done so Phase 2 (replay) runs on this thread under the
+        // single-owner guarantee.  The worker loop starts immediately — no blocking.
+        _ = Task.Run(() => RunRestorePhase1Async(token));
 
         while (true)
         {
@@ -387,6 +414,32 @@ public sealed class RaftPartitionExecutor : IDisposable
                 CancelPendingReplies();
                 break;
             }
+        }
+    }
+
+    private async Task RunRestorePhase1Async(CancellationToken token)
+    {
+        try
+        {
+            IReadOnlyList<RaftLog> logs = await _stateMachine.StartRestoreAsync().ConfigureAwait(false);
+
+            // Deliver logs back to the executor for Phase 2 replay on the worker thread.
+            _maintenanceQueue.Enqueue(new PendingOperation(
+                new RaftRequest(RaftRequestType.RestoreLogsLoaded, logs),
+                reply: null));
+            _workAvailable.Release();
+        }
+        catch (Exception ex) when (!token.IsCancellationRequested)
+        {
+            _logger.LogError(
+                "[RaftPartitionExecutor/{PartitionId}] WAL restore (Phase 1) failed; partition will not process operations: {Message}\n{StackTrace}",
+                _partitionId, ex.Message, ex.StackTrace);
+
+            _restoreTcs.TrySetException(ex);
+            _stopping = true;
+            _cts.Cancel();
+            DrainAll();
+            CancelPendingReplies();
         }
     }
 
@@ -458,7 +511,7 @@ public sealed class RaftPartitionExecutor : IDisposable
     private async Task ExecuteOneAsync(PendingOperation op)
     {
         RaftRequest request = op.Request;
-        Stopwatch sw = Stopwatch.StartNew();
+        ValueStopwatch sw = ValueStopwatch.StartNew();
 
         try
         {
@@ -552,6 +605,23 @@ public sealed class RaftPartitionExecutor : IDisposable
                     break;
 
                 case RaftRequestType.DrainBarrier:
+                    // Re-enqueue if higher-priority queues still have work so the
+                    // barrier only resolves once everything queued before it is done.
+                    if (!_controlQueue.IsEmpty || !_replicationQueue.IsEmpty || !_clientQueue.IsEmpty)
+                    {
+                        _maintenanceQueue.Enqueue(op);
+                        _workAvailable.Release();
+                        return;
+                    }
+                    Interlocked.Increment(ref _totalProcessed);
+                    op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
+                    return;
+
+                case RaftRequestType.RestoreLogsLoaded:
+                    // Phase 2: replay logs and finalise restore on the executor thread.
+                    await _stateMachine.CompleteRestoreAsync(request.RestoredLogs ?? []).ConfigureAwait(false);
+                    _restoreCompleted = true;
+                    _restoreTcs.TrySetResult();
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
                     break;
 
@@ -584,6 +654,12 @@ public sealed class RaftPartitionExecutor : IDisposable
             }
 
             Interlocked.Increment(ref _totalProcessed);
+
+            double elapsedMs = sw.GetElapsedTime().TotalMilliseconds;
+            string opClass = RaftOperationMapper.GetKind(request.Type).ToString();
+            TagList tags = new() { { "partition_id", _partitionId }, { "operation_class", opClass } };
+            KommanderMetrics.ExecutorOperationsTotal.Add(1, tags);
+            KommanderMetrics.ExecutorOperationDurationMs.Record(elapsedMs, tags);
         }
         catch (Exception ex)
         {
@@ -591,15 +667,20 @@ public sealed class RaftPartitionExecutor : IDisposable
                 "[RaftPartitionExecutor/{PartitionId}] {Name}: {Message}\n{StackTrace}",
                 _partitionId, ex.GetType().Name, ex.Message, ex.StackTrace);
 
+            // If restore Phase 2 itself throws, fault the restore task so waiters don't block.
+            if (request.Type == RaftRequestType.RestoreLogsLoaded)
+                _restoreTcs.TrySetException(ex);
+
             op.Reply?.TrySetException(ex);
         }
         finally
         {
-            if (_slowThresholdMs > 0 && sw.ElapsedMilliseconds > _slowThresholdMs)
+            long elapsedMs = sw.GetElapsedMilliseconds();
+            if (_slowThresholdMs > 0 && elapsedMs > _slowThresholdMs)
             {
                 _logger.LogWarning(
                     "[RaftPartitionExecutor/{PartitionId}] Slow dispatch: {Type} took {ElapsedMs}ms",
-                    _partitionId, request.Type, sw.ElapsedMilliseconds);
+                    _partitionId, request.Type, elapsedMs);
             }
         }
     }
@@ -612,10 +693,16 @@ public sealed class RaftPartitionExecutor : IDisposable
         foreach (PendingOperation op in ops)
             batch.Add((op.Request.Logs, op.Request.AutoCommit, RegisterReply(op)));
 
+        ValueStopwatch sw = ValueStopwatch.StartNew();
         try
         {
             await _stateMachine.ReplicateLogsBatchAsync(batch).ConfigureAwait(false);
             Interlocked.Add(ref _totalProcessed, ops.Count);
+
+            double elapsedMs = sw.GetElapsedTime().TotalMilliseconds;
+            TagList tags = new() { { "partition_id", _partitionId }, { "operation_class", "Replication" } };
+            KommanderMetrics.ExecutorOperationsTotal.Add(ops.Count, tags);
+            KommanderMetrics.ExecutorOperationDurationMs.Record(elapsedMs, tags);
         }
         catch (Exception ex)
         {

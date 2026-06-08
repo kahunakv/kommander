@@ -37,6 +37,14 @@ public sealed class RaftRequest
     /// </summary>
     public RaftWalCompletion? WalCompletion { get; }
 
+    /// <summary>
+    /// Raw log entries loaded from the WAL during the restore phase.
+    /// Set when <see cref="Type"/> is <see cref="RaftRequestType.RestoreLogsLoaded"/>.
+    /// Replayed on the executor thread by
+    /// <see cref="RaftPartitionStateMachine.CompleteRestoreAsync"/>.
+    /// </summary>
+    public IReadOnlyList<RaftLog>? RestoredLogs { get; }
+
     public RaftRequest(
         RaftRequestType type, 
         long term = -1, 
@@ -111,16 +119,18 @@ public sealed class RaftRequest
     {
         Type = type;
         WalCompletion = completion;
-        WalOperation = completion.Operation;
         Status = completion.Status;
-        if (completion.Operation is { } op)
-        {
-            Timestamp = op.Timestamp;
-            Endpoint = op.Endpoint;
-            Term = op.Term;
-            AutoCommit = op.AutoCommit;
-            CommitIndex = op.LogIndex;
-            Logs = op.Logs.Item2;
-        }
+    }
+
+    /// <summary>
+    /// Constructs a <see cref="RaftRequestType.RestoreLogsLoaded"/> maintenance request
+    /// that carries the raw WAL logs loaded during Phase 1 of the nonblocking restore.
+    /// The executor replays these on its own thread via
+    /// <see cref="RaftPartitionStateMachine.CompleteRestoreAsync"/>.
+    /// </summary>
+    public RaftRequest(RaftRequestType type, IReadOnlyList<RaftLog> restoredLogs)
+    {
+        Type = type;
+        RestoredLogs = restoredLogs;
     }
 }

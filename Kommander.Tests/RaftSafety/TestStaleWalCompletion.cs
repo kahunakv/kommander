@@ -55,6 +55,12 @@ public class TestStaleWalCompletion
     }
 
     // ── Operation-ID fencing ──────────────────────────────────────────────
+    // After Task 17 the OperationId is the authoritative pending-map key.
+    // There is no longer an embedded WALWriteOperation to cross-check against;
+    // instead the state machine looks up pendingWalOperations[OperationId] and
+    // discards the completion if the entry is absent.  The test below models
+    // the abstract rule (unknown id → stale); the live handler is exercised in
+    // TestWalCompletionFences.OrphanLeaderPropose_CompletionIsDiscardedWithoutException.
 
     [Fact]
     public void StaleCompletion_OperationIdMismatch_ShouldBeDropped()

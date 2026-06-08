@@ -53,6 +53,7 @@ public static class RaftOperationMapper
             RaftRequestType.GetNodeState         => RaftOperationKind.Client,
             RaftRequestType.GetTicketState       => RaftOperationKind.Client,
             RaftRequestType.DrainBarrier         => RaftOperationKind.Maintenance,
+            RaftRequestType.RestoreLogsLoaded    => RaftOperationKind.Maintenance,
 
             _ => throw new ArgumentOutOfRangeException(nameof(requestType), requestType, "Unrecognised RaftRequestType"),
         };
@@ -117,7 +118,8 @@ public static class RaftOperationMapper
 
             RaftRequestType.GetNodeState or
             RaftRequestType.GetTicketState or
-            RaftRequestType.DrainBarrier => RaftStatePriority.Low,
+            RaftRequestType.DrainBarrier or
+            RaftRequestType.RestoreLogsLoaded => RaftStatePriority.Low,
 
             RaftRequestType.AppendLogs or
             RaftRequestType.CompleteAppendLogs or

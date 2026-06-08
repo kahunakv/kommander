@@ -14,7 +14,9 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
 
     public RaftWalFacadeAdapter(RaftWriteAhead wal) => this.wal = wal;
 
-    public ValueTask<long> RecoverAsync() => wal.Recover();
+    public ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync() => wal.LoadRestoreLogsAsync();
+
+    public ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs) => wal.CompleteRestoreAsync(logs);
 
     public async ValueTask<long> GetMaxLogAsync() => await wal.GetMaxLog().ConfigureAwait(false);
 

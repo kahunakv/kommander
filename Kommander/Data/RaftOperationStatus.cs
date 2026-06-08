@@ -20,4 +20,11 @@ public enum RaftOperationStatus
     /// The caller should back off and retry after a delay.
     /// </summary>
     ProposalQueueFull = 11,
+
+    /// <summary>
+    /// The partition is still restoring state from the WAL.
+    /// Client proposals are not accepted until restore completes.
+    /// The caller should back off and retry after a short delay.
+    /// </summary>
+    RestoreInProgress = 12,
 }

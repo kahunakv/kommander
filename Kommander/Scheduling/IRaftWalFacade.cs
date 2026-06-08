@@ -14,7 +14,20 @@ namespace Kommander.Scheduling;
 /// </summary>
 public interface IRaftWalFacade
 {
-    ValueTask<long> RecoverAsync();
+    /// <summary>
+    /// Phase 1 of the nonblocking restore: reads all persisted log entries from WAL
+    /// storage using the I/O scheduler.  The returned list is delivered back to the
+    /// partition executor as a <see cref="Kommander.Data.RaftRequestType.RestoreLogsLoaded"/>
+    /// maintenance event for replay under the single-owner guarantee.
+    /// </summary>
+    ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync();
+
+    /// <summary>
+    /// Phase 2 of the nonblocking restore: replays the loaded log entries by invoking
+    /// the application replication callbacks and updating the WAL commit index.
+    /// Must be called on the partition executor thread.
+    /// </summary>
+    ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs);
 
     ValueTask<long> GetMaxLogAsync();
 

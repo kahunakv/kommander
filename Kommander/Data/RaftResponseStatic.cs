@@ -15,4 +15,13 @@ internal static class RaftResponseStatic
         RaftResponseType.None,
         RaftOperationStatus.ProposalQueueFull,
         HLCTimestamp.Zero);
+
+    /// <summary>
+    /// Pre-allocated rejection response for client proposals arriving before the
+    /// partition has completed its WAL restore.  Callers should retry after a delay.
+    /// </summary>
+    public static RaftResponse RestoreInProgressResponse = new(
+        RaftResponseType.None,
+        RaftOperationStatus.RestoreInProgress,
+        HLCTimestamp.Zero);
 }

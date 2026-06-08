@@ -541,12 +541,15 @@ public class TestRaftPartitionStateMachine
     {
         private readonly FakeWAL wal = new();
 
-        public ValueTask<long> RecoverAsync()
+        public ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync()
         {
             wal.Write([(1, [new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed }])]);
             wal.DrainAll();
-            return ValueTask.FromResult(1L);
+            IReadOnlyList<RaftLog> logs = [new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed }];
+            return ValueTask.FromResult(logs);
         }
+
+        public ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs) => ValueTask.CompletedTask;
 
         public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(wal.GetMaxLog(partitionId: 1));
 

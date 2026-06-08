@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Kommander.Data;
+using Kommander.Diagnostics;
 using Kommander.Logging;
 using Kommander.Scheduling;
 using Kommander.System;
@@ -61,24 +62,38 @@ public sealed class RaftPartitionStateMachine
             replySink.TryComplete(correlationId.Value, response);
     }
 
-    public async ValueTask RestoreWalAsync()
+    /// <summary>
+    /// Phase 1 of the nonblocking restore.  Initialises the heartbeat timestamp and
+    /// loads the raw WAL entries through the I/O scheduler.  The returned list must be
+    /// delivered back to the executor as a
+    /// <see cref="RaftRequestType.RestoreLogsLoaded"/> maintenance event so that
+    /// <see cref="CompleteRestoreAsync"/> runs under the single-owner guarantee.
+    /// </summary>
+    public ValueTask<IReadOnlyList<RaftLog>> StartRestoreAsync()
+    {
+        lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        return wal.LoadRestoreLogsAsync();
+    }
+
+    /// <summary>
+    /// Phase 2 of the nonblocking restore.  Called on the executor thread after
+    /// <see cref="StartRestoreAsync"/> has loaded logs from storage.  Replays the
+    /// committed entries via the application replication callbacks, updates the
+    /// current term, and sends the initial handshake.
+    /// </summary>
+    public async ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs)
     {
         if (restored)
             return;
 
-        // Do NOT set restored = true yet; if any step below throws the caller
-        // must be able to retry rather than seeing restored=true and skipping.
-        lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        await wal.CompleteRestoreAsync(logs).ConfigureAwait(false);
 
-        long currentIndex = await wal.RecoverAsync().ConfigureAwait(false);
-        
-        logger.LogInfoWalRestored(host.LocalEndpoint, host.PartitionId, nodeState, currentIndex, 0L /* restore timing handled by actor adapter */);
-        
         currentTerm = await wal.GetCurrentTermAsync().ConfigureAwait(false);
+
+        logger.LogInfoWalRestored(host.LocalEndpoint, host.PartitionId, nodeState, logs.Count, 0L);
 
         await SendHandshakeAsync().ConfigureAwait(false);
 
-        // Mark restored only after every step succeeds.
         restored = true;
     }
 
@@ -445,7 +460,15 @@ public sealed class RaftPartitionStateMachine
 
         IncreaseVotes(host.LocalEndpoint, currentTerm);
 
-        logger.LogWarnVotedToBecomeLeader(host.LocalEndpoint, host.PartitionId, nodeState, (currentTime - lastHeartbeat).TotalMilliseconds, currentTerm);
+        double delayMs = lastHeartbeat != HLCTimestamp.Zero
+            ? (currentTime - lastHeartbeat).TotalMilliseconds
+            : 0;
+
+        TagList electionTags = new() { { "partition_id", host.PartitionId } };
+        KommanderMetrics.ElectionsStartedTotal.Add(1, electionTags);
+        KommanderMetrics.ElectionDelayMs.Record(delayMs, electionTags);
+
+        logger.LogWarnVotedToBecomeLeader(host.LocalEndpoint, host.PartitionId, nodeState, delayMs, currentTerm);
 
         if (host.Nodes.Count == 0)
         {
@@ -509,10 +532,18 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
+        HLCTimestamp prevHeartbeat = lastHeartbeat;
         lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
 
         if (nodeState != RaftNodeState.Leader && nodeState != RaftNodeState.Candidate)
             return;
+
+        TagList heartbeatTags = new() { { "partition_id", host.PartitionId } };
+        KommanderMetrics.HeartbeatsSentTotal.Add(1, heartbeatTags);
+
+        if (prevHeartbeat != HLCTimestamp.Zero)
+            KommanderMetrics.HeartbeatDelayMs.Record(
+                (lastHeartbeat - prevHeartbeat).TotalMilliseconds, heartbeatTags);
 
         //int number = 0;
         
@@ -833,7 +864,13 @@ public sealed class RaftPartitionStateMachine
 
             if (operation is not null)
             {
-                pendingWalOperations[operation.OperationId] = new() { ReplyCorrelationId = replyCorrelationId };
+                pendingWalOperations[operation.OperationId] = new()
+                {
+                    ReplyCorrelationId = replyCorrelationId,
+                    Logs = logs,
+                    Endpoint = endpoint,
+                    Timestamp = timestamp,
+                };
                 return;
             }
 
@@ -964,9 +1001,11 @@ public sealed class RaftPartitionStateMachine
         pendingWalOperations[operation.OperationId] = new()
         {
             ReplyCorrelationId = replyCorrelationId,
-            TicketId = currentTime
+            TicketId = currentTime,
+            Logs = logs,
+            AutoCommit = autoCommit,
         };
-        
+
         return (RaftOperationStatus.Pending, currentTime);
 
         // Append proposal logs to the Write-Ahead Log
@@ -1095,7 +1134,9 @@ public sealed class RaftPartitionStateMachine
         pendingWalOperations[operation.OperationId] = new()
         {
             ReplyCorrelationId = replyCorrelationId,
-            TicketId = currentTime
+            TicketId = currentTime,
+            Logs = checkpointLogs,
+            AutoCommit = true,
         };
 
         return (RaftOperationStatus.Pending, currentTime);
@@ -1404,6 +1445,8 @@ public sealed class RaftPartitionStateMachine
                 "[{LocalEndpoint}/{PartitionId}/{State}] WAL completion for partition {CompletionPartition} delivered to partition {HostPartition}; discarding stale completion.",
                 host.LocalEndpoint, host.PartitionId, nodeState,
                 completion.PartitionId, host.PartitionId);
+            KommanderMetrics.StaleCompletionsTotal.Add(1,
+                new KeyValuePair<string, object?>("reason", "partition_mismatch"));
             return;
         }
 
@@ -1418,30 +1461,12 @@ public sealed class RaftPartitionStateMachine
                 host.LocalEndpoint, host.PartitionId, nodeState,
                 completion.Term, currentTerm, completion.OperationId);
             pendingWalOperations.Remove(completion.OperationId, out _);
-            return;
-        }
-
-        WALWriteOperation? operation = completion.Operation;
-        if (operation is null)
-            return;
-
-        // ── Operation-ID consistency check ─────────────────────────────────────
-        // The envelope OperationId must agree with the embedded operation's own id.
-        // A mismatch means the completion was corrupted or is a stale replay.
-        if (completion.OperationId != operation.OperationId)
-        {
-            logger.LogWarning(
-                "[{LocalEndpoint}/{PartitionId}/{State}] WAL completion envelope OperationId {EnvelopeId} does not match embedded operation OperationId {OperationId}; discarding.",
-                host.LocalEndpoint, host.PartitionId, nodeState,
-                completion.OperationId, operation.OperationId);
+            KommanderMetrics.StaleCompletionsTotal.Add(1,
+                new KeyValuePair<string, object?>("reason", "term_mismatch"));
             return;
         }
 
         // ── Log-range validation ───────────────────────────────────────────────
-        // Validate internal consistency of the log-range metadata, and cross-check
-        // the minimum log index against the actual logs carried by the operation.
-        // (MaxLogIndex semantics differ by operation type so only MinLogIndex is
-        // cross-checked; range order is always unambiguous.)
         if (completion.MinLogIndex >= 0 && completion.MaxLogIndex >= 0 && completion.MinLogIndex > completion.MaxLogIndex)
         {
             logger.LogWarning(
@@ -1451,10 +1476,32 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
-        List<RaftLog> completionLogs = operation.Logs.Logs;
-        if (completionLogs.Count > 0 && completion.MinLogIndex >= 0)
+        // ── Pending-operation fence ────────────────────────────────────────────
+        // Use the envelope OperationId (authoritative) as the lookup key.
+        // All operation types that carry per-operation data in pending (leader and
+        // follower paths) require the pending entry: a completion for an operation
+        // that was never registered — or was already processed — must not drive
+        // further state transitions; that would create orphaned proposals and
+        // mis-routed client replies.  Only Compaction is fire-and-forget.
+        bool found = pendingWalOperations.Remove(completion.OperationId, out RaftPendingWalOperation? pending);
+
+        if (!found && completion.OperationType is
+            WALWriteOperationType.LeaderPropose or
+            WALWriteOperationType.LeaderCommit or
+            WALWriteOperationType.LeaderRollback or
+            WALWriteOperationType.FollowerAppend)
         {
-            long actualMin = completionLogs.Min(l => l.Id);
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] WAL completion op {OperationId} ({Type}) is not in pendingWalOperations; discarding unknown/superseded completion.",
+                host.LocalEndpoint, host.PartitionId, nodeState,
+                completion.OperationId, completion.OperationType);
+            return;
+        }
+
+        // ── Min-log cross-check against pending entry ──────────────────────────
+        if (pending?.Logs is { Count: > 0 } pendingLogs && completion.MinLogIndex >= 0)
+        {
+            long actualMin = pendingLogs.Min(l => l.Id);
             if (actualMin != completion.MinLogIndex)
             {
                 logger.LogWarning(
@@ -1465,43 +1512,22 @@ public sealed class RaftPartitionStateMachine
             }
         }
 
-        // ── Pending-operation fence ────────────────────────────────────────────
-        // Use the envelope OperationId (authoritative) as the lookup key.
-        // For leader operations the pending entry must exist: a completion for an
-        // operation that was never registered — or was already processed — must not
-        // drive further state transitions; that would create orphaned proposals and
-        // mis-routed client replies.  Follower-append and compaction completions may
-        // legitimately have no pending entry (fire-and-forget paths).
-        bool found = pendingWalOperations.Remove(completion.OperationId, out RaftPendingWalOperation? pending);
-
-        if (!found && completion.OperationType is
-            WALWriteOperationType.LeaderPropose or
-            WALWriteOperationType.LeaderCommit or
-            WALWriteOperationType.LeaderRollback)
-        {
-            logger.LogWarning(
-                "[{LocalEndpoint}/{PartitionId}/{State}] WAL completion op {OperationId} ({Type}) is not in pendingWalOperations; discarding unknown/superseded completion.",
-                host.LocalEndpoint, host.PartitionId, nodeState,
-                completion.OperationId, completion.OperationType);
-            return;
-        }
-
         switch (completion.OperationType)
         {
             case WALWriteOperationType.LeaderPropose:
-                CompleteLeaderPropose(operation, completion.Status, pending);
+                CompleteLeaderPropose(completion, pending);
                 break;
 
             case WALWriteOperationType.LeaderCommit:
-                CompleteLeaderCommit(operation, completion.Status, pending);
+                CompleteLeaderCommit(completion, pending);
                 break;
 
             case WALWriteOperationType.LeaderRollback:
-                CompleteLeaderRollback(operation, completion.Status, pending);
+                CompleteLeaderRollback(completion, pending);
                 break;
 
             case WALWriteOperationType.FollowerAppend:
-                await CompleteFollowerAppend(operation, completion.Status, pending).ConfigureAwait(false);
+                await CompleteFollowerAppend(completion, pending).ConfigureAwait(false);
                 break;
 
             case WALWriteOperationType.Compaction:
@@ -1511,17 +1537,19 @@ public sealed class RaftPartitionStateMachine
         }
     }
 
-    private void CompleteLeaderPropose(WALWriteOperation operation, RaftOperationStatus status, RaftPendingWalOperation? pending)
+    private void CompleteLeaderPropose(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
-        HLCTimestamp ticketId = pending?.TicketId ?? operation.Timestamp;
+        HLCTimestamp ticketId = pending?.TicketId ?? HLCTimestamp.Zero;
+        List<RaftLog> logs = pending?.Logs ?? [];
+        bool autoCommit = pending?.AutoCommit ?? false;
 
-        if (status != RaftOperationStatus.Success)
+        if (completion.Status != RaftOperationStatus.Success)
         {
-            CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, status, ticketId));
+            CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, completion.Status, ticketId));
             return;
         }
 
-        RaftProposalQuorum proposalQuorum = RaftProposalQuorumPool.Rent(operation.Logs.Item2, operation.AutoCommit, ticketId);
+        RaftProposalQuorum proposalQuorum = RaftProposalQuorumPool.Rent(logs, autoCommit, ticketId);
         proposalQuorum.MarkNodeCompleted(host.LocalEndpoint);
 
         foreach (RaftNode node in host.Nodes)
@@ -1530,7 +1558,7 @@ public sealed class RaftPartitionStateMachine
                 throw new RaftException("Corrupted nodes");
 
             proposalQuorum.AddExpectedNodeCompletion(node.Endpoint);
-            AppendLogToNode(node, ticketId, operation.Logs.Item2);
+            AppendLogToNode(node, ticketId, logs);
         }
 
         if (!activeProposals.TryAdd(ticketId, proposalQuorum))
@@ -1540,20 +1568,20 @@ public sealed class RaftPartitionStateMachine
         }
 
         if (logger.IsEnabled(LogLevel.Debug))
-            logger.LogDebugProposedLogs(host.LocalEndpoint, host.PartitionId, nodeState, ticketId, string.Join(',', operation.Logs.Item2.Select(x => x.Id.ToString())));
+            logger.LogDebugProposedLogs(host.LocalEndpoint, host.PartitionId, nodeState, ticketId, string.Join(',', logs.Select(x => x.Id.ToString())));
 
         CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, ticketId));
     }
 
-    private void CompleteLeaderCommit(WALWriteOperation operation, RaftOperationStatus status, RaftPendingWalOperation? pending)
+    private void CompleteLeaderCommit(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
         RaftProposalQuorum? proposal = pending?.Proposal;
-        HLCTimestamp ticketId = pending?.TicketId ?? operation.Timestamp;
+        HLCTimestamp ticketId = pending?.TicketId ?? HLCTimestamp.Zero;
 
-        if (status != RaftOperationStatus.Success || proposal is null)
+        if (completion.Status != RaftOperationStatus.Success || proposal is null)
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't commit proposal {Timestamp}", host.LocalEndpoint, host.PartitionId, nodeState, ticketId);
-            CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, status, 0));
+            CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, completion.Status, 0));
             return;
         }
 
@@ -1580,18 +1608,18 @@ public sealed class RaftPartitionStateMachine
 
         wal.NotifyCommitted();
 
-        CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, operation.LogIndex));
+        CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, completion.MaxLogIndex));
     }
 
-    private void CompleteLeaderRollback(WALWriteOperation operation, RaftOperationStatus status, RaftPendingWalOperation? pending)
+    private void CompleteLeaderRollback(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
         RaftProposalQuorum? proposal = pending?.Proposal;
-        HLCTimestamp ticketId = pending?.TicketId ?? operation.Timestamp;
+        HLCTimestamp ticketId = pending?.TicketId ?? HLCTimestamp.Zero;
 
-        if (status != RaftOperationStatus.Success || proposal is null)
+        if (completion.Status != RaftOperationStatus.Success || proposal is null)
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't rollback proposal {Timestamp}", host.LocalEndpoint, host.PartitionId, nodeState, ticketId);
-            CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, status, 0));
+            CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, completion.Status, 0));
             return;
         }
 
@@ -1614,18 +1642,19 @@ public sealed class RaftPartitionStateMachine
                 string.Join(',', proposal.Logs.Select(x => x.Id.ToString()))
             );
 
-        CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, operation.LogIndex));
+        CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, completion.MaxLogIndex));
     }
 
-    private async Task CompleteFollowerAppend(WALWriteOperation operation, RaftOperationStatus status, RaftPendingWalOperation? pending)
+    private async Task CompleteFollowerAppend(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
-        string endpoint = operation.Endpoint ?? "";
-        long leaderTerm = operation.Term;
-        long committedIndex = status == RaftOperationStatus.Success ? operation.LogIndex : -1;
+        string endpoint = pending!.Endpoint ?? "";
+        long leaderTerm = completion.Term;
+        HLCTimestamp timestamp = pending.Timestamp;
+        long committedIndex = completion.Status == RaftOperationStatus.Success ? completion.MaxLogIndex : -1;
 
-        if (status == RaftOperationStatus.Success)
+        if (completion.Status == RaftOperationStatus.Success)
         {
-            foreach (RaftLog log in operation.Logs.Item2)
+            foreach (RaftLog log in pending.Logs ?? [])
             {
                 if (log.Type != RaftLogType.Committed)
                     continue;
@@ -1650,13 +1679,13 @@ public sealed class RaftPartitionStateMachine
             host.EnqueueResponse(endpoint, new(
                 RaftResponderRequestType.CompleteAppendLogs,
                 new(endpoint),
-                new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, operation.Timestamp, host.LocalEndpoint, status, committedIndex)
+                new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, completion.Status, committedIndex)
             ));
         }
 
-        CompleteReply(pending?.ReplyCorrelationId, RaftResponseStatic.NoneResponse);
+        CompleteReply(pending.ReplyCorrelationId, RaftResponseStatic.NoneResponse);
     }
-    
+
     /// <summary>
     /// Checks whether a proposal has been completed/committed or not.
     /// </summary>

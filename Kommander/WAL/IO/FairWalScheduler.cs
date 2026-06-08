@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using Kommander.Data;
+using Kommander.Diagnostics;
 using Kommander.WAL.Data;
 using Microsoft.Extensions.Logging;
 
@@ -212,6 +213,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             return;
 
         _started = true;
+        KommanderMetrics.RegisterScheduler(this);
 
         for (int i = 0; i < _workers.Length; i++)
         {
@@ -223,6 +225,18 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             };
             _workers[i].Start();
         }
+    }
+
+    /// <summary>
+    /// Returns a best-effort snapshot of per-partition pending-or-in-flight depths.
+    /// Used by <see cref="KommanderMetrics"/> to populate the
+    /// <c>raft.wal.queue_depth</c> observable gauge.  No lock is held during
+    /// iteration; values are approximate (suitable for metrics).
+    /// </summary>
+    internal IEnumerable<(int partitionId, int depth)> SnapshotPartitionDepths()
+    {
+        foreach (KeyValuePair<int, PartitionState> kv in _partitions)
+            yield return (kv.Key, kv.Value.Depth);
     }
 
     /// <summary>
@@ -369,12 +383,16 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             status = RaftOperationStatus.Errored;
         }
 
+        KommanderMetrics.WalBatchesTotal.Add(1);
+        KommanderMetrics.WalBatchSize.Record(batch.Count);
+
         foreach (WALWriteOperation op in batch)
         {
             try
             {
                 op.OnComplete(BuildCompletion(op, status));
                 Interlocked.Increment(ref _totalOperationsCompleted);
+                KommanderMetrics.WalOperationsTotal.Add(1);
             }
             catch (Exception ex)
             {
@@ -429,8 +447,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             MinLogIndex: minIndex,
             MaxLogIndex: op.LogIndex,
             OperationType: op.Type,
-            Status: status,
-            Operation: op
+            Status: status
         );
     }
 

@@ -60,7 +60,8 @@ public sealed class TestBackpressureAndAdmissionControl
 
     private sealed class StubWal : IRaftWalFacade
     {
-        public ValueTask<long> RecoverAsync() => ValueTask.FromResult(0L);
+        public ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync() => ValueTask.FromResult<IReadOnlyList<RaftLog>>([]);
+        public ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs) => ValueTask.CompletedTask;
         public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(0L);
         public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(0L);
 
@@ -307,6 +308,8 @@ public sealed class TestBackpressureAndAdmissionControl
     public async Task ClientQueue_WhenCapacityIsZero_IsUnbounded()
     {
         using RaftPartitionExecutor executor = BuildExecutor(maxClientQueueDepth: 0);
+
+        await executor.RestoreTask;
 
         // Send many proposals as Post — none should be rejected.
         for (int i = 0; i < 200; i++)

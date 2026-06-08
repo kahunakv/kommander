@@ -65,7 +65,8 @@ public sealed class TestRaftPartitionExecutor
         public int ProposeCallCount;
         public int CommitCallCount;
 
-        public ValueTask<long> RecoverAsync() => ValueTask.FromResult(0L);
+        public ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync() => ValueTask.FromResult<IReadOnlyList<RaftLog>>([]);
+        public ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs) => ValueTask.CompletedTask;
         public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(0L);
         public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(0L);
 
@@ -152,6 +153,9 @@ public sealed class TestRaftPartitionExecutor
         // we post from many threads simultaneously and check the total-processed count.
         var (executor, _, _) = BuildExecutor(partitionId: 0);
 
+        await executor.RestoreTask;
+
+        long baseCount = executor.TotalProcessed;
         CountdownEvent done = new(threadCount * postsPerThread);
 
         Thread[] threads = new Thread[threadCount];
@@ -173,13 +177,14 @@ public sealed class TestRaftPartitionExecutor
         foreach (Thread t in threads)
             t.Join();
 
+        long expected = threadCount * postsPerThread;
+
         // Give the executor worker time to drain all queued operations.
         bool drained = await Task.Run(async () =>
         {
-            int expected = threadCount * postsPerThread;
             for (int attempt = 0; attempt < 200; attempt++)
             {
-                if (executor.TotalProcessed >= expected)
+                if (executor.TotalProcessed - baseCount >= expected)
                     return true;
                 await Task.Delay(10);
             }
@@ -189,8 +194,8 @@ public sealed class TestRaftPartitionExecutor
         executor.Stop();
 
         Assert.True(drained,
-            $"Expected {threadCount * postsPerThread} ops processed but got {executor.TotalProcessed}.");
-        Assert.Equal((long)(threadCount * postsPerThread), executor.TotalProcessed);
+            $"Expected {expected} ops processed but got {executor.TotalProcessed - baseCount}.");
+        Assert.Equal(expected, executor.TotalProcessed - baseCount);
     }
 
     /// <summary>
@@ -212,6 +217,9 @@ public sealed class TestRaftPartitionExecutor
 
         var (executor, _, _) = BuildExecutor(partitionId: 1);
 
+        await executor.RestoreTask;
+        long baseCount = executor.TotalProcessed;
+
         // Post a mix of client and control operations.
         for (int i = 0; i < clientOps; i++)
             executor.Post(new RaftRequest(RaftRequestType.GetNodeState));
@@ -225,7 +233,7 @@ public sealed class TestRaftPartitionExecutor
         {
             for (int attempt = 0; attempt < 200; attempt++)
             {
-                if (executor.TotalProcessed >= expected)
+                if (executor.TotalProcessed - baseCount >= expected)
                     return true;
                 await Task.Delay(10);
             }
@@ -234,8 +242,8 @@ public sealed class TestRaftPartitionExecutor
 
         executor.Stop();
 
-        Assert.True(drained, $"Expected {expected} ops, got {executor.TotalProcessed}.");
-        Assert.Equal(expected, executor.TotalProcessed);
+        Assert.True(drained, $"Expected {expected} ops, got {executor.TotalProcessed - baseCount}.");
+        Assert.Equal(expected, executor.TotalProcessed - baseCount);
     }
 
     /// <summary>
@@ -247,6 +255,7 @@ public sealed class TestRaftPartitionExecutor
     {
         var (executor, _, _) = BuildExecutor(partitionId: 2);
 
+        await executor.RestoreTask;
         RaftResponse response = await executor.Ask(new RaftRequest(RaftRequestType.GetNodeState), TestContext.Current.CancellationToken);
 
         executor.Stop();
@@ -321,6 +330,8 @@ public sealed class TestRaftPartitionExecutor
     {
         var (executor, sm, host) = BuildExecutor(partitionId: 7);
 
+        await executor.RestoreTask;
+
         host.Leader = host.LocalEndpoint;
         host.Configuration.HeartbeatInterval = TimeSpan.FromMilliseconds(1);
 
@@ -361,5 +372,62 @@ public sealed class TestRaftPartitionExecutor
             executor.Post(new RaftRequest(RaftRequestType.CheckLeader)));
 
         // Clean up without starting.
+    }
+
+    /// <summary>
+    /// Client operations posted before restore completes must be rejected with
+    /// <see cref="RaftOperationStatus.RestoreInProgress"/> and must not be
+    /// enqueued or processed by the state machine.
+    ///
+    /// Uses a blocking WAL stub whose <c>LoadRestoreLogsAsync</c> gate can be
+    /// released by the test, giving a deterministic pre-restore window.
+    /// </summary>
+    [Fact]
+    public async Task RestoreGate_ClientOpsBeforeRestore_ReturnRestoreInProgress()
+    {
+        // A WAL that blocks Phase 1 until the test releases it.
+        TaskCompletionSource restoreGate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        BlockingStubWal blockingWal = new(restoreGate.Task);
+
+        StubHost host = new(partitionId: 8);
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, blockingWal, sink, NullLogger<IRaft>.Instance);
+        using RaftPartitionExecutor executor = new(sm, partitionId: 8, slowThresholdMs: 0, NullLogger<IRaft>.Instance);
+        executor.Start();
+
+        // Restore is blocked — Ask a client op immediately.
+        Task<RaftResponse> clientTask = executor.Ask(
+            new RaftRequest(RaftRequestType.GetNodeState),
+            TestContext.Current.CancellationToken);
+
+        // The ask must resolve quickly (rejected, not enqueued).
+        RaftResponse response = await clientTask.WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+
+        Assert.Equal(RaftOperationStatus.RestoreInProgress, response.Status);
+        Assert.True(executor.TotalClientRejected >= 1, "Expected at least one restore-gate rejection.");
+
+        // Now unblock restore so the executor can finish and be disposed cleanly.
+        restoreGate.SetResult();
+        await executor.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+    }
+
+    private sealed class BlockingStubWal(Task gate) : IRaftWalFacade
+    {
+        public async ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync()
+        {
+            await gate.ConfigureAwait(false);
+            return [];
+        }
+
+        public ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs) => ValueTask.CompletedTask;
+        public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(0L);
+        public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(0L);
+        public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp ts, bool autoCommit) => MakeNoOp();
+        public WALWriteOperation EnqueueCommit(List<RaftLog> logs) => MakeNoOp();
+        public WALWriteOperation EnqueueRollback(List<RaftLog> logs) => MakeNoOp();
+        public WALWriteOperation? EnqueueProposeOrCommit(List<RaftLog>? logs, HLCTimestamp timestamp = default, string? endpoint = null, long term = -1) => MakeNoOp();
+        public void NotifyCommitted() { }
+        private static WALWriteOperation MakeNoOp() => new(_ => { }, 0, WALWriteOperationType.LeaderPropose, (0, []));
     }
 }
