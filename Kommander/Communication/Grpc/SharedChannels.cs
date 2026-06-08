@@ -2,6 +2,7 @@
 using Grpc.Net.Client;
 using System.Net.Security;
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using Grpc.Core;
 
 namespace Kommander.Communication.Grpc;
@@ -43,14 +44,14 @@ public static class SharedChannels
     /// <returns>
     /// A single <see cref="GrpcChannel"/> instance associated with the specified URL.
     /// </returns>
-    public static GrpcChannel GetChannel(string url, bool allowInsecureCertificateValidation = false)
+    public static GrpcChannel GetChannel(string url, RaftTransportSecurityOptions? securityOptions = null)
     {
         if (!url.StartsWith("https://") && !url.StartsWith("http://"))
             url = "https://" + url;
 
         Lazy<List<GrpcChannel>> urlChannelsLazy = channels.GetOrAdd(
             url,
-            k => new Lazy<List<GrpcChannel>>(() => CreateSharedChannels(k, allowInsecureCertificateValidation)));
+            k => new Lazy<List<GrpcChannel>>(() => CreateSharedChannels(k, securityOptions)));
 
         List<GrpcChannel> urlChannels = urlChannelsLazy.Value;
 
@@ -65,30 +66,30 @@ public static class SharedChannels
     /// The target URL for retrieving or creating the associated gRPC channels. If the URL does not start
     /// with "https://" or "http://", it is automatically prefixed with "https://".
     /// </param>
-    /// <param name="allowInsecureCertificateValidation">
-    /// When true, skips remote certificate validation. Only set this in development.
+    /// <param name="securityOptions">
+    /// Transport security options controlling certificate validation and thumbprint pinning.
     /// </param>
     /// <returns>
     /// A list of <see cref="GrpcChannel"/> instances associated with the specified URL.
     /// </returns>
-    public static List<GrpcChannel> GetAllChannels(string url, bool allowInsecureCertificateValidation = false)
+    public static List<GrpcChannel> GetAllChannels(string url, RaftTransportSecurityOptions? securityOptions = null)
     {
         if (!url.StartsWith("https://") && !url.StartsWith("http://"))
             url = "https://" + url;
 
         Lazy<List<GrpcChannel>> urlChannelsLazy = channels.GetOrAdd(
             url,
-            k => new Lazy<List<GrpcChannel>>(() => CreateSharedChannels(k, allowInsecureCertificateValidation)));
+            k => new Lazy<List<GrpcChannel>>(() => CreateSharedChannels(k, securityOptions)));
 
         return urlChannelsLazy.Value;
     }
-    
-    public static GrpcInterSharedStreaming GetStreaming(string url, Metadata? metadata = null, bool allowInsecureCertificateValidation = false)
+
+    public static GrpcInterSharedStreaming GetStreaming(string url, Metadata? metadata = null, RaftTransportSecurityOptions? securityOptions = null)
     {
         Lazy<List<GrpcInterSharedStreaming>> lazyStreaming = streamings.GetOrAdd(
             url,
             k => new Lazy<List<GrpcInterSharedStreaming>>(
-                () => CreateAsyncDuplexStreamingCallInternal(k, metadata, allowInsecureCertificateValidation)));
+                () => CreateAsyncDuplexStreamingCallInternal(k, metadata, securityOptions)));
 
         return lazyStreaming.Value[Random.Shared.Next(0, lazyStreaming.Value.Count)];
     }
@@ -108,14 +109,14 @@ public static class SharedChannels
     private static List<GrpcInterSharedStreaming> CreateAsyncDuplexStreamingCallInternal(
         string url,
         Metadata? metadata,
-        bool allowInsecureCertificateValidation)
+        RaftTransportSecurityOptions? securityOptions)
     {
         if (!url.StartsWith("https://") && !url.StartsWith("http://"))
             url = "https://" + url;
 
         Lazy<List<GrpcChannel>> urlChannelsLazy = channels.GetOrAdd(
             url,
-            k => new Lazy<List<GrpcChannel>>(() => CreateSharedChannels(k, allowInsecureCertificateValidation)));
+            k => new Lazy<List<GrpcChannel>>(() => CreateSharedChannels(k, securityOptions)));
 
         List<GrpcChannel> urlChannels = urlChannelsLazy.Value;
 
@@ -164,11 +165,33 @@ public static class SharedChannels
         }
     }
 
-    private static List<GrpcChannel> CreateSharedChannels(string url, bool allowInsecureCertificateValidation)
+    private static SslClientAuthenticationOptions BuildSslOptions(RaftTransportSecurityOptions? securityOptions)
     {
         SslClientAuthenticationOptions sslOptions = new();
-        if (allowInsecureCertificateValidation)
+
+        if (securityOptions?.AllowInsecureCertificateValidation == true)
+        {
             sslOptions.RemoteCertificateValidationCallback = delegate { return true; };
+        }
+        else if (securityOptions?.TrustedServerCertificateThumbprints is { Count: > 0 } thumbprints)
+        {
+            sslOptions.RemoteCertificateValidationCallback = (_, certificate, _, _) =>
+            {
+                if (certificate is null)
+                    return false;
+
+                byte[] hash = SHA256.HashData(certificate.GetRawCertData());
+                string thumbprint = Convert.ToHexString(hash);
+                return thumbprints.Any(t => string.Equals(t, thumbprint, StringComparison.OrdinalIgnoreCase));
+            };
+        }
+
+        return sslOptions;
+    }
+
+    private static List<GrpcChannel> CreateSharedChannels(string url, RaftTransportSecurityOptions? securityOptions)
+    {
+        SslClientAuthenticationOptions sslOptions = BuildSslOptions(securityOptions);
 
         SocketsHttpHandler handler = new()
         {

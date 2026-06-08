@@ -262,6 +262,15 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                     "Do not use this setting in production.",
                     LocalEndpoint);
             }
+
+            if (effectiveSecurity.RequireTls
+                && configuration.HttpScheme is not null
+                && configuration.HttpScheme.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new RaftException(
+                    $"[{LocalEndpoint}] RequireTls is enabled but the configured HttpScheme is plain HTTP ('{configuration.HttpScheme}'). " +
+                    "Set HttpScheme to 'https://' or disable RequireTls.");
+            }
         }
 
         //raftBatcher = new(this);

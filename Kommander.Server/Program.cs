@@ -138,9 +138,25 @@ try
     ThreadPool.SetMinThreads(128, 128);
     
     if (opts.AllowInsecureCertificateValidation)
+    {
         FlurlHttp.Clients.WithDefaults(x =>
             x.ConfigureInnerHandler(ih =>
-                ih.ServerCertificateCustomValidationCallback = (a, b, c, d) => true));
+                ih.ServerCertificateCustomValidationCallback = (_, _, _, _) => true));
+    }
+    else if (transportSecurity.TrustedServerCertificateThumbprints.Count > 0)
+    {
+        IReadOnlyCollection<string> thumbprints = transportSecurity.TrustedServerCertificateThumbprints;
+        FlurlHttp.Clients.WithDefaults(x =>
+            x.ConfigureInnerHandler(ih =>
+                ih.ServerCertificateCustomValidationCallback = (_, certificate, _, _) =>
+                {
+                    if (certificate is null)
+                        return false;
+                    byte[] hash = System.Security.Cryptography.SHA256.HashData(certificate.GetRawCertData());
+                    string thumbprint = Convert.ToHexString(hash);
+                    return thumbprints.Any(t => string.Equals(t, thumbprint, StringComparison.OrdinalIgnoreCase));
+                }));
+    }
 
     WebApplication app = builder.Build();
 

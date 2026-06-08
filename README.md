@@ -19,6 +19,7 @@ Kommander is designed to keep the consensus core separate from storage, discover
 - **Testing-friendly in-memory components:** `InMemoryWAL`, `InMemoryCommunication`, and focused test utilities support fast local simulations without external infrastructure.
 - **Cluster discovery options:** Static discovery for fixed clusters, dynamic discovery for application-managed membership lists, and multicast discovery for local-network discovery.
 - **Transport choices:** gRPC for networked clusters, REST/JSON for HTTP-based integration and debugging, and in-memory communication for tests.
+- **Node authentication:** Shared-secret HMAC authentication for node-to-node REST and gRPC traffic, with optional server certificate thumbprint pinning.
 - **Batch replication:** Replicate multiple log entries in a single proposal to reduce coordination overhead.
 - **Manual proposal control:** Use automatic commits for the common path, or disable auto-commit and explicitly call `CommitLogs` or `RollbackLogs`.
 - **Hybrid logical clocks:** Proposal tickets use HLC timestamps to preserve causality across physical time and logical counters.
@@ -164,6 +165,90 @@ app.Run();
 
 The sample server in `Kommander.Server` maps both gRPC and REST endpoints and starts the cluster from command-line options.
 
+## Transport Security And Node Authentication
+
+### Threat Model
+
+TLS encrypts traffic and proves the server's identity when the certificate is validated correctly. It does not authenticate the calling node. Without an additional check, any client that can reach a Raft port can send handshake, vote, append, or step-down messages.
+
+Kommander separates these two concerns:
+
+1. **Transport security** — TLS encrypts the wire and validates the remote server certificate.
+2. **Node authentication** — every inbound REST and gRPC Raft request proves it belongs to the same cluster.
+
+In-memory communication (used in tests) is excluded from these requirements.
+
+### Authentication Modes
+
+`RaftTransportSecurityOptions.NodeAuthenticationMode` controls which mode is active:
+
+| Mode | Description |
+| --- | --- |
+| `Disabled` | No authentication. Existing unauthenticated clusters keep working. A warning is logged at startup. |
+| `SharedSecret` | HMAC-SHA256 per-request signature derived from a shared cluster secret. Recommended for production. |
+| `MutualTls` | mTLS client certificate validation. Not yet implemented. |
+
+### Shared Secret Protocol
+
+Each request carries four signed fields:
+
+| Header | Content |
+| --- | --- |
+| `X-Kommander-Cluster-Auth` | Base64url HMAC-SHA256 signature |
+| `X-Kommander-Cluster-Node` | Sender node endpoint |
+| `X-Kommander-Cluster-Timestamp` | Unix milliseconds |
+| `X-Kommander-Cluster-Nonce` | Random 128-bit nonce, base64url |
+
+The signature covers `method + path + sender + timestamp + nonce + SHA-256(body)`. Validation rejects missing fields, malformed fields, timestamp skew beyond the configured window (default 60 s), and replayed nonces. All HMAC comparisons use constant-time equality.
+
+### Configuring Shared Secret
+
+```csharp
+RaftConfiguration configuration = new()
+{
+    Host = "node-1",
+    Port = 8001,
+    TransportSecurity = new RaftTransportSecurityOptions
+    {
+        NodeAuthenticationMode = RaftNodeAuthenticationMode.SharedSecret,
+        SharedSecret = Environment.GetEnvironmentVariable("CLUSTER_SECRET"),
+        AllowedClockSkew = TimeSpan.FromSeconds(60)
+    }
+};
+```
+
+Generate at least 256 bits of random secret material and distribute it through a secret manager, Docker secret, Kubernetes Secret, or environment variable. Do not put the secret in source control.
+
+### Certificate Validation
+
+| Option | Default | Description |
+| --- | ---: | --- |
+| `RequireTls` | `true` | Reject requests that arrive over plain HTTP. Throws at startup if `HttpScheme` is `http://`. |
+| `AllowInsecureCertificateValidation` | `false` | Skip remote certificate validation. Development only. A warning is logged at startup. |
+| `TrustedServerCertificateThumbprints` | empty | SHA-256 hex thumbprints of accepted server certificates. When set, only pinned certificates are accepted regardless of chain trust. |
+| `TrustedClientCertificateThumbprints` | empty | Reserved for future mTLS client certificate pinning. |
+
+When neither `AllowInsecureCertificateValidation` nor thumbprints are set, the platform default certificate chain and hostname validation applies.
+
+### Kommander.Server CLI Options
+
+| Option | Description |
+| --- | --- |
+| `--node-auth-mode` | `Disabled`, `SharedSecret`, or `MutualTls` |
+| `--node-shared-secret` | Shared secret value. Required when mode is `SharedSecret`. |
+| `--node-auth-header` | Override the default `X-Kommander-Cluster-Auth` header name. |
+| `--allow-insecure-certificate-validation` | Skip TLS certificate validation. Development only. |
+| `--trusted-server-cert-thumbprint` | One or more trusted server certificate SHA-256 thumbprints (hex). |
+| `--trusted-client-cert-thumbprint` | Reserved for future mTLS use. |
+
+### Secret Rotation
+
+To rotate the shared secret without downtime:
+
+1. Sign outbound requests with the new secret.
+2. Accept both old and new secrets on inbound requests during a transition window (requires a secondary secret field, not yet built in — use a rolling restart in the interim).
+3. Remove the old secret after all nodes are updated.
+
 ## Creating A Node
 
 `RaftManager` is the main implementation of `IRaft`:
@@ -205,8 +290,9 @@ The transport entry points are intended for communication adapters and HTTP/gRPC
 | `Host` | `null` | Host advertised as part of the node endpoint. |
 | `Port` | `0` | Port advertised as part of the node endpoint. |
 | `InitialPartitions` | `1` | Number of initial user partitions. Partition `0` is reserved. |
+| `TransportSecurity` | see below | Node authentication and TLS validation settings. See [Transport Security And Node Authentication](#transport-security-and-node-authentication). |
 | `HttpScheme` | `https://` | Scheme used by `RestCommunication`. |
-| `HttpAuthBearerToken` | empty | Bearer token attached by `RestCommunication`. |
+| `HttpAuthBearerToken` | empty | **Deprecated.** Legacy bearer token. Use `TransportSecurity.SharedSecret` instead. |
 | `HttpTimeout` | `5` | REST request timeout in seconds. |
 | `HttpVersion` | `2.0` | REST HTTP version. |
 | `HeartbeatInterval` | `500 ms` | Leader heartbeat interval. |
@@ -447,7 +533,7 @@ public interface IWAL
 | `RestCommunication` | Networked clusters using REST/JSON endpoints. |
 | `InMemoryCommunication` | Unit tests and in-process simulations. |
 
-For `RestCommunication`, configure `HttpScheme`, `HttpAuthBearerToken`, `HttpTimeout`, and `HttpVersion` on `RaftConfiguration`.
+For `RestCommunication`, configure `HttpScheme`, `HttpTimeout`, and `HttpVersion` on `RaftConfiguration`, and `TransportSecurity` for node authentication and certificate validation.
 
 Custom transports implement `ICommunication`.
 
