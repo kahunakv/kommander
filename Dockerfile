@@ -31,6 +31,7 @@ ARG KOMMANDER_RAFT_PORT
 ARG KOMMANDER_HTTP_PORTS
 ARG KOMMANDER_HTTPS_PORTS
 ARG KOMMANDER_INITIAL_CLUSTER
+ARG KOMMANDER_ALLOW_INSECURE_CERT=false
 
 ENV KOMMANDER_RAFT_NODENAME="$KOMMANDER_RAFT_NODENAME"
 ENV KOMMANDER_RAFT_NODEID="$KOMMANDER_RAFT_NODEID"
@@ -39,11 +40,16 @@ ENV KOMMANDER_RAFT_PORT="$KOMMANDER_RAFT_PORT"
 ENV KOMMANDER_HTTP_PORTS="$KOMMANDER_HTTP_PORTS"
 ENV KOMMANDER_HTTPS_PORTS="$KOMMANDER_HTTPS_PORTS"
 ENV KOMMANDER_INITIAL_CLUSTER="$KOMMANDER_INITIAL_CLUSTER"
+ENV KOMMANDER_ALLOW_INSECURE_CERT="$KOMMANDER_ALLOW_INSECURE_CERT"
 
 COPY --chmod=755 <<EOT /app/entrypoint.sh
 #!/usr/bin/env bash
-echo "kommander --raft-nodename $KOMMANDER_RAFT_NODENAME --raft-nodeid $KOMMANDER_RAFT_NODEID --raft-host $KOMMANDER_RAFT_HOST --raft-port $KOMMANDER_RAFT_PORT --http-ports $KOMMANDER_HTTP_PORTS --https-ports $KOMMANDER_HTTPS_PORTS --https-certificate /app/certificate.pfx --initial-cluster $KOMMANDER_INITIAL_CLUSTER --sqlite-wal-path /app/data --sqlite-wal-revision v2"
-dotnet /app/Kommander.Server.dll --raft-nodename $KOMMANDER_RAFT_NODENAME --raft-nodeid $KOMMANDER_RAFT_NODEID --raft-host $KOMMANDER_RAFT_HOST --raft-port $KOMMANDER_RAFT_PORT --http-ports $KOMMANDER_HTTP_PORTS --https-ports $KOMMANDER_HTTPS_PORTS --https-certificate /app/certificate.pfx --initial-cluster $KOMMANDER_INITIAL_CLUSTER --sqlite-wal-path /app/data --sqlite-wal-revision v2
+INSECURE_FLAG=""
+if [ "\$KOMMANDER_ALLOW_INSECURE_CERT" = "true" ]; then
+  INSECURE_FLAG="--allow-insecure-certificate-validation true"
+fi
+echo "kommander --raft-nodename $KOMMANDER_RAFT_NODENAME --raft-nodeid $KOMMANDER_RAFT_NODEID --raft-host $KOMMANDER_RAFT_HOST --raft-port $KOMMANDER_RAFT_PORT --http-ports $KOMMANDER_HTTP_PORTS --https-ports $KOMMANDER_HTTPS_PORTS --https-certificate /app/certificate.pfx --initial-cluster $KOMMANDER_INITIAL_CLUSTER --sqlite-wal-path /app/data --sqlite-wal-revision v2 \$INSECURE_FLAG"
+dotnet /app/Kommander.Server.dll --raft-nodename $KOMMANDER_RAFT_NODENAME --raft-nodeid $KOMMANDER_RAFT_NODEID --raft-host $KOMMANDER_RAFT_HOST --raft-port $KOMMANDER_RAFT_PORT --http-ports $KOMMANDER_HTTP_PORTS --https-ports $KOMMANDER_HTTPS_PORTS --https-certificate /app/certificate.pfx --initial-cluster $KOMMANDER_INITIAL_CLUSTER --sqlite-wal-path /app/data --sqlite-wal-revision v2 \$INSECURE_FLAG
 EOT
 
 # when starting the container, run dotnet with the built dll

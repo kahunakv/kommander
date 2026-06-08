@@ -18,3 +18,10 @@ subjectAltName = @alt_names
 
 [ alt_names ]
 DNS.1 = localhost
+DNS.2 = node1
+DNS.3 = node2
+DNS.4 = node3
+IP.1  = 172.20.0.2
+IP.2  = 172.20.0.3
+IP.3  = 172.20.0.4
+IP.4  = 127.0.0.1

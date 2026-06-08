@@ -69,7 +69,7 @@ public sealed class RaftService : Rafter.RafterBase
             senderNode,
             timestamp,
             nonce,
-            isSecureTransport: true);
+            isSecureTransport: isSecure);
 
         if (!result.IsAuthenticated)
         {
@@ -117,7 +117,7 @@ public sealed class RaftService : Rafter.RafterBase
     /// <returns>A task representing the asynchronous operation, with a result of type GrpcVoteResponse.</returns>
     public override Task<GrpcVoteResponse> Vote(GrpcVoteRequest request, ServerCallContext context)
     {
-        //logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got Vote message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
+        ValidateAuth(context);
 
         raft.Vote(new(
             request.Partition,
@@ -138,7 +138,7 @@ public sealed class RaftService : Rafter.RafterBase
     /// <returns>A task that represents the asynchronous operation, returning a response of type GrpcRequestVotesResponse.</returns>
     public override Task<GrpcRequestVotesResponse> RequestVotes(GrpcRequestVotesRequest request, ServerCallContext context)
     {
-        //logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got RequestVotes message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
+        ValidateAuth(context);
 
         raft.RequestVote(new(
             request.Partition,
@@ -159,9 +159,8 @@ public sealed class RaftService : Rafter.RafterBase
     /// <returns>A task representing the asynchronous operation, with a result of type GrpcAppendLogsResponse.</returns>
     public override Task<GrpcAppendLogsResponse> AppendLogs(GrpcAppendLogsRequest request, ServerCallContext context)
     {
-        //if (request.Logs.Count > 0)
-        //    logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got AppendLogs message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
-        
+        ValidateAuth(context);
+
         raft.AppendLogs(new(
             request.Partition, 
             request.Term, 
@@ -175,9 +174,8 @@ public sealed class RaftService : Rafter.RafterBase
     
     public override Task<GrpcCompleteAppendLogsResponse> CompleteAppendLogs(GrpcCompleteAppendLogsRequest request, ServerCallContext context)
     {
-        //if (request.Logs.Count > 0)
-        //    logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got AppendLogs message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
-        
+        ValidateAuth(context);
+
         raft.CompleteAppendLogs(new(
             request.Partition, 
             request.Term, 

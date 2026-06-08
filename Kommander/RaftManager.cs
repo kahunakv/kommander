@@ -242,6 +242,28 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         OnSystemRestoreFinished += SystemRestoreFinished;
         OnLeaderChanged += SystemLeaderChanged;
 
+        if (communication is Kommander.Communication.Rest.RestCommunication
+                          or Kommander.Communication.Grpc.GrpcCommunication)
+        {
+            RaftTransportSecurityOptions effectiveSecurity = configuration.GetEffectiveTransportSecurity();
+
+            if (effectiveSecurity.NodeAuthenticationMode == RaftNodeAuthenticationMode.Disabled)
+            {
+                Logger.LogWarning(
+                    "[{Endpoint}] Node authentication is Disabled for network transport. " +
+                    "Configure TransportSecurity.NodeAuthenticationMode to SharedSecret or MutualTls in production.",
+                    LocalEndpoint);
+            }
+
+            if (effectiveSecurity.AllowInsecureCertificateValidation)
+            {
+                Logger.LogWarning(
+                    "[{Endpoint}] Certificate validation is disabled (AllowInsecureCertificateValidation = true). " +
+                    "Do not use this setting in production.",
+                    LocalEndpoint);
+            }
+        }
+
         //raftBatcher = new(this);
     }
 

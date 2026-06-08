@@ -11,6 +11,7 @@ services:
         KOMMANDER_HTTP_PORTS: 8004 8081
         KOMMANDER_HTTPS_PORTS: 8005 8082
         KOMMANDER_INITIAL_CLUSTER: 172.20.0.3:8084 172.20.0.4:8086
+        KOMMANDER_ALLOW_INSECURE_CERT: "true"
     container_name: node1
     ports:
       - "8081:8004"
@@ -32,6 +33,7 @@ services:
         KOMMANDER_HTTP_PORTS: 8004 8083
         KOMMANDER_HTTPS_PORTS: 8005 8084
         KOMMANDER_INITIAL_CLUSTER: 172.20.0.2:8082 172.20.0.4:8086
+        KOMMANDER_ALLOW_INSECURE_CERT: "true"
     container_name: node2
     ports:
       - "8083:8004"
@@ -53,6 +55,7 @@ services:
         KOMMANDER_HTTP_PORTS: 8004 8085
         KOMMANDER_HTTPS_PORTS: 8005 8086
         KOMMANDER_INITIAL_CLUSTER: 172.20.0.2:8082 172.20.0.3:8084
+        KOMMANDER_ALLOW_INSECURE_CERT: "true"
     container_name: node3
     ports:
       - "8085:8004"

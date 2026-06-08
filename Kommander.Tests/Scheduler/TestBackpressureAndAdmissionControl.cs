@@ -170,31 +170,27 @@ public sealed class TestBackpressureAndAdmissionControl
         const int cap = 4;
         using RaftPartitionExecutor executor = BuildExecutor(maxClientQueueDepth: cap);
 
-        // Wait for restore so client ops are not gated by RestoreInProgress.
         await executor.RestoreTask;
 
-        // Keep the queue hot with a continuous background burst while we probe.
-        // We cancel the burst once we have found a synchronous rejection.
-        using CancellationTokenSource burstCts = new();
-        Task burstTask = Task.WhenAll(Enumerable.Range(0, 8).Select(_ => Task.Run(() =>
-        {
-            while (!burstCts.IsCancellationRequested)
-                executor.Post(new RaftRequest(RaftRequestType.GetNodeState));
-        })));
-
+        // Strategy: post well beyond cap in a tight non-yielding burst from the main
+        // thread, then immediately probe with Ask — no background threads needed.
+        //
+        // Because there are no awaits or Thread.Yield calls inside the inner loop,
+        // the current thread holds the CPU for the entire burst.  The worker cannot
+        // be scheduled mid-burst, so the queue depth reliably reaches cap before Ask
+        // is called.  We repeat in an outer loop on the off-chance the OS preempts
+        // us at exactly the wrong microsecond.
         Task<RaftResponse>? rejectedTask = null;
-        for (int attempt = 0; attempt < 1_000; attempt++)
+
+        for (int attempt = 0; attempt < 10_000 && rejectedTask is null; attempt++)
         {
+            for (int i = 0; i < cap * 8; i++)
+                executor.Post(new RaftRequest(RaftRequestType.GetNodeState));
+
             Task<RaftResponse> t = AskNodeState(executor);
             if (t.IsCompleted && (await t).Status == RaftOperationStatus.ProposalQueueFull)
-            {
                 rejectedTask = t;
-                break;
-            }
         }
-
-        burstCts.Cancel();
-        await burstTask;
 
         Assert.NotNull(rejectedTask);
         Assert.True(rejectedTask!.IsCompleted, "Rejected Ask must complete synchronously (TCS set in Enqueue)");
