@@ -1,4 +1,5 @@
 
+using System.Collections.Concurrent;
 using Kommander.Data;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
@@ -20,21 +21,25 @@ public class SqliteWAL : IWAL, IDisposable
     private const int MaxNumberOfRangedEntries = 100;
 
     /// <summary>
-    /// Provides synchronization to ensure thread-safe operations when accessing or modifying the SQLite Write-Ahead Log (WAL).
-    /// This semaphore is used to manage concurrent access to database resources, particularly during critical sections
-    /// such as opening connections or executing commands. It enforces sequential execution in scenarios where resource
-    /// contention could occur, thus preventing race conditions or data corruption.
+    /// Serializes creation of new per-partition connections. Only held while a connection for a
+    /// previously unseen partition is being opened; never held during normal read/write operations.
     /// </summary>
     private readonly SemaphoreSlim semaphore = new(1, 1);
 
     /// <summary>
-    /// Maps partition IDs to their corresponding resources,
-    /// specifically a tuple containing a <see cref="ReaderWriterLock"/>
-    /// for thread-safe access and a <see cref="SqliteConnection"/> for database operations.
-    /// This structure is used to manage and store active connections to each partition's SQLite
-    /// Write-Ahead Log (WAL) file, enabling synchronization and efficient database access.
+    /// Serializes access to the metadata connection and its database operations.
+    /// Separate from <see cref="semaphore"/> so that metadata and partition connection creation
+    /// do not contend with each other.
     /// </summary>
-    private readonly Dictionary<int, (ReaderWriterLock, SqliteConnection)> connections = new();
+    private readonly object _metaDataLock = new();
+
+    /// <summary>
+    /// Maps partition IDs to their per-partition <see cref="ReaderWriterLock"/> and
+    /// <see cref="SqliteConnection"/>. Uses <see cref="ConcurrentDictionary{TKey,TValue}"/> so that
+    /// the unsynchronized fast-path <see cref="ConcurrentDictionary{TKey,TValue}.TryGetValue"/> is safe
+    /// to call concurrently with the semaphore-guarded <see cref="ConcurrentDictionary{TKey,TValue}.TryAdd"/>.
+    /// </summary>
+    private readonly ConcurrentDictionary<int, (ReaderWriterLock, SqliteConnection)> connections = new();
 
     /// <summary>
     /// Represents the base directory path used for database file storage in the SQLite Write-Ahead Log (WAL).
@@ -53,11 +58,11 @@ public class SqliteWAL : IWAL, IDisposable
     private readonly string revision;
 
     /// <summary>
-    /// Represents a connection to the SQLite database used for storing metadata for the Write-Ahead Log (WAL).
-    /// This connection is responsible for managing the metadata table, executing SQL commands related to metadata storage,
-    /// and ensuring thread-safety when interacting with the metadata database.
+    /// Connection to the metadata database. Initialised lazily under <see cref="_metaDataLock"/>.
+    /// Marked <c>volatile</c> so the null check in the double-check locking fast path observes the
+    /// store from any thread without an explicit memory barrier.
     /// </summary>
-    private SqliteConnection? metaDataConnection;
+    private volatile SqliteConnection? metaDataConnection;
 
     /// <summary>
     /// Represents the logger instance used for recording messages, errors, and debug information
@@ -83,19 +88,17 @@ public class SqliteWAL : IWAL, IDisposable
     }
 
     /// <summary>
-    /// Attempts to open or retrieve an existing SQLite database connection and its associated reader-writer lock for the specified partition.
+    /// Returns the <see cref="ReaderWriterLock"/> and <see cref="SqliteConnection"/> for
+    /// <paramref name="partitionId"/>, creating them on first access.
     /// </summary>
-    /// <param name="partitionId">The unique identifier of the partition for which the database connection is to be retrieved or opened.</param>
-    /// <returns>A tuple containing a <see cref="ReaderWriterLock"/> and a <see cref="SqliteConnection"/> associated with the specified partition.</returns>
     private (ReaderWriterLock, SqliteConnection) TryOpenDatabase(int partitionId)
     {
         if (connections.TryGetValue(partitionId, out (ReaderWriterLock readerWriterLock, SqliteConnection connection) connTuple))
             return connTuple;
 
+        semaphore.Wait();
         try
         {
-            semaphore.Wait();
-
             if (connections.TryGetValue(partitionId, out connTuple))
                 return connTuple;
 
@@ -128,10 +131,10 @@ public class SqliteWAL : IWAL, IDisposable
             string pragmasQuery = $"PRAGMA journal_mode=WAL; PRAGMA synchronous={synchronousMode}; PRAGMA temp_store=MEMORY;";
             using SqliteCommand command3 = new(pragmasQuery, connection);
             command3.ExecuteNonQuery();
-            
+
             ReaderWriterLock readerWriterLock = new();
 
-            connections.Add(partitionId, (readerWriterLock, connection));
+            connections.TryAdd(partitionId, (readerWriterLock, connection));
 
             return (readerWriterLock, connection);
         }
@@ -142,54 +145,38 @@ public class SqliteWAL : IWAL, IDisposable
     }
 
     /// <summary>
-    /// Attempts to open and initialize the metadata database associated with the Write-Ahead Log (WAL).
-    /// Ensures the database file exists, applies necessary configurations, and sets up required tables.
+    /// Returns the metadata <see cref="SqliteConnection"/>, creating it on first access.
+    /// Must be called with <see cref="_metaDataLock"/> already held.
     /// </summary>
-    /// <returns>
-    /// A SqliteConnection object that represents an open connection to the metadata database.
-    /// </returns>
     private SqliteConnection TryOpenMetaDataDatabase()
     {
         if (metaDataConnection is not null)
             return metaDataConnection;
 
-        try
-        {
-            semaphore.Wait();
+        string completePath = $"{path}/raft_metadata_{revision}.db";
 
-            if (metaDataConnection is not null)
-                return metaDataConnection;
-            
-            string completePath = $"{path}/raft_metadata_{revision}.db";
-            //bool firstTime = !File.Exists(completePath);
+        string connectionString = $"Data Source={completePath}";
+        SqliteConnection connection = new(connectionString);
 
-            string connectionString = $"Data Source={completePath}";
-            SqliteConnection connection = new(connectionString);
+        connection.Open();
 
-            connection.Open();
+        const string createTableQuery = """
+        CREATE TABLE IF NOT EXISTS metadata (
+            key STRING PRIMARY KEY,
+            value STRING
+        );
+        """;
 
-            const string createTableQuery = """
-            CREATE TABLE IF NOT EXISTS metadata (
-                key STRING PRIMARY KEY,
-                value STRING
-            );
-            """;
+        using SqliteCommand command1 = new(createTableQuery, connection);
+        command1.ExecuteNonQuery();
 
-            using SqliteCommand command1 = new(createTableQuery, connection);
-            command1.ExecuteNonQuery();
+        const string pragmasQuery = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;";
+        using SqliteCommand command3 = new(pragmasQuery, connection);
+        command3.ExecuteNonQuery();
 
-            const string pragmasQuery = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;";
-            using SqliteCommand command3 = new(pragmasQuery, connection);
-            command3.ExecuteNonQuery();
+        metaDataConnection = connection;
 
-            metaDataConnection = connection;
-
-            return connection;
-        }
-        finally
-        {
-            semaphore.Release();
-        }
+        return connection;
     }
 
     /// <summary>
@@ -388,7 +375,7 @@ public class SqliteWAL : IWAL, IDisposable
                                 insertOrReplaceCommand.Parameters["@logType"].Value = log.LogType;
 
                             if (log.LogData is null)
-                                insertOrReplaceCommand.Parameters["@log"].Value = "";
+                                insertOrReplaceCommand.Parameters["@log"].Value = DBNull.Value;
                             else
                                 insertOrReplaceCommand.Parameters["@log"].Value = log.LogData;
 
@@ -465,9 +452,10 @@ public class SqliteWAL : IWAL, IDisposable
 
     /// <summary>
     /// Retrieves the current term of the Raft log for the specified partition.
+    /// Returns the term of the log entry with the highest id, matching the RocksDB and InMemory
+    /// adapter semantics. Returns 0 if no logs exist.
     /// </summary>
     /// <param name="partitionId">The identifier of the partition for which the current term is to be retrieved.</param>
-    /// <returns>The current term of the Raft log for the specified partition, or 0 if no logs are present.</returns>
     public long GetCurrentTerm(int partitionId)
     {
         (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
@@ -476,7 +464,7 @@ public class SqliteWAL : IWAL, IDisposable
         {
             readerWriterLock.AcquireReaderLock(TimeSpan.FromSeconds(10));
 
-            const string query = "SELECT MAX(term) AS max FROM logs WHERE partitionId = @partitionId";
+            const string query = "SELECT term FROM logs WHERE partitionId = @partitionId ORDER BY id DESC LIMIT 1";
             using SqliteCommand command = new(query, connection);
 
             command.Parameters.AddWithValue("@partitionId", partitionId);
@@ -532,7 +520,7 @@ public class SqliteWAL : IWAL, IDisposable
         using SqliteDataReader reader = command.ExecuteReader();
 
         while (reader.Read())
-            return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
+            return reader.IsDBNull(0) ? -1 : reader.GetInt64(0);
 
         return -1;
     }
@@ -664,19 +652,22 @@ public class SqliteWAL : IWAL, IDisposable
     /// <returns>The metadata value associated with the specified key, or null if the key does not exist or the value is null.</returns>
     public string? GetMetaData(string key)
     {
-        SqliteConnection connection = TryOpenMetaDataDatabase();
-        
-        const string query = "SELECT value FROM metadata WHERE key = @key";
-        using SqliteCommand command = new(query, connection);
+        lock (_metaDataLock)
+        {
+            SqliteConnection connection = TryOpenMetaDataDatabase();
 
-        command.Parameters.AddWithValue("@key", key);
+            const string query = "SELECT value FROM metadata WHERE key = @key";
+            using SqliteCommand command = new(query, connection);
 
-        using SqliteDataReader reader = command.ExecuteReader();
+            command.Parameters.AddWithValue("@key", key);
 
-        while (reader.Read())
-            return reader.IsDBNull(0) ? null : reader.GetString(0);
+            using SqliteDataReader reader = command.ExecuteReader();
 
-        return null;
+            while (reader.Read())
+                return reader.IsDBNull(0) ? null : reader.GetString(0);
+
+            return null;
+        }
     }
 
     /// <summary>
@@ -687,26 +678,29 @@ public class SqliteWAL : IWAL, IDisposable
     /// <returns>Returns <c>true</c> if the metadata update or insertion was successful.</returns>
     public bool SetMetaData(string key, string value)
     {
-        SqliteConnection connection = TryOpenMetaDataDatabase();
+        lock (_metaDataLock)
+        {
+            SqliteConnection connection = TryOpenMetaDataDatabase();
 
-        const string insertOrReplaceSql = """
-                                          INSERT INTO metadata (key, value)
-                                          VALUES (@key, @value)
-                                          ON CONFLICT(key) DO UPDATE SET value=@value;
-                                          """;
-        
-        using SqliteCommand insertOrReplaceCommand = new(insertOrReplaceSql, connection);
+            const string insertOrReplaceSql = """
+                                              INSERT INTO metadata (key, value)
+                                              VALUES (@key, @value)
+                                              ON CONFLICT(key) DO UPDATE SET value=@value;
+                                              """;
 
-        insertOrReplaceCommand.Parameters.AddWithValue("@key", key);
-        
-        if (string.IsNullOrEmpty(value))
-            insertOrReplaceCommand.Parameters.AddWithValue("@value", "");
-        else
-            insertOrReplaceCommand.Parameters.AddWithValue("@value", value);
+            using SqliteCommand insertOrReplaceCommand = new(insertOrReplaceSql, connection);
 
-        insertOrReplaceCommand.ExecuteNonQuery();
+            insertOrReplaceCommand.Parameters.AddWithValue("@key", key);
 
-        return true;
+            if (string.IsNullOrEmpty(value))
+                insertOrReplaceCommand.Parameters.AddWithValue("@value", "");
+            else
+                insertOrReplaceCommand.Parameters.AddWithValue("@value", value);
+
+            insertOrReplaceCommand.ExecuteNonQuery();
+
+            return true;
+        }
     }
 
     public void Dispose()
