@@ -218,7 +218,7 @@ public class SqliteWAL : IWAL, IDisposable
                     Term = reader.IsDBNull(1) ? 0 : reader.GetInt64(1),
                     Type = reader.IsDBNull(2) ? RaftLogType.Proposed : (RaftLogType)reader.GetInt32(2),
                     LogType = reader.IsDBNull(3) ? "" : reader.GetString(3),
-                    LogData = reader.IsDBNull(4) ? [] : (byte[])reader[4],
+                    LogData = reader.IsDBNull(4) ? null : (byte[])reader[4],
                     Time = new(
                         reader.IsDBNull(5) ? 0 : reader.GetInt32(5),
                         reader.IsDBNull(6) ? 0 : reader.GetInt64(6),
@@ -269,7 +269,7 @@ public class SqliteWAL : IWAL, IDisposable
                     Term = reader.IsDBNull(1) ? 0 : reader.GetInt64(1),
                     Type = reader.IsDBNull(2) ? RaftLogType.Proposed : (RaftLogType)reader.GetInt32(2),
                     LogType = reader.IsDBNull(3) ? "" : reader.GetString(3),
-                    LogData = reader.IsDBNull(4) ? [] : (byte[])reader[4],
+                    LogData = reader.IsDBNull(4) ? null : (byte[])reader[4],
                     Time = new(
                         reader.IsDBNull(5) ? 0 : reader.GetInt32(5),
                         reader.IsDBNull(6) ? 0 : reader.GetInt64(6),

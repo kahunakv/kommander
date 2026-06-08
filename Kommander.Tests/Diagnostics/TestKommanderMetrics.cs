@@ -96,10 +96,10 @@ public sealed class TestKommanderMetrics : IDisposable
 
         public StubHost(int partitionId = 0) => PartitionId = partitionId;
 
-        public HLCTimestamp GetLastNodeActivity(string endpoint) => HLCTimestamp.Zero;
+        public HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId) => HLCTimestamp.Zero;
         public HLCTimestamp GetLastNodeHearthbeat(string endpoint) => HLCTimestamp.Zero;
         public void UpdateLastHeartbeat(string endpoint, HLCTimestamp timestamp) { }
-        public void UpdateLastNodeActivity(string endpoint, HLCTimestamp timestamp) { }
+        public void UpdateLastNodeActivity(string endpoint, int partitionId, HLCTimestamp timestamp) { }
         public void EnqueueResponse(string endpoint, RaftResponderRequest request) => EnqueuedResponses.Add((endpoint, request));
         public Task InvokeLeaderChanged(int partitionId, string leader) => Task.CompletedTask;
         public Task<bool> InvokeReplicationReceived(int partitionId, RaftLog log) => Task.FromResult(false);

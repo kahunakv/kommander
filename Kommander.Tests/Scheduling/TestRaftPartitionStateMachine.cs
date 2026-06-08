@@ -514,13 +514,13 @@ public class TestRaftPartitionStateMachine
             EnqueuedResponses.Clear();
         }
 
-        public HLCTimestamp GetLastNodeActivity(string endpoint) => HLCTimestamp.Zero;
+        public HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId) => HLCTimestamp.Zero;
 
         public HLCTimestamp GetLastNodeHearthbeat(string endpoint) => HLCTimestamp.Zero;
 
         public void UpdateLastHeartbeat(string endpoint, HLCTimestamp timestamp) { }
 
-        public void UpdateLastNodeActivity(string endpoint, HLCTimestamp timestamp) { }
+        public void UpdateLastNodeActivity(string endpoint, int partitionId, HLCTimestamp timestamp) { }
 
         public void EnqueueResponse(string endpoint, RaftResponderRequest request) => EnqueuedResponses.Add((endpoint, request.Type));
 

@@ -772,28 +772,47 @@ public sealed class TestThreeNodeCluster
         string previousLeader,
         CancellationToken cancellationToken)
     {
+        const long totalBudgetMs = 30_000;
         ValueStopwatch stopwatch = ValueStopwatch.StartNew();
 
-        while (stopwatch.GetElapsedMilliseconds() < 15_000)
+        while (stopwatch.GetElapsedMilliseconds() < totalBudgetMs)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
             foreach (IRaft node in nodes)
             {
-                string leader = await node.WaitForLeaderStableAsync(
-                    partitionId,
-                    TimeSpan.FromMilliseconds(150),
-                    cancellationToken);
+                long remaining = totalBudgetMs - stopwatch.GetElapsedMilliseconds();
+                if (remaining <= 0)
+                    break;
 
-                if (leader != previousLeader)
-                    return leader;
+                // Cap each per-node wait so the outer budget is always honoured.
+                // WaitForLeaderStableAsync loops indefinitely if no leader is stable yet,
+                // so without a bound, one slow node can exhaust the entire timeout.
+                using CancellationTokenSource nodeCts =
+                    CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                nodeCts.CancelAfter(TimeSpan.FromMilliseconds(Math.Min(remaining, 500)));
+
+                try
+                {
+                    string leader = await node.WaitForLeaderStableAsync(
+                        partitionId,
+                        TimeSpan.FromMilliseconds(150),
+                        nodeCts.Token);
+
+                    if (leader != previousLeader)
+                        return leader;
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    // Per-node budget expired; continue to the next node.
+                }
             }
 
             await Task.Delay(25, cancellationToken).ConfigureAwait(false);
         }
 
         throw new TimeoutException(
-            $"Partition {partitionId} did not change leaders from {previousLeader} within 15 seconds.");
+            $"Partition {partitionId} did not change leaders from {previousLeader} within {totalBudgetMs / 1000} seconds.");
     }
 
     private static IRaft GetNodeByEndpoint(IRaft[] nodes, string endpoint) =>

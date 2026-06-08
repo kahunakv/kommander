@@ -242,7 +242,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 LogType = message.LogType
             };
             
-            if (message.Log is not null)
+            if (message.HasLog)
             {
                 if (MemoryMarshal.TryGetArray(message.Log.Memory, out ArraySegment<byte> segment))
                     raftLog.LogData = segment.Array;
@@ -308,7 +308,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 LogType = message.LogType
             };
 
-            if (message.Log is not null)
+            if (message.HasLog)
             {
                 if (MemoryMarshal.TryGetArray(message.Log.Memory, out ArraySegment<byte> segment))
                     raftLog.LogData = segment.Array;

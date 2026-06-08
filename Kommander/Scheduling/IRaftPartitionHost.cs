@@ -25,13 +25,13 @@ public interface IRaftPartitionHost
 
     IReadOnlyList<RaftNode> Nodes { get; }
 
-    HLCTimestamp GetLastNodeActivity(string endpoint);
+    HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId);
 
     HLCTimestamp GetLastNodeHearthbeat(string endpoint);
 
     void UpdateLastHeartbeat(string endpoint, HLCTimestamp timestamp);
 
-    void UpdateLastNodeActivity(string endpoint, HLCTimestamp timestamp);
+    void UpdateLastNodeActivity(string endpoint, int partitionId, HLCTimestamp timestamp);
 
     void EnqueueResponse(string endpoint, RaftResponderRequest request);
 

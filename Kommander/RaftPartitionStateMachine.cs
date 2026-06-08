@@ -124,10 +124,12 @@ public sealed class RaftPartitionStateMachine
                 
                 logger.LogInfoVotingConcluded(host.LocalEndpoint, host.PartitionId, nodeState, (currentTime - votingStartedAt).TotalMilliseconds);
             
-                nodeState = RaftNodeState.Follower; 
+                nodeState = RaftNodeState.Follower;
                 host.Leader = "";
                 lastHeartbeat = currentTime;
-                electionTimeout += TimeSpan.FromMilliseconds(Random.Shared.Next(host.Configuration.StartElectionTimeoutIncrement, host.Configuration.EndElectionTimeoutIncrement));
+                electionTimeout = TimeSpan.FromMilliseconds(Math.Min(
+                    electionTimeout.TotalMilliseconds + Random.Shared.Next(host.Configuration.StartElectionTimeoutIncrement, host.Configuration.EndElectionTimeoutIncrement),
+                    host.Configuration.EndElectionTimeout));
                 expectedLeaders.Clear();
                 lastCommitIndexes.Clear();
                 activeProposals.Clear();
@@ -431,7 +433,7 @@ public sealed class RaftPartitionStateMachine
             string expectedLeader = expectedLeaders.GetValueOrDefault(currentTerm, "");
             if (!string.IsNullOrEmpty(expectedLeader))
             {
-                HLCTimestamp lastKnownHeartbeat = host.GetLastNodeActivity(expectedLeader);
+                HLCTimestamp lastKnownHeartbeat = host.GetLastNodeActivity(expectedLeader, host.PartitionId);
 
                 if (lastKnownHeartbeat != HLCTimestamp.Zero && ((currentTime - lastKnownHeartbeat) < electionTimeout))
                 {
@@ -845,7 +847,7 @@ public sealed class RaftPartitionStateMachine
         
         lastHeartbeat = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, timestamp);
         
-        host.UpdateLastNodeActivity(expectedLeader, lastHeartbeat);
+        host.UpdateLastNodeActivity(expectedLeader, host.PartitionId, lastHeartbeat);
 
         if (logs is not null && logs.Count > 0)
         {
@@ -1358,7 +1360,7 @@ public sealed class RaftPartitionStateMachine
         HLCTimestamp currentTime = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, timestamp);
 
         if (endpoint != host.LocalEndpoint)
-            host.UpdateLastNodeActivity(endpoint, currentTime);
+            host.UpdateLastNodeActivity(endpoint, host.PartitionId, currentTime);
         
         if (committedIndex > 0)
         {

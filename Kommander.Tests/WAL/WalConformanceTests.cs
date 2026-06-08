@@ -444,6 +444,248 @@ public abstract class WalConformanceTests
         finally { cleanup(); }
     }
 
+    // ──────────────────────────── log lifecycle (propose / commit / rollback) ───
+
+    [Fact]
+    public void Lifecycle_Proposed_ThenCommit_TypeUpdated()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(70, [new RaftLog { Id = 1, Term = 2, Type = RaftLogType.Proposed, LogType = "t" }])]);
+            wal.Write([(70, [new RaftLog { Id = 1, Term = 2, Type = RaftLogType.Committed, LogType = "t" }])]);
+
+            RaftLog result = Assert.Single(wal.ReadLogs(70));
+            Assert.Equal(RaftLogType.Committed, result.Type);
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void Lifecycle_Proposed_ThenRolledBack_TypeUpdated()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(71, [new RaftLog { Id = 1, Term = 2, Type = RaftLogType.Proposed, LogType = "t" }])]);
+            wal.Write([(71, [new RaftLog { Id = 1, Term = 2, Type = RaftLogType.RolledBack, LogType = "t" }])]);
+
+            RaftLog result = Assert.Single(wal.ReadLogs(71));
+            Assert.Equal(RaftLogType.RolledBack, result.Type);
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void Lifecycle_ProposedCheckpoint_ThenCommit_RegistersAsLastCheckpoint()
+    {
+        if (!SupportsCheckpoints) return;
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(72, [new RaftLog { Id = 1, Term = 3, Type = RaftLogType.ProposedCheckpoint, LogType = "t" }])]);
+            Assert.Equal(-1, wal.GetLastCheckpoint(72)); // not committed yet
+
+            wal.Write([(72, [new RaftLog { Id = 1, Term = 3, Type = RaftLogType.CommittedCheckpoint, LogType = "t" }])]);
+            Assert.Equal(1, wal.GetLastCheckpoint(72));
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void Lifecycle_ProposedCheckpoint_ThenRolledBack_DoesNotRegisterAsCheckpoint()
+    {
+        if (!SupportsCheckpoints) return;
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(73, [
+                new RaftLog { Id = 1, Term = 3, Type = RaftLogType.ProposedCheckpoint, LogType = "t" },
+                Log(id: 2, term: 3)
+            ])]);
+            wal.Write([(73, [new RaftLog { Id = 1, Term = 3, Type = RaftLogType.RolledBackCheckpoint, LogType = "t" }])]);
+
+            Assert.Equal(-1, wal.GetLastCheckpoint(73));
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void GetLastCheckpoint_OnlyCommittedCheckpointTypeCounts()
+    {
+        if (!SupportsCheckpoints) return;
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(74, [
+                new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Proposed,             LogType = "t" },
+                new RaftLog { Id = 2, Term = 1, Type = RaftLogType.Committed,            LogType = "t" },
+                new RaftLog { Id = 3, Term = 1, Type = RaftLogType.ProposedCheckpoint,   LogType = "t" },
+                new RaftLog { Id = 4, Term = 1, Type = RaftLogType.RolledBack,           LogType = "t" },
+                new RaftLog { Id = 5, Term = 1, Type = RaftLogType.RolledBackCheckpoint, LogType = "t" },
+                new RaftLog { Id = 6, Term = 1, Type = RaftLogType.CommittedCheckpoint,  LogType = "t" },
+                new RaftLog { Id = 7, Term = 1, Type = RaftLogType.Committed,            LogType = "t" }
+            ])]);
+            Assert.Equal(6, wal.GetLastCheckpoint(74));
+        }
+        finally { cleanup(); }
+    }
+
+    // ──────────────────────────── data fidelity ─────────────────────────────────
+
+    [Fact]
+    public void Write_NullLogData_RoundTripsAsNull()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(75, [new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed, LogData = null, LogType = "t" }])]);
+            RaftLog result = Assert.Single(wal.ReadLogs(75));
+            Assert.Null(result.LogData);
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void Write_BinaryLogData_RoundTripsExactly()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            byte[] payload = [0x00, 0xFF, 0x42, 0x01, 0x80, 0x7F];
+            wal.Write([(76, [new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed, LogData = payload, LogType = "t" }])]);
+            RaftLog result = Assert.Single(wal.ReadLogs(76));
+            Assert.Equal(payload, result.LogData);
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void Write_LogTypeString_RoundTripsCorrectly()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(77, [new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed, LogType = "myapp.SomeCommand", LogData = null }])]);
+            RaftLog result = Assert.Single(wal.ReadLogs(77));
+            Assert.Equal("myapp.SomeCommand", result.LogType);
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void Write_AllLogEnumValues_CanBeStoredAndReadBack()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            RaftLogType[] all = [
+                RaftLogType.Proposed,
+                RaftLogType.Committed,
+                RaftLogType.ProposedCheckpoint,
+                RaftLogType.CommittedCheckpoint,
+                RaftLogType.RolledBack,
+                RaftLogType.RolledBackCheckpoint
+            ];
+
+            List<RaftLog> logs = all.Select((t, i) =>
+                new RaftLog { Id = i + 1, Term = 1, Type = t, LogType = "t" }).ToList();
+            wal.Write([(78, logs)]);
+
+            // Use ReadLogsRange from id=1 to bypass checkpoint filtering
+            // (CommittedCheckpoint at id=4 would otherwise cause ReadLogs to skip ids 1-3).
+            List<RaftLog> result = wal.ReadLogsRange(78, 1);
+            Assert.Equal(all.Length, result.Count);
+            for (int i = 0; i < all.Length; i++)
+                Assert.Equal(all[i], result[i].Type);
+        }
+        finally { cleanup(); }
+    }
+
+    // ──────────────────────────── restore-from-checkpoint semantics ─────────────
+
+    [Fact]
+    public void RestoreSemantics_UncommittedCheckpoint_DoesNotFilterReadLogs()
+    {
+        // A ProposedCheckpoint that was never upgraded should not act as a restore point.
+        if (!SupportsCheckpoints) return;
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(79, [
+                Log(id: 1),
+                new RaftLog { Id = 2, Term = 1, Type = RaftLogType.ProposedCheckpoint, LogType = "t" },
+                Log(id: 3)
+            ])]);
+
+            Assert.Equal(-1, wal.GetLastCheckpoint(79));
+            Assert.Equal([1L, 2L, 3L], wal.ReadLogs(79).Select(l => l.Id));
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void RestoreSemantics_AfterCompact_ReadLogsIncludesCheckpointAndNewer()
+    {
+        // Simulate: write logs → checkpoint → compact → restore reads from checkpoint.
+        if (!SupportsCheckpoints) return;
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(80, [
+                Log(id: 1), Log(id: 2), Log(id: 3),
+                Log(id: 4, type: RaftLogType.CommittedCheckpoint),
+                Log(id: 5), Log(id: 6)
+            ])]);
+
+            wal.CompactLogsOlderThan(80, lastCheckpoint: 4, compactNumberEntries: 10);
+
+            List<long> ids = wal.ReadLogs(80).Select(l => l.Id).ToList();
+            Assert.DoesNotContain(1L, ids);
+            Assert.DoesNotContain(2L, ids);
+            Assert.DoesNotContain(3L, ids);
+            Assert.Contains(4L, ids);
+            Assert.Contains(5L, ids);
+            Assert.Contains(6L, ids);
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void RestoreSemantics_TermAdvances_GetCurrentTermTracksLatestId()
+    {
+        // Simulate multiple term changes; GetCurrentTerm must track the entry with the highest id.
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(81, [Log(id: 1, term: 1), Log(id: 2, term: 2), Log(id: 3, term: 3)])]);
+            Assert.Equal(3, wal.GetCurrentTerm(81));
+
+            wal.Write([(81, [Log(id: 4, term: 4)])]);
+            Assert.Equal(4, wal.GetCurrentTerm(81));
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void MetaData_NodeState_TermAndVotePersistence()
+    {
+        // Simulates the scheduler persisting node term and voted-for values.
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            Assert.True(wal.SetMetaData("current-term", "3"));
+            Assert.True(wal.SetMetaData("voted-for", "node-2"));
+
+            Assert.Equal("3", wal.GetMetaData("current-term"));
+            Assert.Equal("node-2", wal.GetMetaData("voted-for"));
+
+            wal.SetMetaData("current-term", "4");
+            Assert.Equal("4", wal.GetMetaData("current-term"));
+        }
+        finally { cleanup(); }
+    }
+
     // ──────────────────────────── concurrent access ─────────────────────────────
 
     /// <summary>
@@ -577,6 +819,151 @@ public abstract class WalConformanceTests
             await Task.WhenAll(tasks);
 
             Assert.True(wal.GetMaxLog(partitionId) >= 1);
+        }
+        finally { cleanup(); }
+    }
+
+    // ──────────────────────────── scheduler-driven concurrent patterns ──────────
+
+    /// <summary>
+    /// Simulates the leader's Propose → Commit lifecycle across multiple partitions running
+    /// concurrently, mirroring how the Raft scheduler drives separate partitions on separate threads.
+    /// </summary>
+    [Fact]
+    public async Task SchedulerDriven_ProposeThenCommit_ConcurrentPartitions()
+    {
+        const int partitions = 8;
+        const int logsPerPartition = 5;
+
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            Task[] workers = Enumerable.Range(0, partitions).Select(p => Task.Run(() =>
+            {
+                int partitionId = 100 + p;
+
+                // Phase 1 — propose
+                List<RaftLog> proposed = Enumerable.Range(1, logsPerPartition)
+                    .Select(i => new RaftLog { Id = i, Term = 1, Type = RaftLogType.Proposed, LogType = "t" })
+                    .ToList();
+                Assert.Equal(RaftOperationStatus.Success, wal.Write([(partitionId, proposed)]));
+
+                // Phase 2 — commit (same ids, upgraded type)
+                List<RaftLog> committed = Enumerable.Range(1, logsPerPartition)
+                    .Select(i => new RaftLog { Id = i, Term = 1, Type = RaftLogType.Committed, LogType = "t" })
+                    .ToList();
+                Assert.Equal(RaftOperationStatus.Success, wal.Write([(partitionId, committed)]));
+
+                List<RaftLog> result = wal.ReadLogs(partitionId);
+                Assert.Equal(logsPerPartition, result.Count);
+                Assert.All(result, l => Assert.Equal(RaftLogType.Committed, l.Type));
+            }, TestContext.Current.CancellationToken)).ToArray();
+
+            await Task.WhenAll(workers);
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// Simulates follower state-check reads (GetCurrentTerm + GetMaxLog) running concurrently
+    /// with leader writes — the pattern during replication where the scheduler queries progress
+    /// while new entries arrive.
+    /// </summary>
+    [Fact]
+    public async Task SchedulerDriven_FollowerReads_ConcurrentWithLeaderWrites()
+    {
+        const int partitionId = 110;
+        const int writerCount = 5;
+        const int readerCount = 10;
+
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(partitionId, [Log(id: 1, term: 1)])]);
+
+            Task[] writers = Enumerable.Range(0, writerCount).Select(i => Task.Run(() =>
+            {
+                wal.Write([(partitionId, [Log(id: (long)i + 2, term: (long)i + 2)])]);
+            }, TestContext.Current.CancellationToken)).ToArray();
+
+            Task[] readers = Enumerable.Range(0, readerCount).Select(_ => Task.Run(() =>
+            {
+                long term = wal.GetCurrentTerm(partitionId);
+                Assert.True(term >= 1);
+                long maxLog = wal.GetMaxLog(partitionId);
+                Assert.True(maxLog >= 1);
+            }, TestContext.Current.CancellationToken)).ToArray();
+
+            await Task.WhenAll([.. writers, .. readers]);
+
+            Assert.Equal(writerCount + 1, wal.CountPersistedLogs(partitionId));
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// Simulates the full checkpoint lifecycle under concurrent load: multiple partitions
+    /// writing, checkpointing, and compacting simultaneously.
+    /// </summary>
+    [Fact]
+    public async Task SchedulerDriven_CheckpointAndCompact_ConcurrentPartitions()
+    {
+        if (!SupportsCheckpoints) return;
+        const int partitions = 4;
+
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            Task[] workers = Enumerable.Range(0, partitions).Select(p => Task.Run(() =>
+            {
+                int partitionId = 120 + p;
+
+                wal.Write([(partitionId, [
+                    Log(id: 1), Log(id: 2), Log(id: 3),
+                    Log(id: 4, type: RaftLogType.CommittedCheckpoint),
+                    Log(id: 5), Log(id: 6), Log(id: 7)
+                ])]);
+
+                Assert.Equal(4, wal.GetLastCheckpoint(partitionId));
+                wal.CompactLogsOlderThan(partitionId, lastCheckpoint: 4, compactNumberEntries: 10);
+
+                List<long> ids = wal.ReadLogs(partitionId).Select(l => l.Id).ToList();
+                Assert.DoesNotContain(1L, ids);
+                Assert.DoesNotContain(2L, ids);
+                Assert.DoesNotContain(3L, ids);
+                Assert.Contains(4L, ids);
+                Assert.Contains(5L, ids);
+            }, TestContext.Current.CancellationToken)).ToArray();
+
+            await Task.WhenAll(workers);
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// Simulates the metadata access pattern used by the scheduler to persist node state
+    /// (current term, voted-for): concurrent reads and writes must not corrupt each other.
+    /// </summary>
+    [Fact]
+    public async Task SchedulerDriven_MetadataConcurrentReadWrite_NoCorruption()
+    {
+        const int workerCount = 20;
+
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            Task[] workers = Enumerable.Range(0, workerCount).Select(i => Task.Run(() =>
+            {
+                string key = $"node-{i % 4}-term"; // 4 distinct keys, 5 writers each
+                Assert.True(wal.SetMetaData(key, $"term-{i}"));
+                Assert.NotNull(wal.GetMetaData(key));
+            }, TestContext.Current.CancellationToken)).ToArray();
+
+            await Task.WhenAll(workers);
+
+            // Each key was written at least once; all four must be readable.
+            for (int k = 0; k < 4; k++)
+                Assert.NotNull(wal.GetMetaData($"node-{k}-term"));
         }
         finally { cleanup(); }
     }

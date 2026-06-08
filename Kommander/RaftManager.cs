@@ -64,7 +64,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     private int _disposed;
 
-    private readonly ConcurrentDictionary<string, HLCTimestamp> lastActivity = new();
+    private readonly ConcurrentDictionary<(string endpoint, int partitionId), HLCTimestamp> lastActivity = new();
     
     private readonly ConcurrentDictionary<string, HLCTimestamp> lastHearthBeat = new();
     
@@ -473,25 +473,38 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// </summary>
     /// <param name="endpoint"></param>
     /// <returns></returns>
+    public HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId)
+    {
+        return lastActivity.TryGetValue((endpoint, partitionId), out HLCTimestamp lastTimestamp) ? lastTimestamp : HLCTimestamp.Zero;
+    }
+
     public HLCTimestamp GetLastNodeActivity(string endpoint)
     {
-        return lastActivity.TryGetValue(endpoint, out HLCTimestamp lastTimestamp) ? lastTimestamp : HLCTimestamp.Zero;
+        HLCTimestamp max = HLCTimestamp.Zero;
+        foreach (((string ep, int _) key, HLCTimestamp ts) in lastActivity)
+        {
+            if (key.ep == endpoint && ts > max)
+                max = ts;
+        }
+        return max;
     }
 
     /// <summary>
-    /// Updates the last activity known of a specific node on any partitions
+    /// Updates the last activity known of a specific node on a specific partition
     /// </summary>
     /// <param name="nodeId"></param>
+    /// <param name="partitionId"></param>
     /// <param name="lastTimestamp"></param>
-    internal void UpdateLastNodeActivity(string nodeId, HLCTimestamp lastTimestamp)
-    {                
-        if (lastActivity.TryGetValue(nodeId, out HLCTimestamp currentTimestamp))
+    internal void UpdateLastNodeActivity(string nodeId, int partitionId, HLCTimestamp lastTimestamp)
+    {
+        var key = (nodeId, partitionId);
+        if (lastActivity.TryGetValue(key, out HLCTimestamp currentTimestamp))
         {
             if (lastTimestamp > currentTimestamp)
-                lastActivity[nodeId] = lastTimestamp;
+                lastActivity[key] = lastTimestamp;
         }
-        else        
-            lastActivity.TryAdd(nodeId, lastTimestamp);
+        else
+            lastActivity.TryAdd(key, lastTimestamp);
     }
     
     /// <summary>
@@ -536,13 +549,13 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         HLCTimestamp now = hybridLogicalClock.TrySendOrLocalEvent(LocalNodeId);
         List<string> active = [];
 
-        foreach ((string endpoint, HLCTimestamp lastSeen) in lastActivity)
+        foreach (((string endpoint, int _) key, HLCTimestamp lastSeen) in lastActivity)
         {
-            if (endpoint == LocalEndpoint)
+            if (key.endpoint == LocalEndpoint)
                 continue;
 
-            if ((now - lastSeen) <= within)
-                active.Add(endpoint);
+            if ((now - lastSeen) <= within && !active.Contains(key.endpoint))
+                active.Add(key.endpoint);
         }
 
         active.Sort(StringComparer.Ordinal);
