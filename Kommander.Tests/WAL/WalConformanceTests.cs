@@ -238,6 +238,39 @@ public abstract class WalConformanceTests
         finally { cleanup(); }
     }
 
+    // ──────────────────────────── ReadLogs + checkpoint filtering ───────────────
+
+    [Fact]
+    public void ReadLogs_NoCheckpoint_ReturnsAllLogs()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(25, [Log(id: 1), Log(id: 2), Log(id: 3)])]);
+            Assert.Equal([1L, 2L, 3L], wal.ReadLogs(25).Select(l => l.Id));
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void ReadLogs_WithCheckpoint_IncludesCheckpointEntryAndNewer()
+    {
+        if (!SupportsCheckpoints) return;
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(26, [
+                Log(id: 1),
+                Log(id: 2, type: RaftLogType.CommittedCheckpoint),
+                Log(id: 3),
+                Log(id: 4)
+            ])]);
+            // Must include the checkpoint entry itself (id=2) and all entries after it.
+            Assert.Equal([2L, 3L, 4L], wal.ReadLogs(26).Select(l => l.Id));
+        }
+        finally { cleanup(); }
+    }
+
     // ──────────────────────────── ReadLogsRange ─────────────────────────────────
 
     [Fact]
@@ -408,6 +441,143 @@ public abstract class WalConformanceTests
     {
         using IWAL wal = CreateWal(out Action cleanup);
         try { Assert.Null(wal.GetMetaData("no-such-key")); }
+        finally { cleanup(); }
+    }
+
+    // ──────────────────────────── concurrent access ─────────────────────────────
+
+    /// <summary>
+    /// Multiple threads reading the same partition concurrently must not corrupt the connection
+    /// or return garbled data. This is the direct regression test for the SqliteWAL
+    /// ReaderWriterLock bug where shared SqliteConnection was raced by concurrent readers.
+    /// </summary>
+    [Fact]
+    public async Task ConcurrentReads_SamePartition_NeverCorruptOrThrow()
+    {
+        const int partitionId = 50;
+        const int readerCount = 20;
+
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(partitionId, [Log(id: 1), Log(id: 2), Log(id: 3), Log(id: 4), Log(id: 5)])]);
+
+            Task[] readers = Enumerable.Range(0, readerCount).Select(_ => Task.Run(() =>
+            {
+                List<RaftLog> logs = wal.ReadLogs(partitionId);
+                Assert.Equal(5, logs.Count);
+                Assert.Equal([1L, 2L, 3L, 4L, 5L], logs.Select(l => l.Id));
+
+                List<RaftLog> range = wal.ReadLogsRange(partitionId, 3);
+                Assert.Equal([3L, 4L, 5L], range.Select(l => l.Id));
+
+                Assert.Equal(5, wal.GetMaxLog(partitionId));
+                Assert.Equal(1, wal.GetCurrentTerm(partitionId));
+            }, TestContext.Current.CancellationToken)).ToArray();
+
+            await Task.WhenAll(readers);
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// Concurrent writes and reads on the same partition must not produce torn reads, lost writes,
+    /// or exceptions. Final state must be consistent.
+    /// </summary>
+    [Fact]
+    public async Task ConcurrentWritesAndReads_SamePartition_NeverCorruptOrThrow()
+    {
+        const int partitionId = 51;
+        const int workerCount = 10;
+
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            // Seed a base log so reads on an empty partition don't complicate assertions.
+            wal.Write([(partitionId, [Log(id: 1, term: 1)])]);
+
+            Task[] workers = Enumerable.Range(0, workerCount).Select(i => Task.Run(() =>
+            {
+                long id = (long)i + 2; // ids 2..11, no collisions
+                Assert.Equal(RaftOperationStatus.Success,
+                    wal.Write([(partitionId, [Log(id: id, term: (long)i + 1)])]));
+
+                // Read must not throw regardless of concurrent writers.
+                List<RaftLog> _ = wal.ReadLogs(partitionId);
+                long maxLog = wal.GetMaxLog(partitionId);
+                Assert.True(maxLog >= 1);
+            }, TestContext.Current.CancellationToken)).ToArray();
+
+            await Task.WhenAll(workers);
+
+            // After all writers finished, all 11 logs must be present.
+            Assert.Equal(11, wal.CountPersistedLogs(partitionId));
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// Operations on different partitions must be able to run in parallel without blocking
+    /// or corrupting each other.
+    /// </summary>
+    [Fact]
+    public async Task ConcurrentAccess_DifferentPartitions_RunInParallel()
+    {
+        const int partitionCount = 8;
+        const int opsPerPartition = 10;
+
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            Task[] workers = Enumerable.Range(0, partitionCount).Select(p => Task.Run(() =>
+            {
+                int partitionId = 60 + p;
+
+                for (int i = 1; i <= opsPerPartition; i++)
+                    Assert.Equal(RaftOperationStatus.Success,
+                        wal.Write([(partitionId, [Log(id: i, term: 1)])]));
+
+                Assert.Equal(opsPerPartition, wal.CountPersistedLogs(partitionId));
+                Assert.Equal(opsPerPartition, wal.GetMaxLog(partitionId));
+            }, TestContext.Current.CancellationToken)).ToArray();
+
+            await Task.WhenAll(workers);
+
+            // Cross-check: no partition leaked logs into another.
+            for (int p = 0; p < partitionCount; p++)
+                Assert.Equal(opsPerPartition, wal.CountPersistedLogs(60 + p));
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// Concurrent write + compact on the same partition must not corrupt the log or deadlock.
+    /// </summary>
+    [Fact]
+    public async Task ConcurrentWriteAndCompact_SamePartition_NeverDeadlocksOrCorrupts()
+    {
+        const int partitionId = 52;
+        const int rounds = 30;
+
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            Task[] tasks = Enumerable.Range(1, rounds).SelectMany(i =>
+            {
+                long id = i;
+                return new Task[]
+                {
+                    Task.Run(() => wal.Write([(partitionId, [Log(id: id, term: 1)])]),
+                        TestContext.Current.CancellationToken),
+                    Task.Run(() => wal.CompactLogsOlderThan(partitionId, lastCheckpoint: id, compactNumberEntries: 3),
+                        TestContext.Current.CancellationToken)
+                };
+            }).ToArray();
+
+            await Task.WhenAll(tasks);
+
+            Assert.True(wal.GetMaxLog(partitionId) >= 1);
+        }
         finally { cleanup(); }
     }
 

@@ -34,12 +34,14 @@ public class SqliteWAL : IWAL, IDisposable
     private readonly object _metaDataLock = new();
 
     /// <summary>
-    /// Maps partition IDs to their per-partition <see cref="ReaderWriterLock"/> and
-    /// <see cref="SqliteConnection"/>. Uses <see cref="ConcurrentDictionary{TKey,TValue}"/> so that
-    /// the unsynchronized fast-path <see cref="ConcurrentDictionary{TKey,TValue}.TryGetValue"/> is safe
+    /// Maps partition IDs to their per-partition exclusive lock and <see cref="SqliteConnection"/>.
+    /// All operations on a partition — reads and writes — serialize through the lock because
+    /// <see cref="SqliteConnection"/> wraps a single <c>sqlite3*</c> handle that is not safe for
+    /// concurrent command execution. Uses <see cref="ConcurrentDictionary{TKey,TValue}"/> so that
+    /// the lock-free fast-path <see cref="ConcurrentDictionary{TKey,TValue}.TryGetValue"/> is safe
     /// to call concurrently with the semaphore-guarded <see cref="ConcurrentDictionary{TKey,TValue}.TryAdd"/>.
     /// </summary>
-    private readonly ConcurrentDictionary<int, (ReaderWriterLock, SqliteConnection)> connections = new();
+    private readonly ConcurrentDictionary<int, (object Lock, SqliteConnection Connection)> connections = new();
 
     /// <summary>
     /// Represents the base directory path used for database file storage in the SQLite Write-Ahead Log (WAL).
@@ -88,12 +90,12 @@ public class SqliteWAL : IWAL, IDisposable
     }
 
     /// <summary>
-    /// Returns the <see cref="ReaderWriterLock"/> and <see cref="SqliteConnection"/> for
+    /// Returns the exclusive lock and <see cref="SqliteConnection"/> for
     /// <paramref name="partitionId"/>, creating them on first access.
     /// </summary>
-    private (ReaderWriterLock, SqliteConnection) TryOpenDatabase(int partitionId)
+    private (object Lock, SqliteConnection Connection) TryOpenDatabase(int partitionId)
     {
-        if (connections.TryGetValue(partitionId, out (ReaderWriterLock readerWriterLock, SqliteConnection connection) connTuple))
+        if (connections.TryGetValue(partitionId, out (object Lock, SqliteConnection Connection) connTuple))
             return connTuple;
 
         semaphore.Wait();
@@ -132,11 +134,11 @@ public class SqliteWAL : IWAL, IDisposable
             using SqliteCommand command3 = new(pragmasQuery, connection);
             command3.ExecuteNonQuery();
 
-            ReaderWriterLock readerWriterLock = new();
+            object partitionLock = new();
 
-            connections.TryAdd(partitionId, (readerWriterLock, connection));
+            connections.TryAdd(partitionId, (partitionLock, connection));
 
-            return (readerWriterLock, connection);
+            return (partitionLock, connection);
         }
         finally
         {
@@ -186,12 +188,10 @@ public class SqliteWAL : IWAL, IDisposable
     /// <returns>A list of <see cref="RaftLog"/> containing the logs retrieved from the partition.</returns>
     public List<RaftLog> ReadLogs(int partitionId)
     {
-        (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
 
-        try
+        lock (partitionLock)
         {
-            readerWriterLock.AcquireReaderLock(TimeSpan.FromSeconds(10));
-
             List<RaftLog> result = [];
 
             long lastCheckpoint = GetLastCheckpointInternal(connection, partitionId);
@@ -199,7 +199,7 @@ public class SqliteWAL : IWAL, IDisposable
             const string query = """
              SELECT id, term, type, logType, log, timeNode, timePhysical, timeCounter
              FROM logs
-             WHERE partitionId = @partitionId AND id > @lastCheckpoint
+             WHERE partitionId = @partitionId AND id >= @lastCheckpoint
              ORDER BY id ASC;
              """;
 
@@ -220,7 +220,7 @@ public class SqliteWAL : IWAL, IDisposable
                     LogType = reader.IsDBNull(3) ? "" : reader.GetString(3),
                     LogData = reader.IsDBNull(4) ? [] : (byte[])reader[4],
                     Time = new(
-                        reader.IsDBNull(5) ? 0 : reader.GetInt32(5), 
+                        reader.IsDBNull(5) ? 0 : reader.GetInt32(5),
                         reader.IsDBNull(6) ? 0 : reader.GetInt64(6),
                         reader.IsDBNull(7) ? 0 : (uint)reader.GetInt64(7)
                     )
@@ -228,10 +228,6 @@ public class SqliteWAL : IWAL, IDisposable
             }
 
             return result;
-        }
-        finally
-        {
-            readerWriterLock.ReleaseReaderLock();
         }
     }
 
@@ -243,12 +239,10 @@ public class SqliteWAL : IWAL, IDisposable
     /// <returns>A list of <see cref="RaftLog"/> objects representing the logs in the specified range.</returns>
     public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex)
     {
-        (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
 
-        try
+        lock (partitionLock)
         {
-            readerWriterLock.AcquireReaderLock(TimeSpan.FromSeconds(10));
-
             List<RaftLog> result = [];
 
             int counter = 0;
@@ -277,7 +271,7 @@ public class SqliteWAL : IWAL, IDisposable
                     LogType = reader.IsDBNull(3) ? "" : reader.GetString(3),
                     LogData = reader.IsDBNull(4) ? [] : (byte[])reader[4],
                     Time = new(
-                        reader.IsDBNull(5) ? 0 : reader.GetInt32(5), 
+                        reader.IsDBNull(5) ? 0 : reader.GetInt32(5),
                         reader.IsDBNull(6) ? 0 : reader.GetInt64(6),
                         reader.IsDBNull(7) ? 0 : (uint)reader.GetInt64(7)
                     )
@@ -290,10 +284,6 @@ public class SqliteWAL : IWAL, IDisposable
             }
 
             return result;
-        }
-        finally
-        {
-            readerWriterLock.ReleaseReaderLock();
         }
     }
 
@@ -336,14 +326,12 @@ public class SqliteWAL : IWAL, IDisposable
             
             foreach (KeyValuePair<int, List<RaftLog>> kv in plan)
             {
-                (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(kv.Key);
+                (object partitionLock, SqliteConnection connection) = TryOpenDatabase(kv.Key);
 
-                try
+                lock (partitionLock)
                 {
-                    readerWriterLock.AcquireWriterLock(TimeSpan.FromSeconds(10));
-
                     using SqliteTransaction transaction = connection.BeginTransaction();
-                    
+
                     using SqliteCommand insertOrReplaceCommand = new(insertOrReplaceSql, connection);
 
                     insertOrReplaceCommand.Transaction = transaction;
@@ -357,7 +345,7 @@ public class SqliteWAL : IWAL, IDisposable
                     insertOrReplaceCommand.Parameters.Add("@timeNode", SqliteType.Integer);
                     insertOrReplaceCommand.Parameters.Add("@timePhysical", SqliteType.Integer);
                     insertOrReplaceCommand.Parameters.Add("@timeCounter", SqliteType.Integer);
-                    
+
                     insertOrReplaceCommand.Prepare();
 
                     try
@@ -394,10 +382,6 @@ public class SqliteWAL : IWAL, IDisposable
                         throw;
                     }
                 }
-                finally
-                {
-                    readerWriterLock.ReleaseWriterLock();
-                }
             }
         } 
         catch (Exception ex)
@@ -419,12 +403,10 @@ public class SqliteWAL : IWAL, IDisposable
     {
         try
         {
-            (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+            (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
 
-            try
+            lock (partitionLock)
             {
-                readerWriterLock.AcquireReaderLock(TimeSpan.FromSeconds(10));
-
                 const string query = "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId";
                 using SqliteCommand command = new(query, connection);
 
@@ -436,16 +418,12 @@ public class SqliteWAL : IWAL, IDisposable
                     return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
 
                 return 0;
-            } 
-            finally
-            {
-                readerWriterLock.ReleaseReaderLock();
             }
         }
         catch (Exception ex)
         {
             logger.LogError("Error during GetMaxLog: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
-            
+
             return 0;
         }
     }
@@ -458,12 +436,10 @@ public class SqliteWAL : IWAL, IDisposable
     /// <param name="partitionId">The identifier of the partition for which the current term is to be retrieved.</param>
     public long GetCurrentTerm(int partitionId)
     {
-        (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
 
-        try
+        lock (partitionLock)
         {
-            readerWriterLock.AcquireReaderLock(TimeSpan.FromSeconds(10));
-
             const string query = "SELECT term FROM logs WHERE partitionId = @partitionId ORDER BY id DESC LIMIT 1";
             using SqliteCommand command = new(query, connection);
 
@@ -476,10 +452,6 @@ public class SqliteWAL : IWAL, IDisposable
 
             return 0;
         }
-        finally
-        {
-            readerWriterLock.ReleaseReaderLock();
-        }
     }
 
     /// <summary>
@@ -489,17 +461,11 @@ public class SqliteWAL : IWAL, IDisposable
     /// <returns>Returns the log index of the last checkpoint within the specified partition.</returns>
     public long GetLastCheckpoint(int partitionId)
     {
-        (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
 
-        try
+        lock (partitionLock)
         {
-            readerWriterLock.AcquireReaderLock(TimeSpan.FromSeconds(10));
-
             return GetLastCheckpointInternal(connection, partitionId);
-        }
-        finally
-        {
-            readerWriterLock.ReleaseReaderLock();
         }
     }
 
@@ -528,36 +494,28 @@ public class SqliteWAL : IWAL, IDisposable
     /// <inheritdoc/>
     public int CountPersistedLogs(int partitionId)
     {
-        (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
 
-        try
+        lock (partitionLock)
         {
-            readerWriterLock.AcquireReaderLock(TimeSpan.FromSeconds(10));
-
             const string query = "SELECT COUNT(*) FROM logs WHERE partitionId = @partitionId";
             using SqliteCommand command = new(query, connection);
             command.Parameters.AddWithValue("@partitionId", partitionId);
             return Convert.ToInt32(command.ExecuteScalar());
-        }
-        finally
-        {
-            readerWriterLock.ReleaseReaderLock();
         }
     }
 
     /// <inheritdoc/>
     public int CountRemovableLogs(int partitionId)
     {
-        long lastCheckpoint = GetLastCheckpoint(partitionId);
+        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
 
-        if (lastCheckpoint <= 0)
-            return 0;
-
-        (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
-
-        try
+        lock (partitionLock)
         {
-            readerWriterLock.AcquireReaderLock(TimeSpan.FromSeconds(10));
+            long lastCheckpoint = GetLastCheckpointInternal(connection, partitionId);
+
+            if (lastCheckpoint <= 0)
+                return 0;
 
             const string query = """
              SELECT COUNT(*)
@@ -568,10 +526,6 @@ public class SqliteWAL : IWAL, IDisposable
             command.Parameters.AddWithValue("@partitionId", partitionId);
             command.Parameters.AddWithValue("@lastCheckpoint", lastCheckpoint);
             return Convert.ToInt32(command.ExecuteScalar());
-        }
-        finally
-        {
-            readerWriterLock.ReleaseReaderLock();
         }
     }
 
@@ -586,62 +540,56 @@ public class SqliteWAL : IWAL, IDisposable
     /// </returns>
     public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
     {
-        (ReaderWriterLock readerWriterLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
-        bool writerLockHeld = false;
+        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
 
         try
         {
-            readerWriterLock.AcquireWriterLock(TimeSpan.FromSeconds(10));
-            writerLockHeld = true;
-
-            using SqliteTransaction transaction = connection.BeginTransaction();
-
-            try
+            lock (partitionLock)
             {
-                const string deleteSql = """
-                 DELETE FROM logs
-                 WHERE partitionId = @partitionId
-                   AND id IN (
-                     SELECT id
-                     FROM logs
-                     WHERE partitionId = @partitionId AND id < @lastCheckpoint
-                     ORDER BY id ASC
-                     LIMIT @limit
-                   );
-                 """;
+                using SqliteTransaction transaction = connection.BeginTransaction();
 
-                using SqliteCommand deleteCommand = new(deleteSql, connection);
+                try
+                {
+                    const string deleteSql = """
+                     DELETE FROM logs
+                     WHERE partitionId = @partitionId
+                       AND id IN (
+                         SELECT id
+                         FROM logs
+                         WHERE partitionId = @partitionId AND id < @lastCheckpoint
+                         ORDER BY id ASC
+                         LIMIT @limit
+                       );
+                     """;
 
-                deleteCommand.Transaction = transaction;
-                deleteCommand.Parameters.AddWithValue("@partitionId", partitionId);
-                deleteCommand.Parameters.AddWithValue("@lastCheckpoint", lastCheckpoint);
-                deleteCommand.Parameters.AddWithValue("@limit", compactNumberEntries);
+                    using SqliteCommand deleteCommand = new(deleteSql, connection);
 
-                int removed = deleteCommand.ExecuteNonQuery();
+                    deleteCommand.Transaction = transaction;
+                    deleteCommand.Parameters.AddWithValue("@partitionId", partitionId);
+                    deleteCommand.Parameters.AddWithValue("@lastCheckpoint", lastCheckpoint);
+                    deleteCommand.Parameters.AddWithValue("@limit", compactNumberEntries);
 
-                transaction.Commit();
+                    int removed = deleteCommand.ExecuteNonQuery();
 
-                if (removed > 0)
-                    logger.LogDebug("Removed {Count} from WAL for partition {PartitionId}", removed, partitionId);
+                    transaction.Commit();
 
-                return (RaftOperationStatus.Success, removed);
-            }
-            catch
-            {
-                transaction.Rollback();
-                throw;
+                    if (removed > 0)
+                        logger.LogDebug("Removed {Count} from WAL for partition {PartitionId}", removed, partitionId);
+
+                    return (RaftOperationStatus.Success, removed);
+                }
+                catch
+                {
+                    transaction.Rollback();
+                    throw;
+                }
             }
         }
         catch (Exception ex)
         {
             logger.LogError("Error during compact: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
-            
+
             return (RaftOperationStatus.Errored, 0);
-        }
-        finally
-        {
-            if (writerLockHeld)
-                readerWriterLock.ReleaseWriterLock();
         }
     }
 
@@ -710,7 +658,7 @@ public class SqliteWAL : IWAL, IDisposable
         semaphore.Dispose();
         metaDataConnection?.Dispose();
         
-        foreach (KeyValuePair<int, (ReaderWriterLock, SqliteConnection)> conn in connections)
-            conn.Value.Item2.Dispose();
+        foreach (KeyValuePair<int, (object Lock, SqliteConnection Connection)> conn in connections)
+            conn.Value.Connection.Dispose();
     }
 }

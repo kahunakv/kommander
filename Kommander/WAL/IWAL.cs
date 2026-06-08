@@ -24,10 +24,12 @@ namespace Kommander.WAL;
 /// <list type="bullet">
 ///   <item><b>RocksDbWAL</b>: Concurrent reads and writes are safe. RocksDB's internal locking serializes
 ///         write batches. Iterators and write batches are per-call and must not be shared across threads.</item>
-///   <item><b>SqliteWAL</b>: Uses a per-partition <see cref="System.Threading.ReaderWriterLock"/> to allow
-///         concurrent reads within a partition while serializing writes. The underlying
-///         <see cref="Microsoft.Data.Sqlite.SqliteConnection"/> is never exposed outside its lock scope.</item>
-///   <item><b>InMemoryWAL</b>: Uses a single global <see cref="System.Threading.ReaderWriterLock"/>. Suitable
+///   <item><b>SqliteWAL</b>: Uses a per-partition exclusive <c>lock</c> that serializes all operations —
+///         reads and writes — for that partition. <see cref="Microsoft.Data.Sqlite.SqliteConnection"/>
+///         wraps a single <c>sqlite3*</c> handle and is not safe for concurrent command execution, so
+///         concurrent reads on the same partition are not permitted. Cross-partition operations can
+///         overlap freely because each partition has its own connection and lock.</item>
+///   <item><b>InMemoryWAL</b>: Uses a single global <see cref="System.Threading.ReaderWriterLockSlim"/>. Suitable
 ///         for tests; does not persist checkpoints or removable log counts.</item>
 /// </list>
 /// </summary>

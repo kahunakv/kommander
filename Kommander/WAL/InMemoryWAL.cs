@@ -5,30 +5,29 @@ using Microsoft.Extensions.Logging;
 namespace Kommander.WAL;
 
 /// <summary>
-/// Keeps a log of all Raft operations in memory
-/// Useful for testing and debugging
+/// Keeps a log of all Raft operations in memory.
+/// Useful for testing and debugging.
 /// </summary>
 public class InMemoryWAL : IWAL, IDisposable
 {
-    private readonly ReaderWriterLock readerWriterLock = new();
-    
+    private readonly ReaderWriterLockSlim rwLock = new(LockRecursionPolicy.NoRecursion);
+
     private readonly Dictionary<string, string> allConfigs = new();
-    
+
     private readonly Dictionary<int, SortedDictionary<long, RaftLog>> allLogs = new();
 
     private readonly ILogger<IRaft> logger;
-    
+
     public InMemoryWAL(ILogger<IRaft> logger)
     {
         this.logger = logger;
     }
-    
+
     public List<RaftLog> ReadLogs(int partitionId)
     {
+        rwLock.EnterReadLock();
         try
         {
-            readerWriterLock.AcquireReaderLock(TimeSpan.FromMilliseconds(5000));
-            
             List<RaftLog> result = [];
 
             if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
@@ -41,18 +40,17 @@ public class InMemoryWAL : IWAL, IDisposable
         }
         finally
         {
-            readerWriterLock.ReleaseReaderLock();    
+            rwLock.ExitReadLock();
         }
     }
 
     public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex)
     {
+        rwLock.EnterReadLock();
         try
         {
-            readerWriterLock.AcquireReaderLock(TimeSpan.FromMilliseconds(5000));
-        
             List<RaftLog> result = [];
-            
+
             if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
             {
                 foreach (KeyValuePair<long, RaftLog> keyValue in partitionLogs)
@@ -66,16 +64,15 @@ public class InMemoryWAL : IWAL, IDisposable
         }
         finally
         {
-            readerWriterLock.ReleaseReaderLock();    
+            rwLock.ExitReadLock();
         }
     }
 
     public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs)
     {
+        rwLock.EnterWriteLock();
         try
         {
-            readerWriterLock.AcquireWriterLock(TimeSpan.FromMilliseconds(5000));
-
             foreach ((int partitionId, List<RaftLog> raftLogs) item in logs)
             {
                 foreach (RaftLog log in item.raftLogs)
@@ -91,16 +88,15 @@ public class InMemoryWAL : IWAL, IDisposable
         }
         finally
         {
-            readerWriterLock.ReleaseWriterLock();
+            rwLock.ExitWriteLock();
         }
     }
 
     public long GetMaxLog(int partitionId)
     {
+        rwLock.EnterReadLock();
         try
         {
-            readerWriterLock.AcquireReaderLock(TimeSpan.FromMilliseconds(5000));
-        
             if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
             {
                 if (partitionLogs.Count > 0)
@@ -111,16 +107,15 @@ public class InMemoryWAL : IWAL, IDisposable
         }
         finally
         {
-            readerWriterLock.ReleaseReaderLock();
+            rwLock.ExitReadLock();
         }
     }
 
     public long GetCurrentTerm(int partitionId)
     {
+        rwLock.EnterReadLock();
         try
         {
-            readerWriterLock.AcquireReaderLock(TimeSpan.FromMilliseconds(5000));
-
             if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
             {
                 if (partitionLogs.Count > 0)
@@ -131,7 +126,7 @@ public class InMemoryWAL : IWAL, IDisposable
         }
         finally
         {
-            readerWriterLock.ReleaseReaderLock();
+            rwLock.ExitReadLock();
         }
     }
 
@@ -142,10 +137,9 @@ public class InMemoryWAL : IWAL, IDisposable
 
     public int CountPersistedLogs(int partitionId)
     {
+        rwLock.EnterReadLock();
         try
         {
-            readerWriterLock.AcquireReaderLock(TimeSpan.FromMilliseconds(5000));
-
             if (!allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
                 return 0;
 
@@ -153,7 +147,7 @@ public class InMemoryWAL : IWAL, IDisposable
         }
         finally
         {
-            readerWriterLock.ReleaseReaderLock();
+            rwLock.ExitReadLock();
         }
     }
 
@@ -164,30 +158,36 @@ public class InMemoryWAL : IWAL, IDisposable
 
     public string? GetMetaData(string key)
     {
+        rwLock.EnterReadLock();
         try
         {
-            readerWriterLock.AcquireReaderLock(TimeSpan.FromMilliseconds(5000));
-
             return allConfigs.GetValueOrDefault(key);
         }
         finally
         {
-            readerWriterLock.ReleaseReaderLock();
+            rwLock.ExitReadLock();
         }
     }
 
     public bool SetMetaData(string key, string value)
     {
-        allConfigs[key] = value;
-        return true;
+        rwLock.EnterWriteLock();
+        try
+        {
+            allConfigs[key] = value;
+            return true;
+        }
+        finally
+        {
+            rwLock.ExitWriteLock();
+        }
     }
 
     public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
     {
+        rwLock.EnterWriteLock();
         try
         {
-            readerWriterLock.AcquireWriterLock(TimeSpan.FromMilliseconds(5000));
-
             if (!allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
                 return (RaftOperationStatus.Success, 0);
 
@@ -211,14 +211,14 @@ public class InMemoryWAL : IWAL, IDisposable
         }
         finally
         {
-            readerWriterLock.ReleaseWriterLock();
+            rwLock.ExitWriteLock();
         }
     }
 
     public void Dispose()
     {
         GC.SuppressFinalize(this);
-        
-        // TODO release managed resources here
+
+        rwLock.Dispose();
     }
 }

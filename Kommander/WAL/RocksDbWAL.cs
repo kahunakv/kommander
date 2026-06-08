@@ -753,8 +753,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 foreach (byte[] log in logsToRemove)
                     writeBatch.Delete(log, cf: columnFamilyHandle);
 
-                // Compaction only removes already superseded history; it does not acknowledge new Raft appends.
-                db.Write(writeBatch);
+                db.Write(writeBatch, writeOptions);
                 
                 logger.LogDebug("Removed {Count} from WAL for partition {PartitionId}", removed, partitionId);
             }
