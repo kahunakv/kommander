@@ -52,4 +52,22 @@ public sealed class KommanderCommandLineOptions
 
     [Option("raft-port", Required = false, HelpText = "Port to bind incoming Raft consensus and replication requests", Default = 2070)]
     public int RaftPort { get; set; } = 2070;
+
+    [Option("node-auth-mode", Required = false, HelpText = "Node authentication mode: Disabled, SharedSecret, MutualTls", Default = "Disabled")]
+    public string NodeAuthMode { get; set; } = "Disabled";
+
+    [Option("node-shared-secret", Required = false, HelpText = "Shared secret for node authentication (SharedSecret mode)")]
+    public string NodeSharedSecret { get; set; } = "";
+
+    [Option("node-auth-header", Required = false, HelpText = "HTTP/gRPC header name for the cluster auth token")]
+    public string NodeAuthHeader { get; set; } = "";
+
+    [Option("allow-insecure-certificate-validation", Required = false, HelpText = "Skip TLS certificate validation (development only)", Default = false)]
+    public bool AllowInsecureCertificateValidation { get; set; }
+
+    [Option("trusted-server-cert-thumbprint", Required = false, HelpText = "Trusted server certificate thumbprints (hex)")]
+    public IEnumerable<string>? TrustedServerCertThumbprints { get; set; }
+
+    [Option("trusted-client-cert-thumbprint", Required = false, HelpText = "Trusted client certificate thumbprints (hex)")]
+    public IEnumerable<string>? TrustedClientCertThumbprints { get; set; }
 }

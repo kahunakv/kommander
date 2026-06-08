@@ -1,4 +1,5 @@
 
+using System.Globalization;
 using Google.Protobuf;
 using Google.Protobuf.Collections;
 using Grpc.Core;
@@ -33,7 +34,8 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<HandshakeResponse> Handshake(RaftManager manager, RaftNode node, HandshakeRequest request)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(node.Endpoint));
+        bool allowInsecure = AllowInsecureCert(manager);
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(node.Endpoint, allowInsecure));
 
         GrpcHandshakeRequest handshake = new()
         {
@@ -43,7 +45,11 @@ public class GrpcCommunication : ICommunication
             Endpoint = request.Endpoint
         };
 
-        GrpcHandshakeResponse response = await client.HandshakeAsync(handshake).ResponseAsync.ConfigureAwait(false);
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Handshake");
+        GrpcHandshakeResponse response = await client
+            .HandshakeAsync(handshake, new CallOptions(metadata))
+            .ResponseAsync
+            .ConfigureAwait(false);
         return new(response.NodeId, response.MaxLogId, response.Endpoint);
     }
     
@@ -57,7 +63,10 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftNode node, RequestVotesRequest request)
     {
-        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(node.Endpoint);
+        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
+            node.Endpoint,
+            BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
+            AllowInsecureCert(manager));
 
         GrpcRequestVotesRequest requestVotes = new()
         {
@@ -103,7 +112,10 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<VoteResponse> Vote(RaftManager manager, RaftNode node, VoteRequest request)
     {
-        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(node.Endpoint);
+        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
+            node.Endpoint,
+            BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
+            AllowInsecureCert(manager));
 
         GrpcVoteRequest voteRequest = new()
         {
@@ -148,7 +160,10 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftNode node, AppendLogsRequest request)
     {
-        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(node.Endpoint);
+        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
+            node.Endpoint,
+            BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
+            AllowInsecureCert(manager));
         
         GrpcAppendLogsRequest appendLogsRequest = GrpcCommunicationPool.RentAppendLogsRequest();
 
@@ -201,7 +216,10 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftNode node, CompleteAppendLogsRequest request)
     {
-        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(node.Endpoint);
+        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
+            node.Endpoint,
+            BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
+            AllowInsecureCert(manager));
         
         GrpcCompleteAppendLogsRequest completeAppendLogsRequest = GrpcCommunicationPool.RentCompleteAppendLogsRequest();
 
@@ -255,8 +273,11 @@ public class GrpcCommunication : ICommunication
     {
         if (request.Requests is null)
             return new();
-        
-        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(node.Endpoint);
+
+        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
+            node.Endpoint,
+            BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
+            AllowInsecureCert(manager));
         
         RepeatedField<GrpcBatchRequestsRequestItem> items = new();
             
@@ -405,6 +426,28 @@ public class GrpcCommunication : ICommunication
         return batchRequestsResponse;
     }
     
+    private static Metadata BuildAuthMetadata(RaftManager manager, string grpcMethod)
+    {
+        RaftTransportSecurityOptions security = manager.Configuration.GetEffectiveTransportSecurity();
+        if (security.NodeAuthenticationMode != RaftNodeAuthenticationMode.SharedSecret)
+            return [];
+
+        RaftTransportAuthenticator authenticator = new(security);
+        RaftTransportAuthenticationHeaders signed = authenticator.Sign("POST", grpcMethod, manager.LocalEndpoint);
+
+        return
+        [
+            new(signed.SignatureHeaderName, signed.Signature),
+            new(RaftTransportAuthenticationHeaders.SenderNodeHeaderName, signed.SenderNode),
+            new(RaftTransportAuthenticationHeaders.TimestampHeaderName,
+                signed.TimestampUnixMilliseconds.ToString(CultureInfo.InvariantCulture)),
+            new(RaftTransportAuthenticationHeaders.NonceHeaderName, signed.Nonce)
+        ];
+    }
+
+    private static bool AllowInsecureCert(RaftManager manager) =>
+        manager.Configuration.GetEffectiveTransportSecurity().AllowInsecureCertificateValidation;
+
     private static IEnumerable<GrpcRaftLog> GetLogs(List<RaftLog> requestLogs)
     {
         foreach (RaftLog requestLog in requestLogs)

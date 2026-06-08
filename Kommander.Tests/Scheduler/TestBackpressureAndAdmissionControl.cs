@@ -170,17 +170,18 @@ public sealed class TestBackpressureAndAdmissionControl
         const int cap = 4;
         using RaftPartitionExecutor executor = BuildExecutor(maxClientQueueDepth: cap);
 
-        // Saturate via a concurrent burst.
-        await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => Task.Run(() =>
+        // Wait for restore so client ops are not gated by RestoreInProgress.
+        await executor.RestoreTask;
+
+        // Keep the queue hot with a continuous background burst while we probe.
+        // We cancel the burst once we have found a synchronous rejection.
+        using CancellationTokenSource burstCts = new();
+        Task burstTask = Task.WhenAll(Enumerable.Range(0, 8).Select(_ => Task.Run(() =>
         {
-            for (int i = 0; i < 2_000; i++)
+            while (!burstCts.IsCancellationRequested)
                 executor.Post(new RaftRequest(RaftRequestType.GetNodeState));
         })));
 
-        Assert.True(executor.TotalClientRejected > 0, "Should have seen at least one rejection");
-
-        // Keep asking until we get a rejection — since the queue is still hot,
-        // we should see a rejection quickly.
         Task<RaftResponse>? rejectedTask = null;
         for (int attempt = 0; attempt < 1_000; attempt++)
         {
@@ -191,6 +192,9 @@ public sealed class TestBackpressureAndAdmissionControl
                 break;
             }
         }
+
+        burstCts.Cancel();
+        await burstTask;
 
         Assert.NotNull(rejectedTask);
         Assert.True(rejectedTask!.IsCompleted, "Rejected Ask must complete synchronously (TCS set in Enqueue)");

@@ -41,6 +41,43 @@ public sealed class RaftService : Rafter.RafterBase
         this.logger = logger;
     }
 
+    private void ValidateAuth(ServerCallContext context)
+    {
+        if (raft is not RaftManager manager)
+            return;
+
+        RaftTransportSecurityOptions security = manager.Configuration.GetEffectiveTransportSecurity();
+        if (security.NodeAuthenticationMode == RaftNodeAuthenticationMode.Disabled)
+            return;
+
+        RaftTransportAuthenticator authenticator = new(security);
+
+        Metadata headers = context.RequestHeaders;
+        string? signature = headers.GetValue(security.HeaderName);
+        string? senderNode = headers.GetValue(RaftTransportAuthenticationHeaders.SenderNodeHeaderName);
+        string? timestamp = headers.GetValue(RaftTransportAuthenticationHeaders.TimestampHeaderName);
+        string? nonce = headers.GetValue(RaftTransportAuthenticationHeaders.NonceHeaderName);
+
+        bool isSecure = context.Host?.StartsWith("https://", StringComparison.OrdinalIgnoreCase) != false
+            || context.Peer?.StartsWith("ipv4:", StringComparison.OrdinalIgnoreCase) == false;
+
+        RaftTransportAuthenticationResult result = authenticator.Validate(
+            "POST",
+            context.Method,
+            bodyBytes: null,
+            signature,
+            senderNode,
+            timestamp,
+            nonce,
+            isSecureTransport: true);
+
+        if (!result.IsAuthenticated)
+        {
+            logger.LogWarning("[RaftService] gRPC auth rejected for {Method}: {Status}", context.Method, result.Status);
+            throw new RpcException(new Status(StatusCode.Unauthenticated, result.Status.ToString()));
+        }
+    }
+
     /// <summary>
     /// Handles a handshake request by delegating to the IRaft implementation, using the details provided in the request.
     /// </summary>
@@ -49,8 +86,8 @@ public sealed class RaftService : Rafter.RafterBase
     /// <returns>A task representing the asynchronous operation, with a result of type GrpcHandshakeResponse.</returns>
     public override async Task<GrpcHandshakeResponse> Handshake(GrpcHandshakeRequest request, ServerCallContext context)
     {
-        //logger.LogDebug("[{LocalEndpoint}/{PartitionId}] Got Vote message from {Endpoint} on Term={Term}", raft.GetLocalEndpoint(), request.Partition, request.Endpoint, request.Term);
-                
+        ValidateAuth(context);
+
         await raft.Handshake(new(
             request.NodeId,
             request.Partition,
@@ -181,12 +218,14 @@ public sealed class RaftService : Rafter.RafterBase
     
     public override async Task BatchRequests(
         IAsyncStreamReader<GrpcBatchRequestsRequest> requestStream,
-        IServerStreamWriter<GrpcBatchRequestsResponse> responseStream, 
+        IServerStreamWriter<GrpcBatchRequestsResponse> responseStream,
         ServerCallContext context
     )
     {
         if (raft is null)
             throw new InvalidOperationException("Raft is null");
+
+        ValidateAuth(context);
 
         try
         {

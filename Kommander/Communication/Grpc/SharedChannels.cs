@@ -43,16 +43,18 @@ public static class SharedChannels
     /// <returns>
     /// A single <see cref="GrpcChannel"/> instance associated with the specified URL.
     /// </returns>
-    public static GrpcChannel GetChannel(string url)
+    public static GrpcChannel GetChannel(string url, bool allowInsecureCertificateValidation = false)
     {
         if (!url.StartsWith("https://") && !url.StartsWith("http://"))
             url = "https://" + url;
-        
-        Lazy<List<GrpcChannel>> urlChannelsLazy = channels.GetOrAdd(url, GetSharedChannels);
+
+        Lazy<List<GrpcChannel>> urlChannelsLazy = channels.GetOrAdd(
+            url,
+            k => new Lazy<List<GrpcChannel>>(() => CreateSharedChannels(k, allowInsecureCertificateValidation)));
 
         List<GrpcChannel> urlChannels = urlChannelsLazy.Value;
-        
-        return urlChannels[Random.Shared.Next(0, urlChannels.Count)];               
+
+        return urlChannels[Random.Shared.Next(0, urlChannels.Count)];
     }
 
     /// <summary>
@@ -63,31 +65,32 @@ public static class SharedChannels
     /// The target URL for retrieving or creating the associated gRPC channels. If the URL does not start
     /// with "https://" or "http://", it is automatically prefixed with "https://".
     /// </param>
+    /// <param name="allowInsecureCertificateValidation">
+    /// When true, skips remote certificate validation. Only set this in development.
+    /// </param>
     /// <returns>
     /// A list of <see cref="GrpcChannel"/> instances associated with the specified URL.
     /// </returns>
-    public static List<GrpcChannel> GetAllChannels(string url)
+    public static List<GrpcChannel> GetAllChannels(string url, bool allowInsecureCertificateValidation = false)
     {
         if (!url.StartsWith("https://") && !url.StartsWith("http://"))
             url = "https://" + url;
-        
-        Lazy<List<GrpcChannel>> urlChannelsLazy = channels.GetOrAdd(url, GetSharedChannels);
+
+        Lazy<List<GrpcChannel>> urlChannelsLazy = channels.GetOrAdd(
+            url,
+            k => new Lazy<List<GrpcChannel>>(() => CreateSharedChannels(k, allowInsecureCertificateValidation)));
 
         return urlChannelsLazy.Value;
     }
     
-    public static GrpcInterSharedStreaming GetStreaming(string url)
+    public static GrpcInterSharedStreaming GetStreaming(string url, Metadata? metadata = null, bool allowInsecureCertificateValidation = false)
     {
-        Lazy<List<GrpcInterSharedStreaming>> lazyStreaming = streamings.GetOrAdd(url, CreateStreaming);
-        
-        List<GrpcInterSharedStreaming> streamingList = lazyStreaming.Value;
-        
-        return streamingList[Random.Shared.Next(0, streamingList.Count)];
-    }
+        Lazy<List<GrpcInterSharedStreaming>> lazyStreaming = streamings.GetOrAdd(
+            url,
+            k => new Lazy<List<GrpcInterSharedStreaming>>(
+                () => CreateAsyncDuplexStreamingCallInternal(k, metadata, allowInsecureCertificateValidation)));
 
-    private static Lazy<List<GrpcInterSharedStreaming>> CreateStreaming(string url)
-    {
-        return new(() => CreateAsyncDuplexStreamingCallInternal(url));
+        return lazyStreaming.Value[Random.Shared.Next(0, lazyStreaming.Value.Count)];
     }
 
     /// <summary>
@@ -102,25 +105,33 @@ public static class SharedChannels
     /// A list of <see cref="GrpcInterSharedStreaming"/> instances, each containing a duplex
     /// streaming call for gRPC batch requests.
     /// </returns>
-    private static List<GrpcInterSharedStreaming> CreateAsyncDuplexStreamingCallInternal(string url)
+    private static List<GrpcInterSharedStreaming> CreateAsyncDuplexStreamingCallInternal(
+        string url,
+        Metadata? metadata,
+        bool allowInsecureCertificateValidation)
     {
         if (!url.StartsWith("https://") && !url.StartsWith("http://"))
             url = "https://" + url;
-        
-        Lazy<List<GrpcChannel>> urlChannelsLazy = channels.GetOrAdd(url, GetSharedChannels);
+
+        Lazy<List<GrpcChannel>> urlChannelsLazy = channels.GetOrAdd(
+            url,
+            k => new Lazy<List<GrpcChannel>>(() => CreateSharedChannels(k, allowInsecureCertificateValidation)));
 
         List<GrpcChannel> urlChannels = urlChannelsLazy.Value;
-        
+
         List<GrpcInterSharedStreaming> streamingList = new(4);
+
+        CallOptions callOptions = metadata is { Count: > 0 } ? new CallOptions(metadata) : default;
 
         for (int i = 0; i < 4; i++)
         {
             Rafter.RafterClient client = new(urlChannels[i]);
 
-            AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming = client.BatchRequests();
+            AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming =
+                client.BatchRequests(callOptions);
 
             _ = ListenForEvents(streaming);
-            
+
             streamingList.Add(new(streaming));
         }
 
@@ -153,17 +164,11 @@ public static class SharedChannels
         }
     }
 
-    private static Lazy<List<GrpcChannel>> GetSharedChannels(string url)
+    private static List<GrpcChannel> CreateSharedChannels(string url, bool allowInsecureCertificateValidation)
     {
-        return new(() => CreateSharedChannels(url));
-    }
-    
-    private static List<GrpcChannel> CreateSharedChannels(string url)
-    {
-        SslClientAuthenticationOptions sslOptions = new()
-        {
-            RemoteCertificateValidationCallback = delegate { return true; }
-        };
+        SslClientAuthenticationOptions sslOptions = new();
+        if (allowInsecureCertificateValidation)
+            sslOptions.RemoteCertificateValidationCallback = delegate { return true; };
 
         SocketsHttpHandler handler = new()
         {

@@ -21,13 +21,34 @@ if (opts is null)
 
 try
 {
+    if (!Enum.TryParse(opts.NodeAuthMode, ignoreCase: true, out RaftNodeAuthenticationMode authMode))
+        throw new RaftException($"Unknown --node-auth-mode value: {opts.NodeAuthMode}");
+
+    if (authMode == RaftNodeAuthenticationMode.SharedSecret && string.IsNullOrWhiteSpace(opts.NodeSharedSecret))
+        throw new RaftException("--node-shared-secret must be set when --node-auth-mode is SharedSecret");
+
+    RaftTransportSecurityOptions transportSecurity = new()
+    {
+        NodeAuthenticationMode = authMode,
+        SharedSecret = string.IsNullOrWhiteSpace(opts.NodeSharedSecret) ? null : opts.NodeSharedSecret,
+        AllowInsecureCertificateValidation = opts.AllowInsecureCertificateValidation,
+        TrustedServerCertificateThumbprints = (IReadOnlyCollection<string>?)opts.TrustedServerCertThumbprints?.ToList()
+            ?? Array.Empty<string>(),
+        TrustedClientCertificateThumbprints = (IReadOnlyCollection<string>?)opts.TrustedClientCertThumbprints?.ToList()
+            ?? Array.Empty<string>()
+    };
+
+    if (!string.IsNullOrWhiteSpace(opts.NodeAuthHeader))
+        transportSecurity.HeaderName = opts.NodeAuthHeader;
+
     RaftConfiguration configuration = new()
     {
         NodeName = string.IsNullOrEmpty(opts.RaftNodeName) ? Environment.MachineName : opts.RaftNodeName,
         NodeId = opts.RaftNodeId,
         Host = opts.RaftHost,
         Port = opts.RaftPort,
-        InitialPartitions = opts.InitialClusterPartitions
+        InitialPartitions = opts.InitialClusterPartitions,
+        TransportSecurity = transportSecurity
     };
 
     List<RaftNode> nodes = [];
@@ -116,7 +137,10 @@ try
     
     ThreadPool.SetMinThreads(128, 128);
     
-    FlurlHttp.Clients.WithDefaults(x => x.ConfigureInnerHandler(ih => ih.ServerCertificateCustomValidationCallback = (a, b, c, d) => true));
+    if (opts.AllowInsecureCertificateValidation)
+        FlurlHttp.Clients.WithDefaults(x =>
+            x.ConfigureInnerHandler(ih =>
+                ih.ServerCertificateCustomValidationCallback = (a, b, c, d) => true));
 
     WebApplication app = builder.Build();
 
