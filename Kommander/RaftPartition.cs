@@ -84,15 +84,35 @@ public sealed class RaftPartition : IDisposable
         internal set => _routingMode = (int)value;
     }
 
-    /// <summary>Current map generation for this partition; bumped on every map mutation.</summary>
-    public long Generation { get; internal set; }
+    private long _generation;
+
+    /// <summary>
+    /// Current map generation; bumped on every partition-map mutation.
+    /// Written by the coordinator thread via <c>StartUserPartitions</c> and read
+    /// by the executor thread's generation-fence closure, so access is
+    /// interlocked to guarantee visibility on ARM64 and other weakly-ordered
+    /// architectures.
+    /// </summary>
+    public long Generation
+    {
+        get => Interlocked.Read(ref _generation);
+        internal set => Interlocked.Exchange(ref _generation, value);
+    }
+
+    private volatile int _state = (int)RaftPartitionState.Active;
 
     /// <summary>
     /// Lifecycle state of this partition as last applied by <c>StartUserPartitions</c>.
     /// Reflects the persisted partition map — <see cref="RaftPartitionState.Draining"/>
     /// means the partition is being merged and should not accept new writes.
+    /// Written by the coordinator thread and read by consumers on other threads,
+    /// so the backing field is volatile.
     /// </summary>
-    public RaftPartitionState State { get; internal set; } = RaftPartitionState.Active;
+    public RaftPartitionState State
+    {
+        get => (RaftPartitionState)_state;
+        internal set => _state = (int)value;
+    }
 
     /// <summary>
     /// Constructor

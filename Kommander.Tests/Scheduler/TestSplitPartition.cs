@@ -23,6 +23,13 @@ namespace Kommander.Tests.Scheduler;
 ///   5. Generation fence holds after full cutover (Phase 2)
 ///   6. Crash mid-split: coordinator detects Splitting pair and resumes Phase 2
 ///   7. Idempotency: a second split on an already-Splitting source is rejected
+///   8. Splitting a Draining partition (mid-merge) is rejected with Errored
+///   9. Explicit target partition id that collides with an existing entry is rejected with Errored
+///  10. Out-of-range HashBoundary (too low, too high) is rejected with Errored
+///  11. Single-element partition (StartRange == EndRange) produces an auto-boundary that is rejected
+///  12. Crash after Phase 1 of an Unrouted split: InitializePartitions resumes Phase 2
+///  13. Unrouted split: both partitions end up Active with Unrouted routing and zero ranges
+///  14. Explicit HashBoundary is honoured: ranges reflect the caller-specified split point
 /// </summary>
 public sealed class TestSplitPartition
 {
@@ -429,5 +436,298 @@ public sealed class TestSplitPartition
         // Guard must have rejected the duplicate: Errored with the current (Splitting) generation.
         Assert.Equal(RaftOperationStatus.Errored, status);
         Assert.Equal(2, gen);
+    }
+
+    // ── Test 8: Split a Draining partition is rejected ────────────────────────
+
+    [Fact]
+    public async Task Split_Draining_IsRejectedWithError()
+    {
+        using RaftManager manager = Build();
+
+        // P1 is Draining with no adjacent Active neighbor.  InitializePartitions crash
+        // recovery will log a warning and skip it (no survivor to pair with), leaving
+        // P1 in Draining state — which lets the split guard fire cleanly.
+        manager.SystemCoordinator.Send(MakeConfigReplicated(
+        [
+            new() { PartitionId = 1, StartRange = 0, EndRange = 999, Generation = 2, State = RaftPartitionState.Draining, RoutingMode = RaftRoutingMode.HashRange },
+        ]));
+        await WaitForIdleAsync(manager);
+
+        manager.SystemCoordinator.ReplicateOverride = AlwaysSucceed();
+        manager.SystemCoordinator.StartPartitionsOverride = ranges => manager.StartUserPartitions(ranges);
+
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        manager.SystemCoordinator.Send(new RaftSystemRequest(
+            1, new RaftSplitPlan { TargetRoutingMode = RaftRoutingMode.HashRange, AutoCommit = false }, tcs));
+        await WaitForIdleAsync(manager);
+
+        (RaftOperationStatus status, long gen) =
+            await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.Equal(RaftOperationStatus.Errored, status);
+        // Generation must be returned as-is; no mutation took place.
+        Assert.Equal(2, gen);
+        Assert.Equal(2, manager.GetPartitionGeneration(1));
+    }
+
+    // ── Test 9: Explicit target id that collides with an existing partition is rejected ─
+
+    [Fact]
+    public async Task Split_ExplicitTargetIdCollision_IsRejectedWithError()
+    {
+        using RaftManager manager = Build();
+
+        manager.SystemCoordinator.Send(MakeConfigReplicated(
+        [
+            new() { PartitionId = 1, StartRange = 0,   EndRange = 499, Generation = 1, State = RaftPartitionState.Active, RoutingMode = RaftRoutingMode.HashRange },
+            new() { PartitionId = 2, StartRange = 500, EndRange = 999, Generation = 1, State = RaftPartitionState.Active, RoutingMode = RaftRoutingMode.HashRange },
+        ]));
+        await WaitForIdleAsync(manager);
+
+        manager.SystemCoordinator.ReplicateOverride = AlwaysSucceed();
+        manager.SystemCoordinator.StartPartitionsOverride = ranges => manager.StartUserPartitions(ranges);
+
+        // Attempt to split P1 with an explicit target id that already belongs to P2.
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        manager.SystemCoordinator.Send(new RaftSystemRequest(
+            1, new RaftSplitPlan { TargetPartitionId = 2, TargetRoutingMode = RaftRoutingMode.HashRange, AutoCommit = false }, tcs));
+        await WaitForIdleAsync(manager);
+
+        (RaftOperationStatus status, long gen) =
+            await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.Equal(RaftOperationStatus.Errored, status);
+
+        // Source partition must be unmodified — no generation bump, no state change.
+        Assert.Equal(1, manager.GetPartitionGeneration(1));
+        Assert.Equal(1, manager.GetPartitionGeneration(2));
+        Assert.Equal(2, manager.Partitions.Count);
+    }
+
+    // ── Test 10: Out-of-range HashBoundary is rejected ────────────────────────
+
+    [Theory]
+    [InlineData(0)]       // boundary == StartRange → source would get EndRange = -1
+    [InlineData(-1)]      // boundary < StartRange
+    [InlineData(1000)]    // boundary > EndRange
+    [InlineData(1001)]    // boundary well beyond EndRange
+    public async Task Split_OutOfRangeHashBoundary_IsRejectedWithError(int boundary)
+    {
+        using RaftManager manager = Build();
+
+        manager.SystemCoordinator.Send(MakeConfigReplicated(
+        [
+            new() { PartitionId = 1, StartRange = 0, EndRange = 999, Generation = 1, State = RaftPartitionState.Active, RoutingMode = RaftRoutingMode.HashRange },
+        ]));
+        await WaitForIdleAsync(manager);
+
+        manager.SystemCoordinator.ReplicateOverride = AlwaysSucceed();
+        manager.SystemCoordinator.StartPartitionsOverride = ranges => manager.StartUserPartitions(ranges);
+
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        manager.SystemCoordinator.Send(new RaftSystemRequest(
+            1, new RaftSplitPlan { HashBoundary = boundary, TargetRoutingMode = RaftRoutingMode.HashRange, AutoCommit = false }, tcs));
+        await WaitForIdleAsync(manager);
+
+        (RaftOperationStatus status, long gen) =
+            await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.Equal(RaftOperationStatus.Errored, status);
+        // Source partition must be completely unmodified.
+        Assert.Equal(1, gen);
+        Assert.Equal(1, manager.GetPartitionGeneration(1));
+        Assert.Equal(1, manager.Partitions.Count);
+    }
+
+    // ── Test 11: Single-element partition cannot be split (auto-boundary) ─────
+
+    [Fact]
+    public async Task Split_SingleElementPartition_IsRejectedWithError()
+    {
+        using RaftManager manager = Build();
+
+        // StartRange == EndRange: midpoint auto-boundary == StartRange, which fails
+        // the splitBoundary <= StartRange check.
+        manager.SystemCoordinator.Send(MakeConfigReplicated(
+        [
+            new() { PartitionId = 1, StartRange = 42, EndRange = 42, Generation = 1, State = RaftPartitionState.Active, RoutingMode = RaftRoutingMode.HashRange },
+        ]));
+        await WaitForIdleAsync(manager);
+
+        manager.SystemCoordinator.ReplicateOverride = AlwaysSucceed();
+        manager.SystemCoordinator.StartPartitionsOverride = ranges => manager.StartUserPartitions(ranges);
+
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        manager.SystemCoordinator.Send(new RaftSystemRequest(
+            1, new RaftSplitPlan { TargetRoutingMode = RaftRoutingMode.HashRange, AutoCommit = false }, tcs));
+        await WaitForIdleAsync(manager);
+
+        (RaftOperationStatus status, long gen) =
+            await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.Equal(RaftOperationStatus.Errored, status);
+        Assert.Equal(1, gen);
+        Assert.Equal(1, manager.GetPartitionGeneration(1));
+        Assert.Equal(1, manager.Partitions.Count);
+    }
+
+    // ── Test 12: Crash after Phase 1 of Unrouted split — coordinator resumes Phase 2 ─
+
+    [Fact]
+    public async Task Split_Unrouted_CrashAfterPhase1_InitializePartitionsResumesPhase2()
+    {
+        using RaftManager manager = Build();
+
+        // Simulate persisted state after a crash mid-split of an Unrouted partition.
+        // Both source and target have StartRange = EndRange = 0, so range-adjacency
+        // matching cannot pair them — the fix uses routing-mode matching instead.
+        List<RaftPartitionRange> splittingMap =
+        [
+            new() { PartitionId = 1, StartRange = 0, EndRange = 0, Generation = 2, State = RaftPartitionState.Splitting, RoutingMode = RaftRoutingMode.Unrouted },
+            new() { PartitionId = 2, StartRange = 0, EndRange = 0, Generation = 1, State = RaftPartitionState.Splitting, RoutingMode = RaftRoutingMode.Unrouted },
+        ];
+
+        manager.SystemCoordinator.ReplicateOverride = AlwaysSucceed();
+
+        TaskCompletionSource done = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        List<RaftPartitionRange>? recoveredRanges = null;
+        manager.SystemCoordinator.StartPartitionsOverride = ranges =>
+        {
+            manager.StartUserPartitions(ranges);
+            if (ranges.Count > 0 && ranges.All(r => r.State == RaftPartitionState.Active))
+            {
+                recoveredRanges = [..ranges];
+                done.TrySetResult();
+            }
+        };
+
+        manager.SystemCoordinator.Send(MakeConfigReplicated(splittingMap, mapVersion: 2));
+        await done.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.NotNull(recoveredRanges);
+        Assert.Equal(2, recoveredRanges.Count);
+        Assert.All(recoveredRanges, r => Assert.Equal(RaftPartitionState.Active, r.State));
+        Assert.All(recoveredRanges, r => Assert.Equal(RaftRoutingMode.Unrouted, r.RoutingMode));
+
+        // Phase 2 bumps both generations: source 2→3, target 1→2.
+        Assert.Equal(3, recoveredRanges.Single(r => r.PartitionId == 1).Generation);
+        Assert.Equal(2, recoveredRanges.Single(r => r.PartitionId == 2).Generation);
+
+        Assert.True(manager.Partitions.ContainsKey(1));
+        Assert.True(manager.Partitions.ContainsKey(2));
+    }
+
+    // ── Test 13: Unrouted split — full happy-path ──────────────────────────────
+
+    [Fact]
+    public async Task Split_Unrouted_BothPartitionsActiveWithUnroutedRoutingMode()
+    {
+        using RaftManager manager = Build();
+
+        manager.SystemCoordinator.Send(MakeConfigReplicated(
+        [
+            new() { PartitionId = 1, StartRange = 0, EndRange = 0, Generation = 1, State = RaftPartitionState.Active, RoutingMode = RaftRoutingMode.Unrouted },
+        ]));
+        await WaitForIdleAsync(manager);
+
+        manager.SystemCoordinator.ReplicateOverride = AlwaysSucceed();
+
+        TaskCompletionSource done = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        int startCount = 0;
+        List<RaftPartitionRange>? finalRanges = null;
+        manager.SystemCoordinator.StartPartitionsOverride = ranges =>
+        {
+            manager.StartUserPartitions(ranges);
+            if (++startCount == 2)
+            {
+                finalRanges = [..ranges];
+                done.TrySetResult();
+            }
+        };
+
+        manager.SystemCoordinator.Send(new RaftSystemRequest(
+            1, new RaftSplitPlan { TargetRoutingMode = RaftRoutingMode.Unrouted, AutoCommit = true }));
+        await done.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.NotNull(finalRanges);
+        Assert.Equal(2, finalRanges.Count);
+
+        // Both partitions are Active after Phase 2.
+        Assert.All(finalRanges, r => Assert.Equal(RaftPartitionState.Active, r.State));
+        Assert.All(finalRanges, r => Assert.Equal(RaftRoutingMode.Unrouted, r.RoutingMode));
+
+        // Unrouted partitions have no meaningful hash range — both start/end at zero.
+        Assert.All(finalRanges, r => Assert.Equal(0, r.StartRange));
+        Assert.All(finalRanges, r => Assert.Equal(0, r.EndRange));
+
+        // Source keeps its original range (no shrink in Unrouted split).
+        RaftPartitionRange src = finalRanges.Single(r => r.PartitionId == 1);
+        Assert.Equal(3, src.Generation); // Phase1: 1→2, Phase2: 2→3
+
+        // Target starts at generation 2 after Phase 2.
+        RaftPartitionRange tgt = finalRanges.Single(r => r.PartitionId != 1);
+        Assert.Equal(2, tgt.Generation); // Phase1: gen=1, Phase2: 1→2
+
+        Assert.Equal(2, manager.Partitions.Count);
+    }
+
+    // ── Test 14: Explicit HashBoundary is honoured ─────────────────────────────
+
+    [Fact]
+    public async Task Split_ExplicitHashBoundary_RangesReflectCallerSpecifiedSplitPoint()
+    {
+        using RaftManager manager = Build();
+
+        manager.SystemCoordinator.Send(MakeConfigReplicated(
+        [
+            new() { PartitionId = 1, StartRange = 0, EndRange = 999, Generation = 1, State = RaftPartitionState.Active, RoutingMode = RaftRoutingMode.HashRange },
+        ]));
+        await WaitForIdleAsync(manager);
+
+        manager.SystemCoordinator.ReplicateOverride = AlwaysSucceed();
+
+        TaskCompletionSource done = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        int startCount = 0;
+        List<RaftPartitionRange>? finalRanges = null;
+        manager.SystemCoordinator.StartPartitionsOverride = ranges =>
+        {
+            manager.StartUserPartitions(ranges);
+            if (++startCount == 2)
+            {
+                finalRanges = [..ranges];
+                done.TrySetResult();
+            }
+        };
+
+        // Split at boundary 200: source keeps [0,199], target gets [200,999].
+        manager.SystemCoordinator.Send(new RaftSystemRequest(
+            1, new RaftSplitPlan { HashBoundary = 200, TargetRoutingMode = RaftRoutingMode.HashRange, AutoCommit = true }));
+        await done.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.NotNull(finalRanges);
+        Assert.Equal(2, finalRanges.Count);
+
+        List<RaftPartitionRange> sorted = [..finalRanges.OrderBy(r => r.StartRange)];
+
+        // Source (P1) owns exactly [0, 199].
+        Assert.Equal(0,   sorted[0].StartRange);
+        Assert.Equal(199, sorted[0].EndRange);
+        Assert.Equal(1,   sorted[0].PartitionId);
+
+        // Target owns exactly [200, 999].
+        Assert.Equal(200, sorted[1].StartRange);
+        Assert.Equal(999, sorted[1].EndRange);
+
+        // No gap between the two halves.
+        Assert.Equal(sorted[0].EndRange + 1, sorted[1].StartRange);
+
+        // Both Active after Phase 2.
+        Assert.All(sorted, r => Assert.Equal(RaftPartitionState.Active, r.State));
+        Assert.All(sorted, r => Assert.Equal(RaftRoutingMode.HashRange, r.RoutingMode));
     }
 }

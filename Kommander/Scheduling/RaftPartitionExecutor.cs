@@ -705,7 +705,22 @@ public sealed class RaftPartitionExecutor : IDisposable
         List<(List<RaftLog>? Logs, bool AutoCommit, ulong? ReplyCorrelationId)> batch = new(ops.Count);
 
         foreach (PendingOperation op in ops)
-            batch.Add((op.Request.Logs, op.Request.AutoCommit, RegisterReply(op)));
+        {
+            RaftRequest req = op.Request;
+
+            // Mirror the generation fence in ExecuteOneAsync: a fenced write whose
+            // expected generation doesn't match the current partition generation must be
+            // rejected even when it lands in a batch drain cycle.
+            if (req.ExpectedGeneration != 0 &&
+                _getGeneration is { } getGen &&
+                getGen() != req.ExpectedGeneration)
+            {
+                op.Reply?.TrySetResult(RaftResponseStatic.PartitionMovedResponse);
+                continue;
+            }
+
+            batch.Add((req.Logs, req.AutoCommit, RegisterReply(op)));
+        }
 
         ValueStopwatch sw = ValueStopwatch.StartNew();
         try

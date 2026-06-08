@@ -291,9 +291,16 @@ internal sealed class RaftSystemCoordinator : IDisposable
         foreach (RaftPartitionRange target in splitting.Where(r => r.Generation == 1))
         {
             // For HashRange splits: source.EndRange + 1 == target.StartRange after Phase 1 shrink.
-            RaftPartitionRange? source = splitting.FirstOrDefault(r =>
-                r.PartitionId != target.PartitionId &&
-                r.EndRange + 1 == target.StartRange);
+            // For Unrouted splits: both source and target have StartRange = EndRange = 0, so the
+            // range-adjacency condition (source.EndRange + 1 == 0) can never be satisfied.
+            // Match by routing mode instead — any other Splitting Unrouted entry is the source.
+            RaftPartitionRange? source = target.RoutingMode == RaftRoutingMode.HashRange
+                ? splitting.FirstOrDefault(r =>
+                    r.PartitionId != target.PartitionId &&
+                    r.EndRange + 1 == target.StartRange)
+                : splitting.FirstOrDefault(r =>
+                    r.PartitionId != target.PartitionId &&
+                    r.RoutingMode == RaftRoutingMode.Unrouted);
 
             if (source is not null && !_pendingSplits.ContainsKey(source.PartitionId))
             {
@@ -472,6 +479,18 @@ internal sealed class RaftSystemCoordinator : IDisposable
             return;
         }
 
+        // A Draining partition is mid-merge and must not be split — that would create a
+        // sub-range from a partition scheduled for removal.  A Removed partition is a
+        // tombstone and no longer owns any range.
+        if (partitionRange.State != RaftPartitionState.Active)
+        {
+            logger.LogError(
+                "TrySplitPartition: Partition {Id} cannot be split (State={State})",
+                partitionId, partitionRange.State);
+            completion?.TrySetResult((RaftOperationStatus.Errored, partitionRange.Generation));
+            return;
+        }
+
         // Resolve target partition id: explicit plan value if non-zero, else auto-assign.
         RaftPartitionRange? maxPartition = ranges.MaxBy(r => r.PartitionId);
         if (maxPartition is null)
@@ -485,6 +504,15 @@ internal sealed class RaftSystemCoordinator : IDisposable
             ? plan.TargetPartitionId
             : maxPartition.PartitionId + 1;
 
+        if (ranges.Any(r => r.PartitionId == targetPartitionId))
+        {
+            logger.LogError(
+                "TrySplitPartition: Target partition id {Id} already exists in map",
+                targetPartitionId);
+            completion?.TrySetResult((RaftOperationStatus.Errored, partitionRange.Generation));
+            return;
+        }
+
         RaftRoutingMode targetRoutingMode = plan?.TargetRoutingMode ?? RaftRoutingMode.HashRange;
 
         // Capture the original end before shrinking.
@@ -495,6 +523,19 @@ internal sealed class RaftSystemCoordinator : IDisposable
         {
             splitBoundary = plan?.HashBoundary
                 ?? (partitionRange.StartRange + (partitionRange.EndRange - partitionRange.StartRange) / 2);
+
+            // Boundary must split the range into two non-empty halves.
+            // splitBoundary <= StartRange → source gets an inverted range (EndRange < StartRange).
+            // splitBoundary > EndRange    → target starts beyond the source's current end.
+            // StartRange == EndRange      → midpoint == StartRange, same as the <= case.
+            if (splitBoundary <= partitionRange.StartRange || splitBoundary > partitionRange.EndRange)
+            {
+                logger.LogError(
+                    "TrySplitPartition: HashBoundary {B} is outside ({S},{E}]",
+                    splitBoundary, partitionRange.StartRange, partitionRange.EndRange);
+                completion?.TrySetResult((RaftOperationStatus.Errored, partitionRange.Generation));
+                return;
+            }
 
             // Shrink the existing partition so it no longer owns [splitBoundary, originalEnd].
             partitionRange.EndRange = splitBoundary - 1;
@@ -622,6 +663,19 @@ internal sealed class RaftSystemCoordinator : IDisposable
             logger.LogError(
                 "TrySplitPartitionCommit: Target partition {Id} not found", split.TargetPartitionId);
             split.Completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+            return;
+        }
+
+        // Guard against double-execution: if a previous Phase 2 already ran (e.g. a stale
+        // retry or a manual re-enqueue), both partitions will be Active rather than Splitting.
+        // Re-running would corrupt generations and replicate a stale map version.
+        if (sourceRange.State != RaftPartitionState.Splitting || targetRange.State != RaftPartitionState.Splitting)
+        {
+            logger.LogWarning(
+                "TrySplitPartitionCommit: Unexpected states (source={SrcState}, target={TgtState}); skipping duplicate Phase 2",
+                sourceRange.State, targetRange.State);
+            _pendingSplits.Remove(sourcePartitionId);
+            split.Completion?.TrySetResult((RaftOperationStatus.Success, targetRange.Generation));
             return;
         }
 

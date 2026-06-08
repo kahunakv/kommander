@@ -21,6 +21,10 @@ namespace Kommander.Tests.Scheduler;
 /// <c>Generation</c>. These tests verify the full path from
 /// <c>RaftPartition.ReplicateLogs</c> through the executor fence check.
 ///
+/// The batch path (<c>ExecuteBatchAsync</c>) is also covered: two fenced writes
+/// dispatched concurrently land in the same drain cycle and must both be
+/// checked — a stale write must receive <c>PartitionMoved</c> even in a batch.
+///
 /// All tests use the coordinator-override harness (no real Raft quorum).
 /// Leadership is simulated by setting <c>partition.Leader</c> directly,
 /// which is legal here because <c>Kommander.Tests</c> is an
@@ -258,5 +262,141 @@ public sealed class TestGenerationFence
         List<RaftPartitionRange> mutableCopy = map.ToList();
         mutableCopy.Clear();
         Assert.Equal(2, manager.GetPartitionMap().Count);
+    }
+
+    // ── OnPartitionMapChanged ─────────────────────────────────────────────────
+    //
+    // Task 3.4 acceptance criterion: a subscriber registered before a partition map
+    // change receives the event with the updated snapshot.  CreatePartitionAsync
+    // goes through the same StartUserPartitions → OnPartitionMapChanged chain as
+    // ConfigReplicated, so the harness tests below cover the same code path without
+    // requiring a real Raft quorum.
+
+    /// <summary>
+    /// A handler subscribed before <c>ConfigReplicated</c> is applied receives
+    /// exactly one event with a snapshot that reflects the new map.
+    /// </summary>
+    [Fact]
+    public async Task OnPartitionMapChanged_FiredOnceWithCorrectSnapshot()
+    {
+        using RaftManager manager = Build();
+
+        List<IReadOnlyList<RaftPartitionRange>> received = [];
+        manager.OnPartitionMapChanged += snap => received.Add(snap);
+
+        manager.SystemCoordinator.Send(MakeConfigReplicated(
+        [
+            new() { PartitionId = 1, StartRange = 0, EndRange = 499, Generation = 3, State = RaftPartitionState.Active, RoutingMode = RaftRoutingMode.HashRange },
+            new() { PartitionId = 2, StartRange = 500, EndRange = 999, Generation = 7, State = RaftPartitionState.Active, RoutingMode = RaftRoutingMode.HashRange },
+        ]));
+        await WaitForIdleAsync(manager);
+
+        Assert.Single(received);
+
+        IReadOnlyList<RaftPartitionRange> snap = received[0];
+        Assert.Equal(2, snap.Count);
+        Assert.Contains(snap, r => r.PartitionId == 1 && r.Generation == 3);
+        Assert.Contains(snap, r => r.PartitionId == 2 && r.Generation == 7);
+    }
+
+    /// <summary>
+    /// Each distinct map update fires a separate event; the subscriber receives
+    /// notifications in order with the correct generation values.
+    /// </summary>
+    [Fact]
+    public async Task OnPartitionMapChanged_FiredForEveryMapUpdate()
+    {
+        using RaftManager manager = Build();
+
+        List<IReadOnlyList<RaftPartitionRange>> received = [];
+        manager.OnPartitionMapChanged += snap => received.Add(snap);
+
+        manager.SystemCoordinator.Send(MakeConfigReplicated(
+        [
+            new() { PartitionId = 1, StartRange = 0, EndRange = int.MaxValue, Generation = 1, State = RaftPartitionState.Active, RoutingMode = RaftRoutingMode.HashRange },
+        ]));
+        await WaitForIdleAsync(manager);
+
+        manager.SystemCoordinator.Send(MakeConfigReplicated(
+        [
+            new() { PartitionId = 1, StartRange = 0, EndRange = int.MaxValue, Generation = 5, State = RaftPartitionState.Active, RoutingMode = RaftRoutingMode.HashRange },
+        ], mapVersion: 2));
+        await WaitForIdleAsync(manager);
+
+        Assert.Equal(2, received.Count);
+        Assert.Equal(1, received[0].Single(r => r.PartitionId == 1).Generation);
+        Assert.Equal(5, received[1].Single(r => r.PartitionId == 1).Generation);
+    }
+
+    /// <summary>
+    /// Mutating the snapshot delivered by <c>OnPartitionMapChanged</c> has no
+    /// effect on the live partition map returned by <see cref="IRaft.GetPartitionMap"/>.
+    /// </summary>
+    [Fact]
+    public async Task OnPartitionMapChanged_SnapshotIsIsolated_MutationsDoNotAffectLiveMap()
+    {
+        using RaftManager manager = Build();
+
+        IReadOnlyList<RaftPartitionRange>? delivered = null;
+        manager.OnPartitionMapChanged += snap => delivered = snap;
+
+        manager.SystemCoordinator.Send(MakeConfigReplicated(
+        [
+            new() { PartitionId = 1, StartRange = 0, EndRange = int.MaxValue, Generation = 2, State = RaftPartitionState.Active, RoutingMode = RaftRoutingMode.HashRange },
+        ]));
+        await WaitForIdleAsync(manager);
+
+        Assert.NotNull(delivered);
+
+        // Wipe the delivered snapshot's backing list.
+        List<RaftPartitionRange> mutable = delivered!.ToList();
+        mutable.Clear();
+
+        // Live map must be unaffected.
+        Assert.Equal(1, manager.GetPartitionMap().Count);
+        Assert.Equal(2, manager.GetPartitionGeneration(1));
+    }
+
+    /// <summary>
+    /// Two fenced writes are dispatched without awaiting between them so they
+    /// arrive in the executor's replication queue together.  The executor may
+    /// drain both in one <c>ExecuteBatchAsync</c> call.  The write whose
+    /// <c>expectedGeneration</c> is stale must receive <c>PartitionMoved</c>;
+    /// the write whose generation matches must not.
+    ///
+    /// Regression for the batch-path fence gap: before the fix, stale writes that
+    /// landed in a batch bypassed the fence entirely because <c>ExecuteBatchAsync</c>
+    /// never read <c>ExpectedGeneration</c>.  After the fix the fence fires
+    /// per-item before the item is added to the batch, so batching cannot hide a
+    /// stale generation.
+    /// </summary>
+    [Fact]
+    public async Task ReplicateLogs_ConcurrentFencedWrites_StaleWriteReceivesPartitionMoved()
+    {
+        using RaftManager manager = Build();
+
+        // Start at gen=2 so the stale generation (1) is non-zero and triggers the fence.
+        manager.SystemCoordinator.Send(MakeConfigReplicated(OnePartition(gen: 2)));
+        await WaitForIdleAsync(manager);
+
+        RaftPartition partition = manager.Partitions[1];
+        await SimulateLeaderAsync(manager, partition);
+
+        long currentGen = manager.GetPartitionGeneration(1);  // == 2
+
+        // Fire both writes without awaiting between them.  They arrive in the queue
+        // together and the executor may pick them up in the same drain batch.
+        Task<(bool, RaftOperationStatus, HLCTimestamp)> validTask =
+            partition.ReplicateLogs("test", "valid"u8.ToArray(), autoCommit: true, expectedGeneration: currentGen);
+        Task<(bool, RaftOperationStatus, HLCTimestamp)> staleTask =
+            partition.ReplicateLogs("test", "stale"u8.ToArray(), autoCommit: true, expectedGeneration: currentGen - 1);
+
+        (bool _, RaftOperationStatus validStatus, _) = await validTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        (bool _, RaftOperationStatus staleStatus, _) = await staleTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        // Valid write must not be rejected by the fence.
+        Assert.NotEqual(RaftOperationStatus.PartitionMoved, validStatus);
+        // Stale write must always be rejected — including when it lands in a batch.
+        Assert.Equal(RaftOperationStatus.PartitionMoved, staleStatus);
     }
 }

@@ -91,9 +91,17 @@ public interface IRaft
     public event Func<int, string, Task<bool>>? OnLeaderChanged;
 
     /// <summary>
-    /// Fired on the <see cref="RaftSystemCoordinator"/> thread every time
-    /// <c>StartUserPartitions</c> applies a new partition map — after
-    /// <c>ConfigReplicated</c>, <c>ConfigRestored</c>, or <c>LeaderChanged</c>.
+    /// Fired every time <c>StartUserPartitions</c> applies a new partition map —
+    /// after <c>ConfigReplicated</c>, <c>ConfigRestored</c>, <c>LeaderChanged</c>,
+    /// or any split / merge phase transition.
+    /// <para>
+    /// <b>Threading:</b> the event fires on whichever thread calls
+    /// <c>StartUserPartitions</c>.  In production that is always the
+    /// <see cref="RaftSystemCoordinator"/>'s single-consumer loop, so handlers
+    /// receive notifications serially and must not block or re-enter the
+    /// coordinator.  In tests <c>StartUserPartitions</c> may be called from any
+    /// thread via the <c>StartPartitionsOverride</c> hook.
+    /// </para>
     /// The argument is a point-in-time snapshot; mutating it has no effect on the live map.
     /// </summary>
     public event Action<IReadOnlyList<RaftPartitionRange>>? OnPartitionMapChanged;

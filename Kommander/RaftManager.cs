@@ -1476,7 +1476,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
         RaftSplitPlan effectivePlan = new()
         {
-            TargetPartitionId = targetPartitionId,
+            // Method parameter takes precedence; fall back to plan.TargetPartitionId so a
+            // caller who passes only the plan (leaving targetPartitionId at its default 0)
+            // still has their explicit id honoured.
+            TargetPartitionId = targetPartitionId > 0 ? targetPartitionId : (plan?.TargetPartitionId ?? 0),
             TargetRoutingMode = plan?.TargetRoutingMode ?? RaftRoutingMode.HashRange,
             HashBoundary      = plan?.HashBoundary,
             AutoCommit        = true
