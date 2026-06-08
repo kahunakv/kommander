@@ -14,4 +14,10 @@ public enum RaftOperationStatus
     ProposalTimeout = 8,
     ReplicationFailed = 9,
     Pending = 10,
+
+    /// <summary>
+    /// The per-partition client proposal queue is full.
+    /// The caller should back off and retry after a delay.
+    /// </summary>
+    ProposalQueueFull = 11,
 }

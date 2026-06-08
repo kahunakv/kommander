@@ -66,7 +66,7 @@ public class TestElectionSafety
         };
 
         // Term-1 votes should not count towards term-2 quorum.
-        Assert.Equal(1, votes[2].Count);
+        Assert.Single(votes[2]);
         Assert.Equal(2, votes[1].Count);
     }
 

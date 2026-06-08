@@ -94,7 +94,7 @@ public sealed class TestRaftPartitionExecutor
                 _ => { },           // no-op completion callback
                 operationId: 0,
                 WALWriteOperationType.LeaderPropose,
-                (partitionId: 0, logs: [])
+                (0, [])
             );
     }
 
@@ -139,10 +139,6 @@ public sealed class TestRaftPartitionExecutor
     {
         const int threadCount = 8;
         const int postsPerThread = 50;
-
-        int concurrentCount = 0;
-        int maxConcurrency = 0;
-        int totalExecuted = 0;
 
         // We use CheckLeader (control) as the operation type since it calls the
         // state machine synchronously — it never touches the WAL, so it returns
@@ -251,7 +247,7 @@ public sealed class TestRaftPartitionExecutor
     {
         var (executor, _, _) = BuildExecutor(partitionId: 2);
 
-        RaftResponse response = await executor.Ask(new RaftRequest(RaftRequestType.GetNodeState));
+        RaftResponse response = await executor.Ask(new RaftRequest(RaftRequestType.GetNodeState), TestContext.Current.CancellationToken);
 
         executor.Stop();
 
@@ -275,7 +271,7 @@ public sealed class TestRaftPartitionExecutor
             executor.Post(new RaftRequest(RaftRequestType.CheckLeader));
 
         // Allow a short time for the executor to start processing.
-        await Task.Delay(20);
+        await Task.Delay(20, TestContext.Current.CancellationToken);
 
         // Stop will drain and then join the worker.
         executor.Stop();
@@ -337,7 +333,7 @@ public sealed class TestRaftPartitionExecutor
         executor.Stop();
         executor.ResetTestingState();
 
-        await Task.Delay(10);
+        await Task.Delay(10, TestContext.Current.CancellationToken);
         await sm.CheckPartitionLeadershipAsync();
 
         Assert.Collection(host.EnqueuedResponses, message =>

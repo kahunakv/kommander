@@ -243,7 +243,7 @@ public sealed class TestRaftTransportDispatcher
             dispatcher.Enqueue("node-a:8001", MakeVote("node-a:8001"));
 
             // Wait until the worker is confirmed blocked — deterministic synchronisation.
-            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
             // Enqueue more messages while the worker is blocked: they accumulate.
             dispatcher.Enqueue("node-a:8001", MakeVote("node-a:8001"));

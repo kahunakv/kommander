@@ -229,7 +229,13 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         transportDispatcher = new Communication.RaftTransportDispatcher(this, communication, Logger);
 
         readScheduler = new(logger, configuration.ReadIOThreads);
-        walScheduler = new(walAdapter, logger, configuration.WriteIOThreads);
+        walScheduler = new(
+            walAdapter,
+            logger,
+            configuration.WriteIOThreads,
+            configuration.MaxWalQueueDepthPerPartition,
+            configuration.MaxWalBatchSize,
+            configuration.MaxGlobalWalQueueDepth);
 
         OnSystemLogRestored += SystemLogRestored;
         OnSystemReplicationReceived += SystemReplicationReceived;

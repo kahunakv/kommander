@@ -207,7 +207,7 @@ public sealed class TestFairWalScheduler
         }
 
         // Stop after all ops are enqueued; workers must drain completely.
-        await Task.Run(scheduler.Stop);
+        await Task.Run(scheduler.Stop, TestContext.Current.CancellationToken);
 
         Assert.Equal(total, completed.Count);
     }

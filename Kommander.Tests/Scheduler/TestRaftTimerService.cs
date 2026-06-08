@@ -149,7 +149,6 @@ public sealed class TestRaftTimerService
     [Fact]
     public void TriggerCheckLeader_AfterStop_IsNoOp()
     {
-        int checkLeaderCalls = 0;
         DelegatingTimerHost host = new(
             joinedGetter: () => true,
             partitionsGetter: () => [],          // We count via the delegate below

@@ -1,6 +1,7 @@
-
+using System.Text;
 using Kommander.Data;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
 
 namespace Kommander.Communication.Rest;
 
@@ -8,6 +9,17 @@ public static class RestCommunicationExtensions
 {
     public static void MapRestRaftRoutes(this WebApplication app)
     {
+        app.UseWhen(
+            context => context.Request.Path.StartsWithSegments("/v1/raft"),
+            branch => branch.Use(async (context, next) =>
+            {
+                IRaft? raft = context.RequestServices.GetService(typeof(IRaft)) as IRaft;
+                if (!await AuthorizeRequestAsync(context, raft).ConfigureAwait(false))
+                    return;
+
+                await next(context).ConfigureAwait(false);
+            }));
+
         app.MapPost("/v1/raft/handshake", async (HandshakeRequest request, IRaft raft) =>
         {
             await raft.Handshake(request);
@@ -116,5 +128,72 @@ public static class RestCommunicationExtensions
         {
             return await raft.WaitForLeader(partitionId, CancellationToken.None).ConfigureAwait(false);
         });
+    }
+
+    internal static async Task<RaftTransportAuthenticationResult> AuthenticateRequestAsync(
+        HttpContext context,
+        RaftConfiguration configuration)
+    {
+        RaftTransportSecurityOptions transportSecurity = configuration.GetEffectiveTransportSecurity();
+        RaftTransportAuthenticator authenticator = new(transportSecurity);
+
+        if (transportSecurity.NodeAuthenticationMode == RaftNodeAuthenticationMode.Disabled)
+        {
+            return new RaftTransportAuthenticationResult
+            {
+                Status = RaftTransportAuthenticationStatus.Disabled
+            };
+        }
+
+        byte[] bodyBytes = await ReadRequestBodyAsync(context.Request).ConfigureAwait(false);
+
+        context.Request.Headers.TryGetValue(transportSecurity.HeaderName, out var signatureValues);
+        context.Request.Headers.TryGetValue(
+            RaftTransportAuthenticationHeaders.SenderNodeHeaderName,
+            out var senderNodeValues);
+        context.Request.Headers.TryGetValue(
+            RaftTransportAuthenticationHeaders.TimestampHeaderName,
+            out var timestampValues);
+        context.Request.Headers.TryGetValue(
+            RaftTransportAuthenticationHeaders.NonceHeaderName,
+            out var nonceValues);
+
+        return authenticator.Validate(
+            context.Request.Method,
+            context.Request.Path.Value ?? string.Empty,
+            bodyBytes,
+            signatureValues.ToString(),
+            senderNodeValues.ToString(),
+            timestampValues.ToString(),
+            nonceValues.ToString(),
+            context.Request.IsHttps);
+    }
+
+    internal static async Task<bool> AuthorizeRequestAsync(HttpContext context, IRaft? raft)
+    {
+        if (raft is not RaftManager manager)
+        {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            return false;
+        }
+
+        RaftTransportAuthenticationResult authenticationResult =
+            await AuthenticateRequestAsync(context, manager.Configuration).ConfigureAwait(false);
+
+        if (authenticationResult.IsAuthenticated)
+            return true;
+
+        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        return false;
+    }
+
+    private static async Task<byte[]> ReadRequestBodyAsync(HttpRequest request)
+    {
+        request.EnableBuffering();
+
+        using MemoryStream buffer = new();
+        await request.Body.CopyToAsync(buffer).ConfigureAwait(false);
+        request.Body.Position = 0;
+        return buffer.ToArray();
     }
 }

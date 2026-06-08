@@ -118,7 +118,16 @@ public sealed class RaftPartition : IDisposable
         IRaftWalFacade wal = new RaftWalFacadeAdapter(walHandler);
         RaftPartitionStateMachine stateMachine = new(host, wal, replySink, logger);
 
-        executor = new RaftPartitionExecutor(stateMachine, partitionId, slowThresholdMs: 500, logger);
+        executor = new RaftPartitionExecutor(
+            stateMachine,
+            partitionId,
+            slowThresholdMs: manager.Configuration.SlowRaftStateMachineLog,
+            logger,
+            maxClientQueueDepth:     manager.Configuration.MaxQueuedClientProposalsPerPartition,
+            drainQuantumControl:     manager.Configuration.MaxDrainQuantumControl,
+            drainQuantumReplication: manager.Configuration.MaxDrainQuantumReplication,
+            drainQuantumClient:      manager.Configuration.MaxDrainQuantumClient,
+            drainQuantumMaintenance: manager.Configuration.MaxDrainQuantumMaintenance);
         executorRef = executor;
         replySink.Executor = executor;
         executor.Start();

@@ -59,11 +59,28 @@ public sealed class RaftPartitionExecutor : IDisposable
 
     // One concurrent queue per priority class. Using separate queues avoids
     // a single ConcurrentQueue that would need priority inspection on every dequeue.
+    // Control, replication, and maintenance queues are unbounded; the client queue is
+    // bounded to prevent proposal floods from starving control-plane traffic or
+    // consuming unbounded memory under backpressure.
 
     private readonly ConcurrentQueue<PendingOperation> _controlQueue = new();
     private readonly ConcurrentQueue<PendingOperation> _replicationQueue = new();
     private readonly ConcurrentQueue<PendingOperation> _clientQueue = new();
     private readonly ConcurrentQueue<PendingOperation> _maintenanceQueue = new();
+
+    // Tracks items currently in _clientQueue (pending, not yet dequeued by the worker).
+    // Compared against _maxClientQueueDepth on every client enqueue for admission control.
+    // Interlocked so producers can read/write concurrently without taking a lock.
+    private int _clientQueueDepth;
+
+    // 0 or negative means unbounded (not recommended for production use).
+    private readonly int _maxClientQueueDepth;
+
+    // Per-cycle drain quanta (max items drained from each priority class per wake).
+    private readonly int _drainQuantumControl;
+    private readonly int _drainQuantumReplication;
+    private readonly int _drainQuantumClient;
+    private readonly int _drainQuantumMaintenance;
 
     // ── Wakeup mechanism ───────────────────────────────────────────────────
 
@@ -97,9 +114,34 @@ public sealed class RaftPartitionExecutor : IDisposable
     // ── Observability ──────────────────────────────────────────────────────
 
     private long _totalProcessed;
+    private long _totalClientRejected;
 
     /// <summary>Total number of operations processed by this executor since start.</summary>
     public long TotalProcessed => Interlocked.Read(ref _totalProcessed);
+
+    /// <summary>Total number of client proposals rejected due to queue saturation.</summary>
+    public long TotalClientRejected => Interlocked.Read(ref _totalClientRejected);
+
+    /// <summary>
+    /// Current number of client proposals pending in the queue (not yet dequeued by
+    /// the worker).  When the capacity limit is active, this value is clamped to the
+    /// capacity to avoid exposing the brief transient overshoot that can occur between
+    /// the atomic increment and the rejection decrement in the admission-control gate.
+    /// </summary>
+    public int ClientQueueDepth
+    {
+        get
+        {
+            int d = Interlocked.CompareExchange(ref _clientQueueDepth, 0, 0);
+            return _maxClientQueueDepth > 0 ? Math.Min(d, _maxClientQueueDepth) : d;
+        }
+    }
+
+    /// <summary>
+    /// Configured maximum for the client queue.
+    /// 0 or negative means the queue is unbounded.
+    /// </summary>
+    public int ClientQueueCapacity => _maxClientQueueDepth;
 
     /// <summary>Id of the partition owned by this executor.</summary>
     public int PartitionId => _partitionId;
@@ -116,16 +158,36 @@ public sealed class RaftPartitionExecutor : IDisposable
     /// many milliseconds.  Use 0 to disable.
     /// </param>
     /// <param name="logger">Logger.</param>
+    /// <param name="maxClientQueueDepth">
+    /// Maximum number of client proposals that may be queued at one time.
+    /// When the limit is reached new proposals are rejected immediately with
+    /// <see cref="RaftOperationStatus.ProposalQueueFull"/> rather than blocking.
+    /// Use 0 or a negative value to disable the limit (not recommended in production).
+    /// </param>
+    /// <param name="drainQuantumControl">Max control ops drained per wake cycle. 0 = use default.</param>
+    /// <param name="drainQuantumReplication">Max replication ops drained per wake cycle. 0 = use default.</param>
+    /// <param name="drainQuantumClient">Max client ops drained per wake cycle. 0 = use default.</param>
+    /// <param name="drainQuantumMaintenance">Max maintenance ops drained per wake cycle. 0 = use default.</param>
     public RaftPartitionExecutor(
         RaftPartitionStateMachine stateMachine,
         int partitionId,
         int slowThresholdMs,
-        ILogger<IRaft> logger)
+        ILogger<IRaft> logger,
+        int maxClientQueueDepth = 0,
+        int drainQuantumControl = 0,
+        int drainQuantumReplication = 0,
+        int drainQuantumClient = 0,
+        int drainQuantumMaintenance = 0)
     {
         _stateMachine = stateMachine;
         _partitionId = partitionId;
         _slowThresholdMs = slowThresholdMs;
         _logger = logger;
+        _maxClientQueueDepth = maxClientQueueDepth;
+        _drainQuantumControl     = drainQuantumControl     > 0 ? drainQuantumControl     : (int)RaftOperationPriority.Control;
+        _drainQuantumReplication = drainQuantumReplication > 0 ? drainQuantumReplication : (int)RaftOperationPriority.Replication;
+        _drainQuantumClient      = drainQuantumClient      > 0 ? drainQuantumClient      : (int)RaftOperationPriority.Client;
+        _drainQuantumMaintenance = drainQuantumMaintenance > 0 ? drainQuantumMaintenance : (int)RaftOperationPriority.Maintenance;
 
         _worker = new Thread(WorkerLoop)
         {
@@ -220,15 +282,54 @@ public sealed class RaftPartitionExecutor : IDisposable
 
     private void Enqueue(RaftRequest request, TaskCompletionSource<RaftResponse>? reply)
     {
+        RaftOperationKind kind = RaftOperationMapper.GetKind(request.Type);
+
+        // Admission control: reject client proposals when the queue is full.
+        // Control, replication, and maintenance queues are never bounded so
+        // control-plane traffic cannot be starved (non-negotiable correctness rule 6).
+        //
+        // We use an increment-first pattern to avoid a read-check-increment race:
+        //   1. Atomically increment the counter (reserves a slot).
+        //   2. If the post-increment value exceeds the cap, release the slot and reject.
+        // This guarantees depth never exceeds _maxClientQueueDepth even under heavy
+        // concurrent load from many producer threads.
+        if (kind == RaftOperationKind.Client && _maxClientQueueDepth > 0)
+        {
+            int after = Interlocked.Increment(ref _clientQueueDepth);
+            if (after > _maxClientQueueDepth)
+            {
+                Interlocked.Decrement(ref _clientQueueDepth);
+                Interlocked.Increment(ref _totalClientRejected);
+                _logger.LogWarning(
+                    "[RaftPartitionExecutor/{PartitionId}] Client queue full ({Depth}/{Capacity}); rejecting {Type}",
+                    _partitionId, after - 1, _maxClientQueueDepth, request.Type);
+                reply?.TrySetResult(RaftResponseStatic.ProposalQueueFullResponse);
+                return;
+            }
+
+            // Slot claimed — enqueue and wake the worker.
+            _clientQueue.Enqueue(new PendingOperation(request, reply));
+            _workAvailable.Release();
+            return;
+        }
+
         PendingOperation op = new(request, reply);
 
-        RaftOperationKind kind = RaftOperationMapper.GetKind(request.Type);
         switch (kind)
         {
-            case RaftOperationKind.Control:     _controlQueue.Enqueue(op); break;
-            case RaftOperationKind.Replication: _replicationQueue.Enqueue(op); break;
-            case RaftOperationKind.Client:      _clientQueue.Enqueue(op); break;
-            case RaftOperationKind.Maintenance: _maintenanceQueue.Enqueue(op); break;
+            case RaftOperationKind.Control:
+                _controlQueue.Enqueue(op);
+                break;
+            case RaftOperationKind.Replication:
+                _replicationQueue.Enqueue(op);
+                break;
+            case RaftOperationKind.Client:
+                // Unbounded path (maxClientQueueDepth <= 0).
+                _clientQueue.Enqueue(op);
+                break;
+            case RaftOperationKind.Maintenance:
+                _maintenanceQueue.Enqueue(op);
+                break;
         }
 
         _workAvailable.Release();
@@ -290,17 +391,19 @@ public sealed class RaftPartitionExecutor : IDisposable
     }
 
     /// <summary>
-    /// Weighted-fair drain: Control×8, Replication×4, Client×2, Maintenance×1.
+    /// Weighted-fair drain using configurable per-class quanta.
+    /// Defaults: Control×8, Replication×4, Client×2, Maintenance×1.
     /// </summary>
     private void DrainQueues()
     {
-        DrainQueue(_controlQueue,     (int)RaftOperationPriority.Control);
-        DrainQueue(_replicationQueue, (int)RaftOperationPriority.Replication);
-        DrainQueue(_clientQueue,      (int)RaftOperationPriority.Client);
-        DrainQueue(_maintenanceQueue, (int)RaftOperationPriority.Maintenance);
+        DrainQueue(_controlQueue,     _drainQuantumControl);
+        DrainQueue(_replicationQueue, _drainQuantumReplication);
+        // Only decrement the depth counter when the bounded path was used in Enqueue.
+        DrainQueue(_clientQueue,      _drainQuantumClient, decrementClientDepth: _maxClientQueueDepth > 0);
+        DrainQueue(_maintenanceQueue, _drainQuantumMaintenance);
     }
 
-    private void DrainQueue(ConcurrentQueue<PendingOperation> queue, int maxPerCycle)
+    private void DrainQueue(ConcurrentQueue<PendingOperation> queue, int maxPerCycle, bool decrementClientDepth = false)
     {
         // Collect up to maxPerCycle items from this queue into the scratch list.
         _drainBatch.Clear();
@@ -310,6 +413,8 @@ public sealed class RaftPartitionExecutor : IDisposable
         {
             _drainBatch.Add(op);
             taken++;
+            if (decrementClientDepth)
+                Interlocked.Decrement(ref _clientQueueDepth);
         }
 
         if (_drainBatch.Count == 0)
@@ -338,7 +443,7 @@ public sealed class RaftPartitionExecutor : IDisposable
     {
         DrainQueue(_controlQueue,     int.MaxValue);
         DrainQueue(_replicationQueue, int.MaxValue);
-        DrainQueue(_clientQueue,      int.MaxValue);
+        DrainQueue(_clientQueue,      int.MaxValue, decrementClientDepth: _maxClientQueueDepth > 0);
         DrainQueue(_maintenanceQueue, int.MaxValue);
     }
 

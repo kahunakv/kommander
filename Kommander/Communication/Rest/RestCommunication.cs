@@ -1,4 +1,4 @@
-
+using System.Text;
 using System.Text.Json;
 using Flurl.Http;
 using Kommander.Data;
@@ -13,19 +13,11 @@ public class RestCommunication : ICommunication
 {
     public async Task<HandshakeResponse> Handshake(RaftManager manager, RaftNode node, HandshakeRequest request)
     {
-        RaftConfiguration configuration = manager.Configuration;
-        
         string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.HandshakeRequest);
         
         try
         {
-            return await (configuration.HttpScheme + node.Endpoint)
-                .WithOAuthBearerToken(configuration.HttpAuthBearerToken)
-                .AppendPathSegments("v1/raft/handshake")
-                .WithHeader("Accept", "application/json")
-                .WithHeader("Content-Type", "application/json")
-                .WithTimeout(configuration.HttpTimeout)
-                .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
+            return await CreateRaftRequest(manager, node, "/v1/raft/handshake", payload)
                 .PostStringAsync(payload)
                 .ReceiveJson<HandshakeResponse>().ConfigureAwait(false);
         }
@@ -39,19 +31,11 @@ public class RestCommunication : ICommunication
     
     public async Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftNode node, RequestVotesRequest request)
     {
-        RaftConfiguration configuration = manager.Configuration;
-        
         string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.RequestVotesRequest);
         
         try
         {
-            return await (configuration.HttpScheme + node.Endpoint)
-                .WithOAuthBearerToken(configuration.HttpAuthBearerToken)
-                .AppendPathSegments("v1/raft/request-vote")
-                .WithHeader("Accept", "application/json")
-                .WithHeader("Content-Type", "application/json")
-                .WithTimeout(configuration.HttpTimeout)
-                .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
+            return await CreateRaftRequest(manager, node, "/v1/raft/request-vote", payload)
                 .PostStringAsync(payload)
                 .ReceiveJson<RequestVotesResponse>().ConfigureAwait(false);
         }
@@ -65,19 +49,11 @@ public class RestCommunication : ICommunication
 
     public async Task<VoteResponse> Vote(RaftManager manager, RaftNode node, VoteRequest request)
     {
-        RaftConfiguration configuration = manager.Configuration;
-        
         string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.VoteRequest);
         
         try
         {
-            return await (configuration.HttpScheme + node.Endpoint)
-                .WithOAuthBearerToken(configuration.HttpAuthBearerToken)
-                .AppendPathSegments("v1/raft/vote")
-                .WithHeader("Accept", "application/json")
-                .WithHeader("Content-Type", "application/json")
-                .WithTimeout(configuration.HttpTimeout)
-                .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
+            return await CreateRaftRequest(manager, node, "/v1/raft/vote", payload)
                 .PostStringAsync(payload)
                 .ReceiveJson<VoteResponse>().ConfigureAwait(false);
         }
@@ -91,19 +67,15 @@ public class RestCommunication : ICommunication
 
     public async Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftNode node, CompleteAppendLogsRequest request)
     {
-        RaftConfiguration configuration = manager.Configuration;
-        
         string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.CompleteAppendLogsRequest);
         
         try
         {
-            CompleteAppendLogsResponse? response = await (configuration.HttpScheme + node.Endpoint)
-                .WithOAuthBearerToken(configuration.HttpAuthBearerToken)
-                .AppendPathSegments("v1/raft/complete-append-logs")
-                .WithHeader("Accept", "application/json")
-                .WithHeader("Content-Type", "application/json")
-                .WithTimeout(configuration.HttpTimeout)
-                .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
+            CompleteAppendLogsResponse? response = await CreateRaftRequest(
+                    manager,
+                    node,
+                    "/v1/raft/complete-append-logs",
+                    payload)
                 .PostStringAsync(payload)
                 .ReceiveJson<CompleteAppendLogsResponse>().ConfigureAwait(false);
 
@@ -119,19 +91,11 @@ public class RestCommunication : ICommunication
 
     public async Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftNode node, AppendLogsRequest request)
     {
-        RaftConfiguration configuration = manager.Configuration;
-        
         string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.AppendLogsRequest);
         
         try
         {
-            AppendLogsResponse? response = await (configuration.HttpScheme + node.Endpoint)
-                .WithOAuthBearerToken(configuration.HttpAuthBearerToken)
-                .AppendPathSegments("v1/raft/append-logs")
-                .WithHeader("Accept", "application/json")
-                .WithHeader("Content-Type", "application/json")
-                .WithTimeout(configuration.HttpTimeout)
-                .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
+            AppendLogsResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/append-logs", payload)
                 .PostStringAsync(payload)
                 .ReceiveJson<AppendLogsResponse>().ConfigureAwait(false);
             
@@ -150,19 +114,11 @@ public class RestCommunication : ICommunication
 
     public async Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)
     {
-        RaftConfiguration configuration = manager.Configuration;
-        
         string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.BatchRequestsRequest);
         
         try
         {
-            BatchRequestsResponse? response = await (configuration.HttpScheme + node.Endpoint)
-                .WithOAuthBearerToken(configuration.HttpAuthBearerToken)
-                .AppendPathSegments("v1/raft/batch-requests")
-                .WithHeader("Accept", "application/json")
-                .WithHeader("Content-Type", "application/json")
-                .WithTimeout(configuration.HttpTimeout)
-                .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
+            BatchRequestsResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/batch-requests", payload)
                 .PostStringAsync(payload)
                 .ReceiveJson<BatchRequestsResponse>().ConfigureAwait(false);
 
@@ -174,5 +130,66 @@ public class RestCommunication : ICommunication
         }
 
         return new();
+    }
+
+    internal static IReadOnlyDictionary<string, string> BuildAuthenticationHeaders(
+        RaftConfiguration configuration,
+        string senderNode,
+        string method,
+        string path,
+        string payload)
+    {
+        RaftTransportSecurityOptions transportSecurity = configuration.GetEffectiveTransportSecurity();
+
+        if (transportSecurity.NodeAuthenticationMode != RaftNodeAuthenticationMode.SharedSecret)
+            return new Dictionary<string, string>();
+
+        RaftTransportAuthenticator authenticator = new(transportSecurity);
+        RaftTransportAuthenticationHeaders authHeaders = authenticator.Sign(
+            method,
+            path,
+            senderNode,
+            Encoding.UTF8.GetBytes(payload));
+
+        return new Dictionary<string, string>
+        {
+            [authHeaders.SignatureHeaderName] = authHeaders.Signature,
+            [RaftTransportAuthenticationHeaders.SenderNodeHeaderName] = authHeaders.SenderNode,
+            [RaftTransportAuthenticationHeaders.TimestampHeaderName] =
+                authHeaders.TimestampUnixMilliseconds.ToString(),
+            [RaftTransportAuthenticationHeaders.NonceHeaderName] = authHeaders.Nonce
+        };
+    }
+
+    private static IFlurlRequest CreateRaftRequest(
+        RaftManager manager,
+        RaftNode node,
+        string path,
+        string payload)
+    {
+        RaftConfiguration configuration = manager.Configuration;
+        IFlurlRequest request = (configuration.HttpScheme + node.Endpoint)
+            .WithHeader("Accept", "application/json")
+            .WithHeader("Content-Type", "application/json")
+            .WithTimeout(configuration.HttpTimeout)
+            .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
+            .AppendPathSegments(path.Trim('/').Split('/'));
+
+#pragma warning disable CS0618
+        if (!string.IsNullOrWhiteSpace(configuration.HttpAuthBearerToken))
+            request = request.WithOAuthBearerToken(configuration.HttpAuthBearerToken);
+#pragma warning restore CS0618
+
+        foreach ((string headerName, string headerValue) in BuildAuthenticationHeaders(
+                     configuration,
+                     manager.LocalEndpoint,
+                     "POST",
+                     path,
+                     payload))
+        {
+            request = request.WithHeader(headerName, headerValue);
+        }
+
+        return request;
     }
 }

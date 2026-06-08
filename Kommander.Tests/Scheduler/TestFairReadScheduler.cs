@@ -154,7 +154,7 @@ public sealed class TestFairReadScheduler
         }
 
         // Stop after enqueueing all operations; workers must drain.
-        await Task.Run(scheduler.Stop);
+        await Task.Run(scheduler.Stop, TestContext.Current.CancellationToken);
 
         // All tasks must have completed (not cancelled, not still pending).
         bool allDone = tasks.All(t => t.IsCompleted);

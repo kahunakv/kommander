@@ -263,7 +263,7 @@ public sealed class TestRaftSystemCoordinator
     }
 
     [Fact]
-    public async Task Send_AfterStop_IsNoOp()
+    public Task Send_AfterStop_IsNoOp()
     {
         RaftManager manager = Build();
         using (manager)
@@ -277,6 +277,7 @@ public sealed class TestRaftSystemCoordinator
             // manager.Dispose() (via using) will call Stop() a second time — must be idempotent.
             Assert.Empty(manager.Partitions);
         }
+        return Task.CompletedTask;
     }
 
     [Fact]
@@ -296,8 +297,8 @@ public sealed class TestRaftSystemCoordinator
                 new RaftSystemRequest(RaftSystemRequestType.RestoreCompleted));
 
         // Dispose should drain (or abort cleanly) within the 5 s timeout.
-        Task disposeTask = Task.Run(() => manager.Dispose());
-        await disposeTask.WaitAsync(TimeSpan.FromSeconds(10));
+        Task disposeTask = Task.Run(() => manager.Dispose(), TestContext.Current.CancellationToken);
+        await disposeTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
     }
 
     // ── TrySetInitialPartitions ───────────────────────────────────────────────
@@ -339,7 +340,7 @@ public sealed class TestRaftSystemCoordinator
             // Trigger as leader — must use existing config, not replicate.
             manager.SystemCoordinator.Send(
                 new RaftSystemRequest(RaftSystemRequestType.LeaderChanged, manager.LocalEndpoint));
-            await done.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await done.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
             Assert.False(replicateCalled, "ReplicateSystemLogs must not be called when config is already present");
             Assert.NotNull(activated);
@@ -375,7 +376,7 @@ public sealed class TestRaftSystemCoordinator
 
             manager.SystemCoordinator.Send(
                 new RaftSystemRequest(RaftSystemRequestType.LeaderChanged, manager.LocalEndpoint));
-            await done.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await done.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
             // Exactly one replication call.
             Assert.Single(replicatedPayloads);
@@ -425,7 +426,7 @@ public sealed class TestRaftSystemCoordinator
 
             manager.SystemCoordinator.Send(
                 new RaftSystemRequest(RaftSystemRequestType.LeaderChanged, manager.LocalEndpoint));
-            await done.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await done.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
             Assert.Equal(2, callCount);
             Assert.True(manager.IsInitialized);
@@ -466,17 +467,17 @@ public sealed class TestRaftSystemCoordinator
                 new RaftSystemRequest(RaftSystemRequestType.LeaderChanged, manager.LocalEndpoint));
 
             // Wait until the first replication attempt has returned.
-            await firstAttemptDone.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await firstAttemptDone.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
             // Yield briefly so the coordinator loop advances past the completed
             // Replicate() call and suspends inside Task.Delay(5000, cancellationToken).
-            await Task.Delay(20);
+            await Task.Delay(20, TestContext.Current.CancellationToken);
 
             // Cancelling now fires inside the production retry delay, not the override.
             manager.SystemCoordinator.Stop();
 
             // Wait for the loop to exit cleanly — deterministic, no fixed delay.
-            await manager.SystemCoordinator.LoopTask.WaitAsync(TimeSpan.FromSeconds(5));
+            await manager.SystemCoordinator.LoopTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
             Assert.False(startCalled);
         }
     }
@@ -522,7 +523,7 @@ public sealed class TestRaftSystemCoordinator
 
             manager.SystemCoordinator.Send(
                 new RaftSystemRequest(RaftSystemRequestType.SplitPartition, 1));
-            await done.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await done.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
             // The replicated map must have 2 non-overlapping ranges.
             Assert.NotNull(replicatedRanges);
@@ -578,7 +579,7 @@ public sealed class TestRaftSystemCoordinator
 
             manager.SystemCoordinator.Send(
                 new RaftSystemRequest(RaftSystemRequestType.SplitPartition, 1));
-            await replicateDone.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await replicateDone.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
             await WaitForIdleAsync(manager);
 
             Assert.False(startCalled, "StartUserPartitions must not be called when node is not leader");

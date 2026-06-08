@@ -317,6 +317,12 @@ public class TestSeededPrngAndReplay
         Assert.Contains(expectedMessageFragment, result.Violation.Message);
     }
 
+    private static readonly JsonSerializerOptions ReplaySerializerOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    };
+
     private static void TamperReplayLog(string replayPath, Func<ReplayLogEntry, ReplayLogEntry> mutate)
     {
         ReplayLogReader reader = new(replayPath);
@@ -328,11 +334,7 @@ public class TestSeededPrngAndReplay
                 ? mutate(entry)
                 : entry;
 
-            lines.Add(JsonSerializer.Serialize(updated, new JsonSerializerOptions
-            {
-                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-            }));
+            lines.Add(JsonSerializer.Serialize(updated, ReplaySerializerOptions));
         }
 
         File.WriteAllLines(replayPath, lines);

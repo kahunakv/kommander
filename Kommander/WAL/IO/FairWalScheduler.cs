@@ -33,8 +33,8 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 {
     // ── Constants ──────────────────────────────────────────────────────────
 
-    /// <summary>Maximum number of operations drained from a partition in a single batch.</summary>
-    private const int MaxBatchSize = 256;
+    /// <summary>Default max operations drained from a partition in a single batch.</summary>
+    public const int DefaultMaxBatchSize = 256;
 
     /// <summary>Default per-partition pending-queue depth limit.</summary>
     public const int DefaultMaxQueueDepth = 4096;
@@ -44,6 +44,13 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     private readonly IWAL walAdapter;
     private readonly ILogger<IRaft> logger;
     private readonly int maxQueueDepthPerPartition;
+    private readonly int maxGlobalQueueDepth;
+    private readonly int maxBatchSize;
+
+    // Total pending-or-in-flight operations across all partitions.
+    // Checked against maxGlobalQueueDepth (when > 0) in Enqueue;
+    // decremented in ProcessPartition after each batch write completes.
+    private int _globalQueueDepth;
 
     // ── Per-partition state ────────────────────────────────────────────────
 
@@ -112,15 +119,27 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// Per-partition soft back-pressure limit.  Defaults to
     /// <see cref="DefaultMaxQueueDepth"/>.
     /// </param>
+    /// <param name="maxBatchSize">
+    /// Maximum operations drained from a partition in a single storage flush.
+    /// Defaults to <see cref="DefaultMaxBatchSize"/>.
+    /// </param>
+    /// <param name="maxGlobalQueueDepth">
+    /// Global cap on total pending-or-in-flight operations across all partitions.
+    /// 0 or negative disables the global cap (only per-partition limits apply).
+    /// </param>
     public FairWalScheduler(
         IWAL walAdapter,
         ILogger<IRaft> logger,
         int workerCount = 0,
-        int maxQueueDepthPerPartition = DefaultMaxQueueDepth)
+        int maxQueueDepthPerPartition = DefaultMaxQueueDepth,
+        int maxBatchSize = DefaultMaxBatchSize,
+        int maxGlobalQueueDepth = 0)
     {
         this.walAdapter = walAdapter;
         this.logger = logger;
         this.maxQueueDepthPerPartition = maxQueueDepthPerPartition;
+        this.maxGlobalQueueDepth = maxGlobalQueueDepth > 0 ? maxGlobalQueueDepth : 0;
+        this.maxBatchSize = maxBatchSize <= 0 ? DefaultMaxBatchSize : maxBatchSize;
 
         if (workerCount <= 0)
             workerCount = Math.Max(1, Environment.ProcessorCount);
@@ -154,6 +173,16 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         {
             if (state.Depth >= maxQueueDepthPerPartition)
                 throw new BackpressureExceededException(partitionId, state.Depth);
+
+            if (maxGlobalQueueDepth > 0)
+            {
+                int globalDepth = Interlocked.Increment(ref _globalQueueDepth);
+                if (globalDepth > maxGlobalQueueDepth)
+                {
+                    Interlocked.Decrement(ref _globalQueueDepth);
+                    throw new BackpressureExceededException(partitionId, globalDepth);
+                }
+            }
 
             state.Ops.Enqueue(operation);
             state.Depth++;
@@ -225,7 +254,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
     private void WorkerLoop(int workerId)
     {
-        List<WALWriteOperation> batch = new(MaxBatchSize);
+        List<WALWriteOperation> batch = new(maxBatchSize);
         CancellationToken token = _cts.Token;
 
         while (true)
@@ -261,13 +290,13 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
         lock (state.Lock)
         {
-            // Drain up to MaxBatchSize operations.
+            // Drain up to maxBatchSize operations.
             // Do NOT decrement Depth here: we decrement after ExecuteBatch completes
             // so that Depth tracks queued-plus-in-flight operations.  Decrementing
             // at dequeue time would let Depth fall to 0 before the WAL write returns,
             // allowing a flood of new enqueues during a slow write and making the
             // backpressure limit unreliable.
-            while (batch.Count < MaxBatchSize && state.Ops.TryDequeue(out WALWriteOperation? op))
+            while (batch.Count < maxBatchSize && state.Ops.TryDequeue(out WALWriteOperation? op))
                 batch.Add(op);
 
             // Clear the scheduled flag and raise the in-flight flag BEFORE
@@ -299,6 +328,9 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
         // After the write completes, decrement Depth for exactly the items we
         // just processed, clear InFlight, then re-schedule if new items arrived.
+        if (maxGlobalQueueDepth > 0)
+            Interlocked.Add(ref _globalQueueDepth, -batch.Count);
+
         lock (state.Lock)
         {
             state.Depth   -= batch.Count;
