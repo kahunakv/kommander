@@ -102,6 +102,7 @@ public sealed class RaftPartitionExecutor : IDisposable
     private readonly RaftPartitionStateMachine _stateMachine;
     private readonly ILogger<IRaft> _logger;
     private readonly int _partitionId;
+    private readonly Func<long>? _getGeneration;
 
     // Slow-message threshold (ms) — same as actor adapter uses.
     private readonly int _slowThresholdMs;
@@ -206,12 +207,14 @@ public sealed class RaftPartitionExecutor : IDisposable
         int drainQuantumControl = 0,
         int drainQuantumReplication = 0,
         int drainQuantumClient = 0,
-        int drainQuantumMaintenance = 0)
+        int drainQuantumMaintenance = 0,
+        Func<long>? getGeneration = null)
     {
         _stateMachine = stateMachine;
         _partitionId = partitionId;
         _slowThresholdMs = slowThresholdMs;
         _logger = logger;
+        _getGeneration = getGeneration;
         _maxClientQueueDepth = maxClientQueueDepth;
         _drainQuantumControl     = drainQuantumControl     > 0 ? drainQuantumControl     : (int)RaftOperationPriority.Control;
         _drainQuantumReplication = drainQuantumReplication > 0 ? drainQuantumReplication : (int)RaftOperationPriority.Replication;
@@ -277,7 +280,11 @@ public sealed class RaftPartitionExecutor : IDisposable
         if (!_started || _stopping)
             return Task.CompletedTask;
 
-        return Ask(new RaftRequest(RaftRequestType.DrainBarrier), cancellationToken);
+        // Guard the Ask call: a background task (e.g. WAL restore on the I/O scheduler)
+        // may set _stopping between the check above and ThrowIfNotReady inside Ask — a
+        // TOCTOU that is benign here because DrainAsync is already best-effort.
+        try { return Ask(new RaftRequest(RaftRequestType.DrainBarrier), cancellationToken); }
+        catch (InvalidOperationException) { return Task.CompletedTask; }
     }
 
     /// <summary>
@@ -584,6 +591,13 @@ public sealed class RaftPartitionExecutor : IDisposable
                     break;
 
                 case RaftRequestType.ReplicateLogs:
+                    if (request.ExpectedGeneration != 0 &&
+                        _getGeneration is { } getGen &&
+                        getGen() != request.ExpectedGeneration)
+                    {
+                        op.Reply?.TrySetResult(RaftResponseStatic.PartitionMovedResponse);
+                        break;
+                    }
                     await _stateMachine.ReplicateLogsAsync(request.Logs, request.AutoCommit, RegisterReply(op)).ConfigureAwait(false);
                     break;
 

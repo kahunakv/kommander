@@ -691,6 +691,45 @@ public class RocksDbWAL : IWAL, IDisposable
         return true;
     }
 
+    /// <inheritdoc/>
+    public RaftOperationStatus DeletePartitionWAL(int partitionId)
+    {
+        try
+        {
+            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+
+            List<byte[]> keysToDelete = [];
+
+            using (Iterator? iterator = db.NewIterator(cf: columnFamilyHandle))
+            {
+                Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+                BuildLogKey(seekKey, partitionId, 0);
+                iterator.Seek(seekKey);
+
+                while (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId))
+                {
+                    keysToDelete.Add(iterator.Key());
+                    iterator.Next();
+                }
+            }
+
+            if (keysToDelete.Count > 0)
+            {
+                using WriteBatch writeBatch = new();
+                foreach (byte[] key in keysToDelete)
+                    writeBatch.Delete(key, cf: columnFamilyHandle);
+                db.Write(writeBatch, writeOptions);
+            }
+
+            return RaftOperationStatus.Success;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError("Error during DeletePartitionWAL({PartitionId}): {Message}", partitionId, ex.Message);
+            return RaftOperationStatus.Errored;
+        }
+    }
+
     /// <summary>
     /// Compacts and removes logs in the Write-Ahead Log (WAL) for a specific partition that are older than the given checkpoint.
     /// </summary>

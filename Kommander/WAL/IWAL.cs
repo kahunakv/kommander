@@ -82,4 +82,12 @@ public interface IWAL : IDisposable
     public bool SetMetaData(string key, string value);
 
     public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries);
+
+    /// <summary>
+    /// Permanently removes all WAL entries for the given partition id.
+    /// Safe to call multiple times (idempotent): calling on an already-deleted
+    /// or non-existent partition returns <see cref="RaftOperationStatus.Success"/>.
+    /// Must not touch any other partition's data.
+    /// </summary>
+    RaftOperationStatus DeletePartitionWAL(int partitionId);
 }

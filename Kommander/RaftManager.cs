@@ -190,6 +190,9 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// </summary>
     public event Func<int, string, Task<bool>>? OnLeaderChanged;
 
+    /// <inheritdoc/>
+    public event Action<IReadOnlyList<RaftPartitionRange>>? OnPartitionMapChanged;
+
     /// <summary>
     /// Constructor
     /// </summary>
@@ -370,29 +373,39 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     {
         foreach (RaftPartitionRange range in ranges)
         {
+            // Tombstone entries must never re-create a stopped partition.
+            if (range.State == RaftPartitionState.Removed)
+                continue;
+
             if (partitions.TryGetValue(range.PartitionId, out RaftPartition? partition))
             {
                 // Volatile writes — visible to any thread already holding a reference.
                 partition.StartRange = range.StartRange;
                 partition.EndRange = range.EndRange;
+                partition.RoutingMode = range.RoutingMode;
+                partition.Generation = range.Generation;
+                partition.State = range.State;
             }
             else
             {
-                partitions.TryAdd(
+                RaftPartition newPartition = new(
+                    this,
+                    walAdapter,
                     range.PartitionId,
-                    new(
-                        this,
-                        walAdapter,
-                        range.PartitionId,
-                        range.StartRange,
-                        range.EndRange,
-                        Logger
-                    )
+                    range.StartRange,
+                    range.EndRange,
+                    Logger
                 );
+                newPartition.RoutingMode = range.RoutingMode;
+                newPartition.Generation = range.Generation;
+                newPartition.State = range.State;
+                partitions.TryAdd(range.PartitionId, newPartition);
             }
         }
 
         IsInitialized = true;
+
+        OnPartitionMapChanged?.Invoke(GetPartitionMap());
     }
 
     /// <summary>
@@ -710,7 +723,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <param name="autoCommit"></param>
     /// <param name="cancellationToken"></param>
     /// <returns></returns>
-    public async Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, CancellationToken cancellationToken = default)
+    public async Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, CancellationToken cancellationToken = default, long expectedGeneration = 0)
     {
         if (partitionId == RaftSystemConfig.SystemPartition)
             throw new RaftException("System partition cannot be used from userland");
@@ -723,7 +736,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
         do
         {
-            (success, status, ticketId) = await partition.ReplicateLogs(type, data, autoCommit).ConfigureAwait(false);
+            (success, status, ticketId) = await partition.ReplicateLogs(type, data, autoCommit, expectedGeneration).ConfigureAwait(false);
 
             if (status == RaftOperationStatus.ActiveProposal)
                 await Task.Delay(ProposalRetryDelay, cancellationToken).ConfigureAwait(false);
@@ -750,7 +763,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         string type,
         IEnumerable<byte[]> logs,
         bool autoCommit = true,
-        CancellationToken cancellationToken = default
+        CancellationToken cancellationToken = default,
+        long expectedGeneration = 0
     )
     {
         if (partitionId == RaftSystemConfig.SystemPartition)
@@ -765,7 +779,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         do
         {
             // ReSharper disable once PossibleMultipleEnumeration
-            (success, status, ticketId) = await partition.ReplicateLogs(type, logs.ToList(), autoCommit).ConfigureAwait(false);
+            (success, status, ticketId) = await partition.ReplicateLogs(type, logs.ToList(), autoCommit, expectedGeneration).ConfigureAwait(false);
 
             if (status == RaftOperationStatus.ActiveProposal)
                 await Task.Delay(ProposalRetryDelay, cancellationToken).ConfigureAwait(false);
@@ -1441,16 +1455,177 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <exception cref="RaftException"></exception>
     public async Task SplitPartition(int partitionId)
     {
+        await SplitPartitionAsync(partitionId, ct: CancellationToken.None).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public async Task<RaftPartitionLifecycleResult> SplitPartitionAsync(
+        int sourcePartitionId,
+        int targetPartitionId = 0,
+        RaftSplitPlan? plan = null,
+        CancellationToken ct = default)
+    {
         if (!IsInitialized)
             throw new RaftException("System is not initialized");
 
-        if (partitionId == RaftSystemConfig.SystemPartition)
+        if (sourcePartitionId == RaftSystemConfig.SystemPartition)
             throw new RaftException("System partition cannot be split");
 
-        if (!await AmILeader(partitionId, CancellationToken.None).ConfigureAwait(false))
+        if (!await AmILeader(sourcePartitionId, ct).ConfigureAwait(false))
             throw new RaftException("Split cannot be initiated by follower");
 
-        systemCoordinator.Send(new(RaftSystemRequestType.SplitPartition, partitionId));
+        RaftSplitPlan effectivePlan = new()
+        {
+            TargetPartitionId = targetPartitionId,
+            TargetRoutingMode = plan?.TargetRoutingMode ?? RaftRoutingMode.HashRange,
+            HashBoundary      = plan?.HashBoundary,
+            AutoCommit        = true
+        };
+
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        systemCoordinator.Send(new System.RaftSystemRequest(sourcePartitionId, effectivePlan, tcs));
+
+        (RaftOperationStatus status, long generation) = await tcs.Task.WaitAsync(ct).ConfigureAwait(false);
+        return new RaftPartitionLifecycleResult
+        {
+            Success    = status == RaftOperationStatus.Success,
+            Status     = status,
+            Generation = generation
+        };
+    }
+
+    /// <inheritdoc/>
+    public async Task<RaftPartitionLifecycleResult> MergePartitionsAsync(
+        int survivorPartitionId,
+        int sourcePartitionId,
+        RaftMergePlan? plan = null,
+        CancellationToken ct = default)
+    {
+        if (!IsInitialized)
+            throw new RaftException("System is not initialized");
+
+        if (sourcePartitionId == RaftSystemConfig.SystemPartition || survivorPartitionId == RaftSystemConfig.SystemPartition)
+            throw new RaftException("System partition cannot be merged");
+
+        if (sourcePartitionId == survivorPartitionId)
+            throw new RaftException("Source and survivor partition must be different");
+
+        if (!await AmILeader(survivorPartitionId, ct).ConfigureAwait(false))
+            throw new RaftException("Merge cannot be initiated by follower: not leader of survivor partition");
+
+        if (!await AmILeader(sourcePartitionId, ct).ConfigureAwait(false))
+            throw new RaftException("Merge cannot be initiated by follower: not leader of source partition");
+
+        // Use the caller's plan when provided (carries any extended fields added in the future).
+        // Fall back to a default plan built from the validated method parameters.
+        RaftMergePlan effectivePlan = plan ?? new()
+        {
+            SurvivorPartitionId = survivorPartitionId,
+            SourcePartitionId   = sourcePartitionId
+        };
+
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        systemCoordinator.Send(new System.RaftSystemRequest(effectivePlan, tcs));
+
+        (RaftOperationStatus status, long generation) = await tcs.Task.WaitAsync(ct).ConfigureAwait(false);
+        return new RaftPartitionLifecycleResult
+        {
+            Success    = status == RaftOperationStatus.Success,
+            Status     = status,
+            Generation = generation
+        };
+    }
+
+    /// <inheritdoc/>
+    public async Task<RaftPartitionLifecycleResult> CreatePartitionAsync(
+        int partitionId,
+        RaftRoutingMode mode = RaftRoutingMode.Unrouted,
+        (int start, int end)? hashRange = null,
+        CancellationToken ct = default)
+    {
+        if (!IsInitialized)
+            throw new RaftException("System is not initialized");
+
+        if (!await AmILeader(RaftSystemConfig.SystemPartition, ct).ConfigureAwait(false))
+            throw new RaftException("CreatePartition cannot be initiated by a follower");
+
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        systemCoordinator.Send(new System.RaftSystemRequest(
+            partitionId, mode, hashRange?.start, hashRange?.end, tcs));
+
+        (RaftOperationStatus status, long generation) = await tcs.Task.WaitAsync(ct).ConfigureAwait(false);
+        return new RaftPartitionLifecycleResult
+        {
+            Success = status == RaftOperationStatus.Success,
+            Status = status,
+            Generation = generation
+        };
+    }
+
+    /// <inheritdoc/>
+    public async Task<RaftPartitionLifecycleResult> RemovePartitionAsync(
+        int partitionId,
+        CancellationToken ct = default)
+    {
+        if (!IsInitialized)
+            throw new RaftException("System is not initialized");
+
+        if (!await AmILeader(RaftSystemConfig.SystemPartition, ct).ConfigureAwait(false))
+            throw new RaftException("RemovePartition cannot be initiated by a follower");
+
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        systemCoordinator.Send(
+            new System.RaftSystemRequest(System.RaftSystemRequestType.RemovePartition, partitionId)
+            {
+                Completion = tcs
+            });
+
+        (RaftOperationStatus status, long generation) = await tcs.Task.WaitAsync(ct).ConfigureAwait(false);
+        return new RaftPartitionLifecycleResult
+        {
+            Success = status == RaftOperationStatus.Success,
+            Status = status,
+            Generation = generation
+        };
+    }
+
+    /// <inheritdoc/>
+    public long GetPartitionGeneration(int partitionId)
+    {
+        if (partitions.TryGetValue(partitionId, out RaftPartition? partition))
+            return partition.Generation;
+
+        return 0;
+    }
+
+    /// <inheritdoc/>
+    public IReadOnlyList<RaftPartitionRange> GetPartitionMap()
+    {
+        List<RaftPartitionRange> snapshot = new(partitions.Count);
+
+        foreach (KeyValuePair<int, RaftPartition> kv in partitions)
+        {
+            RaftPartition p = kv.Value;
+            snapshot.Add(new RaftPartitionRange
+            {
+                PartitionId  = p.PartitionId,
+                StartRange   = p.StartRange,
+                EndRange     = p.EndRange,
+                RoutingMode  = p.RoutingMode,
+                Generation   = p.Generation,
+                State        = p.State,
+            });
+        }
+
+        return snapshot;
     }
 
     /// <summary>
@@ -1466,7 +1641,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
         foreach (KeyValuePair<int, RaftPartition> partition in partitions)
         {
-            if (partition.Value.StartRange <= rangeId && partition.Value.EndRange >= rangeId)
+            if (partition.Value.RoutingMode == RaftRoutingMode.HashRange &&
+                partition.Value.StartRange <= rangeId && partition.Value.EndRange >= rangeId)
                 return partition.Key;
         }
 
@@ -1486,10 +1662,11 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
         foreach (KeyValuePair<int, RaftPartition> partition in partitions)
         {
-            if (partition.Value.StartRange <= rangeId && partition.Value.EndRange >= rangeId)
+            if (partition.Value.RoutingMode == RaftRoutingMode.HashRange &&
+                partition.Value.StartRange <= rangeId && partition.Value.EndRange >= rangeId)
                 return partition.Key;
         }
-        
+
         throw new RaftException("Couldn't find partition range for: " + prefixPartitionKey + " " + rangeId);
     }
     

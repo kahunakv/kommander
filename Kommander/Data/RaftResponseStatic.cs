@@ -24,4 +24,14 @@ internal static class RaftResponseStatic
         RaftResponseType.None,
         RaftOperationStatus.RestoreInProgress,
         HLCTimestamp.Zero);
+
+    /// <summary>
+    /// Pre-allocated rejection response returned when the proposal's
+    /// <c>ExpectedGeneration</c> does not match the partition's current committed
+    /// generation. Callers should refresh the partition map and retry.
+    /// </summary>
+    public static RaftResponse PartitionMovedResponse = new(
+        RaftResponseType.None,
+        RaftOperationStatus.PartitionMoved,
+        HLCTimestamp.Zero);
 }

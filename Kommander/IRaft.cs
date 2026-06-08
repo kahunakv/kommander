@@ -1,6 +1,7 @@
 
 using System.ComponentModel;
 using Kommander.Data;
+using Kommander.System;
 using Kommander.WAL;
 using Kommander.WAL.IO;
 using Kommander.Communication;
@@ -88,6 +89,14 @@ public interface IRaft
     /// Event called when a leader is elected on certain partition
     /// </summary>
     public event Func<int, string, Task<bool>>? OnLeaderChanged;
+
+    /// <summary>
+    /// Fired on the <see cref="RaftSystemCoordinator"/> thread every time
+    /// <c>StartUserPartitions</c> applies a new partition map — after
+    /// <c>ConfigReplicated</c>, <c>ConfigRestored</c>, or <c>LeaderChanged</c>.
+    /// The argument is a point-in-time snapshot; mutating it has no effect on the live map.
+    /// </summary>
+    public event Action<IReadOnlyList<RaftPartitionRange>>? OnPartitionMapChanged;
     
     /// <summary>
     /// Joins the Raft cluster
@@ -168,8 +177,13 @@ public interface IRaft
     /// <param name="data"></param>
     /// <param name="autoCommit"></param>
     /// <param name="cancellationToken"></param>
+    /// <param name="expectedGeneration">
+    /// When non-zero, the proposal is rejected with <see cref="RaftOperationStatus.PartitionMoved"/>
+    /// if the partition's committed generation no longer matches this value.
+    /// Zero disables the fence (default behavior).
+    /// </param>
     /// <returns></returns>
-    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, CancellationToken cancellationToken = default);
+    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, CancellationToken cancellationToken = default, long expectedGeneration = 0);
 
     /// <summary>
     /// Replicate logs to the followers in the partition
@@ -179,8 +193,9 @@ public interface IRaft
     /// <param name="logs"></param>
     /// <param name="autoCommit"></param>
     /// <param name="cancellationToken"></param>
+    /// <param name="expectedGeneration"></param>
     /// <returns></returns>
-    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true, CancellationToken cancellationToken = default);
+    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true, CancellationToken cancellationToken = default, long expectedGeneration = 0);
 
     /// <summary>
     /// Replicate a checkpoint to the followers in the partition
@@ -305,6 +320,67 @@ public interface IRaft
     public Task<RaftOperationStatus> ResumeHeartbeatsAsync(
         int partitionId,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Creates a new partition. Leader-only. Idempotent: if the partition already exists
+    /// with Active state, returns its current generation without mutating the map.
+    /// </summary>
+    public Task<RaftPartitionLifecycleResult> CreatePartitionAsync(
+        int partitionId,
+        RaftRoutingMode mode = RaftRoutingMode.Unrouted,
+        (int start, int end)? hashRange = null,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Removes a partition. Leader-only. Idempotent: if the partition is already in
+    /// the Removed state, re-attempts WAL reclamation and returns Success.
+    /// </summary>
+    public Task<RaftPartitionLifecycleResult> RemovePartitionAsync(
+        int partitionId,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Splits <paramref name="sourcePartitionId"/> into two partitions using the
+    /// two-phase (Prepare → Commit) protocol. Leader-only.
+    /// <para>
+    /// Pass <paramref name="targetPartitionId"/> = 0 to let the coordinator
+    /// auto-assign the next available id. The <paramref name="plan"/> controls the
+    /// hash boundary and routing mode; <see cref="RaftSplitPlan.HashBoundary"/> = null
+    /// computes the midpoint automatically.
+    /// </para>
+    /// </summary>
+    public Task<RaftPartitionLifecycleResult> SplitPartitionAsync(
+        int sourcePartitionId,
+        int targetPartitionId = 0,
+        RaftSplitPlan? plan = null,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Merges two adjacent partitions into one, absorbing <paramref name="sourcePartitionId"/>
+    /// into <paramref name="survivorPartitionId"/>.
+    /// <para>
+    /// The caller must be the leader of both partitions. The source partition enters
+    /// <c>Draining</c> state in Phase 1, then is removed and its WAL deleted in Phase 2.
+    /// The survivor absorbs the source's hash range.
+    /// </para>
+    /// </summary>
+    public Task<RaftPartitionLifecycleResult> MergePartitionsAsync(
+        int survivorPartitionId,
+        int sourcePartitionId,
+        RaftMergePlan? plan = null,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns the committed generation for the given partition, or 0 if it does not exist.
+    /// Reads from the in-memory partition dictionary — no WAL I/O.
+    /// </summary>
+    public long GetPartitionGeneration(int partitionId);
+
+    /// <summary>
+    /// Returns a snapshot of the current partition map.
+    /// The returned list is a copy; mutating it does not affect the manager.
+    /// </summary>
+    public IReadOnlyList<RaftPartitionRange> GetPartitionMap();
 
     /// <summary>
     /// Returns the correct partition id according to the partition key

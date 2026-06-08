@@ -446,6 +446,7 @@ public sealed class TestBackpressureAndAdmissionControl
         public long GetLastCheckpoint(int partitionId) => 0;
         public int CountPersistedLogs(int partitionId) => 0;
         public int CountRemovableLogs(int partitionId) => 0;
+        public RaftOperationStatus DeletePartitionWAL(int partitionId) => RaftOperationStatus.Success;
         public string? GetMetaData(string key) => null;
         public bool SetMetaData(string key, string value) => true;
         public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries) => (RaftOperationStatus.Success, 0);

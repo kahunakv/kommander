@@ -183,6 +183,20 @@ public class InMemoryWAL : IWAL, IDisposable
         }
     }
 
+    public RaftOperationStatus DeletePartitionWAL(int partitionId)
+    {
+        rwLock.EnterWriteLock();
+        try
+        {
+            allLogs.Remove(partitionId);
+            return RaftOperationStatus.Success;
+        }
+        finally
+        {
+            rwLock.ExitWriteLock();
+        }
+    }
+
     public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
     {
         rwLock.EnterWriteLock();

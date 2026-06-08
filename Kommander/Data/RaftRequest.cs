@@ -24,7 +24,15 @@ public sealed class RaftRequest
     
     public RaftOperationStatus Status { get; }
     
-    public bool AutoCommit { get; } 
+    public bool AutoCommit { get; }
+
+    /// <summary>
+    /// When non-zero, the executor rejects the proposal with
+    /// <see cref="RaftOperationStatus.PartitionMoved"/> if the partition's
+    /// committed <c>Generation</c> no longer matches this value.
+    /// Zero means "no fence" — identical to the previous behavior.
+    /// </summary>
+    public long ExpectedGeneration { get; }
 
     public WALWriteOperation? WalOperation { get; }
 
@@ -64,11 +72,12 @@ public sealed class RaftRequest
         Logs = logs;
     }
 
-    public RaftRequest(RaftRequestType type, List<RaftLog> logs, bool autoCommit)
+    public RaftRequest(RaftRequestType type, List<RaftLog> logs, bool autoCommit, long expectedGeneration = 0)
     {
         Type = type;
         Logs = logs;
         AutoCommit = autoCommit;
+        ExpectedGeneration = expectedGeneration;
     }
     
     public RaftRequest(RaftRequestType type, HLCTimestamp timestamp, bool autoCommit)

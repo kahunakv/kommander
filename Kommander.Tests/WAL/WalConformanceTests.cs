@@ -968,6 +968,68 @@ public abstract class WalConformanceTests
         finally { cleanup(); }
     }
 
+    // ──────────────────────────── DeletePartitionWAL ────────────────────────────
+
+    [Fact]
+    public void DeletePartitionWAL_RemovesAllEntriesForPartition()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(5, [Log(id: 1), Log(id: 2), Log(id: 3)])]);
+            wal.Write([(6, [Log(id: 1), Log(id: 2)])]);
+
+            Assert.Equal(RaftOperationStatus.Success, wal.DeletePartitionWAL(5));
+
+            // Partition 5 must be empty after deletion.
+            Assert.Empty(wal.ReadLogs(5));
+            Assert.Equal(0, wal.GetMaxLog(5));
+
+            // Neighbouring partition 6 must be unaffected.
+            Assert.Equal(2, wal.ReadLogs(6).Count);
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void DeletePartitionWAL_Idempotent_ReturnsSuccess()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(7, [Log(id: 1)])]);
+
+            // First call removes the data.
+            Assert.Equal(RaftOperationStatus.Success, wal.DeletePartitionWAL(7));
+            // Second call on already-empty partition.
+            Assert.Equal(RaftOperationStatus.Success, wal.DeletePartitionWAL(7));
+            // Call on a partition that was never written.
+            Assert.Equal(RaftOperationStatus.Success, wal.DeletePartitionWAL(99));
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void DeletePartitionWAL_BoundaryPartitions_NotAffected()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            // Write logs to three adjacent partition IDs.
+            wal.Write([(10, [Log(id: 1), Log(id: 2)])]);
+            wal.Write([(11, [Log(id: 1), Log(id: 2)])]);
+            wal.Write([(12, [Log(id: 1), Log(id: 2)])]);
+
+            Assert.Equal(RaftOperationStatus.Success, wal.DeletePartitionWAL(11));
+
+            // Partitions 10 and 12 must be completely untouched.
+            Assert.Equal(2, wal.ReadLogs(10).Count);
+            Assert.Empty(wal.ReadLogs(11));
+            Assert.Equal(2, wal.ReadLogs(12).Count);
+        }
+        finally { cleanup(); }
+    }
+
     // ──────────────────────────── helpers ───────────────────────────────────────
 
     protected static RaftLog Log(long id, long term = 1, RaftLogType type = RaftLogType.Committed) =>

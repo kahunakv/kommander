@@ -412,6 +412,119 @@ public sealed class TestRaftPartitionExecutor
         await executor.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
     }
 
+    // ── Generation fence tests (Task 3.2) ─────────────────────────────────
+
+    private static (RaftPartitionExecutor executor, RaftPartitionStateMachine sm) BuildExecutorWithGeneration(
+        Func<long> getGeneration,
+        int partitionId = 0)
+    {
+        StubHost host = new(partitionId);
+        IRaftWalFacade wal = new StubWal();
+        CapturingReplySink sink = new();
+
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+        RaftPartitionExecutor executor = new(sm, partitionId, slowThresholdMs: 0, NullLogger<IRaft>.Instance,
+            getGeneration: getGeneration);
+        executor.Start();
+        return (executor, sm);
+    }
+
+    /// <summary>
+    /// When ExpectedGeneration is 0 (the default), the fence is bypassed regardless
+    /// of what the generation delegate returns.
+    /// </summary>
+    [Fact]
+    public async Task GenerationFence_ZeroExpectedGeneration_IsPassThrough()
+    {
+        long currentGen = 42;
+        var (executor, _) = BuildExecutorWithGeneration(() => currentGen);
+        await executor.RestoreTask;
+
+        // expectedGeneration = 0 → no fence, proposal flows through to the state machine.
+        RaftResponse response = await executor.Ask(
+            new RaftRequest(RaftRequestType.ReplicateLogs, [new RaftLog { LogType = "t", LogData = [] }], autoCommit: true, expectedGeneration: 0),
+            TestContext.Current.CancellationToken);
+
+        // The state machine returns NodeIsNotLeader (no leader set) rather than PartitionMoved.
+        Assert.NotEqual(RaftOperationStatus.PartitionMoved, response.Status);
+
+        executor.Stop();
+        executor.Dispose();
+    }
+
+    /// <summary>
+    /// When ExpectedGeneration matches the current generation the proposal is accepted.
+    /// </summary>
+    [Fact]
+    public async Task GenerationFence_MatchingGeneration_ProposalAccepted()
+    {
+        long currentGen = 7;
+        var (executor, _) = BuildExecutorWithGeneration(() => currentGen);
+        await executor.RestoreTask;
+
+        RaftResponse response = await executor.Ask(
+            new RaftRequest(RaftRequestType.ReplicateLogs, [new RaftLog { LogType = "t", LogData = [] }], autoCommit: true, expectedGeneration: 7),
+            TestContext.Current.CancellationToken);
+
+        Assert.NotEqual(RaftOperationStatus.PartitionMoved, response.Status);
+
+        executor.Stop();
+        executor.Dispose();
+    }
+
+    /// <summary>
+    /// When ExpectedGeneration is non-zero and does not match the current generation
+    /// the executor returns PartitionMoved without touching the state machine.
+    /// </summary>
+    [Fact]
+    public async Task GenerationFence_MismatchedGeneration_ReturnsPartitionMoved()
+    {
+        long currentGen = 5;
+        var (executor, _) = BuildExecutorWithGeneration(() => currentGen);
+        await executor.RestoreTask;
+
+        RaftResponse response = await executor.Ask(
+            new RaftRequest(RaftRequestType.ReplicateLogs, [new RaftLog { LogType = "t", LogData = [] }], autoCommit: true, expectedGeneration: 99),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(RaftOperationStatus.PartitionMoved, response.Status);
+
+        executor.Stop();
+        executor.Dispose();
+    }
+
+    /// <summary>
+    /// Generation changes mid-stream: the first proposal (matching gen) passes; the
+    /// second proposal (now stale gen after bump) is rejected.
+    /// </summary>
+    [Fact]
+    public async Task GenerationFence_GenerationBumpedMidStream_SecondProposalRejected()
+    {
+        long currentGen = 1;
+        var (executor, _) = BuildExecutorWithGeneration(() => Interlocked.Read(ref currentGen));
+        await executor.RestoreTask;
+
+        // First proposal with gen=1 → not PartitionMoved.
+        RaftResponse first = await executor.Ask(
+            new RaftRequest(RaftRequestType.ReplicateLogs, [new RaftLog { LogType = "t", LogData = [] }], autoCommit: true, expectedGeneration: 1),
+            TestContext.Current.CancellationToken);
+
+        Assert.NotEqual(RaftOperationStatus.PartitionMoved, first.Status);
+
+        // Simulate a partition map mutation that bumps the generation.
+        Interlocked.Exchange(ref currentGen, 2);
+
+        // Second proposal still carries the old gen=1 → PartitionMoved.
+        RaftResponse second = await executor.Ask(
+            new RaftRequest(RaftRequestType.ReplicateLogs, [new RaftLog { LogType = "t", LogData = [] }], autoCommit: true, expectedGeneration: 1),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(RaftOperationStatus.PartitionMoved, second.Status);
+
+        executor.Stop();
+        executor.Dispose();
+    }
+
     private sealed class BlockingStubWal(Task gate) : IRaftWalFacade
     {
         public async ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync()

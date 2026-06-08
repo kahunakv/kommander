@@ -2,6 +2,7 @@
 using Kommander.Data;
 using Kommander.Diagnostics;
 using Kommander.Scheduling;
+using Kommander.System;
 using Kommander.Time;
 using Kommander.WAL;
 using Microsoft.Extensions.Logging;
@@ -60,6 +61,7 @@ public sealed class RaftPartition : IDisposable
 
     private volatile int _startRange;
     private volatile int _endRange;
+    private volatile int _routingMode;
 
     public int PartitionId { get; }
 
@@ -74,6 +76,23 @@ public sealed class RaftPartition : IDisposable
         get => _endRange;
         internal set => _endRange = value;
     }
+
+    /// <summary>Routing mode; updated in-place when the partition map is applied.</summary>
+    public RaftRoutingMode RoutingMode
+    {
+        get => (RaftRoutingMode)_routingMode;
+        internal set => _routingMode = (int)value;
+    }
+
+    /// <summary>Current map generation for this partition; bumped on every map mutation.</summary>
+    public long Generation { get; internal set; }
+
+    /// <summary>
+    /// Lifecycle state of this partition as last applied by <c>StartUserPartitions</c>.
+    /// Reflects the persisted partition map — <see cref="RaftPartitionState.Draining"/>
+    /// means the partition is being merged and should not accept new writes.
+    /// </summary>
+    public RaftPartitionState State { get; internal set; } = RaftPartitionState.Active;
 
     /// <summary>
     /// Constructor
@@ -127,7 +146,8 @@ public sealed class RaftPartition : IDisposable
             drainQuantumControl:     manager.Configuration.MaxDrainQuantumControl,
             drainQuantumReplication: manager.Configuration.MaxDrainQuantumReplication,
             drainQuantumClient:      manager.Configuration.MaxDrainQuantumClient,
-            drainQuantumMaintenance: manager.Configuration.MaxDrainQuantumMaintenance);
+            drainQuantumMaintenance: manager.Configuration.MaxDrainQuantumMaintenance,
+            getGeneration:           () => Generation);
         executorRef = executor;
         replySink.Executor = executor;
         executor.Start();
@@ -233,21 +253,21 @@ public sealed class RaftPartition : IDisposable
     /// <param name="autoCommit">A boolean value indicating whether the log should be committed automatically upon replication success.</param>
     /// <returns>A task that represents the asynchronous operation, containing a tuple with a boolean indicating success,
     /// a <see cref="RaftOperationStatus"/> indicating the result status, and an <see cref="HLCTimestamp"/> representing the ticket ID for the log entry.</returns>
-    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, byte[] data, bool autoCommit)
+    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, byte[] data, bool autoCommit, long expectedGeneration = 0)
     {
         if (string.IsNullOrEmpty(Leader))
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
-        
+
         if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
 
         List<RaftLog> logsToReplicate = [new() { Type = RaftLogType.Proposed, LogType = type, LogData = data }];
-        
-        RaftResponse response = await executor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit)).ConfigureAwait(false);
-        
+
+        RaftResponse response = await executor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit, expectedGeneration)).ConfigureAwait(false);
+
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
-        
+
         return (false, response.Status, HLCTimestamp.Zero);
     }
 
@@ -258,21 +278,21 @@ public sealed class RaftPartition : IDisposable
     /// <param name="logs">A collection of log entries, each represented as a byte array, to be replicated.</param>
     /// <param name="autoCommit">A boolean indicating whether the logs should be automatically committed after replication.</param>
     /// <returns>A tuple containing a boolean indicating success, the status of the operation as a <see cref="RaftOperationStatus"/> value, and the <see cref="HLCTimestamp"/> ticket ID of the operation.</returns>
-    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, IEnumerable<byte[]> logs, bool autoCommit = true)
+    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, IEnumerable<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0)
     {
         if (string.IsNullOrEmpty(Leader))
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
-        
+
         if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
 
         List<RaftLog> logsToReplicate = logs.Select(data => new RaftLog { Type = RaftLogType.Proposed, LogType = type, LogData = data }).ToList();
-        
-        RaftResponse response = await executor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit)).ConfigureAwait(false);
-        
+
+        RaftResponse response = await executor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit, expectedGeneration)).ConfigureAwait(false);
+
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
-        
+
         return (false, response.Status, HLCTimestamp.Zero);
     }
 
@@ -481,6 +501,9 @@ public sealed class RaftPartition : IDisposable
 
     internal Task DrainAsync(CancellationToken cancellationToken = default) =>
         executor.DrainAsync(cancellationToken);
+
+    /// <summary>Completes when the partition's WAL restore (Phase 2) has finished.</summary>
+    internal Task RestoreTask => executor.RestoreTask;
 
     public void Dispose()
     {

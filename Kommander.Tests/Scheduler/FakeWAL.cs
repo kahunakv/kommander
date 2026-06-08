@@ -145,6 +145,13 @@ public sealed class FakeWAL : IWAL
     public int CountRemovableLogs(int partitionId) => 0;
 
     /// <inheritdoc/>
+    public RaftOperationStatus DeletePartitionWAL(int partitionId)
+    {
+        _logs.Remove(partitionId);
+        return RaftOperationStatus.Success;
+    }
+
+    /// <inheritdoc/>
     public string? GetMetaData(string key) => _meta.GetValueOrDefault(key);
 
     /// <inheritdoc/>

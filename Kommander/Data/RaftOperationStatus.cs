@@ -27,4 +27,10 @@ public enum RaftOperationStatus
     /// The caller should back off and retry after a short delay.
     /// </summary>
     RestoreInProgress = 12,
+
+    /// <summary>
+    /// The partition has moved to a new generation. The caller should refresh
+    /// the partition map and retry the request on the new owner.
+    /// </summary>
+    PartitionMoved = 13,
 }

@@ -533,6 +533,28 @@ public class SqliteWAL : IWAL, IDisposable
     /// Compacts logs in the SQLite database that are older than the specified checkpoint and within the specified limit.
     /// </summary>
     /// <param name="partitionId">The identifier of the partition whose logs are to be compacted.</param>
+    /// <inheritdoc/>
+    public RaftOperationStatus DeletePartitionWAL(int partitionId)
+    {
+        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+        lock (partitionLock)
+        {
+            try
+            {
+                using SqliteCommand command = new(
+                    "DELETE FROM logs WHERE partitionId = @partitionId", connection);
+                command.Parameters.AddWithValue("@partitionId", partitionId);
+                command.ExecuteNonQuery();
+                return RaftOperationStatus.Success;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("Error during DeletePartitionWAL({PartitionId}): {Message}", partitionId, ex.Message);
+                return RaftOperationStatus.Errored;
+            }
+        }
+    }
+
     /// <param name="lastCheckpoint">The checkpoint ID indicating the upper bound for compaction. Logs with IDs less than this value will be compacted.</param>
     /// <param name="compactNumberEntries">The maximum number of log entries to be compacted in a single operation.</param>
     /// <returns>
