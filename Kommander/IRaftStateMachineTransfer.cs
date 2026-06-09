@@ -43,9 +43,11 @@ public interface IRaftStateMachineTransfer
     /// </para>
     /// <para>
     /// <b>Checkpoint retry:</b> after a successful import the coordinator replicates a
-    /// checkpoint into the target partition's log; if that checkpoint replication fails,
-    /// the coordinator retries the checkpoint once. No re-import is attempted — the same
-    /// local state is used for both checkpoint attempts.
+    /// checkpoint into the target partition's log; if that replication fails, the coordinator
+    /// retries the checkpoint replication once. <c>ImportRange</c> is never called again — the
+    /// state already applied locally is used for both checkpoint attempts. If both checkpoint
+    /// attempts fail the coordinator logs an error; the snapshot is present on the leader but
+    /// followers have not yet received it via the log, so manual intervention may be required.
     /// </para>
     /// The coordinator disposes the stream after this call returns.
     /// </summary>

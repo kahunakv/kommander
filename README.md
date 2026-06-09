@@ -276,6 +276,8 @@ Use a unique `NodeId` when you can. If `NodeId` is `0`, Kommander derives one fr
 | Leadership | `AmILeaderQuick`, `AmILeader`, `WaitForLeader` |
 | Replication | `ReplicateLogs`, `ReplicateCheckpoint`, `CommitLogs`, `RollbackLogs` |
 | Partition routing | `GetPartitionKey`, `GetPrefixPartitionKey` |
+| Elastic partitions | `CreatePartitionAsync`, `RemovePartitionAsync`, `SplitPartitionAsync`, `MergePartitionsAsync`, `GetPartitionMap`, `GetPartitionGeneration`, `RegisterStateMachineTransfer` |
+| Partition events | `OnPartitionMapChanged` |
 | Transport entry points | `Handshake`, `RequestVote`, `Vote`, `AppendLogs`, `CompleteAppendLogs` |
 | Components | `WalAdapter`, `Communication`, `Discovery`, `Configuration`, `HybridLogicalClock`, `ReadScheduler`, `WalScheduler` |
 | Events | `OnRestoreStarted`, `OnRestoreFinished`, `OnReplicationError`, `OnLogRestored`, `OnReplicationReceived`, `OnLeaderChanged` |
@@ -558,16 +560,65 @@ public interface IDiscovery
 }
 ```
 
-## Dynamic Partitions
+## Elastic Partitions
 
-Initial user partitions are replicated through the reserved system partition and then started on every node. If you keep a concrete `RaftManager` reference, you can request a partition split:
+Partitions can be created, split, merged, and removed at runtime without restarting any node. All lifecycle operations are serialized through the system partition and replicated to every node, so the partition map is always consistent and durable.
 
 ```csharp
-RaftManager manager = /* created node */;
-await manager.SplitPartition(partitionId);
+// Create a new unrouted partition addressed by id directly.
+RaftPartitionLifecycleResult created = await raft.CreatePartitionAsync(
+    partitionId: 10,
+    mode: RaftRoutingMode.Unrouted);
+
+// Split partition 1 into two hash-range halves.
+RaftPartitionLifecycleResult split = await raft.SplitPartitionAsync(
+    sourcePartitionId: 1);
+
+// Merge partition 3 (source) into partition 2 (survivor).
+RaftPartitionLifecycleResult merged = await raft.MergePartitionsAsync(
+    survivorPartitionId: 2,
+    sourcePartitionId:   3);
+
+// Remove a partition (tombstone persists; WAL is reclaimed).
+RaftPartitionLifecycleResult removed = await raft.RemovePartitionAsync(partitionId: 10);
 ```
 
-The caller must be initialized, the target partition cannot be partition `0`, and the local node must be leader for the target partition.
+All operations require the caller to be the leader of the relevant partition(s). Splits and merges use a two-phase commit so the hash ring is never incomplete during the transition.
+
+The **generation fence** protects writes during topology changes. Pass `expectedGeneration` to `ReplicateLogs` to detect when the partition a client cached has been split or merged:
+
+```csharp
+long gen = raft.GetPartitionGeneration(partitionId);
+
+RaftReplicationResult result = await raft.ReplicateLogs(
+    partitionId,
+    type:              "MyEvent",
+    data:              payload,
+    expectedGeneration: gen);
+
+if (result.Status == RaftOperationStatus.PartitionMoved)
+{
+    // Partition topology changed; re-read the map and retry on the new partition.
+}
+```
+
+Subscribe to `OnPartitionMapChanged` to react to map updates without polling:
+
+```csharp
+raft.OnPartitionMapChanged += snapshot =>
+{
+    foreach (RaftPartitionRange range in snapshot)
+        Console.WriteLine($"  P{range.PartitionId} {range.State} [{range.StartRange},{range.EndRange}] gen={range.Generation}");
+};
+```
+
+For large datasets, register a snapshot transfer implementation to copy state from source to target in one step instead of shipping individual log entries:
+
+```csharp
+raft.RegisterStateMachineTransfer(new MySnapshotTransfer());
+```
+
+See [Elastic Partitions Developer Guide](docs/elastic-partitions-developer-guide.md) for a full walkthrough of the two-phase protocols, crash recovery, routing, the generation fence, snapshot transfer, and how to extend the system.
 
 ## Utilities
 
