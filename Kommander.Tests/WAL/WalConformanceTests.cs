@@ -1036,6 +1036,81 @@ public abstract class WalConformanceTests
         new() { Id = id, Term = term, Type = type, LogType = "conformance" };
 }
 
+// ─────────────────────── SqliteWAL-specific tests ───────────────────────────
+
+/// <summary>
+/// Tests that exercise SQLite-specific behavior of DeletePartitionWAL:
+/// no file creation for never-written partitions, and connection eviction after delete.
+/// These cannot be expressed in the abstract conformance suite because they depend on
+/// file-system state and the internal connection dictionary.
+/// </summary>
+public sealed class SqliteDeletePartitionWalTests
+{
+    private static (SqliteWAL Wal, string Dir, Action Cleanup) BuildWal()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), $"sqlite-del-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        SqliteWAL wal = new(dir, "rev1", NullLogger<IRaft>.Instance, syncWrites: false);
+        Action cleanup = () => { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); };
+        return (wal, dir, cleanup);
+    }
+
+    /// <summary>
+    /// DeletePartitionWAL on a partition that was never written must NOT create a .db file.
+    /// The old implementation called TryOpenDatabase unconditionally, which ran
+    /// CREATE TABLE IF NOT EXISTS and left a stale open connection in the dictionary.
+    /// </summary>
+    [Fact]
+    public void DeletePartitionWAL_NeverWrittenPartition_DoesNotCreateDbFile()
+    {
+        (SqliteWAL wal, string dir, Action cleanup) = BuildWal();
+        using (wal)
+        {
+            try
+            {
+                RaftOperationStatus status = wal.DeletePartitionWAL(42);
+
+                Assert.Equal(RaftOperationStatus.Success, status);
+                Assert.Empty(Directory.GetFiles(dir, "raft42_*.db"));
+            }
+            finally { cleanup(); }
+        }
+    }
+
+    /// <summary>
+    /// After DeletePartitionWAL on a partition that was written to, the connection must
+    /// be closed and removed from the internal dictionary. A subsequent write must open a
+    /// fresh connection (not reuse the evicted handle) and the data must be readable.
+    /// </summary>
+    [Fact]
+    public void DeletePartitionWAL_EvictsConnection_SubsequentWriteOpensNewConnection()
+    {
+        (SqliteWAL wal, string dir, Action cleanup) = BuildWal();
+        using (wal)
+        {
+            try
+            {
+                // Write data, then delete.
+                wal.Write([(55, [new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed, LogType = "t" }])]);
+                Assert.Single(wal.ReadLogs(55));
+
+                RaftOperationStatus deleteStatus = wal.DeletePartitionWAL(55);
+                Assert.Equal(RaftOperationStatus.Success, deleteStatus);
+
+                // After delete, reads must return empty.
+                Assert.Empty(wal.ReadLogs(55));
+
+                // Write again — must open a fresh connection without error.
+                RaftOperationStatus writeStatus = wal.Write(
+                    [(55, [new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed, LogType = "t2" }])]);
+                Assert.Equal(RaftOperationStatus.Success, writeStatus);
+                Assert.Single(wal.ReadLogs(55));
+            }
+            finally { cleanup(); }
+        }
+    }
+}
+
 // ─────────────────────────── concrete adapters ──────────────────────────────
 
 public sealed class InMemoryWalConformanceTests : WalConformanceTests

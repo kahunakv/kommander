@@ -276,9 +276,12 @@ public sealed class TestMergePartition
             }
         };
 
-        // Delivering the Draining map triggers InitializePartitions, which detects the
-        // Draining partition and re-enqueues MergePartitionCommit to complete Phase 2.
+        // ConfigReplicated populates systemConfiguration (no crash recovery).  LeaderChanged
+        // with a non-local endpoint drives InitializePartitions(crashRecovery: true), which
+        // detects the Draining partition and re-enqueues MergePartitionCommit to complete Phase 2.
         manager.SystemCoordinator.Send(MakeConfigReplicated(drainingMap, mapVersion: 2));
+        manager.SystemCoordinator.Send(
+            new RaftSystemRequest(RaftSystemRequestType.LeaderChanged, "other-node:9001"));
         await done.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         Assert.NotNull(recoveredRanges);

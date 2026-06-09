@@ -191,7 +191,10 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 systemConfiguration[systemMessage.Key] = systemMessage.Value;
                 logger.LogInformation("Replicated system configuration: {Key}", systemMessage.Key);
 
-                InitializePartitions();
+                // Live replication: update the partition map but do NOT run crash-recovery
+                // re-enqueuing. Followers must never attempt to drive Phase 2 commits, and
+                // leaders already track in-progress operations via _pendingSplits/_pendingMerges.
+                InitializePartitions(crashRecovery: false);
             }
             break;
 
@@ -207,7 +210,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 if (manager.LocalEndpoint == leaderNode)
                     await TrySetInitialPartitions(cancellationToken).ConfigureAwait(false);
                 else
-                    InitializePartitions();
+                    InitializePartitions(crashRecovery: false);
                 break;
 
             case RaftSystemRequestType.SplitPartition:
@@ -227,6 +230,10 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 break;
 
             case RaftSystemRequestType.RestoreCompleted:
+                // WAL restore finished: apply the persisted map and run crash-recovery
+                // re-enqueuing to resume any Splitting/Draining phases left incomplete
+                // before the previous shutdown.
+                InitializePartitions(crashRecovery: true);
                 break;
 
             case RaftSystemRequestType.CreatePartition:
@@ -257,7 +264,16 @@ internal sealed class RaftSystemCoordinator : IDisposable
     private void StartPartitions(List<RaftPartitionRange> ranges) =>
         (StartPartitionsOverride ?? manager.StartUserPartitions)(ranges);
 
-    private void InitializePartitions()
+    /// <param name="crashRecovery">
+    /// When <see langword="true"/>, re-enqueues Phase 2 for any Splitting or Draining
+    /// partition found in the map (crash-recovery path). Must only be set when this node
+    /// is becoming the leader (<c>LeaderChanged</c>) or completing WAL restore
+    /// (<c>RestoreCompleted</c>). Must be <see langword="false"/> for live replication
+    /// events (<c>ConfigReplicated</c>) because followers must never drive Phase 2 commits,
+    /// and leaders already track in-progress operations via <c>_pendingSplits</c> /
+    /// <c>_pendingMerges</c>.
+    /// </param>
+    private void InitializePartitions(bool crashRecovery = false)
     {
         if (!systemConfiguration.TryGetValue(RaftSystemConfigKeys.Partitions, out string? partitions))
         {
@@ -281,6 +297,9 @@ internal sealed class RaftSystemCoordinator : IDisposable
             if (range.State == RaftPartitionState.Removed)
                 manager.WalAdapter.DeletePartitionWAL(range.PartitionId);
         }
+
+        if (!crashRecovery)
+            return;
 
         // Crash recovery: if Phase 1 was committed but Phase 2 was not, the map will
         // contain Splitting pairs.  Re-enqueue Phase 2 so the leader can complete them.
@@ -403,17 +422,21 @@ internal sealed class RaftSystemCoordinator : IDisposable
                     "Failed to replicate initial partitions {Status} {LogIndex} Retry={Retry}",
                     result.Status, result.LogIndex, i);
 
-                if (result.Status != RaftOperationStatus.Success)
+                // NodeIsNotLeader means another node won leadership during init.
+                // Defer immediately — the new leader will drive TrySetInitialPartitions.
+                if (result.Status == RaftOperationStatus.NodeIsNotLeader)
+                    return;
+
+                // Transient error: retry with backoff.  After MaxRetries the node cannot
+                // start without an initial partition map, so terminate.
+                try { await Task.Delay(RetryDelay, cancellationToken).ConfigureAwait(false); }
+                catch (OperationCanceledException)
                 {
-                    try { await Task.Delay(RetryDelay, cancellationToken).ConfigureAwait(false); }
-                    catch (OperationCanceledException)
-                    {
-                        logger.LogWarning("[RaftSystemCoordinator] TrySetInitialPartitions delay aborted on shutdown");
-                        return;
-                    }
-                    if (i <= 8)
-                        continue;
+                    logger.LogWarning("[RaftSystemCoordinator] TrySetInitialPartitions delay aborted on shutdown");
+                    return;
                 }
+                if (i <= 8)
+                    continue;
 
                 logger.LogError(
                     "Cannot continue without initial partitions {Status} {LogIndex}",
@@ -428,6 +451,10 @@ internal sealed class RaftSystemCoordinator : IDisposable
             break;
         }
 
+        // Keep local cache in sync so any coordinator operation that is already queued
+        // behind this LeaderChanged (e.g. SplitPartition, CreatePartition) finds the map
+        // immediately rather than waiting for the async ConfigReplicated callback.
+        systemConfiguration[RaftSystemConfigKeys.Partitions] = message.Value;
         StartPartitions(initialRanges);
     }
 
@@ -1072,6 +1099,15 @@ internal sealed class RaftSystemCoordinator : IDisposable
             newStart = message.HashRangeStart.Value;
             newEnd = message.HashRangeEnd.Value;
 
+            if (newStart > newEnd)
+            {
+                logger.LogError(
+                    "TryCreatePartition: Invalid HashRange [{Start},{End}]",
+                    newStart, newEnd);
+                completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+                return;
+            }
+
             foreach (RaftPartitionRange range in map.Partitions)
             {
                 if (range.RoutingMode != RaftRoutingMode.HashRange)
@@ -1190,6 +1226,18 @@ internal sealed class RaftSystemCoordinator : IDisposable
             return;
         }
 
+        // A partition in Splitting or Draining is mid-protocol. Removing it would orphan the
+        // paired target (Splitting) or bypass MergePartitionCommit (Draining). The caller must
+        // complete or abort the pending phase-transition before removing.
+        if (entry.State is RaftPartitionState.Splitting or RaftPartitionState.Draining)
+        {
+            logger.LogError(
+                "TryRemovePartition: Partition {Id} is in {State} state; complete or abort the pending phase first",
+                partitionId, entry.State);
+            completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+            return;
+        }
+
         // Mark Removed, bump generation and map version, then replicate.
         entry.State = RaftPartitionState.Removed;
         entry.Generation++;
@@ -1259,6 +1307,12 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
         logger.LogInformation(
             "TryRemovePartition: Partition {Id} removed and WAL reclaimed", partitionId);
+
+        // Fire OnPartitionMapChanged on the leader, matching the contract on followers
+        // (who fire it via ConfigReplicated → StartUserPartitions). The partition has
+        // already been evicted from manager.Partitions, so StartUserPartitions skips the
+        // Removed tombstone and the event snapshot reflects the post-remove state.
+        StartPartitions(map.Partitions);
 
         completion?.TrySetResult((RaftOperationStatus.Success, entry.Generation));
     }

@@ -27,13 +27,13 @@ public abstract class PartitionLifecycleTests
 
     // ── Builders ──────────────────────────────────────────────────────────────
 
-    private static RaftManager Build(IWAL wal)
+    private static RaftManager Build(IWAL wal, int initialPartitions = 0)
     {
         RaftConfiguration config = new()
         {
             Host = "localhost",
             Port = 9000,
-            InitialPartitions = 0
+            InitialPartitions = initialPartitions
         };
         return new(
             config,
@@ -95,6 +95,95 @@ public abstract class PartitionLifecycleTests
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Test 0 — LeaderChanged followed immediately by CreatePartition in the same
+    /// channel burst must succeed.
+    ///
+    /// Before the fix, TrySetInitialPartitions did not write to systemConfiguration
+    /// after replication succeeded. Any coordinator operation already queued behind
+    /// LeaderChanged (e.g. a CreatePartition sent in the same burst) would call
+    /// systemConfiguration.TryGetValue, find nothing, and return Errored — because
+    /// ConfigReplicated, which updates systemConfiguration, arrives asynchronously.
+    ///
+    /// After the fix, TrySetInitialPartitions writes to systemConfiguration before
+    /// calling StartPartitions, so the queued CreatePartition finds the map immediately.
+    /// </summary>
+    [Fact]
+    public async Task LeaderChanged_ThenCreatePartition_CreateSucceedsWithoutWaitingForConfigReplicated()
+    {
+        IWAL wal = CreateWal(out Action cleanup);
+        // initialPartitions=1 so TrySetInitialPartitions produces a valid (non-empty) map
+        // and DivideIntoRanges doesn't divide by zero with count=0.
+        using RaftManager manager = Build(wal, initialPartitions: 1);
+        try
+        {
+            int replicateCallCount = 0;
+            manager.SystemCoordinator.ReplicateOverride = (_, _, _, _) =>
+            {
+                replicateCallCount++;
+                return Task.FromResult(new RaftReplicationResult(true, RaftOperationStatus.Success, HLCTimestamp.Zero, replicateCallCount));
+            };
+            manager.SystemCoordinator.StartPartitionsOverride = ranges => manager.StartUserPartitions(ranges);
+
+            // Send LeaderChanged (triggers TrySetInitialPartitions) and CreatePartition
+            // in a single synchronous burst — both are in the channel before the loop
+            // processes either, so ConfigReplicated has no opportunity to run between them.
+            TaskCompletionSource<(RaftOperationStatus Status, long Generation)> createTcs =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+            manager.SystemCoordinator.Send(
+                new RaftSystemRequest(RaftSystemRequestType.LeaderChanged, "localhost:9000"));
+            manager.SystemCoordinator.Send(
+                new RaftSystemRequest(10, RaftRoutingMode.Unrouted, null, null, createTcs));
+
+            (RaftOperationStatus status, long gen) =
+                await createTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Assert.True(manager.Partitions.ContainsKey(10));
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// Test 0b — TrySetInitialPartitions: NodeIsNotLeader must exit the retry loop
+    /// immediately (one attempt only), not sleep and retry 9 times.
+    ///
+    /// The original code had the inner condition as != Success (always true), so
+    /// NodeIsNotLeader would sleep RetryDelay × 9 then call Environment.Exit(1).
+    /// The fix changes the inner condition to != NodeIsNotLeader, matching every other
+    /// method in the file.  We cannot call Environment.Exit in a test, so we verify the
+    /// observable side-effect: exactly one replication call was made (no retries).
+    /// </summary>
+    [Fact]
+    public async Task TrySetInitialPartitions_NodeIsNotLeader_ExitsRetryLoopAfterOneAttempt()
+    {
+        IWAL wal = CreateWal(out Action cleanup);
+        using RaftManager manager = Build(wal, initialPartitions: 1);
+        try
+        {
+            int replicateCallCount = 0;
+            manager.SystemCoordinator.RetryDelay = TimeSpan.Zero;
+            manager.SystemCoordinator.ReplicateOverride = (_, _, _, _) =>
+            {
+                replicateCallCount++;
+                // Always return NodeIsNotLeader so the loop always hits the fast-abort path.
+                return Task.FromResult(new RaftReplicationResult(false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero, 0));
+            };
+            manager.SystemCoordinator.StartPartitionsOverride = ranges => manager.StartUserPartitions(ranges);
+
+            // LeaderChanged triggers TrySetInitialPartitions.  With the bug, it would
+            // sleep RetryDelay × 9 then exit.  With the fix, it exits after one attempt.
+            manager.SystemCoordinator.Send(
+                new RaftSystemRequest(RaftSystemRequestType.LeaderChanged, "localhost:9000"));
+
+            await WaitForIdleAsync(manager);
+
+            // Exactly one replication call — no retry loop.
+            Assert.Equal(1, replicateCallCount);
+        }
+        finally { cleanup(); }
+    }
 
     /// <summary>
     /// Test 1 — Create an Unrouted partition, write a WAL log to it, read it back.
@@ -281,6 +370,191 @@ public abstract class PartitionLifecycleTests
             // Map must have exactly one entry for partition 30.
             Assert.NotNull(lastReplicatedRanges);
             Assert.Equal(1, lastReplicatedRanges.Count(r => r.PartitionId == 30));
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// Test 6 — CreatePartition with an inverted HashRange (start &gt; end) is rejected
+    /// immediately with Errored. The inverted interval would pass the overlap check
+    /// (it covers nothing) and silently corrupt the partition map, so the guard must
+    /// fire before any replication.
+    /// </summary>
+    [Fact]
+    public async Task CreatePartition_InvertedHashRange_IsRejectedWithError()
+    {
+        IWAL wal = CreateWal(out Action cleanup);
+        using RaftManager manager = Build(wal);
+        try
+        {
+            List<RaftPartitionRange> initial =
+            [
+                new() { PartitionId = 1, StartRange = 0, EndRange = int.MaxValue, Generation = 1, State = RaftPartitionState.Active, RoutingMode = RaftRoutingMode.HashRange }
+            ];
+            manager.SystemCoordinator.Send(MakeConfigReplicated(initial));
+            await WaitForIdleAsync(manager);
+
+            bool replicateCalled = false;
+            manager.SystemCoordinator.ReplicateOverride = (_, _, _, _) =>
+            {
+                replicateCalled = true;
+                return Task.FromResult(new RaftReplicationResult(true, RaftOperationStatus.Success, HLCTimestamp.Zero, 1));
+            };
+
+            // start=500, end=100 — inverted range
+            (RaftOperationStatus status, _) = await SendCreateAsync(manager, partitionId: 42,
+                RaftRoutingMode.HashRange, start: 500, end: 100);
+
+            Assert.Equal(RaftOperationStatus.Errored, status);
+            Assert.False(replicateCalled);
+            Assert.False(manager.Partitions.ContainsKey(42));
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// Test 6b — RemovePartition fires OnPartitionMapChanged on the leader.
+    /// Followers fire the event via ConfigReplicated → StartUserPartitions.  The leader
+    /// must fire it too so routing-table consumers see the remove without a round-trip.
+    /// The removed partition must not appear in the snapshot (StartUserPartitions skips
+    /// Removed tombstones).
+    /// </summary>
+    [Fact]
+    public async Task RemovePartition_FiresOnPartitionMapChanged_PartitionAbsentFromSnapshot()
+    {
+        IWAL wal = CreateWal(out Action cleanup);
+        using RaftManager manager = Build(wal);
+        try
+        {
+            List<RaftPartitionRange> initial =
+            [
+                new() { PartitionId = 1, StartRange = 0, EndRange = int.MaxValue, Generation = 1, State = RaftPartitionState.Active, RoutingMode = RaftRoutingMode.HashRange }
+            ];
+            manager.SystemCoordinator.Send(MakeConfigReplicated(initial));
+            await WaitForIdleAsync(manager);
+
+            int replicateCallCount = 0;
+            manager.SystemCoordinator.ReplicateOverride = (_, _, _, _) =>
+            {
+                replicateCallCount++;
+                return Task.FromResult(new RaftReplicationResult(true, RaftOperationStatus.Success, HLCTimestamp.Zero, replicateCallCount));
+            };
+            manager.SystemCoordinator.StartPartitionsOverride = ranges => manager.StartUserPartitions(ranges);
+
+            // Create partition 20.
+            (RaftOperationStatus createStatus, _) = await SendCreateAsync(manager, partitionId: 20, RaftRoutingMode.Unrouted);
+            Assert.Equal(RaftOperationStatus.Success, createStatus);
+
+            // Subscribe to the event AFTER creation so we only capture the remove snapshot.
+            List<IReadOnlyList<RaftPartitionRange>> snapshots = [];
+            manager.OnPartitionMapChanged += snap => snapshots.Add(snap);
+
+            // Remove partition 20.
+            (RaftOperationStatus removeStatus, _) = await SendRemoveAsync(manager, partitionId: 20);
+            Assert.Equal(RaftOperationStatus.Success, removeStatus);
+
+            // Event must have fired exactly once for the remove.
+            Assert.Single(snapshots);
+
+            // The snapshot must not contain the removed partition.
+            Assert.DoesNotContain(snapshots[0], r => r.PartitionId == 20);
+
+            // Partition 1 must still be in the snapshot.
+            Assert.Contains(snapshots[0], r => r.PartitionId == 1 && r.State == RaftPartitionState.Active);
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// Test 7 — RemovePartition on a Splitting partition is rejected with Errored.
+    /// Removing a Splitting source would orphan the paired Splitting target permanently:
+    /// crash-recovery in InitializePartitions looks for (Splitting, Splitting) pairs and
+    /// would never find a match, leaving the target stuck in Splitting forever.
+    ///
+    /// P1 is the only Splitting partition in the map (P2 is Active). Crash-recovery
+    /// iterates Splitting partitions = [P1] and looks for a second Splitting entry with
+    /// EndRange+1 == P1.StartRange — none exists, so no SplitPartitionCommit is enqueued
+    /// and P1 remains Splitting when the remove attempt arrives.
+    /// </summary>
+    [Fact]
+    public async Task RemovePartition_SplittingPartition_IsRejectedWithError()
+    {
+        IWAL wal = CreateWal(out Action cleanup);
+        using RaftManager manager = Build(wal);
+        try
+        {
+            // P1 is solo Splitting — crash-recovery cannot find a pair, so no Phase 2 fires.
+            List<RaftPartitionRange> splittingMap =
+            [
+                new() { PartitionId = 1, StartRange = 0,   EndRange = 499,          Generation = 2, State = RaftPartitionState.Splitting, RoutingMode = RaftRoutingMode.HashRange },
+                new() { PartitionId = 2, StartRange = 500, EndRange = int.MaxValue, Generation = 1, State = RaftPartitionState.Active,    RoutingMode = RaftRoutingMode.HashRange }
+            ];
+
+            manager.SystemCoordinator.ReplicateOverride = (_, _, _, _) =>
+                Task.FromResult(new RaftReplicationResult(false, RaftOperationStatus.Errored, HLCTimestamp.Zero, 0));
+            manager.SystemCoordinator.StartPartitionsOverride = ranges => manager.StartUserPartitions(ranges);
+
+            manager.SystemCoordinator.Send(MakeConfigReplicated(splittingMap, mapVersion: 2));
+            await WaitForIdleAsync(manager);
+
+            bool replicateCalled = false;
+            manager.SystemCoordinator.ReplicateOverride = (_, _, _, _) =>
+            {
+                replicateCalled = true;
+                return Task.FromResult(new RaftReplicationResult(true, RaftOperationStatus.Success, HLCTimestamp.Zero, 1));
+            };
+
+            (RaftOperationStatus status, _) = await SendRemoveAsync(manager, partitionId: 1);
+
+            Assert.Equal(RaftOperationStatus.Errored, status);
+            Assert.False(replicateCalled);
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// Test 8 — RemovePartition on a Draining partition is rejected with Errored.
+    /// Removing a Draining source bypasses the MergePartitionCommit phase entirely:
+    /// the survivor never absorbs the source's hash range, leaving the range unowned.
+    ///
+    /// P2 is Draining HashRange [1000,1999], which is not adjacent to P1 [0,499].
+    /// Crash-recovery adjacency requires EndRange+1 == StartRange; the gap means no
+    /// viable survivor is found, so InitializePartitions logs a warning and skips P2.
+    /// P2 remains Draining, and the RemovePartition guard fires as expected.
+    /// </summary>
+    [Fact]
+    public async Task RemovePartition_DrainingPartition_IsRejectedWithError()
+    {
+        IWAL wal = CreateWal(out Action cleanup);
+        using RaftManager manager = Build(wal);
+        try
+        {
+            // P2 is Draining HashRange with a gap from P1 — crash-recovery finds no
+            // adjacent Active HashRange partner and skips P2, leaving it in Draining state.
+            List<RaftPartitionRange> drainingMap =
+            [
+                new() { PartitionId = 1, StartRange = 0,    EndRange = 499,  Generation = 1, State = RaftPartitionState.Active,   RoutingMode = RaftRoutingMode.HashRange },
+                new() { PartitionId = 2, StartRange = 1000, EndRange = 1999, Generation = 2, State = RaftPartitionState.Draining, RoutingMode = RaftRoutingMode.HashRange }
+            ];
+
+            manager.SystemCoordinator.ReplicateOverride = (_, _, _, _) =>
+                Task.FromResult(new RaftReplicationResult(false, RaftOperationStatus.Errored, HLCTimestamp.Zero, 0));
+            manager.SystemCoordinator.StartPartitionsOverride = ranges => manager.StartUserPartitions(ranges);
+
+            manager.SystemCoordinator.Send(MakeConfigReplicated(drainingMap, mapVersion: 2));
+            await WaitForIdleAsync(manager);
+
+            bool replicateCalled = false;
+            manager.SystemCoordinator.ReplicateOverride = (_, _, _, _) =>
+            {
+                replicateCalled = true;
+                return Task.FromResult(new RaftReplicationResult(true, RaftOperationStatus.Success, HLCTimestamp.Zero, 1));
+            };
+
+            (RaftOperationStatus status, _) = await SendRemoveAsync(manager, partitionId: 2);
+
+            Assert.Equal(RaftOperationStatus.Errored, status);
+            Assert.False(replicateCalled);
         }
         finally { cleanup(); }
     }

@@ -381,9 +381,13 @@ public sealed class TestSplitPartition
             }
         };
 
-        // Delivering the Splitting map triggers InitializePartitions which detects the
-        // Splitting pair and re-enqueues SplitPartitionCommit to complete Phase 2.
+        // ConfigReplicated populates systemConfiguration (live replication — no crash
+        // recovery).  LeaderChanged with a non-local endpoint simulates this node becoming
+        // a follower and drives InitializePartitions(crashRecovery: true), which detects
+        // the Splitting pair and re-enqueues SplitPartitionCommit to complete Phase 2.
         manager.SystemCoordinator.Send(MakeConfigReplicated(splittingMap, mapVersion: 2));
+        manager.SystemCoordinator.Send(
+            new RaftSystemRequest(RaftSystemRequestType.LeaderChanged, "other-node:9001"));
         await done.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         Assert.NotNull(recoveredRanges);
@@ -397,6 +401,43 @@ public sealed class TestSplitPartition
         // Both halves are live.
         Assert.True(manager.Partitions.ContainsKey(1));
         Assert.True(manager.Partitions.ContainsKey(2));
+    }
+
+    // ── Test 6b: ConfigReplicated must NOT trigger crash-recovery re-enqueuing ──
+
+    /// <summary>
+    /// Followers must never drive Phase 2 commits. ConfigReplicated is a live replication
+    /// event and must call InitializePartitions(crashRecovery: false). Verifies that
+    /// delivering a Splitting map via ConfigReplicated alone does NOT enqueue
+    /// SplitPartitionCommit (which would cause a follower to attempt replication).
+    /// </summary>
+    [Fact]
+    public async Task Split_ConfigReplicated_DoesNotTriggerCrashRecoveryReEnqueue()
+    {
+        using RaftManager manager = Build();
+
+        List<RaftPartitionRange> splittingMap =
+        [
+            new() { PartitionId = 1, StartRange = 0, EndRange = 499, Generation = 2, State = RaftPartitionState.Splitting, RoutingMode = RaftRoutingMode.HashRange },
+            new() { PartitionId = 2, StartRange = 500, EndRange = 999, Generation = 1, State = RaftPartitionState.Splitting, RoutingMode = RaftRoutingMode.HashRange }
+        ];
+
+        bool replicateCalled = false;
+        manager.SystemCoordinator.ReplicateOverride = (_, _, _, _) =>
+        {
+            replicateCalled = true;
+            return Task.FromResult(new RaftReplicationResult(true, RaftOperationStatus.Success, HLCTimestamp.Zero, 1));
+        };
+        manager.SystemCoordinator.StartPartitionsOverride = ranges => manager.StartUserPartitions(ranges);
+
+        manager.SystemCoordinator.Send(MakeConfigReplicated(splittingMap, mapVersion: 2));
+        await WaitForIdleAsync(manager);
+
+        // No SplitPartitionCommit was enqueued — replication must not have been called.
+        Assert.False(replicateCalled);
+        // Partitions are present and still in Splitting state.
+        Assert.True(manager.Partitions.ContainsKey(1));
+        Assert.Equal(RaftPartitionState.Splitting, manager.Partitions[1].State);
     }
 
     // ── Test 7: Idempotency — duplicate split while Splitting is rejected ─────
@@ -607,6 +648,8 @@ public sealed class TestSplitPartition
         };
 
         manager.SystemCoordinator.Send(MakeConfigReplicated(splittingMap, mapVersion: 2));
+        manager.SystemCoordinator.Send(
+            new RaftSystemRequest(RaftSystemRequestType.LeaderChanged, "other-node:9001"));
         await done.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         Assert.NotNull(recoveredRanges);

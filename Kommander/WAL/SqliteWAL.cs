@@ -536,7 +536,20 @@ public class SqliteWAL : IWAL, IDisposable
     /// <inheritdoc/>
     public RaftOperationStatus DeletePartitionWAL(int partitionId)
     {
-        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+        // Fast path: no connection was ever opened and the file does not exist — nothing to do.
+        // Calling TryOpenDatabase here would CREATE the file via CREATE TABLE IF NOT EXISTS,
+        // which is incorrect for a partition that was never written to.
+        if (!connections.TryGetValue(partitionId, out (object Lock, SqliteConnection Connection) connTuple))
+        {
+            string completePath = $"{path}/raft{partitionId}_{revision}.db";
+            if (!File.Exists(completePath))
+                return RaftOperationStatus.Success;
+
+            // File exists but the connection was not yet opened — open it so we can delete.
+            connTuple = TryOpenDatabase(partitionId);
+        }
+
+        (object partitionLock, SqliteConnection connection) = connTuple;
         lock (partitionLock)
         {
             try
@@ -545,13 +558,23 @@ public class SqliteWAL : IWAL, IDisposable
                     "DELETE FROM logs WHERE partitionId = @partitionId", connection);
                 command.Parameters.AddWithValue("@partitionId", partitionId);
                 command.ExecuteNonQuery();
-                return RaftOperationStatus.Success;
             }
             catch (Exception ex)
             {
                 logger.LogError("Error during DeletePartitionWAL({PartitionId}): {Message}", partitionId, ex.Message);
                 return RaftOperationStatus.Errored;
             }
+
+            // Close and evict the connection so future callers cannot accidentally reuse
+            // a handle to a partition that has been logically deleted.
+            connections.TryRemove(partitionId, out _);
+            try { connection.Close(); }
+            catch (Exception ex)
+            {
+                logger.LogWarning("DeletePartitionWAL({PartitionId}): connection close failed: {Message}", partitionId, ex.Message);
+            }
+
+            return RaftOperationStatus.Success;
         }
     }
 
