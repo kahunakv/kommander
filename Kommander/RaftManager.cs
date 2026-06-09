@@ -64,6 +64,15 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     private int _disposed;
 
+    private IRaftStateMachineTransfer? _stateMachineTransfer;
+
+    /// <summary>
+    /// Optional snapshot-transfer implementation registered by the application.
+    /// Accessed by <see cref="RaftSystemCoordinator"/> during <c>TrySplitPartition</c>.
+    /// Null when the application has not registered one (log-shipping fallback).
+    /// </summary>
+    internal IRaftStateMachineTransfer? StateMachineTransfer => Volatile.Read(ref _stateMachineTransfer);
+
     private readonly ConcurrentDictionary<(string endpoint, int partitionId), HLCTimestamp> lastActivity = new();
     
     private readonly ConcurrentDictionary<string, HLCTimestamp> lastHearthBeat = new();
@@ -1599,6 +1608,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             Generation = generation
         };
     }
+
+    /// <inheritdoc/>
+    public void RegisterStateMachineTransfer(IRaftStateMachineTransfer? transfer) =>
+        Volatile.Write(ref _stateMachineTransfer, transfer);
 
     /// <inheritdoc/>
     public long GetPartitionGeneration(int partitionId)

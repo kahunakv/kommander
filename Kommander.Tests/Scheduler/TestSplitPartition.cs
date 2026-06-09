@@ -73,6 +73,17 @@ public sealed class TestSplitPartition
                 RaftSystemConfigKeys.Partitions,
                 JsonSerializer.Serialize(new RaftPartitionMap { MapVersion = mapVersion, Partitions = ranges })));
 
+    /// <summary>
+    /// Simulates a WAL-restore entry (as opposed to a live replication event).
+    /// ConfigRestored populates systemConfiguration but does NOT call StartPartitions or
+    /// trigger crash recovery — that happens via the subsequent RestoreCompleted message.
+    /// </summary>
+    private static RaftSystemRequest MakeConfigRestored(List<RaftPartitionRange> ranges, long mapVersion = 1) =>
+        new(RaftSystemRequestType.ConfigRestored,
+            SerializeMessage(
+                RaftSystemConfigKeys.Partitions,
+                JsonSerializer.Serialize(new RaftPartitionMap { MapVersion = mapVersion, Partitions = ranges })));
+
     private static Task WaitForIdleAsync(RaftManager manager) =>
         manager.SystemCoordinator.DrainAsync().WaitAsync(TimeSpan.FromSeconds(5));
 
@@ -381,13 +392,14 @@ public sealed class TestSplitPartition
             }
         };
 
-        // ConfigReplicated populates systemConfiguration (live replication — no crash
-        // recovery).  LeaderChanged with a non-local endpoint simulates this node becoming
-        // a follower and drives InitializePartitions(crashRecovery: true), which detects
-        // the Splitting pair and re-enqueues SplitPartitionCommit to complete Phase 2.
-        manager.SystemCoordinator.Send(MakeConfigReplicated(splittingMap, mapVersion: 2));
-        manager.SystemCoordinator.Send(
-            new RaftSystemRequest(RaftSystemRequestType.LeaderChanged, "other-node:9001"));
+        // ConfigRestored replays the WAL entry into systemConfiguration without calling
+        // StartPartitions or crash recovery (mirrors real WAL-replay behaviour).
+        // RestoreCompleted then fires InitializePartitions(crashRecovery: true), which
+        // applies the map, detects the Splitting pair, and re-enqueues SplitPartitionCommit.
+        // Crash recovery is the responsibility of the node that discovers the persisted
+        // Splitting state via WAL replay — not of every follower on every LeaderChanged.
+        manager.SystemCoordinator.Send(MakeConfigRestored(splittingMap, mapVersion: 2));
+        manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RestoreCompleted));
         await done.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         Assert.NotNull(recoveredRanges);
@@ -410,6 +422,8 @@ public sealed class TestSplitPartition
     /// event and must call InitializePartitions(crashRecovery: false). Verifies that
     /// delivering a Splitting map via ConfigReplicated alone does NOT enqueue
     /// SplitPartitionCommit (which would cause a follower to attempt replication).
+    /// See also Split_LeaderChangedFollower_DoesNotTriggerCrashRecoveryReEnqueue for
+    /// the LeaderChanged (follower) variant.
     /// </summary>
     [Fact]
     public async Task Split_ConfigReplicated_DoesNotTriggerCrashRecoveryReEnqueue()
@@ -438,6 +452,172 @@ public sealed class TestSplitPartition
         // Partitions are present and still in Splitting state.
         Assert.True(manager.Partitions.ContainsKey(1));
         Assert.Equal(RaftPartitionState.Splitting, manager.Partitions[1].State);
+    }
+
+    // ── Test 6c: LeaderChanged (follower) must NOT trigger crash-recovery re-enqueuing ─
+
+    /// <summary>
+    /// Followers receive LeaderChanged whenever leadership changes, which happens frequently
+    /// (elections, transfers). InitializePartitions must NOT run crash recovery on that path:
+    /// if it did, every leadership change would register stale _pendingSplits entries that
+    /// cause double-commits when the follower later wins leadership.
+    /// Crash recovery is the restarting node's responsibility, triggered via RestoreCompleted.
+    /// </summary>
+    [Fact]
+    public async Task Split_LeaderChangedFollower_DoesNotTriggerCrashRecoveryReEnqueue()
+    {
+        using RaftManager manager = Build();
+
+        List<RaftPartitionRange> splittingMap =
+        [
+            new() { PartitionId = 1, StartRange = 0, EndRange = 499, Generation = 2, State = RaftPartitionState.Splitting, RoutingMode = RaftRoutingMode.HashRange },
+            new() { PartitionId = 2, StartRange = 500, EndRange = 999, Generation = 1, State = RaftPartitionState.Splitting, RoutingMode = RaftRoutingMode.HashRange }
+        ];
+
+        bool replicateCalled = false;
+        manager.SystemCoordinator.ReplicateOverride = (_, _, _, _) =>
+        {
+            replicateCalled = true;
+            return Task.FromResult(new RaftReplicationResult(true, RaftOperationStatus.Success, HLCTimestamp.Zero, 1));
+        };
+        manager.SystemCoordinator.StartPartitionsOverride = ranges => manager.StartUserPartitions(ranges);
+
+        // Populate systemConfiguration via ConfigReplicated (follower received live replication).
+        manager.SystemCoordinator.Send(MakeConfigReplicated(splittingMap, mapVersion: 2));
+        // Follower path: LeaderChanged with a remote endpoint must NOT re-enqueue Phase 2.
+        manager.SystemCoordinator.Send(
+            new RaftSystemRequest(RaftSystemRequestType.LeaderChanged, "other-node:9001"));
+        await WaitForIdleAsync(manager);
+
+        // No SplitPartitionCommit was enqueued by the LeaderChanged (follower) path.
+        Assert.False(replicateCalled);
+        // Partitions remain in Splitting state — no Phase 2 was driven.
+        Assert.True(manager.Partitions.ContainsKey(1));
+        Assert.Equal(RaftPartitionState.Splitting, manager.Partitions[1].State);
+    }
+
+    // ── Test 6.2b: ExportRange failure — split still completes via log-shipping fallback ─
+
+    /// <summary>
+    /// When ExportRange throws, RunSnapshotTransferAsync logs the error and returns without
+    /// aborting the split.  AutoCommit must still enqueue SplitPartitionCommit so both
+    /// partitions reach Active state.  A faulting transfer must never prevent Phase 2.
+    /// </summary>
+    [Fact]
+    public async Task Split_ExportRangeFails_SplitStillCompletesViaLogShipping()
+    {
+        using RaftManager manager = Build();
+
+        manager.SystemCoordinator.Send(MakeConfigReplicated(
+        [
+            new() { PartitionId = 1, StartRange = 0, EndRange = 999, Generation = 1, State = RaftPartitionState.Active, RoutingMode = RaftRoutingMode.HashRange }
+        ]));
+        await WaitForIdleAsync(manager);
+
+        manager.SystemCoordinator.ReplicateOverride = AlwaysSucceed();
+
+        // Register a transfer whose ExportRange always throws.
+        manager.RegisterStateMachineTransfer(new ThrowingExportTransfer());
+
+        TaskCompletionSource done = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        int startCount = 0;
+        List<RaftPartitionRange>? finalRanges = null;
+        manager.SystemCoordinator.StartPartitionsOverride = ranges =>
+        {
+            manager.StartUserPartitions(ranges);
+            if (++startCount == 2)
+            {
+                finalRanges = [..ranges];
+                done.TrySetResult();
+            }
+        };
+
+        manager.SystemCoordinator.Send(new RaftSystemRequest(
+            1, new RaftSplitPlan { TargetRoutingMode = RaftRoutingMode.HashRange, AutoCommit = true }));
+        await done.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        // Phase 2 must have completed: both partitions Active.
+        Assert.NotNull(finalRanges);
+        Assert.Equal(2, finalRanges.Count);
+        Assert.All(finalRanges, r => Assert.Equal(RaftPartitionState.Active, r.State));
+    }
+
+    private sealed class ThrowingExportTransfer : IRaftStateMachineTransfer
+    {
+        public Task<Stream> ExportRange(RaftSplitPlan plan, long upToIndex, CancellationToken ct) =>
+            throw new InvalidOperationException("simulated ExportRange failure");
+
+        public Task ImportRange(int targetPartitionId, Stream snapshot, CancellationToken ct) =>
+            Task.CompletedTask;
+    }
+
+    // ── Test 6.2c: ImportRange failure — split still completes via log-shipping fallback ─
+
+    /// <summary>
+    /// When ExportRange succeeds but ImportRange throws, the import did not happen so no
+    /// state was applied to the target partition.  RunSnapshotTransferAsync must log the
+    /// error, skip the checkpoint step entirely, and return — leaving AutoCommit to enqueue
+    /// SplitPartitionCommit so both partitions still reach Active state.
+    /// </summary>
+    [Fact]
+    public async Task Split_ImportRangeFails_SplitStillCompletesViaLogShipping()
+    {
+        using RaftManager manager = Build();
+
+        manager.SystemCoordinator.Send(MakeConfigReplicated(
+        [
+            new() { PartitionId = 1, StartRange = 0, EndRange = 999, Generation = 1, State = RaftPartitionState.Active, RoutingMode = RaftRoutingMode.HashRange }
+        ]));
+        await WaitForIdleAsync(manager);
+
+        manager.SystemCoordinator.ReplicateOverride = AlwaysSucceed();
+
+        // Register a transfer whose ExportRange returns a valid stream but ImportRange throws.
+        manager.RegisterStateMachineTransfer(new ThrowingImportTransfer());
+
+        // Verify ReplicateCheckpoint is never called when ImportRange fails — the coordinator
+        // must short-circuit before attempting to replicate a checkpoint for a state that was
+        // never applied.
+        bool checkpointCalled = false;
+        manager.SystemCoordinator.ReplicateCheckpointOverride = (_, _) =>
+        {
+            checkpointCalled = true;
+            return Task.FromResult(new RaftReplicationResult(true, RaftOperationStatus.Success, HLCTimestamp.Zero, 1));
+        };
+
+        TaskCompletionSource done = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        int startCount = 0;
+        List<RaftPartitionRange>? finalRanges = null;
+        manager.SystemCoordinator.StartPartitionsOverride = ranges =>
+        {
+            manager.StartUserPartitions(ranges);
+            if (++startCount == 2)
+            {
+                finalRanges = [..ranges];
+                done.TrySetResult();
+            }
+        };
+
+        manager.SystemCoordinator.Send(new RaftSystemRequest(
+            1, new RaftSplitPlan { TargetRoutingMode = RaftRoutingMode.HashRange, AutoCommit = true }));
+        await done.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        // Phase 2 must have completed: both partitions Active.
+        Assert.NotNull(finalRanges);
+        Assert.Equal(2, finalRanges.Count);
+        Assert.All(finalRanges, r => Assert.Equal(RaftPartitionState.Active, r.State));
+
+        // No checkpoint was attempted — the import never happened.
+        Assert.False(checkpointCalled);
+    }
+
+    private sealed class ThrowingImportTransfer : IRaftStateMachineTransfer
+    {
+        public Task<Stream> ExportRange(RaftSplitPlan plan, long upToIndex, CancellationToken ct) =>
+            Task.FromResult<Stream>(new MemoryStream("export-payload"u8.ToArray()));
+
+        public Task ImportRange(int targetPartitionId, Stream snapshot, CancellationToken ct) =>
+            throw new InvalidOperationException("simulated ImportRange failure");
     }
 
     // ── Test 7: Idempotency — duplicate split while Splitting is rejected ─────
@@ -647,9 +827,8 @@ public sealed class TestSplitPartition
             }
         };
 
-        manager.SystemCoordinator.Send(MakeConfigReplicated(splittingMap, mapVersion: 2));
-        manager.SystemCoordinator.Send(
-            new RaftSystemRequest(RaftSystemRequestType.LeaderChanged, "other-node:9001"));
+        manager.SystemCoordinator.Send(MakeConfigRestored(splittingMap, mapVersion: 2));
+        manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RestoreCompleted));
         await done.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         Assert.NotNull(recoveredRanges);
@@ -717,6 +896,95 @@ public sealed class TestSplitPartition
         Assert.Equal(2, tgt.Generation); // Phase1: gen=1, Phase2: 1→2
 
         Assert.Equal(2, manager.Partitions.Count);
+    }
+
+    // ── Test 6.2: Snapshot transfer — ExportRange/ImportRange/Checkpoint are invoked ─
+
+    private sealed class FakeTransfer : IRaftStateMachineTransfer
+    {
+        private static readonly byte[] ExportPayload = "snapshot-payload"u8.ToArray();
+
+        public int ExportCallCount;
+        public int ImportCallCount;
+        public RaftSplitPlan? LastExportPlan;
+        public long LastExportIndex;
+        public byte[]? ImportedBytes;
+
+        public Task<Stream> ExportRange(RaftSplitPlan plan, long upToIndex, CancellationToken ct)
+        {
+            ExportCallCount++;
+            LastExportPlan  = plan;
+            LastExportIndex = upToIndex;
+            return Task.FromResult<Stream>(new MemoryStream(ExportPayload));
+        }
+
+        public async Task ImportRange(int targetPartitionId, Stream snapshot, CancellationToken ct)
+        {
+            ImportCallCount++;
+            using MemoryStream ms = new();
+            await snapshot.CopyToAsync(ms, ct);
+            ImportedBytes = ms.ToArray();
+        }
+    }
+
+    [Fact]
+    public async Task Split_WithSnapshotTransfer_ExportsImportsAndReplicatesCheckpoint()
+    {
+        using RaftManager manager = Build();
+
+        manager.SystemCoordinator.Send(MakeConfigReplicated(
+        [
+            new() { PartitionId = 1, StartRange = 0, EndRange = 999, Generation = 1, State = RaftPartitionState.Active, RoutingMode = RaftRoutingMode.HashRange }
+        ]));
+        await WaitForIdleAsync(manager);
+
+        manager.SystemCoordinator.ReplicateOverride = AlwaysSucceed();
+
+        // Register a fake snapshot transfer.
+        FakeTransfer fakeTransfer = new();
+        manager.RegisterStateMachineTransfer(fakeTransfer);
+
+        // Capture ReplicateCheckpoint calls so we know which partition was checkpointed.
+        int checkpointedPartitionId = -1;
+        manager.SystemCoordinator.ReplicateCheckpointOverride = (partitionId, _) =>
+        {
+            checkpointedPartitionId = partitionId;
+            return Task.FromResult(new RaftReplicationResult(true, RaftOperationStatus.Success, HLCTimestamp.Zero, 1));
+        };
+
+        TaskCompletionSource done = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        int startCount = 0;
+        manager.SystemCoordinator.StartPartitionsOverride = ranges =>
+        {
+            manager.StartUserPartitions(ranges);
+            if (++startCount == 2) done.TrySetResult();
+        };
+
+        manager.SystemCoordinator.Send(new RaftSystemRequest(
+            1, new RaftSplitPlan { TargetRoutingMode = RaftRoutingMode.HashRange, AutoCommit = true }));
+        await done.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        // ExportRange called exactly once, with the resolved target partition id.
+        Assert.Equal(1, fakeTransfer.ExportCallCount);
+        Assert.NotNull(fakeTransfer.LastExportPlan);
+        Assert.Equal(2, fakeTransfer.LastExportPlan.TargetPartitionId);  // auto-assigned: max(1)+1
+        Assert.Equal(RaftRoutingMode.HashRange, fakeTransfer.LastExportPlan.TargetRoutingMode);
+        // upToIndex must be GetMaxLog(sourcePartitionId). No WAL entries were written to
+        // partition 1 in this test, so the expected value is 0.  Any future change that
+        // passes a different index (e.g. a hardcoded constant or the wrong partition id)
+        // will be caught here.
+        Assert.Equal(0L, fakeTransfer.LastExportIndex);
+
+        // ImportRange received the exact bytes exported.
+        Assert.Equal(1, fakeTransfer.ImportCallCount);
+        Assert.Equal("snapshot-payload"u8.ToArray(), fakeTransfer.ImportedBytes);
+
+        // Checkpoint replicated for the target partition (id=2).
+        Assert.Equal(2, checkpointedPartitionId);
+
+        // Split completed: both partitions are Active.
+        Assert.Equal(2, manager.Partitions.Count);
+        Assert.All(manager.Partitions.Values, p => Assert.Equal(RaftPartitionState.Active, p.State));
     }
 
     // ── Test 14: Explicit HashBoundary is honoured ─────────────────────────────

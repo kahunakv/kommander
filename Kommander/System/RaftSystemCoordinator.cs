@@ -44,6 +44,13 @@ internal sealed class RaftSystemCoordinator : IDisposable
     internal Action<List<RaftPartitionRange>>? StartPartitionsOverride;
 
     /// <summary>
+    /// Test hook for <see cref="ReplicateCheckpointForPartition"/>.
+    /// When set, replaces the call to <see cref="RaftManager.ReplicateCheckpoint"/> so unit
+    /// tests can assert checkpoint replication without a live Raft quorum.
+    /// </summary>
+    internal Func<int, CancellationToken, Task<RaftReplicationResult>>? ReplicateCheckpointOverride;
+
+    /// <summary>
     /// Delay between replication retries. Defaults to 5 seconds in production;
     /// tests set this to <see cref="TimeSpan.Zero"/> for fast retry cycles.
     /// </summary>
@@ -210,6 +217,12 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 if (manager.LocalEndpoint == leaderNode)
                     await TrySetInitialPartitions(cancellationToken).ConfigureAwait(false);
                 else
+                    // Follower path: just apply the current map. Crash-recovery re-enqueuing
+                    // (SplitPartitionCommit / MergePartitionCommit) is the new leader's
+                    // responsibility — it runs via RestoreCompleted after WAL replay, before
+                    // leadership is determined. Running it here on every leader election would
+                    // register stale _pendingSplits/_pendingMerges entries on followers that
+                    // would cause double-commits if this node later wins leadership.
                     InitializePartitions(crashRecovery: false);
                 break;
 
@@ -260,6 +273,11 @@ internal sealed class RaftSystemCoordinator : IDisposable
         ReplicateOverride is { } fn
             ? fn(type, data, autoCommit, ct)
             : manager.ReplicateSystemLogs(type, data, autoCommit, ct);
+
+    private Task<RaftReplicationResult> ReplicateCheckpointForPartition(int partitionId, CancellationToken ct) =>
+        ReplicateCheckpointOverride is { } fn
+            ? fn(partitionId, ct)
+            : manager.ReplicateCheckpoint(partitionId, ct);
 
     private void StartPartitions(List<RaftPartitionRange> ranges) =>
         (StartPartitionsOverride ?? manager.StartUserPartitions)(ranges);
@@ -641,10 +659,107 @@ internal sealed class RaftSystemCoordinator : IDisposable
         systemConfiguration[RaftSystemConfigKeys.Partitions] = message.Value;
         StartPartitions(ranges);
 
+        // Snapshot transfer: primary path when the application has registered an
+        // IRaftStateMachineTransfer.  Errors are logged and the split falls back to
+        // the log-shipping path (Phase 2 completes normally; caller ships data via ReplicateLogs).
+        if (manager.StateMachineTransfer is { } transfer)
+        {
+            RaftSplitPlan transferPlan = new()
+            {
+                TargetPartitionId = targetPartitionId,
+                TargetRoutingMode = targetRoutingMode,
+                HashBoundary      = targetRoutingMode == RaftRoutingMode.HashRange ? splitBoundary : null,
+                AutoCommit        = false,
+            };
+            await RunSnapshotTransferAsync(partitionId, targetPartitionId, transferPlan, transfer, cancellationToken).ConfigureAwait(false);
+        }
+
         _pendingSplits[partitionId] = new SplitInProgress(targetPartitionId, completion);
 
         if (plan?.AutoCommit == true)
             Send(new RaftSystemRequest(RaftSystemRequestType.SplitPartitionCommit, partitionId));
+    }
+
+    /// <summary>
+    /// Executes the snapshot-transfer step of a split (Phase 4, step 2):
+    /// exports a point-in-time state snapshot from the source partition, imports it into
+    /// the target partition, then replicates a checkpoint into the target partition's log
+    /// so all target replicas converge on the imported state.
+    /// <para>
+    /// This is an optimization: on error the split remains valid and continues via the
+    /// log-shipping fallback. The caller is responsible for data movement before Phase 2.
+    /// </para>
+    /// <para>
+    /// NOTE: tail catch-up (shipping entries committed after <c>snapshotIndex</c>) requires
+    /// the quiesce infrastructure from Phase 4 Task 4.2 (step 3) and is deferred.
+    /// </para>
+    /// </summary>
+    private async Task RunSnapshotTransferAsync(
+        int sourcePartitionId,
+        int targetPartitionId,
+        RaftSplitPlan plan,
+        IRaftStateMachineTransfer transfer,
+        CancellationToken cancellationToken)
+    {
+        long snapshotIndex = manager.WalAdapter.GetMaxLog(sourcePartitionId);
+
+        Stream snapshot;
+        try
+        {
+            snapshot = await transfer.ExportRange(plan, snapshotIndex, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(
+                "TrySplitPartition: ExportRange source={Src} → target={Tgt} failed: {Message}; falling back to log-shipping",
+                sourcePartitionId, targetPartitionId, ex.Message);
+            return;
+        }
+
+        try
+        {
+            await using (snapshot.ConfigureAwait(false))
+                await transfer.ImportRange(targetPartitionId, snapshot, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(
+                "TrySplitPartition: ImportRange target={Tgt} failed: {Message}; falling back to log-shipping",
+                targetPartitionId, ex.Message);
+            return;
+        }
+
+        // Replicate the installed snapshot as a checkpoint so all target replicas
+        // converge without replaying the full source log.
+        //
+        // Unlike ExportRange/ImportRange failures (where the import never happened and
+        // log-shipping fallback is safe), a checkpoint failure here is categorically
+        // different: the state exists only in the leader's local state machine and was
+        // never written to the Raft log. Followers have an empty state machine with no
+        // log to replay. There is no recovery path for them if we silently continue.
+        // ImportRange must be idempotent/atomic (documented on IRaftStateMachineTransfer)
+        // so a checkpoint retry is safe — the local state is unchanged.
+        RaftReplicationResult checkpointResult =
+            await ReplicateCheckpointForPartition(targetPartitionId, cancellationToken).ConfigureAwait(false);
+
+        if (checkpointResult.Status != RaftOperationStatus.Success)
+        {
+            logger.LogWarning(
+                "TrySplitPartition: ReplicateCheckpoint target={Tgt} failed ({Status}); retrying once",
+                targetPartitionId, checkpointResult.Status);
+
+            checkpointResult = await ReplicateCheckpointForPartition(targetPartitionId, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (checkpointResult.Status != RaftOperationStatus.Success)
+            logger.LogError(
+                "TrySplitPartition: ReplicateCheckpoint target={Tgt} failed after retry ({Status}); " +
+                "snapshot was imported locally but followers are diverged — manual intervention required",
+                targetPartitionId, checkpointResult.Status);
+        else
+            logger.LogInformation(
+                "TrySplitPartition: Snapshot transfer complete — source={Src} snapshotIndex={Idx}, target={Tgt} checkpoint committed",
+                sourcePartitionId, snapshotIndex, targetPartitionId);
     }
 
     /// <summary>

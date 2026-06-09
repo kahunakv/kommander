@@ -65,6 +65,12 @@ public sealed class TestMergePartition
                 RaftSystemConfigKeys.Partitions,
                 JsonSerializer.Serialize(new RaftPartitionMap { MapVersion = mapVersion, Partitions = ranges })));
 
+    private static RaftSystemRequest MakeConfigRestored(List<RaftPartitionRange> ranges, long mapVersion = 1) =>
+        new(RaftSystemRequestType.ConfigRestored,
+            SerializeMessage(
+                RaftSystemConfigKeys.Partitions,
+                JsonSerializer.Serialize(new RaftPartitionMap { MapVersion = mapVersion, Partitions = ranges })));
+
     private static Task WaitForIdleAsync(RaftManager manager) =>
         manager.SystemCoordinator.DrainAsync().WaitAsync(TimeSpan.FromSeconds(5));
 
@@ -276,12 +282,12 @@ public sealed class TestMergePartition
             }
         };
 
-        // ConfigReplicated populates systemConfiguration (no crash recovery).  LeaderChanged
-        // with a non-local endpoint drives InitializePartitions(crashRecovery: true), which
-        // detects the Draining partition and re-enqueues MergePartitionCommit to complete Phase 2.
-        manager.SystemCoordinator.Send(MakeConfigReplicated(drainingMap, mapVersion: 2));
-        manager.SystemCoordinator.Send(
-            new RaftSystemRequest(RaftSystemRequestType.LeaderChanged, "other-node:9001"));
+        // ConfigRestored replays the WAL entry into systemConfiguration without calling
+        // StartPartitions or crash recovery. RestoreCompleted then fires
+        // InitializePartitions(crashRecovery: true), which detects the Draining partition
+        // and re-enqueues MergePartitionCommit to resume Phase 2.
+        manager.SystemCoordinator.Send(MakeConfigRestored(drainingMap, mapVersion: 2));
+        manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RestoreCompleted));
         await done.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         Assert.NotNull(recoveredRanges);

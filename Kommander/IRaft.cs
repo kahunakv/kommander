@@ -403,4 +403,21 @@ public interface IRaft
     /// <param name="prefixPartitionKey"></param>
     /// <returns></returns>
     public int GetPrefixPartitionKey(string prefixPartitionKey);
+
+    /// <summary>
+    /// Registers an optional <see cref="IRaftStateMachineTransfer"/> implementation that the
+    /// split coordinator will use as the primary data-transfer path during
+    /// <see cref="SplitPartitionAsync"/>. When an implementation is registered, the coordinator
+    /// calls <see cref="IRaftStateMachineTransfer.ExportRange"/> on the source partition and
+    /// <see cref="IRaftStateMachineTransfer.ImportRange"/> on the target partition, then
+    /// replicates a checkpoint into the target partition's log so all replicas converge.
+    /// <para>
+    /// If no implementation is registered (or <paramref name="transfer"/> is null), the
+    /// coordinator falls back to the log-shipping path: the caller is responsible for moving
+    /// data from source to target via <see cref="ReplicateLogs"/> before committing Phase 2.
+    /// </para>
+    /// Safe to call at any time, including before <see cref="JoinCluster"/>.
+    /// The registration is not replicated — each node must register independently.
+    /// </summary>
+    void RegisterStateMachineTransfer(IRaftStateMachineTransfer? transfer);
 }
