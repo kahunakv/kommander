@@ -114,7 +114,16 @@ public class RaftConfiguration
     /// Increment election timeout by this value every time the node couldn't find quorum
     /// </summary>
     public int EndElectionTimeoutIncrement { get; set; } = 200;
-    
+
+    /// <summary>
+    /// When set, election timeouts are derived from <c>new Random(ElectionTimeoutSeed ^ partitionId)</c>
+    /// instead of <see cref="Random.Shared"/>, making leader election fully reproducible for a given
+    /// seed value. Each partition gets a distinct but deterministic random sequence so nodes converge
+    /// on a single leader without deadlocking. Leave <c>null</c> (the default) for normal randomised
+    /// behaviour in production.
+    /// </summary>
+    public int? ElectionTimeoutSeed { get; set; }
+
     /// <summary>
     /// If the per-partition raft state machine takes more than this value to process a message it will show a log
     /// Slow processing of messages might indicate a performance issue

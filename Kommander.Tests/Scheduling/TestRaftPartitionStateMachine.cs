@@ -463,6 +463,90 @@ public class TestRaftPartitionStateMachine
         });
     }
 
+    // ── ElectionTimeoutSeed tests ────────────────────────────────────────────
+
+    /// <summary>
+    /// Two state machines on the same partition with the same seed must receive
+    /// identical initial election timeouts.
+    /// </summary>
+    [Fact]
+    public void ElectionTimeoutSeed_SamePartition_ProducesIdenticalTimeout()
+    {
+        const int seed = 42;
+
+        FakePartitionHost hostA = new() { PartitionId = 5, Configuration = { ElectionTimeoutSeed = seed } };
+        FakePartitionHost hostB = new() { PartitionId = 5, Configuration = { ElectionTimeoutSeed = seed } };
+
+        RaftPartitionStateMachine smA = new(hostA, new FakeWalFacade(), new CapturingReplySink(), NullLogger<IRaft>.Instance);
+        RaftPartitionStateMachine smB = new(hostB, new FakeWalFacade(), new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        Assert.Equal(smA.ElectionTimeout, smB.ElectionTimeout);
+    }
+
+    /// <summary>
+    /// Two partitions with the same seed but different partition IDs must receive
+    /// different timeouts so they do not start elections simultaneously and
+    /// deadlock.
+    /// </summary>
+    [Fact]
+    public void ElectionTimeoutSeed_DifferentPartitions_ProducesDifferentTimeouts()
+    {
+        const int seed = 42;
+
+        FakePartitionHost hostA = new() { PartitionId = 1, Configuration = { ElectionTimeoutSeed = seed } };
+        FakePartitionHost hostB = new() { PartitionId = 2, Configuration = { ElectionTimeoutSeed = seed } };
+
+        RaftPartitionStateMachine smA = new(hostA, new FakeWalFacade(), new CapturingReplySink(), NullLogger<IRaft>.Instance);
+        RaftPartitionStateMachine smB = new(hostB, new FakeWalFacade(), new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        Assert.NotEqual(smA.ElectionTimeout, smB.ElectionTimeout);
+    }
+
+    /// <summary>
+    /// Two different seeds on the same partition must produce different timeouts.
+    /// </summary>
+    [Fact]
+    public void ElectionTimeoutSeed_DifferentSeeds_ProducesDifferentTimeouts()
+    {
+        FakePartitionHost hostA = new() { PartitionId = 3, Configuration = { ElectionTimeoutSeed = 1 } };
+        FakePartitionHost hostB = new() { PartitionId = 3, Configuration = { ElectionTimeoutSeed = 2 } };
+
+        RaftPartitionStateMachine smA = new(hostA, new FakeWalFacade(), new CapturingReplySink(), NullLogger<IRaft>.Instance);
+        RaftPartitionStateMachine smB = new(hostB, new FakeWalFacade(), new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        Assert.NotEqual(smA.ElectionTimeout, smB.ElectionTimeout);
+    }
+
+    /// <summary>
+    /// Without a seed the initial timeout must still fall within the configured range.
+    /// </summary>
+    [Fact]
+    public void ElectionTimeout_NoSeed_FallsWithinConfiguredRange()
+    {
+        FakePartitionHost host = new();
+
+        RaftPartitionStateMachine sm = new(host, new FakeWalFacade(), new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        Assert.InRange(sm.ElectionTimeout.TotalMilliseconds,
+            host.Configuration.StartElectionTimeout,
+            host.Configuration.EndElectionTimeout);
+    }
+
+    /// <summary>
+    /// With a seed the initial timeout must still fall within the configured range.
+    /// </summary>
+    [Fact]
+    public void ElectionTimeout_WithSeed_FallsWithinConfiguredRange()
+    {
+        FakePartitionHost host = new() { PartitionId = 7, Configuration = { ElectionTimeoutSeed = 99 } };
+
+        RaftPartitionStateMachine sm = new(host, new FakeWalFacade(), new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        Assert.InRange(sm.ElectionTimeout.TotalMilliseconds,
+            host.Configuration.StartElectionTimeout,
+            host.Configuration.EndElectionTimeout);
+    }
+
     private static async Task WaitForHeartbeatWindow(TimeSpan interval)
     {
         TimeSpan delay = interval + TimeSpan.FromMilliseconds(5);
@@ -474,7 +558,7 @@ public class TestRaftPartitionStateMachine
 
     private sealed class FakePartitionHost : IRaftPartitionHost
     {
-        public int PartitionId => 1;
+        public int PartitionId { get; init; } = 1;
 
         public string Leader { get; set; } = "";
 

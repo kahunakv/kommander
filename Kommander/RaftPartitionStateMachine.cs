@@ -28,6 +28,8 @@ public sealed class RaftPartitionStateMachine
     private readonly Dictionary<HLCTimestamp, RaftProposalQuorum> activeProposals = [];
     private readonly Dictionary<long, Scheduling.RaftPendingWalOperation> pendingWalOperations = [];
 
+    private readonly Random random;
+
     private RaftNodeState nodeState = RaftNodeState.Follower;
     private long currentTerm;
     private HLCTimestamp lastHeartbeat = HLCTimestamp.Zero;
@@ -40,6 +42,12 @@ public sealed class RaftPartitionStateMachine
     public RaftNodeState NodeState => nodeState;
     public long CurrentTerm => currentTerm;
 
+    /// <summary>
+    /// The current election timeout for this partition. Exposed so callers with access to a seeded
+    /// configuration can verify reproducibility without depending on wall-clock behaviour.
+    /// </summary>
+    public TimeSpan ElectionTimeout => electionTimeout;
+
     public RaftPartitionStateMachine(
         IRaftPartitionHost host,
         IRaftWalFacade wal,
@@ -51,7 +59,11 @@ public sealed class RaftPartitionStateMachine
         this.replySink = replySink;
         this.logger = logger;
 
-        electionTimeout = TimeSpan.FromMilliseconds(Random.Shared.Next(
+        random = host.Configuration.ElectionTimeoutSeed is int seed
+            ? new Random(seed ^ host.PartitionId)
+            : Random.Shared;
+
+        electionTimeout = TimeSpan.FromMilliseconds(random.Next(
             host.Configuration.StartElectionTimeout,
             host.Configuration.EndElectionTimeout));
     }
@@ -128,7 +140,7 @@ public sealed class RaftPartitionStateMachine
                 host.Leader = "";
                 lastHeartbeat = currentTime;
                 electionTimeout = TimeSpan.FromMilliseconds(Math.Min(
-                    electionTimeout.TotalMilliseconds + Random.Shared.Next(host.Configuration.StartElectionTimeoutIncrement, host.Configuration.EndElectionTimeoutIncrement),
+                    electionTimeout.TotalMilliseconds + random.Next(host.Configuration.StartElectionTimeoutIncrement, host.Configuration.EndElectionTimeoutIncrement),
                     host.Configuration.EndElectionTimeout));
                 expectedLeaders.Clear();
                 lastCommitIndexes.Clear();
@@ -445,7 +457,7 @@ public sealed class RaftPartitionStateMachine
 
         if (await AmIOutdatedAsync().ConfigureAwait(false))
         {
-            electionTimeout += TimeSpan.FromMilliseconds(Random.Shared.Next(host.Configuration.StartElectionTimeoutIncrement, host.Configuration.EndElectionTimeoutIncrement));
+            electionTimeout += TimeSpan.FromMilliseconds(random.Next(host.Configuration.StartElectionTimeoutIncrement, host.Configuration.EndElectionTimeoutIncrement));
 
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] We're outdated, cannot become leader...", host.LocalEndpoint, host.PartitionId, nodeState);
             return;
