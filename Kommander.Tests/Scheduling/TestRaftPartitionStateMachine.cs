@@ -516,9 +516,9 @@ public class TestRaftPartitionStateMachine
 
         public HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId) => HLCTimestamp.Zero;
 
-        public HLCTimestamp GetLastNodeHearthbeat(string endpoint) => HLCTimestamp.Zero;
+        public HLCTimestamp GetLastNodeHearthbeat(string endpoint, int partitionId) => HLCTimestamp.Zero;
 
-        public void UpdateLastHeartbeat(string endpoint, HLCTimestamp timestamp) { }
+        public void UpdateLastHeartbeat(string endpoint, int partitionId, HLCTimestamp timestamp) { }
 
         public void UpdateLastNodeActivity(string endpoint, int partitionId, HLCTimestamp timestamp) { }
 

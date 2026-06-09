@@ -556,13 +556,13 @@ public sealed class RaftPartitionStateMachine
 
             if (host.PartitionId != RaftSystemConfig.SystemPartition && !force)
             {
-                HLCTimestamp lastHearthBeatToNode = host.GetLastNodeHearthbeat(node.Endpoint);
+                HLCTimestamp lastHearthBeatToNode = host.GetLastNodeHearthbeat(node.Endpoint, host.PartitionId);
 
                 if (lastHearthBeatToNode != HLCTimestamp.Zero && ((lastHeartbeat - lastHearthBeatToNode) <= host.Configuration.RecentHeartbeat))
                     continue;
             }
 
-            host.UpdateLastHeartbeat(node.Endpoint, lastHeartbeat);
+            host.UpdateLastHeartbeat(node.Endpoint, host.PartitionId, lastHeartbeat);
             
             //logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Sending heartbeat to {Node} #{Number}", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, ++number);
             

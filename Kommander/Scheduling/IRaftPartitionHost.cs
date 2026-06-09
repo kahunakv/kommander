@@ -27,9 +27,9 @@ public interface IRaftPartitionHost
 
     HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId);
 
-    HLCTimestamp GetLastNodeHearthbeat(string endpoint);
+    HLCTimestamp GetLastNodeHearthbeat(string endpoint, int partitionId);
 
-    void UpdateLastHeartbeat(string endpoint, HLCTimestamp timestamp);
+    void UpdateLastHeartbeat(string endpoint, int partitionId, HLCTimestamp timestamp);
 
     void UpdateLastNodeActivity(string endpoint, int partitionId, HLCTimestamp timestamp);
 

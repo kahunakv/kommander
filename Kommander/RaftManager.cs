@@ -75,7 +75,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     private readonly ConcurrentDictionary<(string endpoint, int partitionId), HLCTimestamp> lastActivity = new();
     
-    private readonly ConcurrentDictionary<string, HLCTimestamp> lastHearthBeat = new();
+    private readonly ConcurrentDictionary<(string endpoint, int partitionId), HLCTimestamp> lastHearthBeat = new();
     
     private readonly Communication.RaftTransportDispatcher transportDispatcher;
 
@@ -530,29 +530,36 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
     
     /// <summary>
-    /// Obtains the last heathbeat sent to a specific node on any partitions
+    /// Obtains the last heartbeat sent to a specific node for a specific partition.
+    /// The throttle key must include the partition id: a single node hosts many partitions,
+    /// and keying only by endpoint would let one partition's heartbeat suppress the
+    /// heartbeats of every other partition to the same node (within RecentHeartbeat),
+    /// starving their followers and triggering perpetual re-elections.
     /// </summary>
     /// <param name="nodeId"></param>
+    /// <param name="partitionId"></param>
     /// <returns></returns>
-    internal HLCTimestamp GetLastNodeHearthbeat(string nodeId)
+    internal HLCTimestamp GetLastNodeHearthbeat(string nodeId, int partitionId)
     {
-        return lastHearthBeat.TryGetValue(nodeId, out HLCTimestamp lastTimestamp) ? lastTimestamp : HLCTimestamp.Zero;
+        return lastHearthBeat.TryGetValue((nodeId, partitionId), out HLCTimestamp lastTimestamp) ? lastTimestamp : HLCTimestamp.Zero;
     }
-    
+
     /// <summary>
-    /// Updates the last heathbeat sent to a node
+    /// Updates the last heartbeat sent to a node for a specific partition.
     /// </summary>
     /// <param name="nodeId"></param>
+    /// <param name="partitionId"></param>
     /// <param name="lastTimestamp"></param>
-    internal void UpdateLastHeartbeat(string nodeId, HLCTimestamp lastTimestamp)
+    internal void UpdateLastHeartbeat(string nodeId, int partitionId, HLCTimestamp lastTimestamp)
     {
-        if (lastHearthBeat.TryGetValue(nodeId, out HLCTimestamp currentTimestamp))
+        var key = (nodeId, partitionId);
+        if (lastHearthBeat.TryGetValue(key, out HLCTimestamp currentTimestamp))
         {
             if (lastTimestamp > currentTimestamp)
-                lastHearthBeat[nodeId] = lastTimestamp;
+                lastHearthBeat[key] = lastTimestamp;
         }
-        else        
-            lastHearthBeat.TryAdd(nodeId, lastTimestamp);
+        else
+            lastHearthBeat.TryAdd(key, lastTimestamp);
     }
 
     /// <summary>

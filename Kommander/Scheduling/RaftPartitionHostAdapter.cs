@@ -39,9 +39,9 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
 
     public HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId) => manager.GetLastNodeActivity(endpoint, partitionId);
 
-    public HLCTimestamp GetLastNodeHearthbeat(string endpoint) => manager.GetLastNodeHearthbeat(endpoint);
+    public HLCTimestamp GetLastNodeHearthbeat(string endpoint, int partitionId) => manager.GetLastNodeHearthbeat(endpoint, partitionId);
 
-    public void UpdateLastHeartbeat(string endpoint, HLCTimestamp timestamp) => manager.UpdateLastHeartbeat(endpoint, timestamp);
+    public void UpdateLastHeartbeat(string endpoint, int partitionId, HLCTimestamp timestamp) => manager.UpdateLastHeartbeat(endpoint, partitionId, timestamp);
 
     public void UpdateLastNodeActivity(string endpoint, int partitionId, HLCTimestamp timestamp) => manager.UpdateLastNodeActivity(endpoint, partitionId, timestamp);
 
