@@ -108,19 +108,34 @@ public sealed class TestRaftPartitionExecutor
             => Replies.Enqueue((correlationId, response));
     }
 
+    /// <summary>
+    /// Deferred relay sink that mirrors the production <c>PartitionReplySink</c> pattern.
+    /// The executor reference is injected after both the state machine and executor are
+    /// created, breaking the circular construction dependency.  All replies are forwarded
+    /// to <see cref="RaftPartitionExecutor.DeliverReply"/> so that <c>Ask</c> callers
+    /// receive their responses correctly.
+    /// </summary>
+    private sealed class TestReplySink : IRaftOperationReplySink
+    {
+        internal RaftPartitionExecutor? Executor;
+
+        public void TryComplete(ulong correlationId, RaftResponse response)
+            => Executor?.DeliverReply(correlationId, response);
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────
 
     private static (RaftPartitionExecutor executor, RaftPartitionStateMachine sm, StubHost host) BuildExecutor(
         int partitionId = 0,
-        IRaftWalFacade? wal = null,
-        IRaftOperationReplySink? sink = null)
+        IRaftWalFacade? wal = null)
     {
         StubHost host = new(partitionId);
         wal ??= new StubWal();
-        sink ??= new CapturingReplySink();
 
-        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+        TestReplySink relaySink = new();
+        RaftPartitionStateMachine sm = new(host, wal, relaySink, NullLogger<IRaft>.Instance);
         RaftPartitionExecutor executor = new(sm, partitionId, slowThresholdMs: 0, NullLogger<IRaft>.Instance);
+        relaySink.Executor = executor;
         executor.Start();
         return (executor, sm, host);
     }
@@ -420,11 +435,12 @@ public sealed class TestRaftPartitionExecutor
     {
         StubHost host = new(partitionId);
         IRaftWalFacade wal = new StubWal();
-        CapturingReplySink sink = new();
 
-        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+        TestReplySink relaySink = new();
+        RaftPartitionStateMachine sm = new(host, wal, relaySink, NullLogger<IRaft>.Instance);
         RaftPartitionExecutor executor = new(sm, partitionId, slowThresholdMs: 0, NullLogger<IRaft>.Instance,
             getGeneration: getGeneration);
+        relaySink.Executor = executor;
         executor.Start();
         return (executor, sm);
     }
