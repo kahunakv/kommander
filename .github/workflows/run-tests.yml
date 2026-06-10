@@ -7,6 +7,7 @@ on:
 jobs:
   Kommander-Tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       GIT_BRANCH: ${{ github.head_ref || github.ref_name }}
       GIT_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
@@ -22,4 +23,4 @@ jobs:
             8.0.x
             9.0.x
       - name: Run Tests
-        run: (cd Kommander.Tests && dotnet test -l "console;verbosity=detailed" --filter "Category!=Stress")
+        run: (cd Kommander.Tests && dotnet test -l "console;verbosity=detailed" --filter "Category!=Stress" --blame-hang --blame-hang-timeout 120s)

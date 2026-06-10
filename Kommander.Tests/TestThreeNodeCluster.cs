@@ -738,7 +738,7 @@ public sealed class TestThreeNodeCluster
         await node2.UpdateNodes();
         await node3.UpdateNodes();
 
-        await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster(), node3.JoinCluster()]);
+        await Task.WhenAll([node1.JoinCluster(TestContext.Current.CancellationToken), node2.JoinCluster(TestContext.Current.CancellationToken), node3.JoinCluster(TestContext.Current.CancellationToken)]);
 
         for (int i = 1; i <= partitions; i++)
             await WaitForAnyLeader([node1, node2, node3], i, TestContext.Current.CancellationToken);

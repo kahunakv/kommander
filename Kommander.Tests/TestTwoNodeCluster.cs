@@ -109,7 +109,7 @@ public class TestTwoNodeCluster
         await node1.UpdateNodes();
         await node2.UpdateNodes();
 
-        await Task.WhenAll([node1.JoinCluster(), node2.JoinCluster()]);
+        await Task.WhenAll([node1.JoinCluster(TestContext.Current.CancellationToken), node2.JoinCluster(TestContext.Current.CancellationToken)]);
 
         return (node1, node2);
     }

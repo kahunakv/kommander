@@ -349,7 +349,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <summary>
     /// Joins the cluster
     /// </summary>
-    public async Task JoinCluster()
+    public async Task JoinCluster(CancellationToken cancellationToken = default)
     {
         // Registers itself at the discovery service
         await clusterHandler.JoinCluster(configuration).ConfigureAwait(false);
@@ -370,8 +370,20 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             );
         }
 
+        // Wait for the system coordinator to replicate the initial partition map and call
+        // StartUserPartitions. On a slow or loaded host this can take longer than expected;
+        // impose an explicit deadline so JoinCluster never blocks indefinitely. The 60 s
+        // hard timeout fires only when the caller does not supply their own cancellation.
+        ValueStopwatch joinStopwatch = ValueStopwatch.StartNew();
         while (!IsInitialized)
-            await Task.Delay(1000).ConfigureAwait(false);
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (joinStopwatch.GetElapsedMilliseconds() > 60_000)
+                throw new TimeoutException("RaftManager.JoinCluster timed out after 60 s waiting for cluster initialization. The system partition may have failed to elect a leader.");
+
+            await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     /// <summary>

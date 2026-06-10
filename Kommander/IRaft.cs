@@ -110,7 +110,7 @@ public interface IRaft
     /// Joins the Raft cluster
     /// </summary>
     /// <returns></returns>
-    public Task JoinCluster();
+    public Task JoinCluster(CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Leaves the Raft cluster
