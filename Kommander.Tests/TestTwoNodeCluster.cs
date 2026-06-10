@@ -422,6 +422,14 @@ public class TestTwoNodeCluster
                     return;
             }
 
+            // Actively drive the election loop so CI load cannot starve the background timer.
+            foreach (IRaft node in nodes)
+            {
+                RaftManager manager = (RaftManager)node;
+                if (manager.Partitions.TryGetValue(partitionId, out RaftPartition? partition))
+                    partition.CheckLeader();
+            }
+
             await Task.Delay(25, cancellationToken).ConfigureAwait(false);
         }
 

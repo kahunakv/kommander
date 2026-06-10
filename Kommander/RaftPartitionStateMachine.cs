@@ -139,9 +139,12 @@ public sealed class RaftPartitionStateMachine
                 nodeState = RaftNodeState.Follower;
                 host.Leader = "";
                 lastHeartbeat = currentTime;
-                electionTimeout = TimeSpan.FromMilliseconds(Math.Min(
-                    electionTimeout.TotalMilliseconds + random.Next(host.Configuration.StartElectionTimeoutIncrement, host.Configuration.EndElectionTimeoutIncrement),
-                    host.Configuration.EndElectionTimeout));
+                // Pick a fresh random timeout in the full [StartElectionTimeout, EndElectionTimeout)
+                // range rather than capping an incremented value. Incremental backoff converges
+                // both nodes to EndElectionTimeout after just one or two failed elections, causing
+                // a persistent split-vote livelock because they fire at the same instant every time.
+                electionTimeout = TimeSpan.FromMilliseconds(
+                    random.Next(host.Configuration.StartElectionTimeout, host.Configuration.EndElectionTimeout));
                 expectedLeaders.Clear();
                 lastCommitIndexes.Clear();
                 activeProposals.Clear();
