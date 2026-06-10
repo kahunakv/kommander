@@ -621,9 +621,11 @@ public class TestRaftPartitionStateMachine
         public void InvokeReplicationError(int partitionId, RaftLog log) { }
     }
 
-    private sealed class FakeWalFacade : IRaftWalFacade
+    private sealed class FakeWalFacade : IRaftWalFacade, IDisposable
     {
         private readonly FakeWAL wal = new();
+
+        public void Dispose() => wal.Dispose();
 
         public ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync()
         {

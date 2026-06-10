@@ -137,7 +137,7 @@ public abstract class PartitionLifecycleTests
                 new RaftSystemRequest(10, RaftRoutingMode.Unrouted, null, null, createTcs));
 
             (RaftOperationStatus status, long gen) =
-                await createTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                await createTcs.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
             Assert.Equal(RaftOperationStatus.Success, status);
             Assert.True(manager.Partitions.ContainsKey(10));

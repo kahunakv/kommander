@@ -761,7 +761,7 @@ public sealed class TestSplitPartition
         // Source partition must be completely unmodified.
         Assert.Equal(1, gen);
         Assert.Equal(1, manager.GetPartitionGeneration(1));
-        Assert.Equal(1, manager.Partitions.Count);
+        Assert.Single(manager.Partitions);
     }
 
     // ── Test 11: Single-element partition cannot be split (auto-boundary) ─────
@@ -794,7 +794,7 @@ public sealed class TestSplitPartition
         Assert.Equal(RaftOperationStatus.Errored, status);
         Assert.Equal(1, gen);
         Assert.Equal(1, manager.GetPartitionGeneration(1));
-        Assert.Equal(1, manager.Partitions.Count);
+        Assert.Single(manager.Partitions);
     }
 
     // ── Test 12: Crash after Phase 1 of Unrouted split — coordinator resumes Phase 2 ─

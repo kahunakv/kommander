@@ -191,7 +191,7 @@ public interface IRaft
     /// Zero disables the fence (default behavior).
     /// </param>
     /// <returns></returns>
-    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, CancellationToken cancellationToken = default, long expectedGeneration = 0);
+    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Replicate logs to the followers in the partition
@@ -203,7 +203,7 @@ public interface IRaft
     /// <param name="cancellationToken"></param>
     /// <param name="expectedGeneration"></param>
     /// <returns></returns>
-    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true, CancellationToken cancellationToken = default, long expectedGeneration = 0);
+    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Replicate a checkpoint to the followers in the partition

@@ -751,7 +751,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <param name="autoCommit"></param>
     /// <param name="cancellationToken"></param>
     /// <returns></returns>
-    public async Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, CancellationToken cancellationToken = default, long expectedGeneration = 0)
+    public async Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default)
     {
         if (partitionId == RaftSystemConfig.SystemPartition)
             throw new RaftException("System partition cannot be used from userland");
@@ -791,8 +791,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         string type,
         IEnumerable<byte[]> logs,
         bool autoCommit = true,
-        CancellationToken cancellationToken = default,
-        long expectedGeneration = 0
+        long expectedGeneration = 0,
+        CancellationToken cancellationToken = default
     )
     {
         if (partitionId == RaftSystemConfig.SystemPartition)

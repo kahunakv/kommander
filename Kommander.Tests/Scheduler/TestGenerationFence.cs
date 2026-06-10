@@ -192,7 +192,7 @@ public sealed class TestGenerationFence
     /// requests that arrive at the executor after the bump must receive
     /// <c>PartitionMoved</c>; requests that arrived before must not be double-applied.
     ///
-    /// Uses <see cref="RaftManager.ReplicateLogs(int, string, byte[], bool, CancellationToken, long)"/>
+    /// Uses <see cref="RaftManager.ReplicateLogs(int, string, byte[], bool, long, CancellationToken)"/>
     /// through the full stack to validate end-to-end ordering.
     /// </summary>
     [Fact]
@@ -353,7 +353,7 @@ public sealed class TestGenerationFence
         mutable.Clear();
 
         // Live map must be unaffected.
-        Assert.Equal(1, manager.GetPartitionMap().Count);
+        Assert.Single(manager.GetPartitionMap());
         Assert.Equal(2, manager.GetPartitionGeneration(1));
     }
 

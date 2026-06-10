@@ -189,7 +189,7 @@ public sealed class TestThreeNodeCluster
             leader = await GetLeader(i, [node1, node2, node3]);
             Assert.NotNull(leader);
 
-            RaftReplicationResult response = await leader.ReplicateLogs(i, "Greeting", data, false, TestContext.Current.CancellationToken);
+            RaftReplicationResult response = await leader.ReplicateLogs(i, "Greeting", data, false, cancellationToken: TestContext.Current.CancellationToken);
 
             Assert.True(response.Success);
 
