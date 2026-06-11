@@ -1662,6 +1662,14 @@ public sealed class RaftPartitionStateMachine
         CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, completion.MaxLogIndex));
     }
 
+    /// <summary>
+    /// Finalises a follower append after the WAL write completes. Dispatches each committed
+    /// log entry to the appropriate callback: entries on P0 with <c>LogType == "_RaftSystem"</c>
+    /// go to <c>InvokeSystemReplicationReceived</c> (system coordinator); all other entries —
+    /// including non-system types on P0 — go to <c>InvokeReplicationReceived</c> (consumer).
+    /// This type-based routing is what allows P0 to host consumer data alongside coordinator
+    /// entries without any WAL format change.
+    /// </summary>
     private async Task CompleteFollowerAppend(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
         string endpoint = pending!.Endpoint ?? "";
@@ -1676,7 +1684,7 @@ public sealed class RaftPartitionStateMachine
                 if (log.Type != RaftLogType.Committed)
                     continue;
 
-                if (host.PartitionId == RaftSystemConfig.SystemPartition)
+                if (host.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType)
                 {
                     if (!await host.InvokeSystemReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
                         host.InvokeReplicationError(host.PartitionId, log);

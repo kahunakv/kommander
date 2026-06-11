@@ -4,6 +4,7 @@ using Kommander.Communication.Memory;
 using Kommander.Data;
 using Kommander.Diagnostics;
 using Kommander.Discovery;
+using Kommander.System;
 using Kommander.Time;
 using Kommander.WAL;
 using Microsoft.Extensions.Logging;
@@ -491,6 +492,42 @@ public class TestTwoNodeCluster
         }
 
         return followers;
+    }
+
+    /// <summary>
+    /// Consumer writes to P0 with a non-system log type must succeed on the P0 leader.
+    /// The _RaftSystem type remains reserved and must throw RaftException.
+    /// Covers the type-gated relaxation in ReplicateLogs (Task 2).
+    /// </summary>
+    [Fact]
+    public async Task ReplicateLogsToSystemPartition_ConsumerTypeSucceeds_SystemTypeThrows()
+    {
+        InMemoryCommunication communication = new();
+
+        (IRaft node1, IRaft node2) = await AssembleTwoNodeCluster(communication, logger);
+
+        // P0 leader is elected as part of cluster formation (JoinCluster waits for IsInitialized).
+        IRaft? p0Leader = await GetLeader(RaftSystemConfig.SystemPartition, [node1, node2]);
+        Assert.NotNull(p0Leader);
+
+        // Consumer write to P0 with a non-system type must succeed.
+        byte[] payload = [1, 2, 3];
+        RaftReplicationResult result = await p0Leader.ReplicateLogs(
+            RaftSystemConfig.SystemPartition,
+            "consumer-type",
+            payload,
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        Assert.True(result.Success);
+        Assert.Equal(RaftOperationStatus.Success, result.Status);
+
+        // Writing the reserved _RaftSystem type to P0 via the public API must throw.
+        await Assert.ThrowsAsync<RaftException>(() =>
+            p0Leader.ReplicateLogs(RaftSystemConfig.SystemPartition, "_RaftSystem", payload,
+                cancellationToken: TestContext.Current.CancellationToken));
+
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
     }
 
     private static void SeedWal(IWAL wal, int partitionId, List<RaftLog> logs) =>

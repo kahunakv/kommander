@@ -317,8 +317,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     {
         if (log.LogType != RaftSystemConfig.RaftLogType || log.LogData is null)
         {
-            Logger.LogError("Invalid log type: {LogType} in system partition", log.LogType);
-            
+            // Post-shared-P0: non-system P0 entries are dispatched to consumer callbacks
+            // upstream (RaftWriteAhead restore branch) and should never reach here.
+            Logger.LogDebug("SystemLogRestored: skipping entry on system partition (LogType={LogType}, DataNull={DataNull}) — non-system types are routed to consumer callbacks upstream", log.LogType, log.LogData is null);
+
             return Task.FromResult(true);
         }
 
@@ -331,8 +333,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     {
         if (log.LogType != RaftSystemConfig.RaftLogType || log.LogData is null)
         {
-            Logger.LogError("Invalid log type: {LogType} in system partition", log.LogType);
-            
+            // Post-shared-P0: non-system P0 entries are dispatched to consumer callbacks
+            // upstream (CompleteFollowerAppend dispatch) and should never reach here.
+            Logger.LogDebug("SystemReplicationReceived: skipping entry on system partition (LogType={LogType}, DataNull={DataNull}) — non-system types are routed to consumer callbacks upstream", log.LogType, log.LogData is null);
+
             return Task.FromResult(true);
         }
 
@@ -743,18 +747,17 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
-    /// Replicate a single log to the follower nodes in the specified partition
+    /// Replicates a single log entry to the follower nodes in the specified partition.
+    /// P0 routes committed entries by log type: <c>_RaftSystem</c> entries go to the system
+    /// coordinator; all other types go to consumer callbacks (<c>OnReplicationReceived</c> /
+    /// <c>OnLogRestored</c>).  Passing <c>type == "_RaftSystem"</c> on partition 0 is rejected
+    /// with <see cref="RaftException"/> to prevent userland from forging coordinator entries.
+    /// P0 is never a valid target for create, split, merge, or remove.
     /// </summary>
-    /// <param name="partitionId"></param>
-    /// <param name="type"></param>
-    /// <param name="data"></param>
-    /// <param name="autoCommit"></param>
-    /// <param name="cancellationToken"></param>
-    /// <returns></returns>
     public async Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default)
     {
-        if (partitionId == RaftSystemConfig.SystemPartition)
-            throw new RaftException("System partition cannot be used from userland");
+        if (partitionId == RaftSystemConfig.SystemPartition && type == RaftSystemConfig.RaftLogType)
+            throw new RaftException("System log type is reserved on the system partition");
 
         RaftPartition partition = GetPartition(partitionId);
 
@@ -778,14 +781,13 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
-    /// Replicates logs across a Raft partition.
+    /// Replicates a batch of log entries to the follower nodes in the specified partition.
+    /// P0 routes committed entries by log type: <c>_RaftSystem</c> entries go to the system
+    /// coordinator; all other types go to consumer callbacks (<c>OnReplicationReceived</c> /
+    /// <c>OnLogRestored</c>).  Passing <c>type == "_RaftSystem"</c> on partition 0 is rejected
+    /// with <see cref="RaftException"/> to prevent userland from forging coordinator entries.
+    /// P0 is never a valid target for create, split, merge, or remove.
     /// </summary>
-    /// <param name="partitionId">The identifier of the partition where logs are to be replicated.</param>
-    /// <param name="type">The type of the operation being performed.</param>
-    /// <param name="logs">A collection of logs to be replicated.</param>
-    /// <param name="autoCommit">Indicates whether the logs should be automatically committed after proposal replication.</param>
-    /// <param name="cancellationToken">A token to signal the cancellation of the operation.</param>
-    /// <returns>A task representing the asynchronous operation, with a result of type <see cref="RaftReplicationResult"/>.</returns>
     public async Task<RaftReplicationResult> ReplicateLogs(
         int partitionId,
         string type,
@@ -795,8 +797,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         CancellationToken cancellationToken = default
     )
     {
-        if (partitionId == RaftSystemConfig.SystemPartition)
-            throw new RaftException("System partition cannot be used from userland");
+        if (partitionId == RaftSystemConfig.SystemPartition && type == RaftSystemConfig.RaftLogType)
+            throw new RaftException("System log type is reserved on the system partition");
 
         RaftPartition partition = GetPartition(partitionId);
 
@@ -1581,6 +1583,9 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         if (!IsInitialized)
             throw new RaftException("System is not initialized");
 
+        if (partitionId == RaftSystemConfig.SystemPartition)
+            throw new RaftException("System partition cannot be created");
+
         if (!await AmILeader(RaftSystemConfig.SystemPartition, ct).ConfigureAwait(false))
             throw new RaftException("CreatePartition cannot be initiated by a follower");
 
@@ -1606,6 +1611,9 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     {
         if (!IsInitialized)
             throw new RaftException("System is not initialized");
+
+        if (partitionId == RaftSystemConfig.SystemPartition)
+            throw new RaftException("System partition cannot be removed");
 
         if (!await AmILeader(RaftSystemConfig.SystemPartition, ct).ConfigureAwait(false))
             throw new RaftException("RemovePartition cannot be initiated by a follower");

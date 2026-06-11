@@ -59,7 +59,7 @@ Install-Package Kommander
 
 **Node:** A running `RaftManager` instance. Each node has a local endpoint built from `RaftConfiguration.Host` and `RaftConfiguration.Port`.
 
-**Partition:** A separately elected Raft group. Partition `0` is reserved for Kommander system configuration. Application data should use user partitions, which start at `1`.
+**Partition:** A separately elected Raft group. Partition `0` is the system partition: Kommander replicates its own configuration there using the reserved `_RaftSystem` log type. Application data normally uses user partitions, which start at `1`. The system partition can also **co-locate consumer data**: entries written with any non-`_RaftSystem` log type are replicated and dispatched to the consumer callbacks just like a user partition, while Kommander's own `_RaftSystem` entries continue to drive the system coordinator. Routing on partition `0` is by log type, so the two never interfere. Partition `0` itself can never be created, split, merged, or removed.
 
 **Leader:** The node currently allowed to accept proposals for a partition.
 
@@ -349,6 +349,8 @@ RaftReplicationResult result = await raft.ReplicateLogs(
 | `TicketId` | Hybrid logical clock timestamp that identifies the proposal. |
 | `LogIndex` | Last log index assigned to the proposal. |
 
+You may also replicate to the system partition (`0`) to co-locate consumer state with the partition map — useful for coordination data that must share a leader with partition lifecycle operations. The only restriction is the log `type`: `_RaftSystem` is reserved for Kommander, so `ReplicateLogs(0, "_RaftSystem", …)` throws a `RaftException`. Any other type is accepted and routed to the consumer callbacks.
+
 ## Manual Commit And Rollback
 
 `ReplicateLogs` auto-commits by default. Set `autoCommit: false` to stop after quorum proposal completion, then commit or roll back explicitly:
@@ -425,7 +427,7 @@ int prefixPartition = raft.GetPrefixPartitionKey("tenant-42");
 
 `GetPartitionKey` uses the prefix before the last `/` separator. `GetPrefixPartitionKey` hashes the complete string provided.
 
-Partition `0` is reserved for system configuration. Do not call public replication APIs with partition `0`; `RaftManager` rejects userland writes to the system partition.
+The partition helpers map keys onto user partitions only and never return `0`. You *can* replicate to partition `0` explicitly to co-locate consumer state with the system partition (see [Replicating Logs](#replicating-logs)); the only rejected write is the reserved `_RaftSystem` log type.
 
 ## Events
 
@@ -583,7 +585,7 @@ RaftPartitionLifecycleResult merged = await raft.MergePartitionsAsync(
 RaftPartitionLifecycleResult removed = await raft.RemovePartitionAsync(partitionId: 10);
 ```
 
-All operations require the caller to be the leader of the relevant partition(s). Splits and merges use a two-phase commit so the hash ring is never incomplete during the transition.
+All operations require the caller to be the leader of the relevant partition(s). Splits and merges use a two-phase commit so the hash ring is never incomplete during the transition. The system partition (`0`) is never a valid target — `CreatePartitionAsync`, `SplitPartitionAsync`, `MergePartitionsAsync`, and `RemovePartitionAsync` all reject it with a `RaftException`.
 
 The **generation fence** protects writes during topology changes. Pass `expectedGeneration` to `ReplicateLogs` to detect when the partition a client cached has been split or merged:
 
@@ -728,7 +730,7 @@ dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category!=Stress&Fu
 ## Current Limitations
 
 - Cluster membership is discovery-driven; there is no public membership-change API on `IRaft`.
-- Partition `0` is reserved and not available for application replication.
+- Partition `0` is the system partition: it cannot be created, split, merged, or removed, and the `_RaftSystem` log type is reserved. Application data may still be co-located there using any other log type (see Concepts).
 - RocksDB WAL format `2.0.0` is not compatible with pre-`0.10.7` id-only RocksDB WAL keys. Start with a fresh data directory or migrate existing keys.
 - WAL compaction is checkpoint-driven. Historical entries below the last committed checkpoint are removable; uncheckpointed history is retained.
 - The Nixie actor runtime has been removed from the production library. Existing code that passed an `ActorSystem` to `RaftManager` must use the new constructor shown above.

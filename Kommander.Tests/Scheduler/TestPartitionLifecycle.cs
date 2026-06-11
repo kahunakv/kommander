@@ -560,6 +560,62 @@ public abstract class PartitionLifecycleTests
     }
 
     /// <summary>
+    /// P0 self-protection: TryCreatePartition with the system partition id (0) must
+    /// resolve the completion with Errored and never replicate anything.
+    /// Defense-in-depth guard in the coordinator; the public CreatePartitionAsync
+    /// has the same check one layer above.
+    /// </summary>
+    [Fact]
+    public async Task CreatePartition_SystemPartition_ReturnsError_NothingReplicated()
+    {
+        IWAL wal = CreateWal(out Action cleanup);
+        using RaftManager manager = Build(wal);
+        try
+        {
+            bool replicateCalled = false;
+            manager.SystemCoordinator.ReplicateOverride = (_, _, _, _) =>
+            {
+                replicateCalled = true;
+                return Task.FromResult(new RaftReplicationResult(true, RaftOperationStatus.Success, HLCTimestamp.Zero, 1));
+            };
+
+            (RaftOperationStatus status, _) = await SendCreateAsync(manager, partitionId: 0, mode: RaftRoutingMode.Unrouted);
+
+            Assert.Equal(RaftOperationStatus.Errored, status);
+            Assert.False(replicateCalled);
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// P0 self-protection: TryRemovePartition with the system partition id (0) must
+    /// resolve the completion with Errored and never replicate anything.
+    /// Defense-in-depth guard in the coordinator; the public RemovePartitionAsync
+    /// has the same check one layer above.
+    /// </summary>
+    [Fact]
+    public async Task RemovePartition_SystemPartition_ReturnsError_NothingReplicated()
+    {
+        IWAL wal = CreateWal(out Action cleanup);
+        using RaftManager manager = Build(wal);
+        try
+        {
+            bool replicateCalled = false;
+            manager.SystemCoordinator.ReplicateOverride = (_, _, _, _) =>
+            {
+                replicateCalled = true;
+                return Task.FromResult(new RaftReplicationResult(true, RaftOperationStatus.Success, HLCTimestamp.Zero, 1));
+            };
+
+            (RaftOperationStatus status, _) = await SendRemoveAsync(manager, partitionId: 0);
+
+            Assert.Equal(RaftOperationStatus.Errored, status);
+            Assert.False(replicateCalled);
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
     /// Removing a partition that does not exist returns Errored without replicating.
     /// Consistent guard across all WAL backends.
     /// </summary>
@@ -588,6 +644,24 @@ public abstract class PartitionLifecycleTests
 
             Assert.Equal(RaftOperationStatus.Errored, status);
             Assert.False(replicateCalled);
+        }
+        finally { cleanup(); }
+    }
+    /// <summary>
+    /// Replicating the reserved _RaftSystem log type to P0 via the public ReplicateLogs
+    /// API must throw RaftException regardless of the manager's initialization state.
+    /// The guard is the first check in ReplicateLogs, before any partition or leader lookup.
+    /// </summary>
+    [Fact]
+    public async Task ReplicateLogs_SystemPartition_WithSystemLogType_Throws()
+    {
+        IWAL wal = CreateWal(out Action cleanup);
+        using RaftManager manager = Build(wal);
+        try
+        {
+            await Assert.ThrowsAsync<RaftException>(() =>
+                manager.ReplicateLogs(0, "_RaftSystem", [1, 2, 3],
+                    cancellationToken: TestContext.Current.CancellationToken));
         }
         finally { cleanup(); }
     }

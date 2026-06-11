@@ -1165,6 +1165,13 @@ internal sealed class RaftSystemCoordinator : IDisposable
     {
         TaskCompletionSource<(RaftOperationStatus, long)>? completion = message.Completion;
 
+        if (message.PartitionId == RaftSystemConfig.SystemPartition)
+        {
+            logger.LogWarning("TryCreatePartition: System partition (id=0) cannot be created");
+            completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+            return;
+        }
+
         if (!systemConfiguration.TryGetValue(RaftSystemConfigKeys.Partitions, out string? partitions))
         {
             logger.LogError("TryCreatePartition: No partition map in system configuration");
@@ -1307,6 +1314,13 @@ internal sealed class RaftSystemCoordinator : IDisposable
     {
         TaskCompletionSource<(RaftOperationStatus, long)>? completion = message.Completion;
         int partitionId = message.PartitionId;
+
+        if (partitionId == RaftSystemConfig.SystemPartition)
+        {
+            logger.LogWarning("TryRemovePartition: System partition (id=0) cannot be removed");
+            completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+            return;
+        }
 
         if (!systemConfiguration.TryGetValue(RaftSystemConfigKeys.Partitions, out string? partitions))
         {

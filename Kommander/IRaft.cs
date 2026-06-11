@@ -332,6 +332,9 @@ public interface IRaft
     /// <summary>
     /// Creates a new partition. Leader-only. Idempotent: if the partition already exists
     /// with Active state, returns its current generation without mutating the map.
+    /// Throws <see cref="RaftException"/> if <paramref name="partitionId"/> is the system
+    /// partition (id 0); P0 is permanently protected and can never be created, removed,
+    /// split, or merged.
     /// </summary>
     public Task<RaftPartitionLifecycleResult> CreatePartitionAsync(
         int partitionId,
@@ -342,6 +345,9 @@ public interface IRaft
     /// <summary>
     /// Removes a partition. Leader-only. Idempotent: if the partition is already in
     /// the Removed state, re-attempts WAL reclamation and returns Success.
+    /// Throws <see cref="RaftException"/> if <paramref name="partitionId"/> is the system
+    /// partition (id 0); P0 is permanently protected and can never be created, removed,
+    /// split, or merged.
     /// </summary>
     public Task<RaftPartitionLifecycleResult> RemovePartitionAsync(
         int partitionId,

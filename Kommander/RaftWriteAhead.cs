@@ -129,6 +129,11 @@ public sealed class RaftWriteAhead
     /// Phase 2 of the nonblocking restore: replays the loaded log entries by invoking
     /// the application replication callbacks and updating the WAL commit index.
     /// Must be called on the partition executor thread (single-owner guarantee).
+    /// For P0, each entry is dispatched by log type: <c>_RaftSystem</c> entries go to
+    /// <c>InvokeSystemLogRestored</c>; all other types go to <c>InvokeLogRestored</c>
+    /// (consumer).  After replay completes, P0 fires both <c>InvokeSystemRestoreFinished</c>
+    /// and <c>InvokeRestoreFinished</c> so the coordinator and the consumer each observe
+    /// restore completion; non-P0 partitions fire only <c>InvokeRestoreFinished</c>.
     /// </summary>
     public async ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs)
     {
@@ -168,7 +173,7 @@ public sealed class RaftWriteAhead
                 if (log.Type != RaftLogType.Committed)
                     continue;
 
-                if (partition.PartitionId == RaftSystemConfig.SystemPartition)
+                if (partition.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType)
                 {
                     if (!await manager.InvokeSystemLogRestored(partition.PartitionId, log).ConfigureAwait(false))
                         manager.InvokeReplicationError(partition.PartitionId, log);
@@ -191,7 +196,12 @@ public sealed class RaftWriteAhead
             commitIndex = await GetMaxLog().ConfigureAwait(false) + 1;
 
         if (partition.PartitionId == RaftSystemConfig.SystemPartition)
+        {
+            // Fire both signals so the system coordinator and the consumer each learn
+            // restore is complete. For non-P0 partitions only the consumer signal fires.
             manager.InvokeSystemRestoreFinished(partition.PartitionId);
+            manager.InvokeRestoreFinished(partition.PartitionId);
+        }
         else
             manager.InvokeRestoreFinished(partition.PartitionId);
     }
