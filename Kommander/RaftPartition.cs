@@ -195,11 +195,12 @@ public sealed class RaftPartition : IDisposable
     public void RequestVote(RequestVotesRequest request)
     {
         executor.Post(new(
-            RaftRequestType.RequestVote, 
-            request.Term, 
-            request.MaxLogId, 
-            request.Time, 
-            request.Endpoint
+            RaftRequestType.RequestVote,
+            request.Term,
+            request.MaxLogId,
+            request.Time,
+            request.Endpoint,
+            preVote: request.PreVote
         ));
     }
 
@@ -210,11 +211,12 @@ public sealed class RaftPartition : IDisposable
     public void Vote(VoteRequest request)
     {
         executor.Post(new(
-            RaftRequestType.ReceiveVote, 
-            request.Term, 
-            request.MaxLogId, 
-            request.Time, 
-            request.Endpoint
+            RaftRequestType.ReceiveVote,
+            request.Term,
+            request.MaxLogId,
+            request.Time,
+            request.Endpoint,
+            preVote: request.PreVote
         ));
     }
 

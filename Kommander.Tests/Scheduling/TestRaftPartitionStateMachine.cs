@@ -463,6 +463,148 @@ public class TestRaftPartitionStateMachine
         });
     }
 
+    // ── PreVote tests (Raft §9.6) ────────────────────────────────────────────
+
+    /// <summary>
+    /// A pre-vote ask from a candidate with a stale log must be denied, and answering it must not
+    /// mutate any real state (term/votes/expected-leaders). Proven indirectly by then granting a
+    /// *real* vote to a different candidate at the same term, which is only possible if the pre-vote
+    /// left <c>expectedLeaders</c> untouched.
+    /// </summary>
+    [Fact]
+    public async Task VoteAsync_PreVote_StaleLog_DeniesAndDoesNotMutateState()
+    {
+        FakePartitionHost host = new();
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        // Seed a local log so localMaxId = 1, currentTerm = 1.
+        IReadOnlyList<RaftLog> restored = await sm.StartRestoreAsync();
+        await sm.CompleteRestoreAsync(restored);
+        long termBefore = sm.CurrentTerm;
+        host.ClearObservations();
+
+        // Candidate's log (0) is behind ours (1): pre-vote must be denied with no reply.
+        await sm.VoteAsync(
+            new RaftNode("node-b"),
+            voteTerm: 2,
+            remoteMaxLogId: 0,
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            preVote: true);
+
+        Assert.Empty(host.EnqueuedRequests);
+        Assert.Equal(termBefore, sm.CurrentTerm);
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+
+        // Proof that expectedLeaders was not poisoned: a real vote for a *different* up-to-date
+        // candidate at the same term is still granted.
+        await sm.VoteAsync(
+            new RaftNode("node-c"),
+            voteTerm: 2,
+            remoteMaxLogId: 5,
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId));
+
+        Assert.Collection(host.EnqueuedRequests, entry =>
+        {
+            Assert.Equal("node-c", entry.Endpoint);
+            Assert.Equal(RaftResponderRequestType.Vote, entry.Request.Type);
+            Assert.False(entry.Request.VoteRequest!.PreVote);
+        });
+    }
+
+    /// <summary>
+    /// A pre-vote ask from an up-to-date candidate, with no fresh leader, must be granted with a
+    /// <see cref="VoteRequest"/> carrying <c>PreVote=true</c> — without mutating any real state.
+    /// </summary>
+    [Fact]
+    public async Task VoteAsync_PreVote_HealthyCandidate_GrantsWithoutMutatingState()
+    {
+        FakePartitionHost host = new();
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        long termBefore = sm.CurrentTerm;
+
+        await sm.VoteAsync(
+            new RaftNode("node-b"),
+            voteTerm: 1,
+            remoteMaxLogId: 0,
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            preVote: true);
+
+        // Exactly one pre-vote grant, and no real state changed.
+        Assert.Collection(host.EnqueuedRequests, entry =>
+        {
+            Assert.Equal("node-b", entry.Endpoint);
+            Assert.Equal(RaftResponderRequestType.Vote, entry.Request.Type);
+            Assert.True(entry.Request.VoteRequest!.PreVote);
+            Assert.Equal(1L, entry.Request.VoteRequest!.Term);
+        });
+        Assert.Equal(termBefore, sm.CurrentTerm);
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+
+        // Proof the pre-vote did not record an expected leader: a real vote for a *different*
+        // candidate at the same term is still granted.
+        host.ClearObservations();
+        await sm.VoteAsync(
+            new RaftNode("node-c"),
+            voteTerm: 1,
+            remoteMaxLogId: 0,
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId));
+
+        Assert.Collection(host.EnqueuedRequests, entry =>
+        {
+            Assert.Equal("node-c", entry.Endpoint);
+            Assert.Equal(RaftResponderRequestType.Vote, entry.Request.Type);
+            Assert.False(entry.Request.VoteRequest!.PreVote);
+        });
+    }
+
+    /// <summary>
+    /// Reaching a pre-vote quorum (self-grant + one peer in a 3-node cluster) promotes to exactly
+    /// one real election: the term increments once, the node becomes Candidate, real (non-pre-vote)
+    /// RequestVotes go out, and the pre-vote round is reset so further pre-grants are ignored.
+    /// </summary>
+    [Fact]
+    public async Task PreVoteQuorum_PromotesToExactlyOneRealElection()
+    {
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [new("node-b"), new("node-c")] // 3-node cluster → pre-vote quorum = 2
+        };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        // Election timer fires on a follower with no fresh leader: opens a side-effect-free pre-vote.
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        Assert.Equal(0L, sm.CurrentTerm); // pre-vote must not bump the term
+        Assert.Contains(host.EnqueuedRequests, e =>
+            e.Request.Type == RaftResponderRequestType.RequestVotes && e.Request.RequestVotesRequest!.PreVote);
+
+        host.ClearObservations();
+
+        // Self already pre-granted; one peer pre-grant reaches quorum and promotes to a real election.
+        await sm.ReceivedVoteAsync("node-b", voteTerm: 1, remoteMaxLogId: 0, preVote: true);
+
+        Assert.Equal(1L, sm.CurrentTerm); // incremented exactly once
+        Assert.Equal(RaftNodeState.Candidate, sm.NodeState);
+        Assert.Contains(host.EnqueuedRequests, e =>
+            e.Request.Type == RaftResponderRequestType.RequestVotes && !e.Request.RequestVotesRequest!.PreVote);
+
+        // The round was reset: a late pre-grant is ignored and triggers no second election.
+        host.ClearObservations();
+        await sm.ReceivedVoteAsync("node-c", voteTerm: 1, remoteMaxLogId: 0, preVote: true);
+
+        Assert.Equal(1L, sm.CurrentTerm);
+        Assert.Equal(RaftNodeState.Candidate, sm.NodeState);
+        Assert.DoesNotContain(host.EnqueuedRequests, e => e.Request.Type == RaftResponderRequestType.RequestVotes);
+    }
+
     // ── ElectionTimeoutSeed tests ────────────────────────────────────────────
 
     /// <summary>
@@ -592,10 +734,17 @@ public class TestRaftPartitionStateMachine
 
         public List<(string Endpoint, RaftResponderRequestType Type)> EnqueuedResponses { get; } = [];
 
+        /// <summary>
+        /// Full enqueued requests, captured alongside <see cref="EnqueuedResponses"/> so pre-vote
+        /// tests can inspect the <see cref="VoteRequest.PreVote"/> / <see cref="RequestVotesRequest.PreVote"/> flags.
+        /// </summary>
+        public List<(string Endpoint, RaftResponderRequest Request)> EnqueuedRequests { get; } = [];
+
         public void ClearObservations()
         {
             LeaderChanges.Clear();
             EnqueuedResponses.Clear();
+            EnqueuedRequests.Clear();
         }
 
         public HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId) => HLCTimestamp.Zero;
@@ -606,7 +755,11 @@ public class TestRaftPartitionStateMachine
 
         public void UpdateLastNodeActivity(string endpoint, int partitionId, HLCTimestamp timestamp) { }
 
-        public void EnqueueResponse(string endpoint, RaftResponderRequest request) => EnqueuedResponses.Add((endpoint, request.Type));
+        public void EnqueueResponse(string endpoint, RaftResponderRequest request)
+        {
+            EnqueuedResponses.Add((endpoint, request.Type));
+            EnqueuedRequests.Add((endpoint, request));
+        }
 
         public Task InvokeLeaderChanged(int partitionId, string leader)
         {

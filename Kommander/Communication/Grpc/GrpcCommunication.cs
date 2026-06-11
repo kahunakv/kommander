@@ -75,9 +75,10 @@ public class GrpcCommunication : ICommunication
             TimeNode = request.Time.N,
             TimePhysical = request.Time.L,
             TimeCounter = request.Time.C,
-            Endpoint = request.Endpoint
+            Endpoint = request.Endpoint,
+            PreVote = request.PreVote
         };
-        
+
         GrpcBatchRequestsRequestItem requestItem = new()
         {
             Type = GrpcBatchRequestsRequestType.RequestVotes,
@@ -124,9 +125,10 @@ public class GrpcCommunication : ICommunication
             TimeNode = request.Time.N,
             TimePhysical = request.Time.L,
             TimeCounter = request.Time.C,
-            Endpoint = request.Endpoint
+            Endpoint = request.Endpoint,
+            PreVote = request.PreVote
         };
-        
+
         GrpcBatchRequestsRequestItem requestItem = new()
         {
             Type = GrpcBatchRequestsRequestType.Vote,
@@ -313,7 +315,8 @@ public class GrpcCommunication : ICommunication
                     TimeNode = requestItem.Vote.Time.N,
                     TimePhysical = requestItem.Vote.Time.L,
                     TimeCounter = requestItem.Vote.Time.C,
-                    Endpoint = requestItem.Vote.Endpoint
+                    Endpoint = requestItem.Vote.Endpoint,
+                    PreVote = requestItem.Vote.PreVote
                 };
                 
                 item.Vote = voteRequest;
@@ -330,7 +333,8 @@ public class GrpcCommunication : ICommunication
                     TimeNode = requestItem.RequestVotes.Time.N,
                     TimePhysical = requestItem.RequestVotes.Time.L,
                     TimeCounter = requestItem.RequestVotes.Time.C,
-                    Endpoint = requestItem.RequestVotes.Endpoint
+                    Endpoint = requestItem.RequestVotes.Endpoint,
+                    PreVote = requestItem.RequestVotes.PreVote
                 };
                 
                 item.RequestVotes = requestVotes;

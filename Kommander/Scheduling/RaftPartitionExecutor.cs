@@ -644,13 +644,14 @@ public sealed class RaftPartitionExecutor : IDisposable
                         new RaftNode(request.Endpoint ?? ""),
                         request.Term,
                         request.CommitIndex,
-                        request.Timestamp
+                        request.Timestamp,
+                        request.PreVote
                     ).ConfigureAwait(false);
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
                     break;
 
                 case RaftRequestType.ReceiveVote:
-                    await _stateMachine.ReceivedVoteAsync(request.Endpoint ?? "", request.Term, request.CommitIndex).ConfigureAwait(false);
+                    await _stateMachine.ReceivedVoteAsync(request.Endpoint ?? "", request.Term, request.CommitIndex, request.PreVote).ConfigureAwait(false);
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
                     break;
 

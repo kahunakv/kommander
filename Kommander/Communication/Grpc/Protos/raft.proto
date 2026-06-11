@@ -31,6 +31,7 @@ message GrpcVoteRequest {
     int64 TimePhysical = 5;
     uint32 TimeCounter = 6;
     string Endpoint = 7;
+    bool PreVote = 8;
 }
 
 message GrpcVoteResponse {
@@ -45,6 +46,7 @@ message GrpcRequestVotesRequest {
     int64 TimePhysical = 5;
     uint32 TimeCounter = 6;
     string Endpoint = 7;
+    bool PreVote = 8;
 }
 
 message GrpcRequestVotesResponse {

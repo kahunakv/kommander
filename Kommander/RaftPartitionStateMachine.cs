@@ -32,6 +32,25 @@ public sealed class RaftPartitionStateMachine
 
     private RaftNodeState nodeState = RaftNodeState.Follower;
     private long currentTerm;
+
+    /// <summary>
+    /// Gates whether an incoming <c>Vote(PreVote=true)</c> reply is tallied as a pre-grant.
+    /// Pre-vote-only bookkeeping: it is never persisted and answering a pre-vote never mutates it.
+    /// </summary>
+    private RaftElectionPhase electionPhase = RaftElectionPhase.None;
+
+    /// <summary>
+    /// The hypothetical <c>currentTerm + 1</c> the currently-open pre-vote round is for.
+    /// <c>-1</c> when no round is open. Pre-vote-only and side-effect-free: the real
+    /// <see cref="currentTerm"/> is only bumped once a pre-vote quorum promotes to a real election.
+    /// </summary>
+    private long preVoteTerm = -1;
+
+    /// <summary>
+    /// Endpoints (including self) that pre-granted for <see cref="preVoteTerm"/>.
+    /// Pre-vote-only and side-effect-free; separate from the real-election <see cref="votes"/> tally.
+    /// </summary>
+    private readonly HashSet<string> preVotes = [];
     private HLCTimestamp lastHeartbeat = HLCTimestamp.Zero;
     private HLCTimestamp lastVotation = HLCTimestamp.Zero;
     private HLCTimestamp votingStartedAt = HLCTimestamp.Zero;
@@ -72,6 +91,19 @@ public sealed class RaftPartitionStateMachine
     {
         if (correlationId is not null)
             replySink.TryComplete(correlationId.Value, response);
+    }
+
+    /// <summary>
+    /// Clears all bookkeeping for the current pre-vote round. Called when a candidacy is
+    /// abandoned (Candidate→Follower) and when a real election begins, so a stale pre-vote
+    /// round for an old term can never leak into and falsely promote a later term.
+    /// Side-effect-free with respect to real Raft state (term/votes/leader are untouched).
+    /// </summary>
+    private void ResetPreVoteRound()
+    {
+        preVotes.Clear();
+        preVoteTerm = -1;
+        electionPhase = RaftElectionPhase.None;
     }
 
     /// <summary>
@@ -148,7 +180,8 @@ public sealed class RaftPartitionStateMachine
                 expectedLeaders.Clear();
                 lastCommitIndexes.Clear();
                 activeProposals.Clear();
-                
+                ResetPreVoteRound();
+
                 await host.InvokeLeaderChanged(host.PartitionId, "");
                 return;
             
@@ -157,7 +190,9 @@ public sealed class RaftPartitionStateMachine
                 return;
             
             case RaftNodeState.Follower:
-                await StartElectionAsync(currentTime, ignoreRecentVoteCooldown: false).ConfigureAwait(false);
+                // Run a side-effect-free pre-vote first; only a pre-vote quorum promotes to a
+                // real election (Raft §9.6), so a stale node can't disrupt a healthy leader.
+                await StartPreVoteAsync(currentTime).ConfigureAwait(false);
                 break;
             
             default:
@@ -405,7 +440,7 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
-        await RequestVotesAsync(currentTime).ConfigureAwait(false);
+        await RequestVotesAsync(currentTime, currentTerm).ConfigureAwait(false);
         CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Pending, 0L));
     }
 
@@ -466,6 +501,10 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
+        // A real election is starting: discard any open pre-vote round so a stale
+        // pre-grant set for an old hypothetical term can't bleed into this one.
+        ResetPreVoteRound();
+
         nodeState = RaftNodeState.Candidate;
         host.Leader = "";
         expectedLeaders.Clear();
@@ -498,35 +537,99 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
-        await RequestVotesAsync(currentTime).ConfigureAwait(false);
+        await RequestVotesAsync(currentTime, currentTerm).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Requests votes to obtain leadership when a node becomes a candidate, reaching out to other known nodes in the cluster.
+    /// The pre-election (Raft §9.6) that gates a real election. Before bumping the term and
+    /// becoming a Candidate, a follower whose leader went silent first runs a side-effect-free
+    /// probe: it asks peers whether they *would* vote for it at <c>currentTerm + 1</c> given its
+    /// current log, WITHOUT changing its own term/state. Only a pre-vote quorum (tallied in
+    /// <see cref="ReceivedVoteAsync"/>) promotes to <see cref="StartElectionAsync"/>. This is what
+    /// stops a stale or partitioned node from repeatedly inflating its term and disrupting a healthy
+    /// leader — the livelock this whole change targets.
+    /// </summary>
+    private async Task StartPreVoteAsync(HLCTimestamp currentTime)
+    {
+        // Same "should I even try?" guards as a real election. These guards do NOT touch any Raft
+        // consensus state (currentTerm / votes / expectedLeaders / nodeState) — that is the whole
+        // point of pre-vote. The one local write below (lastHeartbeat) is a back-off bookkeeping
+        // refresh on the "leader still fresh" path, mirroring StartElectionAsync, not a consensus
+        // mutation: it just records that we observed the leader so we don't immediately re-trigger.
+        if (lastVotation != HLCTimestamp.Zero && ((currentTime - lastVotation) < (electionTimeout * 2)))
+            return;
+
+        string expectedLeader = expectedLeaders.GetValueOrDefault(currentTerm, "");
+        if (!string.IsNullOrEmpty(expectedLeader))
+        {
+            HLCTimestamp lastKnownHeartbeat = host.GetLastNodeActivity(expectedLeader, host.PartitionId);
+
+            if (lastKnownHeartbeat != HLCTimestamp.Zero && ((currentTime - lastKnownHeartbeat) < electionTimeout))
+            {
+                // Intentional: back off and remember we saw the leader. Not a consensus mutation.
+                lastHeartbeat = lastKnownHeartbeat;
+                return;
+            }
+        }
+
+        if (await AmIOutdatedAsync().ConfigureAwait(false))
+        {
+            electionTimeout += TimeSpan.FromMilliseconds(random.Next(host.Configuration.StartElectionTimeoutIncrement, host.Configuration.EndElectionTimeoutIncrement));
+
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] We're outdated, skipping pre-vote...", host.LocalEndpoint, host.PartitionId, nodeState);
+            return;
+        }
+
+        // No peers to probe: there is nothing a pre-vote can tell us, so go straight to a real election.
+        if (host.Nodes.Count == 0)
+        {
+            await StartElectionAsync(currentTime, ignoreRecentVoteCooldown: true).ConfigureAwait(false);
+            return;
+        }
+
+        // Open a fresh pre-vote round for the hypothetical next term and seed our own pre-grant.
+        electionPhase = RaftElectionPhase.PreVote;
+        preVoteTerm = currentTerm + 1;
+        preVotes.Clear();
+        preVotes.Add(host.LocalEndpoint);
+
+        logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Starting pre-vote round for Term={PreVoteTerm}", host.LocalEndpoint, host.PartitionId, nodeState, preVoteTerm);
+
+        await RequestVotesAsync(currentTime, preVoteTerm, preVote: true).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Requests votes from the other known nodes in the cluster. Shared by both the real election
+    /// (<paramref name="preVote"/> = false) and the side-effect-free pre-vote probe
+    /// (<paramref name="preVote"/> = true, Raft §9.6). The only difference on the wire is the
+    /// <see cref="RequestVotesRequest.PreVote"/> flag and the <paramref name="term"/> used (the
+    /// real <see cref="currentTerm"/> for an election, the hypothetical <c>currentTerm + 1</c> for a probe).
     /// </summary>
     /// <param name="timestamp"></param>
+    /// <param name="term">Term to advertise: <see cref="currentTerm"/> for a real election, the hypothetical next term for a pre-vote.</param>
+    /// <param name="preVote">When true the outbound request is marked as a pre-vote probe.</param>
     /// <exception cref="RaftException"></exception>
-    private async Task RequestVotesAsync(HLCTimestamp timestamp)
+    private async Task RequestVotesAsync(HLCTimestamp timestamp, long term, bool preVote = false)
     {
         IReadOnlyList<RaftNode> nodes = host.Nodes;
-        
+
         if (nodes.Count == 0)
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] No other nodes availables to vote", host.LocalEndpoint, host.PartitionId, nodeState);
             return;
         }
-        
+
         long currentMaxLog = await wal.GetMaxLogAsync().ConfigureAwait(false);
-        
-        RequestVotesRequest request = new(host.PartitionId, currentTerm, currentMaxLog, timestamp, host.LocalEndpoint);
+
+        RequestVotesRequest request = new(host.PartitionId, term, currentMaxLog, timestamp, host.LocalEndpoint, preVote);
 
         foreach (RaftNode node in nodes)
         {
             if (node.Endpoint == host.LocalEndpoint)
                 throw new RaftException("Corrupted nodes");
-            
-            logger.LogInfoAskedForVotes(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, currentTerm);
-            
+
+            logger.LogInfoAskedForVotes(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, term);
+
             host.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.RequestVotes, node, request));
         }
     }
@@ -640,14 +743,71 @@ public sealed class RaftPartitionStateMachine
 
     /// <summary>
     /// When another node requests our vote, we verify that the term is valid and the commitIndex is
-    /// higher than ours to ensure we don't elect outdated nodes as leaders. 
+    /// higher than ours to ensure we don't elect outdated nodes as leaders.
+    ///
+    /// When <paramref name="preVote"/> is true this answers a side-effect-free pre-election probe
+    /// (Raft §9.6): we evaluate the §3 grant predicate and, on grant, reply with a
+    /// <see cref="VoteRequest"/> carrying <c>PreVote=true</c> — but we must NOT mutate any real
+    /// state (<see cref="currentTerm"/>, <see cref="votes"/>, <see cref="expectedLeaders"/>,
+    /// <see cref="lastVotation"/>, <see cref="lastHeartbeat"/>, <see cref="nodeState"/>). This is
+    /// what lets a stale/partitioned node probe its electability without disrupting a healthy leader.
     /// </summary>
     /// <param name="node"></param>
     /// <param name="voteTerm"></param>
     /// <param name="remoteMaxLogId"></param>
     /// <param name="timestamp"></param>
-    public async Task VoteAsync(RaftNode node, long voteTerm, long remoteMaxLogId, HLCTimestamp timestamp)
+    /// <param name="preVote">When true, evaluate as a pure pre-vote probe and never persist state.</param>
+    public async Task VoteAsync(RaftNode node, long voteTerm, long remoteMaxLogId, HLCTimestamp timestamp, bool preVote = false)
     {
+        if (preVote)
+        {
+            // Side-effect-free pre-vote (Raft §9.6). NOTHING below this branch's `return`
+            // may mutate state: we only read term/log/leader-freshness and, on grant, reply.
+
+            // A live leader never helps a challenger unseat it.
+            if (nodeState == RaftNodeState.Leader)
+            {
+                logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Denying pre-vote to {Endpoint} Term={Term}: we are the leader", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
+                return;
+            }
+
+            // Deny if we still consider a current leader fresh — i.e. we ourselves would not be
+            // willing to start an election right now. Mirrors the StartElectionAsync guard.
+            string preVoteExpectedLeader = expectedLeaders.GetValueOrDefault(currentTerm, "");
+            if (!string.IsNullOrEmpty(preVoteExpectedLeader))
+            {
+                HLCTimestamp lastKnownHeartbeat = host.GetLastNodeActivity(preVoteExpectedLeader, host.PartitionId);
+                if (lastKnownHeartbeat != HLCTimestamp.Zero && ((timestamp - lastKnownHeartbeat) < electionTimeout))
+                {
+                    logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Denying pre-vote to {Endpoint} Term={Term}: current leader {Leader} still fresh", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm, preVoteExpectedLeader);
+                    return;
+                }
+            }
+
+            // The hypothetical term must not be stale.
+            if (voteTerm < currentTerm)
+            {
+                logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Denying pre-vote to {Endpoint}: stale Term={Term} < CurrentTerm={CurrentTerm}", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm, currentTerm);
+                return;
+            }
+
+            long preVoteLocalMaxId = await wal.GetMaxLogAsync().ConfigureAwait(false);
+
+            // The candidate's log must be at least as up-to-date. Note: `>=`, not the real-vote
+            // path's strict rejection — a pre-vote only probes electability, it doesn't elect.
+            if (remoteMaxLogId < preVoteLocalMaxId)
+            {
+                logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Denying pre-vote to {Endpoint} Term={Term}: outdated log RemoteMaxId={RemoteId} LocalMaxId={MaxId}", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm, remoteMaxLogId, preVoteLocalMaxId);
+                return;
+            }
+
+            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Granting pre-vote to {Endpoint} Term={Term}", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
+
+            VoteRequest preGrant = new(host.PartitionId, voteTerm, preVoteLocalMaxId, timestamp, host.LocalEndpoint, preVote: true);
+            host.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Vote, node, preGrant));
+            return;
+        }
+
         if (votes.ContainsKey(voteTerm))
         {
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received request to vote from {Endpoint} but already voted in that Term={Term}. Ignoring...", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
@@ -675,14 +835,14 @@ public sealed class RaftPartitionStateMachine
         }
         
         long localMaxId = await wal.GetMaxLogAsync().ConfigureAwait(false);
-        
+
         if (localMaxId > remoteMaxLogId)
         {
+            // Reject a real vote for a candidate whose log is behind ours (Raft §5.4.1). We do NOT
+            // bump our own term here: with PreVote (§9.6) in place a stale candidate can no longer
+            // reach this real-vote path with an inflated term, so the old `currentTerm++` heuristic
+            // that forced us to be elected is no longer needed and only risked spurious term churn.
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received request to vote on outdated log from {Endpoint} RemoteMaxId={RemoteId} LocalMaxId={MaxId}. Ignoring...", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, remoteMaxLogId, localMaxId);
-            
-            // If we know that we have a commitIndex ahead of other nodes in this partition,
-            // we increase the term to force being chosen as leaders.
-            currentTerm++;  
             return;
         }
         
@@ -700,13 +860,48 @@ public sealed class RaftPartitionStateMachine
 
     /// <summary>
     /// Processes a vote received in the Raft consensus protocol.
+    ///
+    /// When <paramref name="preVote"/> is true this tallies a side-effect-free pre-grant (Raft §9.6)
+    /// against the currently-open pre-vote round. A node running a pre-vote round is still a Follower,
+    /// so this branch sits before the normal "didn't ask for it" Follower early-return. Reaching a
+    /// pre-vote quorum promotes to a real election exactly once; no real vote/commit bookkeeping is
+    /// touched on the pre-vote path.
     /// </summary>
     /// <param name="endpoint">The identifier of the remote node sending the vote.</param>
     /// <param name="voteTerm">The term associated with the received vote.</param>
     /// <param name="remoteMaxLogId">The highest log ID from the remote node.</param>
+    /// <param name="preVote">When true, tally as a pre-vote grant for the open pre-vote round.</param>
     /// <returns>A task that represents the asynchronous operation.</returns>
-    public async Task ReceivedVoteAsync(string endpoint, long voteTerm, long remoteMaxLogId)
+    public async Task ReceivedVoteAsync(string endpoint, long voteTerm, long remoteMaxLogId, bool preVote = false)
     {
+        if (preVote)
+        {
+            // Tally a pre-grant. Placed before the Follower early-return because a node running a
+            // pre-vote round is still a Follower. Touches only pre-vote state until quorum promotes.
+            if (electionPhase != RaftElectionPhase.PreVote || voteTerm != preVoteTerm)
+            {
+                logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Ignoring pre-vote grant from {Endpoint} Term={Term}: no matching open round (phase={Phase} preVoteTerm={PreVoteTerm})", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, voteTerm, electionPhase, preVoteTerm);
+                return;
+            }
+
+            preVotes.Add(endpoint);
+            int preVoteQuorum = Math.Max(2, ((host.Nodes.Count + 1) / 2) + 1);
+
+            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received pre-vote from {Endpoint} Term={Term} PreVotes={PreVotes} Quorum={Quorum}/{Total}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, voteTerm, preVotes.Count, preVoteQuorum, host.Nodes.Count + 1);
+
+            if (preVotes.Count < preVoteQuorum)
+                return;
+
+            // Pre-vote quorum reached: promote to a real election (which bumps the term and casts
+            // the self-vote). StartElectionAsync resets the round itself once it commits to candidacy,
+            // but it can also bail out early (e.g. the AmIOutdatedAsync guard) *before* that reset, so
+            // we reset again here unconditionally to guarantee the round can't be tallied twice.
+            HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+            await StartElectionAsync(currentTime, ignoreRecentVoteCooldown: true).ConfigureAwait(false);
+            ResetPreVoteRound();
+            return;
+        }
+
         if (nodeState == RaftNodeState.Follower)
         {
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Node} but we didn't ask for it Term={Term}. Ignoring...", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, voteTerm);

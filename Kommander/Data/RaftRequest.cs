@@ -23,8 +23,15 @@ public sealed class RaftRequest
     public TransferLeadershipRequest? TransferLeadership { get; }
     
     public RaftOperationStatus Status { get; }
-    
+
     public bool AutoCommit { get; }
+
+    /// <summary>
+    /// When true the carried <see cref="RaftRequestType.RequestVote"/> /
+    /// <see cref="RaftRequestType.ReceiveVote"/> is a side-effect-free pre-election probe
+    /// (Raft §9.6); the state machine answers/tallies it without persisting term/vote state.
+    /// </summary>
+    public bool PreVote { get; }
 
     /// <summary>
     /// When non-zero, the executor rejects the proposal with
@@ -59,8 +66,9 @@ public sealed class RaftRequest
         long commitIndex = 0, 
         HLCTimestamp timestamp = default, 
         string? endpoint = null, 
-        RaftOperationStatus status = RaftOperationStatus.Success, 
-        List<RaftLog>? logs = null
+        RaftOperationStatus status = RaftOperationStatus.Success,
+        List<RaftLog>? logs = null,
+        bool preVote = false
     )
     {
         Type = type;
@@ -70,6 +78,7 @@ public sealed class RaftRequest
         Endpoint = endpoint;
         Status = status;
         Logs = logs;
+        PreVote = preVote;
     }
 
     public RaftRequest(RaftRequestType type, List<RaftLog> logs, bool autoCommit, long expectedGeneration = 0)

@@ -540,6 +540,116 @@ public sealed class TestThreeNodeCluster
         await GetNodeByEndpoint(nodes, healthyFollower).LeaveCluster(true);
     }
 
+    /// <summary>
+    /// PreVote regression (Raft §9.6): a follower whose transport is paused while the rest of the
+    /// quorum keeps committing must, on resume, rejoin without livelock — the partition keeps a
+    /// single decided leader, the resumed node reverts to Follower, and its stale log catches up.
+    /// Before PreVote this scenario could leave the resumed (term-inflated, stale-log) node stuck
+    /// campaigning forever, surfacing as "Leader couldn't be found or is not decided".
+    /// </summary>
+    [Fact]
+    public async Task PausedStaleFollower_OnResume_RejoinsWithoutLivelock()
+    {
+        InMemoryCommunication communication = new();
+
+        IRaft node1 = GetNode1(communication, "memory", 1, logger);
+        IRaft node2 = GetNode2(communication, "memory", 1, logger);
+        IRaft node3 = GetNode3(communication, "memory", 1, logger);
+        IRaft[] nodes = [node1, node2, node3];
+
+        Dictionary<string, IRaft> network = new()
+        {
+            { "localhost:8001", node1 },
+            { "localhost:8002", node2 },
+            { "localhost:8003", node3 }
+        };
+        communication.SetNodes(network);
+
+        await node1.UpdateNodes();
+        await node2.UpdateNodes();
+        await node3.UpdateNodes();
+
+        await Task.WhenAll(
+            node1.JoinCluster(TestContext.Current.CancellationToken),
+            node2.JoinCluster(TestContext.Current.CancellationToken),
+            node3.JoinCluster(TestContext.Current.CancellationToken));
+
+        string initialLeader = await node1.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        // Pause a follower (never the leader) so the remaining two nodes still form a quorum.
+        IRaft pausedNode = nodes.First(node => node.GetLocalEndpoint() != initialLeader);
+        string pausedEndpoint = pausedNode.GetLocalEndpoint();
+        communication.PartitionNode(pausedEndpoint);
+
+        // Commit entries on the surviving quorum while the paused node's log goes stale and it
+        // campaigns in isolation (its pre-votes can reach no one, so it never disrupts the leader).
+        IRaft leader = GetNodeByEndpoint(nodes, initialLeader);
+        byte[] data = "Hello World"u8.ToArray();
+        const int entries = 6;
+        for (int i = 0; i < entries; i++)
+        {
+            RaftReplicationResult response = await leader.ReplicateLogs(
+                1,
+                "Greeting",
+                data,
+                cancellationToken: TestContext.Current.CancellationToken);
+
+            Assert.Equal(RaftOperationStatus.Success, response.Status);
+        }
+
+        long leaderMaxLog = leader.WalAdapter.GetMaxLog(1);
+        Assert.True(leaderMaxLog >= entries);
+
+        // Give the isolated node time to time out and run (failing) pre-vote rounds.
+        await Task.Delay(1_000, TestContext.Current.CancellationToken);
+
+        // The surviving quorum must still have exactly one leader, unchanged by the isolation.
+        Assert.Equal(1, await CountLeaders(nodes.Where(n => n.GetLocalEndpoint() != pausedEndpoint).ToArray(), 1));
+
+        // Resume the paused node's transport.
+        communication.HealPartition(pausedEndpoint);
+
+        // No livelock: a single leader is decided across the whole cluster, and the resumed node
+        // agrees on it rather than getting stuck as a perpetual candidate.
+        string resumedLeaderView = await pausedNode.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, await CountLeaders(nodes, 1));
+        Assert.False(await pausedNode.AmILeaderQuick(1)); // reverted to / stayed Follower
+
+        IRaft decidedLeader = GetNodeByEndpoint(nodes, resumedLeaderView);
+
+        // Drive further replication after the rejoin: the resumed follower must accept it and
+        // converge with the leader (it is a healthy follower again, not a stuck candidate).
+        for (int i = 0; i < 3; i++)
+        {
+            RaftReplicationResult response = await decidedLeader.ReplicateLogs(
+                1,
+                "Greeting",
+                data,
+                cancellationToken: TestContext.Current.CancellationToken);
+
+            Assert.Equal(RaftOperationStatus.Success, response.Status);
+        }
+
+        // The resumed node's log converges with the leader's.
+        await WaitForConditionAsync(
+            () => pausedNode.WalAdapter.GetMaxLog(1) >= decidedLeader.WalAdapter.GetMaxLog(1),
+            TestContext.Current.CancellationToken,
+            timeoutMs: 20_000);
+
+        Assert.True(pausedNode.WalAdapter.GetMaxLog(1) >= decidedLeader.WalAdapter.GetMaxLog(1));
+
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+        await node3.LeaveCluster(true);
+    }
+
     [Theory]
     [Trait("Category", "Stress")]
     [InlineData("memory", 8)]

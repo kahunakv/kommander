@@ -15,12 +15,19 @@ public sealed class VoteRequest
 
     public string Endpoint { get; set; }
 
-    public VoteRequest(int partition, long term, long maxLogId, HLCTimestamp time, string endpoint)
+    /// <summary>
+    /// When true this Vote is a side-effect-free pre-election grant (Raft §9.6);
+    /// the peer does not persist term/vote state.
+    /// </summary>
+    public bool PreVote { get; set; }
+
+    public VoteRequest(int partition, long term, long maxLogId, HLCTimestamp time, string endpoint, bool preVote = false)
     {
         Partition = partition;
         Term = term;
         MaxLogId = maxLogId;
         Time = time;
         Endpoint = endpoint;
+        PreVote = preVote;
     }
 }

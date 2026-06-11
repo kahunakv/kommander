@@ -20,14 +20,51 @@ public class InMemoryCommunication : ICommunication
     private static readonly Task<CompleteAppendLogsResponse> completeAppendLogsResponse = Task.FromResult(new CompleteAppendLogsResponse());
     
     private Dictionary<string, IRaft> nodes = new();
-    
+
+    /// <summary>
+    /// Endpoints currently "transport-paused". A message is dropped if either its sender or its
+    /// target is in this set, which simulates a full (both-directions) network partition without
+    /// stopping the node's timers — the node keeps running and campaigning in isolation. Used by
+    /// tests/simulations to reproduce disruptive-rejoin scenarios; empty in normal operation.
+    /// </summary>
+    private readonly HashSet<string> partitionedEndpoints = [];
+
     public void SetNodes(Dictionary<string, IRaft> nodes)
     {
         this.nodes = nodes;
     }
 
+    /// <summary>
+    /// Drops all traffic to and from <paramref name="endpoint"/> until <see cref="HealPartition"/>
+    /// is called, simulating a transport pause while the node itself keeps ticking.
+    /// </summary>
+    public void PartitionNode(string endpoint)
+    {
+        lock (partitionedEndpoints)
+            partitionedEndpoints.Add(endpoint);
+    }
+
+    /// <summary>
+    /// Restores traffic to and from <paramref name="endpoint"/> after a <see cref="PartitionNode"/> call.
+    /// </summary>
+    public void HealPartition(string endpoint)
+    {
+        lock (partitionedEndpoints)
+            partitionedEndpoints.Remove(endpoint);
+    }
+
+    private bool IsPartitioned(string source, string target)
+    {
+        lock (partitionedEndpoints)
+            return partitionedEndpoints.Count > 0 &&
+                (partitionedEndpoints.Contains(source) || partitionedEndpoints.Contains(target));
+    }
+
     public Task<HandshakeResponse> Handshake(RaftManager manager, RaftNode node, HandshakeRequest request)
     {
+        if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))
+            return handshakeResponse;
+
         if (manager.ClusterHandler.IsNode(node.Endpoint))
         {
             if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
@@ -47,6 +84,9 @@ public class InMemoryCommunication : ICommunication
     
     public Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftNode node, RequestVotesRequest request)
     {
+        if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))
+            return requestVoteResponse;
+
         if (manager.ClusterHandler.IsNode(node.Endpoint) && nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
             targetNode.RequestVote(request);
         else
@@ -57,6 +97,9 @@ public class InMemoryCommunication : ICommunication
 
     public Task<VoteResponse> Vote(RaftManager manager, RaftNode node, VoteRequest request)
     {
+        if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))
+            return voteResponse;
+
         if (manager.ClusterHandler.IsNode(node.Endpoint) && nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
             targetNode.Vote(request);
         else
@@ -67,6 +110,9 @@ public class InMemoryCommunication : ICommunication
 
     public Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftNode node, AppendLogsRequest request)
     {
+        if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))
+            return appendLogsResponse;
+
         if (manager.ClusterHandler.IsNode(node.Endpoint) && nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
             targetNode.AppendLogs(request);
         else
@@ -77,6 +123,9 @@ public class InMemoryCommunication : ICommunication
     
     public Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftNode node, CompleteAppendLogsRequest request)
     {
+        if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))
+            return completeAppendLogsResponse;
+
         if (manager.ClusterHandler.IsNode(node.Endpoint) && nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
             targetNode.CompleteAppendLogs(request);
         else
@@ -87,6 +136,9 @@ public class InMemoryCommunication : ICommunication
 
     public async Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)
     {
+        if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))
+            return new();
+
         if (manager.ClusterHandler.IsNode(node.Endpoint))
         {
             if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))

@@ -124,9 +124,10 @@ public sealed class RaftService : Rafter.RafterBase
             request.Term,
             request.MaxLogId,
             new(request.TimeNode, request.TimePhysical, request.TimeCounter),
-            request.Endpoint
+            request.Endpoint,
+            request.PreVote
         ));
-        
+
         return voteResponse;
     }
 
@@ -145,9 +146,10 @@ public sealed class RaftService : Rafter.RafterBase
             request.Term,
             request.MaxLogId,
             new(request.TimeNode, request.TimePhysical, request.TimeCounter),
-            request.Endpoint
+            request.Endpoint,
+            request.PreVote
         ));
-        
+
         return requestVoteResponse;
     }
 
@@ -267,7 +269,8 @@ public sealed class RaftService : Rafter.RafterBase
                                     requestVotes.Term,
                                     requestVotes.MaxLogId,
                                     new(requestVotes.TimeNode, requestVotes.TimePhysical, requestVotes.TimeCounter),
-                                    requestVotes.Endpoint
+                                    requestVotes.Endpoint,
+                                    requestVotes.PreVote
                                 ));
                                 break;
                             }
@@ -281,7 +284,8 @@ public sealed class RaftService : Rafter.RafterBase
                                     voteRequest.Term,
                                     voteRequest.MaxLogId,
                                     new(voteRequest.TimeNode, voteRequest.TimePhysical, voteRequest.TimeCounter),
-                                    voteRequest.Endpoint
+                                    voteRequest.Endpoint,
+                                    voteRequest.PreVote
                                 ));
                                 break;
                             }
