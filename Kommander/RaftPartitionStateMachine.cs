@@ -1174,14 +1174,11 @@ public sealed class RaftPartitionStateMachine
             }
         }
 
-        IReadOnlyList<RaftNode> nodes = host.Nodes;
-        
-        if (nodes.Count == 0)
-        {
-            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] No quorum available to propose logs", host.LocalEndpoint, host.PartitionId, nodeState);
-            
-            return (RaftOperationStatus.Errored, HLCTimestamp.Zero);
-        }               
+        // No peers: a single-node leader is its own quorum. Rather than rejecting the proposal,
+        // we enqueue it to the local WAL exactly like the multi-node path; CompleteLeaderPropose
+        // then drives the commit immediately (quorum = self), so JoinCluster/IsInitialized can
+        // complete on a single-node cluster. The self-only commit shortcut lives entirely behind
+        // the Nodes.Count == 0 guard in CompleteLeaderPropose, so multi-node safety is unaffected.
 
         // Snapshot Type and Time before mutation so we can restore atomically if
         // the WAL scheduler rejects the operation (e.g. BackpressureExceededException).
@@ -1781,6 +1778,26 @@ public sealed class RaftPartitionStateMachine
 
         if (logger.IsEnabled(LogLevel.Debug))
             logger.LogDebugProposedLogs(host.LocalEndpoint, host.PartitionId, nodeState, ticketId, string.Join(',', logs.Select(x => x.Id.ToString())));
+
+        // Single-node leader (no peers): the self-completion above already satisfies quorum, but no
+        // peer ack will ever arrive to drive CompleteAppendLogsAsync. Drive the identical
+        // Completed → (auto)commit transition here so autoCommit and the WAL completion envelope
+        // behave exactly like the multi-node quorum path. Guarded by Nodes.Count == 0 so it can
+        // never short-circuit a real quorum when peers exist.
+        if (host.Nodes.Count == 0)
+        {
+            proposalQuorum.SetState(RaftProposalState.Completed);
+
+            if (autoCommit)
+            {
+                WALWriteOperation commitOperation = wal.EnqueueCommit(proposalQuorum.Logs);
+                pendingWalOperations[commitOperation.OperationId] = new()
+                {
+                    Proposal = proposalQuorum,
+                    TicketId = ticketId
+                };
+            }
+        }
 
         CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, ticketId));
     }
