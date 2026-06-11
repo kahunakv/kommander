@@ -304,18 +304,21 @@ public sealed class TestRaftSystemCoordinator
     // ── TrySetInitialPartitions ───────────────────────────────────────────────
 
     [Fact]
-    public async Task LeaderChanged_AsLeader_ConfigAlreadyPresent_ActivatesWithoutReplication()
+    public async Task LeaderChanged_AsLeader_ConfigAlreadyPresent_ReAssertsMapAndActivates()
     {
         // If systemConfiguration already has partition data (e.g. after restore),
-        // TrySetInitialPartitions must activate partitions directly without calling
-        // ReplicateSystemLogs.
+        // TrySetInitialPartitions must re-assert that exact map to the cluster (so
+        // followers that joined/restarted with an empty WAL converge) AND activate
+        // partitions locally. The re-asserted payload must be byte-identical to the
+        // existing map — same MapVersion, same ranges.
         RaftManager manager = Build();
         using (manager)
         {
-            bool replicateCalled = false;
-            manager.SystemCoordinator.ReplicateOverride = (_, _, _, _) =>
+            List<byte[]> replicatedPayloads = [];
+            manager.SystemCoordinator.ReplicateOverride = (_, data, autoCommit, _) =>
             {
-                replicateCalled = true;
+                replicatedPayloads.Add(data);
+                Assert.True(autoCommit, "Map re-assert must autoCommit so followers see a Committed entry");
                 return Task.FromResult(new RaftReplicationResult(true, RaftOperationStatus.Success, HLCTimestamp.Zero, 1));
             };
 
@@ -334,18 +337,63 @@ public sealed class TestRaftSystemCoordinator
                 new() { PartitionId = 1, StartRange = 0, EndRange = 500_000_000 },
                 new() { PartitionId = 2, StartRange = 500_000_001, EndRange = int.MaxValue }
             ];
-            manager.SystemCoordinator.Send(MakeConfigRestored(knownRanges));
+            manager.SystemCoordinator.Send(MakeConfigRestored(knownRanges, mapVersion: 4));
             await WaitForIdleAsync(manager);
 
-            // Trigger as leader — must use existing config, not replicate.
+            // Trigger as leader — must re-assert the existing config to followers.
             manager.SystemCoordinator.Send(
                 new RaftSystemRequest(RaftSystemRequestType.LeaderChanged, manager.LocalEndpoint));
             await done.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
-            Assert.False(replicateCalled, "ReplicateSystemLogs must not be called when config is already present");
+            // Exactly one re-assert replication carrying the unchanged map.
+            Assert.Single(replicatedPayloads);
+            using MemoryStream ms = new(replicatedPayloads[0]);
+            Kommander.System.Protos.RaftSystemMessage msg =
+                Kommander.System.Protos.RaftSystemMessage.Parser.ParseFrom(ms);
+            Assert.Equal(RaftSystemConfigKeys.Partitions, msg.Key);
+            RaftPartitionMap? reasserted = JsonSerializer.Deserialize<RaftPartitionMap>(msg.Value);
+            Assert.NotNull(reasserted);
+            Assert.Equal(4, reasserted.MapVersion);
+            Assert.Equal(2, reasserted.Partitions.Count);
+
             Assert.NotNull(activated);
             Assert.Equal(2, activated.Count);
             Assert.True(manager.IsInitialized);
+        }
+    }
+
+    [Fact]
+    public async Task LeaderChanged_AsFollower_NoConfigYet_StartsNothing_ThenRecoversOnConfigReplicated()
+    {
+        // Reproduces the "Failed to get partitions from system configuration" race:
+        // a follower whose systemConfiguration cache is still empty processes
+        // LeaderChanged before the partition map has been replicated to it.
+        // InitializePartitions must NOT start any partitions (and must not throw),
+        // and the node must then recover once the map arrives via ConfigReplicated.
+        RaftManager manager = Build();
+        using (manager)
+        {
+            // LeaderChanged to a different node arrives before any config — the empty
+            // cache means no partitions can be started yet.
+            manager.SystemCoordinator.Send(
+                new RaftSystemRequest(RaftSystemRequestType.LeaderChanged, "other-node:9001"));
+            await WaitForIdleAsync(manager);
+
+            Assert.Empty(manager.Partitions);
+            Assert.False(manager.IsInitialized);
+
+            // The leader re-asserts the map; the follower receives it as a Committed
+            // entry → ConfigReplicated → InitializePartitions starts the partitions.
+            List<RaftPartitionRange> ranges =
+            [
+                new() { PartitionId = 1, StartRange = 0, EndRange = int.MaxValue }
+            ];
+            manager.SystemCoordinator.Send(MakeConfigReplicated(ranges));
+            await WaitForIdleAsync(manager);
+
+            Assert.True(manager.IsInitialized);
+            Assert.Single(manager.Partitions);
+            Assert.True(manager.Partitions.ContainsKey(1));
         }
     }
 

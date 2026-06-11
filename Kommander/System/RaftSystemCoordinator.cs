@@ -295,7 +295,14 @@ internal sealed class RaftSystemCoordinator : IDisposable
     {
         if (!systemConfiguration.TryGetValue(RaftSystemConfigKeys.Partitions, out string? partitions))
         {
-            logger.LogWarning("InitializePartitions: Failed to get partitions from system configuration");
+            // Expected transient on a node whose systemConfiguration cache is not yet
+            // warm: a follower may process LeaderChanged before the map has been
+            // replicated to it, and a fresh node fires RestoreCompleted with an empty
+            // WAL. No partitions are started here, but this self-heals — the leader
+            // re-asserts the map on every LeaderChanged (see TrySetInitialPartitions),
+            // so a Committed map entry arrives shortly via ConfigReplicated and drives
+            // InitializePartitions again. Logged at Debug to avoid false alarms.
+            logger.LogDebug("InitializePartitions: partition map not yet available in system configuration; awaiting replication");
             return;
         }
 
@@ -403,6 +410,46 @@ internal sealed class RaftSystemCoordinator : IDisposable
             RaftPartitionMap? existingMap = JsonSerializer.Deserialize<RaftPartitionMap>(partitions);
             if (existingMap is not null)
             {
+                // Re-assert the authoritative map to the rest of the cluster on every
+                // leadership change. A follower that joined or restarted with an empty WAL
+                // only learns the partition map through log replication; if its
+                // LeaderChanged is processed before catch-up — or if this leader already
+                // held the map and therefore never (re)created it — that follower's
+                // InitializePartitions finds an empty systemConfiguration cache, logs
+                // "Failed to get partitions from system configuration", and starts no
+                // partitions, leaving the cluster stuck. Re-replicating the existing map
+                // guarantees every follower eventually receives a fresh Committed entry
+                // (→ ConfigReplicated → InitializePartitions) and converges.
+                //
+                // Best-effort and idempotent: the payload is byte-identical to what is
+                // already committed, so followers simply overwrite their cache with the
+                // same content. If we are no longer the leader the write is rejected and
+                // the genuine leader will re-assert on its own LeaderChanged.
+                RaftSystemMessage reassert = new()
+                {
+                    Key = RaftSystemConfigKeys.Partitions,
+                    Value = partitions
+                };
+
+                try
+                {
+                    RaftReplicationResult result = await Replicate(
+                        RaftSystemConfig.RaftLogType,
+                        Serialize(reassert),
+                        true,
+                        cancellationToken
+                    ).ConfigureAwait(false);
+
+                    if (result.Status != RaftOperationStatus.Success)
+                        logger.LogWarning(
+                            "[RaftSystemCoordinator] Failed to re-assert existing partition map to followers: {Status}",
+                            result.Status);
+                }
+                catch (OperationCanceledException)
+                {
+                    logger.LogWarning("[RaftSystemCoordinator] TrySetInitialPartitions re-assert aborted on shutdown");
+                }
+
                 StartPartitions(existingMap.Partitions);
                 return;
             }
