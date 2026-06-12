@@ -1541,10 +1541,17 @@ internal sealed class RaftSystemCoordinator : IDisposable
     /// (all peers plus self) as the initial roster, all <see cref="ClusterMemberRole.Voter"/>.
     /// This preserves today's static-discovery behavior on greenfield clusters while
     /// providing a committed roster that future membership changes can build on.
+    /// <para>
+    /// <b>Known limitation:</b> the roster captures only the nodes visible to the P0 leader via
+    /// <see cref="IDiscovery.GetNodes"/> at the instant of seeding. A node that registers in
+    /// discovery after the seed is committed is absent from the roster. Once Task 3 gates votes
+    /// on role, that node will be <see cref="ClusterMemberRole.NotMember"/> and cannot participate
+    /// until it is explicitly added via the Task 5 Join RPC.
+    /// </para>
     /// </summary>
     private async Task TrySeedInitialMembership(CancellationToken cancellationToken)
     {
-        if (systemConfiguration.ContainsKey(RaftSystemConfigKeys.Members))
+        if (systemConfiguration.ContainsKey(RaftSystemConfigKeys.Members) || _cachedMembership.MembershipVersion > 0)
             return;
 
         List<RaftNode> peers = manager.Discovery.GetNodes();
@@ -1558,13 +1565,21 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 Role = ClusterMemberRole.Voter,
                 JoinedVersion = 1
             },
-            ..peers.Select(n => new ClusterMember
-            {
-                Endpoint = n.Endpoint,
-                NodeId = HashUtils.SmallSimpleHash(n.Endpoint),
-                Role = ClusterMemberRole.Voter,
-                JoinedVersion = 1
-            })
+            // Peer NodeIds are provisional (0) because discovery only yields endpoints.
+            // Task 5 (Join RPC) will replace these with each node's real configured NodeId
+            // when it self-reports. All Task 2 logic keys on Endpoint, not NodeId.
+            // Self-exclusion and dedup guard against discovery backends that list the local
+            // endpoint or return duplicates — both would corrupt quorum math.
+            ..peers
+                .Where(n => n.Endpoint != manager.LocalEndpoint)
+                .DistinctBy(n => n.Endpoint)
+                .Select(n => new ClusterMember
+                {
+                    Endpoint = n.Endpoint,
+                    NodeId = 0,
+                    Role = ClusterMemberRole.Voter,
+                    JoinedVersion = 1
+                })
         ];
 
         ClusterMembership seed = new() { MembershipVersion = 1, Members = allMembers };

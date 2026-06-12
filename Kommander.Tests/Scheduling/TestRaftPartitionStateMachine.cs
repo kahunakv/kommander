@@ -1,6 +1,7 @@
 
 using Kommander.Data;
 using Kommander.Scheduling;
+using Kommander.System;
 using Kommander.Tests.Scheduler;
 using Kommander.Time;
 using Kommander.WAL.Data;
@@ -698,6 +699,149 @@ public class TestRaftPartitionStateMachine
         await Task.Delay(delay);
     }
 
+    // ── Task 3: role gating ───────────────────────────────────────────────────
+
+    [Fact]
+    public async Task StartElection_WhenLearner_NeverEnqueuesRequestVotes()
+    {
+        // ReceiveStepDownNoticeAsync is the cleanest public path into StartElectionAsync
+        // that does not bypass the role check (ForceLeaderForTestingAsync does bypass it).
+        FakePartitionHost host = new() { LocalRole = ClusterMemberRole.Learner };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.ReceiveStepDownNoticeAsync(new StepDownNoticeRequest(
+            host.PartitionId, term: 0,
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            "node-b"));
+
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        Assert.DoesNotContain(host.EnqueuedResponses,
+            r => r.Type == RaftResponderRequestType.RequestVotes);
+    }
+
+    [Fact]
+    public async Task StartElection_WhenNotMember_NeverEnqueuesRequestVotes()
+    {
+        FakePartitionHost host = new() { LocalRole = ClusterMemberRole.NotMember };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.ReceiveStepDownNoticeAsync(new StepDownNoticeRequest(
+            host.PartitionId, term: 0,
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            "node-b"));
+
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        Assert.DoesNotContain(host.EnqueuedResponses,
+            r => r.Type == RaftResponderRequestType.RequestVotes);
+    }
+
+    [Fact]
+    public async Task VoteAsync_PreVote_DeniedForNonRosterEndpoint()
+    {
+        // Roster: only "node-a" (self) and "node-b" are voters.
+        FakePartitionHost host = new()
+        {
+            VoterEndpoints = ["node-a", "node-b"]
+        };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        // "node-z" is not in the committed roster — pre-vote must be silently denied.
+        await sm.VoteAsync(new RaftNode("node-z"), voteTerm: 1, remoteMaxLogId: 0,
+            timestamp: host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            preVote: true);
+
+        // No Vote reply should have been enqueued for node-z.
+        Assert.DoesNotContain(host.EnqueuedResponses,
+            r => r.Endpoint == "node-z" && r.Type == RaftResponderRequestType.Vote);
+    }
+
+    [Fact]
+    public async Task VoteAsync_RealVote_DeniedForNonRosterEndpoint()
+    {
+        FakePartitionHost host = new()
+        {
+            VoterEndpoints = ["node-a", "node-b"]
+        };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.VoteAsync(new RaftNode("node-z"), voteTerm: 1, remoteMaxLogId: 0,
+            timestamp: host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            preVote: false);
+
+        Assert.DoesNotContain(host.EnqueuedResponses,
+            r => r.Endpoint == "node-z" && r.Type == RaftResponderRequestType.Vote);
+    }
+
+    [Fact]
+    public async Task VoteAsync_RealVote_GrantedForRosterVoter()
+    {
+        // When the requesting node IS in the roster the existing election path is unchanged.
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [new("node-b")],
+            VoterEndpoints = ["node-a", "node-b"]
+        };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 1, remoteMaxLogId: 0,
+            timestamp: host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            preVote: false);
+
+        Assert.Contains(host.EnqueuedResponses,
+            r => r.Endpoint == "node-b" && r.Type == RaftResponderRequestType.Vote);
+    }
+
+    [Fact]
+    public async Task VoteAsync_PreVote_GrantedForRosterVoter()
+    {
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [new("node-b")],
+            VoterEndpoints = ["node-a", "node-b"]
+        };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 1, remoteMaxLogId: 0,
+            timestamp: host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            preVote: true);
+
+        Assert.Contains(host.EnqueuedResponses,
+            r => r.Endpoint == "node-b" && r.Type == RaftResponderRequestType.Vote);
+    }
+
+    [Fact]
+    public async Task VoteAsync_NoRoster_TreatsAllEndpointsAsVoters()
+    {
+        // VoterEndpoints == null → pre-seed fallback → all endpoints accepted.
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [new("node-b")],
+            VoterEndpoints = null
+        };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 1, remoteMaxLogId: 0,
+            timestamp: host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            preVote: false);
+
+        Assert.Contains(host.EnqueuedResponses,
+            r => r.Endpoint == "node-b" && r.Type == RaftResponderRequestType.Vote);
+    }
+
     private sealed class FakePartitionHost : IRaftPartitionHost
     {
         public int PartitionId { get; init; } = 1;
@@ -707,6 +851,18 @@ public class TestRaftPartitionStateMachine
         public string LocalEndpoint => "node-a";
 
         public int LocalNodeId => 1;
+
+        /// <summary>Defaults to Voter (pre-seed fallback). Override to test learner/non-member gating.</summary>
+        public ClusterMemberRole LocalRole { get; set; } = ClusterMemberRole.Voter;
+
+        /// <summary>
+        /// When null every endpoint is treated as a voter (pre-seed fallback).
+        /// Set to a specific set to exercise IsVoter denial.
+        /// </summary>
+        public HashSet<string>? VoterEndpoints { get; set; }
+
+        public bool IsVoter(string endpoint) =>
+            VoterEndpoints is null || VoterEndpoints.Contains(endpoint);
 
         public RaftConfiguration Configuration { get; } = new()
         {

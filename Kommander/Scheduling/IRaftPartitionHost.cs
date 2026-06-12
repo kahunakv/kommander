@@ -1,5 +1,6 @@
 
 using Kommander.Data;
+using Kommander.System;
 using Kommander.Time;
 
 namespace Kommander.Scheduling;
@@ -18,6 +19,18 @@ public interface IRaftPartitionHost
     string LocalEndpoint { get; }
 
     int LocalNodeId { get; }
+
+    /// <summary>
+    /// The local node's role in the committed membership roster.
+    /// Returns <see cref="ClusterMemberRole.Voter"/> when no roster exists yet (pre-seed fallback).
+    /// </summary>
+    ClusterMemberRole LocalRole { get; }
+
+    /// <summary>
+    /// Returns true if <paramref name="endpoint"/> is a committed <see cref="ClusterMemberRole.Voter"/>
+    /// in the current roster. Always returns true when no roster has been seeded yet (pre-seed fallback).
+    /// </summary>
+    bool IsVoter(string endpoint);
 
     RaftConfiguration Configuration { get; }
 

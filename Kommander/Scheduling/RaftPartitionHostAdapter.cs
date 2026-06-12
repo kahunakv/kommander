@@ -1,5 +1,6 @@
 
 using Kommander.Data;
+using Kommander.System;
 using Kommander.Time;
 
 namespace Kommander;
@@ -30,6 +31,16 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
     public string LocalEndpoint => manager.LocalEndpoint;
 
     public int LocalNodeId => manager.LocalNodeId;
+
+    public ClusterMemberRole LocalRole => manager.LocalRole;
+
+    public bool IsVoter(string endpoint)
+    {
+        ClusterMembership roster = manager.SystemCoordinator.GetMembership();
+        if (roster.MembershipVersion == 0)
+            return true; // pre-seed: treat all known peers as voters (backward compat)
+        return roster.Members.Any(m => m.Endpoint == endpoint && m.Role == ClusterMemberRole.Voter);
+    }
 
     public RaftConfiguration Configuration => manager.Configuration;
 

@@ -475,6 +475,12 @@ public sealed class RaftPartitionStateMachine
 
     private async Task StartElectionAsync(HLCTimestamp currentTime, bool ignoreRecentVoteCooldown)
     {
+        if (host.LocalRole != ClusterMemberRole.Voter)
+        {
+            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Suppressing election: local role is {Role}, not Voter", host.LocalEndpoint, host.PartitionId, nodeState, host.LocalRole);
+            return;
+        }
+
         if (!ignoreRecentVoteCooldown)
         {
             if ((lastVotation != HLCTimestamp.Zero && ((currentTime - lastVotation) < (electionTimeout * 2))))
@@ -551,6 +557,12 @@ public sealed class RaftPartitionStateMachine
     /// </summary>
     private async Task StartPreVoteAsync(HLCTimestamp currentTime)
     {
+        if (host.LocalRole != ClusterMemberRole.Voter)
+        {
+            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Suppressing pre-vote: local role is {Role}, not Voter", host.LocalEndpoint, host.PartitionId, nodeState, host.LocalRole);
+            return;
+        }
+
         // Same "should I even try?" guards as a real election. These guards do NOT touch any Raft
         // consensus state (currentTerm / votes / expectedLeaders / nodeState) — that is the whole
         // point of pre-vote. The one local write below (lastHeartbeat) is a back-off bookkeeping
@@ -764,6 +776,12 @@ public sealed class RaftPartitionStateMachine
             // Side-effect-free pre-vote (Raft §9.6). NOTHING below this branch's `return`
             // may mutate state: we only read term/log/leader-freshness and, on grant, reply.
 
+            if (!host.IsVoter(node.Endpoint))
+            {
+                logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Denying pre-vote to {Endpoint} Term={Term}: endpoint is not a committed voter", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
+                return;
+            }
+
             // A live leader never helps a challenger unseat it.
             if (nodeState == RaftNodeState.Leader)
             {
@@ -805,6 +823,12 @@ public sealed class RaftPartitionStateMachine
 
             VoteRequest preGrant = new(host.PartitionId, voteTerm, preVoteLocalMaxId, timestamp, host.LocalEndpoint, preVote: true);
             host.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Vote, node, preGrant));
+            return;
+        }
+
+        if (!host.IsVoter(node.Endpoint))
+        {
+            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Denying vote to {Endpoint} Term={Term}: endpoint is not a committed voter", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
             return;
         }
 

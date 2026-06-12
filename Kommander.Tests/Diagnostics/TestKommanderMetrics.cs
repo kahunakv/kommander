@@ -3,6 +3,7 @@ using System.Diagnostics.Metrics;
 using Kommander.Data;
 using Kommander.Diagnostics;
 using Kommander.Scheduling;
+using Kommander.System;
 using Kommander.Time;
 using Kommander.WAL;
 using Kommander.WAL.Data;
@@ -89,6 +90,8 @@ public sealed class TestKommanderMetrics : IDisposable
         public string Leader { get; set; } = "";
         public string LocalEndpoint => "test-node";
         public int LocalNodeId => 1;
+        public ClusterMemberRole LocalRole => ClusterMemberRole.Voter;
+        public bool IsVoter(string endpoint) => true;
         public RaftConfiguration Configuration => _config;
         public HybridLogicalClock HybridLogicalClock { get; } = new();
         public IReadOnlyList<RaftNode> Nodes { get; set; } = Array.Empty<RaftNode>();

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Kommander.Data;
 using Kommander.Scheduling;
+using Kommander.System;
 using Kommander.Time;
 using Kommander.WAL.Data;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -38,6 +39,8 @@ public sealed class TestRaftPartitionExecutor
         public string Leader { get; set; } = "";
         public string LocalEndpoint => "test-node";
         public int LocalNodeId => 1;
+        public ClusterMemberRole LocalRole => ClusterMemberRole.Voter;
+        public bool IsVoter(string endpoint) => true;
         public RaftConfiguration Configuration => _config;
         public HybridLogicalClock HybridLogicalClock { get; } = new();
         public IReadOnlyList<RaftNode> NodesOverride { get; set; } = Array.Empty<RaftNode>();
