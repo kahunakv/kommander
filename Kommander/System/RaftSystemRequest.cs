@@ -42,6 +42,19 @@ public sealed class RaftSystemRequest
     /// </summary>
     public RaftSplitPlan? SplitPlan { get; init; }
 
+    /// <summary>Node endpoint (host:port) for AddMember / PromoteMember / RemoveMember requests.</summary>
+    public string? MemberEndpoint { get; init; }
+
+    /// <summary>Node id for AddMember requests.</summary>
+    public int MemberNodeId { get; init; }
+
+    /// <summary>
+    /// The <see cref="ClusterMembership.MembershipVersion"/> the caller read before building
+    /// this request. The coordinator rejects the change with
+    /// <see cref="RaftOperationStatus.StaleMembership"/> if the committed version has moved.
+    /// </summary>
+    public long ExpectedMembershipVersion { get; init; }
+
     public RaftSystemRequest(RaftSystemRequestType type)
     {
         Type = type;
@@ -89,6 +102,27 @@ public sealed class RaftSystemRequest
     {
         Type = RaftSystemRequestType.MergePartition;
         MergePlan = plan;
+        Completion = completion;
+    }
+
+    /// <summary>
+    /// Constructor for <see cref="RaftSystemRequestType.AddMember"/>,
+    /// <see cref="RaftSystemRequestType.PromoteMember"/>, and
+    /// <see cref="RaftSystemRequestType.RemoveMember"/> requests.
+    /// <paramref name="expectedMembershipVersion"/> must match the current committed
+    /// <see cref="ClusterMembership.MembershipVersion"/> or the coordinator rejects the change.
+    /// </summary>
+    public RaftSystemRequest(
+        RaftSystemRequestType type,
+        string endpoint,
+        int nodeId,
+        long expectedMembershipVersion,
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)>? completion = null)
+    {
+        Type = type;
+        MemberEndpoint = endpoint;
+        MemberNodeId = nodeId;
+        ExpectedMembershipVersion = expectedMembershipVersion;
         Completion = completion;
     }
 

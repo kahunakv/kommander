@@ -6,6 +6,7 @@ using Kommander.System.Protos;
 using Google.Protobuf;
 using Kommander.Data;
 using Microsoft.Extensions.Logging;
+using Kommander.Discovery;
 
 namespace Kommander.System;
 
@@ -59,6 +60,25 @@ internal sealed class RaftSystemCoordinator : IDisposable
     // Queue of drain sentinels.  Each DrainAsync() call enqueues one TCS here
     // and sends a DrainSentinel request; the loop completes it in FIFO order.
     private readonly ConcurrentQueue<TaskCompletionSource> _drainQueue = new();
+
+    // ── Membership state ───────────────────────────────────────────────────
+    // Cached view of the committed roster.  Only updated from within the single-
+    // consumer loop so no locking is required.
+    private ClusterMembership _cachedMembership = new() { MembershipVersion = 0, Members = [] };
+
+    // The single-consumer channel loop already serialises membership changes: Receive
+    // is awaited to completion before the next message is dequeued, so two changes can
+    // never interleave through the normal path.  This flag is belt-and-suspenders for
+    // code paths that bypass the loop (e.g. the MembershipChangePendingForTest hook)
+    // and as a test affordance to simulate an in-flight change.
+    private bool _membershipChangePending;
+
+    /// <summary>Test hook — lets tests inject the pending-change flag directly.</summary>
+    internal bool MembershipChangePendingForTest
+    {
+        get => _membershipChangePending;
+        set => _membershipChangePending = value;
+    }
 
     // ── Split state ────────────────────────────────────────────────────────
     // Keyed by source partition id; holds everything needed to complete Phase 2.
@@ -183,6 +203,9 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 RaftSystemMessage systemMessage = Unserialize(message.LogData);
                 systemConfiguration[systemMessage.Key] = systemMessage.Value;
                 logger.LogInformation("Restored system configuration: {Key}", systemMessage.Key);
+
+                if (systemMessage.Key == RaftSystemConfigKeys.Members)
+                    ApplyMembershipFromCache();
             }
             break;
 
@@ -198,10 +221,13 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 systemConfiguration[systemMessage.Key] = systemMessage.Value;
                 logger.LogInformation("Replicated system configuration: {Key}", systemMessage.Key);
 
-                // Live replication: update the partition map but do NOT run crash-recovery
-                // re-enqueuing. Followers must never attempt to drive Phase 2 commits, and
-                // leaders already track in-progress operations via _pendingSplits/_pendingMerges.
-                InitializePartitions(crashRecovery: false);
+                // Live replication: dispatch to the correct subsystem based on the key.
+                // Followers must never attempt to drive Phase 2 commits, and leaders already
+                // track in-progress operations via _pendingSplits/_pendingMerges.
+                if (systemMessage.Key == RaftSystemConfigKeys.Partitions)
+                    InitializePartitions(crashRecovery: false);
+                else if (systemMessage.Key == RaftSystemConfigKeys.Members)
+                    ApplyMembershipFromCache();
             }
             break;
 
@@ -255,6 +281,18 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
             case RaftSystemRequestType.RemovePartition:
                 await TryRemovePartition(message, cancellationToken).ConfigureAwait(false);
+                break;
+
+            case RaftSystemRequestType.AddMember:
+                await TryAddMember(message, cancellationToken).ConfigureAwait(false);
+                break;
+
+            case RaftSystemRequestType.PromoteMember:
+                await TryPromoteMember(message, cancellationToken).ConfigureAwait(false);
+                break;
+
+            case RaftSystemRequestType.RemoveMember:
+                await TryRemoveMember(message, cancellationToken).ConfigureAwait(false);
                 break;
 
             case RaftSystemRequestType.DrainSentinel:
@@ -451,6 +489,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 }
 
                 StartPartitions(existingMap.Partitions);
+                await TrySeedInitialMembership(cancellationToken).ConfigureAwait(false);
                 return;
             }
         }
@@ -521,6 +560,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
         // immediately rather than waiting for the async ConfigReplicated callback.
         systemConfiguration[RaftSystemConfigKeys.Partitions] = message.Value;
         StartPartitions(initialRanges);
+        await TrySeedInitialMembership(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1491,6 +1531,368 @@ internal sealed class RaftSystemCoordinator : IDisposable
         StartPartitions(map.Partitions);
 
         completion?.TrySetResult((RaftOperationStatus.Success, entry.Generation));
+    }
+
+    // ── Membership seeding ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// Called by the P0 leader after the partition map is established.
+    /// If no <c>members</c> record exists yet, writes the current discovery set
+    /// (all peers plus self) as the initial roster, all <see cref="ClusterMemberRole.Voter"/>.
+    /// This preserves today's static-discovery behavior on greenfield clusters while
+    /// providing a committed roster that future membership changes can build on.
+    /// </summary>
+    private async Task TrySeedInitialMembership(CancellationToken cancellationToken)
+    {
+        if (systemConfiguration.ContainsKey(RaftSystemConfigKeys.Members))
+            return;
+
+        List<RaftNode> peers = manager.Discovery.GetNodes();
+
+        List<ClusterMember> allMembers =
+        [
+            new()
+            {
+                Endpoint = manager.LocalEndpoint,
+                NodeId = manager.LocalNodeId,
+                Role = ClusterMemberRole.Voter,
+                JoinedVersion = 1
+            },
+            ..peers.Select(n => new ClusterMember
+            {
+                Endpoint = n.Endpoint,
+                NodeId = HashUtils.SmallSimpleHash(n.Endpoint),
+                Role = ClusterMemberRole.Voter,
+                JoinedVersion = 1
+            })
+        ];
+
+        ClusterMembership seed = new() { MembershipVersion = 1, Members = allMembers };
+        string json = JsonSerializer.Serialize(seed);
+
+        RaftSystemMessage message = new() { Key = RaftSystemConfigKeys.Members, Value = json };
+
+        if (cancellationToken.IsCancellationRequested)
+            return;
+
+        RaftReplicationResult result;
+        try
+        {
+            result = await Replicate(
+                RaftSystemConfig.RaftLogType, Serialize(message), true, cancellationToken
+            ).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            logger.LogWarning("[RaftSystemCoordinator] TrySeedInitialMembership aborted on shutdown");
+            return;
+        }
+
+        if (result.Status != RaftOperationStatus.Success)
+        {
+            logger.LogWarning(
+                "[RaftSystemCoordinator] TrySeedInitialMembership: Failed to seed initial roster: {Status}",
+                result.Status);
+            return;
+        }
+
+        systemConfiguration[RaftSystemConfigKeys.Members] = json;
+        _cachedMembership = seed;
+        logger.LogInformation(
+            "[RaftSystemCoordinator] Seeded initial membership roster with {Count} voter(s)",
+            allMembers.Count);
+    }
+
+    // ── Membership helpers ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// Returns the current cached roster. Returns an empty <see cref="ClusterMembership"/>
+    /// (version 0, no members) when no roster has been committed yet.
+    /// </summary>
+    internal ClusterMembership GetMembership() => _cachedMembership;
+
+    /// <summary>
+    /// Reads the <see cref="RaftSystemConfigKeys.Members"/> entry from
+    /// <c>systemConfiguration</c> and updates <see cref="_cachedMembership"/>.
+    /// A no-op when the key is absent (pre-seed transient).
+    /// </summary>
+    private void ApplyMembershipFromCache()
+    {
+        if (!systemConfiguration.TryGetValue(RaftSystemConfigKeys.Members, out string? membersJson))
+            return;
+
+        ClusterMembership? membership = JsonSerializer.Deserialize<ClusterMembership>(membersJson);
+        if (membership is null)
+        {
+            logger.LogError("ApplyMembershipFromCache: Failed to parse membership record");
+            return;
+        }
+
+        // Accept only monotonically newer versions so that a slow ConfigReplicated replay
+        // does not clobber a locally-updated cache that is already at a higher version.
+        if (membership.MembershipVersion > _cachedMembership.MembershipVersion)
+            _cachedMembership = membership;
+    }
+
+    /// <summary>
+    /// Shared pre-flight checks for all membership mutations.
+    /// Returns false and completes <paramref name="completion"/> with the appropriate
+    /// failure status if the request should be rejected without replication.
+    /// </summary>
+    private bool ValidateMembershipRequest(
+        long expectedVersion,
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)>? completion)
+    {
+        if (_membershipChangePending)
+        {
+            logger.LogWarning("[RaftSystemCoordinator] Membership change rejected: another change is in flight");
+            completion?.TrySetResult((RaftOperationStatus.ConcurrentMembershipChange, 0));
+            return false;
+        }
+
+        if (_cachedMembership.MembershipVersion != expectedVersion)
+        {
+            logger.LogWarning(
+                "[RaftSystemCoordinator] Membership change rejected: expected version {Expected} but current is {Current}",
+                expectedVersion, _cachedMembership.MembershipVersion);
+            completion?.TrySetResult((RaftOperationStatus.StaleMembership, _cachedMembership.MembershipVersion));
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Replicates a new membership record, updates the local cache, and resolves
+    /// <paramref name="completion"/>. Handles the retry/backoff loop identically to
+    /// partition-map mutations.
+    /// <para>
+    /// <see cref="_membershipChangePending"/> is NOT cleared here — callers wrap this call in
+    /// <c>try/finally { _membershipChangePending = false; }</c> so the flag is always
+    /// released even if this method throws unexpectedly.
+    /// </para>
+    /// </summary>
+    private async Task ReplicateMembership(
+        ClusterMembership newMembership,
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)>? completion,
+        CancellationToken cancellationToken)
+    {
+        string json = JsonSerializer.Serialize(newMembership);
+        RaftSystemMessage sysMessage = new() { Key = RaftSystemConfigKeys.Members, Value = json };
+
+        try
+        {
+            for (int i = 0; i < MaxRetries; i++)
+            {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    completion?.TrySetCanceled(cancellationToken);
+                    return;
+                }
+
+                RaftReplicationResult result = await Replicate(
+                    RaftSystemConfig.RaftLogType, Serialize(sysMessage), true, cancellationToken
+                ).ConfigureAwait(false);
+
+                if (result.Status != RaftOperationStatus.Success)
+                {
+                    logger.LogWarning(
+                        "ReplicateMembership: replication failed {Status} {LogIndex} Retry={Retry}",
+                        result.Status, result.LogIndex, i);
+
+                    if (result.Status == RaftOperationStatus.NodeIsNotLeader)
+                    {
+                        completion?.TrySetResult((result.Status, 0));
+                        return;
+                    }
+
+                    try { await Task.Delay(RetryDelay, cancellationToken).ConfigureAwait(false); }
+                    catch (OperationCanceledException)
+                    {
+                        logger.LogWarning("[RaftSystemCoordinator] ReplicateMembership delay aborted on shutdown");
+                        return;
+                    }
+
+                    if (i <= 8) continue;
+
+                    completion?.TrySetResult((result.Status, 0));
+                    return;
+                }
+
+                break;
+            }
+
+            systemConfiguration[RaftSystemConfigKeys.Members] = json;
+            _cachedMembership = newMembership;
+
+            completion?.TrySetResult((RaftOperationStatus.Success, newMembership.MembershipVersion));
+        }
+        catch (OperationCanceledException)
+        {
+            completion?.TrySetCanceled(cancellationToken);
+            throw;
+        }
+        catch (Exception)
+        {
+            completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Appends a new node as a <see cref="ClusterMemberRole.Learner"/> to the committed roster.
+    /// Rejected if another change is in flight or the expected version is stale.
+    /// </summary>
+    private async Task TryAddMember(RaftSystemRequest message, CancellationToken cancellationToken)
+    {
+        TaskCompletionSource<(RaftOperationStatus, long)>? completion = message.Completion;
+
+        if (!ValidateMembershipRequest(message.ExpectedMembershipVersion, completion))
+            return;
+
+        string endpoint = message.MemberEndpoint ?? "";
+
+        if (string.IsNullOrEmpty(endpoint))
+        {
+            logger.LogWarning("TryAddMember: Endpoint is null or empty; rejecting");
+            completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+            return;
+        }
+
+        if (_cachedMembership.Members.Any(m => m.Endpoint == endpoint))
+        {
+            logger.LogWarning("TryAddMember: Endpoint {Endpoint} is already in the roster", endpoint);
+            completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+            return;
+        }
+
+        long newVersion = _cachedMembership.MembershipVersion + 1;
+
+        ClusterMembership newMembership = new()
+        {
+            MembershipVersion = newVersion,
+            Members =
+            [
+                .._cachedMembership.Members,
+                new ClusterMember
+                {
+                    Endpoint = endpoint,
+                    NodeId = message.MemberNodeId,
+                    Role = ClusterMemberRole.Learner,
+                    JoinedVersion = newVersion
+                }
+            ]
+        };
+
+        _membershipChangePending = true;
+        logger.LogInformation("TryAddMember: Adding {Endpoint} as Learner at version {Version}", endpoint, newVersion);
+
+        try
+        {
+            await ReplicateMembership(newMembership, completion, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _membershipChangePending = false;
+        }
+    }
+
+    /// <summary>
+    /// Promotes a committed <see cref="ClusterMemberRole.Learner"/> to
+    /// <see cref="ClusterMemberRole.Voter"/>. The node enters quorum at the commit point.
+    /// </summary>
+    private async Task TryPromoteMember(RaftSystemRequest message, CancellationToken cancellationToken)
+    {
+        TaskCompletionSource<(RaftOperationStatus, long)>? completion = message.Completion;
+
+        if (!ValidateMembershipRequest(message.ExpectedMembershipVersion, completion))
+            return;
+
+        string endpoint = message.MemberEndpoint ?? "";
+
+        ClusterMember? member = _cachedMembership.Members.FirstOrDefault(m => m.Endpoint == endpoint);
+        if (member is null)
+        {
+            logger.LogError("TryPromoteMember: Endpoint {Endpoint} not found in roster", endpoint);
+            completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+            return;
+        }
+
+        if (member.Role != ClusterMemberRole.Learner)
+        {
+            logger.LogError(
+                "TryPromoteMember: Endpoint {Endpoint} is not a Learner (Role={Role})",
+                endpoint, member.Role);
+            completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+            return;
+        }
+
+        long newVersion = _cachedMembership.MembershipVersion + 1;
+
+        ClusterMembership newMembership = new()
+        {
+            MembershipVersion = newVersion,
+            Members = _cachedMembership.Members
+                .Select(m => m.Endpoint == endpoint
+                    ? new ClusterMember { Endpoint = m.Endpoint, NodeId = m.NodeId, Role = ClusterMemberRole.Voter, JoinedVersion = m.JoinedVersion }
+                    : m)
+                .ToList()
+        };
+
+        _membershipChangePending = true;
+        logger.LogInformation("TryPromoteMember: Promoting {Endpoint} to Voter at version {Version}", endpoint, newVersion);
+
+        try
+        {
+            await ReplicateMembership(newMembership, completion, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _membershipChangePending = false;
+        }
+    }
+
+    /// <summary>
+    /// Removes a node from the committed roster (graceful leave or failure-driven eviction).
+    /// Quorum shrinks at the commit point; single-server safety is preserved because
+    /// changes are applied one node at a time.
+    /// </summary>
+    private async Task TryRemoveMember(RaftSystemRequest message, CancellationToken cancellationToken)
+    {
+        TaskCompletionSource<(RaftOperationStatus, long)>? completion = message.Completion;
+
+        if (!ValidateMembershipRequest(message.ExpectedMembershipVersion, completion))
+            return;
+
+        string endpoint = message.MemberEndpoint ?? "";
+
+        ClusterMember? member = _cachedMembership.Members.FirstOrDefault(m => m.Endpoint == endpoint);
+        if (member is null)
+        {
+            logger.LogError("TryRemoveMember: Endpoint {Endpoint} not found in roster", endpoint);
+            completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+            return;
+        }
+
+        long newVersion = _cachedMembership.MembershipVersion + 1;
+
+        ClusterMembership newMembership = new()
+        {
+            MembershipVersion = newVersion,
+            Members = _cachedMembership.Members.Where(m => m.Endpoint != endpoint).ToList()
+        };
+
+        _membershipChangePending = true;
+        logger.LogInformation("TryRemoveMember: Removing {Endpoint} at version {Version}", endpoint, newVersion);
+
+        try
+        {
+            await ReplicateMembership(newMembership, completion, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _membershipChangePending = false;
+        }
     }
 
     // ── Static helpers ─────────────────────────────────────────────────────

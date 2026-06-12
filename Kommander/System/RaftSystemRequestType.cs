@@ -34,5 +34,24 @@ public enum RaftSystemRequestType
     /// <see cref="RaftSystemCoordinator.DrainAsync"/>, letting tests wait for
     /// all previously-enqueued work to finish without a fixed delay.
     /// </summary>
-    DrainSentinel
+    DrainSentinel,
+
+    /// <summary>
+    /// Adds a new node to the committed cluster roster as a <see cref="ClusterMemberRole.Learner"/>.
+    /// Rejected if another membership change is in flight or the expected version is stale.
+    /// </summary>
+    AddMember,
+
+    /// <summary>
+    /// Promotes a committed <see cref="ClusterMemberRole.Learner"/> to <see cref="ClusterMemberRole.Voter"/>.
+    /// The node enters quorum at the commit point of this entry.
+    /// </summary>
+    PromoteMember,
+
+    /// <summary>
+    /// Removes a node from the committed cluster roster (graceful leave or failure-driven eviction).
+    /// Quorum shrinks at the commit point; single-server safety guarantees the remaining
+    /// majority can still commit.
+    /// </summary>
+    RemoveMember
 }

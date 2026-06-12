@@ -33,4 +33,16 @@ public enum RaftOperationStatus
     /// the partition map and retry the request on the new owner.
     /// </summary>
     PartitionMoved = 13,
+
+    /// <summary>
+    /// The membership change was computed against an older <c>MembershipVersion</c>.
+    /// The caller should re-read the current roster and retry with the correct version.
+    /// </summary>
+    StaleMembership = 14,
+
+    /// <summary>
+    /// Another membership change is already in flight. Only one single-server change
+    /// may be pending at a time. The caller should retry after the in-flight change commits.
+    /// </summary>
+    ConcurrentMembershipChange = 15,
 }

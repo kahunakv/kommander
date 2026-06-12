@@ -1,5 +1,6 @@
 
 using Kommander.Discovery;
+using Kommander.System;
 
 namespace Kommander;
 
@@ -46,26 +47,33 @@ public sealed class ClusterHandler
     }
 
     /// <summary>
-    /// Updates the list of nodes in the cluster by retrieving the latest node information
-    /// from the discovery service and assigning it to the raft manager.
+    /// Updates <see cref="RaftManager.Nodes"/> from the committed cluster roster.
+    /// Once the P0 leader has seeded the roster (MembershipVersion &gt; 0) every call
+    /// here derives the peer set from committed voters, excluding self, so quorum math
+    /// is always based on the same source of truth as the membership record.
+    /// <para>
+    /// Before the initial seed (pre-join transient or before the first P0 election),
+    /// the roster is empty and this method falls back to <see cref="IDiscovery.GetNodes"/>
+    /// exactly once, preserving today's static-discovery bootstrap behavior.
+    /// </para>
     /// </summary>
-    /// <returns>A completed task representing the update operation.</returns>
     public Task UpdateNodes()
     {
-        manager.Nodes = discovery.GetNodes();
+        ClusterMembership roster = manager.SystemCoordinator.GetMembership();
 
-        /*if (manager.Logger.IsEnabled(LogLevel.Debug))
+        if (roster.MembershipVersion > 0)
         {
-            StringBuilder builder = new();
-
-            foreach (RaftNode node in manager.Nodes)
-            {
-                builder.Append(node.Endpoint);
-                builder.Append(' ');
-            }
-
-            manager.Logger.LogDebug("[{Endpoint}] Nodes: {Nodes}", manager.LocalEndpoint, builder.ToString());
-        }*/
+            // Roster is committed — derive the peer set from voters only, excluding self.
+            manager.Nodes = roster.Members
+                .Where(m => m.Role == ClusterMemberRole.Voter && m.Endpoint != manager.LocalEndpoint)
+                .Select(m => new RaftNode(m.Endpoint))
+                .ToList();
+        }
+        else
+        {
+            // Pre-seed transient: no roster committed yet — fall back to discovery.
+            manager.Nodes = discovery.GetNodes();
+        }
 
         return Task.CompletedTask;
     }

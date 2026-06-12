@@ -85,6 +85,28 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     internal List<RaftNode> Nodes { get; set; } = [];
 
     /// <summary>
+    /// Returns the local node's role in the committed cluster roster:
+    /// <see cref="System.ClusterMemberRole.Voter"/>, <see cref="System.ClusterMemberRole.Learner"/>,
+    /// <see cref="System.ClusterMemberRole.Leaving"/>, or <see cref="System.ClusterMemberRole.NotMember"/>.
+    /// <para>
+    /// Returns <see cref="System.ClusterMemberRole.Voter"/> during the pre-seed transient
+    /// (roster version 0) so existing behavior is preserved on greenfield clusters.
+    /// </para>
+    /// </summary>
+    public System.ClusterMemberRole LocalRole
+    {
+        get
+        {
+            System.ClusterMembership roster = systemCoordinator.GetMembership();
+            if (roster.MembershipVersion == 0)
+                return System.ClusterMemberRole.Voter;
+
+            System.ClusterMember? self = roster.Members.FirstOrDefault(m => m.Endpoint == LocalEndpoint);
+            return self?.Role ?? System.ClusterMemberRole.NotMember;
+        }
+    }
+
+    /// <summary>
     /// Returns the system partition
     /// </summary>
     internal RaftPartition? SystemPartition => systemPartition;
