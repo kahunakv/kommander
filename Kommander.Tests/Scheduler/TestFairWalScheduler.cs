@@ -8,7 +8,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Kommander.Tests.Scheduler;
 
 /// <summary>
-/// Acceptance tests for <see cref="FairWalScheduler"/> (Task 7).
+/// Acceptance tests for <see cref="FairWalScheduler"/>.
 ///
 /// Covers:
 /// - Same-partition writes complete in submitted order.

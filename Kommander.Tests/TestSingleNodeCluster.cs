@@ -10,7 +10,7 @@ using Microsoft.Extensions.Logging;
 namespace Kommander.Tests;
 
 /// <summary>
-/// Task 11 regression: a single-node (0-peer) cluster must finish <see cref="IRaft.JoinCluster"/>
+/// Regression: a single-node (0-peer) cluster must finish <see cref="IRaft.JoinCluster"/>
 /// and flip <see cref="IRaft.IsInitialized"/>. The node elects itself immediately (the
 /// <c>Nodes.Count == 0</c> fast-path), but before the fix <c>ReplicateLogs</c> rejected the
 /// coordinator's initial partition-map proposal with <c>Errored</c> when there were no peers, so

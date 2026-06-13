@@ -17,6 +17,8 @@ namespace Kommander.Communication;
 [JsonSerializable(typeof(StepDownNoticeRequest))]
 [JsonSerializable(typeof(TransferLeadershipRequest))]
 [JsonSerializable(typeof(HandshakeRequest))]
+[JsonSerializable(typeof(JoinRequest))]
+[JsonSerializable(typeof(JoinResponse))]
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
 public sealed partial class RestJsonContext : JsonSerializerContext
 {

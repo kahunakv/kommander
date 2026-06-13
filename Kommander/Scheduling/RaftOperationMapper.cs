@@ -50,10 +50,11 @@ public static class RaftOperationMapper
             RaftRequestType.ReplicateCheckpoint  => RaftOperationKind.Client,
             RaftRequestType.CommitLogs           => RaftOperationKind.Client,
             RaftRequestType.RollbackLogs         => RaftOperationKind.Client,
-            RaftRequestType.GetNodeState         => RaftOperationKind.Client,
-            RaftRequestType.GetTicketState       => RaftOperationKind.Client,
-            RaftRequestType.DrainBarrier         => RaftOperationKind.Maintenance,
-            RaftRequestType.RestoreLogsLoaded    => RaftOperationKind.Maintenance,
+            RaftRequestType.GetNodeState              => RaftOperationKind.Client,
+            RaftRequestType.GetTicketState            => RaftOperationKind.Client,
+            RaftRequestType.GetFollowerCommittedIndex => RaftOperationKind.Client,
+            RaftRequestType.DrainBarrier              => RaftOperationKind.Maintenance,
+            RaftRequestType.RestoreLogsLoaded         => RaftOperationKind.Maintenance,
 
             _ => throw new ArgumentOutOfRangeException(nameof(requestType), requestType, "Unrecognised RaftRequestType"),
         };
@@ -118,6 +119,7 @@ public static class RaftOperationMapper
 
             RaftRequestType.GetNodeState or
             RaftRequestType.GetTicketState or
+            RaftRequestType.GetFollowerCommittedIndex or
             RaftRequestType.DrainBarrier or
             RaftRequestType.RestoreLogsLoaded => RaftStatePriority.Low,
 

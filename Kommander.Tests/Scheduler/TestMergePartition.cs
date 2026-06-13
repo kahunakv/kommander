@@ -13,7 +13,7 @@ using Google.Protobuf;
 namespace Kommander.Tests.Scheduler;
 
 /// <summary>
-/// Functional tests for the two-phase merge protocol (Task 5.4).
+/// Functional tests for the two-phase merge protocol.
 ///
 /// Tests cover:
 ///   1. Basic merge: survivor absorbs source range, source is Removed, WAL reclaimed

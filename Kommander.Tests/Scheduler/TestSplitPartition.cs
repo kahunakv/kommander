@@ -13,7 +13,7 @@ using Google.Protobuf;
 namespace Kommander.Tests.Scheduler;
 
 /// <summary>
-/// Functional tests for the two-phase split protocol (Task 4.4).
+/// Functional tests for the two-phase split protocol.
 ///
 /// Tests cover:
 ///   1. Basic split correctness (ranges, generations, state)

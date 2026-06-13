@@ -132,6 +132,26 @@ public class RestCommunication : ICommunication
         return new();
     }
 
+    public async Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
+    {
+        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.JoinRequest);
+
+        try
+        {
+            JoinResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/join", payload)
+                .PostStringAsync(payload)
+                .ReceiveJson<JoinResponse>().ConfigureAwait(false);
+
+            return response ?? new JoinResponse(false);
+        }
+        catch (Exception e)
+        {
+            manager.Logger.LogError("[{Endpoint}] SendJoin: {Message}", manager.LocalEndpoint, e.Message);
+        }
+
+        return new JoinResponse(false);
+    }
+
     internal static IReadOnlyDictionary<string, string> BuildAuthenticationHeaders(
         RaftConfiguration configuration,
         string senderNode,

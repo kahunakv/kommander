@@ -11,7 +11,7 @@ using Google.Protobuf;
 namespace Kommander.Tests.Scheduler;
 
 /// <summary>
-/// Unit tests for <see cref="RaftSystemCoordinator"/> (Task 13).
+/// Unit tests for <see cref="RaftSystemCoordinator"/>.
 ///
 /// All tests operate without a real Raft cluster.  They drive the coordinator
 /// directly via <see cref="RaftSystemCoordinator.Send"/> and observe side-effects
@@ -646,7 +646,7 @@ public sealed class TestRaftSystemCoordinator
         }
     }
 
-    // ── Task 1.4 — TrySplitPartition bumps Generation correctly ──────────────
+    // ── TrySplitPartition bumps Generation correctly ──────────────
 
     [Fact]
     public async Task SplitPartition_SourceGenerationIncrements_FromHigherBaseline()
@@ -792,7 +792,7 @@ public sealed class TestRaftSystemCoordinator
         }
     }
 
-    // ── Task 1.3 — Unrouted partitions filtered from GetPartitionKey / GetPrefixPartitionKey ──
+    // ── Unrouted partitions filtered from GetPartitionKey / GetPrefixPartitionKey ──
 
     [Fact]
     public async Task GetPrefixPartitionKey_UnroutedPartition_IsExcluded()
@@ -1077,7 +1077,7 @@ public sealed class TestRaftSystemCoordinator
         Assert.Equal(RaftRoutingMode.Unrouted, r.RoutingMode);
     }
 
-    // ── Task 1.2 — DivideIntoRanges defaults + boundary arithmetic ────────────
+    // ── DivideIntoRanges defaults + boundary arithmetic ────────────
 
     /// <summary>
     /// Verifies that every entry produced by DivideIntoRanges carries the
@@ -1141,7 +1141,7 @@ public sealed class TestRaftSystemCoordinator
         }
     }
 
-    // ── Task 2.3 — TryCreatePartition ────────────────────────────────────────
+    // ── TryCreatePartition ────────────────────────────────────────
 
     /// <summary>Sends a CreatePartition request and returns a task that resolves when the coordinator finishes processing it.</summary>
     private static Task<(RaftOperationStatus Status, long Generation)> SendCreateAsync(
@@ -1355,7 +1355,7 @@ public sealed class TestRaftSystemCoordinator
         }
     }
 
-    // ── Task 2.4 — TryRemovePartition ────────────────────────────────────────
+    // ── TryRemovePartition ────────────────────────────────────────
 
     /// <summary>Sends a RemovePartition request and returns a task that resolves when the coordinator finishes processing it.</summary>
     private static Task<(RaftOperationStatus Status, long Generation)> SendRemoveAsync(
@@ -1586,7 +1586,7 @@ public sealed class TestRaftSystemCoordinator
         }
     }
 
-    // ── Membership (Task 1) ───────────────────────────────────────────────────
+    // ── Membership ───────────────────────────────────────────────────
 
     /// <summary>Helper that builds a coordinator with a fast replication stub.</summary>
     private static (RaftManager Manager, List<byte[]> Replicated) BuildWithMembershipHarness()

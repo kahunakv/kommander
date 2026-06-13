@@ -4,6 +4,7 @@ using Google.Protobuf;
 using Google.Protobuf.Collections;
 using Grpc.Core;
 using Kommander.Data;
+using Microsoft.Extensions.Logging;
 
 namespace Kommander.Communication.Grpc;
 
@@ -429,6 +430,36 @@ public class GrpcCommunication : ICommunication
         return batchRequestsResponse;
     }
     
+    /// <summary>
+    /// Sends a <see cref="JoinRequest"/> to <paramref name="node"/> via the <c>Join</c> gRPC RPC.
+    /// </summary>
+    public async Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
+    {
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(node.Endpoint, GetSecurityOptions(manager)));
+
+        GrpcJoinRequest grpcRequest = new()
+        {
+            Endpoint = request.Endpoint,
+            NodeId = request.NodeId
+        };
+
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Join");
+        try
+        {
+            GrpcJoinResponse response = await client
+                .JoinAsync(grpcRequest, new CallOptions(metadata))
+                .ResponseAsync
+                .ConfigureAwait(false);
+
+            return new JoinResponse(response.Success, string.IsNullOrEmpty(response.LeaderHint) ? null : response.LeaderHint, response.MembershipVersion);
+        }
+        catch (Exception ex)
+        {
+            manager.Logger.LogWarning("SendJoin to {Endpoint}: {Message}", node.Endpoint, ex.Message);
+            return new JoinResponse(false);
+        }
+    }
+
     private static Metadata BuildAuthMetadata(RaftManager manager, string grpcMethod)
     {
         RaftTransportSecurityOptions security = manager.Configuration.GetEffectiveTransportSecurity();

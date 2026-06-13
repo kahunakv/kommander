@@ -11,7 +11,7 @@ namespace Kommander.Tests.WAL;
 /// <summary>
 /// End-to-end compaction integration tests for SQLite and RocksDB.
 /// Exercises automatic triggering and drain-to-bound via <see cref="RaftWriteAhead.NotifyCommitted"/>,
-/// not the full Raft state-machine commit completion path (covered by Task 5 unit tests).
+/// not the full Raft state-machine commit completion path (covered by unit tests).
 /// </summary>
 public sealed class TestWalAutomaticCompactionIntegration
 {

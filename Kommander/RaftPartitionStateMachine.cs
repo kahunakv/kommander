@@ -444,6 +444,9 @@ public sealed class RaftPartitionStateMachine
         if (host.Nodes.Count == 0)
         {
             nodeState = RaftNodeState.Leader;
+            // Seed the backfill cursor from our durable committed index: a fresh leader that
+            // commits nothing new must still be able to backfill a stale follower.
+            localCommittedIndex = wal.GetCommitIndex();
             host.Leader = host.LocalEndpoint;
             lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
 
@@ -486,6 +489,21 @@ public sealed class RaftPartitionStateMachine
         Math.Max(
             lastCommitIndexes.GetValueOrDefault(endpoint, -1),
             startCommitIndexes.GetValueOrDefault(endpoint, -1));
+
+    /// <summary>
+    /// Returns the last commit index for <paramref name="endpoint"/>:
+    /// • If endpoint equals <see cref="IRaftHost.LocalEndpoint"/> (i.e., this is the leader asking about itself),
+    ///   returns <see cref="localCommittedIndex"/> — the leader's own durable commit frontier.
+    /// • Otherwise returns the last index reported by that follower via <c>CompleteAppendLogs</c>,
+    ///   or -1 when no acknowledgement has been received yet.
+    /// Must be called on the executor thread (reads private state machine fields).
+    /// </summary>
+    internal long GetFollowerCommittedIndex(string endpoint)
+    {
+        if (endpoint == host.LocalEndpoint)
+            return localCommittedIndex;
+        return lastCommitIndexes.GetValueOrDefault(endpoint, -1);
+    }
 
     private async Task StartElectionAsync(HLCTimestamp currentTime, bool ignoreRecentVoteCooldown)
     {
@@ -549,6 +567,9 @@ public sealed class RaftPartitionStateMachine
         if (host.Nodes.Count == 0)
         {
             nodeState = RaftNodeState.Leader;
+            // Seed the backfill cursor from our durable committed index: a fresh leader that
+            // commits nothing new must still be able to backfill a stale follower.
+            localCommittedIndex = wal.GetCommitIndex();
             host.Leader = host.LocalEndpoint;
             lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
 
@@ -733,7 +754,7 @@ public sealed class RaftPartitionStateMachine
                 // Empty batch: the leader has compacted past followerMaxLog+1. The follower
                 // cannot catch up via log replay alone and needs a snapshot transfer. Fall
                 // through to a plain heartbeat until snapshot-based recovery is implemented
-                // (see elastic-partitions-spec.md and GetRangeAsync for the full limitation).
+                // (see GetRangeAsync for the full limitation).
             }
 
             AppendLogToNode(node, lastHeartbeat, null);
@@ -1038,6 +1059,9 @@ public sealed class RaftPartitionStateMachine
         
         // Here quorum was achieved and we can mark ourselves as leader in the partition
         nodeState = RaftNodeState.Leader;
+        // Seed the backfill cursor from our durable committed index so a freshly-elected leader
+        // can backfill a stale follower immediately, without waiting for a new client write.
+        localCommittedIndex = wal.GetCommitIndex();
         host.Leader = host.LocalEndpoint;
 
         lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
@@ -1644,21 +1668,19 @@ public sealed class RaftPartitionStateMachine
         if (endpoint != host.LocalEndpoint)
             host.UpdateLastNodeActivity(endpoint, host.PartitionId, currentTime);
         
+        // Always register the follower's committed index so the backfill loop can detect lag
+        // via TryGetValue. A fresh follower with no log entries reports -1; without this
+        // the TryGetValue check in SendHeartbeat would fail and backfill would never fire.
+        if (!lastCommitIndexes.TryGetValue(endpoint, out long currentIndex) || committedIndex > currentIndex)
+            lastCommitIndexes[endpoint] = committedIndex;
+
         if (committedIndex > 0)
         {
-            if (lastCommitIndexes.TryGetValue(endpoint, out long currentIndex))
-            {
-                if (committedIndex > currentIndex)
-                    lastCommitIndexes[endpoint] = committedIndex;
-            }
-            else
-                lastCommitIndexes[endpoint] = committedIndex;
-
             if (startCommitIndexes.TryGetValue(endpoint, out currentIndex))
             {
                 if (committedIndex > currentIndex)
                     startCommitIndexes[endpoint] = committedIndex;
-            } 
+            }
             else
                 startCommitIndexes[endpoint] = committedIndex;
 

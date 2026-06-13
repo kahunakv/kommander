@@ -40,6 +40,13 @@ public interface IRaftWalFacade
     /// </summary>
     ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries);
 
+    /// <summary>
+    /// Highest committed log id (excludes proposed-but-uncommitted tail entries). Used to seed the
+    /// leader's per-follower backfill cursor on election, so a leader that has committed nothing in
+    /// its current term can still backfill a stale follower without waiting for a new write.
+    /// </summary>
+    long GetCommitIndex();
+
     WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp timestamp, bool autoCommit);
 
     WALWriteOperation EnqueueCommit(List<RaftLog> logs);

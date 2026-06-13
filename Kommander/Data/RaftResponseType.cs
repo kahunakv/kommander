@@ -5,5 +5,6 @@ public enum RaftResponseType
 {
     None,
     NodeState,
-    TicketState
+    TicketState,
+    FollowerCommittedIndex,
 }

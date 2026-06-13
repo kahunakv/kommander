@@ -9,7 +9,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Kommander.Tests.Scheduler;
 
 /// <summary>
-/// Unit tests for <see cref="RaftTransportDispatcher"/> (Task 12).
+/// Unit tests for <see cref="RaftTransportDispatcher"/>.
 ///
 /// Covers:
 /// - Single-message path: one message dispatched via the per-type ICommunication method.
@@ -123,6 +123,9 @@ public sealed class TestRaftTransportDispatcher
             Record("BatchRequests", node.Endpoint, snapshot);
             return new();
         }
+
+        public Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
+            => Task.FromResult(new JoinResponse(false));
     }
 
     // ── Test helpers ──────────────────────────────────────────────────────────

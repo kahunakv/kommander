@@ -12,7 +12,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Kommander.Tests.Scheduler;
 
 /// <summary>
-/// Acceptance tests for Task 15 — Backpressure and Admission Control.
+/// Acceptance tests for Backpressure and Admission Control.
 ///
 /// Verifies:
 /// - Client proposals are rejected with <see cref="RaftOperationStatus.ProposalQueueFull"/>
@@ -68,6 +68,8 @@ public sealed class TestBackpressureAndAdmissionControl
         public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(0L);
         public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(0L);
         public ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) => ValueTask.FromResult(new List<RaftLog>());
+
+        public long GetCommitIndex() => 0;
 
         public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp ts, bool autoCommit)
             => MakeNoOp();

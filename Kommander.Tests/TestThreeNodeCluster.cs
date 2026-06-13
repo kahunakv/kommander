@@ -639,6 +639,96 @@ public sealed class TestThreeNodeCluster
         await node3.LeaveCluster(true);
     }
 
+    /// <summary>
+    /// Validates multi-round chunked backfill: a follower paused while the leader commits
+    /// more entries than <c>MaxBackfillEntriesPerRound</c> must converge across several heartbeat
+    /// rounds, not just the first one. Uses <c>MaxBackfillEntriesPerRound=5</c> and 20 committed
+    /// entries so the follower requires at least 4 successive backfill rounds.
+    ///
+    /// If the chunk loop were broken — e.g. the follower's <c>lastCommitIndexes</c> entry is not
+    /// updated between rounds — the follower would stall near entry 5 and the
+    /// <see cref="WaitForConditionAsync"/> timeout would fire, failing the test.
+    /// </summary>
+    [Fact]
+    public async Task PausedStaleFollower_MultiRoundBackfill_ConvergesAcrossChunks()
+    {
+        InMemoryCommunication communication = new();
+
+        IRaft node1 = GetNode1WithBackfillConfig(communication, logger, maxBackfillEntriesPerRound: 5, backfillThreshold: 3);
+        IRaft node2 = GetNode2WithBackfillConfig(communication, logger, maxBackfillEntriesPerRound: 5, backfillThreshold: 3);
+        IRaft node3 = GetNode3WithBackfillConfig(communication, logger, maxBackfillEntriesPerRound: 5, backfillThreshold: 3);
+        IRaft[] nodes = [node1, node2, node3];
+
+        Dictionary<string, IRaft> network = new()
+        {
+            { "localhost:8001", node1 },
+            { "localhost:8002", node2 },
+            { "localhost:8003", node3 }
+        };
+        communication.SetNodes(network);
+
+        await node1.UpdateNodes();
+        await node2.UpdateNodes();
+        await node3.UpdateNodes();
+
+        await Task.WhenAll(
+            node1.JoinCluster(TestContext.Current.CancellationToken),
+            node2.JoinCluster(TestContext.Current.CancellationToken),
+            node3.JoinCluster(TestContext.Current.CancellationToken));
+
+        string initialLeader = await node1.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        IRaft pausedNode = nodes.First(n => n.GetLocalEndpoint() != initialLeader);
+        string pausedEndpoint = pausedNode.GetLocalEndpoint();
+        communication.PartitionNode(pausedEndpoint);
+
+        // Commit 20 entries — 4× MaxBackfillEntriesPerRound — while the follower is offline.
+        IRaft leader = GetNodeByEndpoint(nodes, initialLeader);
+        byte[] data = "Chunk test"u8.ToArray();
+        const int entries = 20;
+        for (int i = 0; i < entries; i++)
+        {
+            RaftReplicationResult response = await leader.ReplicateLogs(
+                1, "Chunk", data,
+                cancellationToken: TestContext.Current.CancellationToken);
+            Assert.Equal(RaftOperationStatus.Success, response.Status);
+        }
+
+        Assert.True(leader.WalAdapter.GetMaxLog(1) >= entries);
+
+        await Task.Delay(500, TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, await CountLeaders(
+            nodes.Where(n => n.GetLocalEndpoint() != pausedEndpoint).ToArray(), 1));
+
+        communication.HealPartition(pausedEndpoint);
+
+        string resumedLeaderView = await pausedNode.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, await CountLeaders(nodes, 1));
+        Assert.False(await pausedNode.AmILeaderQuick(1));
+
+        IRaft decidedLeader = GetNodeByEndpoint(nodes, resumedLeaderView);
+
+        // Multi-round convergence: each heartbeat ships at most 5 entries, so ≥4 rounds are needed.
+        await WaitForConditionAsync(
+            () => pausedNode.WalAdapter.GetMaxLog(1) >= decidedLeader.WalAdapter.GetMaxLog(1),
+            TestContext.Current.CancellationToken,
+            timeoutMs: 20_000);
+
+        Assert.True(pausedNode.WalAdapter.GetMaxLog(1) >= decidedLeader.WalAdapter.GetMaxLog(1));
+
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+        await node3.LeaveCluster(true);
+    }
+
     [Theory]
     [Trait("Category", "Stress")]
     [InlineData("memory", 8)]
@@ -1053,6 +1143,78 @@ public sealed class TestThreeNodeCluster
         );
 
         return node;
+    }
+
+    private static IRaft GetNode1WithBackfillConfig(
+        InMemoryCommunication communication, ILogger<IRaft> logger,
+        int maxBackfillEntriesPerRound, int backfillThreshold)
+    {
+        RaftConfiguration config = new()
+        {
+            NodeName = "node1", NodeId = 1, Host = "localhost", Port = 8001,
+            InitialPartitions = 1,
+            HeartbeatInterval = TimeSpan.FromMilliseconds(50),
+            RecentHeartbeat = TimeSpan.FromMilliseconds(25),
+            VotingTimeout = TimeSpan.FromMilliseconds(250),
+            CheckLeaderInterval = TimeSpan.FromMilliseconds(25),
+            UpdateNodesInterval = TimeSpan.FromMilliseconds(100),
+            TimerInitialDelay = TimeSpan.FromMilliseconds(25),
+            StartElectionTimeout = 100,
+            EndElectionTimeout = 250,
+            MaxBackfillEntriesPerRound = maxBackfillEntriesPerRound,
+            BackfillThreshold = backfillThreshold,
+        };
+        return new RaftManager(config,
+            new StaticDiscovery([new("localhost:8002"), new("localhost:8003")]),
+            new InMemoryWAL(logger), communication, new HybridLogicalClock(), logger);
+    }
+
+    private static IRaft GetNode2WithBackfillConfig(
+        InMemoryCommunication communication, ILogger<IRaft> logger,
+        int maxBackfillEntriesPerRound, int backfillThreshold)
+    {
+        RaftConfiguration config = new()
+        {
+            NodeName = "node2", NodeId = 2, Host = "localhost", Port = 8002,
+            InitialPartitions = 1,
+            HeartbeatInterval = TimeSpan.FromMilliseconds(50),
+            RecentHeartbeat = TimeSpan.FromMilliseconds(25),
+            VotingTimeout = TimeSpan.FromMilliseconds(250),
+            CheckLeaderInterval = TimeSpan.FromMilliseconds(25),
+            UpdateNodesInterval = TimeSpan.FromMilliseconds(100),
+            TimerInitialDelay = TimeSpan.FromMilliseconds(25),
+            StartElectionTimeout = 100,
+            EndElectionTimeout = 250,
+            MaxBackfillEntriesPerRound = maxBackfillEntriesPerRound,
+            BackfillThreshold = backfillThreshold,
+        };
+        return new RaftManager(config,
+            new StaticDiscovery([new("localhost:8001"), new("localhost:8003")]),
+            new InMemoryWAL(logger), communication, new HybridLogicalClock(), logger);
+    }
+
+    private static IRaft GetNode3WithBackfillConfig(
+        InMemoryCommunication communication, ILogger<IRaft> logger,
+        int maxBackfillEntriesPerRound, int backfillThreshold)
+    {
+        RaftConfiguration config = new()
+        {
+            NodeName = "node3", NodeId = 3, Host = "localhost", Port = 8003,
+            InitialPartitions = 1,
+            HeartbeatInterval = TimeSpan.FromMilliseconds(50),
+            RecentHeartbeat = TimeSpan.FromMilliseconds(25),
+            VotingTimeout = TimeSpan.FromMilliseconds(250),
+            CheckLeaderInterval = TimeSpan.FromMilliseconds(25),
+            UpdateNodesInterval = TimeSpan.FromMilliseconds(100),
+            TimerInitialDelay = TimeSpan.FromMilliseconds(25),
+            StartElectionTimeout = 100,
+            EndElectionTimeout = 250,
+            MaxBackfillEntriesPerRound = maxBackfillEntriesPerRound,
+            BackfillThreshold = backfillThreshold,
+        };
+        return new RaftManager(config,
+            new StaticDiscovery([new("localhost:8001"), new("localhost:8002")]),
+            new InMemoryWAL(logger), communication, new HybridLogicalClock(), logger);
     }
 
     private static IWAL GetWAL(string walStorage, ILogger<IRaft> logger)

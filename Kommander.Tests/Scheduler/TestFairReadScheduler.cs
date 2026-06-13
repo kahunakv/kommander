@@ -5,7 +5,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Kommander.Tests.Scheduler;
 
 /// <summary>
-/// Acceptance tests for <see cref="FairReadScheduler"/> (Task 8).
+/// Acceptance tests for <see cref="FairReadScheduler"/>.
 ///
 /// Covers:
 /// - Same-partition reads complete in submitted order (FIFO).

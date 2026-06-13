@@ -11,7 +11,7 @@ using Microsoft.Extensions.Logging;
 namespace Kommander.Tests;
 
 /// <summary>
-/// Integration tests for Task 2 — roster-derived Nodes + greenfield seed.
+/// Integration tests for roster-derived Nodes + greenfield seed.
 /// Each test stands up a full in-memory 3-node cluster and checks that after
 /// JoinCluster the committed membership roster is present and Nodes is derived
 /// from it.

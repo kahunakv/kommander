@@ -134,6 +134,18 @@ public class InMemoryCommunication : ICommunication
         return completeAppendLogsResponse;
     }
 
+    public async Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
+    {
+        if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))
+            return new JoinResponse(false);
+
+        if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode) && targetNode is RaftManager targetManager)
+            return await targetManager.ReceiveJoin(request).ConfigureAwait(false);
+
+        Console.WriteLine("SendJoin Unknown node: " + node.Endpoint);
+        return new JoinResponse(false);
+    }
+
     public async Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)
     {
         if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))

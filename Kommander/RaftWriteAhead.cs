@@ -518,6 +518,15 @@ public sealed class RaftWriteAhead
     }
 
     /// <summary>
+    /// Returns the highest log id known to be committed, read from the in-memory
+    /// <c>commitIndex</c> (which is the next-commit slot, so the committed id is one less).
+    /// Unlike <see cref="GetMaxLog"/> this excludes proposed-but-uncommitted tail entries,
+    /// so the leader can seed its backfill cursor on election without shipping uncommitted logs.
+    /// Synchronous: it reads an in-memory counter, no WAL/scheduler round-trip.
+    /// </summary>
+    public long GetCommitIndex() => commitIndex - 1;
+
+    /// <summary>
     /// Retrieves the current term of the Raft log for the specified partition.
     /// This term represents the latest term recognized by the Write-Ahead Log (WAL).
     /// </summary>
@@ -767,9 +776,8 @@ public sealed class RaftWriteAhead
     /// producing a log gap that the follower's append path will reject. This method returns
     /// an empty list in that case (all pre-compaction entries are gone), and the
     /// <c>SendHeartbeat</c> backfill path falls through to a plain heartbeat — leaving the
-    /// follower unable to catch up without a full snapshot. Snapshot-based recovery is
-    /// tracked as part of the elastic-partitions transfer spec
-    /// (<c>docs/elastic-partitions-spec.md</c>).</para>
+    /// follower unable to catch up without a full snapshot. Snapshot-based recovery to close
+    /// this gap is not yet implemented.</para>
     /// </summary>
     public async ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries)
     {

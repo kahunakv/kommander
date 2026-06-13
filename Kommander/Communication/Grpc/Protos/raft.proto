@@ -8,6 +8,7 @@ service Rafter {
     rpc AppendLogs (GrpcAppendLogsRequest) returns (GrpcAppendLogsResponse);
     rpc CompleteAppendLogs (GrpcCompleteAppendLogsRequest) returns (GrpcCompleteAppendLogsResponse);
     rpc BatchRequests (stream GrpcBatchRequestsRequest) returns (stream GrpcBatchRequestsResponse);
+    rpc Join (GrpcJoinRequest) returns (GrpcJoinResponse);
 }
 
 message GrpcHandshakeRequest {
@@ -146,6 +147,17 @@ message GrpcTransferLeadershipRequest {
   uint32 TimeCounter = 5;
   string Endpoint = 6;
   string TargetEndpoint = 7;
+}
+
+message GrpcJoinRequest {
+    string Endpoint = 1;
+    int32 NodeId = 2;
+}
+
+message GrpcJoinResponse {
+    bool Success = 1;
+    string LeaderHint = 2;
+    int64 MembershipVersion = 3;
 }
 
 enum GrpcRaftLogType {

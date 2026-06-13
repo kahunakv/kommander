@@ -570,6 +570,13 @@ public sealed class RaftPartitionExecutor : IDisposable
                     break;
                 }
 
+                case RaftRequestType.GetFollowerCommittedIndex:
+                {
+                    long followerIndex = _stateMachine.GetFollowerCommittedIndex(request.Endpoint ?? "");
+                    op.Reply?.TrySetResult(new RaftResponse(RaftResponseType.FollowerCommittedIndex, RaftOperationStatus.Success, followerIndex));
+                    break;
+                }
+
                 case RaftRequestType.AppendLogs:
                     await _stateMachine.AppendLogsAsync(
                         request.Endpoint ?? "",

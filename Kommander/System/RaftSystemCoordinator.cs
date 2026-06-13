@@ -778,7 +778,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
     /// </para>
     /// <para>
     /// NOTE: tail catch-up (shipping entries committed after <c>snapshotIndex</c>) requires
-    /// the quiesce infrastructure from Phase 4 Task 4.2 (step 3) and is deferred.
+    /// the partition-quiesce infrastructure and is deferred.
     /// </para>
     /// </summary>
     private async Task RunSnapshotTransferAsync(
@@ -1544,9 +1544,10 @@ internal sealed class RaftSystemCoordinator : IDisposable
     /// <para>
     /// <b>Known limitation:</b> the roster captures only the nodes visible to the P0 leader via
     /// <see cref="IDiscovery.GetNodes"/> at the instant of seeding. A node that registers in
-    /// discovery after the seed is committed is absent from the roster. Once Task 3 gates votes
-    /// on role, that node will be <see cref="ClusterMemberRole.NotMember"/> and cannot participate
-    /// until it is explicitly added via the Task 5 Join RPC.
+    /// discovery after the seed is committed is absent from the roster. Because role gating
+    /// suppresses elections/votes for non-voters, that node will be
+    /// <see cref="ClusterMemberRole.NotMember"/> and cannot participate until it is explicitly
+    /// added via the Join RPC.
     /// </para>
     /// </summary>
     private async Task TrySeedInitialMembership(CancellationToken cancellationToken)
@@ -1566,8 +1567,8 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 JoinedVersion = 1
             },
             // Peer NodeIds are provisional (0) because discovery only yields endpoints.
-            // Task 5 (Join RPC) will replace these with each node's real configured NodeId
-            // when it self-reports. All Task 2 logic keys on Endpoint, not NodeId.
+            // The Join RPC will replace these with each node's real configured NodeId when it
+            // self-reports; the roster-derived peer set keys on Endpoint, not NodeId.
             // Self-exclusion and dedup guard against discovery backends that list the local
             // endpoint or return duplicates — both would corrupt quorum math.
             ..peers
@@ -1625,6 +1626,113 @@ internal sealed class RaftSystemCoordinator : IDisposable
     /// (version 0, no members) when no roster has been committed yet.
     /// </summary>
     internal ClusterMembership GetMembership() => _cachedMembership;
+
+    // ── Learner promotion driver ───────────────────────────────────────────────
+    // Keyed by learner endpoint; records when the learner first appeared caught-up on all partitions.
+    private readonly Dictionary<string, DateTimeOffset> _learnerCaughtUpSince = new();
+
+    /// <summary>
+    /// Called from <c>RaftManager.UpdateNodes</c> on every <see cref="RaftTimerService"/>
+    /// <c>UpdateNodes</c> tick.  Runs only when this node is the P0 leader.
+    /// <para>
+    /// For each Learner in the committed roster it measures the per-partition lag by querying
+    /// <see cref="RaftManager.GetFollowerCommittedIndexAsync"/> and compares with
+    /// <see cref="RaftPartitionStateMachine.localCommittedIndex"/> held on this leader.
+    /// A learner that stays within <see cref="RaftConfiguration.LearnerPromotionLag"/> entries
+    /// on <em>all</em> partitions for at least <see cref="RaftConfiguration.LearnerPromotionStableWindow"/>
+    /// is promoted to Voter by posting a <see cref="RaftSystemRequestType.PromoteMember"/> request
+    /// onto the coordinator channel.  At most one membership change is in flight at a time.
+    /// </para>
+    /// </summary>
+    internal async Task CheckLearnerPromotionsAsync()
+    {
+        // Only the P0 leader runs the driver.
+        if (!await manager.AmILeaderQuick(RaftSystemConfig.SystemPartition).ConfigureAwait(false))
+        {
+            _learnerCaughtUpSince.Clear();
+            return;
+        }
+
+        // Belt-and-suspenders: a membership change is already committed or being replicated.
+        if (_membershipChangePending)
+            return;
+
+        ClusterMembership roster = _cachedMembership;
+        List<ClusterMember> learners = roster.Members
+            .Where(m => m.Role == ClusterMemberRole.Learner)
+            .ToList();
+
+        if (learners.Count == 0)
+        {
+            _learnerCaughtUpSince.Clear();
+            return;
+        }
+
+        // Collect all partition ids (system + user) to measure lag on.
+        List<int> allPartitionIds = new(manager.Partitions.Count + 1) { RaftSystemConfig.SystemPartition };
+        allPartitionIds.AddRange(manager.Partitions.Keys);
+
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+
+        foreach (ClusterMember learner in learners)
+        {
+            string endpoint = learner.Endpoint;
+            bool caughtUp = true;
+
+            foreach (int partitionId in allPartitionIds)
+            {
+                // Only measure lag on partitions where we are the leader.  As a follower we
+                // do not receive CompleteAppendLogs from other followers, so lastCommitIndexes
+                // for the learner is never populated and lag would be incorrectly huge.
+                bool isPartitionLeader = await manager.AmILeaderQuick(partitionId).ConfigureAwait(false);
+                if (!isPartitionLeader)
+                    continue;
+
+                // Ask the leader's own partition state machine for its committed index.
+                long leaderCommitted = await manager.GetFollowerCommittedIndexAsync(partitionId, manager.LocalEndpoint).ConfigureAwait(false);
+                if (leaderCommitted < 0)
+                    continue;
+
+                long learnerCommitted = await manager.GetFollowerCommittedIndexAsync(partitionId, endpoint).ConfigureAwait(false);
+
+                long lag = leaderCommitted - learnerCommitted;
+                if (lag > manager.Configuration.LearnerPromotionLag)
+                {
+                    caughtUp = false;
+                    break;
+                }
+            }
+
+            if (caughtUp)
+            {
+                if (!_learnerCaughtUpSince.TryGetValue(endpoint, out DateTimeOffset since))
+                {
+                    _learnerCaughtUpSince[endpoint] = now;
+                    // Not stable yet — stable window starts now.
+                }
+                else if (now - since >= manager.Configuration.LearnerPromotionStableWindow)
+                {
+                    // Stable long enough — promote.
+                    logger.LogInformation("[RaftSystemCoordinator] Promoting Learner {Endpoint} to Voter (stable for {Duration:g})", endpoint, now - since);
+                    _learnerCaughtUpSince.Remove(endpoint);
+
+                    Send(new RaftSystemRequest(
+                        RaftSystemRequestType.PromoteMember,
+                        endpoint,
+                        learner.NodeId,
+                        roster.MembershipVersion));
+
+                    // Promote one at a time — exit; next tick handles remaining learners.
+                    return;
+                }
+            }
+            else
+            {
+                // Not caught up — reset the stable window for this learner.
+                _learnerCaughtUpSince.Remove(endpoint);
+            }
+        }
+    }
 
     /// <summary>
     /// Reads the <see cref="RaftSystemConfigKeys.Members"/> entry from

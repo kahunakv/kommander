@@ -186,6 +186,9 @@ public sealed class FakeTransport : ICommunication
     public Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)
         => EnqueueAndWait<BatchRequestsResponse>(manager.GetLocalEndpoint(), node.Endpoint, MessageKind.BatchRequests, request);
 
+    public Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
+        => Task.FromResult(new JoinResponse(false));
+
     // ── Internal ──────────────────────────────────────────────────────────
 
     private Task<TResponse> EnqueueAndWait<TResponse>(string source, string dest, MessageKind kind, object payload)

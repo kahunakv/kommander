@@ -504,6 +504,19 @@ public sealed class RaftPartition : IDisposable
     }
     
     /// <summary>
+    /// Returns the last commit index acknowledged by <paramref name="endpoint"/> on this
+    /// partition, or -1 when no <c>CompleteAppendLogs</c> has been received from that endpoint.
+    /// Runs on the executor thread so it is safe to read <c>lastCommitIndexes</c>.
+    /// </summary>
+    public async ValueTask<long> GetFollowerCommittedIndexAsync(string endpoint)
+    {
+        RaftResponse? response = await executor.Ask(new(RaftRequestType.GetFollowerCommittedIndex, endpoint: endpoint)).ConfigureAwait(false);
+        if (response is null || response.Type != RaftResponseType.FollowerCommittedIndex)
+            return -1;
+        return response.LogIndex;
+    }
+
+    /// <summary>
     /// Sends a CheckLeader message to the raft state actor to check for leader changes
     /// </summary>
     public void CheckLeader()

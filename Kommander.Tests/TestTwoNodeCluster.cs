@@ -497,7 +497,7 @@ public class TestTwoNodeCluster
     /// <summary>
     /// Consumer writes to P0 with a non-system log type must succeed on the P0 leader.
     /// The _RaftSystem type remains reserved and must throw RaftException.
-    /// Covers the type-gated relaxation in ReplicateLogs (Task 2).
+    /// Covers the type-gated relaxation in ReplicateLogs.
     /// </summary>
     [Fact]
     public async Task ReplicateLogsToSystemPartition_ConsumerTypeSucceeds_SystemTypeThrows()

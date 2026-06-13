@@ -32,4 +32,11 @@ public enum RaftRequestType
     /// guarantee, satisfying correctness rule 1.
     /// </summary>
     RestoreLogsLoaded,
+
+    /// <summary>
+    /// Returns the last commit index reported by a specific follower endpoint via
+    /// <c>CompleteAppendLogs</c> acknowledgements.  Used by the promotion driver to
+    /// measure learner lag without reading WAL storage.
+    /// </summary>
+    GetFollowerCommittedIndex,
 }

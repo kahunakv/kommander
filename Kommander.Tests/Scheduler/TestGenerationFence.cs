@@ -13,7 +13,7 @@ using Google.Protobuf;
 namespace Kommander.Tests.Scheduler;
 
 /// <summary>
-/// Integration-level tests for the generation fence (Task 3.2 / 3.5).
+/// Integration-level tests for the generation fence.
 ///
 /// The fence rejects a <c>ReplicateLogs</c> proposal with
 /// <see cref="RaftOperationStatus.PartitionMoved"/> when the caller's
@@ -266,7 +266,7 @@ public sealed class TestGenerationFence
 
     // ── OnPartitionMapChanged ─────────────────────────────────────────────────
     //
-    // Task 3.4 acceptance criterion: a subscriber registered before a partition map
+    // Acceptance criterion: a subscriber registered before a partition map
     // change receives the event with the updated snapshot.  CreatePartitionAsync
     // goes through the same StartUserPartitions → OnPartitionMapChanged chain as
     // ConfigReplicated, so the harness tests below cover the same code path without

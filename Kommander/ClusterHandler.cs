@@ -35,6 +35,13 @@ public sealed class ClusterHandler
     }
 
     /// <summary>
+    /// Marks this node as having joined the cluster without registering with discovery.
+    /// Used by the seed-based <c>JoinCluster(seeds)</c> path where the roster entry,
+    /// not discovery registration, is the authoritative join signal.
+    /// </summary>
+    internal void MarkJoined() => Joined = true;
+
+    /// <summary>
     /// Leaves the cluster by unregistering the current node from the discovery service
     /// and marking the node as no longer part of the cluster.
     /// </summary>
@@ -63,9 +70,12 @@ public sealed class ClusterHandler
 
         if (roster.MembershipVersion > 0)
         {
-            // Roster is committed — derive the peer set from voters only, excluding self.
+            // Roster is committed — include Voters and Learners (excluding self) so that
+            // the leader sends heartbeats and replication traffic to joining nodes.
+            // Learners participate in log replication but not in quorum calculation.
             manager.Nodes = roster.Members
-                .Where(m => m.Role == ClusterMemberRole.Voter && m.Endpoint != manager.LocalEndpoint)
+                .Where(m => (m.Role == ClusterMemberRole.Voter || m.Role == ClusterMemberRole.Learner)
+                         && m.Endpoint != manager.LocalEndpoint)
                 .Select(m => new RaftNode(m.Endpoint))
                 .ToList();
         }

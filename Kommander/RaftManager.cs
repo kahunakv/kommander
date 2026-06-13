@@ -413,6 +413,177 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
+    /// Seed-based join: contacts each seed in turn until this node is admitted as a Learner,
+    /// then waits for automatic promotion to Voter (same 60 s deadline as <see cref="JoinCluster(CancellationToken)"/>).
+    /// <para>
+    /// Unlike the discovery-based overload this variant does NOT call <see cref="IDiscovery.Register"/>;
+    /// it relies on the P0 leader learning of the new node via the committed roster entry so that
+    /// the leader's next <c>UpdateNodes</c> tick includes this endpoint in its peer set and begins
+    /// sending P0 heartbeats.  Once the system-partition logs are replicated the coordinator calls
+    /// <see cref="StartUserPartitions"/> and <see cref="IsInitialized"/> becomes <c>true</c>.
+    /// </para>
+    /// </summary>
+    public async Task JoinCluster(IEnumerable<string> seeds, CancellationToken cancellationToken = default)
+    {
+        // Start schedulers and the system partition exactly as the discovery-based join does.
+        if (systemPartition is null)
+        {
+            readScheduler.Start();
+            walScheduler.Start();
+
+            systemPartition = new(
+                this,
+                walAdapter,
+                RaftSystemConfig.SystemPartition,
+                0,
+                0,
+                Logger
+            );
+        }
+
+        // Mark as joined so timer UpdateNodes ticks start firing once the roster has us.
+        clusterHandler.MarkJoined();
+
+        // Contact seeds until a P0 leader accepts us as a Learner.
+        JoinResponse? accepted = null;
+        ValueStopwatch joinStopwatch = ValueStopwatch.StartNew();
+
+        while (accepted is null || !accepted.Success)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (joinStopwatch.GetElapsedMilliseconds() > 60_000)
+                throw new TimeoutException("RaftManager.JoinCluster(seeds) timed out after 60 s before being admitted as a Learner.");
+
+            List<string> seedList = seeds.ToList();
+            string? leaderHint = null;
+
+            foreach (string seed in seedList)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                string target = leaderHint ?? seed;
+                RaftNode node = new(target);
+                try
+                {
+                    JoinResponse resp = await communication.SendJoin(this, node, new JoinRequest(LocalEndpoint, LocalNodeId)).ConfigureAwait(false);
+                    if (resp.Success)
+                    {
+                        accepted = resp;
+                        break;
+                    }
+                    if (!string.IsNullOrEmpty(resp.LeaderHint))
+                    {
+                        leaderHint = resp.LeaderHint;
+                        // Retry immediately against the leader hint.
+                        try
+                        {
+                            RaftNode leaderNode = new(leaderHint);
+                            resp = await communication.SendJoin(this, leaderNode, new JoinRequest(LocalEndpoint, LocalNodeId)).ConfigureAwait(false);
+                            if (resp.Success)
+                            {
+                                accepted = resp;
+                                break;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.LogWarning("JoinCluster: failed to contact leader hint {Hint}: {Message}", leaderHint, ex.Message);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogWarning("JoinCluster: failed to contact seed {Seed}: {Message}", seed, ex.Message);
+                }
+            }
+
+            if (accepted is null || !accepted.Success)
+                await Task.Delay(500, cancellationToken).ConfigureAwait(false);
+        }
+
+        Logger.LogInformation("JoinCluster: admitted as Learner at roster version {Version}", accepted.MembershipVersion);
+
+        // Wait for IsInitialized (system coordinator receives partition map from P0 leader).
+        while (!IsInitialized)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (joinStopwatch.GetElapsedMilliseconds() > 60_000)
+                throw new TimeoutException("RaftManager.JoinCluster(seeds) timed out after 60 s waiting for cluster initialization.");
+            await Task.Delay(500, cancellationToken).ConfigureAwait(false);
+        }
+
+        // Wait for promotion to Voter.
+        while (LocalRole != System.ClusterMemberRole.Voter)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (joinStopwatch.GetElapsedMilliseconds() > 60_000)
+                throw new TimeoutException("RaftManager.JoinCluster(seeds) timed out after 60 s waiting for Voter promotion.");
+            await Task.Delay(500, cancellationToken).ConfigureAwait(false);
+        }
+
+        Logger.LogInformation("JoinCluster: promoted to Voter; join complete");
+    }
+
+    /// <summary>
+    /// Handles an inbound <see cref="JoinRequest"/> from a joining node.
+    /// <para>
+    /// If this node is the P0 leader it commits the joiner as a <see cref="ClusterMemberRole.Learner"/>
+    /// and returns <see cref="JoinResponse.Success"/> = <c>true</c>.
+    /// Otherwise it returns <see cref="JoinResponse.Success"/> = <c>false</c> with the current
+    /// P0 leader endpoint in <see cref="JoinResponse.LeaderHint"/> so the caller can retry directly
+    /// against the leader.
+    /// </para>
+    /// </summary>
+    public async Task<JoinResponse> ReceiveJoin(JoinRequest request)
+    {
+        if (systemPartition is null || !IsInitialized)
+            return new JoinResponse(false);
+
+        bool isLeader = await AmILeaderQuick(RaftSystemConfig.SystemPartition).ConfigureAwait(false);
+        if (!isLeader)
+        {
+            string leaderHint = systemPartition.Leader;
+            return new JoinResponse(false, string.IsNullOrEmpty(leaderHint) ? null : leaderHint);
+        }
+
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        systemCoordinator.Send(new System.RaftSystemRequest(
+            System.RaftSystemRequestType.AddMember,
+            request.Endpoint,
+            request.NodeId,
+            systemCoordinator.GetMembership().MembershipVersion,
+            tcs));
+
+        (RaftOperationStatus status, long version) = await tcs.Task.ConfigureAwait(false);
+
+        if (status == RaftOperationStatus.Success)
+            return new JoinResponse(true, null, version);
+
+        // Another membership change was in flight or version mismatch — return current leader so
+        // the caller can retry after a brief backoff.
+        return new JoinResponse(false, LocalEndpoint);
+    }
+
+    /// <summary>
+    /// Returns the last commit index acknowledged by <paramref name="endpoint"/> on the given partition,
+    /// or -1 when no <c>CompleteAppendLogs</c> has been received yet.  Delegates to the
+    /// partition executor so the read is thread-safe.
+    /// </summary>
+    internal async ValueTask<long> GetFollowerCommittedIndexAsync(int partitionId, string endpoint)
+    {
+        if (partitionId == RaftSystemConfig.SystemPartition)
+            return systemPartition is not null
+                ? await systemPartition.GetFollowerCommittedIndexAsync(endpoint).ConfigureAwait(false)
+                : -1;
+
+        if (partitions.TryGetValue(partitionId, out RaftPartition? partition))
+            return await partition.GetFollowerCommittedIndexAsync(endpoint).ConfigureAwait(false);
+
+        return -1;
+    }
+
+    /// <summary>
     /// Start the user partitions
     /// </summary>
     /// <param name="ranges"></param>
@@ -516,6 +687,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             return;
 
         await clusterHandler.UpdateNodes().ConfigureAwait(false);
+        await systemCoordinator.CheckLearnerPromotionsAsync().ConfigureAwait(false);
     }
 
     // ── IRaftTimerHost ─────────────────────────────────────────────────────

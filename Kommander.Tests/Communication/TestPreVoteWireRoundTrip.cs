@@ -5,7 +5,7 @@ using Kommander.Communication.Grpc;
 namespace Kommander.Tests.Communication;
 
 /// <summary>
-/// Task 7 wire correctness: the <c>PreVote</c> flag (Raft §9.6) must survive proto3 serialization
+/// Wire correctness: the <c>PreVote</c> flag (Raft §9.6) must survive proto3 serialization
 /// on the gRPC vote payloads, and — because proto3 <c>bool</c> defaults to <c>false</c> — an
 /// un-upgraded peer that never sets the field must deserialize as a normal (non-pre-vote) request,
 /// preserving backward compatibility.

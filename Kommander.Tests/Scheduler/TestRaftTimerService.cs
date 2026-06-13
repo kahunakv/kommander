@@ -6,7 +6,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Kommander.Tests.Scheduler;
 
 /// <summary>
-/// Acceptance tests for <see cref="RaftTimerService"/> (Task 11).
+/// Acceptance tests for <see cref="RaftTimerService"/>.
 ///
 /// All tests drive the service via the public <see cref="RaftTimerService.TriggerCheckLeader"/>
 /// and <see cref="RaftTimerService.TriggerUpdateNodes"/> methods, which expose the same code

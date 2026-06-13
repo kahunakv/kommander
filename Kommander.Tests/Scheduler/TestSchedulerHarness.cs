@@ -5,7 +5,7 @@ using Kommander.Scheduling;
 namespace Kommander.Tests.Scheduler;
 
 /// <summary>
-/// Tests for the deterministic scheduler test harness (Task 2).
+/// Tests for the deterministic scheduler test harness.
 ///
 /// Acceptance criteria verified:
 ///  1. Tests can simulate delayed WAL writes.

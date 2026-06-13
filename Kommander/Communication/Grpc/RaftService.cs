@@ -372,4 +372,25 @@ public sealed class RaftService : Rafter.RafterBase
             logger.LogError("BatchRequests: {Type} {Message}\n{StackTrace}", ex.GetType().Name, ex.Message, ex.StackTrace);
         }
     }
+
+    /// <summary>
+    /// Handles a <c>Join</c> RPC from a node requesting to enter the cluster as a Learner.
+    /// If this node is the P0 leader it commits the joiner; otherwise returns the current leader as a hint.
+    /// </summary>
+    public override async Task<GrpcJoinResponse> Join(GrpcJoinRequest request, ServerCallContext context)
+    {
+        ValidateAuth(context);
+
+        if (raft is not RaftManager manager)
+            return new GrpcJoinResponse { Success = false };
+
+        Data.JoinResponse response = await manager.ReceiveJoin(new Data.JoinRequest(request.Endpoint, request.NodeId)).ConfigureAwait(false);
+
+        return new GrpcJoinResponse
+        {
+            Success = response.Success,
+            LeaderHint = response.LeaderHint ?? "",
+            MembershipVersion = response.MembershipVersion
+        };
+    }
 }

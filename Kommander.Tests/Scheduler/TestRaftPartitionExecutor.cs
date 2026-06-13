@@ -9,7 +9,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Kommander.Tests.Scheduler;
 
 /// <summary>
-/// Acceptance tests for <see cref="RaftPartitionExecutor"/> (Task 9).
+/// Acceptance tests for <see cref="RaftPartitionExecutor"/>.
 ///
 /// Covers:
 /// - Single-owner invariant: concurrent posts never race inside the state machine.
@@ -73,6 +73,8 @@ public sealed class TestRaftPartitionExecutor
         public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(0L);
         public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(0L);
         public ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) => ValueTask.FromResult(new List<RaftLog>());
+
+        public long GetCommitIndex() => 0;
 
         public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp timestamp, bool autoCommit)
         {
@@ -431,7 +433,7 @@ public sealed class TestRaftPartitionExecutor
         await executor.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
     }
 
-    // ── Generation fence tests (Task 3.2) ─────────────────────────────────
+    // ── Generation fence tests ─────────────────────────────────
 
     private static (RaftPartitionExecutor executor, RaftPartitionStateMachine sm) BuildExecutorWithGeneration(
         Func<long> getGeneration,
@@ -557,6 +559,8 @@ public sealed class TestRaftPartitionExecutor
         public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(0L);
         public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(0L);
         public ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) => ValueTask.FromResult(new List<RaftLog>());
+
+        public long GetCommitIndex() => 0;
         public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp ts, bool autoCommit) => MakeNoOp();
         public WALWriteOperation EnqueueCommit(List<RaftLog> logs) => MakeNoOp();
         public WALWriteOperation EnqueueRollback(List<RaftLog> logs) => MakeNoOp();

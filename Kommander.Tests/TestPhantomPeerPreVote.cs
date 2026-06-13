@@ -86,6 +86,7 @@ public sealed class TestPhantomPeerPreVote
         public Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftNode node, AppendLogsRequest request) => s_appendLogs;
         public Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftNode node, CompleteAppendLogsRequest request) => s_completeAppendLogs;
         public Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request) => Task.FromResult(new BatchRequestsResponse());
+        public Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request) => Task.FromResult(new JoinResponse(false));
     }
 
     /// <summary>
@@ -140,6 +141,7 @@ public sealed class TestPhantomPeerPreVote
 
         public Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftNode node, CompleteAppendLogsRequest request) => s_completeAppendLogs;
         public Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request) => Task.FromResult(new BatchRequestsResponse());
+        public Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request) => Task.FromResult(new JoinResponse(false));
     }
 
     // -----------------------------------------------------------------------

@@ -232,6 +232,24 @@ public class RaftConfiguration
     /// </summary>
     public int MaxBackfillEntriesPerRound { get; set; } = 128;
 
+    // ── Learner promotion ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Maximum number of committed entries a learner may trail the leader on any partition
+    /// and still be considered caught up for promotion purposes.
+    /// The promotion driver checks this threshold on every <c>UpdateNodes</c> tick.
+    /// Default 10.
+    /// </summary>
+    public int LearnerPromotionLag { get; set; } = 10;
+
+    /// <summary>
+    /// How long a learner must remain within <see cref="LearnerPromotionLag"/> entries of the
+    /// leader on all partitions before the P0 leader promotes it to Voter.
+    /// Prevents premature promotion of nodes that are briefly caught up but still unstable.
+    /// Default 3 seconds.
+    /// </summary>
+    public TimeSpan LearnerPromotionStableWindow { get; set; } = TimeSpan.FromSeconds(3);
+
     // ── WAL compaction ────────────────────────────────────────────────────────
 
     /// <summary>

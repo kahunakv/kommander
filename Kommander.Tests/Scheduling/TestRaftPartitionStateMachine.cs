@@ -11,7 +11,7 @@ using System.Diagnostics;
 namespace Kommander.Tests.Scheduling;
 
 /// <summary>
-/// Verifies Task 5 acceptance: <see cref="RaftPartitionStateMachine"/> is usable without Nixie.
+/// <see cref="RaftPartitionStateMachine"/> is usable without Nixie.
 /// </summary>
 public class TestRaftPartitionStateMachine
 {
@@ -699,7 +699,7 @@ public class TestRaftPartitionStateMachine
         await Task.Delay(delay);
     }
 
-    // ── Task 3: role gating ───────────────────────────────────────────────────
+    // ── Role gating ───────────────────────────────────────────────────
 
     [Fact]
     public async Task StartElection_WhenLearner_NeverEnqueuesRequestVotes()
@@ -1006,6 +1006,8 @@ public class TestRaftPartitionStateMachine
 
         public ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) =>
             ValueTask.FromResult(new List<RaftLog>());
+
+        public long GetCommitIndex() => wal.GetMaxLog(partitionId: 1);
 
         public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp timestamp, bool autoCommit) =>
             new(null!, 1, WALWriteOperationType.LeaderPropose, (1, logs), timestamp, autoCommit: autoCommit, term: term);
