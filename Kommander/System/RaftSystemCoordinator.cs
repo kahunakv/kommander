@@ -1725,6 +1725,19 @@ internal sealed class RaftSystemCoordinator : IDisposable
                         manager, leaderNode, partitionId, endpoint).ConfigureAwait(false);
                 }
 
+                // null here has two interpretations that we cannot distinguish today:
+                //   (a) the learner genuinely has no assignment for this partition (future
+                //       per-partition placement) — skipping is correct.
+                //   (b) replication just started and the learner has not yet sent a
+                //       CompleteAppendLogs ack — skipping creates an early-promotion window
+                //       where the learner may be promoted before receiving a single entry on
+                //       a freshly-replicated partition.
+                // In the current join-all-partitions model (b) is the common case, so this
+                // skip is a known gap. The impact is mitigated by PreVote (the new Voter
+                // cannot win an election until its log is fresh enough) and by the backfill
+                // path that replays outstanding entries after promotion. When per-partition
+                // placement is introduced, callers should supply an explicit "expected
+                // partition set" so (a) and (b) can be told apart and (b) blocked.
                 if (learnerCommittedNullable is null)
                     continue;
 
@@ -2030,8 +2043,12 @@ internal sealed class RaftSystemCoordinator : IDisposable
         ClusterMember? member = _cachedMembership.Members.FirstOrDefault(m => m.Endpoint == endpoint);
         if (member is null)
         {
-            logger.LogError("TryRemoveMember: Endpoint {Endpoint} not found in roster", endpoint);
-            completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+            // Idempotent: the endpoint is already absent — a previous RemoveMember committed but
+            // the response was lost before the caller saw it. Treat as success so the caller's
+            // retry loop does not spin to timeout.
+            logger.LogInformation("TryRemoveMember: Endpoint {Endpoint} is not in the roster; treating as idempotent success at version {Version}",
+                endpoint, _cachedMembership.MembershipVersion);
+            completion?.TrySetResult((RaftOperationStatus.Success, _cachedMembership.MembershipVersion));
             return;
         }
 

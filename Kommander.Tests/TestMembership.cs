@@ -99,10 +99,10 @@ public sealed class TestMembership
             ct.ThrowIfCancellationRequested();
             foreach (RaftManager n in nodes)
             {
-                if (await n.AmILeaderQuick(partitionId).ConfigureAwait(false))
+                if (await n.AmILeaderQuick(partitionId))
                     return;
             }
-            await Task.Delay(25, ct).ConfigureAwait(false);
+            await Task.Delay(25, ct);
         }
         throw new TimeoutException($"No leader elected for partition {partitionId} within 15 s.");
     }
@@ -114,7 +114,7 @@ public sealed class TestMembership
         {
             ct.ThrowIfCancellationRequested();
             if (cond()) return;
-            await Task.Delay(25, ct).ConfigureAwait(false);
+            await Task.Delay(25, ct);
         }
         throw new TimeoutException("Condition not satisfied within timeout.");
     }
@@ -239,6 +239,119 @@ public sealed class TestMembership
             Assert.Equal(ClusterMemberRole.Voter, node.LocalRole);
             Assert.Equal(0L, node.SystemCoordinator.GetMembership().MembershipVersion);
             await Task.CompletedTask;
+        }
+    }
+
+    // ── Task 6: graceful leave ────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GracefulLeave_RemovesNodeFromRoster_RemainingTwoVotersKeepCommitting()
+    {
+        // Arrange: 3-node cluster, wait for committed roster.
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        (RaftManager n1, RaftManager n2, RaftManager n3) = await BuildThreeNodeCluster(logger, ct);
+
+        await WaitForCondition(
+            () => n1.SystemCoordinator.GetMembership().MembershipVersion > 0
+               && n2.SystemCoordinator.GetMembership().MembershipVersion > 0
+               && n3.SystemCoordinator.GetMembership().MembershipVersion > 0,
+            ct);
+
+        try
+        {
+            // Act: n3 leaves gracefully. LeaveCluster commits RemoveMember before stopping.
+            await n3.LeaveCluster(dispose: true);
+
+            // Assert: n1 and n2 both see a 2-voter roster.
+            await WaitForCondition(
+                () =>
+                {
+                    ClusterMembership m1 = n1.SystemCoordinator.GetMembership();
+                    ClusterMembership m2 = n2.SystemCoordinator.GetMembership();
+                    return m1.Members.Count == 2
+                        && m1.Members.All(m => m.Role == ClusterMemberRole.Voter)
+                        && !m1.Members.Any(m => m.Endpoint == "localhost:8103")
+                        && m2.Members.Count == 2
+                        && m2.Members.All(m => m.Role == ClusterMemberRole.Voter)
+                        && !m2.Members.Any(m => m.Endpoint == "localhost:8103");
+                },
+                ct);
+
+            // Remaining quorum (n1 + n2) must still be able to commit.
+            RaftManager leader = n1;
+            foreach (RaftManager candidate in new[] { n1, n2 })
+            {
+                if (await candidate.AmILeaderQuick(1))
+                {
+                    leader = candidate;
+                    break;
+                }
+            }
+
+            RaftReplicationResult result = await leader.ReplicateLogs(1, "test", [1, 2, 3], cancellationToken: ct);
+            Assert.Equal(RaftOperationStatus.Success, result.Status);
+
+            // n3 is no longer a Voter in the roster — its LocalRole after stop is NotMember
+            // (the roster was updated before it stopped, so _leaving is the last observed state).
+            // What we can assert is that it was removed from peer rosters.
+            Assert.DoesNotContain(n1.GetNodes(), n => n.Endpoint == "localhost:8103");
+            Assert.DoesNotContain(n2.GetNodes(), n => n.Endpoint == "localhost:8103");
+        }
+        finally
+        {
+            await n2.LeaveCluster(true);
+            await n1.LeaveCluster(true);
+        }
+    }
+
+    [Fact]
+    public async Task GracefulLeave_WhenLeader_RemainingNodesElectNewLeader()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        (RaftManager n1, RaftManager n2, RaftManager n3) = await BuildThreeNodeCluster(logger, ct);
+
+        await WaitForCondition(
+            () => n1.SystemCoordinator.GetMembership().MembershipVersion > 0
+               && n2.SystemCoordinator.GetMembership().MembershipVersion > 0
+               && n3.SystemCoordinator.GetMembership().MembershipVersion > 0,
+            ct);
+
+        // Find the P0 leader and make it leave.
+        RaftManager? p0Leader = null;
+        foreach (RaftManager n in new[] { n1, n2, n3 })
+        {
+            if (await n.AmILeaderQuick(0))
+            {
+                p0Leader = n;
+                break;
+            }
+        }
+
+        Assert.NotNull(p0Leader);
+        RaftManager[] survivors = new[] { n1, n2, n3 }.Where(n => n != p0Leader).ToArray();
+
+        try
+        {
+            await p0Leader.LeaveCluster(dispose: true);
+
+            // Survivors elect a new P0 leader and keep committing.
+            await WaitForLeader(survivors, partitionId: 0, ct);
+
+            // Roster on survivors shows only 2 voters.
+            await WaitForCondition(
+                () => survivors.All(n =>
+                {
+                    ClusterMembership m = n.SystemCoordinator.GetMembership();
+                    return m.Members.Count == 2
+                        && m.Members.All(x => x.Role == ClusterMemberRole.Voter)
+                        && !m.Members.Any(x => x.Endpoint == p0Leader.LocalEndpoint);
+                }),
+                ct);
+        }
+        finally
+        {
+            foreach (RaftManager s in survivors)
+                await s.LeaveCluster(true);
         }
     }
 

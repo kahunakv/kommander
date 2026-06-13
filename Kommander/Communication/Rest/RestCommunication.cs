@@ -132,6 +132,16 @@ public class RestCommunication : ICommunication
         return new();
     }
 
+    /// <summary>
+    /// REST implementation is pending (Task 10 will add the Leave endpoint).
+    /// Returns failure so the caller retries via a node that can route the request.
+    /// </summary>
+    public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request)
+    {
+        manager.Logger.LogWarning("SendLeave: REST transport does not yet implement the Leave endpoint; graceful leave will time out.");
+        return Task.FromResult(new LeaveResponse(false));
+    }
+
     public async Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
     {
         string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.JoinRequest);

@@ -146,6 +146,30 @@ public class TestRaftPartitionStateMachine
     }
 
     [Fact]
+    public async Task ReceivedVoteAsync_LearnerInNodes_DoesNotInflateElectionQuorum()
+    {
+        // Three peers in Nodes, but only node-b/node-c are voters; node-d is a Learner that
+        // receives replication yet must not count toward quorum. The election denominator must
+        // be the 3 voters (self + b + c), so self-vote + one voter grant (2 of 3) wins — a
+        // learner in Nodes must not push the quorum to 3-of-4.
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [new("node-b"), new("node-c"), new("node-d")],
+            VoterEndpoints = ["node-a", "node-b", "node-c"]
+        };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: 21);
+        await sm.ReceivedVoteAsync("node-b", voteTerm: 1, remoteMaxLogId: 0);
+
+        // Quorum is 2-of-3 voters; the learner does not raise it to 3, so one grant elects us.
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        Assert.Equal(host.LocalEndpoint, host.Leader);
+    }
+
+    [Fact]
     public async Task StepDownAsync_Leader_BecomesFollowerAndSendsSingleNotice()
     {
         FakePartitionHost host = new()

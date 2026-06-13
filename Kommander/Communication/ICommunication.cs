@@ -28,6 +28,13 @@ public interface ICommunication
     public Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request);
 
     /// <summary>
+    /// Sends a <see cref="LeaveRequest"/> to <paramref name="node"/> asking the P0 leader to
+    /// remove the departing endpoint from the committed roster.  If the target is not the P0
+    /// leader it returns <see cref="LeaveResponse.LeaderHint"/> so the caller can retry.
+    /// </summary>
+    public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request);
+
+    /// <summary>
     /// Queries the remote node at <paramref name="node"/> for the last committed log index it has
     /// recorded for <paramref name="followerEndpoint"/> on <paramref name="partitionId"/>.
     /// <para>

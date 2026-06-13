@@ -189,6 +189,9 @@ public sealed class FakeTransport : ICommunication
     public Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
         => Task.FromResult(new JoinResponse(false));
 
+    public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request)
+        => Task.FromResult(new LeaveResponse(false));
+
     // ── Internal ──────────────────────────────────────────────────────────
 
     private Task<TResponse> EnqueueAndWait<TResponse>(string source, string dest, MessageKind kind, object payload)

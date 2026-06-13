@@ -118,12 +118,123 @@ public sealed class TestFourNodeJoin
         return nodes[0];
     }
 
+    private static async Task<RaftManager> FindLeaderForPartitionAsync(RaftManager[] nodes, int partitionId, CancellationToken ct)
+    {
+        long deadline = Environment.TickCount64 + 15_000;
+        while (Environment.TickCount64 < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+            foreach (RaftManager node in nodes)
+            {
+                if (await node.AmILeaderQuick(partitionId).ConfigureAwait(false))
+                    return node;
+            }
+            await Task.Delay(100, ct).ConfigureAwait(false);
+        }
+        throw new TimeoutException($"No leader for partition {partitionId} within 15 s.");
+    }
+
+    /// <summary>
+    /// Regression for the quorum-inflation bug: a Learner is in the leader's peer set (so it
+    /// receives replication) but must NOT count toward quorum. With one of three voters down and
+    /// a Learner present, a commit must still succeed at 2-of-3 voters. If the Learner inflated the
+    /// denominator to 3-of-4, the leader plus one surviving voter (2 acks) could never reach quorum
+    /// and this commit would stall.
+    /// </summary>
+    [Fact]
+    public async Task LearnerPresent_DoesNotInflateQuorum_CommitSucceedsWithOneVoterDown()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        InMemoryCommunication communication = new();
+
+        // Long stable window so the partitioned Learner is never auto-promoted during the test.
+        TimeSpan longWindow = TimeSpan.FromSeconds(60);
+
+        RaftManager node1 = BuildNode("node1", 1, 8221, ["localhost:8222", "localhost:8223"], communication, logger, promotionStableWindow: longWindow);
+        RaftManager node2 = BuildNode("node2", 2, 8222, ["localhost:8221", "localhost:8223"], communication, logger, promotionStableWindow: longWindow);
+        RaftManager node3 = BuildNode("node3", 3, 8223, ["localhost:8221", "localhost:8222"], communication, logger, promotionStableWindow: longWindow);
+        RaftManager node4 = BuildNode("node4", 4, 8224, ["localhost:8221", "localhost:8222", "localhost:8223"], communication, logger, promotionStableWindow: longWindow);
+
+        communication.SetNodes(new Dictionary<string, IRaft>
+        {
+            ["localhost:8221"] = node1,
+            ["localhost:8222"] = node2,
+            ["localhost:8223"] = node3,
+            ["localhost:8224"] = node4
+        });
+
+        try
+        {
+            await Task.WhenAll(node1.JoinCluster(ct), node2.JoinCluster(ct), node3.JoinCluster(ct));
+            await WaitForConditionAsync(
+                () => node1.IsInitialized && node2.IsInitialized && node3.IsInitialized, ct);
+
+            RaftManager[] voters = [node1, node2, node3];
+
+            // Partition node4 up-front: it never acks, so it stays a Learner (the long stable
+            // window also blocks the never-acked promotion path from promoting it mid-test).
+            communication.PartitionNode("localhost:8224");
+
+            // Admit node4 as a Learner via the P0 leader. We do NOT use JoinCluster(seeds) here
+            // because that blocks until promotion to Voter — node4 must remain a Learner.
+            RaftManager p0Leader = await FindLeaderForPartitionAsync(voters, 0, ct);
+            TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+            p0Leader.SystemCoordinator.Send(new System.RaftSystemRequest(
+                System.RaftSystemRequestType.AddMember, "localhost:8224", 4,
+                p0Leader.SystemCoordinator.GetMembership().MembershipVersion, tcs));
+            (RaftOperationStatus addStatus, _) = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+            Assert.Equal(RaftOperationStatus.Success, addStatus);
+
+            // Wait until every voter's derived peer set includes the Learner — whichever voter is
+            // the user-partition leader must have node4 in host.Nodes for the test to be meaningful.
+            await WaitForConditionAsync(
+                () => voters.All(v => v.GetNodes().Any(n => n.Endpoint == "localhost:8224")), ct);
+            Assert.Equal(System.ClusterMemberRole.Learner,
+                p0Leader.SystemCoordinator.GetMembership().Members.First(m => m.Endpoint == "localhost:8224").Role);
+
+            // Take down one voter that is not the user-partition leader (and, if possible, not the
+            // P0 leader either, to avoid incidental P0 re-election churn).
+            int userPartition = p0Leader.Partitions.Keys.First(k => k != 0);
+            RaftManager p1Leader = await FindLeaderForPartitionAsync(voters, userPartition, ct);
+
+            RaftManager voterToKill =
+                voters.FirstOrDefault(v => v.GetLocalEndpoint() != p1Leader.GetLocalEndpoint()
+                                        && v.GetLocalEndpoint() != p0Leader.GetLocalEndpoint())
+                ?? voters.First(v => v.GetLocalEndpoint() != p1Leader.GetLocalEndpoint());
+
+            communication.PartitionNode(voterToKill.GetLocalEndpoint());
+
+            // Two of three voters remain (leader + one follower). The commit must succeed at
+            // 2-of-3 — the Learner must not have inflated the quorum to 3-of-4.
+            RaftReplicationResult result = await p1Leader.ReplicateLogs(
+                userPartition, "test", [9, 9, 9], cancellationToken: ct);
+
+            Assert.Equal(RaftOperationStatus.Success, result.Status);
+
+            // The Learner must still be a Learner — never promoted.
+            Assert.Equal(System.ClusterMemberRole.Learner,
+                p0Leader.SystemCoordinator.GetMembership().Members.First(m => m.Endpoint == "localhost:8224").Role);
+
+            communication.HealPartition(voterToKill.GetLocalEndpoint());
+            communication.HealPartition("localhost:8224");
+        }
+        finally
+        {
+            await node4.LeaveCluster(dispose: true);
+            await node3.LeaveCluster(dispose: true);
+            await node2.LeaveCluster(dispose: true);
+            await node1.LeaveCluster(dispose: true);
+        }
+    }
+
     private RaftManager BuildNode(
         string name, int id, int port,
         string[] peers,
         InMemoryCommunication communication,
         ILogger<IRaft> logger,
-        int initialPartitions = 1)
+        int initialPartitions = 1,
+        TimeSpan? promotionStableWindow = null)
     {
         RaftConfiguration config = new()
         {
@@ -143,7 +254,7 @@ public sealed class TestFourNodeJoin
             BackfillThreshold = 0,
             MaxBackfillEntriesPerRound = 128,
             LearnerPromotionLag = 5,
-            LearnerPromotionStableWindow = TimeSpan.FromMilliseconds(500),
+            LearnerPromotionStableWindow = promotionStableWindow ?? TimeSpan.FromMilliseconds(500),
         };
 
         return new RaftManager(

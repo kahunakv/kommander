@@ -433,6 +433,16 @@ public class GrpcCommunication : ICommunication
     /// <summary>
     /// Sends a <see cref="JoinRequest"/> to <paramref name="node"/> via the <c>Join</c> gRPC RPC.
     /// </summary>
+    /// <summary>
+    /// gRPC implementation is pending (Task 10 will add the Leave RPC).
+    /// Returns failure so the caller retries via a node that can route the request.
+    /// </summary>
+    public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request)
+    {
+        manager.Logger.LogWarning("SendLeave: gRPC transport does not yet implement the Leave RPC; graceful leave will time out.");
+        return Task.FromResult(new LeaveResponse(false));
+    }
+
     public async Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
     {
         Rafter.RafterClient client = new(SharedChannels.GetChannel(node.Endpoint, GetSecurityOptions(manager)));
