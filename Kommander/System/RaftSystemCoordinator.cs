@@ -1635,19 +1635,22 @@ internal sealed class RaftSystemCoordinator : IDisposable
     /// Called from <c>RaftManager.UpdateNodes</c> on every <see cref="RaftTimerService"/>
     /// <c>UpdateNodes</c> tick.  Runs only when this node is the P0 leader.
     /// <para>
-    /// For each Learner in the committed roster it measures the per-partition lag by querying
-    /// <see cref="RaftManager.GetFollowerCommittedIndexAsync"/> and compares with
-    /// <see cref="RaftPartitionStateMachine.localCommittedIndex"/> held on this leader.
-    /// A learner that stays within <see cref="RaftConfiguration.LearnerPromotionLag"/> entries
-    /// on <em>all</em> partitions for at least <see cref="RaftConfiguration.LearnerPromotionStableWindow"/>
-    /// is promoted to Voter by posting a <see cref="RaftSystemRequestType.PromoteMember"/> request
-    /// onto the coordinator channel.  At most one membership change is in flight at a time.
+    /// For each Learner in the committed roster it measures the per-partition lag on every
+    /// partition (system + user).  For partitions this node leads, lag is read directly from
+    /// <c>lastCommitIndexes</c>.  For partitions led by another node the driver queries that
+    /// node via <see cref="ICommunication.GetRemoteFollowerLag"/> — in the in-memory transport
+    /// this is a direct call; the gRPC transport returns <see langword="null"/> (skip) until a
+    /// dedicated RPC is added.  A learner that stays within
+    /// <see cref="RaftConfiguration.LearnerPromotionLag"/> entries on <em>all</em> checked
+    /// partitions for at least <see cref="RaftConfiguration.LearnerPromotionStableWindow"/> is
+    /// promoted to Voter.  At most one membership change is in flight at a time.
     /// </para>
     /// </summary>
     internal async Task CheckLearnerPromotionsAsync()
     {
         // Only the P0 leader runs the driver.
-        if (!await manager.AmILeaderQuick(RaftSystemConfig.SystemPartition).ConfigureAwait(false))
+        bool amP0Leader = await manager.AmILeaderQuick(RaftSystemConfig.SystemPartition).ConfigureAwait(false);
+        if (!amP0Leader)
         {
             _learnerCaughtUpSince.Clear();
             return;
@@ -1681,21 +1684,51 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
             foreach (int partitionId in allPartitionIds)
             {
-                // Only measure lag on partitions where we are the leader.  As a follower we
-                // do not receive CompleteAppendLogs from other followers, so lastCommitIndexes
-                // for the learner is never populated and lag would be incorrectly huge.
                 bool isPartitionLeader = await manager.AmILeaderQuick(partitionId).ConfigureAwait(false);
-                if (!isPartitionLeader)
+
+                long leaderCommitted;
+                long? learnerCommittedNullable;
+
+                if (isPartitionLeader)
+                {
+                    // Happy path: we lead this partition and can read lastCommitIndexes directly.
+                    leaderCommitted = await manager.GetFollowerCommittedIndexAsync(partitionId, manager.LocalEndpoint).ConfigureAwait(false);
+                    if (leaderCommitted < 0)
+                        continue;
+
+                    // Nullable: null means the learner has never acked this partition at all —
+                    // i.e., the node was not configured with this partition. Skip the lag check
+                    // so a node with fewer partitions than the P0 leader is not blocked.
+                    learnerCommittedNullable = await manager.GetFollowerCommittedIndexNullableAsync(partitionId, endpoint).ConfigureAwait(false);
+                }
+                else
+                {
+                    // This partition is led by another node. Query that node remotely so the
+                    // promotion gate covers ALL partitions, not just those the P0 leader leads.
+                    // If the transport returns null (gRPC before a dedicated RPC is added, or
+                    // the leader is unknown/unreachable) we skip the partition — same as before.
+                    string? leaderEndpoint = manager.GetPartitionLeaderEndpoint(partitionId);
+                    if (string.IsNullOrEmpty(leaderEndpoint))
+                        continue;
+
+                    RaftNode leaderNode = new(leaderEndpoint);
+
+                    // Ask the remote leader for its own committed index (follower = leaderEndpoint
+                    // maps to localCommittedIndex on that node) and for the learner's lag.
+                    long? remoteLeaderCommitted = await manager.Communication.GetRemoteFollowerLag(
+                        manager, leaderNode, partitionId, leaderEndpoint).ConfigureAwait(false);
+                    if (remoteLeaderCommitted is null || remoteLeaderCommitted.Value < 0)
+                        continue;
+
+                    leaderCommitted = remoteLeaderCommitted.Value;
+                    learnerCommittedNullable = await manager.Communication.GetRemoteFollowerLag(
+                        manager, leaderNode, partitionId, endpoint).ConfigureAwait(false);
+                }
+
+                if (learnerCommittedNullable is null)
                     continue;
 
-                // Ask the leader's own partition state machine for its committed index.
-                long leaderCommitted = await manager.GetFollowerCommittedIndexAsync(partitionId, manager.LocalEndpoint).ConfigureAwait(false);
-                if (leaderCommitted < 0)
-                    continue;
-
-                long learnerCommitted = await manager.GetFollowerCommittedIndexAsync(partitionId, endpoint).ConfigureAwait(false);
-
-                long lag = leaderCommitted - learnerCommitted;
+                long lag = leaderCommitted - learnerCommittedNullable.Value;
                 if (lag > manager.Configuration.LearnerPromotionLag)
                 {
                     caughtUp = false;
@@ -1884,8 +1917,13 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
         if (_cachedMembership.Members.Any(m => m.Endpoint == endpoint))
         {
-            logger.LogWarning("TryAddMember: Endpoint {Endpoint} is already in the roster", endpoint);
-            completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+            // Idempotent: a previous AddMember committed but the JoinResponse was lost, so the
+            // joiner retried. Treat this as success so the caller can proceed past the admission
+            // loop without waiting for the 60 s timeout. Return the current version so the joiner
+            // can log the correct roster version.
+            logger.LogInformation("TryAddMember: Endpoint {Endpoint} is already in the roster; treating as idempotent success at version {Version}",
+                endpoint, _cachedMembership.MembershipVersion);
+            completion?.TrySetResult((RaftOperationStatus.Success, _cachedMembership.MembershipVersion));
             return;
         }
 

@@ -448,13 +448,13 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         JoinResponse? accepted = null;
         ValueStopwatch joinStopwatch = ValueStopwatch.StartNew();
 
+        List<string> seedList = seeds.ToList();
+
         while (accepted is null || !accepted.Success)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (joinStopwatch.GetElapsedMilliseconds() > 60_000)
                 throw new TimeoutException("RaftManager.JoinCluster(seeds) timed out after 60 s before being admitted as a Learner.");
-
-            List<string> seedList = seeds.ToList();
             string? leaderHint = null;
 
             foreach (string seed in seedList)
@@ -532,6 +532,12 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// P0 leader endpoint in <see cref="JoinResponse.LeaderHint"/> so the caller can retry directly
     /// against the leader.
     /// </para>
+    /// <para>
+    /// <b>Idempotency:</b> if the endpoint is already committed in the roster (e.g. a previous
+    /// <c>AddMember</c> committed but the response was lost before the joiner saw it), this
+    /// method returns <c>Success</c> with the current roster version rather than an error.  This
+    /// prevents the joiner's retry loop from spinning to the 60 s timeout.
+    /// </para>
     /// </summary>
     public async Task<JoinResponse> ReceiveJoin(JoinRequest request)
     {
@@ -581,6 +587,40 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             return await partition.GetFollowerCommittedIndexAsync(endpoint).ConfigureAwait(false);
 
         return -1;
+    }
+
+    /// <summary>
+    /// Nullable variant: returns <c>null</c> when <paramref name="endpoint"/> has never sent a
+    /// <c>CompleteAppendLogs</c> for this partition — meaning the node does not participate in it.
+    /// Distinguishes "not a participant" from "participant with no committed entries yet (-1)".
+    /// </summary>
+    internal async ValueTask<long?> GetFollowerCommittedIndexNullableAsync(int partitionId, string endpoint)
+    {
+        if (partitionId == RaftSystemConfig.SystemPartition)
+            return systemPartition is not null
+                ? await systemPartition.GetFollowerCommittedIndexNullableAsync(endpoint).ConfigureAwait(false)
+                : null;
+
+        if (partitions.TryGetValue(partitionId, out RaftPartition? partition))
+            return await partition.GetFollowerCommittedIndexNullableAsync(endpoint).ConfigureAwait(false);
+
+        return null;
+    }
+
+    /// <inheritdoc/>
+    public ValueTask<long?> GetFollowerLagAsync(int partitionId, string followerEndpoint)
+        => GetFollowerCommittedIndexNullableAsync(partitionId, followerEndpoint);
+
+    /// <summary>
+    /// Returns the endpoint of the current known leader for <paramref name="partitionId"/>,
+    /// or <see langword="null"/> if unknown or no leader has been observed yet.
+    /// Reads the cached Leader field — no I/O.
+    /// </summary>
+    internal string? GetPartitionLeaderEndpoint(int partitionId)
+    {
+        if (partitionId == RaftSystemConfig.SystemPartition)
+            return systemPartition?.Leader;
+        return partitions.TryGetValue(partitionId, out RaftPartition? p) ? p.Leader : null;
     }
 
     /// <summary>

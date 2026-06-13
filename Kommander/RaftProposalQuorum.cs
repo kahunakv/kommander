@@ -92,12 +92,14 @@ public sealed class RaftProposalQuorum
 
     /// <summary>
     /// Marks the specified node as having completed its participation in the proposal.
-    /// This updates the node's state to indicate that the proposal is complete for that node.
+    /// Silently ignores nodes that were not registered via <see cref="AddExpectedNodeCompletion"/>
+    /// (e.g. learner acks — learners receive log entries but are excluded from quorum).
     /// </summary>
     /// <param name="nodeId">The unique identifier of the node to be marked as completed.</param>
     public void MarkNodeCompleted(string nodeId)
     {
-        nodes[nodeId] = true;
+        if (nodes.ContainsKey(nodeId))
+            nodes[nodeId] = true;
     }
 
     /// <summary>

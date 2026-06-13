@@ -498,11 +498,23 @@ public sealed class RaftPartitionStateMachine
     ///   or -1 when no acknowledgement has been received yet.
     /// Must be called on the executor thread (reads private state machine fields).
     /// </summary>
+    /// <summary>
+    /// Returns the follower's last committed index, or <c>long.MinValue</c> when the follower
+    /// has never sent a <c>CompleteAppendLogs</c> for this partition (key absent from
+    /// <see cref="lastCommitIndexes"/>).
+    /// <para>
+    /// The <c>long.MinValue</c> sentinel lets callers distinguish "not a participant" from
+    /// "participant with no committed entries yet (−1)".  <see cref="RaftPartition"/> maps it
+    /// to −1 for the non-nullable API and to <c>null</c> for the nullable API.
+    /// </para>
+    /// </summary>
     internal long GetFollowerCommittedIndex(string endpoint)
     {
         if (endpoint == host.LocalEndpoint)
             return localCommittedIndex;
-        return lastCommitIndexes.GetValueOrDefault(endpoint, -1);
+        if (lastCommitIndexes.TryGetValue(endpoint, out long idx))
+            return idx;
+        return long.MinValue; // sentinel: never heard from on this partition
     }
 
     private async Task StartElectionAsync(HLCTimestamp currentTime, bool ignoreRecentVoteCooldown)
@@ -980,9 +992,11 @@ public sealed class RaftPartitionStateMachine
             }
 
             preVotes.Add(endpoint);
-            int preVoteQuorum = Math.Max(2, ((host.Nodes.Count + 1) / 2) + 1);
+            // Quorum is computed over voters only; learners in host.Nodes must not inflate the denominator.
+            int preVoterTotal = host.Nodes.Count(n => host.IsVoter(n.Endpoint)) + 1; // +1 for self
+            int preVoteQuorum = Math.Max(2, (preVoterTotal / 2) + 1);
 
-            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received pre-vote from {Endpoint} Term={Term} PreVotes={PreVotes} Quorum={Quorum}/{Total}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, voteTerm, preVotes.Count, preVoteQuorum, host.Nodes.Count + 1);
+            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received pre-vote from {Endpoint} Term={Term} PreVotes={PreVotes} Quorum={Quorum}/{Total}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, voteTerm, preVotes.Count, preVoteQuorum, preVoterTotal);
 
             if (preVotes.Count < preVoteQuorum)
                 return;
@@ -1035,22 +1049,24 @@ public sealed class RaftPartitionStateMachine
         }
 
         int numberVotes = IncreaseVotes(endpoint, voteTerm);
-        int quorum = Math.Max(2, ((host.Nodes.Count + 1) / 2) + 1);
-        
+        // Quorum is computed over voters only; learners in host.Nodes must not inflate the denominator.
+        int voterTotal = host.Nodes.Count(n => host.IsVoter(n.Endpoint)) + 1; // +1 for self
+        int quorum = Math.Max(2, (voterTotal / 2) + 1);
+
         lastCommitIndexes[endpoint] = remoteMaxLogId;
         startCommitIndexes[endpoint] = remoteMaxLogId;
-        
+
         logger.LogInformation(
-            "[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} Term={Term} Votes={Votes} Quorum={Quorum}/{Total} RemoteCommitId={CommitId} Local={LocalCommitId}", 
-            host.LocalEndpoint, 
-            host.PartitionId, 
-            nodeState, 
-            endpoint, 
-            voteTerm, 
-            numberVotes, 
-            quorum, 
-            host.Nodes.Count + 1, 
-            remoteMaxLogId, 
+            "[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} Term={Term} Votes={Votes} Quorum={Quorum}/{Total} RemoteCommitId={CommitId} Local={LocalCommitId}",
+            host.LocalEndpoint,
+            host.PartitionId,
+            nodeState,
+            endpoint,
+            voteTerm,
+            numberVotes,
+            quorum,
+            voterTotal,
+            remoteMaxLogId,
             maxLogResponse
         );
 
@@ -1856,6 +1872,11 @@ public sealed class RaftPartitionStateMachine
         }
 
         RaftProposalQuorum proposalQuorum = RaftProposalQuorumPool.Rent(logs, autoCommit, ticketId);
+
+        // Register the local leader as a voter participant and mark it completed immediately.
+        // Must be done via AddExpectedNodeCompletion so MarkNodeCompleted (which now only
+        // updates existing keys) correctly counts the self-vote in the quorum denominator.
+        proposalQuorum.AddExpectedNodeCompletion(host.LocalEndpoint);
         proposalQuorum.MarkNodeCompleted(host.LocalEndpoint);
 
         foreach (RaftNode node in host.Nodes)
@@ -1863,7 +1884,10 @@ public sealed class RaftPartitionStateMachine
             if (node.Endpoint == host.LocalEndpoint)
                 throw new RaftException("Corrupted nodes");
 
-            proposalQuorum.AddExpectedNodeCompletion(node.Endpoint);
+            // Learners receive log entries for catch-up but must not count toward quorum.
+            // Only add voters to the quorum set; AppendLogToNode is called for all nodes.
+            if (host.IsVoter(node.Endpoint))
+                proposalQuorum.AddExpectedNodeCompletion(node.Endpoint);
             AppendLogToNode(node, ticketId, logs);
         }
 
@@ -1876,12 +1900,11 @@ public sealed class RaftPartitionStateMachine
         if (logger.IsEnabled(LogLevel.Debug))
             logger.LogDebugProposedLogs(host.LocalEndpoint, host.PartitionId, nodeState, ticketId, string.Join(',', logs.Select(x => x.Id.ToString())));
 
-        // Single-node leader (no peers): the self-completion above already satisfies quorum, but no
-        // peer ack will ever arrive to drive CompleteAppendLogsAsync. Drive the identical
-        // Completed → (auto)commit transition here so autoCommit and the WAL completion envelope
-        // behave exactly like the multi-node quorum path. Guarded by Nodes.Count == 0 so it can
-        // never short-circuit a real quorum when peers exist.
-        if (host.Nodes.Count == 0)
+        // Single-voter leader (no voter peers): the self-completion above already satisfies
+        // quorum, but no voter ack will arrive to drive CompleteAppendLogsAsync. Drive the
+        // Completed → (auto)commit transition here. Guarded to voter-only peers so learner-only
+        // peers (which never ack for quorum) don't silently prevent single-voter commit.
+        if (!host.Nodes.Any(n => host.IsVoter(n.Endpoint)))
         {
             proposalQuorum.SetState(RaftProposalState.Completed);
 
@@ -1917,13 +1940,11 @@ public sealed class RaftPartitionStateMachine
         if (completion.MaxLogIndex > localCommittedIndex)
             localCommittedIndex = completion.MaxLogIndex;
 
-        foreach (string node in proposal.Nodes)
-        {
-            if (node == host.LocalEndpoint)
-                continue;
-
-            AppendLogToNode(new(node), ticketId, proposal.Logs);
-        }
+        // Send committed entries to ALL peers (voters + learners). proposal.Nodes only tracks
+        // quorum voters; learners were excluded from quorum but still need log delivery so their
+        // WAL stays in sync. host.Nodes already excludes self, so no self-skip is needed here.
+        foreach (RaftNode node in host.Nodes)
+            AppendLogToNode(node, ticketId, proposal.Logs);
 
         if (logger.IsEnabled(LogLevel.Debug))
             logger.LogDebugCommittedLogs(
@@ -1954,13 +1975,9 @@ public sealed class RaftPartitionStateMachine
 
         proposal.SetState(RaftProposalState.RolledBack);
 
-        foreach (string node in proposal.Nodes)
-        {
-            if (node == host.LocalEndpoint)
-                continue;
-
-            AppendLogToNode(new(node), ticketId, proposal.Logs);
-        }
+        // Same as CompleteLeaderCommit: deliver rollback to all peers, not just quorum voters.
+        foreach (RaftNode node in host.Nodes)
+            AppendLogToNode(node, ticketId, proposal.Logs);
 
         if (logger.IsEnabled(LogLevel.Debug))
             logger.LogDebugRolledbackLogs(

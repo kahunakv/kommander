@@ -62,27 +62,27 @@ public sealed class TestFourNodeJoin
                 node1.JoinCluster(ct),
                 node2.JoinCluster(ct),
                 node3.JoinCluster(ct)
-            ).ConfigureAwait(false);
+            );
 
             await WaitForConditionAsync(
                 () => node1.IsInitialized && node2.IsInitialized && node3.IsInitialized,
-                ct).ConfigureAwait(false);
+                ct);
 
             // ── Step 2: commit entries so node4 has log to backfill ──────────────────
-            RaftManager leader = await FindLeaderAsync([node1, node2, node3], ct).ConfigureAwait(false);
+            RaftManager leader = await FindLeaderAsync([node1, node2, node3], ct);
             int userPartitionId = leader.Partitions.Keys.FirstOrDefault();
             if (userPartitionId != 0)
             {
                 for (int i = 0; i < 10; i++)
                 {
-                    await leader.ReplicateLogs(userPartitionId, "test", [1, 2, 3], cancellationToken: ct).ConfigureAwait(false);
+                    await leader.ReplicateLogs(userPartitionId, "test", [1, 2, 3], cancellationToken: ct);
                 }
             }
 
             // ── Step 3: node4 joins via seeds ────────────────────────────────────────
             // JoinCluster(seeds) contacts a seed, is admitted as Learner, waits for
             // IsInitialized, then waits for promotion to Voter — all within the 60 s deadline.
-            await node4.JoinCluster(["localhost:8201"], ct).ConfigureAwait(false);
+            await node4.JoinCluster(["localhost:8201"], ct);
 
             // ── Step 4: verify node4 is now a committed Voter ─────────────────────────
             Assert.Equal(System.ClusterMemberRole.Voter, node4.LocalRole);
@@ -91,14 +91,14 @@ public sealed class TestFourNodeJoin
             await WaitForConditionAsync(
                 () => node1.SystemCoordinator.GetMembership().Members
                     .Any(m => m.Endpoint == "localhost:8204" && m.Role == System.ClusterMemberRole.Voter),
-                ct).ConfigureAwait(false);
+                ct);
         }
         finally
         {
-            await node4.LeaveCluster(dispose: true).ConfigureAwait(false);
-            await node3.LeaveCluster(dispose: true).ConfigureAwait(false);
-            await node2.LeaveCluster(dispose: true).ConfigureAwait(false);
-            await node1.LeaveCluster(dispose: true).ConfigureAwait(false);
+            await node4.LeaveCluster(dispose: true);
+            await node3.LeaveCluster(dispose: true);
+            await node2.LeaveCluster(dispose: true);
+            await node1.LeaveCluster(dispose: true);
         }
     }
 

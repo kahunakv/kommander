@@ -134,6 +134,17 @@ public class InMemoryCommunication : ICommunication
         return completeAppendLogsResponse;
     }
 
+    public async Task<long?> GetRemoteFollowerLag(RaftManager manager, RaftNode node, int partitionId, string followerEndpoint)
+    {
+        if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))
+            return null;
+
+        if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
+            return await targetNode.GetFollowerLagAsync(partitionId, followerEndpoint).ConfigureAwait(false);
+
+        return null;
+    }
+
     public async Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
     {
         if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))

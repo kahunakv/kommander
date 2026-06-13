@@ -26,4 +26,21 @@ public interface ICommunication
     /// <see cref="JoinResponse.LeaderHint"/> pointing to the current leader.
     /// </summary>
     public Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request);
+
+    /// <summary>
+    /// Queries the remote node at <paramref name="node"/> for the last committed log index it has
+    /// recorded for <paramref name="followerEndpoint"/> on <paramref name="partitionId"/>.
+    /// <para>
+    /// This is used by <c>CheckLearnerPromotionsAsync</c> when the local P0 leader is not the
+    /// leader of a given partition — it asks the actual partition leader for the learner's lag so
+    /// the promotion gate can cover all partitions, not just those led locally.
+    /// </para>
+    /// <para>
+    /// Implementations that do not support this query (e.g. the gRPC transport before a dedicated
+    /// RPC is added) return <see langword="null"/>, causing the caller to skip the partition's lag
+    /// check — the same behaviour as before this method existed.
+    /// </para>
+    /// </summary>
+    public Task<long?> GetRemoteFollowerLag(RaftManager manager, RaftNode node, int partitionId, string followerEndpoint)
+        => Task.FromResult<long?>(null);
 }

@@ -513,7 +513,21 @@ public sealed class RaftPartition : IDisposable
         RaftResponse? response = await executor.Ask(new(RaftRequestType.GetFollowerCommittedIndex, endpoint: endpoint)).ConfigureAwait(false);
         if (response is null || response.Type != RaftResponseType.FollowerCommittedIndex)
             return -1;
-        return response.LogIndex;
+        // long.MinValue is the state machine's sentinel for "never heard from"; normalize to -1.
+        return response.LogIndex == long.MinValue ? -1 : response.LogIndex;
+    }
+
+    /// <summary>
+    /// Nullable variant: returns <c>null</c> when the endpoint has never sent a
+    /// <c>CompleteAppendLogs</c> for this partition (distinguished from −1, which means
+    /// "heard from but no committed entries yet").
+    /// </summary>
+    public async ValueTask<long?> GetFollowerCommittedIndexNullableAsync(string endpoint)
+    {
+        RaftResponse? response = await executor.Ask(new(RaftRequestType.GetFollowerCommittedIndex, endpoint: endpoint)).ConfigureAwait(false);
+        if (response is null || response.Type != RaftResponseType.FollowerCommittedIndex)
+            return null;
+        return response.LogIndex == long.MinValue ? null : response.LogIndex;
     }
 
     /// <summary>

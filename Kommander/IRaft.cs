@@ -248,6 +248,23 @@ public interface IRaft
     public string GetLocalNodeName();
 
     /// <summary>
+    /// Returns the last committed log index that this node's partition state machine has
+    /// recorded for <paramref name="followerEndpoint"/> on <paramref name="partitionId"/>.
+    /// <para>
+    /// This is only meaningful when the local node is the leader of the requested partition;
+    /// only leaders track per-follower committed indexes via <c>CompleteAppendLogs</c> acks.
+    /// Returns <see langword="null"/> when the follower has never acked this partition or when
+    /// the local node does not lead the partition.
+    /// </para>
+    /// <para>
+    /// Intended for cluster-internal use by the promotion driver and similar lag-checking
+    /// code.  Not a public API surface.
+    /// </para>
+    /// </summary>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public ValueTask<long?> GetFollowerLagAsync(int partitionId, string followerEndpoint);
+
+    /// <summary>
     /// Checks if the local node is the leader in the given partition
     /// </summary>
     /// <param name="partitionId"></param>
