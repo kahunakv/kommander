@@ -31,8 +31,10 @@ public interface ICommunication
     /// Sends a <see cref="LeaveRequest"/> to <paramref name="node"/> asking the P0 leader to
     /// remove the departing endpoint from the committed roster.  If the target is not the P0
     /// leader it returns <see cref="LeaveResponse.LeaderHint"/> so the caller can retry.
+    /// <paramref name="cancellationToken"/> bounds the per-attempt wait so the caller's deadline
+    /// is always respected even when the target node is stopped or unreachable.
     /// </summary>
-    public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request);
+    public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Queries the remote node at <paramref name="node"/> for the last committed log index it has

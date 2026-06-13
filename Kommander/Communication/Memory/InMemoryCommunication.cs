@@ -134,13 +134,13 @@ public class InMemoryCommunication : ICommunication
         return completeAppendLogsResponse;
     }
 
-    public async Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request)
+    public async Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default)
     {
         if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))
             return new LeaveResponse(false);
 
         if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode) && targetNode is RaftManager targetManager)
-            return await targetManager.ReceiveLeave(request).ConfigureAwait(false);
+            return await targetManager.ReceiveLeave(request, cancellationToken).ConfigureAwait(false);
 
         Console.WriteLine("SendLeave Unknown node: " + node.Endpoint);
         return new LeaveResponse(false);

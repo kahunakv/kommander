@@ -2052,6 +2052,24 @@ internal sealed class RaftSystemCoordinator : IDisposable
             return;
         }
 
+        // Quorum-safety precondition: at least 1 voter must remain after removal so the
+        // cluster can still commit entries (single-node commit is supported — see commit 3fe6cae).
+        // We do NOT gate non-Voter (Learner/Leaving) removals — those don't affect quorum.
+        if (member.Role == ClusterMemberRole.Voter)
+        {
+            int remainingVoters = _cachedMembership.Members.Count(m => m.Role == ClusterMemberRole.Voter && m.Endpoint != endpoint);
+            if (remainingVoters < 1)
+            {
+                // Would leave zero voters: cluster becomes permanently unavailable.
+                // Return InsufficientVoters so the caller gives up immediately rather than
+                // retrying — this is a permanent condition, not a transient one.
+                logger.LogError("TryRemoveMember: Refusing to remove {Endpoint} — would leave {Remaining} voter(s), making the cluster unavailable",
+                    endpoint, remainingVoters);
+                completion?.TrySetResult((RaftOperationStatus.InsufficientVoters, 0));
+                return;
+            }
+        }
+
         long newVersion = _cachedMembership.MembershipVersion + 1;
 
         ClusterMembership newMembership = new()
@@ -2122,6 +2140,13 @@ internal sealed class RaftSystemCoordinator : IDisposable
     }
 
     private int _stopped;
+
+    /// <summary>
+    /// Returns true once <see cref="Stop"/> has been called.
+    /// Used by <c>RaftManager.ReceiveLeave</c> to fail-fast without posting
+    /// to the coordinator channel, which is already completed at that point.
+    /// </summary>
+    internal bool IsStopped => _stopped != 0;
 
     // ── Lifecycle ──────────────────────────────────────────────────────────
 

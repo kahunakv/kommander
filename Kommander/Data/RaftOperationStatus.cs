@@ -45,4 +45,10 @@ public enum RaftOperationStatus
     /// may be pending at a time. The caller should retry after the in-flight change commits.
     /// </summary>
     ConcurrentMembershipChange = 15,
+
+    /// <summary>
+    /// The requested removal would leave fewer voters than needed to form a majority,
+    /// making the cluster permanently unavailable.  The caller must not retry.
+    /// </summary>
+    InsufficientVoters = 16,
 }

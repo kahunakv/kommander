@@ -1671,7 +1671,9 @@ public sealed class TestRaftSystemCoordinator
         (RaftManager manager, _) = BuildWithMembershipHarness();
         using (manager)
         {
-            // Add → promote → remove.
+            // Add two nodes as learners, promote both to voters, then remove one.
+            // The quorum guard blocks removal of the last voter, so we keep node2 as a
+            // surviving voter to satisfy the minimum-voter invariant.
             var tcs1 = new TaskCompletionSource<(RaftOperationStatus, long)>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
             manager.SystemCoordinator.Send(new RaftSystemRequest(
@@ -1681,22 +1683,35 @@ public sealed class TestRaftSystemCoordinator
             var tcs2 = new TaskCompletionSource<(RaftOperationStatus, long)>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
             manager.SystemCoordinator.Send(new RaftSystemRequest(
-                RaftSystemRequestType.PromoteMember, "node1:9001", 1, 1L, tcs2));
+                RaftSystemRequestType.AddMember, "node2:9002", 2, 1L, tcs2));
             await tcs2.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
-            var tcs3 = new TaskCompletionSource<(RaftOperationStatus Status, long Generation)>(
+            var tcs3 = new TaskCompletionSource<(RaftOperationStatus, long)>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
             manager.SystemCoordinator.Send(new RaftSystemRequest(
-                RaftSystemRequestType.RemoveMember, "node1:9001", 1, 2L, tcs3));
+                RaftSystemRequestType.PromoteMember, "node1:9001", 1, 2L, tcs3));
+            await tcs3.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
-            (RaftOperationStatus status, long version) = await tcs3.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            var tcs4 = new TaskCompletionSource<(RaftOperationStatus, long)>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(
+                RaftSystemRequestType.PromoteMember, "node2:9002", 2, 3L, tcs4));
+            await tcs4.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+            var tcs5 = new TaskCompletionSource<(RaftOperationStatus Status, long Generation)>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(
+                RaftSystemRequestType.RemoveMember, "node1:9001", 1, 4L, tcs5));
+
+            (RaftOperationStatus status, long version) = await tcs5.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
             Assert.Equal(RaftOperationStatus.Success, status);
-            Assert.Equal(3L, version);
+            Assert.Equal(5L, version);
 
             Kommander.System.ClusterMembership m = manager.SystemCoordinator.GetMembership();
-            Assert.Equal(3L, m.MembershipVersion);
-            Assert.Empty(m.Members);
+            Assert.Equal(5L, m.MembershipVersion);
+            Assert.Single(m.Members);
+            Assert.Equal("node2:9002", m.Members[0].Endpoint);
         }
     }
 

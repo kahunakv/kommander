@@ -600,8 +600,13 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// to timeout.
     /// </para>
     /// </summary>
-    public async Task<LeaveResponse> ReceiveLeave(LeaveRequest request)
+    public async Task<LeaveResponse> ReceiveLeave(LeaveRequest request, CancellationToken cancellationToken = default)
     {
+        // Fail-fast when this node has already stopped — the coordinator channel is closed
+        // and posting to it would block until the per-attempt CTS fires (3 s per attempt).
+        if (systemCoordinator.IsStopped)
+            return new LeaveResponse(false);
+
         if (systemPartition is null || !IsInitialized)
             return new LeaveResponse(false);
 
@@ -615,6 +620,11 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+        // Cancel the TCS if the caller's token fires (e.g., per-attempt timeout) so this
+        // method never blocks indefinitely when the coordinator has already been stopped.
+        await using CancellationTokenRegistration reg = cancellationToken.Register(
+            () => tcs.TrySetCanceled(cancellationToken));
+
         systemCoordinator.Send(new System.RaftSystemRequest(
             System.RaftSystemRequestType.RemoveMember,
             request.Endpoint,
@@ -622,12 +632,24 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             systemCoordinator.GetMembership().MembershipVersion,
             tcs));
 
-        (RaftOperationStatus status, long _) = await tcs.Task.ConfigureAwait(false);
+        try
+        {
+            (RaftOperationStatus status, long _) = await tcs.Task.ConfigureAwait(false);
 
-        if (status == RaftOperationStatus.Success)
-            return new LeaveResponse(true);
+            if (status == RaftOperationStatus.Success)
+                return new LeaveResponse(true);
 
-        // Concurrent change or stale version — caller retries.
+            // InsufficientVoters is a permanent condition: removal would brick the cluster.
+            // Return a null-hint response so the caller does not retry.
+            if (status == RaftOperationStatus.InsufficientVoters)
+                return new LeaveResponse(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Per-attempt timeout or caller cancelled — return false so caller retries or gives up.
+        }
+
+        // Concurrent change, stale version, or timeout — caller retries with current leader.
         return new LeaveResponse(false, LocalEndpoint);
     }
 
@@ -732,7 +754,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// When the local node is part of a committed roster (MembershipVersion &gt; 0) this method
     /// first transitions the node to the <see cref="System.ClusterMemberRole.Leaving"/> role
     /// (suppressing elections immediately), commits a <c>RemoveMember</c> entry on P0, and
-    /// waits up to 30 s for the removal to propagate back to this node before tearing down.
+    /// waits up to 10 s for the removal to propagate back to this node before tearing down.
     /// If the cluster has no committed roster (pre-seed transient or test teardown path) the
     /// step is skipped and the node stops immediately.
     /// </para>
@@ -785,13 +807,14 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     /// <summary>
     /// Sends a <c>RemoveMember(self)</c> to the P0 leader, retrying until the removal commits or
-    /// a 30 s deadline expires.  After a successful commit it waits (up to the same deadline) for
-    /// the local roster cache to reflect the removal so downstream callers see <c>NotMember</c>.
+    /// a 10 s deadline expires.  Each individual <c>SendLeave</c> call is bounded by a 3 s
+    /// per-attempt token so a stopped or unreachable node never blocks indefinitely.
     /// Failures are logged but never thrown — the caller always proceeds to stop afterwards.
     /// </summary>
     private async Task CommitGracefulLeaveAsync()
     {
-        const int deadlineMs = 30_000;
+        const int deadlineMs = 10_000;
+        const int attemptTimeoutMs = 3_000;
         ValueStopwatch sw = ValueStopwatch.StartNew();
         LeaveRequest request = new(LocalEndpoint, configuration.NodeId);
 
@@ -810,45 +833,42 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                     continue;
                 }
 
+                using CancellationTokenSource cts = new(attemptTimeoutMs);
+
                 RaftNode leaderNode = new(leaderEndpoint);
-                LeaveResponse resp = await communication.SendLeave(this, leaderNode, request).ConfigureAwait(false);
+                LeaveResponse resp = await communication.SendLeave(this, leaderNode, request, cts.Token).ConfigureAwait(false);
 
                 if (resp.Success)
                 {
-                    // Wait for the committed removal to propagate to our local roster cache.
-                    while (sw.GetElapsedMilliseconds() < deadlineMs)
-                    {
-                        System.ClusterMembership current = systemCoordinator.GetMembership();
-                        if (!current.Members.Any(m => m.Endpoint == LocalEndpoint))
-                            return;
-
-                        await Task.Delay(50).ConfigureAwait(false);
-                    }
-
-                    Logger.LogWarning("LeaveCluster: removal committed but roster propagation timed out after 30 s; proceeding to stop.");
+                    await WaitForRosterRemovalAsync(sw, deadlineMs).ConfigureAwait(false);
                     return;
                 }
 
-                // Not the leader — follow the hint if provided.
-                if (!string.IsNullOrEmpty(resp.LeaderHint) && resp.LeaderHint != leaderEndpoint)
+                // Null hint = no leader to route to (quorum guard, transport stub, stopped node).
+                // Nothing to retry — proceed to stop.
+                if (string.IsNullOrEmpty(resp.LeaderHint))
+                {
+                    Logger.LogInformation("LeaveCluster: leave not accepted and no leader hint; proceeding to stop.");
+                    return;
+                }
+
+                // Not the leader — follow the hint if it differs from the endpoint we just tried.
+                if (resp.LeaderHint != leaderEndpoint)
                 {
                     try
                     {
+                        using CancellationTokenSource hintCts = new(attemptTimeoutMs);
                         RaftNode hint = new(resp.LeaderHint);
-                        LeaveResponse hintResp = await communication.SendLeave(this, hint, request).ConfigureAwait(false);
+                        LeaveResponse hintResp = await communication.SendLeave(this, hint, request, hintCts.Token).ConfigureAwait(false);
                         if (hintResp.Success)
                         {
-                            // Same propagation wait.
-                            while (sw.GetElapsedMilliseconds() < deadlineMs)
-                            {
-                                System.ClusterMembership current = systemCoordinator.GetMembership();
-                                if (!current.Members.Any(m => m.Endpoint == LocalEndpoint))
-                                    return;
+                            await WaitForRosterRemovalAsync(sw, deadlineMs).ConfigureAwait(false);
+                            return;
+                        }
 
-                                await Task.Delay(50).ConfigureAwait(false);
-                            }
-
-                            Logger.LogWarning("LeaveCluster: removal committed but roster propagation timed out after 30 s; proceeding to stop.");
+                        if (string.IsNullOrEmpty(hintResp.LeaderHint))
+                        {
+                            Logger.LogInformation("LeaveCluster: leave not accepted by hint {Hint} and no further leader hint; proceeding to stop.", resp.LeaderHint);
                             return;
                         }
                     }
@@ -867,7 +887,25 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             }
         }
 
-        Logger.LogWarning("LeaveCluster: graceful leave timed out after 30 s; proceeding to stop without committed removal.");
+        Logger.LogWarning("LeaveCluster: graceful leave timed out; proceeding to stop without committed removal.");
+    }
+
+    /// <summary>
+    /// Polls the local roster cache until the local endpoint is absent (removal propagated) or
+    /// the overall deadline is reached.  Returns <c>true</c> if the removal was observed locally.
+    /// </summary>
+    private async Task<bool> WaitForRosterRemovalAsync(ValueStopwatch sw, int deadlineMs)
+    {
+        while (sw.GetElapsedMilliseconds() < deadlineMs)
+        {
+            if (!systemCoordinator.GetMembership().Members.Any(m => m.Endpoint == LocalEndpoint))
+                return true;
+
+            await Task.Delay(50).ConfigureAwait(false);
+        }
+
+        Logger.LogWarning("LeaveCluster: removal committed but roster propagation timed out; proceeding to stop.");
+        return false;
     }
 
     private async Task DrainPartitions(CancellationToken cancellationToken)

@@ -127,7 +127,7 @@ public sealed class TestRaftTransportDispatcher
         public Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
             => Task.FromResult(new JoinResponse(false));
 
-        public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request)
+        public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default)
             => Task.FromResult(new LeaveResponse(false));
     }
 

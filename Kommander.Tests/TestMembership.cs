@@ -277,23 +277,20 @@ public sealed class TestMembership
                 },
                 ct);
 
-            // Remaining quorum (n1 + n2) must still be able to commit.
-            RaftManager leader = n1;
-            foreach (RaftManager candidate in new[] { n1, n2 })
-            {
-                if (await candidate.AmILeaderQuick(1))
-                {
-                    leader = candidate;
-                    break;
-                }
-            }
+            // Wait for a leader on partition 1 — n3 may have been leader and its departure
+            // triggers a re-election that takes a few hundred milliseconds.
+            await WaitForLeader([n1, n2], partitionId: 1, ct);
 
+            // Remaining quorum (n1 + n2) must still be able to commit.
+            RaftManager leader = await n1.AmILeaderQuick(1) ? n1 : n2;
             RaftReplicationResult result = await leader.ReplicateLogs(1, "test", [1, 2, 3], cancellationToken: ct);
             Assert.Equal(RaftOperationStatus.Success, result.Status);
 
-            // n3 is no longer a Voter in the roster — its LocalRole after stop is NotMember
-            // (the roster was updated before it stopped, so _leaving is the last observed state).
-            // What we can assert is that it was removed from peer rosters.
+            // Nodes list is updated lazily by the UpdateNodes timer; trigger it explicitly
+            // so the assertion doesn't race the 50 ms tick.
+            await n1.UpdateNodes();
+            await n2.UpdateNodes();
+
             Assert.DoesNotContain(n1.GetNodes(), n => n.Endpoint == "localhost:8103");
             Assert.DoesNotContain(n2.GetNodes(), n => n.Endpoint == "localhost:8103");
         }
@@ -353,6 +350,35 @@ public sealed class TestMembership
             foreach (RaftManager s in survivors)
                 await s.LeaveCluster(true);
         }
+    }
+
+    [Fact]
+    public async Task GracefulLeave_LastVoter_ExitsFastWithoutSpinning()
+    {
+        // Verifies that when InsufficientVoters is returned (removing the last voter would
+        // make the cluster permanently unavailable), CommitGracefulLeaveAsync exits
+        // immediately rather than spinning to the 10 s graceful-leave deadline.
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        (RaftManager n1, RaftManager n2, RaftManager n3) = await BuildThreeNodeCluster(logger, ct);
+
+        await WaitForCondition(
+            () => n1.SystemCoordinator.GetMembership().MembershipVersion > 0,
+            ct);
+
+        // Remove n1 and n2 in order, leaving n3 as the sole voter.
+        await n1.LeaveCluster(dispose: true);
+        await n2.LeaveCluster(dispose: true);
+
+        // n3 is the last voter.  Either:
+        //   (a) n3 is the P0 leader → TryRemoveMember returns InsufficientVoters → fast exit, or
+        //   (b) the cached leader (n1/n2) is stopped → IsStopped returns LeaveResponse(false, null) → fast exit.
+        // In both cases the call must complete well under the 10 s deadline.
+        long startMs = Environment.TickCount64;
+        await n3.LeaveCluster(dispose: true);
+        long elapsedMs = Environment.TickCount64 - startMs;
+
+        Assert.True(elapsedMs < 5_000,
+            $"Last-voter LeaveCluster took {elapsedMs} ms; expected < 5 000 ms.");
     }
 
     [Fact]
