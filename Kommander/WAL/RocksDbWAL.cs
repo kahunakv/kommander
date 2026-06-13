@@ -59,14 +59,6 @@ public class RocksDbWAL : IWAL, IDisposable
     private const int MaxShards = 8;
 
     /// <summary>
-    /// Defines the maximum number of log entries that can be retrieved in a ranged query
-    /// when reading logs from the Write-Ahead Log (WAL). This constant is used to limit
-    /// the number of entries returned in a single operation to ensure performance and
-    /// prevent excessive resource usage during log read operations.
-    /// </summary>
-    private const int MaxNumberOfRangedEntries = 100;
-
-    /// <summary>
     /// Specifies the fixed width, in bytes, used for encoding and storing
     /// unique identifiers within the Write-Ahead Log (WAL).
     /// This value is utilized to ensure consistent byte representation of IDs
@@ -259,32 +251,21 @@ public class RocksDbWAL : IWAL, IDisposable
     }
 
     /// <summary>
-    /// Reads a range of logs from the Write-Ahead Log (WAL) for the specified partition,
-    /// starting from the given log index.
+    /// Reads up to <paramref name="maxEntries"/> logs for <paramref name="partitionId"/> with id ≥
+    /// <paramref name="startLogIndex"/>, sorted ascending. The iterator stops advancing once
+    /// <paramref name="maxEntries"/> rows have been read so large tails are not scanned in full.
     /// </summary>
-    /// <param name="partitionId">
-    /// The ID of the partition from which to read the logs.
-    /// </param>
-    /// <param name="startLogIndex">
-    /// The starting index from which logs should be read. Logs with a lower index will be excluded.
-    /// </param>
-    /// <returns>
-    /// A list of <see cref="RaftLog"/> instances representing the logs read from the specified partition,
-    /// starting from the specified log index.
-    /// </returns>
-    public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex)
+    public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue)
     {
         List<RaftLog> result = [];
 
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-        
+
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
-        
+
         Span<byte> seekKey = stackalloc byte[LogKeyWidth];
         BuildLogKey(seekKey, partitionId, Math.Max(0, startLogIndex));
         iterator.Seek(seekKey);
-
-        int counter = 0;
 
         while (iterator.Valid())
         {
@@ -292,7 +273,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 break;
 
             RaftLogMessage message = Unserializer(iterator.Value());
-            
+
             if (message.Partition != partitionId || message.Id < startLogIndex)
             {
                 iterator.Next();
@@ -317,12 +298,10 @@ public class RocksDbWAL : IWAL, IDisposable
             }
 
             result.Add(raftLog);
-            
+
             iterator.Next();
 
-            counter++;
-
-            if (counter >= MaxNumberOfRangedEntries)
+            if (result.Count >= maxEntries)
                 break;
         }
 

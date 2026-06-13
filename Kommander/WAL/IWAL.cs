@@ -42,10 +42,12 @@ public interface IWAL : IDisposable
     public List<RaftLog> ReadLogs(int partitionId);
 
     /// <summary>
-    /// Reads up to a bounded number of logs for <paramref name="partitionId"/> with id ≥
-    /// <paramref name="startLogIndex"/>, sorted ascending.
+    /// Reads up to <paramref name="maxEntries"/> logs for <paramref name="partitionId"/> with id ≥
+    /// <paramref name="startLogIndex"/>, sorted ascending. The storage engine must stop reading after
+    /// <paramref name="maxEntries"/> rows so that callers far behind the leader do not read the entire
+    /// remaining tail only to discard most of it in memory.
     /// </summary>
-    public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex);
+    public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue);
 
     /// <summary>
     /// Persists <paramref name="logs"/>. Atomic per partition. Overwrites any existing entry with the same

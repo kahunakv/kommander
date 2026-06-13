@@ -44,7 +44,7 @@ public class InMemoryWAL : IWAL, IDisposable
         }
     }
 
-    public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex)
+    public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue)
     {
         rwLock.EnterReadLock();
         try
@@ -55,8 +55,11 @@ public class InMemoryWAL : IWAL, IDisposable
             {
                 foreach (KeyValuePair<long, RaftLog> keyValue in partitionLogs)
                 {
-                    if (keyValue.Key >= startLogIndex)
-                        result.Add(keyValue.Value);
+                    if (keyValue.Key < startLogIndex)
+                        continue;
+                    result.Add(keyValue.Value);
+                    if (result.Count >= maxEntries)
+                        break;
                 }
             }
 

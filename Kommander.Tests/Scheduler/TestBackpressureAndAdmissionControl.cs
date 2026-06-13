@@ -67,6 +67,7 @@ public sealed class TestBackpressureAndAdmissionControl
         public ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs) => ValueTask.CompletedTask;
         public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(0L);
         public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(0L);
+        public ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) => ValueTask.FromResult(new List<RaftLog>());
 
         public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp ts, bool autoCommit)
             => MakeNoOp();
@@ -443,7 +444,7 @@ public sealed class TestBackpressureAndAdmissionControl
         }
 
         public List<RaftLog> ReadLogs(int partitionId) => [];
-        public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex) => [];
+        public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue) => [];
         public long GetMaxLog(int partitionId) => 0;
         public long GetCurrentTerm(int partitionId) => 0;
         public long GetLastCheckpoint(int partitionId) => 0;

@@ -842,6 +842,60 @@ public class TestRaftPartitionStateMachine
             r => r.Endpoint == "node-b" && r.Type == RaftResponderRequestType.Vote);
     }
 
+    [Fact]
+    public async Task ReceivedVoteAsync_FromNonRosterEndpoint_IsDiscarded()
+    {
+        // A candidate should not tally a grant from an endpoint absent from the roster,
+        // even if the grant is technically well-formed (stale node, buggy peer, etc.).
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [new("node-b")],
+            VoterEndpoints = ["node-a", "node-b"] // node-z is NOT in the roster
+        };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        // Put the state machine into Candidate state so the real-vote tally branch is reachable.
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: 200);
+        Assert.Equal(RaftNodeState.Candidate, sm.NodeState);
+
+        long termBefore = sm.CurrentTerm;
+
+        // node-z sends a vote grant for the candidate's term — must be discarded.
+        await sm.ReceivedVoteAsync("node-z", voteTerm: termBefore, remoteMaxLogId: 0, preVote: false);
+
+        // Still a Candidate — the stray grant must not have pushed us to Leader.
+        Assert.Equal(RaftNodeState.Candidate, sm.NodeState);
+    }
+
+    [Fact]
+    public async Task ReceivedVoteAsync_PreVote_FromNonRosterEndpoint_IsDiscarded()
+    {
+        // 3-node cluster: self (node-a), node-b, node-c.  Quorum = 2.
+        // Self already casts the first pre-grant; one more grant reaches quorum and would promote
+        // to Candidate.  A non-roster grant must be discarded so promotion does not happen.
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [new("node-b"), new("node-c")],
+            VoterEndpoints = ["node-a", "node-b", "node-c"] // node-z is NOT in the roster
+        };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        // CheckPartitionLeadershipAsync on a fresh follower (lastHeartbeat == Zero) opens a
+        // pre-vote round, seeds self's pre-grant, and stays in Follower state.
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+
+        // node-z sends a pre-vote grant for the open round — must be discarded without promoting.
+        await sm.ReceivedVoteAsync("node-z", voteTerm: sm.CurrentTerm + 1, remoteMaxLogId: 0, preVote: true);
+
+        // Still Follower — the stray grant must not have completed the pre-vote quorum.
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+    }
+
     private sealed class FakePartitionHost : IRaftPartitionHost
     {
         public int PartitionId { get; init; } = 1;
@@ -949,6 +1003,9 @@ public class TestRaftPartitionStateMachine
         public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(wal.GetMaxLog(partitionId: 1));
 
         public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(wal.GetCurrentTerm(partitionId: 1));
+
+        public ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) =>
+            ValueTask.FromResult(new List<RaftLog>());
 
         public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp timestamp, bool autoCommit) =>
             new(null!, 1, WALWriteOperationType.LeaderPropose, (1, logs), timestamp, autoCommit: autoCommit, term: term);

@@ -757,6 +757,40 @@ public sealed class RaftWriteAhead
     }
 
     /// <summary>
+    /// Reads up to <paramref name="maxEntries"/> committed log entries with id ≥
+    /// <paramref name="startLogIndex"/>, sorted ascending. The bound is pushed to the storage
+    /// engine so that a follower far behind the leader does not cause a full tail scan.
+    /// Uncommitted (proposed/rolled-back) entries within the returned batch are filtered out.
+    ///
+    /// <para><b>Compaction floor limitation:</b> if the leader has already compacted past
+    /// <paramref name="startLogIndex"/>, the WAL returns entries starting above that index,
+    /// producing a log gap that the follower's append path will reject. This method returns
+    /// an empty list in that case (all pre-compaction entries are gone), and the
+    /// <c>SendHeartbeat</c> backfill path falls through to a plain heartbeat — leaving the
+    /// follower unable to catch up without a full snapshot. Snapshot-based recovery is
+    /// tracked as part of the elastic-partitions transfer spec
+    /// (<c>docs/elastic-partitions-spec.md</c>).</para>
+    /// </summary>
+    public async ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries)
+    {
+        List<RaftLog> all = await manager.ReadScheduler.EnqueueTask(
+            partition.PartitionId,
+            () => walAdapter.ReadLogsRange(partition.PartitionId, startLogIndex, maxEntries)
+        ).ConfigureAwait(false);
+
+        // Filter out any uncommitted entries (proposed/rolled-back) within the bounded batch.
+        // The storage layer already capped the row count, so no further size check is needed.
+        List<RaftLog> result = [];
+        foreach (RaftLog log in all)
+        {
+            if (log.Type != RaftLogType.Committed && log.Type != RaftLogType.CommittedCheckpoint)
+                continue;
+            result.Add(log);
+        }
+        return result;
+    }
+
+    /// <summary>
     /// Starts log compaction for this partition if no pass is already running.
     /// Returns immediately without waiting for the pass to finish.
     /// </summary>

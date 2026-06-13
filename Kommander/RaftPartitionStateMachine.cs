@@ -58,6 +58,15 @@ public sealed class RaftPartitionStateMachine
     private bool heartbeatsSuspendedForTesting;
     private bool restored;
 
+    /// <summary>
+    /// Highest log index the leader has durably committed (set by <see cref="CompleteLeaderCommit"/>).
+    /// Compared against <see cref="lastCommitIndexes"/> in <c>SendHeartbeat</c> to decide whether
+    /// a follower gap warrants backfill. Intentionally excludes in-flight proposed-but-uncommitted
+    /// entries so healthy followers don't trigger spurious WAL reads under write load.
+    /// Reset to -1 on every leader→follower transition.
+    /// </summary>
+    private long localCommittedIndex = -1;
+
     public RaftNodeState NodeState => nodeState;
     public long CurrentTerm => currentTerm;
 
@@ -155,7 +164,7 @@ public sealed class RaftPartitionStateMachine
             case RaftNodeState.Leader:
             {
                 if (currentTime != HLCTimestamp.Zero && ((currentTime - lastHeartbeat) >= host.Configuration.HeartbeatInterval))
-                    SendHeartbeat(false);
+                    await SendHeartbeat(false).ConfigureAwait(false);
             
                 return;
             }
@@ -179,6 +188,7 @@ public sealed class RaftPartitionStateMachine
                     random.Next(host.Configuration.StartElectionTimeout, host.Configuration.EndElectionTimeout));
                 expectedLeaders.Clear();
                 lastCommitIndexes.Clear();
+                localCommittedIndex = -1;
                 activeProposals.Clear();
                 ResetPreVoteRound();
 
@@ -219,6 +229,7 @@ public sealed class RaftPartitionStateMachine
         votingStartedAt = HLCTimestamp.Zero;
         expectedLeaders.Clear();
         lastCommitIndexes.Clear();
+        localCommittedIndex = -1;
         activeProposals.Clear();
 
         await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
@@ -280,6 +291,7 @@ public sealed class RaftPartitionStateMachine
         expectedLeaders.Clear();
         expectedLeaders[targetTerm] = targetEndpoint;
         lastCommitIndexes.Clear();
+        localCommittedIndex = -1;
         activeProposals.Clear();
 
         await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
@@ -305,15 +317,14 @@ public sealed class RaftPartitionStateMachine
         return Task.CompletedTask;
     }
 
-    public Task ResumeHeartbeatsAsync(ulong? replyCorrelationId)
+    public async Task ResumeHeartbeatsAsync(ulong? replyCorrelationId)
     {
         heartbeatsSuspendedForTesting = false;
 
         if (nodeState == RaftNodeState.Leader && host.Leader == host.LocalEndpoint)
-            SendHeartbeat(true);
+            await SendHeartbeat(true).ConfigureAwait(false);
 
         CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, 0L));
-        return Task.CompletedTask;
     }
 
     public void ResetTestingState()
@@ -364,6 +375,7 @@ public sealed class RaftPartitionStateMachine
         votingStartedAt = HLCTimestamp.Zero;
         expectedLeaders.Clear();
         lastCommitIndexes.Clear();
+        localCommittedIndex = -1;
         activeProposals.Clear();
         lastHeartbeat = HLCTimestamp.Zero;
 
@@ -390,6 +402,7 @@ public sealed class RaftPartitionStateMachine
         votingStartedAt = HLCTimestamp.Zero;
         expectedLeaders.Clear();
         lastCommitIndexes.Clear();
+        localCommittedIndex = -1;
         activeProposals.Clear();
         lastHeartbeat = HLCTimestamp.Zero;
 
@@ -414,6 +427,7 @@ public sealed class RaftPartitionStateMachine
 
         expectedLeaders.Clear();
         lastCommitIndexes.Clear();
+        localCommittedIndex = -1;
         votes.Clear();
         activeProposals.Clear();
 
@@ -434,7 +448,7 @@ public sealed class RaftPartitionStateMachine
             lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
 
             await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
-            SendHeartbeat(true);
+            await SendHeartbeat(true).ConfigureAwait(false);
 
             CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, 0L));
             return;
@@ -539,7 +553,7 @@ public sealed class RaftPartitionStateMachine
             lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
 
             await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
-            SendHeartbeat(true);
+            await SendHeartbeat(true).ConfigureAwait(false);
             return;
         }
 
@@ -651,13 +665,13 @@ public sealed class RaftPartitionStateMachine
     /// </summary>
     /// <param name="force"></param>
     /// <exception cref="RaftException"></exception>
-    private void SendHeartbeat(bool force)
+    private async Task SendHeartbeat(bool force)
     {
         if (!force && heartbeatsSuspendedForTesting)
             return;
 
         IReadOnlyList<RaftNode> nodes = host.Nodes;
-        
+
         if (nodes.Count == 0)
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] No other nodes availables to send hearthbeat", host.LocalEndpoint, host.PartitionId, nodeState);
@@ -677,8 +691,6 @@ public sealed class RaftPartitionStateMachine
             KommanderMetrics.HeartbeatDelayMs.Record(
                 (lastHeartbeat - prevHeartbeat).TotalMilliseconds, heartbeatTags);
 
-        //int number = 0;
-        
         foreach (RaftNode node in nodes)
         {
             if (node.Endpoint == host.LocalEndpoint)
@@ -693,9 +705,37 @@ public sealed class RaftPartitionStateMachine
             }
 
             host.UpdateLastHeartbeat(node.Endpoint, host.PartitionId, lastHeartbeat);
-            
-            //logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Sending heartbeat to {Node} #{Number}", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, ++number);
-            
+
+            // Backfill: if the follower's acknowledged committed log trails the leader's committed
+            // index by more than BackfillThreshold, ship up to MaxBackfillEntriesPerRound committed
+            // entries instead of an empty heartbeat so it converges without waiting for new writes.
+            // localCommittedIndex is in-memory and always reflects only durably committed entries,
+            // so healthy followers with in-flight proposals do not trigger spurious WAL reads.
+            if (nodeState == RaftNodeState.Leader
+                && localCommittedIndex >= 0
+                && lastCommitIndexes.TryGetValue(node.Endpoint, out long followerMaxLog)
+                && localCommittedIndex - followerMaxLog > host.Configuration.BackfillThreshold)
+            {
+                List<RaftLog> backfill = await wal.GetRangeAsync(
+                    followerMaxLog + 1,
+                    host.Configuration.MaxBackfillEntriesPerRound
+                ).ConfigureAwait(false);
+
+                if (backfill.Count > 0)
+                {
+                    logger.LogDebug(
+                        "[{LocalEndpoint}/{PartitionId}/{State}] Backfilling {Count} entries to {Endpoint} from={From} leaderCommitted={LeaderCommitted}",
+                        host.LocalEndpoint, host.PartitionId, nodeState,
+                        backfill.Count, node.Endpoint, followerMaxLog + 1, localCommittedIndex);
+                    AppendLogToNode(node, lastHeartbeat, backfill);
+                    continue;
+                }
+                // Empty batch: the leader has compacted past followerMaxLog+1. The follower
+                // cannot catch up via log replay alone and needs a snapshot transfer. Fall
+                // through to a plain heartbeat until snapshot-based recovery is implemented
+                // (see elastic-partitions-spec.md and GetRangeAsync for the full limitation).
+            }
+
             AppendLogToNode(node, lastHeartbeat, null);
         }
     }
@@ -898,6 +938,16 @@ public sealed class RaftPartitionStateMachine
     /// <returns>A task that represents the asynchronous operation.</returns>
     public async Task ReceivedVoteAsync(string endpoint, long voteTerm, long remoteMaxLogId, bool preVote = false)
     {
+        // Symmetric guard: discard grants from any endpoint that is not a committed voter.
+        // Normal operation is safe without this (candidates only solicit host.Nodes, which is
+        // voters-only), but an unsolicited or stale grant from a non-roster node should not
+        // be tallied toward quorum.
+        if (!host.IsVoter(endpoint))
+        {
+            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Ignoring {PreVote}vote grant from {Endpoint} Term={Term}: endpoint is not a committed voter", host.LocalEndpoint, host.PartitionId, nodeState, preVote ? "pre-" : "", endpoint, voteTerm);
+            return;
+        }
+
         if (preVote)
         {
             // Tally a pre-grant. Placed before the Follower early-return because a node running a
@@ -1009,7 +1059,7 @@ public sealed class RaftPartitionStateMachine
 
         await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint);
 
-        SendHeartbeat(true);
+        await SendHeartbeat(true).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1058,6 +1108,7 @@ public sealed class RaftPartitionStateMachine
                 host.Leader = endpoint;
                 currentTerm = leaderTerm;
                 lastCommitIndexes.Clear();
+                localCommittedIndex = -1;
                 activeProposals.Clear();
                 expectedLeaders.TryAdd(leaderTerm, endpoint);
                 
@@ -1840,6 +1891,9 @@ public sealed class RaftPartitionStateMachine
 
         proposal.SetState(RaftProposalState.Committed);
         HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+
+        if (completion.MaxLogIndex > localCommittedIndex)
+            localCommittedIndex = completion.MaxLogIndex;
 
         foreach (string node in proposal.Nodes)
         {

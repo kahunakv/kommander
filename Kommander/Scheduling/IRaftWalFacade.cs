@@ -33,6 +33,13 @@ public interface IRaftWalFacade
 
     ValueTask<long> GetCurrentTermAsync();
 
+    /// <summary>
+    /// Reads up to <paramref name="maxEntries"/> committed log entries with id ≥
+    /// <paramref name="startLogIndex"/>, sorted ascending. Used by the leader to
+    /// backfill stale followers one bounded chunk at a time.
+    /// </summary>
+    ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries);
+
     WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp timestamp, bool autoCommit);
 
     WALWriteOperation EnqueueCommit(List<RaftLog> logs);

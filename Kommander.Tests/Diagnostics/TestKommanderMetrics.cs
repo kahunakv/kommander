@@ -116,6 +116,7 @@ public sealed class TestKommanderMetrics : IDisposable
         public ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs) => ValueTask.CompletedTask;
         public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(0L);
         public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(0L);
+        public ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) => ValueTask.FromResult(new List<RaftLog>());
         public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp ts, bool autoCommit) => MakeNoOp();
         public WALWriteOperation EnqueueCommit(List<RaftLog> logs) => MakeNoOp();
         public WALWriteOperation EnqueueRollback(List<RaftLog> logs) => MakeNoOp();

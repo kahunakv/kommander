@@ -299,6 +299,30 @@ public abstract class WalConformanceTests
         finally { cleanup(); }
     }
 
+    /// <summary>
+    /// Verifies that <paramref name="maxEntries"/> is honoured at the storage level: writing 10 entries
+    /// and requesting 3 must return exactly 3, not all 10. This guards against the O(n²) full-tail
+    /// scan that happens when the limit is only applied in memory after reading everything.
+    /// </summary>
+    [Fact]
+    public void ReadLogsRange_MaxEntriesIsEnforcedAtStorageLevel()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(200, [
+                Log(id: 1), Log(id: 2), Log(id: 3), Log(id: 4), Log(id: 5),
+                Log(id: 6), Log(id: 7), Log(id: 8), Log(id: 9), Log(id: 10)
+            ])]);
+
+            List<RaftLog> result = wal.ReadLogsRange(200, 1, maxEntries: 3);
+
+            Assert.Equal(3, result.Count);
+            Assert.Equal([1L, 2L, 3L], result.Select(l => l.Id));
+        }
+        finally { cleanup(); }
+    }
+
     // ──────────────────────────── CountPersistedLogs ────────────────────────────
 
     [Fact]

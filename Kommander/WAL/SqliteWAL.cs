@@ -13,14 +13,6 @@ namespace Kommander.WAL;
 public class SqliteWAL : IWAL, IDisposable
 {
     /// <summary>
-    /// Represents the maximum number of ranged log entries that can be read in a single call.
-    /// This constant is used to limit the number of Raft log entries retrieved from the SQLite Write-Ahead Log (WAL)
-    /// during operations like reading a range of logs. It ensures that the operation retrieves a reasonable number
-    /// of entries to prevent excessive memory usage or prolonged database operations.
-    /// </summary>
-    private const int MaxNumberOfRangedEntries = 100;
-
-    /// <summary>
     /// Serializes creation of new per-partition connections. Only held while a connection for a
     /// previously unseen partition is being opened; never held during normal read/write operations.
     /// </summary>
@@ -232,20 +224,17 @@ public class SqliteWAL : IWAL, IDisposable
     }
 
     /// <summary>
-    /// Reads a range of Raft logs starting from a specified log index for a given partition.
+    /// Reads up to <paramref name="maxEntries"/> Raft logs for <paramref name="partitionId"/> with id ≥
+    /// <paramref name="startLogIndex"/>, sorted ascending. The LIMIT is pushed into SQL so the database
+    /// engine stops reading at the boundary rather than returning the full tail to the caller.
     /// </summary>
-    /// <param name="partitionId">The identifier of the partition from which logs should be read.</param>
-    /// <param name="startLogIndex">The starting log index from which logs will be retrieved.</param>
-    /// <returns>A list of <see cref="RaftLog"/> objects representing the logs in the specified range.</returns>
-    public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex)
+    public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue)
     {
         (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
 
         lock (partitionLock)
         {
             List<RaftLog> result = [];
-
-            int counter = 0;
 
             const string query = """
              SELECT id, term, type, logType, log, timeNode, timePhysical, timeCounter
@@ -277,9 +266,7 @@ public class SqliteWAL : IWAL, IDisposable
                     )
                 });
 
-                counter++;
-
-                if (counter >= MaxNumberOfRangedEntries)
+                if (result.Count >= maxEntries)
                     break;
             }
 

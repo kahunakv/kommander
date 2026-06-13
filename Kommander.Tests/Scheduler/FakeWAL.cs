@@ -111,10 +111,10 @@ public sealed class FakeWAL : IWAL
     }
 
     /// <inheritdoc/>
-    public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex)
+    public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue)
     {
         if (_logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? dict))
-            return dict.Where(kv => kv.Key >= startLogIndex).Select(kv => kv.Value).ToList();
+            return dict.Where(kv => kv.Key >= startLogIndex).Take(maxEntries).Select(kv => kv.Value).ToList();
         return [];
     }
 

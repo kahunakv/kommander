@@ -308,7 +308,7 @@ public sealed class TestFairWalScheduler
         }
 
         public List<RaftLog> ReadLogs(int partitionId) => [];
-        public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex) => [];
+        public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue) => [];
         public long GetMaxLog(int partitionId) => 0;
         public long GetCurrentTerm(int partitionId) => 0;
         public long GetLastCheckpoint(int partitionId) => -1;
@@ -335,7 +335,7 @@ public sealed class TestFairWalScheduler
         }
 
         public List<RaftLog> ReadLogs(int partitionId) => [];
-        public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex) => [];
+        public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue) => [];
         public long GetMaxLog(int partitionId) => 0;
         public long GetCurrentTerm(int partitionId) => 0;
         public long GetLastCheckpoint(int partitionId) => -1;
@@ -355,7 +355,7 @@ public sealed class TestFairWalScheduler
             => throw new InvalidOperationException("Simulated WAL error.");
 
         public List<RaftLog> ReadLogs(int partitionId) => [];
-        public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex) => [];
+        public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue) => [];
         public long GetMaxLog(int partitionId) => 0;
         public long GetCurrentTerm(int partitionId) => 0;
         public long GetLastCheckpoint(int partitionId) => -1;

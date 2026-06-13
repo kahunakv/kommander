@@ -586,9 +586,10 @@ public sealed class TestThreeNodeCluster
 
         // Commit entries on the surviving quorum while the paused node's log goes stale and it
         // campaigns in isolation (its pre-votes can reach no one, so it never disrupts the leader).
+        // Use more than BackfillThreshold (default 10) entries so automatic backfill fires on resume.
         IRaft leader = GetNodeByEndpoint(nodes, initialLeader);
         byte[] data = "Hello World"u8.ToArray();
-        const int entries = 6;
+        const int entries = 12;
         for (int i = 0; i < entries; i++)
         {
             RaftReplicationResult response = await leader.ReplicateLogs(
@@ -624,20 +625,8 @@ public sealed class TestThreeNodeCluster
 
         IRaft decidedLeader = GetNodeByEndpoint(nodes, resumedLeaderView);
 
-        // Drive further replication after the rejoin: the resumed follower must accept it and
-        // converge with the leader (it is a healthy follower again, not a stuck candidate).
-        for (int i = 0; i < 3; i++)
-        {
-            RaftReplicationResult response = await decidedLeader.ReplicateLogs(
-                1,
-                "Greeting",
-                data,
-                cancellationToken: TestContext.Current.CancellationToken);
-
-            Assert.Equal(RaftOperationStatus.Success, response.Status);
-        }
-
-        // The resumed node's log converges with the leader's.
+        // The leader's heartbeat loop detects the gap (> BackfillThreshold) and ships committed
+        // entries automatically — no manual replications needed to drive convergence.
         await WaitForConditionAsync(
             () => pausedNode.WalAdapter.GetMaxLog(1) >= decidedLeader.WalAdapter.GetMaxLog(1),
             TestContext.Current.CancellationToken,

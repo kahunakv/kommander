@@ -215,6 +215,25 @@ public class RaftConfiguration
     /// a separate "reserve" concept unnecessary.
     /// </remarks>
 
+    // ── Bounded log backfill ──────────────────────────────────────────────────
+
+    /// <summary>
+    /// Number of committed entries a follower may trail the leader before the leader
+    /// switches from empty heartbeats to active backfill on that follower.
+    /// Lower values trigger backfill sooner; higher values tolerate more lag before
+    /// kicking in. Default 10.
+    /// </summary>
+    public int BackfillThreshold { get; set; } = 10;
+
+    /// <summary>
+    /// Maximum number of committed entries shipped to a single stale follower per
+    /// heartbeat interval. Bounds the per-round WAL read and network payload so that
+    /// backfill cannot starve concurrent client writes. Default 128.
+    /// </summary>
+    public int MaxBackfillEntriesPerRound { get; set; } = 128;
+
+    // ── WAL compaction ────────────────────────────────────────────────────────
+
     /// <summary>
     /// Committed operations between automatic WAL compaction triggers per partition.
     /// Set to 0 or a negative value to disable automatic compaction.
