@@ -4,6 +4,7 @@ using Kommander.Communication;
 using Kommander.Communication.Memory;
 using Kommander.Data;
 using Kommander.Discovery;
+using Kommander.Gossip;
 using Kommander.Time;
 using Kommander.WAL;
 using Microsoft.Extensions.Logging;
@@ -88,6 +89,7 @@ public sealed class TestPhantomPeerPreVote
         public Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request) => Task.FromResult(new BatchRequestsResponse());
         public Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request) => Task.FromResult(new JoinResponse(false));
         public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default) => Task.FromResult(new LeaveResponse(false));
+        public Task<GossipAck> SendGossip(RaftManager manager, RaftNode node, GossipMessage digest, CancellationToken cancellationToken = default) => Task.FromResult(new GossipAck(0, null));
     }
 
     /// <summary>
@@ -144,6 +146,7 @@ public sealed class TestPhantomPeerPreVote
         public Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request) => Task.FromResult(new BatchRequestsResponse());
         public Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request) => Task.FromResult(new JoinResponse(false));
         public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default) => Task.FromResult(new LeaveResponse(false));
+        public Task<GossipAck> SendGossip(RaftManager manager, RaftNode node, GossipMessage digest, CancellationToken cancellationToken = default) => Task.FromResult(new GossipAck(0, null));
     }
 
     // -----------------------------------------------------------------------

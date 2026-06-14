@@ -295,6 +295,10 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 await TryRemoveMember(message, cancellationToken).ConfigureAwait(false);
                 break;
 
+            case RaftSystemRequestType.ApplyGossipRoster:
+                ApplyGossipRoster(message);
+                break;
+
             case RaftSystemRequestType.DrainSentinel:
                 if (_drainQueue.TryDequeue(out TaskCompletionSource? tcs))
                     tcs.TrySetResult();
@@ -1627,6 +1631,33 @@ internal sealed class RaftSystemCoordinator : IDisposable
     /// </summary>
     internal ClusterMembership GetMembership() => _cachedMembership;
 
+    /// <summary>
+    /// Applies a gossiped roster to the local cache when its version exceeds the locally
+    /// committed version.  Called from the coordinator channel loop so it is serialized
+    /// against all other cache mutations; the Raft log is never written.
+    /// </summary>
+    private void ApplyGossipRoster(RaftSystemRequest request)
+    {
+        ClusterMembership? roster = request.GossipedRoster;
+        if (roster is null || roster.MembershipVersion <= _cachedMembership.MembershipVersion)
+            return;
+
+        logger.LogDebug(
+            "Gossip: updating local cache from v{Old} to v{New} via peer push",
+            _cachedMembership.MembershipVersion, roster.MembershipVersion);
+
+        _cachedMembership = roster;
+    }
+
+    /// <summary>
+    /// Resets the local membership cache to an empty roster.
+    /// Intended for tests that need to simulate a node that missed committed membership
+    /// entries, allowing the gossip anti-entropy path to be exercised in isolation.
+    /// Must not be called in production code.
+    /// </summary>
+    internal void ResetMembershipCacheForTest() =>
+        _cachedMembership = new ClusterMembership { MembershipVersion = 0, Members = [] };
+
     // ── Learner promotion driver ───────────────────────────────────────────────
     // Keyed by learner endpoint; records when the learner first appeared caught-up on all partitions.
     private readonly Dictionary<string, DateTimeOffset> _learnerCaughtUpSince = new();
@@ -1777,6 +1808,67 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 // Not caught up — reset the stable window for this learner.
                 _learnerCaughtUpSince.Remove(endpoint);
             }
+        }
+    }
+
+    /// <summary>
+    /// P0-leader-only eviction driver: for each member whose SWIM liveness state has
+    /// been <see cref="Gossip.MemberLivenessState.Dead"/> for at least
+    /// <c>DeadMemberEvictionGrace</c>, commits a single <c>RemoveMember</c> entry.
+    /// One eviction per call; caller retries on the next tick.
+    ///
+    /// <para>
+    /// Only the P0 leader evicts — followers update their own liveness table but never
+    /// commit membership changes.  The quorum-safety precondition in
+    /// <see cref="TryRemoveMember"/> prevents eviction from draining the voter set below
+    /// a viable majority.
+    /// </para>
+    /// </summary>
+    internal async Task EvictDeadMembersAsync()
+    {
+        bool amP0Leader = await manager.AmILeaderQuick(RaftSystemConfig.SystemPartition).ConfigureAwait(false);
+        if (!amP0Leader)
+            return;
+
+        if (_membershipChangePending)
+            return;
+
+        ClusterMembership roster = _cachedMembership;
+        if (roster.MembershipVersion == 0)
+            return;
+
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        TimeSpan grace = manager.Configuration.DeadMemberEvictionGrace;
+
+        IReadOnlyList<string> evictable = manager.Liveness.GetEvictable(now, grace);
+        if (evictable.Count == 0)
+            return;
+
+        foreach (string endpoint in evictable)
+        {
+            // Only evict members that are still in the roster.
+            ClusterMember? member = roster.Members.FirstOrDefault(m => m.Endpoint == endpoint);
+            if (member is null)
+            {
+                manager.Liveness.Remove(endpoint);
+                continue;
+            }
+
+            // Don't evict self — a running node cannot be dead.
+            if (endpoint == manager.LocalEndpoint)
+            {
+                manager.Liveness.Remove(endpoint);
+                continue;
+            }
+
+            logger.LogWarning(
+                "[RaftSystemCoordinator] Evicting Dead member {Endpoint} (dead > {Grace:g}); roster version {Version}",
+                endpoint, grace, roster.MembershipVersion);
+
+            Send(new RaftSystemRequest(RaftSystemRequestType.RemoveMember, endpoint, member.NodeId, roster.MembershipVersion));
+
+            // One eviction per tick — the coordinator loop processes them serially.
+            return;
         }
     }
 

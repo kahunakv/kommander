@@ -4,6 +4,7 @@ using Google.Protobuf;
 using Google.Protobuf.Collections;
 using Grpc.Core;
 using Kommander.Data;
+using Kommander.Gossip;
 using Microsoft.Extensions.Logging;
 
 namespace Kommander.Communication.Grpc;
@@ -441,6 +442,37 @@ public class GrpcCommunication : ICommunication
     /// </summary>
     public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default)
         => Task.FromResult(new LeaveResponse(false));
+
+    /// <summary>
+    /// The Gossip RPC is not yet implemented on the gRPC transport.
+    /// Returns an empty ACK (version 0, no roster) so the gossip loop silently skips
+    /// this peer rather than throwing. Gossip convergence falls back to the in-process
+    /// path; deployed clusters that use this transport will rely on Raft replication alone
+    /// until a dedicated gRPC RPC is added.
+    /// </summary>
+    public Task<GossipAck> SendGossip(RaftManager manager, RaftNode node, GossipMessage digest, CancellationToken cancellationToken = default)
+        => Task.FromResult(new GossipAck(0, null));
+
+    /// <summary>
+    /// The Ping RPC is not yet implemented on the gRPC transport.
+    /// Returns <c>PingResponse(false, 0)</c> — i.e. the peer is reported unreachable.
+    /// <para>
+    /// <b>Warning:</b> if <c>PingInterval</c> is positive on a gRPC cluster these stubs will
+    /// cause every healthy peer to be suspected, declared Dead, and eventually evicted.
+    /// <c>PingInterval</c> defaults to <see cref="TimeSpan.Zero"/> precisely to prevent this;
+    /// do not enable the ping timer until the wire RPC is implemented.
+    /// </para>
+    /// </summary>
+    public Task<Gossip.PingResponse> SendPing(RaftManager manager, RaftNode node, Gossip.PingRequest request, CancellationToken cancellationToken = default)
+        => Task.FromResult(new Gossip.PingResponse(false, 0));
+
+    /// <summary>
+    /// The PingReq RPC is not yet implemented on the gRPC transport.
+    /// Returns <c>PingReqResponse(false)</c> — the target is reported unreachable.
+    /// See the warning on <see cref="SendPing"/>.
+    /// </summary>
+    public Task<Gossip.PingReqResponse> SendPingReq(RaftManager manager, RaftNode node, Gossip.PingReqRequest request, CancellationToken cancellationToken = default)
+        => Task.FromResult(new Gossip.PingReqResponse(false));
 
     public async Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
     {

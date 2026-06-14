@@ -53,5 +53,14 @@ public enum RaftSystemRequestType
     /// Quorum shrinks at the commit point; single-server safety guarantees the remaining
     /// majority can still commit.
     /// </summary>
-    RemoveMember
+    RemoveMember,
+
+    /// <summary>
+    /// Applies a gossiped roster to the local membership cache when its version is
+    /// strictly newer than the locally committed version.
+    /// This path never writes to the Raft log — it only converges the local cache so
+    /// that <c>UpdateNodes</c> and peer routing reflect committed changes that have not
+    /// yet been replicated to this node via the normal append-logs path.
+    /// </summary>
+    ApplyGossipRoster
 }

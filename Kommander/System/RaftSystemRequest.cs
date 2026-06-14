@@ -55,6 +55,13 @@ public sealed class RaftSystemRequest
     /// </summary>
     public long ExpectedMembershipVersion { get; init; }
 
+    /// <summary>
+    /// Gossiped membership roster for <see cref="RaftSystemRequestType.ApplyGossipRoster"/> requests.
+    /// Applied to the local cache only when its version exceeds the locally committed version;
+    /// never written to the Raft log.
+    /// </summary>
+    public ClusterMembership? GossipedRoster { get; init; }
+
     public RaftSystemRequest(RaftSystemRequestType type)
     {
         Type = type;
@@ -103,6 +110,15 @@ public sealed class RaftSystemRequest
         Type = RaftSystemRequestType.MergePartition;
         MergePlan = plan;
         Completion = completion;
+    }
+
+    /// <summary>
+    /// Constructor for <see cref="RaftSystemRequestType.ApplyGossipRoster"/> requests.
+    /// </summary>
+    public RaftSystemRequest(ClusterMembership gossipedRoster)
+    {
+        Type = RaftSystemRequestType.ApplyGossipRoster;
+        GossipedRoster = gossipedRoster;
     }
 
     /// <summary>

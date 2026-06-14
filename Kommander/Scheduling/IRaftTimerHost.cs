@@ -18,4 +18,16 @@ public interface IRaftTimerHost
 
     /// <summary>Refreshes the cluster node registry via discovery.</summary>
     Task UpdateNodes();
+
+    /// <summary>
+    /// Runs one gossip round: contacts up to <c>GossipFanout</c> random peers,
+    /// exchanges membership versions, and applies any newer roster to the local cache.
+    /// </summary>
+    Task GossipAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Runs one SWIM probe round: picks a random peer, probes it directly and (on
+    /// timeout) via indirect relays, then updates the local liveness table.
+    /// </summary>
+    Task PingAsync(CancellationToken cancellationToken = default);
 }

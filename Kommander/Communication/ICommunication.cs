@@ -1,5 +1,6 @@
 
 using Kommander.Data;
+using Kommander.Gossip;
 
 namespace Kommander.Communication;
 
@@ -35,6 +36,50 @@ public interface ICommunication
     /// is always respected even when the target node is stopped or unreachable.
     /// </summary>
     public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Sends a <see cref="GossipMessage"/> to <paramref name="node"/> for membership anti-entropy.
+    /// The receiver applies the roster to its local cache when the sender's version is strictly
+    /// higher, and responds with its own roster when it holds newer data, enabling push-pull
+    /// convergence in one round trip.  Gossip never writes to the Raft log.
+    /// <para>
+    /// Implementations that do not yet support gossip (e.g. the gRPC transport before a
+    /// dedicated RPC is added) return a <see cref="GossipAck"/> with version 0 and a
+    /// null roster, which causes the caller to skip the update silently.
+    /// </para>
+    /// </summary>
+    public Task<GossipAck> SendGossip(
+        RaftManager manager, RaftNode node, GossipMessage digest,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(new GossipAck(0, null));
+
+    /// <summary>
+    /// Sends a SWIM direct probe to <paramref name="node"/>.  The receiver replies immediately
+    /// (while alive) with its current incarnation so the sender can record an up-to-date
+    /// <see cref="Gossip.MemberLivenessState.Alive"/> entry.
+    /// <para>
+    /// Implementations that do not yet support this RPC return
+    /// <c>PingResponse(false, 0)</c>, causing the sender to treat the probe as timed out.
+    /// </para>
+    /// </summary>
+    public Task<Gossip.PingResponse> SendPing(
+        RaftManager manager, RaftNode node, Gossip.PingRequest request,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(new Gossip.PingResponse(false, 0));
+
+    /// <summary>
+    /// Asks <paramref name="node"/> to relay a direct ping to
+    /// <see cref="Gossip.PingReqRequest.TargetEndpoint"/> on the caller's behalf.
+    /// Used as an indirect probe step when a direct ping times out.
+    /// <para>
+    /// Implementations that do not yet support this RPC return
+    /// <c>PingReqResponse(false)</c>, causing the indirect probe to be counted as a failure.
+    /// </para>
+    /// </summary>
+    public Task<Gossip.PingReqResponse> SendPingReq(
+        RaftManager manager, RaftNode node, Gossip.PingReqRequest request,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(new Gossip.PingReqResponse(false));
 
     /// <summary>
     /// Queries the remote node at <paramref name="node"/> for the last committed log index it has

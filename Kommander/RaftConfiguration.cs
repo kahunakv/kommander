@@ -250,6 +250,66 @@ public class RaftConfiguration
     /// </summary>
     public TimeSpan LearnerPromotionStableWindow { get; set; } = TimeSpan.FromSeconds(3);
 
+    // ── Gossip anti-entropy ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Interval between gossip rounds.  Each round contacts <see cref="GossipFanout"/>
+    /// random peers and exchanges membership versions, pulling the current roster from
+    /// any peer that holds a newer committed version.  Default 5 seconds.
+    /// </summary>
+    public TimeSpan GossipInterval { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Number of random peers contacted per gossip round.  Higher values converge
+    /// stale caches faster at the cost of additional network fan-out.
+    /// Setting this to 0 disables gossip entirely.  Default 2.
+    /// </summary>
+    public int GossipFanout { get; set; } = 2;
+
+    // ── SWIM failure detector ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// How long to wait for a direct or indirect ping response before declaring a
+    /// probe as timed out.  Smaller values detect failures faster at the cost of
+    /// more false positives on slow networks.  Default 500 ms.
+    /// </summary>
+    public TimeSpan PingTimeout { get; set; } = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>
+    /// Number of random intermediary nodes used for indirect probing after a direct
+    /// ping times out.  Reduces false positives caused by a single faulty path between
+    /// the prober and the target.  Default 2.
+    /// </summary>
+    public int IndirectPingFanout { get; set; } = 2;
+
+    /// <summary>
+    /// How long a node can remain <c>Suspect</c> before being promoted to <c>Dead</c>.
+    /// Should be large enough for a healthy node to refute suspicion via gossip before
+    /// being declared dead.  Default 5 seconds.
+    /// </summary>
+    public TimeSpan SuspicionTimeout { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// How long a <c>Dead</c> node must remain in that state before the P0 leader
+    /// commits a <c>RemoveMember</c> entry.  A grace period absorbs transient partitions
+    /// that resolve before the eviction log entry is applied.  Default 30 seconds.
+    /// </summary>
+    public TimeSpan DeadMemberEvictionGrace { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Interval between SWIM ping rounds.  Each round picks one random peer to probe.
+    /// Setting this to zero or a negative value disables the failure detector entirely.
+    /// <para>
+    /// <b>Default is <see cref="TimeSpan.Zero"/> (disabled).</b>  The SWIM prober must only
+    /// be enabled when <see cref="ICommunication.SendPing"/> and
+    /// <see cref="ICommunication.SendPingReq"/> are genuinely implemented for the active
+    /// transport.  The gRPC and REST stubs return <c>false</c> for every probe, which would
+    /// cause the failure detector to mark every healthy peer as Dead and evict them.
+    /// Set a positive interval only after the wire RPCs are available (see Task 15).
+    /// </para>
+    /// </summary>
+    public TimeSpan PingInterval { get; set; } = TimeSpan.Zero;
+
     // ── WAL compaction ────────────────────────────────────────────────────────
 
     /// <summary>

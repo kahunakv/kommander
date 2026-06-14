@@ -37,13 +37,20 @@ public sealed class RaftTimerService : IDisposable
 
     private Timer? _checkLeaderTimer;
     private Timer? _updateNodesTimer;
+    private Timer? _gossipTimer;
+    private Timer? _pingTimer;
 
     private volatile bool _started;
     private volatile bool _stopped;
     private int _updateNodesRunning;  // 0 = idle, 1 = running; prevents overlapping ticks
+    private int _gossipRunning;       // 0 = idle, 1 = running; prevents overlapping ticks
+    private int _pingRunning;         // 0 = idle, 1 = running; prevents overlapping ticks
 
     private readonly TimeSpan _checkLeaderInterval;
     private readonly TimeSpan _updateNodesInterval;
+    private readonly TimeSpan _gossipInterval;
+    private readonly int _gossipFanout;
+    private readonly TimeSpan _pingInterval;
     private readonly TimeSpan _initialDelay;
 
     public RaftTimerService(
@@ -56,6 +63,9 @@ public sealed class RaftTimerService : IDisposable
         _logger = logger;
         _checkLeaderInterval = configuration.CheckLeaderInterval;
         _updateNodesInterval = configuration.UpdateNodesInterval;
+        _gossipInterval = configuration.GossipInterval;
+        _gossipFanout = configuration.GossipFanout;
+        _pingInterval = configuration.PingInterval;
         _initialDelay = initialDelay ?? configuration.TimerInitialDelay;
     }
 
@@ -80,6 +90,28 @@ public sealed class RaftTimerService : IDisposable
             _initialDelay,
             _updateNodesInterval
         );
+
+        // Gossip is disabled when GossipFanout is 0.
+        if (_gossipFanout > 0)
+        {
+            _gossipTimer = new Timer(
+                _ => TriggerGossip(),
+                null,
+                _initialDelay,
+                _gossipInterval
+            );
+        }
+
+        // SWIM failure detector is disabled when PingInterval is non-positive.
+        if (_pingInterval > TimeSpan.Zero)
+        {
+            _pingTimer = new Timer(
+                _ => TriggerPing(),
+                null,
+                _initialDelay,
+                _pingInterval
+            );
+        }
     }
 
     /// <summary>
@@ -94,6 +126,8 @@ public sealed class RaftTimerService : IDisposable
         _stopped = true;
         _checkLeaderTimer?.Change(Timeout.Infinite, Timeout.Infinite);
         _updateNodesTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+        _gossipTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+        _pingTimer?.Change(Timeout.Infinite, Timeout.Infinite);
     }
 
     /// <summary>
@@ -166,11 +200,84 @@ public sealed class RaftTimerService : IDisposable
         }
     }
 
+    /// <summary>
+    /// Runs one gossip round, contacting random peers to exchange membership versions
+    /// and pulling any newer committed roster into the local cache.
+    ///
+    /// <para>Invoked by the internal gossip timer, but public so tests can drive it
+    /// synchronously without waiting for a real timer tick.</para>
+    /// </summary>
+    public void TriggerGossip()
+    {
+        if (_stopped || !_host.Joined)
+            return;
+
+        if (Interlocked.CompareExchange(ref _gossipRunning, 1, 0) != 0)
+            return;
+
+        _ = GossipTickAsync();
+    }
+
+    private async Task GossipTickAsync()
+    {
+        try
+        {
+            await _host.GossipAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                "RaftTimerService.TriggerGossip: {Message}\n{StackTrace}",
+                ex.Message, ex.StackTrace);
+        }
+        finally
+        {
+            Volatile.Write(ref _gossipRunning, 0);
+        }
+    }
+
+    /// <summary>
+    /// Runs one SWIM probe round.
+    ///
+    /// <para>Invoked by the internal ping timer, but public so tests can drive it
+    /// synchronously without waiting for a real timer tick.</para>
+    /// </summary>
+    public void TriggerPing()
+    {
+        if (_stopped || !_host.Joined)
+            return;
+
+        if (Interlocked.CompareExchange(ref _pingRunning, 1, 0) != 0)
+            return;
+
+        _ = PingTickAsync();
+    }
+
+    private async Task PingTickAsync()
+    {
+        try
+        {
+            await _host.PingAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                "RaftTimerService.TriggerPing: {Message}\n{StackTrace}",
+                ex.Message, ex.StackTrace);
+        }
+        finally
+        {
+            Volatile.Write(ref _pingRunning, 0);
+        }
+    }
+
     public void Dispose()
     {
         GC.SuppressFinalize(this);
         Stop();
         _checkLeaderTimer?.Dispose();
         _updateNodesTimer?.Dispose();
+        _gossipTimer?.Dispose();
+        _pingTimer?.Dispose();
     }
 }

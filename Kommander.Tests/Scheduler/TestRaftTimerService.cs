@@ -40,6 +40,10 @@ public sealed class TestRaftTimerService
             return Task.CompletedTask;
         }
 
+        public Task GossipAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public Task PingAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+
         // Convenience — number of CheckLeader calls recorded across all tracking partitions.
         public int TotalCheckLeaderCalls => UserPartitions.Sum(p => p.CheckLeaderCount);
     }
@@ -79,6 +83,8 @@ public sealed class TestRaftTimerService
         public RaftPartition? SystemPartition => null;
         public IEnumerable<RaftPartition> GetUserPartitions() => _partitionsGetter();
         public Task UpdateNodes() => _updateNodes();
+        public Task GossipAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task PingAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────

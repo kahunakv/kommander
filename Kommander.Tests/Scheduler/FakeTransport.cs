@@ -1,6 +1,7 @@
 
 using Kommander.Communication;
 using Kommander.Data;
+using Kommander.Gossip;
 
 namespace Kommander.Tests.Scheduler;
 
@@ -191,6 +192,9 @@ public sealed class FakeTransport : ICommunication
 
     public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default)
         => Task.FromResult(new LeaveResponse(false));
+
+    public Task<GossipAck> SendGossip(RaftManager manager, RaftNode node, GossipMessage digest, CancellationToken cancellationToken = default)
+        => Task.FromResult(new GossipAck(0, null));
 
     // ── Internal ──────────────────────────────────────────────────────────
 

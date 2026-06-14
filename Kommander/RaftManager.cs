@@ -4,6 +4,7 @@ using System.ComponentModel;
 
 using Kommander.Communication;
 using Kommander.Data;
+using Kommander.Gossip;
 using Kommander.Diagnostics;
 using Kommander.Discovery;
 using Kommander.System;
@@ -65,6 +66,13 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     private int _disposed;
 
     private IRaftStateMachineTransfer? _stateMachineTransfer;
+
+    /// <summary>
+    /// SWIM failure-detector liveness table for this node.
+    /// Tracks Alive/Suspect/Dead state for all known peers.
+    /// The P0 leader uses this table to decide which members to evict.
+    /// </summary>
+    internal readonly LivenessTable Liveness = new();
 
     /// <summary>
     /// Optional snapshot-transfer implementation registered by the application.
@@ -654,6 +662,240 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
+    /// Handles an inbound gossip digest from a peer.
+    /// <para>
+    /// If the sender carries a newer committed roster the request is posted to the
+    /// coordinator channel so it is applied to the local membership cache in the correct
+    /// serial order.  The response always carries the local committed version and, when
+    /// locally newer, the full roster so the sender can catch up in the same round trip.
+    /// </para>
+    /// <para>
+    /// This method is intentionally synchronous: the coordinator update is fire-and-forget
+    /// (posted to a channel); the caller does not need to await it before returning the ACK.
+    /// </para>
+    /// </summary>
+    public GossipAck ReceiveGossip(GossipMessage digest)
+    {
+        ClusterMembership local = systemCoordinator.GetMembership();
+
+        // If peer has a newer committed roster, queue an update to our local cache.
+        if (digest.Roster is not null && digest.MembershipVersion > local.MembershipVersion)
+            systemCoordinator.Send(new System.RaftSystemRequest(digest.Roster));
+
+        // Apply piggybacked liveness updates; refute self-suspicion if required.
+        if (Liveness.ApplyUpdates(LocalEndpoint, digest.LivenessUpdates))
+        {
+            long refutedInc = Liveness.RefuteSuspicion(LocalEndpoint);
+            Logger.LogInformation("ReceiveGossip: self was Suspect in gossip; refuting with incarnation {Inc}", refutedInc);
+        }
+
+        // Respond with our current roster so the sender can catch up if we are ahead.
+        bool includeRoster = local.MembershipVersion > digest.MembershipVersion;
+        return new GossipAck(local.MembershipVersion, includeRoster ? local : null);
+    }
+
+    /// <summary>
+    /// Runs one gossip round: contacts up to <see cref="RaftConfiguration.GossipFanout"/>
+    /// randomly chosen peers from the current node list, sends a <see cref="GossipMessage"/>
+    /// carrying the locally committed roster and piggybacked liveness state, and applies any
+    /// newer roster returned in the ACK.
+    /// <para>
+    /// Called by <see cref="RaftTimerService.TriggerGossip"/> on a periodic timer.  Tests
+    /// may call it directly to drive gossip deterministically without waiting for the timer.
+    /// </para>
+    /// </summary>
+    public async Task GossipAsync(CancellationToken cancellationToken = default)
+    {
+        ClusterMembership membership = systemCoordinator.GetMembership();
+        if (membership.MembershipVersion == 0 || configuration.GossipFanout <= 0)
+            return;
+
+        List<RaftNode> peers = [..Nodes];
+        if (peers.Count == 0)
+            return;
+
+        IReadOnlyList<MemberLivenessEntry> livenessUpdates = Liveness.GetAll();
+        GossipMessage digest = new(LocalEndpoint, membership.MembershipVersion, membership)
+        {
+            LivenessUpdates = livenessUpdates.Count > 0 ? livenessUpdates : null
+        };
+
+        int fanout = Math.Min(configuration.GossipFanout, peers.Count);
+
+        // Partial Fisher-Yates shuffle to pick fanout random peers.
+        for (int i = 0; i < fanout; i++)
+        {
+            int j = Random.Shared.Next(i, peers.Count);
+            (peers[i], peers[j]) = (peers[j], peers[i]);
+        }
+
+        for (int i = 0; i < fanout; i++)
+        {
+            try
+            {
+                GossipAck ack = await communication.SendGossip(this, peers[i], digest, cancellationToken).ConfigureAwait(false);
+
+                // If peer returned a newer roster, update our local cache.
+                if (ack.Roster is not null && ack.MembershipVersion > systemCoordinator.GetMembership().MembershipVersion)
+                    systemCoordinator.Send(new System.RaftSystemRequest(ack.Roster));
+            }
+            catch (Exception ex)
+            {
+                Logger.LogDebug("GossipAsync: failed to contact {Peer}: {Message}", peers[i].Endpoint, ex.Message);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Handles an inbound SWIM direct probe from a peer.
+    /// The receiver is always alive if it can process the message; it returns its current
+    /// incarnation so the sender can record an up-to-date Alive entry.
+    /// If our own liveness entry is Suspect (e.g. carried in a prior gossip round), we
+    /// refute immediately by bumping our incarnation.
+    /// </summary>
+    public PingResponse ReceivePing(PingRequest request)
+    {
+        long incarnation = Liveness.GetSelfIncarnation();
+        // If we've been marked Suspect by another node's gossip reaching us, refute.
+        if (Liveness.GetState(LocalEndpoint) >= MemberLivenessState.Suspect)
+            incarnation = Liveness.RefuteSuspicion(LocalEndpoint);
+        return new PingResponse(true, incarnation);
+    }
+
+    /// <summary>
+    /// Handles an inbound SWIM indirect probe request: relays a direct
+    /// <see cref="PingRequest"/> to <see cref="PingReqRequest.TargetEndpoint"/> and reports
+    /// whether the target was reachable within <c>PingTimeout</c>.
+    /// </summary>
+    public async Task<PingReqResponse> ReceivePingReq(PingReqRequest request, CancellationToken cancellationToken = default)
+    {
+        RaftNode? targetNode = Nodes.FirstOrDefault(n => n.Endpoint == request.TargetEndpoint);
+        if (targetNode is null)
+            return new PingReqResponse(false);
+
+        using CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(configuration.PingTimeout);
+
+        try
+        {
+            PingResponse resp = await communication.SendPing(this, targetNode, new PingRequest(LocalEndpoint), cts.Token).ConfigureAwait(false);
+            return new PingReqResponse(resp.Alive);
+        }
+        catch
+        {
+            return new PingReqResponse(false);
+        }
+    }
+
+    /// <summary>
+    /// Runs one SWIM probe round: picks a random peer from <see cref="Nodes"/>, sends a
+    /// direct <see cref="PingRequest"/>, and if it times out follows up with up to
+    /// <c>IndirectPingFanout</c> indirect probes.  On total failure the peer is marked
+    /// <see cref="MemberLivenessState.Suspect"/>; on success it is marked
+    /// <see cref="MemberLivenessState.Alive"/>.
+    /// <para>
+    /// Also advances the Suspect→Dead expiry, so a peer whose suspicion age exceeds
+    /// <c>SuspicionTimeout</c> transitions to Dead during this call.
+    /// </para>
+    /// <para>
+    /// Called by <see cref="RaftTimerService.TriggerPing"/> on a periodic timer.  Tests may
+    /// call it directly to drive probing deterministically without waiting for the timer.
+    /// </para>
+    /// </summary>
+    public async Task PingAsync(CancellationToken cancellationToken = default)
+    {
+        // Advance Suspect → Dead before processing this round's probe results.
+        Liveness.AdvanceExpiry(DateTimeOffset.UtcNow, configuration.SuspicionTimeout);
+
+        ClusterMembership membership = systemCoordinator.GetMembership();
+        if (membership.MembershipVersion == 0)
+            return;
+
+        List<RaftNode> peers = [..Nodes];
+        if (peers.Count == 0)
+            return;
+
+        // Pick one random peer to probe this round.
+        int idx = Random.Shared.Next(peers.Count);
+        RaftNode target = peers[idx];
+
+        // Direct probe.
+        bool alive = false;
+        long incarnation = 0;
+
+        using (CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+        {
+            cts.CancelAfter(configuration.PingTimeout);
+            try
+            {
+                PingResponse resp = await communication.SendPing(this, target, new PingRequest(LocalEndpoint), cts.Token).ConfigureAwait(false);
+                alive = resp.Alive;
+                incarnation = resp.Incarnation;
+            }
+            catch
+            {
+                alive = false;
+            }
+        }
+
+        if (alive)
+        {
+            Liveness.MarkAlive(target.Endpoint, incarnation);
+            return;
+        }
+
+        // Indirect probe via up to IndirectPingFanout intermediaries.
+        List<RaftNode> relays = peers.Where(p => p.Endpoint != target.Endpoint).ToList();
+        int fanout = Math.Min(configuration.IndirectPingFanout, relays.Count);
+
+        // Partial Fisher-Yates shuffle for relay selection.
+        for (int i = 0; i < fanout; i++)
+        {
+            int j = Random.Shared.Next(i, relays.Count);
+            (relays[i], relays[j]) = (relays[j], relays[i]);
+        }
+
+        bool reachedViaRelay = false;
+        using (CancellationTokenSource relayCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+        {
+            relayCts.CancelAfter(configuration.PingTimeout);
+            for (int i = 0; i < fanout && !reachedViaRelay; i++)
+            {
+                try
+                {
+                    PingReqResponse relayResp = await communication.SendPingReq(
+                        this, relays[i],
+                        new PingReqRequest(LocalEndpoint, target.Endpoint),
+                        relayCts.Token).ConfigureAwait(false);
+                    if (relayResp.Reached)
+                        reachedViaRelay = true;
+                }
+                catch
+                {
+                    // relay also unreachable — continue to next
+                }
+            }
+        }
+
+        if (reachedViaRelay)
+        {
+            // A relay confirmed the target is reachable.  PingReqResponse does not carry the
+            // target's incarnation, so MarkAlive(…, 0) would be silently dropped for any node
+            // whose incarnation is > 0 (e.g. after a prior refutation).  ClearSuspicion
+            // transitions Suspect→Alive while preserving the existing incarnation.
+            Liveness.ClearSuspicion(target.Endpoint);
+        }
+        else
+        {
+            // Both direct and indirect probes failed — suspect.
+            MemberLivenessState prev = Liveness.GetState(target.Endpoint);
+            Liveness.MarkSuspect(target.Endpoint);
+            if (prev == MemberLivenessState.Alive)
+                Logger.LogWarning("PingAsync: {Endpoint} failed direct and indirect probe; marked Suspect", target.Endpoint);
+        }
+    }
+
+    /// <summary>
     /// Returns the last commit index acknowledged by <paramref name="endpoint"/> on the given partition,
     /// or -1 when no <c>CompleteAppendLogs</c> has been received yet.  Delegates to the
     /// partition executor so the read is thread-safe.
@@ -932,6 +1174,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
         await clusterHandler.UpdateNodes().ConfigureAwait(false);
         await systemCoordinator.CheckLearnerPromotionsAsync().ConfigureAwait(false);
+        await systemCoordinator.EvictDeadMembersAsync().ConfigureAwait(false);
     }
 
     // ── IRaftTimerHost ─────────────────────────────────────────────────────
@@ -941,6 +1184,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     IEnumerable<RaftPartition> Scheduling.IRaftTimerHost.GetUserPartitions() => partitions.Values;
 
     Task Scheduling.IRaftTimerHost.UpdateNodes() => UpdateNodes();
+
+    Task Scheduling.IRaftTimerHost.GossipAsync(CancellationToken cancellationToken) => GossipAsync(cancellationToken);
+
+    Task Scheduling.IRaftTimerHost.PingAsync(CancellationToken cancellationToken) => PingAsync(cancellationToken);
 
     // ──────────────────────────────────────────────────────────────────────
 

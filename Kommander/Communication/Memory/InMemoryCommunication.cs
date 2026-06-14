@@ -1,5 +1,6 @@
 
 using Kommander.Data;
+using Kommander.Gossip;
 
 namespace Kommander.Communication.Memory;
 
@@ -144,6 +145,39 @@ public class InMemoryCommunication : ICommunication
 
         Console.WriteLine("SendLeave Unknown node: " + node.Endpoint);
         return new LeaveResponse(false);
+    }
+
+    public Task<GossipAck> SendGossip(RaftManager manager, RaftNode node, GossipMessage digest, CancellationToken cancellationToken = default)
+    {
+        if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))
+            return Task.FromResult(new GossipAck(0, null));
+
+        if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode) && targetNode is RaftManager targetManager)
+            return Task.FromResult(targetManager.ReceiveGossip(digest));
+
+        return Task.FromResult(new GossipAck(0, null));
+    }
+
+    public Task<Gossip.PingResponse> SendPing(RaftManager manager, RaftNode node, Gossip.PingRequest request, CancellationToken cancellationToken = default)
+    {
+        if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))
+            return Task.FromResult(new Gossip.PingResponse(false, 0));
+
+        if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode) && targetNode is RaftManager targetManager)
+            return Task.FromResult(targetManager.ReceivePing(request));
+
+        return Task.FromResult(new Gossip.PingResponse(false, 0));
+    }
+
+    public Task<Gossip.PingReqResponse> SendPingReq(RaftManager manager, RaftNode node, Gossip.PingReqRequest request, CancellationToken cancellationToken = default)
+    {
+        if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))
+            return Task.FromResult(new Gossip.PingReqResponse(false));
+
+        if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode) && targetNode is RaftManager targetManager)
+            return targetManager.ReceivePingReq(request, cancellationToken);
+
+        return Task.FromResult(new Gossip.PingReqResponse(false));
     }
 
     public async Task<long?> GetRemoteFollowerLag(RaftManager manager, RaftNode node, int partitionId, string followerEndpoint)
