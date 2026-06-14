@@ -1839,4 +1839,104 @@ public sealed class TestRaftSystemCoordinator
             Assert.Equal("nodeA:9001", cached.Members[0].Endpoint);
         }
     }
+
+    [Fact]
+    public async Task RemoveMember_WouldLeaveZeroVoters_ReturnsInsufficientVoters()
+    {
+        // Removing the last Voter would leave the cluster permanently unavailable.
+        // The quorum guard must reject this with InsufficientVoters and leave the
+        // roster unchanged.
+        (RaftManager manager, _) = BuildWithMembershipHarness();
+        using (manager)
+        {
+            var t1 = new TaskCompletionSource<(RaftOperationStatus, long)>(TaskCreationOptions.RunContinuationsAsynchronously);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.AddMember, "solo:9001", 1, 0L, t1));
+            await t1.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+            var t2 = new TaskCompletionSource<(RaftOperationStatus, long)>(TaskCreationOptions.RunContinuationsAsynchronously);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.PromoteMember, "solo:9001", 1, 1L, t2));
+            await t2.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+            // Attempt to remove the only voter.
+            var t3 = new TaskCompletionSource<(RaftOperationStatus Status, long Generation)>(TaskCreationOptions.RunContinuationsAsynchronously);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RemoveMember, "solo:9001", 1, 2L, t3));
+            (RaftOperationStatus status, _) = await t3.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+            Assert.Equal(RaftOperationStatus.InsufficientVoters, status);
+            // Roster must be unchanged — the sole voter is still present.
+            Kommander.System.ClusterMembership m = manager.SystemCoordinator.GetMembership();
+            Assert.Equal(2L, m.MembershipVersion);
+            Assert.Single(m.Members);
+            Assert.Equal("solo:9001", m.Members[0].Endpoint);
+        }
+    }
+
+    [Fact]
+    public async Task RemoveMember_TwoToOneVoter_Permitted()
+    {
+        // Removing a Voter when one voter remains (2→1) must succeed — single-node
+        // commit is supported and one voter satisfies a quorum of 1.
+        (RaftManager manager, _) = BuildWithMembershipHarness();
+        using (manager)
+        {
+            foreach ((string ep, int id, long ver, RaftSystemRequestType type) in new (string, int, long, RaftSystemRequestType)[]
+            {
+                ("nodeA:9001", 1, 0L,  RaftSystemRequestType.AddMember),
+                ("nodeB:9002", 2, 1L,  RaftSystemRequestType.AddMember),
+                ("nodeA:9001", 1, 2L,  RaftSystemRequestType.PromoteMember),
+                ("nodeB:9002", 2, 3L,  RaftSystemRequestType.PromoteMember),
+            })
+            {
+                var tcs = new TaskCompletionSource<(RaftOperationStatus, long)>(TaskCreationOptions.RunContinuationsAsynchronously);
+                manager.SystemCoordinator.Send(new RaftSystemRequest(type, ep, id, ver, tcs));
+                await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            }
+
+            // Remove nodeA — nodeB remains as the sole voter.
+            var remove = new TaskCompletionSource<(RaftOperationStatus Status, long Generation)>(TaskCreationOptions.RunContinuationsAsynchronously);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RemoveMember, "nodeA:9001", 1, 4L, remove));
+            (RaftOperationStatus status, _) = await remove.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Kommander.System.ClusterMembership m = manager.SystemCoordinator.GetMembership();
+            Assert.Single(m.Members);
+            Assert.Equal("nodeB:9002", m.Members[0].Endpoint);
+            Assert.Equal(Kommander.System.ClusterMemberRole.Voter, m.Members[0].Role);
+        }
+    }
+
+    [Fact]
+    public async Task RemoveMember_LearnerRole_NotBlockedByQuorumGuard()
+    {
+        // Learner removals bypass the quorum guard — Learners do not participate in
+        // quorum, so removing them can never reduce the cluster's ability to commit.
+        // This must be permitted even when only one Voter remains.
+        (RaftManager manager, _) = BuildWithMembershipHarness();
+        using (manager)
+        {
+            // Add one Voter and one Learner.
+            var t1 = new TaskCompletionSource<(RaftOperationStatus, long)>(TaskCreationOptions.RunContinuationsAsynchronously);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.AddMember, "voter:9001", 1, 0L, t1));
+            await t1.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+            var t2 = new TaskCompletionSource<(RaftOperationStatus, long)>(TaskCreationOptions.RunContinuationsAsynchronously);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.PromoteMember, "voter:9001", 1, 1L, t2));
+            await t2.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+            var t3 = new TaskCompletionSource<(RaftOperationStatus, long)>(TaskCreationOptions.RunContinuationsAsynchronously);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.AddMember, "learner:9002", 2, 2L, t3));
+            await t3.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+            // Remove the Learner — should succeed despite only one Voter remaining.
+            var remove = new TaskCompletionSource<(RaftOperationStatus Status, long Generation)>(TaskCreationOptions.RunContinuationsAsynchronously);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RemoveMember, "learner:9002", 2, 3L, remove));
+            (RaftOperationStatus status, _) = await remove.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Kommander.System.ClusterMembership m = manager.SystemCoordinator.GetMembership();
+            Assert.Single(m.Members);
+            Assert.Equal("voter:9001", m.Members[0].Endpoint);
+            Assert.Equal(Kommander.System.ClusterMemberRole.Voter, m.Members[0].Role);
+        }
+    }
 }

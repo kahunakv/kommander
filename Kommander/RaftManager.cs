@@ -678,9 +678,9 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 return new LeaveResponse(true);
 
             // InsufficientVoters is a permanent condition: removal would brick the cluster.
-            // Return a null-hint response so the caller does not retry.
+            // Terminal=true prevents CommitGracefulLeaveAsync from retrying.
             if (status == RaftOperationStatus.InsufficientVoters)
-                return new LeaveResponse(false);
+                return new LeaveResponse(false, null, Terminal: true);
         }
         catch (OperationCanceledException)
         {
@@ -1190,16 +1190,17 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                     return;
                 }
 
-                // Null hint = no leader to route to (quorum guard, transport stub, stopped node).
-                // Nothing to retry — proceed to stop.
-                if (string.IsNullOrEmpty(resp.LeaderHint))
+                // Terminal = permanently blocked (e.g. InsufficientVoters) — give up immediately.
+                // A null-hint without Terminal means the leader is unknown right now (election
+                // in progress); the loop continues and retries within the 10 s deadline.
+                if (resp.Terminal)
                 {
-                    Logger.LogInformation("LeaveCluster: leave not accepted and no leader hint; proceeding to stop.");
+                    Logger.LogInformation("LeaveCluster: leave permanently rejected; proceeding to stop.");
                     return;
                 }
 
                 // Not the leader — follow the hint if it differs from the endpoint we just tried.
-                if (resp.LeaderHint != leaderEndpoint)
+                if (!string.IsNullOrEmpty(resp.LeaderHint) && resp.LeaderHint != leaderEndpoint)
                 {
                     try
                     {
@@ -1212,9 +1213,9 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                             return;
                         }
 
-                        if (string.IsNullOrEmpty(hintResp.LeaderHint))
+                        if (hintResp.Terminal)
                         {
-                            Logger.LogInformation("LeaveCluster: leave not accepted by hint {Hint} and no further leader hint; proceeding to stop.", resp.LeaderHint);
+                            Logger.LogInformation("LeaveCluster: leave permanently rejected by hint {Hint}; proceeding to stop.", resp.LeaderHint);
                             return;
                         }
                     }

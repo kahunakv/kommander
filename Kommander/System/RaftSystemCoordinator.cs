@@ -2025,6 +2025,12 @@ internal sealed class RaftSystemCoordinator : IDisposable
             _cachedMembership = newMembership;
             manager.RaiseMembershipChanged(newMembership);
 
+            // Raft §6 self-removal: if this node is no longer a voter in the new
+            // configuration, step down from every partition it currently leads so
+            // followers can elect a new leader without waiting for a heartbeat timeout.
+            if (!newMembership.Members.Any(m => m.Endpoint == manager.LocalEndpoint && m.Role == ClusterMemberRole.Voter))
+                _ = StepDownSelfRemovedAsync();
+
             completion?.TrySetResult((RaftOperationStatus.Success, newMembership.MembershipVersion));
         }
         catch (OperationCanceledException)
@@ -2036,6 +2042,30 @@ internal sealed class RaftSystemCoordinator : IDisposable
         {
             completion?.TrySetResult((RaftOperationStatus.Errored, 0));
             throw;
+        }
+    }
+
+    /// <summary>
+    /// Steps down from every partition this node currently leads after the committed
+    /// membership record has removed it from the voter set.  Called fire-and-forget
+    /// from <see cref="ReplicateMembership"/> so the completion TCS is resolved without
+    /// waiting for election convergence; failures are logged and swallowed.
+    /// </summary>
+    private async Task StepDownSelfRemovedAsync()
+    {
+        List<int> partitionIds = [RaftSystemConfig.SystemPartition, ..manager.Partitions.Keys];
+
+        foreach (int partitionId in partitionIds)
+        {
+            try
+            {
+                if (await manager.AmILeaderQuick(partitionId).ConfigureAwait(false))
+                    await manager.StepDownAsync(partitionId).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning("StepDownSelfRemoved: partition {PartitionId}: {Message}", partitionId, ex.Message);
+            }
         }
     }
 

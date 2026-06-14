@@ -847,7 +847,7 @@ public sealed class RaftWriteAhead
 
             logger.LogInformation("[{Endpoint}/{Partition}] Compaction process started LastCheckpoint={LastCheckpoint}", manager.LocalEndpoint, partition.PartitionId, lastCheckpoint);
 
-            // Scheduled on ReadScheduler, not WalScheduler — see docs/adr/0003-wal-compaction-scheduling.md.
+            // Scheduled on ReadScheduler, not WalScheduler — see specs/adr/0003-wal-compaction-scheduling.md.
             // All drain batches run inside a single scheduled task — no yield between
             // batches. The pass cap bounds total work; re-enqueueing per batch would
             // interleave reads for this partition if read latency during compaction matters.

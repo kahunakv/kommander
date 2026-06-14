@@ -391,7 +391,8 @@ public sealed class RaftService : Rafter.RafterBase
         return new GrpcLeaveResponse
         {
             Success = response.Success,
-            LeaderHint = response.LeaderHint ?? ""
+            LeaderHint = response.LeaderHint ?? "",
+            Terminal = response.Terminal
         };
     }
 

@@ -370,10 +370,9 @@ public sealed class TestMembership
         await n1.LeaveCluster(dispose: true);
         await n2.LeaveCluster(dispose: true);
 
-        // n3 is the last voter.  Either:
-        //   (a) n3 is the P0 leader → TryRemoveMember returns InsufficientVoters → fast exit, or
-        //   (b) the cached leader (n1/n2) is stopped → IsStopped returns LeaveResponse(false, null) → fast exit.
-        // In both cases the call must complete well under the 10 s deadline.
+        // n3 is the last voter. After n1/n2 stepped down (self-removal), n3 is the P0 leader.
+        // TryRemoveMember returns InsufficientVoters → Terminal=true → CommitGracefulLeaveAsync
+        // exits immediately.  The call must complete well under the 10 s deadline.
         long startMs = Environment.TickCount64;
         await n3.LeaveCluster(dispose: true);
         long elapsedMs = Environment.TickCount64 - startMs;
@@ -1136,6 +1135,82 @@ public sealed class TestMembership
             await n2.LeaveCluster(true);
             await n3.LeaveCluster(true);
         }
+    }
+
+    [Fact]
+    public async Task GracefulLeave_Leader_StepsDownFromAllPartitions()
+    {
+        // When the P0 leader removes itself from the roster it must actively step down
+        // from every partition it leads (Raft §6 self-removal rule) so that followers
+        // can elect a new leader without waiting for a heartbeat timeout.  We use the
+        // standard test configuration (50 ms heartbeat) and verify that both the system
+        // partition and the single user partition have a new leader within the normal
+        // WaitForLeader window.
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        InMemoryCommunication comm = new();
+
+        RaftManager n1 = MakeNode(comm, "localhost", 8111, 1, ["localhost:8112", "localhost:8113"], logger);
+        RaftManager n2 = MakeNode(comm, "localhost", 8112, 2, ["localhost:8111", "localhost:8113"], logger);
+        RaftManager n3 = MakeNode(comm, "localhost", 8113, 3, ["localhost:8111", "localhost:8112"], logger);
+
+        comm.SetNodes(new Dictionary<string, IRaft>
+        {
+            ["localhost:8111"] = n1,
+            ["localhost:8112"] = n2,
+            ["localhost:8113"] = n3,
+        });
+
+        await n1.UpdateNodes();
+        await n2.UpdateNodes();
+        await n3.UpdateNodes();
+
+        await Task.WhenAll(n1.JoinCluster(ct), n2.JoinCluster(ct), n3.JoinCluster(ct));
+
+        await WaitForLeader([n1, n2, n3], partitionId: 0, ct);
+        await WaitForLeader([n1, n2, n3], partitionId: 1, ct);
+
+        await WaitForCondition(
+            () => n1.SystemCoordinator.GetMembership().MembershipVersion > 0
+               && n2.SystemCoordinator.GetMembership().MembershipVersion > 0
+               && n3.SystemCoordinator.GetMembership().MembershipVersion > 0,
+            ct);
+
+        // Find the P0 leader.
+        RaftManager? p0Leader = null;
+        foreach (RaftManager n in new[] { n1, n2, n3 })
+        {
+            if (await n.AmILeaderQuick(0))
+            {
+                p0Leader = n;
+                break;
+            }
+        }
+
+        Assert.NotNull(p0Leader);
+        RaftManager[] survivors = new[] { n1, n2, n3 }.Where(n => n != p0Leader).ToArray();
+
+        // The leader commits RemoveMember(self); StepDownSelfRemovedAsync fires and yields
+        // leadership on both P0 and the user partition before LeaveCluster returns.
+        await p0Leader.LeaveCluster(dispose: true);
+
+        // Survivors must have elected a new leader on both partitions.
+        await WaitForLeader(survivors, partitionId: 0, ct);
+        await WaitForLeader(survivors, partitionId: 1, ct);
+
+        // Roster on survivors must show exactly 2 voters, not including the departed node.
+        await WaitForCondition(
+            () => survivors.All(n =>
+            {
+                ClusterMembership m = n.SystemCoordinator.GetMembership();
+                return m.Members.Count == 2
+                    && m.Members.All(x => x.Role == ClusterMemberRole.Voter)
+                    && !m.Members.Any(x => x.Endpoint == p0Leader.LocalEndpoint);
+            }),
+            ct);
+
+        foreach (RaftManager s in survivors)
+            await s.LeaveCluster(true);
     }
 
     private RaftManager BuildJoinSeedsNode(

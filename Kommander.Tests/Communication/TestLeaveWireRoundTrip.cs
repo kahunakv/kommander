@@ -47,6 +47,19 @@ public class TestLeaveWireRoundTrip
 
         Assert.False(parsed.Success);
         Assert.Equal("localhost:8201", parsed.LeaderHint);
+        Assert.False(parsed.Terminal); // non-terminal by default
+    }
+
+    [Fact]
+    public void GrpcLeaveResponse_Terminal_SurvivesRoundTrip()
+    {
+        GrpcLeaveResponse original = new() { Success = false, Terminal = true };
+
+        GrpcLeaveResponse parsed = GrpcLeaveResponse.Parser.ParseFrom(original.ToByteArray());
+
+        Assert.False(parsed.Success);
+        Assert.Equal("", parsed.LeaderHint); // proto3 default
+        Assert.True(parsed.Terminal);
     }
 
     // ── REST / JSON ───────────────────────────────────────────────────────────
@@ -88,5 +101,20 @@ public class TestLeaveWireRoundTrip
         Assert.NotNull(parsed);
         Assert.False(parsed.Success);
         Assert.Equal("localhost:8201", parsed.LeaderHint);
+        Assert.False(parsed.Terminal);
+    }
+
+    [Fact]
+    public void LeaveResponse_Terminal_SurvivesRestJsonRoundTrip()
+    {
+        LeaveResponse original = new(false, null, Terminal: true);
+
+        string json = JsonSerializer.Serialize(original, RestJsonContext.Default.LeaveResponse);
+        LeaveResponse? parsed = JsonSerializer.Deserialize(json, RestJsonContext.Default.LeaveResponse);
+
+        Assert.NotNull(parsed);
+        Assert.False(parsed.Success);
+        Assert.Null(parsed.LeaderHint);
+        Assert.True(parsed.Terminal);
     }
 }
