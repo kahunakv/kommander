@@ -134,13 +134,31 @@ public class RestCommunication : ICommunication
     }
 
     /// <summary>
-    /// The Leave endpoint is not yet implemented on the REST transport.
-    /// Returns failure so <c>CommitGracefulLeaveAsync</c> falls back to the timeout path
-    /// and the node stops without a committed removal.  Survivors retain the departed
-    /// endpoint as a voter until a failure-detector evicts it.
+    /// Sends a <see cref="LeaveRequest"/> to <paramref name="node"/> via the
+    /// <c>POST /v1/raft/leave</c> REST endpoint.  If the target is not the P0 leader it
+    /// returns <see cref="LeaveResponse.LeaderHint"/> so the caller can retry against the
+    /// current leader.  Returns failure on any transport or HTTP error.
     /// </summary>
-    public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default)
-        => Task.FromResult(new LeaveResponse(false));
+    public async Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default)
+    {
+        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.LeaveRequest);
+
+        try
+        {
+            LeaveResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/leave", payload)
+                .PostStringAsync(payload)
+                .ReceiveJson<LeaveResponse>()
+                .ConfigureAwait(false);
+
+            return response ?? new LeaveResponse(false);
+        }
+        catch (Exception e)
+        {
+            manager.Logger.LogError("[{Endpoint}] SendLeave: {Message}", manager.LocalEndpoint, e.Message);
+        }
+
+        return new LeaveResponse(false);
+    }
 
     /// <summary>
     /// The Gossip endpoint is not yet implemented on the REST transport.

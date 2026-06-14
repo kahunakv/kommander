@@ -504,21 +504,22 @@ network; "stub" means it returns a default and the feature is inert (or worse) o
 |---|---|---|---|
 | Roster commit / replication (Add/Promote/Remove) | ✅ wired | ✅ wired | ✅ wired |
 | Join RPC | ✅ wired | ✅ wired | ✅ wired |
-| Graceful leave RPC (`SendLeave`) | ✅ wired | ⛔ not yet implemented | ⛔ not yet implemented |
+| Graceful leave RPC (`SendLeave`) | ✅ wired | ✅ wired | ✅ wired |
+| Cross-partition lag (`GetRemoteFollowerLag`) | ✅ wired | ✅ wired | ✅ wired |
 | Gossip anti-entropy (`SendGossip`) | ✅ wired | ⛔ not yet implemented | ⛔ not yet implemented |
 | SWIM probes (`SendPing`/`SendPingReq`) | ✅ wired | ⛔ not yet implemented | ⛔ not yet implemented |
-| Cross-partition lag (`GetRemoteFollowerLag`) | ✅ wired | ⛔ not yet implemented | ⛔ not yet implemented |
 | Snapshot install for catch-up below floor | ⛔ not yet implemented | ⛔ not yet implemented | ⛔ not yet implemented |
 
 What this means in practice on **gRPC/REST today**:
 
-- **Membership commits and joins work** — roster changes propagate via Raft replication.
-- **Gossip is inert** — convergence falls back entirely to Raft replication (correct, just slower).
-- **Graceful leave times out** — `LeaveCluster` burns its deadline and stops without a committed
-  removal; the node is cleaned up later only if/when the detector evicts it.
+- **Membership commits, joins, graceful leave, and cross-partition promotion all work** — roster
+  changes propagate via Raft replication, `LeaveCluster` commits a real `RemoveMember` before
+  stopping, and the promotion gate can measure learner lag on partitions led by any node.
+- **Gossip is inert** — roster convergence falls back entirely to Raft replication (correct, just
+  slower; a node still learns of every committed change, it just isn't accelerated epidemically).
 - **The SWIM detector must stay disabled** (`PingInterval = Zero`) — see the big warning above.
-- **Promotion** relies on lag the P0 leader can observe locally; cross-partition lag over the wire is
-  not yet available.
+  Without it, a crashed node is not auto-evicted; remove it with an explicit `LeaveCluster` (or a
+  future wired detector).
 
 Keep this matrix in sync as capabilities land — it's the first thing a confused operator checks.
 
@@ -532,10 +533,12 @@ Keep this matrix in sync as capabilities land — it's the first thing a confuse
 3. Confirm: `raft.GetMembership()` on any node shows the new endpoint with `Role == Voter`.
 
 ### Remove a node (planned)
-1. Call `LeaveCluster(dispose: true)` on the node being retired.
+1. Call `LeaveCluster(dispose: true)` on the node being retired. This works on every transport —
+   it commits a `RemoveMember` on P0 before the node stops.
 2. Confirm the roster on a surviving node no longer lists it and `MembershipVersion` advanced.
-3. On gRPC/REST today (leave RPC not yet implemented over the wire), prefer stopping the node and
-   letting the failure detector evict it once `DeadMemberEvictionGrace` expires.
+3. If a node crashes without a graceful leave, evict it with an explicit `LeaveCluster` from another
+   operator action, or — once the SWIM probes are wired and `PingInterval` is enabled — let the
+   failure detector evict it after `DeadMemberEvictionGrace`.
 
 ### Replace a dead node
 1. The detector (if enabled and supported) evicts the dead endpoint automatically after the grace.
@@ -555,9 +558,9 @@ Keep this matrix in sync as capabilities land — it's the first thing a confuse
 | Symptom | Likely cause | Where to look |
 |---|---|---|
 | `JoinCluster` throws `TimeoutException` | Seeds unreachable, or the Learner never catches up (e.g. compacted partition, no snapshot install) | `ReceiveJoin`, backfill in `RaftPartitionStateMachine`; check the partition compaction floor |
-| New node stays `Learner` forever | Lag never reaches `LearnerPromotionLag`, or the P0 leader can't observe its lag (cross-partition lag not yet available over gRPC/REST) | `CheckLearnerPromotionsAsync`; `GetRemoteFollowerLag` in `ICommunication` |
+| New node stays `Learner` forever | Lag never reaches `LearnerPromotionLag`, or it can't catch up on a partition (e.g. compacted past the floor with no snapshot install) | `CheckLearnerPromotionsAsync`; `GetRemoteFollowerLag` in `ICommunication`; partition compaction floor |
 | Healthy nodes get evicted | SWIM enabled on a transport where Ping is not yet implemented | **Set `PingInterval = Zero`**; see the SWIM warning |
-| `LeaveCluster` doesn't shrink the roster on gRPC/REST | `SendLeave` is not yet implemented over the wire on those transports | Transport matrix above |
+| `LeaveCluster` doesn't shrink the roster | Leaving node couldn't reach the P0 leader, or the removal would leave zero voters (`InsufficientVoters`) | `CommitGracefulLeaveAsync`, `TryRemoveMember`; check connectivity to the P0 leader |
 | Roster versions differ between nodes | A node isn't getting replication/gossip; gossip not yet wired on gRPC/REST | `UpdateNodes`, `ApplyGossipRoster`, transport matrix |
 | `RemoveMember` returns `InsufficientVoters` | Removal would leave zero voters | By design — terminal, don't retry |
 | Commit stalls right after adding a node | (Should not happen) Learner counted toward quorum — a real bug | Quorum math in `RaftPartitionStateMachine`; the invariant below |

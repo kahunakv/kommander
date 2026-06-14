@@ -664,7 +664,7 @@ raft.OnMembershipChanged += membership =>
 
 Membership changes are single-server (one node added, promoted, or removed per committed step), so any two consecutive configurations always share a majority. A removal that would leave zero voters is refused with `InsufficientVoters`.
 
-> **Transport support:** the committed roster, joins, and promotion work on all transports. Graceful-leave, gossip dissemination, and the SWIM failure detector are currently wired only on the in-process (`InMemoryCommunication`) transport; on gRPC/REST those RPCs are stubbed, so the failure detector is **disabled by default** (`PingInterval` defaults to `TimeSpan.Zero`) to avoid evicting healthy peers. Do not enable it on a transport without working Ping support. See the developer guide's transport matrix for the current state.
+> **Transport support:** the committed roster, joins, graceful leave, and cross-partition learner promotion all work on every transport (gRPC, REST, and in-memory). Gossip dissemination and the SWIM failure detector are currently wired only on the in-process (`InMemoryCommunication`) transport; on gRPC/REST those RPCs are not yet implemented, so the failure detector is **disabled by default** (`PingInterval` defaults to `TimeSpan.Zero`) to avoid evicting healthy peers. Do not enable it on a transport without working Ping support. Without gossip, roster convergence still happens via Raft replication (just not epidemically). See the developer guide's transport matrix for the current state.
 
 See [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md) for the design motivations, the full lifecycle walkthroughs, the SWIM failure detector, configuration, the code map, an operations runbook, and the invariants to preserve when extending the system.
 
@@ -775,7 +775,7 @@ dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category!=Stress&Fu
 
 ## Current Limitations
 
-- Dynamic cluster membership is supported via `IRaft` (`JoinCluster`, `LeaveCluster`, `GetMembership`, `OnMembershipChanged`), but graceful-leave, gossip dissemination, and the SWIM failure detector are wired only on the in-memory transport today; on gRPC/REST those RPCs are stubbed and the failure detector is disabled by default. See the [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md).
+- Dynamic cluster membership is supported via `IRaft` (`JoinCluster`, `LeaveCluster`, `GetMembership`, `LocalRole`, `OnMembershipChanged`) on every transport, including graceful leave and cross-partition learner promotion over gRPC/REST. Gossip dissemination and the SWIM failure detector are wired only on the in-memory transport today; on gRPC/REST they are not yet implemented and the failure detector is disabled by default (`PingInterval = TimeSpan.Zero`). See the [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md).
 - Partition `0` is the system partition: it cannot be created, split, merged, or removed, and the `_RaftSystem` log type is reserved. Application data may still be co-located there using any other log type (see Concepts).
 - RocksDB WAL format `2.0.0` is not compatible with pre-`0.10.7` id-only RocksDB WAL keys. Start with a fresh data directory or migrate existing keys.
 - WAL compaction is checkpoint-driven. Historical entries below the last committed checkpoint are removable; uncheckpointed history is retained.

@@ -9,6 +9,7 @@ service Rafter {
     rpc CompleteAppendLogs (GrpcCompleteAppendLogsRequest) returns (GrpcCompleteAppendLogsResponse);
     rpc BatchRequests (stream GrpcBatchRequestsRequest) returns (stream GrpcBatchRequestsResponse);
     rpc Join (GrpcJoinRequest) returns (GrpcJoinResponse);
+    rpc Leave (GrpcLeaveRequest) returns (GrpcLeaveResponse);
     rpc GetFollowerLag (GrpcGetFollowerLagRequest) returns (GrpcGetFollowerLagResponse);
 }
 
@@ -159,6 +160,16 @@ message GrpcJoinResponse {
     bool Success = 1;
     string LeaderHint = 2;
     int64 MembershipVersion = 3;
+}
+
+message GrpcLeaveRequest {
+    string Endpoint = 1;
+    int32 NodeId = 2;
+}
+
+message GrpcLeaveResponse {
+    bool Success = 1;
+    string LeaderHint = 2;
 }
 
 message GrpcGetFollowerLagRequest {

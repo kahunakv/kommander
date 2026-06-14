@@ -129,6 +129,14 @@ public static class RestCommunicationExtensions
             return await raft.WaitForLeader(partitionId, CancellationToken.None).ConfigureAwait(false);
         });
 
+        app.MapPost("/v1/raft/leave", async (LeaveRequest request, IRaft raft, HttpContext httpContext) =>
+        {
+            if (raft is not RaftManager manager)
+                return new LeaveResponse(false);
+
+            return await manager.ReceiveLeave(request, httpContext.RequestAborted).ConfigureAwait(false);
+        });
+
         app.MapPost("/v1/raft/get-follower-lag", async (GetFollowerLagRequest request, IRaft raft) =>
         {
             if (raft is not RaftManager manager)

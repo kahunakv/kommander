@@ -36,7 +36,7 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<HandshakeResponse> Handshake(RaftManager manager, RaftNode node, HandshakeRequest request)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(node.Endpoint, GetSecurityOptions(manager)));
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetSecurityOptions(manager)));
 
         GrpcHandshakeRequest handshake = new()
         {
@@ -65,7 +65,7 @@ public class GrpcCommunication : ICommunication
     public async Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftNode node, RequestVotesRequest request)
     {
         GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
-            node.Endpoint,
+            GetEndpointUrl(manager, node),
             BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
             GetSecurityOptions(manager));
 
@@ -115,7 +115,7 @@ public class GrpcCommunication : ICommunication
     public async Task<VoteResponse> Vote(RaftManager manager, RaftNode node, VoteRequest request)
     {
         GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
-            node.Endpoint,
+            GetEndpointUrl(manager, node),
             BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
             GetSecurityOptions(manager));
 
@@ -164,10 +164,10 @@ public class GrpcCommunication : ICommunication
     public async Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftNode node, AppendLogsRequest request)
     {
         GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
-            node.Endpoint,
+            GetEndpointUrl(manager, node),
             BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
             GetSecurityOptions(manager));
-        
+
         GrpcAppendLogsRequest appendLogsRequest = GrpcCommunicationPool.RentAppendLogsRequest();
 
         try
@@ -220,10 +220,10 @@ public class GrpcCommunication : ICommunication
     public async Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftNode node, CompleteAppendLogsRequest request)
     {
         GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
-            node.Endpoint,
+            GetEndpointUrl(manager, node),
             BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
             GetSecurityOptions(manager));
-        
+
         GrpcCompleteAppendLogsRequest completeAppendLogsRequest = GrpcCommunicationPool.RentCompleteAppendLogsRequest();
 
         try
@@ -278,7 +278,7 @@ public class GrpcCommunication : ICommunication
             return new();
 
         GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
-            node.Endpoint,
+            GetEndpointUrl(manager, node),
             BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
             GetSecurityOptions(manager));
         
@@ -432,16 +432,36 @@ public class GrpcCommunication : ICommunication
     }
     
     /// <summary>
-    /// Sends a <see cref="JoinRequest"/> to <paramref name="node"/> via the <c>Join</c> gRPC RPC.
+    /// Sends a <see cref="LeaveRequest"/> to <paramref name="node"/> via the <c>Leave</c> gRPC RPC.
+    /// If the target is not the P0 leader it returns <see cref="LeaveResponse.LeaderHint"/> so the
+    /// caller can retry against the current leader.
     /// </summary>
-    /// <summary>
-    /// The Leave RPC is not yet implemented on the gRPC transport.
-    /// Returns failure so <c>CommitGracefulLeaveAsync</c> falls back to the timeout path
-    /// and the node stops without a committed removal.  Survivors retain the departed
-    /// endpoint as a voter until a failure-detector evicts it.
-    /// </summary>
-    public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default)
-        => Task.FromResult(new LeaveResponse(false));
+    public async Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default)
+    {
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetSecurityOptions(manager)));
+
+        GrpcLeaveRequest grpcRequest = new()
+        {
+            Endpoint = request.Endpoint,
+            NodeId = request.NodeId
+        };
+
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Leave");
+        try
+        {
+            GrpcLeaveResponse response = await client
+                .LeaveAsync(grpcRequest, new CallOptions(metadata, cancellationToken: cancellationToken))
+                .ResponseAsync
+                .ConfigureAwait(false);
+
+            return new LeaveResponse(response.Success, string.IsNullOrEmpty(response.LeaderHint) ? null : response.LeaderHint);
+        }
+        catch (Exception ex)
+        {
+            manager.Logger.LogWarning("SendLeave to {Endpoint}: {Message}", node.Endpoint, ex.Message);
+            return new LeaveResponse(false);
+        }
+    }
 
     /// <summary>
     /// The Gossip RPC is not yet implemented on the gRPC transport.
@@ -482,7 +502,7 @@ public class GrpcCommunication : ICommunication
     /// </summary>
     public async Task<long?> GetRemoteFollowerLag(RaftManager manager, RaftNode node, int partitionId, string followerEndpoint)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(node.Endpoint, GetSecurityOptions(manager)));
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetSecurityOptions(manager)));
 
         GrpcGetFollowerLagRequest grpcRequest = new()
         {
@@ -510,7 +530,7 @@ public class GrpcCommunication : ICommunication
 
     public async Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(node.Endpoint, GetSecurityOptions(manager)));
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetSecurityOptions(manager)));
 
         GrpcJoinRequest grpcRequest = new()
         {
@@ -556,6 +576,14 @@ public class GrpcCommunication : ICommunication
 
     private static RaftTransportSecurityOptions GetSecurityOptions(RaftManager manager) =>
         manager.Configuration.GetEffectiveTransportSecurity();
+
+    /// <summary>
+    /// Builds the full URL for <paramref name="node"/> by prepending the configured
+    /// <see cref="RaftConfiguration.GrpcScheme"/>.  Defaults to <c>https://</c>; set
+    /// <c>GrpcScheme = "http://"</c> (plus <c>Http2UnencryptedSupport</c>) for tests.
+    /// </summary>
+    private static string GetEndpointUrl(RaftManager manager, RaftNode node) =>
+        manager.Configuration.GrpcScheme + node.Endpoint;
 
     private static IEnumerable<GrpcRaftLog> GetLogs(List<RaftLog> requestLogs)
     {

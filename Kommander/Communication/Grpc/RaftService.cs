@@ -374,6 +374,28 @@ public sealed class RaftService : Rafter.RafterBase
     }
 
     /// <summary>
+    /// Handles a <c>Leave</c> RPC from a departing node requesting removal from the committed roster.
+    /// If this node is the P0 leader it commits the removal; otherwise returns the current leader as a hint.
+    /// </summary>
+    public override async Task<GrpcLeaveResponse> Leave(GrpcLeaveRequest request, ServerCallContext context)
+    {
+        ValidateAuth(context);
+
+        if (raft is not RaftManager manager)
+            return new GrpcLeaveResponse { Success = false };
+
+        Data.LeaveResponse response = await manager.ReceiveLeave(
+            new Data.LeaveRequest(request.Endpoint, request.NodeId),
+            context.CancellationToken).ConfigureAwait(false);
+
+        return new GrpcLeaveResponse
+        {
+            Success = response.Success,
+            LeaderHint = response.LeaderHint ?? ""
+        };
+    }
+
+    /// <summary>
     /// Returns the last committed log index the local partition has seen from the queried
     /// follower endpoint.  Used by a remote P0 leader to evaluate learner lag across
     /// partitions it does not locally lead.

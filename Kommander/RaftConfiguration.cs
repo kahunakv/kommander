@@ -39,6 +39,13 @@ public class RaftConfiguration
     public string? HttpScheme { get; set; } = "https://";
 
     /// <summary>
+    /// URL scheme prepended to peer endpoints when opening gRPC channels.
+    /// Override to <c>"http://"</c> in test environments that use cleartext HTTP/2
+    /// (requires <c>SocketsHttpHandler.Http2UnencryptedSupport</c> to be enabled).
+    /// </summary>
+    public string GrpcScheme { get; set; } = "https://";
+
+    /// <summary>
     /// Transport security and node authentication settings for network transports.
     /// </summary>
     public RaftTransportSecurityOptions TransportSecurity
