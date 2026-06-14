@@ -15,6 +15,7 @@ Kommander is designed to keep the consensus core separate from storage, discover
 - **Raft consensus algorithm:** Per-partition leader election, quorum-based proposal replication, commits, rollbacks, checkpoints, and leader change notifications.
 - **Partitioned replication:** Nodes can lead some partitions and follow others, allowing application data to be distributed across independent Raft groups. Partition `0` is reserved for replicated system configuration; application partitions start at `1`.
 - **Elastic partitions:** Create, split, merge, and remove partitions at runtime without restarting any node. The partition map is replicated through the system partition so every node converges on every change, and two-phase protocols ensure no key range is ever uncovered during a split or merge. See [Elastic Partitions Developer Guide](docs/elastic-partitions-developer-guide.md).
+- **Dynamic cluster membership:** Add and remove nodes from a running cluster. The voting roster is a committed, versioned record on the system partition (never gossip- or discovery-derived), so quorum is always consistent. New nodes join as non-voting learners, catch up, and are auto-promoted to voters; a SWIM-style gossip layer disseminates the roster and detects failures advisorily. See [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md).
 - **Durable write-ahead logging:** Built-in WAL adapters for RocksDB and SQLite persist proposed, committed, rolled-back, and checkpoint entries before state-machine callbacks run.
 - **Automatic WAL compaction:** Committed-operation counters trigger bounded per-partition compaction so removable history below the last committed checkpoint does not grow without bound.
 - **Testing-friendly in-memory components:** `InMemoryWAL`, `InMemoryCommunication`, and focused test utilities support fast local simulations without external infrastructure.
@@ -271,7 +272,8 @@ Use a unique `NodeId` when you can. If `NodeId` is `0`, Kommander derives one fr
 
 | Area | Members |
 | --- | --- |
-| Lifecycle | `JoinCluster`, `LeaveCluster`, `UpdateNodes` |
+| Lifecycle | `JoinCluster` (no-arg and seed-based overloads), `LeaveCluster`, `UpdateNodes` |
+| Membership | `GetMembership`, `LocalRole`, `OnMembershipChanged` |
 | Cluster state | `Joined`, `IsInitialized`, `GetNodes`, `GetLocalEndpoint`, `GetLocalNodeId`, `GetLocalNodeName` |
 | Leadership | `AmILeaderQuick`, `AmILeader`, `WaitForLeader` |
 | Replication | `ReplicateLogs`, `ReplicateCheckpoint`, `CommitLogs`, `RollbackLogs` |
@@ -622,6 +624,50 @@ raft.RegisterStateMachineTransfer(new MySnapshotTransfer());
 
 See [Elastic Partitions Developer Guide](docs/elastic-partitions-developer-guide.md) for a full walkthrough of the two-phase protocols, crash recovery, routing, the generation fence, snapshot transfer, and how to extend the system.
 
+## Dynamic Cluster Membership
+
+Nodes can join and leave a running cluster without a restart or an operator editing discovery. The authoritative voting roster is a committed, versioned record on the system partition (partition `0`) — it is changed only through Raft, never by a gossip message or a raw discovery snapshot — so every node agrees on exactly who can vote. A separate gossip + SWIM layer spreads the roster faster and detects dead nodes, but it is strictly advisory: only the system-partition leader, through a committed change, ever alters who counts toward quorum.
+
+A new node joins as a non-voting **learner**, receives replication to catch up, and is automatically promoted to **voter** once it is within `LearnerPromotionLag` entries of the committed log for `LearnerPromotionStableWindow`. Because learners never count toward quorum, adding a node can never stall commits.
+
+```csharp
+// New node joins an existing cluster by contacting seed endpoints.
+// Blocks until this node is a committed voter (or the deadline trips).
+await raft.JoinCluster(
+    seeds: ["host1:7000", "host2:7000", "host3:7000"],
+    cancellationToken: cts.Token);
+
+// Or use the IDiscovery implementation registered at construction.
+await raft.JoinCluster(cancellationToken: cts.Token);
+
+// Read the current roster.
+ClusterMembership roster = raft.GetMembership();
+foreach (ClusterMember m in roster.Members)
+    Console.WriteLine($"  {m.Endpoint}  {m.Role}");   // Learner | Voter | Leaving
+
+// This node's role.
+ClusterMemberRole role = raft.LocalRole;
+
+// Leave gracefully: commits a RemoveMember and shuts down.
+await raft.LeaveCluster(dispose: true);
+```
+
+Subscribe to `OnMembershipChanged` to react to roster updates without polling. It fires in commit order on join, promotion, leave, and failure-driven eviction; use `MembershipVersion` as a monotonic sequence number:
+
+```csharp
+raft.OnMembershipChanged += membership =>
+{
+    string members = string.Join(", ", membership.Members.Select(m => $"{m.Endpoint}({m.Role})"));
+    Console.WriteLine($"[v{membership.MembershipVersion}] {members}");
+};
+```
+
+Membership changes are single-server (one node added, promoted, or removed per committed step), so any two consecutive configurations always share a majority. A removal that would leave zero voters is refused with `InsufficientVoters`.
+
+> **Transport support:** the committed roster, joins, and promotion work on all transports. Graceful-leave, gossip dissemination, and the SWIM failure detector are currently wired only on the in-process (`InMemoryCommunication`) transport; on gRPC/REST those RPCs are stubbed, so the failure detector is **disabled by default** (`PingInterval` defaults to `TimeSpan.Zero`) to avoid evicting healthy peers. Do not enable it on a transport without working Ping support. See the developer guide's transport matrix for the current state.
+
+See [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md) for the design motivations, the full lifecycle walkthroughs, the SWIM failure detector, configuration, the code map, an operations runbook, and the invariants to preserve when extending the system.
+
 ## Utilities
 
 Kommander also exposes a small set of utility APIs used by the library and available to callers.
@@ -729,7 +775,7 @@ dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category!=Stress&Fu
 
 ## Current Limitations
 
-- Cluster membership is discovery-driven; there is no public membership-change API on `IRaft`.
+- Dynamic cluster membership is supported via `IRaft` (`JoinCluster`, `LeaveCluster`, `GetMembership`, `OnMembershipChanged`), but graceful-leave, gossip dissemination, and the SWIM failure detector are wired only on the in-memory transport today; on gRPC/REST those RPCs are stubbed and the failure detector is disabled by default. See the [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md).
 - Partition `0` is the system partition: it cannot be created, split, merged, or removed, and the `_RaftSystem` log type is reserved. Application data may still be co-located there using any other log type (see Concepts).
 - RocksDB WAL format `2.0.0` is not compatible with pre-`0.10.7` id-only RocksDB WAL keys. Start with a fresh data directory or migrate existing keys.
 - WAL compaction is checkpoint-driven. Historical entries below the last committed checkpoint are removable; uncheckpointed history is retained.

@@ -76,4 +76,43 @@ public sealed class TestRestJsonContext
         Assert.Equal("node-a", item.TransferLeadership.Endpoint);
         Assert.Equal("node-c", item.TransferLeadership.TargetEndpoint);
     }
+
+    [Fact]
+    public void GetFollowerLagRequest_SurvivesRestJsonRoundTrip()
+    {
+        GetFollowerLagRequest original = new(PartitionId: 2, FollowerEndpoint: "localhost:8205");
+
+        string json = JsonSerializer.Serialize(original, RestJsonContext.Default.GetFollowerLagRequest);
+        GetFollowerLagRequest? deserialized = JsonSerializer.Deserialize(json, RestJsonContext.Default.GetFollowerLagRequest);
+
+        Assert.NotNull(deserialized);
+        Assert.Equal(2, deserialized.PartitionId);
+        Assert.Equal("localhost:8205", deserialized.FollowerEndpoint);
+    }
+
+    [Fact]
+    public void GetFollowerLagResponse_WithValue_SurvivesRestJsonRoundTrip()
+    {
+        GetFollowerLagResponse original = new(HasValue: true, Value: 99);
+
+        string json = JsonSerializer.Serialize(original, RestJsonContext.Default.GetFollowerLagResponse);
+        GetFollowerLagResponse? deserialized = JsonSerializer.Deserialize(json, RestJsonContext.Default.GetFollowerLagResponse);
+
+        Assert.NotNull(deserialized);
+        Assert.True(deserialized.HasValue);
+        Assert.Equal(99, deserialized.Value);
+    }
+
+    [Fact]
+    public void GetFollowerLagResponse_NoValue_SurvivesRestJsonRoundTrip()
+    {
+        GetFollowerLagResponse original = new(HasValue: false);
+
+        string json = JsonSerializer.Serialize(original, RestJsonContext.Default.GetFollowerLagResponse);
+        GetFollowerLagResponse? deserialized = JsonSerializer.Deserialize(json, RestJsonContext.Default.GetFollowerLagResponse);
+
+        Assert.NotNull(deserialized);
+        Assert.False(deserialized.HasValue);
+        Assert.Equal(0, deserialized.Value);
+    }
 }

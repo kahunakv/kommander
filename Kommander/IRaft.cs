@@ -107,6 +107,22 @@ public interface IRaft
     public event Action<IReadOnlyList<RaftPartitionRange>>? OnPartitionMapChanged;
 
     /// <summary>
+    /// Returns the local node's role in the committed cluster roster:
+    /// <see cref="System.ClusterMemberRole.Voter"/>, <see cref="System.ClusterMemberRole.Learner"/>,
+    /// <see cref="System.ClusterMemberRole.Leaving"/>, or <see cref="System.ClusterMemberRole.NotMember"/>.
+    /// <para>
+    /// Returns <see cref="System.ClusterMemberRole.Leaving"/> immediately when
+    /// <see cref="LeaveCluster"/> has been called, even before the removal commits, so
+    /// election gates suppress campaigning during the drain window.
+    /// </para>
+    /// <para>
+    /// Returns <see cref="System.ClusterMemberRole.Voter"/> during the pre-seed transient
+    /// (roster version 0) so existing behavior is preserved on greenfield clusters.
+    /// </para>
+    /// </summary>
+    public System.ClusterMemberRole LocalRole { get; }
+
+    /// <summary>
     /// Fired whenever the committed cluster membership roster advances to a new version —
     /// on join, leave, promotion from Learner to Voter, and SWIM-driven eviction.
     /// <para>

@@ -128,6 +128,15 @@ public static class RestCommunicationExtensions
         {
             return await raft.WaitForLeader(partitionId, CancellationToken.None).ConfigureAwait(false);
         });
+
+        app.MapPost("/v1/raft/get-follower-lag", async (GetFollowerLagRequest request, IRaft raft) =>
+        {
+            if (raft is not RaftManager manager)
+                return new GetFollowerLagResponse(false);
+
+            long? lag = await manager.GetFollowerLagAsync(request.PartitionId, request.FollowerEndpoint).ConfigureAwait(false);
+            return lag.HasValue ? new GetFollowerLagResponse(true, lag.Value) : new GetFollowerLagResponse(false);
+        });
     }
 
     internal static async Task<RaftTransportAuthenticationResult> AuthenticateRequestAsync(

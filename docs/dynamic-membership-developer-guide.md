@@ -4,13 +4,6 @@ Welcome! This guide is for the next developer who has to **use, support, or exte
 dynamic membership system. It explains not just *how* the pieces work but *why* they were built this
 way, so when something misbehaves at 3 a.m. you understand the model well enough to reason about it.
 
-It pairs with two other docs:
-
-- `docs/dynamic-membership-spec.md` — the design rationale and safety arguments in depth.
-- `docs/dynamic-membership-tasks.md` — the implementation breakdown with per-task status
-  (✅ Done · 🟡 Partial · ⬜ Not started). **Check it before relying on a feature** — some pieces are
-  done only on the in-process transport (see the [Transport support matrix](#transport-support-matrix)).
-
 ---
 
 ## Table of contents
@@ -361,8 +354,8 @@ traffic so it never starves writes. Backfill is committed-only and idempotent (e
 **Important limitation (today):** backfill only catches up a follower that is still **above the
 compaction floor**. If a partition's WAL has compacted past the point a fresh Learner needs, tail-only
 backfill can't bootstrap it — that requires a snapshot install (`ExportRange`/`ImportRange`), which is
-**not yet wired into the learner path** (tracked as Task 12). Until then, a Learner can only join
-partitions whose log hasn't compacted past its start point.
+**not yet wired into the learner path**. Until then, a Learner can only join partitions whose log
+hasn't compacted past its start point.
 
 ---
 
@@ -404,7 +397,7 @@ healthy peer would be probed, fail, be declared `Dead`, and **the P0 leader woul
 cluster down to a single node.**
 
 **Only set `PingInterval > 0` on a transport with working Ping support** (InMemory today; gRPC/REST
-once Task 8w lands). This is the single most important operational gotcha in the system.
+Ping is not yet implemented). This is the single most important operational gotcha in the system.
 
 ---
 
@@ -507,15 +500,15 @@ When you need to change or debug membership, start here.
 This is the most important table for avoiding surprises. "Wired" means the RPC actually crosses the
 network; "stub" means it returns a default and the feature is inert (or worse) on that transport.
 
-| Capability | InMemory | gRPC | REST | Tracking |
-|---|---|---|---|---|
-| Roster commit / replication (Add/Promote/Remove) | ✅ wired | ✅ wired | ✅ wired | Tasks 1–6 |
-| Join RPC | ✅ wired | ✅ wired | ✅ wired | Task 5 |
-| Graceful leave RPC (`SendLeave`) | ✅ wired | ⛔ stub | ⛔ stub | Task 11 |
-| Gossip anti-entropy (`SendGossip`) | ✅ wired | ⛔ stub | ⛔ stub | Task 14 |
-| SWIM probes (`SendPing`/`SendPingReq`) | ✅ wired | ⛔ stub | ⛔ stub | Task 8w |
-| Cross-partition lag (`GetRemoteFollowerLag`) | ✅ wired | ⛔ stub | ⛔ stub | Task 10 |
-| Snapshot install for catch-up below floor | ⛔ not built | ⛔ not built | ⛔ not built | Task 12 |
+| Capability | InMemory | gRPC | REST |
+|---|---|---|---|
+| Roster commit / replication (Add/Promote/Remove) | ✅ wired | ✅ wired | ✅ wired |
+| Join RPC | ✅ wired | ✅ wired | ✅ wired |
+| Graceful leave RPC (`SendLeave`) | ✅ wired | ⛔ not yet implemented | ⛔ not yet implemented |
+| Gossip anti-entropy (`SendGossip`) | ✅ wired | ⛔ not yet implemented | ⛔ not yet implemented |
+| SWIM probes (`SendPing`/`SendPingReq`) | ✅ wired | ⛔ not yet implemented | ⛔ not yet implemented |
+| Cross-partition lag (`GetRemoteFollowerLag`) | ✅ wired | ⛔ not yet implemented | ⛔ not yet implemented |
+| Snapshot install for catch-up below floor | ⛔ not yet implemented | ⛔ not yet implemented | ⛔ not yet implemented |
 
 What this means in practice on **gRPC/REST today**:
 
@@ -527,7 +520,7 @@ What this means in practice on **gRPC/REST today**:
 - **Promotion** relies on lag the P0 leader can observe locally; cross-partition lag over the wire is
   not yet available.
 
-Keep this matrix in sync as the wire tasks land — it's the first thing a confused operator checks.
+Keep this matrix in sync as capabilities land — it's the first thing a confused operator checks.
 
 ---
 
@@ -541,8 +534,8 @@ Keep this matrix in sync as the wire tasks land — it's the first thing a confu
 ### Remove a node (planned)
 1. Call `LeaveCluster(dispose: true)` on the node being retired.
 2. Confirm the roster on a surviving node no longer lists it and `MembershipVersion` advanced.
-3. On gRPC/REST today (leave RPC stubbed), prefer stopping the node and letting eviction handle it —
-   or wait for Task 11.
+3. On gRPC/REST today (leave RPC not yet implemented over the wire), prefer stopping the node and
+   letting the failure detector evict it once `DeadMemberEvictionGrace` expires.
 
 ### Replace a dead node
 1. The detector (if enabled and supported) evicts the dead endpoint automatically after the grace.
@@ -562,10 +555,10 @@ Keep this matrix in sync as the wire tasks land — it's the first thing a confu
 | Symptom | Likely cause | Where to look |
 |---|---|---|
 | `JoinCluster` throws `TimeoutException` | Seeds unreachable, or the Learner never catches up (e.g. compacted partition, no snapshot install) | `ReceiveJoin`, backfill in `RaftPartitionStateMachine`; check the partition compaction floor |
-| New node stays `Learner` forever | Lag never reaches `LearnerPromotionLag`, or the P0 leader can't observe its lag (cross-partition, gRPC) | `CheckLearnerPromotionsAsync`; `GetRemoteFollowerLag` (Task 10) |
-| Healthy nodes get evicted | SWIM enabled on a transport with stubbed Ping | **Set `PingInterval = Zero`**; see the SWIM warning |
-| `LeaveCluster` doesn't shrink the roster on gRPC/REST | `SendLeave` is stubbed there | Transport matrix; Task 11 |
-| Roster versions differ between nodes | A node isn't getting replication/gossip; gossip stubbed on gRPC | `UpdateNodes`, `ApplyGossipRoster`, transport matrix |
+| New node stays `Learner` forever | Lag never reaches `LearnerPromotionLag`, or the P0 leader can't observe its lag (cross-partition lag not yet available over gRPC/REST) | `CheckLearnerPromotionsAsync`; `GetRemoteFollowerLag` in `ICommunication` |
+| Healthy nodes get evicted | SWIM enabled on a transport where Ping is not yet implemented | **Set `PingInterval = Zero`**; see the SWIM warning |
+| `LeaveCluster` doesn't shrink the roster on gRPC/REST | `SendLeave` is not yet implemented over the wire on those transports | Transport matrix above |
+| Roster versions differ between nodes | A node isn't getting replication/gossip; gossip not yet wired on gRPC/REST | `UpdateNodes`, `ApplyGossipRoster`, transport matrix |
 | `RemoveMember` returns `InsufficientVoters` | Removal would leave zero voters | By design — terminal, don't retry |
 | Commit stalls right after adding a node | (Should not happen) Learner counted toward quorum — a real bug | Quorum math in `RaftPartitionStateMachine`; the invariant below |
 

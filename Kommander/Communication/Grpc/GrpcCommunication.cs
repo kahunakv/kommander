@@ -474,6 +474,40 @@ public class GrpcCommunication : ICommunication
     public Task<Gossip.PingReqResponse> SendPingReq(RaftManager manager, RaftNode node, Gossip.PingReqRequest request, CancellationToken cancellationToken = default)
         => Task.FromResult(new Gossip.PingReqResponse(false));
 
+    /// <summary>
+    /// Queries <paramref name="node"/> for the committed log index it has recorded for
+    /// <paramref name="followerEndpoint"/> on <paramref name="partitionId"/> via the
+    /// <c>GetFollowerLag</c> gRPC RPC.  Returns <see langword="null"/> when the remote
+    /// node reports that it has no record for the follower on that partition.
+    /// </summary>
+    public async Task<long?> GetRemoteFollowerLag(RaftManager manager, RaftNode node, int partitionId, string followerEndpoint)
+    {
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(node.Endpoint, GetSecurityOptions(manager)));
+
+        GrpcGetFollowerLagRequest grpcRequest = new()
+        {
+            PartitionId = partitionId,
+            FollowerEndpoint = followerEndpoint
+        };
+
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/GetFollowerLag");
+        try
+        {
+            GrpcGetFollowerLagResponse response = await client
+                .GetFollowerLagAsync(grpcRequest, new CallOptions(metadata))
+                .ResponseAsync
+                .ConfigureAwait(false);
+
+            return response.HasValue ? response.Value : null;
+        }
+        catch (Exception ex)
+        {
+            manager.Logger.LogWarning("GetRemoteFollowerLag from {Endpoint} partition {PartitionId}: {Message}",
+                node.Endpoint, partitionId, ex.Message);
+            return null;
+        }
+    }
+
     public async Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
     {
         Rafter.RafterClient client = new(SharedChannels.GetChannel(node.Endpoint, GetSecurityOptions(manager)));

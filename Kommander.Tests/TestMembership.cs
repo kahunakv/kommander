@@ -984,57 +984,93 @@ public sealed class TestMembership
     }
 
     [Fact]
-    public async Task OnMembershipChanged_FiresWithMonotonicallyIncreasingVersion()
+    public async Task OnMembershipChanged_FiresAcrossJoinPromoteLeave()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
 
         InMemoryCommunication comm = new();
 
-        RaftManager n1 = MakeNode(comm, "localhost", 8201, 1, ["localhost:8202", "localhost:8203"], logger);
-        RaftManager n2 = MakeNode(comm, "localhost", 8202, 2, ["localhost:8201", "localhost:8203"], logger);
-        RaftManager n3 = MakeNode(comm, "localhost", 8203, 3, ["localhost:8201", "localhost:8202"], logger);
+        RaftManager n1 = BuildJoinSeedsNode(comm, "node1", 1, 8401, ["localhost:8402", "localhost:8403"]);
+        RaftManager n2 = BuildJoinSeedsNode(comm, "node2", 2, 8402, ["localhost:8401", "localhost:8403"]);
+        RaftManager n3 = BuildJoinSeedsNode(comm, "node3", 3, 8403, ["localhost:8401", "localhost:8402"]);
+        RaftManager n4 = BuildJoinSeedsNode(comm, "node4", 4, 8404,
+            ["localhost:8401", "localhost:8402", "localhost:8403"], initialPartitions: 0);
 
         comm.SetNodes(new Dictionary<string, IRaft>
         {
-            ["localhost:8201"] = n1,
-            ["localhost:8202"] = n2,
-            ["localhost:8203"] = n3,
+            ["localhost:8401"] = n1,
+            ["localhost:8402"] = n2,
+            ["localhost:8403"] = n3,
+            ["localhost:8404"] = n4,
         });
 
-        // Collect events from n1 via the interface.
-        List<long> versions = [];
+        // Collect membership events from n1 via the IRaft interface.
+        List<(long Version, int MemberCount)> events = [];
         IRaft i1 = n1;
         i1.OnMembershipChanged += m =>
         {
-            lock (versions) versions.Add(m.MembershipVersion);
+            lock (events) events.Add((m.MembershipVersion, m.Members.Count));
         };
-
-        await n1.UpdateNodes();
-        await n2.UpdateNodes();
-        await n3.UpdateNodes();
-
-        await Task.WhenAll(n1.JoinCluster(ct), n2.JoinCluster(ct), n3.JoinCluster(ct));
-        await WaitForLeader([n1, n2, n3], partitionId: 1, ct);
 
         try
         {
-            // Wait until at least one event fires.
-            await WaitForCondition(() => { lock (versions) return versions.Count > 0; }, ct);
+            // ── Phase 1: join ─────────────────────────────────────────────────────
+            await Task.WhenAll(n1.JoinCluster(ct), n2.JoinCluster(ct), n3.JoinCluster(ct));
+            await WaitForCondition(
+                () => n1.IsInitialized && n2.IsInitialized && n3.IsInitialized, ct);
 
-            List<long> snapshot;
-            lock (versions) snapshot = [.. versions];
+            await WaitForCondition(() => { lock (events) return events.Count > 0; }, ct);
+            long versionAfterSeed;
+            lock (events) versionAfterSeed = events[^1].Version;
+            Assert.True(versionAfterSeed > 0);
 
-            // Versions must be monotonically increasing.
-            for (int j = 1; j < snapshot.Count; j++)
-                Assert.True(snapshot[j] > snapshot[j - 1],
-                    $"version at [{j}] = {snapshot[j]} not greater than [{j - 1}] = {snapshot[j - 1]}");
+            // ── Phase 2: 4th node joins as Learner then is promoted to Voter ──────
+            await n4.JoinCluster(["localhost:8401", "localhost:8402", "localhost:8403"], ct);
+            // JoinCluster(seeds) blocks until Voter; n1 must see the promotion event.
+            await WaitForCondition(
+                () =>
+                {
+                    lock (events)
+                        return events.Any(e => e.MemberCount == 4);
+                },
+                ct, timeoutMs: 15_000);
 
-            // Final GetMembership() must match the last fired version.
+            long versionAfterPromotion;
+            lock (events) versionAfterPromotion = events[^1].Version;
+            Assert.True(versionAfterPromotion > versionAfterSeed,
+                $"promotion must advance version: {versionAfterPromotion} > {versionAfterSeed}");
+            Assert.Equal(System.ClusterMemberRole.Voter, n4.LocalRole);
+
+            // ── Phase 3: n4 leaves ────────────────────────────────────────────────
+            await n4.LeaveCluster(dispose: false);
+            await WaitForCondition(
+                () =>
+                {
+                    lock (events)
+                        return events.Any(e => e.MemberCount == 3 && e.Version > versionAfterPromotion);
+                },
+                ct, timeoutMs: 15_000);
+
+            long versionAfterLeave;
+            lock (events) versionAfterLeave = events[^1].Version;
+            Assert.True(versionAfterLeave > versionAfterPromotion,
+                $"leave must advance version: {versionAfterLeave} > {versionAfterPromotion}");
+
+            // ── Monotonicity across all phases ────────────────────────────────────
+            List<long> allVersions;
+            lock (events) allVersions = events.Select(e => e.Version).ToList();
+            for (int j = 1; j < allVersions.Count; j++)
+                Assert.True(allVersions[j] >= allVersions[j - 1],
+                    $"version regression at [{j}]: {allVersions[j]} < {allVersions[j - 1]}");
+
+            // GetMembership() snapshot must agree with latest event.
             ClusterMembership current = i1.GetMembership();
-            Assert.True(current.MembershipVersion >= snapshot[^1]);
+            Assert.True(current.MembershipVersion >= versionAfterLeave);
+            Assert.Equal(3, current.Members.Count);
         }
         finally
         {
+            await n4.LeaveCluster(true);
             await n1.LeaveCluster(true);
             await n2.LeaveCluster(true);
             await n3.LeaveCluster(true);

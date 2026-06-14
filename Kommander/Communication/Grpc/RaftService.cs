@@ -374,6 +374,25 @@ public sealed class RaftService : Rafter.RafterBase
     }
 
     /// <summary>
+    /// Returns the last committed log index the local partition has seen from the queried
+    /// follower endpoint.  Used by a remote P0 leader to evaluate learner lag across
+    /// partitions it does not locally lead.
+    /// </summary>
+    public override async Task<GrpcGetFollowerLagResponse> GetFollowerLag(GrpcGetFollowerLagRequest request, ServerCallContext context)
+    {
+        ValidateAuth(context);
+
+        if (raft is not RaftManager manager)
+            return new GrpcGetFollowerLagResponse { HasValue = false };
+
+        long? lag = await manager.GetFollowerLagAsync(request.PartitionId, request.FollowerEndpoint).ConfigureAwait(false);
+
+        return lag.HasValue
+            ? new GrpcGetFollowerLagResponse { HasValue = true, Value = lag.Value }
+            : new GrpcGetFollowerLagResponse { HasValue = false };
+    }
+
+    /// <summary>
     /// Handles a <c>Join</c> RPC from a node requesting to enter the cluster as a Learner.
     /// If this node is the P0 leader it commits the joiner; otherwise returns the current leader as a hint.
     /// </summary>

@@ -173,6 +173,36 @@ public class RestCommunication : ICommunication
     public Task<Gossip.PingReqResponse> SendPingReq(RaftManager manager, RaftNode node, Gossip.PingReqRequest request, CancellationToken cancellationToken = default)
         => Task.FromResult(new Gossip.PingReqResponse(false));
 
+    /// <summary>
+    /// Queries the remote node for the last committed log index it has recorded for
+    /// <paramref name="followerEndpoint"/> on <paramref name="partitionId"/> via the
+    /// <c>POST /v1/raft/get-follower-lag</c> REST endpoint.  Returns <see langword="null"/>
+    /// when the remote node reports no record for the follower on that partition, or when
+    /// the request fails.
+    /// </summary>
+    public async Task<long?> GetRemoteFollowerLag(RaftManager manager, RaftNode node, int partitionId, string followerEndpoint)
+    {
+        GetFollowerLagRequest request = new(partitionId, followerEndpoint);
+        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.GetFollowerLagRequest);
+
+        try
+        {
+            GetFollowerLagResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/get-follower-lag", payload)
+                .PostStringAsync(payload)
+                .ReceiveJson<GetFollowerLagResponse>()
+                .ConfigureAwait(false);
+
+            return response is { HasValue: true } ? response.Value : null;
+        }
+        catch (Exception e)
+        {
+            manager.Logger.LogError("[{Endpoint}] GetRemoteFollowerLag partition {PartitionId}: {Message}",
+                manager.LocalEndpoint, partitionId, e.Message);
+        }
+
+        return null;
+    }
+
     public async Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
     {
         string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.JoinRequest);
