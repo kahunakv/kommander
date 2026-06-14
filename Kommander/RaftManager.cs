@@ -247,6 +247,9 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <inheritdoc/>
     public event Action<IReadOnlyList<RaftPartitionRange>>? OnPartitionMapChanged;
 
+    /// <inheritdoc/>
+    public event Action<System.ClusterMembership>? OnMembershipChanged;
+
     /// <summary>
     /// Constructor
     /// </summary>
@@ -2333,6 +2336,17 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
         return 0;
     }
+
+    /// <inheritdoc/>
+    public System.ClusterMembership GetMembership() => systemCoordinator.GetMembership();
+
+    /// <summary>
+    /// Fires <see cref="OnMembershipChanged"/> with the new roster.
+    /// Called by <see cref="RaftSystemCoordinator"/> each time <c>_cachedMembership</c>
+    /// advances to a strictly higher version.
+    /// </summary>
+    internal void RaiseMembershipChanged(System.ClusterMembership membership) =>
+        OnMembershipChanged?.Invoke(membership);
 
     /// <inheritdoc/>
     public IReadOnlyList<RaftPartitionRange> GetPartitionMap()

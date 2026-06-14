@@ -105,12 +105,41 @@ public interface IRaft
     /// The argument is a point-in-time snapshot; mutating it has no effect on the live map.
     /// </summary>
     public event Action<IReadOnlyList<RaftPartitionRange>>? OnPartitionMapChanged;
-    
+
+    /// <summary>
+    /// Fired whenever the committed cluster membership roster advances to a new version —
+    /// on join, leave, promotion from Learner to Voter, and SWIM-driven eviction.
+    /// <para>
+    /// The argument is the new <see cref="ClusterMembership"/> snapshot. <c>MembershipVersion</c>
+    /// is monotonically increasing within a cluster lifetime.
+    /// </para>
+    /// <para>
+    /// <b>Threading:</b> fires on the <see cref="RaftSystemCoordinator"/> consumer loop.
+    /// Handlers must not block or re-enter the coordinator.
+    /// </para>
+    /// </summary>
+    public event Action<System.ClusterMembership>? OnMembershipChanged;
+
+    /// <summary>
+    /// Returns a point-in-time snapshot of the current committed cluster membership.
+    /// The returned object is immutable; it will not reflect future changes.
+    /// </summary>
+    public System.ClusterMembership GetMembership();
+
     /// <summary>
     /// Joins the Raft cluster
     /// </summary>
     /// <returns></returns>
     public Task JoinCluster(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Joins the Raft cluster by contacting the given seed endpoints directly,
+    /// bypassing the discovery mechanism.  Useful when discovery is unavailable
+    /// or when adding a node programmatically.
+    /// </summary>
+    /// <param name="seeds">One or more endpoints of existing cluster members.</param>
+    /// <param name="cancellationToken"></param>
+    public Task JoinCluster(IEnumerable<string> seeds, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Leaves the Raft cluster

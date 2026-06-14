@@ -1618,6 +1618,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
         systemConfiguration[RaftSystemConfigKeys.Members] = json;
         _cachedMembership = seed;
+        manager.RaiseMembershipChanged(seed);
         logger.LogInformation(
             "[RaftSystemCoordinator] Seeded initial membership roster with {Count} voter(s)",
             allMembers.Count);
@@ -1647,6 +1648,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
             _cachedMembership.MembershipVersion, roster.MembershipVersion);
 
         _cachedMembership = roster;
+        manager.RaiseMembershipChanged(roster);
     }
 
     /// <summary>
@@ -1892,7 +1894,10 @@ internal sealed class RaftSystemCoordinator : IDisposable
         // Accept only monotonically newer versions so that a slow ConfigReplicated replay
         // does not clobber a locally-updated cache that is already at a higher version.
         if (membership.MembershipVersion > _cachedMembership.MembershipVersion)
+        {
             _cachedMembership = membership;
+            manager.RaiseMembershipChanged(membership);
+        }
     }
 
     /// <summary>
@@ -1985,6 +1990,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
             systemConfiguration[RaftSystemConfigKeys.Members] = json;
             _cachedMembership = newMembership;
+            manager.RaiseMembershipChanged(newMembership);
 
             completion?.TrySetResult((RaftOperationStatus.Success, newMembership.MembershipVersion));
         }

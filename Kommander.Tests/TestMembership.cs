@@ -942,4 +942,195 @@ public sealed class TestMembership
             await n3.LeaveCluster(true);
         }
     }
+
+    // ── Task 9: IRaft public membership surface ────────────────────────────────
+
+    [Fact]
+    public async Task GetMembership_ViaInterface_MatchesRosterAfterJoin()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        (RaftManager n1, RaftManager n2, RaftManager n3) = await BuildThreeNodeCluster(logger, ct);
+
+        try
+        {
+            // Verify via the IRaft interface (not the concrete type).
+            IRaft i1 = n1;
+            IRaft i2 = n2;
+            IRaft i3 = n3;
+
+            await WaitForCondition(
+                () => i1.GetMembership().MembershipVersion > 0
+                   && i2.GetMembership().MembershipVersion > 0
+                   && i3.GetMembership().MembershipVersion > 0,
+                ct);
+
+            foreach (IRaft node in new[] { i1, i2, i3 })
+            {
+                ClusterMembership m = node.GetMembership();
+                Assert.True(m.MembershipVersion > 0);
+                Assert.Equal(3, m.Members.Count);
+                Assert.All(m.Members, mem => Assert.Equal(ClusterMemberRole.Voter, mem.Role));
+                Assert.Contains(m.Members, x => x.Endpoint == "localhost:8101");
+                Assert.Contains(m.Members, x => x.Endpoint == "localhost:8102");
+                Assert.Contains(m.Members, x => x.Endpoint == "localhost:8103");
+            }
+        }
+        finally
+        {
+            await n1.LeaveCluster(true);
+            await n2.LeaveCluster(true);
+            await n3.LeaveCluster(true);
+        }
+    }
+
+    [Fact]
+    public async Task OnMembershipChanged_FiresWithMonotonicallyIncreasingVersion()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        InMemoryCommunication comm = new();
+
+        RaftManager n1 = MakeNode(comm, "localhost", 8201, 1, ["localhost:8202", "localhost:8203"], logger);
+        RaftManager n2 = MakeNode(comm, "localhost", 8202, 2, ["localhost:8201", "localhost:8203"], logger);
+        RaftManager n3 = MakeNode(comm, "localhost", 8203, 3, ["localhost:8201", "localhost:8202"], logger);
+
+        comm.SetNodes(new Dictionary<string, IRaft>
+        {
+            ["localhost:8201"] = n1,
+            ["localhost:8202"] = n2,
+            ["localhost:8203"] = n3,
+        });
+
+        // Collect events from n1 via the interface.
+        List<long> versions = [];
+        IRaft i1 = n1;
+        i1.OnMembershipChanged += m =>
+        {
+            lock (versions) versions.Add(m.MembershipVersion);
+        };
+
+        await n1.UpdateNodes();
+        await n2.UpdateNodes();
+        await n3.UpdateNodes();
+
+        await Task.WhenAll(n1.JoinCluster(ct), n2.JoinCluster(ct), n3.JoinCluster(ct));
+        await WaitForLeader([n1, n2, n3], partitionId: 1, ct);
+
+        try
+        {
+            // Wait until at least one event fires.
+            await WaitForCondition(() => { lock (versions) return versions.Count > 0; }, ct);
+
+            List<long> snapshot;
+            lock (versions) snapshot = [.. versions];
+
+            // Versions must be monotonically increasing.
+            for (int j = 1; j < snapshot.Count; j++)
+                Assert.True(snapshot[j] > snapshot[j - 1],
+                    $"version at [{j}] = {snapshot[j]} not greater than [{j - 1}] = {snapshot[j - 1]}");
+
+            // Final GetMembership() must match the last fired version.
+            ClusterMembership current = i1.GetMembership();
+            Assert.True(current.MembershipVersion >= snapshot[^1]);
+        }
+        finally
+        {
+            await n1.LeaveCluster(true);
+            await n2.LeaveCluster(true);
+            await n3.LeaveCluster(true);
+        }
+    }
+
+    [Fact]
+    public async Task JoinCluster_Seeds_ViaInterface_AdmitsNewNode()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        InMemoryCommunication comm = new();
+
+        // n4 gets static discovery of the 3-node cluster so it can route CompleteAppendLogs
+        // ACKs back to the P0 leader before its own committed roster populates its node list.
+        RaftManager n1 = BuildJoinSeedsNode(comm, "node1", 1, 8361, ["localhost:8362", "localhost:8363"]);
+        RaftManager n2 = BuildJoinSeedsNode(comm, "node2", 2, 8362, ["localhost:8361", "localhost:8363"]);
+        RaftManager n3 = BuildJoinSeedsNode(comm, "node3", 3, 8363, ["localhost:8361", "localhost:8362"]);
+        // n4 has no user partitions; its discovery seeds include all 3 existing nodes so it can
+        // route CompleteAppendLogs ACKs before its committed roster populates Nodes.
+        RaftManager n4 = BuildJoinSeedsNode(comm, "node4", 4, 8364,
+            ["localhost:8361", "localhost:8362", "localhost:8363"], initialPartitions: 0);
+
+        // Register all 4 nodes up-front so the leader can reach n4 once it appears in the roster.
+        comm.SetNodes(new Dictionary<string, IRaft>
+        {
+            ["localhost:8361"] = n1,
+            ["localhost:8362"] = n2,
+            ["localhost:8363"] = n3,
+            ["localhost:8364"] = n4,
+        });
+
+        try
+        {
+            await Task.WhenAll(n1.JoinCluster(ct), n2.JoinCluster(ct), n3.JoinCluster(ct));
+
+            await WaitForCondition(
+                () => n1.IsInitialized && n2.IsInitialized && n3.IsInitialized, ct);
+
+            // Call via IRaft interface, using seeds — this blocks until n4 is a Voter.
+            IRaft i4 = n4;
+            await i4.JoinCluster(["localhost:8361", "localhost:8362", "localhost:8363"], ct);
+
+            // JoinCluster(seeds) already waited for Voter promotion.
+            Assert.Equal(System.ClusterMemberRole.Voter, n4.LocalRole);
+
+            // n1 must see n4 as a Voter in its committed roster.
+            await WaitForCondition(
+                () => n1.GetMembership().Members.Any(m => m.Endpoint == "localhost:8364" && m.Role == ClusterMemberRole.Voter),
+                ct, timeoutMs: 15_000);
+
+            // GetMembership via the IRaft interface reflects the new voter.
+            ClusterMembership m = n1.GetMembership();
+            Assert.Equal(4, m.Members.Count);
+            Assert.Contains(m.Members, x => x.Endpoint == "localhost:8364" && x.Role == ClusterMemberRole.Voter);
+        }
+        finally
+        {
+            await n4.LeaveCluster(true);
+            await n1.LeaveCluster(true);
+            await n2.LeaveCluster(true);
+            await n3.LeaveCluster(true);
+        }
+    }
+
+    private RaftManager BuildJoinSeedsNode(
+        InMemoryCommunication comm, string name, int id, int port,
+        string[] peers, int initialPartitions = 1)
+    {
+        RaftConfiguration config = new()
+        {
+            NodeName = name,
+            NodeId = id,
+            Host = "localhost",
+            Port = port,
+            InitialPartitions = initialPartitions,
+            HeartbeatInterval = TimeSpan.FromMilliseconds(50),
+            RecentHeartbeat = TimeSpan.FromMilliseconds(25),
+            VotingTimeout = TimeSpan.FromMilliseconds(500),
+            CheckLeaderInterval = TimeSpan.FromMilliseconds(25),
+            UpdateNodesInterval = TimeSpan.FromMilliseconds(200),
+            TimerInitialDelay = TimeSpan.FromMilliseconds(25),
+            StartElectionTimeout = 100,
+            EndElectionTimeout = 300,
+            BackfillThreshold = 0,
+            MaxBackfillEntriesPerRound = 128,
+            LearnerPromotionLag = 5,
+            LearnerPromotionStableWindow = TimeSpan.FromMilliseconds(500),
+        };
+
+        return new RaftManager(
+            config,
+            new StaticDiscovery(peers.Select(p => new RaftNode(p)).ToList()),
+            new InMemoryWAL(logger),
+            comm,
+            new HybridLogicalClock(),
+            logger);
+    }
 }
