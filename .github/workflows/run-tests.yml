@@ -21,6 +21,6 @@ jobs:
         with:
           dotnet-version: |
             8.0.x
-            9.0.x
+            10.0.x
       - name: Run Tests
         run: (cd Kommander.Tests && dotnet test -l "console;verbosity=detailed" --filter "Category!=Stress" --blame-hang --blame-hang-timeout 120s)

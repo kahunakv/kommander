@@ -5,11 +5,15 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>true</IsPackable>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <!-- CA1873: the .NET 10 SDK enables this logging-arg analyzer by default; the existing
+         structured-logging call sites trip it. Suppressed to preserve clean builds; revisit by
+         guarding hot-path logs with logger.IsEnabled or LoggerMessage source generation. -->
+    <NoWarn>$(NoWarn);CA1873</NoWarn>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>Kommander</PackageId>
-    <Version>0.11.3</Version>
+    <Version>0.12.0</Version>
     <Description>Distributed consensus with Raft for C#/.NET</Description>
     <Authors>Andres Gutierrez</Authors>
     <Company>Andres Gutierrez</Company>
@@ -40,11 +44,11 @@
     <PackageReference Include="Flurl" Version="4.0.0" />
     <PackageReference Include="Flurl.Http" Version="4.0.2" />
 
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.16" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.16" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.9" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.9" />
     <PackageReference Include="Microsoft.IO.RecyclableMemoryStream" Version="3.0.1" />
     <PackageReference Include="Standart.Hash.xxHash" Version="4.0.5" />
-    <PackageReference Include="RocksDB" Version="9.10.0.55496" />
+    <PackageReference Include="RocksDB" Version="10.10.1.1747" />
     <PackageReference Include="Google.Protobuf" Version="3.29.6" />
     <PackageReference Include="Grpc.AspNetCore" Version="2.67.0" />
     <PackageReference Include="Grpc.AspNetCore.Server.Reflection" Version="2.67.0" />

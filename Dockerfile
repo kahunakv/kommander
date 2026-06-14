@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build-env
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build-env
 
 RUN mkdir -p /src
 #COPY Nixie /src/Nixie/
@@ -10,7 +10,7 @@ WORKDIR /
 
 RUN cd /src/Kommander.Server/ && dotnet publish -c release -o /app
 
-FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 WORKDIR /app
 
 # expose the ports

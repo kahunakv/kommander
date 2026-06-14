@@ -650,20 +650,22 @@ public sealed class TestMembership
             // Permanently partition n3 so n1 and n2 can never ping it.
             comm.PartitionNode("localhost:8153");
 
-            // Manually drive several ping rounds on n1 and n2 so n3 becomes Suspect and
-            // then Dead within the short test timeouts.  The timer would do this too, but
-            // driving it directly keeps the test fast and deterministic.
-            for (int i = 0; i < 20; i++)
+            // Drive ping rounds on n1 and n2 until n3 is observed Dead. The Suspect → Dead
+            // transition (AdvanceExpiry) runs *inside* PingAsync, so we must keep pinging while
+            // we wait — a passive poll would never make progress. Bounded by a generous deadline
+            // so the test stays robust under full-suite CPU contention.
+            long deadObservedDeadline = Environment.TickCount64 + 15_000;
+            while (Environment.TickCount64 < deadObservedDeadline
+                   && n1.Liveness.GetState("localhost:8153") != MemberLivenessState.Dead)
             {
+                ct.ThrowIfCancellationRequested();
                 await n1.PingAsync(ct);
                 await n2.PingAsync(ct);
                 await Task.Delay(100, ct);
             }
 
             // n3 should now be Dead on n1.
-            await WaitForCondition(
-                () => n1.Liveness.GetState("localhost:8153") == MemberLivenessState.Dead,
-                ct, timeoutMs: 5_000);
+            Assert.Equal(MemberLivenessState.Dead, n1.Liveness.GetState("localhost:8153"));
 
             // Drive UpdateNodes on the P0 leader so EvictDeadMembersAsync fires.
             // Repeat until the eviction is actually committed to the roster.
