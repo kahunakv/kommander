@@ -39,4 +39,12 @@ public enum RaftRequestType
     /// measure learner lag without reading WAL storage.
     /// </summary>
     GetFollowerCommittedIndex,
+
+    /// <summary>
+    /// Posted by the background snapshot-transfer task back to the partition executor once the
+    /// target follower has confirmed the snapshot was installed.  The executor processes this on
+    /// its worker thread to safely advance <c>lastCommitIndexes[endpoint]</c> to the snapshot
+    /// index, allowing normal backfill to resume from the next entry.
+    /// </summary>
+    SnapshotInstalled,
 }

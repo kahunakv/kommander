@@ -23,6 +23,8 @@ namespace Kommander.Communication;
 [JsonSerializable(typeof(LeaveResponse))]
 [JsonSerializable(typeof(GetFollowerLagRequest))]
 [JsonSerializable(typeof(GetFollowerLagResponse))]
+[JsonSerializable(typeof(SnapshotRequest))]
+[JsonSerializable(typeof(SnapshotResponse))]
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
 public sealed partial class RestJsonContext : JsonSerializerContext
 {

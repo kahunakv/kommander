@@ -55,6 +55,7 @@ public static class RaftOperationMapper
             RaftRequestType.GetFollowerCommittedIndex => RaftOperationKind.Client,
             RaftRequestType.DrainBarrier              => RaftOperationKind.Maintenance,
             RaftRequestType.RestoreLogsLoaded         => RaftOperationKind.Maintenance,
+            RaftRequestType.SnapshotInstalled         => RaftOperationKind.Maintenance,
 
             _ => throw new ArgumentOutOfRangeException(nameof(requestType), requestType, "Unrecognised RaftRequestType"),
         };
@@ -121,7 +122,8 @@ public static class RaftOperationMapper
             RaftRequestType.GetTicketState or
             RaftRequestType.GetFollowerCommittedIndex or
             RaftRequestType.DrainBarrier or
-            RaftRequestType.RestoreLogsLoaded => RaftStatePriority.Low,
+            RaftRequestType.RestoreLogsLoaded or
+            RaftRequestType.SnapshotInstalled => RaftStatePriority.Low,
 
             RaftRequestType.AppendLogs or
             RaftRequestType.CompleteAppendLogs or

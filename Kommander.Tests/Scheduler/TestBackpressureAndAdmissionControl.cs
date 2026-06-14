@@ -1,5 +1,6 @@
 
 using System.Collections.Concurrent;
+using Kommander;
 using Kommander.Data;
 using Kommander.Scheduling;
 using Kommander.System;
@@ -59,6 +60,8 @@ public sealed class TestBackpressureAndAdmissionControl
         public Task<bool> InvokeReplicationReceived(int partitionId, RaftLog log) => Task.FromResult(false);
         public Task<bool> InvokeSystemReplicationReceived(int partitionId, RaftLog log) => Task.FromResult(false);
         public void InvokeReplicationError(int partitionId, RaftLog log) { }
+        public IRaftStateMachineTransfer? StateMachineTransfer => null;
+        public Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct) => Task.FromResult(new SnapshotResponse(false));
     }
 
     private sealed class StubWal : IRaftWalFacade
@@ -69,6 +72,7 @@ public sealed class TestBackpressureAndAdmissionControl
         public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(0L);
         public ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) => ValueTask.FromResult(new List<RaftLog>());
 
+        public ValueTask<long> GetLastCheckpointAsync() => ValueTask.FromResult(-1L);
         public long GetCommitIndex() => 0;
 
         public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp ts, bool autoCommit)

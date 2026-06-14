@@ -221,6 +221,29 @@ public class RestCommunication : ICommunication
         return null;
     }
 
+    public async Task<SnapshotResponse> SendInstallSnapshot(
+        RaftManager manager, RaftNode node, SnapshotRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.SnapshotRequest);
+
+        try
+        {
+            SnapshotResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/install-snapshot", payload)
+                .PostStringAsync(payload)
+                .ReceiveJson<SnapshotResponse>().ConfigureAwait(false);
+
+            return response ?? new SnapshotResponse(false);
+        }
+        catch (Exception e)
+        {
+            manager.Logger.LogError("[{Endpoint}] SendInstallSnapshot partition {PartitionId}: {Message}",
+                manager.LocalEndpoint, request.PartitionId, e.Message);
+        }
+
+        return new SnapshotResponse(false);
+    }
+
     public async Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
     {
         string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.JoinRequest);

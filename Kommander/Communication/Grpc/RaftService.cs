@@ -415,6 +415,35 @@ public sealed class RaftService : Rafter.RafterBase
     }
 
     /// <summary>
+    /// Handles an <c>InstallSnapshot</c> RPC from the partition leader.
+    /// Delegates to <see cref="RaftManager.ReceiveInstallSnapshot"/> which imports the state
+    /// and seeds the WAL with a <c>CommittedCheckpoint</c> at the snapshot index.
+    /// </summary>
+    public override async Task<GrpcInstallSnapshotResponse> InstallSnapshot(GrpcInstallSnapshotRequest request, ServerCallContext context)
+    {
+        ValidateAuth(context);
+
+        if (raft is not RaftManager manager)
+            return new GrpcInstallSnapshotResponse { Success = false };
+
+        Data.SnapshotRequest snapshotRequest = new()
+        {
+            SessionId = request.SessionId,
+            PartitionId = request.PartitionId,
+            SnapshotIndex = request.SnapshotIndex,
+            FollowerEndpoint = request.FollowerEndpoint,
+            ChunkIndex = request.ChunkIndex,
+            IsLast = request.IsLast,
+            Data = request.Data.ToByteArray(),
+        };
+
+        Data.SnapshotResponse result = await manager.ReceiveInstallSnapshot(
+            snapshotRequest, context.CancellationToken).ConfigureAwait(false);
+
+        return new GrpcInstallSnapshotResponse { Success = result.Success };
+    }
+
+    /// <summary>
     /// Handles a <c>Join</c> RPC from a node requesting to enter the cluster as a Learner.
     /// If this node is the P0 leader it commits the joiner; otherwise returns the current leader as a hint.
     /// </summary>

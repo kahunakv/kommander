@@ -65,4 +65,9 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
     public Task<bool> InvokeSystemReplicationReceived(int partitionId, RaftLog log) => manager.InvokeSystemReplicationReceived(partitionId, log);
 
     public void InvokeReplicationError(int partitionId, RaftLog log) => manager.InvokeReplicationError(partitionId, log);
+
+    public IRaftStateMachineTransfer? StateMachineTransfer => manager.StateMachineTransfer;
+
+    public Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct) =>
+        manager.Communication.SendInstallSnapshot(manager, node, request, ct);
 }

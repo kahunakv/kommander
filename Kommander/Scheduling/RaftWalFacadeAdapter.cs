@@ -25,6 +25,9 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
     public async ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) =>
         await wal.GetRangeAsync(startLogIndex, maxEntries).ConfigureAwait(false);
 
+    public async ValueTask<long> GetLastCheckpointAsync() =>
+        await wal.GetLastCheckpointAsync().ConfigureAwait(false);
+
     public long GetCommitIndex() => wal.GetCommitIndex();
 
     public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp timestamp, bool autoCommit) =>

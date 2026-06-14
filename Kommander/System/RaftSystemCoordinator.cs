@@ -1664,6 +1664,10 @@ internal sealed class RaftSystemCoordinator : IDisposable
     // Keyed by learner endpoint; records when the learner first appeared caught-up on all partitions.
     private readonly Dictionary<string, DateTimeOffset> _learnerCaughtUpSince = new();
 
+    // Endpoints for which a terminal "below WAL floor, no transfer" signal has already been sent.
+    // Prevents re-logging and re-signalling on every promotion tick.
+    private readonly HashSet<string> _terminalBelowFloorEndpoints = new();
+
     /// <summary>
     /// Called from <c>RaftManager.UpdateNodes</c> on every <see cref="RaftTimerService"/>
     /// <c>UpdateNodes</c> tick.  Runs only when this node is the P0 leader.
@@ -1679,13 +1683,14 @@ internal sealed class RaftSystemCoordinator : IDisposable
     /// promoted to Voter.  At most one membership change is in flight at a time.
     /// </para>
     /// </summary>
-    internal async Task CheckLearnerPromotionsAsync()
+    internal async Task CheckLearnerPromotionsAsync(CancellationToken cancellationToken = default)
     {
         // Only the P0 leader runs the driver.
         bool amP0Leader = await manager.AmILeaderQuick(RaftSystemConfig.SystemPartition).ConfigureAwait(false);
         if (!amP0Leader)
         {
             _learnerCaughtUpSince.Clear();
+            _terminalBelowFloorEndpoints.Clear();
             return;
         }
 
@@ -1701,6 +1706,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
         if (learners.Count == 0)
         {
             _learnerCaughtUpSince.Clear();
+            _terminalBelowFloorEndpoints.Clear();
             return;
         }
 
@@ -1777,6 +1783,33 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 long lag = leaderCommitted - learnerCommittedNullable.Value;
                 if (lag > manager.Configuration.LearnerPromotionLag)
                 {
+                    // If the learner is below the WAL compaction floor and no snapshot transfer
+                    // is registered it can never catch up via log replay. Signal the joiner once
+                    // so JoinCluster fails fast with a clear error instead of timing out.
+                    if (!_terminalBelowFloorEndpoints.Contains(endpoint))
+                    {
+                        long floor = manager.WalAdapter.GetLastCheckpoint(partitionId);
+                        if (floor > 0 && learnerCommittedNullable.Value < floor && manager.StateMachineTransfer is null)
+                        {
+                            string reason =
+                                $"learner is below WAL compaction floor on partition {partitionId} " +
+                                $"(learnerIndex={learnerCommittedNullable.Value}, floor={floor}). " +
+                                "Register IRaftStateMachineTransfer to enable snapshot-based catch-up.";
+
+                            logger.LogWarning(
+                                "[RaftSystemCoordinator] Learner {Endpoint} permanently blocked: {Reason}",
+                                endpoint, reason);
+
+                            _terminalBelowFloorEndpoints.Add(endpoint);
+
+                            // Route the terminal signal to the actual joiner. In-process (InMemoryCommunication)
+                            // this calls SetJoinTerminalReason directly on the target manager. Over gRPC/REST the
+                            // default ICommunication stub is a no-op (joiner times out after 60 s — a future task
+                            // adds the wire notification).
+                            await manager.Communication.NotifyJoinBlocked(manager, endpoint, reason, cancellationToken).ConfigureAwait(false);
+                        }
+                    }
+
                     caughtUp = false;
                     break;
                 }

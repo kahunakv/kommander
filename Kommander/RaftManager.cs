@@ -68,6 +68,25 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     private IRaftStateMachineTransfer? _stateMachineTransfer;
 
     /// <summary>
+    /// Per-endpoint terminal reasons set by the P0 leader when it determines a learner can
+    /// never be promoted (e.g., below the WAL compaction floor with no snapshot transfer).
+    /// The entry for the local endpoint is checked inside <see cref="JoinCluster(IEnumerable{string}, CancellationToken)"/>
+    /// so the joiner fails fast with a descriptive error rather than spinning to the timeout.
+    /// Written by the coordinator, read by the joining node's <c>JoinCluster</c> loop.
+    /// Only the local node's entry matters on the follower side; leader entries are noise-free
+    /// because the leader never waits for its own promotion.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, string> _joinTerminalReasons = new();
+
+    /// <summary>
+    /// In-progress snapshot receive sessions keyed by <see cref="SnapshotRequest.SessionId"/>.
+    /// Each value is a <see cref="MemoryStream"/> accumulating chunks until <see cref="SnapshotRequest.IsLast"/>
+    /// triggers the final <c>ImportRange</c> call.  Sessions are removed on completion or on any
+    /// error so a retry always starts a clean accumulation.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, MemoryStream> _pendingSnapshots = new();
+
+    /// <summary>
     /// SWIM failure-detector liveness table for this node.
     /// Tracks Alive/Suspect/Dead state for all known peers.
     /// The P0 leader uses this table to decide which members to evict.
@@ -543,6 +562,14 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             cancellationToken.ThrowIfCancellationRequested();
             if (joinStopwatch.GetElapsedMilliseconds() > 60_000)
                 throw new TimeoutException("RaftManager.JoinCluster(seeds) timed out after 60 s waiting for Voter promotion.");
+
+            // The P0 leader signals a terminal condition (e.g., learner is below the WAL
+            // compaction floor and no snapshot transfer is registered) so the joiner fails
+            // fast with a descriptive error rather than spinning to the 60 s deadline.
+            string? terminalReason = GetJoinTerminalReason(LocalEndpoint);
+            if (terminalReason is not null)
+                throw new InvalidOperationException($"RaftManager.JoinCluster: promotion permanently blocked — {terminalReason}");
+
             await Task.Delay(500, cancellationToken).ConfigureAwait(false);
         }
 
@@ -662,6 +689,80 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
         // Concurrent change, stale version, or timeout — caller retries with current leader.
         return new LeaveResponse(false, LocalEndpoint);
+    }
+
+    /// <summary>
+    /// Installs a partition snapshot received from the partition leader.
+    /// Called on a follower when the leader delivers one chunk of a snapshot transfer.
+    ///
+    /// <para>Large snapshots are split into bounded chunks by the sender.  Each chunk carries a
+    /// <see cref="SnapshotRequest.SessionId"/> that identifies the transfer session; this method
+    /// accumulates chunks in <see cref="_pendingSnapshots"/> until <see cref="SnapshotRequest.IsLast"/>
+    /// is true, then delegates to <see cref="IRaftStateMachineTransfer.ImportRange"/> and seeds the
+    /// WAL with a <c>CommittedCheckpoint</c> entry at <see cref="SnapshotRequest.SnapshotIndex"/>
+    /// so that normal backfill can resume from there.</para>
+    ///
+    /// <para>The method is idempotent at the session boundary: if the local WAL already reflects
+    /// <see cref="SnapshotRequest.SnapshotIndex"/> or higher, every chunk for that transfer returns
+    /// success immediately.  On any error the partial session is removed so a retry starts clean.</para>
+    /// </summary>
+    public async Task<SnapshotResponse> ReceiveInstallSnapshot(
+        SnapshotRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        IRaftStateMachineTransfer? transfer = Volatile.Read(ref _stateMachineTransfer);
+        if (transfer is null)
+            return new SnapshotResponse(false);
+
+        // Idempotency: already at or past the snapshot index — accept without re-importing.
+        long currentMax = walAdapter.GetMaxLog(request.PartitionId);
+        if (currentMax >= request.SnapshotIndex)
+            return new SnapshotResponse(true);
+
+        // Accumulate the chunk into the session buffer.
+        MemoryStream buf = _pendingSnapshots.GetOrAdd(request.SessionId, _ => new MemoryStream());
+        await buf.WriteAsync(request.Data, cancellationToken).ConfigureAwait(false);
+
+        // Non-final chunks are accepted; wait for IsLast before applying.
+        if (!request.IsLast)
+            return new SnapshotResponse(true);
+
+        // All chunks received — apply and clean up session state.
+        _pendingSnapshots.TryRemove(request.SessionId, out _);
+        buf.Position = 0;
+
+        try
+        {
+            await transfer.ImportRange(request.PartitionId, buf, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(
+                "[{Endpoint}] ReceiveInstallSnapshot: ImportRange partition={PartitionId} index={Index} failed: {Message}",
+                LocalEndpoint, request.PartitionId, request.SnapshotIndex, ex.Message);
+            return new SnapshotResponse(false);
+        }
+        finally
+        {
+            await buf.DisposeAsync().ConfigureAwait(false);
+        }
+
+        // Seed the WAL with a CommittedCheckpoint at the snapshot index so GetMaxLog reflects
+        // the installed position and normal backfill can resume from snapshotIndex + 1.
+        RaftLog checkpointLog = new()
+        {
+            Id = request.SnapshotIndex,
+            Type = RaftLogType.CommittedCheckpoint,
+            Term = walAdapter.GetCurrentTerm(request.PartitionId),
+        };
+
+        walAdapter.Write([(request.PartitionId, [checkpointLog])]);
+
+        Logger.LogInformation(
+            "[{Endpoint}] ReceiveInstallSnapshot: partition={PartitionId} installed snapshot at index={Index}",
+            LocalEndpoint, request.PartitionId, request.SnapshotIndex);
+
+        return new SnapshotResponse(true);
     }
 
     /// <summary>
@@ -2327,6 +2428,18 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <inheritdoc/>
     public void RegisterStateMachineTransfer(IRaftStateMachineTransfer? transfer) =>
         Volatile.Write(ref _stateMachineTransfer, transfer);
+
+    /// <summary>
+    /// Called by the P0 coordinator when it determines that <paramref name="endpoint"/> can never
+    /// be promoted (e.g., below WAL compaction floor with no snapshot transfer registered).
+    /// <c>JoinCluster(seeds)</c> polls this on the local endpoint and throws
+    /// <see cref="InvalidOperationException"/> immediately rather than spinning to the timeout.
+    /// </summary>
+    internal void SetJoinTerminalReason(string endpoint, string reason) =>
+        _joinTerminalReasons[endpoint] = reason;
+
+    internal string? GetJoinTerminalReason(string endpoint) =>
+        _joinTerminalReasons.TryGetValue(endpoint, out string? reason) ? reason : null;
 
     /// <inheritdoc/>
     public long GetPartitionGeneration(int partitionId)

@@ -170,6 +170,7 @@ public sealed class RaftPartition : IDisposable
             getGeneration:           () => Generation);
         executorRef = executor;
         replySink.Executor = executor;
+        stateMachine.SetPostToExecutor(req => executorRef.Post(req));
         executor.Start();
     }
 

@@ -55,4 +55,18 @@ public interface IRaftPartitionHost
     Task<bool> InvokeSystemReplicationReceived(int partitionId, RaftLog log);
 
     void InvokeReplicationError(int partitionId, RaftLog log);
+
+    /// <summary>
+    /// Returns the registered <see cref="IRaftStateMachineTransfer"/> for snapshot-based catch-up,
+    /// or <see langword="null"/> when none has been registered.  The state machine uses this to
+    /// determine whether a compacted follower can be recovered via snapshot transfer.
+    /// </summary>
+    IRaftStateMachineTransfer? StateMachineTransfer { get; }
+
+    /// <summary>
+    /// Sends a snapshot to <paramref name="node"/> on behalf of the partition leader.
+    /// Wraps the active <see cref="Kommander.Communication.ICommunication"/> so the state machine
+    /// does not need a direct reference to the transport layer.
+    /// </summary>
+    Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct);
 }

@@ -667,6 +667,11 @@ public sealed class RaftPartitionExecutor : IDisposable
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
                     break;
 
+                case RaftRequestType.SnapshotInstalled:
+                    _stateMachine.CompleteSnapshotInstalled(request.Endpoint ?? "", request.CommitIndex);
+                    op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
+                    break;
+
                 default:
                     _logger.LogError(
                         "[RaftPartitionExecutor/{PartitionId}] Unrecognised request type: {Type}",

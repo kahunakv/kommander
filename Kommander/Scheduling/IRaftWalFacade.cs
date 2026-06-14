@@ -41,6 +41,14 @@ public interface IRaftWalFacade
     ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries);
 
     /// <summary>
+    /// Returns the id of the last <see cref="Kommander.WAL.Data.RaftLogType.CommittedCheckpoint"/> WAL entry for
+    /// this partition, or -1 if no checkpoint exists.  Used by the leader to detect when a
+    /// follower's acknowledged log index falls below the compaction floor and a snapshot transfer
+    /// is required.
+    /// </summary>
+    ValueTask<long> GetLastCheckpointAsync();
+
+    /// <summary>
     /// Highest committed log id (excludes proposed-but-uncommitted tail entries). Used to seed the
     /// leader's per-follower backfill cursor on election, so a leader that has committed nothing in
     /// its current term can still backfill a stale follower without waiting for a new write.

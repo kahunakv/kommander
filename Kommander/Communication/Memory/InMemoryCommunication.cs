@@ -203,6 +203,34 @@ public class InMemoryCommunication : ICommunication
         return new JoinResponse(false);
     }
 
+    public async Task<SnapshotResponse> SendInstallSnapshot(RaftManager manager, RaftNode node, SnapshotRequest request, CancellationToken cancellationToken = default)
+    {
+        if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))
+            return new SnapshotResponse(false);
+
+        if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode) && targetNode is RaftManager targetManager)
+            return await targetManager.ReceiveInstallSnapshot(request, cancellationToken).ConfigureAwait(false);
+
+        return new SnapshotResponse(false);
+    }
+
+    /// <summary>
+    /// Routes the terminal join-blocked reason directly to the target node's in-process
+    /// <see cref="RaftManager.SetJoinTerminalReason"/> so the joiner's <c>JoinCluster(seeds)</c>
+    /// loop can throw <see cref="System.InvalidOperationException"/> immediately.
+    /// </summary>
+    public Task NotifyJoinBlocked(RaftManager manager, string targetEndpoint, string reason, CancellationToken cancellationToken = default)
+    {
+        if (!IsPartitioned(manager.LocalEndpoint, targetEndpoint)
+            && nodes.TryGetValue(targetEndpoint, out IRaft? targetNode)
+            && targetNode is RaftManager targetManager)
+        {
+            targetManager.SetJoinTerminalReason(targetEndpoint, reason);
+        }
+
+        return Task.CompletedTask;
+    }
+
     public async Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)
     {
         if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))

@@ -11,6 +11,7 @@ service Rafter {
     rpc Join (GrpcJoinRequest) returns (GrpcJoinResponse);
     rpc Leave (GrpcLeaveRequest) returns (GrpcLeaveResponse);
     rpc GetFollowerLag (GrpcGetFollowerLagRequest) returns (GrpcGetFollowerLagResponse);
+    rpc InstallSnapshot (GrpcInstallSnapshotRequest) returns (GrpcInstallSnapshotResponse);
 }
 
 message GrpcHandshakeRequest {
@@ -180,6 +181,20 @@ message GrpcGetFollowerLagRequest {
 message GrpcGetFollowerLagResponse {
     bool HasValue = 1;
     int64 Value = 2;
+}
+
+message GrpcInstallSnapshotRequest {
+    string SessionId = 1;
+    int32 PartitionId = 2;
+    int64 SnapshotIndex = 3;
+    string FollowerEndpoint = 4;
+    int32 ChunkIndex = 5;
+    bool IsLast = 6;
+    bytes Data = 7;
+}
+
+message GrpcInstallSnapshotResponse {
+    bool Success = 1;
 }
 
 enum GrpcRaftLogType {

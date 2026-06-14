@@ -97,4 +97,36 @@ public interface ICommunication
     /// </summary>
     public Task<long?> GetRemoteFollowerLag(RaftManager manager, RaftNode node, int partitionId, string followerEndpoint)
         => Task.FromResult<long?>(null);
+
+    /// <summary>
+    /// Ships a full-partition snapshot to a follower that is below the leader's compaction floor.
+    /// The follower installs the snapshot and seeds its WAL with a <c>CommittedCheckpoint</c>
+    /// at <see cref="SnapshotRequest.SnapshotIndex"/> so backfill can resume normally.
+    /// <para>
+    /// Implementations that do not yet support this RPC return
+    /// <c>SnapshotResponse(false)</c>, leaving the follower stuck until a future transfer is
+    /// attempted.
+    /// </para>
+    /// </summary>
+    public Task<SnapshotResponse> SendInstallSnapshot(
+        RaftManager manager, RaftNode node, SnapshotRequest request,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(new SnapshotResponse(false));
+
+    /// <summary>
+    /// Notifies a joining node that its promotion has been permanently blocked (e.g., the
+    /// learner is below the WAL compaction floor and no <see cref="IRaftStateMachineTransfer"/>
+    /// is registered).  The target node's <c>JoinCluster(seeds)</c> loop polls for this and
+    /// throws <see cref="System.InvalidOperationException"/> immediately rather than spinning
+    /// to the 60-second deadline.
+    ///
+    /// <para>
+    /// The default implementation is a no-op: transports that do not yet wire this notification
+    /// leave the joiner to time out, which is the pre-existing behaviour.
+    /// </para>
+    /// </summary>
+    public Task NotifyJoinBlocked(
+        RaftManager manager, string targetEndpoint, string reason,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
 }

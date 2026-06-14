@@ -528,6 +528,41 @@ public class GrpcCommunication : ICommunication
         }
     }
 
+    public async Task<SnapshotResponse> SendInstallSnapshot(
+        RaftManager manager, RaftNode node, SnapshotRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetSecurityOptions(manager)));
+
+        GrpcInstallSnapshotRequest grpcRequest = new()
+        {
+            SessionId = request.SessionId,
+            PartitionId = request.PartitionId,
+            SnapshotIndex = request.SnapshotIndex,
+            FollowerEndpoint = request.FollowerEndpoint,
+            ChunkIndex = request.ChunkIndex,
+            IsLast = request.IsLast,
+            Data = Google.Protobuf.ByteString.CopyFrom(request.Data),
+        };
+
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/InstallSnapshot");
+        try
+        {
+            GrpcInstallSnapshotResponse response = await client
+                .InstallSnapshotAsync(grpcRequest, new CallOptions(metadata, cancellationToken: cancellationToken))
+                .ResponseAsync
+                .ConfigureAwait(false);
+
+            return new SnapshotResponse(response.Success);
+        }
+        catch (Exception ex)
+        {
+            manager.Logger.LogWarning("SendInstallSnapshot to {Endpoint} partition {PartitionId}: {Message}",
+                node.Endpoint, request.PartitionId, ex.Message);
+            return new SnapshotResponse(false);
+        }
+    }
+
     public async Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
     {
         Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetSecurityOptions(manager)));

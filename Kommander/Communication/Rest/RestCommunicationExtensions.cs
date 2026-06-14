@@ -145,6 +145,14 @@ public static class RestCommunicationExtensions
             long? lag = await manager.GetFollowerLagAsync(request.PartitionId, request.FollowerEndpoint).ConfigureAwait(false);
             return lag.HasValue ? new GetFollowerLagResponse(true, lag.Value) : new GetFollowerLagResponse(false);
         });
+
+        app.MapPost("/v1/raft/install-snapshot", async (SnapshotRequest request, IRaft raft) =>
+        {
+            if (raft is not RaftManager manager)
+                return new SnapshotResponse(false);
+
+            return await manager.ReceiveInstallSnapshot(request).ConfigureAwait(false);
+        });
     }
 
     internal static async Task<RaftTransportAuthenticationResult> AuthenticateRequestAsync(

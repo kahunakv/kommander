@@ -527,6 +527,18 @@ public sealed class RaftWriteAhead
     public long GetCommitIndex() => commitIndex - 1;
 
     /// <summary>
+    /// Returns the id of the last <c>CommittedCheckpoint</c> WAL entry for this partition, or
+    /// -1 when no checkpoint exists.  Scheduled on the read thread so it does not race with WAL writes.
+    /// </summary>
+    public async ValueTask<long> GetLastCheckpointAsync()
+    {
+        return await manager.ReadScheduler.EnqueueTask(
+            partition.PartitionId,
+            () => walAdapter.GetLastCheckpoint(partition.PartitionId)
+        ).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Retrieves the current term of the Raft log for the specified partition.
     /// This term represents the latest term recognized by the Write-Ahead Log (WAL).
     /// </summary>

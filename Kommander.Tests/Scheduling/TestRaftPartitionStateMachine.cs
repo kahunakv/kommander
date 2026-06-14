@@ -1,4 +1,5 @@
 
+using Kommander;
 using Kommander.Data;
 using Kommander.Scheduling;
 using Kommander.System;
@@ -920,6 +921,47 @@ public class TestRaftPartitionStateMachine
         Assert.Equal(RaftNodeState.Follower, sm.NodeState);
     }
 
+    [Fact]
+    public async Task AppendLogs_AfterVoteSplit_AdoptsRealLeaderNotVoteTarget()
+    {
+        // Vote-split regression: node-a grants its term-4 vote to node-b, but node-c wins term 4
+        // with a different quorum. When the real leader node-c sends AppendEntries (term >=
+        // currentTerm), node-a must adopt it — not reject it forever because it voted for node-b.
+        // Granting a vote does not make the candidate the leader; conflating the two wedges the
+        // follower against the real leader and loses per-partition liveness.
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [new("node-b"), new("node-c")],
+            VoterEndpoints = ["node-a", "node-b", "node-c"]
+        };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        // node-a votes for node-b in term 4 (the candidate that ends up losing).
+        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 4, remoteMaxLogId: 0,
+            timestamp: host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            preVote: false);
+        Assert.Contains(host.EnqueuedResponses,
+            r => r.Endpoint == "node-b" && r.Type == RaftResponderRequestType.Vote);
+
+        // node-c won term 4 and now sends a heartbeat. The real leader must be adopted.
+        await sm.AppendLogsAsync("node-c", term: 4,
+            timestamp: host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            logs: null);
+
+        // node-a follows the real leader node-c, not its vote target node-b.
+        Assert.Equal("node-c", host.Leader);
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        Assert.Contains("node-c", host.LeaderChanges);
+
+        // The append must NOT have been rejected as "logs from another leader".
+        Assert.DoesNotContain(host.EnqueuedRequests, e =>
+            e.Endpoint == "node-c"
+            && e.Request.CompleteAppendLogsRequest is { } c
+            && c.Status == RaftOperationStatus.LogsFromAnotherLeader);
+    }
+
     private sealed class FakePartitionHost : IRaftPartitionHost
     {
         public int PartitionId { get; init; } = 1;
@@ -1006,6 +1048,11 @@ public class TestRaftPartitionStateMachine
         public Task<bool> InvokeSystemReplicationReceived(int partitionId, RaftLog log) => Task.FromResult(true);
 
         public void InvokeReplicationError(int partitionId, RaftLog log) { }
+
+        public IRaftStateMachineTransfer? StateMachineTransfer => null;
+
+        public Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct) =>
+            Task.FromResult(new SnapshotResponse(false));
     }
 
     private sealed class FakeWalFacade : IRaftWalFacade, IDisposable
@@ -1030,6 +1077,8 @@ public class TestRaftPartitionStateMachine
 
         public ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) =>
             ValueTask.FromResult(new List<RaftLog>());
+
+        public ValueTask<long> GetLastCheckpointAsync() => ValueTask.FromResult(-1L);
 
         public long GetCommitIndex() => wal.GetMaxLog(partitionId: 1);
 
