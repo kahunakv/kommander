@@ -584,14 +584,11 @@ public sealed class TestMembership
             StartElectionTimeout = 100,
             EndElectionTimeout = 250,
             // Fast SWIM settings so tests complete in < 10 s.
-            // PingInterval must be set explicitly: the default is TimeSpan.Zero (disabled)
-            // because the gRPC/REST stubs return false for every probe, which would cause
-            // healthy peers to be evicted on non-InMemory transports.
             PingTimeout = TimeSpan.FromMilliseconds(100),
             IndirectPingFanout = 1,
             SuspicionTimeout = TimeSpan.FromMilliseconds(600),
             DeadMemberEvictionGrace = TimeSpan.FromMilliseconds(800),
-            PingInterval = TimeSpan.FromMilliseconds(100),   // safe: uses InMemoryCommunication
+            PingInterval = TimeSpan.FromMilliseconds(100),
         };
 
         return new RaftManager(

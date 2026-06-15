@@ -65,7 +65,8 @@ public sealed class GrpcTestNode : IAsyncDisposable
             VotingTimeout = TimeSpan.FromMilliseconds(500),
             StartElectionTimeout = 600,
             EndElectionTimeout = 900,
-            TimerInitialDelay = TimeSpan.FromMilliseconds(500)
+            TimerInitialDelay = TimeSpan.FromMilliseconds(500),
+            PingInterval = TimeSpan.Zero   // disable SWIM in short-lived harness tests
         };
 
         ILogger<IRaft> logger = loggerFactory.CreateLogger<IRaft>();

@@ -307,15 +307,13 @@ public class RaftConfiguration
     /// Interval between SWIM ping rounds.  Each round picks one random peer to probe.
     /// Setting this to zero or a negative value disables the failure detector entirely.
     /// <para>
-    /// <b>Default is <see cref="TimeSpan.Zero"/> (disabled).</b>  The SWIM prober must only
-    /// be enabled when <see cref="ICommunication.SendPing"/> and
-    /// <see cref="ICommunication.SendPingReq"/> are genuinely implemented for the active
-    /// transport.  The gRPC and REST stubs return <c>false</c> for every probe, which would
-    /// cause the failure detector to mark every healthy peer as Dead and evict them.
-    /// Set a positive interval only after the wire RPCs are available (see Task 15).
+    /// Default is <b>1 second</b>.  All built-in transports (InMemory, gRPC, REST) implement
+    /// <see cref="ICommunication.SendPing"/> and <see cref="ICommunication.SendPingReq"/>,
+    /// so the detector is active out of the box.  Set to <see cref="TimeSpan.Zero"/> to
+    /// disable it entirely (e.g. in test clusters that control membership explicitly).
     /// </para>
     /// </summary>
-    public TimeSpan PingInterval { get; set; } = TimeSpan.Zero;
+    public TimeSpan PingInterval { get; set; } = TimeSpan.FromSeconds(1);
 
     // ── WAL compaction ────────────────────────────────────────────────────────
 

@@ -65,7 +65,8 @@ public sealed class RestTestNode : IAsyncDisposable
             StartElectionTimeout = 600,
             EndElectionTimeout = 900,
             TimerInitialDelay = TimeSpan.FromMilliseconds(500),
-            TransportSecurity = new() { RequireTls = false }
+            TransportSecurity = new() { RequireTls = false },
+            PingInterval = TimeSpan.Zero   // disable SWIM in short-lived harness tests
         };
 
         ILogger<IRaft> logger = loggerFactory.CreateLogger<IRaft>();
