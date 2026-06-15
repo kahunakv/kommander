@@ -1,5 +1,8 @@
 using System.Text;
+using System.Text.Json;
 using Kommander.Data;
+using Kommander.Gossip;
+using Kommander.System;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 
@@ -152,6 +155,25 @@ public static class RestCommunicationExtensions
                 return new SnapshotResponse(false);
 
             return await manager.ReceiveInstallSnapshot(request).ConfigureAwait(false);
+        });
+
+        app.MapPost("/v1/raft/gossip", (GossipRequest request, IRaft raft) =>
+        {
+            if (raft is not RaftManager manager)
+                return new GossipResponse(0, null);
+
+            ClusterMembership? roster = request.RosterJson is not null
+                ? JsonSerializer.Deserialize<ClusterMembership>(request.RosterJson)
+                : null;
+
+            GossipMessage digest = new(request.SenderEndpoint, request.MembershipVersion, roster);
+            GossipAck ack = manager.ReceiveGossip(digest);
+
+            string? ackRosterJson = ack.Roster is not null
+                ? JsonSerializer.Serialize(ack.Roster)
+                : null;
+
+            return new GossipResponse(ack.MembershipVersion, ackRosterJson);
         });
     }
 

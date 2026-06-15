@@ -464,14 +464,43 @@ public class GrpcCommunication : ICommunication
     }
 
     /// <summary>
-    /// The Gossip RPC is not yet implemented on the gRPC transport.
-    /// Returns an empty ACK (version 0, no roster) so the gossip loop silently skips
-    /// this peer rather than throwing. Gossip convergence falls back to the in-process
-    /// path; deployed clusters that use this transport will rely on Raft replication alone
-    /// until a dedicated gRPC RPC is added.
+    /// Sends the local membership roster to <paramref name="node"/> for gossip anti-entropy.
+    /// The receiver applies it when it is newer and replies with its own roster when it is
+    /// strictly ahead, enabling push-pull convergence in one round trip.
     /// </summary>
-    public Task<GossipAck> SendGossip(RaftManager manager, RaftNode node, GossipMessage digest, CancellationToken cancellationToken = default)
-        => Task.FromResult(new GossipAck(0, null));
+    public async Task<GossipAck> SendGossip(RaftManager manager, RaftNode node, GossipMessage digest, CancellationToken cancellationToken = default)
+    {
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetSecurityOptions(manager)));
+
+        GrpcGossipRequest grpcRequest = new()
+        {
+            SenderEndpoint = digest.SenderEndpoint,
+            MembershipVersion = digest.MembershipVersion,
+            RosterJson = digest.Roster is not null
+                ? ByteString.CopyFromUtf8(global::System.Text.Json.JsonSerializer.Serialize(digest.Roster))
+                : ByteString.Empty
+        };
+
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Gossip");
+        try
+        {
+            GrpcGossipResponse response = await client
+                .GossipAsync(grpcRequest, new CallOptions(metadata, cancellationToken: cancellationToken))
+                .ResponseAsync
+                .ConfigureAwait(false);
+
+            Kommander.System.ClusterMembership? roster = null;
+            if (!response.RosterJson.IsEmpty)
+                roster = global::System.Text.Json.JsonSerializer.Deserialize<Kommander.System.ClusterMembership>(response.RosterJson.Span);
+
+            return new GossipAck(response.MembershipVersion, roster);
+        }
+        catch (Exception ex)
+        {
+            manager.Logger.LogWarning("SendGossip to {Endpoint}: {Message}", node.Endpoint, ex.Message);
+            return new GossipAck(0, null);
+        }
+    }
 
     /// <summary>
     /// The Ping RPC is not yet implemented on the gRPC transport.

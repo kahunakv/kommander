@@ -12,6 +12,7 @@ service Rafter {
     rpc Leave (GrpcLeaveRequest) returns (GrpcLeaveResponse);
     rpc GetFollowerLag (GrpcGetFollowerLagRequest) returns (GrpcGetFollowerLagResponse);
     rpc InstallSnapshot (GrpcInstallSnapshotRequest) returns (GrpcInstallSnapshotResponse);
+    rpc Gossip (GrpcGossipRequest) returns (GrpcGossipResponse);
 }
 
 message GrpcHandshakeRequest {
@@ -196,6 +197,17 @@ message GrpcInstallSnapshotRequest {
 
 message GrpcInstallSnapshotResponse {
     bool Success = 1;
+}
+
+message GrpcGossipRequest {
+    string SenderEndpoint = 1;
+    int64 MembershipVersion = 2;
+    bytes RosterJson = 3;
+}
+
+message GrpcGossipResponse {
+    int64 MembershipVersion = 1;
+    bytes RosterJson = 2;
 }
 
 enum GrpcRaftLogType {

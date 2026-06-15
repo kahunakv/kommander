@@ -3,6 +3,7 @@ using System.Text.Json;
 using Flurl.Http;
 using Kommander.Data;
 using Kommander.Gossip;
+using Kommander.System;
 using Microsoft.Extensions.Logging;
 
 namespace Kommander.Communication.Rest;
@@ -161,14 +162,43 @@ public class RestCommunication : ICommunication
     }
 
     /// <summary>
-    /// The Gossip endpoint is not yet implemented on the REST transport.
-    /// Returns an empty ACK (version 0, no roster) so the gossip loop silently skips
-    /// this peer.  Gossip convergence falls back to the in-process path; deployed
-    /// clusters that use this transport will rely on Raft replication alone until a
-    /// dedicated REST endpoint is added.
+    /// Sends a gossip push to a peer via <c>POST /v1/raft/gossip</c>.
+    /// The roster is encoded as JSON in <see cref="GossipRequest.RosterJson"/> so that
+    /// <see cref="ClusterMembership"/> does not need to be registered in <see cref="RestJsonContext"/>.
+    /// Returns an empty <see cref="GossipAck"/> on any transport or deserialization error.
     /// </summary>
-    public Task<GossipAck> SendGossip(RaftManager manager, RaftNode node, GossipMessage digest, CancellationToken cancellationToken = default)
-        => Task.FromResult(new GossipAck(0, null));
+    public async Task<GossipAck> SendGossip(RaftManager manager, RaftNode node, GossipMessage digest, CancellationToken cancellationToken = default)
+    {
+        string? rosterJson = digest.Roster is not null
+            ? JsonSerializer.Serialize(digest.Roster)
+            : null;
+
+        GossipRequest request = new(digest.SenderEndpoint, digest.MembershipVersion, rosterJson);
+        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.GossipRequest);
+
+        try
+        {
+            GossipResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/gossip", payload)
+                .PostStringAsync(payload)
+                .ReceiveJson<GossipResponse>()
+                .ConfigureAwait(false);
+
+            if (response is null)
+                return new GossipAck(0, null);
+
+            ClusterMembership? roster = response.RosterJson is not null
+                ? JsonSerializer.Deserialize<ClusterMembership>(response.RosterJson)
+                : null;
+
+            return new GossipAck(response.MembershipVersion, roster);
+        }
+        catch (Exception e)
+        {
+            manager.Logger.LogWarning("[{Endpoint}] SendGossip: {Message}", manager.LocalEndpoint, e.Message);
+        }
+
+        return new GossipAck(0, null);
+    }
 
     /// <summary>
     /// The Ping endpoint is not yet implemented on the REST transport.

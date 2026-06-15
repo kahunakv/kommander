@@ -1,9 +1,11 @@
 
 using Grpc.Core;
 using Kommander.Data;
+using Kommander.Gossip;
 using Google.Protobuf.Collections;
 using Microsoft.Extensions.Logging;
 using System.Runtime.InteropServices;
+using ClusterMembership = Kommander.System.ClusterMembership;
 
 namespace Kommander.Communication.Grpc;
 
@@ -394,6 +396,36 @@ public sealed class RaftService : Rafter.RafterBase
             LeaderHint = response.LeaderHint ?? "",
             Terminal = response.Terminal
         };
+    }
+
+    /// <summary>
+    /// Receives a gossip push from a peer, applies the roster if it is newer, and responds
+    /// with the local roster when strictly ahead, completing the push-pull exchange in one
+    /// round trip.
+    /// </summary>
+    public override Task<GrpcGossipResponse> Gossip(GrpcGossipRequest request, ServerCallContext context)
+    {
+        ValidateAuth(context);
+
+        if (raft is not RaftManager manager)
+            return Task.FromResult(new GrpcGossipResponse());
+
+        ClusterMembership? roster = null;
+        if (!request.RosterJson.IsEmpty)
+            roster = global::System.Text.Json.JsonSerializer.Deserialize<ClusterMembership>(request.RosterJson.Span);
+
+        GossipMessage digest = new(request.SenderEndpoint, request.MembershipVersion, roster);
+        GossipAck ack = manager.ReceiveGossip(digest);
+
+        GrpcGossipResponse grpcResponse = new()
+        {
+            MembershipVersion = ack.MembershipVersion,
+            RosterJson = ack.Roster is not null
+                ? Google.Protobuf.ByteString.CopyFromUtf8(global::System.Text.Json.JsonSerializer.Serialize(ack.Roster))
+                : Google.Protobuf.ByteString.Empty
+        };
+
+        return Task.FromResult(grpcResponse);
     }
 
     /// <summary>

@@ -370,7 +370,12 @@ public sealed class TestMembership
         await n1.LeaveCluster(dispose: true);
         await n2.LeaveCluster(dispose: true);
 
-        // n3 is the last voter. After n1/n2 stepped down (self-removal), n3 is the P0 leader.
+        // Wait for n3 to win the P0 leader election after n1/n2 departed. This must happen
+        // before LeaveCluster sets _leaving=true, which suppresses elections and would prevent
+        // n3 from ever becoming the leader required to receive its own ReceiveLeave request.
+        await WaitForCondition(() => n3.GetPartitionLeaderEndpoint(0) == n3.LocalEndpoint, ct);
+
+        // n3 is the last voter and P0 leader.
         // TryRemoveMember returns InsufficientVoters → Terminal=true → CommitGracefulLeaveAsync
         // exits immediately.  The call must complete well under the 10 s deadline.
         long startMs = Environment.TickCount64;

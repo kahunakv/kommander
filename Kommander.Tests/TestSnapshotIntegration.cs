@@ -181,7 +181,8 @@ public sealed class TestSnapshotIntegration
             int userPartitionId = leader.Partitions.Keys.FirstOrDefault(k => k != 0);
             Assert.NotEqual(0, userPartitionId);
 
-            for (int i = 0; i < 5; i++)
+            // Write enough logs so the learner lag exceeds LearnerPromotionLag (default 10).
+            for (int i = 0; i < 15; i++)
                 await leader.ReplicateLogs(userPartitionId, "test", [1, 2, 3], cancellationToken: ct);
 
             RaftReplicationResult cpResult = await leader.ReplicateCheckpoint(userPartitionId, ct);
@@ -197,6 +198,8 @@ public sealed class TestSnapshotIntegration
                 wal1.GetLastCheckpoint(userPartitionId),
                 Math.Max(wal2.GetLastCheckpoint(userPartitionId),
                          wal3.GetLastCheckpoint(userPartitionId)));
+
+            Assert.True(floor > 10, $"Expected floor > LearnerPromotionLag (10), was {floor}");
 
             // JoinCluster should throw InvalidOperationException (terminal signal) fast,
             // not TimeoutException after 60 s.
