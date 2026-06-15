@@ -503,25 +503,51 @@ public class GrpcCommunication : ICommunication
     }
 
     /// <summary>
-    /// The Ping RPC is not yet implemented on the gRPC transport.
-    /// Returns <c>PingResponse(false, 0)</c> — i.e. the peer is reported unreachable.
-    /// <para>
-    /// <b>Warning:</b> if <c>PingInterval</c> is positive on a gRPC cluster these stubs will
-    /// cause every healthy peer to be suspected, declared Dead, and eventually evicted.
-    /// <c>PingInterval</c> defaults to <see cref="TimeSpan.Zero"/> precisely to prevent this;
-    /// do not enable the ping timer until the wire RPC is implemented.
-    /// </para>
+    /// Sends a direct SWIM probe to <paramref name="node"/> via the <c>Ping</c> gRPC RPC.
+    /// Returns <c>PingResponse(false, 0)</c> on any transport error so the caller treats
+    /// the node as unreachable.
     /// </summary>
-    public Task<Gossip.PingResponse> SendPing(RaftManager manager, RaftNode node, Gossip.PingRequest request, CancellationToken cancellationToken = default)
-        => Task.FromResult(new Gossip.PingResponse(false, 0));
+    public async Task<Gossip.PingResponse> SendPing(RaftManager manager, RaftNode node, Gossip.PingRequest request, CancellationToken cancellationToken = default)
+    {
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetSecurityOptions(manager)));
+        GrpcPingRequest grpcRequest = new() { SenderEndpoint = request.SenderEndpoint };
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Ping");
+        try
+        {
+            GrpcPingResponse response = await client
+                .PingAsync(grpcRequest, new CallOptions(metadata, cancellationToken: cancellationToken))
+                .ResponseAsync.ConfigureAwait(false);
+            return new Gossip.PingResponse(response.Alive, response.Incarnation);
+        }
+        catch (Exception ex)
+        {
+            manager.Logger.LogWarning("SendPing to {Endpoint}: {Message}", node.Endpoint, ex.Message);
+            return new Gossip.PingResponse(false, 0);
+        }
+    }
 
     /// <summary>
-    /// The PingReq RPC is not yet implemented on the gRPC transport.
-    /// Returns <c>PingReqResponse(false)</c> — the target is reported unreachable.
-    /// See the warning on <see cref="SendPing"/>.
+    /// Asks <paramref name="node"/> to relay a direct probe to a third node via the
+    /// <c>PingReq</c> gRPC RPC.  Returns <c>PingReqResponse(false)</c> on any transport error.
     /// </summary>
-    public Task<Gossip.PingReqResponse> SendPingReq(RaftManager manager, RaftNode node, Gossip.PingReqRequest request, CancellationToken cancellationToken = default)
-        => Task.FromResult(new Gossip.PingReqResponse(false));
+    public async Task<Gossip.PingReqResponse> SendPingReq(RaftManager manager, RaftNode node, Gossip.PingReqRequest request, CancellationToken cancellationToken = default)
+    {
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetSecurityOptions(manager)));
+        GrpcPingReqRequest grpcRequest = new() { SenderEndpoint = request.SenderEndpoint, TargetEndpoint = request.TargetEndpoint };
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/PingReq");
+        try
+        {
+            GrpcPingReqResponse response = await client
+                .PingReqAsync(grpcRequest, new CallOptions(metadata, cancellationToken: cancellationToken))
+                .ResponseAsync.ConfigureAwait(false);
+            return new Gossip.PingReqResponse(response.Reached);
+        }
+        catch (Exception ex)
+        {
+            manager.Logger.LogWarning("SendPingReq to {Endpoint}: {Message}", node.Endpoint, ex.Message);
+            return new Gossip.PingReqResponse(false);
+        }
+    }
 
     /// <summary>
     /// Queries <paramref name="node"/> for the committed log index it has recorded for

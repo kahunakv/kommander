@@ -6,6 +6,10 @@ using Google.Protobuf.Collections;
 using Microsoft.Extensions.Logging;
 using System.Runtime.InteropServices;
 using ClusterMembership = Kommander.System.ClusterMembership;
+using GossipPingRequest = Kommander.Gossip.PingRequest;
+using GossipPingResponse = Kommander.Gossip.PingResponse;
+using GossipPingReqRequest = Kommander.Gossip.PingReqRequest;
+using GossipPingReqResponse = Kommander.Gossip.PingReqResponse;
 
 namespace Kommander.Communication.Grpc;
 
@@ -396,6 +400,40 @@ public sealed class RaftService : Rafter.RafterBase
             LeaderHint = response.LeaderHint ?? "",
             Terminal = response.Terminal
         };
+    }
+
+    /// <summary>
+    /// Handles a direct SWIM probe.  The receiver replies with its current incarnation so the
+    /// sender can record a fresh <c>Alive</c> liveness entry without a full gossip round.
+    /// </summary>
+    public override Task<GrpcPingResponse> Ping(GrpcPingRequest request, ServerCallContext context)
+    {
+        ValidateAuth(context);
+
+        if (raft is not RaftManager manager)
+            return Task.FromResult(new GrpcPingResponse { Alive = false });
+
+        GossipPingResponse resp = manager.ReceivePing(new GossipPingRequest(request.SenderEndpoint));
+        return Task.FromResult(new GrpcPingResponse { Alive = resp.Alive, Incarnation = resp.Incarnation });
+    }
+
+    /// <summary>
+    /// Handles an indirect SWIM probe request.  This node relays a direct <c>Ping</c> to the
+    /// target endpoint and reports whether the target was reachable, allowing the originator to
+    /// distinguish a one-way path failure from a dead node.
+    /// </summary>
+    public override async Task<GrpcPingReqResponse> PingReq(GrpcPingReqRequest request, ServerCallContext context)
+    {
+        ValidateAuth(context);
+
+        if (raft is not RaftManager manager)
+            return new GrpcPingReqResponse { Reached = false };
+
+        GossipPingReqResponse resp = await manager.ReceivePingReq(
+            new GossipPingReqRequest(request.SenderEndpoint, request.TargetEndpoint),
+            context.CancellationToken).ConfigureAwait(false);
+
+        return new GrpcPingReqResponse { Reached = resp.Reached };
     }
 
     /// <summary>

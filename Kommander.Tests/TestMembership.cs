@@ -8,6 +8,8 @@ using Kommander.System;
 using Kommander.Time;
 using Kommander.WAL;
 using Microsoft.Extensions.Logging;
+using GossipPingReqRequest = Kommander.Gossip.PingReqRequest;
+using GossipPingReqResponse = Kommander.Gossip.PingReqResponse;
 
 namespace Kommander.Tests;
 
@@ -841,10 +843,10 @@ public sealed class TestMembership
             // Relay path: n1 asks n2 to probe n3 on its behalf.
             // InMemoryCommunication.SendPingReq routes to n2.ReceivePingReq which in turn
             // sends a direct Ping to n3 via the same communication instance.
-            PingReqResponse relayResp = await comm.SendPingReq(
+            GossipPingReqResponse relayResp = await comm.SendPingReq(
                 n1,
                 new RaftNode("localhost:8152"),
-                new PingReqRequest("localhost:8151", "localhost:8153"),
+                new GossipPingReqRequest("localhost:8151", "localhost:8153"),
                 ct);
 
             Assert.True(relayResp.Reached, "relay (n2) must be able to reach n3");

@@ -5,6 +5,10 @@ using Kommander.Data;
 using Kommander.Gossip;
 using Kommander.System;
 using Microsoft.Extensions.Logging;
+using WirePingRequest = Kommander.Data.PingRequest;
+using WirePingResponse = Kommander.Data.PingResponse;
+using WirePingReqRequest = Kommander.Data.PingReqRequest;
+using WirePingReqResponse = Kommander.Data.PingReqResponse;
 
 namespace Kommander.Communication.Rest;
 
@@ -147,7 +151,7 @@ public class RestCommunication : ICommunication
         try
         {
             LeaveResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/leave", payload)
-                .PostStringAsync(payload)
+                .PostStringAsync(payload, cancellationToken: cancellationToken)
                 .ReceiveJson<LeaveResponse>()
                 .ConfigureAwait(false);
 
@@ -179,7 +183,7 @@ public class RestCommunication : ICommunication
         try
         {
             GossipResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/gossip", payload)
-                .PostStringAsync(payload)
+                .PostStringAsync(payload, cancellationToken: cancellationToken)
                 .ReceiveJson<GossipResponse>()
                 .ConfigureAwait(false);
 
@@ -201,25 +205,62 @@ public class RestCommunication : ICommunication
     }
 
     /// <summary>
-    /// The Ping endpoint is not yet implemented on the REST transport.
-    /// Returns <c>PingResponse(false, 0)</c> — i.e. the peer is reported unreachable.
-    /// <para>
-    /// <b>Warning:</b> if <c>PingInterval</c> is positive on a REST cluster these stubs will
-    /// cause every healthy peer to be suspected, declared Dead, and eventually evicted.
-    /// <c>PingInterval</c> defaults to <see cref="TimeSpan.Zero"/> precisely to prevent this;
-    /// do not enable the ping timer until the wire RPC is implemented.
-    /// </para>
+    /// Sends a direct SWIM probe to <paramref name="node"/> via <c>POST /v1/raft/ping</c>.
+    /// Returns <c>PingResponse(false, 0)</c> on any transport error so the caller treats
+    /// the node as unreachable.
     /// </summary>
-    public Task<Gossip.PingResponse> SendPing(RaftManager manager, RaftNode node, Gossip.PingRequest request, CancellationToken cancellationToken = default)
-        => Task.FromResult(new Gossip.PingResponse(false, 0));
+    public async Task<Gossip.PingResponse> SendPing(RaftManager manager, RaftNode node, Gossip.PingRequest request, CancellationToken cancellationToken = default)
+    {
+        WirePingRequest wireRequest = new(request.SenderEndpoint);
+        string payload = JsonSerializer.Serialize(wireRequest, RestJsonContext.Default.PingRequest);
+
+        try
+        {
+            WirePingResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/ping", payload)
+                .PostStringAsync(payload, cancellationToken: cancellationToken)
+                .ReceiveJson<WirePingResponse>()
+                .ConfigureAwait(false);
+
+            return response is not null
+                ? new Gossip.PingResponse(response.Alive, response.Incarnation)
+                : new Gossip.PingResponse(false, 0);
+        }
+        catch (Exception e)
+        {
+            manager.Logger.LogWarning("[{Endpoint}] SendPing: {Message}", manager.LocalEndpoint, e.Message);
+        }
+
+        return new Gossip.PingResponse(false, 0);
+    }
 
     /// <summary>
-    /// The PingReq endpoint is not yet implemented on the REST transport.
-    /// Returns <c>PingReqResponse(false)</c> — the target is reported unreachable.
-    /// See the warning on <see cref="SendPing"/>.
+    /// Asks <paramref name="node"/> to relay a direct probe to a third node via
+    /// <c>POST /v1/raft/ping-req</c>.  Returns <c>PingReqResponse(false)</c> on any
+    /// transport error.
     /// </summary>
-    public Task<Gossip.PingReqResponse> SendPingReq(RaftManager manager, RaftNode node, Gossip.PingReqRequest request, CancellationToken cancellationToken = default)
-        => Task.FromResult(new Gossip.PingReqResponse(false));
+    public async Task<Gossip.PingReqResponse> SendPingReq(RaftManager manager, RaftNode node, Gossip.PingReqRequest request, CancellationToken cancellationToken = default)
+    {
+        WirePingReqRequest wireRequest = new(request.SenderEndpoint, request.TargetEndpoint);
+        string payload = JsonSerializer.Serialize(wireRequest, RestJsonContext.Default.PingReqRequest);
+
+        try
+        {
+            WirePingReqResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/ping-req", payload)
+                .PostStringAsync(payload, cancellationToken: cancellationToken)
+                .ReceiveJson<WirePingReqResponse>()
+                .ConfigureAwait(false);
+
+            return response is not null
+                ? new Gossip.PingReqResponse(response.Reached)
+                : new Gossip.PingReqResponse(false);
+        }
+        catch (Exception e)
+        {
+            manager.Logger.LogWarning("[{Endpoint}] SendPingReq: {Message}", manager.LocalEndpoint, e.Message);
+        }
+
+        return new Gossip.PingReqResponse(false);
+    }
 
     /// <summary>
     /// Queries the remote node for the last committed log index it has recorded for
@@ -260,7 +301,7 @@ public class RestCommunication : ICommunication
         try
         {
             SnapshotResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/install-snapshot", payload)
-                .PostStringAsync(payload)
+                .PostStringAsync(payload, cancellationToken: cancellationToken)
                 .ReceiveJson<SnapshotResponse>().ConfigureAwait(false);
 
             return response ?? new SnapshotResponse(false);

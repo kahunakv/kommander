@@ -27,6 +27,10 @@ namespace Kommander.Communication;
 [JsonSerializable(typeof(SnapshotResponse))]
 [JsonSerializable(typeof(GossipRequest))]
 [JsonSerializable(typeof(GossipResponse))]
+[JsonSerializable(typeof(PingRequest))]
+[JsonSerializable(typeof(PingResponse))]
+[JsonSerializable(typeof(PingReqRequest))]
+[JsonSerializable(typeof(PingReqResponse))]
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
 public sealed partial class RestJsonContext : JsonSerializerContext
 {

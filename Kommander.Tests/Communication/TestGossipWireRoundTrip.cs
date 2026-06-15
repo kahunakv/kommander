@@ -9,8 +9,8 @@ using Kommander.System;
 namespace Kommander.Tests.Communication;
 
 /// <summary>
-/// Wire correctness: <c>Gossip</c> RPC messages must survive proto3 and JSON serialization
-/// with all fields preserved, including the optional <c>RosterJson</c> payload.
+/// Wire correctness: <c>Gossip</c>, <c>Ping</c>, and <c>PingReq</c> RPC messages must survive
+/// proto3 and JSON serialization with all fields preserved.
 /// </summary>
 public class TestGossipWireRoundTrip
 {
@@ -138,6 +138,90 @@ public class TestGossipWireRoundTrip
         Assert.NotNull(parsed);
         Assert.Equal(99, parsed.MembershipVersion);
         Assert.Equal(rosterJson, parsed.RosterJson);
+    }
+
+    // ── gRPC / proto3 – Ping ─────────────────────────────────────────────────
+
+    [Fact]
+    public void GrpcPingRequest_SurvivesRoundTrip()
+    {
+        GrpcPingRequest original = new() { SenderEndpoint = "localhost:8201" };
+        GrpcPingRequest parsed = GrpcPingRequest.Parser.ParseFrom(original.ToByteArray());
+        Assert.Equal("localhost:8201", parsed.SenderEndpoint);
+    }
+
+    [Fact]
+    public void GrpcPingResponse_SurvivesRoundTrip()
+    {
+        GrpcPingResponse original = new() { Alive = true, Incarnation = 7 };
+        GrpcPingResponse parsed = GrpcPingResponse.Parser.ParseFrom(original.ToByteArray());
+        Assert.True(parsed.Alive);
+        Assert.Equal(7, parsed.Incarnation);
+    }
+
+    [Fact]
+    public void GrpcPingReqRequest_SurvivesRoundTrip()
+    {
+        GrpcPingReqRequest original = new()
+        {
+            SenderEndpoint = "localhost:8201",
+            TargetEndpoint = "localhost:8203"
+        };
+        GrpcPingReqRequest parsed = GrpcPingReqRequest.Parser.ParseFrom(original.ToByteArray());
+        Assert.Equal("localhost:8201", parsed.SenderEndpoint);
+        Assert.Equal("localhost:8203", parsed.TargetEndpoint);
+    }
+
+    [Fact]
+    public void GrpcPingReqResponse_SurvivesRoundTrip()
+    {
+        GrpcPingReqResponse original = new() { Reached = true };
+        GrpcPingReqResponse parsed = GrpcPingReqResponse.Parser.ParseFrom(original.ToByteArray());
+        Assert.True(parsed.Reached);
+    }
+
+    // ── REST / JSON – Ping ────────────────────────────────────────────────────
+
+    [Fact]
+    public void PingRequest_SurvivesRestJsonRoundTrip()
+    {
+        PingRequest original = new("localhost:8201");
+        string json = JsonSerializer.Serialize(original, RestJsonContext.Default.PingRequest);
+        PingRequest? parsed = JsonSerializer.Deserialize(json, RestJsonContext.Default.PingRequest);
+        Assert.NotNull(parsed);
+        Assert.Equal("localhost:8201", parsed.SenderEndpoint);
+    }
+
+    [Fact]
+    public void PingResponse_SurvivesRestJsonRoundTrip()
+    {
+        PingResponse original = new(true, 7);
+        string json = JsonSerializer.Serialize(original, RestJsonContext.Default.PingResponse);
+        PingResponse? parsed = JsonSerializer.Deserialize(json, RestJsonContext.Default.PingResponse);
+        Assert.NotNull(parsed);
+        Assert.True(parsed.Alive);
+        Assert.Equal(7, parsed.Incarnation);
+    }
+
+    [Fact]
+    public void PingReqRequest_SurvivesRestJsonRoundTrip()
+    {
+        PingReqRequest original = new("localhost:8201", "localhost:8203");
+        string json = JsonSerializer.Serialize(original, RestJsonContext.Default.PingReqRequest);
+        PingReqRequest? parsed = JsonSerializer.Deserialize(json, RestJsonContext.Default.PingReqRequest);
+        Assert.NotNull(parsed);
+        Assert.Equal("localhost:8201", parsed.SenderEndpoint);
+        Assert.Equal("localhost:8203", parsed.TargetEndpoint);
+    }
+
+    [Fact]
+    public void PingReqResponse_SurvivesRestJsonRoundTrip()
+    {
+        PingReqResponse original = new(true);
+        string json = JsonSerializer.Serialize(original, RestJsonContext.Default.PingReqResponse);
+        PingReqResponse? parsed = JsonSerializer.Deserialize(json, RestJsonContext.Default.PingReqResponse);
+        Assert.NotNull(parsed);
+        Assert.True(parsed.Reached);
     }
 
     // ── End-to-end JSON codec (ClusterMembership ↔ RosterJson) ───────────────

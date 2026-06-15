@@ -5,6 +5,10 @@ using System.ComponentModel;
 using Kommander.Communication;
 using Kommander.Data;
 using Kommander.Gossip;
+using GossipPingRequest = Kommander.Gossip.PingRequest;
+using GossipPingResponse = Kommander.Gossip.PingResponse;
+using GossipPingReqRequest = Kommander.Gossip.PingReqRequest;
+using GossipPingReqResponse = Kommander.Gossip.PingReqResponse;
 using Kommander.Diagnostics;
 using Kommander.Discovery;
 using Kommander.System;
@@ -857,37 +861,37 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// If our own liveness entry is Suspect (e.g. carried in a prior gossip round), we
     /// refute immediately by bumping our incarnation.
     /// </summary>
-    public PingResponse ReceivePing(PingRequest request)
+    public GossipPingResponse ReceivePing(GossipPingRequest request)
     {
         long incarnation = Liveness.GetSelfIncarnation();
         // If we've been marked Suspect by another node's gossip reaching us, refute.
         if (Liveness.GetState(LocalEndpoint) >= MemberLivenessState.Suspect)
             incarnation = Liveness.RefuteSuspicion(LocalEndpoint);
-        return new PingResponse(true, incarnation);
+        return new GossipPingResponse(true, incarnation);
     }
 
     /// <summary>
     /// Handles an inbound SWIM indirect probe request: relays a direct
-    /// <see cref="PingRequest"/> to <see cref="PingReqRequest.TargetEndpoint"/> and reports
+    /// <see cref="GossipPingRequest"/> to <see cref="GossipPingReqRequest.TargetEndpoint"/> and reports
     /// whether the target was reachable within <c>PingTimeout</c>.
     /// </summary>
-    public async Task<PingReqResponse> ReceivePingReq(PingReqRequest request, CancellationToken cancellationToken = default)
+    public async Task<GossipPingReqResponse> ReceivePingReq(GossipPingReqRequest request, CancellationToken cancellationToken = default)
     {
         RaftNode? targetNode = Nodes.FirstOrDefault(n => n.Endpoint == request.TargetEndpoint);
         if (targetNode is null)
-            return new PingReqResponse(false);
+            return new GossipPingReqResponse(false);
 
         using CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         cts.CancelAfter(configuration.PingTimeout);
 
         try
         {
-            PingResponse resp = await communication.SendPing(this, targetNode, new PingRequest(LocalEndpoint), cts.Token).ConfigureAwait(false);
-            return new PingReqResponse(resp.Alive);
+            GossipPingResponse resp = await communication.SendPing(this, targetNode, new GossipPingRequest(LocalEndpoint), cts.Token).ConfigureAwait(false);
+            return new GossipPingReqResponse(resp.Alive);
         }
         catch
         {
-            return new PingReqResponse(false);
+            return new GossipPingReqResponse(false);
         }
     }
 
@@ -932,7 +936,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             cts.CancelAfter(configuration.PingTimeout);
             try
             {
-                PingResponse resp = await communication.SendPing(this, target, new PingRequest(LocalEndpoint), cts.Token).ConfigureAwait(false);
+                GossipPingResponse resp = await communication.SendPing(this, target, new GossipPingRequest(LocalEndpoint), cts.Token).ConfigureAwait(false);
                 alive = resp.Alive;
                 incarnation = resp.Incarnation;
             }
@@ -967,9 +971,9 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             {
                 try
                 {
-                    PingReqResponse relayResp = await communication.SendPingReq(
+                    GossipPingReqResponse relayResp = await communication.SendPingReq(
                         this, relays[i],
-                        new PingReqRequest(LocalEndpoint, target.Endpoint),
+                        new GossipPingReqRequest(LocalEndpoint, target.Endpoint),
                         relayCts.Token).ConfigureAwait(false);
                     if (relayResp.Reached)
                         reachedViaRelay = true;

@@ -1,9 +1,14 @@
 
 using Kommander;
+using Kommander.Data;
 using Kommander.Gossip;
 using Kommander.System;
 using Kommander.Communication.Grpc;
 using Microsoft.Extensions.Logging;
+using PingRequest = Kommander.Gossip.PingRequest;
+using PingResponse = Kommander.Gossip.PingResponse;
+using PingReqRequest = Kommander.Gossip.PingReqRequest;
+using PingReqResponse = Kommander.Gossip.PingReqResponse;
 
 namespace Kommander.Tests.Communication;
 
@@ -120,9 +125,9 @@ public class TestGrpcTransport
     }
 
     /// <summary>
-    /// Sends a gossip push (with a stale membership version) from one node to another via
-    /// the real gRPC transport and asserts that the responder returns its current roster
-    /// when it is strictly ahead, completing the push-pull exchange in one round trip.
+    /// Sender at <c>currentVersion - 1</c> (strictly behind the receiver).
+    /// Contract: receiver is strictly ahead → ACK carries the receiver's full roster and
+    /// its membership version.  This is the push-pull exchange completing in one round trip.
     /// Ports 8876-8878.
     /// </summary>
     [Fact]
@@ -143,26 +148,30 @@ public class TestGrpcTransport
         GrpcTestNode caller   = harness.Nodes[0];
         GrpcTestNode receiver = harness.Nodes[1];
 
-        ClusterMembership localMembership = caller.Manager.GetMembership();
-        long currentVersion = localMembership.MembershipVersion;
+        // Read the receiver's version so we know what the ACK should echo back.
+        ClusterMembership receiverMembership = receiver.Manager.GetMembership();
+        long receiverVersion = receiverMembership.MembershipVersion;
+        Assert.True(receiverVersion > 0, "Receiver must have a committed roster before testing gossip.");
 
-        // Send a digest that is one version behind; the receiver should reply with its roster.
-        GossipMessage staleDigest = new(caller.Endpoint, currentVersion - 1, null);
+        // Digest is one version behind the receiver — receiver is strictly ahead.
+        GossipMessage staleDigest = new(caller.Endpoint, receiverVersion - 1, null);
 
         GrpcCommunication grpc = new();
         RaftNode receiverNode = new(receiver.Endpoint);
 
         GossipAck ack = await grpc.SendGossip(caller.Manager, receiverNode, staleDigest, ct);
 
-        // The receiver is at the same or newer version; it returns its roster.
-        Assert.True(ack.MembershipVersion >= 0);
+        // Receiver is strictly ahead: ACK must include the current roster and its version.
+        Assert.Equal(receiverVersion, ack.MembershipVersion);
+        Assert.NotNull(ack.Roster);
+        Assert.Equal(receiverVersion, ack.Roster.MembershipVersion);
     }
 
     /// <summary>
-    /// Sends a gossip push from a node that carries a newer (higher) membership version than
-    /// the receiver, then verifies the receiver accepts the update — i.e. the receiver's
-    /// membership version is at least as high as the sent version after the round trip.
-    /// Ports 8876-8878 (reuses the range; each test is independently scheduled).
+    /// Sender at <c>currentVersion</c> (same as receiver, not strictly behind).
+    /// Contract: receiver is NOT strictly ahead → ACK carries the receiver's version but
+    /// no roster (<see cref="GossipAck.Roster"/> is null).
+    /// Ports 8879-8881.
     /// </summary>
     [Fact]
     public async Task GossipRpc_CurrentSenderVersion_EmptyAck()
@@ -182,19 +191,94 @@ public class TestGrpcTransport
         GrpcTestNode caller   = harness.Nodes[0];
         GrpcTestNode receiver = harness.Nodes[1];
 
-        ClusterMembership localMembership = caller.Manager.GetMembership();
-        long currentVersion = localMembership.MembershipVersion;
+        ClusterMembership receiverMembership = receiver.Manager.GetMembership();
+        long receiverVersion = receiverMembership.MembershipVersion;
+        Assert.True(receiverVersion > 0, "Receiver must have a committed roster before testing gossip.");
 
-        // Sender is at the same version; the receiver should not need to send back its roster.
-        GossipMessage digest = new(caller.Endpoint, currentVersion, localMembership);
+        // Digest matches the receiver's version exactly — receiver is NOT strictly ahead.
+        GossipMessage digest = new(caller.Endpoint, receiverVersion, receiverMembership);
 
         GrpcCommunication grpc = new();
         RaftNode receiverNode = new(receiver.Endpoint);
 
         GossipAck ack = await grpc.SendGossip(caller.Manager, receiverNode, digest, ct);
 
-        // When the receiver is not strictly ahead, it returns version 0 and no roster.
-        Assert.True(ack.MembershipVersion >= 0); // did not throw
+        // Receiver is not strictly ahead: ACK echoes the version but omits the roster.
+        Assert.Equal(receiverVersion, ack.MembershipVersion);
+        Assert.Null(ack.Roster);
+    }
+
+    /// <summary>
+    /// A direct Ping RPC over gRPC returns <c>Alive=true</c> and a positive incarnation for a
+    /// healthy node.  Validates <c>GrpcCommunication.SendPing</c> →
+    /// <c>RaftService.Ping</c> → <c>RaftManager.ReceivePing</c>.
+    /// Ports 8888-8890.
+    /// </summary>
+    [Fact]
+    public async Task PingRpc_HealthyNode_ReturnsAliveTrue()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        using ILoggerFactory logFactory = CreateLoggerFactory();
+
+        await using GrpcClusterHarness harness = await GrpcClusterHarness.CreateAsync(
+            [8888, 8889, 8890],
+            logFactory,
+            partitions: 1,
+            ct: ct);
+
+        await WaitForLeaderAsync(harness, partitionId: 0, TimeSpan.FromSeconds(15), ct);
+
+        GrpcTestNode caller   = harness.Nodes[0];
+        GrpcTestNode receiver = harness.Nodes[1];
+
+        GrpcCommunication grpc = new();
+        RaftNode receiverNode = new(receiver.Endpoint);
+
+        PingResponse resp = await grpc.SendPing(
+            caller.Manager,
+            receiverNode,
+            new PingRequest(caller.Endpoint),
+            ct);
+
+        Assert.True(resp.Alive, "healthy node must respond Alive=true");
+        Assert.True(resp.Incarnation >= 0, $"incarnation must be non-negative, got {resp.Incarnation}");
+    }
+
+    /// <summary>
+    /// An indirect PingReq relay over gRPC: caller asks the relay node to probe the target;
+    /// the relay confirms it can reach the target (<c>Reached=true</c>).
+    /// Validates <c>GrpcCommunication.SendPingReq</c> → <c>RaftService.PingReq</c> →
+    /// <c>RaftManager.ReceivePingReq</c> → outbound Ping to target.
+    /// Ports 8891-8893.
+    /// </summary>
+    [Fact]
+    public async Task PingReqRpc_HealthyTarget_ReturnsReachedTrue()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        using ILoggerFactory logFactory = CreateLoggerFactory();
+
+        await using GrpcClusterHarness harness = await GrpcClusterHarness.CreateAsync(
+            [8891, 8892, 8893],
+            logFactory,
+            partitions: 1,
+            ct: ct);
+
+        await WaitForLeaderAsync(harness, partitionId: 0, TimeSpan.FromSeconds(15), ct);
+
+        GrpcTestNode caller  = harness.Nodes[0];
+        GrpcTestNode relay   = harness.Nodes[1];
+        GrpcTestNode target  = harness.Nodes[2];
+
+        GrpcCommunication grpc = new();
+        RaftNode relayNode = new(relay.Endpoint);
+
+        PingReqResponse resp = await grpc.SendPingReq(
+            caller.Manager,
+            relayNode,
+            new PingReqRequest(caller.Endpoint, target.Endpoint),
+            ct);
+
+        Assert.True(resp.Reached, "relay must be able to reach the healthy target");
     }
 
     private static async Task WaitForLeaderAsync(

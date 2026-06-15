@@ -5,6 +5,10 @@ using Kommander.Gossip;
 using Kommander.System;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using WirePingRequest = Kommander.Data.PingRequest;
+using WirePingResponse = Kommander.Data.PingResponse;
+using WirePingReqRequest = Kommander.Data.PingReqRequest;
+using WirePingReqResponse = Kommander.Data.PingReqResponse;
 
 namespace Kommander.Communication.Rest;
 
@@ -174,6 +178,27 @@ public static class RestCommunicationExtensions
                 : null;
 
             return new GossipResponse(ack.MembershipVersion, ackRosterJson);
+        });
+
+        app.MapPost("/v1/raft/ping", (WirePingRequest request, IRaft raft) =>
+        {
+            if (raft is not RaftManager manager)
+                return new WirePingResponse(false, 0);
+
+            Gossip.PingResponse resp = manager.ReceivePing(new Gossip.PingRequest(request.SenderEndpoint));
+            return new WirePingResponse(resp.Alive, resp.Incarnation);
+        });
+
+        app.MapPost("/v1/raft/ping-req", async (WirePingReqRequest request, IRaft raft, HttpContext httpContext) =>
+        {
+            if (raft is not RaftManager manager)
+                return new WirePingReqResponse(false);
+
+            Gossip.PingReqResponse resp = await manager.ReceivePingReq(
+                new Gossip.PingReqRequest(request.SenderEndpoint, request.TargetEndpoint),
+                httpContext.RequestAborted).ConfigureAwait(false);
+
+            return new WirePingReqResponse(resp.Reached);
         });
     }
 
