@@ -92,4 +92,12 @@ public interface IWAL : IDisposable
     /// Must not touch any other partition's data.
     /// </summary>
     RaftOperationStatus DeletePartitionWAL(int partitionId);
+
+    /// <summary>
+    /// Deletes all log entries for <paramref name="partitionId"/> whose id is strictly greater than
+    /// <paramref name="afterLogId"/>. Called by the follower path after a successful append to discard
+    /// any conflicting tail left over from a previous term's replication.
+    /// Idempotent: no-op when no entries exist beyond <paramref name="afterLogId"/>.
+    /// </summary>
+    RaftOperationStatus TruncateLogsAfter(int partitionId, long afterLogId);
 }

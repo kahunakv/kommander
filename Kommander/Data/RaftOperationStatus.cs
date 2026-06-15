@@ -51,4 +51,19 @@ public enum RaftOperationStatus
     /// making the cluster permanently unavailable.  The caller must not retry.
     /// </summary>
     InsufficientVoters = 16,
+
+    /// <summary>
+    /// The follower's log does not contain the expected entry at <c>PrevLogIndex</c> with
+    /// term <c>PrevLogTerm</c> (Log Matching Property violation).  The leader must backtrack
+    /// <c>nextIndex</c> for this peer and retry with an earlier prefix anchor.
+    /// </summary>
+    LogMismatch = 17,
+
+    /// <summary>
+    /// The entry the leader needs to send has been compacted below the follower's
+    /// <c>nextIndex</c>.  The leader cannot backfill via normal AppendEntries and must
+    /// instead install a snapshot.  The leader must not keep decrementing
+    /// <c>nextIndex</c> for this peer.
+    /// </summary>
+    SnapshotRequired = 18,
 }

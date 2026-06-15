@@ -200,6 +200,32 @@ public class InMemoryWAL : IWAL, IDisposable
         }
     }
 
+    public RaftOperationStatus TruncateLogsAfter(int partitionId, long afterLogId)
+    {
+        rwLock.EnterWriteLock();
+        try
+        {
+            if (!allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+                return RaftOperationStatus.Success;
+
+            List<long> toRemove = [];
+            foreach (long id in partitionLogs.Keys)
+            {
+                if (id > afterLogId)
+                    toRemove.Add(id);
+            }
+
+            foreach (long id in toRemove)
+                partitionLogs.Remove(id);
+
+            return RaftOperationStatus.Success;
+        }
+        finally
+        {
+            rwLock.ExitWriteLock();
+        }
+    }
+
     public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
     {
         rwLock.EnterWriteLock();

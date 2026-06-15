@@ -41,6 +41,17 @@ public sealed class RaftRequest
     /// </summary>
     public long ExpectedGeneration { get; }
 
+    /// <summary>
+    /// Log index of the entry immediately preceding the first entry in <see cref="Logs"/>.
+    /// Zero when the batch starts from the beginning of the log.
+    /// Carried on <see cref="RaftRequestType.AppendLogs"/> messages so the follower can
+    /// enforce the Log Matching Property before writing.
+    /// </summary>
+    public long PrevLogIndex { get; }
+
+    /// <summary>Term of the entry at <see cref="PrevLogIndex"/>. Zero when <see cref="PrevLogIndex"/> is zero.</summary>
+    public long PrevLogTerm { get; }
+
     public WALWriteOperation? WalOperation { get; }
 
     /// <summary>
@@ -61,14 +72,16 @@ public sealed class RaftRequest
     public IReadOnlyList<RaftLog>? RestoredLogs { get; }
 
     public RaftRequest(
-        RaftRequestType type, 
-        long term = -1, 
-        long commitIndex = 0, 
-        HLCTimestamp timestamp = default, 
-        string? endpoint = null, 
+        RaftRequestType type,
+        long term = -1,
+        long commitIndex = 0,
+        HLCTimestamp timestamp = default,
+        string? endpoint = null,
         RaftOperationStatus status = RaftOperationStatus.Success,
         List<RaftLog>? logs = null,
-        bool preVote = false
+        bool preVote = false,
+        long prevLogIndex = 0,
+        long prevLogTerm = 0
     )
     {
         Type = type;
@@ -79,6 +92,8 @@ public sealed class RaftRequest
         Status = status;
         Logs = logs;
         PreVote = preVote;
+        PrevLogIndex = prevLogIndex;
+        PrevLogTerm = prevLogTerm;
     }
 
     public RaftRequest(RaftRequestType type, List<RaftLog> logs, bool autoCommit, long expectedGeneration = 0)

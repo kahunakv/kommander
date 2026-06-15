@@ -71,6 +71,7 @@ public sealed class TestBackpressureAndAdmissionControl
         public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(0L);
         public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(0L);
         public ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) => ValueTask.FromResult(new List<RaftLog>());
+        public ValueTask<long> GetAnyTermAtAsync(long logIndex) => ValueTask.FromResult(-1L);
 
         public ValueTask<long> GetLastCheckpointAsync() => ValueTask.FromResult(-1L);
         public long GetCommitIndex() => 0;
@@ -457,6 +458,7 @@ public sealed class TestBackpressureAndAdmissionControl
         public int CountPersistedLogs(int partitionId) => 0;
         public int CountRemovableLogs(int partitionId) => 0;
         public RaftOperationStatus DeletePartitionWAL(int partitionId) => RaftOperationStatus.Success;
+        public RaftOperationStatus TruncateLogsAfter(int partitionId, long afterLogId) => RaftOperationStatus.Success;
         public string? GetMetaData(string key) => null;
         public bool SetMetaData(string key, string value) => true;
         public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries) => (RaftOperationStatus.Success, 0);

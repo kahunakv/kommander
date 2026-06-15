@@ -1054,6 +1054,99 @@ public abstract class WalConformanceTests
         finally { cleanup(); }
     }
 
+    // ──────────────────────── TruncateLogsAfter ──────────────────────────────────
+
+    /// <summary>
+    /// Entries strictly beyond <paramref name="afterLogId"/> are removed; entries at or
+    /// below the boundary survive intact.
+    /// </summary>
+    [Fact]
+    public void TruncateLogsAfter_RemovesTailBeyondBoundary()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(1, [Log(id: 1), Log(id: 2), Log(id: 3), Log(id: 4), Log(id: 5)])]);
+
+            Assert.Equal(RaftOperationStatus.Success, wal.TruncateLogsAfter(1, 3));
+
+            List<RaftLog> remaining = wal.ReadLogsRange(1, 1);
+            Assert.Equal(3, remaining.Count);
+            Assert.Equal(1, remaining[0].Id);
+            Assert.Equal(2, remaining[1].Id);
+            Assert.Equal(3, remaining[2].Id);
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// When nothing exists beyond the boundary the call is a no-op and returns
+    /// <see cref="RaftOperationStatus.Success"/>.
+    /// </summary>
+    [Fact]
+    public void TruncateLogsAfter_IsNoOp_WhenNothingExistsBeyondBoundary()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(1, [Log(id: 1), Log(id: 2), Log(id: 3)])]);
+
+            Assert.Equal(RaftOperationStatus.Success, wal.TruncateLogsAfter(1, 3));
+
+            List<RaftLog> remaining = wal.ReadLogsRange(1, 1);
+            Assert.Equal(3, remaining.Count);
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// Simulates the in-order happy path: a FollowerAppend batch ending at id=4 truncates
+    /// only entries beyond 4 (here id=5), while entries 1-4 remain intact.
+    /// This is the canonical scenario for per-endpoint ordered delivery: the follower held
+    /// a divergent proposal at id=5 from a previous term; truncation at batch-max=4 removes it.
+    /// </summary>
+    [Fact]
+    public void TruncateLogsAfter_PrefixAppend_PreservesEntriesUpToBatchMax()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            // Follower holds 1-5; leader's batch ends at 4.
+            wal.Write([(1, [Log(id: 1), Log(id: 2), Log(id: 3), Log(id: 4), Log(id: 5)])]);
+
+            // op.LogIndex = 4 (batch max) — mirrors what FairWalScheduler passes.
+            Assert.Equal(RaftOperationStatus.Success, wal.TruncateLogsAfter(1, 4));
+
+            List<RaftLog> remaining = wal.ReadLogsRange(1, 1);
+            Assert.Equal(4, remaining.Count);
+            Assert.Equal(new long[] { 1, 2, 3, 4 }, remaining.Select(e => e.Id).ToArray());
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// Truncation on one partition must not touch any other partition's data.
+    /// </summary>
+    [Fact]
+    public void TruncateLogsAfter_BoundaryPartitions_NotAffected()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(10, [Log(id: 1), Log(id: 2), Log(id: 3)])]);
+            wal.Write([(11, [Log(id: 1), Log(id: 2), Log(id: 3)])]);
+            wal.Write([(12, [Log(id: 1), Log(id: 2), Log(id: 3)])]);
+
+            Assert.Equal(RaftOperationStatus.Success, wal.TruncateLogsAfter(11, 1));
+
+            // Partitions 10 and 12 must be completely untouched.
+            Assert.Equal(3, wal.ReadLogsRange(10, 1).Count);
+            Assert.Single(wal.ReadLogsRange(11, 1));     // only id=1 survives
+            Assert.Equal(3, wal.ReadLogsRange(12, 1).Count);
+        }
+        finally { cleanup(); }
+    }
+
     // ──────────────────────────── helpers ───────────────────────────────────────
 
     protected static RaftLog Log(long id, long term = 1, RaftLogType type = RaftLogType.Committed) =>

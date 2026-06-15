@@ -1078,6 +1078,8 @@ public class TestRaftPartitionStateMachine
         public ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) =>
             ValueTask.FromResult(new List<RaftLog>());
 
+        public ValueTask<long> GetAnyTermAtAsync(long logIndex) => ValueTask.FromResult(-1L);
+
         public ValueTask<long> GetLastCheckpointAsync() => ValueTask.FromResult(-1L);
 
         public long GetCommitIndex() => wal.GetMaxLog(partitionId: 1);

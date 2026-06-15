@@ -68,6 +68,10 @@ message GrpcAppendLogsRequest {
   uint32 TimeCounter = 5;
   string Endpoint = 6;
   repeated GrpcRaftLog Logs = 7;
+  // Log Matching Property anchor: index and term of the entry immediately
+  // preceding this batch (0/0 when the batch starts from the beginning).
+  int64 PrevLogIndex = 8;
+  int64 PrevLogTerm = 9;
 }
 
 message GrpcAppendLogsResponse {
@@ -248,4 +252,16 @@ enum GrpcRaftOperationStatus {
   PROPOSAL_NOT_FOUND = 7;
   PROPOSAL_TIMEOUT = 8;
   REPLICATION_FAILED = 9;
+  // 10–13: Pending, ProposalQueueFull, RestoreInProgress, PartitionMoved
+  PENDING = 10;
+  PROPOSAL_QUEUE_FULL = 11;
+  RESTORE_IN_PROGRESS = 12;
+  PARTITION_MOVED = 13;
+  // 14–16: dynamic-membership statuses
+  STALE_MEMBERSHIP = 14;
+  CONCURRENT_MEMBERSHIP_CHANGE = 15;
+  INSUFFICIENT_VOTERS = 16;
+  // 17–18: log catch-up / backfill statuses
+  LOG_MISMATCH = 17;
+  SNAPSHOT_REQUIRED = 18;
 }

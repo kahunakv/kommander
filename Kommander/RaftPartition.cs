@@ -245,7 +245,10 @@ public sealed class RaftPartition : IDisposable
             request.Time,
             request.Endpoint,
             RaftOperationStatus.Success,
-            request.Logs
+            request.Logs,
+            preVote: false,
+            prevLogIndex: request.PrevLogIndex,
+            prevLogTerm: request.PrevLogTerm
         ));
     }
     

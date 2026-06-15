@@ -170,13 +170,15 @@ public sealed class RaftService : Rafter.RafterBase
         ValidateAuth(context);
 
         raft.AppendLogs(new(
-            request.Partition, 
-            request.Term, 
-            new(request.TimeNode, request.TimePhysical, request.TimeCounter), 
-            request.Endpoint, 
-            GetLogs(request.Logs)
+            request.Partition,
+            request.Term,
+            new(request.TimeNode, request.TimePhysical, request.TimeCounter),
+            request.Endpoint,
+            GetLogs(request.Logs),
+            request.PrevLogIndex,
+            request.PrevLogTerm
         ));
-        
+
         return appendLogsResponse;
     }
     
@@ -338,7 +340,9 @@ public sealed class RaftService : Rafter.RafterBase
                                     appendLogsRequest.Term,
                                     new(appendLogsRequest.TimeNode, appendLogsRequest.TimePhysical, appendLogsRequest.TimeCounter),
                                     appendLogsRequest.Endpoint,
-                                    GetLogs(appendLogsRequest.Logs)
+                                    GetLogs(appendLogsRequest.Logs),
+                                    appendLogsRequest.PrevLogIndex,
+                                    appendLogsRequest.PrevLogTerm
                                 ));
                                 break;
                             }

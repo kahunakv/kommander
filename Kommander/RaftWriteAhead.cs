@@ -778,18 +778,35 @@ public sealed class RaftWriteAhead
     }
 
     /// <summary>
+    /// Returns the term of the single entry at <paramref name="logIndex"/>, or <c>-1</c> if
+    /// no entry with that id exists.  All entry types (Proposed, Committed, etc.) are included
+    /// so a Log Matching Property check is correct even when the anchor entry is uncommitted.
+    /// </summary>
+    public async ValueTask<long> GetAnyTermAtAsync(long logIndex)
+    {
+        List<RaftLog> entries = await manager.ReadScheduler.EnqueueTask(
+            partition.PartitionId,
+            () => walAdapter.ReadLogsRange(partition.PartitionId, logIndex, 1)
+        ).ConfigureAwait(false);
+
+        return entries.Count > 0 && entries[0].Id == logIndex ? entries[0].Term : -1;
+    }
+
+    /// <summary>
     /// Reads up to <paramref name="maxEntries"/> committed log entries with id ≥
     /// <paramref name="startLogIndex"/>, sorted ascending. The bound is pushed to the storage
     /// engine so that a follower far behind the leader does not cause a full tail scan.
     /// Uncommitted (proposed/rolled-back) entries within the returned batch are filtered out.
     ///
-    /// <para><b>Compaction floor limitation:</b> if the leader has already compacted past
-    /// <paramref name="startLogIndex"/>, the WAL returns entries starting above that index,
-    /// producing a log gap that the follower's append path will reject. This method returns
-    /// an empty list in that case (all pre-compaction entries are gone), and the
-    /// <c>SendHeartbeat</c> backfill path falls through to a plain heartbeat — leaving the
-    /// follower unable to catch up without a full snapshot. Snapshot-based recovery to close
-    /// this gap is not yet implemented.</para>
+    /// <para><b>Compaction floor handling:</b> if the leader has already compacted past
+    /// <paramref name="startLogIndex"/>, the requested prefix no longer exists, so this method
+    /// returns an empty list rather than a batch that would advance the follower over a gap.
+    /// The leader never ships a non-contiguous range — log-shipping always starts at the
+    /// follower's <c>lastCommitIndexes + 1</c>, which keeps the follower's log contiguous by
+    /// construction (the follower append path does not itself enforce a prev-entry match).
+    /// On the empty result, <c>SendHeartbeat</c> initiates a snapshot transfer to the follower
+    /// (when a state-machine transfer is registered and a checkpoint exists); the follower then
+    /// resumes normal log shipping from the snapshot index.</para>
     /// </summary>
     public async ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries)
     {

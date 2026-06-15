@@ -369,6 +369,7 @@ public sealed class TestSnapshotIntegration
         public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries) =>
             inner.CompactLogsOlderThan(partitionId, lastCheckpoint, compactNumberEntries);
         public RaftOperationStatus DeletePartitionWAL(int partitionId) => inner.DeletePartitionWAL(partitionId);
+        public RaftOperationStatus TruncateLogsAfter(int partitionId, long afterLogId) => inner.TruncateLogsAfter(partitionId, afterLogId);
         public void Dispose() => inner.Dispose();
     }
 }

@@ -41,6 +41,15 @@ public interface IRaftWalFacade
     ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries);
 
     /// <summary>
+    /// Returns the term of the entry at exactly <paramref name="logIndex"/>, or <c>-1</c> if
+    /// no entry with that id exists.  Unlike <see cref="GetRangeAsync"/>, this reads <em>any</em>
+    /// entry regardless of commit status (Proposed, Committed, etc.) so it can be used for the
+    /// Log Matching Property anchor check, which must succeed even when the entry at prevLogIndex
+    /// is still in the Proposed state on the follower.
+    /// </summary>
+    ValueTask<long> GetAnyTermAtAsync(long logIndex);
+
+    /// <summary>
     /// Returns the id of the last <see cref="Kommander.WAL.Data.RaftLogType.CommittedCheckpoint"/> WAL entry for
     /// this partition, or -1 if no checkpoint exists.  Used by the leader to detect when a
     /// follower's acknowledged log index falls below the compaction floor and a snapshot transfer

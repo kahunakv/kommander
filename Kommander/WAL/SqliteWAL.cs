@@ -565,6 +565,29 @@ public class SqliteWAL : IWAL, IDisposable
         }
     }
 
+    /// <inheritdoc/>
+    public RaftOperationStatus TruncateLogsAfter(int partitionId, long afterLogId)
+    {
+        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+        lock (partitionLock)
+        {
+            try
+            {
+                using SqliteCommand command = new(
+                    "DELETE FROM logs WHERE partitionId = @partitionId AND id > @afterLogId", connection);
+                command.Parameters.AddWithValue("@partitionId", partitionId);
+                command.Parameters.AddWithValue("@afterLogId", afterLogId);
+                command.ExecuteNonQuery();
+                return RaftOperationStatus.Success;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("TruncateLogsAfter({PartitionId}, {AfterLogId}): {Message}", partitionId, afterLogId, ex.Message);
+                return RaftOperationStatus.Errored;
+            }
+        }
+    }
+
     /// <param name="lastCheckpoint">The checkpoint ID indicating the upper bound for compaction. Logs with IDs less than this value will be compacted.</param>
     /// <param name="compactNumberEntries">The maximum number of log entries to be compacted in a single operation.</param>
     /// <returns>

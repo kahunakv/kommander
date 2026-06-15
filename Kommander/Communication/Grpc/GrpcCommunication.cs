@@ -178,6 +178,8 @@ public class GrpcCommunication : ICommunication
             appendLogsRequest.TimePhysical = request.Time.L;
             appendLogsRequest.TimeCounter = request.Time.C;
             appendLogsRequest.Endpoint = request.Endpoint;
+            appendLogsRequest.PrevLogIndex = request.PrevLogIndex;
+            appendLogsRequest.PrevLogTerm = request.PrevLogTerm;
 
             if (request.Logs is not null)
                 appendLogsRequest.Logs.AddRange(GetLogs(request.Logs ?? []));
@@ -385,7 +387,9 @@ public class GrpcCommunication : ICommunication
                     TimeNode = requestItem.AppendLogs.Time.N,
                     TimePhysical = requestItem.AppendLogs.Time.L,
                     TimeCounter = requestItem.AppendLogs.Time.C,
-                    Endpoint = requestItem.AppendLogs.Endpoint
+                    Endpoint = requestItem.AppendLogs.Endpoint,
+                    PrevLogIndex = requestItem.AppendLogs.PrevLogIndex,
+                    PrevLogTerm = requestItem.AppendLogs.PrevLogTerm
                 };
 
                 if (requestItem.AppendLogs.Logs is not null)

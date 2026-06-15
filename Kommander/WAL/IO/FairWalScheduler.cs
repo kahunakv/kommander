@@ -386,6 +386,15 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         KommanderMetrics.WalBatchesTotal.Add(1);
         KommanderMetrics.WalBatchSize.Record(batch.Count);
 
+        if (status == RaftOperationStatus.Success)
+        {
+            foreach (WALWriteOperation op in batch)
+            {
+                if (op.Type == WALWriteOperationType.FollowerAppend && op.LogIndex > 0)
+                    walAdapter.TruncateLogsAfter(partitionId, op.LogIndex);
+            }
+        }
+
         foreach (WALWriteOperation op in batch)
         {
             try

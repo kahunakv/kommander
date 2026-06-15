@@ -25,6 +25,23 @@ public sealed class RaftPartitionStateMachine
     private readonly Dictionary<long, HashSet<string>> votes = [];
     private readonly Dictionary<string, long> lastCommitIndexes = [];
     private readonly Dictionary<string, long> startCommitIndexes = [];
+
+    /// <summary>
+    /// Per-follower replication cursor: the index of the next log entry to send to each peer.
+    /// Seeded to <c>leaderMaxLog + 1</c> on election win (optimistic: assume peer is in sync).
+    /// Backtracked on <see cref="RaftOperationStatus.LogMismatch"/> and advanced on
+    /// <see cref="RaftOperationStatus.Success"/> replies.  Only meaningful while this node is
+    /// Leader; cleared on every leader→follower transition so stale progress never leaks across terms.
+    /// </summary>
+    private readonly Dictionary<string, long> nextIndex = [];
+
+    /// <summary>
+    /// Per-follower highest log index known to be replicated on that peer.
+    /// Zero until the peer confirms receipt of at least one entry.  Advanced in lock-step with
+    /// <see cref="nextIndex"/> on a success reply; used to detect full catch-up
+    /// (<c>matchIndex[peer] == leaderMaxLog</c>).
+    /// </summary>
+    private readonly Dictionary<string, long> matchIndex = [];
     private readonly Dictionary<long, string> expectedLeaders = [];
     private readonly Dictionary<HLCTimestamp, RaftProposalQuorum> activeProposals = [];
     private readonly Dictionary<long, Scheduling.RaftPendingWalOperation> pendingWalOperations = [];
@@ -211,6 +228,8 @@ public sealed class RaftPartitionStateMachine
                     random.Next(host.Configuration.StartElectionTimeout, host.Configuration.EndElectionTimeout));
                 expectedLeaders.Clear();
                 lastCommitIndexes.Clear();
+                nextIndex.Clear();
+                matchIndex.Clear();
                 localCommittedIndex = -1;
                 activeProposals.Clear();
                 ResetPreVoteRound();
@@ -252,6 +271,8 @@ public sealed class RaftPartitionStateMachine
         votingStartedAt = HLCTimestamp.Zero;
         expectedLeaders.Clear();
         lastCommitIndexes.Clear();
+        nextIndex.Clear();
+        matchIndex.Clear();
         localCommittedIndex = -1;
         activeProposals.Clear();
 
@@ -314,6 +335,8 @@ public sealed class RaftPartitionStateMachine
         expectedLeaders.Clear();
         expectedLeaders[targetTerm] = targetEndpoint;
         lastCommitIndexes.Clear();
+        nextIndex.Clear();
+        matchIndex.Clear();
         localCommittedIndex = -1;
         activeProposals.Clear();
 
@@ -398,6 +421,8 @@ public sealed class RaftPartitionStateMachine
         votingStartedAt = HLCTimestamp.Zero;
         expectedLeaders.Clear();
         lastCommitIndexes.Clear();
+        nextIndex.Clear();
+        matchIndex.Clear();
         localCommittedIndex = -1;
         activeProposals.Clear();
         lastHeartbeat = HLCTimestamp.Zero;
@@ -425,6 +450,8 @@ public sealed class RaftPartitionStateMachine
         votingStartedAt = HLCTimestamp.Zero;
         expectedLeaders.Clear();
         lastCommitIndexes.Clear();
+        nextIndex.Clear();
+        matchIndex.Clear();
         localCommittedIndex = -1;
         activeProposals.Clear();
         lastHeartbeat = HLCTimestamp.Zero;
@@ -450,6 +477,8 @@ public sealed class RaftPartitionStateMachine
 
         expectedLeaders.Clear();
         lastCommitIndexes.Clear();
+        nextIndex.Clear();
+        matchIndex.Clear();
         localCommittedIndex = -1;
         votes.Clear();
         activeProposals.Clear();
@@ -607,6 +636,8 @@ public sealed class RaftPartitionStateMachine
             localCommittedIndex = wal.GetCommitIndex();
             host.Leader = host.LocalEndpoint;
             lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+            nextIndex.Clear();
+            matchIndex.Clear();
 
             await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
             await SendHeartbeat(true).ConfigureAwait(false);
@@ -767,23 +798,43 @@ public sealed class RaftPartitionStateMachine
             // entries instead of an empty heartbeat so it converges without waiting for new writes.
             // localCommittedIndex is in-memory and always reflects only durably committed entries,
             // so healthy followers with in-flight proposals do not trigger spurious WAL reads.
+            //
+            // nextIndex[peer] tracks where the next batch should start.  On first backfill it
+            // equals leaderMaxLog+1 (seeded optimistically on election), which is above the
+            // follower's lag point, so we clamp to followerMaxLog+1.  After a LogMismatch reply
+            // the leader backtracks nextIndex[peer] below followerMaxLog+1 and the clamp lets
+            // it find the correct divergence point without re-shipping already-acked entries.
             if (nodeState == RaftNodeState.Leader
                 && localCommittedIndex >= 0
                 && lastCommitIndexes.TryGetValue(node.Endpoint, out long followerMaxLog)
                 && localCommittedIndex - followerMaxLog > host.Configuration.BackfillThreshold)
             {
+                // Use nextIndex[peer] when it has been backtracked below localCommittedIndex
+                // (i.e. a prior LogMismatch moved it to a divergence point that needs re-probing).
+                // Otherwise start from followerMaxLog+1, the standard committed-anchor start.
+                // The > localCommittedIndex guard prevents the optimistic election seed
+                // (leaderMaxLog+1) from being used as a start when the follower is behind.
+                long from = nextIndex.TryGetValue(node.Endpoint, out long ni) && ni <= localCommittedIndex
+                    ? ni
+                    : followerMaxLog + 1;
+
                 List<RaftLog> backfill = await wal.GetRangeAsync(
-                    followerMaxLog + 1,
+                    from,
                     host.Configuration.MaxBackfillEntriesPerRound
                 ).ConfigureAwait(false);
 
                 if (backfill.Count > 0)
                 {
+                    long prevIdx  = from - 1;
+                    long prevTerm = prevIdx > 0
+                        ? await wal.GetAnyTermAtAsync(prevIdx).ConfigureAwait(false)
+                        : 0;
+
                     logger.LogDebug(
-                        "[{LocalEndpoint}/{PartitionId}/{State}] Backfilling {Count} entries to {Endpoint} from={From} leaderCommitted={LeaderCommitted}",
+                        "[{LocalEndpoint}/{PartitionId}/{State}] Backfilling {Count} entries to {Endpoint} from={From} prevLogIndex={PrevLogIndex} leaderCommitted={LeaderCommitted}",
                         host.LocalEndpoint, host.PartitionId, nodeState,
-                        backfill.Count, node.Endpoint, followerMaxLog + 1, localCommittedIndex);
-                    AppendLogToNode(node, lastHeartbeat, backfill);
+                        backfill.Count, node.Endpoint, from, prevIdx, localCommittedIndex);
+                    AppendLogToNode(node, lastHeartbeat, backfill, prevIdx, prevTerm);
                     continue;
                 }
 
@@ -1118,6 +1169,16 @@ public sealed class RaftPartitionStateMachine
         localCommittedIndex = wal.GetCommitIndex();
         host.Leader = host.LocalEndpoint;
 
+        // Seed per-follower replication progress. nextIndex is optimistic (leaderMaxLog + 1);
+        // it will be corrected by LogMismatch replies if any peer is behind.
+        nextIndex.Clear();
+        matchIndex.Clear();
+        foreach (RaftNode peer in host.Nodes)
+        {
+            nextIndex[peer.Endpoint] = maxLogResponse + 1;
+            matchIndex[peer.Endpoint] = 0;
+        }
+
         lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
 
         logger.LogInformation(
@@ -1149,14 +1210,16 @@ public sealed class RaftPartitionStateMachine
     /// <param name="timestamp"></param>
     /// <param name="logs"></param>
     /// <returns></returns>
-    public Task AppendLogsAsync(string endpoint, long term, HLCTimestamp timestamp, List<RaftLog>? logs, ulong? replyCorrelationId = null) =>
-        AppendLogsCoreAsync(endpoint, term, timestamp, logs, replyCorrelationId);
+    public Task AppendLogsAsync(string endpoint, long term, HLCTimestamp timestamp, List<RaftLog>? logs, long prevLogIndex = 0, long prevLogTerm = 0, ulong? replyCorrelationId = null) =>
+        AppendLogsCoreAsync(endpoint, term, timestamp, logs, prevLogIndex, prevLogTerm, replyCorrelationId);
 
     private async Task AppendLogsCoreAsync(
         string endpoint,
         long leaderTerm,
         HLCTimestamp timestamp,
         List<RaftLog>? logs,
+        long prevLogIndex = 0,
+        long prevLogTerm = 0,
         ulong? replyCorrelationId = null
     )
     {
@@ -1188,6 +1251,8 @@ public sealed class RaftPartitionStateMachine
             host.Leader = endpoint;
             currentTerm = leaderTerm;
             lastCommitIndexes.Clear();
+            nextIndex.Clear();
+            matchIndex.Clear();
             localCommittedIndex = -1;
             activeProposals.Clear();
             expectedLeaders[leaderTerm] = endpoint;   // overwrite any stale vote target with the real leader
@@ -1198,21 +1263,55 @@ public sealed class RaftPartitionStateMachine
 
         lastHeartbeat = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, timestamp);
 
-        host.UpdateLastNodeActivity(endpoint, host.PartitionId, lastHeartbeat);
+        // Log Matching Property check: the follower must hold an entry at prevLogIndex with
+        // prevLogTerm before it can safely append the incoming batch.  A mismatch means the
+        // follower's log diverges from the leader's at this position; the leader must backtrack
+        // its nextIndex for this peer and retry with an earlier anchor.
+        // NOTE: GetAnyTermAtAsync is used (not GetRangeAsync) so that a Proposed-but-uncommitted
+        // entry at prevLogIndex is matched correctly; GetRangeAsync filters uncommitted entries.
+        if (prevLogIndex > 0 && logs is not null && logs.Count > 0)
+        {
+            long localMaxLog = await wal.GetMaxLogAsync().ConfigureAwait(false);
+
+            if (prevLogIndex > localMaxLog)
+            {
+                logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Log Matching rejection from {Endpoint}: prevLogIndex={PrevLogIndex} > localMaxLog={LocalMaxLog}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, prevLogIndex, localMaxLog);
+
+                host.EnqueueResponse(endpoint, new(
+                    RaftResponderRequestType.CompleteAppendLogs,
+                    new(endpoint),
+                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, localMaxLog)
+                ));
+                return;
+            }
+
+            long localTermAtPrev = await wal.GetAnyTermAtAsync(prevLogIndex).ConfigureAwait(false);
+            if (localTermAtPrev != prevLogTerm)
+            {
+                logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Log Matching rejection from {Endpoint}: prevLogIndex={PrevLogIndex} localTerm={LocalTerm} != prevLogTerm={PrevLogTerm}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, prevLogIndex, localTermAtPrev, prevLogTerm);
+
+                host.EnqueueResponse(endpoint, new(
+                    RaftResponderRequestType.CompleteAppendLogs,
+                    new(endpoint),
+                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, localMaxLog)
+                ));
+                return;
+            }
+        }
 
         if (logs is not null && logs.Count > 0)
         {
             if (logger.IsEnabled(LogLevel.Debug))
                 logger.LogDebugReceivedLogs(
-                    host.LocalEndpoint, 
-                    host.PartitionId, 
-                    nodeState, 
-                    endpoint, 
-                    leaderTerm, 
-                    timestamp, 
+                    host.LocalEndpoint,
+                    host.PartitionId,
+                    nodeState,
+                    endpoint,
+                    leaderTerm,
+                    timestamp,
                     string.Join(',', logs.Select(x => x.Id.ToString()))
                 );
-            
+
             WALWriteOperation? operation = wal.EnqueueProposeOrCommit(logs, timestamp, endpoint, leaderTerm);
 
             if (operation is not null)
@@ -1646,11 +1745,19 @@ public sealed class RaftPartitionStateMachine
     
     /// <summary>
     /// Appends logs to a specific node in the cluster.
+    /// <paramref name="prevLogIndex"/> and <paramref name="prevLogTerm"/> are the Log Matching
+    /// anchors: the id and term of the entry immediately preceding the first entry in
+    /// <paramref name="logs"/>.  Both default to 0 (no anchor check) for heartbeats and live
+    /// proposals where the leader knows the follower is in sync; they are set for backfill batches
+    /// so a divergent follower can reject with <see cref="RaftOperationStatus.LogMismatch"/> and
+    /// enable leader-side backtracking via <see cref="nextIndex"/>.
     /// </summary>
     /// <param name="node"></param>
     /// <param name="timestamp"></param>
     /// <param name="logs"></param>
-    private void AppendLogToNode(RaftNode node, HLCTimestamp timestamp, List<RaftLog>? logs)
+    /// <param name="prevLogIndex">Id of the entry immediately before the first entry in <paramref name="logs"/>; 0 skips the check.</param>
+    /// <param name="prevLogTerm">Term of the entry at <paramref name="prevLogIndex"/>; 0 when index is 0.</param>
+    private void AppendLogToNode(RaftNode node, HLCTimestamp timestamp, List<RaftLog>? logs, long prevLogIndex = 0, long prevLogTerm = 0)
     {
         AppendLogsRequest request;
 
@@ -1658,40 +1765,20 @@ public sealed class RaftPartitionStateMachine
             request = new(host.PartitionId, currentTerm, timestamp, host.LocalEndpoint);
         else
         {
-            /*long lastCommitIndex = lastCommitIndexes.GetValueOrDefault(node.Endpoint, 0);
-
-            lastCommitIndex -= 3;
-            if (lastCommitIndex < 0)
-                lastCommitIndex = 0;
-
-            RaftWALResponse getRangeResponse = await walActor.Ask(new(RaftWALActionType.GetRange, currentTerm, lastCommitIndex)).ConfigureAwait(false);
-            if (getRangeResponse.Logs is null)
-            {
-                logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Failed to get logs range {Timestamp} From={From}", host.LocalEndpoint, host.PartitionId, nodeState, timestamp, lastCommitIndex);
-
-                return;
-            }*/
-
-            request = new(host.PartitionId, currentTerm, timestamp, host.LocalEndpoint, logs);
+            request = new(host.PartitionId, currentTerm, timestamp, host.LocalEndpoint, logs, prevLogIndex, prevLogTerm);
 
             if (logger.IsEnabled(LogLevel.Debug))
                 logger.LogDebug(
-                    "[{LocalEndpoint}/{PartitionId}/{State}] Enqueued entries for {Endpoint} {Timestamp} From={From} Logs={Logs}", 
-                    host.LocalEndpoint, 
-                    host.PartitionId, 
-                    nodeState, 
-                    node.Endpoint, 
-                    timestamp, 
-                    0, 
+                    "[{LocalEndpoint}/{PartitionId}/{State}] Enqueued entries for {Endpoint} {Timestamp} PrevLogIndex={PrevLogIndex} Logs={Logs}",
+                    host.LocalEndpoint,
+                    host.PartitionId,
+                    nodeState,
+                    node.Endpoint,
+                    timestamp,
+                    prevLogIndex,
                     string.Join(',', logs.Select(x => x.Id.ToString()))
                 );
         }
-
-        /*if (request.Logs is null || request.Logs.Count == 0)
-        {
-            host.ResponseBatcherActor.Send(new(RaftResponderRequestType.AppendLogs, node, request));
-            return;
-        }*/
 
         host.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.AppendLogs, node, request));
     }
@@ -1715,6 +1802,28 @@ public sealed class RaftPartitionStateMachine
         // the TryGetValue check in SendHeartbeat would fail and backfill would never fire.
         if (!lastCommitIndexes.TryGetValue(endpoint, out long currentIndex) || committedIndex > currentIndex)
             lastCommitIndexes[endpoint] = committedIndex;
+
+        // LogMismatch: the follower's log diverges at the prevLogIndex we sent.
+        // committedIndex carries the follower's local max log at the time of rejection.
+        // Backtrack nextIndex[peer] to just past the follower's furthest matching entry so
+        // the next backfill heartbeat re-probes from there, finding the real divergence point.
+        if (status == RaftOperationStatus.LogMismatch)
+        {
+            long backtracked = Math.Max(1, committedIndex + 1);
+            nextIndex[endpoint] = backtracked;
+
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] LogMismatch from {Endpoint}: backtracking nextIndex to {NextIndex} (followerMax={CommittedIndex})",
+                host.LocalEndpoint,
+                host.PartitionId,
+                nodeState,
+                endpoint,
+                backtracked,
+                committedIndex
+            );
+
+            return ValueTask.CompletedTask;
+        }
 
         if (committedIndex > 0)
         {
@@ -1744,6 +1853,12 @@ public sealed class RaftPartitionStateMachine
 
             return ValueTask.CompletedTask;
         }
+
+        // Success: advance matchIndex and nextIndex for this peer so the backfill loop
+        // knows the follower has caught up to at least committedIndex.
+        if (!matchIndex.TryGetValue(endpoint, out long currentMatchIndex) || committedIndex > currentMatchIndex)
+            matchIndex[endpoint] = committedIndex;
+        nextIndex[endpoint] = matchIndex[endpoint] + 1;
 
         if (!activeProposals.TryGetValue(timestamp, out RaftProposalQuorum? proposal))
             return ValueTask.CompletedTask;
@@ -1863,7 +1978,7 @@ public sealed class RaftPartitionStateMachine
         switch (completion.OperationType)
         {
             case WALWriteOperationType.LeaderPropose:
-                CompleteLeaderPropose(completion, pending);
+                await CompleteLeaderPropose(completion, pending).ConfigureAwait(false);
                 break;
 
             case WALWriteOperationType.LeaderCommit:
@@ -1885,7 +2000,14 @@ public sealed class RaftPartitionStateMachine
         }
     }
 
-    private void CompleteLeaderPropose(RaftWalCompletion completion, RaftPendingWalOperation? pending)
+    /// <summary>
+    /// Completes a leader propose WAL write by broadcasting the proposed entries to all peers.
+    /// Computes Log Matching anchors (<c>prevLogIndex</c> / <c>prevLogTerm</c>) from the local
+    /// WAL so that followers with a divergent uncommitted suffix reject the batch with
+    /// <see cref="RaftOperationStatus.LogMismatch"/> rather than silently overwriting at the
+    /// wrong anchor point.  Async because the term lookup requires a WAL read.
+    /// </summary>
+    private async Task CompleteLeaderPropose(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
         HLCTimestamp ticketId = pending?.TicketId ?? HLCTimestamp.Zero;
         List<RaftLog> logs = pending?.Logs ?? [];
@@ -1896,6 +2018,13 @@ public sealed class RaftPartitionStateMachine
             CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, completion.Status, ticketId));
             return;
         }
+
+        // Compute Log Matching anchors: the entry immediately preceding this batch.
+        // prevLogTerm requires a WAL read; prevLogIndex=0 skips the check on followers.
+        long prevLogIndex = logs.Count > 0 ? logs.Min(l => l.Id) - 1 : 0;
+        long prevLogTerm  = prevLogIndex > 0
+            ? await wal.GetAnyTermAtAsync(prevLogIndex).ConfigureAwait(false)
+            : 0;
 
         RaftProposalQuorum proposalQuorum = RaftProposalQuorumPool.Rent(logs, autoCommit, ticketId);
 
@@ -1914,7 +2043,7 @@ public sealed class RaftPartitionStateMachine
             // Only add voters to the quorum set; AppendLogToNode is called for all nodes.
             if (host.IsVoter(node.Endpoint))
                 proposalQuorum.AddExpectedNodeCompletion(node.Endpoint);
-            AppendLogToNode(node, ticketId, logs);
+            AppendLogToNode(node, ticketId, logs, prevLogIndex, prevLogTerm);
         }
 
         if (!activeProposals.TryAdd(ticketId, proposalQuorum))
