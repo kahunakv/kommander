@@ -209,6 +209,122 @@ public class TestGrpcTransport
     }
 
     /// <summary>
+    /// Done-check #3: A permanently-stopped node (simulating a hard partition) transitions to
+    /// Dead on the surviving nodes and is evicted from the committed roster by the P0 leader
+    /// within <c>SuspicionTimeout + DeadMemberEvictionGrace</c>.
+    ///
+    /// This is the end-to-end SWIM pipeline over the real gRPC transport:
+    /// timer-driven <c>PingAsync</c> → failed gRPC probe → Suspect → Dead → <c>RemoveMember</c>.
+    /// Ports 8903-8905.
+    /// </summary>
+    [Fact]
+    public async Task Swim_StoppedNode_IsEvictedFromRoster_Grpc()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        using ILoggerFactory logFactory = CreateLoggerFactory();
+
+        // Fast SWIM: worst-case time from stop → eviction is
+        //   1 probe interval + SuspicionTimeout + DeadMemberEvictionGrace
+        //   = 200 ms + 1.5 s + 2 s ≈ 3.7 s.  Test timeout is 30 s.
+        TimeSpan pingInterval            = TimeSpan.FromMilliseconds(200);
+        TimeSpan suspicionTimeout        = TimeSpan.FromSeconds(1.5);
+        TimeSpan deadMemberEvictionGrace = TimeSpan.FromSeconds(2);
+
+        await using GrpcClusterHarness harness = await GrpcClusterHarness.CreateWithSwimAsync(
+            [8903, 8904, 8905],
+            logFactory,
+            pingInterval,
+            suspicionTimeout,
+            deadMemberEvictionGrace,
+            partitions: 1,
+            ct: ct);
+
+        await WaitForLeaderAsync(harness, partitionId: 0, TimeSpan.FromSeconds(15), ct);
+        await Task.Delay(500, ct);   // let roster stabilize
+
+        // Identify the node to stop (prefer a follower so leader election doesn't interfere).
+        GrpcTestNode? toStop = null;
+        foreach (GrpcTestNode n in harness.Nodes)
+        {
+            if (!await n.Manager.AmILeaderQuick(0))
+            {
+                toStop = n;
+                break;
+            }
+        }
+        Assert.NotNull(toStop);
+        string stoppedEndpoint = toStop.Endpoint;
+
+        long rosterBefore = harness.Nodes[0].Manager.GetMembership().MembershipVersion;
+
+        // Stop the node: Kestrel stops accepting connections → gRPC probes fail.
+        await toStop.DisposeAsync();
+
+        // Wait for the two surviving nodes to evict the stopped node.
+        // The timer-driven PingAsync fires every pingInterval; Suspect → Dead after
+        // SuspicionTimeout; Dead → RemoveMember after DeadMemberEvictionGrace.
+        GrpcTestNode survivor = harness.Nodes.First(n => n != toStop);
+        await WaitForCondition(
+            () =>
+            {
+                ClusterMembership m = survivor.Manager.GetMembership();
+                return m.MembershipVersion > rosterBefore
+                    && !m.Members.Any(mem => mem.Endpoint == stoppedEndpoint);
+            },
+            TimeSpan.FromSeconds(20),
+            ct);
+
+        ClusterMembership roster = survivor.Manager.GetMembership();
+        Assert.DoesNotContain(roster.Members, m => m.Endpoint == stoppedEndpoint);
+        Assert.Equal(2, roster.Members.Count);
+    }
+
+    /// <summary>
+    /// Done-check #4: Healthy nodes that respond to every probe are never evicted even after
+    /// <c>SuspicionTimeout + DeadMemberEvictionGrace</c> has elapsed.
+    ///
+    /// Verifies that the gRPC <c>Ping</c> RPC correctly returns <c>Alive=true</c> for
+    /// reachable peers, so the detector does not falsely evict any member.
+    /// Ports 8906-8908.
+    /// </summary>
+    [Fact]
+    public async Task Swim_HealthyNodes_AreNeverEvictedByDetector_Grpc()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        using ILoggerFactory logFactory = CreateLoggerFactory();
+
+        TimeSpan pingInterval            = TimeSpan.FromMilliseconds(200);
+        TimeSpan suspicionTimeout        = TimeSpan.FromSeconds(1);
+        TimeSpan deadMemberEvictionGrace = TimeSpan.FromSeconds(1);
+
+        await using GrpcClusterHarness harness = await GrpcClusterHarness.CreateWithSwimAsync(
+            [8906, 8907, 8908],
+            logFactory,
+            pingInterval,
+            suspicionTimeout,
+            deadMemberEvictionGrace,
+            partitions: 1,
+            ct: ct);
+
+        await WaitForLeaderAsync(harness, partitionId: 0, TimeSpan.FromSeconds(15), ct);
+        await Task.Delay(500, ct);
+
+        long rosterBefore = harness.Nodes[0].Manager.GetMembership().MembershipVersion;
+        int membersBefore = harness.Nodes[0].Manager.GetMembership().Members.Count;
+
+        // Let the SWIM timer run for longer than SuspicionTimeout + DeadMemberEvictionGrace.
+        // All nodes are healthy and answering probes; none should be evicted.
+        await Task.Delay(suspicionTimeout + deadMemberEvictionGrace + TimeSpan.FromSeconds(1), ct);
+
+        foreach (GrpcTestNode n in harness.Nodes)
+        {
+            ClusterMembership roster = n.Manager.GetMembership();
+            Assert.Equal(rosterBefore, roster.MembershipVersion);
+            Assert.Equal(membersBefore, roster.Members.Count);
+        }
+    }
+
+    /// <summary>
     /// A direct Ping RPC over gRPC returns <c>Alive=true</c> and a positive incarnation for a
     /// healthy node.  Validates <c>GrpcCommunication.SendPing</c> →
     /// <c>RaftService.Ping</c> → <c>RaftManager.ReceivePing</c>.
@@ -304,5 +420,19 @@ public class TestGrpcTransport
             await Task.Delay(200, cts.Token).ConfigureAwait(false);
         }
         Assert.Fail($"No leader elected for partition {partitionId} within {timeout}");
+    }
+
+    private static async Task WaitForCondition(Func<bool> condition, TimeSpan timeout, CancellationToken ct)
+    {
+        using CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(timeout);
+
+        while (!cts.Token.IsCancellationRequested)
+        {
+            if (condition())
+                return;
+            await Task.Delay(200, cts.Token).ConfigureAwait(false);
+        }
+        Assert.Fail("Condition not met within the timeout.");
     }
 }

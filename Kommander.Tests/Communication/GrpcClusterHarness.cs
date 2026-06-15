@@ -48,6 +48,70 @@ public sealed class GrpcTestNode : IAsyncDisposable
     }
 
     /// <summary>
+    /// Creates and wires a single gRPC test node with SWIM failure detection enabled.
+    /// Use this overload for tests that exercise eviction or heal behaviour; the standard
+    /// <see cref="Create"/> factory disables SWIM to avoid eviction side-effects in short
+    /// wire tests that focus on other RPCs.
+    /// </summary>
+    public static GrpcTestNode CreateWithSwim(
+        int port,
+        IReadOnlyList<RaftNode> allPeers,
+        ILoggerFactory loggerFactory,
+        TimeSpan pingInterval,
+        TimeSpan suspicionTimeout,
+        TimeSpan deadMemberEvictionGrace,
+        int partitions = 1)
+    {
+        RaftConfiguration config = new()
+        {
+            NodeId = port,
+            Host = "localhost",
+            Port = port,
+            InitialPartitions = partitions,
+            GrpcScheme = "http://",
+            HeartbeatInterval = TimeSpan.FromMilliseconds(150),
+            VotingTimeout = TimeSpan.FromMilliseconds(500),
+            StartElectionTimeout = 600,
+            EndElectionTimeout = 900,
+            TimerInitialDelay = TimeSpan.FromMilliseconds(500),
+            PingInterval = pingInterval,
+            PingTimeout = TimeSpan.FromMilliseconds(300),
+            IndirectPingFanout = 1,
+            SuspicionTimeout = suspicionTimeout,
+            DeadMemberEvictionGrace = deadMemberEvictionGrace
+        };
+
+        ILogger<IRaft> logger = loggerFactory.CreateLogger<IRaft>();
+        List<RaftNode> peers = [.. allPeers.Where(n => n.Endpoint != $"localhost:{port}")];
+
+        RaftManager manager = new(
+            config,
+            new StaticDiscovery(peers),
+            new InMemoryWAL(logger),
+            new GrpcCommunication(),
+            new HybridLogicalClock(),
+            logger
+        );
+
+        WebApplicationBuilder builder = WebApplication.CreateBuilder();
+        builder.Logging.ClearProviders();
+
+        builder.Services.AddSingleton<IRaft>(manager);
+        builder.Services.AddSingleton(logger);
+        builder.Services.AddGrpc();
+
+        builder.WebHost.ConfigureKestrel(kestrel =>
+        {
+            kestrel.Listen(IPAddress.Loopback, port, o => o.Protocols = HttpProtocols.Http2);
+        });
+
+        WebApplication app = builder.Build();
+        app.MapGrpcRaftRoutes();
+
+        return new GrpcTestNode(manager, app, port);
+    }
+
+    /// <summary>
     /// Creates and wires a single gRPC test node.
     /// <paramref name="allPeers"/> must contain ALL cluster nodes (including this one);
     /// the harness filters out the local port automatically so discovery only exposes peers.
@@ -128,6 +192,33 @@ public sealed class GrpcClusterHarness : IAsyncDisposable
             await n.StartAsync(ct).ConfigureAwait(false);
 
         // Join all nodes concurrently to start Raft timers and elect leaders.
+        await Task.WhenAll(nodes.Select(n => n.Manager.JoinCluster(ct))).ConfigureAwait(false);
+
+        return new GrpcClusterHarness(nodes);
+    }
+
+    /// <summary>
+    /// Creates a cluster with SWIM failure detection enabled at the specified intervals.
+    /// All nodes share the same SWIM config; individual nodes can be stopped to simulate
+    /// a permanent partition and trigger the Dead → eviction pipeline.
+    /// </summary>
+    public static async Task<GrpcClusterHarness> CreateWithSwimAsync(
+        IReadOnlyList<int> ports,
+        ILoggerFactory loggerFactory,
+        TimeSpan pingInterval,
+        TimeSpan suspicionTimeout,
+        TimeSpan deadMemberEvictionGrace,
+        int partitions = 1,
+        CancellationToken ct = default)
+    {
+        List<RaftNode> peers = ports.Select(p => new RaftNode($"localhost:{p}")).ToList();
+
+        GrpcTestNode[] nodes = [.. ports.Select(p => GrpcTestNode.CreateWithSwim(
+            p, peers, loggerFactory, pingInterval, suspicionTimeout, deadMemberEvictionGrace, partitions))];
+
+        foreach (GrpcTestNode n in nodes)
+            await n.StartAsync(ct).ConfigureAwait(false);
+
         await Task.WhenAll(nodes.Select(n => n.Manager.JoinCluster(ct))).ConfigureAwait(false);
 
         return new GrpcClusterHarness(nodes);
