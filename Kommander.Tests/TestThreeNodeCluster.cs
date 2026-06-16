@@ -632,7 +632,7 @@ public sealed class TestThreeNodeCluster
             TestContext.Current.CancellationToken,
             timeoutMs: 20_000);
 
-        Assert.True(pausedNode.WalAdapter.GetMaxLog(1) >= decidedLeader.WalAdapter.GetMaxLog(1));
+        AssertContiguousLog(pausedNode, decidedLeader, 1);
 
         await node1.LeaveCluster(true);
         await node2.LeaveCluster(true);
@@ -722,7 +722,197 @@ public sealed class TestThreeNodeCluster
             TestContext.Current.CancellationToken,
             timeoutMs: 20_000);
 
-        Assert.True(pausedNode.WalAdapter.GetMaxLog(1) >= decidedLeader.WalAdapter.GetMaxLog(1));
+        AssertContiguousLog(pausedNode, decidedLeader, 1);
+
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+        await node3.LeaveCluster(true);
+    }
+
+    /// <summary>
+    /// Contiguous convergence via backfill: a follower partitioned from the start receives
+    /// no live-proposal traffic and must catch up entirely through the heartbeat backfill loop.
+    /// Asserts the follower's log is contiguous from id 1 to N, with the same term and type
+    /// as the leader at every position — not merely that GetMaxLog matches.
+    /// </summary>
+    [Fact]
+    public async Task BackfilledFollower_HasContiguousLog_MatchingLeader()
+    {
+        InMemoryCommunication communication = new();
+
+        IRaft node1 = GetNode1WithBackfillConfig(communication, logger, maxBackfillEntriesPerRound: 5, backfillThreshold: 2);
+        IRaft node2 = GetNode2WithBackfillConfig(communication, logger, maxBackfillEntriesPerRound: 5, backfillThreshold: 2);
+        IRaft node3 = GetNode3WithBackfillConfig(communication, logger, maxBackfillEntriesPerRound: 5, backfillThreshold: 2);
+        IRaft[] nodes = [node1, node2, node3];
+
+        Dictionary<string, IRaft> network = new()
+        {
+            { "localhost:8001", node1 },
+            { "localhost:8002", node2 },
+            { "localhost:8003", node3 }
+        };
+        communication.SetNodes(network);
+
+        await node1.UpdateNodes();
+        await node2.UpdateNodes();
+        await node3.UpdateNodes();
+
+        await Task.WhenAll(
+            node1.JoinCluster(TestContext.Current.CancellationToken),
+            node2.JoinCluster(TestContext.Current.CancellationToken),
+            node3.JoinCluster(TestContext.Current.CancellationToken));
+
+        string initialLeader = await node1.WaitForLeaderStableAsync(
+            1, TimeSpan.FromMilliseconds(150), TestContext.Current.CancellationToken);
+
+        IRaft follower = nodes.First(n => n.GetLocalEndpoint() != initialLeader);
+        communication.PartitionNode(follower.GetLocalEndpoint());
+
+        IRaft leader = GetNodeByEndpoint(nodes, initialLeader);
+        byte[] data = "BackfillEntry"u8.ToArray();
+        const int entries = 15;
+        for (int i = 0; i < entries; i++)
+        {
+            RaftReplicationResult result = await leader.ReplicateLogs(
+                1, "Backfill", data,
+                cancellationToken: TestContext.Current.CancellationToken);
+            Assert.Equal(RaftOperationStatus.Success, result.Status);
+        }
+
+        Assert.True(leader.WalAdapter.GetMaxLog(1) >= entries);
+
+        communication.HealPartition(follower.GetLocalEndpoint());
+
+        string resumedLeaderView = await follower.WaitForLeaderStableAsync(
+            1, TimeSpan.FromMilliseconds(150), TestContext.Current.CancellationToken);
+
+        IRaft decidedLeader = GetNodeByEndpoint(nodes, resumedLeaderView);
+
+        await WaitForConditionAsync(
+            () => follower.WalAdapter.GetMaxLog(1) >= decidedLeader.WalAdapter.GetMaxLog(1),
+            TestContext.Current.CancellationToken,
+            timeoutMs: 20_000);
+
+        AssertContiguousLog(follower, decidedLeader, 1);
+
+        await node1.LeaveCluster(true);
+        await node2.LeaveCluster(true);
+        await node3.LeaveCluster(true);
+    }
+
+    /// <summary>
+    /// Divergent suffix via anchored backfill: a follower holding stale proposed entries from
+    /// a fake previous term is brought up to date through the leader's heartbeat backfill loop.
+    ///
+    /// Setup: all three nodes join and reach steady state, then the target follower is
+    /// partitioned.  While isolated its WAL is injected with stale Proposed entries (term 999)
+    /// at the ids immediately above its current max; in parallel the leader commits those same
+    /// ids (and more) with the actual election term.  On heal the follower reports a higher
+    /// maxLog (from the injected stale entries) than the leader last acked.  The leader's
+    /// backfill sends a batch with <c>prevLogIndex</c> pointing at one of the stale entries,
+    /// which fails the follower-side LMP term check; the leader backtracks <c>nextIndex</c>
+    /// past the stale ids until the anchor matches a legitimately-committed entry, then
+    /// re-ships the correct range and the follower truncates its stale tail.
+    ///
+    /// Drives divergence through backfill (not a live proposal) so the anchored prevLog check
+    /// in <see cref="RaftPartitionStateMachine.TrySendBackfillBatchAsync"/> is exercised.
+    /// </summary>
+    [Fact]
+    public async Task DivergentSuffix_BackfillDetectsMismatch_TruncatesAndReplaces()
+    {
+        InMemoryCommunication communication = new();
+
+        IRaft node1 = GetNode1WithBackfillConfig(communication, logger, maxBackfillEntriesPerRound: 5, backfillThreshold: 2);
+        IRaft node2 = GetNode2WithBackfillConfig(communication, logger, maxBackfillEntriesPerRound: 5, backfillThreshold: 2);
+        IRaft node3 = GetNode3WithBackfillConfig(communication, logger, maxBackfillEntriesPerRound: 5, backfillThreshold: 2);
+        IRaft[] nodes = [node1, node2, node3];
+
+        Dictionary<string, IRaft> network = new()
+        {
+            { "localhost:8001", node1 },
+            { "localhost:8002", node2 },
+            { "localhost:8003", node3 }
+        };
+        communication.SetNodes(network);
+
+        await node1.UpdateNodes();
+        await node2.UpdateNodes();
+        await node3.UpdateNodes();
+
+        // All three nodes join so the system partition elects a leader.
+        await Task.WhenAll(
+            node1.JoinCluster(TestContext.Current.CancellationToken),
+            node2.JoinCluster(TestContext.Current.CancellationToken),
+            node3.JoinCluster(TestContext.Current.CancellationToken));
+
+        string leaderEndpoint = await node1.WaitForLeaderStableAsync(
+            1, TimeSpan.FromMilliseconds(150), TestContext.Current.CancellationToken);
+
+        IRaft leader = GetNodeByEndpoint(nodes, leaderEndpoint);
+        IRaft follower = nodes.First(n => n.GetLocalEndpoint() != leaderEndpoint && n != leader);
+
+        // Commit a few real entries so the follower has a legitimate committed prefix.
+        byte[] data = "Seed"u8.ToArray();
+        for (int i = 0; i < 3; i++)
+        {
+            RaftReplicationResult r = await leader.ReplicateLogs(1, "Seed", data,
+                cancellationToken: TestContext.Current.CancellationToken);
+            Assert.Equal(RaftOperationStatus.Success, r.Status);
+        }
+
+        // Wait for the follower to receive the seed entries before partitioning it.
+        await WaitForConditionAsync(
+            () => follower.WalAdapter.GetMaxLog(1) >= 3,
+            TestContext.Current.CancellationToken);
+
+        // Partition the follower.  From this point it receives no leader messages.
+        communication.PartitionNode(follower.GetLocalEndpoint());
+
+        long followerMaxBeforeStale = follower.WalAdapter.GetMaxLog(1);
+
+        // Inject stale proposed entries directly into the follower's WAL at the ids immediately
+        // above its current max, using a term (999) that can never match the real election term.
+        // This simulates entries a previous stale leader proposed but never committed, leaving a
+        // divergent suffix the current leader must detect and replace via anchored backfill.
+        long staleStart = followerMaxBeforeStale + 1;
+        follower.WalAdapter.Write([(1,
+        [
+            new RaftLog { Id = staleStart,     Term = 999, Type = RaftLogType.Proposed, LogType = "stale" },
+            new RaftLog { Id = staleStart + 1, Term = 999, Type = RaftLogType.Proposed, LogType = "stale" },
+            new RaftLog { Id = staleStart + 2, Term = 999, Type = RaftLogType.Proposed, LogType = "stale" },
+        ])]);
+
+        // Commit enough entries on the surviving quorum to exceed BackfillThreshold and to
+        // overlap the follower's stale ids so the leader must write over them.
+        const int newEntries = 15;
+        for (int i = 0; i < newEntries; i++)
+        {
+            RaftReplicationResult r = await leader.ReplicateLogs(1, "Live", "LiveData"u8.ToArray(),
+                cancellationToken: TestContext.Current.CancellationToken);
+            Assert.Equal(RaftOperationStatus.Success, r.Status);
+        }
+
+        Assert.True(leader.WalAdapter.GetMaxLog(1) >= followerMaxBeforeStale + newEntries);
+
+        // Heal the partition.  The follower reports a higher maxLog (from the 3 injected stale
+        // entries) than the leader last acked.  The leader's backfill fires and sends a batch
+        // anchored at the stale ids; the follower's LMP term check rejects (term 999 ≠ leader
+        // term), the leader backtracks nextIndex past the stale range, and on the next round
+        // the anchor lands on a committed entry both sides agree on.  The follower writes the
+        // correct range and TruncateLogsAfter removes any remaining stale tail.
+        communication.HealPartition(follower.GetLocalEndpoint());
+
+        await WaitForConditionAsync(
+            () => follower.WalAdapter.GetMaxLog(1) >= leader.WalAdapter.GetMaxLog(1),
+            TestContext.Current.CancellationToken,
+            timeoutMs: 30_000);
+
+        // Log must be byte-for-byte identical to the leader: contiguous ids, matching terms/types.
+        AssertContiguousLog(follower, leader, 1);
+
+        // No stale entries with term 999 must survive.
+        List<RaftLog> followerLogs = follower.WalAdapter.ReadLogs(1);
+        Assert.DoesNotContain(followerLogs, l => l.Term == 999);
 
         await node1.LeaveCluster(true);
         await node2.LeaveCluster(true);
@@ -1002,6 +1192,40 @@ public sealed class TestThreeNodeCluster
 
         throw new TimeoutException(
             $"Partition {partitionId} did not change leaders from {previousLeader} within {totalBudgetMs / 1000} seconds.");
+    }
+
+    /// <summary>
+    /// Reads both nodes' full committed log for <paramref name="partitionId"/> and asserts:
+    /// <list type="bullet">
+    ///   <item>Same count of entries.</item>
+    ///   <item>Ids are contiguous from 1 to N with no gaps.</item>
+    ///   <item>Per-id <c>Term</c> and <c>Type</c> match the leader's log exactly.</item>
+    /// </list>
+    /// This is a stronger check than <c>GetMaxLog ≥ N</c>: it catches holes, reordered ids,
+    /// and entries that survived with a mismatched term from a previous election.
+    /// </summary>
+    private static void AssertContiguousLog(IRaft follower, IRaft leader, int partitionId)
+    {
+        List<RaftLog> followerLogs = follower.WalAdapter.ReadLogs(partitionId);
+        List<RaftLog> leaderLogs   = leader.WalAdapter.ReadLogs(partitionId);
+
+        Assert.Equal(leaderLogs.Count, followerLogs.Count);
+
+        for (int i = 0; i < followerLogs.Count; i++)
+        {
+            RaftLog f = followerLogs[i];
+            RaftLog l = leaderLogs[i];
+            Assert.Equal(l.Id,   f.Id);
+            Assert.Equal(l.Term, f.Term);
+            Assert.Equal(l.Type, f.Type);
+        }
+
+        long expectedId = 1;
+        foreach (RaftLog log in followerLogs)
+        {
+            Assert.Equal(expectedId, log.Id);
+            expectedId++;
+        }
     }
 
     private static IRaft GetNodeByEndpoint(IRaft[] nodes, string endpoint) =>
