@@ -1526,18 +1526,16 @@ public sealed class RaftPartitionStateMachine
                 return (RaftOperationStatus.ActiveProposal, HLCTimestamp.Zero);
         }
         
-        IReadOnlyList<RaftNode> nodes = host.Nodes;
-        
-        if (nodes.Count == 0)
-        {
-            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] No quorum available to propose logs", host.LocalEndpoint, host.PartitionId, nodeState);
-            
-            return (RaftOperationStatus.Errored, HLCTimestamp.Zero);
-        }
-        
+        // No peers: a single-node leader is its own quorum. We enqueue the checkpoint to the local
+        // WAL exactly like the multi-node path and let CompleteLeaderPropose drive the commit
+        // immediately (quorum = self), behind its Nodes.Count == 0 guard. Without this a single-node
+        // cluster could never checkpoint, and since compaction is checkpoint-driven its WAL would
+        // grow without bound. Multi-node safety is unaffected: with peers, the same proposal still
+        // requires a real quorum.
+
         // We need a proper HLC sequence to determine a consistent order of the logs
         HLCTimestamp currentTime = host.HybridLogicalClock.SendOrLocalEvent(host.LocalNodeId);
-        
+
         List<RaftLog> checkpointLogs = [new()
         {
             Id = 0,

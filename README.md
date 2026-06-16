@@ -16,6 +16,7 @@ Kommander is designed to keep the consensus core separate from storage, discover
 - **Partitioned replication:** Nodes can lead some partitions and follow others, allowing application data to be distributed across independent Raft groups. Partition `0` is reserved for replicated system configuration; application partitions start at `1`.
 - **Elastic partitions:** Create, split, merge, and remove partitions at runtime without restarting any node. The partition map is replicated through the system partition so every node converges on every change, and two-phase protocols ensure no key range is ever uncovered during a split or merge. See [Elastic Partitions Developer Guide](docs/elastic-partitions-developer-guide.md).
 - **Dynamic cluster membership:** Add and remove nodes from a running cluster. The voting roster is a committed, versioned record on the system partition (never gossip- or discovery-derived), so quorum is always consistent. New nodes join as non-voting learners, catch up, and are auto-promoted to voters; a SWIM-style gossip layer disseminates the roster and detects failures advisorily. See [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md).
+- **Log catch-up & backfill:** A leader detects a follower that has fallen behind and backfills the missing entries in bounded, anchored chunks, enforcing the Raft Log Matching Property so a follower's log never grows a gap or a divergent tail. Followers too far behind the compaction floor are caught up with a snapshot instead. See [Log Catch-Up & Backfill Developer Guide](docs/log-backfill-developer-guide.md).
 - **Durable write-ahead logging:** Built-in WAL adapters for RocksDB and SQLite persist proposed, committed, rolled-back, and checkpoint entries before state-machine callbacks run.
 - **Automatic WAL compaction:** Committed-operation counters trigger bounded per-partition compaction so removable history below the last committed checkpoint does not grow without bound.
 - **Testing-friendly in-memory components:** `InMemoryWAL`, `InMemoryCommunication`, and focused test utilities support fast local simulations without external infrastructure.
@@ -38,11 +39,20 @@ Kommander implements this model with partitioned Raft groups. Each partition ele
 
 The library keeps storage, discovery, and communication pluggable. That separation lets applications use the same Raft behavior with different persistence engines, network transports, and cluster discovery strategies.
 
+## Documentation
+
+| Guide | What it covers |
+| --- | --- |
+| [Architecture Overview](docs/architecture-overview.md) | A beginner-friendly tour of the whole system: concepts, the component map, and the main runtime flows (election, write path, catch-up, restart, compaction). Start here. |
+| [Log Catch-Up & Backfill Developer Guide](docs/log-backfill-developer-guide.md) | How a lagging follower is brought back in sync: the live-vs-backfill split, the Log Matching anchor, multi-round convergence, and the snapshot handoff. |
+| [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md) | Adding/removing nodes at runtime, the committed roster, learner promotion, and the SWIM failure detector. |
+| [Elastic Partitions Developer Guide](docs/elastic-partitions-developer-guide.md) | Creating, splitting, merging, and removing partitions at runtime, the two-phase protocols, and the generation fence. |
+
 ## Packages And Targets
 
-Kommander targets `.NET 8.0`.
+Kommander multi-targets `.NET 8.0` and `.NET 10.0`.
 
-Current package version in this tree: `0.12.0`.
+Current package version in this tree: `0.13.0`.
 
 Install from NuGet:
 
@@ -275,8 +285,10 @@ Use a unique `NodeId` when you can. If `NodeId` is `0`, Kommander derives one fr
 | Lifecycle | `JoinCluster` (no-arg and seed-based overloads), `LeaveCluster`, `UpdateNodes` |
 | Membership | `GetMembership`, `LocalRole`, `OnMembershipChanged` |
 | Cluster state | `Joined`, `IsInitialized`, `GetNodes`, `GetLocalEndpoint`, `GetLocalNodeId`, `GetLocalNodeName` |
-| Leadership | `AmILeaderQuick`, `AmILeader`, `WaitForLeader` |
+| Leadership | `AmILeaderQuick`, `AmILeader`, `WaitForLeader`, `WaitForLeaderStableAsync` |
+| Leadership control | `StepDownAsync`, `TransferLeadershipAsync`, `SuspendHeartbeatsAsync`, `ResumeHeartbeatsAsync` |
 | Replication | `ReplicateLogs`, `ReplicateCheckpoint`, `CommitLogs`, `RollbackLogs` |
+| Catch-up observability | `GetFollowerLagAsync`, `GetActiveNodes`, `GetLastNodeActivity` |
 | Partition routing | `GetPartitionKey`, `GetPrefixPartitionKey` |
 | Elastic partitions | `CreatePartitionAsync`, `RemovePartitionAsync`, `SplitPartitionAsync`, `MergePartitionsAsync`, `GetPartitionMap`, `GetPartitionGeneration`, `RegisterStateMachineTransfer` |
 | Partition events | `OnPartitionMapChanged` |
@@ -297,6 +309,9 @@ The transport entry points are intended for communication adapters and HTTP/gRPC
 | `InitialPartitions` | `1` | Number of initial user partitions. Partition `0` is reserved. |
 | `TransportSecurity` | see below | Node authentication and TLS validation settings. See [Transport Security And Node Authentication](#transport-security-and-node-authentication). |
 | `HttpScheme` | `https://` | Scheme used by `RestCommunication`. |
+| `GrpcScheme` | `https://` | URL scheme prepended to peer endpoints when opening gRPC channels. Set to `http://` (plus `Http2UnencryptedSupport`) for cleartext test environments. |
+| `GrpcChannelsPerNode` | `4` | Number of pooled gRPC channels (and matching streaming calls) created per peer URL. Each channel owns its own `SocketsHttpHandler` and TCP/HTTP2 connection, so effective per-peer concurrency is approximately `GrpcChannelsPerNode × MaxConcurrentStreams`. Clamped to [1, 64] at runtime. Set to `1` to restore single-connection behaviour. |
+| `GrpcEnableMultipleHttp2Connections` | `false` | When `true`, each pooled channel's handler may open additional TCP/HTTP2 connections on demand, raising the per-channel stream ceiling further on saturated links. |
 | `HttpAuthBearerToken` | empty | **Deprecated.** Legacy bearer token. Use `TransportSecurity.SharedSecret` instead. |
 | `HttpTimeout` | `5` | REST request timeout in seconds. |
 | `HttpVersion` | `2.0` | REST HTTP version. |
@@ -314,6 +329,8 @@ The transport entry points are intended for communication adapters and HTTP/gRPC
 | `SlowRaftWALMachineLog` | `25 ms` | Slow WAL warning threshold. |
 | `ReadIOThreads` | `8` | Fair scheduler workers for synchronous WAL reads. |
 | `WriteIOThreads` | `4` | Fair scheduler workers for synchronous WAL writes. |
+| `BackfillThreshold` | `10` | How many entries a follower may lag before the leader engages backfill. Below this, the live replication path handles catch-up. |
+| `MaxBackfillEntriesPerRound` | `128` | Maximum entries shipped in a single backfill round, bounding message size and keeping backfill fair to live traffic. |
 | `CompactEveryOperations` | `10000` | Successfully persisted commit/follower-append operations between automatic WAL compaction triggers per partition. Set to `0` or below to disable automatic compaction. |
 | `CompactNumberEntries` | `100` | Max entries removed per adapter compaction batch. Values below `1` are treated as `1`. |
 | `MaxEntriesPerCompaction` | `5000` | Upper bound on entries removed by one triggered compaction pass before yielding. Values below `CompactNumberEntries` are clamped up. |
@@ -417,6 +434,8 @@ string endpoint = await raft.WaitForLeader(1, cancellationToken);
 | `ProposalTimeout` | The proposal did not complete in time. |
 | `ReplicationFailed` | Replication failed before commit. |
 | `Pending` | Internal state used while asynchronous work is in progress. |
+| `LogMismatch` | A follower rejected a backfill batch because it does not hold the anchored preceding entry; the leader backtracks and retries lower. |
+| `SnapshotRequired` | A follower needs entries below the leader's compaction floor; catch-up switches from backfill to snapshot install. |
 
 ## Partition Routing
 
@@ -667,6 +686,23 @@ Membership changes are single-server (one node added, promoted, or removed per c
 > **Transport support:** the committed roster, joins, graceful leave, and cross-partition learner promotion all work on every transport (gRPC, REST, and in-memory). Gossip dissemination and the SWIM failure detector are currently wired only on the in-process (`InMemoryCommunication`) transport; on gRPC/REST those RPCs are not yet implemented, so the failure detector is **disabled by default** (`PingInterval` defaults to `TimeSpan.Zero`) to avoid evicting healthy peers. Do not enable it on a transport without working Ping support. Without gossip, roster convergence still happens via Raft replication (just not epidemically). See the developer guide's transport matrix for the current state.
 
 See [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md) for the design motivations, the full lifecycle walkthroughs, the SWIM failure detector, configuration, the code map, an operations runbook, and the invariants to preserve when extending the system.
+
+## Log Catch-Up & Backfill
+
+A follower can fall behind its leader — it was slow, briefly partitioned, paused, or just joined. Kommander keeps it in sync through two distinct paths:
+
+- The **live path** broadcasts each new proposal/commit to followers that are keeping up. It is intentionally unanchored, so a transiently-behind follower never stalls a live proposal.
+- The **backfill path** engages once a follower lags by more than `BackfillThreshold`. The leader reads the missing range from its own log and ships it in bounded chunks (`MaxBackfillEntriesPerRound`), each **anchored** with the preceding entry's index and term. The follower enforces the Log Matching Property: it applies a chunk only if it already holds that anchor, otherwise it rejects with `LogMismatch` and the leader backtracks. This is what guarantees a follower's log never grows a gap or keeps a divergent tail.
+
+If a follower needs entries the leader has already compacted away (below the **compaction floor**), backfill cannot help; the leader returns `SnapshotRequired` and catch-up hands off to snapshot install.
+
+Backfill is automatic and needs no application calls. You can observe how far a follower is behind:
+
+```csharp
+long? lag = await raft.GetFollowerLagAsync(partitionId: 1, followerEndpoint: "host2:8002");
+```
+
+See [Log Catch-Up & Backfill Developer Guide](docs/log-backfill-developer-guide.md) for the full flows, the live-vs-backfill rationale, configuration tuning, the code map, and the invariants to preserve when extending it.
 
 ## Utilities
 

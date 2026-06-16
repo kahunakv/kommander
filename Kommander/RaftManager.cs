@@ -325,6 +325,16 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         OnSystemRestoreFinished += SystemRestoreFinished;
         OnLeaderChanged += SystemLeaderChanged;
 
+        if (communication is Kommander.Communication.Grpc.GrpcCommunication)
+        {
+            // Establish process-wide gRPC pool defaults before any peer I/O fires so that
+            // external SharedChannels consumers (e.g. Kahuna's GrpcServerBatcher) inherit
+            // the operator's RaftConfiguration values rather than the library fallback (4, false).
+            Kommander.Communication.Grpc.SharedChannels.Configure(
+                configuration.GetEffectiveGrpcChannelsPerNode(),
+                configuration.GrpcEnableMultipleHttp2Connections);
+        }
+
         if (communication is Kommander.Communication.Rest.RestCommunication
                           or Kommander.Communication.Grpc.GrpcCommunication)
         {

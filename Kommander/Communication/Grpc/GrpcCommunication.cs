@@ -36,7 +36,7 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<HandshakeResponse> Handshake(RaftManager manager, RaftNode node, HandshakeRequest request)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetSecurityOptions(manager)));
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
 
         GrpcHandshakeRequest handshake = new()
         {
@@ -67,7 +67,7 @@ public class GrpcCommunication : ICommunication
         GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
             GetEndpointUrl(manager, node),
             BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
-            GetSecurityOptions(manager));
+            GetPoolOptions(manager));
 
         GrpcRequestVotesRequest requestVotes = new()
         {
@@ -117,7 +117,7 @@ public class GrpcCommunication : ICommunication
         GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
             GetEndpointUrl(manager, node),
             BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
-            GetSecurityOptions(manager));
+            GetPoolOptions(manager));
 
         GrpcVoteRequest voteRequest = new()
         {
@@ -166,7 +166,7 @@ public class GrpcCommunication : ICommunication
         GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
             GetEndpointUrl(manager, node),
             BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
-            GetSecurityOptions(manager));
+            GetPoolOptions(manager));
 
         GrpcAppendLogsRequest appendLogsRequest = GrpcCommunicationPool.RentAppendLogsRequest();
 
@@ -224,7 +224,7 @@ public class GrpcCommunication : ICommunication
         GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
             GetEndpointUrl(manager, node),
             BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
-            GetSecurityOptions(manager));
+            GetPoolOptions(manager));
 
         GrpcCompleteAppendLogsRequest completeAppendLogsRequest = GrpcCommunicationPool.RentCompleteAppendLogsRequest();
 
@@ -282,7 +282,7 @@ public class GrpcCommunication : ICommunication
         GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
             GetEndpointUrl(manager, node),
             BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
-            GetSecurityOptions(manager));
+            GetPoolOptions(manager));
         
         RepeatedField<GrpcBatchRequestsRequestItem> items = new();
             
@@ -442,7 +442,7 @@ public class GrpcCommunication : ICommunication
     /// </summary>
     public async Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetSecurityOptions(manager)));
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
 
         GrpcLeaveRequest grpcRequest = new()
         {
@@ -474,7 +474,7 @@ public class GrpcCommunication : ICommunication
     /// </summary>
     public async Task<GossipAck> SendGossip(RaftManager manager, RaftNode node, GossipMessage digest, CancellationToken cancellationToken = default)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetSecurityOptions(manager)));
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
 
         GrpcGossipRequest grpcRequest = new()
         {
@@ -513,7 +513,7 @@ public class GrpcCommunication : ICommunication
     /// </summary>
     public async Task<Gossip.PingResponse> SendPing(RaftManager manager, RaftNode node, Gossip.PingRequest request, CancellationToken cancellationToken = default)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetSecurityOptions(manager)));
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
         GrpcPingRequest grpcRequest = new() { SenderEndpoint = request.SenderEndpoint };
         Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Ping");
         try
@@ -536,7 +536,7 @@ public class GrpcCommunication : ICommunication
     /// </summary>
     public async Task<Gossip.PingReqResponse> SendPingReq(RaftManager manager, RaftNode node, Gossip.PingReqRequest request, CancellationToken cancellationToken = default)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetSecurityOptions(manager)));
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
         GrpcPingReqRequest grpcRequest = new() { SenderEndpoint = request.SenderEndpoint, TargetEndpoint = request.TargetEndpoint };
         Metadata metadata = BuildAuthMetadata(manager, "/Rafter/PingReq");
         try
@@ -561,7 +561,7 @@ public class GrpcCommunication : ICommunication
     /// </summary>
     public async Task<long?> GetRemoteFollowerLag(RaftManager manager, RaftNode node, int partitionId, string followerEndpoint)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetSecurityOptions(manager)));
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
 
         GrpcGetFollowerLagRequest grpcRequest = new()
         {
@@ -591,7 +591,7 @@ public class GrpcCommunication : ICommunication
         RaftManager manager, RaftNode node, SnapshotRequest request,
         CancellationToken cancellationToken = default)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetSecurityOptions(manager)));
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
 
         GrpcInstallSnapshotRequest grpcRequest = new()
         {
@@ -624,7 +624,7 @@ public class GrpcCommunication : ICommunication
 
     public async Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetSecurityOptions(manager)));
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
 
         GrpcJoinRequest grpcRequest = new()
         {
@@ -670,6 +670,11 @@ public class GrpcCommunication : ICommunication
 
     private static RaftTransportSecurityOptions GetSecurityOptions(RaftManager manager) =>
         manager.Configuration.GetEffectiveTransportSecurity();
+
+    private static GrpcChannelPoolOptions GetPoolOptions(RaftManager manager) =>
+        new(manager.Configuration.GetEffectiveGrpcChannelsPerNode(),
+            manager.Configuration.GrpcEnableMultipleHttp2Connections,
+            GetSecurityOptions(manager));
 
     /// <summary>
     /// Builds the full URL for <paramref name="node"/> by prepending the configured

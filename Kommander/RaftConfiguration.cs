@@ -222,6 +222,54 @@ public class RaftConfiguration
     /// a separate "reserve" concept unnecessary.
     /// </remarks>
 
+    // ── gRPC channel pool ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Number of pooled gRPC channels (and matching streaming calls) created per peer URL.
+    /// Each channel owns its own <c>SocketsHttpHandler</c> and therefore its own TCP/HTTP2
+    /// connection, so effective per-peer concurrency is approximately
+    /// <c>GrpcChannelsPerNode × MaxConcurrentStreams</c>
+    /// (× additional connections per channel when <see cref="GrpcEnableMultipleHttp2Connections"/>
+    /// is <see langword="true"/>).
+    /// Values below 1 are clamped to 1; values above 64 are capped — each unit is a
+    /// permanently-held connection and handler for the lifetime of the process.
+    /// Default 4.
+    /// </summary>
+    public int GrpcChannelsPerNode { get; set; } = 4;
+
+    /// <summary>
+    /// When <see langword="true"/>, each pooled channel's <c>SocketsHttpHandler</c> may
+    /// open multiple TCP/HTTP2 connections to the same peer instead of multiplexing all
+    /// streams over one, raising the per-channel stream ceiling on saturated links.
+    /// Default <see langword="false"/>.
+    /// </summary>
+    public bool GrpcEnableMultipleHttp2Connections { get; set; }
+
+    private const int GrpcChannelsPerNodeMax = 64;
+
+    // Warn at most once per process so repeated calls don't spam.
+    // internal so tests can reset it between isolated assertion runs.
+    internal static int grpcChannelsCapWarned;
+
+    /// <summary>
+    /// Returns <see cref="GrpcChannelsPerNode"/> clamped to [1, 64].  Values below 1 are
+    /// raised to 1; values above 64 are capped because each unit is a permanently-held
+    /// connection and <c>SocketsHttpHandler</c> for the process lifetime.  A one-time warning
+    /// is emitted to <c>stderr</c> when the raw value exceeds the cap so misconfigured
+    /// deployments are visible without requiring a structured logger.
+    /// </summary>
+    public int GetEffectiveGrpcChannelsPerNode()
+    {
+        int v = GrpcChannelsPerNode;
+
+        if (v > GrpcChannelsPerNodeMax && Interlocked.CompareExchange(ref grpcChannelsCapWarned, 1, 0) == 0)
+            Console.Error.WriteLine(
+                $"[Kommander] GrpcChannelsPerNode={v} exceeds the maximum of {GrpcChannelsPerNodeMax}; " +
+                $"clamped to {GrpcChannelsPerNodeMax}. Each pooled channel is a permanently-held connection and handler.");
+
+        return Math.Clamp(v, 1, GrpcChannelsPerNodeMax);
+    }
+
     // ── Bounded log backfill ──────────────────────────────────────────────────
 
     /// <summary>

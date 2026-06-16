@@ -76,6 +76,46 @@ public sealed class TestSingleNodeCluster
         await node.LeaveCluster(true);
     }
 
+    [Fact]
+    public async Task SingleNode_Leader_ReplicateCheckpoint_CommitsLocallyWithoutPeers()
+    {
+        IRaft node = BuildSingleNode(1);
+
+        using CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(10));
+
+        await node.JoinCluster(cts.Token);
+        Assert.True(node.IsInitialized);
+        Assert.True(await node.AmILeaderQuick(1));
+
+        // Replicate an entry first so the checkpoint marks a non-trivial point in the log.
+        RaftReplicationResult entry = await node.ReplicateLogs(
+            1,
+            "Greeting",
+            "Hello World"u8.ToArray(),
+            cancellationToken: cts.Token);
+        Assert.True(entry.Success);
+
+        // Without the single-node checkpoint path this returned Errored (no quorum), so a 0-peer
+        // cluster could never checkpoint and therefore never compact.
+        RaftReplicationResult checkpoint = await node.ReplicateCheckpoint(1, cts.Token);
+
+        Assert.True(checkpoint.Success);
+        Assert.Equal(RaftOperationStatus.Success, checkpoint.Status);
+
+        // The Success reply is sent at propose-completion; the committed-checkpoint WAL write lands
+        // immediately after on the executor. Poll briefly to confirm the checkpoint actually commits
+        // locally (quorum = self), not merely that the propose was accepted. (InMemoryWAL does not
+        // implement GetLastCheckpoint, so we assert on the persisted committed-checkpoint entry.)
+        while (!node.WalAdapter.ReadLogs(1).Any(l => l.Type == RaftLogType.CommittedCheckpoint)
+               && !cts.Token.IsCancellationRequested)
+            await Task.Delay(25, cts.Token);
+
+        Assert.Contains(node.WalAdapter.ReadLogs(1), l => l.Type == RaftLogType.CommittedCheckpoint);
+
+        await node.LeaveCluster(true);
+    }
+
     private IRaft BuildSingleNode(int partitions)
     {
         RaftConfiguration config = new()
