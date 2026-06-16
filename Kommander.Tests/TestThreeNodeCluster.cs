@@ -1291,6 +1291,7 @@ public sealed class TestThreeNodeCluster
             UpdateNodesInterval = TimeSpan.FromMilliseconds(100),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
             StartElectionTimeout = 100,
+            EnableQuiescence = false,
             EndElectionTimeout = 250,
         };
 
@@ -1326,6 +1327,7 @@ public sealed class TestThreeNodeCluster
             UpdateNodesInterval = TimeSpan.FromMilliseconds(100),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
             StartElectionTimeout = 100,
+            EnableQuiescence = false,
             EndElectionTimeout = 250,
         };
 
@@ -1361,6 +1363,7 @@ public sealed class TestThreeNodeCluster
             UpdateNodesInterval = TimeSpan.FromMilliseconds(100),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
             StartElectionTimeout = 100,
+            EnableQuiescence = false,
             EndElectionTimeout = 250,
         };
 
@@ -1391,6 +1394,7 @@ public sealed class TestThreeNodeCluster
             UpdateNodesInterval = TimeSpan.FromMilliseconds(100),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
             StartElectionTimeout = 100,
+            EnableQuiescence = false,
             EndElectionTimeout = 250,
             MaxBackfillEntriesPerRound = maxBackfillEntriesPerRound,
             BackfillThreshold = backfillThreshold,
@@ -1415,6 +1419,7 @@ public sealed class TestThreeNodeCluster
             UpdateNodesInterval = TimeSpan.FromMilliseconds(100),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
             StartElectionTimeout = 100,
+            EnableQuiescence = false,
             EndElectionTimeout = 250,
             MaxBackfillEntriesPerRound = maxBackfillEntriesPerRound,
             BackfillThreshold = backfillThreshold,
@@ -1439,6 +1444,7 @@ public sealed class TestThreeNodeCluster
             UpdateNodesInterval = TimeSpan.FromMilliseconds(100),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
             StartElectionTimeout = 100,
+            EnableQuiescence = false,
             EndElectionTimeout = 250,
             MaxBackfillEntriesPerRound = maxBackfillEntriesPerRound,
             BackfillThreshold = backfillThreshold,

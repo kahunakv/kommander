@@ -58,13 +58,40 @@ public class TestRaftConfigurationValidation
         cfg.Validate(); // must not throw
     }
 
+    // ── Quiescence on with SWIM disabled (PingInterval = 0) → throws ──────────
+
+    [Fact]
+    public void Validate_QuiescenceEnabled_PingIntervalZero_Throws()
+    {
+        RaftConfiguration cfg = new()
+        {
+            EnableQuiescence = true,
+            PingInterval = TimeSpan.Zero,
+            StartElectionTimeout = 2000,
+        };
+        RaftException ex = Assert.Throws<RaftException>(cfg.Validate);
+        Assert.Contains("PingInterval", ex.Message);
+    }
+
+    [Fact]
+    public void Validate_QuiescenceDisabled_PingIntervalZero_DoesNotThrow()
+    {
+        RaftConfiguration cfg = new()
+        {
+            EnableQuiescence = false,
+            PingInterval = TimeSpan.Zero,
+            StartElectionTimeout = 2000,
+        };
+        cfg.Validate(); // SWIM-off is fine when quiescence is off
+    }
+
     // ── Quiescence knob defaults ──────────────────────────────────────────────
 
     [Fact]
-    public void EnableQuiescence_DefaultsToFalse()
+    public void EnableQuiescence_DefaultsToTrue()
     {
         RaftConfiguration cfg = new();
-        Assert.False(cfg.EnableQuiescence);
+        Assert.True(cfg.EnableQuiescence);
     }
 
     [Fact]

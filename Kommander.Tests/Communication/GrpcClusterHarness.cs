@@ -72,6 +72,7 @@ public sealed class GrpcTestNode : IAsyncDisposable
             HeartbeatInterval = TimeSpan.FromMilliseconds(150),
             VotingTimeout = TimeSpan.FromMilliseconds(500),
             StartElectionTimeout = 600,
+            EnableQuiescence = false,
             EndElectionTimeout = 900,
             TimerInitialDelay = TimeSpan.FromMilliseconds(500),
             PingInterval = pingInterval,
@@ -128,6 +129,7 @@ public sealed class GrpcTestNode : IAsyncDisposable
             HeartbeatInterval = TimeSpan.FromMilliseconds(150),
             VotingTimeout = TimeSpan.FromMilliseconds(500),
             StartElectionTimeout = 600,
+            EnableQuiescence = false,
             EndElectionTimeout = 900,
             TimerInitialDelay = TimeSpan.FromMilliseconds(500),
             PingInterval = TimeSpan.Zero   // disable SWIM in short-lived harness tests

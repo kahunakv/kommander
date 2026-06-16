@@ -277,10 +277,9 @@ public class RaftConfiguration
     /// after <see cref="QuiesceAfter"/> of inactivity, relying on SWIM node-level liveness
     /// to suppress follower elections.  Set to <see langword="false"/> to restore the
     /// original per-partition heartbeating on every interval, independent of idle time.
-    /// Default <see langword="false"/>; will be flipped to <see langword="true"/> once
-    /// heartbeat suppression (leader-side quiesce) is implemented.
+    /// Default <see langword="true"/>.
     /// </summary>
-    public bool EnableQuiescence { get; set; }
+    public bool EnableQuiescence { get; set; } = true;
 
     /// <summary>
     /// How long a partition must remain idle (no proposals, no in-flight replication)
@@ -426,8 +425,16 @@ public class RaftConfiguration
     /// Validates configuration invariants at startup and throws <see cref="RaftException"/>
     /// on any violation.
     /// <para>
-    /// When <see cref="EnableQuiescence"/> is <see langword="true"/>, enforces
-    /// <c>PingInterval &lt; StartElectionTimeout</c>: quiesced followers gate failover on
+    /// When <see cref="EnableQuiescence"/> is <see langword="true"/>, enforces two invariants:
+    /// </para>
+    /// <para>
+    /// 1. <c>PingInterval &gt; 0</c>: quiescence relies on the SWIM failure detector to notice a
+    /// dead leader node, because a quiesced follower stops watching the per-partition heartbeat
+    /// timer. A non-positive <c>PingInterval</c> disables SWIM probing, so quiesced followers
+    /// would never detect a dead leader and could never fail over — a liveness hazard.
+    /// </para>
+    /// <para>
+    /// 2. <c>PingInterval &lt; StartElectionTimeout</c>: quiesced followers gate failover on
     /// SWIM <c>Suspect</c> (fires after approximately one <c>PingInterval</c>), so a
     /// <c>PingInterval</c> at or above <c>StartElectionTimeout</c> would make quiesced
     /// failover slower than normal election timeout — defeating the purpose of the reconciliation.
@@ -436,6 +443,13 @@ public class RaftConfiguration
     /// <exception cref="RaftException">Thrown when a timing invariant is violated.</exception>
     public void Validate()
     {
+        if (EnableQuiescence && PingInterval <= TimeSpan.Zero)
+            throw new RaftException(
+                "[Kommander] EnableQuiescence=true requires SWIM to be enabled (PingInterval > 0). " +
+                "Quiesced followers stop watching the per-partition heartbeat timer and detect a dead " +
+                "leader only via the SWIM failure detector, so a non-positive PingInterval would leave " +
+                "them unable to fail over. Set PingInterval > 0, or set EnableQuiescence=false.");
+
         if (EnableQuiescence && PingInterval.TotalMilliseconds >= StartElectionTimeout)
             throw new RaftException(
                 $"[Kommander] EnableQuiescence=true requires PingInterval ({PingInterval.TotalMilliseconds} ms) " +

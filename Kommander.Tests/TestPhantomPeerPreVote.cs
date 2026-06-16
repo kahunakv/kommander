@@ -223,6 +223,7 @@ public sealed class TestPhantomPeerPreVote
             UpdateNodesInterval = TimeSpan.FromMilliseconds(100),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
             StartElectionTimeout = 100,
+            EnableQuiescence = false,
             EndElectionTimeout = 250,
         };
 

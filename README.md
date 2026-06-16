@@ -17,6 +17,7 @@ Kommander is designed to keep the consensus core separate from storage, discover
 - **Elastic partitions:** Create, split, merge, and remove partitions at runtime without restarting any node. The partition map is replicated through the system partition so every node converges on every change, and two-phase protocols ensure no key range is ever uncovered during a split or merge. See [Elastic Partitions Developer Guide](docs/elastic-partitions-developer-guide.md).
 - **Dynamic cluster membership:** Add and remove nodes from a running cluster. The voting roster is a committed, versioned record on the system partition (never gossip- or discovery-derived), so quorum is always consistent. New nodes join as non-voting learners, catch up, and are auto-promoted to voters; a SWIM-style gossip layer disseminates the roster and detects failures advisorily. See [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md).
 - **Log catch-up & backfill:** A leader detects a follower that has fallen behind and backfills the missing entries in bounded, anchored chunks, enforcing the Raft Log Matching Property so a follower's log never grows a gap or a divergent tail. Followers too far behind the compaction floor are caught up with a snapshot instead. See [Log Catch-Up & Backfill Developer Guide](docs/log-backfill-developer-guide.md).
+- **Partition quiescence:** An idle leader stops sending per-partition heartbeats after a configurable idle window and sends followers a one-time quiesce marker; followers then gate elections on the SWIM failure detector instead of a per-partition timer. This drops steady-state heartbeat traffic from `O(nodes × partitions)` toward per-node SWIM probing, making deployments with hundreds or thousands of mostly-idle partitions practical. Any write wakes the partition instantly, and a dead leader is still detected promptly via SWIM. See [Partition Quiescence Developer Guide](docs/partition-quiescence-developer-guide.md).
 - **Durable write-ahead logging:** Built-in WAL adapters for RocksDB and SQLite persist proposed, committed, rolled-back, and checkpoint entries before state-machine callbacks run.
 - **Automatic WAL compaction:** Committed-operation counters trigger bounded per-partition compaction so removable history below the last committed checkpoint does not grow without bound.
 - **Testing-friendly in-memory components:** `InMemoryWAL`, `InMemoryCommunication`, and focused test utilities support fast local simulations without external infrastructure.
@@ -47,6 +48,7 @@ The library keeps storage, discovery, and communication pluggable. That separati
 | [Log Catch-Up & Backfill Developer Guide](docs/log-backfill-developer-guide.md) | How a lagging follower is brought back in sync: the live-vs-backfill split, the Log Matching anchor, multi-round convergence, and the snapshot handoff. |
 | [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md) | Adding/removing nodes at runtime, the committed roster, learner promotion, and the SWIM failure detector. |
 | [Elastic Partitions Developer Guide](docs/elastic-partitions-developer-guide.md) | Creating, splitting, merging, and removing partitions at runtime, the two-phase protocols, and the generation fence. |
+| [Partition Quiescence Developer Guide](docs/partition-quiescence-developer-guide.md) | How idle partitions stop heartbeating and lean on SWIM for liveness: the quiesce/wake flows, the failover-timing rule, and the configuration knobs. |
 
 ## Packages And Targets
 
@@ -325,6 +327,9 @@ The transport entry points are intended for communication adapters and HTTP/gRPC
 | `EndElectionTimeout` | `4000 ms` | Upper election timeout bound. |
 | `StartElectionTimeoutIncrement` | `100 ms` | Lower timeout backoff increment. |
 | `EndElectionTimeoutIncrement` | `200 ms` | Upper timeout backoff increment. |
+| `EnableQuiescence` | `true` | When `true`, idle partitions stop sending per-partition heartbeats and followers gate elections on SWIM node liveness. Set to `false` to restore per-partition heartbeating on every interval. Requires `PingInterval > 0` and `PingInterval < StartElectionTimeout` (validated at construction). See [Partition Quiescence](#partition-quiescence). |
+| `QuiesceAfter` | `1500 ms` | How long a partition must be idle (no proposals, no in-flight replication) before its leader quiesces it. |
+| `PingInterval` | `1000 ms` | SWIM failure-detector probe cadence. With quiescence on, a quiesced follower detects a dead leader roughly one `PingInterval` after the crash; must be `> 0` and `< StartElectionTimeout`. |
 | `SlowRaftStateMachineLog` | `50 ms` | Slow partition state-machine operation warning threshold. |
 | `SlowRaftWALMachineLog` | `25 ms` | Slow WAL warning threshold. |
 | `ReadIOThreads` | `8` | Fair scheduler workers for synchronous WAL reads. |
@@ -703,6 +708,27 @@ long? lag = await raft.GetFollowerLagAsync(partitionId: 1, followerEndpoint: "ho
 ```
 
 See [Log Catch-Up & Backfill Developer Guide](docs/log-backfill-developer-guide.md) for the full flows, the live-vs-backfill rationale, configuration tuning, the code map, and the invariants to preserve when extending it.
+
+## Partition Quiescence
+
+Heartbeats in Kommander are per-partition: every leader periodically tells each follower "I'm still your leader of this partition." With many mostly-idle partitions, that steady-state cost grows as `O(nodes × partitions)` even when nothing is being written. **Quiescence** removes that waste.
+
+When a partition has had no writes for `QuiesceAfter` (default 1500 ms), its leader sends followers a one-time **quiesce marker** and then stops heartbeating that partition. Quiesced followers stop watching the per-partition election timer and instead rely on the cluster-wide **SWIM failure detector** — which already tracks "is that node alive?" once per node, independent of how many partitions it leads. The result is that idle partitions cost essentially nothing on the wire, while a genuinely dead leader is still detected promptly (followers fail over on SWIM `Suspect`, after roughly one `PingInterval`).
+
+Quiescence is transparent: any write instantly un-quiesces the partition and resumes normal replication and heartbeating. It is enabled by default and is a pure local optimization — it never changes elections, quorum, or the commit path.
+
+```csharp
+RaftConfiguration config = new()
+{
+    EnableQuiescence = true,                         // default
+    QuiesceAfter = TimeSpan.FromMilliseconds(1500),  // idle window before a leader quiesces
+    PingInterval = TimeSpan.FromSeconds(1),          // SWIM probe cadence; must be > 0 and < StartElectionTimeout
+};
+```
+
+Because quiesced followers depend on SWIM for failover, `RaftConfiguration.Validate()` (run at construction) requires `PingInterval > 0` and `PingInterval < StartElectionTimeout` whenever quiescence is enabled; set `EnableQuiescence = false` to restore classic per-partition heartbeating.
+
+See [Partition Quiescence Developer Guide](docs/partition-quiescence-developer-guide.md) for the quiesce/wake flows, the failover-timing rule, the code map, and the invariants to preserve when extending it.
 
 ## Utilities
 

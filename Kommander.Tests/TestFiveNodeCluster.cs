@@ -118,6 +118,7 @@ public class TestFiveNodeCluster
             CompactEveryOperations = 100,
             CompactNumberEntries = 50,
             StartElectionTimeout = 500,
+            EnableQuiescence = false,
             EndElectionTimeout = 1000,
         };
         

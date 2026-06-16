@@ -238,6 +238,7 @@ public sealed class TestSnapshotIntegration
             UpdateNodesInterval = TimeSpan.FromMilliseconds(200),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
             StartElectionTimeout = 100,
+            EnableQuiescence = false,
             EndElectionTimeout = 300,
             BackfillThreshold = 0,
             MaxBackfillEntriesPerRound = 128,

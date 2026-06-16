@@ -45,6 +45,7 @@ public class TestTwoNodeCluster
             UpdateNodesInterval = TimeSpan.FromMilliseconds(100),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
             StartElectionTimeout = 100,
+            EnableQuiescence = false,
             EndElectionTimeout = 250,
         };
 
@@ -76,6 +77,7 @@ public class TestTwoNodeCluster
             UpdateNodesInterval = TimeSpan.FromMilliseconds(100),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
             StartElectionTimeout = 100,
+            EnableQuiescence = false,
             EndElectionTimeout = 250,
         };
 

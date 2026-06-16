@@ -124,6 +124,7 @@ public class TestGrpcChannelPool
                 HeartbeatInterval = TimeSpan.FromMilliseconds(150),
                 VotingTimeout = TimeSpan.FromMilliseconds(500),
                 StartElectionTimeout = 600,
+                EnableQuiescence = false,
                 EndElectionTimeout = 900,
                 TimerInitialDelay = TimeSpan.FromMilliseconds(500),
                 PingInterval = TimeSpan.Zero
@@ -269,6 +270,7 @@ public class TestGrpcChannelPool
                 HeartbeatInterval = TimeSpan.FromMilliseconds(150),
                 VotingTimeout = TimeSpan.FromMilliseconds(500),
                 StartElectionTimeout = 600,
+                EnableQuiescence = false,
                 EndElectionTimeout = 900,
                 TimerInitialDelay = TimeSpan.FromMilliseconds(500),
                 PingInterval = TimeSpan.Zero

@@ -54,6 +54,7 @@ public sealed class TestMembership
             UpdateNodesInterval = TimeSpan.FromMilliseconds(50),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
             StartElectionTimeout = 100,
+            EnableQuiescence = false,
             EndElectionTimeout = 250,
         };
 
@@ -582,6 +583,7 @@ public sealed class TestMembership
             UpdateNodesInterval = TimeSpan.FromMilliseconds(100),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
             StartElectionTimeout = 100,
+            EnableQuiescence = false,
             EndElectionTimeout = 250,
             // Fast SWIM settings so tests complete in < 10 s.
             PingTimeout = TimeSpan.FromMilliseconds(100),
@@ -1235,6 +1237,7 @@ public sealed class TestMembership
             UpdateNodesInterval = TimeSpan.FromMilliseconds(200),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
             StartElectionTimeout = 100,
+            EnableQuiescence = false,
             EndElectionTimeout = 300,
             BackfillThreshold = 0,
             MaxBackfillEntriesPerRound = 128,
