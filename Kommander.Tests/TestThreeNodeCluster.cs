@@ -817,8 +817,16 @@ public sealed class TestThreeNodeCluster
     /// Drives divergence through backfill (not a live proposal) so the anchored prevLog check
     /// in <see cref="RaftPartitionStateMachine.TrySendBackfillBatchAsync"/> is exercised.
     /// </summary>
+    /// <summary>
+    /// A partitioned follower that accumulated stale proposed entries (uncommitted, wrong term) while
+    /// disconnected must converge to the leader log after the partition heals.  Convergence happens via
+    /// same-id overwrite: the leader's backfill batch includes entries at the same ids as the stale ones,
+    /// the follower's WAL write replaces them in-place, and <c>TruncateLogsAfter</c> removes any
+    /// remaining stale tail beyond the batch.  The LMP prevLogIndex anchor lands on the last legitimately
+    /// committed entry (which both sides agree on), so no LogMismatch or nextIndex backtracking occurs.
+    /// </summary>
     [Fact]
-    public async Task DivergentSuffix_BackfillDetectsMismatch_TruncatesAndReplaces()
+    public async Task DivergentSuffix_Backfill_OverwritesStaleUncommittedEntries()
     {
         InMemoryCommunication communication = new();
 
@@ -894,12 +902,11 @@ public sealed class TestThreeNodeCluster
 
         Assert.True(leader.WalAdapter.GetMaxLog(1) >= followerMaxBeforeStale + newEntries);
 
-        // Heal the partition.  The follower reports a higher maxLog (from the 3 injected stale
-        // entries) than the leader last acked.  The leader's backfill fires and sends a batch
-        // anchored at the stale ids; the follower's LMP term check rejects (term 999 ≠ leader
-        // term), the leader backtracks nextIndex past the stale range, and on the next round
-        // the anchor lands on a committed entry both sides agree on.  The follower writes the
-        // correct range and TruncateLogsAfter removes any remaining stale tail.
+        // Heal the partition.  The follower's reported maxLog (3 real + 3 stale = 6) is above
+        // what the leader last acked for it.  The leader fires backfill starting at nextIndex
+        // (which still points at the first stale id), anchored at the last committed entry both
+        // sides agree on — so the LMP check passes.  The batch entries overwrite the follower's
+        // stale ids in-place, and TruncateLogsAfter removes any tail beyond the batch end.
         communication.HealPartition(follower.GetLocalEndpoint());
 
         await WaitForConditionAsync(
