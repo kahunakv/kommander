@@ -1,5 +1,6 @@
 
 using Kommander.Data;
+using Kommander.Gossip;
 using Kommander.System;
 using Kommander.Time;
 
@@ -70,4 +71,6 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
 
     public Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct) =>
         manager.Communication.SendInstallSnapshot(manager, node, request, ct);
+
+    public MemberLivenessState GetNodeLiveness(string endpoint) => manager.Liveness.GetState(endpoint);
 }

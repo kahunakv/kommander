@@ -1,6 +1,7 @@
 
 using Kommander;
 using Kommander.Data;
+using Kommander.Gossip;
 using Kommander.Scheduling;
 using Kommander.System;
 using Kommander.Tests.Scheduler;
@@ -1023,6 +1024,10 @@ public class TestRaftPartitionStateMachine
             EnqueuedRequests.Clear();
         }
 
+        public LivenessTable LivenessTable { get; } = new();
+
+        public MemberLivenessState GetNodeLiveness(string endpoint) => LivenessTable.GetState(endpoint);
+
         public HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId) => HLCTimestamp.Zero;
 
         public HLCTimestamp GetLastNodeHearthbeat(string endpoint, int partitionId) => HLCTimestamp.Zero;
@@ -1105,5 +1110,29 @@ public class TestRaftPartitionStateMachine
 
         public void TryComplete(ulong correlationId, RaftResponse response) =>
             Completed.Add((correlationId, response));
+    }
+
+    // ── GetNodeLiveness host surface ─────────────────────────────────────────
+
+    [Fact]
+    public void GetNodeLiveness_UnknownEndpoint_ReturnsAlive()
+    {
+        FakePartitionHost host = new();
+        Assert.Equal(MemberLivenessState.Alive, host.GetNodeLiveness("never-seen.invalid:9999"));
+    }
+
+    [Fact]
+    public void GetNodeLiveness_ReflectsLivenessTableState()
+    {
+        FakePartitionHost host = new();
+
+        host.LivenessTable.MarkAlive("node-b", incarnation: 1);
+        Assert.Equal(MemberLivenessState.Alive, host.GetNodeLiveness("node-b"));
+
+        host.LivenessTable.MarkSuspect("node-b");
+        Assert.Equal(MemberLivenessState.Suspect, host.GetNodeLiveness("node-b"));
+
+        host.LivenessTable.AdvanceExpiry(DateTimeOffset.UtcNow.AddSeconds(30), suspicionTimeout: TimeSpan.Zero);
+        Assert.Equal(MemberLivenessState.Dead, host.GetNodeLiveness("node-b"));
     }
 }

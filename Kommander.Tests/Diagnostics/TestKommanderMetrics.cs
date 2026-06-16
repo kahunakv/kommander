@@ -3,6 +3,7 @@ using System.Diagnostics.Metrics;
 using Kommander;
 using Kommander.Data;
 using Kommander.Diagnostics;
+using Kommander.Gossip;
 using Kommander.Scheduling;
 using Kommander.System;
 using Kommander.Time;
@@ -111,6 +112,7 @@ public sealed class TestKommanderMetrics : IDisposable
         public void InvokeReplicationError(int partitionId, RaftLog log) { }
         public IRaftStateMachineTransfer? StateMachineTransfer => null;
         public Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct) => Task.FromResult(new SnapshotResponse(false));
+        public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;
     }
 
     private sealed class StubWal : IRaftWalFacade

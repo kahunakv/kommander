@@ -585,7 +585,8 @@ public sealed class RaftPartitionExecutor : IDisposable
                         request.Logs,
                         request.PrevLogIndex,
                         request.PrevLogTerm,
-                        RegisterReply(op)
+                        RegisterReply(op),
+                        request.Quiesce
                     ).ConfigureAwait(false);
                     break;
 

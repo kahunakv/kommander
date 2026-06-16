@@ -177,7 +177,7 @@ public sealed class RaftService : Rafter.RafterBase
             GetLogs(request.Logs),
             request.PrevLogIndex,
             request.PrevLogTerm
-        ));
+        ) { Quiesce = request.Quiesce });
 
         return appendLogsResponse;
     }
@@ -343,7 +343,7 @@ public sealed class RaftService : Rafter.RafterBase
                                     GetLogs(appendLogsRequest.Logs),
                                     appendLogsRequest.PrevLogIndex,
                                     appendLogsRequest.PrevLogTerm
-                                ));
+                                ) { Quiesce = appendLogsRequest.Quiesce });
                                 break;
                             }
 

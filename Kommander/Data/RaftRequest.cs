@@ -52,6 +52,13 @@ public sealed class RaftRequest
     /// <summary>Term of the entry at <see cref="PrevLogIndex"/>. Zero when <see cref="PrevLogIndex"/> is zero.</summary>
     public long PrevLogTerm { get; }
 
+    /// <summary>
+    /// Mirrors <see cref="AppendLogsRequest.Quiesce"/>: the leader's signal that this is
+    /// the final AppendLogs before heartbeat suppression, telling the follower to switch to
+    /// SWIM-based election gating.
+    /// </summary>
+    public bool Quiesce { get; }
+
     public WALWriteOperation? WalOperation { get; }
 
     /// <summary>
@@ -81,7 +88,8 @@ public sealed class RaftRequest
         List<RaftLog>? logs = null,
         bool preVote = false,
         long prevLogIndex = 0,
-        long prevLogTerm = 0
+        long prevLogTerm = 0,
+        bool quiesce = false
     )
     {
         Type = type;
@@ -94,6 +102,7 @@ public sealed class RaftRequest
         PreVote = preVote;
         PrevLogIndex = prevLogIndex;
         PrevLogTerm = prevLogTerm;
+        Quiesce = quiesce;
     }
 
     public RaftRequest(RaftRequestType type, List<RaftLog> logs, bool autoCommit, long expectedGeneration = 0)

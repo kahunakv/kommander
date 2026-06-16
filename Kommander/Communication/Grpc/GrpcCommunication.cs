@@ -180,6 +180,7 @@ public class GrpcCommunication : ICommunication
             appendLogsRequest.Endpoint = request.Endpoint;
             appendLogsRequest.PrevLogIndex = request.PrevLogIndex;
             appendLogsRequest.PrevLogTerm = request.PrevLogTerm;
+            appendLogsRequest.Quiesce = request.Quiesce;
 
             if (request.Logs is not null)
                 appendLogsRequest.Logs.AddRange(GetLogs(request.Logs ?? []));
@@ -389,7 +390,8 @@ public class GrpcCommunication : ICommunication
                     TimeCounter = requestItem.AppendLogs.Time.C,
                     Endpoint = requestItem.AppendLogs.Endpoint,
                     PrevLogIndex = requestItem.AppendLogs.PrevLogIndex,
-                    PrevLogTerm = requestItem.AppendLogs.PrevLogTerm
+                    PrevLogTerm = requestItem.AppendLogs.PrevLogTerm,
+                    Quiesce = requestItem.AppendLogs.Quiesce
                 };
 
                 if (requestItem.AppendLogs.Logs is not null)

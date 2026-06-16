@@ -2,6 +2,7 @@
 using Kommander;
 using Kommander.Data;
 using Kommander.Diagnostics;
+using Kommander.Gossip;
 using Kommander.Scheduling;
 using Kommander.System;
 using Kommander.Time;
@@ -483,6 +484,8 @@ public class TestSnapshotInstall
 
         public Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct) =>
             comm?.SendInstallSnapshot(null!, node, request, ct) ?? Task.FromResult(new SnapshotResponse(false));
+
+        public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;
     }
 
     private sealed class FloorWal : IRaftWalFacade

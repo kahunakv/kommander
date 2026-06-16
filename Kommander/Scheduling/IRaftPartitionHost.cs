@@ -1,5 +1,6 @@
 
 using Kommander.Data;
+using Kommander.Gossip;
 using Kommander.System;
 using Kommander.Time;
 
@@ -69,4 +70,12 @@ public interface IRaftPartitionHost
     /// does not need a direct reference to the transport layer.
     /// </summary>
     Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct);
+
+    /// <summary>
+    /// SWIM failure-detector view of <paramref name="endpoint"/>. Returns
+    /// <see cref="MemberLivenessState.Alive"/> for unknown endpoints (same default as
+    /// <see cref="Gossip.LivenessTable.GetState"/>). This reflects the SWIM probing result,
+    /// not per-partition <c>lastActivity</c> — the two signals are distinct.
+    /// </summary>
+    MemberLivenessState GetNodeLiveness(string endpoint);
 }

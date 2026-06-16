@@ -29,6 +29,14 @@ public sealed class AppendLogsRequest
     /// </summary>
     public long PrevLogTerm { get; set; }
 
+    /// <summary>
+    /// When <see langword="true"/>, this is the leader's final AppendLogs before suppressing
+    /// per-partition heartbeats.  Receiving followers switch to SWIM-based election gating
+    /// instead of the heartbeat timer.  Only meaningful when
+    /// <see cref="RaftConfiguration.EnableQuiescence"/> is on.
+    /// </summary>
+    public bool Quiesce { get; set; }
+
     public AppendLogsRequest(int partition, long term, HLCTimestamp time, string endpoint, List<RaftLog>? logs = null, long prevLogIndex = 0, long prevLogTerm = 0)
     {
         Partition = partition;

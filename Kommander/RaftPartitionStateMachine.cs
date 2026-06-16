@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using Kommander.Data;
 using Kommander.Diagnostics;
+using Kommander.Gossip;
 using Kommander.Logging;
 using Kommander.Scheduling;
 using Kommander.System;
@@ -90,6 +91,23 @@ public sealed class RaftPartitionStateMachine
     private TimeSpan electionTimeout;
     private bool heartbeatsSuspendedForTesting;
     private bool restored;
+
+    /// <summary>
+    /// When <see langword="true"/> this partition is quiesced: no per-partition heartbeats are
+    /// expected or sent.  Followers gate elections on SWIM node state instead of the heartbeat
+    /// timer.  Only set when <see cref="RaftConfiguration.EnableQuiescence"/> is on.
+    /// </summary>
+    private bool quiesced;
+
+    /// <summary>
+    /// HLC timestamp of the last real proposal enqueued on this leader.
+    /// Zero until the first proposal arrives after winning election.
+    /// Used to determine when the partition has been idle long enough to quiesce:
+    /// once <c>now - lastProposalAt &gt; QuiesceAfter</c> and no proposals are in flight,
+    /// the leader sends a quiesce marker and stops heartbeating.
+    /// </summary>
+    private HLCTimestamp lastProposalAt;
+
 
     /// <summary>
     /// Highest log index the leader has durably committed (set by <see cref="CompleteLeaderCommit"/>).
@@ -191,8 +209,25 @@ public sealed class RaftPartitionStateMachine
     }
 
     /// <summary>
-    /// Periodically, it checks the leadership status of the partition and, based on timeouts,
-    /// decides whether to start a new election process.
+    /// Periodically checks partition leadership and drives elections when necessary.
+    /// <para>
+    /// <b>Quiesced followers</b> (when <see cref="RaftConfiguration.EnableQuiescence"/> is on
+    /// and <see cref="quiesced"/> is <see langword="true"/>): the per-partition heartbeat timer
+    /// is ignored.  Instead, an election is triggered only when the SWIM failure detector marks
+    /// the expected leader's node as <see cref="MemberLivenessState.Suspect"/> or
+    /// <see cref="MemberLivenessState.Dead"/> — i.e. <c>GetNodeLiveness(leader) != Alive</c>.
+    /// This relies on the invariant <c>PingInterval &lt; StartElectionTimeout</c>
+    /// (validated at startup by <see cref="RaftConfiguration.Validate"/>): a SWIM Suspect fires
+    /// after approximately one <c>PingInterval</c>, comfortably under <c>StartElectionTimeout</c>,
+    /// so quiesced failover is not slower than normal election timeout.
+    /// </para>
+    /// <para>
+    /// <b>Live-but-stalled-partition caveat:</b> if a leader's node stays <c>Alive</c> in SWIM
+    /// but stops driving a specific partition (e.g. its executor wedges) while still answering
+    /// SWIM pings, quiesced followers will not elect a new leader for that partition.  Accepted
+    /// limitation for v1; mitigation would require per-partition sequence numbers in the SWIM
+    /// ping payload.
+    /// </para>
     /// </summary>
     public async Task CheckPartitionLeadershipAsync()
     {
@@ -203,9 +238,30 @@ public sealed class RaftPartitionStateMachine
             // if node is leader just send hearthbeats every Configuration.HeartbeatInterval
             case RaftNodeState.Leader:
             {
+                if (quiesced)
+                    return;
+
                 if (currentTime != HLCTimestamp.Zero && ((currentTime - lastHeartbeat) >= host.Configuration.HeartbeatInterval))
-                    await SendHeartbeat(false).ConfigureAwait(false);
-            
+                {
+                    // When quiescence is on and the partition has been idle longer than QuiesceAfter,
+                    // send a quiesce marker to followers and stop heartbeating.  Followers switch to
+                    // SWIM-based election gating once they receive the marker.
+                    if (host.Configuration.EnableQuiescence
+                        && !quiesced
+                        && activeProposals.Count == 0
+                        && lastProposalAt != HLCTimestamp.Zero
+                        && (currentTime - lastProposalAt) >= host.Configuration.QuiesceAfter)
+                    {
+                        quiesced = true;
+                        lastHeartbeat = currentTime;
+                        SendQuiesceMarker(currentTime);
+                    }
+                    else
+                    {
+                        await SendHeartbeat(false).ConfigureAwait(false);
+                    }
+                }
+
                 return;
             }
             
@@ -232,15 +288,31 @@ public sealed class RaftPartitionStateMachine
                 matchIndex.Clear();
                 localCommittedIndex = -1;
                 activeProposals.Clear();
+                lastProposalAt = HLCTimestamp.Zero;
+                quiesced = false;
                 ResetPreVoteRound();
 
                 await host.InvokeLeaderChanged(host.PartitionId, "");
                 return;
             
+            // Quiesced follower: per-partition heartbeat timer is suppressed.
+            // Gate elections on SWIM node state instead — Suspect or Dead triggers failover.
+            case RaftNodeState.Follower when quiesced && host.Configuration.EnableQuiescence:
+            {
+                string expectedLeaderNode = expectedLeaders.GetValueOrDefault(currentTerm, "");
+                if (string.IsNullOrEmpty(expectedLeaderNode) ||
+                    host.GetNodeLiveness(expectedLeaderNode) == MemberLivenessState.Alive)
+                    return; // leader's node is Alive per SWIM — stay calm
+                // Leader node is Suspect or Dead — un-quiesce and challenge leadership.
+                quiesced = false;
+                await StartPreVoteAsync(currentTime).ConfigureAwait(false);
+                break;
+            }
+
             // if node is follower and leader is not sending hearthbeats, start an election
             case RaftNodeState.Follower when (lastHeartbeat != HLCTimestamp.Zero && ((currentTime - lastHeartbeat) < electionTimeout)):
                 return;
-            
+
             case RaftNodeState.Follower:
                 // Run a side-effect-free pre-vote first; only a pre-vote quorum promotes to a
                 // real election (Raft §9.6), so a stale node can't disrupt a healthy leader.
@@ -275,6 +347,8 @@ public sealed class RaftPartitionStateMachine
         matchIndex.Clear();
         localCommittedIndex = -1;
         activeProposals.Clear();
+        lastProposalAt = HLCTimestamp.Zero;
+        quiesced = false;
 
         await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
 
@@ -377,6 +451,59 @@ public sealed class RaftPartitionStateMachine
     {
         heartbeatsSuspendedForTesting = false;
     }
+
+    /// <summary>
+    /// Forces the partition into quiesced state for unit testing without going through the
+    /// full leader-side quiesce path that suppresses heartbeats.  Also records the expected
+    /// leader so the quiesced follower branch can look up the SWIM state.
+    /// </summary>
+    public void SetQuiescedForTesting(bool value, string? leaderEndpoint = null, long term = 1)
+    {
+        quiesced = value;
+        if (value && leaderEndpoint is not null)
+            expectedLeaders[term] = leaderEndpoint;
+    }
+
+    /// <summary>
+    /// Seeds the state shared by all become-leader paths: advances the HLC, marks the node as
+    /// Leader, records the durable committed index for backfill, and starts both the heartbeat
+    /// timer and the idle-quiesce clock at the same election timestamp.  Per-follower cursors
+    /// (<see cref="nextIndex"/>, <see cref="matchIndex"/>) remain the caller's responsibility
+    /// because they differ between the single-node fast-path and the quorum-win path.
+    /// <para>
+    /// Seeding <see cref="lastProposalAt"/> here ensures that a partition that wins an election
+    /// and receives no client writes still quiesces after <see cref="RaftConfiguration.QuiesceAfter"/>,
+    /// which is the common case for idle partitions in large multi-partition deployments.
+    /// </para>
+    /// </summary>
+    private HLCTimestamp BecomeLeader()
+    {
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        nodeState = RaftNodeState.Leader;
+        localCommittedIndex = wal.GetCommitIndex();
+        host.Leader = host.LocalEndpoint;
+        lastHeartbeat = ts;
+        lastProposalAt = ts;
+        quiesced = false;
+        return ts;
+    }
+
+    /// <summary>
+    /// Forces the node into Leader state for the given term.  Test-only; delegates to
+    /// <see cref="BecomeLeader"/> so the test path exercises the same bookkeeping as the
+    /// real election paths.
+    /// </summary>
+    public void SetLeaderForTesting(long term)
+    {
+        currentTerm = term;
+        BecomeLeader();
+    }
+
+    /// <summary>
+    /// Resets <see cref="lastProposalAt"/> to <see cref="HLCTimestamp.Zero"/>.  Test-only;
+    /// used to assert that the quiesce guard correctly blocks when no proposal history exists.
+    /// </summary>
+    public void ClearLastProposalAtForTesting() => lastProposalAt = HLCTimestamp.Zero;
 
     private RaftNode? SelectStepDownTarget()
     {
@@ -495,13 +622,7 @@ public sealed class RaftPartitionStateMachine
 
         if (host.Nodes.Count == 0)
         {
-            nodeState = RaftNodeState.Leader;
-            // Seed the backfill cursor from our durable committed index: a fresh leader that
-            // commits nothing new must still be able to backfill a stale follower.
-            localCommittedIndex = wal.GetCommitIndex();
-            host.Leader = host.LocalEndpoint;
-            lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
-
+            BecomeLeader();
             await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
             await SendHeartbeat(true).ConfigureAwait(false);
 
@@ -630,15 +751,9 @@ public sealed class RaftPartitionStateMachine
 
         if (host.Nodes.Count == 0)
         {
-            nodeState = RaftNodeState.Leader;
-            // Seed the backfill cursor from our durable committed index: a fresh leader that
-            // commits nothing new must still be able to backfill a stale follower.
-            localCommittedIndex = wal.GetCommitIndex();
-            host.Leader = host.LocalEndpoint;
-            lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
             nextIndex.Clear();
             matchIndex.Clear();
-
+            BecomeLeader();
             await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
             await SendHeartbeat(true).ConfigureAwait(false);
             return;
@@ -756,6 +871,8 @@ public sealed class RaftPartitionStateMachine
     {
         if (!force && heartbeatsSuspendedForTesting)
             return;
+        if (!force && quiesced)
+            return;
 
         IReadOnlyList<RaftNode> nodes = host.Nodes;
 
@@ -830,7 +947,22 @@ public sealed class RaftPartitionStateMachine
             AppendLogToNode(node, lastHeartbeat, null);
         }
     }
-    
+
+    /// <summary>
+    /// Broadcasts a quiesce-flagged empty AppendLogs to all peers, signalling them to switch from
+    /// the heartbeat timer to SWIM-based election gating.  Called once when the leader decides
+    /// to suppress per-partition heartbeats for an idle partition.
+    /// </summary>
+    private void SendQuiesceMarker(HLCTimestamp timestamp)
+    {
+        foreach (RaftNode node in host.Nodes)
+        {
+            if (node.Endpoint == host.LocalEndpoint)
+                throw new RaftException("Corrupted nodes");
+            AppendLogToNode(node, timestamp, null, quiesce: true);
+        }
+    }
+
     /// <summary>
     /// After the partition startup a handshake is sent to the other nodes to
     /// verify if we have the most recent logs and the node id is unique
@@ -1131,13 +1263,7 @@ public sealed class RaftPartitionStateMachine
         if (numberVotes < quorum)
             return;
         
-        // Here quorum was achieved and we can mark ourselves as leader in the partition
-        nodeState = RaftNodeState.Leader;
-        // Seed the backfill cursor from our durable committed index so a freshly-elected leader
-        // can backfill a stale follower immediately, without waiting for a new client write.
-        localCommittedIndex = wal.GetCommitIndex();
-        host.Leader = host.LocalEndpoint;
-
+        // Here quorum was achieved and we can mark ourselves as leader in the partition.
         // Seed per-follower replication progress. nextIndex is optimistic (leaderMaxLog + 1);
         // it will be corrected by LogMismatch replies if any peer is behind.
         nextIndex.Clear();
@@ -1148,20 +1274,20 @@ public sealed class RaftPartitionStateMachine
             matchIndex[peer.Endpoint] = 0;
         }
 
-        lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        HLCTimestamp electionTs = BecomeLeader();
 
         logger.LogInformation(
-            "[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} and proclamed leader in {Elapsed}ms Term={Term} Votes={Votes} Quorum={Quorum}/{Total} RemoteCommitId={CommitId} Local={LocalCommitId}", 
-            host.LocalEndpoint, 
-            host.PartitionId, 
-            nodeState, 
-            endpoint, 
-            (lastHeartbeat - votingStartedAt).TotalMilliseconds, 
-            voteTerm, 
-            numberVotes, 
-            quorum, 
+            "[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} and proclamed leader in {Elapsed}ms Term={Term} Votes={Votes} Quorum={Quorum}/{Total} RemoteCommitId={CommitId} Local={LocalCommitId}",
+            host.LocalEndpoint,
+            host.PartitionId,
+            nodeState,
+            endpoint,
+            (electionTs - votingStartedAt).TotalMilliseconds,
+            voteTerm,
+            numberVotes,
+            quorum,
             host.Nodes.Count + 1,
-            remoteMaxLogId, 
+            remoteMaxLogId,
             maxLogResponse
         );
 
@@ -1179,8 +1305,8 @@ public sealed class RaftPartitionStateMachine
     /// <param name="timestamp"></param>
     /// <param name="logs"></param>
     /// <returns></returns>
-    public Task AppendLogsAsync(string endpoint, long term, HLCTimestamp timestamp, List<RaftLog>? logs, long prevLogIndex = 0, long prevLogTerm = 0, ulong? replyCorrelationId = null) =>
-        AppendLogsCoreAsync(endpoint, term, timestamp, logs, prevLogIndex, prevLogTerm, replyCorrelationId);
+    public Task AppendLogsAsync(string endpoint, long term, HLCTimestamp timestamp, List<RaftLog>? logs, long prevLogIndex = 0, long prevLogTerm = 0, ulong? replyCorrelationId = null, bool quiesce = false) =>
+        AppendLogsCoreAsync(endpoint, term, timestamp, logs, prevLogIndex, prevLogTerm, replyCorrelationId, quiesce);
 
     private async Task AppendLogsCoreAsync(
         string endpoint,
@@ -1189,7 +1315,8 @@ public sealed class RaftPartitionStateMachine
         List<RaftLog>? logs,
         long prevLogIndex = 0,
         long prevLogTerm = 0,
-        ulong? replyCorrelationId = null
+        ulong? replyCorrelationId = null,
+        bool quiesce = false
     )
     {
         if (currentTerm > leaderTerm)
@@ -1231,6 +1358,10 @@ public sealed class RaftPartitionStateMachine
         }
 
         lastHeartbeat = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, timestamp);
+        // A quiesce-flagged message tells us to stop expecting heartbeats and gate elections
+        // on SWIM liveness instead.  Any non-quiesce AppendLogs (real logs or normal heartbeat)
+        // wakes us back up by clearing the flag.
+        quiesced = quiesce;
 
         // Log Matching Property check: the follower must hold an entry at prevLogIndex with
         // prevLogTerm before it can safely append the incoming batch.  A mismatch means the
@@ -1358,8 +1489,10 @@ public sealed class RaftPartitionStateMachine
 
         if (nodeState != RaftNodeState.Leader)
             return (RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
-        
+
         HLCTimestamp currentTime = host.HybridLogicalClock.SendOrLocalEvent(host.LocalNodeId);
+        lastProposalAt = currentTime;
+        quiesced = false; // un-quiesce on new proposal: resume normal heartbeating
 
         // Try to clear and reuse expired proposals
         if (activeProposals.Count > 5)
@@ -1724,15 +1857,15 @@ public sealed class RaftPartitionStateMachine
     /// <param name="logs"></param>
     /// <param name="prevLogIndex">Id of the entry immediately before the first entry in <paramref name="logs"/>; 0 skips the check.</param>
     /// <param name="prevLogTerm">Term of the entry at <paramref name="prevLogIndex"/>; 0 when index is 0.</param>
-    private void AppendLogToNode(RaftNode node, HLCTimestamp timestamp, List<RaftLog>? logs, long prevLogIndex = 0, long prevLogTerm = 0)
+    private void AppendLogToNode(RaftNode node, HLCTimestamp timestamp, List<RaftLog>? logs, long prevLogIndex = 0, long prevLogTerm = 0, bool quiesce = false)
     {
         AppendLogsRequest request;
 
         if (logs is null || logs.Count == 0)
-            request = new(host.PartitionId, currentTerm, timestamp, host.LocalEndpoint);
+            request = new(host.PartitionId, currentTerm, timestamp, host.LocalEndpoint) { Quiesce = quiesce };
         else
         {
-            request = new(host.PartitionId, currentTerm, timestamp, host.LocalEndpoint, logs, prevLogIndex, prevLogTerm);
+            request = new(host.PartitionId, currentTerm, timestamp, host.LocalEndpoint, logs, prevLogIndex, prevLogTerm) { Quiesce = quiesce };
 
             if (logger.IsEnabled(LogLevel.Debug))
                 logger.LogDebug(

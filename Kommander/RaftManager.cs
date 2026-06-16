@@ -299,6 +299,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
         Logger = logger;
 
+        configuration.Validate();
+
         LocalEndpoint = string.Concat(configuration.Host, ":", configuration.Port);
         LocalNodeName = string.IsNullOrEmpty(this.configuration.NodeName) ? Environment.MachineName : this.configuration.NodeName;
         LocalNodeId = this.configuration.NodeId > 0 ? this.configuration.NodeId : HashUtils.SmallSimpleHash(LocalNodeName);

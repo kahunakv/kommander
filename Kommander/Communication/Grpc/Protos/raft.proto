@@ -72,6 +72,9 @@ message GrpcAppendLogsRequest {
   // preceding this batch (0/0 when the batch starts from the beginning).
   int64 PrevLogIndex = 8;
   int64 PrevLogTerm = 9;
+  // When true, this is the leader's final AppendLogs before suppressing heartbeats.
+  // Receivers switch to SWIM-based election gating instead of the heartbeat timer.
+  bool Quiesce = 10;
 }
 
 message GrpcAppendLogsResponse {

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Kommander;
 using Kommander.Data;
+using Kommander.Gossip;
 using Kommander.Scheduling;
 using Kommander.System;
 using Kommander.Time;
@@ -61,6 +62,7 @@ public sealed class TestRaftPartitionExecutor
         public void InvokeReplicationError(int partitionId, RaftLog log) { }
         public IRaftStateMachineTransfer? StateMachineTransfer => null;
         public Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct) => Task.FromResult(new SnapshotResponse(false));
+        public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;
     }
 
     /// <summary>

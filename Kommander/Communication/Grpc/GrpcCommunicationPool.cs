@@ -29,6 +29,9 @@ public static class GrpcCommunicationPool
     public static void Return(GrpcAppendLogsRequest obj)
     {
         obj.Logs.Clear();
+        obj.PrevLogIndex = 0;
+        obj.PrevLogTerm = 0;
+        obj.Quiesce = false;
         _appendLogsPool ??= new();
         _appendLogsPool.Push(obj);
     }
