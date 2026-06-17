@@ -83,7 +83,17 @@ public interface IWAL : IDisposable
 
     public bool SetMetaData(string key, string value);
 
-    public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries);
+    /// <param name="compactNumberEntries">Maximum entries removed per internal delete batch.</param>
+    /// <param name="maxTotalEntries">
+    /// When set, removes up to this many entries in one storage transaction by issuing
+    /// multiple internal batches of <paramref name="compactNumberEntries"/>. When <see langword="null"/>,
+    /// only one batch is removed.
+    /// </param>
+    public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(
+        int partitionId,
+        long lastCheckpoint,
+        int compactNumberEntries,
+        int? maxTotalEntries = null);
 
     /// <summary>
     /// Permanently removes all WAL entries for the given partition id.

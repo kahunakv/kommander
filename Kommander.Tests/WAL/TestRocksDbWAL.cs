@@ -7,6 +7,40 @@ namespace Kommander.Tests.WAL;
 public sealed class TestRocksDbWAL
 {
     [Fact]
+    public void CompactLogsOlderThanPass_UsesSingleWriteForMultipleBatches()
+    {
+        string path = CreateTempWalPath();
+
+        try
+        {
+            using RocksDbWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false);
+
+            List<RaftLog> logs = [];
+            for (long id = 1; id <= 9; id++)
+                logs.Add(CreateLog(4, id, term: id));
+
+            Assert.Equal(
+                RaftOperationStatus.Success,
+                wal.Write(new List<(int, List<RaftLog>)> { (4, logs) }));
+
+            (RaftOperationStatus status, int removed) = wal.CompactLogsOlderThan(
+                4,
+                lastCheckpoint: 10,
+                compactNumberEntries: 2,
+                maxTotalEntries: 9);
+
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Assert.Equal(9, removed);
+            Assert.Equal(1, wal.LastCompactionWriteCount);
+            Assert.Empty(wal.ReadLogsRange(4, 1));
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    [Fact]
     public void SyncWritesCanBeDisabledForTestWal()
     {
         string path = CreateTempWalPath();

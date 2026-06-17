@@ -3,6 +3,7 @@ using System.Text.Json;
 using Flurl.Http;
 using Kommander.Data;
 using Kommander.Gossip;
+using Kommander.Logging;
 using Kommander.System;
 using Microsoft.Extensions.Logging;
 using WirePingRequest = Kommander.Data.PingRequest;
@@ -106,7 +107,7 @@ public class RestCommunication : ICommunication
                 .ReceiveJson<AppendLogsResponse>().ConfigureAwait(false);
             
             if (request.Logs is not null && request.Logs.Count > 0)
-                manager.Logger.LogDebug("[{Endpoint}/{Partition}] Logs replicated to {RemoteEndpoint}", manager.LocalEndpoint, request.Partition, node.Endpoint);
+                manager.Logger.LogDebugLogsReplicated(manager.LocalEndpoint, request.Partition, node.Endpoint);
 
             return response;
         }

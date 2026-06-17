@@ -694,7 +694,7 @@ public sealed class RaftPartitionStateMachine
     {
         if (host.LocalRole != ClusterMemberRole.Voter)
         {
-            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Suppressing election: local role is {Role}, not Voter", host.LocalEndpoint, host.PartitionId, nodeState, host.LocalRole);
+            logger.LogDebugSuppressingElection(host.LocalEndpoint, host.PartitionId, nodeState, host.LocalRole);
             return;
         }
 
@@ -775,7 +775,7 @@ public sealed class RaftPartitionStateMachine
     {
         if (host.LocalRole != ClusterMemberRole.Voter)
         {
-            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Suppressing pre-vote: local role is {Role}, not Voter", host.LocalEndpoint, host.PartitionId, nodeState, host.LocalRole);
+            logger.LogDebugSuppressingPreVote(host.LocalEndpoint, host.PartitionId, nodeState, host.LocalRole);
             return;
         }
 
@@ -821,7 +821,7 @@ public sealed class RaftPartitionStateMachine
         preVotes.Clear();
         preVotes.Add(host.LocalEndpoint);
 
-        logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Starting pre-vote round for Term={PreVoteTerm}", host.LocalEndpoint, host.PartitionId, nodeState, preVoteTerm);
+        logger.LogInfoStartingPreVoteRound(host.LocalEndpoint, host.PartitionId, nodeState, preVoteTerm);
 
         await RequestVotesAsync(currentTime, preVoteTerm, preVote: true).ConfigureAwait(false);
     }
@@ -935,9 +935,7 @@ public sealed class RaftPartitionStateMachine
                     RaftNode capturedNode = node;
                     if (pendingSnapshotEndpoints.TryAdd(capturedNode.Endpoint, 0))
                     {
-                        logger.LogInformation(
-                            "[{LocalEndpoint}/{PartitionId}/{State}] Starting snapshot transfer to {Endpoint} at index {Index}",
-                            host.LocalEndpoint, host.PartitionId, nodeState, capturedNode.Endpoint, lastCheckpoint);
+                        logger.LogInfoStartingSnapshotTransfer(host.LocalEndpoint, host.PartitionId, nodeState, capturedNode.Endpoint, lastCheckpoint);
 
                         _ = TrySendSnapshotAsync(capturedNode, lastCheckpoint);
                     }
@@ -974,13 +972,13 @@ public sealed class RaftPartitionStateMachine
     {
         if (host.LocalNodeId == remoteNodeId)
         {
-            logger.LogCritical("[{LocalEndpoint}/{PartitionId}/{State}] Same node id was found in the cluster {NodeId} {RemoteNodeId}", host.LocalEndpoint, host.PartitionId, nodeState, host.LocalNodeId, remoteNodeId);
+            logger.LogCritSameNodeId(host.LocalEndpoint, host.PartitionId, nodeState, host.LocalNodeId, remoteNodeId);
             
             Environment.Exit(1);
             return;
         }
         
-        logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received handshake from {Endpoint}/{RemoteNodeId}. WAL log at {Index}.", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, remoteNodeId, remoteMaxLogId);
+        logger.LogInfoReceivedHandshake(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, remoteNodeId, remoteMaxLogId);
         
         startCommitIndexes[endpoint] = remoteMaxLogId;
     }
@@ -1010,7 +1008,7 @@ public sealed class RaftPartitionStateMachine
             if (node.Endpoint == host.LocalEndpoint)
                 throw new RaftException("Corrupted nodes");
             
-            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Sending handshake to {Node} #{Number}", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, ++number);
+            logger.LogDebugSendingHandshake(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, ++number);
             
             host.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Handshake, node, request));
         }
@@ -1041,14 +1039,14 @@ public sealed class RaftPartitionStateMachine
 
             if (!host.IsVoter(node.Endpoint))
             {
-                logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Denying pre-vote to {Endpoint} Term={Term}: endpoint is not a committed voter", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
+                logger.LogDebugDenyingPreVoteNotVoter(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
                 return;
             }
 
             // A live leader never helps a challenger unseat it.
             if (nodeState == RaftNodeState.Leader)
             {
-                logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Denying pre-vote to {Endpoint} Term={Term}: we are the leader", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
+                logger.LogDebugDenyingPreVoteWeAreLeader(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
                 return;
             }
 
@@ -1060,7 +1058,7 @@ public sealed class RaftPartitionStateMachine
                 HLCTimestamp lastKnownHeartbeat = host.GetLastNodeActivity(preVoteExpectedLeader, host.PartitionId);
                 if (lastKnownHeartbeat != HLCTimestamp.Zero && ((timestamp - lastKnownHeartbeat) < electionTimeout))
                 {
-                    logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Denying pre-vote to {Endpoint} Term={Term}: current leader {Leader} still fresh", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm, preVoteExpectedLeader);
+                    logger.LogDebugDenyingPreVoteLeaderFresh(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm, preVoteExpectedLeader);
                     return;
                 }
             }
@@ -1068,7 +1066,7 @@ public sealed class RaftPartitionStateMachine
             // The hypothetical term must not be stale.
             if (voteTerm < currentTerm)
             {
-                logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Denying pre-vote to {Endpoint}: stale Term={Term} < CurrentTerm={CurrentTerm}", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm, currentTerm);
+                logger.LogDebugDenyingPreVoteStaleTerm(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm, currentTerm);
                 return;
             }
 
@@ -1078,11 +1076,11 @@ public sealed class RaftPartitionStateMachine
             // path's strict rejection — a pre-vote only probes electability, it doesn't elect.
             if (remoteMaxLogId < preVoteLocalMaxId)
             {
-                logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Denying pre-vote to {Endpoint} Term={Term}: outdated log RemoteMaxId={RemoteId} LocalMaxId={MaxId}", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm, remoteMaxLogId, preVoteLocalMaxId);
+                logger.LogDebugDenyingPreVoteOutdatedLog(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm, remoteMaxLogId, preVoteLocalMaxId);
                 return;
             }
 
-            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Granting pre-vote to {Endpoint} Term={Term}", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
+            logger.LogDebugGrantingPreVote(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
 
             VoteRequest preGrant = new(host.PartitionId, voteTerm, preVoteLocalMaxId, timestamp, host.LocalEndpoint, preVote: true);
             host.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Vote, node, preGrant));
@@ -1091,25 +1089,25 @@ public sealed class RaftPartitionStateMachine
 
         if (!host.IsVoter(node.Endpoint))
         {
-            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Denying vote to {Endpoint} Term={Term}: endpoint is not a committed voter", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
+            logger.LogDebugDenyingVoteNotVoter(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
             return;
         }
 
         if (votes.ContainsKey(voteTerm))
         {
-            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received request to vote from {Endpoint} but already voted in that Term={Term}. Ignoring...", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
+            logger.LogInfoAlreadyVotedInTerm(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
             return;
         }
 
         if (nodeState != RaftNodeState.Follower && voteTerm == currentTerm)
         {
-            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received request to vote from {Endpoint} but we're candidate or leader on the same Term={Term}. Ignoring...", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
+            logger.LogInfoCandidateOrLeaderSameTerm(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
             return;
         }
 
         if (currentTerm > voteTerm)
         {
-            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received request to vote on previous term from {Endpoint} Term={Term}. Ignoring...", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
+            logger.LogInfoVoteOnPreviousTerm(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
             return;
         }
 
@@ -1117,7 +1115,7 @@ public sealed class RaftPartitionStateMachine
         
         if (!string.IsNullOrEmpty(expectedLeader) && expectedLeader != node.Endpoint)
         {
-            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received request to vote from {Endpoint} but we already voted for {ExpectedLeader}. Ignoring...", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, expectedLeader);
+            logger.LogInfoAlreadyVotedForOther(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, expectedLeader);
             return;
         }
         
@@ -1129,7 +1127,7 @@ public sealed class RaftPartitionStateMachine
             // bump our own term here: with PreVote (§9.6) in place a stale candidate can no longer
             // reach this real-vote path with an inflated term, so the old `currentTerm++` heuristic
             // that forced us to be elected is no longer needed and only risked spurious term churn.
-            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received request to vote on outdated log from {Endpoint} RemoteMaxId={RemoteId} LocalMaxId={MaxId}. Ignoring...", host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, remoteMaxLogId, localMaxId);
+            logger.LogInfoVoteOutdatedLog(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, remoteMaxLogId, localMaxId);
             return;
         }
         
@@ -1167,7 +1165,7 @@ public sealed class RaftPartitionStateMachine
         // be tallied toward quorum.
         if (!host.IsVoter(endpoint))
         {
-            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Ignoring {PreVote}vote grant from {Endpoint} Term={Term}: endpoint is not a committed voter", host.LocalEndpoint, host.PartitionId, nodeState, preVote ? "pre-" : "", endpoint, voteTerm);
+            logger.LogDebugIgnoringVoteGrantNotVoter(host.LocalEndpoint, host.PartitionId, nodeState, preVote ? "pre-" : "", endpoint, voteTerm);
             return;
         }
 
@@ -1177,7 +1175,7 @@ public sealed class RaftPartitionStateMachine
             // pre-vote round is still a Follower. Touches only pre-vote state until quorum promotes.
             if (electionPhase != RaftElectionPhase.PreVote || voteTerm != preVoteTerm)
             {
-                logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Ignoring pre-vote grant from {Endpoint} Term={Term}: no matching open round (phase={Phase} preVoteTerm={PreVoteTerm})", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, voteTerm, electionPhase, preVoteTerm);
+                logger.LogDebugIgnoringPreVoteGrantNoRound(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, voteTerm, electionPhase, preVoteTerm);
                 return;
             }
 
@@ -1186,7 +1184,7 @@ public sealed class RaftPartitionStateMachine
             int preVoterTotal = host.Nodes.Count(n => host.IsVoter(n.Endpoint)) + 1; // +1 for self
             int preVoteQuorum = Math.Max(2, (preVoterTotal / 2) + 1);
 
-            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received pre-vote from {Endpoint} Term={Term} PreVotes={PreVotes} Quorum={Quorum}/{Total}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, voteTerm, preVotes.Count, preVoteQuorum, preVoterTotal);
+            logger.LogInfoReceivedPreVote(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, voteTerm, preVotes.Count, preVoteQuorum, preVoterTotal);
 
             if (preVotes.Count < preVoteQuorum)
                 return;
@@ -1203,7 +1201,7 @@ public sealed class RaftPartitionStateMachine
 
         if (nodeState == RaftNodeState.Follower)
         {
-            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Node} but we didn't ask for it Term={Term}. Ignoring...", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, voteTerm);
+            logger.LogInfoReceivedUnsolicitedVote(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, voteTerm);
             return;
         }
 
@@ -1218,7 +1216,7 @@ public sealed class RaftPartitionStateMachine
             lastCommitIndexes[endpoint] = remoteMaxLogId;
             startCommitIndexes[endpoint] = remoteMaxLogId;
             
-            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Node} but already declared as leader Term={Term}. Ignoring...", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, voteTerm);
+            logger.LogInfoReceivedVoteAlreadyLeader(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, voteTerm);
             return;
         }
         
@@ -1246,19 +1244,7 @@ public sealed class RaftPartitionStateMachine
         lastCommitIndexes[endpoint] = remoteMaxLogId;
         startCommitIndexes[endpoint] = remoteMaxLogId;
 
-        logger.LogInformation(
-            "[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} Term={Term} Votes={Votes} Quorum={Quorum}/{Total} RemoteCommitId={CommitId} Local={LocalCommitId}",
-            host.LocalEndpoint,
-            host.PartitionId,
-            nodeState,
-            endpoint,
-            voteTerm,
-            numberVotes,
-            quorum,
-            voterTotal,
-            remoteMaxLogId,
-            maxLogResponse
-        );
+        logger.LogInfoReceivedVote(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, voteTerm, numberVotes, quorum, voterTotal, remoteMaxLogId, maxLogResponse);
 
         if (numberVotes < quorum)
             return;
@@ -1276,20 +1262,7 @@ public sealed class RaftPartitionStateMachine
 
         HLCTimestamp electionTs = BecomeLeader();
 
-        logger.LogInformation(
-            "[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} and proclamed leader in {Elapsed}ms Term={Term} Votes={Votes} Quorum={Quorum}/{Total} RemoteCommitId={CommitId} Local={LocalCommitId}",
-            host.LocalEndpoint,
-            host.PartitionId,
-            nodeState,
-            endpoint,
-            (electionTs - votingStartedAt).TotalMilliseconds,
-            voteTerm,
-            numberVotes,
-            quorum,
-            host.Nodes.Count + 1,
-            remoteMaxLogId,
-            maxLogResponse
-        );
+        logger.LogInfoReceivedVoteProclaimedLeader(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, (electionTs - votingStartedAt).TotalMilliseconds, voteTerm, numberVotes, quorum, host.Nodes.Count + 1, remoteMaxLogId, maxLogResponse);
 
         await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint);
 
@@ -1341,7 +1314,7 @@ public sealed class RaftPartitionStateMachine
         // must constrain voting only, never leader acceptance.
         if (host.Leader != endpoint || currentTerm != leaderTerm || nodeState != RaftNodeState.Follower)
         {
-            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Leader is now {Endpoint} LeaderTerm={Term}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, leaderTerm);
+            logger.LogInfoLeaderIsNow(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, leaderTerm);
 
             nodeState = RaftNodeState.Follower;
             host.Leader = endpoint;
@@ -1908,10 +1881,7 @@ public sealed class RaftPartitionStateMachine
         long prevIdx  = from - 1;
         long prevTerm = prevIdx > 0 ? await wal.GetAnyTermAtAsync(prevIdx).ConfigureAwait(false) : 0;
 
-        logger.LogDebug(
-            "[{LocalEndpoint}/{PartitionId}/{State}] Backfilling {Count} entries to {Endpoint} from={From} prevLogIndex={PrevLogIndex} leaderCommitted={LeaderCommitted}",
-            host.LocalEndpoint, host.PartitionId, nodeState,
-            backfill.Count, node.Endpoint, from, prevIdx, localCommittedIndex);
+        logger.LogDebugBackfilling(host.LocalEndpoint, host.PartitionId, nodeState, backfill.Count, node.Endpoint, from, prevIdx, localCommittedIndex);
 
         AppendLogToNode(node, timestamp, backfill, prevIdx, prevTerm);
         return true;
@@ -2039,7 +2009,7 @@ public sealed class RaftPartitionStateMachine
 
         if (!proposal.AutoCommit)
         {
-            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Proposal {Timestamp} doesn't have auto-commit", host.LocalEndpoint, host.PartitionId, nodeState, timestamp);
+            logger.LogInfoProposalNoAutoCommit(host.LocalEndpoint, host.PartitionId, nodeState, timestamp);
             return;
         }
 
@@ -2463,9 +2433,7 @@ public sealed class RaftPartitionStateMachine
 
             if (success)
             {
-                logger.LogInformation(
-                    "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot installed on {Endpoint} at index {Index} ({Chunks} chunk(s))",
-                    host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, snapshotIndex, chunkIndex + 1);
+                logger.LogInfoSnapshotInstalled(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, snapshotIndex, chunkIndex + 1);
 
                 // Notify the executor thread so it can safely update lastCommitIndexes.
                 postToExecutor?.Invoke(new RaftRequest(

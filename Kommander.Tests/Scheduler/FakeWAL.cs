@@ -165,12 +165,18 @@ public sealed class FakeWAL : IWAL
     }
 
     /// <inheritdoc/>
-    public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
+    public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(
+        int partitionId,
+        long lastCheckpoint,
+        int compactNumberEntries,
+        int? maxTotalEntries = null)
     {
+        int passCap = maxTotalEntries ?? compactNumberEntries;
+
         if (!_logs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? dict))
             return (RaftOperationStatus.Success, 0);
 
-        long[] toRemove = dict.Keys.Where(k => k < lastCheckpoint).Take(compactNumberEntries).ToArray();
+        long[] toRemove = dict.Keys.Where(k => k < lastCheckpoint).Take(passCap).ToArray();
         foreach (long key in toRemove)
             dict.Remove(key);
 

@@ -1,6 +1,7 @@
 
 using System.Collections.Concurrent;
 using Kommander.Data;
+using Kommander.Logging;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 
@@ -26,14 +27,30 @@ public class SqliteWAL : IWAL, IDisposable
     private readonly object _metaDataLock = new();
 
     /// <summary>
-    /// Maps partition IDs to their per-partition exclusive lock and <see cref="SqliteConnection"/>.
-    /// All operations on a partition — reads and writes — serialize through the lock because
-    /// <see cref="SqliteConnection"/> wraps a single <c>sqlite3*</c> handle that is not safe for
-    /// concurrent command execution. Uses <see cref="ConcurrentDictionary{TKey,TValue}"/> so that
-    /// the lock-free fast-path <see cref="ConcurrentDictionary{TKey,TValue}.TryGetValue"/> is safe
-    /// to call concurrently with the semaphore-guarded <see cref="ConcurrentDictionary{TKey,TValue}.TryAdd"/>.
+    /// Per-partition SQLite state: exclusive lock, open connection, and a lazily created
+    /// prepared upsert reused across write transactions on that connection.
     /// </summary>
-    private readonly ConcurrentDictionary<int, (object Lock, SqliteConnection Connection)> connections = new();
+    private sealed class PartitionDatabase
+    {
+        public object Lock { get; } = new();
+
+        public SqliteConnection Connection { get; }
+
+        public SqliteCommand? PreparedUpsert { get; set; }
+
+        public PartitionDatabase(SqliteConnection connection) => Connection = connection;
+    }
+
+    /// <summary>
+    /// Maps partition IDs to their per-partition database state.
+    /// All operations on a partition — reads and writes — serialize through
+    /// <see cref="PartitionDatabase.Lock"/> because <see cref="SqliteConnection"/> wraps a single
+    /// <c>sqlite3*</c> handle that is not safe for concurrent command execution. Uses
+    /// <see cref="ConcurrentDictionary{TKey,TValue}"/> so that the lock-free fast-path
+    /// <see cref="ConcurrentDictionary{TKey,TValue}.TryGetValue"/> is safe to call concurrently
+    /// with the semaphore-guarded <see cref="ConcurrentDictionary{TKey,TValue}.TryAdd"/>.
+    /// </summary>
+    private readonly ConcurrentDictionary<int, PartitionDatabase> connections = new();
 
     /// <summary>
     /// Represents the base directory path used for database file storage in the SQLite Write-Ahead Log (WAL).
@@ -70,9 +87,19 @@ public class SqliteWAL : IWAL, IDisposable
 
     internal bool SyncWritesEnabled => syncWrites;
 
+    /// <summary>For tests: number of storage commits issued by the last compaction call.</summary>
+    internal int LastCompactionCommitCount { get; private set; }
+
     /// <summary>
     /// Represents a Write-Ahead Log (WAL) implementation using SQLite as the storage backend.
     /// </summary>
+    /// <param name="syncWrites">
+    /// When <see langword="true"/> (default), partition databases use <c>PRAGMA synchronous=FULL</c>
+    /// so every committed transaction is durable across power loss. When <see langword="false"/>,
+    /// uses <c>synchronous=NORMAL</c> in WAL journal mode: the database file cannot be corrupted,
+    /// but the last committed transaction may be lost on power loss — the same durability/throughput
+    /// trade-off as non-sync RocksDB writes.
+    /// </param>
     public SqliteWAL(string path, string revision, ILogger<IRaft> logger, bool syncWrites = true)
     {
         this.path = path;
@@ -82,19 +109,18 @@ public class SqliteWAL : IWAL, IDisposable
     }
 
     /// <summary>
-    /// Returns the exclusive lock and <see cref="SqliteConnection"/> for
-    /// <paramref name="partitionId"/>, creating them on first access.
+    /// Returns the database state for <paramref name="partitionId"/>, creating it on first access.
     /// </summary>
-    private (object Lock, SqliteConnection Connection) TryOpenDatabase(int partitionId)
+    private PartitionDatabase TryOpenDatabase(int partitionId)
     {
-        if (connections.TryGetValue(partitionId, out (object Lock, SqliteConnection Connection) connTuple))
-            return connTuple;
+        if (connections.TryGetValue(partitionId, out PartitionDatabase? database))
+            return database;
 
         semaphore.Wait();
         try
         {
-            if (connections.TryGetValue(partitionId, out connTuple))
-                return connTuple;
+            if (connections.TryGetValue(partitionId, out database))
+                return database;
 
             string completePath = $"{path}/raft{partitionId}_{revision}.db";
 
@@ -121,16 +147,17 @@ public class SqliteWAL : IWAL, IDisposable
             using SqliteCommand command1 = new(createTableQuery, connection);
             command1.ExecuteNonQuery();
 
-            string synchronousMode = syncWrites ? "FULL" : "OFF";
+            // In WAL mode, NORMAL is crash-safe for the database file; FULL fsyncs the WAL on every commit.
+            string synchronousMode = syncWrites ? "FULL" : "NORMAL";
             string pragmasQuery = $"PRAGMA journal_mode=WAL; PRAGMA synchronous={synchronousMode}; PRAGMA temp_store=MEMORY;";
             using SqliteCommand command3 = new(pragmasQuery, connection);
             command3.ExecuteNonQuery();
 
-            object partitionLock = new();
+            database = new(connection);
 
-            connections.TryAdd(partitionId, (partitionLock, connection));
+            connections.TryAdd(partitionId, database);
 
-            return (partitionLock, connection);
+            return database;
         }
         finally
         {
@@ -180,13 +207,13 @@ public class SqliteWAL : IWAL, IDisposable
     /// <returns>A list of <see cref="RaftLog"/> containing the logs retrieved from the partition.</returns>
     public List<RaftLog> ReadLogs(int partitionId)
     {
-        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+        PartitionDatabase database = TryOpenDatabase(partitionId);
 
-        lock (partitionLock)
+        lock (database.Lock)
         {
             List<RaftLog> result = [];
 
-            long lastCheckpoint = GetLastCheckpointInternal(connection, partitionId);
+            long lastCheckpoint = GetLastCheckpointInternal(database.Connection, partitionId);
 
             const string query = """
              SELECT id, term, type, logType, log, timeNode, timePhysical, timeCounter
@@ -195,7 +222,7 @@ public class SqliteWAL : IWAL, IDisposable
              ORDER BY id ASC;
              """;
 
-            using SqliteCommand command = new(query, connection);
+            using SqliteCommand command = new(query, database.Connection);
 
             command.Parameters.AddWithValue("@partitionId", partitionId);
             command.Parameters.AddWithValue("@lastCheckpoint", lastCheckpoint);
@@ -225,28 +252,40 @@ public class SqliteWAL : IWAL, IDisposable
 
     /// <summary>
     /// Reads up to <paramref name="maxEntries"/> Raft logs for <paramref name="partitionId"/> with id ≥
-    /// <paramref name="startLogIndex"/>, sorted ascending. The LIMIT is pushed into SQL so the database
-    /// engine stops reading at the boundary rather than returning the full tail to the caller.
+    /// <paramref name="startLogIndex"/>, sorted ascending. When <paramref name="maxEntries"/> is not
+    /// <see cref="int.MaxValue"/>, the limit is pushed into SQL so the engine can stop at the boundary
+    /// instead of scanning the full tail.
     /// </summary>
     public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue)
     {
-        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+        PartitionDatabase database = TryOpenDatabase(partitionId);
 
-        lock (partitionLock)
+        lock (database.Lock)
         {
             List<RaftLog> result = [];
 
-            const string query = """
-             SELECT id, term, type, logType, log, timeNode, timePhysical, timeCounter
-             FROM logs
-             WHERE partitionId = @partitionId AND id >= @startIndex
-             ORDER BY id ASC;
-             """;
+            bool applyLimit = maxEntries != int.MaxValue;
+            string query = applyLimit
+                ? """
+                 SELECT id, term, type, logType, log, timeNode, timePhysical, timeCounter
+                 FROM logs
+                 WHERE partitionId = @partitionId AND id >= @startIndex
+                 ORDER BY id ASC
+                 LIMIT @maxEntries;
+                 """
+                : """
+                 SELECT id, term, type, logType, log, timeNode, timePhysical, timeCounter
+                 FROM logs
+                 WHERE partitionId = @partitionId AND id >= @startIndex
+                 ORDER BY id ASC;
+                 """;
 
-            using SqliteCommand command = new(query, connection);
+            using SqliteCommand command = new(query, database.Connection);
 
             command.Parameters.AddWithValue("@partitionId", partitionId);
             command.Parameters.AddWithValue("@startIndex", startLogIndex);
+            if (applyLimit)
+                command.Parameters.AddWithValue("@maxEntries", maxEntries);
 
             using SqliteDataReader reader = command.ExecuteReader();
 
@@ -265,9 +304,6 @@ public class SqliteWAL : IWAL, IDisposable
                         reader.IsDBNull(7) ? 0 : (uint)reader.GetInt64(7)
                     )
                 });
-
-                if (result.Count >= maxEntries)
-                    break;
             }
 
             return result;
@@ -304,36 +340,16 @@ public class SqliteWAL : IWAL, IDisposable
         
         try
         {
-            const string insertOrReplaceSql = """
-              INSERT INTO logs (id, partitionId, term, type, logType, log, timeNode, timePhysical, timeCounter)
-              VALUES (@id, @partitionId, @term, @type, @logType, @log, @timeNode, @timePhysical, @timeCounter)
-              ON CONFLICT(partitionId, id) DO UPDATE SET term=@term, type=@type, logType=@logType,
-              log=@log, timeNode=@timeNode, timePhysical=@timePhysical, timeCounter=@timeCounter;
-              """;
-            
             foreach (KeyValuePair<int, List<RaftLog>> kv in plan)
             {
-                (object partitionLock, SqliteConnection connection) = TryOpenDatabase(kv.Key);
+                PartitionDatabase database = TryOpenDatabase(kv.Key);
 
-                lock (partitionLock)
+                lock (database.Lock)
                 {
-                    using SqliteTransaction transaction = connection.BeginTransaction();
+                    using SqliteTransaction transaction = database.Connection.BeginTransaction();
 
-                    using SqliteCommand insertOrReplaceCommand = new(insertOrReplaceSql, connection);
-
+                    SqliteCommand insertOrReplaceCommand = GetOrCreatePreparedUpsert(database);
                     insertOrReplaceCommand.Transaction = transaction;
-
-                    insertOrReplaceCommand.Parameters.Add("@id", SqliteType.Integer);
-                    insertOrReplaceCommand.Parameters.Add("@partitionId", SqliteType.Integer);
-                    insertOrReplaceCommand.Parameters.Add("@term", SqliteType.Integer);
-                    insertOrReplaceCommand.Parameters.Add("@type", SqliteType.Integer);
-                    insertOrReplaceCommand.Parameters.Add("@logType", SqliteType.Text);
-                    insertOrReplaceCommand.Parameters.Add("@log", SqliteType.Blob);
-                    insertOrReplaceCommand.Parameters.Add("@timeNode", SqliteType.Integer);
-                    insertOrReplaceCommand.Parameters.Add("@timePhysical", SqliteType.Integer);
-                    insertOrReplaceCommand.Parameters.Add("@timeCounter", SqliteType.Integer);
-
-                    insertOrReplaceCommand.Prepare();
 
                     try
                     {
@@ -368,6 +384,10 @@ public class SqliteWAL : IWAL, IDisposable
                         transaction.Rollback();
                         throw;
                     }
+                    finally
+                    {
+                        insertOrReplaceCommand.Transaction = null;
+                    }
                 }
             }
         } 
@@ -381,6 +401,38 @@ public class SqliteWAL : IWAL, IDisposable
         return RaftOperationStatus.Success;
     }
 
+    private static SqliteCommand CreatePreparedUpsert(SqliteConnection connection)
+    {
+        const string insertOrReplaceSql = """
+          INSERT INTO logs (id, partitionId, term, type, logType, log, timeNode, timePhysical, timeCounter)
+          VALUES (@id, @partitionId, @term, @type, @logType, @log, @timeNode, @timePhysical, @timeCounter)
+          ON CONFLICT(partitionId, id) DO UPDATE SET term=@term, type=@type, logType=@logType,
+          log=@log, timeNode=@timeNode, timePhysical=@timePhysical, timeCounter=@timeCounter;
+          """;
+
+        SqliteCommand command = new(insertOrReplaceSql, connection);
+        command.Parameters.Add("@id", SqliteType.Integer);
+        command.Parameters.Add("@partitionId", SqliteType.Integer);
+        command.Parameters.Add("@term", SqliteType.Integer);
+        command.Parameters.Add("@type", SqliteType.Integer);
+        command.Parameters.Add("@logType", SqliteType.Text);
+        command.Parameters.Add("@log", SqliteType.Blob);
+        command.Parameters.Add("@timeNode", SqliteType.Integer);
+        command.Parameters.Add("@timePhysical", SqliteType.Integer);
+        command.Parameters.Add("@timeCounter", SqliteType.Integer);
+        command.Prepare();
+        return command;
+    }
+
+    private static SqliteCommand GetOrCreatePreparedUpsert(PartitionDatabase database)
+    {
+        if (database.PreparedUpsert is not null)
+            return database.PreparedUpsert;
+
+        database.PreparedUpsert = CreatePreparedUpsert(database.Connection);
+        return database.PreparedUpsert;
+    }
+
     /// <summary>
     /// Retrieves the highest log identifier from the logs for a specific partition.
     /// </summary>
@@ -390,12 +442,12 @@ public class SqliteWAL : IWAL, IDisposable
     {
         try
         {
-            (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+            PartitionDatabase database = TryOpenDatabase(partitionId);
 
-            lock (partitionLock)
+            lock (database.Lock)
             {
                 const string query = "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId";
-                using SqliteCommand command = new(query, connection);
+                using SqliteCommand command = new(query, database.Connection);
 
                 command.Parameters.AddWithValue("@partitionId", partitionId);
 
@@ -423,12 +475,12 @@ public class SqliteWAL : IWAL, IDisposable
     /// <param name="partitionId">The identifier of the partition for which the current term is to be retrieved.</param>
     public long GetCurrentTerm(int partitionId)
     {
-        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+        PartitionDatabase database = TryOpenDatabase(partitionId);
 
-        lock (partitionLock)
+        lock (database.Lock)
         {
             const string query = "SELECT term FROM logs WHERE partitionId = @partitionId ORDER BY id DESC LIMIT 1";
-            using SqliteCommand command = new(query, connection);
+            using SqliteCommand command = new(query, database.Connection);
 
             command.Parameters.AddWithValue("@partitionId", partitionId);
 
@@ -448,11 +500,11 @@ public class SqliteWAL : IWAL, IDisposable
     /// <returns>Returns the log index of the last checkpoint within the specified partition.</returns>
     public long GetLastCheckpoint(int partitionId)
     {
-        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+        PartitionDatabase database = TryOpenDatabase(partitionId);
 
-        lock (partitionLock)
+        lock (database.Lock)
         {
-            return GetLastCheckpointInternal(connection, partitionId);
+            return GetLastCheckpointInternal(database.Connection, partitionId);
         }
     }
 
@@ -481,12 +533,12 @@ public class SqliteWAL : IWAL, IDisposable
     /// <inheritdoc/>
     public int CountPersistedLogs(int partitionId)
     {
-        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+        PartitionDatabase database = TryOpenDatabase(partitionId);
 
-        lock (partitionLock)
+        lock (database.Lock)
         {
             const string query = "SELECT COUNT(*) FROM logs WHERE partitionId = @partitionId";
-            using SqliteCommand command = new(query, connection);
+            using SqliteCommand command = new(query, database.Connection);
             command.Parameters.AddWithValue("@partitionId", partitionId);
             return Convert.ToInt32(command.ExecuteScalar());
         }
@@ -495,11 +547,11 @@ public class SqliteWAL : IWAL, IDisposable
     /// <inheritdoc/>
     public int CountRemovableLogs(int partitionId)
     {
-        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+        PartitionDatabase database = TryOpenDatabase(partitionId);
 
-        lock (partitionLock)
+        lock (database.Lock)
         {
-            long lastCheckpoint = GetLastCheckpointInternal(connection, partitionId);
+            long lastCheckpoint = GetLastCheckpointInternal(database.Connection, partitionId);
 
             if (lastCheckpoint <= 0)
                 return 0;
@@ -509,7 +561,7 @@ public class SqliteWAL : IWAL, IDisposable
              FROM logs
              WHERE partitionId = @partitionId AND id < @lastCheckpoint;
              """;
-            using SqliteCommand command = new(query, connection);
+            using SqliteCommand command = new(query, database.Connection);
             command.Parameters.AddWithValue("@partitionId", partitionId);
             command.Parameters.AddWithValue("@lastCheckpoint", lastCheckpoint);
             return Convert.ToInt32(command.ExecuteScalar());
@@ -526,23 +578,22 @@ public class SqliteWAL : IWAL, IDisposable
         // Fast path: no connection was ever opened and the file does not exist — nothing to do.
         // Calling TryOpenDatabase here would CREATE the file via CREATE TABLE IF NOT EXISTS,
         // which is incorrect for a partition that was never written to.
-        if (!connections.TryGetValue(partitionId, out (object Lock, SqliteConnection Connection) connTuple))
+        if (!connections.TryGetValue(partitionId, out PartitionDatabase? database))
         {
             string completePath = $"{path}/raft{partitionId}_{revision}.db";
             if (!File.Exists(completePath))
                 return RaftOperationStatus.Success;
 
             // File exists but the connection was not yet opened — open it so we can delete.
-            connTuple = TryOpenDatabase(partitionId);
+            database = TryOpenDatabase(partitionId);
         }
 
-        (object partitionLock, SqliteConnection connection) = connTuple;
-        lock (partitionLock)
+        lock (database.Lock)
         {
             try
             {
                 using SqliteCommand command = new(
-                    "DELETE FROM logs WHERE partitionId = @partitionId", connection);
+                    "DELETE FROM logs WHERE partitionId = @partitionId", database.Connection);
                 command.Parameters.AddWithValue("@partitionId", partitionId);
                 command.ExecuteNonQuery();
             }
@@ -555,7 +606,11 @@ public class SqliteWAL : IWAL, IDisposable
             // Close and evict the connection so future callers cannot accidentally reuse
             // a handle to a partition that has been logically deleted.
             connections.TryRemove(partitionId, out _);
-            try { connection.Close(); }
+            try
+            {
+                database.PreparedUpsert?.Dispose();
+                database.Connection.Close();
+            }
             catch (Exception ex)
             {
                 logger.LogWarning("DeletePartitionWAL({PartitionId}): connection close failed: {Message}", partitionId, ex.Message);
@@ -568,13 +623,13 @@ public class SqliteWAL : IWAL, IDisposable
     /// <inheritdoc/>
     public RaftOperationStatus TruncateLogsAfter(int partitionId, long afterLogId)
     {
-        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
-        lock (partitionLock)
+        PartitionDatabase database = TryOpenDatabase(partitionId);
+        lock (database.Lock)
         {
             try
             {
                 using SqliteCommand command = new(
-                    "DELETE FROM logs WHERE partitionId = @partitionId AND id > @afterLogId", connection);
+                    "DELETE FROM logs WHERE partitionId = @partitionId AND id > @afterLogId", database.Connection);
                 command.Parameters.AddWithValue("@partitionId", partitionId);
                 command.Parameters.AddWithValue("@afterLogId", afterLogId);
                 command.ExecuteNonQuery();
@@ -589,19 +644,28 @@ public class SqliteWAL : IWAL, IDisposable
     }
 
     /// <param name="lastCheckpoint">The checkpoint ID indicating the upper bound for compaction. Logs with IDs less than this value will be compacted.</param>
-    /// <param name="compactNumberEntries">The maximum number of log entries to be compacted in a single operation.</param>
+    /// <param name="compactNumberEntries">The maximum number of log entries removed per internal delete batch.</param>
+    /// <param name="maxTotalEntries">
+    /// When set, multiple internal batches of <paramref name="compactNumberEntries"/> are issued
+    /// inside one SQLite transaction so a compaction pass costs a single fsync.
+    /// </param>
     /// <returns>
     /// A tuple of <see cref="RaftOperationStatus"/> and the number of entries removed.
     /// </returns>
-    public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
+    public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(
+        int partitionId,
+        long lastCheckpoint,
+        int compactNumberEntries,
+        int? maxTotalEntries = null)
     {
-        (object partitionLock, SqliteConnection connection) = TryOpenDatabase(partitionId);
+        int passCap = maxTotalEntries ?? compactNumberEntries;
+        PartitionDatabase database = TryOpenDatabase(partitionId);
 
         try
         {
-            lock (partitionLock)
+            lock (database.Lock)
             {
-                using SqliteTransaction transaction = connection.BeginTransaction();
+                using SqliteTransaction transaction = database.Connection.BeginTransaction();
 
                 try
                 {
@@ -617,21 +681,34 @@ public class SqliteWAL : IWAL, IDisposable
                        );
                      """;
 
-                    using SqliteCommand deleteCommand = new(deleteSql, connection);
+                    using SqliteCommand deleteCommand = new(deleteSql, database.Connection);
 
                     deleteCommand.Transaction = transaction;
                     deleteCommand.Parameters.AddWithValue("@partitionId", partitionId);
                     deleteCommand.Parameters.AddWithValue("@lastCheckpoint", lastCheckpoint);
-                    deleteCommand.Parameters.AddWithValue("@limit", compactNumberEntries);
+                    SqliteParameter limitParameter = deleteCommand.Parameters.Add("@limit", SqliteType.Integer);
 
-                    int removed = deleteCommand.ExecuteNonQuery();
+                    int totalRemoved = 0;
+
+                    while (totalRemoved < passCap)
+                    {
+                        int batchLimit = Math.Min(compactNumberEntries, passCap - totalRemoved);
+                        limitParameter.Value = batchLimit;
+
+                        int removed = deleteCommand.ExecuteNonQuery();
+                        totalRemoved += removed;
+
+                        if (removed < batchLimit)
+                            break;
+                    }
 
                     transaction.Commit();
+                    LastCompactionCommitCount = 1;
 
-                    if (removed > 0)
-                        logger.LogDebug("Removed {Count} from WAL for partition {PartitionId}", removed, partitionId);
+                    if (totalRemoved > 0)
+                        logger.LogDebugRemovedFromWal(totalRemoved, partitionId);
 
-                    return (RaftOperationStatus.Success, removed);
+                    return (RaftOperationStatus.Success, totalRemoved);
                 }
                 catch
                 {
@@ -713,7 +790,10 @@ public class SqliteWAL : IWAL, IDisposable
         semaphore.Dispose();
         metaDataConnection?.Dispose();
         
-        foreach (KeyValuePair<int, (object Lock, SqliteConnection Connection)> conn in connections)
-            conn.Value.Connection.Dispose();
+        foreach (PartitionDatabase database in connections.Values)
+        {
+            database.PreparedUpsert?.Dispose();
+            database.Connection.Dispose();
+        }
     }
 }

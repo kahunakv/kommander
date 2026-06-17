@@ -367,8 +367,8 @@ public sealed class TestSnapshotIntegration
         public int CountRemovableLogs(int partitionId) => inner.CountRemovableLogs(partitionId);
         public string? GetMetaData(string key) => inner.GetMetaData(key);
         public bool SetMetaData(string key, string value) => inner.SetMetaData(key, value);
-        public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries) =>
-            inner.CompactLogsOlderThan(partitionId, lastCheckpoint, compactNumberEntries);
+        public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries, int? maxTotalEntries = null) =>
+            inner.CompactLogsOlderThan(partitionId, lastCheckpoint, compactNumberEntries, maxTotalEntries);
         public RaftOperationStatus DeletePartitionWAL(int partitionId) => inner.DeletePartitionWAL(partitionId);
         public RaftOperationStatus TruncateLogsAfter(int partitionId, long afterLogId) => inner.TruncateLogsAfter(partitionId, afterLogId);
         public void Dispose() => inner.Dispose();

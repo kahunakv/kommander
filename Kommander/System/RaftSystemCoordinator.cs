@@ -5,6 +5,7 @@ using System.Threading.Channels;
 using Kommander.System.Protos;
 using Google.Protobuf;
 using Kommander.Data;
+using Kommander.Logging;
 using Microsoft.Extensions.Logging;
 using Kommander.Discovery;
 
@@ -202,7 +203,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
                 RaftSystemMessage systemMessage = Unserialize(message.LogData);
                 systemConfiguration[systemMessage.Key] = systemMessage.Value;
-                logger.LogInformation("Restored system configuration: {Key}", systemMessage.Key);
+                logger.LogInfoRestoredSystemConfiguration(systemMessage.Key);
 
                 if (systemMessage.Key == RaftSystemConfigKeys.Members)
                     ApplyMembershipFromCache();
@@ -219,7 +220,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
                 RaftSystemMessage systemMessage = Unserialize(message.LogData);
                 systemConfiguration[systemMessage.Key] = systemMessage.Value;
-                logger.LogInformation("Replicated system configuration: {Key}", systemMessage.Key);
+                logger.LogInfoReplicatedSystemConfiguration(systemMessage.Key);
 
                 // Live replication: dispatch to the correct subsystem based on the key.
                 // Followers must never attempt to drive Phase 2 commits, and leaders already
@@ -434,9 +435,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 continue;
             }
 
-            logger.LogInformation(
-                "InitializePartitions: Re-enqueuing MergePartitionCommit for stuck Draining partition {Src} → survivor {Surv}",
-                src.PartitionId, survivor.PartitionId);
+            logger.LogInfoReEnqueuingMergePartitionCommit(src.PartitionId, survivor.PartitionId);
 
             _pendingMerges[src.PartitionId] = new MergeInProgress(survivor.PartitionId, null);
             Send(new RaftSystemRequest(RaftSystemRequestType.MergePartitionCommit, src.PartitionId));
@@ -553,9 +552,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 return;
             }
 
-            logger.LogInformation(
-                "Successfully replicated initial partitions {Status} {LogIndex}",
-                result.Status, result.LogIndex);
+            logger.LogInfoSuccessfullyReplicatedInitialPartitions(result.Status, result.LogIndex);
             break;
         }
 
@@ -742,8 +739,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 return;
             }
 
-            logger.LogInformation(
-                "TrySplitPartition: Phase 1 committed for partition {Partition}", partitionId);
+            logger.LogInfoSplitPartitionPhase1Committed(partitionId);
             break;
         }
 
@@ -848,9 +844,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 "snapshot was imported locally but followers are diverged — manual intervention required",
                 targetPartitionId, checkpointResult.Status);
         else
-            logger.LogInformation(
-                "TrySplitPartition: Snapshot transfer complete — source={Src} snapshotIndex={Idx}, target={Tgt} checkpoint committed",
-                sourcePartitionId, snapshotIndex, targetPartitionId);
+            logger.LogInfoSplitPartitionSnapshotTransferComplete(sourcePartitionId, snapshotIndex, targetPartitionId);
     }
 
     /// <summary>
@@ -962,8 +956,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 return;
             }
 
-            logger.LogInformation(
-                "TrySplitPartitionCommit: Phase 2 committed for partition {Partition}", sourcePartitionId);
+            logger.LogInfoSplitPartitionCommitPhase2Committed(sourcePartitionId);
             break;
         }
 
@@ -1100,9 +1093,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 return;
             }
 
-            logger.LogInformation(
-                "TryMergePartitions: Phase 1 committed — source {Src} is Draining",
-                plan.SourcePartitionId);
+            logger.LogInfoMergePartitionsPhase1Committed(plan.SourcePartitionId);
             break;
         }
 
@@ -1227,9 +1218,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 return;
             }
 
-            logger.LogInformation(
-                "TryMergePartitionCommit: Phase 2 committed — source {Src} removed, survivor {Surv} expanded",
-                sourcePartitionId, merge.SurvivorPartitionId);
+            logger.LogInfoMergePartitionCommitPhase2Committed(sourcePartitionId, merge.SurvivorPartitionId);
             break;
         }
 
@@ -1284,9 +1273,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
         {
             if (existing.State == RaftPartitionState.Active)
             {
-                logger.LogInformation(
-                    "TryCreatePartition: Partition {Id} already active at generation {Gen}",
-                    message.PartitionId, existing.Generation);
+                logger.LogInfoCreatePartitionAlreadyActive(message.PartitionId, existing.Generation);
                 completion?.TrySetResult((RaftOperationStatus.Success, existing.Generation));
                 return;
             }
@@ -1439,7 +1426,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
         // Idempotency: already removed by a prior call.
         if (entry.State == RaftPartitionState.Removed)
         {
-            logger.LogInformation("TryRemovePartition: Partition {Id} already removed", partitionId);
+            logger.LogInfoRemovePartitionAlreadyRemoved(partitionId);
             completion?.TrySetResult((RaftOperationStatus.Success, entry.Generation));
             // Re-attempt WAL reclamation in case a prior crash prevented it.
             manager.WalAdapter.DeletePartitionWAL(partitionId);
@@ -1525,8 +1512,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
         manager.WalAdapter.DeletePartitionWAL(partitionId);
 
-        logger.LogInformation(
-            "TryRemovePartition: Partition {Id} removed and WAL reclaimed", partitionId);
+        logger.LogInfoRemovePartitionReclaimedWal(partitionId);
 
         // Fire OnPartitionMapChanged on the leader, matching the contract on followers
         // (who fire it via ConfigReplicated → StartUserPartitions). The partition has
@@ -1619,9 +1605,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
         systemConfiguration[RaftSystemConfigKeys.Members] = json;
         _cachedMembership = seed;
         manager.RaiseMembershipChanged(seed);
-        logger.LogInformation(
-            "[RaftSystemCoordinator] Seeded initial membership roster with {Count} voter(s)",
-            allMembers.Count);
+        logger.LogInfoSeededInitialMembership(allMembers.Count);
     }
 
     // ── Membership helpers ─────────────────────────────────────────────────
@@ -1643,9 +1627,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
         if (roster is null || roster.MembershipVersion <= _cachedMembership.MembershipVersion)
             return;
 
-        logger.LogDebug(
-            "Gossip: updating local cache from v{Old} to v{New} via peer push",
-            _cachedMembership.MembershipVersion, roster.MembershipVersion);
+        logger.LogDebugGossipUpdatingCache(_cachedMembership.MembershipVersion, roster.MembershipVersion);
 
         _cachedMembership = roster;
         manager.RaiseMembershipChanged(roster);
@@ -1825,7 +1807,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 else if (now - since >= manager.Configuration.LearnerPromotionStableWindow)
                 {
                     // Stable long enough — promote.
-                    logger.LogInformation("[RaftSystemCoordinator] Promoting Learner {Endpoint} to Voter (stable for {Duration:g})", endpoint, now - since);
+                    logger.LogInfoPromotingLearnerToVoter(endpoint, now - since);
                     _learnerCaughtUpSince.Remove(endpoint);
 
                     Send(new RaftSystemRequest(
@@ -2095,8 +2077,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
             // joiner retried. Treat this as success so the caller can proceed past the admission
             // loop without waiting for the 60 s timeout. Return the current version so the joiner
             // can log the correct roster version.
-            logger.LogInformation("TryAddMember: Endpoint {Endpoint} is already in the roster; treating as idempotent success at version {Version}",
-                endpoint, _cachedMembership.MembershipVersion);
+            logger.LogInfoAddMemberAlreadyInRoster(endpoint, _cachedMembership.MembershipVersion);
             completion?.TrySetResult((RaftOperationStatus.Success, _cachedMembership.MembershipVersion));
             return;
         }
@@ -2120,7 +2101,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
         };
 
         _membershipChangePending = true;
-        logger.LogInformation("TryAddMember: Adding {Endpoint} as Learner at version {Version}", endpoint, newVersion);
+        logger.LogInfoAddMemberAddingLearner(endpoint, newVersion);
 
         try
         {
@@ -2175,7 +2156,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
         };
 
         _membershipChangePending = true;
-        logger.LogInformation("TryPromoteMember: Promoting {Endpoint} to Voter at version {Version}", endpoint, newVersion);
+        logger.LogInfoPromoteMemberToVoter(endpoint, newVersion);
 
         try
         {
@@ -2207,8 +2188,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
             // Idempotent: the endpoint is already absent — a previous RemoveMember committed but
             // the response was lost before the caller saw it. Treat as success so the caller's
             // retry loop does not spin to timeout.
-            logger.LogInformation("TryRemoveMember: Endpoint {Endpoint} is not in the roster; treating as idempotent success at version {Version}",
-                endpoint, _cachedMembership.MembershipVersion);
+            logger.LogInfoRemoveMemberNotInRoster(endpoint, _cachedMembership.MembershipVersion);
             completion?.TrySetResult((RaftOperationStatus.Success, _cachedMembership.MembershipVersion));
             return;
         }
@@ -2240,7 +2220,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
         };
 
         _membershipChangePending = true;
-        logger.LogInformation("TryRemoveMember: Removing {Endpoint} at version {Version}", endpoint, newVersion);
+        logger.LogInfoRemoveMember(endpoint, newVersion);
 
         try
         {

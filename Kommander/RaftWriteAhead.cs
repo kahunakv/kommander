@@ -120,7 +120,7 @@ public sealed class RaftWriteAhead
         List<RaftLog> logs = await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () => walAdapter.ReadLogs(partition.PartitionId)).ConfigureAwait(false);
 
         if (logs.Count > 0)
-            manager.Logger.LogInformation("[{Endpoint}/{Partition}] Recovered {LogsCount} logs", manager.LocalEndpoint, partition.PartitionId, logs.Count);
+            manager.Logger.LogInfoRecoveredLogs(manager.LocalEndpoint, partition.PartitionId, logs.Count);
 
         return logs;
     }
@@ -652,7 +652,7 @@ public sealed class RaftWriteAhead
                     else
                         plan.Add(RaftLogAction.Rollback, [log]);
 
-                    logger.LogDebug("[{Endpoint}/{Partition}] Rolledback log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+                    logger.LogDebugRolledbackLog(manager.LocalEndpoint, partition.PartitionId, log.Id);
 
                     commitIndex = log.Id + 1;
                 }
@@ -678,7 +678,7 @@ public sealed class RaftWriteAhead
                     else
                         plan.Add(RaftLogAction.Propose, [log]);
 
-                    logger.LogDebug("[{Endpoint}/{Partition}] Proposed checkpoint log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+                    logger.LogDebugProposedCheckpointLog(manager.LocalEndpoint, partition.PartitionId, log.Id);
 
                     proposeIndex = log.Id + 1;
                 } 
@@ -691,7 +691,7 @@ public sealed class RaftWriteAhead
                     else
                         plan.Add(RaftLogAction.Rollback, [log]);
 
-                    logger.LogDebug("[{Endpoint}/{Partition}] Rolled back checkpoint log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+                    logger.LogDebugRolledBackCheckpointLog(manager.LocalEndpoint, partition.PartitionId, log.Id);
 
                     commitIndex = log.Id + 1;
                 } 
@@ -704,7 +704,7 @@ public sealed class RaftWriteAhead
                     else
                         plan.Add(RaftLogAction.Commit, [log]);
 
-                    logger.LogDebug("[{Endpoint}/{Partition}] Committed checkpoint log #{Id}", manager.LocalEndpoint, partition.PartitionId, log.Id);
+                    logger.LogDebugCommittedCheckpointLog(manager.LocalEndpoint, partition.PartitionId, log.Id);
 
                     commitIndex = log.Id + 1;
                 } 
@@ -862,47 +862,24 @@ public sealed class RaftWriteAhead
             if (lastCheckpoint <= 0)
                 return;
 
-            logger.LogInformation("[{Endpoint}/{Partition}] Compaction process started LastCheckpoint={LastCheckpoint}", manager.LocalEndpoint, partition.PartitionId, lastCheckpoint);
+            logger.LogInfoCompactionStarted(manager.LocalEndpoint, partition.PartitionId, lastCheckpoint);
 
-            // Scheduled on ReadScheduler, not WalScheduler — see specs/adr/0003-wal-compaction-scheduling.md.
-            // All drain batches run inside a single scheduled task — no yield between
-            // batches. The pass cap bounds total work; re-enqueueing per batch would
-            // interleave reads for this partition if read latency during compaction matters.
+            // Scheduled on ReadScheduler, not WalScheduler — compaction deletes must not
+            // contend with the write path on the WAL scheduler.
+            // All drain batches run inside a single WAL compaction call so durable backends
+            // commit one transaction / db.Write per pass instead of one per batch.
             int removedTotal = await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () =>
             {
-                int total = 0;
+                (RaftOperationStatus status, int removed) = walAdapter.CompactLogsOlderThan(
+                    partition.PartitionId,
+                    lastCheckpoint,
+                    compactNumberEntries,
+                    maxEntriesPerCompaction);
 
-                while (true)
-                {
-                    (RaftOperationStatus status, int removed) = walAdapter.CompactLogsOlderThan(
-                        partition.PartitionId,
-                        lastCheckpoint,
-                        compactNumberEntries);
-
-                    if (status != RaftOperationStatus.Success)
-                        break;
-
-                    if (removed <= 0)
-                        break;
-
-                    total += removed;
-
-                    if (removed < compactNumberEntries)
-                        break;
-
-                    if (total >= maxEntriesPerCompaction)
-                        break;
-                }
-
-                return total;
+                return status == RaftOperationStatus.Success ? removed : 0;
             }).ConfigureAwait(false);
 
-            logger.LogInformation(
-                "[{Endpoint}/{Partition}] Compaction finished Removed={RemovedTotal} LastCheckpoint={LastCheckpoint}",
-                manager.LocalEndpoint,
-                partition.PartitionId,
-                removedTotal,
-                lastCheckpoint);
+            logger.LogInfoCompactionFinished(manager.LocalEndpoint, partition.PartitionId, removedTotal, lastCheckpoint);
         }
         catch (Exception ex)
         {

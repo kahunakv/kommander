@@ -5,9 +5,8 @@ keep-alive traffic: the **quiescence** feature. It is written for two readers �
 *understand* why idle partitions go quiet, and someone who wants to *extend or debug* it. No prior Raft
 expertise is assumed; we build the idea up first, then walk the real flows and the code.
 
-For the design rationale and history, see `specs/quiescence-node-liveness-spec.md`. This guide is the
-user-facing companion to that spec. Quiescence builds directly on the SWIM failure detector documented
-in the [Dynamic Membership Developer Guide](dynamic-membership-developer-guide.md) — read its
+Quiescence builds directly on the SWIM failure detector documented in the
+[Dynamic Membership Developer Guide](dynamic-membership-developer-guide.md) — read its
 *Failure detection (SWIM)* section if the terms `Alive`/`Suspect`/`Dead` are unfamiliar.
 
 ---

@@ -318,7 +318,7 @@ public sealed class TestFairWalScheduler
         public RaftOperationStatus TruncateLogsAfter(int partitionId, long afterLogId) => RaftOperationStatus.Success;
         public string? GetMetaData(string key) => null;
         public bool SetMetaData(string key, string value) => true;
-        public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int p, long lc, int n) => (RaftOperationStatus.Success, 0);
+        public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int p, long lc, int n, int? maxTotalEntries = null) => (RaftOperationStatus.Success, 0);
         public void Dispose() { }
     }
 
@@ -346,7 +346,7 @@ public sealed class TestFairWalScheduler
         public RaftOperationStatus TruncateLogsAfter(int partitionId, long afterLogId) => RaftOperationStatus.Success;
         public string? GetMetaData(string key) => null;
         public bool SetMetaData(string key, string value) => true;
-        public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int p, long lc, int n) => (RaftOperationStatus.Success, 0);
+        public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int p, long lc, int n, int? maxTotalEntries = null) => (RaftOperationStatus.Success, 0);
         public void Dispose() { _gate.Dispose(); }
     }
 
@@ -367,7 +367,7 @@ public sealed class TestFairWalScheduler
         public RaftOperationStatus TruncateLogsAfter(int partitionId, long afterLogId) => RaftOperationStatus.Success;
         public string? GetMetaData(string key) => null;
         public bool SetMetaData(string key, string value) => true;
-        public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int p, long lc, int n) => (RaftOperationStatus.Success, 0);
+        public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int p, long lc, int n, int? maxTotalEntries = null) => (RaftOperationStatus.Success, 0);
         public void Dispose() { }
     }
 }

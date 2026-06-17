@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Threading.Channels;
 using Kommander.Communication.Grpc;
 using Kommander.Data;
+using Kommander.Logging;
 using Microsoft.Extensions.Logging;
 
 namespace Kommander.Communication;
@@ -159,9 +160,7 @@ internal sealed class RaftTransportDispatcher : IDisposable
                 return;
             }
 
-            logger.LogTrace(
-                "[RaftTransportDispatcher/{Endpoint}] Sending batch of {Count} messages",
-                node.Endpoint, messages.Count);
+            logger.LogTraceSendingBatch(node.Endpoint, messages.Count);
 
             List<BatchRequestsRequestItem> items =
                 GrpcCommunicationPool.RentListBatchRequestsRequestItem(messages.Count);

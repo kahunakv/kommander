@@ -13,6 +13,7 @@ using Kommander.Diagnostics;
 using Kommander.Discovery;
 using Kommander.System;
 using Kommander.Time;
+using Kommander.Logging;
 using Kommander.WAL;
 using Kommander.WAL.IO;
 using Microsoft.Extensions.Logging;
@@ -402,7 +403,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         {
             // Post-shared-P0: non-system P0 entries are dispatched to consumer callbacks
             // upstream (RaftWriteAhead restore branch) and should never reach here.
-            Logger.LogDebug("SystemLogRestored: skipping entry on system partition (LogType={LogType}, DataNull={DataNull}) — non-system types are routed to consumer callbacks upstream", log.LogType, log.LogData is null);
+            Logger.LogDebugSystemLogRestoredSkip(log.LogType, log.LogData is null);
 
             return Task.FromResult(true);
         }
@@ -418,7 +419,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         {
             // Post-shared-P0: non-system P0 entries are dispatched to consumer callbacks
             // upstream (CompleteFollowerAppend dispatch) and should never reach here.
-            Logger.LogDebug("SystemReplicationReceived: skipping entry on system partition (LogType={LogType}, DataNull={DataNull}) — non-system types are routed to consumer callbacks upstream", log.LogType, log.LogData is null);
+            Logger.LogDebugSystemReplicationReceivedSkip(log.LogType, log.LogData is null);
 
             return Task.FromResult(true);
         }
@@ -561,7 +562,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 await Task.Delay(500, cancellationToken).ConfigureAwait(false);
         }
 
-        Logger.LogInformation("JoinCluster: admitted as Learner at roster version {Version}", accepted.MembershipVersion);
+        Logger.LogInfoJoinClusterAdmittedAsLearner(accepted.MembershipVersion);
 
         // Wait for IsInitialized (system coordinator receives partition map from P0 leader).
         while (!IsInitialized)
@@ -774,9 +775,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
         walAdapter.Write([(request.PartitionId, [checkpointLog])]);
 
-        Logger.LogInformation(
-            "[{Endpoint}] ReceiveInstallSnapshot: partition={PartitionId} installed snapshot at index={Index}",
-            LocalEndpoint, request.PartitionId, request.SnapshotIndex);
+        Logger.LogInfoReceiveInstallSnapshot(LocalEndpoint, request.PartitionId, request.SnapshotIndex);
 
         return new SnapshotResponse(true);
     }
@@ -806,7 +805,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         if (Liveness.ApplyUpdates(LocalEndpoint, digest.LivenessUpdates))
         {
             long refutedInc = Liveness.RefuteSuspicion(LocalEndpoint);
-            Logger.LogInformation("ReceiveGossip: self was Suspect in gossip; refuting with incarnation {Inc}", refutedInc);
+            Logger.LogInfoReceiveGossipRefuting(refutedInc);
         }
 
         // Respond with our current roster so the sender can catch up if we are ahead.
@@ -861,7 +860,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             }
             catch (Exception ex)
             {
-                Logger.LogDebug("GossipAsync: failed to contact {Peer}: {Message}", peers[i].Endpoint, ex.Message);
+                Logger.LogDebugGossipAsyncFailed(peers[i].Endpoint, ex.Message);
             }
         }
     }
@@ -1231,7 +1230,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
                         if (hintResp.Terminal)
                         {
-                            Logger.LogInformation("LeaveCluster: leave permanently rejected by hint {Hint}; proceeding to stop.", resp.LeaderHint);
+                            Logger.LogInfoLeaveClusterRejectedByHint(resp.LeaderHint);
                             return;
                         }
                     }

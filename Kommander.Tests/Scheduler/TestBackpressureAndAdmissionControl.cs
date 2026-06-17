@@ -463,7 +463,7 @@ public sealed class TestBackpressureAndAdmissionControl
         public RaftOperationStatus TruncateLogsAfter(int partitionId, long afterLogId) => RaftOperationStatus.Success;
         public string? GetMetaData(string key) => null;
         public bool SetMetaData(string key, string value) => true;
-        public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries) => (RaftOperationStatus.Success, 0);
+        public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries, int? maxTotalEntries = null) => (RaftOperationStatus.Success, 0);
         public void Dispose() => _gate.Dispose();
     }
 

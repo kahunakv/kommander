@@ -12,6 +12,49 @@ namespace Kommander.Tests.WAL;
 public sealed class TestRaftWriteAheadCompaction
 {
     [Fact]
+    public async Task Compact_UsesSingleStorageCommitPerPass()
+    {
+        string path = CreateTempWalPath();
+
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance);
+            const int partitionId = 1;
+            const int compactNumberEntries = 2;
+            const int maxEntriesPerCompaction = 100;
+            const int removableCount = 9;
+
+            SeedRemovableLogs(wal, partitionId, removableCount, checkpointId: removableCount + 1);
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal,
+                compactNumberEntries,
+                maxEntriesPerCompaction,
+                compactEveryOperations: 0,
+                partitionId,
+                out RaftManager manager,
+                out RaftPartition partition);
+
+            try
+            {
+                writeAhead.Compact();
+                await writeAhead.WaitForCompactionIdleAsync().ConfigureAwait(true);
+
+                Assert.Equal(1, wal.LastCompactionCommitCount);
+            }
+            finally
+            {
+                partition.Dispose();
+                manager.Dispose();
+            }
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    [Fact]
     public async Task Compact_DrainsMultipleBatchesWhenRemovableExceedsBatchSize()
     {
         string path = CreateTempWalPath();

@@ -2,6 +2,7 @@
 using System.Text;
 using Google.Protobuf;
 using Kommander.Data;
+using Kommander.Logging;
 using Kommander.WAL.Protos;
 using Microsoft.IO;
 using RocksDbSharp;
@@ -102,6 +103,9 @@ public class RocksDbWAL : IWAL, IDisposable
     private readonly bool syncWrites;
 
     internal bool SyncWritesEnabled => syncWrites;
+
+    /// <summary>For tests: number of <c>db.Write</c> calls issued by the last compaction call.</summary>
+    internal int LastCompactionWriteCount { get; private set; }
     
     public RocksDbWAL(string path, string revision, ILogger<IRaft> logger, bool syncWrites = true)
     {
@@ -758,25 +762,36 @@ public class RocksDbWAL : IWAL, IDisposable
     /// The log index up to which logs will be considered for compaction. Logs with an ID less than this checkpoint will be removed.
     /// </param>
     /// <param name="compactNumberEntries">
-    /// The maximum number of entries to process during the compaction operation.
+    /// The maximum number of entries removed per internal iterator batch when building the write batch.
+    /// </param>
+    /// <param name="maxTotalEntries">
+    /// When set, multiple internal batches are accumulated into one <c>db.Write</c> so a compaction
+    /// pass costs a single fsync.
     /// </param>
     /// <returns>
     /// A tuple of <see cref="RaftOperationStatus"/> and the number of entries removed.
     /// </returns>
-    public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
+    public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(
+        int partitionId,
+        long lastCheckpoint,
+        int compactNumberEntries,
+        int? maxTotalEntries = null)
     {
+        int passCap = maxTotalEntries ?? compactNumberEntries;
+
         try
         {
             ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
-            List<byte[]> logsToRemove = new(compactNumberEntries);
+            using WriteBatch writeBatch = new();
+            int removed = 0;
 
             using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
             Span<byte> seekKey = stackalloc byte[LogKeyWidth];
             BuildLogKey(seekKey, partitionId, 0);
             iterator.Seek(seekKey);
 
-            while (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId))
+            while (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId) && removed < passCap)
             {
                 RaftLogMessage message = Unserializer(iterator.Value());
 
@@ -788,10 +803,8 @@ public class RocksDbWAL : IWAL, IDisposable
 
                 if (message.Id < lastCheckpoint)
                 {
-                    logsToRemove.Add(iterator.Key());
-
-                    if (logsToRemove.Count >= compactNumberEntries)
-                        break;
+                    writeBatch.Delete(iterator.Key(), cf: columnFamilyHandle);
+                    removed++;
                 }
                 else
                 {
@@ -801,26 +814,23 @@ public class RocksDbWAL : IWAL, IDisposable
                 iterator.Next();
             }
 
-            int removed = logsToRemove.Count;
-
             if (removed > 0)
             {
-                using WriteBatch writeBatch = new();
-
-                foreach (byte[] log in logsToRemove)
-                    writeBatch.Delete(log, cf: columnFamilyHandle);
-
                 db.Write(writeBatch, writeOptions);
-                
-                logger.LogDebug("Removed {Count} from WAL for partition {PartitionId}", removed, partitionId);
+                LastCompactionWriteCount = 1;
+                logger.LogDebugRemovedFromWal(removed, partitionId);
             }
-            
+            else
+            {
+                LastCompactionWriteCount = 0;
+            }
+
             return (RaftOperationStatus.Success, removed);
-        } 
+        }
         catch (Exception ex)
         {
             logger.LogError("Error during compact: {Message}", ex.Message);
-                
+
             return (RaftOperationStatus.Errored, 0);
         }
     }

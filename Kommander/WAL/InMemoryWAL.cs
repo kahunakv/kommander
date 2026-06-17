@@ -226,8 +226,14 @@ public class InMemoryWAL : IWAL, IDisposable
         }
     }
 
-    public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries)
+    public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(
+        int partitionId,
+        long lastCheckpoint,
+        int compactNumberEntries,
+        int? maxTotalEntries = null)
     {
+        int passCap = maxTotalEntries ?? compactNumberEntries;
+
         rwLock.EnterWriteLock();
         try
         {
@@ -243,7 +249,7 @@ public class InMemoryWAL : IWAL, IDisposable
 
                 toRemove.Add(id);
 
-                if (toRemove.Count >= compactNumberEntries)
+                if (toRemove.Count >= passCap)
                     break;
             }
 

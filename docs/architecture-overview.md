@@ -271,7 +271,7 @@ Two details that matter:
 - **The "log up to date" check** is a safety rule: a node will not vote for a candidate whose log is
   behind its own. This guarantees a new leader already has every committed entry — the protocol never
   has to "un-commit" anything. Kommander also uses a **PreVote** step to stop a flapping node from
-  disrupting a healthy leader (see `specs/prevote-disruptive-rejoin-spec.md`).
+  disrupting a healthy leader.
 
 ### Flow 3 — Writing data (the propose → replicate → commit path)
 
@@ -364,7 +364,7 @@ The key design choices, so you do not get surprised when reading the code:
   cannot help (the data is gone). The leader signals `SnapshotRequired`, and catch-up switches to
   installing a snapshot instead (Flow 6).
 
-If you want the full rationale, the design notes live in `specs/log-catchup-backfill-spec.md`.
+For a full walkthrough, see the [Log Catch-Up & Backfill Developer Guide](log-backfill-developer-guide.md).
 
 ### Flow 5 — Restarting and replaying the log
 
@@ -440,7 +440,7 @@ new backend, that contract is your spec.
 | in-memory | fast deterministic tests, no sockets |
 
 Node-to-node traffic can be authenticated with a shared-secret HMAC and optional server certificate
-pinning (see `RaftTransportAuthenticator` and `specs/node-transport-authentication-spec.md`).
+pinning (see `RaftTransportAuthenticator`).
 
 **Discovery — `IDiscovery`**
 
@@ -548,7 +548,6 @@ Kommander/
 Kommander.Server/   ASP.NET Core host exposing Kommander as a gRPC/REST service
 Kommander.Tests/    NUnit suite: clusters, WAL conformance, scheduler, safety
 docs/               this guide + feature deep-dives
-specs/              internal design docs and ADRs (specs/adr/)
 ```
 
 Reading order if you are new: `IRaft.cs` (what it does) → this guide's flows →
@@ -635,5 +634,4 @@ invariant you touched. (See `CLAUDE.md` for the full contributor checklist.)
 
 *This document is an overview. For the membership lifecycle see the
 [Dynamic Membership Developer Guide](dynamic-membership-developer-guide.md); for runtime partition
-changes see the [Elastic Partitions Developer Guide](elastic-partitions-developer-guide.md); for design
-rationale see `specs/`.*
+changes see the [Elastic Partitions Developer Guide](elastic-partitions-developer-guide.md).*

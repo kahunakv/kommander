@@ -5,9 +5,6 @@ This guide explains how Kommander keeps a **lagging follower** in sync with its 
 works, and someone who wants to *extend or debug* it. No prior Raft expertise is assumed; we build the
 idea up first, then walk the real flows and the code.
 
-For the design rationale and history, see `specs/log-catchup-backfill-spec.md`. This guide is the
-user-facing companion to that spec.
-
 ---
 
 ## Table of contents
@@ -416,6 +413,5 @@ dotnet test Kommander.Tests/Kommander.Tests.csproj --filter FullyQualifiedName~B
 
 ---
 
-*Design rationale and the as-built history live in `specs/log-catchup-backfill-spec.md`. For the
-broader system, see the [Architecture Overview](architecture-overview.md); for how a brand-new node
-joins and catches up, see the [Dynamic Membership Developer Guide](dynamic-membership-developer-guide.md).*
+*For the broader system, see the [Architecture Overview](architecture-overview.md); for how a brand-new
+node joins and catches up, see the [Dynamic Membership Developer Guide](dynamic-membership-developer-guide.md).*

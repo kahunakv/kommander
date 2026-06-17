@@ -91,6 +91,55 @@ public sealed class TestSqliteWAL
     }
 
     [Fact]
+    public void CompactLogsOlderThanPass_RemovesUpToCapInSingleTransaction()
+    {
+        string path = CreateTempWalPath();
+
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance);
+
+            Assert.Equal(
+                RaftOperationStatus.Success,
+                wal.Write(
+                    new List<(int, List<RaftLog>)>
+                    {
+                        (
+                            7,
+                            [
+                                CreateLog(id: 1),
+                                CreateLog(id: 2),
+                                CreateLog(id: 3),
+                                CreateLog(id: 4),
+                                CreateLog(id: 5),
+                                CreateLog(id: 6),
+                                CreateLog(id: 7),
+                                CreateLog(id: 8),
+                                CreateLog(id: 9)
+                            ]
+                        )
+                    }
+                )
+            );
+
+            (RaftOperationStatus status, int removed) = wal.CompactLogsOlderThan(
+                7,
+                lastCheckpoint: 10,
+                compactNumberEntries: 2,
+                maxTotalEntries: 9);
+
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Assert.Equal(9, removed);
+            Assert.Equal(1, wal.LastCompactionCommitCount);
+            Assert.Empty(wal.ReadLogs(7));
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    [Fact]
     public void CompactLogsOlderThanDeletesOnlyBoundedOlderLogs()
     {
         string path = CreateTempWalPath();
