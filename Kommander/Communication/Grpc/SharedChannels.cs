@@ -1,6 +1,8 @@
 
 using Grpc.Net.Client;
+using Grpc.Net.Compression;
 using System.Diagnostics;
+using System.IO.Compression;
 using System.Net.Security;
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
@@ -33,7 +35,8 @@ public sealed class GrpcInterSharedStreaming
 internal readonly record struct GrpcChannelPoolOptions(
     int ChannelsPerNode,
     bool EnableMultipleHttp2Connections,
-    RaftTransportSecurityOptions? SecurityOptions);
+    RaftTransportSecurityOptions? SecurityOptions,
+    bool EnableSnapshotCompression = false);
 
 /// <summary>
 /// Provides utilities for managing and retrieving shared gRPC channels and streamings.
@@ -234,7 +237,7 @@ public static class SharedChannels
         // GetOrAdd for this URL, so we must bind to its actual count, not opts.ChannelsPerNode.
         List<GrpcInterSharedStreaming> streamingList = new(urlChannels.Count);
 
-        CallOptions callOptions = metadata is { Count: > 0 } ? new CallOptions(metadata) : default;
+        CallOptions callOptions = BuildStreamingCallOptions(metadata, opts.EnableSnapshotCompression);
 
         for (int i = 0; i < urlChannels.Count; i++)
         {
@@ -322,11 +325,33 @@ public static class SharedChannels
                 EnableMultipleHttp2Connections = opts.EnableMultipleHttp2Connections
             };
 
-            urlChannels.Add(GrpcChannel.ForAddress(url, new() {
+            GrpcChannelOptions channelOptions = new()
+            {
                 HttpHandler = handler
-            }));
+            };
+
+            if (opts.EnableSnapshotCompression)
+            {
+                channelOptions.CompressionProviders =
+                [
+                    new GzipCompressionProvider(CompressionLevel.Fastest)
+                ];
+            }
+
+            urlChannels.Add(GrpcChannel.ForAddress(url, channelOptions));
         }
 
         return urlChannels;
-    }             
+    }
+
+    private static CallOptions BuildStreamingCallOptions(Metadata? metadata, bool snapshotCompressionEnabled)
+    {
+        if (!snapshotCompressionEnabled)
+            return metadata is { Count: > 0 } ? new CallOptions(metadata) : default;
+
+        WriteOptions writeOptions = new(WriteFlags.NoCompress);
+        return metadata is { Count: > 0 }
+            ? new CallOptions(metadata, writeOptions: writeOptions)
+            : new CallOptions(writeOptions: writeOptions);
+    }
 }

@@ -245,6 +245,15 @@ public class RaftConfiguration
     /// </summary>
     public bool GrpcEnableMultipleHttp2Connections { get; set; }
 
+    /// <summary>
+    /// When <see langword="true"/>, gRPC channels register gzip compression providers and
+    /// <see cref="Communication.Grpc.GrpcCommunication.SendInstallSnapshot"/> requests gzip
+    /// encoding on the unary snapshot RPC via the
+    /// <c>grpc-internal-encoding-request</c> metadata header. The hot replication stream
+    /// explicitly opts out of compression. Default <see langword="false"/>.
+    /// </summary>
+    public bool GrpcEnableSnapshotCompression { get; set; }
+
     private const int GrpcChannelsPerNodeMax = 64;
 
     // Warn at most once per process so repeated calls don't spam.

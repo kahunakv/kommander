@@ -1,4 +1,6 @@
 ﻿
+using System.Text.Json.Serialization;
+using Kommander.Communication.Grpc;
 using Kommander.Time;
 
 namespace Kommander.Data;
@@ -36,6 +38,13 @@ public sealed class AppendLogsRequest
     /// <see cref="RaftConfiguration.EnableQuiescence"/> is on.
     /// </summary>
     public bool Quiesce { get; set; }
+
+    /// <summary>
+    /// Shared gRPC log payload for one batch fanned out to multiple followers. Populated by the
+    /// leader before fan-out; ignored by REST and not serialized on the wire.
+    /// </summary>
+    [JsonIgnore]
+    public AppendLogsGrpcLogCache? GrpcLogCache { get; set; }
 
     public AppendLogsRequest(int partition, long term, HLCTimestamp time, string endpoint, List<RaftLog>? logs = null, long prevLogIndex = 0, long prevLogTerm = 0)
     {

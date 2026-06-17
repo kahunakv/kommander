@@ -99,7 +99,7 @@ public sealed class GrpcTestNode : IAsyncDisposable
 
         builder.Services.AddSingleton<IRaft>(manager);
         builder.Services.AddSingleton(logger);
-        builder.Services.AddGrpc();
+        builder.Services.AddKommanderGrpc();
 
         builder.WebHost.ConfigureKestrel(kestrel =>
         {
@@ -117,7 +117,12 @@ public sealed class GrpcTestNode : IAsyncDisposable
     /// <paramref name="allPeers"/> must contain ALL cluster nodes (including this one);
     /// the harness filters out the local port automatically so discovery only exposes peers.
     /// </summary>
-    public static GrpcTestNode Create(int port, IReadOnlyList<RaftNode> allPeers, ILoggerFactory loggerFactory, int partitions = 1)
+    public static GrpcTestNode Create(
+        int port,
+        IReadOnlyList<RaftNode> allPeers,
+        ILoggerFactory loggerFactory,
+        int partitions = 1,
+        Action<RaftConfiguration>? configure = null)
     {
         RaftConfiguration config = new()
         {
@@ -134,6 +139,8 @@ public sealed class GrpcTestNode : IAsyncDisposable
             TimerInitialDelay = TimeSpan.FromMilliseconds(500),
             PingInterval = TimeSpan.Zero   // disable SWIM in short-lived harness tests
         };
+
+        configure?.Invoke(config);
 
         ILogger<IRaft> logger = loggerFactory.CreateLogger<IRaft>();
 
@@ -154,7 +161,7 @@ public sealed class GrpcTestNode : IAsyncDisposable
 
         builder.Services.AddSingleton<IRaft>(manager);
         builder.Services.AddSingleton(logger);
-        builder.Services.AddGrpc();
+        builder.Services.AddKommanderGrpc();
 
         builder.WebHost.ConfigureKestrel(kestrel =>
         {

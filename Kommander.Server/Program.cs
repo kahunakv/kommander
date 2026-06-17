@@ -99,7 +99,7 @@ try
     });
 
     builder.Services.AddHostedService<ReplicationService>();
-    builder.Services.AddGrpc();
+    builder.Services.AddKommanderGrpc();
     builder.Services.AddGrpcReflection();
     
     builder.WebHost.ConfigureKestrel(options =>

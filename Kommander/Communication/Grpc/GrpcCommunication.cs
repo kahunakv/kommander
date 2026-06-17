@@ -14,6 +14,12 @@ namespace Kommander.Communication.Grpc;
 /// </summary>
 public class GrpcCommunication : ICommunication
 {
+    internal const string GrpcRequestEncodingHeader = "grpc-internal-encoding-request";
+
+    internal const string GzipRequestEncoding = "gzip";
+
+    private readonly GossipRosterJsonCache gossipRosterJsonCache = new();
+
     private static readonly RequestVotesResponse requestVotesResponse = new();
     
     private static readonly VoteResponse voteResponse = new();
@@ -182,8 +188,8 @@ public class GrpcCommunication : ICommunication
             appendLogsRequest.PrevLogTerm = request.PrevLogTerm;
             appendLogsRequest.Quiesce = request.Quiesce;
 
-            if (request.Logs is not null)
-                appendLogsRequest.Logs.AddRange(GetLogs(request.Logs ?? []));
+            if (request.Logs is { Count: > 0 })
+                AddGrpcLogs(appendLogsRequest.Logs, request);
 
             GrpcBatchRequestsRequestItem requestItem = new()
             {
@@ -394,8 +400,8 @@ public class GrpcCommunication : ICommunication
                     Quiesce = requestItem.AppendLogs.Quiesce
                 };
 
-                if (requestItem.AppendLogs.Logs is not null)
-                    appendRequest.Logs.AddRange(GetLogs(requestItem.AppendLogs.Logs));
+                if (requestItem.AppendLogs.Logs is { Count: > 0 })
+                    AddGrpcLogs(appendRequest.Logs, requestItem.AppendLogs);
                 
                 item.AppendLogs = appendRequest;
                 continue;
@@ -483,7 +489,7 @@ public class GrpcCommunication : ICommunication
             SenderEndpoint = digest.SenderEndpoint,
             MembershipVersion = digest.MembershipVersion,
             RosterJson = digest.Roster is not null
-                ? ByteString.CopyFromUtf8(global::System.Text.Json.JsonSerializer.Serialize(digest.Roster))
+                ? gossipRosterJsonCache.GetUtf8(digest.MembershipVersion, digest.Roster)
                 : ByteString.Empty
         };
 
@@ -603,14 +609,20 @@ public class GrpcCommunication : ICommunication
             FollowerEndpoint = request.FollowerEndpoint,
             ChunkIndex = request.ChunkIndex,
             IsLast = request.IsLast,
-            Data = Google.Protobuf.ByteString.CopyFrom(request.Data),
+            Data = request.Data.Length == 0
+                ? ByteString.Empty
+                : UnsafeByteOperations.UnsafeWrap(request.Data),
         };
 
         Metadata metadata = BuildAuthMetadata(manager, "/Rafter/InstallSnapshot");
+        CallOptions callOptions = BuildInstallSnapshotCallOptions(
+            manager.Configuration,
+            metadata,
+            cancellationToken);
         try
         {
             GrpcInstallSnapshotResponse response = await client
-                .InstallSnapshotAsync(grpcRequest, new CallOptions(metadata, cancellationToken: cancellationToken))
+                .InstallSnapshotAsync(grpcRequest, callOptions)
                 .ResponseAsync
                 .ConfigureAwait(false);
 
@@ -670,13 +682,30 @@ public class GrpcCommunication : ICommunication
         ];
     }
 
+    /// <summary>
+    /// Builds <see cref="CallOptions"/> for <c>InstallSnapshot</c>. When
+    /// <see cref="RaftConfiguration.GrpcEnableSnapshotCompression"/> is set, requests gzip
+    /// encoding on the unary request so the registered channel compression provider is used.
+    /// </summary>
+    internal static CallOptions BuildInstallSnapshotCallOptions(
+        RaftConfiguration configuration,
+        Metadata metadata,
+        CancellationToken cancellationToken)
+    {
+        if (configuration.GrpcEnableSnapshotCompression)
+            metadata.Add(GrpcRequestEncodingHeader, GzipRequestEncoding);
+
+        return new CallOptions(metadata, cancellationToken: cancellationToken);
+    }
+
     private static RaftTransportSecurityOptions GetSecurityOptions(RaftManager manager) =>
         manager.Configuration.GetEffectiveTransportSecurity();
 
     private static GrpcChannelPoolOptions GetPoolOptions(RaftManager manager) =>
         new(manager.Configuration.GetEffectiveGrpcChannelsPerNode(),
             manager.Configuration.GrpcEnableMultipleHttp2Connections,
-            GetSecurityOptions(manager));
+            GetSecurityOptions(manager),
+            manager.Configuration.GrpcEnableSnapshotCompression);
 
     /// <summary>
     /// Builds the full URL for <paramref name="node"/> by prepending the configured
@@ -685,6 +714,14 @@ public class GrpcCommunication : ICommunication
     /// </summary>
     private static string GetEndpointUrl(RaftManager manager, RaftNode node) =>
         manager.Configuration.GrpcScheme + node.Endpoint;
+
+    private static void AddGrpcLogs(RepeatedField<GrpcRaftLog> target, AppendLogsRequest request)
+    {
+        if (request.GrpcLogCache is not null)
+            target.AddRange(request.GrpcLogCache.GetOrCreate(request.Logs!));
+        else
+            target.AddRange(GetLogs(request.Logs!));
+    }
 
     private static IEnumerable<GrpcRaftLog> GetLogs(List<RaftLog> requestLogs)
     {

@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using Kommander.Communication.Grpc;
 using Kommander.Data;
 using Kommander.Diagnostics;
 using Kommander.Gossip;
@@ -1830,7 +1831,14 @@ public sealed class RaftPartitionStateMachine
     /// <param name="logs"></param>
     /// <param name="prevLogIndex">Id of the entry immediately before the first entry in <paramref name="logs"/>; 0 skips the check.</param>
     /// <param name="prevLogTerm">Term of the entry at <paramref name="prevLogIndex"/>; 0 when index is 0.</param>
-    private void AppendLogToNode(RaftNode node, HLCTimestamp timestamp, List<RaftLog>? logs, long prevLogIndex = 0, long prevLogTerm = 0, bool quiesce = false)
+    private void AppendLogToNode(
+        RaftNode node,
+        HLCTimestamp timestamp,
+        List<RaftLog>? logs,
+        long prevLogIndex = 0,
+        long prevLogTerm = 0,
+        bool quiesce = false,
+        AppendLogsGrpcLogCache? grpcLogCache = null)
     {
         AppendLogsRequest request;
 
@@ -1838,7 +1846,11 @@ public sealed class RaftPartitionStateMachine
             request = new(host.PartitionId, currentTerm, timestamp, host.LocalEndpoint) { Quiesce = quiesce };
         else
         {
-            request = new(host.PartitionId, currentTerm, timestamp, host.LocalEndpoint, logs, prevLogIndex, prevLogTerm) { Quiesce = quiesce };
+            request = new(host.PartitionId, currentTerm, timestamp, host.LocalEndpoint, logs, prevLogIndex, prevLogTerm)
+            {
+                Quiesce = quiesce,
+                GrpcLogCache = grpcLogCache,
+            };
 
             if (logger.IsEnabled(LogLevel.Debug))
                 logger.LogDebug(
@@ -2160,6 +2172,8 @@ public sealed class RaftPartitionStateMachine
         proposalQuorum.AddExpectedNodeCompletion(host.LocalEndpoint);
         proposalQuorum.MarkNodeCompleted(host.LocalEndpoint);
 
+        AppendLogsGrpcLogCache? grpcLogCache = logs.Count > 0 ? new() : null;
+
         foreach (RaftNode node in host.Nodes)
         {
             if (node.Endpoint == host.LocalEndpoint)
@@ -2169,7 +2183,7 @@ public sealed class RaftPartitionStateMachine
             // Only add voters to the quorum set; AppendLogToNode is called for all nodes.
             if (host.IsVoter(node.Endpoint))
                 proposalQuorum.AddExpectedNodeCompletion(node.Endpoint);
-            AppendLogToNode(node, ticketId, logs);
+            AppendLogToNode(node, ticketId, logs, grpcLogCache: grpcLogCache);
         }
 
         if (!activeProposals.TryAdd(ticketId, proposalQuorum))
@@ -2232,11 +2246,13 @@ public sealed class RaftPartitionStateMachine
         if (completion.MaxLogIndex > localCommittedIndex)
             localCommittedIndex = completion.MaxLogIndex;
 
+        AppendLogsGrpcLogCache? grpcLogCache = proposal.Logs.Count > 0 ? new() : null;
+
         // Send committed entries to ALL peers (voters + learners). proposal.Nodes only tracks
         // quorum voters; learners were excluded from quorum but still need log delivery so their
         // WAL stays in sync. host.Nodes already excludes self, so no self-skip is needed here.
         foreach (RaftNode node in host.Nodes)
-            AppendLogToNode(node, ticketId, proposal.Logs);
+            AppendLogToNode(node, ticketId, proposal.Logs, grpcLogCache: grpcLogCache);
 
         if (logger.IsEnabled(LogLevel.Debug))
             logger.LogDebugCommittedLogs(
@@ -2273,9 +2289,11 @@ public sealed class RaftPartitionStateMachine
 
         proposal.SetState(RaftProposalState.RolledBack);
 
+        AppendLogsGrpcLogCache? grpcLogCache = proposal.Logs.Count > 0 ? new() : null;
+
         // Same as CompleteLeaderCommit: deliver rollback to all peers, not just quorum voters.
         foreach (RaftNode node in host.Nodes)
-            AppendLogToNode(node, ticketId, proposal.Logs);
+            AppendLogToNode(node, ticketId, proposal.Logs, grpcLogCache: grpcLogCache);
 
         if (logger.IsEnabled(LogLevel.Debug))
             logger.LogDebugRolledbackLogs(
