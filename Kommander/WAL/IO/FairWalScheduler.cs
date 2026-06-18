@@ -7,15 +7,22 @@ using Microsoft.Extensions.Logging;
 namespace Kommander.WAL.IO;
 
 /// <summary>
-/// Fair, partition-aware WAL write scheduler.
+/// Fair, partition-aware WAL write scheduler with cross-partition group commit.
 ///
-/// <para>Design goals (per the raft-refactor-plan):</para>
+/// <para>Design goals:</para>
 /// <list type="bullet">
 ///   <item>FIFO write order within each partition — no operation is ever applied out
 ///       of submission order for the same partition.</item>
 ///   <item>Fair scheduling across partitions — a hot partition cannot starve others.
 ///       Each partition occupies at most one slot in the global ready-queue at a
 ///       time; partitions alternate in round-robin fashion as they produce work.</item>
+///   <item><b>Cross-partition group commit:</b> when multiple partitions are ready
+///       simultaneously, a single worker drains up to
+///       <see cref="DefaultMaxGroupBatchPartitions"/> of them and issues ONE
+///       <c>walAdapter.Write</c> call spanning all of them.  For RocksDB (which
+///       shares a single WAL across all column families) this means one fsync
+///       regardless of how many partitions are included — the dominant cost saving
+///       in many-partition deployments.</item>
 ///   <item>Compatible writes are batched within each drain cycle to amortize
 ///       <c>walAdapter.Write</c> overhead.</item>
 ///   <item>Bounded per-partition queues with back-pressure: callers receive a
@@ -26,9 +33,12 @@ namespace Kommander.WAL.IO;
 ///       worker threads exit.</item>
 /// </list>
 ///
-/// <para><b>Concurrency model:</b> up to <c>workerCount</c> partitions can have
-/// their write batches processed simultaneously.  Within a single partition only
-/// one batch is ever in-flight at a time.</para>
+/// <para><b>Concurrency model:</b> up to <c>workerCount</c> workers can hold
+/// write batches simultaneously.  The single-writer-per-partition invariant is
+/// maintained by the <c>InFlight</c> flag: a partition included in one worker's
+/// group batch cannot simultaneously appear in another worker's batch because its
+/// ID is consumed from <c>_readyPartitions</c> (a drain-once queue) before
+/// <c>InFlight</c> is set.</para>
 /// </summary>
 public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 {
@@ -40,6 +50,13 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// <summary>Default per-partition pending-queue depth limit.</summary>
     public const int DefaultMaxQueueDepth = 4096;
 
+    /// <summary>
+    /// Default maximum number of partitions coalesced into a single WAL write call.
+    /// When multiple partitions are ready simultaneously a worker drains up to this
+    /// many of them and issues one <c>walAdapter.Write</c> (one fsync for RocksDB).
+    /// </summary>
+    public const int DefaultMaxGroupBatchPartitions = 64;
+
     // ── Configuration ──────────────────────────────────────────────────────
 
     private readonly IWAL walAdapter;
@@ -47,10 +64,11 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     private readonly int maxQueueDepthPerPartition;
     private readonly int maxGlobalQueueDepth;
     private readonly int maxBatchSize;
+    private readonly int maxGroupBatchPartitions;
 
     // Total pending-or-in-flight operations across all partitions.
     // Checked against maxGlobalQueueDepth (when > 0) in Enqueue;
-    // decremented in ProcessPartition after each batch write completes.
+    // decremented in ProcessGroupBatch after each batch write completes.
     private int _globalQueueDepth;
 
     // ── Per-partition state ────────────────────────────────────────────────
@@ -70,7 +88,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         public bool Scheduled;
 
         /// <summary>
-        /// True while a worker thread is executing a WAL write for this partition.
+        /// True while a worker thread is executing a WAL write that includes this partition.
         /// A concurrent <see cref="Enqueue"/> that sees <c>InFlight=true</c> must NOT
         /// add the partition to <c>_readyPartitions</c>; the post-I/O lock section
         /// will re-schedule once the write finishes.
@@ -102,7 +120,11 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     private long _totalBatchesWritten;
     private long _totalOperationsCompleted;
 
-    /// <summary>Total number of WAL write batches dispatched to the storage adapter.</summary>
+    /// <summary>
+    /// Total number of <c>walAdapter.Write</c> calls dispatched to the storage adapter.
+    /// Each group-commit batch counts as one call regardless of how many partitions it spans,
+    /// so this is the count most directly correlated with fsync pressure on RocksDB.
+    /// </summary>
     public long TotalBatchesWritten => Interlocked.Read(ref _totalBatchesWritten);
 
     /// <summary>Total number of individual operations completed.</summary>
@@ -128,19 +150,26 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// Global cap on total pending-or-in-flight operations across all partitions.
     /// 0 or negative disables the global cap (only per-partition limits apply).
     /// </param>
+    /// <param name="maxGroupBatchPartitions">
+    /// Maximum number of partitions coalesced into a single <c>walAdapter.Write</c>
+    /// call (one fsync for RocksDB).  Defaults to
+    /// <see cref="DefaultMaxGroupBatchPartitions"/>.
+    /// </param>
     public FairWalScheduler(
         IWAL walAdapter,
         ILogger<IRaft> logger,
         int workerCount = 0,
         int maxQueueDepthPerPartition = DefaultMaxQueueDepth,
         int maxBatchSize = DefaultMaxBatchSize,
-        int maxGlobalQueueDepth = 0)
+        int maxGlobalQueueDepth = 0,
+        int maxGroupBatchPartitions = DefaultMaxGroupBatchPartitions)
     {
         this.walAdapter = walAdapter;
         this.logger = logger;
         this.maxQueueDepthPerPartition = maxQueueDepthPerPartition;
         this.maxGlobalQueueDepth = maxGlobalQueueDepth > 0 ? maxGlobalQueueDepth : 0;
         this.maxBatchSize = maxBatchSize <= 0 ? DefaultMaxBatchSize : maxBatchSize;
+        this.maxGroupBatchPartitions = maxGroupBatchPartitions <= 0 ? DefaultMaxGroupBatchPartitions : maxGroupBatchPartitions;
 
         if (workerCount <= 0)
             workerCount = Math.Max(1, Environment.ProcessorCount);
@@ -268,12 +297,14 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
     private void WorkerLoop(int workerId)
     {
-        List<WALWriteOperation> batch = new(maxBatchSize);
+        // Per-worker reusable scratch space — cleared at the start of each iteration.
+        List<int> partitionGroup = new(maxGroupBatchPartitions);
+        List<(int PartitionId, List<WALWriteOperation> Ops)> groupBatches = new(maxGroupBatchPartitions);
         CancellationToken token = _cts.Token;
 
         while (true)
         {
-            // Try to take the next ready partition.
+            // Block until at least one partition is ready.
             int partitionId;
             try
             {
@@ -282,7 +313,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             catch (OperationCanceledException)
             {
                 // Drain remaining items before exiting.
-                DrainRemaining(batch);
+                DrainRemaining(partitionGroup, groupBatches);
                 break;
             }
             catch (ObjectDisposedException)
@@ -291,86 +322,88 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                 break;
             }
 
-            ProcessPartition(partitionId, batch);
+            // Gather additional ready partitions without blocking — this is the
+            // group-commit coalescing step.  Up to maxGroupBatchPartitions−1 extra
+            // partitions join this worker's batch, all sharing the same Write call.
+            partitionGroup.Clear();
+            partitionGroup.Add(partitionId);
+            while (partitionGroup.Count < maxGroupBatchPartitions && _readyPartitions.TryTake(out int extraId))
+                partitionGroup.Add(extraId);
+
+            ProcessGroupBatch(partitionGroup, groupBatches);
         }
     }
 
-    private void ProcessPartition(int partitionId, List<WALWriteOperation> batch)
+    /// <summary>
+    /// Core group-commit routine.
+    ///
+    /// <para>Phase 1 — lock each partition, drain up to <see cref="maxBatchSize"/>
+    /// ops, and mark <c>InFlight=true</c>.  The partition's slot in
+    /// <c>_readyPartitions</c> has already been consumed (the caller dequeued it),
+    /// so no other worker can race to the same partition.</para>
+    ///
+    /// <para>Phase 2 — issue a single <c>walAdapter.Write</c> spanning all drained
+    /// partitions.  For RocksDB this is one <c>db.Write</c> / one fsync regardless
+    /// of partition count.</para>
+    ///
+    /// <para>Phase 3 — per-partition post-write: run <c>FollowerAppend</c>
+    /// truncation, fire <c>OnComplete</c> callbacks, decrement depth, clear
+    /// <c>InFlight</c>, and re-schedule if new ops arrived during the write.</para>
+    /// </summary>
+    private void ProcessGroupBatch(
+        List<int> partitionIds,
+        List<(int PartitionId, List<WALWriteOperation> Ops)> groupBatches)
     {
-        if (!_partitions.TryGetValue(partitionId, out PartitionState? state))
-            return;
+        groupBatches.Clear();
 
-        batch.Clear();
-
-        lock (state.Lock)
+        // ── Phase 1: drain ops per partition, mark InFlight ────────────────
+        foreach (int pid in partitionIds)
         {
-            // Drain up to maxBatchSize operations.
-            // Do NOT decrement Depth here: we decrement after ExecuteBatch completes
-            // so that Depth tracks queued-plus-in-flight operations.  Decrementing
-            // at dequeue time would let Depth fall to 0 before the WAL write returns,
-            // allowing a flood of new enqueues during a slow write and making the
-            // backpressure limit unreliable.
-            while (batch.Count < maxBatchSize && state.Ops.TryDequeue(out WALWriteOperation? op))
-                batch.Add(op);
+            if (!_partitions.TryGetValue(pid, out PartitionState? state))
+                continue;
 
-            // Clear the scheduled flag and raise the in-flight flag BEFORE
-            // releasing the lock and starting I/O.
-            // * Scheduled=false: the partition's ID has been removed from
-            //   _readyPartitions (we just dequeued it); clearing it allows the
-            //   post-I/O code to re-add if needed.
-            // * InFlight=true: signals Enqueue that a write is in progress for
-            //   this partition, so it must NOT add to _readyPartitions.  Without
-            //   this flag a concurrent Enqueue would see Scheduled=false, add the
-            //   partition, and a second worker could start on the same partition
-            //   while the first write is still in flight.
-            state.Scheduled = false;
-            state.InFlight  = true;
-        }
+            List<WALWriteOperation> pidBatch = new(maxBatchSize);
 
-        if (batch.Count == 0)
-        {
             lock (state.Lock)
-                state.InFlight = false;
-            return;
-        }
-
-        // Execute the WAL write outside the partition lock so other partitions
-        // are not blocked by this I/O.  Only one worker can be here for a given
-        // partition at a time because the partition is not in _readyPartitions
-        // while Scheduled=false.
-        ExecuteBatch(partitionId, batch);
-
-        // After the write completes, decrement Depth for exactly the items we
-        // just processed, clear InFlight, then re-schedule if new items arrived.
-        if (maxGlobalQueueDepth > 0)
-            Interlocked.Add(ref _globalQueueDepth, -batch.Count);
-
-        lock (state.Lock)
-        {
-            state.Depth   -= batch.Count;
-            state.InFlight = false;
-
-            if (state.Ops.Count > 0 && !state.Scheduled)
             {
-                // Only mark Scheduled=true when the partition ID is actually
-                // inserted into the ready-queue.  If the bounded queue is full,
-                // TryAdd returns false; leaving Scheduled=false lets the next
-                // Enqueue call re-schedule the partition rather than stranding it.
-                if (_readyPartitions.TryAdd(partitionId))
-                    state.Scheduled = true;
+                while (pidBatch.Count < maxBatchSize && state.Ops.TryDequeue(out WALWriteOperation? op))
+                    pidBatch.Add(op);
+
+                // Clear Scheduled (the id has been consumed from _readyPartitions)
+                // and raise InFlight so Enqueue cannot re-add this partition while
+                // the combined Write is in progress.
+                state.Scheduled = false;
+                state.InFlight  = true;
+            }
+
+            if (pidBatch.Count > 0)
+            {
+                groupBatches.Add((pid, pidBatch));
+            }
+            else
+            {
+                // Nothing to write; clear InFlight immediately.
+                lock (state.Lock)
+                    state.InFlight = false;
             }
         }
-    }
 
-    private void ExecuteBatch(int partitionId, List<WALWriteOperation> batch)
-    {
+        if (groupBatches.Count == 0)
+            return;
+
+        // ── Phase 2: single cross-partition WAL write ──────────────────────
         RaftOperationStatus status;
 
         try
         {
-            List<(int, List<RaftLog>)> logGroups = new(batch.Count);
-            foreach (WALWriteOperation op in batch)
-                logGroups.Add(op.Logs);
+            // Build the combined log-groups list that spans all partitions in this batch.
+            int totalOps = 0;
+            foreach ((_, List<WALWriteOperation> ops) in groupBatches)
+                totalOps += ops.Count;
+            List<(int, List<RaftLog>)> logGroups = new(totalOps);
+            foreach ((_, List<WALWriteOperation> ops) in groupBatches)
+                foreach (WALWriteOperation op in ops)
+                    logGroups.Add(op.Logs);
 
             status = walAdapter.Write(logGroups);
             Interlocked.Increment(ref _totalBatchesWritten);
@@ -378,36 +411,63 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         catch (Exception ex)
         {
             logger.LogError(
-                "[FairWalScheduler] Partition {PartitionId} WAL write error: {Message}",
-                partitionId, ex.Message);
+                "[FairWalScheduler] Group WAL write error ({PartitionCount} partitions): {Message}",
+                groupBatches.Count, ex.Message);
             status = RaftOperationStatus.Errored;
         }
 
         KommanderMetrics.WalBatchesTotal.Add(1);
-        KommanderMetrics.WalBatchSize.Record(batch.Count);
 
-        if (status == RaftOperationStatus.Success)
+        // ── Phase 3: per-partition post-write cleanup ──────────────────────
+        foreach ((int pid, List<WALWriteOperation> pidBatch) in groupBatches)
         {
-            foreach (WALWriteOperation op in batch)
-            {
-                if (op.Type == WALWriteOperationType.FollowerAppend && op.LogIndex > 0)
-                    walAdapter.TruncateLogsAfter(partitionId, op.LogIndex);
-            }
-        }
+            KommanderMetrics.WalBatchSize.Record(pidBatch.Count);
 
-        foreach (WALWriteOperation op in batch)
-        {
-            try
+            if (status == RaftOperationStatus.Success)
             {
-                op.OnComplete(BuildCompletion(op, status));
-                Interlocked.Increment(ref _totalOperationsCompleted);
-                KommanderMetrics.WalOperationsTotal.Add(1);
+                foreach (WALWriteOperation op in pidBatch)
+                {
+                    if (op.Type == WALWriteOperationType.FollowerAppend && op.LogIndex > 0)
+                        walAdapter.TruncateLogsAfter(pid, op.LogIndex);
+                }
             }
-            catch (Exception ex)
+
+            foreach (WALWriteOperation op in pidBatch)
             {
-                logger.LogError(
-                    "[FairWalScheduler] OnComplete callback for partition {PartitionId} op {OperationId} threw: {Message}",
-                    partitionId, op.OperationId, ex.Message);
+                try
+                {
+                    op.OnComplete(BuildCompletion(op, status));
+                    Interlocked.Increment(ref _totalOperationsCompleted);
+                    KommanderMetrics.WalOperationsTotal.Add(1);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(
+                        "[FairWalScheduler] OnComplete callback for partition {PartitionId} op {OperationId} threw: {Message}",
+                        pid, op.OperationId, ex.Message);
+                }
+            }
+
+            if (maxGlobalQueueDepth > 0)
+                Interlocked.Add(ref _globalQueueDepth, -pidBatch.Count);
+
+            if (!_partitions.TryGetValue(pid, out PartitionState? state))
+                continue;
+
+            lock (state.Lock)
+            {
+                state.Depth   -= pidBatch.Count;
+                state.InFlight = false;
+
+                if (state.Ops.Count > 0 && !state.Scheduled)
+                {
+                    // Only mark Scheduled=true when the partition ID is actually
+                    // inserted into the ready-queue.  If the bounded queue is full,
+                    // TryAdd returns false; leaving Scheduled=false lets the next
+                    // Enqueue call re-schedule the partition rather than stranding it.
+                    if (_readyPartitions.TryAdd(pid))
+                        state.Scheduled = true;
+                }
             }
         }
     }
@@ -416,10 +476,17 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// After the CTS fires, drain any partitions that were already in
     /// the ready-queue but not yet processed.
     /// </summary>
-    private void DrainRemaining(List<WALWriteOperation> batch)
+    private void DrainRemaining(
+        List<int> partitionGroup,
+        List<(int PartitionId, List<WALWriteOperation> Ops)> groupBatches)
     {
-        while (_readyPartitions.TryTake(out int partitionId))
-            ProcessPartition(partitionId, batch);
+        // Drain everything still in the ready-queue as one group-commit batch.
+        partitionGroup.Clear();
+        while (_readyPartitions.TryTake(out int pid))
+            partitionGroup.Add(pid);
+
+        if (partitionGroup.Count > 0)
+            ProcessGroupBatch(partitionGroup, groupBatches);
 
         // Also sweep all partition states for any items that were enqueued
         // but whose partitionId was not yet in the ready-queue (should not
@@ -438,7 +505,11 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                 shouldProcess = state.Ops.Count > 0 && !state.InFlight;
 
             if (shouldProcess)
-                ProcessPartition(kv.Key, batch);
+            {
+                partitionGroup.Clear();
+                partitionGroup.Add(kv.Key);
+                ProcessGroupBatch(partitionGroup, groupBatches);
+            }
         }
     }
 

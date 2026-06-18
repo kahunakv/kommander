@@ -251,6 +251,57 @@ public sealed class TestFairWalScheduler
     }
 
     /// <summary>
+    /// When multiple partitions are ready simultaneously, the scheduler must issue a
+    /// single <c>walAdapter.Write</c> call containing ops from all of them — the
+    /// cross-partition group-commit path.
+    ///
+    /// <para>Coordination: the first Write call (partition 1) is held inside
+    /// <see cref="CoordinatedWal"/> until the test has enqueued ops for all remaining
+    /// partitions.  After releasing, the second Write call receives all remaining
+    /// partitions at once, proving they are coalesced into a single WAL call.</para>
+    /// </summary>
+    [Fact]
+    public async Task GroupCommit_MultiplePartitionsCoalescedIntoSingleWrite()
+    {
+        const int partitions = 4;
+
+        CoordinatedWal wal = new();
+        CountdownEvent done = new(partitions);
+
+        using FairWalScheduler scheduler = new(
+            wal,
+            NullLogger<IRaft>.Instance,
+            workerCount: 1,
+            maxGroupBatchPartitions: partitions);
+        scheduler.Start();
+
+        // Enqueue partition 1 — the worker picks it up and blocks inside Write.
+        scheduler.Enqueue(MakeOp(1, 1, Logs(1), _ => done.Signal()));
+
+        // Wait until the worker is mid-write so all subsequent enqueues arrive
+        // in _readyPartitions while the worker cannot process them.
+        wal.WaitForFirstWrite();
+
+        // Enqueue the remaining partitions — they accumulate in the ready-queue.
+        for (int p = 2; p <= partitions; p++)
+        {
+            int partition = p;
+            scheduler.Enqueue(MakeOp(partition, partition, Logs(partition), _ => done.Signal()));
+        }
+
+        // Unblock the first Write — worker finishes it and then sees all remaining
+        // partitions ready at once, coalescing them into one Write call.
+        wal.Release();
+
+        bool finished = await Task.Run(() => done.Wait(TimeSpan.FromSeconds(10)));
+        Assert.True(finished, "GroupCommit test timed out.");
+
+        // The second Write call should have included all remaining partitions.
+        Assert.True(wal.MaxPartitionsInSingleWrite >= partitions - 1,
+            $"Expected ≥{partitions - 1} partitions in one Write call; got max={wal.MaxPartitionsInSingleWrite}");
+    }
+
+    /// <summary>
     /// Completions from a WAL error must still be delivered to every operation
     /// in the batch (the scheduler must not silently skip callbacks on failure).
     /// </summary>
@@ -348,6 +399,55 @@ public sealed class TestFairWalScheduler
         public bool SetMetaData(string key, string value) => true;
         public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int p, long lc, int n, int? maxTotalEntries = null) => (RaftOperationStatus.Success, 0);
         public void Dispose() { _gate.Dispose(); }
+    }
+
+    /// <summary>
+    /// WAL that blocks the first Write call until <see cref="Release"/> is called,
+    /// allowing the test to enqueue more operations before the scheduler moves on.
+    /// Records the maximum number of distinct partitions seen in any single Write call.
+    /// </summary>
+    private sealed class CoordinatedWal : IWAL
+    {
+        private readonly ManualResetEventSlim _firstWriteStarted = new(false);
+        private readonly ManualResetEventSlim _releaseGate = new(false);
+        private int _writeCount;
+        private int _maxPartitionsInSingleWrite;
+
+        public int MaxPartitionsInSingleWrite => Volatile.Read(ref _maxPartitionsInSingleWrite);
+
+        public void WaitForFirstWrite() => _firstWriteStarted.Wait();
+        public void Release() => _releaseGate.Set();
+
+        public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs)
+        {
+            int callIndex = Interlocked.Increment(ref _writeCount);
+            if (callIndex == 1)
+            {
+                _firstWriteStarted.Set();
+                _releaseGate.Wait();
+            }
+
+            int partitionCount = logs.Select(l => l.Item1).Distinct().Count();
+            int prev = _maxPartitionsInSingleWrite;
+            while (partitionCount > prev)
+                prev = Interlocked.CompareExchange(ref _maxPartitionsInSingleWrite, partitionCount, prev);
+
+            return RaftOperationStatus.Success;
+        }
+
+        public List<RaftLog> ReadLogs(int partitionId) => [];
+        public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue) => [];
+        public long GetMaxLog(int partitionId) => 0;
+        public long GetCurrentTerm(int partitionId) => 0;
+        public long GetLastCheckpoint(int partitionId) => -1;
+        public int CountPersistedLogs(int partitionId) => 0;
+        public int CountRemovableLogs(int partitionId) => 0;
+        public RaftOperationStatus DeletePartitionWAL(int partitionId) => RaftOperationStatus.Success;
+        public RaftOperationStatus TruncateLogsAfter(int partitionId, long afterLogId) => RaftOperationStatus.Success;
+        public string? GetMetaData(string key) => null;
+        public bool SetMetaData(string key, string value) => true;
+        public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int p, long lc, int n, int? maxTotalEntries = null) => (RaftOperationStatus.Success, 0);
+        public void Dispose() { }
     }
 
     /// <summary>WAL that always throws to simulate a storage error.</summary>

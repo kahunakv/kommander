@@ -2,39 +2,88 @@
 namespace Kommander;
 
 /// <summary>
-/// Raft configuration
+/// Complete configuration for a Kommander Raft node.
+///
+/// <para>Pass an instance to <see cref="RaftManager"/> at construction time.
+/// All properties have production-safe defaults; the minimum required fields are
+/// <see cref="Host"/>, <see cref="Port"/>, and either <see cref="NodeId"/> or
+/// <see cref="NodeName"/> (from which an id is derived).</para>
+///
+/// <para>Properties are grouped by subsystem:</para>
+/// <list type="bullet">
+///   <item>Node identity — <see cref="NodeName"/>, <see cref="NodeId"/>, <see cref="Host"/>, <see cref="Port"/>.</item>
+///   <item>Transport — <see cref="GrpcScheme"/>, <see cref="HttpScheme"/>, <see cref="HttpTimeout"/>,
+///       <see cref="HttpVersion"/>, <see cref="TransportSecurity"/>.</item>
+///   <item>Raft timing — <see cref="HeartbeatInterval"/>, <see cref="StartElectionTimeout"/>,
+///       <see cref="EndElectionTimeout"/>, <see cref="VotingTimeout"/>, and related fields.</item>
+///   <item>WAL scheduler — <see cref="MaxWalQueueDepthPerPartition"/>, <see cref="MaxWalBatchSize"/>,
+///       <see cref="MaxWalGroupBatchPartitions"/>, etc.</item>
+///   <item>gRPC channel pool — <see cref="GrpcChannelsPerNode"/>, <see cref="GrpcEnableMultipleHttp2Connections"/>.</item>
+///   <item>Quiescence — <see cref="EnableQuiescence"/>, <see cref="QuiesceAfter"/>.</item>
+///   <item>SWIM failure detector — <see cref="PingInterval"/>, <see cref="PingTimeout"/>, <see cref="SuspicionTimeout"/>.</item>
+///   <item>Gossip — <see cref="GossipInterval"/>, <see cref="GossipFanout"/>.</item>
+///   <item>WAL compaction — <see cref="CompactEveryOperations"/>, <see cref="CompactNumberEntries"/>, <see cref="MaxEntriesPerCompaction"/>.</item>
+/// </list>
+///
+/// <para>Call <see cref="Validate"/> before starting the node to catch invariant
+/// violations (e.g., quiescence requires an active SWIM detector).</para>
 /// </summary>
 public class RaftConfiguration
 {
     private RaftTransportSecurityOptions transportSecurity = new();
 
+    // ── Node identity ─────────────────────────────────────────────────────────
+
     /// <summary>
-    /// Unique name for the node in the cluster.
+    /// Human-readable name for this node, used in log messages and as a seed for
+    /// <see cref="NodeId"/> when <see cref="NodeId"/> is not set.
+    /// If left <see langword="null"/> or empty, <see cref="Environment.MachineName"/>
+    /// is used.  Does not need to be globally unique; <see cref="NodeId"/> is the
+    /// authoritative identity.
     /// </summary>
     public string? NodeName { get; set; }
-    
+
     /// <summary>
-    /// Unique identifier for the node in the cluster.
+    /// Numeric identity for this node, unique within the cluster.
+    /// Used in vote requests, append-entries RPCs, and membership log entries.
+    /// When set to 0 or a negative value, the runtime derives the id automatically
+    /// as a stable hash of <see cref="NodeName"/> (or <see cref="Environment.MachineName"/>).
+    /// Set an explicit positive value when you need a deterministic id independent
+    /// of the machine name.
     /// </summary>
     public int NodeId { get; set; }
-    
+
     /// <summary>
-    /// Host to identify the node within the cluster
+    /// Hostname or IP address advertised to peer nodes for inbound gRPC and HTTP
+    /// connections.  Must be reachable by all other cluster members.
+    /// Example: <c>"node1.internal"</c> or <c>"10.0.0.1"</c>.
     /// </summary>
     public string? Host { get; set; }
-    
+
     /// <summary>
-    /// Port to bind for incoming connections
+    /// TCP port the node listens on for gRPC (and optionally REST) connections.
+    /// All peer nodes must be able to reach this port.
     /// </summary>
     public int Port { get; set; }
 
     /// <summary>
-    /// Number of initial partitions to create
+    /// Number of data partitions created during cluster bootstrap (first-ever
+    /// leader election on partition 0).  Partition 0 (the system partition) is
+    /// always present and is not counted here.  The value is written into the
+    /// committed partition map and ignored on subsequent restarts.
+    /// Default 1.
     /// </summary>
     public int InitialPartitions { get; set; } = 1;
 
+    // ── Transport ─────────────────────────────────────────────────────────────
+
     /// <summary>
-    /// Communication scheme when sending HTTP requests
+    /// URL scheme prepended to peer endpoints when the REST transport sends HTTP
+    /// requests (e.g. <c>"https://"</c> or <c>"http://"</c>).
+    /// This field is validated against <see cref="RaftTransportSecurityOptions.RequireTls"/>:
+    /// if TLS is required but the scheme is plain HTTP a startup error is thrown.
+    /// For gRPC connections, use <see cref="GrpcScheme"/> instead.
+    /// Default <c>"https://"</c>.
     /// </summary>
     public string? HttpScheme { get; set; } = "https://";
 
@@ -42,11 +91,14 @@ public class RaftConfiguration
     /// URL scheme prepended to peer endpoints when opening gRPC channels.
     /// Override to <c>"http://"</c> in test environments that use cleartext HTTP/2
     /// (requires <c>SocketsHttpHandler.Http2UnencryptedSupport</c> to be enabled).
+    /// Default <c>"https://"</c>.
     /// </summary>
     public string GrpcScheme { get; set; } = "https://";
 
     /// <summary>
     /// Transport security and node authentication settings for network transports.
+    /// Controls TLS requirements, shared-secret bearer tokens, certificate
+    /// thumbprint pinning, and allowed clock skew for HMAC-signed requests.
     /// </summary>
     public RaftTransportSecurityOptions TransportSecurity
     {
@@ -61,64 +113,115 @@ public class RaftConfiguration
     /// </summary>
     [Obsolete("Use TransportSecurity.SharedSecret or other TransportSecurity settings instead.")]
     public string? HttpAuthBearerToken { get; set; } = "";
-    
+
     /// <summary>
-    /// Timeout for HTTP requests in seconds
+    /// Timeout in seconds applied to outbound REST HTTP requests.
+    /// Tune in proportion to your network round-trip time; the default (5 s)
+    /// suits LAN clusters.  gRPC calls use stream-level deadlines set by the
+    /// caller rather than this global timeout.
+    /// Default 5.
     /// </summary>
     public int HttpTimeout { get; set; } = 5;
-    
+
     /// <summary>
-    /// HTTP version to use for requests
+    /// HTTP protocol version string sent on REST transport requests
+    /// (e.g. <c>"2.0"</c> for HTTP/2, <c>"1.1"</c> for HTTP/1.1).
+    /// Has no effect on gRPC channels, which always use HTTP/2.
+    /// Default <c>"2.0"</c>.
     /// </summary>
     public string? HttpVersion { get; set; } = "2.0";
-    
+
+    // ── Raft timing ───────────────────────────────────────────────────────────
+
     /// <summary>
-    /// Interval to send pings to other nodes from the leader
+    /// How often the leader sends Raft AppendEntries heartbeats to each follower
+    /// to maintain authority and reset their election timers.  Must be well below
+    /// <see cref="StartElectionTimeout"/> — a common guideline is
+    /// <c>HeartbeatInterval ≤ StartElectionTimeout / 5</c>.
+    /// This is distinct from the SWIM <see cref="PingInterval"/>, which is used
+    /// by the node-level failure detector independently of Raft partition state.
+    /// Default 500 ms.
     /// </summary>
     public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromMilliseconds(500);
-    
+
     /// <summary>
-    /// If any partition sends a heartbeat to a node within this range, it will be considered as a recent heartbeat
+    /// De-duplication window for per-node heartbeat sends.  If the leader already
+    /// sent a heartbeat to a specific follower within this duration, the current
+    /// <c>CheckLeader</c> tick skips it.  This prevents redundant sends when
+    /// <see cref="CheckLeaderInterval"/> fires more frequently than
+    /// <see cref="HeartbeatInterval"/>.
+    /// Default 100 ms.
     /// </summary>
     public TimeSpan RecentHeartbeat { get; set; } = TimeSpan.FromMilliseconds(100);
-    
+
     /// <summary>
-    /// Wait time for the leader to receive votes from other nodes
+    /// How long a candidate waits after broadcasting RequestVote RPCs before
+    /// checking whether a quorum of votes has arrived.  If quorum is not reached
+    /// within this window the election round is abandoned and restarted with a
+    /// new randomised timeout.
+    /// Default 1500 ms.
     /// </summary>
     public TimeSpan VotingTimeout { get; set; } = TimeSpan.FromMilliseconds(1500);
-    
+
     /// <summary>
-    /// Interval to perform leader election actions
+    /// Interval at which the Raft timer service fires the <c>CheckLeader</c> pass —
+    /// the heartbeat send loop (on leaders) and the election-timeout check (on
+    /// followers).  Smaller values give tighter heartbeat jitter control but add
+    /// timer overhead.
+    /// Default 250 ms.
     /// </summary>
     public TimeSpan CheckLeaderInterval { get; set; } = TimeSpan.FromMilliseconds(250);
 
     /// <summary>
-    /// Initial delay before periodic Raft timers start firing.
+    /// Grace period after node startup before the periodic Raft and SWIM timers
+    /// begin firing.  Allows the node time to restore WAL state and join the
+    /// cluster before participating in elections.
+    /// Default 2500 ms.
     /// </summary>
     public TimeSpan TimerInitialDelay { get; set; } = TimeSpan.FromMilliseconds(2500);
-    
+
     /// <summary>
-    /// Interval to report liveness to the node registry
+    /// Interval at which the timer service refreshes the in-memory membership view
+    /// and triggers gossip exchange rounds.  This is also the cadence at which
+    /// SWIM-triggered membership changes (additions, evictions) are reflected in the
+    /// local routing tables.
+    /// Default 5000 ms.
     /// </summary>
     public TimeSpan UpdateNodesInterval { get; set; } = TimeSpan.FromMilliseconds(5000);
 
     /// <summary>
-    /// If followers hadn't received a heartbeat from the leader in this time, they will start an election
+    /// Lower bound of the randomised election timeout range (milliseconds).
+    /// When a follower has not received a Raft heartbeat from a leader for a
+    /// duration drawn from [<see cref="StartElectionTimeout"/>,
+    /// <see cref="EndElectionTimeout"/>], it transitions to Candidate and starts
+    /// a new election.  Randomisation staggers elections across nodes so multiple
+    /// candidates do not collide repeatedly.
+    /// Default 2000 ms.
     /// </summary>
     public int StartElectionTimeout { get; set; } = 2000;
-    
+
     /// <summary>
-    /// If followers hadn't received a heartbeat from the leader in this time, they will start an election
+    /// Upper bound of the randomised election timeout range (milliseconds).
+    /// Must be greater than <see cref="StartElectionTimeout"/>.  A wider range
+    /// reduces the probability of simultaneous elections in large clusters at the
+    /// cost of higher worst-case failover latency.
+    /// Default 4000 ms.
     /// </summary>
     public int EndElectionTimeout { get; set; } = 4000;
-    
+
     /// <summary>
-    /// Increment election timeout by this value every time the node couldn't find quorum
+    /// Amount (milliseconds) added to <see cref="StartElectionTimeout"/> after
+    /// each failed election round (no quorum reached).  Backing off the lower
+    /// bound reduces contention when multiple nodes repeatedly collide as candidates.
+    /// Default 100 ms.
     /// </summary>
     public int StartElectionTimeoutIncrement { get; set; } = 100;
-    
+
     /// <summary>
-    /// Increment election timeout by this value every time the node couldn't find quorum
+    /// Amount (milliseconds) added to <see cref="EndElectionTimeout"/> after
+    /// each failed election round.  Widens the randomisation range over successive
+    /// failures, further reducing the chance of repeated simultaneous elections.
+    /// Default 200 ms.
     /// </summary>
     public int EndElectionTimeoutIncrement { get; set; } = 200;
 
@@ -131,25 +234,43 @@ public class RaftConfiguration
     /// </summary>
     public int? ElectionTimeoutSeed { get; set; }
 
+    // ── Observability ─────────────────────────────────────────────────────────
+
     /// <summary>
-    /// If the per-partition raft state machine takes more than this value to process a message it will show a log
-    /// Slow processing of messages might indicate a performance issue
+    /// Warning threshold (milliseconds) for the per-partition state-machine executor.
+    /// If processing a single operation takes longer than this value, a warning is
+    /// emitted to the logger to help identify scheduling hot spots.
+    /// Set to 0 to disable slow-processing warnings.
+    /// Default 50 ms.
     /// </summary>
     public int SlowRaftStateMachineLog { get; set; } = 50;
-    
+
     /// <summary>
-    /// If the per-partition raft state machine takes more than this value to process a message it will show a log
-    /// Slow processing of messages might indicate a performance issue
+    /// Intended warning threshold (milliseconds) for WAL write operations.
+    /// Reserved for future use — this field is not yet wired into the WAL write path
+    /// and has no effect at runtime.
+    /// Default 25 ms.
     /// </summary>
     public int SlowRaftWALMachineLog { get; set; } = 25;
-    
+
+    // ── I/O thread pools ──────────────────────────────────────────────────────
+
     /// <summary>
-    /// Number of background threads used for I/O read operations
+    /// Number of background threads in the <see cref="WAL.IO.FairReadScheduler"/>
+    /// pool used to serve WAL read requests (log replay, snapshot reads).
+    /// Increase on storage-bound nodes or when read-heavy workloads (e.g. follower
+    /// log reconstruction) saturate the default pool.
+    /// Default 8.
     /// </summary>
     public int ReadIOThreads { get; set; } = 8;
-    
+
     /// <summary>
-    /// Number of background threads used for I/O write operations
+    /// Number of worker threads in the <see cref="WAL.IO.FairWalScheduler"/> pool
+    /// that flush WAL write batches to storage.  Each thread can process one
+    /// cross-partition group-commit batch concurrently.  Values above 1 allow
+    /// multiple batches to be in-flight simultaneously, but per-partition FIFO
+    /// ordering is always preserved.
+    /// Default 4.
     /// </summary>
     public int WriteIOThreads { get; set; } = 4;
 
@@ -185,6 +306,26 @@ public class RaftConfiguration
     /// Larger batches reduce per-call overhead at the cost of higher individual latency.
     /// </summary>
     public int MaxWalBatchSize { get; set; } = 256;
+
+    /// <summary>
+    /// Maximum number of partitions coalesced into a single <c>walAdapter.Write</c>
+    /// call (cross-partition group commit).  When multiple partitions are ready
+    /// simultaneously a worker drains up to this many of them and issues one
+    /// storage write — for RocksDB this is one <c>db.Write</c> / one fsync
+    /// regardless of partition count.
+    ///
+    /// <para><b>SQLite note:</b> SQLite stores each partition in a separate database
+    /// file, so a group-commit batch still issues one transaction per partition file.
+    /// If one partition's write fails the entire batch's status is set to
+    /// <c>Errored</c>, which means partitions that committed successfully will
+    /// receive a spurious error completion and their proposers will retry.  The
+    /// upsert is idempotent (<c>ON CONFLICT DO UPDATE</c>) so retries are safe, but
+    /// cross-partition failure propagation is wider than it was pre-D1.  RocksDB is
+    /// not affected (atomic <c>WriteBatch</c>).</para>
+    ///
+    /// Defaults to <see cref="WAL.IO.FairWalScheduler.DefaultMaxGroupBatchPartitions"/> (64).
+    /// </summary>
+    public int MaxWalGroupBatchPartitions { get; set; } = WAL.IO.FairWalScheduler.DefaultMaxGroupBatchPartitions;
 
     // ── Partition executor drain quanta ───────────────────────────────────────
 
@@ -399,7 +540,7 @@ public class RaftConfiguration
     /// Set to 0 or a negative value to disable automatic compaction.
     /// </summary>
     public int CompactEveryOperations { get; set; } = 10000;
-    
+
     /// <summary>
     /// Maximum number of log entries removed per <c>CompactLogsOlderThan</c> call during compaction.
     /// Values below 1 are treated as 1 at use time.

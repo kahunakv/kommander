@@ -321,7 +321,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             configuration.WriteIOThreads,
             configuration.MaxWalQueueDepthPerPartition,
             configuration.MaxWalBatchSize,
-            configuration.MaxGlobalWalQueueDepth);
+            configuration.MaxGlobalWalQueueDepth,
+            configuration.MaxWalGroupBatchPartitions);
 
         OnSystemLogRestored += SystemLogRestored;
         OnSystemReplicationReceived += SystemReplicationReceived;
