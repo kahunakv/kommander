@@ -57,6 +57,17 @@ public sealed class RaftWriteAhead
 
     private int compactionInFlight;
 
+    /// <summary>
+    /// Application-supplied floor: compaction will not truncate committed entries at or above this
+    /// id, even when the checkpoint has advanced past it. Used to retain a WAL tail for
+    /// point-in-time recovery. Default <see cref="long.MaxValue"/> means no extra retention
+    /// (truncate to checkpoint). A value &lt;= 0 is normalized to <see cref="long.MaxValue"/>
+    /// (no protection), NOT to 0 — a zero floor would suppress all compaction by collapsing
+    /// <c>effectiveFloor</c> to 0 and triggering the early-return, which is never the desired
+    /// behaviour when a caller has not yet computed its protected index.
+    /// </summary>
+    private long minRetainIndex = long.MaxValue;
+
     // Test-only handle for WaitForCompactionIdleAsync; not a production synchronization point.
     private Task? compactionPassTask;
 
@@ -849,6 +860,29 @@ public sealed class RaftWriteAhead
     /// </summary>
     internal int CompactionPassCount => Volatile.Read(ref compactionPassCount);
 
+    /// <summary>
+    /// Sets the minimum WAL index that compaction must not truncate below, regardless of the
+    /// checkpoint position. Used by point-in-time recovery consumers to protect a retained tail.
+    /// <para>
+    /// This setter is synchronous and thread-safe via a volatile write; after it returns the next
+    /// compaction pass observes the new value without any scheduling round-trip.
+    /// </para>
+    /// <para>
+    /// Values &lt;= 0 are normalized to <see cref="long.MaxValue"/> (no protection). This prevents
+    /// a caller that has not yet computed its protected index (e.g. first tick, empty PITR window)
+    /// from accidentally disabling compaction by passing 0.
+    /// </para>
+    /// <para>
+    /// The floor is in-memory and resets to <see cref="long.MaxValue"/> on process restart.
+    /// Consumers must re-assert it after every node start before relying on PITR for that node.
+    /// </para>
+    /// </summary>
+    public void SetMinRetainIndex(long index) =>
+        Volatile.Write(ref minRetainIndex, index <= 0 ? long.MaxValue : index);
+
+    /// <summary>Current retention floor. Diagnostics/tests only; <see cref="long.MaxValue"/> means unset.</summary>
+    internal long MinRetainIndex => Volatile.Read(ref minRetainIndex);
+
     private async Task RunCompactionPassAsync()
     {
         Interlocked.Increment(ref compactionPassCount);
@@ -862,7 +896,13 @@ public sealed class RaftWriteAhead
             if (lastCheckpoint <= 0)
                 return;
 
-            logger.LogInfoCompactionStarted(manager.LocalEndpoint, partition.PartitionId, lastCheckpoint);
+            long retainFloor = Volatile.Read(ref minRetainIndex);
+            long effectiveFloor = Math.Min(lastCheckpoint, retainFloor);
+
+            if (effectiveFloor <= 0)
+                return;
+
+            logger.LogInfoCompactionStarted(manager.LocalEndpoint, partition.PartitionId, effectiveFloor);
 
             // Scheduled on ReadScheduler, not WalScheduler — compaction deletes must not
             // contend with the write path on the WAL scheduler.
@@ -872,14 +912,14 @@ public sealed class RaftWriteAhead
             {
                 (RaftOperationStatus status, int removed) = walAdapter.CompactLogsOlderThan(
                     partition.PartitionId,
-                    lastCheckpoint,
+                    effectiveFloor,
                     compactNumberEntries,
                     maxEntriesPerCompaction);
 
                 return status == RaftOperationStatus.Success ? removed : 0;
             }).ConfigureAwait(false);
 
-            logger.LogInfoCompactionFinished(manager.LocalEndpoint, partition.PartitionId, removedTotal, lastCheckpoint);
+            logger.LogInfoCompactionFinished(manager.LocalEndpoint, partition.PartitionId, removedTotal, effectiveFloor);
         }
         catch (Exception ex)
         {

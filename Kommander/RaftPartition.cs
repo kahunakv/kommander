@@ -39,6 +39,8 @@ public sealed class RaftPartition : IDisposable
 
     private readonly RaftManager manager;
 
+    private readonly RaftWriteAhead walHandler;
+
     private int _disposed;
 
     private string _leader = "";
@@ -146,7 +148,7 @@ public sealed class RaftPartition : IDisposable
         // 'executor' which is assigned below, before Start() launches the worker thread,
         // so it is always non-null when any callback fires during normal operation.
         RaftPartitionExecutor? executorRef = null;
-        RaftWriteAhead walHandler = new(
+        walHandler = new(
             manager,
             completion => executorRef!.Post(new RaftRequest(RaftRequestType.WriteOperationCompleted, completion)),
             this,
@@ -188,6 +190,14 @@ public sealed class RaftPartition : IDisposable
             request.Endpoint
         ));
     }
+
+    /// <summary>
+    /// Sets the minimum WAL log index that compaction must not truncate below, regardless of
+    /// the checkpoint position. Forwarded directly to the underlying <see cref="RaftWriteAhead"/>;
+    /// the write is volatile so the next compaction pass observes it immediately with no
+    /// scheduling round-trip. See <see cref="RaftWriteAhead.SetMinRetainIndex"/> for semantics.
+    /// </summary>
+    public void SetMinRetainIndex(long index) => walHandler.SetMinRetainIndex(index);
 
     /// <summary>
     /// Enqueues a "request a vote" message from the partition.

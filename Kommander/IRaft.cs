@@ -275,6 +275,25 @@ public interface IRaft
     public Task<(bool success, RaftOperationStatus status, long commitLogId)> RollbackLogs(int partitionId, HLCTimestamp ticketId);
 
     /// <summary>
+    /// Sets the minimum WAL log index that compaction must not truncate below on
+    /// <paramref name="partitionId"/>, regardless of the checkpoint position.
+    /// Consumers use this to protect a retained WAL tail for point-in-time recovery.
+    /// <para>
+    /// This call is synchronous and non-blocking: the floor is a volatile field read once per
+    /// compaction pass and has no ordering relationship to the write path.
+    /// </para>
+    /// <para>
+    /// If <paramref name="partitionId"/> is not hosted on this node the call is a no-op.
+    /// </para>
+    /// <para>
+    /// Values &lt;= 0 are normalised to "no protection" (truncate to checkpoint). The floor is
+    /// in-memory and resets to "no protection" on process restart; callers must re-assert it on
+    /// every node start before relying on PITR for that node.
+    /// </para>
+    /// </summary>
+    public void SetMinRetainIndex(int partitionId, long index);
+
+    /// <summary>
     /// Obtains the local endpoint
     /// </summary>
     /// <returns></returns>

@@ -1439,6 +1439,17 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
+    /// Sets the minimum WAL log index that compaction must not truncate below on the given
+    /// partition. No-ops silently when the partition is not hosted on this node.
+    /// See <see cref="IRaft.SetMinRetainIndex"/> for full semantics.
+    /// </summary>
+    public void SetMinRetainIndex(int partitionId, long index)
+    {
+        if (partitions.TryGetValue(partitionId, out RaftPartition? partition))
+            partition.SetMinRetainIndex(index);
+    }
+
+    /// <summary>
     /// Passes the Handshake to the appropriate partition
     /// </summary>
     /// <param name="request"></param>
