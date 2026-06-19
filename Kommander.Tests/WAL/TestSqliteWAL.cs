@@ -218,6 +218,188 @@ public sealed class TestSqliteWAL
         }
     }
 
+    // ── Sharding-specific tests ───────────────────────────────────────────────
+
+    /// <summary>
+    /// A fresh directory resolves shardCount=0 to Environment.ProcessorCount, persists that
+    /// value, and returns it on reopen (even when the caller passes shardCount=0 again).
+    /// </summary>
+    [Fact]
+    public void ShardCount_PersistsOnFirstOpen_IsRestoredOnReopen()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            int expected;
+            using (SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false, shardCount: 4))
+            {
+                expected = 4;
+                // Write to force the metadata DB to be persisted.
+                wal.Write([(1, [CreateLog(1)])]);
+            }
+
+            // Reopen with shardCount=0 (accept persisted) — data must still be readable.
+            using SqliteWAL wal2 = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false, shardCount: 0);
+            Assert.Equal(1, Assert.Single(wal2.ReadLogs(1)).Id);
+
+            // The persisted shard_count metadata must match what we seeded.
+            Assert.Equal(expected.ToString(), wal2.GetMetaData("shard_count"));
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    /// <summary>
+    /// Reopening with a non-zero shardCount that differs from the persisted value must throw
+    /// with a message naming both values, preventing silent log orphaning.
+    /// </summary>
+    [Fact]
+    public void ShardCount_ConflictingNonZeroOnReopen_ThrowsDescriptiveError()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using (SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false, shardCount: 4))
+                wal.Write([(1, [CreateLog(1)])]);
+
+            InvalidOperationException ex = Assert.Throws<InvalidOperationException>(
+                () => new SqliteWAL(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false, shardCount: 2));
+
+            // The message should name both the configured and persisted values.
+            Assert.Contains("2", ex.Message);
+            Assert.Contains("4", ex.Message);
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    /// <summary>
+    /// Reopening with the same non-zero shardCount as was seeded must succeed.
+    /// </summary>
+    [Fact]
+    public void ShardCount_MatchingNonZeroOnReopen_Succeeds()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using (SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false, shardCount: 3))
+                wal.Write([(1, [CreateLog(1)])]);
+
+            // Same count — must not throw.
+            using SqliteWAL wal2 = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false, shardCount: 3);
+            Assert.Equal(1, Assert.Single(wal2.ReadLogs(1)).Id);
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    /// <summary>
+    /// When two partitions share a shard (shardCount=1), deleting one must leave the other's
+    /// rows untouched and fully readable and writable.
+    /// </summary>
+    [Fact]
+    public void DeletePartitionWAL_OnSharedShard_DoesNotAffectSiblingPartition()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false, shardCount: 1);
+
+            // Write to two partitions that share the single shard.
+            wal.Write([(10, [CreateLog(1), CreateLog(2)]), (20, [CreateLog(1)])]);
+
+            Assert.Equal(RaftOperationStatus.Success, wal.DeletePartitionWAL(10));
+
+            // Partition 10 is gone.
+            Assert.Empty(wal.ReadLogs(10));
+
+            // Partition 20 is unaffected.
+            Assert.Equal(1, Assert.Single(wal.ReadLogs(20)).Id);
+
+            // Partition 20 can still be written to.
+            Assert.Equal(RaftOperationStatus.Success, wal.Write([(20, [CreateLog(2)])]));
+            Assert.Equal(2, wal.ReadLogs(20).Count);
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    /// <summary>
+    /// A Write call covering P partitions all on the same shard (shardCount=1) must issue
+    /// exactly one SQLite transaction regardless of partition count.
+    /// </summary>
+    [Fact]
+    public void Write_MultiPartitionOnSingleShard_IssuesOneTransaction()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false, shardCount: 1);
+
+            List<(int, List<RaftLog>)> batch =
+            [
+                (1, [CreateLog(1)]),
+                (2, [CreateLog(1)]),
+                (3, [CreateLog(1)]),
+                (5, [CreateLog(1)]),
+            ];
+
+            Assert.Equal(RaftOperationStatus.Success, wal.Write(batch));
+            Assert.Equal(1, wal.LastWriteTransactionCount);
+
+            // All partitions are readable.
+            foreach (int p in new[] { 1, 2, 3, 5 })
+                Assert.Single(wal.ReadLogs(p));
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    /// <summary>
+    /// A Write call covering partitions spread across multiple shards issues exactly one
+    /// transaction per shard, not one per partition.
+    /// </summary>
+    [Fact]
+    public void Write_MultiPartitionAcrossShards_IssuesOneTransactionPerShard()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            // shardCount=2 — even partitions go to shard 0, odd to shard 1.
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false, shardCount: 2);
+
+            List<(int, List<RaftLog>)> batch =
+            [
+                (0, [CreateLog(1)]),  // shard 0
+                (2, [CreateLog(1)]),  // shard 0
+                (1, [CreateLog(1)]),  // shard 1
+                (3, [CreateLog(1)]),  // shard 1
+            ];
+
+            Assert.Equal(RaftOperationStatus.Success, wal.Write(batch));
+
+            // 4 partitions across 2 shards — should be 2 transactions.
+            Assert.Equal(2, wal.LastWriteTransactionCount);
+
+            foreach (int p in new[] { 0, 1, 2, 3 })
+                Assert.Single(wal.ReadLogs(p));
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
     private static RaftLog CreateLog(long id, string? logType = "sqlite-test")
     {
         return new()

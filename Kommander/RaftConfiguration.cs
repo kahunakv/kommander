@@ -308,6 +308,29 @@ public class RaftConfiguration
     public int MaxWalBatchSize { get; set; } = 256;
 
     /// <summary>
+    /// Desired number of SQLite shard databases across which partitions are distributed
+    /// (<c>partitionId mod shardCount</c>).
+    ///
+    /// <para>This value is used <b>only</b> to seed a brand-new data directory; once a
+    /// directory has been initialised the value persisted in its metadata DB is authoritative.
+    /// A non-zero value that differs from the persisted one causes <see cref="WAL.SqliteWAL"/>
+    /// to throw at startup (changing the shard count for an existing directory orphans all
+    /// previously-written logs).  Use <c>0</c> (the default) to accept whatever value was
+    /// written at directory creation time.</para>
+    ///
+    /// <para>Typical trade-offs:</para>
+    /// <list type="bullet">
+    ///   <item><c>1</c> — single shared database; maximum fsync amortization, all writes serialized.</item>
+    ///   <item><see cref="Environment.ProcessorCount"/> (resolved when <c>0</c> seeds a new directory)
+    ///       — balanced default: one shard per CPU thread, parallelism without per-partition overhead.</item>
+    ///   <item>Large value — approaches the legacy one-file-per-partition layout with no amortization.</item>
+    /// </list>
+    ///
+    /// Default <c>0</c> (resolved to <see cref="Environment.ProcessorCount"/> on first initialisation).
+    /// </summary>
+    public int SqliteWalShardCount { get; set; }
+
+    /// <summary>
     /// Maximum number of partitions coalesced into a single <c>walAdapter.Write</c>
     /// call (cross-partition group commit).  When multiple partitions are ready
     /// simultaneously a worker drains up to this many of them and issues one

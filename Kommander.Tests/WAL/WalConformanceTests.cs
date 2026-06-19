@@ -1257,6 +1257,26 @@ public sealed class SqliteWalConformanceTests : WalConformanceTests
     }
 }
 
+/// <summary>
+/// Runs the full WAL conformance suite against a <see cref="SqliteWAL"/> configured with
+/// shardCount=1 (all partitions on a single shard) to verify the sharded code path preserves
+/// all IWAL semantics when co-resident partitions share one database and one transaction.
+/// </summary>
+public sealed class SqliteWalSingleShardConformanceTests : WalConformanceTests
+{
+    protected override IWAL CreateWal(out Action cleanup)
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"wal-conform-sqlite-s1-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(path);
+        cleanup = () =>
+        {
+            if (Directory.Exists(path))
+                Directory.Delete(path, recursive: true);
+        };
+        return new SqliteWAL(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false, shardCount: 1);
+    }
+}
+
 public sealed class RocksDbWalConformanceTests : WalConformanceTests
 {
     protected override IWAL CreateWal(out Action cleanup)
