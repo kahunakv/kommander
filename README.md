@@ -18,6 +18,7 @@ Kommander is designed to keep the consensus core separate from storage, discover
 - **Dynamic cluster membership:** Add and remove nodes from a running cluster. The voting roster is a committed, versioned record on the system partition (never gossip- or discovery-derived), so quorum is always consistent. New nodes join as non-voting learners, catch up, and are auto-promoted to voters; a SWIM-style gossip layer disseminates the roster and detects failures advisorily. See [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md).
 - **Log catch-up & backfill:** A leader detects a follower that has fallen behind and backfills the missing entries in bounded, anchored chunks, enforcing the Raft Log Matching Property so a follower's log never grows a gap or a divergent tail. Followers too far behind the compaction floor are caught up with a snapshot instead. See [Log Catch-Up & Backfill Developer Guide](docs/log-backfill-developer-guide.md).
 - **Partition quiescence:** An idle leader stops sending per-partition heartbeats after a configurable idle window and sends followers a one-time quiesce marker; followers then gate elections on the SWIM failure detector instead of a per-partition timer. This drops steady-state heartbeat traffic from `O(nodes × partitions)` toward per-node SWIM probing, making deployments with hundreds or thousands of mostly-idle partitions practical. Any write wakes the partition instantly, and a dead leader is still detected promptly via SWIM. See [Partition Quiescence Developer Guide](docs/partition-quiescence-developer-guide.md).
+- **Leader balancing:** Leaders are elected independently, so over time they can pile up on one node while peers sit idle. The leader balancer watches how leaderships are distributed and how loaded each one is, then spreads them evenly — equalizing the *count* first and the *load* (a smoothed throughput + queue-depth score) second. The system-partition leader plans moves and sends advisory *suggestions* to each partition's current leader, which performs the safe Raft handoff; it is throttled, self-healing, off by default, and can never affect correctness. See [Leader Balancer Developer Guide](docs/leader-balancer-developer-guide.md).
 - **Durable write-ahead logging:** Built-in WAL adapters for RocksDB and SQLite persist proposed, committed, rolled-back, and checkpoint entries before state-machine callbacks run.
 - **Automatic WAL compaction:** Committed-operation counters trigger bounded per-partition compaction so removable history below the last committed checkpoint does not grow without bound.
 - **Testing-friendly in-memory components:** `InMemoryWAL`, `InMemoryCommunication`, and focused test utilities support fast local simulations without external infrastructure.
@@ -49,12 +50,13 @@ The library keeps storage, discovery, and communication pluggable. That separati
 | [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md) | Adding/removing nodes at runtime, the committed roster, learner promotion, and the SWIM failure detector. |
 | [Elastic Partitions Developer Guide](docs/elastic-partitions-developer-guide.md) | Creating, splitting, merging, and removing partitions at runtime, the two-phase protocols, and the generation fence. |
 | [Partition Quiescence Developer Guide](docs/partition-quiescence-developer-guide.md) | How idle partitions stop heartbeating and lean on SWIM for liveness: the quiesce/wake flows, the failover-timing rule, and the configuration knobs. |
+| [Leader Balancer Developer Guide](docs/leader-balancer-developer-guide.md) | How leaderships are spread evenly across the cluster: load reports, the global view, the two-tier (count then load) planner, the transfer-suggestion mechanism, configuration, and observability. |
 
 ## Packages And Targets
 
 Kommander multi-targets `.NET 8.0` and `.NET 10.0`.
 
-Current package version in this tree: `0.13.0`.
+Current package version in this tree: `0.16.0`.
 
 Install from NuGet:
 
@@ -729,6 +731,30 @@ RaftConfiguration config = new()
 Because quiesced followers depend on SWIM for failover, `RaftConfiguration.Validate()` (run at construction) requires `PingInterval > 0` and `PingInterval < StartElectionTimeout` whenever quiescence is enabled; set `EnableQuiescence = false` to restore classic per-partition heartbeating.
 
 See [Partition Quiescence Developer Guide](docs/partition-quiescence-developer-guide.md) for the quiesce/wake flows, the failover-timing rule, the code map, and the invariants to preserve when extending it.
+
+## Leader Balancing
+
+Each partition elects its leader independently, with nothing coordinating *where* leaders land. Bad luck in election timing can leave one node holding most of the leaders — doing the heartbeat, replication, and commit work for all of them — while its peers sit nearly idle. Even when the *counts* are even, the **hot** partitions can cluster on one node. The **leader balancer** corrects both.
+
+The leader of the system partition acts as the controller. Every node periodically gossips an advisory **load report** of the partitions it leads and how busy each is (a smoothed throughput + queue-depth score). The controller reduces these into a global view and runs a two-tier plan: **count balance** first (drive each node toward the cluster average), then **load balance** (count-neutral hot/cold swaps when load is still skewed). Because only a partition's own leader can hand off its leadership, the controller does not transfer directly — it sends a **suggestion** to the current leader, which validates and performs the standard Raft handoff. Moves are throttled, gated by cooldowns and stability checks, and confirmed by observing the next round of reports, so the balancer is convergent and self-healing.
+
+It is **off by default** and purely advisory: a stale or dropped suggestion can only cause a wasted or skipped move, never an unsafe one, since every actual transfer is re-validated by the partition leader.
+
+```csharp
+RaftConfiguration config = new()
+{
+    EnableLeaderBalancer = true,                          // default false
+    LeaderBalancerInterval = TimeSpan.FromSeconds(30),    // how often the controller plans a pass
+    LeaderBalancerReportInterval = TimeSpan.FromSeconds(5), // how often each node emits a load report
+    MaxMovesPerPass = 4,                                  // cap on moves planned per pass
+    MaxConcurrentTransfers = 2,                           // cap on moves in flight cluster-wide
+    MoveCooldown = TimeSpan.FromSeconds(60),              // per-partition cooldown after a move
+};
+```
+
+Progress is observable via the `Kommander` meter: `raft.balancer.moves_total` (by outcome), `raft.balancer.skipped_passes_total`, and the `raft.balancer.count_imbalance` / `raft.balancer.load_imbalance` gauges (which trend toward zero as the cluster converges).
+
+See [Leader Balancer Developer Guide](docs/leader-balancer-developer-guide.md) for the load score, the global view, the two-tier planner, the suggestion mechanism, the full configuration and metrics reference, the code map, and the invariants to preserve when extending it.
 
 ## Utilities
 

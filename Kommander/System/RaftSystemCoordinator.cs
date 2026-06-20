@@ -1700,6 +1700,31 @@ internal sealed class RaftSystemCoordinator : IDisposable
         return snapshot;
     }
 
+    /// <summary>
+    /// Drops retained load reports whose age exceeds a small multiple of the report TTL.
+    /// TTL-filtering at view-build time already keeps stale reports out of any planning view,
+    /// but the retained map must also be pruned so it cannot grow without bound as endpoints
+    /// churn, and so a long-departed node's report cannot linger. Called on the P0 leader at
+    /// the start of each balancer pass; runs on the single-consumer coordinator loop so no
+    /// locking is required.
+    /// </summary>
+    private void EvictStaleLoadReports(TimeSpan ttl, Time.HLCTimestamp now)
+    {
+        TimeSpan maxAge = ttl * 3;
+        List<string>? stale = null;
+        foreach (NodeLoadReport r in _loadReports.Values)
+        {
+            if ((now - r.Time) > maxAge)
+                (stale ??= []).Add(r.Endpoint);
+        }
+
+        if (stale is null)
+            return;
+
+        foreach (string endpoint in stale)
+            _loadReports.Remove(endpoint);
+    }
+
     // ── Balancer controller ────────────────────────────────────────────────
 
     /// <summary>
@@ -1747,31 +1772,42 @@ internal sealed class RaftSystemCoordinator : IDisposable
         global::System.DateTimeOffset now = global::System.DateTimeOffset.UtcNow;
         Time.HLCTimestamp hlcNow = manager.HybridLogicalClock.TrySendOrLocalEvent(manager.LocalNodeId);
 
-        // ── Step 1: reconcile outstanding moves ──────────────────────────────
-
-        // Build a lightweight view from the retained reports to confirm/expire outstanding moves.
-        // We do this before the IsComplete check so we always release finished slots.
+        // ── Step 1: reduce retained reports into the single authoritative view ──
+        // GlobalLeadershipView.Build is the *only* reduction of reports into owner/load
+        // facts: it applies the TTL and resolves conflicting claims by newest Time. Both
+        // reconciliation and planning consume this one view, so they can never disagree on
+        // ownership, and a stale (TTL-expired) report can neither be planned on nor falsely
+        // confirm an outstanding move.
         ClusterMembership membership = GetMembership();
 
-        // Build a minimal partition-owner map from stored reports to detect confirmations.
-        Dictionary<int, string> currentOwners = new();
-        foreach (NodeLoadReport r in _loadReports.Values)
+        TimeSpan ttl = config.LeaderBalancerReportTtl;
+
+        // Prune the retained report map so it cannot grow without bound as endpoints churn
+        // and a long-departed node's report cannot linger. (TTL-filtering in Build already
+        // keeps stale reports out of the view; this bounds the map itself.)
+        EvictStaleLoadReports(ttl, hlcNow);
+
+        IReadOnlyList<NodeLoadReport> reports = GetLoadReports();
+        HashSet<string> aliveEndpoints = new(StringComparer.Ordinal);
+        foreach (ClusterMember m in membership.Members)
         {
-            foreach (PartitionLoad pl in r.Leaderships)
-            {
-                // Latest report wins on conflict (same as GlobalLeadershipView).
-                if (!currentOwners.TryGetValue(pl.PartitionId, out _))
-                    currentOwners[pl.PartitionId] = r.Endpoint;
-            }
+            if (m.Role == ClusterMemberRole.Voter &&
+                manager.Liveness.GetState(m.Endpoint) < Gossip.MemberLivenessState.Suspect)
+                aliveEndpoints.Add(m.Endpoint);
         }
 
+        GlobalLeadershipView view = GlobalLeadershipView.Build(reports, membership.Members, aliveEndpoints, ttl, hlcNow);
+
+        // ── Step 2: reconcile outstanding moves against the view ────────────────
+        // Done before the IsComplete gate so finished slots are always released, even on a
+        // pass we will otherwise skip for planning.
         List<int> toRemove = [];
         foreach ((int partitionId, (string target, global::System.DateTimeOffset deadline)) in _outstandingMoves)
         {
-            if (currentOwners.TryGetValue(partitionId, out string? owner) &&
+            if (view.PartitionOwner.TryGetValue(partitionId, out string? owner) &&
                 string.Equals(owner, target, global::System.StringComparison.Ordinal))
             {
-                // Move confirmed by the global view — enter cooldown.
+                // Move confirmed by the view — enter cooldown.
                 Diagnostics.KommanderMetrics.BalancerMovesTotal.Add(1,
                     new global::System.Collections.Generic.KeyValuePair<string, object?>("outcome", "succeeded"));
                 _balancerCooldowns[partitionId] = now + config.MoveCooldown;
@@ -1788,20 +1824,6 @@ internal sealed class RaftSystemCoordinator : IDisposable
         }
         foreach (int id in toRemove)
             _outstandingMoves.Remove(id);
-
-        // ── Step 2: build a complete GlobalLeadershipView ────────────────────
-
-        IReadOnlyList<NodeLoadReport> reports = GetLoadReports();
-        HashSet<string> aliveEndpoints = new(StringComparer.Ordinal);
-        foreach (ClusterMember m in membership.Members)
-        {
-            if (m.Role == ClusterMemberRole.Voter &&
-                manager.Liveness.GetState(m.Endpoint) < Gossip.MemberLivenessState.Suspect)
-                aliveEndpoints.Add(m.Endpoint);
-        }
-
-        TimeSpan ttl = config.LeaderBalancerReportTtl;
-        GlobalLeadershipView view = GlobalLeadershipView.Build(reports, membership.Members, aliveEndpoints, ttl, hlcNow);
 
         // Update imbalance gauges based on the current view (even if the pass is skipped).
         UpdateImbalanceGauges(view);
@@ -1871,6 +1893,10 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
         // ── Step 4: dispatch ──────────────────────────────────────────────────
 
+        // Diagnostic only: the P0 system-partition term at planning time, surfaced in the
+        // recipient's drop logs. Not validated by the recipient (it checks live leadership).
+        long systemTerm = manager.WalAdapter.GetCurrentTerm(RaftSystemConfig.SystemPartition);
+
         foreach (LeaderMove move in moves)
         {
             if (_outstandingMoves.Count >= config.MaxConcurrentTransfers)
@@ -1878,7 +1904,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
             Data.TransferLeadershipSuggestionRequest suggestion = new(
                 move.PartitionId,
-                0L,
+                systemTerm,
                 hlcNow,
                 manager.LocalEndpoint,
                 move.ToEndpoint);
