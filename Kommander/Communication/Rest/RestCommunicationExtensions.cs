@@ -99,7 +99,12 @@ public static class RestCommunicationExtensions
                             if (raft is RaftManager transferManager)
                                 transferManager.TransferLeadership(item.TransferLeadership!);
                             break;
-                        
+
+                        case BatchRequestsRequestType.TransferLeadershipSuggestion:
+                            if (raft is RaftManager suggestionManager)
+                                suggestionManager.ReceiveTransferLeadershipSuggestion(item.TransferLeadershipSuggestion!);
+                            break;
+
                         case BatchRequestsRequestType.AppendLogs:
                             raft.AppendLogs(item.AppendLogs!);
                             break;
@@ -170,7 +175,14 @@ public static class RestCommunicationExtensions
                 ? JsonSerializer.Deserialize<ClusterMembership>(request.RosterJson)
                 : null;
 
-            GossipMessage digest = new(request.SenderEndpoint, request.MembershipVersion, roster);
+            NodeLoadReport? loadReport = request.LoadReportJson is not null
+                ? JsonSerializer.Deserialize<NodeLoadReport>(request.LoadReportJson)
+                : null;
+
+            GossipMessage digest = new(request.SenderEndpoint, request.MembershipVersion, roster)
+            {
+                LoadReport = loadReport,
+            };
             GossipAck ack = manager.ReceiveGossip(digest);
 
             string? ackRosterJson = ack.Roster is not null

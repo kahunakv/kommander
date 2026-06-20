@@ -169,7 +169,8 @@ public sealed class RaftPartition : IDisposable
             drainQuantumReplication: manager.Configuration.MaxDrainQuantumReplication,
             drainQuantumClient:      manager.Configuration.MaxDrainQuantumClient,
             drainQuantumMaintenance: manager.Configuration.MaxDrainQuantumMaintenance,
-            getGeneration:           () => Generation);
+            getGeneration:           () => Generation,
+            walQueueDepthProvider:   () => manager.WalScheduler.GetPartitionDepth(partitionId));
         executorRef = executor;
         replySink.Executor = executor;
         stateMachine.SetPostToExecutor(req => executorRef.Post(req));
@@ -198,6 +199,12 @@ public sealed class RaftPartition : IDisposable
     /// scheduling round-trip. See <see cref="RaftWriteAhead.SetMinRetainIndex"/> for semantics.
     /// </summary>
     public void SetMinRetainIndex(long index) => walHandler.SetMinRetainIndex(index);
+
+    /// <summary>
+    /// Advisory composite load score for this partition, forwarded from the executor's
+    /// <see cref="Scheduling.RaftPartitionExecutor.CurrentLoad"/> accumulator.
+    /// </summary>
+    internal double GetCurrentLoad(double wOps, double wQueue) => executor.CurrentLoad(wOps, wQueue);
 
     /// <summary>
     /// Enqueues a "request a vote" message from the partition.

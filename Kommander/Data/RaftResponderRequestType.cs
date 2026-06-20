@@ -10,5 +10,6 @@ public enum RaftResponderRequestType
     TransferLeadership,
     AppendLogs,
     CompleteAppendLogs,
-    TryBatch
+    TryBatch,
+    TransferLeadershipSuggestion
 }

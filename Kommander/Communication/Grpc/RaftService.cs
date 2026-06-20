@@ -6,6 +6,7 @@ using Google.Protobuf.Collections;
 using Microsoft.Extensions.Logging;
 using System.Runtime.InteropServices;
 using ClusterMembership = Kommander.System.ClusterMembership;
+using NodeLoadReport = Kommander.System.NodeLoadReport;
 using GossipPingRequest = Kommander.Gossip.PingRequest;
 using GossipPingResponse = Kommander.Gossip.PingResponse;
 using GossipPingReqRequest = Kommander.Gossip.PingReqRequest;
@@ -331,6 +332,23 @@ public sealed class RaftService : Rafter.RafterBase
                                 break;
                             }
 
+                            case GrpcBatchRequestsRequestType.TransferLeadershipSuggestion:
+                            {
+                                if (raft is not RaftManager suggestionManager)
+                                    throw new InvalidOperationException("raft is not a RaftManager");
+
+                                GrpcTransferLeadershipSuggestionRequest s = request.TransferLeadershipSuggestion!;
+
+                                suggestionManager.ReceiveTransferLeadershipSuggestion(new(
+                                    s.Partition,
+                                    s.Term,
+                                    new(s.TimeNode, s.TimePhysical, s.TimeCounter),
+                                    s.SuggestedBy,
+                                    s.TargetEndpoint
+                                ));
+                                break;
+                            }
+
                             case GrpcBatchRequestsRequestType.AppendLogs:
                             {
                                 GrpcAppendLogsRequest appendLogsRequest = request.AppendLogs!;
@@ -456,7 +474,14 @@ public sealed class RaftService : Rafter.RafterBase
         if (!request.RosterJson.IsEmpty)
             roster = global::System.Text.Json.JsonSerializer.Deserialize<ClusterMembership>(request.RosterJson.Span);
 
-        GossipMessage digest = new(request.SenderEndpoint, request.MembershipVersion, roster);
+        NodeLoadReport? loadReport = null;
+        if (!request.LoadReportJson.IsEmpty)
+            loadReport = global::System.Text.Json.JsonSerializer.Deserialize<NodeLoadReport>(request.LoadReportJson.Span);
+
+        GossipMessage digest = new(request.SenderEndpoint, request.MembershipVersion, roster)
+        {
+            LoadReport = loadReport,
+        };
         GossipAck ack = manager.ReceiveGossip(digest);
 
         GrpcGossipResponse grpcResponse = new()

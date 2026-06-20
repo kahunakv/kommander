@@ -9,4 +9,11 @@ namespace Kommander.Data;
 public sealed record GossipRequest(
     string SenderEndpoint,
     long MembershipVersion,
-    string? RosterJson);
+    string? RosterJson)
+{
+    /// <summary>
+    /// Advisory load report serialized as JSON, present only when
+    /// <c>EnableLeaderBalancer</c> is on at the sender.  Null means not participating.
+    /// </summary>
+    public string? LoadReportJson { get; init; }
+}

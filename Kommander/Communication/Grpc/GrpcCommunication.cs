@@ -490,7 +490,10 @@ public class GrpcCommunication : ICommunication
             MembershipVersion = digest.MembershipVersion,
             RosterJson = digest.Roster is not null
                 ? gossipRosterJsonCache.GetUtf8(digest.MembershipVersion, digest.Roster)
-                : ByteString.Empty
+                : ByteString.Empty,
+            LoadReportJson = digest.LoadReport is not null
+                ? ByteString.CopyFromUtf8(global::System.Text.Json.JsonSerializer.Serialize(digest.LoadReport))
+                : ByteString.Empty,
         };
 
         Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Gossip");

@@ -30,4 +30,13 @@ public interface IRaftTimerHost
     /// timeout) via indirect relays, then updates the local liveness table.
     /// </summary>
     Task PingAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Enqueues one leader-balancer pass into the system coordinator's channel.
+    /// The pass runs inside the coordinator's single-consumer loop so it is
+    /// serialized with all other coordinator state mutations.
+    /// No-op when <see cref="RaftConfiguration.EnableLeaderBalancer"/> is false
+    /// or when the node is not the P0 leader.
+    /// </summary>
+    void TriggerBalancerPass();
 }

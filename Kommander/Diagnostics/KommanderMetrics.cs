@@ -115,6 +115,49 @@ public static class KommanderMetrics
             unit: "ms",
             description: "Time since last heartbeat when an election was triggered, in milliseconds.");
 
+    // ── Leader balancer ───────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Total leadership-transfer moves by outcome: <c>planned</c>, <c>succeeded</c>,
+    /// <c>timed_out</c>.  A sustained high <c>timed_out</c> rate indicates suggestions
+    /// are not reaching their recipient or the recipient is dropping them.
+    /// </summary>
+    internal static readonly Counter<long> BalancerMovesTotal =
+        Meter.CreateCounter<long>(
+            "raft.balancer.moves_total",
+            description: "Total leadership transfer moves by outcome (planned/succeeded/timed_out).");
+
+    /// <summary>
+    /// Total balancer passes skipped because the global view was incomplete (fewer
+    /// fresh reports than live nodes or a report older than the TTL).
+    /// </summary>
+    internal static readonly Counter<long> BalancerSkippedPassesTotal =
+        Meter.CreateCounter<long>(
+            "raft.balancer.skipped_passes_total",
+            description: "Balancer passes skipped because the global view was incomplete.");
+
+    // Observable gauge state — updated by the coordinator at the end of each pass (P0 only).
+    // Stored as long bit-fields so Interlocked can update them safely across threads.
+    // The OTel callback reads without a lock; a torn read of a gauge sample is acceptable.
+    private static long _balancerCountImbalanceBits;
+    private static long _balancerLoadImbalanceBits;
+
+    internal static double BalancerCountImbalance
+    {
+        get => global::System.BitConverter.Int64BitsToDouble(
+                   Interlocked.Read(ref _balancerCountImbalanceBits));
+        set => Interlocked.Exchange(ref _balancerCountImbalanceBits,
+                   global::System.BitConverter.DoubleToInt64Bits(value));
+    }
+
+    internal static double BalancerLoadImbalance
+    {
+        get => global::System.BitConverter.Int64BitsToDouble(
+                   Interlocked.Read(ref _balancerLoadImbalanceBits));
+        set => Interlocked.Exchange(ref _balancerLoadImbalanceBits,
+                   global::System.BitConverter.DoubleToInt64Bits(value));
+    }
+
     // ── Observable gauges (dynamic per-partition) ─────────────────────────────
 
     // Weak references allow GC to collect stopped instances without leaking.
@@ -135,6 +178,16 @@ public static class KommanderMetrics
             "raft.wal.queue_depth",
             MeasureWalQueueDepths,
             description: "Current number of pending-or-in-flight WAL operations per partition in the scheduler.");
+
+        Meter.CreateObservableGauge(
+            "raft.balancer.count_imbalance",
+            static () => BalancerCountImbalance,
+            description: "Max node leadership count minus target (P0 leader only; 0 when balancer is off or node is not P0).");
+
+        Meter.CreateObservableGauge(
+            "raft.balancer.load_imbalance",
+            static () => BalancerLoadImbalance,
+            description: "Fractional load imbalance: (maxLoad / meanLoad) - 1 (P0 leader only; 0 when not applicable).");
     }
 
     /// <summary>

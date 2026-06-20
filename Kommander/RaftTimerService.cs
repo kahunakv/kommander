@@ -39,6 +39,7 @@ public sealed class RaftTimerService : IDisposable
     private Timer? _updateNodesTimer;
     private Timer? _gossipTimer;
     private Timer? _pingTimer;
+    private Timer? _balancerTimer;
 
     private volatile bool _started;
     private volatile bool _stopped;
@@ -51,6 +52,8 @@ public sealed class RaftTimerService : IDisposable
     private readonly TimeSpan _gossipInterval;
     private readonly int _gossipFanout;
     private readonly TimeSpan _pingInterval;
+    private readonly TimeSpan _balancerInterval;
+    private readonly bool _balancerEnabled;
     private readonly TimeSpan _initialDelay;
 
     public RaftTimerService(
@@ -66,6 +69,8 @@ public sealed class RaftTimerService : IDisposable
         _gossipInterval = configuration.GossipInterval;
         _gossipFanout = configuration.GossipFanout;
         _pingInterval = configuration.PingInterval;
+        _balancerInterval = configuration.LeaderBalancerInterval;
+        _balancerEnabled = configuration.EnableLeaderBalancer;
         _initialDelay = initialDelay ?? configuration.TimerInitialDelay;
     }
 
@@ -112,6 +117,17 @@ public sealed class RaftTimerService : IDisposable
                 _pingInterval
             );
         }
+
+        // Leader balancer is disabled when the feature flag is off.
+        if (_balancerEnabled && _balancerInterval > TimeSpan.Zero)
+        {
+            _balancerTimer = new Timer(
+                _ => TriggerBalancer(),
+                null,
+                _initialDelay,
+                _balancerInterval
+            );
+        }
     }
 
     /// <summary>
@@ -128,6 +144,7 @@ public sealed class RaftTimerService : IDisposable
         _updateNodesTimer?.Change(Timeout.Infinite, Timeout.Infinite);
         _gossipTimer?.Change(Timeout.Infinite, Timeout.Infinite);
         _pingTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+        _balancerTimer?.Change(Timeout.Infinite, Timeout.Infinite);
     }
 
     /// <summary>
@@ -271,6 +288,20 @@ public sealed class RaftTimerService : IDisposable
         }
     }
 
+    /// <summary>
+    /// Enqueues one leader-balancer planning pass into the system coordinator.
+    ///
+    /// <para>Invoked by the internal balancer timer, but public so tests can drive
+    /// a pass deterministically without waiting for a real timer tick.</para>
+    /// </summary>
+    public void TriggerBalancer()
+    {
+        if (_stopped || !_host.Joined)
+            return;
+
+        _host.TriggerBalancerPass();
+    }
+
     public void Dispose()
     {
         GC.SuppressFinalize(this);
@@ -279,5 +310,6 @@ public sealed class RaftTimerService : IDisposable
         _updateNodesTimer?.Dispose();
         _gossipTimer?.Dispose();
         _pingTimer?.Dispose();
+        _balancerTimer?.Dispose();
     }
 }

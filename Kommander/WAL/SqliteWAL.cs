@@ -156,7 +156,10 @@ public class SqliteWAL : IWAL, IDisposable
                 return shard;
 
             string completePath = $"{path}/raft_shard{shardId}_{revision}.db";
-            SqliteConnection connection = new($"Data Source={completePath}");
+            // Pooling=False: ensure Dispose() physically closes the file handle instead of
+            // returning it to the ADO.NET pool.  SqliteWAL manages connection lifetime
+            // explicitly (shards dict), so pooling only causes FD leaks on dispose.
+            SqliteConnection connection = new($"Data Source={completePath};Pooling=False");
             connection.Open();
 
             const string createTableQuery = """
@@ -242,7 +245,8 @@ public class SqliteWAL : IWAL, IDisposable
             return metaDataConnection;
 
         string completePath = $"{path}/raft_metadata_{revision}.db";
-        SqliteConnection connection = new($"Data Source={completePath}");
+        // Pooling=False: same as the shard connections — physical close on Dispose.
+        SqliteConnection connection = new($"Data Source={completePath};Pooling=False");
         connection.Open();
 
         const string createTableQuery = """

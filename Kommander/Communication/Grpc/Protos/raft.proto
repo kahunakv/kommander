@@ -124,6 +124,7 @@ message GrpcBatchRequestsRequestItem
     GrpcCompleteAppendLogsRequest CompleteAppendLogs = 7;
     GrpcStepDownNoticeRequest StepDownNotice = 8;
     GrpcTransferLeadershipRequest TransferLeadership = 9;
+    GrpcTransferLeadershipSuggestionRequest TransferLeadershipSuggestion = 10;
   }
 }
 
@@ -141,6 +142,7 @@ enum GrpcBatchRequestsRequestType {
   COMPLETE_APPEND_LOGS = 5;
   STEP_DOWN_NOTICE = 6;
   TRANSFER_LEADERSHIP = 7;
+  TRANSFER_LEADERSHIP_SUGGESTION = 8;
 }
 
 message GrpcStepDownNoticeRequest {
@@ -159,6 +161,16 @@ message GrpcTransferLeadershipRequest {
   int64 TimePhysical = 4;
   uint32 TimeCounter = 5;
   string Endpoint = 6;
+  string TargetEndpoint = 7;
+}
+
+message GrpcTransferLeadershipSuggestionRequest {
+  int32 Partition = 1;
+  int64 Term = 2;
+  int32 TimeNode = 3;
+  int64 TimePhysical = 4;
+  uint32 TimeCounter = 5;
+  string SuggestedBy = 6;
   string TargetEndpoint = 7;
 }
 
@@ -230,6 +242,7 @@ message GrpcGossipRequest {
     string SenderEndpoint = 1;
     int64 MembershipVersion = 2;
     bytes RosterJson = 3;
+    bytes LoadReportJson = 4;
 }
 
 message GrpcGossipResponse {

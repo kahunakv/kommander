@@ -556,6 +556,112 @@ public class RaftConfiguration
     /// </summary>
     public TimeSpan PingInterval { get; set; } = TimeSpan.FromSeconds(1);
 
+    // ── Leader balancer ───────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Master switch for the advisory leader-balancing feature.
+    /// When <see langword="false"/> (the default), no load reports are built or gossiped,
+    /// no transfer suggestions are sent, and the balancer loop never runs.
+    /// Flip to <see langword="true"/> only after all nodes in the cluster are on a version
+    /// that supports the feature; it is independently revertible at runtime via rolling restart.
+    /// </summary>
+    public bool EnableLeaderBalancer { get; set; }
+
+    /// <summary>
+    /// How often each node emits a <c>NodeLoadReport</c> on the gossip path.
+    /// The P0 leader uses this cadence to refresh its global leadership view.
+    /// Shorter intervals give fresher data at the cost of more gossip traffic.
+    /// <para>Default is <b>5 seconds</b>.</para>
+    /// </summary>
+    public TimeSpan LeaderBalancerReportInterval { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// How often the P0 leader runs a balancer planning pass, building a
+    /// <c>GlobalLeadershipView</c> and dispatching any <c>LeaderMove</c> suggestions.
+    /// Shorter intervals react faster but add coordinator overhead.
+    /// <para>Default is <b>30 seconds</b>.</para>
+    /// </summary>
+    public TimeSpan LeaderBalancerInterval { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Maximum age of a <c>NodeLoadReport</c> before it is considered stale and excluded
+    /// from the planning view.  Must be greater than <see cref="LeaderBalancerReportInterval"/>
+    /// to tolerate at least one missed emission.
+    /// <para>Default is <b>20 seconds</b>.</para>
+    /// </summary>
+    public TimeSpan LeaderBalancerReportTtl { get; set; } = TimeSpan.FromSeconds(20);
+
+    /// <summary>
+    /// Minimum leader-count imbalance (above and below the ideal per-node count) that
+    /// must exist before the count tier emits any moves.  A deadband of 1 means a node
+    /// must be at least 2 above the natural ceiling before it is considered over-loaded.
+    /// Prevents flip-flopping around perfectly-balanced distributions.
+    /// <para>Default is <b>1</b>.</para>
+    /// </summary>
+    public int CountDeadband { get; set; } = 1;
+
+    /// <summary>
+    /// Fractional load skew threshold between the busiest and quietest live voter node
+    /// that triggers load-tier swaps when the count distribution is already balanced.
+    /// Skew is measured as <c>(maxLoad − minLoad) / maxLoad</c>.
+    /// <para>Default is <b>0.25</b> (25 %).</para>
+    /// </summary>
+    public double LoadImbalanceThreshold { get; set; } = 0.25;
+
+    /// <summary>
+    /// How long a partition must remain on the same leader (ms) before it is eligible
+    /// to be moved.  Prevents the balancer from immediately shuffling a partition that
+    /// just won an election, giving the new leader time to stabilise.
+    /// <para>Default is <b>5000 ms</b>.</para>
+    /// </summary>
+    public long MinLeaderStabilityMs { get; set; } = 5000;
+
+    /// <summary>
+    /// How long a partition is excluded from further moves after a transfer suggestion
+    /// is confirmed or times out.  Prevents rapid oscillation on hot partitions.
+    /// <para>Default is <b>60 seconds</b>.</para>
+    /// </summary>
+    public TimeSpan MoveCooldown { get; set; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// Maximum number of <c>LeaderMove</c> suggestions emitted in a single planner pass.
+    /// Limits the blast radius of a bad planning decision and keeps the suggestion queue
+    /// from growing unbounded during large imbalances.
+    /// <para>Default is <b>4</b>.</para>
+    /// </summary>
+    public int MaxMovesPerPass { get; set; } = 4;
+
+    /// <summary>
+    /// Maximum number of in-flight transfer suggestions the P0 leader tracks simultaneously.
+    /// Once this limit is reached no new moves are dispatched until outstanding ones confirm
+    /// or time out.  Prevents the cluster from being in permanent leadership churn.
+    /// <para>Default is <b>2</b>.</para>
+    /// </summary>
+    public int MaxConcurrentTransfers { get; set; } = 2;
+
+    /// <summary>
+    /// Weight of the EWMA ops/sec term in the composite per-partition load score:
+    /// <c>Load = LeaderBalancerOpsWeight × OpsPerSecond + LeaderBalancerQueueWeight × QueueDepth</c>.
+    /// Higher values make the balancer more sensitive to throughput differences between partitions.
+    /// <para>Default is <b>1.0</b>.</para>
+    /// </summary>
+    public double LeaderBalancerOpsWeight { get; set; } = 1.0;
+
+    /// <summary>
+    /// Weight of the instantaneous queue-depth term in the composite per-partition load score.
+    /// Higher values make the balancer more sensitive to pending-work backlog.
+    /// <para>Default is <b>0.5</b>.</para>
+    /// </summary>
+    public double LeaderBalancerQueueWeight { get; set; } = 0.5;
+
+    /// <summary>
+    /// How long the P0 leader waits for a suggested move to be confirmed by the global view
+    /// before declaring it dropped or failed and clearing it from the outstanding-move table.
+    /// After timeout the partition is eligible again subject to <see cref="MoveCooldown"/>.
+    /// <para>Default is <b>15 s</b>.</para>
+    /// </summary>
+    public TimeSpan SuggestionTimeout { get; set; } = TimeSpan.FromSeconds(15);
+
     // ── WAL compaction ────────────────────────────────────────────────────────
 
     /// <summary>

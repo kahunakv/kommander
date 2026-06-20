@@ -30,4 +30,11 @@ public interface IRaftWalScheduler
     /// (or an error) has been observed.
     /// </param>
     void Enqueue(WALWriteOperation operation);
+
+    /// <summary>
+    /// Returns the current pending-or-in-flight work depth for a single partition, or 0 if
+    /// the partition has no queued work. The value is approximate and suitable for advisory
+    /// load scoring only.
+    /// </summary>
+    int GetPartitionDepth(int partitionId);
 }

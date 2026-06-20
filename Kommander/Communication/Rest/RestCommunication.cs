@@ -178,7 +178,14 @@ public class RestCommunication : ICommunication
             ? JsonSerializer.Serialize(digest.Roster)
             : null;
 
-        GossipRequest request = new(digest.SenderEndpoint, digest.MembershipVersion, rosterJson);
+        string? loadReportJson = digest.LoadReport is not null
+            ? JsonSerializer.Serialize(digest.LoadReport)
+            : null;
+
+        GossipRequest request = new(digest.SenderEndpoint, digest.MembershipVersion, rosterJson)
+        {
+            LoadReportJson = loadReportJson,
+        };
         string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.GossipRequest);
 
         try

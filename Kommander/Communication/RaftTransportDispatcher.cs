@@ -191,6 +191,10 @@ internal sealed class RaftTransportDispatcher : IDisposable
                             items.Add(new() { Type = BatchRequestsRequestType.TransferLeadership, TransferLeadership = msg.TransferLeadershipRequest });
                             break;
 
+                        case RaftResponderRequestType.TransferLeadershipSuggestion:
+                            items.Add(new() { Type = BatchRequestsRequestType.TransferLeadershipSuggestion, TransferLeadershipSuggestion = msg.TransferLeadershipSuggestionRequest });
+                            break;
+
                         case RaftResponderRequestType.AppendLogs:
                             items.Add(new() { Type = BatchRequestsRequestType.AppendLogs, AppendLogs = msg.AppendLogsRequest });
                             break;
@@ -259,6 +263,20 @@ internal sealed class RaftTransportDispatcher : IDisposable
                             {
                                 Type = BatchRequestsRequestType.TransferLeadership,
                                 TransferLeadership = message.TransferLeadershipRequest
+                            }
+                        ]
+                    }),
+
+                RaftResponderRequestType.TransferLeadershipSuggestion
+                    when message.Node is not null && message.TransferLeadershipSuggestionRequest is not null
+                    => communication.BatchRequests(manager, message.Node, new BatchRequestsRequest
+                    {
+                        Requests =
+                        [
+                            new BatchRequestsRequestItem
+                            {
+                                Type = BatchRequestsRequestType.TransferLeadershipSuggestion,
+                                TransferLeadershipSuggestion = message.TransferLeadershipSuggestionRequest
                             }
                         ]
                     }),

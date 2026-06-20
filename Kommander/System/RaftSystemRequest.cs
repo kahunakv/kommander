@@ -62,6 +62,12 @@ public sealed class RaftSystemRequest
     /// </summary>
     public ClusterMembership? GossipedRoster { get; init; }
 
+    /// <summary>
+    /// Advisory load report for <see cref="RaftSystemRequestType.ApplyGossipLoadReport"/> requests.
+    /// Stored in the coordinator's in-memory per-endpoint map; never written to the Raft log.
+    /// </summary>
+    public NodeLoadReport? GossipedLoadReport { get; init; }
+
     public RaftSystemRequest(RaftSystemRequestType type)
     {
         Type = type;
@@ -119,6 +125,15 @@ public sealed class RaftSystemRequest
     {
         Type = RaftSystemRequestType.ApplyGossipRoster;
         GossipedRoster = gossipedRoster;
+    }
+
+    /// <summary>
+    /// Constructor for <see cref="RaftSystemRequestType.ApplyGossipLoadReport"/> requests.
+    /// </summary>
+    public RaftSystemRequest(NodeLoadReport gossipedLoadReport)
+    {
+        Type = RaftSystemRequestType.ApplyGossipLoadReport;
+        GossipedLoadReport = gossipedLoadReport;
     }
 
     /// <summary>

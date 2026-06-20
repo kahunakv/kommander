@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using Kommander.Data;
+using Kommander.System;
 
 namespace Kommander.Communication;
 
@@ -16,6 +17,9 @@ namespace Kommander.Communication;
 [JsonSerializable(typeof(BatchRequestsRequestItem))]
 [JsonSerializable(typeof(StepDownNoticeRequest))]
 [JsonSerializable(typeof(TransferLeadershipRequest))]
+[JsonSerializable(typeof(TransferLeadershipSuggestionRequest))]
+[JsonSerializable(typeof(NodeLoadReport))]
+[JsonSerializable(typeof(PartitionLoad))]
 [JsonSerializable(typeof(HandshakeRequest))]
 [JsonSerializable(typeof(JoinRequest))]
 [JsonSerializable(typeof(JoinResponse))]

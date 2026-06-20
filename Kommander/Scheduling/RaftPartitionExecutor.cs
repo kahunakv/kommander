@@ -127,6 +127,11 @@ public sealed class RaftPartitionExecutor : IDisposable
     private readonly TaskCompletionSource _restoreTcs =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    // ── Load tracking ─────────────────────────────────────────────────────
+
+    private readonly PartitionLoadAccumulator _loadAccumulator;
+    private readonly Func<int>? _walQueueDepthProvider;
+
     // ── Observability ──────────────────────────────────────────────────────
 
     private long _totalProcessed;
@@ -158,6 +163,16 @@ public sealed class RaftPartitionExecutor : IDisposable
     /// 0 or negative means the queue is unbounded.
     /// </summary>
     public int ClientQueueCapacity => _maxClientQueueDepth;
+
+    /// <summary>
+    /// Advisory composite load score for this partition, combining EWMA ops/sec and
+    /// instantaneous queue backlog. See <see cref="PartitionLoadAccumulator.CurrentLoad"/>.
+    /// </summary>
+    public double CurrentLoad(double wOps, double wQueue) =>
+        _loadAccumulator.CurrentLoad(wOps, wQueue, ClientQueueDepth, _walQueueDepthProvider?.Invoke() ?? 0);
+
+    /// <summary>EWMA ops/sec estimate. Exposed for diagnostics and tests.</summary>
+    internal double CurrentOpsPerSecond() => _loadAccumulator.CurrentOpsPerSecond();
 
     /// <summary>
     /// True once Phase 2 of the partition restore (log replay) has completed on
@@ -198,6 +213,10 @@ public sealed class RaftPartitionExecutor : IDisposable
     /// <param name="drainQuantumReplication">Max replication ops drained per wake cycle. 0 = use default.</param>
     /// <param name="drainQuantumClient">Max client ops drained per wake cycle. 0 = use default.</param>
     /// <param name="drainQuantumMaintenance">Max maintenance ops drained per wake cycle. 0 = use default.</param>
+    /// <param name="walQueueDepthProvider">
+    /// Optional delegate returning the current WAL pending-or-in-flight depth for this
+    /// partition. Used in the composite load score. Null disables the WAL depth term.
+    /// </param>
     public RaftPartitionExecutor(
         RaftPartitionStateMachine stateMachine,
         int partitionId,
@@ -208,7 +227,8 @@ public sealed class RaftPartitionExecutor : IDisposable
         int drainQuantumReplication = 0,
         int drainQuantumClient = 0,
         int drainQuantumMaintenance = 0,
-        Func<long>? getGeneration = null)
+        Func<long>? getGeneration = null,
+        Func<int>? walQueueDepthProvider = null)
     {
         _stateMachine = stateMachine;
         _partitionId = partitionId;
@@ -220,6 +240,8 @@ public sealed class RaftPartitionExecutor : IDisposable
         _drainQuantumReplication = drainQuantumReplication > 0 ? drainQuantumReplication : (int)RaftOperationPriority.Replication;
         _drainQuantumClient      = drainQuantumClient      > 0 ? drainQuantumClient      : (int)RaftOperationPriority.Client;
         _drainQuantumMaintenance = drainQuantumMaintenance > 0 ? drainQuantumMaintenance : (int)RaftOperationPriority.Maintenance;
+        _walQueueDepthProvider = walQueueDepthProvider;
+        _loadAccumulator = new PartitionLoadAccumulator();
 
         _worker = new Thread(WorkerLoop)
         {
@@ -686,10 +708,12 @@ public sealed class RaftPartitionExecutor : IDisposable
             Interlocked.Increment(ref _totalProcessed);
 
             double elapsedMs = sw.GetElapsedTime().TotalMilliseconds;
-            string opClass = RaftOperationMapper.GetKind(request.Type).ToString();
-            TagList tags = new() { { "partition_id", _partitionId }, { "operation_class", opClass } };
+            RaftOperationKind kind = RaftOperationMapper.GetKind(request.Type);
+            TagList tags = new() { { "partition_id", _partitionId }, { "operation_class", kind.ToString() } };
             KommanderMetrics.ExecutorOperationsTotal.Add(1, tags);
             KommanderMetrics.ExecutorOperationDurationMs.Record(elapsedMs, tags);
+            if (kind is RaftOperationKind.Client or RaftOperationKind.Replication)
+                _loadAccumulator.RecordOps(1);
         }
         catch (Exception ex)
         {
@@ -748,6 +772,7 @@ public sealed class RaftPartitionExecutor : IDisposable
             TagList tags = new() { { "partition_id", _partitionId }, { "operation_class", "Replication" } };
             KommanderMetrics.ExecutorOperationsTotal.Add(ops.Count, tags);
             KommanderMetrics.ExecutorOperationDurationMs.Record(elapsedMs, tags);
+            _loadAccumulator.RecordOps(ops.Count);
         }
         catch (Exception ex)
         {

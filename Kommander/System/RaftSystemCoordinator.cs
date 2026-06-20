@@ -62,6 +62,33 @@ internal sealed class RaftSystemCoordinator : IDisposable
     // and sends a DrainSentinel request; the loop completes it in FIFO order.
     private readonly ConcurrentQueue<TaskCompletionSource> _drainQueue = new();
 
+    // ── Load-report store ──────────────────────────────────────────────────
+    // Keyed by sender endpoint; retains only the highest ReportVersion per node.
+    // Written exclusively from the single-consumer loop; reads via GetLoadReports()
+    // copy the snapshot to avoid races with Phase 4 callers on other threads.
+    private readonly Dictionary<string, NodeLoadReport> _loadReports = new(StringComparer.Ordinal);
+
+    // ── Balancer controller state ──────────────────────────────────────────
+    // All accessed exclusively from the single-consumer loop — no locking required.
+
+    /// <summary>
+    /// Per-partition cooldown end time.  After a transfer suggestion is confirmed
+    /// (view shows the new owner) the partition is placed in cooldown for
+    /// <see cref="RaftConfiguration.MoveCooldown"/> to prevent oscillation.
+    /// Cleared on P0 leadership loss (the new P0 resets from an empty table).
+    /// </summary>
+    private readonly Dictionary<int, global::System.DateTimeOffset> _balancerCooldowns = new();
+
+    /// <summary>
+    /// Outstanding transfer suggestions dispatched but not yet view-confirmed.
+    /// Key = partition id; value = intended target endpoint + expiry deadline.
+    /// On view confirmation the entry is removed and the partition enters cooldown.
+    /// On expiry the entry is cleared; the partition re-enters cooldown for one
+    /// <see cref="RaftConfiguration.MoveCooldown"/> to prevent hot-looping.
+    /// Cleared on P0 leadership loss.
+    /// </summary>
+    private readonly Dictionary<int, (string Target, global::System.DateTimeOffset Deadline)> _outstandingMoves = new();
+
     // ── Membership state ───────────────────────────────────────────────────
     // Cached view of the committed roster.  Only updated from within the single-
     // consumer loop so no locking is required.
@@ -298,6 +325,14 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
             case RaftSystemRequestType.ApplyGossipRoster:
                 ApplyGossipRoster(message);
+                break;
+
+            case RaftSystemRequestType.ApplyGossipLoadReport:
+                ApplyGossipLoadReport(message);
+                break;
+
+            case RaftSystemRequestType.RunBalancerPass:
+                await RunBalancerPassAsync(cancellationToken).ConfigureAwait(false);
                 break;
 
             case RaftSystemRequestType.DrainSentinel:
@@ -1634,6 +1669,274 @@ internal sealed class RaftSystemCoordinator : IDisposable
     }
 
     /// <summary>
+    /// Stores a gossiped <see cref="NodeLoadReport"/> in the per-endpoint map, keeping
+    /// only the highest <see cref="NodeLoadReport.ReportVersion"/> per endpoint.
+    /// Called from the coordinator channel loop — no locking required.
+    /// </summary>
+    private void ApplyGossipLoadReport(RaftSystemRequest request)
+    {
+        NodeLoadReport? report = request.GossipedLoadReport;
+        if (report is null || string.IsNullOrEmpty(report.Endpoint))
+            return;
+
+        if (_loadReports.TryGetValue(report.Endpoint, out NodeLoadReport? existing) &&
+            report.ReportVersion <= existing.ReportVersion)
+            return;
+
+        _loadReports[report.Endpoint] = report;
+    }
+
+    /// <summary>
+    /// Returns a snapshot of all load reports currently retained, keyed by endpoint.
+    /// The P0 balancer controller (Phase 4) calls this at the start of each planning pass.
+    /// Entries are not TTL-filtered here — <see cref="GlobalLeadershipView.Build"/> applies
+    /// the TTL when reducing reports into a planning view.
+    /// </summary>
+    internal IReadOnlyList<NodeLoadReport> GetLoadReports()
+    {
+        List<NodeLoadReport> snapshot = new(_loadReports.Count);
+        foreach (NodeLoadReport r in _loadReports.Values)
+            snapshot.Add(r);
+        return snapshot;
+    }
+
+    // ── Balancer controller ────────────────────────────────────────────────
+
+    /// <summary>
+    /// Executes one leader-balancer planning pass.
+    /// Only acts when this node is the P0 leader and <c>EnableLeaderBalancer</c> is on.
+    ///
+    /// <para><b>Pass sequence:</b>
+    /// <list type="number">
+    ///   <item>Clear P0 imbalance gauges and return early when not P0 or flag is off.</item>
+    ///   <item>Reconcile outstanding moves: confirm view-visible completions (enter cooldown)
+    ///         or expire timed-out ones (enter cooldown for one cycle to prevent hot-looping).</item>
+    ///   <item>Reduce retained load reports → <see cref="GlobalLeadershipView"/>.  Skip pass if
+    ///         the view is incomplete (increments <c>raft.balancer.skipped_passes_total</c>).</item>
+    ///   <item>Update imbalance gauges (even on a skipped pass, after reconciliation).</item>
+    ///   <item>Cap new moves by <see cref="RaftConfiguration.MaxConcurrentTransfers"/> — number
+    ///         of already-outstanding slots consumed.</item>
+    ///   <item>Dispatch each planned move as a
+    ///         <see cref="Data.TransferLeadershipSuggestionRequest"/> to the partition's current owner
+    ///         via <see cref="RaftManager.SendTransferLeadershipSuggestion"/>.</item>
+    /// </list></para>
+    ///
+    /// <para>The controller holds no durable state — if P0 leadership moves the new leader
+    /// resets cooldowns and the outstanding table and re-derives reality from the next pass.</para>
+    /// </summary>
+    private Task RunBalancerPassAsync(CancellationToken cancellationToken)
+    {
+        RaftConfiguration config = manager.Configuration;
+
+        if (!config.EnableLeaderBalancer)
+            return Task.CompletedTask;
+
+        // Only the P0 leader runs passes.
+        if (!string.Equals(leaderNode, manager.LocalEndpoint, global::System.StringComparison.Ordinal))
+        {
+            // Reset gauges so a node that steps down doesn't leave stale readings.
+            Diagnostics.KommanderMetrics.BalancerCountImbalance = 0.0;
+            Diagnostics.KommanderMetrics.BalancerLoadImbalance = 0.0;
+            // Clear in-memory balancer state on leadership loss so the next P0 leader
+            // starts clean regardless of how long this node was P0.
+            _balancerCooldowns.Clear();
+            _outstandingMoves.Clear();
+            return Task.CompletedTask;
+        }
+
+        global::System.DateTimeOffset now = global::System.DateTimeOffset.UtcNow;
+        Time.HLCTimestamp hlcNow = manager.HybridLogicalClock.TrySendOrLocalEvent(manager.LocalNodeId);
+
+        // ── Step 1: reconcile outstanding moves ──────────────────────────────
+
+        // Build a lightweight view from the retained reports to confirm/expire outstanding moves.
+        // We do this before the IsComplete check so we always release finished slots.
+        ClusterMembership membership = GetMembership();
+
+        // Build a minimal partition-owner map from stored reports to detect confirmations.
+        Dictionary<int, string> currentOwners = new();
+        foreach (NodeLoadReport r in _loadReports.Values)
+        {
+            foreach (PartitionLoad pl in r.Leaderships)
+            {
+                // Latest report wins on conflict (same as GlobalLeadershipView).
+                if (!currentOwners.TryGetValue(pl.PartitionId, out _))
+                    currentOwners[pl.PartitionId] = r.Endpoint;
+            }
+        }
+
+        List<int> toRemove = [];
+        foreach ((int partitionId, (string target, global::System.DateTimeOffset deadline)) in _outstandingMoves)
+        {
+            if (currentOwners.TryGetValue(partitionId, out string? owner) &&
+                string.Equals(owner, target, global::System.StringComparison.Ordinal))
+            {
+                // Move confirmed by the global view — enter cooldown.
+                Diagnostics.KommanderMetrics.BalancerMovesTotal.Add(1,
+                    new global::System.Collections.Generic.KeyValuePair<string, object?>("outcome", "succeeded"));
+                _balancerCooldowns[partitionId] = now + config.MoveCooldown;
+                toRemove.Add(partitionId);
+            }
+            else if (now >= deadline)
+            {
+                // Suggestion timed out — enter cooldown for one cycle then retry.
+                Diagnostics.KommanderMetrics.BalancerMovesTotal.Add(1,
+                    new global::System.Collections.Generic.KeyValuePair<string, object?>("outcome", "timed_out"));
+                _balancerCooldowns[partitionId] = now + config.MoveCooldown;
+                toRemove.Add(partitionId);
+            }
+        }
+        foreach (int id in toRemove)
+            _outstandingMoves.Remove(id);
+
+        // ── Step 2: build a complete GlobalLeadershipView ────────────────────
+
+        IReadOnlyList<NodeLoadReport> reports = GetLoadReports();
+        HashSet<string> aliveEndpoints = new(StringComparer.Ordinal);
+        foreach (ClusterMember m in membership.Members)
+        {
+            if (m.Role == ClusterMemberRole.Voter &&
+                manager.Liveness.GetState(m.Endpoint) < Gossip.MemberLivenessState.Suspect)
+                aliveEndpoints.Add(m.Endpoint);
+        }
+
+        TimeSpan ttl = config.LeaderBalancerReportTtl;
+        GlobalLeadershipView view = GlobalLeadershipView.Build(reports, membership.Members, aliveEndpoints, ttl, hlcNow);
+
+        // Update imbalance gauges based on the current view (even if the pass is skipped).
+        UpdateImbalanceGauges(view);
+
+        if (!view.IsComplete())
+        {
+            Diagnostics.KommanderMetrics.BalancerSkippedPassesTotal.Add(1);
+            return Task.CompletedTask;
+        }
+
+        // ── Step 3: plan ──────────────────────────────────────────────────────
+
+        // Build the effective cooldown set for the planner.
+        // Outstanding partitions (in-flight, unconfirmed suggestions) must be treated as
+        // ineligible so the planner cannot re-select them and issue a duplicate suggestion.
+        // Without this exclusion the planner re-plans any outstanding partition every pass,
+        // extending its effective deadline on every iteration when LeaderBalancerInterval <
+        // SuggestionTimeout.  We fold outstanding IDs into the cooldown map with a
+        // far-future expiry rather than changing the Plan() API; the sentinel value is
+        // simply "still in cooldown" from the planner's perspective.
+        global::System.Collections.Generic.IReadOnlyDictionary<int, global::System.DateTimeOffset> cooldowns;
+        if (_outstandingMoves.Count > 0)
+        {
+            Dictionary<int, global::System.DateTimeOffset> merged = new(_balancerCooldowns);
+            global::System.DateTimeOffset farFuture = now + global::System.TimeSpan.FromDays(1);
+            foreach (int pid in _outstandingMoves.Keys)
+                merged.TryAdd(pid, farFuture);
+            cooldowns = merged;
+        }
+        else
+        {
+            cooldowns = _balancerCooldowns;
+        }
+
+        // Cap new moves by outstanding capacity.
+        int availableSlots = global::System.Math.Max(0, config.MaxConcurrentTransfers - _outstandingMoves.Count);
+        if (availableSlots == 0)
+            return Task.CompletedTask;
+
+        RaftPartitionMap partitionMap;
+        if (systemConfiguration.TryGetValue(RaftSystemConfigKeys.Partitions, out string? mapJson))
+        {
+            partitionMap = global::System.Text.Json.JsonSerializer.Deserialize<RaftPartitionMap>(mapJson)
+                           ?? new RaftPartitionMap { Partitions = [] };
+        }
+        else
+        {
+            partitionMap = new RaftPartitionMap { Partitions = [] };
+        }
+
+        // Reduce MaxMovesPerPass by outstanding capacity when already near the cap.
+        int effectiveMaxMoves = global::System.Math.Min(config.MaxMovesPerPass, availableSlots);
+        RaftConfiguration planConfig = effectiveMaxMoves == config.MaxMovesPerPass
+            ? config
+            : new RaftConfiguration
+            {
+                MaxMovesPerPass = effectiveMaxMoves,
+                CountDeadband = config.CountDeadband,
+                LoadImbalanceThreshold = config.LoadImbalanceThreshold,
+                MinLeaderStabilityMs = config.MinLeaderStabilityMs,
+                MoveCooldown = config.MoveCooldown,
+                MaxConcurrentTransfers = config.MaxConcurrentTransfers,
+            };
+
+        global::System.Collections.Generic.IReadOnlyList<LeaderMove> moves =
+            LeaderBalancePlanner.Plan(view, partitionMap, planConfig, cooldowns, now);
+
+        // ── Step 4: dispatch ──────────────────────────────────────────────────
+
+        foreach (LeaderMove move in moves)
+        {
+            if (_outstandingMoves.Count >= config.MaxConcurrentTransfers)
+                break;
+
+            Data.TransferLeadershipSuggestionRequest suggestion = new(
+                move.PartitionId,
+                0L,
+                hlcNow,
+                manager.LocalEndpoint,
+                move.ToEndpoint);
+
+            manager.SendTransferLeadershipSuggestion(move.FromEndpoint, suggestion);
+
+            _outstandingMoves[move.PartitionId] = (move.ToEndpoint, now + config.SuggestionTimeout);
+
+            Diagnostics.KommanderMetrics.BalancerMovesTotal.Add(1,
+                new global::System.Collections.Generic.KeyValuePair<string, object?>("outcome", "planned"));
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static void UpdateImbalanceGauges(GlobalLeadershipView view)
+    {
+        // Count imbalance: max count − target (floor target = totalLeaders / liveVoters).
+        if (view.LiveVoters.Count == 0)
+        {
+            Diagnostics.KommanderMetrics.BalancerCountImbalance = 0.0;
+            Diagnostics.KommanderMetrics.BalancerLoadImbalance = 0.0;
+            return;
+        }
+
+        int totalLeaders = 0;
+        foreach (global::System.Collections.Generic.KeyValuePair<string, global::System.Collections.Generic.List<int>> kv in view.LeadersByNode)
+            totalLeaders += kv.Value.Count;
+
+        double target = (double)totalLeaders / view.LiveVoters.Count;
+        double maxCount = 0;
+        foreach (global::System.Collections.Generic.KeyValuePair<string, global::System.Collections.Generic.List<int>> kv in view.LeadersByNode)
+        {
+            if (kv.Value.Count > maxCount)
+                maxCount = kv.Value.Count;
+        }
+        Diagnostics.KommanderMetrics.BalancerCountImbalance = global::System.Math.Max(0.0, maxCount - target);
+
+        // Load imbalance: (maxLoad / meanLoad) - 1.
+        if (view.LoadByNode.Count == 0)
+        {
+            Diagnostics.KommanderMetrics.BalancerLoadImbalance = 0.0;
+            return;
+        }
+
+        double sumLoad = 0;
+        double maxLoad = 0;
+        foreach (global::System.Collections.Generic.KeyValuePair<string, double> kv in view.LoadByNode)
+        {
+            sumLoad += kv.Value;
+            if (kv.Value > maxLoad)
+                maxLoad = kv.Value;
+        }
+        double meanLoad = sumLoad / view.LoadByNode.Count;
+        Diagnostics.KommanderMetrics.BalancerLoadImbalance = meanLoad > 0.0 ? (maxLoad / meanLoad) - 1.0 : 0.0;
+    }
+
+    /// <summary>
     /// Resets the local membership cache to an empty roster.
     /// Intended for tests that need to simulate a node that missed committed membership
     /// entries, allowing the gossip anti-entropy path to be exercised in isolation.
@@ -1641,6 +1944,38 @@ internal sealed class RaftSystemCoordinator : IDisposable
     /// </summary>
     internal void ResetMembershipCacheForTest() =>
         _cachedMembership = new ClusterMembership { MembershipVersion = 0, Members = [] };
+
+    /// <summary>
+    /// Returns the current count of outstanding move suggestions for test assertions.
+    /// Must not be called from production code — races with the coordinator loop.
+    /// </summary>
+    internal int OutstandingMoveCountForTest => _outstandingMoves.Count;
+
+    /// <summary>
+    /// Injects a <see cref="RaftPartitionMap"/> into the coordinator's system-configuration
+    /// store via the <c>ConfigRestored</c> channel message.
+    /// Allows unit tests to seed the partition map without running a full Raft log.
+    /// Must only be used from tests; call <see cref="DrainAsync"/> afterwards.
+    /// </summary>
+    internal void SetPartitionMapForTest(RaftPartitionMap map)
+    {
+        string json = global::System.Text.Json.JsonSerializer.Serialize(map);
+        RaftSystemMessage proto = new() { Key = RaftSystemConfigKeys.Partitions, Value = json };
+        Send(new RaftSystemRequest(RaftSystemRequestType.ConfigRestored, Serialize(proto)));
+    }
+
+    /// <summary>
+    /// Injects a <see cref="ClusterMembership"/> into the coordinator's cache via the
+    /// <c>ConfigRestored</c> channel message so tests can drive balancer passes without
+    /// calling <c>JoinCluster</c>.
+    /// Must only be used from tests; call <see cref="DrainAsync"/> afterwards.
+    /// </summary>
+    internal void SetMembershipForTest(ClusterMembership membership)
+    {
+        string json = global::System.Text.Json.JsonSerializer.Serialize(membership);
+        RaftSystemMessage proto = new() { Key = RaftSystemConfigKeys.Members, Value = json };
+        Send(new RaftSystemRequest(RaftSystemRequestType.ConfigRestored, Serialize(proto)));
+    }
 
     // ── Learner promotion driver ───────────────────────────────────────────────
     // Keyed by learner endpoint; records when the learner first appeared caught-up on all partitions.

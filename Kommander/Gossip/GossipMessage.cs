@@ -3,6 +3,7 @@ using Kommander.System;
 
 namespace Kommander.Gossip;
 
+
 /// <summary>
 /// Full-state membership push sent to a random peer each gossip round.
 /// Carries the sender's committed roster so the receiver can apply it when
@@ -40,6 +41,14 @@ public sealed record GossipMessage(
     /// (higher incarnation wins; Dead &gt; Suspect &gt; Alive at the same incarnation).
     /// </summary>
     public IReadOnlyList<MemberLivenessEntry>? LivenessUpdates { get; init; }
+
+    /// <summary>
+    /// Advisory load report for the sender node, piggybacked on the gossip round.
+    /// Present only when <c>EnableLeaderBalancer</c> is true on the sender.
+    /// The receiver forwards it to the system coordinator, which retains the
+    /// highest <see cref="NodeLoadReport.ReportVersion"/> per endpoint for planning.
+    /// </summary>
+    public NodeLoadReport? LoadReport { get; init; }
 };
 
 /// <summary>

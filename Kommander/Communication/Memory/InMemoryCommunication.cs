@@ -267,7 +267,12 @@ public class InMemoryCommunication : ICommunication
                                 if (targetNode is RaftManager transferManager)
                                     transferManager.TransferLeadership(item.TransferLeadership!);
                                 break;
-                            
+
+                            case BatchRequestsRequestType.TransferLeadershipSuggestion:
+                                if (targetNode is RaftManager suggestionManager)
+                                    suggestionManager.ReceiveTransferLeadershipSuggestion(item.TransferLeadershipSuggestion!);
+                                break;
+
                             case BatchRequestsRequestType.AppendLogs:
                                 targetNode.AppendLogs(item.AppendLogs!);
                                 break;

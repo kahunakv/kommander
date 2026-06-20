@@ -269,6 +269,14 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     }
 
     /// <summary>
+    /// Returns the current pending-or-in-flight depth for a single partition, or 0 if the
+    /// partition has no queued work. The value is approximate (no lock held) and suitable
+    /// for advisory load scoring only.
+    /// </summary>
+    public int GetPartitionDepth(int partitionId) =>
+        _partitions.TryGetValue(partitionId, out PartitionState? state) ? state.Depth : 0;
+
+    /// <summary>
     /// Stops the scheduler.
     ///
     /// <para>When called, no new operations are accepted.  All operations that were

@@ -62,5 +62,23 @@ public enum RaftSystemRequestType
     /// that <c>UpdateNodes</c> and peer routing reflect committed changes that have not
     /// yet been replicated to this node via the normal append-logs path.
     /// </summary>
-    ApplyGossipRoster
+    ApplyGossipRoster,
+
+    /// <summary>
+    /// Delivers a <see cref="NodeLoadReport"/> received via gossip to the system coordinator.
+    /// The coordinator keeps the newest <see cref="NodeLoadReport.ReportVersion"/> per endpoint
+    /// in an in-memory map for use by the Phase 4 balancer controller.
+    /// Never written to the Raft log.
+    /// </summary>
+    ApplyGossipLoadReport,
+
+    /// <summary>
+    /// Triggers one leader-balancer planning pass on the P0 leader.
+    /// Reduces retained load reports into a <see cref="GlobalLeadershipView"/>, runs the
+    /// two-tier planner, dispatches suggestions for each planned move, and updates the
+    /// outstanding-move table.  Sent by the timer service every
+    /// <see cref="RaftConfiguration.LeaderBalancerInterval"/>; silently ignored when this
+    /// node is not the P0 leader or <see cref="RaftConfiguration.EnableLeaderBalancer"/> is false.
+    /// </summary>
+    RunBalancerPass
 }

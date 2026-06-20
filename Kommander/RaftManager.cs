@@ -106,8 +106,12 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     internal IRaftStateMachineTransfer? StateMachineTransfer => Volatile.Read(ref _stateMachineTransfer);
 
     private readonly ConcurrentDictionary<(string endpoint, int partitionId), HLCTimestamp> lastActivity = new();
-    
+
     private readonly ConcurrentDictionary<(string endpoint, int partitionId), HLCTimestamp> lastHearthBeat = new();
+
+    // Monotonically increasing counter for NodeLoadReport.ReportVersion.
+    // Incremented on every BuildLocalLoadReport call; never reset.
+    private long _reportVersion;
     
     private readonly Communication.RaftTransportDispatcher transportDispatcher;
 
@@ -164,6 +168,12 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     internal ConcurrentDictionary<int, RaftPartition> Partitions => partitions;
 
     internal RaftSystemCoordinator SystemCoordinator => systemCoordinator;
+
+    /// <summary>
+    /// Exposes the timer service for tests that drive gossip or balancer passes
+    /// without waiting for wall-clock timer ticks.
+    /// </summary>
+    internal RaftTimerService TimerService => timerService;
 
     /// <summary>
     /// Whether the node is fully initialized or not
@@ -809,6 +819,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             Logger.LogInfoReceiveGossipRefuting(refutedInc);
         }
 
+        // Store advisory load report when the balancer is enabled.
+        if (configuration.EnableLeaderBalancer && digest.LoadReport is { } report)
+            systemCoordinator.Send(new System.RaftSystemRequest(report));
+
         // Respond with our current roster so the sender can catch up if we are ahead.
         bool includeRoster = local.MembershipVersion > digest.MembershipVersion;
         return new GossipAck(local.MembershipVersion, includeRoster ? local : null);
@@ -827,6 +841,18 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     public async Task GossipAsync(CancellationToken cancellationToken = default)
     {
         ClusterMembership membership = systemCoordinator.GetMembership();
+
+        // Always store the local load report so the local coordinator's view is always
+        // complete, even when gossip is skipped due to uninitialized membership.
+        // The report must be stored before the membership/fanout guards so test-driven
+        // drains always have fresh data.
+        System.NodeLoadReport? localReport = null;
+        if (configuration.EnableLeaderBalancer)
+        {
+            localReport = BuildLocalLoadReport();
+            systemCoordinator.Send(new System.RaftSystemRequest(localReport));
+        }
+
         if (membership.MembershipVersion == 0 || configuration.GossipFanout <= 0)
             return;
 
@@ -837,7 +863,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         IReadOnlyList<MemberLivenessEntry> livenessUpdates = Liveness.GetAll();
         GossipMessage digest = new(LocalEndpoint, membership.MembershipVersion, membership)
         {
-            LivenessUpdates = livenessUpdates.Count > 0 ? livenessUpdates : null
+            LivenessUpdates = livenessUpdates.Count > 0 ? livenessUpdates : null,
+            LoadReport = localReport,
         };
 
         int fanout = Math.Min(configuration.GossipFanout, peers.Count);
@@ -1310,6 +1337,9 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     Task Scheduling.IRaftTimerHost.PingAsync(CancellationToken cancellationToken) => PingAsync(cancellationToken);
 
+    void Scheduling.IRaftTimerHost.TriggerBalancerPass() =>
+        systemCoordinator.Send(new System.RaftSystemRequest(System.RaftSystemRequestType.RunBalancerPass));
+
     // ──────────────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -1450,6 +1480,50 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
+    /// Builds an advisory load report for this node, covering only the partitions for which
+    /// this node is currently leader. The report is stamped with a monotonically increasing
+    /// <c>ReportVersion</c> and the local HLC time so receivers can discard stale entries.
+    /// <para>
+    /// Only called when <see cref="RaftConfiguration.EnableLeaderBalancer"/> is
+    /// <see langword="true"/>. The report is never committed to the Raft log; it is gossiped
+    /// out-of-band so a stale or dropped report only delays balancing, never violates safety.
+    /// </para>
+    /// </summary>
+    internal NodeLoadReport BuildLocalLoadReport()
+    {
+        double wOps = configuration.LeaderBalancerOpsWeight;
+        double wQueue = configuration.LeaderBalancerQueueWeight;
+        double ticksToMs = 1000.0 / global::System.Diagnostics.Stopwatch.Frequency;
+        long now = global::System.Diagnostics.Stopwatch.GetTimestamp();
+
+        List<PartitionLoad> leaderships = [];
+
+        foreach (KeyValuePair<int, RaftPartition> kv in partitions)
+        {
+            RaftPartition p = kv.Value;
+            if (!string.Equals(p.Leader, LocalEndpoint, StringComparison.Ordinal))
+                continue;
+
+            long leaderSinceMs = (long)((now - p.LeaderChangedTicks) * ticksToMs);
+
+            leaderships.Add(new PartitionLoad
+            {
+                PartitionId = p.PartitionId,
+                Load = p.GetCurrentLoad(wOps, wQueue),
+                LeaderSinceMs = leaderSinceMs > 0 ? leaderSinceMs : 0,
+            });
+        }
+
+        return new NodeLoadReport
+        {
+            Endpoint = LocalEndpoint,
+            ReportVersion = Interlocked.Increment(ref _reportVersion),
+            Time = hybridLogicalClock.TrySendOrLocalEvent(LocalNodeId),
+            Leaderships = leaderships,
+        };
+    }
+
+    /// <summary>
     /// Passes the Handshake to the appropriate partition
     /// </summary>
     /// <param name="request"></param>
@@ -1503,6 +1577,86 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         RaftPartition partition = GetPartition(request.Partition);
 
         partition.TransferLeadership(request);
+    }
+
+    /// <summary>
+    /// Receives an advisory leadership-transfer suggestion from the P0 balancer.
+    /// Validates that this node currently leads the partition, that the partition is
+    /// <see cref="System.RaftPartitionState.Active"/>, and that <paramref name="request"/>
+    /// <see cref="Data.TransferLeadershipSuggestionRequest.TargetEndpoint"/> is a live voter —
+    /// then fires the local transfer fire-and-forget.  Drops silently on any validation failure
+    /// so a stale or misdirected suggestion is always safe.
+    /// </summary>
+    internal void ReceiveTransferLeadershipSuggestion(Data.TransferLeadershipSuggestionRequest request)
+    {
+        if (!partitions.TryGetValue(request.Partition, out RaftPartition? partition))
+            return;
+
+        // Only act if we currently lead this partition.
+        if (!string.Equals(partition.Leader, LocalEndpoint, global::System.StringComparison.Ordinal))
+        {
+            Logger.LogDebugTransferSuggestionDroppedNotLeader(
+                request.Partition, request.Term, partition.Leader ?? "(none)", request.SuggestedBy);
+            return;
+        }
+
+        // Only move Active partitions.
+        if (partition.State != System.RaftPartitionState.Active)
+        {
+            Logger.LogDebugTransferSuggestionDroppedNotActive(
+                request.Partition, request.Term, partition.State, request.SuggestedBy);
+            return;
+        }
+
+        // Target must be a live voter.
+        System.ClusterMembership membership = systemCoordinator.GetMembership();
+        bool targetIsVoter = membership.Members.Exists(m =>
+            string.Equals(m.Endpoint, request.TargetEndpoint, global::System.StringComparison.Ordinal) &&
+            m.Role == System.ClusterMemberRole.Voter);
+
+        if (!targetIsVoter)
+        {
+            Logger.LogDebugTransferSuggestionDroppedNotVoter(
+                request.Partition, request.Term, request.TargetEndpoint, request.SuggestedBy);
+            return;
+        }
+
+        if (Liveness.GetState(request.TargetEndpoint) >= Gossip.MemberLivenessState.Suspect)
+        {
+            Logger.LogDebugTransferSuggestionDroppedSuspect(
+                request.Partition, request.Term, request.TargetEndpoint, request.SuggestedBy);
+            return;
+        }
+
+        // Fire-and-forget: the executor serialises the transfer; we don't await here.
+        _ = partition.TransferLeadershipAsync(request.TargetEndpoint, global::System.Threading.CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Sends an advisory leadership-transfer suggestion to the node at
+    /// <paramref name="ownerEndpoint"/> via the existing responder transport.
+    /// Fire-and-forget; a failed delivery is silently ignored and the suggestion
+    /// will time out in the Phase 4 outstanding-move table.
+    /// <para>
+    /// When the owner is this node itself — the common case where the P0 balancer leader
+    /// also leads the overloaded partition — the suggestion is delivered in-process.  The
+    /// peer transport cannot be used for self-delivery: a node is not its own peer
+    /// (<see cref="ClusterHandler.IsNode"/> excludes the local endpoint), so a self-addressed
+    /// responder message is dropped on the wire.  Without this short-circuit the balancer
+    /// could never rebalance partitions led by the P0 node.
+    /// </para>
+    /// </summary>
+    internal void SendTransferLeadershipSuggestion(string ownerEndpoint, Data.TransferLeadershipSuggestionRequest request)
+    {
+        if (string.Equals(ownerEndpoint, LocalEndpoint, global::System.StringComparison.Ordinal))
+        {
+            ReceiveTransferLeadershipSuggestion(request);
+            return;
+        }
+
+        RaftNode node = new(ownerEndpoint);
+        EnqueueResponse(ownerEndpoint, new Data.RaftResponderRequest(
+            Data.RaftResponderRequestType.TransferLeadershipSuggestion, node, request));
     }
 
     /// <summary>

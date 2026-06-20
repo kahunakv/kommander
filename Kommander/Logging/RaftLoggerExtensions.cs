@@ -265,6 +265,20 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Debug, Message = "[{Endpoint}/{Partition}] Logs replicated to {RemoteEndpoint}")]
     public static partial void LogDebugLogsReplicated(this ILogger<IRaft> logger, string endpoint, int partition, string remoteEndpoint);
 
+    // ── TransferLeadershipSuggestion drop diagnostics ─────────────────────
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "TransferSuggestion p{Partition} term={Term}: dropped — not leader (current={Leader}), suggested by {SuggestedBy}")]
+    public static partial void LogDebugTransferSuggestionDroppedNotLeader(this ILogger<IRaft> logger, int partition, long term, string leader, string suggestedBy);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "TransferSuggestion p{Partition} term={Term}: dropped — partition state={State}, suggested by {SuggestedBy}")]
+    public static partial void LogDebugTransferSuggestionDroppedNotActive(this ILogger<IRaft> logger, int partition, long term, Kommander.System.RaftPartitionState state, string suggestedBy);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "TransferSuggestion p{Partition} term={Term}: dropped — target {Target} is not a live voter, suggested by {SuggestedBy}")]
+    public static partial void LogDebugTransferSuggestionDroppedNotVoter(this ILogger<IRaft> logger, int partition, long term, string target, string suggestedBy);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "TransferSuggestion p{Partition} term={Term}: dropped — target {Target} is suspect/dead, suggested by {SuggestedBy}")]
+    public static partial void LogDebugTransferSuggestionDroppedSuspect(this ILogger<IRaft> logger, int partition, long term, string target, string suggestedBy);
+
     // ── RaftTransportDispatcher ───────────────────────────────────────────
 
     [LoggerMessage(Level = LogLevel.Trace, Message = "[RaftTransportDispatcher/{Endpoint}] Sending batch of {Count} messages")]

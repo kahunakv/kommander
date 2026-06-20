@@ -10,5 +10,6 @@ public enum BatchRequestsRequestType
     AppendLogs = 4,
     CompleteAppendLogs = 5,
     StepDownNotice = 6,
-    TransferLeadership = 7
+    TransferLeadership = 7,
+    TransferLeadershipSuggestion = 8
 }

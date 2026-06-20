@@ -14,6 +14,8 @@ public sealed class RaftResponderRequest
     public StepDownNoticeRequest? StepDownNoticeRequest { get; }
 
     public TransferLeadershipRequest? TransferLeadershipRequest { get; }
+
+    public TransferLeadershipSuggestionRequest? TransferLeadershipSuggestionRequest { get; }
     
     public AppendLogsRequest? AppendLogsRequest { get; }
     
@@ -68,5 +70,12 @@ public sealed class RaftResponderRequest
         Type = type;
         Node = node;
         CompleteAppendLogsRequest = request;
+    }
+
+    public RaftResponderRequest(RaftResponderRequestType type, RaftNode node, TransferLeadershipSuggestionRequest request)
+    {
+        Type = type;
+        Node = node;
+        TransferLeadershipSuggestionRequest = request;
     }
 }
