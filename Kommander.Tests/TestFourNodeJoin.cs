@@ -311,7 +311,19 @@ public sealed class TestFourNodeJoin
             if (await p0Leader.AmILeaderQuick(testPartitionId))
             {
                 RaftManager transferTarget = voters.First(v => v.GetLocalEndpoint() != p0Endpoint);
-                await p0Leader.TransferLeadershipAsync(testPartitionId, transferTarget.GetLocalEndpoint(), ct);
+                // TransferLeadershipAsync can return ReplicationFailed transiently if the target
+                // hasn't replicated the leader's no-op yet (race between user-partition heartbeat
+                // and this call completing before the first replication round). Retry until the
+                // transfer is initiated or another node has already won the partition.
+                long transferDeadline = Environment.TickCount64 + 10_000;
+                while (Environment.TickCount64 < transferDeadline)
+                {
+                    RaftOperationStatus st = await p0Leader.TransferLeadershipAsync(
+                        testPartitionId, transferTarget.GetLocalEndpoint(), ct);
+                    if (st != RaftOperationStatus.ReplicationFailed)
+                        break;
+                    await Task.Delay(200, ct);
+                }
             }
 
             // Wait until a leader is established for testPartition that is NOT the P0 leader.
