@@ -158,11 +158,24 @@ public interface IRaft
     public Task JoinCluster(IEnumerable<string> seeds, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Leaves the Raft cluster
+    /// Leaves the Raft cluster gracefully, committing a <c>RemoveMember(self)</c> entry so
+    /// surviving nodes drop this node from their committed roster.
+    /// <para>
+    /// <b>Single-voter short-circuit:</b> when the committed roster contains no other
+    /// <c>Voter</c> peer (standalone / embedded case), the membership round-trip is skipped
+    /// entirely and the node stops immediately — no 10 s deadline spin.
+    /// </para>
+    /// <para>
+    /// <b>Cancellation:</b> passing a <paramref name="cancellationToken"/> that is cancelled
+    /// during shutdown causes the method to return promptly rather than waiting up to
+    /// <c>deadlineMs</c>. The local stop sequence always runs regardless.
+    /// </para>
     /// </summary>
-    /// <param name="dispose">If true, also disposes the manager</param>
-    /// <returns></returns>
-    public Task LeaveCluster(bool dispose = false);
+    /// <param name="dispose">If <c>true</c>, also disposes the manager after stopping.</param>
+    /// <param name="cancellationToken">
+    /// Token that, when cancelled, aborts any in-progress graceful-leave attempt immediately.
+    /// </param>
+    public Task LeaveCluster(bool dispose = false, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Updates the active Raft cluster nodes

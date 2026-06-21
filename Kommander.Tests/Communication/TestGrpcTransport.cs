@@ -61,7 +61,7 @@ public class TestGrpcTransport
         }
         Assert.NotNull(leavingNode);
 
-        await leavingNode.Manager.LeaveCluster();
+        await leavingNode.Manager.LeaveCluster(cancellationToken: ct);
 
         // Give surviving nodes time to apply the removal entry.
         await Task.Delay(1500, ct);
