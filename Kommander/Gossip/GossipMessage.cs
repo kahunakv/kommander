@@ -12,16 +12,15 @@ namespace Kommander.Gossip;
 ///
 /// <para>
 /// <b>Design note — full-state push vs. digest/pull:</b>
-/// The task specification called for a lightweight digest
-/// <c>{MembershipVersion, rosterHash}</c> followed by a conditional pull of
-/// the full roster only when the receiver's version is lower.  This
-/// implementation instead ships the full <see cref="ClusterMembership"/> in
-/// every message.  For the cluster sizes Kommander targets (3–9 nodes) the
-/// roster is a small blob (≈ 1 KB), so the bandwidth cost of full-state push
-/// is negligible.  The two-round-trip digest/pull design would add latency and
-/// complexity for no practical benefit at this scale.  When Task 8 adds
-/// per-member liveness state the gossip envelope will be revisited, and a
-/// hash+pull optimisation can be introduced at that point if roster sizes grow.
+/// A lightweight digest <c>{MembershipVersion, rosterHash}</c> followed by a
+/// conditional pull of the full roster only when the receiver's version is lower
+/// is the obvious bandwidth-saving alternative.  This implementation instead ships
+/// the full <see cref="ClusterMembership"/> in every message.  For the cluster
+/// sizes Kommander targets (3–9 nodes) the roster is a small blob (≈ 1 KB), so the
+/// bandwidth cost of full-state push is negligible.  The two-round-trip digest/pull
+/// design would add latency and complexity for no practical benefit at this scale.
+/// If per-member liveness state is later added to the gossip envelope, a hash+pull
+/// optimisation can be introduced at that point should roster sizes grow.
 /// </para>
 ///
 /// <para>

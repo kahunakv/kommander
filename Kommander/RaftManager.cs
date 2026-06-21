@@ -1512,6 +1512,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 Load = p.GetCurrentLoad(wOps, wQueue),
                 LeaderSinceMs = leaderSinceMs > 0 ? leaderSinceMs : 0,
                 LogOpsPerSecond = p.GetLogOpsPerSecond(),
+                WalQueueDepth = walScheduler.GetPartitionDepth(p.PartitionId),
             });
         }
 
@@ -2633,15 +2634,15 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         return 0;
     }
 
-    /// <inheritdoc/>
-    public double GetPartitionLogOpsPerSecond(int partitionId)
+    /// <summary>
+    /// Returns the best <see cref="System.NodeLoadReport"/> for the given partition from the
+    /// gossip cache: prefers the report from the endpoint that currently leads P; falls back
+    /// to the report with the greatest HLC <c>Time</c> among those containing P; returns
+    /// <c>null</c> when no gossip report mentions P at all.
+    /// Cross-endpoint <c>ReportVersion</c> is not used as a tiebreak.
+    /// </summary>
+    private System.NodeLoadReport? FindBestLoadReport(int partitionId)
     {
-        // Local fast-path: no gossip lag.
-        if (partitions.TryGetValue(partitionId, out RaftPartition? p) &&
-            string.Equals(p.Leader, LocalEndpoint, StringComparison.Ordinal))
-            return p.GetLogOpsPerSecond();
-
-        // Remote path: prefer the report from whoever currently leads P.
         string? leaderEndpoint = GetPartitionLeaderEndpoint(partitionId);
         IReadOnlyList<System.NodeLoadReport> reports = systemCoordinator.GetLoadReports();
 
@@ -2676,8 +2677,19 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             }
         }
 
-        if (best is null)
-            return 0.0;
+        return best;
+    }
+
+    /// <inheritdoc/>
+    public double GetPartitionLogOpsPerSecond(int partitionId)
+    {
+        // Local fast-path: no gossip lag.
+        if (partitions.TryGetValue(partitionId, out RaftPartition? p) &&
+            string.Equals(p.Leader, LocalEndpoint, StringComparison.Ordinal))
+            return p.GetLogOpsPerSecond();
+
+        System.NodeLoadReport? best = FindBestLoadReport(partitionId);
+        if (best is null) return 0.0;
 
         foreach (System.PartitionLoad l in best.Leaderships)
         {
@@ -2686,6 +2698,26 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         }
 
         return 0.0;
+    }
+
+    /// <inheritdoc/>
+    public int GetPartitionWalQueueDepth(int partitionId)
+    {
+        // Local fast-path: no gossip lag.
+        if (partitions.TryGetValue(partitionId, out RaftPartition? p) &&
+            string.Equals(p.Leader, LocalEndpoint, StringComparison.Ordinal))
+            return walScheduler.GetPartitionDepth(partitionId);
+
+        System.NodeLoadReport? best = FindBestLoadReport(partitionId);
+        if (best is null) return 0;
+
+        foreach (System.PartitionLoad l in best.Leaderships)
+        {
+            if (l.PartitionId == partitionId)
+                return l.WalQueueDepth;
+        }
+
+        return 0;
     }
 
     /// <inheritdoc/>

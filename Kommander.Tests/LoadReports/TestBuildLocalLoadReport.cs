@@ -328,4 +328,155 @@ public sealed class TestBuildLocalLoadReport
 
         Assert.Equal("mynode:7777", report.Endpoint);
     }
+
+    // ── Stability gate wiring ────────────────────────────────────────────────
+
+    /// <summary>
+    /// A freshly constructed <see cref="RaftPartition"/> (as created by
+    /// <c>StartUserPartitions</c> / <c>CreatePartitionAsync</c>) must emit a
+    /// <c>LeaderSinceMs</c> close to zero in the next load report.
+    /// <para>
+    /// The invariant: <c>_leaderChangedTicks</c> initializes at construction time,
+    /// then resets when the <c>Leader</c> property is first set (initial value is <c>""</c>,
+    /// so the first non-empty assignment always fires the setter and resets the clock).
+    /// <c>BuildLocalLoadReport</c> then computes elapsed ms from that tick, which must be
+    /// far below any practical <c>MinLeaderStabilityMs</c>.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void BuildLocalLoadReport_NewlyLedPartition_HasNearZeroLeaderSinceMs()
+    {
+        using InMemoryWAL wal = new(NullLogger<IRaft>.Instance);
+
+        RaftConfiguration config = new()
+        {
+            Host = "localhost",
+            Port = 9000,
+            InitialPartitions = 0,
+            MinLeaderStabilityMs = 5_000,
+        };
+
+        using RaftManager manager = new(
+            config,
+            new StaticDiscovery([]),
+            wal,
+            new InMemoryCommunication(),
+            new HybridLogicalClock(),
+            NullLogger<IRaft>.Instance);
+
+        ((FairReadScheduler)manager.ReadScheduler).Start();
+
+        RaftPartition p1 = new(manager, wal, 1, 0, 0, NullLogger<IRaft>.Instance);
+
+        try
+        {
+            manager.Partitions[1] = p1;
+            // Setting Leader from "" to a non-empty endpoint resets _leaderChangedTicks,
+            // just as the first election does on a real partition.
+            p1.Leader = manager.LocalEndpoint;
+
+            NodeLoadReport report = manager.BuildLocalLoadReport();
+
+            Assert.Single(report.Leaderships);
+            long sinceMs = report.Leaderships[0].LeaderSinceMs;
+
+            // Must be far below MinLeaderStabilityMs — we just set the leader.
+            Assert.True(sinceMs < config.MinLeaderStabilityMs,
+                $"Expected LeaderSinceMs ({sinceMs} ms) < MinLeaderStabilityMs " +
+                $"({config.MinLeaderStabilityMs} ms) for a freshly led partition.");
+        }
+        finally
+        {
+            p1.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// End-to-end: the load report emitted by a freshly led partition feeds a
+    /// <see cref="LeaderBalancePlanner"/> pass that returns no moves — confirming the
+    /// stability gate covers split-created and newly created partitions without any
+    /// special-casing in the planner.
+    /// </summary>
+    [Fact]
+    public void BuildLocalLoadReport_NewlyLedPartition_IsExcludedByStabilityGate()
+    {
+        using InMemoryWAL wal = new(NullLogger<IRaft>.Instance);
+
+        RaftConfiguration config = new()
+        {
+            Host = "localhost",
+            Port = 9000,
+            InitialPartitions = 0,
+            EnableLeaderBalancer = true,
+            MinLeaderStabilityMs = 5_000,
+            CountDeadband = 0,
+            MaxMovesPerPass = 8,
+            MoveCooldown = TimeSpan.FromSeconds(60),
+            LeaderBalancerReportTtl = TimeSpan.FromSeconds(60),
+        };
+
+        using RaftManager manager = new(
+            config,
+            new StaticDiscovery([]),
+            wal,
+            new InMemoryCommunication(),
+            new HybridLogicalClock(),
+            NullLogger<IRaft>.Instance);
+
+        ((FairReadScheduler)manager.ReadScheduler).Start();
+
+        // Local node leads 5 partitions (all just created — LeaderSinceMs ≈ 0).
+        // Peer leads 1 partition that has been stable. Without the stability gate this
+        // imbalance would trigger moves; the gate must suppress them all.
+        for (int id = 1; id <= 5; id++)
+        {
+            RaftPartition p = new(manager, wal, id, 0, 0, NullLogger<IRaft>.Instance);
+            manager.Partitions[id] = p;
+            p.Leader = manager.LocalEndpoint; // fresh leader — resets LeaderChangedTicks
+        }
+
+        NodeLoadReport localReport = manager.BuildLocalLoadReport();
+
+        // Peer has one long-stable partition.
+        NodeLoadReport peerReport = new()
+        {
+            Endpoint = "peer:9001",
+            ReportVersion = 1,
+            Time = manager.HybridLogicalClock.SendOrLocalEvent(0),
+            Leaderships = [new PartitionLoad { PartitionId = 6, Load = 1.0, LeaderSinceMs = 60_000 }],
+        };
+
+        IReadOnlyList<NodeLoadReport> allReports = [localReport, peerReport];
+        IReadOnlyList<ClusterMember> members =
+        [
+            new ClusterMember { Endpoint = manager.LocalEndpoint, Role = ClusterMemberRole.Voter },
+            new ClusterMember { Endpoint = "peer:9001",           Role = ClusterMemberRole.Voter },
+        ];
+
+        GlobalLeadershipView view = GlobalLeadershipView.Build(
+            allReports,
+            members,
+            aliveEndpoints: new global::System.Collections.Generic.HashSet<string>(members.Select(m => m.Endpoint)),
+            config.LeaderBalancerReportTtl,
+            localReport.Time + TimeSpan.FromMilliseconds(100));
+
+        RaftPartitionMap map = new()
+        {
+            MapVersion = 1,
+            Partitions = Enumerable.Range(1, 6)
+                .Select(id => new RaftPartitionRange { PartitionId = id, State = RaftPartitionState.Active })
+                .ToList(),
+        };
+
+        IReadOnlyList<LeaderMove> moves = LeaderBalancePlanner.Plan(
+            view, map, config,
+            cooldownState: new global::System.Collections.Generic.Dictionary<int, global::System.DateTimeOffset>(),
+            now: global::System.DateTimeOffset.UtcNow);
+
+        Assert.Empty(moves);
+
+        // Cleanup
+        foreach (RaftPartition p in manager.Partitions.Values)
+            p.Dispose();
+    }
 }

@@ -101,7 +101,7 @@ public sealed class TestNodeLoadReport
         Assert.Empty(report.Leaderships);
     }
 
-    // ── Rolling-upgrade / additive-field compatibility (Task 5) ─────────────
+    // ── Rolling-upgrade / additive-field compatibility ──────────────────────
     // LogOpsPerSecond was added to PartitionLoad in a later version. Older nodes
     // will emit JSON that omits the field. Both deserialization paths (plain
     // JsonSerializer used by the gRPC LoadReportJson wire, and the source-generated
@@ -164,11 +164,13 @@ public sealed class TestNodeLoadReport
     }
 
     /// <summary>
-    /// REST path (<c>RestJsonContext</c>): a payload omitting <c>LogOpsPerSecond</c>
-    /// must deserialize without error and yield <c>0.0</c>.
+    /// Source-gen context (<c>RestJsonContext</c>) additive-field safety: a payload omitting
+    /// <c>LogOpsPerSecond</c> must deserialize without error and yield <c>0.0</c>.
+    /// Note: REST gossip uses the plain serializer (same path as gRPC); this test covers
+    /// the source-gen context in case any future REST endpoint serializes these types directly.
     /// </summary>
     [Fact]
-    public void RestPath_MissingLogOpsPerSecond_DefaultsToZero()
+    public void SourceGenContext_MissingLogOpsPerSecond_DefaultsToZero()
     {
         NodeLoadReport source = new()
         {
@@ -191,11 +193,11 @@ public sealed class TestNodeLoadReport
     }
 
     /// <summary>
-    /// REST path (<c>RestJsonContext</c>): a payload including <c>LogOpsPerSecond</c>
-    /// must round-trip the value exactly.
+    /// Source-gen context (<c>RestJsonContext</c>) additive-field safety: a payload including
+    /// <c>LogOpsPerSecond</c> must round-trip the value exactly through the source-generated context.
     /// </summary>
     [Fact]
-    public void RestPath_LogOpsPerSecond_RoundTrips()
+    public void SourceGenContext_LogOpsPerSecond_RoundTrips()
     {
         NodeLoadReport original = new()
         {
@@ -214,5 +216,113 @@ public sealed class TestNodeLoadReport
         Assert.NotNull(deserialized);
         Assert.Single(deserialized.Leaderships);
         Assert.Equal(17.3, deserialized.Leaderships[0].LogOpsPerSecond);
+    }
+
+    // ── WalQueueDepth rolling-upgrade / additive-field compatibility ──────────
+    // WalQueueDepth was added to PartitionLoad in a later version. Older nodes will
+    // omit the field. Both deserialization paths must default the missing field to 0.
+
+    /// <summary>
+    /// gRPC path (plain <c>JsonSerializer</c>): a payload omitting <c>WalQueueDepth</c>
+    /// must deserialize without error and yield <c>0</c>.
+    /// </summary>
+    [Fact]
+    public void GrpcPath_MissingWalQueueDepth_DefaultsToZero()
+    {
+        NodeLoadReport source = new()
+        {
+            Endpoint = "node1:7000",
+            ReportVersion = 1,
+            Leaderships = [new PartitionLoad { PartitionId = 1, Load = 5.0, LeaderSinceMs = 10_000, WalQueueDepth = 42 }],
+        };
+
+        string fullJson = JsonSerializer.Serialize(source);
+        JsonObject root = JsonNode.Parse(fullJson)!.AsObject();
+        root["Leaderships"]![0]!.AsObject().Remove("WalQueueDepth");
+        string legacyJson = root.ToJsonString();
+
+        NodeLoadReport? report = JsonSerializer.Deserialize<NodeLoadReport>(legacyJson);
+
+        Assert.NotNull(report);
+        Assert.Single(report.Leaderships);
+        Assert.Equal(0, report.Leaderships[0].WalQueueDepth);
+    }
+
+    /// <summary>
+    /// gRPC path (plain <c>JsonSerializer</c>): a payload including <c>WalQueueDepth</c>
+    /// must round-trip the value exactly.
+    /// </summary>
+    [Fact]
+    public void GrpcPath_WalQueueDepth_RoundTrips()
+    {
+        NodeLoadReport original = new()
+        {
+            Endpoint = "node1:7000",
+            ReportVersion = 1,
+            Time = new HLCTimestamp(1, 100_000L, 0),
+            Leaderships =
+            [
+                new PartitionLoad { PartitionId = 1, Load = 5.0, LeaderSinceMs = 10_000, WalQueueDepth = 17 },
+            ],
+        };
+
+        string json = JsonSerializer.Serialize(original);
+        NodeLoadReport? deserialized = JsonSerializer.Deserialize<NodeLoadReport>(json);
+
+        Assert.NotNull(deserialized);
+        Assert.Single(deserialized.Leaderships);
+        Assert.Equal(17, deserialized.Leaderships[0].WalQueueDepth);
+    }
+
+    /// <summary>
+    /// Source-gen context (<c>RestJsonContext</c>) additive-field safety: a payload omitting
+    /// <c>WalQueueDepth</c> must deserialize without error and yield <c>0</c>.
+    /// </summary>
+    [Fact]
+    public void SourceGenContext_MissingWalQueueDepth_DefaultsToZero()
+    {
+        NodeLoadReport source = new()
+        {
+            Endpoint = "node1:7000",
+            ReportVersion = 1,
+            Leaderships = [new PartitionLoad { PartitionId = 1, Load = 5.0, LeaderSinceMs = 10_000, WalQueueDepth = 42 }],
+        };
+
+        string fullJson = JsonSerializer.Serialize(source, RestJsonContext.Default.NodeLoadReport);
+        JsonObject root = JsonNode.Parse(fullJson)!.AsObject();
+        root["leaderships"]![0]!.AsObject().Remove("walQueueDepth");
+        string legacyJson = root.ToJsonString();
+
+        NodeLoadReport? report = JsonSerializer.Deserialize(legacyJson, RestJsonContext.Default.NodeLoadReport);
+
+        Assert.NotNull(report);
+        Assert.Single(report.Leaderships);
+        Assert.Equal(0, report.Leaderships[0].WalQueueDepth);
+    }
+
+    /// <summary>
+    /// Source-gen context (<c>RestJsonContext</c>) additive-field safety: a payload including
+    /// <c>WalQueueDepth</c> must round-trip the value exactly.
+    /// </summary>
+    [Fact]
+    public void SourceGenContext_WalQueueDepth_RoundTrips()
+    {
+        NodeLoadReport original = new()
+        {
+            Endpoint = "node1:7000",
+            ReportVersion = 1,
+            Time = new HLCTimestamp(1, 100_000L, 0),
+            Leaderships =
+            [
+                new PartitionLoad { PartitionId = 1, Load = 5.0, LeaderSinceMs = 10_000, WalQueueDepth = 99 },
+            ],
+        };
+
+        string json = JsonSerializer.Serialize(original, RestJsonContext.Default.NodeLoadReport);
+        NodeLoadReport? deserialized = JsonSerializer.Deserialize(json, RestJsonContext.Default.NodeLoadReport);
+
+        Assert.NotNull(deserialized);
+        Assert.Single(deserialized.Leaderships);
+        Assert.Equal(99, deserialized.Leaderships[0].WalQueueDepth);
     }
 }

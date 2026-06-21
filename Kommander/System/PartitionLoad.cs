@@ -32,4 +32,13 @@ public sealed class PartitionLoad
     /// deserializes to 0 (additive, no serializer registration required).
     /// </summary>
     public double LogOpsPerSecond { get; set; }
+
+    /// <summary>
+    /// Per-partition WAL backlog depth at the time this report was built: the number of
+    /// write operations queued for this partition's share of the shared <see cref="FairWalScheduler"/>
+    /// fsync group. Advisory saturation signal — a rising depth while <see cref="LogOpsPerSecond"/>
+    /// plateaus indicates the partition is fsync-bound. A missing field in older JSON payloads
+    /// deserializes to 0 (additive, no serializer registration required).
+    /// </summary>
+    public int WalQueueDepth { get; set; }
 }

@@ -501,6 +501,29 @@ public interface IRaft
     public double GetPartitionLogOpsPerSecond(int partitionId);
 
     /// <summary>
+    /// Returns the number of WAL write operations queued for <paramref name="partitionId"/> in
+    /// the shared <see cref="FairWalScheduler"/> fsync group at the time of the call. This is an
+    /// advisory saturation signal: when <see cref="GetPartitionLogOpsPerSecond"/> plateaus while
+    /// this value rises and stays positive, the partition is fsync-bound.
+    /// <para>
+    /// <b>Local fast-path:</b> when this node leads <paramref name="partitionId"/>, the value is
+    /// read directly from the in-process WAL scheduler — no gossip lag.
+    /// </para>
+    /// <para>
+    /// <b>Remote path:</b> when a peer leads the partition, the value is read from the
+    /// most-recently-received gossip load report emitted by that peer. The result may trail the
+    /// true depth by up to one <see cref="RaftConfiguration.LeaderBalancerReportInterval"/> plus
+    /// propagation delay.
+    /// </para>
+    /// <para>
+    /// <b>Sentinel:</b> returns <c>0</c> when the local node does not lead the partition and
+    /// no gossip report from the current leader has been received yet, or when
+    /// <paramref name="partitionId"/> is unknown.
+    /// </para>
+    /// </summary>
+    public int GetPartitionWalQueueDepth(int partitionId);
+
+    /// <summary>
     /// Returns a snapshot of the current partition map.
     /// The returned list is a copy; mutating it does not affect the manager.
     /// </summary>

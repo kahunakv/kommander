@@ -79,7 +79,7 @@ public sealed class TestLeaderBalancePlanner
     private static readonly global::System.Collections.Generic.Dictionary<int, global::System.DateTimeOffset>
         NoCooldown = new();
 
-    // ── Acceptance 1: count balance & convergence over passes ─────────────────
+    // ── Count balance & convergence over passes ───────────────────────────────
 
     [Fact]
     public void CountTier_MovesFromOverToUnderNode()
@@ -127,7 +127,7 @@ public sealed class TestLeaderBalancePlanner
         Assert.All(moves1, m => Assert.Equal("b:1", m.ToEndpoint));
     }
 
-    // ── Acceptance 2: load balance with equal counts ───────────────────────────
+    // ── Load balance with equal counts ─────────────────────────────────────────
 
     [Fact]
     public void LoadTier_EmitsSwapWhenCountsBalancedButSkewed()
@@ -156,7 +156,7 @@ public sealed class TestLeaderBalancePlanner
         Assert.Equal("a:1", coldMove.ToEndpoint);
     }
 
-    // ── Acceptance 3: deadband → zero moves ───────────────────────────────────
+    // ── Deadband → zero moves ─────────────────────────────────────────────────
 
     [Fact]
     public void CountTier_NoMovesWithinDeadband()
@@ -182,7 +182,7 @@ public sealed class TestLeaderBalancePlanner
         Assert.Empty(moves);
     }
 
-    // ── Acceptance 4: stability gate ──────────────────────────────────────────
+    // ── Stability gate ────────────────────────────────────────────────────────
 
     [Fact]
     public void StabilityGate_BlocksMoveWhenLeaderTooNew()
@@ -206,7 +206,33 @@ public sealed class TestLeaderBalancePlanner
         Assert.Empty(moves);
     }
 
-    // ── Acceptance 5: cooldown exclusion ──────────────────────────────────────
+    /// <summary>
+    /// Stability gate opens once <c>LeaderSinceMs ≥ MinLeaderStabilityMs</c>: the same
+    /// imbalanced scenario as <see cref="StabilityGate_BlocksMoveWhenLeaderTooNew"/> but
+    /// with sinceMs at the threshold must produce moves.
+    /// </summary>
+    [Fact]
+    public void StabilityGate_AllowsMoveOnceThresholdReached()
+    {
+        var members = new[] { Voter("a:1"), Voter("b:1") };
+
+        // Same imbalance as StabilityGate_BlocksMoveWhenLeaderTooNew but sinceMs == minStabilityMs.
+        var reports = new[]
+        {
+            Report("a:1", T0,
+                (1, 1.0, 5000), (2, 1.0, 5000), (3, 1.0, 5000),
+                (4, 1.0, 5000), (5, 1.0, 5000)),
+            Report("b:1", T0, (6, 1.0, 10_000)),
+        };
+
+        var view = BuildView(reports, members);
+        var map = ActiveMap(1, 2, 3, 4, 5, 6);
+        var moves = LeaderBalancePlanner.Plan(view, map, DefaultConfig(minStabilityMs: 5000), NoCooldown, Now);
+
+        Assert.NotEmpty(moves);
+    }
+
+    // ── Cooldown exclusion ────────────────────────────────────────────────────
 
     [Fact]
     public void CooldownExclusion_SkipsPartitionsInCooldown()
@@ -262,7 +288,7 @@ public sealed class TestLeaderBalancePlanner
         Assert.NotEmpty(moves);
     }
 
-    // ── Acceptance 6: lifecycle filter ────────────────────────────────────────
+    // ── Lifecycle filter ──────────────────────────────────────────────────────
 
     [Fact]
     public void LifecycleFilter_SkipsNonActivePartitions()
@@ -294,7 +320,7 @@ public sealed class TestLeaderBalancePlanner
         Assert.Equal(3, moves[0].PartitionId);
     }
 
-    // ── Acceptance 7: incomplete view → zero moves ────────────────────────────
+    // ── Incomplete view → zero moves ──────────────────────────────────────────
 
     [Fact]
     public void IncompleteView_YieldsZeroMoves()
@@ -318,7 +344,7 @@ public sealed class TestLeaderBalancePlanner
         Assert.Empty(moves);
     }
 
-    // ── Acceptance 8: caps respected ──────────────────────────────────────────
+    // ── Caps respected ────────────────────────────────────────────────────────
 
     [Fact]
     public void MaxMovesPerPass_IsRespected()

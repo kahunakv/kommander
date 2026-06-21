@@ -334,6 +334,108 @@ public sealed class TestLeaderBalancerIntegration
     }
 
     /// <summary>
+    /// End-to-end proof of the cross-node log-replication rate signal.
+    ///
+    /// <para>Scenario A — rate propagates via gossip: the leader of partition P drives
+    /// <c>ReplicateLogs</c> load; after the leader's load report is injected into a
+    /// follower's coordinator, <c>GetPartitionLogOpsPerSecond(P)</c> on that follower
+    /// must return a non-zero value.</para>
+    ///
+    /// <para>Scenario B — read-only / follower activity leaves rate ≈0: before any write
+    /// load is driven, the follower observes 0, confirming that follower-replay
+    /// <c>AppendLogs</c> ops do not inflate the signal.</para>
+    ///
+    /// <para>Gossip lag is bypassed deterministically via <see cref="InjectLoadReport"/>,
+    /// matching the pattern used by the balancer integration tests.</para>
+    /// </summary>
+    [Fact]
+    public async Task LogOpsPerSecond_PropagatesViaGossip_AndIsZeroBeforeLoad()
+    {
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(60));
+        CancellationToken ct = cts.Token;
+        ILogger<IRaft> log = NullLogger<IRaft>.Instance;
+
+        InMemoryCommunication comm = new();
+        RaftManager n1 = MakeNode(comm, "localhost", 9740, 1, ["localhost:9741", "localhost:9742"], log);
+        RaftManager n2 = MakeNode(comm, "localhost", 9741, 2, ["localhost:9740", "localhost:9742"], log);
+        RaftManager n3 = MakeNode(comm, "localhost", 9742, 3, ["localhost:9740", "localhost:9741"], log);
+        RaftManager[] nodes = [n1, n2, n3];
+
+        try
+        {
+            comm.SetNodes(new Dictionary<string, IRaft>
+            {
+                ["localhost:9740"] = n1,
+                ["localhost:9741"] = n2,
+                ["localhost:9742"] = n3,
+            });
+
+            await n1.UpdateNodes();
+            await n2.UpdateNodes();
+            await n3.UpdateNodes();
+
+            await Task.WhenAll(n1.JoinCluster(ct), n2.JoinCluster(ct), n3.JoinCluster(ct));
+
+            RaftManager p0 = await WaitForP0Leader(nodes, ct);
+
+            // Create a user partition to carry the signal.
+            const int testPid = 40;
+            await p0.CreatePartitionAsync(testPid, RaftRoutingMode.Unrouted, null, ct);
+
+            // Wait for all nodes to know the partition and for a leader to emerge.
+            await WaitForCondition(() =>
+                nodes.All(n => n.Partitions.ContainsKey(testPid)) &&
+                nodes.Any(n =>
+                    n.Partitions.TryGetValue(testPid, out RaftPartition? p) &&
+                    string.Equals(p.Leader, n.LocalEndpoint, StringComparison.Ordinal)),
+                ct);
+
+            // Identify leader and a non-leader for the partition.
+            RaftManager leaderNode = nodes.First(n =>
+                n.Partitions.TryGetValue(testPid, out RaftPartition? p) &&
+                string.Equals(p.Leader, n.LocalEndpoint, StringComparison.Ordinal));
+            RaftManager followerNode = nodes.First(n => n != leaderNode);
+
+            // ── Scenario B: signal is 0 before any ReplicateLogs load ────────────
+            // The follower has received no gossiped report yet — sentinel must be 0.
+            Assert.Equal(0.0, followerNode.GetPartitionLogOpsPerSecond(testPid));
+
+            // ── Scenario A: drive load then propagate via injected gossip ─────────
+            // Drive several ReplicateLogs on the leader so the EWMA accumulator rises.
+            byte[] payload = [1];
+            for (int i = 0; i < 10; i++)
+                await leaderNode.ReplicateLogs(testPid, "t7", payload, autoCommit: true, cancellationToken: ct);
+
+            // Inject the leader's fresh load report into every non-leader node.
+            foreach (RaftManager n in nodes)
+            {
+                if (n == leaderNode) continue;
+                InjectLoadReport(leaderNode, n);
+                await n.SystemCoordinator.DrainAsync();
+            }
+
+            // Every non-leader node must now observe a non-zero log-ops rate for P.
+            foreach (RaftManager n in nodes)
+            {
+                if (n == leaderNode) continue;
+                double rate = n.GetPartitionLogOpsPerSecond(testPid);
+                Assert.True(rate > 0.0,
+                    $"Follower {n.LocalEndpoint} expected GetPartitionLogOpsPerSecond({testPid}) > 0 " +
+                    $"after gossip injection, got {rate}.");
+            }
+
+            // Leader fast-path must also return non-zero (no report lookup needed).
+            double leaderRate = leaderNode.GetPartitionLogOpsPerSecond(testPid);
+            Assert.True(leaderRate > 0.0,
+                $"Leader {leaderNode.LocalEndpoint} expected GetPartitionLogOpsPerSecond({testPid}) > 0, got {leaderRate}.");
+        }
+        finally
+        {
+            foreach (RaftManager n in nodes) n.Dispose();
+        }
+    }
+
+    /// <summary>
     /// Verifies that an outstanding move that is never confirmed (suggestion dropped) is
     /// cleared after <c>SuggestionTimeout</c> elapses and enters cooldown.
     /// The partition becomes eligible again only after <c>MoveCooldown</c>.
