@@ -1,6 +1,8 @@
 
 using Kommander.Communication.Memory;
+using Kommander.Data;
 using Kommander.Discovery;
+using Kommander.Scheduling;
 using Kommander.System;
 using Kommander.Time;
 using Kommander.WAL;
@@ -187,6 +189,116 @@ public sealed class TestBuildLocalLoadReport
         finally
         {
             p1.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// A partition this node leads, with no <c>ReplicateLogs</c> activity, must emit
+    /// <c>LogOpsPerSecond == 0</c> in the load report.
+    /// </summary>
+    [Fact]
+    public void BuildLocalLoadReport_IdleLedPartition_LogOpsPerSecondIsZero()
+    {
+        using InMemoryWAL wal = new(NullLogger<IRaft>.Instance);
+
+        RaftConfiguration config = new()
+        {
+            Host = "localhost",
+            Port = 9000,
+            InitialPartitions = 0,
+        };
+
+        using RaftManager manager = new(
+            config,
+            new StaticDiscovery([]),
+            wal,
+            new InMemoryCommunication(),
+            new HybridLogicalClock(),
+            NullLogger<IRaft>.Instance);
+
+        ((FairReadScheduler)manager.ReadScheduler).Start();
+
+        RaftPartition p1 = new(manager, wal, 1, 0, 0, NullLogger<IRaft>.Instance);
+
+        try
+        {
+            manager.Partitions[1] = p1;
+            p1.Leader = manager.LocalEndpoint;
+
+            NodeLoadReport report = manager.BuildLocalLoadReport();
+
+            Assert.Single(report.Leaderships);
+            Assert.Equal(0.0, report.Leaderships[0].LogOpsPerSecond);
+        }
+        finally
+        {
+            p1.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// After dispatching <c>ReplicateLogs</c> ops through the partition executor,
+    /// <c>BuildLocalLoadReport</c> must emit a non-zero <c>LogOpsPerSecond</c> for
+    /// the led partition and 0 for a peer-led partition.
+    /// </summary>
+    [Fact]
+    public async Task BuildLocalLoadReport_AfterReplicateLogs_LogOpsPerSecondIsNonZero()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        using InMemoryWAL wal = new(NullLogger<IRaft>.Instance);
+
+        RaftConfiguration config = new()
+        {
+            Host = "localhost",
+            Port = 9000,
+            InitialPartitions = 0,
+        };
+
+        using RaftManager manager = new(
+            config,
+            new StaticDiscovery([]),
+            wal,
+            new InMemoryCommunication(),
+            new HybridLogicalClock(),
+            NullLogger<IRaft>.Instance);
+
+        ((FairReadScheduler)manager.ReadScheduler).Start();
+
+        // p1 is led locally; p2 is led by a peer and must stay at 0.
+        RaftPartition p1 = new(manager, wal, 1, 0, 0, NullLogger<IRaft>.Instance);
+        RaftPartition p2 = new(manager, wal, 2, 0, 0, NullLogger<IRaft>.Instance);
+
+        try
+        {
+            manager.Partitions[1] = p1;
+            manager.Partitions[2] = p2;
+            p1.Leader = manager.LocalEndpoint;
+            p2.Leader = "peer:9001";
+
+            await p1.Executor.RestoreTask;
+
+            // Drive ReplicateLogs load. Empty-log requests return Success immediately
+            // (no WAL touch) but still record to the log accumulator.
+            for (int i = 0; i < 5; i++)
+                p1.Executor.Post(new RaftRequest(
+                    RaftRequestType.ReplicateLogs, new List<RaftLog>(), autoCommit: true));
+
+            await p1.Executor.DrainAsync(ct)
+                .WaitAsync(TimeSpan.FromSeconds(5), ct);
+
+            NodeLoadReport report = manager.BuildLocalLoadReport();
+
+            PartitionLoad led  = report.Leaderships.Single(l => l.PartitionId == 1);
+            Assert.True(led.LogOpsPerSecond > 0.0,
+                $"Expected LogOpsPerSecond > 0 for led partition after ReplicateLogs load, got {led.LogOpsPerSecond}.");
+
+            // p2 is peer-led and must not appear in the report at all.
+            Assert.DoesNotContain(report.Leaderships, l => l.PartitionId == 2);
+        }
+        finally
+        {
+            p1.Dispose();
+            p2.Dispose();
         }
     }
 

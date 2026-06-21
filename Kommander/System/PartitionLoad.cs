@@ -24,4 +24,12 @@ public sealed class PartitionLoad
     /// (<c>LeaderSinceMs &lt; MinLeaderStabilityMs</c>) are not eligible for transfer.
     /// </summary>
     public long LeaderSinceMs { get; set; }
+
+    /// <summary>
+    /// EWMA rate of <c>ReplicateLogs</c> operations per second on this partition at the
+    /// time the report was built. Advisory and path-not-label: keyed on request type, not
+    /// node role, so it is naturally 0 on followers. A missing field in older JSON payloads
+    /// deserializes to 0 (additive, no serializer registration required).
+    /// </summary>
+    public double LogOpsPerSecond { get; set; }
 }

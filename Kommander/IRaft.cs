@@ -472,6 +472,35 @@ public interface IRaft
     public long GetPartitionGeneration(int partitionId);
 
     /// <summary>
+    /// Returns the EWMA rate of <c>ReplicateLogs</c> operations per second for
+    /// <paramref name="partitionId"/>, as measured by whichever node currently leads it.
+    /// <para>
+    /// <b>Path-not-label:</b> the signal is keyed on request type, not node role —
+    /// only <c>ReplicateLogs</c> ops (leader-side write path) contribute; follower-replay
+    /// <c>AppendLogs</c> and maintenance ops do not. A value of 0 on a follower node for a
+    /// partition it does not lead is therefore normal, not an error.
+    /// </para>
+    /// <para>
+    /// <b>Local fast-path:</b> when this node leads <paramref name="partitionId"/>, the
+    /// value is read directly from the in-process executor accumulator — no gossip lag.
+    /// </para>
+    /// <para>
+    /// <b>Remote path:</b> when a peer leads the partition, the value is read from the
+    /// most-recently-received gossip load report emitted by that peer. The result may
+    /// trail the true rate by up to one <see cref="RaftConfiguration.LeaderBalancerReportInterval"/>
+    /// plus propagation delay.
+    /// </para>
+    /// <para>
+    /// <b>Sentinel:</b> returns <c>0</c> when the local node does not lead the partition and
+    /// no gossip report from the current leader has been received yet, or when
+    /// <paramref name="partitionId"/> is unknown. A <c>0</c> return is therefore ambiguous
+    /// between "genuinely idle" and "not yet seen" — callers that need to distinguish the
+    /// two should gate on whether a report from the leader exists at all.
+    /// </para>
+    /// </summary>
+    public double GetPartitionLogOpsPerSecond(int partitionId);
+
+    /// <summary>
     /// Returns a snapshot of the current partition map.
     /// The returned list is a copy; mutating it does not affect the manager.
     /// </summary>

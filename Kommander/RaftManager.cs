@@ -1511,6 +1511,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 PartitionId = p.PartitionId,
                 Load = p.GetCurrentLoad(wOps, wQueue),
                 LeaderSinceMs = leaderSinceMs > 0 ? leaderSinceMs : 0,
+                LogOpsPerSecond = p.GetLogOpsPerSecond(),
             });
         }
 
@@ -2630,6 +2631,61 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             return partition.Generation;
 
         return 0;
+    }
+
+    /// <inheritdoc/>
+    public double GetPartitionLogOpsPerSecond(int partitionId)
+    {
+        // Local fast-path: no gossip lag.
+        if (partitions.TryGetValue(partitionId, out RaftPartition? p) &&
+            string.Equals(p.Leader, LocalEndpoint, StringComparison.Ordinal))
+            return p.GetLogOpsPerSecond();
+
+        // Remote path: prefer the report from whoever currently leads P.
+        string? leaderEndpoint = GetPartitionLeaderEndpoint(partitionId);
+        IReadOnlyList<System.NodeLoadReport> reports = systemCoordinator.GetLoadReports();
+
+        System.NodeLoadReport? best = null;
+
+        if (leaderEndpoint is not null)
+        {
+            foreach (System.NodeLoadReport r in reports)
+            {
+                if (string.Equals(r.Endpoint, leaderEndpoint, StringComparison.Ordinal))
+                {
+                    best = r;
+                    break;
+                }
+            }
+        }
+
+        // Fallback: among all reports that mention P, pick the one with the greatest HLC Time.
+        // Cross-endpoint ReportVersion is not a valid tiebreak.
+        if (best is null)
+        {
+            foreach (System.NodeLoadReport r in reports)
+            {
+                foreach (System.PartitionLoad l in r.Leaderships)
+                {
+                    if (l.PartitionId == partitionId && (best is null || r.Time > best.Time))
+                    {
+                        best = r;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (best is null)
+            return 0.0;
+
+        foreach (System.PartitionLoad l in best.Leaderships)
+        {
+            if (l.PartitionId == partitionId)
+                return l.LogOpsPerSecond;
+        }
+
+        return 0.0;
     }
 
     /// <inheritdoc/>

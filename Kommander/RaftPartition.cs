@@ -207,6 +207,16 @@ public sealed class RaftPartition : IDisposable
     internal double GetCurrentLoad(double wOps, double wQueue) => executor.CurrentLoad(wOps, wQueue);
 
     /// <summary>
+    /// EWMA rate of <c>ReplicateLogs</c> operations per second on this partition.
+    /// Leader-side only: reflects originating write load; returns 0 on follower nodes
+    /// because followers process <c>AppendLogs</c>, not <c>ReplicateLogs</c>.
+    /// </summary>
+    internal double GetLogOpsPerSecond() => executor.CurrentLogOpsPerSecond();
+
+    /// <summary>Exposes the underlying executor for targeted unit tests.</summary>
+    internal RaftPartitionExecutor Executor => executor;
+
+    /// <summary>
     /// Enqueues a "request a vote" message from the partition.
     /// </summary>
     /// <param name="request"></param>

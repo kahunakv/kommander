@@ -130,18 +130,37 @@ public sealed class RaftPartitionExecutor : IDisposable
     // ── Load tracking ─────────────────────────────────────────────────────
 
     private readonly PartitionLoadAccumulator _loadAccumulator;
+
+    /// <summary>
+    /// Tracks the EWMA rate of <c>ReplicateLogs</c> operations — the leader-side
+    /// log-replication path only. <c>AppendLogs</c> (follower replay), checkpoints, and
+    /// commits are deliberately excluded so this accumulator reflects originating write
+    /// load, not protocol overhead. Leader-only by type: only leaders issue
+    /// <c>ReplicateLogs</c>; followers receive <c>AppendLogs</c> instead.
+    /// </summary>
+    private readonly PartitionLoadAccumulator _logLoadAccumulator;
+
     private readonly Func<int>? _walQueueDepthProvider;
 
     // ── Observability ──────────────────────────────────────────────────────
 
     private long _totalProcessed;
     private long _totalClientRejected;
+    private long _totalBatchesExecuted;
 
     /// <summary>Total number of operations processed by this executor since start.</summary>
     public long TotalProcessed => Interlocked.Read(ref _totalProcessed);
 
     /// <summary>Total number of client proposals rejected due to queue saturation.</summary>
     public long TotalClientRejected => Interlocked.Read(ref _totalClientRejected);
+
+    /// <summary>
+    /// Total number of times <c>ExecuteBatchAsync</c> ran — i.e. drain cycles where
+    /// two or more contiguous <c>ReplicateLogs</c> ops were coalesced into a single
+    /// state-machine call. Exposed for tests that need to verify the batch path was
+    /// exercised, not just that the accumulator recorded ops.
+    /// </summary>
+    internal long TotalBatchesExecuted => Interlocked.Read(ref _totalBatchesExecuted);
 
     /// <summary>
     /// Current number of client proposals pending in the queue (not yet dequeued by
@@ -173,6 +192,14 @@ public sealed class RaftPartitionExecutor : IDisposable
 
     /// <summary>EWMA ops/sec estimate. Exposed for diagnostics and tests.</summary>
     internal double CurrentOpsPerSecond() => _loadAccumulator.CurrentOpsPerSecond();
+
+    /// <summary>
+    /// EWMA rate of <c>ReplicateLogs</c> operations per second on this partition.
+    /// Reflects only the leader-side log-replication path (path-not-label: keyed on the
+    /// request type, not the node role). Returns 0 on follower nodes because they process
+    /// <c>AppendLogs</c>, not <c>ReplicateLogs</c>.
+    /// </summary>
+    internal double CurrentLogOpsPerSecond() => _logLoadAccumulator.CurrentOpsPerSecond();
 
     /// <summary>
     /// True once Phase 2 of the partition restore (log replay) has completed on
@@ -242,6 +269,7 @@ public sealed class RaftPartitionExecutor : IDisposable
         _drainQuantumMaintenance = drainQuantumMaintenance > 0 ? drainQuantumMaintenance : (int)RaftOperationPriority.Maintenance;
         _walQueueDepthProvider = walQueueDepthProvider;
         _loadAccumulator = new PartitionLoadAccumulator();
+        _logLoadAccumulator = new PartitionLoadAccumulator();
 
         _worker = new Thread(WorkerLoop)
         {
@@ -714,6 +742,8 @@ public sealed class RaftPartitionExecutor : IDisposable
             KommanderMetrics.ExecutorOperationDurationMs.Record(elapsedMs, tags);
             if (kind is RaftOperationKind.Client or RaftOperationKind.Replication)
                 _loadAccumulator.RecordOps(1);
+            if (request.Type == RaftRequestType.ReplicateLogs)
+                _logLoadAccumulator.RecordOps(1);
         }
         catch (Exception ex)
         {
@@ -767,12 +797,14 @@ public sealed class RaftPartitionExecutor : IDisposable
         {
             await _stateMachine.ReplicateLogsBatchAsync(batch).ConfigureAwait(false);
             Interlocked.Add(ref _totalProcessed, ops.Count);
+            Interlocked.Increment(ref _totalBatchesExecuted);
 
             double elapsedMs = sw.GetElapsedTime().TotalMilliseconds;
             TagList tags = new() { { "partition_id", _partitionId }, { "operation_class", "Replication" } };
             KommanderMetrics.ExecutorOperationsTotal.Add(ops.Count, tags);
             KommanderMetrics.ExecutorOperationDurationMs.Record(elapsedMs, tags);
             _loadAccumulator.RecordOps(ops.Count);
+            _logLoadAccumulator.RecordOps(ops.Count);
         }
         catch (Exception ex)
         {
