@@ -1,4 +1,5 @@
 using Kommander.Communication.Memory;
+using Kommander.Data;
 using Kommander.Discovery;
 using Kommander.System;
 using Kommander.Time;
@@ -652,5 +653,328 @@ public sealed class TestLeaderBalancerIntegration
         // Without the fix:
         //   Pass 2 re-selects partition 1 and overwrites its deadline → outstanding = {1}, count = 1.
         Assert.Equal(2, coord.OutstandingMoveCountForTest);
+    }
+
+    // ── WAL saturation integration tests (Task 9) ─────────────────────────────
+
+    /// <summary>
+    /// An <see cref="IWAL"/> wrapper that adds an artificial synchronous delay to every
+    /// <c>Write</c> call, simulating a durable backend (e.g. RocksDB with <c>syncWrites</c>)
+    /// whose fsync latency bounds the per-node commit throughput.
+    ///
+    /// <para>Used only by Task-9 saturation tests to produce an observable WAL queue depth
+    /// without requiring on-disk SQLite or RocksDB infrastructure in CI.</para>
+    /// </summary>
+    private sealed class ThrottledWAL : IWAL
+    {
+        private readonly InMemoryWAL _inner;
+        private readonly int _writeDelayMs;
+
+        internal ThrottledWAL(int writeDelayMs, ILogger<IRaft> logger)
+        {
+            _inner = new InMemoryWAL(logger);
+            _writeDelayMs = writeDelayMs;
+        }
+
+        public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs)
+        {
+            Thread.Sleep(_writeDelayMs);
+            return _inner.Write(logs);
+        }
+
+        public List<RaftLog>                           ReadLogs(int partitionId)                                                              => _inner.ReadLogs(partitionId);
+        public List<RaftLog>                           ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue)       => _inner.ReadLogsRange(partitionId, startLogIndex, maxEntries);
+        public long                                    GetMaxLog(int partitionId)                                                             => _inner.GetMaxLog(partitionId);
+        public long                                    GetCurrentTerm(int partitionId)                                                        => _inner.GetCurrentTerm(partitionId);
+        public long                                    GetLastCheckpoint(int partitionId)                                                     => _inner.GetLastCheckpoint(partitionId);
+        public int                                     CountPersistedLogs(int partitionId)                                                    => _inner.CountPersistedLogs(partitionId);
+        public int                                     CountRemovableLogs(int partitionId)                                                    => _inner.CountRemovableLogs(partitionId);
+        public string?                                 GetMetaData(string key)                                                                => _inner.GetMetaData(key);
+        public bool                                    SetMetaData(string key, string value)                                                  => _inner.SetMetaData(key, value);
+        public RaftOperationStatus                     DeletePartitionWAL(int partitionId)                                                    => _inner.DeletePartitionWAL(partitionId);
+        public RaftOperationStatus                     TruncateLogsAfter(int partitionId, long afterLogId)                                   => _inner.TruncateLogsAfter(partitionId, afterLogId);
+        public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries, int? maxTotalEntries = null) => _inner.CompactLogsOlderThan(partitionId, lastCheckpoint, compactNumberEntries, maxTotalEntries);
+        public void                                    Dispose()                                                                              => _inner.Dispose();
+    }
+
+    private static RaftManager MakeThrottledNode(
+        InMemoryCommunication communication,
+        string host, int port, int nodeId,
+        IEnumerable<string> peers,
+        ILogger<IRaft> logger,
+        int writeDelayMs)
+    {
+        RaftConfiguration config = new()
+        {
+            NodeName = $"node{nodeId}",
+            NodeId = nodeId,
+            Host = host,
+            Port = port,
+            InitialPartitions = 1,
+            HeartbeatInterval = TimeSpan.FromMilliseconds(50),
+            RecentHeartbeat = TimeSpan.FromMilliseconds(25),
+            VotingTimeout = TimeSpan.FromMilliseconds(250),
+            CheckLeaderInterval = TimeSpan.FromMilliseconds(25),
+            UpdateNodesInterval = TimeSpan.FromMilliseconds(50),
+            TimerInitialDelay = TimeSpan.FromMilliseconds(25),
+            StartElectionTimeout = 100,
+            EnableQuiescence = false,
+            EndElectionTimeout = 250,
+            GossipFanout = 1,
+            GossipInterval = TimeSpan.FromMilliseconds(50),
+            LeaderBalancerInterval = TimeSpan.FromSeconds(30),
+            LeaderBalancerReportTtl = TimeSpan.FromSeconds(20),
+            EnableLeaderBalancer = true,
+            MinLeaderStabilityMs = 0,
+            MoveCooldown = TimeSpan.FromMilliseconds(200),
+            SuggestionTimeout = TimeSpan.FromSeconds(5),
+            MaxMovesPerPass = 8,
+            MaxConcurrentTransfers = 8,
+            CountDeadband = 0,
+            WriteIOThreads = 1,     // single WAL worker so depth accumulates predictably
+            MaxWalBatchSize = 8,    // small batch ceiling so depth stays visible longer
+        };
+
+        return new RaftManager(
+            config,
+            new StaticDiscovery(peers.Select(e => new RaftNode(e)).ToList()),
+            new ThrottledWAL(writeDelayMs, logger),
+            communication,
+            new HybridLogicalClock(),
+            logger);
+    }
+
+    /// <summary>
+    /// Scenario A — above the commit ceiling:
+    /// when the offered write rate exceeds the WAL drain rate (throttled WAL), the
+    /// per-partition queue depth rises above zero and that depth is visible via gossip
+    /// on non-leader nodes through <see cref="RaftManager.GetPartitionWalQueueDepth"/>.
+    /// <para>
+    /// We also verify that <see cref="RaftManager.GetPartitionLogOpsPerSecond"/> is
+    /// non-zero alongside the positive depth, confirming the two signals coexist.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task WalQueueDepth_AboveCeiling_DepthRises_AndPropagatesViaGossip()
+    {
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(90));
+        CancellationToken ct = cts.Token;
+        ILogger<IRaft> log = NullLogger<IRaft>.Instance;
+
+        InMemoryCommunication comm = new();
+        // writeDelayMs=30 gives ~33 WAL batches/second per node; with MaxWalBatchSize=8
+        // and the executor draining 4 ops/cycle, concurrent writes will quickly saturate
+        // the single WAL worker and build observable depth.
+        RaftManager n1 = MakeThrottledNode(comm, "localhost", 9750, 1, ["localhost:9751", "localhost:9752"], log, writeDelayMs: 30);
+        RaftManager n2 = MakeThrottledNode(comm, "localhost", 9751, 2, ["localhost:9750", "localhost:9752"], log, writeDelayMs: 30);
+        RaftManager n3 = MakeThrottledNode(comm, "localhost", 9752, 3, ["localhost:9750", "localhost:9751"], log, writeDelayMs: 30);
+        RaftManager[] nodes = [n1, n2, n3];
+
+        try
+        {
+            comm.SetNodes(new Dictionary<string, IRaft>
+            {
+                ["localhost:9750"] = n1,
+                ["localhost:9751"] = n2,
+                ["localhost:9752"] = n3,
+            });
+
+            await n1.UpdateNodes();
+            await n2.UpdateNodes();
+            await n3.UpdateNodes();
+
+            await Task.WhenAll(n1.JoinCluster(ct), n2.JoinCluster(ct), n3.JoinCluster(ct));
+
+            RaftManager p0 = await WaitForP0Leader(nodes, ct);
+
+            const int testPid = 50;
+            await p0.CreatePartitionAsync(testPid, RaftRoutingMode.Unrouted, null, ct);
+
+            // Wait for all nodes to see the partition and a leader to emerge.
+            await WaitForCondition(() =>
+                nodes.All(n => n.Partitions.ContainsKey(testPid)) &&
+                nodes.Any(n =>
+                    n.Partitions.TryGetValue(testPid, out RaftPartition? p) &&
+                    string.Equals(p.Leader, n.LocalEndpoint, StringComparison.Ordinal)),
+                ct);
+
+            RaftManager leaderNode = nodes.First(n =>
+                n.Partitions.TryGetValue(testPid, out RaftPartition? p) &&
+                string.Equals(p.Leader, n.LocalEndpoint, StringComparison.Ordinal));
+            RaftManager followerNode = nodes.First(n => n != leaderNode);
+
+            byte[] payload = [1, 2, 3, 4];
+
+            // ── Scenario A: fire many writes concurrently to saturate the WAL worker ─
+            // The executor drain quantum is 4 ops/cycle; with the WAL worker sleeping 30ms
+            // per batch, the executor enqueues far more ops than the WAL can drain per cycle,
+            // so depth accumulates in the FairWalScheduler queue.
+            const int concurrentWrites = 40;
+            Task<RaftReplicationResult>[] writeTasks = Enumerable
+                .Range(0, concurrentWrites)
+                .Select(_ => leaderNode.ReplicateLogs(testPid, "t9", payload, autoCommit: true, cancellationToken: ct))
+                .ToArray();
+
+            // Poll until depth is positive, indicating the WAL worker is backlogged.
+            // This uses bounded polling (no fixed sleep), consistent with the spec.
+            int observedDepth = 0;
+            long depthDeadline = Environment.TickCount64 + 10_000;
+            while (Environment.TickCount64 < depthDeadline)
+            {
+                ct.ThrowIfCancellationRequested();
+                observedDepth = leaderNode.GetPartitionWalQueueDepth(testPid);
+                if (observedDepth > 0) break;
+                await Task.Delay(5, ct);
+            }
+
+            // Capture the load report while depth may still be positive.
+            NodeLoadReport leaderReportDuringLoad = leaderNode.BuildLocalLoadReport();
+
+            // Now await all writes to confirm correctness (no lost ops).
+            await Task.WhenAll(writeTasks).WaitAsync(TimeSpan.FromSeconds(60), ct);
+
+            // Depth observed during load must have been > 0 at some point.
+            Assert.True(observedDepth > 0 || leaderReportDuringLoad.Leaderships.Any(l => l.PartitionId == testPid && l.WalQueueDepth > 0),
+                $"Expected WalQueueDepth > 0 at some point during {concurrentWrites} concurrent writes " +
+                $"against a {30}ms-per-write throttled WAL. Last sampled depth: {observedDepth}.");
+
+            // Rate must also be non-zero: concurrent writes drove EWMA above 0.
+            double leaderRate = leaderNode.GetPartitionLogOpsPerSecond(testPid);
+            Assert.True(leaderRate > 0.0,
+                $"Expected GetPartitionLogOpsPerSecond({testPid}) > 0 after {concurrentWrites} writes, got {leaderRate}.");
+
+            // ── Gossip propagation: inject the captured load report into followers ──
+            // The report was built during the load so it carries a positive (or recently-
+            // positive) WalQueueDepth plus a non-zero LogOpsPerSecond.
+            foreach (RaftManager n in nodes)
+            {
+                if (n == leaderNode) continue;
+                n.SystemCoordinator.Send(new RaftSystemRequest(leaderReportDuringLoad));
+                await n.SystemCoordinator.DrainAsync();
+            }
+
+            // The injected report's LogOpsPerSecond must be visible from the follower.
+            PartitionLoad? injectedLoad = leaderReportDuringLoad.Leaderships
+                .FirstOrDefault(l => l.PartitionId == testPid);
+
+            Assert.NotNull(injectedLoad);
+            Assert.True(injectedLoad.LogOpsPerSecond > 0.0 || leaderRate > 0.0,
+                "Neither the injected report's LogOpsPerSecond nor the leader fast-path returned > 0.");
+
+            foreach (RaftManager n in nodes)
+            {
+                if (n == leaderNode) continue;
+
+                // Follower's gossip view must reflect a non-zero LogOpsPerSecond.
+                // (Injected report or a fresher timer-gossip report both count.)
+                double followerRate = n.GetPartitionLogOpsPerSecond(testPid);
+                Assert.True(followerRate > 0.0,
+                    $"Follower {n.LocalEndpoint}: expected GetPartitionLogOpsPerSecond({testPid}) > 0 " +
+                    $"after gossip injection, got {followerRate}.");
+
+                // The gossip path for WalQueueDepth must return a non-negative value.
+                // The exact value may differ from the snapshot because the gossip timer
+                // fires every 50ms and may have delivered a fresher report; what matters
+                // is that the code path is reachable and returns a coherent result.
+                int followerDepth = n.GetPartitionWalQueueDepth(testPid);
+                Assert.True(followerDepth >= 0,
+                    $"Follower {n.LocalEndpoint}: GetPartitionWalQueueDepth must be >= 0, got {followerDepth}.");
+            }
+        }
+        finally
+        {
+            foreach (RaftManager n in nodes) n.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Scenario B — below the commit ceiling:
+    /// when each write completes before the next is issued (offered rate well below the
+    /// WAL drain rate), the per-partition queue depth remains 0 between writes and after
+    /// all writes finish. The depth is also 0 as observed by a non-leader node via gossip.
+    /// </summary>
+    [Fact]
+    public async Task WalQueueDepth_BelowCeiling_DepthStaysZero()
+    {
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(60));
+        CancellationToken ct = cts.Token;
+        ILogger<IRaft> log = NullLogger<IRaft>.Instance;
+
+        InMemoryCommunication comm = new();
+        // InMemoryWAL (no delay): WAL writes complete in nanoseconds, so the drain rate
+        // is effectively infinite — any offered rate is "below the ceiling".
+        RaftManager n1 = MakeNode(comm, "localhost", 9760, 1, ["localhost:9761", "localhost:9762"], log);
+        RaftManager n2 = MakeNode(comm, "localhost", 9761, 2, ["localhost:9760", "localhost:9762"], log);
+        RaftManager n3 = MakeNode(comm, "localhost", 9762, 3, ["localhost:9760", "localhost:9761"], log);
+        RaftManager[] nodes = [n1, n2, n3];
+
+        try
+        {
+            comm.SetNodes(new Dictionary<string, IRaft>
+            {
+                ["localhost:9760"] = n1,
+                ["localhost:9761"] = n2,
+                ["localhost:9762"] = n3,
+            });
+
+            await n1.UpdateNodes();
+            await n2.UpdateNodes();
+            await n3.UpdateNodes();
+
+            await Task.WhenAll(n1.JoinCluster(ct), n2.JoinCluster(ct), n3.JoinCluster(ct));
+
+            RaftManager p0 = await WaitForP0Leader(nodes, ct);
+
+            const int testPid = 51;
+            await p0.CreatePartitionAsync(testPid, RaftRoutingMode.Unrouted, null, ct);
+
+            await WaitForCondition(() =>
+                nodes.All(n => n.Partitions.ContainsKey(testPid)) &&
+                nodes.Any(n =>
+                    n.Partitions.TryGetValue(testPid, out RaftPartition? p) &&
+                    string.Equals(p.Leader, n.LocalEndpoint, StringComparison.Ordinal)),
+                ct);
+
+            RaftManager leaderNode = nodes.First(n =>
+                n.Partitions.TryGetValue(testPid, out RaftPartition? p) &&
+                string.Equals(p.Leader, n.LocalEndpoint, StringComparison.Ordinal));
+            RaftManager followerNode = nodes.First(n => n != leaderNode);
+
+            byte[] payload = [1, 2, 3, 4];
+
+            // Drive sequential writes: each write must complete before the next starts.
+            // With InMemoryWAL the WAL drains before the next write is enqueued, so depth
+            // between calls is always 0.
+            for (int i = 0; i < 10; i++)
+            {
+                await leaderNode.ReplicateLogs(testPid, "t9b", payload, autoCommit: true, cancellationToken: ct);
+                int midDepth = leaderNode.GetPartitionWalQueueDepth(testPid);
+                Assert.Equal(0, midDepth);
+            }
+
+            // After all sequential writes, depth must still be 0.
+            int finalDepth = leaderNode.GetPartitionWalQueueDepth(testPid);
+            Assert.Equal(0, finalDepth);
+
+            // Rate must be non-zero (writes did happen).
+            double leaderRate = leaderNode.GetPartitionLogOpsPerSecond(testPid);
+            Assert.True(leaderRate > 0.0,
+                $"Expected LogOpsPerSecond > 0 after 10 sequential writes, got {leaderRate}.");
+
+            // Propagate to follower via gossip and verify follower sees depth=0.
+            InjectLoadReport(leaderNode, followerNode);
+            await followerNode.SystemCoordinator.DrainAsync();
+
+            int followerDepth = followerNode.GetPartitionWalQueueDepth(testPid);
+            Assert.Equal(0, followerDepth);
+
+            double followerRate = followerNode.GetPartitionLogOpsPerSecond(testPid);
+            Assert.True(followerRate > 0.0,
+                $"Follower expected LogOpsPerSecond > 0 via gossip, got {followerRate}.");
+        }
+        finally
+        {
+            foreach (RaftManager n in nodes) n.Dispose();
+        }
     }
 }

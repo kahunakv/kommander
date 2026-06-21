@@ -1513,6 +1513,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 LeaderSinceMs = leaderSinceMs > 0 ? leaderSinceMs : 0,
                 LogOpsPerSecond = p.GetLogOpsPerSecond(),
                 WalQueueDepth = walScheduler.GetPartitionDepth(p.PartitionId),
+                CommitWaitMs = walScheduler.GetPartitionCommitWaitMs(p.PartitionId),
             });
         }
 
@@ -2718,6 +2719,26 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         }
 
         return 0;
+    }
+
+    /// <inheritdoc/>
+    public double GetPartitionCommitWaitMs(int partitionId)
+    {
+        // Local fast-path: no gossip lag.
+        if (partitions.TryGetValue(partitionId, out RaftPartition? p) &&
+            string.Equals(p.Leader, LocalEndpoint, StringComparison.Ordinal))
+            return walScheduler.GetPartitionCommitWaitMs(partitionId);
+
+        System.NodeLoadReport? best = FindBestLoadReport(partitionId);
+        if (best is null) return 0.0;
+
+        foreach (System.PartitionLoad l in best.Leaderships)
+        {
+            if (l.PartitionId == partitionId)
+                return l.CommitWaitMs;
+        }
+
+        return 0.0;
     }
 
     /// <inheritdoc/>

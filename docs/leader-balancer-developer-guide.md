@@ -349,6 +349,10 @@ Ideas that fit naturally on top of this design (not yet built): blending host-le
 load score, operator-supplied anti-affinity hints (keep certain partitions apart), and evicting a
 node's report immediately when it leaves the cluster instead of waiting for it to age out.
 
+> **Related:** the same per-node load report also carries a per-partition **log-replication rate** and
+> **WAL queue depth** signal, exposed through `IRaft` for load-based split decisions. See the
+> [Per-Partition Log-Replication Rate Signal guide](partition-log-rate-signal-developer-guide.md).
+
 ---
 
 ## FAQ

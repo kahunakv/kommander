@@ -41,4 +41,13 @@ public sealed class PartitionLoad
     /// deserializes to 0 (additive, no serializer registration required).
     /// </summary>
     public int WalQueueDepth { get; set; }
+
+    /// <summary>
+    /// EWMA of the enqueue-to-durable commit-wait latency in milliseconds for this
+    /// partition at the time this report was built. Complements <see cref="WalQueueDepth"/>:
+    /// depth counts operations; this field measures how long each operation waits.
+    /// Under fsync pressure both rise together while <see cref="LogOpsPerSecond"/> plateaus.
+    /// Advisory — a missing field in older JSON payloads deserializes to 0 (additive).
+    /// </summary>
+    public double CommitWaitMs { get; set; }
 }

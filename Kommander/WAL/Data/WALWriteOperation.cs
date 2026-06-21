@@ -35,6 +35,13 @@ public sealed class WALWriteOperation
 
     public long LogIndex { get; }
 
+    /// <summary>
+    /// Monotonic tick count stamped by <see cref="Kommander.WAL.IO.FairWalScheduler"/>
+    /// at the moment the operation enters the per-partition queue. Used to compute
+    /// the enqueue-to-durable latency once the write batch completes.
+    /// </summary>
+    internal long EnqueueTicks;
+
     public WALWriteOperation(
         Action<RaftWalCompletion> onComplete,
         long operationId,

@@ -325,4 +325,112 @@ public sealed class TestNodeLoadReport
         Assert.Single(deserialized.Leaderships);
         Assert.Equal(99, deserialized.Leaderships[0].WalQueueDepth);
     }
+
+    // ── CommitWaitMs rolling-upgrade / additive-field compatibility ───────────
+    // CommitWaitMs was added to PartitionLoad in a later version. Older nodes will
+    // omit the field. Both deserialization paths must default the missing field to 0.
+
+    /// <summary>
+    /// gRPC path (plain <c>JsonSerializer</c>): a payload omitting <c>CommitWaitMs</c>
+    /// must deserialize without error and yield <c>0.0</c>.
+    /// </summary>
+    [Fact]
+    public void GrpcPath_MissingCommitWaitMs_DefaultsToZero()
+    {
+        NodeLoadReport source = new()
+        {
+            Endpoint = "node1:7000",
+            ReportVersion = 1,
+            Leaderships = [new PartitionLoad { PartitionId = 1, Load = 5.0, LeaderSinceMs = 10_000, CommitWaitMs = 42.5 }],
+        };
+
+        string fullJson = JsonSerializer.Serialize(source);
+        JsonObject root = JsonNode.Parse(fullJson)!.AsObject();
+        root["Leaderships"]![0]!.AsObject().Remove("CommitWaitMs");
+        string legacyJson = root.ToJsonString();
+
+        NodeLoadReport? report = JsonSerializer.Deserialize<NodeLoadReport>(legacyJson);
+
+        Assert.NotNull(report);
+        Assert.Single(report.Leaderships);
+        Assert.Equal(0.0, report.Leaderships[0].CommitWaitMs);
+    }
+
+    /// <summary>
+    /// gRPC path (plain <c>JsonSerializer</c>): a payload including <c>CommitWaitMs</c>
+    /// must round-trip the value exactly.
+    /// </summary>
+    [Fact]
+    public void GrpcPath_CommitWaitMs_RoundTrips()
+    {
+        NodeLoadReport original = new()
+        {
+            Endpoint = "node1:7000",
+            ReportVersion = 1,
+            Time = new HLCTimestamp(1, 100_000L, 0),
+            Leaderships =
+            [
+                new PartitionLoad { PartitionId = 1, Load = 5.0, LeaderSinceMs = 10_000, CommitWaitMs = 15.75 },
+            ],
+        };
+
+        string json = JsonSerializer.Serialize(original);
+        NodeLoadReport? deserialized = JsonSerializer.Deserialize<NodeLoadReport>(json);
+
+        Assert.NotNull(deserialized);
+        Assert.Single(deserialized.Leaderships);
+        Assert.Equal(15.75, deserialized.Leaderships[0].CommitWaitMs);
+    }
+
+    /// <summary>
+    /// Source-gen context (<c>RestJsonContext</c>): a payload omitting <c>CommitWaitMs</c>
+    /// must deserialize without error and yield <c>0.0</c>.
+    /// </summary>
+    [Fact]
+    public void SourceGenContext_MissingCommitWaitMs_DefaultsToZero()
+    {
+        NodeLoadReport source = new()
+        {
+            Endpoint = "node1:7000",
+            ReportVersion = 1,
+            Leaderships = [new PartitionLoad { PartitionId = 1, Load = 5.0, LeaderSinceMs = 10_000, CommitWaitMs = 42.5 }],
+        };
+
+        string fullJson = JsonSerializer.Serialize(source, RestJsonContext.Default.NodeLoadReport);
+        JsonObject root = JsonNode.Parse(fullJson)!.AsObject();
+        root["leaderships"]![0]!.AsObject().Remove("commitWaitMs");
+        string legacyJson = root.ToJsonString();
+
+        NodeLoadReport? report = JsonSerializer.Deserialize(legacyJson, RestJsonContext.Default.NodeLoadReport);
+
+        Assert.NotNull(report);
+        Assert.Single(report.Leaderships);
+        Assert.Equal(0.0, report.Leaderships[0].CommitWaitMs);
+    }
+
+    /// <summary>
+    /// Source-gen context (<c>RestJsonContext</c>): a payload including <c>CommitWaitMs</c>
+    /// must round-trip the value exactly.
+    /// </summary>
+    [Fact]
+    public void SourceGenContext_CommitWaitMs_RoundTrips()
+    {
+        NodeLoadReport original = new()
+        {
+            Endpoint = "node1:7000",
+            ReportVersion = 1,
+            Time = new HLCTimestamp(1, 100_000L, 0),
+            Leaderships =
+            [
+                new PartitionLoad { PartitionId = 1, Load = 5.0, LeaderSinceMs = 10_000, CommitWaitMs = 8.3 },
+            ],
+        };
+
+        string json = JsonSerializer.Serialize(original, RestJsonContext.Default.NodeLoadReport);
+        NodeLoadReport? deserialized = JsonSerializer.Deserialize(json, RestJsonContext.Default.NodeLoadReport);
+
+        Assert.NotNull(deserialized);
+        Assert.Single(deserialized.Leaderships);
+        Assert.Equal(8.3, deserialized.Leaderships[0].CommitWaitMs);
+    }
 }

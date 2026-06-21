@@ -97,6 +97,12 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
         /// <summary>Current number of pending-or-in-flight operations.</summary>
         public int Depth;
+
+        /// <summary>
+        /// Per-partition EWMA of enqueue-to-durable latency in milliseconds.
+        /// Updated by the worker thread after each successful Write batch.
+        /// </summary>
+        public readonly PartitionWaitAccumulator CommitWait = new();
     }
 
     private readonly ConcurrentDictionary<int, PartitionState> _partitions = new();
@@ -214,6 +220,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                 }
             }
 
+            operation.EnqueueTicks = global::System.Diagnostics.Stopwatch.GetTimestamp();
             state.Ops.Enqueue(operation);
             state.Depth++;
 
@@ -275,6 +282,14 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// </summary>
     public int GetPartitionDepth(int partitionId) =>
         _partitions.TryGetValue(partitionId, out PartitionState? state) ? state.Depth : 0;
+
+    /// <summary>
+    /// Returns the current EWMA enqueue-to-durable commit-wait latency in milliseconds
+    /// for the given partition, or <c>0</c> if no write batch has yet completed for it.
+    /// The value is approximate and suitable for advisory saturation detection only.
+    /// </summary>
+    public double GetPartitionCommitWaitMs(int partitionId) =>
+        _partitions.TryGetValue(partitionId, out PartitionState? state) ? state.CommitWait.CurrentWaitMs() : 0.0;
 
     /// <summary>
     /// Stops the scheduler.
@@ -424,12 +439,27 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             status = RaftOperationStatus.Errored;
         }
 
+        // Stamp completion time once for all ops in this group batch.
+        long doneAtTicks = global::System.Diagnostics.Stopwatch.GetTimestamp();
+        double ticksToMs = 1000.0 / global::System.Diagnostics.Stopwatch.Frequency;
+
         KommanderMetrics.WalBatchesTotal.Add(1);
 
         // ── Phase 3: per-partition post-write cleanup ──────────────────────
         foreach ((int pid, List<WALWriteOperation> pidBatch) in groupBatches)
         {
             KommanderMetrics.WalBatchSize.Record(pidBatch.Count);
+
+            // Record commit-wait latency for this partition's batch (enqueue→durable).
+            // Average across all ops so each batch contributes one observation to the EWMA,
+            // regardless of batch size, giving consistent per-partition decay behaviour.
+            if (_partitions.TryGetValue(pid, out PartitionState? waitState))
+            {
+                double totalWaitMs = 0;
+                foreach (WALWriteOperation op in pidBatch)
+                    totalWaitMs += (doneAtTicks - op.EnqueueTicks) * ticksToMs;
+                waitState.CommitWait.RecordWaitMs(totalWaitMs / pidBatch.Count);
+            }
 
             if (status == RaftOperationStatus.Success)
             {
