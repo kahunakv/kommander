@@ -11,15 +11,39 @@ using Grpc.Core;
 namespace Kommander.Communication.Grpc;
 
 /// <summary>
+/// A queued outbound <c>AppendLogs</c> item waiting to be coalesced into the next batch write.
+/// </summary>
+/// <param name="BatchItem">
+/// The protobuf batch-request item carrying the serialized <c>AppendLogs</c> payload.
+/// </param>
+/// <param name="PooledRequest">
+/// The rented <see cref="GrpcAppendLogsRequest"/> that backs <paramref name="BatchItem"/>.
+/// The flusher that drains this entry from the queue is responsible for returning it to
+/// <see cref="GrpcCommunicationPool"/> after <c>WriteAsync</c> completes.
+/// </param>
+internal readonly record struct PendingAppendLogs(
+    GrpcBatchRequestsRequestItem BatchItem,
+    GrpcAppendLogsRequest PooledRequest);
+
+/// <summary>
 /// Represents a shared gRPC duplex streaming instance that includes synchronization mechanisms
 /// and facilitates communication between gRPC clients and servers.
 /// </summary>
 public sealed class GrpcInterSharedStreaming
 {
     public SemaphoreSlim Semaphore { get; } = new(1, 1);
-    
+
     public AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> Streaming { get; }
-    
+
+    /// <summary>
+    /// Queue of outbound <c>AppendLogs</c> items that arrived while a <c>WriteAsync</c> was
+    /// already in flight on this stream.  Only populated when
+    /// <see cref="RaftConfiguration.GrpcEnableAppendLogsCoalescing"/> is <see langword="true"/>.
+    /// The thread that acquires <see cref="Semaphore"/> drains this queue and flushes all
+    /// pending items as a single <c>GrpcBatchRequestsRequest</c>.
+    /// </summary>
+    internal readonly ConcurrentQueue<PendingAppendLogs> Pending = new();
+
     public GrpcInterSharedStreaming(AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming)
     {
         Streaming = streaming;

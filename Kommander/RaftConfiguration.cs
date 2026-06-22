@@ -418,6 +418,48 @@ public class RaftConfiguration
     /// </summary>
     public bool GrpcEnableSnapshotCompression { get; set; }
 
+    /// <summary>
+    /// When <see langword="true"/>, enables per-stream outbound <c>AppendLogs</c> coalescing:
+    /// while a <c>WriteAsync</c> to a follower stream is in flight, subsequent
+    /// <c>AppendLogs</c> items for that stream are queued and sent as a single
+    /// <c>GrpcBatchRequestsRequest</c> with multiple items when the stream becomes free.
+    /// <para>
+    /// This collapses N semaphore acquisitions and N HTTP/2 frames into one under sustained
+    /// write load, improving throughput without adding artificial latency — an isolated send
+    /// (nothing queued) still goes out immediately as a batch of one.
+    /// </para>
+    /// <para>
+    /// The coalescing is backpressure-driven: no <c>Task.Delay</c> is introduced. Items that
+    /// naturally queue behind an in-flight write are batched; an idle stream is never delayed.
+    /// The receiver already handles multi-item <c>GrpcBatchRequestsRequest</c> messages, so
+    /// this is fully wire-compatible.
+    /// </para>
+    /// <para>
+    /// Default <see langword="false"/>. Enable for write-heavy multi-partition workloads where
+    /// per-peer send concurrency is the bottleneck. Has no effect when used with the in-memory
+    /// transport.
+    /// </para>
+    /// </summary>
+    public bool GrpcEnableAppendLogsCoalescing { get; set; }
+
+    /// <summary>
+    /// Maximum number of <c>AppendLogs</c> items the coalescing flusher drains into a
+    /// single <c>GrpcBatchRequestsRequest</c> frame per write cycle.  If the queue contains
+    /// more items than this cap, the flusher sends the first batch and immediately loops to
+    /// drain the remainder in the next batch — keeping individual frames bounded.
+    /// <para>
+    /// The primary constraint is the receiver's <c>MaxReceiveMessageSize</c> (gRPC default
+    /// 4 MB). A cap of 256 items matches <see cref="MaxWalBatchSize"/> and leaves ample
+    /// headroom for typical log-entry sizes. Operators on very large entry payloads should
+    /// reduce this value; operators on tiny entries may raise it.
+    /// </para>
+    /// <para>
+    /// Only effective when <see cref="GrpcEnableAppendLogsCoalescing"/> is
+    /// <see langword="true"/>. Default 256.
+    /// </para>
+    /// </summary>
+    public int GrpcAppendLogsMaxCoalesceBatch { get; set; } = 256;
+
     private const int GrpcChannelsPerNodeMax = 64;
 
     // Warn at most once per process so repeated calls don't spam.

@@ -1,4 +1,5 @@
 
+using System.Collections.Concurrent;
 using System.Globalization;
 using Google.Protobuf;
 using Google.Protobuf.Collections;
@@ -161,12 +162,16 @@ public class GrpcCommunication : ICommunication
     }
 
     /// <summary>
-    /// Sends an AppendLogs message to a node via gRPC
+    /// Sends an AppendLogs message to a node via gRPC.
+    /// <para>
+    /// When <see cref="RaftConfiguration.GrpcEnableAppendLogsCoalescing"/> is
+    /// <see langword="true"/>, items that arrive while the stream is busy are queued and
+    /// flushed as a single multi-item <c>GrpcBatchRequestsRequest</c> by the thread that
+    /// next acquires the stream semaphore (backpressure-driven coalescing, no artificial
+    /// delay). When the flag is <see langword="false"/>, the original single-item path is
+    /// used unchanged.
+    /// </para>
     /// </summary>
-    /// <param name="manager"></param>
-    /// <param name="node"></param>
-    /// <param name="request"></param>
-    /// <returns></returns>
     public async Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftNode node, AppendLogsRequest request)
     {
         GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
@@ -174,22 +179,14 @@ public class GrpcCommunication : ICommunication
             BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
             GetPoolOptions(manager));
 
+        if (manager.Configuration.GrpcEnableAppendLogsCoalescing)
+            return await AppendLogsCoalesced(streaming, request, manager.Configuration.GrpcAppendLogsMaxCoalesceBatch);
+
         GrpcAppendLogsRequest appendLogsRequest = GrpcCommunicationPool.RentAppendLogsRequest();
 
         try
-        {            
-            appendLogsRequest.Partition = request.Partition;
-            appendLogsRequest.Term = request.Term;
-            appendLogsRequest.TimeNode = request.Time.N;
-            appendLogsRequest.TimePhysical = request.Time.L;
-            appendLogsRequest.TimeCounter = request.Time.C;
-            appendLogsRequest.Endpoint = request.Endpoint;
-            appendLogsRequest.PrevLogIndex = request.PrevLogIndex;
-            appendLogsRequest.PrevLogTerm = request.PrevLogTerm;
-            appendLogsRequest.Quiesce = request.Quiesce;
-
-            if (request.Logs is { Count: > 0 })
-                AddGrpcLogs(appendLogsRequest.Logs, request);
+        {
+            FillAppendLogsRequest(appendLogsRequest, request);
 
             GrpcBatchRequestsRequestItem requestItem = new()
             {
@@ -217,6 +214,130 @@ public class GrpcCommunication : ICommunication
         }
 
         return appendLogsResponse;
+    }
+
+    /// <summary>
+    /// Coalescing entry-point: builds the <see cref="PendingAppendLogs"/> item from
+    /// <paramref name="request"/> and delegates to <see cref="FlushCoalesced"/>.
+    /// </summary>
+    private async Task<AppendLogsResponse> AppendLogsCoalesced(
+        GrpcInterSharedStreaming streaming,
+        AppendLogsRequest request,
+        int maxBatch)
+    {
+        GrpcAppendLogsRequest appendLogsRequest = GrpcCommunicationPool.RentAppendLogsRequest();
+        FillAppendLogsRequest(appendLogsRequest, request);
+
+        GrpcBatchRequestsRequestItem requestItem = new()
+        {
+            Type = GrpcBatchRequestsRequestType.AppendLogs,
+            AppendLogs = appendLogsRequest
+        };
+
+        await FlushCoalesced(
+            streaming.Pending,
+            streaming.Semaphore,
+            b => streaming.Streaming.RequestStream.WriteAsync(b),
+            maxBatch,
+            new(requestItem, appendLogsRequest));
+
+        return appendLogsResponse;
+    }
+
+    /// <summary>
+    /// Core of the backpressure-driven coalescing flush.  Extracted as
+    /// <see langword="internal static"/> so tests can inject a fake <paramref name="write"/>
+    /// delegate and drive every path without a live gRPC server.
+    /// <para>
+    /// Each caller enqueues <paramref name="item"/> into <paramref name="pending"/> and then
+    /// attempts a non-blocking <c>Wait(0)</c> on <paramref name="semaphore"/>:
+    /// <list type="bullet">
+    ///   <item><description>
+    ///     <b>Flusher</b> (acquired): drains up to <paramref name="maxBatch"/> items per
+    ///     write cycle into one <c>GrpcBatchRequestsRequest</c>, calls
+    ///     <paramref name="write"/>, and loops while the queue is non-empty — bounding
+    ///     individual frames regardless of backlog depth.
+    ///   </description></item>
+    ///   <item><description>
+    ///     <b>Non-flusher</b> (semaphore busy): returns immediately; the active flusher's
+    ///     do/while re-loop will pick up the enqueued item.
+    ///   </description></item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// <b>Pool ownership:</b> the flusher returns all <see cref="GrpcAppendLogsRequest"/>
+    /// objects it drains via <see cref="GrpcCommunicationPool.Return(GrpcAppendLogsRequest)"/>.
+    /// Non-flushers must NOT return their own rented object — ownership transfers to the queue.
+    /// </para>
+    /// <para>
+    /// <b>Fire-and-forget semantics:</b> an item that lands in the queue in the narrow window
+    /// between the flusher's last drain and its <c>Release()</c> will be picked up by the next
+    /// caller that acquires the semaphore.  The Raft retry mechanism handles missing entries.
+    /// </para>
+    /// </summary>
+    internal static async Task FlushCoalesced(
+        ConcurrentQueue<PendingAppendLogs> pending,
+        SemaphoreSlim semaphore,
+        Func<GrpcBatchRequestsRequest, Task> write,
+        int maxBatch,
+        PendingAppendLogs item)
+    {
+        pending.Enqueue(item);
+
+        // Non-blocking try: if the stream is already busy we are done — the active flusher's
+        // re-loop will drain our item.  If we acquire we become the flusher.
+        if (!semaphore.Wait(0))
+            return;
+
+        List<GrpcAppendLogsRequest> toReturn = [];
+        try
+        {
+            do
+            {
+                GrpcBatchRequestsRequest batch = new();
+
+                // Cap per cycle to bound individual frame size.  The do/while re-loops for
+                // any remainder, so no items are lost regardless of backlog depth.
+                int drained = 0;
+                while (drained < maxBatch && pending.TryDequeue(out PendingAppendLogs p))
+                {
+                    batch.Requests.Add(p.BatchItem);
+                    toReturn.Add(p.PooledRequest);
+                    drained++;
+                }
+
+                if (batch.Requests.Count > 0)
+                    await write(batch);
+            }
+            while (!pending.IsEmpty);
+        }
+        finally
+        {
+            semaphore.Release();
+            foreach (GrpcAppendLogsRequest r in toReturn)
+                GrpcCommunicationPool.Return(r);
+        }
+    }
+
+    /// <summary>
+    /// Fills a rented <see cref="GrpcAppendLogsRequest"/> from <paramref name="request"/>.
+    /// Extracted so both the single-item path and the coalescing path share one copy of
+    /// this mapping without duplication.
+    /// </summary>
+    private static void FillAppendLogsRequest(GrpcAppendLogsRequest target, AppendLogsRequest request)
+    {
+        target.Partition = request.Partition;
+        target.Term = request.Term;
+        target.TimeNode = request.Time.N;
+        target.TimePhysical = request.Time.L;
+        target.TimeCounter = request.Time.C;
+        target.Endpoint = request.Endpoint;
+        target.PrevLogIndex = request.PrevLogIndex;
+        target.PrevLogTerm = request.PrevLogTerm;
+        target.Quiesce = request.Quiesce;
+
+        if (request.Logs is { Count: > 0 })
+            AddGrpcLogs(target.Logs, request);
     }
     
     /// <summary>
