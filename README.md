@@ -56,7 +56,7 @@ The library keeps storage, discovery, and communication pluggable. That separati
 
 Kommander multi-targets `.NET 8.0` and `.NET 10.0`.
 
-Current package version in this tree: `0.16.0`.
+Current package version in this tree: `0.17.1`.
 
 Install from NuGet:
 

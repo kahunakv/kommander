@@ -1252,9 +1252,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 {
                     if (++emptyLeaderPolls >= maxEmptyLeaderPolls)
                     {
-                        Logger.LogInformation(
-                            "LeaveCluster: P0 leader unknown after {Polls} polls; proceeding to stop.",
-                            emptyLeaderPolls);
+                        Logger.LogInfoLeaveClusterLeaderUnknown(emptyLeaderPolls);
                         return;
                     }
 

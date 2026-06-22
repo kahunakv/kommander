@@ -47,6 +47,13 @@ public static class SharedChannels
 
     private static readonly ConcurrentDictionary<string, Lazy<List<GrpcInterSharedStreaming>>> streamings = new();
 
+    // Per-URL round-robin counters for channel and streaming pool selection.
+    // Each entry is a single-element int[] so Interlocked.Increment can be used without boxing.
+    // Counter wraparound through int.MaxValue → int.MinValue is harmless: the uint cast before
+    // the modulo ensures the index is always in [0, count).
+    private static readonly ConcurrentDictionary<string, int[]> channelCounters = new();
+    private static readonly ConcurrentDictionary<string, int[]> streamingCounters = new();
+
     // Tracks the scalar pool options (ChannelsPerNode, EnableMultipleHttp2Connections) that were
     // used to create each normalized URL's channel pool.  Debug builds assert that no second caller
     // passes conflicting options for the same URL — Kommander guarantees one transport config per
@@ -129,7 +136,9 @@ public static class SharedChannels
 
         List<GrpcChannel> urlChannels = urlChannelsLazy.Value;
         AssertConsistentPoolConfig(url, opts);
-        return urlChannels[Random.Shared.Next(0, urlChannels.Count)];
+        int[] counter = channelCounters.GetOrAdd(url, _ => new int[1]);
+        int idx = (int)((uint)Interlocked.Increment(ref counter[0]) % urlChannels.Count);
+        return urlChannels[idx];
     }
 
     internal static List<GrpcChannel> GetAllChannels(string url, GrpcChannelPoolOptions opts)
@@ -162,7 +171,9 @@ public static class SharedChannels
 
         List<GrpcInterSharedStreaming> streamingList = lazyStreaming.Value;
         AssertConsistentPoolConfig(url, opts);
-        return streamingList[Random.Shared.Next(0, streamingList.Count)];
+        int[] counter = streamingCounters.GetOrAdd(url, _ => new int[1]);
+        int idx = (int)((uint)Interlocked.Increment(ref counter[0]) % streamingList.Count);
+        return streamingList[idx];
     }
 
     // ── Public backward-compatible overloads ──────────────────────────────────

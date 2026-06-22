@@ -198,6 +198,9 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "LeaveCluster: leave permanently rejected by hint {Hint}; proceeding to stop.")]
     public static partial void LogInfoLeaveClusterRejectedByHint(this ILogger<IRaft> logger, string hint);
 
+    [LoggerMessage(Level = LogLevel.Information, Message = "LeaveCluster: P0 leader unknown after {Polls} polls; proceeding to stop.")]
+    public static partial void LogInfoLeaveClusterLeaderUnknown(this ILogger<IRaft> logger, int polls);
+
     // ── RaftSystemCoordinator ─────────────────────────────────────────────
 
     [LoggerMessage(Level = LogLevel.Information, Message = "Restored system configuration: {Key}")]
