@@ -265,4 +265,150 @@ public sealed class TestRaftTimerService
 
         Assert.Equal(2, callCount);
     }
+
+    // ── Phase 2 hot-set tests ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Minimal IRaftTimerHost that counts how many times GetUserPartitions (full sweep)
+    /// vs GetHotUserPartitions (targeted tick) are called by TriggerCheckLeader.
+    /// </summary>
+    private sealed class HotSetTrackingHost : IRaftTimerHost
+    {
+        public bool Joined => false;
+        public RaftPartition? SystemPartition => null;
+        public int FullSweepCount;
+        public int HotSetCount;
+
+        public IEnumerable<RaftPartition> GetUserPartitions()
+        {
+            Interlocked.Increment(ref FullSweepCount);
+            return [];
+        }
+
+        public IEnumerable<RaftPartition> GetHotUserPartitions()
+        {
+            Interlocked.Increment(ref HotSetCount);
+            return [];
+        }
+
+        public Task UpdateNodes() => Task.CompletedTask;
+        public Task GossipAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task PingAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public void TriggerBalancerPass() { }
+    }
+
+    /// <summary>
+    /// With EnableSharedExecutorPool=true, normal ticks use GetHotUserPartitions and only
+    /// safety-sweep ticks use GetUserPartitions.  The safety period is
+    /// UpdateNodesInterval / CheckLeaderInterval = 5000 / 250 = 20 ticks.
+    /// </summary>
+    [Fact]
+    public void TriggerCheckLeader_HotSetEnabled_UsesHotSetOnNormalTicks()
+    {
+        HotSetTrackingHost host = new();
+        RaftConfiguration config = new()
+        {
+            StartElectionTimeout = 50,
+            EndElectionTimeout = 100,
+            EnableSharedExecutorPool = true,
+            CheckLeaderInterval  = TimeSpan.FromMilliseconds(250),
+            UpdateNodesInterval  = TimeSpan.FromMilliseconds(5000),
+        };
+
+        using RaftTimerService svc = new(host, NullLogger<IRaft>.Instance, config, TimeSpan.Zero);
+
+        // safetyTickPeriod = 5000/250 = 20. Fire 19 ticks — should use hot set every time.
+        for (int i = 0; i < 19; i++)
+            svc.TriggerCheckLeader();
+
+        Assert.Equal(19, host.HotSetCount);
+        Assert.Equal(0, host.FullSweepCount);
+    }
+
+    /// <summary>
+    /// At tick 20 (= safetyTickPeriod) the safety sweep fires — GetUserPartitions is called
+    /// once; subsequent normal ticks revert to the hot set.
+    /// </summary>
+    [Fact]
+    public void TriggerCheckLeader_HotSetEnabled_SafetySweepFiresAtPeriod()
+    {
+        HotSetTrackingHost host = new();
+        RaftConfiguration config = new()
+        {
+            StartElectionTimeout = 50,
+            EndElectionTimeout = 100,
+            EnableSharedExecutorPool = true,
+            CheckLeaderInterval  = TimeSpan.FromMilliseconds(250),
+            UpdateNodesInterval  = TimeSpan.FromMilliseconds(5000),
+        };
+
+        using RaftTimerService svc = new(host, NullLogger<IRaft>.Instance, config, TimeSpan.Zero);
+
+        // Fire exactly safetyTickPeriod = 20 ticks.
+        for (int i = 0; i < 20; i++)
+            svc.TriggerCheckLeader();
+
+        // 20th tick is the safety sweep; the other 19 use the hot set.
+        Assert.Equal(19, host.HotSetCount);
+        Assert.Equal(1, host.FullSweepCount);
+
+        // Next 20 ticks: 19 hot-set + 1 safety.
+        for (int i = 0; i < 20; i++)
+            svc.TriggerCheckLeader();
+
+        Assert.Equal(38, host.HotSetCount);
+        Assert.Equal(2, host.FullSweepCount);
+    }
+
+    /// <summary>
+    /// With EnableSharedExecutorPool=false, every tick is a full sweep — hot set is
+    /// never consulted regardless of partition count.
+    /// </summary>
+    [Fact]
+    public void TriggerCheckLeader_HotSetDisabled_AlwaysFullSweep()
+    {
+        HotSetTrackingHost host = new();
+        RaftConfiguration config = new()
+        {
+            StartElectionTimeout = 50,
+            EndElectionTimeout = 100,
+            EnableSharedExecutorPool = false,
+            CheckLeaderInterval  = TimeSpan.FromMilliseconds(250),
+            UpdateNodesInterval  = TimeSpan.FromMilliseconds(5000),
+        };
+
+        using RaftTimerService svc = new(host, NullLogger<IRaft>.Instance, config, TimeSpan.Zero);
+
+        for (int i = 0; i < 25; i++)
+            svc.TriggerCheckLeader();
+
+        Assert.Equal(25, host.FullSweepCount);
+        Assert.Equal(0, host.HotSetCount);
+    }
+
+    /// <summary>
+    /// When safetyTickPeriod collapses to 1 (UpdateNodesInterval &lt;= CheckLeaderInterval),
+    /// every tick is a full sweep — no hot-set ticks at all.
+    /// </summary>
+    [Fact]
+    public void TriggerCheckLeader_HotSet_SafetyPeriodOne_AlwaysFullSweep()
+    {
+        HotSetTrackingHost host = new();
+        RaftConfiguration config = new()
+        {
+            StartElectionTimeout = 50,
+            EndElectionTimeout = 100,
+            EnableSharedExecutorPool = true,
+            CheckLeaderInterval  = TimeSpan.FromMilliseconds(250),
+            UpdateNodesInterval  = TimeSpan.FromMilliseconds(250), // period = 1
+        };
+
+        using RaftTimerService svc = new(host, NullLogger<IRaft>.Instance, config, TimeSpan.Zero);
+
+        for (int i = 0; i < 5; i++)
+            svc.TriggerCheckLeader();
+
+        Assert.Equal(5, host.FullSweepCount);
+        Assert.Equal(0, host.HotSetCount);
+    }
 }

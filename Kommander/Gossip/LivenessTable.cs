@@ -123,17 +123,30 @@ internal sealed class LivenessTable
     /// <see cref="MemberLivenessState.Dead"/>.  Should be called at the start of
     /// each <c>PingAsync</c> tick.
     /// </summary>
-    public void AdvanceExpiry(DateTimeOffset now, TimeSpan suspicionTimeout)
+    /// <returns>
+    /// The endpoints that transitioned to <see cref="MemberLivenessState.Dead"/> during
+    /// this call.  Empty when nothing expired.  The caller should promote any quiesced
+    /// partitions that believe one of these endpoints is their leader back into the hot
+    /// set so they detect the failure within the next <c>CheckLeader</c> tick.
+    /// </returns>
+    public IReadOnlyList<string> AdvanceExpiry(DateTimeOffset now, TimeSpan suspicionTimeout)
     {
+        List<string>? newlyDead = null;
+
         lock (_lock)
         {
             foreach (string ep in _table.Keys.ToList())
             {
                 Entry e = _table[ep];
                 if (e.State == MemberLivenessState.Suspect && now - e.ChangedAt >= suspicionTimeout)
+                {
                     _table[ep] = new(MemberLivenessState.Dead, e.Incarnation, now);
+                    (newlyDead ??= []).Add(ep);
+                }
             }
         }
+
+        return newlyDead ?? (IReadOnlyList<string>)[];
     }
 
     // ── Eviction ───────────────────────────────────────────────────────────
@@ -167,17 +180,33 @@ internal sealed class LivenessTable
 
     /// <summary>
     /// Applies a batch of <see cref="MemberLivenessEntry"/> updates received via gossip
-    /// using the SWIM merge rule.  Returns <c>true</c> when an entry for
-    /// <paramref name="selfEndpoint"/> with state ≥ <see cref="MemberLivenessState.Suspect"/>
-    /// was applied — the caller should then call <see cref="RefuteSuspicion"/> so the next
-    /// gossip round disseminates the refutation.
+    /// using the SWIM merge rule.
     /// </summary>
-    public bool ApplyUpdates(string selfEndpoint, IReadOnlyList<MemberLivenessEntry>? updates)
+    /// <returns>
+    /// A tuple of:
+    /// <list type="bullet">
+    ///   <item>
+    ///     <c>selfSuspected</c> — <see langword="true"/> when an entry for
+    ///     <paramref name="selfEndpoint"/> with state ≥ <see cref="MemberLivenessState.Suspect"/>
+    ///     was applied.  The caller should then call <see cref="RefuteSuspicion"/> so the next
+    ///     gossip round disseminates the refutation.
+    ///   </item>
+    ///   <item>
+    ///     <c>newlySuspectOrDead</c> — non-self endpoints that were written into the table
+    ///     with state ≥ <see cref="MemberLivenessState.Suspect"/> in this call.  The caller
+    ///     should promote any quiesced partitions that believe one of these endpoints is their
+    ///     leader back into the hot set.
+    ///   </item>
+    /// </list>
+    /// </returns>
+    public (bool selfSuspected, IReadOnlyList<string> newlySuspectOrDead) ApplyUpdates(
+        string selfEndpoint, IReadOnlyList<MemberLivenessEntry>? updates)
     {
         if (updates is null || updates.Count == 0)
-            return false;
+            return (false, []);
 
         bool selfSuspected = false;
+        List<string>? newlySuspectOrDead = null;
 
         lock (_lock)
         {
@@ -192,10 +221,12 @@ internal sealed class LivenessTable
 
                 if (upd.Endpoint == selfEndpoint && upd.State >= MemberLivenessState.Suspect)
                     selfSuspected = true;
+                else if (upd.Endpoint != selfEndpoint && upd.State >= MemberLivenessState.Suspect)
+                    (newlySuspectOrDead ??= []).Add(upd.Endpoint);
             }
         }
 
-        return selfSuspected;
+        return (selfSuspected, newlySuspectOrDead ?? (IReadOnlyList<string>)[]);
     }
 
     /// <summary>

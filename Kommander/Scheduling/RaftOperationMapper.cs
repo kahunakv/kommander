@@ -25,8 +25,9 @@ public static class RaftOperationMapper
             // ── Control ──────────────────────────────────────────────────────────────
             // Leader liveness checks, handshakes, and all election traffic must never
             // be starved by replication or client work.
-            RaftRequestType.CheckLeader           => RaftOperationKind.Control,
-            RaftRequestType.ForceLeaderForTesting => RaftOperationKind.Control,
+            RaftRequestType.CheckLeader              => RaftOperationKind.Control,
+            RaftRequestType.ForceLeaderForTesting    => RaftOperationKind.Control,
+            RaftRequestType.SetQuiescedForTesting    => RaftOperationKind.Control,
             RaftRequestType.StepDown              => RaftOperationKind.Control,
             RaftRequestType.TransferLeadership    => RaftOperationKind.Control,
             RaftRequestType.SuspendHeartbeats     => RaftOperationKind.Control,
@@ -108,6 +109,7 @@ public static class RaftOperationMapper
         {
             RaftRequestType.CheckLeader or
             RaftRequestType.ForceLeaderForTesting or
+            RaftRequestType.SetQuiescedForTesting or
             RaftRequestType.StepDown or
             RaftRequestType.TransferLeadership or
             RaftRequestType.SuspendHeartbeats or

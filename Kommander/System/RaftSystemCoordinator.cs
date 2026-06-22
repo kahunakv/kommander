@@ -1265,7 +1265,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
         {
             await livePartition.DrainAsync(cancellationToken).ConfigureAwait(false);
             livePartition.Stop();
-            manager.Partitions.TryRemove(sourcePartitionId, out _);
+            manager.RemovePartition(sourcePartitionId);
         }
 
         manager.WalAdapter.DeletePartitionWAL(sourcePartitionId);
@@ -1542,7 +1542,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
         {
             await livePartition.DrainAsync(cancellationToken).ConfigureAwait(false);
             livePartition.Stop();
-            manager.Partitions.TryRemove(partitionId, out _);
+            manager.RemovePartition(partitionId);
         }
 
         manager.WalAdapter.DeletePartitionWAL(partitionId);

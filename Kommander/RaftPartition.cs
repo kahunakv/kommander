@@ -180,6 +180,17 @@ public sealed class RaftPartition : IDisposable
         executorRef = executor;
         replySink.Executor = executor;
         stateMachine.SetPostToExecutor(req => executorRef.Post(req));
+
+        // Wire the hot-set callback so the manager learns immediately when this partition
+        // quiesces (→ remove from hot set) or un-quiesces (→ re-add to hot set).
+        // Fired under the single-owner guarantee so the ConcurrentDictionary ops are safe.
+        if (manager.Configuration.EnableSharedExecutorPool)
+            stateMachine.SetOnQuiesceChanged(isQuiesced =>
+            {
+                if (isQuiesced) manager.MarkPartitionCool(PartitionId);
+                else            manager.MarkPartitionHot(PartitionId);
+            });
+
         executor.Start();
     }
 

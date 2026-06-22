@@ -16,6 +16,19 @@ public interface IRaftTimerHost
     /// <summary>All user partitions currently known to the runtime.</summary>
     IEnumerable<RaftPartition> GetUserPartitions();
 
+    /// <summary>
+    /// The subset of user partitions that are currently hot: not quiesced and eligible
+    /// for targeted <c>CheckLeader</c> ticks.  Called by
+    /// <see cref="RaftTimerService.TriggerCheckLeader"/> on every normal interval when
+    /// <see cref="RaftConfiguration.EnableSharedExecutorPool"/> is on, replacing the
+    /// O(M) full sweep with an O(active) scan.
+    ///
+    /// <para>The default implementation falls back to <see cref="GetUserPartitions()"/> so
+    /// existing <see cref="IRaftTimerHost"/> stubs are not broken when they don't override
+    /// this method.</para>
+    /// </summary>
+    IEnumerable<RaftPartition> GetHotUserPartitions() => GetUserPartitions();
+
     /// <summary>Refreshes the cluster node registry via discovery.</summary>
     Task UpdateNodes();
 

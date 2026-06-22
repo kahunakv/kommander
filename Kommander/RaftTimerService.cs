@@ -47,6 +47,22 @@ public sealed class RaftTimerService : IDisposable
     private int _gossipRunning;       // 0 = idle, 1 = running; prevents overlapping ticks
     private int _pingRunning;         // 0 = idle, 1 = running; prevents overlapping ticks
 
+    /// <summary>
+    /// When <see langword="true"/> (requires <see cref="RaftConfiguration.EnableSharedExecutorPool"/>),
+    /// <see cref="TriggerCheckLeader"/> ticks only the hot set on each normal interval and
+    /// does a full sweep of all partitions at the coarse safety interval.
+    /// </summary>
+    private readonly bool _enableHotSet;
+
+    /// <summary>
+    /// Number of ticks between full safety sweeps.
+    /// Computed as <c>UpdateNodesInterval / CheckLeaderInterval</c> (floored to 1).
+    /// </summary>
+    private readonly int _safetyTickPeriod;
+
+    /// <summary>Monotonically increasing tick counter used to schedule the coarse safety sweep.</summary>
+    private int _safetyTickCount;
+
     private readonly TimeSpan _checkLeaderInterval;
     private readonly TimeSpan _updateNodesInterval;
     private readonly TimeSpan _gossipInterval;
@@ -72,6 +88,9 @@ public sealed class RaftTimerService : IDisposable
         _balancerInterval = configuration.LeaderBalancerInterval;
         _balancerEnabled = configuration.EnableLeaderBalancer;
         _initialDelay = initialDelay ?? configuration.TimerInitialDelay;
+        _enableHotSet = configuration.EnableSharedExecutorPool;
+        // Safety sweep every ~UpdateNodesInterval (e.g. 5 s / 250 ms = 20 ticks), minimum 1.
+        _safetyTickPeriod = (int)Math.Max(1, Math.Round(_updateNodesInterval / _checkLeaderInterval));
     }
 
     /// <summary>Starts the periodic timers.  Safe to call only once.</summary>
@@ -148,7 +167,13 @@ public sealed class RaftTimerService : IDisposable
     }
 
     /// <summary>
-    /// Posts a <c>CheckLeader</c> message into every partition executor.
+    /// Posts a <c>CheckLeader</c> message into partition executors.
+    ///
+    /// <para>When <see cref="RaftConfiguration.EnableSharedExecutorPool"/> is on, only the hot
+    /// (non-quiesced) partitions are ticked on each normal interval.  A coarse safety sweep
+    /// over all partitions fires every <c>UpdateNodesInterval / CheckLeaderInterval</c> ticks
+    /// to catch anything that fell out of the hot set incorrectly.  The system partition is
+    /// always ticked regardless of hot-set mode.</para>
     ///
     /// <para>Invoked by the internal timer, but public so tests can drive it
     /// synchronously without waiting for a real timer tick.</para>
@@ -160,10 +185,23 @@ public sealed class RaftTimerService : IDisposable
 
         try
         {
+            // System partition is always hot.
             _host.SystemPartition?.CheckLeader();
 
-            foreach (RaftPartition partition in _host.GetUserPartitions())
-                partition.CheckLeader();
+            if (_enableHotSet)
+            {
+                // Safety sweep at coarse interval; hot-set tick every other cycle.
+                bool fullSweep = Interlocked.Increment(ref _safetyTickCount) % _safetyTickPeriod == 0;
+                foreach (RaftPartition partition in fullSweep
+                             ? _host.GetUserPartitions()
+                             : _host.GetHotUserPartitions())
+                    partition.CheckLeader();
+            }
+            else
+            {
+                foreach (RaftPartition partition in _host.GetUserPartitions())
+                    partition.CheckLeader();
+            }
         }
         catch (Exception ex)
         {
