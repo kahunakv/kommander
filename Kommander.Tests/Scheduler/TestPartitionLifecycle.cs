@@ -278,6 +278,54 @@ public abstract class PartitionLifecycleTests
     }
 
     /// <summary>
+    /// Regression — a pool-mode <see cref="RaftManager"/> (the default,
+    /// <c>EnableSharedExecutorPool=true</c>) must be able to create and remove a partition
+    /// without ever calling <c>JoinCluster</c>.
+    ///
+    /// <para>In pool mode a partition executor depends on a <i>running</i>
+    /// <c>RaftExecutorPool</c>: <c>Start()</c> schedules its restore onto the pool, and
+    /// <c>Stop()</c> (driven by RemovePartition) blocks until a pool thread runs the cleanup
+    /// drain. The pool is therefore started in the <see cref="RaftManager"/> constructor, not
+    /// in <c>JoinCluster</c> — otherwise this coordinator-driven path (and these tests) would
+    /// deadlock on the first RemovePartition. The 5 s bounds inside the Send helpers turn a
+    /// re-regression into a timeout failure here rather than a silent hang.</para>
+    /// </summary>
+    [Fact]
+    public async Task PoolMode_CreateAndRemove_WithoutJoinCluster_DoesNotDeadlock()
+    {
+        IWAL wal = CreateWal(out Action cleanup);
+        // Build() uses the default config, so EnableSharedExecutorPool is true here.
+        using RaftManager manager = Build(wal);
+        try
+        {
+            List<RaftPartitionRange> initial =
+            [
+                new() { PartitionId = 1, StartRange = 0, EndRange = int.MaxValue, Generation = 1, State = RaftPartitionState.Active, RoutingMode = RaftRoutingMode.HashRange }
+            ];
+            manager.SystemCoordinator.Send(MakeConfigReplicated(initial));
+            await WaitForIdleAsync(manager);
+
+            int replicateCallCount = 0;
+            manager.SystemCoordinator.ReplicateOverride = (_, _, _, _) =>
+            {
+                replicateCallCount++;
+                return Task.FromResult(new RaftReplicationResult(true, RaftOperationStatus.Success, HLCTimestamp.Zero, replicateCallCount));
+            };
+            manager.SystemCoordinator.StartPartitionsOverride = ranges => manager.StartUserPartitions(ranges);
+
+            // Create then remove. Either step would hang (not fail) on an unstarted pool.
+            (RaftOperationStatus createStatus, _) = await SendCreateAsync(manager, partitionId: 30, RaftRoutingMode.Unrouted);
+            Assert.Equal(RaftOperationStatus.Success, createStatus);
+            Assert.True(manager.Partitions.ContainsKey(30));
+
+            (RaftOperationStatus removeStatus, _) = await SendRemoveAsync(manager, partitionId: 30);
+            Assert.Equal(RaftOperationStatus.Success, removeStatus);
+            Assert.False(manager.Partitions.ContainsKey(30));
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
     /// Test 4 — Crash-recovery: simulate a restart after the Removed tombstone was
     /// committed but before DeletePartitionWAL ran.
     ///

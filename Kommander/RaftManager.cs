@@ -343,7 +343,18 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             configuration.MaxWalGroupBatchPartitions);
 
         if (configuration.EnableSharedExecutorPool)
+        {
             executorPool = new Scheduling.RaftExecutorPool(configuration.PartitionExecutorPoolSize);
+
+            // Start the pool here, where it is created, rather than in JoinCluster.
+            // A partition executor in pool mode depends on a *running* pool: Start()
+            // schedules its restore onto the pool and Stop() blocks on _stopTcs until a
+            // pool thread runs the cleanup drain. Any code path that constructs partitions
+            // without going through JoinCluster (e.g. driving SystemCoordinator directly)
+            // would otherwise deadlock. Pool threads simply park until work arrives, so
+            // starting early is cheap. Start() is idempotent.
+            executorPool.Start();
+        }
 
         OnSystemLogRestored += SystemLogRestored;
         OnSystemReplicationReceived += SystemReplicationReceived;
