@@ -60,6 +60,18 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     private readonly ConcurrentDictionary<int, RaftPartition> partitions = new();
 
+    /// <summary>
+    /// Partitions that are currently hot: not quiesced and receiving <c>CheckLeader</c> ticks
+    /// on every <see cref="RaftConfiguration.CheckLeaderInterval"/> cycle.
+    /// Populated when a partition is started; entries are removed by the partition's quiesce
+    /// callback and restored when it un-quiesces.  Only used when
+    /// <see cref="RaftConfiguration.EnableSharedExecutorPool"/> is on (Phase 2 hot-set).
+    /// </summary>
+    private readonly ConcurrentDictionary<int, RaftPartition> _hotPartitions = new();
+
+    /// <summary>Test-visible snapshot of the current hot-partition IDs.</summary>
+    internal IEnumerable<int> HotPartitionIds => _hotPartitions.Keys;
+
     private readonly FairReadScheduler readScheduler;
 
     private readonly FairWalScheduler walScheduler;
@@ -839,11 +851,19 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             systemCoordinator.Send(new System.RaftSystemRequest(digest.Roster));
 
         // Apply piggybacked liveness updates; refute self-suspicion if required.
-        if (Liveness.ApplyUpdates(LocalEndpoint, digest.LivenessUpdates))
+        // Wake quiesced partitions for any peer that gossip reports as Suspect/Dead so
+        // their failover is bounded by gossip propagation latency, not the safety sweep.
+        (bool selfSuspected, IReadOnlyList<string> newlySuspectOrDead) =
+            Liveness.ApplyUpdates(LocalEndpoint, digest.LivenessUpdates);
+
+        if (selfSuspected)
         {
             long refutedInc = Liveness.RefuteSuspicion(LocalEndpoint);
             Logger.LogInfoReceiveGossipRefuting(refutedInc);
         }
+
+        foreach (string suspectEndpoint in newlySuspectOrDead)
+            WakePartitionsForLeader(suspectEndpoint);
 
         // Store advisory load report when the balancer is enabled.
         if (configuration.EnableLeaderBalancer && digest.LoadReport is { } report)
@@ -978,7 +998,11 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     public async Task PingAsync(CancellationToken cancellationToken = default)
     {
         // Advance Suspect → Dead before processing this round's probe results.
-        Liveness.AdvanceExpiry(DateTimeOffset.UtcNow, configuration.SuspicionTimeout);
+        // Wake quiesced partitions for any newly-Dead leaders so they detect failure within
+        // the next CheckLeader tick rather than waiting for the coarse safety sweep.
+        IReadOnlyList<string> newlyDead = Liveness.AdvanceExpiry(DateTimeOffset.UtcNow, configuration.SuspicionTimeout);
+        foreach (string deadEndpoint in newlyDead)
+            WakePartitionsForLeader(deadEndpoint);
 
         ClusterMembership membership = systemCoordinator.GetMembership();
         if (membership.MembershipVersion == 0)
@@ -1064,7 +1088,12 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             MemberLivenessState prev = Liveness.GetState(target.Endpoint);
             Liveness.MarkSuspect(target.Endpoint);
             if (prev == MemberLivenessState.Alive)
+            {
                 Logger.LogWarning("PingAsync: {Endpoint} failed direct and indirect probe; marked Suspect", target.Endpoint);
+                // Wake quiesced followers that believe this node is their leader so they
+                // detect the failure at the next CheckLeader tick, not the 5 s safety sweep.
+                WakePartitionsForLeader(target.Endpoint);
+            }
         }
     }
 
@@ -1156,6 +1185,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 newPartition.Generation = range.Generation;
                 newPartition.State = range.State;
                 partitions.TryAdd(range.PartitionId, newPartition);
+                // New partitions start hot; they leave the hot set via the quiesce callback.
+                _hotPartitions.TryAdd(range.PartitionId, newPartition);
             }
         }
 
@@ -1437,6 +1468,13 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     IEnumerable<RaftPartition> Scheduling.IRaftTimerHost.GetUserPartitions() => partitions.Values;
 
+    /// <summary>
+    /// Returns only the hot (non-quiesced) partitions for targeted <c>CheckLeader</c> ticks.
+    /// Updated by <see cref="MarkPartitionHot"/> / <see cref="MarkPartitionCool"/> which are
+    /// wired from each <see cref="RaftPartitionStateMachine"/>'s quiesce callback.
+    /// </summary>
+    IEnumerable<RaftPartition> Scheduling.IRaftTimerHost.GetHotUserPartitions() => _hotPartitions.Values;
+
     Task Scheduling.IRaftTimerHost.UpdateNodes() => UpdateNodes();
 
     Task Scheduling.IRaftTimerHost.GossipAsync(CancellationToken cancellationToken) => GossipAsync(cancellationToken);
@@ -1445,6 +1483,57 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     void Scheduling.IRaftTimerHost.TriggerBalancerPass() =>
         systemCoordinator.Send(new System.RaftSystemRequest(System.RaftSystemRequestType.RunBalancerPass));
+
+    /// <summary>
+    /// Adds <paramref name="partitionId"/> to the hot set so it receives targeted
+    /// <c>CheckLeader</c> ticks.  Called from the partition's quiesce callback when a
+    /// partition transitions from quiesced → active.  Safe to call from any thread.
+    /// </summary>
+    internal void MarkPartitionHot(int partitionId)
+    {
+        if (partitions.TryGetValue(partitionId, out RaftPartition? p))
+            _hotPartitions.TryAdd(partitionId, p);
+    }
+
+    /// <summary>
+    /// Removes <paramref name="partitionId"/> from the hot set.  Called from the partition's
+    /// quiesce callback when it transitions to quiesced state.  Safe to call from any thread.
+    /// </summary>
+    internal void MarkPartitionCool(int partitionId) => _hotPartitions.TryRemove(partitionId, out _);
+
+    /// <summary>
+    /// Promotes every quiesced partition that believes <paramref name="leaderEndpoint"/> is
+    /// its current leader back into the hot set so it receives a <c>CheckLeader</c> tick
+    /// on the next <see cref="RaftConfiguration.CheckLeaderInterval"/> cycle instead of
+    /// waiting for the coarse safety sweep.
+    ///
+    /// <para>Called whenever SWIM transitions <paramref name="leaderEndpoint"/> to Suspect or
+    /// Dead so failover detection for quiesced followers is bounded by SWIM latency rather
+    /// than by <see cref="RaftConfiguration.UpdateNodesInterval"/> (the safety-sweep period).
+    /// This preserves the fast-failover guarantee the quiescence spec relied on.</para>
+    /// </summary>
+    private void WakePartitionsForLeader(string leaderEndpoint)
+    {
+        foreach (RaftPartition p in partitions.Values)
+        {
+            if (string.Equals(p.Leader, leaderEndpoint, StringComparison.Ordinal))
+                MarkPartitionHot(p.PartitionId);
+        }
+    }
+
+    /// <summary>
+    /// Evicts <paramref name="partitionId"/> from both <see cref="partitions"/> and
+    /// <see cref="_hotPartitions"/> in one call.  Use this instead of
+    /// <c>Partitions.TryRemove</c> at removal/merge sites so the two dictionaries never
+    /// drift out of sync: a stale <c>_hotPartitions</c> entry points at a stopped executor
+    /// and causes <see cref="RaftTimerService.TriggerCheckLeader"/> to throw on the next
+    /// hot-set tick, silently aborting the sweep for all survivors that follow it.
+    /// </summary>
+    internal void RemovePartition(int partitionId)
+    {
+        partitions.TryRemove(partitionId, out _);
+        _hotPartitions.TryRemove(partitionId, out _);
+    }
 
     // ──────────────────────────────────────────────────────────────────────
 

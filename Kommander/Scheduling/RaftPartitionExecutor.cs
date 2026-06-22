@@ -736,6 +736,11 @@ public sealed class RaftPartitionExecutor : IDisposable
                     await _stateMachine.ForceLeaderForTestingAsync(RegisterReply(op)).ConfigureAwait(false);
                     break;
 
+                case RaftRequestType.SetQuiescedForTesting:
+                    _stateMachine.SetQuiescedForTesting(op.Request.Quiesce);
+                    op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
+                    break;
+
                 case RaftRequestType.StepDown:
                     await _stateMachine.StepDownAsync(RegisterReply(op)).ConfigureAwait(false);
                     break;

@@ -5,6 +5,15 @@ public enum RaftRequestType
 {
     CheckLeader,
     ForceLeaderForTesting,
+
+    /// <summary>
+    /// Test-only: injects quiesced state directly into the state machine via
+    /// <see cref="RaftPartitionStateMachine.SetQuiescedForTesting"/>, triggering the
+    /// quiesce callback so the hot-set bookkeeping in <see cref="RaftManager"/> is
+    /// updated under the single-owner guarantee.
+    /// The <see cref="RaftRequest.Quiesce"/> field carries the target value.
+    /// </summary>
+    SetQuiescedForTesting,
     StepDown,
     TransferLeadership,
     SuspendHeartbeats,

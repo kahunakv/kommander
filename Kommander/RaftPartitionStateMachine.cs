@@ -101,6 +101,15 @@ public sealed class RaftPartitionStateMachine
     private bool quiesced;
 
     /// <summary>
+    /// Optional callback invoked whenever <see cref="quiesced"/> transitions.
+    /// <see langword="true"/> = just quiesced (leave hot set); <see langword="false"/> = just
+    /// un-quiesced (re-enter hot set).  Fired under the single-owner guarantee so no extra
+    /// locking is required in the callback implementation.  Set by <see cref="RaftPartition"/>
+    /// via <see cref="SetOnQuiesceChanged"/>; <see langword="null"/> in unit tests that use stub hosts.
+    /// </summary>
+    private Action<bool>? _onQuiesceChanged;
+
+    /// <summary>
     /// HLC timestamp of the last real proposal enqueued on this leader.
     /// Zero until the first proposal arrives after winning election.
     /// Used to determine when the partition has been idle long enough to quiesce:
@@ -154,6 +163,25 @@ public sealed class RaftPartitionStateMachine
     /// <see cref="RaftPartition"/> immediately after the executor is created.
     /// </summary>
     public void SetPostToExecutor(Action<RaftRequest> post) => postToExecutor = post;
+
+    /// <summary>
+    /// Wires the quiesce-state-change callback.  Called once by <see cref="RaftPartition"/>
+    /// at construction time so the manager's hot set stays in sync.
+    /// </summary>
+    internal void SetOnQuiesceChanged(Action<bool> callback) => _onQuiesceChanged = callback;
+
+    /// <summary>
+    /// Assigns <paramref name="value"/> to <see cref="quiesced"/> and notifies
+    /// <see cref="_onQuiesceChanged"/> on an actual state change.  Must be called instead of
+    /// directly assigning <c>quiesced</c> so the hot-set tracking stays consistent.
+    /// </summary>
+    private void SetQuiesced(bool value)
+    {
+        if (quiesced == value)
+            return;
+        quiesced = value;
+        _onQuiesceChanged?.Invoke(value);
+    }
 
     private void CompleteReply(ulong? correlationId, RaftResponse response)
     {
@@ -253,7 +281,7 @@ public sealed class RaftPartitionStateMachine
                         && lastProposalAt != HLCTimestamp.Zero
                         && (currentTime - lastProposalAt) >= host.Configuration.QuiesceAfter)
                     {
-                        quiesced = true;
+                        SetQuiesced(true);
                         lastHeartbeat = currentTime;
                         SendQuiesceMarker(currentTime);
                     }
@@ -290,7 +318,7 @@ public sealed class RaftPartitionStateMachine
                 localCommittedIndex = -1;
                 activeProposals.Clear();
                 lastProposalAt = HLCTimestamp.Zero;
-                quiesced = false;
+                SetQuiesced(false);
                 ResetPreVoteRound();
 
                 await host.InvokeLeaderChanged(host.PartitionId, "");
@@ -305,7 +333,7 @@ public sealed class RaftPartitionStateMachine
                     host.GetNodeLiveness(expectedLeaderNode) == MemberLivenessState.Alive)
                     return; // leader's node is Alive per SWIM — stay calm
                 // Leader node is Suspect or Dead — un-quiesce and challenge leadership.
-                quiesced = false;
+                SetQuiesced(false);
                 await StartPreVoteAsync(currentTime).ConfigureAwait(false);
                 break;
             }
@@ -349,7 +377,7 @@ public sealed class RaftPartitionStateMachine
         localCommittedIndex = -1;
         activeProposals.Clear();
         lastProposalAt = HLCTimestamp.Zero;
-        quiesced = false;
+        SetQuiesced(false);
 
         await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
 
@@ -460,7 +488,7 @@ public sealed class RaftPartitionStateMachine
     /// </summary>
     public void SetQuiescedForTesting(bool value, string? leaderEndpoint = null, long term = 1)
     {
-        quiesced = value;
+        SetQuiesced(value);
         if (value && leaderEndpoint is not null)
             expectedLeaders[term] = leaderEndpoint;
     }
@@ -485,7 +513,7 @@ public sealed class RaftPartitionStateMachine
         host.Leader = host.LocalEndpoint;
         lastHeartbeat = ts;
         lastProposalAt = ts;
-        quiesced = false;
+        SetQuiesced(false);
         return ts;
     }
 
@@ -1335,7 +1363,7 @@ public sealed class RaftPartitionStateMachine
         // A quiesce-flagged message tells us to stop expecting heartbeats and gate elections
         // on SWIM liveness instead.  Any non-quiesce AppendLogs (real logs or normal heartbeat)
         // wakes us back up by clearing the flag.
-        quiesced = quiesce;
+        SetQuiesced(quiesce);
 
         // Log Matching Property check: the follower must hold an entry at prevLogIndex with
         // prevLogTerm before it can safely append the incoming batch.  A mismatch means the
@@ -1466,7 +1494,7 @@ public sealed class RaftPartitionStateMachine
 
         HLCTimestamp currentTime = host.HybridLogicalClock.SendOrLocalEvent(host.LocalNodeId);
         lastProposalAt = currentTime;
-        quiesced = false; // un-quiesce on new proposal: resume normal heartbeating
+        SetQuiesced(false); // un-quiesce on new proposal: resume normal heartbeating
 
         // Try to clear and reuse expired proposals
         if (activeProposals.Count > 5)
