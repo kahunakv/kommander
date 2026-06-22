@@ -125,17 +125,22 @@ public sealed class RaftPartition : IDisposable
     /// <param name="startRange"></param>
     /// <param name="endRange"></param>
     /// <param name="logger"></param>
+    /// <param name="pool">
+    /// Optional shared executor pool.  When non-null the partition executor is driven by
+    /// the pool instead of creating its own OS thread.  Must already be started.
+    /// </param>
     public RaftPartition(
-        RaftManager manager, 
-        IWAL walAdapter, 
+        RaftManager manager,
+        IWAL walAdapter,
         int partitionId,
         int startRange,
         int endRange,
-        ILogger<IRaft> logger
+        ILogger<IRaft> logger,
+        RaftExecutorPool? pool = null
     )
     {
         this.manager = manager;
-        
+
         PartitionId = partitionId;
         StartRange = startRange;
         EndRange = endRange;
@@ -170,7 +175,8 @@ public sealed class RaftPartition : IDisposable
             drainQuantumClient:      manager.Configuration.MaxDrainQuantumClient,
             drainQuantumMaintenance: manager.Configuration.MaxDrainQuantumMaintenance,
             getGeneration:           () => Generation,
-            walQueueDepthProvider:   () => manager.WalScheduler.GetPartitionDepth(partitionId));
+            walQueueDepthProvider:   () => manager.WalScheduler.GetPartitionDepth(partitionId),
+            pool:                    pool);
         executorRef = executor;
         replySink.Executor = executor;
         stateMachine.SetPostToExecutor(req => executorRef.Post(req));

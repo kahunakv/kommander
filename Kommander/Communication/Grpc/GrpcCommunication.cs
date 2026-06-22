@@ -274,6 +274,14 @@ public class GrpcCommunication : ICommunication
     /// between the flusher's last drain and its <c>Release()</c> will be picked up by the next
     /// caller that acquires the semaphore.  The Raft retry mechanism handles missing entries.
     /// </para>
+    /// <para>
+    /// <b>Error attribution:</b> unlike the single-item path — where each send's failure is
+    /// observed by its own caller — a failing <paramref name="write"/> here surfaces only to the
+    /// flusher's call; the other producers whose items were coalesced into the failed batch have
+    /// already returned the synthetic success response.  This is acceptable because the send is
+    /// fire-and-forget and the leader re-sends unacknowledged entries via the heartbeat/backfill
+    /// path; no caller relies on the <c>AppendLogs</c> return value for delivery confirmation.
+    /// </para>
     /// </summary>
     internal static async Task FlushCoalesced(
         ConcurrentQueue<PendingAppendLogs> pending,

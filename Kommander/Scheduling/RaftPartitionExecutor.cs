@@ -90,9 +90,25 @@ public sealed class RaftPartitionExecutor : IDisposable
     // Max count is set large so producer bursts don't block.
     private readonly SemaphoreSlim _workAvailable = new(0, int.MaxValue);
 
-    // ── Worker thread ──────────────────────────────────────────────────────
+    // ── Worker thread / pool support ───────────────────────────────────────
 
-    private readonly Thread _worker;
+    // Non-null in dedicated-thread mode; null when driven by a RaftExecutorPool.
+    private readonly Thread? _worker;
+
+    // Non-null in shared-pool mode; null in dedicated-thread mode.
+    private readonly RaftExecutorPool? _pool;
+
+    // Pool-mode coordination: _inQueue prevents the same executor from being
+    // enqueued twice; _runLock ensures at most one pool thread drains this
+    // executor at a time (single-owner invariant under the shared pool).
+    // Both are 0/1 int flags manipulated with Interlocked.CompareExchange.
+    private int _inQueue;
+    private int _runLock;
+
+    // Signals pool-mode Stop() when the final DrainOnPool cleanup completes.
+    private readonly TaskCompletionSource _stopTcs =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     private readonly CancellationTokenSource _cts = new();
     private volatile bool _stopping;
     private bool _started;
@@ -244,6 +260,11 @@ public sealed class RaftPartitionExecutor : IDisposable
     /// Optional delegate returning the current WAL pending-or-in-flight depth for this
     /// partition. Used in the composite load score. Null disables the WAL depth term.
     /// </param>
+    /// <param name="pool">
+    /// When non-null, this executor is driven by the supplied <see cref="RaftExecutorPool"/>
+    /// instead of a dedicated OS thread.  The single-owner invariant is preserved by a
+    /// per-partition run-lock inside <see cref="DrainOnPool"/>.
+    /// </param>
     public RaftPartitionExecutor(
         RaftPartitionStateMachine stateMachine,
         int partitionId,
@@ -255,7 +276,8 @@ public sealed class RaftPartitionExecutor : IDisposable
         int drainQuantumClient = 0,
         int drainQuantumMaintenance = 0,
         Func<long>? getGeneration = null,
-        Func<int>? walQueueDepthProvider = null)
+        Func<int>? walQueueDepthProvider = null,
+        RaftExecutorPool? pool = null)
     {
         _stateMachine = stateMachine;
         _partitionId = partitionId;
@@ -270,26 +292,45 @@ public sealed class RaftPartitionExecutor : IDisposable
         _walQueueDepthProvider = walQueueDepthProvider;
         _loadAccumulator = new PartitionLoadAccumulator();
         _logLoadAccumulator = new PartitionLoadAccumulator();
+        _pool = pool;
 
-        _worker = new Thread(WorkerLoop)
+        if (pool == null)
         {
-            IsBackground = true,
-            Name = $"RaftPartitionExecutor-{partitionId}",
-        };
+            // Dedicated-thread mode: one OS thread per partition.
+            _worker = new Thread(WorkerLoop)
+            {
+                IsBackground = true,
+                Name = $"RaftPartitionExecutor-{partitionId}",
+            };
+        }
 
         KommanderMetrics.RegisterExecutor(this);
     }
 
     // ── Public API ─────────────────────────────────────────────────────────
 
-    /// <summary>Starts the background worker thread.</summary>
+    /// <summary>
+    /// Starts the executor.  Kicks off WAL restore Phase 1 on the thread pool (shared
+    /// between dedicated-thread and pool modes) and, in dedicated-thread mode, starts
+    /// the background worker thread.  In pool mode the worker threads belong to the
+    /// shared <see cref="RaftExecutorPool"/> and are started separately.
+    /// </summary>
     public void Start()
     {
         if (_started)
             return;
 
         _started = true;
-        _worker.Start();
+
+        // Kick off WAL restore Phase 1 on the CLR thread pool regardless of mode.
+        // On completion it posts RestoreLogsLoaded to the maintenance queue and calls
+        // MarkRunnable(), which either releases the per-partition semaphore (dedicated)
+        // or schedules to the shared pool (pool mode).
+        _ = Task.Run(() => RunRestorePhase1Async(_cts.Token));
+
+        // In dedicated-thread mode the worker loop parks on _workAvailable and drains.
+        // In pool mode there is no per-partition thread; the pool drives DrainOnPool.
+        _worker?.Start();
     }
 
     /// <summary>
@@ -343,14 +384,31 @@ public sealed class RaftPartitionExecutor : IDisposable
     /// <para>Any operations that are already queued will be processed up to the point
     /// where cancellation fires.  Pending <see cref="Ask"/> tasks that have not yet
     /// received a reply are cancelled.</para>
+    ///
+    /// <para>In dedicated-thread mode the worker thread is joined before this method
+    /// returns.  In pool mode the method blocks until the final
+    /// <see cref="DrainOnPool"/> cleanup completes on a pool thread.</para>
     /// </summary>
     public void Stop()
     {
         _stopping = true;
         _cts.Cancel();
-        // Release the semaphore so the blocked worker wakes up and notices cancellation.
-        _workAvailable.Release();
-        _worker.Join();
+
+        if (_pool != null)
+        {
+            // Pool mode: trigger one more scheduled drain so the pool sees _stopping and
+            // runs DrainAll + CancelPendingReplies under the single-owner run-lock, then
+            // signals _stopTcs so this call can return.
+            MarkRunnable();
+            _stopTcs.Task.GetAwaiter().GetResult();
+        }
+        else
+        {
+            // Dedicated-thread mode: release the semaphore so the parked worker wakes up,
+            // observes cancellation, drains remaining work, and exits.
+            _workAvailable.Release();
+            _worker!.Join();
+        }
     }
 
     public void ResetTestingState()
@@ -358,7 +416,93 @@ public sealed class RaftPartitionExecutor : IDisposable
         _stateMachine.ResetTestingState();
     }
 
+    // ── Pool-mode drain (called by RaftExecutorPool worker threads) ──────────
+
+    /// <summary>
+    /// Entry point called by a <see cref="RaftExecutorPool"/> worker thread to drain one
+    /// bounded quantum of work from this executor.
+    ///
+    /// <para>Acquires the per-partition run-lock (CAS 0→1) before draining to enforce the
+    /// single-owner invariant: at most one pool thread is inside this method for a given
+    /// partition at any time.  The CAS failure path is a defensive guard — it cannot
+    /// normally fire because <c>_inQueue</c> already prevents duplicate scheduling.</para>
+    ///
+    /// <para>After draining, if work remains the executor re-enqueues itself into the pool.
+    /// The <c>_inQueue</c> clear + re-check pattern closes the race between the drain-
+    /// complete check and a concurrent producer enqueue.</para>
+    /// </summary>
+    internal void DrainOnPool()
+    {
+        // Acquire the per-partition run-lock.  This cannot normally fail because _inQueue
+        // prevents the same executor being in the ready-queue twice, but guard it anyway.
+        if (Interlocked.CompareExchange(ref _runLock, 1, 0) != 0)
+            return;
+
+        try
+        {
+            if (_stopping)
+            {
+                DrainAll();
+                CancelPendingReplies();
+            }
+            else
+            {
+                DrainQueues();
+            }
+        }
+        finally
+        {
+            Volatile.Write(ref _runLock, 0);
+        }
+
+        if (_stopping)
+        {
+            _stopTcs.TrySetResult();
+            Volatile.Write(ref _inQueue, 0);
+            return;
+        }
+
+        // Re-schedule if there is more work.  Otherwise clear _inQueue and re-check
+        // for work that may have arrived between AreQueuesEmpty() and the clear.
+        if (!AreQueuesEmpty())
+        {
+            _pool!.Schedule(this); // _inQueue stays 1
+        }
+        else
+        {
+            Volatile.Write(ref _inQueue, 0);
+            // Close two races:
+            // 1. Producer enqueued after the AreQueuesEmpty() check but before the clear:
+            //    it saw _inQueue==1 and skipped re-scheduling → we must re-schedule now.
+            // 2. Stop() set _stopping=true and called MarkRunnable() while _inQueue was
+            //    still 1 (CAS failed → no reschedule), then returned here and cleared
+            //    _inQueue → Stop() now blocks on _stopTcs forever with nobody scheduled.
+            //    Including _stopping in the condition ensures we re-schedule in that case.
+            if ((!AreQueuesEmpty() || _stopping) && Interlocked.CompareExchange(ref _inQueue, 1, 0) == 0)
+                _pool!.Schedule(this);
+        }
+    }
+
     // ── Internal helpers ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Signals that this executor has runnable work.  In dedicated-thread mode, releases
+    /// the per-partition <c>_workAvailable</c> semaphore to wake the worker thread.  In
+    /// pool mode, sets <c>_inQueue</c> (CAS 0→1) and, if successful, enqueues into the
+    /// shared pool's ready-queue so a pool worker picks it up.
+    /// </summary>
+    private void MarkRunnable()
+    {
+        if (_pool != null)
+        {
+            if (Interlocked.CompareExchange(ref _inQueue, 1, 0) == 0)
+                _pool.Schedule(this);
+        }
+        else
+        {
+            _workAvailable.Release();
+        }
+    }
 
     private void ThrowIfNotReady()
     {
@@ -410,9 +554,9 @@ public sealed class RaftPartitionExecutor : IDisposable
                 return;
             }
 
-            // Slot claimed — enqueue and wake the worker.
+            // Slot claimed — enqueue and signal runnable.
             _clientQueue.Enqueue(new PendingOperation(request, reply));
-            _workAvailable.Release();
+            MarkRunnable();
             return;
         }
 
@@ -435,20 +579,16 @@ public sealed class RaftPartitionExecutor : IDisposable
                 break;
         }
 
-        _workAvailable.Release();
+        MarkRunnable();
     }
 
     // ── Worker loop ────────────────────────────────────────────────────────
 
+    // Only used in dedicated-thread mode (_pool == null).
+    // WAL restore Phase 1 is kicked off in Start() regardless of mode.
     private void WorkerLoop()
     {
         CancellationToken token = _cts.Token;
-
-        // Phase 1 of nonblocking restore: kick off WAL log loading on the I/O
-        // scheduler (thread pool).  The task posts RestoreLogsLoaded back to this
-        // executor when done so Phase 2 (replay) runs on this thread under the
-        // single-owner guarantee.  The worker loop starts immediately — no blocking.
-        _ = Task.Run(() => RunRestorePhase1Async(token));
 
         while (true)
         {
@@ -480,11 +620,12 @@ public sealed class RaftPartitionExecutor : IDisposable
         {
             IReadOnlyList<RaftLog> logs = await _stateMachine.StartRestoreAsync().ConfigureAwait(false);
 
-            // Deliver logs back to the executor for Phase 2 replay on the worker thread.
+            // Deliver logs back to the executor for Phase 2 replay on the worker thread
+            // (dedicated mode) or pool thread (pool mode).
             _maintenanceQueue.Enqueue(new PendingOperation(
                 new RaftRequest(RaftRequestType.RestoreLogsLoaded, logs),
                 reply: null));
-            _workAvailable.Release();
+            MarkRunnable();
         }
         catch (Exception ex) when (!token.IsCancellationRequested)
         {
@@ -495,8 +636,20 @@ public sealed class RaftPartitionExecutor : IDisposable
             _restoreTcs.TrySetException(ex);
             _stopping = true;
             _cts.Cancel();
-            DrainAll();
-            CancelPendingReplies();
+
+            if (_pool != null)
+            {
+                // Pool mode: schedule a cleanup drain rather than calling DrainAll directly,
+                // so cleanup runs under the single-owner run-lock on a pool thread.
+                MarkRunnable();
+            }
+            else
+            {
+                // Dedicated-thread mode: the worker will notice cancellation and drain,
+                // but also drain here defensively in case the worker hasn't started yet.
+                DrainAll();
+                CancelPendingReplies();
+            }
         }
     }
 
@@ -684,7 +837,7 @@ public sealed class RaftPartitionExecutor : IDisposable
                     if (!_controlQueue.IsEmpty || !_replicationQueue.IsEmpty || !_clientQueue.IsEmpty)
                     {
                         _maintenanceQueue.Enqueue(op);
-                        _workAvailable.Release();
+                        MarkRunnable();
                         return;
                     }
                     Interlocked.Increment(ref _totalProcessed);

@@ -485,6 +485,35 @@ public class RaftConfiguration
         return Math.Clamp(v, 1, GrpcChannelsPerNodeMax);
     }
 
+    // ── Shared executor pool (Phase 1 partition scaling) ─────────────────────
+
+    /// <summary>
+    /// When <see langword="true"/>, all partition executors share a bounded pool of
+    /// <see cref="PartitionExecutorPoolSize"/> worker threads instead of each owning a
+    /// dedicated OS thread.  This removes the approximately 1 MB-per-partition thread-stack
+    /// ceiling and allows thousands of partitions to coexist on a small fixed thread count.
+    ///
+    /// <para>Per-partition serial execution (the single-owner invariant) is preserved by a
+    /// per-partition run-lock: at most one pool thread drains a given partition at a time.
+    /// Control-plane operations keep their weighted priority lane, so heartbeats and votes are
+    /// never starved by client load on another partition.</para>
+    ///
+    /// <para>Set to <see langword="false"/> to restore the original one-thread-per-partition
+    /// behaviour as an escape hatch.  Both settings are Raft-safe.
+    /// Default <see langword="true"/>.</para>
+    /// </summary>
+    public bool EnableSharedExecutorPool { get; set; } = true;
+
+    /// <summary>
+    /// Number of worker threads in the shared executor pool when
+    /// <see cref="EnableSharedExecutorPool"/> is <see langword="true"/>.
+    /// <c>0</c> (the default) auto-sizes to <see cref="Environment.ProcessorCount"/>.
+    /// Values below 0 are clamped to 1.  Setting this too low relative to the number of
+    /// hot partitions will increase per-operation latency due to pool contention; setting it
+    /// equal to the partition count recovers dedicated-thread behaviour at higher memory cost.
+    /// </summary>
+    public int PartitionExecutorPoolSize { get; set; }
+
     // ── Quiescence ───────────────────────────────────────────────────────────
 
     /// <summary>
@@ -778,6 +807,13 @@ public class RaftConfiguration
                 "Quiesced followers detect leader failure via SWIM Suspect (approximately one PingInterval), " +
                 "so a PingInterval at or above StartElectionTimeout regresses quiesced failover latency. " +
                 "Lower PingInterval, raise StartElectionTimeout, or set EnableQuiescence=false.");
+
+        // PartitionExecutorPoolSize: no throw needed — the RaftExecutorPool constructor
+        // clamps negative values to 1 and treats 0 as ProcessorCount.  This note keeps
+        // validation self-documenting for readers who look here expecting to find all
+        // range checks in one place.
+        // Effective value: PartitionExecutorPoolSize > 0 ? PartitionExecutorPoolSize
+        //                : PartitionExecutorPoolSize == 0 ? Environment.ProcessorCount : 1
     }
 
     /// <summary>

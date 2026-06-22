@@ -64,6 +64,14 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     private readonly FairWalScheduler walScheduler;
 
+    /// <summary>
+    /// Shared executor pool for all partition executors.  Non-null when
+    /// <see cref="RaftConfiguration.EnableSharedExecutorPool"/> is <see langword="true"/>.
+    /// Created in the constructor; started alongside the I/O schedulers in
+    /// <see cref="JoinCluster(CancellationToken)"/>; stopped after all partitions stop.
+    /// </summary>
+    private readonly Scheduling.RaftExecutorPool? executorPool;
+
     private readonly RaftSystemCoordinator systemCoordinator;
 
     private readonly RaftTimerService timerService;
@@ -334,6 +342,9 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             configuration.MaxGlobalWalQueueDepth,
             configuration.MaxWalGroupBatchPartitions);
 
+        if (configuration.EnableSharedExecutorPool)
+            executorPool = new Scheduling.RaftExecutorPool(configuration.PartitionExecutorPoolSize);
+
         OnSystemLogRestored += SystemLogRestored;
         OnSystemReplicationReceived += SystemReplicationReceived;
         OnSystemRestoreFinished += SystemRestoreFinished;
@@ -455,6 +466,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
         if (systemPartition is null)
         {
+            executorPool?.Start();
             readScheduler.Start();
             walScheduler.Start();
 
@@ -465,7 +477,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 RaftSystemConfig.SystemPartition,
                 0,
                 0,
-                Logger
+                Logger,
+                executorPool
             );
         }
 
@@ -501,6 +514,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         // Start schedulers and the system partition exactly as the discovery-based join does.
         if (systemPartition is null)
         {
+            executorPool?.Start();
             readScheduler.Start();
             walScheduler.Start();
 
@@ -510,7 +524,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 RaftSystemConfig.SystemPartition,
                 0,
                 0,
-                Logger
+                Logger,
+                executorPool
             );
         }
 
@@ -1123,7 +1138,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                     range.PartitionId,
                     range.StartRange,
                     range.EndRange,
-                    Logger
+                    Logger,
+                    executorPool
                 );
                 newPartition.RoutingMode = range.RoutingMode;
                 newPartition.Generation = range.Generation;
@@ -1193,6 +1209,9 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             partition.Stop();
 
         systemPartition?.Stop();
+
+        // All partition executors have stopped; safe to stop the shared pool now.
+        executorPool?.Stop();
 
         // Complete dispatcher channels now that no executor thread is producing more
         // outbound messages; workers drain the remaining buffered items then exit.
@@ -2919,6 +2938,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             partition.Dispose();
 
         systemPartition?.Dispose();
+
+        // All partition executors have been stopped (by Dispose above); safe to stop
+        // and dispose the shared executor pool now.
+        executorPool?.Dispose();
 
         // 3. Dispose the transport dispatcher now that all partition executors have
         //    stopped; workers drain buffered responses then are hard-aborted.
