@@ -111,13 +111,15 @@ public sealed class TestMembership
         throw new TimeoutException($"No leader elected for partition {partitionId} within 15 s.");
     }
 
-    private static async Task WaitForCondition(Func<bool> cond, CancellationToken ct, int timeoutMs = 10_000)
+    private static async Task WaitForCondition(Func<bool> cond, CancellationToken ct, int timeoutMs = 10_000, Func<Task>? tickAction = null)
     {
         ValueStopwatch sw = ValueStopwatch.StartNew();
         while (sw.GetElapsedMilliseconds() < timeoutMs)
         {
             ct.ThrowIfCancellationRequested();
             if (cond()) return;
+            if (tickAction is not null)
+                await tickAction();
             await Task.Delay(25, ct);
         }
         throw new TimeoutException("Condition not satisfied within timeout.");
@@ -929,12 +931,13 @@ public sealed class TestMembership
             // Simulate what happens when PingAsync gets a relay confirmation: the node
             // should still become Alive even after ClearSuspicion preserves incarnation 1.
             // Re-suspect once more and heal via a real PingAsync that now succeeds directly.
+            // PingAsync picks a random peer, so we keep probing until n3 is the chosen target
+            // and MarkAlive(incarnation) clears the suspicion.
             n1.Liveness.MarkSuspect("localhost:8153");
-            await n1.PingAsync(ct); // direct probe reaches n3 → MarkAlive(inc from response)
-
             await WaitForCondition(
                 () => n1.Liveness.GetState("localhost:8153") == MemberLivenessState.Alive,
-                ct, timeoutMs: 3_000);
+                ct, timeoutMs: 5_000,
+                tickAction: async () => await n1.PingAsync(ct));
 
             // Roster must be unchanged — no eviction.
             await n1.UpdateNodes();

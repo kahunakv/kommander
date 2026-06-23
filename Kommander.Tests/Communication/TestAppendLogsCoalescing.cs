@@ -32,11 +32,13 @@ public sealed class TestAppendLogsCoalescing
     /// A controllable fake writer that signals each write's start and blocks until the
     /// test completes it, so items can be injected into the queue mid-write.
     /// </summary>
-    private sealed class ControlledWriter
+    private sealed class ControlledWriter : IDisposable
     {
         private readonly SemaphoreSlim _writeStarted = new(0);
         private readonly ConcurrentQueue<TaskCompletionSource> _pending = new();
         public readonly List<GrpcBatchRequestsRequest> Batches = [];
+
+        public void Dispose() => _writeStarted.Dispose();
 
         public Func<GrpcBatchRequestsRequest, Task> Write => async batch =>
         {
@@ -116,7 +118,7 @@ public sealed class TestAppendLogsCoalescing
             MakePending(partition: 3));
 
         Assert.Empty(batches);          // write was NOT called
-        Assert.Equal(1, pending.Count); // item is in the queue, ready for the flusher
+        Assert.Single(pending); // item is in the queue, ready for the flusher
         Assert.Equal(0, sem.CurrentCount); // still held
 
         sem.Release();
@@ -174,7 +176,7 @@ public sealed class TestAppendLogsCoalescing
     {
         var pending = new ConcurrentQueue<PendingAppendLogs>();
         var sem = new SemaphoreSlim(1, 1);
-        var writer = new ControlledWriter();
+        using var writer = new ControlledWriter();
 
         // Start the flusher with item A; it will block inside fakeWrite.
         Task flushTask = GrpcCommunication.FlushCoalesced(
