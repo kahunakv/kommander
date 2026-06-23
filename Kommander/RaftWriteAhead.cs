@@ -51,6 +51,18 @@ public sealed class RaftWriteAhead
 
     private long commitIndex = 1;
 
+    // Out-of-order resolved (Committed/RolledBack) ids buffered until the gap below them fills,
+    // so the follower's commit frontier (commitIndex) only ever advances over a contiguous prefix.
+    // The unanchored live-propose broadcast delivers entries out of order under load; without this
+    // buffer the frontier either overshoots a hole (applying entries before their predecessors,
+    // which slows WriteOperationCompleted) or — if advanced only on an exact match — freezes at the
+    // first reordered entry. Touched only on the partition's serialized executor path.
+    private readonly SortedSet<long> pendingResolved = new();
+
+    // Reused across follower appends to collect this batch's resolved ids; applied to the frontier
+    // only after the WAL enqueue succeeds, so a backpressure rejection needs no frontier rollback.
+    private readonly List<long> resolvedThisBatch = [];
+
     private int operations;
 
     private long walOperationSequence;
@@ -538,6 +550,41 @@ public sealed class RaftWriteAhead
     public long GetCommitIndex() => commitIndex - 1;
 
     /// <summary>
+    /// Advances the contiguous commit frontier to absorb a resolved (Committed/RolledBack) id.
+    /// An id below the frontier is a duplicate replay (ignored); an id above it sits over an
+    /// unfilled gap and is buffered until the gap closes; an id that fills the next slot advances
+    /// the frontier and then drains any buffered successors that have now become contiguous.
+    /// </summary>
+    private void AdvanceCommitFrontier(long id)
+    {
+        if (id < commitIndex)
+            return;
+
+        if (id > commitIndex)
+        {
+            pendingResolved.Add(id);
+            return;
+        }
+
+        commitIndex = id + 1;
+
+        while (pendingResolved.Count > 0)
+        {
+            long next = pendingResolved.Min;
+            if (next < commitIndex)
+            {
+                pendingResolved.Remove(next);   // stale duplicate already covered by the frontier
+                continue;
+            }
+            if (next > commitIndex)
+                break;                          // gap remains: stop draining
+
+            pendingResolved.Remove(next);
+            commitIndex = next + 1;
+        }
+    }
+
+    /// <summary>
     /// Removes every log entry with id &gt; <paramref name="afterLogId"/> and returns the
     /// post-truncation max log id.
     /// <para>
@@ -553,11 +600,21 @@ public sealed class RaftWriteAhead
     /// </summary>
     public async ValueTask<long> TruncateLogsAfterAsync(long afterLogId)
     {
-        return await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () =>
+        long maxLogId = await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () =>
         {
-            (RaftOperationStatus _, long maxLogId) = walAdapter.TruncateLogsAfterAndGetMax(partition.PartitionId, afterLogId);
-            return maxLogId;
+            (RaftOperationStatus _, long m) = walAdapter.TruncateLogsAfterAndGetMax(partition.PartitionId, afterLogId);
+            return m;
         }).ConfigureAwait(false);
+
+        // The truncation removed every WAL entry above afterLogId, so any buffered out-of-order
+        // resolution above it now points at an absent entry. Drop them; the leader's contiguous
+        // backfill re-delivers (and re-buffers) the gap. Safe to mutate here without a lock: the
+        // repair caller runs inside the partition's serialized executor message, so no concurrent
+        // FollowerAppend is touching pendingResolved.
+        while (pendingResolved.Count > 0 && pendingResolved.Max > afterLogId)
+            pendingResolved.Remove(pendingResolved.Max);
+
+        return maxLogId;
     }
 
     /// <summary>
@@ -653,10 +710,13 @@ public sealed class RaftWriteAhead
             return (RaftOperationStatus.Success, Math.Min(proposeIndex, commitIndex));*/
         }
         
-        // Snapshot mutable counters before the mutation loop so that a backpressure
-        // rejection from WalScheduler.Enqueue can be rolled back atomically.
+        // Snapshot proposeIndex before the mutation loop so a backpressure rejection from
+        // WalScheduler.Enqueue can be rolled back. The commit frontier is intentionally NOT
+        // advanced in the loop: resolved ids are collected and applied only after a successful
+        // enqueue (below), so a rejection needs no frontier rollback.
         long savedProposeIndex = proposeIndex;
-        long savedCommitIndex  = commitIndex;
+
+        resolvedThisBatch.Clear();
 
         // Reuse internal lists
         foreach (KeyValuePair<RaftLogAction, List<RaftLog>> keyValue in plan)
@@ -688,7 +748,7 @@ public sealed class RaftWriteAhead
 
                     logger.LogDebugRolledbackLog(manager.LocalEndpoint, partition.PartitionId, log.Id);
 
-                    commitIndex = log.Id + 1;
+                    resolvedThisBatch.Add(log.Id);
                 }
                 break;    
 
@@ -700,8 +760,8 @@ public sealed class RaftWriteAhead
                         plan.Add(RaftLogAction.Commit, [log]);
                 
                     logger.LogDebugCommittedLogs(manager.LocalEndpoint, partition.PartitionId, log.Id);
-                    
-                    commitIndex = log.Id + 1;
+
+                    resolvedThisBatch.Add(log.Id);
                 }
                 break;    
 
@@ -727,7 +787,7 @@ public sealed class RaftWriteAhead
 
                     logger.LogDebugRolledBackCheckpointLog(manager.LocalEndpoint, partition.PartitionId, log.Id);
 
-                    commitIndex = log.Id + 1;
+                    resolvedThisBatch.Add(log.Id);
                 } 
                 break;
 
@@ -740,7 +800,7 @@ public sealed class RaftWriteAhead
 
                     logger.LogDebugCommittedCheckpointLog(manager.LocalEndpoint, partition.PartitionId, log.Id);
 
-                    commitIndex = log.Id + 1;
+                    resolvedThisBatch.Add(log.Id);
                 } 
                 break;
 
@@ -778,9 +838,14 @@ public sealed class RaftWriteAhead
         catch
         {
             proposeIndex = savedProposeIndex;
-            commitIndex  = savedCommitIndex;
             throw;
         }
+
+        // Enqueue succeeded: advance the commit frontier over this batch's resolved ids. Ascending
+        // order (orderedLogs is sorted) keeps the drain cheap; AdvanceCommitFrontier still buffers
+        // any id that sits above an unfilled gap so the frontier never overshoots a hole.
+        foreach (long id in resolvedThisBatch)
+            AdvanceCommitFrontier(id);
 
         return operation;
     }

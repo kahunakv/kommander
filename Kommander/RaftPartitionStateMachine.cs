@@ -1371,10 +1371,11 @@ public sealed class RaftPartitionStateMachine
         // Mismatch classification:
         //   * localTermAtPrev < 0 — hole: no entry exists at prevLogIndex. Holes arise because the
         //     live-propose path ships prevLogIndex=0 and skips contiguity, so an out-of-order batch
-        //     can leave a gap below prevLogIndex on the follower. The repair truncates the
-        //     strictly-uncommitted holey tail so the leader heals the gap in one forward backfill
-        //     pass instead of walking nextIndex down one slot at a time. A safety guard ensures we
-        //     never truncate at or below the committed frontier.
+        //     can leave a gap below prevLogIndex on the follower. The repair truncates the orphaned
+        //     tail above the gap so the leader heals it in one forward backfill pass instead of
+        //     walking nextIndex down one slot at a time. This is safe by construction: a hole at
+        //     prevLogIndex proves the committed prefix ends below it, so the truncated tail is
+        //     necessarily uncommitted.
         //   * localTermAtPrev >= 0 && localTermAtPrev != prevLogTerm — genuine term divergence: an
         //     entry exists but belongs to a different term. The existing backtrack path is used
         //     unchanged; the leader decrements nextIndex and retries with an earlier anchor.
@@ -1401,31 +1402,24 @@ public sealed class RaftPartitionStateMachine
 
             if (localTermAtPrev < 0)
             {
-                // Hole: no entry at prevLogIndex. Truncate the uncommitted holey tail so the
-                // leader can backfill forward in one pass. The safety guard prevents truncating
-                // at or below the committed frontier.
-                long committed = wal.GetCommitIndex();
-                if (prevLogIndex > committed)
-                {
-                    long newMax = await wal.TruncateLogsAfterAsync(prevLogIndex - 1).ConfigureAwait(false);
-                    logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Log-hole repair from {Endpoint}: prevLogIndex={PrevLogIndex} committed={Committed} truncated to newMax={NewMax}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, prevLogIndex, committed, newMax);
-                    host.EnqueueResponse(endpoint, new(
-                        RaftResponderRequestType.CompleteAppendLogs,
-                        new(endpoint),
-                        new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, newMax)
-                    ));
-                }
-                else
-                {
-                    // Guard failed: hole at or below committed frontier — should not happen in
-                    // practice. Reject without truncating.
-                    logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Log Matching rejection from {Endpoint}: prevLogIndex={PrevLogIndex} localTerm={LocalTerm} != prevLogTerm={PrevLogTerm}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, prevLogIndex, localTermAtPrev, prevLogTerm);
-                    host.EnqueueResponse(endpoint, new(
-                        RaftResponderRequestType.CompleteAppendLogs,
-                        new(endpoint),
-                        new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, localMaxLog)
-                    ));
-                }
+                // Hole: no entry exists at prevLogIndex even though prevLogIndex <= localMaxLog,
+                // so the follower's log has an internal gap. This proves the follower's truly
+                // committed prefix ends below prevLogIndex: the leader commits contiguously, so no
+                // entry above an unfilled gap can have been quorum-committed — any entry sitting
+                // above the gap is an orphan delivered out of order by the unanchored live-propose
+                // broadcast. Truncating that orphaned tail (everything after prevLogIndex-1) can
+                // therefore never discard committed data, regardless of what the in-memory
+                // commitIndex reports (it can transiently overshoot the gap when a misordered
+                // Committed delivery lands above it). Reporting the post-truncation max lets the
+                // leader heal the gap in one forward backfill pass instead of walking nextIndex
+                // down one slot at a time.
+                long newMax = await wal.TruncateLogsAfterAsync(prevLogIndex - 1).ConfigureAwait(false);
+                logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Log-hole repair from {Endpoint}: prevLogIndex={PrevLogIndex} truncated to newMax={NewMax}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, prevLogIndex, newMax);
+                host.EnqueueResponse(endpoint, new(
+                    RaftResponderRequestType.CompleteAppendLogs,
+                    new(endpoint),
+                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, newMax)
+                ));
                 return;
             }
 
@@ -2008,8 +2002,7 @@ public sealed class RaftPartitionStateMachine
             long backtracked  = Math.Max(1, Math.Min(currentNext - 1, committedIndex + 1));
             nextIndex[endpoint] = backtracked;
 
-            logger.LogWarning(
-                "[{LocalEndpoint}/{PartitionId}/{State}] LogMismatch from {Endpoint}: backtracking nextIndex {CurrentNext} → {NextIndex} (followerMax={CommittedIndex})",
+            logger.LogDebugBacktrackingNextIndex(
                 host.LocalEndpoint,
                 host.PartitionId,
                 nodeState,
