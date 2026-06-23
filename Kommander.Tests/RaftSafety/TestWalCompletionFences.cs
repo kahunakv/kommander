@@ -301,9 +301,8 @@ public sealed class TestWalCompletionFences : IDisposable
 
     /// <summary>
     /// A FollowerAppend completion without a matching pending entry is discarded.
-    /// After the Task-17 refactor every FollowerAppend registers a pending entry
-    /// that carries Endpoint, Timestamp, and Logs; an orphan completion must not
-    /// silently send a response to an empty endpoint.
+    /// Every FollowerAppend registers a pending entry that carries Endpoint, Timestamp,
+    /// and Logs; an orphan completion must not silently send a response to an empty endpoint.
     /// </summary>
     [Fact]
     public async Task OrphanFollowerAppend_CompletionIsDiscardedNoResponseEnqueued()

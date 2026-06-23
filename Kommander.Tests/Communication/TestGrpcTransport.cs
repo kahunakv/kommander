@@ -209,7 +209,7 @@ public class TestGrpcTransport
     }
 
     /// <summary>
-    /// Done-check #3: A permanently-stopped node (simulating a hard partition) transitions to
+    /// A permanently-stopped node (simulating a hard partition) transitions to
     /// Dead on the surviving nodes and is evicted from the committed roster by the P0 leader
     /// within <c>SuspicionTimeout + DeadMemberEvictionGrace</c>.
     ///
@@ -280,7 +280,7 @@ public class TestGrpcTransport
     }
 
     /// <summary>
-    /// Done-check #4: Healthy nodes that respond to every probe are never evicted even after
+    /// Healthy nodes that respond to every probe are never evicted even after
     /// <c>SuspicionTimeout + DeadMemberEvictionGrace</c> has elapsed.
     ///
     /// Verifies that the gRPC <c>Ping</c> RPC correctly returns <c>Alive=true</c> for

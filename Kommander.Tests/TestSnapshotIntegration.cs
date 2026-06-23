@@ -30,7 +30,7 @@ public sealed class TestSnapshotIntegration
 {
     private readonly ILogger<IRaft> logger = NullLoggerFactory.Instance.CreateLogger<IRaft>();
 
-    // ── done-check 1 ───────────────────────────────────────────────────────────
+    // ── snapshot ship + learner promotion ───────────────────────────────────────
 
     /// <summary>
     /// A learner joins a 3-node cluster whose user partition has been compacted.
@@ -113,7 +113,7 @@ public sealed class TestSnapshotIntegration
             Assert.Equal(ClusterMemberRole.Voter, n4.LocalRole);
             Assert.True(transfer.ImportWasCalled, "ImportRange should have been called on the learner");
 
-            // Verify done-check re-install no-op: send the same snapshot chunk again;
+            // Verify re-install no-op: send the same snapshot chunk again;
             // since n4's WAL is already at floor, ReceiveInstallSnapshot returns success
             // without calling ImportRange a second time.
             int importsBefore = transfer.ImportCallCount;
@@ -133,7 +133,7 @@ public sealed class TestSnapshotIntegration
         }
     }
 
-    // ── done-check 2 ───────────────────────────────────────────────────────────
+    // ── no transfer registered → join blocked ───────────────────────────────────
 
     /// <summary>
     /// When no <see cref="IRaftStateMachineTransfer"/> is registered and the learner is
@@ -162,7 +162,7 @@ public sealed class TestSnapshotIntegration
             ["localhost:8405", "localhost:8406", "localhost:8407"],
             new InMemoryWAL(logger), logger, initialPartitions: 0);
 
-        // No transfer registered on ANY node — done-check 2 scenario.
+        // No transfer registered on ANY node.
 
         comm.SetNodes(new Dictionary<string, IRaft>
         {

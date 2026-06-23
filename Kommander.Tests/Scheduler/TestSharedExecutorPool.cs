@@ -12,7 +12,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Kommander.Tests.Scheduler;
 
 /// <summary>
-/// Tests for Phase 1 of the partition-scaling spec: shared executor pool.
+/// Tests for the shared executor pool: many partitions multiplexed onto a fixed thread pool.
 ///
 /// Verifies that:
 /// - Config defaults are correct.
@@ -156,8 +156,8 @@ public sealed class TestSharedExecutorPool
 
     /// <summary>
     /// M partitions running on a pool of P threads must create zero dedicated
-    /// "RaftPartitionExecutor-{id}" OS threads. The spec's Done-check is
-    /// process thread count ≈ P + overhead, not ≈ M.
+    /// "RaftPartitionExecutor-{id}" OS threads: process thread count should be
+    /// ≈ P + overhead, not ≈ M.
     ///
     /// Verified by reflecting on the private <c>_worker</c> field: it is
     /// <see langword="null"/> in pool mode and a live <see cref="Thread"/> in
@@ -238,7 +238,7 @@ public sealed class TestSharedExecutorPool
         }
     }
 
-    // ── Control-plane not starved (Task 1.3 Done-check) ──────────────────
+    // ── Control-plane not starved ────────────────────────────────────────
 
     /// <summary>
     /// Saturate one partition's client queue with slow proposals and assert that a
