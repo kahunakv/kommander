@@ -65,7 +65,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
     // ── Load-report store ──────────────────────────────────────────────────
     // Keyed by sender endpoint; retains only the highest ReportVersion per node.
     // Written exclusively from the single-consumer loop; reads via GetLoadReports()
-    // copy the snapshot to avoid races with Phase 4 callers on other threads.
+    // copy the snapshot to avoid races with concurrent callers on other threads.
     private readonly Dictionary<string, NodeLoadReport> _loadReports = new(StringComparer.Ordinal);
 
     // ── Balancer controller state ──────────────────────────────────────────
@@ -803,7 +803,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
     }
 
     /// <summary>
-    /// Executes the snapshot-transfer step of a split (Phase 4, step 2):
+    /// Executes the snapshot-transfer step of a split:
     /// exports a point-in-time state snapshot from the source partition, imports it into
     /// the target partition, then replicates a checkpoint into the target partition's log
     /// so all target replicas converge on the imported state.
@@ -1688,7 +1688,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
     /// <summary>
     /// Returns a snapshot of all load reports currently retained, keyed by endpoint.
-    /// The P0 balancer controller (Phase 4) calls this at the start of each planning pass.
+    /// The P0 balancer controller calls this at the start of each planning pass.
     /// Entries are not TTL-filtered here — <see cref="GlobalLeadershipView.Build"/> applies
     /// the TTL when reducing reports into a planning view.
     /// </summary>

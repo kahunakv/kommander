@@ -5,7 +5,7 @@ namespace Kommander.System;
 /// Stateless, pure advisory planner that produces a list of <see cref="LeaderMove"/>
 /// suggestions from a <see cref="GlobalLeadershipView"/>, a partition map, and
 /// configuration.  No cluster I/O or side effects — all mutable state (cooldowns,
-/// in-flight tracking) is passed in by the caller (Phase 4 controller) and never held
+/// in-flight tracking) is passed in by the caller (balancer controller) and never held
 /// here.  Because every suggested move is ultimately executed through the recipient's
 /// own <c>TransferLeadershipAsync</c> validation, an incorrect or stale plan is always
 /// safe: the worst outcome is a wasted or skipped move.
