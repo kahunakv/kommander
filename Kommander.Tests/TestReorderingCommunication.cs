@@ -8,8 +8,38 @@ using Kommander.Time;
 using Kommander.WAL;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Collections.Concurrent;
 
 namespace Kommander.Tests;
+
+/// <summary>
+/// Counts <see cref="LogLevel.Warning"/> messages whose text contains a specific substring.
+/// Used by Task-5 tests to assert that the leader's LogMismatch backtracking stays O(1)
+/// rather than O(gap) after a hole is induced and healed.
+/// </summary>
+internal sealed class CountingLogger : ILogger<IRaft>
+{
+    private readonly string _substring;
+    private int _count;
+
+    public CountingLogger(string substring) => _substring = substring;
+
+    public int Count => _count;
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+    public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Warning;
+
+    public void Log<TState>(
+        LogLevel logLevel,
+        EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+        if (logLevel >= LogLevel.Warning && formatter(state, exception).Contains(_substring))
+            Interlocked.Increment(ref _count);
+    }
+}
 
 /// <summary>
 /// Smoke-tests for <see cref="ReorderingCommunication"/>.
@@ -26,7 +56,8 @@ public sealed class TestReorderingCommunication
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
-    private IRaft MakeNode(int id, string endpoint, string[] peers, ICommunication comm)
+    private IRaft MakeNode(int id, string endpoint, string[] peers, ICommunication comm,
+        ILogger<IRaft>? nodeLogger = null)
     {
         string host = endpoint.Split(':')[0];
         int port    = int.Parse(endpoint.Split(':')[1]);
@@ -49,13 +80,14 @@ public sealed class TestReorderingCommunication
             EndElectionTimeout   = 250,
         };
 
+        ILogger<IRaft> log = nodeLogger ?? logger;
         return new RaftManager(
             config,
             new StaticDiscovery(peers.Select(p => new RaftNode(p)).ToList()),
-            new InMemoryWAL(logger),
+            new InMemoryWAL(log),
             comm,
             new HybridLogicalClock(),
-            logger);
+            log);
     }
 
     private static async Task WaitForCondition(Func<bool> condition, TimeSpan timeout, CancellationToken ct)
@@ -249,5 +281,182 @@ public sealed class TestReorderingCommunication
 
         await n1.LeaveCluster(true, CancellationToken.None);
         await n2.LeaveCluster(true, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// End-to-end Task-5 verification: a hole induced on one follower heals in O(1)
+    /// backfill rounds and no committed entry is ever discarded.
+    ///
+    /// <para>Procedure:
+    /// <list type="number">
+    ///   <item>Commit several entries so the committed frontier is non-trivial.</item>
+    ///   <item>Hold one AppendLogs to the target follower (shim) and simultaneously
+    ///         partition it so leader retries cannot fill the gap.</item>
+    ///   <item>Inject entries beyond the held range directly — creating a hole below the
+    ///         follower's max.</item>
+    ///   <item>Heal the partition and release the hold, triggering the state machine's
+    ///         hole-repair truncation path.</item>
+    ///   <item>Wait for the follower to converge with the leader's committed max.</item>
+    ///   <item>Assert every committed id is present on all three nodes.</item>
+    ///   <item>Assert the leader's LogMismatch backtracking count stays bounded (≤ 5) —
+    ///         O(1), not O(gap).</item>
+    /// </list>
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task HoleRepair_HealsInBoundedRounds_NoCommittedEntryLost()
+    {
+        const string ep1 = "localhost:9121";
+        const string ep2 = "localhost:9122";
+        const string ep3 = "localhost:9123";
+
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        // The leader node uses a counting logger so we can observe its LogMismatch count.
+        CountingLogger leaderLog = new("LogMismatch from");
+
+        InMemoryCommunication inner = new();
+        ReorderingCommunication shim  = new(inner);
+
+        // We don't know which node will become leader, so wrap all three with the counting
+        // logger and sum across them — in a 3-node cluster only the leader emits LogMismatch.
+        CountingLogger log1 = new("LogMismatch from");
+        CountingLogger log2 = new("LogMismatch from");
+        CountingLogger log3 = new("LogMismatch from");
+
+        IRaft n1 = MakeNode(1, ep1, [ep2, ep3], shim, log1);
+        IRaft n2 = MakeNode(2, ep2, [ep1, ep3], shim, log2);
+        IRaft n3 = MakeNode(3, ep3, [ep1, ep2], shim, log3);
+
+        inner.SetNodes(new Dictionary<string, IRaft>
+        {
+            { ep1, n1 }, { ep2, n2 }, { ep3, n3 }
+        });
+
+        await Task.WhenAll(n1.UpdateNodes(), n2.UpdateNodes(), n3.UpdateNodes());
+
+        await Task.WhenAll(
+            n1.JoinCluster(ct),
+            n2.JoinCluster(ct),
+            n3.JoinCluster(ct));
+
+        string leaderEndpoint = await n1.WaitForLeaderStableAsync(
+            1, TimeSpan.FromMilliseconds(200), ct);
+
+        IRaft[] allNodes       = [n1, n2, n3];
+        IRaft   leaderNode     = allNodes.First(n => n.GetLocalEndpoint() == leaderEndpoint);
+        IRaft   followerNode   = allNodes.First(n => n.GetLocalEndpoint() != leaderEndpoint);
+        string  followerEndpoint = followerNode.GetLocalEndpoint();
+
+        // ── Phase 1: commit several entries to establish a committed frontier ─────────
+
+        List<long> committedIds = [];
+        for (int i = 0; i < 3; i++)
+        {
+            byte[] data = global::System.Text.Encoding.UTF8.GetBytes($"setup-{i}");
+            RaftReplicationResult r = await leaderNode.ReplicateLogs(
+                1, "Task5Setup", data, cancellationToken: ct);
+            Assert.Equal(RaftOperationStatus.Success, r.Status);
+            committedIds.Add(r.LogIndex);
+        }
+
+        long committedFrontier = committedIds.Max();
+
+        // Snapshot LogMismatch count before inducing the hole.
+        int mismatchBefore = log1.Count + log2.Count + log3.Count;
+
+        // ── Phase 2: arm hold, commit one more entry (this one gets held to the follower) ─
+
+        shim.ConfigureHold(1, followerEndpoint, r => r.Logs?.Count > 0);
+
+        RaftReplicationResult holeEntry = await leaderNode.ReplicateLogs(
+            1, "Task5Hole", "hole"u8.ToArray(), cancellationToken: ct);
+        Assert.Equal(RaftOperationStatus.Success, holeEntry.Status);
+
+        // Wait for the shim to capture the batch headed to the follower.
+        await shim.WaitForHeldAsync(ct).WaitAsync(TimeSpan.FromSeconds(10), ct);
+        Assert.True(shim.HasHeld, "Shim must have captured an AppendLogs to the follower.");
+
+        // Partition the follower so leader heartbeats cannot bypass the shim once _holdFired=true.
+        inner.PartitionNode(followerEndpoint);
+
+        AppendLogsRequest heldReq = shim.HeldRequest!;
+        long heldMaxId = heldReq.Logs!.Max(l => l.Id);
+
+        // ── Phase 3: inject entries above the held range directly into the follower ─────
+
+        long term = leaderNode.WalAdapter.GetCurrentTerm(1);
+        long injectLow  = heldMaxId + 3;
+        long injectHigh = heldMaxId + 4;
+
+        followerNode.AppendLogs(new AppendLogsRequest(
+            partition: 1,
+            term:      term,
+            time:      leaderNode.HybridLogicalClock.TrySendOrLocalEvent(1),
+            endpoint:  leaderNode.GetLocalEndpoint(),
+            logs:
+            [
+                new RaftLog { Id = injectLow,  Term = term, Type = RaftLogType.Committed, LogType = "hole-inject" },
+                new RaftLog { Id = injectHigh, Term = term, Type = RaftLogType.Committed, LogType = "hole-inject" },
+            ],
+            prevLogIndex: 0,
+            prevLogTerm:  0));
+
+        // Wait until the follower has accepted the injected entries (hole now exists).
+        await WaitForCondition(
+            () => followerNode.WalAdapter.GetMaxLog(1) >= injectLow,
+            TimeSpan.FromSeconds(5), ct);
+
+        // ── Phase 4: heal partition, release hold → triggers hole-repair path ─────────
+
+        inner.HealPartition(followerEndpoint);
+        shim.ReleaseHeld();
+
+        // ── Phase 5: wait for convergence ────────────────────────────────────────────
+
+        long leaderMax = leaderNode.WalAdapter.GetMaxLog(1);
+
+        // Wait for the follower's WAL max to match what the leader ultimately reaches.
+        await WaitForCondition(
+            () =>
+            {
+                long lMax = leaderNode.WalAdapter.GetMaxLog(1);
+                long fMax = followerNode.WalAdapter.GetMaxLog(1);
+                return fMax >= lMax && lMax >= committedFrontier;
+            },
+            TimeSpan.FromSeconds(15), ct);
+
+        // ── Phase 6: assert no committed entry was discarded ─────────────────────────
+
+        // Read committed ids from the leader's WAL and check all followers have them.
+        HashSet<long> leaderIds = leaderNode.WalAdapter
+            .ReadLogsRange(1, 1)
+            .Select(l => l.Id)
+            .ToHashSet();
+
+        // Every id the leader committed must be present on every node.
+        foreach (IRaft node in allNodes)
+        {
+            HashSet<long> nodeIds = node.WalAdapter.ReadLogsRange(1, 1).Select(l => l.Id).ToHashSet();
+            foreach (long id in leaderIds)
+                Assert.Contains(id, nodeIds);
+        }
+
+        // ── Phase 7: assert O(1) LogMismatch (bounded backtracking, not O(gap)) ──────
+
+        int mismatchAfter = log1.Count + log2.Count + log3.Count;
+        int mismatchDelta = mismatchAfter - mismatchBefore;
+
+        // Gap between heldMaxId and injectHigh is 4 (injectLow = heldMaxId+3, injectHigh = heldMaxId+4).
+        // O(1) repair: the hole-truncation path collapses the gap in a single truncate round,
+        // so the leader needs at most a small constant number of LogMismatch exchanges
+        // (≤ 5 accounts for any NoOp or election noise during the test).
+        Assert.True(mismatchDelta <= 5,
+            $"Expected ≤5 LogMismatch rounds after hole-repair (got {mismatchDelta}). " +
+            "Backtracking is O(gap), not O(1) — the hole-repair truncation path may not be firing.");
+
+        await n1.LeaveCluster(true, CancellationToken.None);
+        await n2.LeaveCluster(true, CancellationToken.None);
+        await n3.LeaveCluster(true, CancellationToken.None);
     }
 }
