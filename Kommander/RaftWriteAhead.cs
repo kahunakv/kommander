@@ -538,6 +538,29 @@ public sealed class RaftWriteAhead
     public long GetCommitIndex() => commitIndex - 1;
 
     /// <summary>
+    /// Removes every log entry with id &gt; <paramref name="afterLogId"/> and returns the
+    /// post-truncation max log id.
+    /// <para>
+    /// Atomicity is provided by the WAL backend, not by the scheduler: this calls the single
+    /// <see cref="IWAL.TruncateLogsAfterAndGetMax"/> operation, which performs the delete and the
+    /// max-read under one acquisition of the backend's per-partition write guard. Scheduling it on the
+    /// <see cref="IRaftReadScheduler"/> only serializes it against other reads; it does <b>not</b>
+    /// exclude the WAL-scheduler write path (a separate thread pool), so the backend-level guard is
+    /// what prevents a concurrent <c>FollowerAppend</c> from re-growing the tail between the two steps.
+    /// </para>
+    /// <para>No-op-safe: if <paramref name="afterLogId"/> is at or above the current max, the
+    /// log is unchanged and the current max is returned.</para>
+    /// </summary>
+    public async ValueTask<long> TruncateLogsAfterAsync(long afterLogId)
+    {
+        return await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () =>
+        {
+            (RaftOperationStatus _, long maxLogId) = walAdapter.TruncateLogsAfterAndGetMax(partition.PartitionId, afterLogId);
+            return maxLogId;
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Returns the id of the last <c>CommittedCheckpoint</c> WAL entry for this partition, or
     /// -1 when no checkpoint exists.  Scheduled on the read thread so it does not race with WAL writes.
     /// </summary>

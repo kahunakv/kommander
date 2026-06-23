@@ -1147,6 +1147,72 @@ public abstract class WalConformanceTests
         finally { cleanup(); }
     }
 
+    // ──────────────────────── TruncateLogsAfterAndGetMax ─────────────────────────
+
+    /// <summary>
+    /// Removes entries strictly beyond the cut and returns the post-truncation max in a
+    /// single operation. Verifies the SQLite DELETE+MAX and RocksDB seek-then-delete paths.
+    /// </summary>
+    [Fact]
+    public void TruncateLogsAfterAndGetMax_RemovesTailAndReturnsNewMax()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(1, [Log(id: 1), Log(id: 2), Log(id: 3), Log(id: 4), Log(id: 5)])]);
+
+            (RaftOperationStatus status, long newMax) = wal.TruncateLogsAfterAndGetMax(1, afterLogId: 3);
+
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Assert.Equal(3, newMax);
+            Assert.Equal([1L, 2L, 3L], wal.ReadLogsRange(1, 1).Select(l => l.Id));
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// Truncating a holey log (missing index N) at N-1 returns N-1 as the new max, simulating
+    /// the exact hole-repair frontier the leader uses when a follower reports localTerm=-1.
+    /// </summary>
+    [Fact]
+    public void TruncateLogsAfterAndGetMax_OnHoleyLog_ReturnsContiguousFrontier()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            // Write 1..5 skipping 3 to plant a hole.
+            wal.Write([(1, [Log(id: 1), Log(id: 2), Log(id: 4), Log(id: 5)])]);
+
+            (RaftOperationStatus status, long newMax) = wal.TruncateLogsAfterAndGetMax(1, afterLogId: 2);
+
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Assert.Equal(2, newMax);
+            Assert.Equal([1L, 2L], wal.ReadLogsRange(1, 1).Select(l => l.Id));
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// No-op safety: cutting at or above the current max leaves the log unchanged and
+    /// returns the existing max.
+    /// </summary>
+    [Fact]
+    public void TruncateLogsAfterAndGetMax_CutAboveMax_IsNoOp()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(1, [Log(id: 1), Log(id: 2), Log(id: 3)])]);
+
+            (RaftOperationStatus status, long newMax) = wal.TruncateLogsAfterAndGetMax(1, afterLogId: 10);
+
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Assert.Equal(3, newMax);
+            Assert.Equal(3, wal.GetMaxLog(1));
+        }
+        finally { cleanup(); }
+    }
+
     // ──────────────────────────── helpers ───────────────────────────────────────
 
     protected static RaftLog Log(long id, long term = 1, RaftLogType type = RaftLogType.Committed) =>

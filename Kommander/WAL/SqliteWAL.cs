@@ -584,6 +584,42 @@ public class SqliteWAL : IWAL, IDisposable
         }
     }
 
+    /// <inheritdoc/>
+    public (RaftOperationStatus Status, long MaxLogId) TruncateLogsAfterAndGetMax(int partitionId, long afterLogId)
+    {
+        ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
+        // Delete and read-max under one shard-lock acquisition so the pair is atomic against the
+        // WAL-scheduler write path, which serializes on the same shard.Lock.
+        lock (shard.Lock)
+        {
+            try
+            {
+                using (SqliteCommand delete = new(
+                    "DELETE FROM logs WHERE partitionId = @partitionId AND id > @afterLogId",
+                    shard.Connection))
+                {
+                    delete.Parameters.AddWithValue("@partitionId", partitionId);
+                    delete.Parameters.AddWithValue("@afterLogId", afterLogId);
+                    delete.ExecuteNonQuery();
+                }
+
+                using SqliteCommand max = new(
+                    "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId",
+                    shard.Connection);
+                max.Parameters.AddWithValue("@partitionId", partitionId);
+                using SqliteDataReader reader = max.ExecuteReader();
+                while (reader.Read())
+                    return (RaftOperationStatus.Success, reader.IsDBNull(0) ? 0 : reader.GetInt64(0));
+                return (RaftOperationStatus.Success, 0);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("TruncateLogsAfterAndGetMax({PartitionId}, {AfterLogId}): {Message}", partitionId, afterLogId, ex.Message);
+                return (RaftOperationStatus.Errored, 0);
+            }
+        }
+    }
+
     /// <summary>
     /// Compacts logs older than <paramref name="lastCheckpoint"/> for the given partition,
     /// removing up to <paramref name="compactNumberEntries"/> per internal batch, all within

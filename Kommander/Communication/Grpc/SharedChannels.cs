@@ -31,9 +31,19 @@ internal readonly record struct PendingAppendLogs(
 /// </summary>
 public sealed class GrpcInterSharedStreaming
 {
+    private readonly Func<AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse>> factory;
+    private readonly object recreateLock = new();
+    private volatile AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming;
+    private volatile bool faulted;
+
     public SemaphoreSlim Semaphore { get; } = new(1, 1);
 
-    public AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> Streaming { get; }
+    /// <summary>
+    /// The current duplex streaming call.  <see cref="EnsureHealthy"/> swaps this for a fresh
+    /// call after the previous one faults, so writers that read it always observe a live (or
+    /// just-recreated) stream rather than a permanently dead pool slot.
+    /// </summary>
+    public AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> Streaming => streaming;
 
     /// <summary>
     /// Queue of outbound <c>AppendLogs</c> items that arrived while a <c>WriteAsync</c> was
@@ -44,9 +54,75 @@ public sealed class GrpcInterSharedStreaming
     /// </summary>
     internal readonly ConcurrentQueue<PendingAppendLogs> Pending = new();
 
-    public GrpcInterSharedStreaming(AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming)
+    internal GrpcInterSharedStreaming(Func<AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse>> factory)
     {
-        Streaming = streaming;
+        this.factory = factory;
+        streaming = factory();
+        _ = ListenForEvents(streaming);
+    }
+
+    /// <summary>
+    /// Flags this stream as faulted so the next <see cref="EnsureHealthy"/> recreates it.
+    /// A writer whose <c>WriteAsync</c> throws calls this to trigger prompt recovery rather
+    /// than waiting for <see cref="ListenForEvents"/> to observe the broken response stream.
+    /// Safe to call from any thread.
+    /// </summary>
+    public void MarkFaulted() => faulted = true;
+
+    /// <summary>
+    /// If the stream has faulted, disposes the dead call and lazily recreates a fresh duplex
+    /// call (and its response-draining loop) in place.  Called before the pool hands the slot
+    /// to a writer, so a transient connection fault no longer kills the slot for the lifetime
+    /// of the process.  Idempotent and thread-safe — concurrent callers recreate once.
+    /// </summary>
+    internal void EnsureHealthy()
+    {
+        if (!faulted)
+            return;
+
+        lock (recreateLock)
+        {
+            if (!faulted)
+                return;
+
+            try
+            {
+                streaming.Dispose();
+            }
+            catch
+            {
+                // The previous call already faulted; disposal is best-effort.
+            }
+
+            AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> fresh = factory();
+            streaming = fresh;
+            faulted = false;
+            _ = ListenForEvents(fresh);
+        }
+    }
+
+    /// <summary>
+    /// Drains the response stream for the life of <paramref name="call"/>.  When the loop ends —
+    /// whether the peer completed it or a transport fault threw — the stream is flagged faulted
+    /// so the pool recreates it on next use instead of leaving a dead slot in rotation.
+    /// </summary>
+    private async Task ListenForEvents(AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> call)
+    {
+        try
+        {
+            // ReSharper disable once AccessToDisposedClosure
+            await foreach (GrpcBatchRequestsResponse _ in call.ResponseStream.ReadAllAsync())
+            {
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("ListenForEvents: {0}: {1}", ex.GetType().Name, ex.Message);
+        }
+        finally
+        {
+            faulted = true;
+        }
     }
 }
 
@@ -197,7 +273,11 @@ public static class SharedChannels
         AssertConsistentPoolConfig(url, opts);
         int[] counter = streamingCounters.GetOrAdd(url, _ => new int[1]);
         int idx = (int)((uint)Interlocked.Increment(ref counter[0]) % streamingList.Count);
-        return streamingList[idx];
+        GrpcInterSharedStreaming selected = streamingList[idx];
+        // Self-heal: if this slot's stream faulted (peer reset, keepalive timeout, connection
+        // fault), recreate it before handing it out instead of returning a permanently dead stream.
+        selected.EnsureHealthy();
+        return selected;
     }
 
     // ── Public backward-compatible overloads ──────────────────────────────────
@@ -278,41 +358,12 @@ public static class SharedChannels
         {
             Rafter.RafterClient client = new(urlChannels[i]);
 
-            AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming =
-                client.BatchRequests(callOptions);
-
-            _ = ListenForEvents(streaming);
-
-            streamingList.Add(new(streaming));
+            // Each slot keeps a factory bound to its own client/channel so EnsureHealthy can
+            // re-open the duplex call in place after a fault, on the same connection.
+            streamingList.Add(new GrpcInterSharedStreaming(() => client.BatchRequests(callOptions)));
         }
 
         return streamingList;
-    }
-
-    /// <summary>
-    /// Asynchronously listens for events streamed from the server and handles responses.
-    /// </summary>
-    /// <param name="streaming">
-    /// The gRPC duplex streaming call containing requests and responses of type
-    /// <see cref="GrpcBatchRequestsRequest"/> and <see cref="GrpcBatchRequestsResponse"/>.
-    /// </param>
-    /// <returns>
-    /// A <see cref="Task"/> representing the asynchronous operation of reading responses from the streaming call.
-    /// </returns>
-    private static async Task ListenForEvents(AsyncDuplexStreamingCall<GrpcBatchRequestsRequest, GrpcBatchRequestsResponse> streaming)
-    {
-        try
-        {
-            // ReSharper disable once AccessToDisposedClosure
-            await foreach (GrpcBatchRequestsResponse response in streaming.ResponseStream.ReadAllAsync())
-            {
-                //Console.WriteLine(response.RequestId);
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine("ListenForEvents: {0}: {1}", ex.GetType().Name, ex.Message);
-        }
     }
 
     private static SslClientAuthenticationOptions BuildSslOptions(RaftTransportSecurityOptions? securityOptions)

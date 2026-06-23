@@ -752,6 +752,24 @@ public class RocksDbWAL : IWAL, IDisposable
         }
     }
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// RocksDB exposes no app-level per-partition write guard (it is internally thread-safe per
+    /// operation), so unlike the in-memory and SQLite backends the delete and max-read here are two
+    /// distinct operations rather than one locked section. This is acceptable: holes are effectively
+    /// absent on the fsync-paced persistent path (the storm this repair targets is in-memory only), so
+    /// this method almost never fires on RocksDB, and the single-writer-per-partition WAL-scheduler
+    /// invariant serializes appends for a given partition regardless.
+    /// </remarks>
+    public (RaftOperationStatus Status, long MaxLogId) TruncateLogsAfterAndGetMax(int partitionId, long afterLogId)
+    {
+        RaftOperationStatus status = TruncateLogsAfter(partitionId, afterLogId);
+        if (status != RaftOperationStatus.Success)
+            return (status, 0);
+
+        return (status, GetMaxLog(partitionId));
+    }
+
     /// <summary>
     /// Compacts and removes logs in the Write-Ahead Log (WAL) for a specific partition that are older than the given checkpoint.
     /// </summary>
