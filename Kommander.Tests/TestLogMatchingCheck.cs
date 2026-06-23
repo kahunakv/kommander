@@ -137,8 +137,8 @@ public sealed class TestLogMatchingCheck
         Assert.Equal(RaftOperationStatus.LogMismatch, reply.Status);
         Assert.Equal(followerMaxBefore, reply.CommitIndex);
 
-        await leader.LeaveCluster(true);
-        await follower.LeaveCluster(true);
+        await leader.LeaveCluster(true, CancellationToken.None);
+        await follower.LeaveCluster(true, CancellationToken.None);
     }
 
     /// <summary>
@@ -184,8 +184,8 @@ public sealed class TestLogMatchingCheck
         Assert.Equal(RaftOperationStatus.LogMismatch, reply2.Status);
         Assert.Equal(followerMaxBefore, reply2.CommitIndex);
 
-        await leader.LeaveCluster(true);
-        await follower.LeaveCluster(true);
+        await leader.LeaveCluster(true, CancellationToken.None);
+        await follower.LeaveCluster(true, CancellationToken.None);
     }
 
     /// <summary>
@@ -228,8 +228,8 @@ public sealed class TestLogMatchingCheck
 
         Assert.True(follower.WalAdapter.GetMaxLog(1) >= 4, "Follower must have accepted the matching append and advanced its log.");
 
-        await leader.LeaveCluster(true);
-        await follower.LeaveCluster(true);
+        await leader.LeaveCluster(true, CancellationToken.None);
+        await follower.LeaveCluster(true, CancellationToken.None);
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────

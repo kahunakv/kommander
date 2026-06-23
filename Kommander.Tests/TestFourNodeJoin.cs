@@ -97,10 +97,10 @@ public sealed class TestFourNodeJoin
         }
         finally
         {
-            await node4.LeaveCluster(dispose: true);
-            await node3.LeaveCluster(dispose: true);
-            await node2.LeaveCluster(dispose: true);
-            await node1.LeaveCluster(dispose: true);
+            await node4.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
+            await node3.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
+            await node2.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
+            await node1.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
         }
     }
 
@@ -223,10 +223,10 @@ public sealed class TestFourNodeJoin
         }
         finally
         {
-            await node4.LeaveCluster(dispose: true);
-            await node3.LeaveCluster(dispose: true);
-            await node2.LeaveCluster(dispose: true);
-            await node1.LeaveCluster(dispose: true);
+            await node4.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
+            await node3.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
+            await node2.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
+            await node1.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
         }
     }
 
@@ -395,10 +395,10 @@ public sealed class TestFourNodeJoin
         }
         finally
         {
-            await n4.LeaveCluster(dispose: true);
-            await n3.LeaveCluster(dispose: true);
-            await n2.LeaveCluster(dispose: true);
-            await n1.LeaveCluster(dispose: true);
+            await n4.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
+            await n3.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
+            await n2.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
+            await n1.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
         }
     }
 

@@ -173,7 +173,7 @@ public sealed class TestPhantomPeerPreVote
 
         Assert.False(node.IsInitialized, "node must NOT be initialized when pre-vote grants are dropped");
 
-        await node.LeaveCluster(true);
+        await node.LeaveCluster(true, CancellationToken.None);
     }
 
     /// <summary>
@@ -198,7 +198,7 @@ public sealed class TestPhantomPeerPreVote
 
         Assert.True(node.IsInitialized, "node must be initialized once pre-vote grants are correctly tallied");
 
-        await node.LeaveCluster(true);
+        await node.LeaveCluster(true, CancellationToken.None);
     }
 
     // -----------------------------------------------------------------------

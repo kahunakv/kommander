@@ -38,11 +38,11 @@ public class TestFiveNodeCluster
     {
         (IRaft node1, IRaft node2, IRaft node3, IRaft node4, IRaft node5) = await AssembleFiveNodeCluster(walStorage, partitions);
         
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
-        await node4.LeaveCluster(true);
-        await node5.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
+        await node4.LeaveCluster(true, CancellationToken.None);
+        await node5.LeaveCluster(true, CancellationToken.None);
     }
     
     [Theory, CombinatorialData]
@@ -60,11 +60,11 @@ public class TestFiveNodeCluster
         Assert.NotEmpty(followers);
         Assert.Equal(4, followers.Count);
         
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
-        await node4.LeaveCluster(true);
-        await node5.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
+        await node4.LeaveCluster(true, CancellationToken.None);
+        await node5.LeaveCluster(true, CancellationToken.None);
     }
     
     private async Task<(IRaft, IRaft, IRaft, IRaft, IRaft)> AssembleFiveNodeCluster(string walStorage, int partitions)

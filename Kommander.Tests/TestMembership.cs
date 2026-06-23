@@ -155,9 +155,9 @@ public sealed class TestMembership
         }
         finally
         {
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3.LeaveCluster(true);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -198,9 +198,9 @@ public sealed class TestMembership
         }
         finally
         {
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3.LeaveCluster(true);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -224,9 +224,9 @@ public sealed class TestMembership
         }
         finally
         {
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3.LeaveCluster(true);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -264,7 +264,7 @@ public sealed class TestMembership
         try
         {
             // Act: n3 leaves gracefully. LeaveCluster commits RemoveMember before stopping.
-            await n3.LeaveCluster(dispose: true);
+            await n3.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
 
             // Assert: n1 and n2 both see a 2-voter roster.
             await WaitForCondition(
@@ -300,8 +300,8 @@ public sealed class TestMembership
         }
         finally
         {
-            await n2.LeaveCluster(true);
-            await n1.LeaveCluster(true);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n1.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -333,7 +333,7 @@ public sealed class TestMembership
 
         try
         {
-            await p0Leader.LeaveCluster(dispose: true);
+            await p0Leader.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
 
             // Survivors elect a new P0 leader and keep committing.
             await WaitForLeader(survivors, partitionId: 0, ct);
@@ -352,7 +352,7 @@ public sealed class TestMembership
         finally
         {
             foreach (RaftManager s in survivors)
-                await s.LeaveCluster(true);
+                await s.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -370,8 +370,8 @@ public sealed class TestMembership
             ct);
 
         // Remove n1 and n2 in order, leaving n3 as the sole voter.
-        await n1.LeaveCluster(dispose: true);
-        await n2.LeaveCluster(dispose: true);
+        await n1.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
+        await n2.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
 
         // Wait for n3 to win the P0 leader election after n1/n2 departed. This must happen
         // before LeaveCluster sets _leaving=true, which suppresses elections and would prevent
@@ -382,7 +382,7 @@ public sealed class TestMembership
         // TryRemoveMember returns InsufficientVoters → Terminal=true → CommitGracefulLeaveAsync
         // exits immediately.  The call must complete well under the 10 s deadline.
         long startMs = Environment.TickCount64;
-        await n3.LeaveCluster(dispose: true);
+        await n3.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
         long elapsedMs = Environment.TickCount64 - startMs;
 
         Assert.True(elapsedMs < 5_000,
@@ -436,9 +436,9 @@ public sealed class TestMembership
         }
         finally
         {
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3.LeaveCluster(true);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -475,9 +475,9 @@ public sealed class TestMembership
         }
         finally
         {
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3.LeaveCluster(true);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -519,9 +519,9 @@ public sealed class TestMembership
         }
         finally
         {
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3.LeaveCluster(true);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -555,9 +555,9 @@ public sealed class TestMembership
         }
         finally
         {
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3.LeaveCluster(true);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -692,9 +692,9 @@ public sealed class TestMembership
         finally
         {
             comm.HealPartition("localhost:8153");
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3.LeaveCluster(true);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -745,9 +745,9 @@ public sealed class TestMembership
         finally
         {
             comm.HealPartition("localhost:8153");
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3.LeaveCluster(true);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -805,9 +805,9 @@ public sealed class TestMembership
         }
         finally
         {
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3.LeaveCluster(true);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -866,9 +866,9 @@ public sealed class TestMembership
         }
         finally
         {
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3.LeaveCluster(true);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -944,9 +944,9 @@ public sealed class TestMembership
         finally
         {
             comm.HealPartition("localhost:8153");
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3.LeaveCluster(true);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -984,9 +984,9 @@ public sealed class TestMembership
         }
         finally
         {
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3.LeaveCluster(true);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -1049,7 +1049,7 @@ public sealed class TestMembership
             Assert.Equal(System.ClusterMemberRole.Voter, n4.LocalRole);
 
             // ── Phase 3: n4 leaves ────────────────────────────────────────────────
-            await n4.LeaveCluster(dispose: false);
+            await n4.LeaveCluster(dispose: false, cancellationToken: CancellationToken.None);
             await WaitForCondition(
                 () =>
                 {
@@ -1077,10 +1077,10 @@ public sealed class TestMembership
         }
         finally
         {
-            await n4.LeaveCluster(true);
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3.LeaveCluster(true);
+            await n4.LeaveCluster(true, CancellationToken.None);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -1136,10 +1136,10 @@ public sealed class TestMembership
         }
         finally
         {
-            await n4.LeaveCluster(true);
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3.LeaveCluster(true);
+            await n4.LeaveCluster(true, CancellationToken.None);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -1198,7 +1198,7 @@ public sealed class TestMembership
 
         // The leader commits RemoveMember(self); StepDownSelfRemovedAsync fires and yields
         // leadership on both P0 and the user partition before LeaveCluster returns.
-        await p0Leader.LeaveCluster(dispose: true);
+        await p0Leader.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
 
         // Survivors must have elected a new leader on both partitions.
         await WaitForLeader(survivors, partitionId: 0, ct);
@@ -1216,7 +1216,7 @@ public sealed class TestMembership
             ct);
 
         foreach (RaftManager s in survivors)
-            await s.LeaveCluster(true);
+            await s.LeaveCluster(true, CancellationToken.None);
     }
 
     private RaftManager BuildJoinSeedsNode(

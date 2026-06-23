@@ -43,7 +43,7 @@ public sealed class TestSingleNodeCluster
 
         Assert.True(node.IsInitialized);
 
-        await node.LeaveCluster(true);
+        await node.LeaveCluster(true, CancellationToken.None);
     }
 
     [Fact]
@@ -73,7 +73,7 @@ public sealed class TestSingleNodeCluster
         Assert.True(node.WalAdapter.GetMaxLog(1) > before);
         Assert.Equal(result.LogIndex, node.WalAdapter.GetMaxLog(1));
 
-        await node.LeaveCluster(true);
+        await node.LeaveCluster(true, CancellationToken.None);
     }
 
     [Fact]
@@ -113,7 +113,7 @@ public sealed class TestSingleNodeCluster
 
         Assert.Contains(node.WalAdapter.ReadLogs(1), l => l.Type == RaftLogType.CommittedCheckpoint);
 
-        await node.LeaveCluster(true);
+        await node.LeaveCluster(true, CancellationToken.None);
     }
 
     private IRaft BuildSingleNode(int partitions)

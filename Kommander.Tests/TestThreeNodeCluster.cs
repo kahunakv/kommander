@@ -45,9 +45,9 @@ public sealed class TestThreeNodeCluster
     {
         (IRaft node1, IRaft node2, IRaft node3) = await AssembleThreNodeCluster(walStorage, partitions);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     [Theory]
@@ -133,9 +133,9 @@ public sealed class TestThreeNodeCluster
         maxId = node3.WalAdapter.GetMaxLog(1);
         Assert.Equal(entries + (entries / 50), maxId);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     [Theory]
@@ -200,9 +200,9 @@ public sealed class TestThreeNodeCluster
             Assert.Equal(0, totalLeaderReceived);
         }
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     [Theory]
@@ -270,9 +270,9 @@ public sealed class TestThreeNodeCluster
             }
         }
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     [Fact]
@@ -301,9 +301,9 @@ public sealed class TestThreeNodeCluster
 
         Assert.NotEqual(initialLeader, nextLeader);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     [Fact]
@@ -347,9 +347,9 @@ public sealed class TestThreeNodeCluster
         Assert.True(response.Success);
         Assert.Equal(RaftOperationStatus.Success, response.Status);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     [Fact]
@@ -380,9 +380,9 @@ public sealed class TestThreeNodeCluster
 
         Assert.Equal(RaftOperationStatus.ReplicationFailed, transferStatus);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     [Fact]
@@ -437,9 +437,9 @@ public sealed class TestThreeNodeCluster
         Assert.Equal(newLeader, node3Leader);
         Assert.Equal(1, await CountLeaders(nodes, 1));
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     [Fact]
@@ -478,9 +478,9 @@ public sealed class TestThreeNodeCluster
 
         Assert.Equal(HLCTimestamp.Zero, leader.GetLastNodeActivity("localhost:9999"));
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     [Fact]
@@ -517,7 +517,7 @@ public sealed class TestThreeNodeCluster
         // leader. The leader simply stops hearing from the removed node, so it must drop out of
         // GetActiveNodes once the liveness window elapses, while the healthy follower remains.
         IRaft isolatedNode = GetNodeByEndpoint(nodes, isolatedFollower);
-        await isolatedNode.LeaveCluster(true);
+        await isolatedNode.LeaveCluster(true, CancellationToken.None);
         network.Remove(isolatedFollower);
 
         await WaitForConditionAsync(
@@ -536,8 +536,8 @@ public sealed class TestThreeNodeCluster
         Assert.Contains(healthyFollower, active);
         Assert.True(leader.GetLastNodeActivity(isolatedFollower) > HLCTimestamp.Zero);
 
-        await leader.LeaveCluster(true);
-        await GetNodeByEndpoint(nodes, healthyFollower).LeaveCluster(true);
+        await leader.LeaveCluster(true, CancellationToken.None);
+        await GetNodeByEndpoint(nodes, healthyFollower).LeaveCluster(true, CancellationToken.None);
     }
 
     /// <summary>
@@ -634,9 +634,9 @@ public sealed class TestThreeNodeCluster
 
         AssertContiguousLog(pausedNode, decidedLeader, 1);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     /// <summary>
@@ -724,9 +724,9 @@ public sealed class TestThreeNodeCluster
 
         AssertContiguousLog(pausedNode, decidedLeader, 1);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     /// <summary>
@@ -795,9 +795,9 @@ public sealed class TestThreeNodeCluster
 
         AssertContiguousLog(follower, decidedLeader, 1);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     /// <summary>
@@ -921,9 +921,9 @@ public sealed class TestThreeNodeCluster
         List<RaftLog> followerLogs = follower.WalAdapter.ReadLogs(1);
         Assert.DoesNotContain(followerLogs, l => l.Term == 999);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     [Theory]
@@ -999,9 +999,9 @@ public sealed class TestThreeNodeCluster
             }
         }
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     [Theory]
@@ -1080,9 +1080,9 @@ public sealed class TestThreeNodeCluster
             }
         }
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     private async Task<(IRaft, IRaft, IRaft)> AssembleThreNodeCluster(

@@ -199,9 +199,9 @@ public sealed class TestSharedSystemPartition
         }
         finally
         {
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3.LeaveCluster(true);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3.LeaveCluster(true, CancellationToken.None);
         }
     }
 
@@ -269,7 +269,7 @@ public sealed class TestSharedSystemPartition
                 TestContext.Current.CancellationToken);
 
             // Stop node3 — this disposes node3's WAL, but the SQLite file stays on disk.
-            await n3.LeaveCluster(true);
+            await n3.LeaveCluster(true, CancellationToken.None);
 
             // Reopen node3's WAL from the same path and restart the node.
             IWAL wal3Reopen = new SqliteWAL(tmpDir, "node3", logger, syncWrites: false);
@@ -324,9 +324,9 @@ public sealed class TestSharedSystemPartition
                 },
                 TestContext.Current.CancellationToken);
 
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3Restart.LeaveCluster(true);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3Restart.LeaveCluster(true, CancellationToken.None);
         }
         finally
         {
@@ -391,9 +391,9 @@ public sealed class TestSharedSystemPartition
         }
         finally
         {
-            await n1.LeaveCluster(true);
-            await n2.LeaveCluster(true);
-            await n3.LeaveCluster(true);
+            await n1.LeaveCluster(true, CancellationToken.None);
+            await n2.LeaveCluster(true, CancellationToken.None);
+            await n3.LeaveCluster(true, CancellationToken.None);
         }
     }
 }

@@ -181,7 +181,7 @@ public sealed class TestSharedExecutorPool
                 executors.Add(ex);
             }
 
-            await Task.WhenAll(executors.Select(e => e.RestoreTask)).WaitAsync(TimeSpan.FromSeconds(10));
+            await Task.WhenAll(executors.Select(e => e.RestoreTask)).WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
             // Core invariant: M partitions, 0 dedicated OS threads.
             int dedicated = CountLiveDedicatedThreads(executors);
@@ -267,17 +267,17 @@ public sealed class TestSharedExecutorPool
         RaftPartitionExecutor exec0 = new(sm0, 0, 0, NullLogger<IRaft>.Instance, pool: pool);
         sink0.Executor = exec0;
         exec0.Start();
-        await exec0.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5));
+        await exec0.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         // Become leader so ReplicateLogs enters EnqueuePropose on the slow WAL.
         // (Non-leader path returns NodeIsNotLeader instantly without touching the WAL.)
-        await exec0.Ask(new RaftRequest(RaftRequestType.ForceLeaderForTesting))
-            .WaitAsync(TimeSpan.FromSeconds(5));
+        await exec0.Ask(new RaftRequest(RaftRequestType.ForceLeaderForTesting), TestContext.Current.CancellationToken)
+            .WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         // Partition 1: instant WAL — it is the "other partition" whose control op
         // must not be starved by partition 0's sustained client load.
         var (exec1, _) = BuildExecutor(pool, partitionId: 1);
-        await exec1.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5));
+        await exec1.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         try
         {
@@ -291,8 +291,8 @@ public sealed class TestSharedExecutorPool
             // the second pool thread (which fails _runLock on partition 0 and parks)
             // must be available to pick up partition 1's CheckLeader within ≤ one cycle.
             global::System.Diagnostics.Stopwatch sw = global::System.Diagnostics.Stopwatch.StartNew();
-            await exec1.Ask(new RaftRequest(RaftRequestType.CheckLeader))
-                .WaitAsync(TimeSpan.FromSeconds(5));
+            await exec1.Ask(new RaftRequest(RaftRequestType.CheckLeader), TestContext.Current.CancellationToken)
+                .WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
             sw.Stop();
 
             // Nominal: ≤ 10 ms (one cycle).  50 ms covers slow/loaded CI machines while
@@ -321,8 +321,8 @@ public sealed class TestSharedExecutorPool
         var (executor, _) = BuildExecutor(pool, partitionId: 0);
         try
         {
-            await executor.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5));
-            await executor.DrainAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            await executor.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            await executor.DrainAsync(TestContext.Current.CancellationToken).WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
         }
         finally
         {
@@ -371,7 +371,7 @@ public sealed class TestSharedExecutorPool
         RaftPartitionExecutor executor = new(sm, 0, 0, NullLogger<IRaft>.Instance, pool: pool);
         sink.Executor = executor;
         executor.Start();
-        await executor.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5));
+        await executor.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         try
         {
@@ -391,8 +391,8 @@ public sealed class TestSharedExecutorPool
                         logs: logs))))
                 .ToArray();
 
-            await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(10));
-            await executor.DrainAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await executor.DrainAsync(TestContext.Current.CancellationToken).WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
         }
         finally
         {
@@ -413,13 +413,13 @@ public sealed class TestSharedExecutorPool
         pool.Start();
 
         var (executor, _) = BuildExecutor(pool, partitionId: 0);
-        await executor.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5));
+        await executor.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
         // Post some work then stop — should not deadlock.
         for (int i = 0; i < 10; i++)
             executor.Post(new RaftRequest(RaftRequestType.CheckLeader));
 
-        bool stopped = await Task.Run(executor.Stop).WaitAsync(TimeSpan.FromSeconds(10))
+        bool stopped = await Task.Run(executor.Stop, TestContext.Current.CancellationToken).WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken)
             .ContinueWith(t => !t.IsFaulted && !t.IsCanceled);
         Assert.True(stopped, "Stop() deadlocked or threw in pool mode.");
 
@@ -448,15 +448,15 @@ public sealed class TestSharedExecutorPool
         for (int i = 0; i < 50; i++)
         {
             var (executor, _) = BuildExecutor(pool, partitionId: i % 8);
-            await executor.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5));
+            await executor.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
             // Fully drain — executor is now idle with _inQueue potentially == 0 or 1
             // depending on whether the restore DrainOnPool just finished.
-            await executor.DrainAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            await executor.DrainAsync(TestContext.Current.CancellationToken).WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
             // Stop() on a quiescent executor — must complete promptly.
-            bool completed = await Task.Run(executor.Stop)
-                .WaitAsync(TimeSpan.FromSeconds(5))
+            bool completed = await Task.Run(executor.Stop, TestContext.Current.CancellationToken)
+                .WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken)
                 .ContinueWith(t => !t.IsFaulted && !t.IsCanceled);
 
             Assert.True(completed, $"Stop() deadlocked on iteration {i}.");
@@ -479,9 +479,9 @@ public sealed class TestSharedExecutorPool
 
         try
         {
-            await executor.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5));
+            await executor.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
             executor.Post(new RaftRequest(RaftRequestType.CheckLeader));
-            await executor.DrainAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            await executor.DrainAsync(TestContext.Current.CancellationToken).WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
         }
         finally
         {

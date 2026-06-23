@@ -107,7 +107,7 @@ public sealed class TestAppendLogsCoalescing
         var sem = new SemaphoreSlim(1, 1);
         var batches = new List<GrpcBatchRequestsRequest>();
 
-        sem.Wait(); // simulate an in-flight write holding the semaphore
+        sem.Wait(CancellationToken.None); // simulate an in-flight write holding the semaphore
 
         await GrpcCommunication.FlushCoalesced(
             pending, sem,
@@ -133,7 +133,7 @@ public sealed class TestAppendLogsCoalescing
         var sem = new SemaphoreSlim(1, 1);
         var batches = new List<GrpcBatchRequestsRequest>();
 
-        sem.Wait(); // hold the semaphore
+        sem.Wait(CancellationToken.None); // hold the semaphore
 
         // Three non-flusher calls: each enqueues its item and returns immediately.
         for (int i = 1; i <= 3; i++)
@@ -217,7 +217,7 @@ public sealed class TestAppendLogsCoalescing
         var sem = new SemaphoreSlim(1, 1);
         var batches = new List<GrpcBatchRequestsRequest>();
 
-        sem.Wait(); // pre-queue 6 items as non-flushers
+        sem.Wait(CancellationToken.None); // pre-queue 6 items as non-flushers
         for (int i = 1; i <= 6; i++)
         {
             await GrpcCommunication.FlushCoalesced(
@@ -255,7 +255,7 @@ public sealed class TestAppendLogsCoalescing
         var sem = new SemaphoreSlim(1, 1);
         var batches = new List<GrpcBatchRequestsRequest>();
 
-        sem.Wait();
+        sem.Wait(CancellationToken.None);
         for (int i = 1; i <= 3; i++)
         {
             await GrpcCommunication.FlushCoalesced(
@@ -313,7 +313,7 @@ public sealed class TestAppendLogsCoalescing
         var sem = new SemaphoreSlim(1, 1);
         var batches = new List<GrpcBatchRequestsRequest>();
 
-        sem.Wait();
+        sem.Wait(CancellationToken.None);
         for (int i = 1; i <= 4; i++)
         {
             await GrpcCommunication.FlushCoalesced(
