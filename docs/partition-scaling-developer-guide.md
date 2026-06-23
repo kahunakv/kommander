@@ -218,19 +218,60 @@ To set expectations clearly:
 | `EnableSharedExecutorPool` | `true` | Master switch. `true` = many partitions share a bounded thread pool. `false` = the original one-OS-thread-per-partition model, and every `CheckLeader` tick becomes a full sweep. Both settings are Raft-safe. |
 | `PartitionExecutorPoolSize` | `0` | Number of pool worker threads. `0` auto-sizes to `Environment.ProcessorCount`; values below 0 are clamped to 1. |
 
-Tuning notes:
+### The pool is fixed-size — there is no autoscaling
+
+The pool allocates exactly `PartitionExecutorPoolSize` (or `Environment.ProcessorCount` when `0`)
+threads at construction and **never grows or shrinks them**. The thread count is fixed for the life of
+the `RaftManager`; changing it means changing the config and restarting. This is deliberate — the value
+of the pool is that it is a small *bounded* `P ≪ M`; autoscaling toward `M` would reintroduce the very
+thread-per-partition cost the pool exists to remove.
+
+### How to size it
+
+The pool size governs **how many partitions can be mid-drain at the same instant** — it scales with the
+number of *simultaneously busy* partitions, **not** the total partition count. Ten thousand idle
+partitions need zero extra threads.
+
+The key fact for sizing: **pool threads are CPU-bound, not I/O-bound.** When the state machine writes to
+the WAL it *enqueues* the write and returns immediately (`Pending`); it does not block waiting for the
+disk. The actual fsync runs on a **separate** I/O pool sized by `WriteIOThreads` (default 4), and the
+reply completes later via callback. So a pool thread spends its time on state-machine logic,
+serialization, and draining queues — not parked on disk. That gives a clean division of dials:
+
+| Bottleneck | Knob to turn |
+|---|---|
+| CPU / scheduling parallelism (executor work) | `PartitionExecutorPoolSize` |
+| Disk write throughput (WAL fsync) | `WriteIOThreads` |
+
+Practical guidance:
+
+- **Start with the default (`0` → `ProcessorCount`).** It is right for almost every deployment, because
+  the executor work is CPU-bound and WAL I/O is offloaded to `WriteIOThreads`.
+- **Raise it above `ProcessorCount` only if you observe head-of-line latency while CPU is *not*
+  saturated** — ops queuing behind busy partitions while cores sit idle. That means threads are stalling
+  (e.g. a custom state-machine callback that blocks). Adding threads helps only when threads are
+  *waiting*, never when cores are *full*.
+- **Don't raise it when CPU is already saturated** — more threads just add context-switching. You're
+  compute-bound; spread partitions across more nodes instead.
+- **Never set it to the partition count** — that recreates the per-partition memory cost the pool exists
+  to remove.
+- If disk is the bottleneck (WAL writes backing up), tune **`WriteIOThreads`**, not the executor pool.
+
+To decide empirically, watch per-dispatch latency (and the executor's slow-message warnings),
+client-queue depth / rejections, and CPU utilization together: rising latency *with spare CPU* → too few
+(or stalling) threads → increase; rising latency *with CPU saturated* → the pool is not the bottleneck,
+leave it. The bounded drain quantum keeps even a small pool making progress across many partitions (a
+busy partition yields after its quantum), so pool size affects **tail latency under contention**, not
+correctness or liveness.
+
+### Other notes
 
 - **Leave `EnableSharedExecutorPool = true`** unless you are isolating a problem; it is what makes large
-  partition counts viable. The `false` path exists as an escape hatch.
-- **Pool size is a latency/throughput dial.** Too small relative to the number of *simultaneously busy*
-  partitions adds head-of-line latency (busy partitions wait for a free worker). Widen the pool for
-  latency-sensitive, high-fan-out workloads. Setting it equal to the partition count recovers
-  dedicated-thread behaviour at full memory cost — rarely what you want.
+  partition counts viable. The `false` path (one OS thread per partition) exists as an escape hatch.
 - Control-plane operations (heartbeats, votes) keep their **priority lane** across the shared pool, so
   client load on one partition cannot starve another partition's election traffic.
-
-The hot-set fast/slow cadence is derived from existing timers — `CheckLeaderInterval` (fast) and
-`UpdateNodesInterval` (safety sweep). There is no separate knob for it.
+- The hot-set fast/slow cadence is derived from existing timers — `CheckLeaderInterval` (fast) and
+  `UpdateNodesInterval` (safety sweep). There is no separate knob for it.
 
 ---
 
