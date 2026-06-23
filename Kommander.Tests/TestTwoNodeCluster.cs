@@ -124,8 +124,8 @@ public class TestTwoNodeCluster
 
         (IRaft node1, IRaft node2) = await AssembleTwoNodeCluster(communication, logger);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
     }
 
     [Fact]
@@ -140,8 +140,8 @@ public class TestTwoNodeCluster
 
         await WaitForAnyLeader([node1, node2], UserPartition, TestContext.Current.CancellationToken);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
     }
 
     [Fact]
@@ -159,8 +159,8 @@ public class TestTwoNodeCluster
         IRaft? leader = await GetLeader(UserPartition, [node1, node2]);
         Assert.NotNull(leader);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
     }
 
     [Fact]
@@ -185,8 +185,8 @@ public class TestTwoNodeCluster
             stableLeader1 == node1.GetLocalEndpoint() || stableLeader1 == node2.GetLocalEndpoint(),
             $"Unexpected leader endpoint '{stableLeader1}'.");
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
     }
 
     [Fact]
@@ -210,8 +210,8 @@ public class TestTwoNodeCluster
         await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
             await partition.GetState(cts.Token));
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
     }
 
     [Fact]
@@ -245,8 +245,8 @@ public class TestTwoNodeCluster
             stopwatch.GetElapsedMilliseconds() < 250,
             $"Cancellation took too long: {stopwatch.GetElapsedMilliseconds()}ms");
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
     }
 
     [Fact]
@@ -292,8 +292,8 @@ public class TestTwoNodeCluster
         Assert.True(response.Success);
         Assert.Equal(RaftOperationStatus.Success, response.Status);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
     }
 
     [Fact]
@@ -325,8 +325,8 @@ public class TestTwoNodeCluster
 
         Assert.Equal(RaftOperationStatus.ReplicationFailed, forceStatus);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
     }
 
     [Fact]
@@ -367,8 +367,8 @@ public class TestTwoNodeCluster
         long maxNode2 = node2.WalAdapter.GetMaxLog(UserPartition);
         Assert.Equal(0, maxNode2);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
     }
 
     [Fact]
@@ -407,8 +407,8 @@ public class TestTwoNodeCluster
         Assert.Equal(0, node1.WalAdapter.GetMaxLog(UserPartition));
         Assert.Equal(2, node2.WalAdapter.GetMaxLog(UserPartition));
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
     }
 
     private static async Task WaitForAnyLeader(IRaft[] nodes, int partitionId, CancellationToken cancellationToken)
@@ -528,8 +528,8 @@ public class TestTwoNodeCluster
             p0Leader.ReplicateLogs(RaftSystemConfig.SystemPartition, "_RaftSystem", payload,
                 cancellationToken: TestContext.Current.CancellationToken));
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
     }
 
     private static void SeedWal(IWAL wal, int partitionId, List<RaftLog> logs) =>

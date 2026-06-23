@@ -101,7 +101,7 @@ public sealed class TestHotPartitionSet
             Assert.Contains(1, manager.HotPartitionIds);
 
             // Drive quiesce through the executor so the callback fires under the single-owner guarantee.
-            await p.Executor.Ask(new RaftRequest(RaftRequestType.SetQuiescedForTesting, quiesce: true))
+            await p.Executor.Ask(new RaftRequest(RaftRequestType.SetQuiescedForTesting, quiesce: true), ct)
                 .WaitAsync(Timeout, ct);
 
             Assert.DoesNotContain(1, manager.HotPartitionIds);
@@ -133,12 +133,12 @@ public sealed class TestHotPartitionSet
             manager.Partitions[1] = p;
             manager.MarkPartitionHot(1);
 
-            await p.Executor.Ask(new RaftRequest(RaftRequestType.SetQuiescedForTesting, quiesce: true))
+            await p.Executor.Ask(new RaftRequest(RaftRequestType.SetQuiescedForTesting, quiesce: true), ct)
                 .WaitAsync(Timeout, ct);
 
             Assert.DoesNotContain(1, manager.HotPartitionIds);
 
-            await p.Executor.Ask(new RaftRequest(RaftRequestType.SetQuiescedForTesting, quiesce: false))
+            await p.Executor.Ask(new RaftRequest(RaftRequestType.SetQuiescedForTesting, quiesce: false), ct)
                 .WaitAsync(Timeout, ct);
 
             Assert.Contains(1, manager.HotPartitionIds);
@@ -249,12 +249,12 @@ public sealed class TestHotPartitionSet
             Assert.Contains(42, manager.HotPartitionIds);
 
             // 2. Quiesce → leaves hot set
-            await p.Executor.Ask(new RaftRequest(RaftRequestType.SetQuiescedForTesting, quiesce: true))
+            await p.Executor.Ask(new RaftRequest(RaftRequestType.SetQuiescedForTesting, quiesce: true), ct)
                 .WaitAsync(Timeout, ct);
             Assert.DoesNotContain(42, manager.HotPartitionIds);
 
             // 3. Un-quiesce → re-enters hot set
-            await p.Executor.Ask(new RaftRequest(RaftRequestType.SetQuiescedForTesting, quiesce: false))
+            await p.Executor.Ask(new RaftRequest(RaftRequestType.SetQuiescedForTesting, quiesce: false), ct)
                 .WaitAsync(Timeout, ct);
             Assert.Contains(42, manager.HotPartitionIds);
 

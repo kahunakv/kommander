@@ -109,9 +109,9 @@ public sealed class TestQuiescence
             1, TimeSpan.FromMilliseconds(150), TestContext.Current.CancellationToken);
         Assert.Equal(initialLeader, currentLeader);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     // ── Write wakes quiesced partition ────────────────────────────────────────
@@ -171,9 +171,9 @@ public sealed class TestQuiescence
                   node3.WalAdapter.GetMaxLog(1) >= 1,
             TestContext.Current.CancellationToken);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     // ── Heartbeat counter stops after quiesce ─────────────────────────────────
@@ -247,9 +247,9 @@ public sealed class TestQuiescence
         // If quiescence is working, no heartbeats should be sent after the quiesce marker.
         Assert.Equal(0, countAfter - countBefore);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     // ── Feature-flag parity ───────────────────────────────────────────────────
@@ -324,9 +324,9 @@ public sealed class TestQuiescence
         Assert.True(countAfter - countBefore >= 3,
             $"Expected heartbeat counter to advance by at least 3 but got {countAfter - countBefore}.");
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     // ── Failover from quiesced partition ──────────────────────────────────────
@@ -391,9 +391,9 @@ public sealed class TestQuiescence
 
         communication.HealPartition(initialLeader);
 
-        await node1.LeaveCluster(true);
-        await node2.LeaveCluster(true);
-        await node3.LeaveCluster(true);
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
