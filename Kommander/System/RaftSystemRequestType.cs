@@ -67,7 +67,7 @@ public enum RaftSystemRequestType
     /// <summary>
     /// Delivers a <see cref="NodeLoadReport"/> received via gossip to the system coordinator.
     /// The coordinator keeps the newest <see cref="NodeLoadReport.ReportVersion"/> per endpoint
-    /// in an in-memory map for use by the Phase 4 balancer controller.
+    /// in an in-memory map for use by the leader-balancer controller.
     /// Never written to the Raft log.
     /// </summary>
     ApplyGossipLoadReport,

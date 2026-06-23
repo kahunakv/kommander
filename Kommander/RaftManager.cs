@@ -65,7 +65,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// on every <see cref="RaftConfiguration.CheckLeaderInterval"/> cycle.
     /// Populated when a partition is started; entries are removed by the partition's quiesce
     /// callback and restored when it un-quiesces.  Only used when
-    /// <see cref="RaftConfiguration.EnableSharedExecutorPool"/> is on (Phase 2 hot-set).
+    /// <see cref="RaftConfiguration.EnableSharedExecutorPool"/> is on.
     /// </summary>
     private readonly ConcurrentDictionary<int, RaftPartition> _hotPartitions = new();
 
@@ -1510,7 +1510,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <para>Called whenever SWIM transitions <paramref name="leaderEndpoint"/> to Suspect or
     /// Dead so failover detection for quiesced followers is bounded by SWIM latency rather
     /// than by <see cref="RaftConfiguration.UpdateNodesInterval"/> (the safety-sweep period).
-    /// This preserves the fast-failover guarantee the quiescence spec relied on.</para>
+    /// This preserves the fast-failover guarantee quiescence depends on.</para>
     /// </summary>
     private void WakePartitionsForLeader(string leaderEndpoint)
     {
@@ -1834,7 +1834,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// Sends an advisory leadership-transfer suggestion to the node at
     /// <paramref name="ownerEndpoint"/> via the existing responder transport.
     /// Fire-and-forget; a failed delivery is silently ignored and the suggestion
-    /// will time out in the Phase 4 outstanding-move table.
+    /// will time out in the balancer's outstanding-move tracking table.
     /// <para>
     /// When the owner is this node itself — the common case where the P0 balancer leader
     /// also leads the overloaded partition — the suggestion is delivered in-process.  The

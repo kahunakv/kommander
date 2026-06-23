@@ -485,7 +485,7 @@ public class RaftConfiguration
         return Math.Clamp(v, 1, GrpcChannelsPerNodeMax);
     }
 
-    // ── Shared executor pool (Phase 1 partition scaling) ─────────────────────
+    // ── Shared executor pool ──────────────────────────────────────────────────
 
     /// <summary>
     /// When <see langword="true"/>, all partition executors share a bounded pool of

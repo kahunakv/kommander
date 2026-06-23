@@ -195,8 +195,8 @@ public class SqliteWAL : IWAL, IDisposable
     }
 
     /// <summary>
-    /// Resolves the effective shard count for this data directory using the seed-once-then-pinned
-    /// strategy described in the spec (S5).
+    /// Resolves the effective shard count for this data directory using a seed-once-then-pinned
+    /// strategy: the configured count is persisted on first open and enforced on all subsequent opens.
     ///
     /// <list type="number">
     ///   <item>If the metadata DB already holds a <c>shard_count</c> value, that value is used.

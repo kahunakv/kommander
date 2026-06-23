@@ -1934,7 +1934,7 @@ public sealed class RaftPartitionStateMachine
     /// batch if the follower is still behind, so convergence does not wait a full heartbeat
     /// interval per batch.
     /// On <see cref="RaftOperationStatus.LogMismatch"/> backtracks <see cref="nextIndex"/> using
-    /// the spec formula <c>max(1, min(nextIndex-1, followerMax+1))</c>, which always steps back
+    /// <c>max(1, min(nextIndex-1, followerMax+1))</c>, which always steps back
     /// at least one position even when the follower's max equals the anchor we sent.
     /// </summary>
     /// <param name="endpoint"></param>
@@ -1956,7 +1956,7 @@ public sealed class RaftPartitionStateMachine
 
         // LogMismatch: the follower's log diverges at the prevLogIndex we sent.
         // committedIndex carries the follower's local max log at the time of rejection.
-        // Spec formula: max(1, min(nextIndex[peer]-1, committedIndex+1)).
+        // Backtrack formula: max(1, min(nextIndex[peer]-1, committedIndex+1)).
         // Taking min ensures we step back at least one position even when the follower's
         // max equals the anchor we just tried, preventing a livelock on repeated rejection
         // at the same anchor point.
