@@ -203,6 +203,13 @@ public class GrpcCommunication : ICommunication
 
                 await streaming.Streaming.RequestStream.WriteAsync(batchRequests);
             }
+            catch
+            {
+                // A failed write means the duplex stream is broken; flag it so the pool
+                // recreates this slot on the next GetStreaming instead of reusing a dead stream.
+                streaming.MarkFaulted();
+                throw;
+            }
             finally
             {
                 streaming.Semaphore.Release();
@@ -237,7 +244,19 @@ public class GrpcCommunication : ICommunication
         await FlushCoalesced(
             streaming.Pending,
             streaming.Semaphore,
-            b => streaming.Streaming.RequestStream.WriteAsync(b),
+            async b =>
+            {
+                try
+                {
+                    await streaming.Streaming.RequestStream.WriteAsync(b);
+                }
+                catch
+                {
+                    // Broken stream: flag for recreation on the next GetStreaming.
+                    streaming.MarkFaulted();
+                    throw;
+                }
+            },
             maxBatch,
             new(requestItem, appendLogsRequest));
 

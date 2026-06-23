@@ -240,6 +240,8 @@ public class TestQuiescedLeader
 
         public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(0L);
 
+        public ValueTask<long> TruncateLogsAfterAsync(long afterLogId) => ValueTask.FromResult(afterLogId);
+
         public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(0L);
 
         public ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) =>

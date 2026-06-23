@@ -498,6 +498,7 @@ public class TestSnapshotInstall
             ValueTask.FromResult<IReadOnlyList<RaftLog>>([]);
         public ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs) => ValueTask.CompletedTask;
         public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(0L);
+        public ValueTask<long> TruncateLogsAfterAsync(long afterLogId) => ValueTask.FromResult(afterLogId);
         public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(1L);
         public ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) =>
             ValueTask.FromResult(new List<RaftLog>());

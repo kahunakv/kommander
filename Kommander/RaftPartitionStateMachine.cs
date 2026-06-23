@@ -1365,12 +1365,22 @@ public sealed class RaftPartitionStateMachine
         // wakes us back up by clearing the flag.
         SetQuiesced(quiesce);
 
-        // Log Matching Property check: the follower must hold an entry at prevLogIndex with
-        // prevLogTerm before it can safely append the incoming batch.  A mismatch means the
-        // follower's log diverges from the leader's at this position; the leader must backtrack
-        // its nextIndex for this peer and retry with an earlier anchor.
-        // NOTE: GetAnyTermAtAsync is used (not GetRangeAsync) so that a Proposed-but-uncommitted
-        // entry at prevLogIndex is matched correctly; GetRangeAsync filters uncommitted entries.
+        // Log Matching Property check: the follower must hold an entry at prevLogIndex whose
+        // term equals prevLogTerm before it can safely append the incoming batch.
+        //
+        // Mismatch classification:
+        //   * localTermAtPrev < 0 — hole: no entry exists at prevLogIndex. Holes arise because the
+        //     live-propose path ships prevLogIndex=0 and skips contiguity, so an out-of-order batch
+        //     can leave a gap below prevLogIndex on the follower. The repair truncates the
+        //     strictly-uncommitted holey tail so the leader heals the gap in one forward backfill
+        //     pass instead of walking nextIndex down one slot at a time. A safety guard ensures we
+        //     never truncate at or below the committed frontier.
+        //   * localTermAtPrev >= 0 && localTermAtPrev != prevLogTerm — genuine term divergence: an
+        //     entry exists but belongs to a different term. The existing backtrack path is used
+        //     unchanged; the leader decrements nextIndex and retries with an earlier anchor.
+        //
+        // GetAnyTermAtAsync is used (not GetRangeAsync) so that a Proposed-but-uncommitted entry at
+        // prevLogIndex is matched correctly; GetRangeAsync filters uncommitted entries.
         if (prevLogIndex > 0 && logs is not null && logs.Count > 0)
         {
             long localMaxLog = await wal.GetMaxLogAsync().ConfigureAwait(false);
@@ -1388,10 +1398,42 @@ public sealed class RaftPartitionStateMachine
             }
 
             long localTermAtPrev = await wal.GetAnyTermAtAsync(prevLogIndex).ConfigureAwait(false);
+
+            if (localTermAtPrev < 0)
+            {
+                // Hole: no entry at prevLogIndex. Truncate the uncommitted holey tail so the
+                // leader can backfill forward in one pass. The safety guard prevents truncating
+                // at or below the committed frontier.
+                long committed = wal.GetCommitIndex();
+                if (prevLogIndex > committed)
+                {
+                    long newMax = await wal.TruncateLogsAfterAsync(prevLogIndex - 1).ConfigureAwait(false);
+                    logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Log-hole repair from {Endpoint}: prevLogIndex={PrevLogIndex} committed={Committed} truncated to newMax={NewMax}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, prevLogIndex, committed, newMax);
+                    host.EnqueueResponse(endpoint, new(
+                        RaftResponderRequestType.CompleteAppendLogs,
+                        new(endpoint),
+                        new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, newMax)
+                    ));
+                }
+                else
+                {
+                    // Guard failed: hole at or below committed frontier — should not happen in
+                    // practice. Reject without truncating.
+                    logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Log Matching rejection from {Endpoint}: prevLogIndex={PrevLogIndex} localTerm={LocalTerm} != prevLogTerm={PrevLogTerm}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, prevLogIndex, localTermAtPrev, prevLogTerm);
+                    host.EnqueueResponse(endpoint, new(
+                        RaftResponderRequestType.CompleteAppendLogs,
+                        new(endpoint),
+                        new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, localMaxLog)
+                    ));
+                }
+                return;
+            }
+
             if (localTermAtPrev != prevLogTerm)
             {
+                // Genuine term divergence: entry exists at prevLogIndex but belongs to a
+                // different term. Leader backtracks nextIndex and retries with an earlier anchor.
                 logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Log Matching rejection from {Endpoint}: prevLogIndex={PrevLogIndex} localTerm={LocalTerm} != prevLogTerm={PrevLogTerm}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, prevLogIndex, localTermAtPrev, prevLogTerm);
-
                 host.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs,
                     new(endpoint),

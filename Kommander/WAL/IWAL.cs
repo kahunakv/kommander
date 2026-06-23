@@ -110,4 +110,20 @@ public interface IWAL : IDisposable
     /// Idempotent: no-op when no entries exist beyond <paramref name="afterLogId"/>.
     /// </summary>
     RaftOperationStatus TruncateLogsAfter(int partitionId, long afterLogId);
+
+    /// <summary>
+    /// Atomically deletes all log entries for <paramref name="partitionId"/> whose id is strictly
+    /// greater than <paramref name="afterLogId"/> and returns the partition's max log id as observed
+    /// <b>after</b> the deletion.
+    /// <para>
+    /// The delete and the max-log read are performed under a <b>single</b> acquisition of the backend's
+    /// per-partition (or per-shard) write guard, so no concurrent write to the same partition can be
+    /// interleaved between them. This is what makes the hole-repair frontier reported to the leader
+    /// exact: a separate <c>TruncateLogsAfter</c> followed by <c>GetMaxLog</c> would expose a window in
+    /// which a concurrent <c>FollowerAppend</c> (running on the WAL scheduler, a different thread pool
+    /// from the read scheduler that drives repair) re-grows the tail and corrupts the reported max.
+    /// </para>
+    /// <para>Returns <c>(Success, 0)</c> when the partition has no entries after truncation.</para>
+    /// </summary>
+    (RaftOperationStatus Status, long MaxLogId) TruncateLogsAfterAndGetMax(int partitionId, long afterLogId);
 }

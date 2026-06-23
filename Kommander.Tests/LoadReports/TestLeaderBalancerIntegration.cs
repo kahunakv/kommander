@@ -693,6 +693,7 @@ public sealed class TestLeaderBalancerIntegration
         public bool                                    SetMetaData(string key, string value)                                                  => _inner.SetMetaData(key, value);
         public RaftOperationStatus                     DeletePartitionWAL(int partitionId)                                                    => _inner.DeletePartitionWAL(partitionId);
         public RaftOperationStatus                     TruncateLogsAfter(int partitionId, long afterLogId)                                   => _inner.TruncateLogsAfter(partitionId, afterLogId);
+        public (RaftOperationStatus Status, long MaxLogId) TruncateLogsAfterAndGetMax(int partitionId, long afterLogId)                     => _inner.TruncateLogsAfterAndGetMax(partitionId, afterLogId);
         public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries, int? maxTotalEntries = null) => _inner.CompactLogsOlderThan(partitionId, lastCheckpoint, compactNumberEntries, maxTotalEntries);
         public void                                    Dispose()                                                                              => _inner.Dispose();
     }

@@ -135,7 +135,33 @@ public class InMemoryWAL : IWAL, IDisposable
 
     public long GetLastCheckpoint(int partitionId)
     {
-        return -1;
+        rwLock.EnterReadLock();
+        try
+        {
+            // The checkpoint is the highest committed-checkpoint entry. A stubbed -1 here keeps the
+            // leader's snapshot fallback (gated on lastCheckpoint > 0) and the checkpoint-driven
+            // compaction pass permanently disabled, so a follower that falls behind can only be
+            // recovered by one-index-at-a-time AppendLogs backtracking — a warning storm under load.
+            // Single ascending pass: keys are sorted, so the last match is the highest. Cost is
+            // bounded by the retained window, which compaction (re-enabled by this very value) keeps small.
+            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+            {
+                long checkpoint = -1;
+                foreach (KeyValuePair<long, RaftLog> entry in partitionLogs)
+                {
+                    if (entry.Value.Type == RaftLogType.CommittedCheckpoint)
+                        checkpoint = entry.Key;
+                }
+
+                return checkpoint;
+            }
+
+            return -1;
+        }
+        finally
+        {
+            rwLock.ExitReadLock();
+        }
     }
 
     public int CountPersistedLogs(int partitionId)
@@ -219,6 +245,36 @@ public class InMemoryWAL : IWAL, IDisposable
                 partitionLogs.Remove(id);
 
             return RaftOperationStatus.Success;
+        }
+        finally
+        {
+            rwLock.ExitWriteLock();
+        }
+    }
+
+    /// <inheritdoc/>
+    public (RaftOperationStatus Status, long MaxLogId) TruncateLogsAfterAndGetMax(int partitionId, long afterLogId)
+    {
+        // Truncate and read-max under one write-lock acquisition so the pair is atomic against the
+        // WAL-scheduler write path (FollowerAppend), which also takes this same write lock.
+        rwLock.EnterWriteLock();
+        try
+        {
+            if (!allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+                return (RaftOperationStatus.Success, 0);
+
+            List<long> toRemove = [];
+            foreach (long id in partitionLogs.Keys)
+            {
+                if (id > afterLogId)
+                    toRemove.Add(id);
+            }
+
+            foreach (long id in toRemove)
+                partitionLogs.Remove(id);
+
+            long max = partitionLogs.Count > 0 ? partitionLogs.Keys.Max() : 0;
+            return (RaftOperationStatus.Success, max);
         }
         finally
         {

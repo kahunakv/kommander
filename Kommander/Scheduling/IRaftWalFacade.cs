@@ -64,6 +64,16 @@ public interface IRaftWalFacade
     /// </summary>
     long GetCommitIndex();
 
+    /// <summary>
+    /// Removes every log entry with id &gt; <paramref name="afterLogId"/> and returns the
+    /// post-truncation max log id.  The truncate and the subsequent max-log read execute inside
+    /// a single scheduled WAL action so the pair is atomic: no concurrent write can be
+    /// interleaved between them.
+    /// <para>No-op-safe: if <paramref name="afterLogId"/> is at or above the current max, the log
+    /// is unchanged and the current max is returned.</para>
+    /// </summary>
+    ValueTask<long> TruncateLogsAfterAsync(long afterLogId);
+
     WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp timestamp, bool autoCommit);
 
     WALWriteOperation EnqueueCommit(List<RaftLog> logs);

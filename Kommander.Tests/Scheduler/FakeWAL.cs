@@ -153,6 +153,7 @@ public sealed class FakeWAL : IWAL
 
     /// <inheritdoc/>
     public RaftOperationStatus TruncateLogsAfter(int partitionId, long afterLogId) => RaftOperationStatus.Success;
+    public (RaftOperationStatus Status, long MaxLogId) TruncateLogsAfterAndGetMax(int partitionId, long afterLogId) => (RaftOperationStatus.Success, afterLogId);
 
     /// <inheritdoc/>
     public string? GetMetaData(string key) => _meta.GetValueOrDefault(key);
