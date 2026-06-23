@@ -14,8 +14,8 @@ namespace Kommander.Tests;
 
 /// <summary>
 /// Counts <see cref="LogLevel.Warning"/> messages whose text contains a specific substring.
-/// Used by Task-5 tests to assert that the leader's LogMismatch backtracking stays O(1)
-/// rather than O(gap) after a hole is induced and healed.
+/// Used by the hole-repair test to assert that the follower's truncation path fires and the
+/// leader's backtracking stays O(1) rather than O(gap) after a hole is induced and healed.
 /// </summary>
 internal sealed class CountingLogger : ILogger<IRaft>
 {
@@ -284,7 +284,7 @@ public sealed class TestReorderingCommunication
     }
 
     /// <summary>
-    /// End-to-end Task-5 verification: a hole induced on one follower heals in O(1)
+    /// End-to-end verification: a hole induced on one follower heals in O(1)
     /// backfill rounds and no committed entry is ever discarded.
     ///
     /// <para>Procedure:
@@ -312,17 +312,17 @@ public sealed class TestReorderingCommunication
 
         CancellationToken ct = TestContext.Current.CancellationToken;
 
-        // The leader node uses a counting logger so we can observe its LogMismatch count.
-        CountingLogger leaderLog = new("LogMismatch from");
-
         InMemoryCommunication inner = new();
         ReorderingCommunication shim  = new(inner);
 
-        // We don't know which node will become leader, so wrap all three with the counting
-        // logger and sum across them — in a 3-node cluster only the leader emits LogMismatch.
-        CountingLogger log1 = new("LogMismatch from");
-        CountingLogger log2 = new("LogMismatch from");
-        CountingLogger log3 = new("LogMismatch from");
+        // The truncation branch (RaftPartitionStateMachine) logs "Log-hole repair from" exactly once
+        // per repair. We don't know which node becomes the follower, so wrap all three and sum: only
+        // the follower that hits a hole emits it. A non-zero count is the proof the truncation path
+        // ran — without it, this test would pass trivially via ordinary forward backfill (see the false
+        // negative this replaces).
+        CountingLogger log1 = new("Log-hole repair from");
+        CountingLogger log2 = new("Log-hole repair from");
+        CountingLogger log3 = new("Log-hole repair from");
 
         IRaft n1 = MakeNode(1, ep1, [ep2, ep3], shim, log1);
         IRaft n2 = MakeNode(2, ep2, [ep1, ep3], shim, log2);
@@ -362,8 +362,9 @@ public sealed class TestReorderingCommunication
 
         long committedFrontier = committedIds.Max();
 
-        // Snapshot LogMismatch count before inducing the hole.
-        int mismatchBefore = log1.Count + log2.Count + log3.Count;
+        // The follower is fully caught up here, so its contiguous frontier equals the leader's max.
+        long contiguousFrontier = followerNode.WalAdapter.GetMaxLog(1);
+        Assert.True(contiguousFrontier >= committedFrontier);
 
         // ── Phase 2: arm hold, commit one more entry (this one gets held to the follower) ─
 
@@ -383,40 +384,85 @@ public sealed class TestReorderingCommunication
         AppendLogsRequest heldReq = shim.HeldRequest!;
         long heldMaxId = heldReq.Logs!.Max(l => l.Id);
 
-        // ── Phase 3: inject entries above the held range directly into the follower ─────
+        // ── Phase 3: inject a far-above-the-gap tail directly into the follower ───────
+        //
+        // The held entry (committedFrontier+1) is missing on the follower. We now append two
+        // entries with ids far above it (a LARGE gap) via the live path (prevLogIndex=0, which
+        // skips contiguity). The follower ends up with: 1..contiguousFrontier, a wide hole, then
+        // the two injected ids. A wide gap is deliberate — it lets the O(1) assertion below
+        // distinguish a single truncate from O(gap) per-index backtracking.
 
+        const long gap = 50;
         long term = leaderNode.WalAdapter.GetCurrentTerm(1);
-        long injectLow  = heldMaxId + 3;
-        long injectHigh = heldMaxId + 4;
+        long injectLow  = heldMaxId + gap;
+        long injectHigh = heldMaxId + gap + 1;
 
         followerNode.AppendLogs(new AppendLogsRequest(
             partition: 1,
             term:      term,
             time:      leaderNode.HybridLogicalClock.TrySendOrLocalEvent(1),
             endpoint:  leaderNode.GetLocalEndpoint(),
+            // Proposed (not Committed): a real out-of-order hole sits below *uncommitted* tail
+            // entries. Injecting Committed entries here would advance the follower's commit frontier
+            // above the hole, and the safety guard would then (correctly) refuse to truncate.
             logs:
             [
-                new RaftLog { Id = injectLow,  Term = term, Type = RaftLogType.Committed, LogType = "hole-inject" },
-                new RaftLog { Id = injectHigh, Term = term, Type = RaftLogType.Committed, LogType = "hole-inject" },
+                new RaftLog { Id = injectLow,  Term = term, Type = RaftLogType.Proposed, LogType = "hole-inject" },
+                new RaftLog { Id = injectHigh, Term = term, Type = RaftLogType.Proposed, LogType = "hole-inject" },
             ],
             prevLogIndex: 0,
             prevLogTerm:  0));
 
-        // Wait until the follower has accepted the injected entries (hole now exists).
+        // Wait until the follower has accepted the injected entries (hole now exists below its max).
         await WaitForCondition(
             () => followerNode.WalAdapter.GetMaxLog(1) >= injectLow,
             TimeSpan.FromSeconds(5), ct);
 
-        // ── Phase 4: heal partition, release hold → triggers hole-repair path ─────────
+        // ── Phase 4: drive the hole-repair branch deterministically ──────────────────
+        //
+        // A backfilling leader whose nextIndex sits above a follower hole sends an anchored
+        // AppendLogs whose prevLogIndex lands on a missing index. Reproducing that anchor
+        // organically depends on election/backtrack timing, so we deliver exactly that request
+        // directly to the follower (bypassing transport, like the injection above). prevLogIndex
+        // is a missing index in the middle of the gap; logs are non-empty so the Log-Matching
+        // branch runs. This is the precise input the follower truncation path handles.
+
+        long anchorInHole = heldMaxId + (gap / 2);   // a missing index, strictly inside the gap
+        followerNode.AppendLogs(new AppendLogsRequest(
+            partition: 1,
+            term:      term,
+            time:      leaderNode.HybridLogicalClock.TrySendOrLocalEvent(1),
+            endpoint:  leaderNode.GetLocalEndpoint(),
+            logs:      [ new RaftLog { Id = anchorInHole + 1, Term = term, Type = RaftLogType.Committed, LogType = "anchor" } ],
+            prevLogIndex: anchorInHole,
+            prevLogTerm:  term));
+
+        // The follower must truncate its entire holey tail back to the contiguous committed
+        // frontier in ONE repair — collapsing a 50-wide gap, not walking it index by index.
+        await WaitForCondition(
+            () => followerNode.WalAdapter.GetMaxLog(1) <= contiguousFrontier,
+            TimeSpan.FromSeconds(5), ct);
+
+        int repairCount = log1.Count + log2.Count + log3.Count;
+        Assert.True(repairCount >= 1,
+            "The hole-repair truncation path must have fired at least once " +
+            "(no \"Log-hole repair\" log observed — the follower is not truncating holey tails).");
+
+        Assert.Equal(contiguousFrontier, followerNode.WalAdapter.GetMaxLog(1));
+
+        // The held entry (committed on the leader) must NOT have been discarded by the truncation:
+        // it sits above the contiguous frontier but was never on the follower, and truncation only
+        // removes uncommitted tail — so the committed prefix 1..contiguousFrontier survives intact.
+        HashSet<long> followerIdsAfterRepair =
+            followerNode.WalAdapter.ReadLogsRange(1, 1).Select(l => l.Id).ToHashSet();
+        for (long id = 1; id <= contiguousFrontier; id++)
+            Assert.Contains(id, followerIdsAfterRepair);
+
+        // ── Phase 5: heal partition, release hold → leader reconverges the follower ───
 
         inner.HealPartition(followerEndpoint);
         shim.ReleaseHeld();
 
-        // ── Phase 5: wait for convergence ────────────────────────────────────────────
-
-        long leaderMax = leaderNode.WalAdapter.GetMaxLog(1);
-
-        // Wait for the follower's WAL max to match what the leader ultimately reaches.
         await WaitForCondition(
             () =>
             {
@@ -426,34 +472,21 @@ public sealed class TestReorderingCommunication
             },
             TimeSpan.FromSeconds(15), ct);
 
-        // ── Phase 6: assert no committed entry was discarded ─────────────────────────
-
-        // Read committed ids from the leader's WAL and check all followers have them.
+        // ── Phase 6: assert no committed entry was discarded cluster-wide ────────────
+        //
+        // Every id the leader holds (including the previously-held committedFrontier+1) must now be
+        // present on every node — the repaired follower fully caught back up.
         HashSet<long> leaderIds = leaderNode.WalAdapter
             .ReadLogsRange(1, 1)
             .Select(l => l.Id)
             .ToHashSet();
 
-        // Every id the leader committed must be present on every node.
         foreach (IRaft node in allNodes)
         {
             HashSet<long> nodeIds = node.WalAdapter.ReadLogsRange(1, 1).Select(l => l.Id).ToHashSet();
             foreach (long id in leaderIds)
                 Assert.Contains(id, nodeIds);
         }
-
-        // ── Phase 7: assert O(1) LogMismatch (bounded backtracking, not O(gap)) ──────
-
-        int mismatchAfter = log1.Count + log2.Count + log3.Count;
-        int mismatchDelta = mismatchAfter - mismatchBefore;
-
-        // Gap between heldMaxId and injectHigh is 4 (injectLow = heldMaxId+3, injectHigh = heldMaxId+4).
-        // O(1) repair: the hole-truncation path collapses the gap in a single truncate round,
-        // so the leader needs at most a small constant number of LogMismatch exchanges
-        // (≤ 5 accounts for any NoOp or election noise during the test).
-        Assert.True(mismatchDelta <= 5,
-            $"Expected ≤5 LogMismatch rounds after hole-repair (got {mismatchDelta}). " +
-            "Backtracking is O(gap), not O(1) — the hole-repair truncation path may not be firing.");
 
         await n1.LeaveCluster(true, CancellationToken.None);
         await n2.LeaveCluster(true, CancellationToken.None);

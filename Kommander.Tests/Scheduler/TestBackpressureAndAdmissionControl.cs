@@ -383,11 +383,10 @@ public sealed class TestBackpressureAndAdmissionControl
     }
 
     /// <summary>
-    /// Validates that the three backpressure config properties have the expected
-    /// defaults from the plan.
+    /// Validates that the three backpressure config properties have the expected defaults.
     /// </summary>
     [Fact]
-    public void RaftConfiguration_BackpressureDefaults_MatchPlanSpec()
+    public void RaftConfiguration_BackpressureDefaults_AreCorrect()
     {
         RaftConfiguration config = new();
 
@@ -412,10 +411,10 @@ public sealed class TestBackpressureAndAdmissionControl
     }
 
     /// <summary>
-    /// Validates that drain quantum configuration defaults match plan spec.
+    /// Validates that drain quantum configuration defaults are correct.
     /// </summary>
     [Fact]
-    public void RaftConfiguration_DrainQuantumDefaults_MatchPlanSpec()
+    public void RaftConfiguration_DrainQuantumDefaults_AreCorrect()
     {
         RaftConfiguration config = new();
 

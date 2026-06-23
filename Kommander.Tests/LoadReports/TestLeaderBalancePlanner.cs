@@ -5,9 +5,9 @@ using Kommander.Time;
 namespace Kommander.Tests.LoadReports;
 
 /// <summary>
-/// Pure unit tests for <see cref="LeaderBalancePlanner"/> covering the spec acceptance
-/// criteria 1–8: count balance, load balance, deadband, stability gate, cooldown,
-/// lifecycle filter, incomplete-view abort, and move caps.
+/// Pure unit tests for <see cref="LeaderBalancePlanner"/> covering: count balance, load
+/// balance, deadband, stability gate, cooldown, lifecycle filter, incomplete-view abort,
+/// and move caps.
 /// </summary>
 public sealed class TestLeaderBalancePlanner
 {

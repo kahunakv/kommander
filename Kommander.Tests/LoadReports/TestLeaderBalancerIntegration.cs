@@ -655,14 +655,14 @@ public sealed class TestLeaderBalancerIntegration
         Assert.Equal(2, coord.OutstandingMoveCountForTest);
     }
 
-    // ── WAL saturation integration tests (Task 9) ─────────────────────────────
+    // ── WAL saturation integration tests ──────────────────────────────────────
 
     /// <summary>
     /// An <see cref="IWAL"/> wrapper that adds an artificial synchronous delay to every
     /// <c>Write</c> call, simulating a durable backend (e.g. RocksDB with <c>syncWrites</c>)
     /// whose fsync latency bounds the per-node commit throughput.
     ///
-    /// <para>Used only by Task-9 saturation tests to produce an observable WAL queue depth
+    /// <para>Used only by the WAL saturation tests to produce an observable WAL queue depth
     /// without requiring on-disk SQLite or RocksDB infrastructure in CI.</para>
     /// </summary>
     private sealed class ThrottledWAL : IWAL
@@ -817,7 +817,7 @@ public sealed class TestLeaderBalancerIntegration
                 .ToArray();
 
             // Poll until depth is positive, indicating the WAL worker is backlogged.
-            // This uses bounded polling (no fixed sleep), consistent with the spec.
+            // This uses bounded polling (no fixed sleep).
             int observedDepth = 0;
             long depthDeadline = Environment.TickCount64 + 10_000;
             while (Environment.TickCount64 < depthDeadline)
