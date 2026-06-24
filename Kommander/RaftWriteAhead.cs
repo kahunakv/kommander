@@ -1,6 +1,7 @@
 ﻿
 using System.Threading;
 using Kommander.Data;
+using Kommander.Diagnostics;
 using Kommander.Logging;
 using Kommander.Support.Collections;
 using Kommander.System;
@@ -301,6 +302,10 @@ public sealed class RaftWriteAhead
             throw;
         }
 
+        // Count the durable phase from the producer side (inert unless instrumentation
+        // is enabled): one LeaderPropose enqueue per single-round committed write.
+        WalPhaseInstrumentation.RecordEnqueued(WALWriteOperationType.LeaderPropose);
+
         return operation;
     }
 
@@ -424,6 +429,10 @@ public sealed class RaftWriteAhead
         );
 
         manager.WalScheduler.Enqueue(operation);
+
+        // The second durable phase of a committed write: pairs with the LeaderPropose
+        // enqueue above, so enqueues-per-write ≈ 2 confirms the two-fsync structure.
+        WalPhaseInstrumentation.RecordEnqueued(WALWriteOperationType.LeaderCommit);
 
         return operation;
     }
@@ -846,6 +855,10 @@ public sealed class RaftWriteAhead
         // any id that sits above an unfilled gap so the frontier never overshoots a hole.
         foreach (long id in resolvedThisBatch)
             AdvanceCommitFrontier(id);
+
+        // Follower-side durable phase. Followers fsync on the propose quorum's critical
+        // path, so this phase's latency is measured symmetrically with the leader's.
+        WalPhaseInstrumentation.RecordEnqueued(WALWriteOperationType.FollowerAppend);
 
         return operation;
     }
