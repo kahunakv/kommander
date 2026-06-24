@@ -455,9 +455,17 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             // regardless of batch size, giving consistent per-partition decay behaviour.
             if (_partitions.TryGetValue(pid, out PartitionState? waitState))
             {
+                // One volatile read decides whether to attribute per-op latency to its
+                // phase for the double-fsync measurement; off by default, no cost in prod.
+                bool instrument = WalPhaseInstrumentation.Enabled;
                 double totalWaitMs = 0;
                 foreach (WALWriteOperation op in pidBatch)
-                    totalWaitMs += (doneAtTicks - op.EnqueueTicks) * ticksToMs;
+                {
+                    double opWaitMs = (doneAtTicks - op.EnqueueTicks) * ticksToMs;
+                    totalWaitMs += opWaitMs;
+                    if (instrument)
+                        WalPhaseInstrumentation.RecordDurable(op.Type, opWaitMs);
+                }
                 waitState.CommitWait.RecordWaitMs(totalWaitMs / pidBatch.Count);
             }
 
