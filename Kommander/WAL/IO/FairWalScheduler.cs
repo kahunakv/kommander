@@ -25,6 +25,15 @@ namespace Kommander.WAL.IO;
 ///       in many-partition deployments.</item>
 ///   <item>Compatible writes are batched within each drain cycle to amortize
 ///       <c>walAdapter.Write</c> overhead.</item>
+///   <item><b>Deferred group commit (opt-in):</b> group commit is otherwise purely
+///       <em>opportunistic</em> — a worker fsyncs whatever happens to be ready the
+///       instant it wakes. When a linger window is configured
+///       (<c>RaftConfiguration.WalGroupCommitLingerMs</c>) the worker instead waits a
+///       bounded, adaptive interval to let more partitions become ready and share the
+///       fsync. This matters where ready partitions trickle in rather than arriving
+///       together — notably the follower append path, whose appends are paced by
+///       replication RPCs — so they would otherwise each force a near-solo fsync. See
+///       <c>LingerForMoreReadyPartitions</c>.</item>
 ///   <item>Bounded per-partition queues with back-pressure: callers receive a
 ///       <see cref="BackpressureExceededException"/> when the per-partition depth
 ///       limit is reached rather than silently blocking indefinitely.</item>
@@ -65,6 +74,15 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     private readonly int maxGlobalQueueDepth;
     private readonly int maxBatchSize;
     private readonly int maxGroupBatchPartitions;
+
+    /// <summary>
+    /// Deferred group-commit linger window in <see cref="Stopwatch"/> ticks, or 0 when
+    /// disabled. When &gt; 0 a worker that took its first ready partition keeps gathering
+    /// more ready partitions (up to <see cref="maxGroupBatchPartitions"/>) until this much
+    /// time elapses or a probe finds nothing newly ready — see the drain loop. 0 preserves
+    /// the original purely-opportunistic batching.
+    /// </summary>
+    private readonly long lingerTicks;
 
     // Total pending-or-in-flight operations across all partitions.
     // Checked against maxGlobalQueueDepth (when > 0) in Enqueue;
@@ -125,6 +143,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
     private long _totalBatchesWritten;
     private long _totalOperationsCompleted;
+    private long _totalPartitionsBatched;
 
     /// <summary>
     /// Total number of <c>walAdapter.Write</c> calls dispatched to the storage adapter.
@@ -135,6 +154,16 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
     /// <summary>Total number of individual operations completed.</summary>
     public long TotalOperationsCompleted => Interlocked.Read(ref _totalOperationsCompleted);
+
+    /// <summary>
+    /// Total number of partitions summed across every group batch. Divided by
+    /// <see cref="TotalBatchesWritten"/> this gives the mean partitions-per-fsync — the
+    /// batch density the deferred group-commit linger is designed to raise. Comparing this
+    /// ratio with the linger on vs off shows directly whether the window is coalescing more
+    /// partitions per fsync (the intended effect) or whether batches were already dense
+    /// (in which case latency is queue-wait-bound, not batch-density-bound).
+    /// </summary>
+    public long TotalPartitionsBatched => Interlocked.Read(ref _totalPartitionsBatched);
 
     // ── Construction ──────────────────────────────────────────────────────
 
@@ -161,6 +190,12 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// call (one fsync for RocksDB).  Defaults to
     /// <see cref="DefaultMaxGroupBatchPartitions"/>.
     /// </param>
+    /// <param name="groupCommitLingerMs">
+    /// Deferred group-commit linger window in milliseconds (see
+    /// <c>RaftConfiguration.WalGroupCommitLingerMs</c>). 0 (default) keeps the original
+    /// opportunistic batching; &gt; 0 lets a worker briefly wait to gather more ready
+    /// partitions into one fsync, bailing early under low load.
+    /// </param>
     public FairWalScheduler(
         IWAL walAdapter,
         ILogger<IRaft> logger,
@@ -168,7 +203,8 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         int maxQueueDepthPerPartition = DefaultMaxQueueDepth,
         int maxBatchSize = DefaultMaxBatchSize,
         int maxGlobalQueueDepth = 0,
-        int maxGroupBatchPartitions = DefaultMaxGroupBatchPartitions)
+        int maxGroupBatchPartitions = DefaultMaxGroupBatchPartitions,
+        int groupCommitLingerMs = 0)
     {
         this.walAdapter = walAdapter;
         this.logger = logger;
@@ -176,6 +212,9 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         this.maxGlobalQueueDepth = maxGlobalQueueDepth > 0 ? maxGlobalQueueDepth : 0;
         this.maxBatchSize = maxBatchSize <= 0 ? DefaultMaxBatchSize : maxBatchSize;
         this.maxGroupBatchPartitions = maxGroupBatchPartitions <= 0 ? DefaultMaxGroupBatchPartitions : maxGroupBatchPartitions;
+        this.lingerTicks = groupCommitLingerMs > 0
+            ? (long)(groupCommitLingerMs / 1000.0 * global::System.Diagnostics.Stopwatch.Frequency)
+            : 0;
 
         if (workerCount <= 0)
             workerCount = Math.Max(1, Environment.ProcessorCount);
@@ -345,15 +384,76 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                 break;
             }
 
-            // Gather additional ready partitions without blocking — this is the
-            // group-commit coalescing step.  Up to maxGroupBatchPartitions−1 extra
-            // partitions join this worker's batch, all sharing the same Write call.
+            // Gather additional ready partitions — the group-commit coalescing step.
+            // Up to maxGroupBatchPartitions−1 extra partitions join this worker's batch,
+            // all sharing the same Write call (one fsync for RocksDB).
             partitionGroup.Clear();
             partitionGroup.Add(partitionId);
+
+            // (1) Opportunistic sweep: take whatever is *already* ready, non-blocking.
             while (partitionGroup.Count < maxGroupBatchPartitions && _readyPartitions.TryTake(out int extraId))
                 partitionGroup.Add(extraId);
 
+            // (2) Deferred linger (opt-in): if the batch is not yet full and a window is
+            //     configured, briefly wait for more partitions to become ready so they
+            //     share this fsync instead of forcing their own. Adaptive and bounded:
+            //     we bail the instant a probe finds nothing newly ready (so sequential /
+            //     low-overlap load pays at most one probe, not the whole window), and the
+            //     total wait never exceeds lingerTicks. This is the lever for paths whose
+            //     ready partitions trickle in (e.g. follower appends paced by replication
+            //     RPCs) rather than arriving all at once like a leader's local proposes.
+            if (lingerTicks > 0 && partitionGroup.Count < maxGroupBatchPartitions)
+                LingerForMoreReadyPartitions(partitionGroup, token);
+
             ProcessGroupBatch(partitionGroup, groupBatches);
+        }
+    }
+
+    /// <summary>Per-probe wait while lingering. BlockingCollection timeouts have ~1 ms
+    /// granularity, so this is the smallest useful slice; the cumulative wait is bounded by
+    /// <see cref="lingerTicks"/>, not by this value.</summary>
+    private const int LingerProbeMs = 1;
+
+    /// <summary>
+    /// Deferred group-commit: after the opportunistic sweep, keep pulling newly-ready
+    /// partitions into <paramref name="partitionGroup"/> so they share this worker's single
+    /// fsync, until the batch is full, the linger window (<see cref="lingerTicks"/>) elapses,
+    /// or a probe finds nothing newly ready.
+    ///
+    /// <para>The early bail on an empty probe is what makes this <b>adaptive</b>:
+    /// <see cref="System.Collections.Concurrent.BlockingCollection{T}.TryTake(out T,int,CancellationToken)"/>
+    /// returns immediately while partitions are already queued (a dense burst is gathered at
+    /// full speed) but blocks up to one short probe when the queue drains — and a probe that
+    /// comes back empty means the arrival burst has paused, so we stop rather than wait out
+    /// the whole window. Sequential / low-overlap load therefore pays at most one probe.</para>
+    ///
+    /// <para>Only <em>when</em> the group fsync fires changes; never <em>whether</em> a write
+    /// is durable before its completion callback runs. Per-partition ordering and the
+    /// <c>Scheduled</c>/<c>InFlight</c> ready-queue discipline are untouched.</para>
+    /// </summary>
+    private void LingerForMoreReadyPartitions(List<int> partitionGroup, CancellationToken token)
+    {
+        long deadline = global::System.Diagnostics.Stopwatch.GetTimestamp() + lingerTicks;
+
+        while (partitionGroup.Count < maxGroupBatchPartitions
+               && global::System.Diagnostics.Stopwatch.GetTimestamp() < deadline)
+        {
+            int extraId;
+            try
+            {
+                if (!_readyPartitions.TryTake(out extraId, LingerProbeMs, token))
+                    break; // queue paused within the probe → burst over, stop lingering.
+            }
+            catch (OperationCanceledException)
+            {
+                break; // shutdown: process what we have; WorkerLoop's next Take drains the rest.
+            }
+            catch (ObjectDisposedException)
+            {
+                break;
+            }
+
+            partitionGroup.Add(extraId);
         }
     }
 
@@ -430,6 +530,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
             status = walAdapter.Write(logGroups);
             Interlocked.Increment(ref _totalBatchesWritten);
+            Interlocked.Add(ref _totalPartitionsBatched, groupBatches.Count);
         }
         catch (Exception ex)
         {

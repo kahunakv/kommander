@@ -352,7 +352,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             configuration.MaxWalQueueDepthPerPartition,
             configuration.MaxWalBatchSize,
             configuration.MaxGlobalWalQueueDepth,
-            configuration.MaxWalGroupBatchPartitions);
+            configuration.MaxWalGroupBatchPartitions,
+            configuration.WalGroupCommitLingerMs);
 
         if (configuration.EnableSharedExecutorPool)
         {
