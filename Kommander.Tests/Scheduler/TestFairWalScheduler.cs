@@ -331,6 +331,161 @@ public sealed class TestFairWalScheduler
         Assert.All(statuses, s => Assert.Equal(RaftOperationStatus.Errored, s));
     }
 
+    // ── Deferred group-commit linger (WalGroupCommitLingerMs) ───────────────
+
+    /// <summary>
+    /// Enabling the linger must not regress the opportunistic cross-partition group
+    /// commit: partitions that pile up behind a blocked Write are still coalesced into
+    /// a single fsync. (The linger's <em>additional</em> benefit — coalescing
+    /// sub-millisecond-staggered arrivals that opportunistic batching misses — is a
+    /// timing property validated by the Task 7 benchmark via
+    /// <see cref="FairWalScheduler.TotalPartitionsBatched"/>, not a deterministic unit
+    /// assertion.)
+    /// </summary>
+    [Fact]
+    public async Task Linger_DoesNotRegressGroupCommitCoalescing()
+    {
+        const int partitions = 4;
+
+        CoordinatedWal wal = new();
+        CountdownEvent done = new(partitions);
+
+        using FairWalScheduler scheduler = new(
+            wal,
+            NullLogger<IRaft>.Instance,
+            workerCount: 1,
+            maxGroupBatchPartitions: partitions,
+            groupCommitLingerMs: 50);
+        scheduler.Start();
+
+        scheduler.Enqueue(MakeOp(1, 1, Logs(1), _ => done.Signal()));
+        wal.WaitForFirstWrite();
+
+        for (int p = 2; p <= partitions; p++)
+        {
+            int partition = p;
+            scheduler.Enqueue(MakeOp(partition, partition, Logs(partition), _ => done.Signal()));
+        }
+
+        wal.Release();
+
+        bool finished = await Task.Run(() => done.Wait(TimeSpan.FromSeconds(10)));
+        Assert.True(finished, "Linger group-commit test timed out.");
+        Assert.True(wal.MaxPartitionsInSingleWrite >= partitions - 1,
+            $"Expected ≥{partitions - 1} partitions coalesced into one Write; got max={wal.MaxPartitionsInSingleWrite}");
+    }
+
+    /// <summary>
+    /// The linger is <b>adaptive</b>: causally-sequential writes — each enqueued only
+    /// after the previous one is durable — must NOT be merged and must not stall. Each
+    /// isolated write gets its own fsync because the worker bails out of the linger the
+    /// instant a probe finds nothing newly ready, so a low-overlap workload pays at most
+    /// one short probe, never the full window. A naive fixed-window implementation that
+    /// always waited would still produce one batch per write here (nothing else is in
+    /// flight), but it would inflate each write's latency by the window; this test pins
+    /// the batch-per-write structure that proves no unwanted merging.
+    /// </summary>
+    [Fact]
+    public async Task Linger_DoesNotMergeCausallySequentialWrites()
+    {
+        const int writes = 8;
+        RecordingWal wal = new();
+
+        using FairWalScheduler scheduler = new(
+            wal,
+            NullLogger<IRaft>.Instance,
+            workerCount: 1,
+            groupCommitLingerMs: 100);
+        scheduler.Start();
+
+        for (long i = 1; i <= writes; i++)
+        {
+            TaskCompletionSource tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            // A different partition each time, so a blindly-waiting window *could* try to
+            // merge them — yet none overlap in time, so each must fsync alone.
+            scheduler.Enqueue(MakeOp((int)i, i, Logs(i), _ => tcs.SetResult()));
+            await tcs.Task; // do not enqueue the next until this one is durable.
+        }
+
+        Assert.Equal(writes, scheduler.TotalBatchesWritten);
+        Assert.Equal(writes, scheduler.TotalPartitionsBatched);
+    }
+
+    /// <summary>
+    /// Per-partition FIFO ordering holds across the linger window: multiple ops for the
+    /// same partition are written in ascending id order regardless of how the worker
+    /// groups them.
+    /// </summary>
+    [Fact]
+    public async Task Linger_PreservesPerPartitionOrder()
+    {
+        const int opCount = 30;
+        const int partitionId = 7;
+
+        RecordingWal wal = new();
+        CountdownEvent done = new(opCount);
+
+        using FairWalScheduler scheduler = new(
+            wal,
+            NullLogger<IRaft>.Instance,
+            workerCount: 1,
+            groupCommitLingerMs: 50);
+        scheduler.Start();
+
+        for (long i = 1; i <= opCount; i++)
+            scheduler.Enqueue(MakeOp(partitionId, i, Logs(i), _ => done.Signal()));
+
+        bool finished = await Task.Run(() => done.Wait(TimeSpan.FromSeconds(10)));
+        Assert.True(finished, "Linger ordering test timed out.");
+
+        long prevMax = 0;
+        foreach ((int p, long minId, long maxId) in wal.Writes)
+        {
+            Assert.Equal(partitionId, p);
+            Assert.True(minId > prevMax, $"Out-of-order write: minId={minId} followed prevMax={prevMax}.");
+            prevMax = maxId;
+        }
+    }
+
+    /// <summary>
+    /// Durability/completion contract under the linger: a burst across many partitions
+    /// all complete with <see cref="RaftOperationStatus.Success"/>, and
+    /// <see cref="FairWalScheduler.TotalPartitionsBatched"/> accounts for every partition
+    /// fsynced and never undercounts the batches.
+    /// </summary>
+    [Fact]
+    public async Task Linger_BurstAcrossPartitions_AllSucceed_AndCounterTracksDensity()
+    {
+        const int partitions = 32;
+
+        RecordingWal wal = new();
+        ConcurrentBag<RaftOperationStatus> statuses = [];
+        CountdownEvent done = new(partitions);
+
+        using FairWalScheduler scheduler = new(
+            wal,
+            NullLogger<IRaft>.Instance,
+            workerCount: 1,
+            maxGroupBatchPartitions: 64,
+            groupCommitLingerMs: 50);
+        scheduler.Start();
+
+        for (int p = 1; p <= partitions; p++)
+            scheduler.Enqueue(MakeOp(p, p, Logs(p), c => { statuses.Add(c.Status); done.Signal(); }));
+
+        bool finished = await Task.Run(() => done.Wait(TimeSpan.FromSeconds(10)));
+        Assert.True(finished, "Linger burst test timed out.");
+
+        Assert.Equal(partitions, statuses.Count);
+        Assert.All(statuses, s => Assert.Equal(RaftOperationStatus.Success, s));
+
+        // Each partition is written exactly once, so the partitions-batched counter sums
+        // to the partition count, and every batch spans ≥1 partition.
+        Assert.Equal(partitions, scheduler.TotalPartitionsBatched);
+        Assert.True(scheduler.TotalBatchesWritten >= 1);
+        Assert.True(scheduler.TotalPartitionsBatched >= scheduler.TotalBatchesWritten);
+    }
+
     // ── Fake WAL implementations for tests ────────────────────────────────
 
     /// <summary>

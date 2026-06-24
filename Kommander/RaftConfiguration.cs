@@ -350,6 +350,30 @@ public class RaftConfiguration
     /// </summary>
     public int MaxWalGroupBatchPartitions { get; set; } = WAL.IO.FairWalScheduler.DefaultMaxGroupBatchPartitions;
 
+    /// <summary>
+    /// Deferred group-commit linger window, in milliseconds. When greater than zero,
+    /// a WAL worker that has dequeued its first ready partition will briefly wait to
+    /// gather <em>more</em> ready partitions before issuing the single group fsync,
+    /// rather than fsyncing whatever is ready at that instant
+    /// (<see cref="WAL.IO.FairWalScheduler"/>'s default <em>opportunistic</em> batching).
+    ///
+    /// <para>This trades a bounded latency floor for denser batches. It pays off only
+    /// because a single fsync is far more expensive (tens of ms) than the window: on
+    /// paths where ready partitions arrive spread out — notably the follower append
+    /// path, whose appends are paced by replication RPCs rather than arriving all at
+    /// once like a leader's local proposes — coalescing them into one fsync removes
+    /// real time from the propose quorum's critical path.</para>
+    ///
+    /// <para>The window is <b>adaptive</b>: the worker bails out the moment a probe
+    /// finds no further partition arriving, so sequential / low-overlap load does not
+    /// pay the full window. It is also bounded by <see cref="MaxWalGroupBatchPartitions"/>
+    /// (a full batch fsyncs immediately).</para>
+    ///
+    /// <para>Defaults to <c>0</c> (disabled — behaviour is byte-for-byte the prior
+    /// opportunistic batching). Enable and measure before relying on it.</para>
+    /// </summary>
+    public int WalGroupCommitLingerMs { get; set; }
+
     // ── Partition executor drain quanta ───────────────────────────────────────
 
     /// <summary>
