@@ -36,15 +36,23 @@ public sealed class FsyncCountTests
     private const int Writes = 200;
 
     /// <summary>
-    /// Pins today's persistent-WAL baseline: each committed write costs exactly two durable
-    /// writes (one propose fsync, one commit fsync), so total fsyncs == 2×W. This is the
-    /// "before" anchor the Task 4 fast path is measured against; when the fast path lands it
-    /// must drive this same assertion to ≈ 1×W with the fast path on (and still 2×W with it off).
+    /// Pins the fsync-per-committed-write count as an exact delta across the single-fsync fast path
+    /// (Task 8). With the fast path <b>off</b> each committed write costs exactly two fsyncs (propose +
+    /// commit) — the Task 2 baseline. With it <b>on</b>, the commit-only batch is written sync-off and
+    /// rides the next fsync, so the count drops to exactly one fsync per committed write.
+    /// <para>
+    /// The number of <c>walAdapter.Write</c> calls is identical either way (still two per write —
+    /// <see cref="FairWalScheduler.TotalBatchesWritten"/>); only how many of them fsync changes, which is
+    /// what <see cref="FairWalScheduler.TotalSyncBatchesWritten"/> isolates. Determinism comes from a
+    /// single worker, single partition, and a strictly serial driver, so no coalescing occurs.
+    /// </para>
     /// </summary>
     [Theory]
-    [InlineData(WalBackend.RocksDb)]
-    [InlineData(WalBackend.Sqlite)]
-    public async Task PersistentBackend_PaysExactlyTwoFsyncsPerCommittedWrite(WalBackend backend)
+    [InlineData(WalBackend.RocksDb, false)]
+    [InlineData(WalBackend.RocksDb, true)]
+    [InlineData(WalBackend.Sqlite, false)]
+    [InlineData(WalBackend.Sqlite, true)]
+    public async Task PersistentBackend_FsyncsPerCommittedWrite_DropFromTwoToOneWithFastPath(WalBackend backend, bool lazyCommit)
     {
         string path = CreateTempWalPath();
         try
@@ -53,23 +61,29 @@ public sealed class FsyncCountTests
             WalPhaseInstrumentation.Enabled = true;
 
             using IWAL wal = CreateWal(backend, path, syncWrites: true);
-            using FairWalScheduler scheduler = new(wal, NullLogger<IRaft>.Instance, workerCount: 1);
+            using FairWalScheduler scheduler = new(wal, NullLogger<IRaft>.Instance, workerCount: 1, lazyCommitMarkers: lazyCommit);
             scheduler.Start();
 
             long batchesBefore = scheduler.TotalBatchesWritten;
+            long syncBefore = scheduler.TotalSyncBatchesWritten;
             for (long id = 1; id <= Writes; id++)
                 await DriveCommittedWriteAsync(scheduler, partitionId: 1, id: id);
-            long fsyncs = scheduler.TotalBatchesWritten - batchesBefore;
+            long writeCalls = scheduler.TotalBatchesWritten - batchesBefore;
+            long fsyncs = scheduler.TotalSyncBatchesWritten - syncBefore;
 
             InstrumentationSnapshot snap = WalPhaseInstrumentation.Snapshot();
 
-            // Exact, not approximate: serial single-writer/single-partition admits no coalescing.
-            Assert.Equal(2L * Writes, fsyncs);
+            // Write-call count is unchanged by the fast path: two Writes (propose + commit) per write.
+            Assert.Equal(2L * Writes, writeCalls);
 
-            // The Task 1 counter must agree, split evenly across the two phases.
+            // The fsync count is the exact lever: 2×W off, 1×W on (commit batch rides the next propose).
+            long expectedFsyncs = lazyCommit ? Writes : 2L * Writes;
+            Assert.Equal(expectedFsyncs, fsyncs);
+
+            // The Task 1 per-phase op-completion counter is unaffected (it counts completed ops per
+            // phase, not fsyncs): both phases still complete W ops regardless of the fast path.
             Assert.Equal(Writes, snap.Propose.Durable);
             Assert.Equal(Writes, snap.Commit.Durable);
-            Assert.Equal(2L * Writes, snap.Propose.Durable + snap.Commit.Durable);
         }
         finally
         {

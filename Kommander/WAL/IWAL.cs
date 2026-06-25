@@ -55,6 +55,24 @@ public interface IWAL : IDisposable
     /// </summary>
     public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs);
 
+    /// <summary>
+    /// Persists <paramref name="logs"/> like <see cref="Write(List{ValueTuple{int, List{RaftLog}}})"/>, but
+    /// when <paramref name="sync"/> is <see langword="false"/> the batch is written <b>without forcing its
+    /// own fsync</b>, so it rides the next durable (sync) write rather than paying a fsync of its own.
+    /// <para>
+    /// This is the storage primitive behind the single-fsync commit fast path
+    /// (<see cref="RaftConfiguration.WalSingleFsyncCommit"/>): the per-entry <c>Committed</c> marker is
+    /// written sync-off because the entry it commits is already quorum-durable from its propose fsync, so
+    /// losing the marker on a crash is recoverable by reconstruction (it never loses acknowledged data).
+    /// <c>CommittedCheckpoint</c> and any first-durability write (proposed entries) must still be written
+    /// with <paramref name="sync"/> = <see langword="true"/>.
+    /// </para>
+    /// <para>The default implementation ignores <paramref name="sync"/> and delegates to the durable
+    /// <see cref="Write(List{ValueTuple{int, List{RaftLog}}})"/>, which is correct for non-durable adapters
+    /// (<see cref="InMemoryWAL"/>, test fakes) that never fsync. Durable backends override it.</para>
+    /// </summary>
+    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs, bool sync) => Write(logs);
+
     /// <summary>Returns the largest log id persisted for <paramref name="partitionId"/>, or 0 if empty.</summary>
     public long GetMaxLog(int partitionId);
 
