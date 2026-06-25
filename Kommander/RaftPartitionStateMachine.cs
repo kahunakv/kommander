@@ -1494,10 +1494,16 @@ public sealed class RaftPartitionStateMachine
             return;
         }
         
+        // On the single-fsync fast path a heartbeat ack carries the follower's TRUE committed frontier
+        // (not the legacy -1). This is the "leader's leaderCommit on reconnect" feedback channel: a
+        // follower whose commit frontier regressed on restart (lazy markers lost, then reconstructed
+        // conservatively) advertises the lower value so the leader can re-supply the still-committed tail.
+        long reportedCommittedIndex = host.Configuration.WalSingleFsyncCommit ? wal.GetCommitIndex() : -1;
+
         host.EnqueueResponse(endpoint, new(
-            RaftResponderRequestType.CompleteAppendLogs, 
-            new(endpoint), 
-            new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.Success, -1)
+            RaftResponderRequestType.CompleteAppendLogs,
+            new(endpoint),
+            new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.Success, reportedCommittedIndex)
         ));
 
         CompleteReply(replyCorrelationId, RaftResponseStatic.NoneResponse);
@@ -2066,6 +2072,23 @@ public sealed class RaftPartitionStateMachine
             RaftNode? behindNode = host.Nodes.FirstOrDefault(n => n.Endpoint == endpoint);
             if (behindNode is not null)
                 await TrySendBackfillBatchAsync(behindNode, committedIndex, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId)).ConfigureAwait(false);
+        }
+
+        // Fast-path commit-frontier re-supply: a follower that restarted after losing its lazy commit
+        // markers reports a committed frontier BELOW what the leader's (monotonic) matchIndex already
+        // recorded — the regression signature. matchIndex never moves backward, so the trigger above
+        // cannot see it; detect it explicitly and re-ship the still-committed tail from the follower's
+        // reported frontier. Idempotent: those entries are present on the follower as Proposed, and the
+        // re-shipped Committed copies upsert and apply them. Confined to the fast path (flag off ⇒ a
+        // heartbeat reports -1 ⇒ this never fires), so legacy replication is unchanged.
+        if (host.Configuration.WalSingleFsyncCommit
+            && nodeState == RaftNodeState.Leader
+            && committedIndex >= 0
+            && localCommittedIndex - committedIndex > host.Configuration.BackfillThreshold)
+        {
+            RaftNode? regressedNode = host.Nodes.FirstOrDefault(n => n.Endpoint == endpoint);
+            if (regressedNode is not null)
+                await TrySendBackfillBatchAsync(regressedNode, committedIndex, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId)).ConfigureAwait(false);
         }
 
         if (!activeProposals.TryGetValue(timestamp, out RaftProposalQuorum? proposal))

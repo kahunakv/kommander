@@ -168,35 +168,85 @@ public sealed class RaftWriteAhead
 
         manager.InvokeRestoreStarted(partition.PartitionId);
 
-        bool found = false;
+        // ── Reconstruct the commit frontier ───────────────────────────────────────────────
+        // logs is sorted ascending by id and begins at the last durable CommittedCheckpoint.
+        // We scan once to derive three quantities used below.
+        long maxLogId = 0;              // highest durable id (any type) — the propose cursor floor
+        long lastResolvedCommitted = 0; // id of the last Committed/CommittedCheckpoint seen (legacy path)
+        long contiguousCommitted = 0;   // highest id of an unbroken committed prefix (fast path)
+        bool any = false;
 
         foreach (RaftLog log in logs)
         {
-            found = true;
+            any = true;
+            if (log.Id > maxLogId)
+                maxLogId = log.Id;
+
+            switch (log.Type)
+            {
+                case RaftLogType.CommittedCheckpoint:
+                    lastResolvedCommitted = log.Id;
+                    // A checkpoint certifies the whole prefix ≤ its id is committed (it is the durable
+                    // recovery anchor), so it may jump the contiguous frontier.
+                    if (log.Id > contiguousCommitted)
+                        contiguousCommitted = log.Id;
+                    break;
+
+                case RaftLogType.Committed:
+                    lastResolvedCommitted = log.Id;
+                    // Extend the contiguous prefix only across an unbroken run; a gap — a Proposed entry
+                    // whose lazy commit marker was lost on the fast path, or any missing id — stops it.
+                    if (log.Id == contiguousCommitted + 1)
+                        contiguousCommitted = log.Id;
+                    break;
+
+                case RaftLogType.Proposed:
+                case RaftLogType.ProposedCheckpoint:
+                case RaftLogType.RolledBack:
+                case RaftLogType.RolledBackCheckpoint:
+                    break;
+
+                default:
+                    throw new NotImplementedException();
+            }
+        }
+
+        if (manager.Configuration.WalSingleFsyncCommit)
+        {
+            // Single-fsync fast path: the per-entry Committed marker is written lazily, so a crash can
+            // leave a durable Proposed prefix whose markers were lost. The on-disk types are no longer a
+            // reliable committed/uncommitted boundary, so reconstruct conservatively:
+            //   commitIndex  = highest CONTIGUOUS committed prefix + 1 (the safe lower bound). Entries
+            //                  above the first gap are NOT treated as committed here; the true frontier
+            //                  above this is re-supplied by the leader on reconnect (follower) or by
+            //                  re-commit once a current-term entry commits on election (leader).
+            //   proposeIndex = maxLogId + 1, so the durable Proposed tail is PRESERVED — a later propose
+            //                  never reuses its ids, which would overwrite an acked-but-lazily-committed
+            //                  entry (data loss). Recovery never treats that tail as committed, so an
+            //                  unacknowledged-but-not-durable write is never promoted.
+            commitIndex = contiguousCommitted + 1;
+            proposeIndex = maxLogId + 1;
+        }
+        else
+        {
+            // Legacy path (commit markers always durable ⇒ the committed prefix is contiguous and
+            // complete). Byte-for-byte the prior behaviour: the frontier is the last committed id, and a
+            // proposed-but-uncommitted tail is discarded (a later propose reuses its ids).
+            commitIndex = any ? lastResolvedCommitted + 1 : await GetMaxLog().ConfigureAwait(false) + 1;
+            proposeIndex = any ? lastResolvedCommitted + 1 : commitIndex;
+        }
+
+        // ── Replay the committed prefix to the application ─────────────────────────────────
+        // Apply only committed data entries strictly below the reconstructed frontier. Checkpoints carry
+        // no application payload (their state is restored via the snapshot transfer); entries at or above
+        // the frontier are deferred to leader re-supply / re-commit.
+        foreach (RaftLog log in logs)
+        {
+            if (log.Type != RaftLogType.Committed || log.Id >= commitIndex)
+                continue;
 
             try
             {
-                switch (log.Type)
-                {
-                    case RaftLogType.ProposedCheckpoint:
-                    case RaftLogType.Proposed:
-                    case RaftLogType.RolledBack:
-                    case RaftLogType.RolledBackCheckpoint:
-                        continue;
-
-                    case RaftLogType.Committed:
-                    case RaftLogType.CommittedCheckpoint:
-                        commitIndex = log.Id + 1;
-                        proposeIndex = log.Id + 1;
-                        break;
-
-                    default:
-                        throw new NotImplementedException();
-                }
-
-                if (log.Type != RaftLogType.Committed)
-                    continue;
-
                 if (partition.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType)
                 {
                     if (!await manager.InvokeSystemLogRestored(partition.PartitionId, log).ConfigureAwait(false))
@@ -215,9 +265,6 @@ public sealed class RaftWriteAhead
                 manager.InvokeReplicationError(partition.PartitionId, log);
             }
         }
-
-        if (!found)
-            commitIndex = await GetMaxLog().ConfigureAwait(false) + 1;
 
         if (partition.PartitionId == RaftSystemConfig.SystemPartition)
         {

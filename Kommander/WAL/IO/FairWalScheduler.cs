@@ -84,6 +84,15 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// </summary>
     private readonly long lingerTicks;
 
+    /// <summary>
+    /// When true, the single-fsync commit fast path is active: a group batch whose logs are <b>all</b>
+    /// per-entry <c>Committed</c> markers is written sync-off (no fsync of its own), riding the next
+    /// durable write. Any batch containing a proposed entry, a <c>CommittedCheckpoint</c>, a rollback, or
+    /// any other type is still written sync. Off (default) preserves byte-for-byte the prior always-sync
+    /// behaviour. Wired from <see cref="RaftConfiguration.WalSingleFsyncCommit"/>.
+    /// </summary>
+    private readonly bool lazyCommitMarkers;
+
     // Total pending-or-in-flight operations across all partitions.
     // Checked against maxGlobalQueueDepth (when > 0) in Enqueue;
     // decremented in ProcessGroupBatch after each batch write completes.
@@ -142,6 +151,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     // ── Observability ──────────────────────────────────────────────────────
 
     private long _totalBatchesWritten;
+    private long _totalSyncBatchesWritten;
     private long _totalOperationsCompleted;
     private long _totalPartitionsBatched;
 
@@ -151,6 +161,15 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// so this is the count most directly correlated with fsync pressure on RocksDB.
     /// </summary>
     public long TotalBatchesWritten => Interlocked.Read(ref _totalBatchesWritten);
+
+    /// <summary>
+    /// Number of group batches dispatched with an fsync (sync=true) — the true fsync count on a durable
+    /// backend. Equals <see cref="TotalBatchesWritten"/> when the single-fsync fast path is off (every
+    /// batch fsyncs). With the fast path on, commit-only batches are written sync-off and excluded here,
+    /// so this drops toward ~1× per committed write while <see cref="TotalBatchesWritten"/> stays ~2×
+    /// (the number of <c>walAdapter.Write</c> calls is unchanged; only how many fsync differs).
+    /// </summary>
+    public long TotalSyncBatchesWritten => Interlocked.Read(ref _totalSyncBatchesWritten);
 
     /// <summary>Total number of individual operations completed.</summary>
     public long TotalOperationsCompleted => Interlocked.Read(ref _totalOperationsCompleted);
@@ -196,6 +215,11 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// opportunistic batching; &gt; 0 lets a worker briefly wait to gather more ready
     /// partitions into one fsync, bailing early under low load.
     /// </param>
+    /// <param name="lazyCommitMarkers">
+    /// Single-fsync commit fast path (see <c>RaftConfiguration.WalSingleFsyncCommit</c>). When true, a
+    /// group batch whose logs are all per-entry <c>Committed</c> markers is written sync-off so it rides
+    /// the next durable write instead of forcing its own fsync. Off (default) keeps every batch sync.
+    /// </param>
     public FairWalScheduler(
         IWAL walAdapter,
         ILogger<IRaft> logger,
@@ -204,7 +228,8 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         int maxBatchSize = DefaultMaxBatchSize,
         int maxGlobalQueueDepth = 0,
         int maxGroupBatchPartitions = DefaultMaxGroupBatchPartitions,
-        int groupCommitLingerMs = 0)
+        int groupCommitLingerMs = 0,
+        bool lazyCommitMarkers = false)
     {
         this.walAdapter = walAdapter;
         this.logger = logger;
@@ -215,6 +240,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         this.lingerTicks = groupCommitLingerMs > 0
             ? (long)(groupCommitLingerMs / 1000.0 * global::System.Diagnostics.Stopwatch.Frequency)
             : 0;
+        this.lazyCommitMarkers = lazyCommitMarkers;
 
         if (workerCount <= 0)
             workerCount = Math.Max(1, Environment.ProcessorCount);
@@ -524,12 +550,26 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             foreach ((_, List<WALWriteOperation> ops) in groupBatches)
                 totalOps += ops.Count;
             List<(int, List<RaftLog>)> logGroups = new(totalOps);
+
+            // Single-fsync fast path: the batch may skip its own fsync only if EVERY log in it is a
+            // per-entry Committed marker (already quorum-durable from its propose fsync, so a lost marker
+            // is reconstructible). Any proposed entry, CommittedCheckpoint (the durable recovery anchor),
+            // rollback, or other type forces a sync write — and that sync write also flushes any sync-off
+            // markers batched alongside it. Off by default ⇒ always sync ⇒ byte-for-byte prior behaviour.
+            bool sync = !lazyCommitMarkers;
+
             foreach ((_, List<WALWriteOperation> ops) in groupBatches)
                 foreach (WALWriteOperation op in ops)
+                {
                     logGroups.Add(op.Logs);
+                    if (!sync && !AllCommittedMarkers(op.Logs.Logs))
+                        sync = true;
+                }
 
-            status = walAdapter.Write(logGroups);
+            status = walAdapter.Write(logGroups, sync);
             Interlocked.Increment(ref _totalBatchesWritten);
+            if (sync)
+                Interlocked.Increment(ref _totalSyncBatchesWritten);
             Interlocked.Add(ref _totalPartitionsBatched, groupBatches.Count);
         }
         catch (Exception ex)
@@ -661,6 +701,26 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// True when every log in <paramref name="logs"/> is a per-entry <see cref="RaftLogType.Committed"/>
+    /// marker — the only type the single-fsync fast path may write sync-off. Notably excludes
+    /// <see cref="RaftLogType.CommittedCheckpoint"/> (the durable recovery anchor, which must always fsync)
+    /// and every first-durability type (Proposed/ProposedCheckpoint) and rollback marker. An empty list is
+    /// not eligible (returns false), so it can never spuriously suppress a fsync.
+    /// </summary>
+    private static bool AllCommittedMarkers(List<RaftLog> logs)
+    {
+        if (logs.Count == 0)
+            return false;
+
+        foreach (RaftLog log in logs)
+        {
+            if (log.Type != RaftLogType.Committed)
+                return false;
+        }
+        return true;
+    }
 
     private static RaftWalCompletion BuildCompletion(WALWriteOperation op, RaftOperationStatus status)
     {

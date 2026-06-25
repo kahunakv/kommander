@@ -324,8 +324,20 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <see cref="RaftOperationStatus.Success"/> if the operation succeeds,
     /// <see cref="RaftOperationStatus.Errored"/> if there is an issue during the operation.
     /// </returns>
-    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs)
+    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs) => Write(logs, sync: true);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// When <paramref name="sync"/> is <see langword="false"/> the batch is written with
+    /// <see cref="NonSynchronousWriteOptions"/> (<c>SetSync(false)</c>), so RocksDB appends it to the WAL
+    /// without an fsync; the next <c>SetSync(true)</c> write flushes the shared WAL up to and including it,
+    /// making prior sync-off writes durable. When this instance was constructed with <c>syncWrites=false</c>
+    /// every write is already non-sync, so <paramref name="sync"/> has no additional effect.
+    /// </remarks>
+    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs, bool sync)
     {
+        WriteOptions effectiveOptions = sync ? writeOptions : NonSynchronousWriteOptions;
+
         try
         {
             if (logs is [{ Item2.Count: 1 } _]) // fast path
@@ -355,8 +367,8 @@ public class RocksDbWAL : IWAL, IDisposable
                 
                 ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
                 
-                db.Put(buffer, Serialize(message), columnFamilyHandle, writeOptions);
-                
+                db.Put(buffer, Serialize(message), columnFamilyHandle, effectiveOptions);
+
                 return RaftOperationStatus.Success;
             }
             
@@ -422,7 +434,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 //Console.WriteLine("Batch of {0}", count);
             }
             
-            db.Write(writeBatch, writeOptions);
+            db.Write(writeBatch, effectiveOptions);
 
             return RaftOperationStatus.Success;
         } 

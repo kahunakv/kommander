@@ -444,8 +444,23 @@ public class SqliteWAL : IWAL, IDisposable
     /// <para>A batch of P partitions spanning S shards costs S fsyncs. When shardCount=1 all
     /// partitions are co-located and the entire batch costs a single fsync.</para>
     /// </summary>
-    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs)
+    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs) => Write(logs, sync: true);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// When <paramref name="sync"/> is <see langword="false"/> and this instance is durable
+    /// (<c>syncWrites=true</c>, i.e. <c>PRAGMA synchronous=FULL</c>), the shard connection is switched to
+    /// <c>PRAGMA synchronous=OFF</c> for the duration of the transaction and restored to <c>FULL</c>
+    /// afterward, all under the shard's write lock. In WAL journal mode this skips the per-commit fsync of
+    /// the <c>-wal</c> file; the next <c>FULL</c> commit fsyncs the <c>-wal</c> and so flushes the prior
+    /// sync-off frames, making them durable. The pragma is toggled <b>outside</b> the transaction (SQLite
+    /// requires it) and only while the exclusive shard lock is held, so no concurrent write on the shard
+    /// observes the lowered durability; reads are unaffected by the synchronous mode.
+    /// </remarks>
+    public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs, bool sync)
     {
+        bool downgradeSync = !sync && syncWrites;
+
         // Group by shard, then merge same-partition entries within each shard.
         Dictionary<int, Dictionary<int, List<RaftLog>>> shardPlan = new();
 
@@ -477,29 +492,40 @@ public class SqliteWAL : IWAL, IDisposable
 
                 lock (shard.Lock)
                 {
-                    using SqliteTransaction transaction = shard.Connection.BeginTransaction();
-                    SqliteCommand upsert = GetOrCreatePreparedUpsert(shard);
-                    upsert.Transaction = transaction;
+                    if (downgradeSync)
+                        SetSynchronousPragma(shard.Connection, "OFF");
 
                     try
                     {
-                        foreach (KeyValuePair<int, List<RaftLog>> kv in shardEntry.Value)
-                        {
-                            int partitionId = kv.Key;
-                            foreach (RaftLog log in kv.Value)
-                                BindAndExecUpsert(upsert, partitionId, log);
-                        }
+                        using SqliteTransaction transaction = shard.Connection.BeginTransaction();
+                        SqliteCommand upsert = GetOrCreatePreparedUpsert(shard);
+                        upsert.Transaction = transaction;
 
-                        transaction.Commit();
-                    }
-                    catch
-                    {
-                        transaction.Rollback();
-                        throw;
+                        try
+                        {
+                            foreach (KeyValuePair<int, List<RaftLog>> kv in shardEntry.Value)
+                            {
+                                int partitionId = kv.Key;
+                                foreach (RaftLog log in kv.Value)
+                                    BindAndExecUpsert(upsert, partitionId, log);
+                            }
+
+                            transaction.Commit();
+                        }
+                        catch
+                        {
+                            transaction.Rollback();
+                            throw;
+                        }
+                        finally
+                        {
+                            upsert.Transaction = null;
+                        }
                     }
                     finally
                     {
-                        upsert.Transaction = null;
+                        if (downgradeSync)
+                            SetSynchronousPragma(shard.Connection, "FULL");
                     }
                 }
             }
@@ -513,6 +539,18 @@ public class SqliteWAL : IWAL, IDisposable
         }
 
         return RaftOperationStatus.Success;
+    }
+
+    /// <summary>
+    /// Sets <c>PRAGMA synchronous</c> on <paramref name="connection"/> to <paramref name="mode"/>
+    /// (e.g. <c>OFF</c> / <c>FULL</c>). Must be called outside a transaction and while holding the
+    /// shard's write lock. Used by the sync-off branch of <see cref="Write(List{ValueTuple{int, List{RaftLog}}}, bool)"/>
+    /// to skip the per-commit fsync for lazy commit-marker writes.
+    /// </summary>
+    private static void SetSynchronousPragma(SqliteConnection connection, string mode)
+    {
+        using SqliteCommand pragma = new($"PRAGMA synchronous={mode};", connection);
+        pragma.ExecuteNonQuery();
     }
 
     // ── IWAL — partition lifecycle ────────────────────────────────────────────
