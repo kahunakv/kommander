@@ -1388,7 +1388,11 @@ public sealed class RaftPartitionStateMachine
 
             if (prevLogIndex > localMaxLog)
             {
-                logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Log Matching rejection from {Endpoint}: prevLogIndex={PrevLogIndex} > localMaxLog={LocalMaxLog}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, prevLogIndex, localMaxLog);
+                // Follower is simply behind the leader's append point (prevLogIndex is ahead of our
+                // tail). Backfill backtracks nextIndex and catches it up — benign and noisy under
+                // high write concurrency, so this stays at Debug. Genuine divergence (a term mismatch
+                // at an existing entry) is the Warning below.
+                logger.LogDebugLogMatchingFollowerBehind(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, prevLogIndex, localMaxLog);
 
                 host.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs,
@@ -2088,6 +2092,10 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
+        // Single-fsync fast path: release the client ticket on propose-quorum-durable,
+        // ahead of the commit fsync below. No-op unless WalSingleFsyncCommit is on.
+        TryReleaseTicketOnQuorumDurable(proposal);
+
         WALWriteOperation operation = wal.EnqueueCommit(proposal.Logs);
         pendingWalOperations[operation.OperationId] = new()
         {
@@ -2268,6 +2276,10 @@ public sealed class RaftPartitionStateMachine
 
             if (autoCommit)
             {
+                // A single-voter leader is its own quorum, so the propose fsync that just
+                // completed already made the entry quorum-durable: the fast path applies here too.
+                TryReleaseTicketOnQuorumDurable(proposalQuorum);
+
                 WALWriteOperation commitOperation = wal.EnqueueCommit(proposalQuorum.Logs);
                 pendingWalOperations[commitOperation.OperationId] = new()
                 {
@@ -2434,6 +2446,37 @@ public sealed class RaftPartitionStateMachine
             return (RaftProposalTicketState.Committed, proposal.LastLogIndex);
 
         return (RaftProposalTicketState.Proposed, -1);
+    }
+
+    /// <summary>
+    /// Single-fsync commit fast path (<see cref="RaftConfiguration.WalSingleFsyncCommit"/>).
+    /// For an <c>autoCommit</c> proposal whose propose quorum is already durable, advances the
+    /// leader's commit frontier and moves the proposal to <see cref="RaftProposalState.Committed"/>
+    /// <b>before</b> the commit fsync is enqueued, so the client ticket (<see cref="CheckTicketCompletion"/>)
+    /// is released on quorum-durable rather than on the leader's own second fsync. The per-entry
+    /// <c>Committed</c> record is still written by the subsequent <c>EnqueueCommit</c>; only the
+    /// acknowledgement point moves earlier.
+    /// <para>
+    /// Safe because propose-quorum-durable is the true Raft commit point — a quorum holds the entry
+    /// on disk — so "acked ⇒ durable on a quorum" is preserved. The frontier value reused here
+    /// (<see cref="RaftProposalQuorum.LastLogIndex"/>) is exactly what <see cref="CompleteLeaderCommit"/>
+    /// would set from <c>completion.MaxLogIndex</c>, and a quorum acking this proposal implies it
+    /// holds every lower-id entry too (followers append contiguously), so advancing the frontier
+    /// here cannot skip an unreplicated predecessor. <see cref="CompleteLeaderCommit"/> still runs
+    /// afterward and re-applies the same (idempotent) advance.
+    /// </para>
+    /// <para>No-op unless the flag is on or the proposal is not <c>autoCommit</c>; the explicit
+    /// two-phase path is untouched.</para>
+    /// </summary>
+    private void TryReleaseTicketOnQuorumDurable(RaftProposalQuorum proposal)
+    {
+        if (!host.Configuration.WalSingleFsyncCommit || !proposal.AutoCommit)
+            return;
+
+        if (proposal.LastLogIndex > localCommittedIndex)
+            localCommittedIndex = proposal.LastLogIndex;
+
+        proposal.SetState(RaftProposalState.Committed);
     }
 
     /// <summary>
