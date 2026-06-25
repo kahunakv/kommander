@@ -86,6 +86,9 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] LogMismatch from {Endpoint}: backtracking nextIndex {CurrentNext} → {NextIndex} (followerMax={CommittedIndex})")]
     public static partial void LogDebugBacktrackingNextIndex(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long currentNext, long nextIndex, long committedIndex);
 
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Log Matching rejection from {Endpoint}: prevLogIndex={PrevLogIndex} > localMaxLog={LocalMaxLog}")]
+    public static partial void LogDebugLogMatchingFollowerBehind(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long prevLogIndex, long localMaxLog);
+
     [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Denying pre-vote to {Endpoint} Term={Term}: endpoint is not a committed voter")]
     public static partial void LogDebugDenyingPreVoteNotVoter(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long term);
 

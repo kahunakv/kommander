@@ -374,6 +374,30 @@ public class RaftConfiguration
     /// </summary>
     public int WalGroupCommitLingerMs { get; set; }
 
+    /// <summary>
+    /// Single-fsync commit fast path. When enabled, an <c>autoCommit</c> single-round
+    /// proposal releases its client ticket as soon as the <b>propose quorum is durable</b>
+    /// — i.e. a quorum already holds the entry on disk — instead of waiting for the
+    /// leader's own second (commit) fsync. The per-entry <c>Committed</c> record is still
+    /// written afterward; only the moment the client is acknowledged moves earlier.
+    ///
+    /// <para>This removes one serial fsync from the client's critical path, which is what
+    /// the set-p50 symptom reflects (a write blocked on two serial fsyncs of its own).
+    /// It does <b>not</b> weaken durability: propose-quorum-durable is the true Raft commit
+    /// point, so the load-bearing invariant "acked ⇒ durable on a quorum, and crash
+    /// recovery yields the same committed prefix" is preserved. The commit frontier is
+    /// reconstructed on restart from the last durable <c>CommittedCheckpoint</c> plus the
+    /// leader's commit index on reconnect (see
+    /// <c>specs/wal-double-fsync-task6-committed-reader-map.md</c>).</para>
+    ///
+    /// <para>Scope is strictly the <c>autoCommit</c> single-round path. The explicit
+    /// two-phase (<c>!AutoCommit</c>) path keeps its separate durable commit, untouched.</para>
+    ///
+    /// <para>Defaults to <c>false</c> (disabled — behaviour is byte-for-byte the prior
+    /// two-fsync commit). Enable and measure before relying on it.</para>
+    /// </summary>
+    public bool WalSingleFsyncCommit { get; set; }
+
     // ── Partition executor drain quanta ───────────────────────────────────────
 
     /// <summary>
