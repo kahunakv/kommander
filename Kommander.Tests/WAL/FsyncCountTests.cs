@@ -8,8 +8,8 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Kommander.Tests.WAL;
 
 /// <summary>
-/// Task 2 of the WAL double-fsync spec: makes fsyncs-per-committed-write a
-/// <b>deterministic, assertable</b> quantity, so the Task 4 fast path's improvement is
+/// Makes fsyncs-per-committed-write a
+/// <b>deterministic, assertable</b> quantity, so the fast path's improvement is
 /// provable as an exact delta (≈ 2×W → ≈ 1×W) rather than inferred from benchmark noise.
 ///
 /// <para>Determinism is achieved by removing every source of coalescing: a single WAL
@@ -20,11 +20,11 @@ namespace Kommander.Tests.WAL;
 /// count is an exact function of the committed-write count, not a timing-dependent one.</para>
 ///
 /// <para>The count is asserted two independent ways: the scheduler's
-/// <see cref="FairWalScheduler.TotalBatchesWritten"/> (the fsync proxy) and the Task 1
+/// <see cref="FairWalScheduler.TotalBatchesWritten"/> (the fsync proxy) and the
 /// <see cref="WalPhaseInstrumentation"/> per-phase durable counters. They must agree at the
 /// pinned baseline of two durable writes (propose + commit) per committed write.</para>
 ///
-/// <para>Both persistent backends are pinned (the double-fsync structure lives in the Raft
+/// <para>Both persistent backends are pinned (the two-fsync structure lives in the Raft
 /// two-phase path, not the storage engine, so RocksDB and SQLite must agree).
 /// <see cref="InMemoryWAL"/> is the control: it issues the same two <c>Write</c> calls per
 /// write but performs no fsync, which is exactly why the symptom and the fix are
@@ -36,9 +36,9 @@ public sealed class FsyncCountTests
     private const int Writes = 200;
 
     /// <summary>
-    /// Pins the fsync-per-committed-write count as an exact delta across the single-fsync fast path
-    /// (Task 8). With the fast path <b>off</b> each committed write costs exactly two fsyncs (propose +
-    /// commit) — the Task 2 baseline. With it <b>on</b>, the commit-only batch is written sync-off and
+    /// Pins the fsync-per-committed-write count as an exact delta across the single-fsync fast path.
+    /// With the fast path <b>off</b> each committed write costs exactly two fsyncs (propose +
+    /// commit) — the baseline. With it <b>on</b>, the commit-only batch is written sync-off and
     /// rides the next fsync, so the count drops to exactly one fsync per committed write.
     /// <para>
     /// The number of <c>walAdapter.Write</c> calls is identical either way (still two per write —
@@ -80,7 +80,7 @@ public sealed class FsyncCountTests
             long expectedFsyncs = lazyCommit ? Writes : 2L * Writes;
             Assert.Equal(expectedFsyncs, fsyncs);
 
-            // The Task 1 per-phase op-completion counter is unaffected (it counts completed ops per
+            // The per-phase op-completion counter is unaffected (it counts completed ops per
             // phase, not fsyncs): both phases still complete W ops regardless of the fast path.
             Assert.Equal(Writes, snap.Propose.Durable);
             Assert.Equal(Writes, snap.Commit.Durable);

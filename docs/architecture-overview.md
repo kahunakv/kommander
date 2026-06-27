@@ -602,7 +602,7 @@ dotnet test   Kommander.Tests/Kommander.Tests.csproj --filter FullyQualifiedName
 
 When you change WAL formats, partition state shape, or the scheduling protocol, update the affected
 tests *in the same change*, and add or update the XML `<summary>` on any key class/method whose
-invariant you touched. (See `CLAUDE.md` for the full contributor checklist.)
+invariant you touched.
 
 ---
 

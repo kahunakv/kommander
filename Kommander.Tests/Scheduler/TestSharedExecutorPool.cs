@@ -244,7 +244,7 @@ public sealed class TestSharedExecutorPool
     /// Saturate one partition's client queue with slow proposals and assert that a
     /// different partition's control op still completes within timing bounds.
     ///
-    /// This is the Done-check for Task 1.3: the bounded drain quantum (2 client ops
+    /// The bounded drain quantum (2 client ops
     /// per cycle) releases the pool thread between bursts, so the second pool thread
     /// can always pick up the waiting control op even while partition 0 is saturated.
     ///

@@ -7,6 +7,7 @@ using Kommander.System;
 using Kommander.Tests.Scheduler;
 using Kommander.Time;
 using Kommander.WAL.Data;
+using Kommander.WAL.IO;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Diagnostics;
 
@@ -78,6 +79,49 @@ public class TestRaftPartitionStateMachine
             Assert.Equal((ulong)7, reply.Id);
             Assert.Equal(RaftOperationStatus.Success, reply.Response.Status);
         });
+    }
+
+    /// <summary>
+    /// The propose path snapshots each log's <c>Type</c>/<c>Time</c>
+    /// before mutating them to <c>(Proposed, currentTime)</c>, and must restore every entry exactly if
+    /// <c>wal.EnqueuePropose</c> throws (e.g. <see cref="BackpressureExceededException"/>). This pins that
+    /// atomic rollback so the pooled-buffer refactor (replacing the <c>ToArray</c> + 2× <c>ConvertAll</c>
+    /// snapshot) cannot silently break it.
+    /// </summary>
+    [Fact]
+    public async Task ReplicateLogs_WhenEnqueueProposeThrows_RestoresEveryLogTypeAndTime()
+    {
+        FakePartitionHost host = new() { NodesOverride = [] };
+        ToggleThrowWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: 1);
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+
+        // Distinct pre-propose Type/Time per entry (none of them Proposed/currentTime) so a misplaced or
+        // missing restore is detectable.
+        HLCTimestamp t1 = new(5, 1000, 1);
+        HLCTimestamp t2 = new(5, 2000, 2);
+        HLCTimestamp t3 = new(5, 3000, 3);
+        List<RaftLog> logs =
+        [
+            new() { Id = 10, Term = 7, Type = RaftLogType.Committed, Time = t1, LogType = "a" },
+            new() { Id = 11, Term = 7, Type = RaftLogType.CommittedCheckpoint, Time = t2, LogType = "b" },
+            new() { Id = 12, Term = 7, Type = RaftLogType.ProposedCheckpoint, Time = t3, LogType = "c" },
+        ];
+
+        wal.ThrowOnPropose = true;
+
+        Assert.Throws<BackpressureExceededException>(() => sm.ReplicateLogs(logs, autoCommit: false));
+
+        // Every entry's Type and Time must be exactly what it was before the failed propose attempt.
+        Assert.Equal(RaftLogType.Committed, logs[0].Type);
+        Assert.Equal(t1, logs[0].Time);
+        Assert.Equal(RaftLogType.CommittedCheckpoint, logs[1].Type);
+        Assert.Equal(t2, logs[1].Time);
+        Assert.Equal(RaftLogType.ProposedCheckpoint, logs[2].Type);
+        Assert.Equal(t3, logs[2].Time);
     }
 
     [Fact]
@@ -1093,6 +1137,62 @@ public class TestRaftPartitionStateMachine
 
         public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp timestamp, bool autoCommit) =>
             new(null!, 1, WALWriteOperationType.LeaderPropose, (1, logs), timestamp, autoCommit: autoCommit, term: term);
+
+        public WALWriteOperation EnqueueCommit(List<RaftLog> logs) =>
+            new(null!, 2, WALWriteOperationType.LeaderCommit, (1, logs));
+
+        public WALWriteOperation EnqueueRollback(List<RaftLog> logs) =>
+            new(null!, 3, WALWriteOperationType.LeaderRollback, (1, logs));
+
+        public WALWriteOperation? EnqueueProposeOrCommit(List<RaftLog>? logs, HLCTimestamp timestamp = default, string? endpoint = null, long term = -1) =>
+            logs is null ? null : EnqueuePropose(term, logs, timestamp, autoCommit: false);
+
+        public void NotifyCommitted() { }
+    }
+
+    /// <summary>
+    /// WAL facade whose <see cref="EnqueuePropose"/> throws <see cref="BackpressureExceededException"/>
+    /// once <see cref="ThrowOnPropose"/> is set — used to drive the propose rollback path. Leave the flag
+    /// off while electing the leader, then turn it on for the propose under test.
+    /// </summary>
+    private sealed class ToggleThrowWalFacade : IRaftWalFacade, IDisposable
+    {
+        private readonly FakeWAL wal = new();
+
+        public bool ThrowOnPropose { get; set; }
+
+        public void Dispose() => wal.Dispose();
+
+        public ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync()
+        {
+            IReadOnlyList<RaftLog> logs = [];
+            return ValueTask.FromResult(logs);
+        }
+
+        public ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs) => ValueTask.CompletedTask;
+
+        public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(wal.GetMaxLog(partitionId: 1));
+
+        public ValueTask<long> TruncateLogsAfterAsync(long afterLogId) => ValueTask.FromResult(afterLogId);
+
+        public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(wal.GetCurrentTerm(partitionId: 1));
+
+        public ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) =>
+            ValueTask.FromResult(new List<RaftLog>());
+
+        public ValueTask<long> GetAnyTermAtAsync(long logIndex) => ValueTask.FromResult(-1L);
+
+        public ValueTask<long> GetLastCheckpointAsync() => ValueTask.FromResult(-1L);
+
+        public long GetCommitIndex() => wal.GetMaxLog(partitionId: 1);
+
+        public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp timestamp, bool autoCommit)
+        {
+            if (ThrowOnPropose)
+                throw new BackpressureExceededException(partitionId: 1, currentDepth: 9999);
+
+            return new(null!, 1, WALWriteOperationType.LeaderPropose, (1, logs), timestamp, autoCommit: autoCommit, term: term);
+        }
 
         public WALWriteOperation EnqueueCommit(List<RaftLog> logs) =>
             new(null!, 2, WALWriteOperationType.LeaderCommit, (1, logs));

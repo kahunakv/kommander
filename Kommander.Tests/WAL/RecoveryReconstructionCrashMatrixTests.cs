@@ -9,7 +9,7 @@ using Microsoft.Extensions.Logging;
 namespace Kommander.Tests.WAL;
 
 /// <summary>
-/// Task 9 of the WAL double-fsync spec: proves the recovered committed prefix is correct under the
+/// Proves the recovered committed prefix is correct under the
 /// single-fsync fast path, with the crash injected at every window the lazy commit marker opens.
 ///
 /// <para>A real process kill can't be staged deterministically in-process (a graceful dispose flushes
@@ -20,7 +20,7 @@ namespace Kommander.Tests.WAL;
 /// deterministic stand-in for the crash: the lost-marker entries are exactly the <c>Proposed</c> rows
 /// the fsync skip would leave behind.</para>
 ///
-/// <para>The invariants asserted (spec Task 9, step 3): the recovered committed prefix matches the
+/// <para>The invariants asserted: the recovered committed prefix matches the
 /// fast-path-off baseline; no acknowledged write is lost (the durable tail is retained, never
 /// overwritten); and no unacknowledged-but-not-durable write is treated as committed (the Proposed
 /// tail above the contiguous committed prefix is not delivered as committed on restore).</para>

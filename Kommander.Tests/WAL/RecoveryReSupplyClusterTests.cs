@@ -9,7 +9,7 @@ using Microsoft.Extensions.Logging;
 namespace Kommander.Tests.WAL;
 
 /// <summary>
-/// Task 9 of the WAL double-fsync spec — the cluster half of the crash matrix: a follower that lost
+/// The cluster half of the crash matrix: a follower that lost
 /// its lazy commit markers on a crash must re-converge to the full committed log via the leader's
 /// re-supply on reconnect, losing no acknowledged write.
 ///

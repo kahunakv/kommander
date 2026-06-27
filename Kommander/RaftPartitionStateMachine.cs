@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using Kommander.Communication.Grpc;
@@ -1570,42 +1571,56 @@ public sealed class RaftPartitionStateMachine
         // complete on a single-node cluster. The self-only commit shortcut lives entirely behind
         // the Nodes.Count == 0 guard in CompleteLeaderPropose, so multi-node safety is unaffected.
 
-        // Snapshot Type and Time before mutation so we can restore atomically if
-        // the WAL scheduler rejects the operation (e.g. BackpressureExceededException).
-        RaftLog[] logsArray = logs.ToArray();
-        RaftLogType[] savedTypes = Array.ConvertAll(logsArray, l => l.Type);
-        HLCTimestamp[] savedTimes = Array.ConvertAll(logsArray, l => l.Time);
-
-        foreach (RaftLog log in logsArray)
-        {
-            log.Type = RaftLogType.Proposed;
-            log.Time = currentTime;
-        }
-
-        WALWriteOperation operation;
+        // Snapshot Type and Time before mutation so we can restore atomically if the WAL scheduler
+        // rejects the operation (e.g. BackpressureExceededException). Uses one pooled (Type, Time) buffer
+        // rather than logs.ToArray() + two Array.ConvertAll copies; logs is an indexable List<RaftLog>, so
+        // it is read and restored by index. Every entry is snapshotted first and only then mutated — the
+        // same all-reads-before-any-writes order as the previous code — so the rollback is identical even
+        // if the same entry appears twice. The buffer holds only value types (no references to clear), and
+        // rent/return stay in this method via try/finally, never escaping onto a field.
+        int logCount = logs.Count;
+        (RaftLogType Type, HLCTimestamp Time)[] snapshot =
+            ArrayPool<(RaftLogType, HLCTimestamp)>.Shared.Rent(logCount);
         try
         {
-            operation = wal.EnqueuePropose(currentTerm, logs, currentTime, autoCommit);
-        }
-        catch
-        {
-            for (int i = 0; i < logsArray.Length; i++)
+            for (int i = 0; i < logCount; i++)
+                snapshot[i] = (logs[i].Type, logs[i].Time);
+
+            for (int i = 0; i < logCount; i++)
             {
-                logsArray[i].Type = savedTypes[i];
-                logsArray[i].Time = savedTimes[i];
+                logs[i].Type = RaftLogType.Proposed;
+                logs[i].Time = currentTime;
             }
-            throw;
+
+            WALWriteOperation operation;
+            try
+            {
+                operation = wal.EnqueuePropose(currentTerm, logs, currentTime, autoCommit);
+            }
+            catch
+            {
+                for (int i = 0; i < logCount; i++)
+                {
+                    logs[i].Type = snapshot[i].Type;
+                    logs[i].Time = snapshot[i].Time;
+                }
+                throw;
+            }
+
+            pendingWalOperations[operation.OperationId] = new()
+            {
+                ReplyCorrelationId = replyCorrelationId,
+                TicketId = currentTime,
+                Logs = logs,
+                AutoCommit = autoCommit,
+            };
+
+            return (RaftOperationStatus.Pending, currentTime);
         }
-
-        pendingWalOperations[operation.OperationId] = new()
+        finally
         {
-            ReplyCorrelationId = replyCorrelationId,
-            TicketId = currentTime,
-            Logs = logs,
-            AutoCommit = autoCommit,
-        };
-
-        return (RaftOperationStatus.Pending, currentTime);
+            ArrayPool<(RaftLogType, HLCTimestamp)>.Shared.Return(snapshot);
+        }
 
         // Append proposal logs to the Write-Ahead Log
         /*(RaftOperationStatus Status, long) proposeResponse = await wal.Propose(currentTerm, logs).ConfigureAwait(false);

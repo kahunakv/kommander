@@ -214,6 +214,11 @@ public sealed class RaftService : Rafter.RafterBase
                 LogType = requestLog.LogType
             };
             
+            // RaftLog.LogData is a byte[], and the happy path aliases the ByteString's backing array
+            // zero-copy. A non-array-backed ByteString (rare) has no array to alias and must be
+            // materialized into a byte[]; consuming it via .Span would only be .ToArray()'d straight back
+            // into LogData, an identical copy — so the ToByteArray fallback is kept on purpose
+            // because the downstream truly needs a byte[].
             if (MemoryMarshal.TryGetArray(requestLog.Data.Memory, out ArraySegment<byte> segment))
                 raftLog.LogData = segment.Array;
             else
