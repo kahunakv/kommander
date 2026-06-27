@@ -248,7 +248,7 @@ public sealed class TestMembership
         }
     }
 
-    // ── Task 6: graceful leave ────────────────────────────────────────────────
+    // ── Graceful leave ────────────────────────────────────────────────────────
 
     [Fact]
     public async Task GracefulLeave_RemovesNodeFromRoster_RemainingTwoVotersKeepCommitting()
@@ -953,7 +953,7 @@ public sealed class TestMembership
         }
     }
 
-    // ── Task 9: IRaft public membership surface ────────────────────────────────
+    // ── IRaft public membership surface ─────────────────────────────────────────
 
     [Fact]
     public async Task GetMembership_ViaInterface_MatchesRosterAfterJoin()

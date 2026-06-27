@@ -10,7 +10,7 @@ using Microsoft.Extensions.Logging;
 namespace Kommander.Tests.WAL;
 
 /// <summary>
-/// Task 7 of the WAL double-fsync spec: the single-fsync fast path
+/// The single-fsync fast path
 /// (<see cref="RaftConfiguration.WalSingleFsyncCommit"/>) releases an <c>autoCommit</c>
 /// proposal's client ticket on <b>propose-quorum-durable</b> instead of on the leader's own
 /// second (commit) fsync.

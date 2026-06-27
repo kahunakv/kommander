@@ -1,10 +1,10 @@
 
+using System.Buffers;
 using System.Text;
 using Google.Protobuf;
 using Kommander.Data;
 using Kommander.Logging;
 using Kommander.WAL.Protos;
-using Microsoft.IO;
 using RocksDbSharp;
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
@@ -18,14 +18,6 @@ namespace Kommander.WAL;
 /// </summary>
 public class RocksDbWAL : IWAL, IDisposable
 {
-    /// <summary>
-    /// A shared, reusable memory stream manager that provides efficient
-    /// memory allocation and deallocation for stream-based operations,
-    /// reducing memory fragmentation and improving performance, especially
-    /// for scenarios involving frequent and large memory allocations.
-    /// </summary>
-    private static readonly RecyclableMemoryStreamManager streamManager = new();
-
     /// <summary>
     /// A static, reusable instance of <see cref="WriteOptions"/> configured to enable synchronous operations.
     /// This ensures data integrity by guaranteeing that write operations are fully persisted to disk
@@ -41,14 +33,6 @@ public class RocksDbWAL : IWAL, IDisposable
     /// and log format maintained within the storage system.
     /// </summary>
     private const string FormatVersion = "2.0.0";
-
-    /// <summary>
-    /// Represents the maximum allowable size, in bytes, for a serialized message
-    /// within the system. Messages exceeding this size require additional processing,
-    /// such as usage of recyclable memory streams, to ensure efficient handling and adherence
-    /// to size constraints.
-    /// </summary>
-    private const int MaxMessageSize = 1024;
 
     /// <summary>
     /// Specifies the maximum number of shards supported by the Write-Ahead Log (WAL) implementation,
@@ -240,6 +224,11 @@ public class RocksDbWAL : IWAL, IDisposable
             
             if (message.HasLog)
             {
+                // RaftLog.LogData is a byte[], and the happy path aliases the ByteString's backing array
+                // zero-copy. A non-array-backed ByteString (rare) has no array to alias and must be
+                // materialized into a byte[]; consuming it via .Span would only be .ToArray()'d straight
+                // back into LogData, an identical copy — so the ToByteArray fallback is kept on purpose
+                // because the downstream truly needs a byte[].
                 if (MemoryMarshal.TryGetArray(message.Log.Memory, out ArraySegment<byte> segment))
                     raftLog.LogData = segment.Array;
                 else
@@ -295,6 +284,11 @@ public class RocksDbWAL : IWAL, IDisposable
 
             if (message.HasLog)
             {
+                // RaftLog.LogData is a byte[], and the happy path aliases the ByteString's backing array
+                // zero-copy. A non-array-backed ByteString (rare) has no array to alias and must be
+                // materialized into a byte[]; consuming it via .Span would only be .ToArray()'d straight
+                // back into LogData, an identical copy — so the ToByteArray fallback is kept on purpose
+                // because the downstream truly needs a byte[].
                 if (MemoryMarshal.TryGetArray(message.Log.Memory, out ArraySegment<byte> segment))
                     raftLog.LogData = segment.Array;
                 else
@@ -366,8 +360,23 @@ public class RocksDbWAL : IWAL, IDisposable
                 BuildLogKey(buffer, partitionId, message.Id);
                 
                 ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-                
-                db.Put(buffer, Serialize(message), columnFamilyHandle, effectiveOptions);
+
+                // RocksDB copies the value synchronously inside Put, so the rented/stack buffer is safe to
+                // release as soon as the call returns. The stackalloc is evaluated only when nothing was
+                // rented (?? short-circuits), so small and large messages never both reserve a buffer.
+                int size = message.CalculateSize();
+                byte[]? rented = size > StackallocThreshold ? ArrayPool<byte>.Shared.Rent(size) : null;
+                Span<byte> valueBuffer = (rented ?? stackalloc byte[StackallocThreshold])[..size];
+                try
+                {
+                    SerializeInto(message, valueBuffer);
+                    db.Put(buffer, valueBuffer, columnFamilyHandle, effectiveOptions);
+                }
+                finally
+                {
+                    if (rented is not null)
+                        ArrayPool<byte>.Shared.Return(rented);
+                }
 
                 return RaftOperationStatus.Success;
             }
@@ -462,8 +471,23 @@ public class RocksDbWAL : IWAL, IDisposable
     {
         Span<byte> buffer = stackalloc byte[LogKeyWidth];
         BuildLogKey(buffer, message.Partition, message.Id);
-        
-        writeBatch.Put(buffer, Serialize(message), cf: columnFamilyHandle);
+
+        // WriteBatch.Put copies the value synchronously, so the rented/stack buffer is safe to release
+        // as soon as the call returns. The stackalloc is evaluated only when nothing was rented
+        // (?? short-circuits), so small and large messages never both reserve a buffer.
+        int size = message.CalculateSize();
+        byte[]? rented = size > StackallocThreshold ? ArrayPool<byte>.Shared.Rent(size) : null;
+        Span<byte> valueBuffer = (rented ?? stackalloc byte[StackallocThreshold])[..size];
+        try
+        {
+            SerializeInto(message, valueBuffer);
+            writeBatch.Put(buffer, valueBuffer, cf: columnFamilyHandle);
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
     }
 
     /// <summary>
@@ -865,18 +889,22 @@ public class RocksDbWAL : IWAL, IDisposable
         }
     }
     
-    private static byte[] Serialize(RaftLogMessage message)
+    /// <summary>
+    /// The largest serialized message size that is serialized onto a <c>stackalloc</c> buffer before
+    /// falling back to an <see cref="ArrayPool{T}"/> rental. Bounds stack usage on the write path while
+    /// keeping the common (small) entry copy-free of any managed allocation.
+    /// </summary>
+    private const int StackallocThreshold = 256;
+
+    /// <summary>
+    /// Serializes <paramref name="message"/> into <paramref name="destination"/>, which must be exactly
+    /// <see cref="MessageExtensions.CalculateSize"/> bytes long (sized by the caller). The bytes produced
+    /// are byte-for-byte identical to the previous <c>MemoryStream.ToArray()</c> path — Protobuf writes a
+    /// canonical encoding regardless of the sink — so on-disk format is unchanged.
+    /// </summary>
+    private static void SerializeInto(RaftLogMessage message, Span<byte> destination)
     {
-        if (!message.Log.IsEmpty && message.Log.Length >= MaxMessageSize)
-        {
-            using RecyclableMemoryStream recyclableMemoryStream = streamManager.GetStream();
-            message.WriteTo((Stream)recyclableMemoryStream);
-            return recyclableMemoryStream.ToArray();
-        }
-        
-        using MemoryStream memoryStream = streamManager.GetStream();
-        message.WriteTo(memoryStream);
-        return memoryStream.ToArray();
+        message.WriteTo(destination);
     }
 
     /// <summary>
@@ -888,16 +916,16 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <returns>
     /// An instance of <see cref="RaftLogMessage"/> deserialized from the provided binary data.
     /// </returns>
+    /// <remarks>
+    /// Parses directly from the caller's buffer via the Protobuf <see cref="ReadOnlySpan{T}"/> overload —
+    /// no intermediate <c>MemoryStream</c> wrapper. The parsed message is identical to the former
+    /// stream-based path for any size; Protobuf's wire decode is independent of the source kind.
+    /// <c>ParseFrom</c> copies out every byte/string field it retains, so the result is safe to use after
+    /// the source buffer is reused or released (the buffer is only borrowed for the duration of this call).
+    /// </remarks>
     private static RaftLogMessage Unserializer(ReadOnlySpan<byte> serializedData)
     {
-        if (serializedData.Length >= MaxMessageSize)
-        {
-            using RecyclableMemoryStream recyclableMemoryStream = streamManager.GetStream(serializedData);
-            return RaftLogMessage.Parser.ParseFrom(recyclableMemoryStream);
-        }
-        
-        using MemoryStream memoryStream = streamManager.GetStream(serializedData);
-        return RaftLogMessage.Parser.ParseFrom(memoryStream);
+        return RaftLogMessage.Parser.ParseFrom(serializedData);
     }
 
     private static void BuildLogKey(Span<byte> result, int partitionId, long logId)

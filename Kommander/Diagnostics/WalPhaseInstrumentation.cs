@@ -3,9 +3,8 @@ using Kommander.WAL.Data;
 namespace Kommander.Diagnostics;
 
 /// <summary>
-/// Process-wide, opt-in instrumentation for the WAL write path, used to turn the
-/// double-fsync spec's code-level diagnosis into measured numbers (see
-/// <c>specs/wal-double-fsync-groupcommit-spec.md</c>).
+/// Process-wide, opt-in instrumentation for the WAL write path, used to turn a code-level
+/// analysis of WAL fsync costs into measured numbers.
 ///
 /// <para>It decomposes a committed write into its two durable phases — leader
 /// <see cref="WALWriteOperationType.LeaderPropose"/> and leader
@@ -15,13 +14,13 @@ namespace Kommander.Diagnostics;
 ///   <item><b>Enqueued count</b> — how many operations of that phase entered the WAL
 ///     scheduler. Recorded by <see cref="RaftWriteAhead"/> at enqueue time. Two
 ///     enqueues (propose + commit) per single-round committed write confirms the
-///     spec's "two serial fsyncs" structure from the producer side, independent of
+///     "two serial fsyncs" structure from the producer side, independent of
 ///     how the scheduler coalesces them.</item>
 ///   <item><b>Durable latency</b> — the enqueue→durable wait (ms) observed by
 ///     <see cref="Kommander.WAL.IO.FairWalScheduler"/> when the phase's write batch
 ///     completes. On a controlled single-writer harness with no scheduler queueing
-///     this approximates the per-phase fsync cost, which is the per-phase latency
-///     split the spec asks to confirm rather than assume.</item>
+///     this approximates the per-phase fsync cost, giving the per-phase latency
+///     split as a measured quantity rather than an assumed one.</item>
 /// </list>
 ///
 /// <para><b>Inert when off.</b> <see cref="Enabled"/> defaults to <c>false</c>; every
@@ -187,5 +186,5 @@ public static class WalPhaseInstrumentation
 /// <summary>Per-phase counts and latency percentiles captured at one instant.</summary>
 public readonly record struct PhaseSnapshot(long Enqueued, long Durable, double MeanMs, double P50Ms, double P99Ms);
 
-/// <summary>Snapshot of all three WAL phases. The input to the Task 3 go/no-go decision.</summary>
+/// <summary>Snapshot of all three WAL phases. The input to the fast-path go/no-go decision.</summary>
 public readonly record struct InstrumentationSnapshot(PhaseSnapshot Propose, PhaseSnapshot Commit, PhaseSnapshot FollowerAppend);

@@ -581,7 +581,7 @@ dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "FullyQualifiedName~
 
 > **Never run multiple `dotnet test` commands in parallel or in the background.** The suite spins up
 > in-process Raft clusters and timing-sensitive state machines; concurrent runs interfere and produce
-> false failures. One suite at a time. (See `CLAUDE.md`.)
+> false failures. One suite at a time.
 
 When you change shared scheduling, WAL, partition state, or cluster coordination, run the full
 project, not just a filter.

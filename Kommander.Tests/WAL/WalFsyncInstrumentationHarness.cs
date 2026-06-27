@@ -8,26 +8,26 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Kommander.Tests.WAL;
 
 /// <summary>
-/// Task 1 of the WAL double-fsync spec: measure-first harness. It drives a fixed
+/// Measure-first harness. It drives a fixed
 /// committed-write count through the real persistent write path
 /// (<see cref="FairWalScheduler"/> over <see cref="RocksDbWAL"/> with <c>syncWrites</c>
-/// enabled) and reports the three numbers that gate the Task 3 go/no-go decision:
+/// enabled) and reports the three numbers that gate the fast-path go/no-go decision:
 ///
 /// <list type="number">
 ///   <item><b>fsyncs-per-committed-write</b> — <see cref="FairWalScheduler.TotalBatchesWritten"/>
-///     divided by the committed-write count. The spec predicts ≈ 2.</item>
+///     divided by the committed-write count. The expected baseline is ≈ 2.</item>
 ///   <item><b>per-phase durable latency split</b> — leader propose fsync vs leader commit
 ///     fsync, from <see cref="WalPhaseInstrumentation"/>. Quorum network wait is excluded
-///     here (no network in this harness); the spec derives it end-to-end elsewhere.</item>
+///     here (no network in this harness); it is accounted for end-to-end elsewhere.</item>
 ///   <item><b>writes-per-partition concurrency</b> — a property of the load shape, reported
 ///     per configuration the harness drives.</item>
 /// </list>
 ///
 /// <para><see cref="FairWalScheduler.TotalBatchesWritten"/> is used directly as the
 /// fsync proxy: with <c>syncWrites</c> on, each group-batch <c>db.Write</c> is exactly
-/// one fsync, and it is documented as the count most directly correlated with fsync
-/// pressure — so no separate fsync counter is added (Task 1 only asks for one if the
-/// batch counter is not a clean proxy).</para>
+/// one fsync, and it is the count most directly correlated with fsync
+/// pressure — so no separate fsync counter is added, since the
+/// batch counter is already a clean proxy.</para>
 ///
 /// <para>The structural assertions (enqueues-per-write == 2; serial single-partition
 /// batches-per-write == 2) are deterministic. The latency numbers are observational and
@@ -79,7 +79,7 @@ public sealed class WalFsyncInstrumentationHarness
     /// <summary>
     /// Serial single-writer, single-partition baseline. With no other partition ready,
     /// cross-partition coalescing cannot engage and each phase is its own group batch, so
-    /// fsyncs-per-write is exactly 2 — pinning the spec's predicted baseline and giving the
+    /// fsyncs-per-write is exactly 2 — pinning the expected baseline and giving the
     /// cleanest per-phase fsync latency split.
     /// </summary>
     [Fact]
@@ -240,7 +240,7 @@ public sealed class WalFsyncInstrumentationHarness
         output.WriteLine($"committed writes (W)             : {writes}");
         output.WriteLine($"writes-per-partition concurrency : {concurrency} writers over {partitions} partition(s)");
         output.WriteLine($"WAL batches (= fsyncs)           : {batchesWritten}");
-        output.WriteLine($"fsyncs-per-committed-write       : {fsyncsPerWrite:F3}  (spec predicts ~2)");
+        output.WriteLine($"fsyncs-per-committed-write       : {fsyncsPerWrite:F3}  (expected ~2)");
         output.WriteLine($"durable phase-writes-per-write   : {durablePerWrite:F3}  (propose + commit fsync ops)");
         output.WriteLine(
             $"propose fsync  ms  : mean={snap.Propose.MeanMs:F3} p50={snap.Propose.P50Ms:F3} p99={snap.Propose.P99Ms:F3} (n={snap.Propose.Durable})");

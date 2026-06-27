@@ -387,8 +387,7 @@ public class RaftConfiguration
     /// point, so the load-bearing invariant "acked ⇒ durable on a quorum, and crash
     /// recovery yields the same committed prefix" is preserved. The commit frontier is
     /// reconstructed on restart from the last durable <c>CommittedCheckpoint</c> plus the
-    /// leader's commit index on reconnect (see
-    /// <c>specs/wal-double-fsync-task6-committed-reader-map.md</c>).</para>
+    /// leader's commit index on reconnect.</para>
     ///
     /// <para>Scope is strictly the <c>autoCommit</c> single-round path. The explicit
     /// two-phase (<c>!AutoCommit</c>) path keeps its separate durable commit, untouched.</para>

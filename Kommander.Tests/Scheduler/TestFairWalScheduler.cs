@@ -338,7 +338,7 @@ public sealed class TestFairWalScheduler
     /// commit: partitions that pile up behind a blocked Write are still coalesced into
     /// a single fsync. (The linger's <em>additional</em> benefit — coalescing
     /// sub-millisecond-staggered arrivals that opportunistic batching misses — is a
-    /// timing property validated by the Task 7 benchmark via
+    /// timing property validated by the benchmark via
     /// <see cref="FairWalScheduler.TotalPartitionsBatched"/>, not a deterministic unit
     /// assertion.)
     /// </summary>

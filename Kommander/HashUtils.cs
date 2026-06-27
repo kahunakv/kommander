@@ -1,4 +1,5 @@
 
+using System.Buffers;
 using System.Text;
 using Standart.Hash.xxHash;
 
@@ -156,22 +157,38 @@ public static class HashUtils
     {
         if (numBuckets <= 0)
             throw new ArgumentException("numBuckets must be greater than 0", nameof(numBuckets));
-        
-        // Convert key to bytes once.
-        byte[] keyBytes = Encoding.UTF8.GetBytes(key);
 
         // Use two fixed seeds to produce two 32-bit hashes.
         const uint seed1 = 0xAAAAAAAA;
         const uint seed2 = 0x55555555;
 
-        ulong hash1 = xxHash32.ComputeHash(keyBytes, seed1);
-        // Use the ArraySegment overload with a fixed seed for consistency.
-        ulong hash2 = xxHash32.ComputeHash(new ArraySegment<byte>(keyBytes), seed2);
+        // Encode the key into a stack buffer (or a pooled rental for long keys) instead of allocating a
+        // fresh byte[] per call. The ReadOnlySpan xxHash overload yields the identical 32-bit value to the
+        // former byte[]/ArraySegment overload for every key (verified against a golden corpus), so neither
+        // the combined hash nor the selected bucket drifts — with one intentional improvement: the empty
+        // key, which the old ArraySegment overload threw on, now hashes cleanly.
+        int maxBytes = Encoding.UTF8.GetMaxByteCount(key.Length);
+        byte[]? rented = maxBytes > 256 ? ArrayPool<byte>.Shared.Rent(maxBytes) : null;
+        // The stackalloc is evaluated only when nothing was rented (?? short-circuits), so the short-key
+        // and long-key paths never both reserve a buffer.
+        Span<byte> buffer = rented ?? stackalloc byte[256];
+        try
+        {
+            int written = Encoding.UTF8.GetBytes(key, buffer);
 
-        // Combine the two 32-bit hashes to form a 64-bit hash.
-        ulong combinedHash = ((ulong)hash1 << 32) | hash2;
+            ulong hash1 = xxHash32.ComputeHash(buffer, written, seed1);
+            ulong hash2 = xxHash32.ComputeHash(buffer, written, seed2);
 
-        return JumpConsistentHash(combinedHash, numBuckets);
+            // Combine the two 32-bit hashes to form a 64-bit hash.
+            ulong combinedHash = (hash1 << 32) | hash2;
+
+            return JumpConsistentHash(combinedHash, numBuckets);
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
     }
 
     /// <summary>

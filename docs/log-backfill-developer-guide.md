@@ -388,7 +388,7 @@ The backfill behavior is covered at two layers:
 - **WAL conformance** — `TruncateLogsAfter_*` verifies divergent-tail truncation across InMemory,
   SQLite, and RocksDB.
 
-Reminder from `CLAUDE.md`: **never run multiple `dotnet test` commands at once.** The suite spins up
+Reminder: **never run multiple `dotnet test` commands at once.** The suite spins up
 in-process Raft clusters; concurrent runs produce false failures. Use a targeted `--filter` while
 iterating, then the full project for shared scheduling/WAL/cluster changes.
 
