@@ -321,8 +321,12 @@ public sealed class RaftWriteAhead
     /// sorted and likewise keep their original order — identical to the stable sort. The result is
     /// only read by callers, never structurally mutated.
     /// </para>
-    /// </summary>
-    private static IReadOnlyList<RaftLog> OrderById(List<RaftLog> logs)
+    /// <remarks>
+    /// Exposed as <see langword="internal"/> (not <see langword="private"/>) so the
+    /// <c>Kommander.MicroBenchmarks</c> project can measure the allocation-free fast path against
+    /// the previous <c>OrderBy(...).ToArray()</c> cost on real code.
+    /// </remarks>
+    internal static IReadOnlyList<RaftLog> OrderById(List<RaftLog> logs)
     {
         for (int i = 1; i < logs.Count; i++)
         {

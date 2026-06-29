@@ -15,6 +15,9 @@ Kommander.Tests/.idea
 Kommander.Tests/bin
 Kommander.Tests/obj
 Kommander.Tests/database*
+Kommander.MicroBenchmarks/bin
+Kommander.MicroBenchmarks/obj
+BenchmarkDotNet.Artifacts/
 Nixie/
 nupkg
 nupkgs
