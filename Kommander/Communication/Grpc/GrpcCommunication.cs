@@ -1,6 +1,7 @@
 
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using Google.Protobuf;
 using Google.Protobuf.Collections;
 using Grpc.Core;
@@ -30,7 +31,26 @@ public class GrpcCommunication : ICommunication
     private static readonly CompleteAppendLogsResponse completeAppendLogsResponse = new();
 
     private static readonly BatchRequestsResponse batchRequestsResponse = new();
-    
+
+    // Per-manager cached signing state for the duplex BatchRequests stream.
+    //
+    // Streaming auth metadata is only consumed when a stream slot is opened (or re-opened by
+    // EnsureHealthy), never per message — gRPC sends metadata once at stream establishment. So
+    // the hot send path must not recompute HMAC/nonce/Metadata on every call. We cache one
+    // StreamingAuth per manager: it holds either a metadata factory (shared-secret mode) that
+    // signs fresh headers each time a slot is created, or null (auth disabled). The factory is
+    // captured once into the streaming pool's slot factories, so warm-stream sends do zero crypto.
+    //
+    // Keyed weakly so transient managers (e.g. per-test clusters) do not leak. Security options
+    // and LocalEndpoint are immutable after RaftManager construction, so caching the authenticator
+    // is safe.
+    private static readonly ConditionalWeakTable<RaftManager, StreamingAuth> streamingAuthByManager = new();
+
+    private sealed class StreamingAuth
+    {
+        public required Func<Metadata?>? Factory { get; init; }
+    }
+
     //private static readonly SemaphoreSlim semaphore = new(1, 1);
 
     /// <summary>
@@ -73,7 +93,7 @@ public class GrpcCommunication : ICommunication
     {
         GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
             GetEndpointUrl(manager, node),
-            BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
+            GetStreamingAuthFactory(manager),
             GetPoolOptions(manager));
 
         GrpcRequestVotesRequest requestVotes = new()
@@ -123,7 +143,7 @@ public class GrpcCommunication : ICommunication
     {
         GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
             GetEndpointUrl(manager, node),
-            BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
+            GetStreamingAuthFactory(manager),
             GetPoolOptions(manager));
 
         GrpcVoteRequest voteRequest = new()
@@ -176,7 +196,7 @@ public class GrpcCommunication : ICommunication
     {
         GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
             GetEndpointUrl(manager, node),
-            BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
+            GetStreamingAuthFactory(manager),
             GetPoolOptions(manager));
 
         if (manager.Configuration.GrpcEnableAppendLogsCoalescing)
@@ -378,7 +398,7 @@ public class GrpcCommunication : ICommunication
     {
         GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
             GetEndpointUrl(manager, node),
-            BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
+            GetStreamingAuthFactory(manager),
             GetPoolOptions(manager));
 
         GrpcCompleteAppendLogsRequest completeAppendLogsRequest = GrpcCommunicationPool.RentCompleteAppendLogsRequest();
@@ -436,7 +456,7 @@ public class GrpcCommunication : ICommunication
 
         GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
             GetEndpointUrl(manager, node),
-            BuildAuthMetadata(manager, "/Rafter/BatchRequests"),
+            GetStreamingAuthFactory(manager),
             GetPoolOptions(manager));
         
         RepeatedField<GrpcBatchRequestsRequestItem> items = new();
@@ -812,6 +832,54 @@ public class GrpcCommunication : ICommunication
             manager.Logger.LogWarning("SendJoin to {Endpoint}: {Message}", node.Endpoint, ex.Message);
             return new JoinResponse(false);
         }
+    }
+
+    /// <summary>
+    /// Returns the cached per-manager metadata factory for the duplex <c>BatchRequests</c> stream,
+    /// or <see langword="null"/> when node authentication is disabled. The returned delegate signs
+    /// fresh headers (new nonce/timestamp) on each invocation; the streaming pool invokes it once
+    /// per stream slot creation and re-open, so callers on the hot send path pay no per-message
+    /// crypto cost. See <see cref="streamingAuthByManager"/> for why this is cached.
+    /// </summary>
+    private static Func<Metadata?>? GetStreamingAuthFactory(RaftManager manager) =>
+        streamingAuthByManager.GetValue(manager, static m => new StreamingAuth
+        {
+            Factory = CreateStreamingAuthFactory(m.Configuration.GetEffectiveTransportSecurity(), m.LocalEndpoint)
+        }).Factory;
+
+    /// <summary>
+    /// Builds the metadata factory for the duplex <c>BatchRequests</c> stream from immutable signing
+    /// state, or <see langword="null"/> when authentication is disabled. Each invocation of the
+    /// returned delegate signs a fresh nonce/timestamp, so per-slot creation and per-reopen yield
+    /// distinct credentials — the receiver's replay detection rejects a shared frozen nonce.
+    /// Extracted as <see langword="internal static"/> so the freshness invariant can be unit-tested
+    /// without constructing a <see cref="RaftManager"/>.
+    /// </summary>
+    internal static Func<Metadata?>? CreateStreamingAuthFactory(
+        RaftTransportSecurityOptions security,
+        string localEndpoint)
+    {
+        if (security.NodeAuthenticationMode != RaftNodeAuthenticationMode.SharedSecret)
+            return null;
+
+        // Build the authenticator once and capture it; security options are immutable after
+        // construction. The grpc method is always BatchRequests for every streaming send path.
+        RaftTransportAuthenticator authenticator = new(security);
+
+        return () =>
+        {
+            RaftTransportAuthenticationHeaders signed =
+                authenticator.Sign("POST", "/Rafter/BatchRequests", localEndpoint);
+
+            return
+            [
+                new(signed.SignatureHeaderName, signed.Signature),
+                new(RaftTransportAuthenticationHeaders.SenderNodeHeaderName, signed.SenderNode),
+                new(RaftTransportAuthenticationHeaders.TimestampHeaderName,
+                    signed.TimestampUnixMilliseconds.ToString(CultureInfo.InvariantCulture)),
+                new(RaftTransportAuthenticationHeaders.NonceHeaderName, signed.Nonce)
+            ];
+        };
     }
 
     private static Metadata BuildAuthMetadata(RaftManager manager, string grpcMethod)
