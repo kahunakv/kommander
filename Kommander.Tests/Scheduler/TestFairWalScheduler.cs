@@ -486,6 +486,88 @@ public sealed class TestFairWalScheduler
         Assert.True(scheduler.TotalPartitionsBatched >= scheduler.TotalBatchesWritten);
     }
 
+    // ── BuildCompletion correctness ────────────────────────────────────────
+
+    /// <summary>
+    /// <see cref="RaftWalCompletion.MinLogIndex"/> must equal the smallest log id in the
+    /// operation's log list, regardless of the order in which logs are stored. This pins
+    /// the correctness of the manual-loop min computation in <c>BuildCompletion</c>.
+    /// </summary>
+    [Theory]
+    [InlineData(new long[] { 5, 1, 3 }, 1L)]      // min is not at index 0
+    [InlineData(new long[] { 7 }, 7L)]              // single entry
+    [InlineData(new long[] { 2, 2, 2 }, 2L)]        // all equal
+    [InlineData(new long[] { 1, 2, 3 }, 1L)]        // already sorted ascending
+    [InlineData(new long[] { 3, 2, 1 }, 1L)]        // descending — min is last
+    public async Task BuildCompletion_MinLogIndex_MatchesActualMinimum(long[] inputIds, long expectedMin)
+    {
+        TaskCompletionSource<RaftWalCompletion> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        RecordingWal wal = new();
+
+        using FairWalScheduler scheduler = new(wal, NullLogger<IRaft>.Instance, workerCount: 1);
+        scheduler.Start();
+
+        List<RaftLog> logs = [.. inputIds.Select(id => new RaftLog { Id = id, Term = 1, Type = RaftLogType.Proposed })];
+        scheduler.Enqueue(new WALWriteOperation(
+            onComplete: c => tcs.SetResult(c),
+            operationId: 1,
+            type: WALWriteOperationType.LeaderPropose,
+            logs: (1, logs),
+            logIndex: inputIds.Max()));
+
+        RaftWalCompletion completion = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.Equal(RaftOperationStatus.Success, completion.Status);
+        Assert.Equal(expectedMin, completion.MinLogIndex);
+        Assert.Equal(inputIds.Max(), completion.MaxLogIndex);
+    }
+
+    // ── Pool overflow safety (DrainRemaining) ────────────────────────────────
+
+    /// <summary>
+    /// At shutdown, <c>DrainRemaining</c> drains the entire ready-queue without a partition-count
+    /// cap — unlike the main loop, which stops at <c>maxGroupBatchPartitions</c>. The op-list pool
+    /// pre-allocated in <c>WorkerLoop</c> starts at <c>maxGroupBatchPartitions</c> slots.
+    /// If more than that many partitions are pending at shutdown, <c>ProcessGroupBatch</c> must
+    /// grow the pool on demand rather than throw <see cref="IndexOutOfRangeException"/>. This
+    /// regression test fires more partitions than the default pool size and then calls
+    /// <see cref="FairWalScheduler.Stop"/>, driving the oversized drain path.
+    /// </summary>
+    [Fact]
+    public async Task Shutdown_DrainRemaining_ToleratesMorePartitionsThanPoolSize()
+    {
+        // Use a pool size smaller than the partition count so the grow path is exercised.
+        const int maxGroupBatch = 4;
+        const int partitions = 16;   // > maxGroupBatch
+        const int total = partitions;
+
+        ConcurrentBag<long> completed = [];
+        // A WAL that blocks all writes until unblocked — keeps ops queued so they pile up
+        // in _readyPartitions, all visible to DrainRemaining's first-phase TryTake loop.
+        BlockingWal blockingWal = new();
+
+        using FairWalScheduler scheduler = new(
+            blockingWal,
+            NullLogger<IRaft>.Instance,
+            workerCount: 1,
+            maxGroupBatchPartitions: maxGroupBatch);
+        scheduler.Start();
+
+        // Enqueue one op per partition; the WAL is blocked so they all accumulate in the queue.
+        for (int p = 1; p <= partitions; p++)
+        {
+            int partition = p;
+            scheduler.Enqueue(MakeOp(partition, partition, Logs(partition),
+                c => completed.Add(c.OperationId)));
+        }
+
+        // Unblock writes and then Stop — DrainRemaining must handle all partitions without crashing.
+        blockingWal.Unblock();
+        await Task.Run(scheduler.Stop, TestContext.Current.CancellationToken);
+
+        Assert.Equal(total, completed.Count);
+    }
+
     // ── Fake WAL implementations for tests ────────────────────────────────
 
     /// <summary>

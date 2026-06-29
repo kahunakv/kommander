@@ -385,9 +385,19 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
     private void WorkerLoop(int workerId)
     {
-        // Per-worker reusable scratch space — cleared at the start of each iteration.
+        // Per-worker reusable scratch space — never crosses iteration or worker boundaries.
         List<int> partitionGroup = new(maxGroupBatchPartitions);
         List<(int PartitionId, List<WALWriteOperation> Ops)> groupBatches = new(maxGroupBatchPartitions);
+
+        // Pre-allocated per-partition operation lists: one slot per possible group-batch partition.
+        // Cleared and reused each iteration instead of allocating a new List per partition per flush.
+        List<List<WALWriteOperation>> opListPool = new(maxGroupBatchPartitions);
+        for (int i = 0; i < maxGroupBatchPartitions; i++)
+            opListPool.Add(new List<WALWriteOperation>(maxBatchSize));
+
+        // Pre-allocated log-groups list passed to walAdapter.Write — cleared and reused each flush.
+        List<(int, List<RaftLog>)> logGroups = new(maxGroupBatchPartitions);
+
         CancellationToken token = _cts.Token;
 
         while (true)
@@ -401,7 +411,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             catch (OperationCanceledException)
             {
                 // Drain remaining items before exiting.
-                DrainRemaining(partitionGroup, groupBatches);
+                DrainRemaining(partitionGroup, groupBatches, opListPool, logGroups);
                 break;
             }
             catch (ObjectDisposedException)
@@ -431,7 +441,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             if (lingerTicks > 0 && partitionGroup.Count < maxGroupBatchPartitions)
                 LingerForMoreReadyPartitions(partitionGroup, token);
 
-            ProcessGroupBatch(partitionGroup, groupBatches);
+            ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups);
         }
     }
 
@@ -501,7 +511,9 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// </summary>
     private void ProcessGroupBatch(
         List<int> partitionIds,
-        List<(int PartitionId, List<WALWriteOperation> Ops)> groupBatches)
+        List<(int PartitionId, List<WALWriteOperation> Ops)> groupBatches,
+        List<List<WALWriteOperation>> opListPool,
+        List<(int, List<RaftLog>)> logGroups)
     {
         groupBatches.Clear();
 
@@ -511,7 +523,13 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             if (!_partitions.TryGetValue(pid, out PartitionState? state))
                 continue;
 
-            List<WALWriteOperation> pidBatch = new(maxBatchSize);
+            // Reuse the pre-allocated list for this group-batch slot; clear before filling.
+            // Grow on demand so DrainRemaining (which drains without a partition-count cap) never
+            // overflows the pool. Once grown to the high-water mark, no further allocation occurs.
+            if (groupBatches.Count >= opListPool.Count)
+                opListPool.Add(new List<WALWriteOperation>(maxBatchSize));
+            List<WALWriteOperation> pidBatch = opListPool[groupBatches.Count];
+            pidBatch.Clear();
 
             lock (state.Lock)
             {
@@ -545,11 +563,8 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
         try
         {
-            // Build the combined log-groups list that spans all partitions in this batch.
-            int totalOps = 0;
-            foreach ((_, List<WALWriteOperation> ops) in groupBatches)
-                totalOps += ops.Count;
-            List<(int, List<RaftLog>)> logGroups = new(totalOps);
+            // Reuse the worker-owned logGroups list — cleared here, populated below.
+            logGroups.Clear();
 
             // Single-fsync fast path: the batch may skip its own fsync only if EVERY log in it is a
             // per-entry Committed marker (already quorum-durable from its propose fsync, so a lost marker
@@ -665,7 +680,9 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// </summary>
     private void DrainRemaining(
         List<int> partitionGroup,
-        List<(int PartitionId, List<WALWriteOperation> Ops)> groupBatches)
+        List<(int PartitionId, List<WALWriteOperation> Ops)> groupBatches,
+        List<List<WALWriteOperation>> opListPool,
+        List<(int, List<RaftLog>)> logGroups)
     {
         // Drain everything still in the ready-queue as one group-commit batch.
         partitionGroup.Clear();
@@ -673,7 +690,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             partitionGroup.Add(pid);
 
         if (partitionGroup.Count > 0)
-            ProcessGroupBatch(partitionGroup, groupBatches);
+            ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups);
 
         // Also sweep all partition states for any items that were enqueued
         // but whose partitionId was not yet in the ready-queue (should not
@@ -695,7 +712,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             {
                 partitionGroup.Clear();
                 partitionGroup.Add(kv.Key);
-                ProcessGroupBatch(partitionGroup, groupBatches);
+                ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups);
             }
         }
     }
@@ -725,7 +742,13 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     private static RaftWalCompletion BuildCompletion(WALWriteOperation op, RaftOperationStatus status)
     {
         List<RaftLog> logs = op.Logs.Logs;
-        long minIndex = logs.Count > 0 ? logs.Min(l => l.Id) : -1;
+        long minIndex = -1;
+        if (logs.Count > 0)
+        {
+            minIndex = logs[0].Id;
+            for (int i = 1; i < logs.Count; i++)
+                if (logs[i].Id < minIndex) minIndex = logs[i].Id;
+        }
 
         return new RaftWalCompletion(
             PartitionId: op.Logs.PartitionId,
