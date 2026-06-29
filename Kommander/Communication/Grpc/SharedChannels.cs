@@ -259,7 +259,7 @@ public static class SharedChannels
         return urlChannels;
     }
 
-    internal static GrpcInterSharedStreaming GetStreaming(string url, Metadata? metadata, GrpcChannelPoolOptions opts)
+    internal static GrpcInterSharedStreaming GetStreaming(string url, Func<Metadata?>? metadataFactory, GrpcChannelPoolOptions opts)
     {
         if (!url.StartsWith("https://") && !url.StartsWith("http://"))
             url = "https://" + url;
@@ -267,7 +267,7 @@ public static class SharedChannels
         Lazy<List<GrpcInterSharedStreaming>> lazyStreaming = streamings.GetOrAdd(
             url,
             k => new Lazy<List<GrpcInterSharedStreaming>>(
-                () => CreateAsyncDuplexStreamingCallInternal(k, metadata, opts)));
+                () => CreateAsyncDuplexStreamingCallInternal(k, metadataFactory, opts)));
 
         List<GrpcInterSharedStreaming> streamingList = lazyStreaming.Value;
         AssertConsistentPoolConfig(url, opts);
@@ -314,7 +314,10 @@ public static class SharedChannels
     public static GrpcInterSharedStreaming GetStreaming(string url, Metadata? metadata = null, RaftTransportSecurityOptions? securityOptions = null)
     {
         DefaultPoolConfig cfg = defaultPoolConfig;
-        return GetStreaming(url, metadata, new GrpcChannelPoolOptions(cfg.ChannelsPerNode, cfg.EnableMultipleHttp2Connections, securityOptions));
+        // Backward-compatible overload for external consumers that hand in an already-built
+        // Metadata instance. Wrap it in a constant factory so the slot-creation path is uniform.
+        Func<Metadata?>? metadataFactory = metadata is null ? null : () => metadata;
+        return GetStreaming(url, metadataFactory, new GrpcChannelPoolOptions(cfg.ChannelsPerNode, cfg.EnableMultipleHttp2Connections, securityOptions));
     }
 
     /// <summary>
@@ -331,7 +334,7 @@ public static class SharedChannels
     /// </returns>
     private static List<GrpcInterSharedStreaming> CreateAsyncDuplexStreamingCallInternal(
         string url,
-        Metadata? metadata,
+        Func<Metadata?>? metadataFactory,
         GrpcChannelPoolOptions opts)
     {
         if (!url.StartsWith("https://") && !url.StartsWith("http://"))
@@ -352,15 +355,25 @@ public static class SharedChannels
         // GetOrAdd for this URL, so we must bind to its actual count, not opts.ChannelsPerNode.
         List<GrpcInterSharedStreaming> streamingList = new(urlChannels.Count);
 
-        CallOptions callOptions = BuildStreamingCallOptions(metadata, opts.EnableSnapshotCompression);
-
         for (int i = 0; i < urlChannels.Count; i++)
         {
             Rafter.RafterClient client = new(urlChannels[i]);
 
             // Each slot keeps a factory bound to its own client/channel so EnsureHealthy can
             // re-open the duplex call in place after a fault, on the same connection.
-            streamingList.Add(new GrpcInterSharedStreaming(() => client.BatchRequests(callOptions)));
+            //
+            // The auth metadata is built *inside* this factory rather than once for the whole
+            // pool. gRPC sends stream metadata only at stream establishment, so for shared-secret
+            // mode the per-stream nonce/timestamp must be signed when the stream is opened — and
+            // re-signed when EnsureHealthy re-opens it. Sharing a single frozen Metadata across
+            // every slot (and every re-open) would reuse one nonce, which replay detection on the
+            // receiver would reject after the first stream. Invoking metadataFactory per slot
+            // gives each stream its own freshly signed headers.
+            streamingList.Add(new GrpcInterSharedStreaming(() =>
+            {
+                CallOptions callOptions = BuildStreamingCallOptions(metadataFactory?.Invoke(), opts.EnableSnapshotCompression);
+                return client.BatchRequests(callOptions);
+            }));
         }
 
         return streamingList;

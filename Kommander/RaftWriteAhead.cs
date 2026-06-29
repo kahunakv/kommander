@@ -1,4 +1,5 @@
 ﻿
+using System.Buffers;
 using System.Threading;
 using Kommander.Data;
 using Kommander.Diagnostics;
@@ -306,54 +307,94 @@ public sealed class RaftWriteAhead
         return await Task.FromResult((RaftOperationStatus.Pending, operation.LogIndex));
     }
 
-    public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp timestamp, bool autoCommit)
+    /// <summary>
+    /// Returns <paramref name="logs"/> in ascending <see cref="RaftLog.Id"/> order. The common
+    /// case — input already non-decreasing (callers build batches in id order, and freshly
+    /// proposed logs share a placeholder id) — returns the original list with no allocation. Only
+    /// when the input is genuinely out of order does it fall back to a stably sorted copy.
+    /// <para>
+    /// The fallback uses <see cref="Enumerable.OrderBy{TSource,TKey}(IEnumerable{TSource},Func{TSource,TKey})"/>,
+    /// which is a stable sort: entries with equal ids keep their relative order. This is
+    /// load-bearing on the propose path, where unassigned entries can share a placeholder id and
+    /// must retain insertion order so they receive sequential indices deterministically. The
+    /// already-sorted check uses a strict <c>&gt;</c> comparison, so equal-id runs are treated as
+    /// sorted and likewise keep their original order — identical to the stable sort. The result is
+    /// only read by callers, never structurally mutated.
+    /// </para>
+    /// </summary>
+    private static IReadOnlyList<RaftLog> OrderById(List<RaftLog> logs)
     {
-        RaftLog[] ordered = logs.OrderBy(log => log.Id).ToArray();
-
-        // Snapshot mutable state before mutation so we can roll back atomically if
-        // the scheduler rejects the operation (e.g. BackpressureExceededException).
-        long savedProposeIndex = proposeIndex;
-        long[] savedIds   = Array.ConvertAll(ordered, l => l.Id);
-        long[] savedTerms = Array.ConvertAll(ordered, l => l.Term);
-
-        foreach (RaftLog log in ordered)
+        for (int i = 1; i < logs.Count; i++)
         {
-            log.Id = proposeIndex++;
-            log.Term = term;
+            if (logs[i - 1].Id > logs[i].Id)
+                return logs.OrderBy(static log => log.Id).ToArray();
         }
 
-        WALWriteOperation operation = new(
-            onComplete,
-            Interlocked.Increment(ref walOperationSequence),
-            WALWriteOperationType.LeaderPropose,
-            (partition.PartitionId, logs),
-            timestamp,
-            term: term,
-            autoCommit: autoCommit,
-            logIndex: proposeIndex
-        );
+        return logs;
+    }
+
+    public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp timestamp, bool autoCommit)
+    {
+        IReadOnlyList<RaftLog> ordered = OrderById(logs);
+        int count = ordered.Count;
+
+        // Snapshot mutable state before mutation so we can roll back atomically if the scheduler
+        // rejects the operation (e.g. BackpressureExceededException). The id/term snapshots use
+        // pooled value buffers (no GC references): rented and returned within this call, never
+        // exposed, so they add no steady-state allocation on the propose hot path.
+        long savedProposeIndex = proposeIndex;
+        long[] savedIds   = ArrayPool<long>.Shared.Rent(count);
+        long[] savedTerms = ArrayPool<long>.Shared.Rent(count);
 
         try
         {
-            manager.WalScheduler.Enqueue(operation);
-        }
-        catch
-        {
-            // Restore all mutations so the caller observes no state change.
-            proposeIndex = savedProposeIndex;
-            for (int i = 0; i < ordered.Length; i++)
+            for (int i = 0; i < count; i++)
             {
-                ordered[i].Id   = savedIds[i];
-                ordered[i].Term = savedTerms[i];
+                RaftLog log = ordered[i];
+                savedIds[i]   = log.Id;
+                savedTerms[i] = log.Term;
+                log.Id   = proposeIndex++;
+                log.Term = term;
             }
-            throw;
+
+            WALWriteOperation operation = new(
+                onComplete,
+                Interlocked.Increment(ref walOperationSequence),
+                WALWriteOperationType.LeaderPropose,
+                (partition.PartitionId, logs),
+                timestamp,
+                term: term,
+                autoCommit: autoCommit,
+                logIndex: proposeIndex
+            );
+
+            try
+            {
+                manager.WalScheduler.Enqueue(operation);
+            }
+            catch
+            {
+                // Restore all mutations so the caller observes no state change.
+                proposeIndex = savedProposeIndex;
+                for (int i = 0; i < count; i++)
+                {
+                    ordered[i].Id   = savedIds[i];
+                    ordered[i].Term = savedTerms[i];
+                }
+                throw;
+            }
+
+            // Count the durable phase from the producer side (inert unless instrumentation
+            // is enabled): one LeaderPropose enqueue per single-round committed write.
+            WalPhaseInstrumentation.RecordEnqueued(WALWriteOperationType.LeaderPropose);
+
+            return operation;
         }
-
-        // Count the durable phase from the producer side (inert unless instrumentation
-        // is enabled): one LeaderPropose enqueue per single-round committed write.
-        WalPhaseInstrumentation.RecordEnqueued(WALWriteOperationType.LeaderPropose);
-
-        return operation;
+        finally
+        {
+            ArrayPool<long>.Shared.Return(savedIds);
+            ArrayPool<long>.Shared.Return(savedTerms);
+        }
     }
 
     /// <summary>
@@ -375,55 +416,66 @@ public sealed class RaftWriteAhead
 
         long lastCommitIndex = -1;
         long savedCommitIndex = commitIndex;
-        RaftLog[] ordered = logs.OrderBy(log => log.Id).ToArray();
-        RaftLogType[] savedTypes = Array.ConvertAll(ordered, l => l.Type);
-
-        foreach (RaftLog log in ordered)
-        {
-            switch (log.Type)
-            {
-                case RaftLogType.Proposed:
-                {
-                    log.Type = RaftLogType.Committed;
-
-                    //RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Commit(partition.PartitionId, log));
-
-                    commitIndex = log.Id + 1;
-                    lastCommitIndex = log.Id;
-                }
-                break;
-
-                case RaftLogType.ProposedCheckpoint:
-                {
-                    log.Type = RaftLogType.CommittedCheckpoint;
-
-                    //RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Commit(partition.PartitionId, log));
-
-                    commitIndex = log.Id + 1;
-                    lastCommitIndex = log.Id;
-                }
-                break;
-
-                case RaftLogType.Committed:
-                case RaftLogType.CommittedCheckpoint:
-                case RaftLogType.RolledBack:
-                case RaftLogType.RolledBackCheckpoint:
-                default:
-                    break;
-            }
-        }
+        IReadOnlyList<RaftLog> ordered = OrderById(logs);
+        int count = ordered.Count;
+        RaftLogType[] savedTypes = ArrayPool<RaftLogType>.Shared.Rent(count);
 
         try
         {
-            WALWriteOperation operation = EnqueueCommitPrepared(logs, lastCommitIndex);
-            return await Task.FromResult((RaftOperationStatus.Pending, operation.LogIndex));
+            for (int i = 0; i < count; i++)
+            {
+                RaftLog log = ordered[i];
+                savedTypes[i] = log.Type;
+
+                switch (log.Type)
+                {
+                    case RaftLogType.Proposed:
+                    {
+                        log.Type = RaftLogType.Committed;
+
+                        //RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Commit(partition.PartitionId, log));
+
+                        commitIndex = log.Id + 1;
+                        lastCommitIndex = log.Id;
+                    }
+                    break;
+
+                    case RaftLogType.ProposedCheckpoint:
+                    {
+                        log.Type = RaftLogType.CommittedCheckpoint;
+
+                        //RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Commit(partition.PartitionId, log));
+
+                        commitIndex = log.Id + 1;
+                        lastCommitIndex = log.Id;
+                    }
+                    break;
+
+                    case RaftLogType.Committed:
+                    case RaftLogType.CommittedCheckpoint:
+                    case RaftLogType.RolledBack:
+                    case RaftLogType.RolledBackCheckpoint:
+                    default:
+                        break;
+                }
+            }
+
+            try
+            {
+                WALWriteOperation operation = EnqueueCommitPrepared(logs, lastCommitIndex);
+                return await Task.FromResult((RaftOperationStatus.Pending, operation.LogIndex));
+            }
+            catch
+            {
+                commitIndex = savedCommitIndex;
+                for (int i = 0; i < count; i++)
+                    ordered[i].Type = savedTypes[i];
+                throw;
+            }
         }
-        catch
+        finally
         {
-            commitIndex = savedCommitIndex;
-            for (int i = 0; i < ordered.Length; i++)
-                ordered[i].Type = savedTypes[i];
-            throw;
+            ArrayPool<RaftLogType>.Shared.Return(savedTypes);
         }
     }
 
@@ -431,37 +483,48 @@ public sealed class RaftWriteAhead
     {
         long lastCommitIndex = -1;
         long savedCommitIndex = commitIndex;
-        RaftLog[] ordered = logs.OrderBy(log => log.Id).ToArray();
-        RaftLogType[] savedTypes = Array.ConvertAll(ordered, l => l.Type);
-
-        foreach (RaftLog log in ordered)
-        {
-            switch (log.Type)
-            {
-                case RaftLogType.Proposed:
-                    log.Type = RaftLogType.Committed;
-                    commitIndex = log.Id + 1;
-                    lastCommitIndex = log.Id;
-                    break;
-
-                case RaftLogType.ProposedCheckpoint:
-                    log.Type = RaftLogType.CommittedCheckpoint;
-                    commitIndex = log.Id + 1;
-                    lastCommitIndex = log.Id;
-                    break;
-            }
-        }
+        IReadOnlyList<RaftLog> ordered = OrderById(logs);
+        int count = ordered.Count;
+        RaftLogType[] savedTypes = ArrayPool<RaftLogType>.Shared.Rent(count);
 
         try
         {
-            return EnqueueCommitPrepared(logs, lastCommitIndex);
+            for (int i = 0; i < count; i++)
+            {
+                RaftLog log = ordered[i];
+                savedTypes[i] = log.Type;
+
+                switch (log.Type)
+                {
+                    case RaftLogType.Proposed:
+                        log.Type = RaftLogType.Committed;
+                        commitIndex = log.Id + 1;
+                        lastCommitIndex = log.Id;
+                        break;
+
+                    case RaftLogType.ProposedCheckpoint:
+                        log.Type = RaftLogType.CommittedCheckpoint;
+                        commitIndex = log.Id + 1;
+                        lastCommitIndex = log.Id;
+                        break;
+                }
+            }
+
+            try
+            {
+                return EnqueueCommitPrepared(logs, lastCommitIndex);
+            }
+            catch
+            {
+                commitIndex = savedCommitIndex;
+                for (int i = 0; i < count; i++)
+                    ordered[i].Type = savedTypes[i];
+                throw;
+            }
         }
-        catch
+        finally
         {
-            commitIndex = savedCommitIndex;
-            for (int i = 0; i < ordered.Length; i++)
-                ordered[i].Type = savedTypes[i];
-            throw;
+            ArrayPool<RaftLogType>.Shared.Return(savedTypes);
         }
     }
 
@@ -501,72 +564,94 @@ public sealed class RaftWriteAhead
         if (logs is null || logs.Count == 0)
             return (RaftOperationStatus.Success, -1);
 
-        RaftLog[] ordered = logs.OrderBy(log => log.Id).ToArray();
-        RaftLogType[] savedTypes = Array.ConvertAll(ordered, l => l.Type);
-
-        foreach (RaftLog log in ordered)
-        {
-            switch (log.Type)
-            {
-                case RaftLogType.Proposed:
-                {
-                    log.Type = RaftLogType.RolledBack;
-
-                    //RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Rollback(partition.PartitionId, log));
-                }
-                break;
-
-                case RaftLogType.ProposedCheckpoint:
-                {
-                    log.Type = RaftLogType.RolledBackCheckpoint;
-
-                    //RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Rollback(partition.PartitionId, log));
-                }
-                break;
-            }
-        }
+        IReadOnlyList<RaftLog> ordered = OrderById(logs);
+        int count = ordered.Count;
+        RaftLogType[] savedTypes = ArrayPool<RaftLogType>.Shared.Rent(count);
 
         try
         {
-            WALWriteOperation operation = EnqueueRollbackPrepared(logs);
-            return await Task.FromResult((RaftOperationStatus.Pending, operation.LogIndex));
+            for (int i = 0; i < count; i++)
+            {
+                RaftLog log = ordered[i];
+                savedTypes[i] = log.Type;
+
+                switch (log.Type)
+                {
+                    case RaftLogType.Proposed:
+                    {
+                        log.Type = RaftLogType.RolledBack;
+
+                        //RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Rollback(partition.PartitionId, log));
+                    }
+                    break;
+
+                    case RaftLogType.ProposedCheckpoint:
+                    {
+                        log.Type = RaftLogType.RolledBackCheckpoint;
+
+                        //RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Rollback(partition.PartitionId, log));
+                    }
+                    break;
+                }
+            }
+
+            try
+            {
+                WALWriteOperation operation = EnqueueRollbackPrepared(logs);
+                return await Task.FromResult((RaftOperationStatus.Pending, operation.LogIndex));
+            }
+            catch
+            {
+                for (int i = 0; i < count; i++)
+                    ordered[i].Type = savedTypes[i];
+                throw;
+            }
         }
-        catch
+        finally
         {
-            for (int i = 0; i < ordered.Length; i++)
-                ordered[i].Type = savedTypes[i];
-            throw;
+            ArrayPool<RaftLogType>.Shared.Return(savedTypes);
         }
     }
 
     public WALWriteOperation EnqueueRollback(List<RaftLog> logs)
     {
-        RaftLog[] ordered = logs.OrderBy(log => log.Id).ToArray();
-        RaftLogType[] savedTypes = Array.ConvertAll(ordered, l => l.Type);
-
-        foreach (RaftLog log in ordered)
-        {
-            switch (log.Type)
-            {
-                case RaftLogType.Proposed:
-                    log.Type = RaftLogType.RolledBack;
-                    break;
-
-                case RaftLogType.ProposedCheckpoint:
-                    log.Type = RaftLogType.RolledBackCheckpoint;
-                    break;
-            }
-        }
+        IReadOnlyList<RaftLog> ordered = OrderById(logs);
+        int count = ordered.Count;
+        RaftLogType[] savedTypes = ArrayPool<RaftLogType>.Shared.Rent(count);
 
         try
         {
-            return EnqueueRollbackPrepared(logs);
+            for (int i = 0; i < count; i++)
+            {
+                RaftLog log = ordered[i];
+                savedTypes[i] = log.Type;
+
+                switch (log.Type)
+                {
+                    case RaftLogType.Proposed:
+                        log.Type = RaftLogType.RolledBack;
+                        break;
+
+                    case RaftLogType.ProposedCheckpoint:
+                        log.Type = RaftLogType.RolledBackCheckpoint;
+                        break;
+                }
+            }
+
+            try
+            {
+                return EnqueueRollbackPrepared(logs);
+            }
+            catch
+            {
+                for (int i = 0; i < count; i++)
+                    ordered[i].Type = savedTypes[i];
+                throw;
+            }
         }
-        catch
+        finally
         {
-            for (int i = 0; i < ordered.Length; i++)
-                ordered[i].Type = savedTypes[i];
-            throw;
+            ArrayPool<RaftLogType>.Shared.Return(savedTypes);
         }
     }
 
@@ -720,8 +805,8 @@ public sealed class RaftWriteAhead
             return null;
 
         bool allOutdated = true;
-        
-        RaftLog[] orderedLogs = logs.OrderBy(log => log.Id).ToArray();
+
+        IReadOnlyList<RaftLog> orderedLogs = OrderById(logs);
 
         foreach (RaftLog log in orderedLogs)
         {
@@ -865,12 +950,23 @@ public sealed class RaftWriteAhead
             }
         }
 
-        List<RaftLog> logsToWrite = new(orderedLogs.Length);
+        List<RaftLog> logsToWrite = new(orderedLogs.Count);
+
+        // Track the maximum id while flattening the plan groups so we avoid a second
+        // LINQ Max() pass over logsToWrite. The max over the concatenated groups equals
+        // the max over logsToWrite, so logIndex is identical to the previous code.
+        long maxLogId = -1;
 
         foreach (KeyValuePair<RaftLogAction, List<RaftLog>> keyValue in plan)
         {
-            if (keyValue.Value.Count > 0)
-                logsToWrite.AddRange(keyValue.Value);
+            List<RaftLog> group = keyValue.Value;
+            for (int i = 0; i < group.Count; i++)
+            {
+                RaftLog log = group[i];
+                logsToWrite.Add(log);
+                if (log.Id > maxLogId)
+                    maxLogId = log.Id;
+            }
         }
 
         if (logsToWrite.Count == 0)
@@ -884,7 +980,7 @@ public sealed class RaftWriteAhead
             timestamp,
             endpoint,
             term,
-            logIndex: logsToWrite.Max(log => log.Id)
+            logIndex: maxLogId
         );
 
         try

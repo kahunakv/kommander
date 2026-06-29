@@ -243,6 +243,11 @@ public sealed class RaftService : Rafter.RafterBase
 
         try
         {
+            // One reusable response per stream: the client drains and discards these (real
+            // acknowledgement travels via protocol-level CompleteAppendLogs), so the only purpose
+            // of writing anything back is to keep the client's response-drain health loop producing
+            // observable frames. We therefore write at most one per inbound batch rather than one
+            // per item — see the WriteAsync below.
             GrpcBatchRequestsResponse response = new() { RequestId = 0 };
 
             await foreach (GrpcBatchRequestsRequest message in requestStream.ReadAllAsync())
@@ -395,9 +400,16 @@ public sealed class RaftService : Rafter.RafterBase
                     {
                         logger.LogError("BatchRequests: {Type} {Message}\n{StackTrace}", ex.GetType().Name, ex.Message, ex.StackTrace);
                     }
-
-                    await responseStream.WriteAsync(response);
                 }
+
+                // Emit a single lightweight response per inbound batch instead of one per item.
+                // Hot AppendLogs/CompleteAppendLogs traffic (especially when coalesced into large
+                // multi-item batches) previously produced one reverse-direction HTTP/2 frame, server
+                // write await, and protobuf wakeup per item — none of which affect quorum or delivery,
+                // since senders return synthetic responses and rely on CompleteAppendLogs for real
+                // acks. One frame per batch still feeds the client's response-drain loop so stream
+                // fault detection keeps working.
+                await responseStream.WriteAsync(response);
             }
         }
         catch (Exception ex)
