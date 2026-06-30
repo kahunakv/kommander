@@ -21,7 +21,7 @@ together; the hot set reuses the quiesced state that quiescence already tracks.
 
 ## Table of contents
 
-1. [The 60-second mental model](#the-60-second-mental-model)
+1. [Summary](#summary)
 2. [Why this exists (the problem)](#why-this-exists-the-problem)
 3. [Core concepts](#core-concepts)
 4. [Flow 1 — A partition becomes runnable and is drained](#flow-1--a-partition-becomes-runnable-and-is-drained)
@@ -38,7 +38,7 @@ together; the hot set reuses the quiesced state that quiescence already tracks.
 
 ---
 
-## The 60-second mental model
+## Summary
 
 Every partition is a little serial state machine: operations for one partition must run **one at a
 time, in order** (this is the *single-owner* rule — it lets the state machine run lock-free).

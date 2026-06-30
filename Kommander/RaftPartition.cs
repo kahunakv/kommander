@@ -351,13 +351,27 @@ public sealed class RaftPartition : IDisposable
     /// <returns>A tuple containing a boolean indicating success, the status of the operation as a <see cref="RaftOperationStatus"/> value, and the <see cref="HLCTimestamp"/> ticket ID of the operation.</returns>
     public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, IEnumerable<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0)
     {
+        // Avoid an extra copy when the caller already provides a list or array.
+        IReadOnlyList<byte[]> payloads = logs as IReadOnlyList<byte[]> ?? logs.ToList();
+        return await ReplicateLogs(type, payloads, autoCommit, expectedGeneration).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Replicates logs across the Raft cluster from an already-materialized payload list,
+    /// avoiding the intermediate copy incurred by the <see cref="IEnumerable{T}"/> overload
+    /// when the caller holds an array or list.
+    /// </summary>
+    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, IReadOnlyList<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0)
+    {
         if (string.IsNullOrEmpty(Leader))
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
 
         if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
 
-        List<RaftLog> logsToReplicate = logs.Select(data => new RaftLog { Type = RaftLogType.Proposed, LogType = type, LogData = data }).ToList();
+        List<RaftLog> logsToReplicate = new(logs.Count);
+        for (int i = 0; i < logs.Count; i++)
+            logsToReplicate.Add(new() { Type = RaftLogType.Proposed, LogType = type, LogData = logs[i] });
 
         RaftResponse response = await executor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit, expectedGeneration)).ConfigureAwait(false);
 

@@ -264,6 +264,16 @@ public interface IRaft
     public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Replicate logs to the followers in the partition.
+    /// Accepts an already-materialized list or array and avoids the intermediate copy
+    /// incurred by the <see cref="IEnumerable{T}"/> overload for list and array callers.
+    /// The default implementation materializes to a list and delegates; override in
+    /// <see cref="RaftManager"/> for the zero-copy path.
+    /// </summary>
+    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IReadOnlyList<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default)
+        => ReplicateLogs(partitionId, type, (IEnumerable<byte[]>)logs, autoCommit, expectedGeneration, cancellationToken);
+
+    /// <summary>
     /// Replicate a checkpoint to the followers in the partition
     /// </summary>
     /// <param name="partitionId"></param>

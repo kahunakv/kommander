@@ -297,14 +297,16 @@ public sealed class RaftWriteAhead
     /// <exception cref="Exception">
     /// May be thrown for unexpected errors during the proposal process or queuing for replication.
     /// </exception>
-    public async Task<(RaftOperationStatus, long)> Propose(long term, List<RaftLog>? logs)
+    public Task<(RaftOperationStatus, long)> Propose(long term, List<RaftLog>? logs)
     {
         if (logs is null || logs.Count == 0)
-            return (RaftOperationStatus.Success, -1);
+            return Task.FromResult((RaftOperationStatus.Success, -1L));
 
         WALWriteOperation operation = EnqueuePropose(term, logs, default, false);
 
-        return await Task.FromResult((RaftOperationStatus.Pending, operation.LogIndex));
+        // Synchronous: EnqueuePropose hands off to the WAL scheduler without awaiting. No async
+        // state machine or extra Task.FromResult round-trip — just wrap the already-known result.
+        return Task.FromResult((RaftOperationStatus.Pending, operation.LogIndex));
     }
 
     /// <summary>
@@ -413,10 +415,10 @@ public sealed class RaftWriteAhead
     /// The operation status is an instance of <see cref="RaftOperationStatus"/> indicating success or failure.
     /// If the operation fails, the commit index will be -1.
     /// </returns>
-    public async Task<(RaftOperationStatus, long)> Commit(List<RaftLog>? logs)
+    public Task<(RaftOperationStatus, long)> Commit(List<RaftLog>? logs)
     {
         if (logs is null || logs.Count == 0)
-            return (RaftOperationStatus.Success, -1);
+            return Task.FromResult((RaftOperationStatus.Success, -1L));
 
         long lastCommitIndex = -1;
         long savedCommitIndex = commitIndex;
@@ -467,7 +469,7 @@ public sealed class RaftWriteAhead
             try
             {
                 WALWriteOperation operation = EnqueueCommitPrepared(logs, lastCommitIndex);
-                return await Task.FromResult((RaftOperationStatus.Pending, operation.LogIndex));
+                return Task.FromResult((RaftOperationStatus.Pending, operation.LogIndex));
             }
             catch
             {
@@ -563,10 +565,10 @@ public sealed class RaftWriteAhead
     /// - <see cref="RaftOperationStatus.Success"/> and -1 if the rollback is completed successfully or no logs were provided.
     /// - The relevant <see cref="RaftOperationStatus"/> and -1 in case of an error.
     /// </returns>
-    public async Task<(RaftOperationStatus, long)> Rollback(List<RaftLog>? logs)
+    public Task<(RaftOperationStatus, long)> Rollback(List<RaftLog>? logs)
     {
         if (logs is null || logs.Count == 0)
-            return (RaftOperationStatus.Success, -1);
+            return Task.FromResult((RaftOperationStatus.Success, -1L));
 
         IReadOnlyList<RaftLog> ordered = OrderById(logs);
         int count = ordered.Count;
@@ -602,7 +604,7 @@ public sealed class RaftWriteAhead
             try
             {
                 WALWriteOperation operation = EnqueueRollbackPrepared(logs);
-                return await Task.FromResult((RaftOperationStatus.Pending, operation.LogIndex));
+                return Task.FromResult((RaftOperationStatus.Pending, operation.LogIndex));
             }
             catch
             {

@@ -91,7 +91,28 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <summary>For tests: number of <c>db.Write</c> calls issued by the last compaction call.</summary>
     internal int LastCompactionWriteCount { get; private set; }
     
-    public RocksDbWAL(string path, string revision, ILogger<IRaft> logger, bool syncWrites = true)
+    /// <summary>
+    /// Opens a RocksDB WAL at <paramref name="path"/>/<paramref name="revision"/>.
+    ///
+    /// <para>
+    /// When <paramref name="sharedResources"/> is non-null, the block cache and WriteBufferManager it
+    /// carries are applied to this database before <c>RocksDb.Open</c> — the block cache to every column
+    /// family, the WBM to the <see cref="DbOptions"/> — so this WAL shares a unified memory budget with
+    /// any other database that received the same bundle. The bundle is <em>borrowed</em>: this constructor
+    /// does not take ownership and must not dispose it; the caller owns the bundle's lifetime.
+    /// </para>
+    ///
+    /// <para>
+    /// When <paramref name="sharedResources"/> is null, behavior is byte-for-byte identical to the
+    /// no-arg default: no block cache is configured and RocksDB's built-in defaults apply.
+    /// </para>
+    /// </summary>
+    public RocksDbWAL(
+        string path,
+        string revision,
+        ILogger<IRaft> logger,
+        bool syncWrites = true,
+        RocksDbSharedResources? sharedResources = null)
     {
         this.path = path;
         this.revision = revision;
@@ -104,15 +125,34 @@ public class RocksDbWAL : IWAL, IDisposable
             .SetCreateMissingColumnFamilies(true)
             .SetAllowConcurrentMemtableWrite(true)
             .SetWalRecoveryMode(Recovery.AbsoluteConsistency);
-        
+
+        // When sharing resources, apply the WBM to the DbOptions before opening. The block cache is
+        // applied per-CF below. Both must be set before RocksDb.Open — they cannot be changed afterward.
+        if (sharedResources is not null)
+            Native.Instance.rocksdb_options_set_write_buffer_manager(
+                dbOptions.Handle, sharedResources.WriteBufferManagerHandle);
+
+        // One shared BlockBasedTableOptions referencing the shared block cache, applied to every CF so
+        // none are excluded from the shared budget. When sharedResources is null, CFs keep defaults.
+        //
+        // Write-buffer sizing when sharing: this WAL has ~10 CFs. With the WBM bounding total memtable
+        // memory across all sharing databases, per-CF write_buffer_size × max_write_buffer_number × CF
+        // count should be a modest fraction of memtableBudgetBytes to leave headroom for the host DB.
+        // The RocksDB defaults (64 MB write_buffer_size, 2 max_write_buffer_number) give ~1.28 GB for
+        // 10 CFs — far above any typical WBM budget. Hosts sharing a WBM should configure lower values
+        // on both this WAL and their own DB, or accept frequent cross-CF/cross-DB flush coupling.
+        BlockBasedTableOptions? sharedBbto = sharedResources is not null
+            ? new BlockBasedTableOptions().SetBlockCache(sharedResources.BlockCache)
+            : null;
+
         ColumnFamilies columnFamilies = new()
         {
-            { "default", new() },
-            { "metadata", new() }
+            { "default", ApplyCfOptions(new(), sharedBbto) },
+            { "metadata", ApplyCfOptions(new(), sharedBbto) }
         };
-        
+
         for (int i = 0; i < MaxShards; i++)
-            columnFamilies.Add("shard" + i, new());
+            columnFamilies.Add("shard" + i, ApplyCfOptions(new(), sharedBbto));
 
         string completePath = $"{path}/{revision}";
         
@@ -926,6 +966,18 @@ public class RocksDbWAL : IWAL, IDisposable
     private static RaftLogMessage Unserializer(ReadOnlySpan<byte> serializedData)
     {
         return RaftLogMessage.Parser.ParseFrom(serializedData);
+    }
+
+    /// <summary>
+    /// Applies a shared <see cref="BlockBasedTableOptions"/> to <paramref name="cfOptions"/> when
+    /// <paramref name="sharedBbto"/> is non-null, then returns <paramref name="cfOptions"/>. A no-op
+    /// when <paramref name="sharedBbto"/> is null so the caller does not need a branch at each CF site.
+    /// </summary>
+    private static ColumnFamilyOptions ApplyCfOptions(ColumnFamilyOptions cfOptions, BlockBasedTableOptions? sharedBbto)
+    {
+        if (sharedBbto is not null)
+            cfOptions.SetBlockBasedTableFactory(sharedBbto);
+        return cfOptions;
     }
 
     private static void BuildLogKey(Span<byte> result, int partitionId, long logId)

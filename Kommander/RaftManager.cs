@@ -34,6 +34,16 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     private static readonly TimeSpan ProposalRetryDelay = TimeSpan.FromMilliseconds(10);
     private static readonly TimeSpan ProposalStatusPollDelay = TimeSpan.FromMilliseconds(10);
 
+    /// <summary>
+    /// Test-only seam. When non-null, replaces the per-attempt partition call inside the
+    /// <see cref="ReplicateLogs(int,string,IReadOnlyList{byte[]},bool,long,CancellationToken)"/>
+    /// retry loop, so a test can return <see cref="RaftOperationStatus.ActiveProposal"/> then a
+    /// terminal status to drive ≥2 iterations and assert the materialized payload list is reused
+    /// across retries (not re-enumerated). Left null in production; the only production cost is one
+    /// field read per replication call.
+    /// </summary>
+    internal Func<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)>? _replicateAttemptHookForTesting;
+
     internal readonly string LocalEndpoint;
 
     internal readonly string LocalNodeName;
@@ -1968,6 +1978,31 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         CancellationToken cancellationToken = default
     )
     {
+        // Materialize once before the retry loop so generator inputs are not re-enumerated on each
+        // retry, and list/array inputs skip the copy.
+        IReadOnlyList<byte[]> materializedLogs = logs as IReadOnlyList<byte[]> ?? logs.ToList();
+        return await ReplicateLogs(partitionId, type, materializedLogs, autoCommit, expectedGeneration, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Replicates a batch of log entries to the follower nodes in the specified partition.
+    /// Accepts an already-materialized list or array and avoids the intermediate copy
+    /// incurred by the <see cref="IEnumerable{T}"/> overload for array and list callers.
+    /// P0 routes committed entries by log type: <c>_RaftSystem</c> entries go to the system
+    /// coordinator; all other types go to consumer callbacks (<c>OnReplicationReceived</c> /
+    /// <c>OnLogRestored</c>).  Passing <c>type == "_RaftSystem"</c> on partition 0 is rejected
+    /// with <see cref="RaftException"/> to prevent userland from forging coordinator entries.
+    /// P0 is never a valid target for create, split, merge, or remove.
+    /// </summary>
+    public async Task<RaftReplicationResult> ReplicateLogs(
+        int partitionId,
+        string type,
+        IReadOnlyList<byte[]> logs,
+        bool autoCommit = true,
+        long expectedGeneration = 0,
+        CancellationToken cancellationToken = default
+    )
+    {
         if (partitionId == RaftSystemConfig.SystemPartition && type == RaftSystemConfig.RaftLogType)
             throw new RaftException("System log type is reserved on the system partition");
 
@@ -1979,8 +2014,12 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
         do
         {
-            // ReSharper disable once PossibleMultipleEnumeration
-            (success, status, ticketId) = await partition.ReplicateLogs(type, logs.ToList(), autoCommit, expectedGeneration).ConfigureAwait(false);
+            // Test seam (null in production): lets a test drive the ActiveProposal retry loop
+            // deterministically without a live leader, to prove the payload list is materialized
+            // once before the loop and reused across retries rather than re-enumerated.
+            (success, status, ticketId) = _replicateAttemptHookForTesting is { } hook
+                ? hook()
+                : await partition.ReplicateLogs(type, logs, autoCommit, expectedGeneration).ConfigureAwait(false);
 
             if (status == RaftOperationStatus.ActiveProposal)
                 await Task.Delay(ProposalRetryDelay, cancellationToken).ConfigureAwait(false);

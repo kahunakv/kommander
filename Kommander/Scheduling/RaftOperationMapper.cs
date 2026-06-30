@@ -62,6 +62,20 @@ public static class RaftOperationMapper
         };
 
     /// <summary>
+    /// Returns the metrics <c>operation_class</c> label string for the given kind.
+    /// Uses static string constants to avoid <c>Enum.ToString()</c> heap allocations on
+    /// every dispatch.
+    /// </summary>
+    public static string GetKindLabel(RaftOperationKind kind) => kind switch
+    {
+        RaftOperationKind.Control     => "Control",
+        RaftOperationKind.Replication => "Replication",
+        RaftOperationKind.Client      => "Client",
+        RaftOperationKind.Maintenance => "Maintenance",
+        _ => kind.ToString(),
+    };
+
+    /// <summary>
     /// Returns the <see cref="RaftOperationPriority"/> weight that corresponds to the
     /// given request type.  The weight is derived from the kind so the two values are
     /// always consistent.
