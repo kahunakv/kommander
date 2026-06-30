@@ -11,16 +11,24 @@ namespace Kommander.Data;
 public sealed class RaftResponse
 {
     public RaftResponseType Type { get; }
-    
+
     public RaftOperationStatus Status { get; } = RaftOperationStatus.Success;
 
     public RaftNodeState NodeState { get; } = RaftNodeState.Follower;
-    
+
     public RaftProposalTicketState ProposalTicketState { get; } = RaftProposalTicketState.NotFound;
-    
+
     public long LogIndex { get; }
-    
+
     public HLCTimestamp TicketId { get; } = HLCTimestamp.Zero;
+
+    /// <summary>
+    /// Carries the event-driven completion task for a proposal ticket when
+    /// <see cref="RaftResponseType"/> is <see cref="RaftResponseType.TicketWaiterTask"/>.
+    /// The task completes when the proposal reaches a terminal state (committed, rolled-back,
+    /// or invalidated) so callers can await it instead of polling <c>GetTicketState</c>.
+    /// </summary>
+    public Task<(RaftProposalTicketState, long)>? WaiterTask { get; }
     
     public RaftResponse(RaftResponseType type, RaftNodeState nodeState)
     {
@@ -52,5 +60,15 @@ public sealed class RaftResponse
         Type = type;
         Status = status;
         TicketId = ticketId;
+    }
+
+    /// <summary>
+    /// Constructs a <see cref="RaftResponseType.TicketWaiterTask"/> response that carries
+    /// the event-driven completion task for an active proposal ticket.
+    /// </summary>
+    public RaftResponse(RaftResponseType type, Task<(RaftProposalTicketState, long)>? waiterTask)
+    {
+        Type = type;
+        WaiterTask = waiterTask;
     }
 }

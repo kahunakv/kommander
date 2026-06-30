@@ -793,6 +793,13 @@ public sealed class RaftPartitionExecutor : IDisposable
                     break;
                 }
 
+                case RaftRequestType.GetTicketWaiterTask:
+                {
+                    Task<(RaftProposalTicketState, long)>? waiterTask = _stateMachine.GetTicketWaiterTask(request.Timestamp);
+                    op.Reply?.TrySetResult(new RaftResponse(RaftResponseType.TicketWaiterTask, waiterTask));
+                    break;
+                }
+
                 case RaftRequestType.GetFollowerCommittedIndex:
                 {
                     long followerIndex = _stateMachine.GetFollowerCommittedIndex(request.Endpoint ?? "");

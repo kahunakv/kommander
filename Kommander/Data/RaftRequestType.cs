@@ -50,6 +50,14 @@ public enum RaftRequestType
     GetFollowerCommittedIndex,
 
     /// <summary>
+    /// Returns the event-driven completion task for an active proposal ticket.
+    /// The returned <see cref="System.Threading.Tasks.Task{T}"/> completes when the
+    /// proposal reaches a terminal state (committed, rolled-back, or invalidated by
+    /// leader loss), eliminating the need to poll <see cref="GetTicketState"/>.
+    /// </summary>
+    GetTicketWaiterTask,
+
+    /// <summary>
     /// Posted by the background snapshot-transfer task back to the partition executor once the
     /// target follower has confirmed the snapshot was installed.  The executor processes this on
     /// its worker thread to safely advance <c>lastCommitIndexes[endpoint]</c> to the snapshot
