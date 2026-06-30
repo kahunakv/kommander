@@ -16,7 +16,7 @@ If you are brand new to Kommander, start with the [Architecture Overview](archit
 
 ## Table of contents
 
-1. [The 60-second mental model](#the-60-second-mental-model)
+1. [Summary](#summary)
 2. [Why "operations per second" alone misleads](#why-operations-per-second-alone-misleads)
 3. [Core concepts](#core-concepts)
 4. [The three signals, and how to read them together](#the-three-signals-and-how-to-read-them-together)
@@ -30,7 +30,7 @@ If you are brand new to Kommander, start with the [Architecture Overview](archit
 
 ---
 
-## The 60-second mental model
+## Summary
 
 Every partition runs its own Raft group, and the **leader** appends every change to that partition's
 log, then replicates it. That log is a single serialized stream: one partition, one commit pipeline.

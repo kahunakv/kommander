@@ -13,7 +13,7 @@ Quiescence builds directly on the SWIM failure detector documented in the
 
 ## Table of contents
 
-1. [The 60-second mental model](#the-60-second-mental-model)
+1. [Summary](#summary)
 2. [Why quiescence exists (the problem)](#why-quiescence-exists-the-problem)
 3. [The two jobs of a heartbeat](#the-two-jobs-of-a-heartbeat)
 4. [Core concepts](#core-concepts)
@@ -30,7 +30,7 @@ Quiescence builds directly on the SWIM failure detector documented in the
 
 ---
 
-## The 60-second mental model
+## Summary
 
 A Raft leader normally sends a **heartbeat** to every follower a few times a second, forever — even
 when nothing is happening. The heartbeat says "I'm still your leader; don't start an election." For one

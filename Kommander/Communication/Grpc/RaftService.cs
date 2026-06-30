@@ -219,6 +219,13 @@ public sealed class RaftService : Rafter.RafterBase
             // materialized into a byte[]; consuming it via .Span would only be .ToArray()'d straight back
             // into LogData, an identical copy — so the ToByteArray fallback is kept on purpose
             // because the downstream truly needs a byte[].
+            //
+            // INVARIANT: this aliased array outlives the RPC handler — RaftPartition.AppendLogs posts
+            // these RaftLogs onto the partition executor channel, where they are consumed asynchronously
+            // and persisted to the WAL. That is safe only because Grpc.Net's default deserializer
+            // allocates a fresh array per message and never recycles it. If a pooled-buffer message
+            // serializer is ever adopted, this alias becomes a use-after-free/corruption hazard and the
+            // happy path must copy (ToByteArray) instead.
             if (MemoryMarshal.TryGetArray(requestLog.Data.Memory, out ArraySegment<byte> segment))
                 raftLog.LogData = segment.Array;
             else

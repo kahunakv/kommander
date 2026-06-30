@@ -8,7 +8,7 @@ way, so when something misbehaves at 3 a.m. you understand the model well enough
 
 ## Table of contents
 
-1. [The 60-second mental model](#the-60-second-mental-model)
+1. [Summary](#summary)
 2. [Why this design? Motivations & advantages](#why-this-design-motivations--advantages)
 3. [Core concepts](#core-concepts)
 4. [The API surface](#the-api-surface)
@@ -26,7 +26,7 @@ way, so when something misbehaves at 3 a.m. you understand the model well enough
 
 ---
 
-## The 60-second mental model
+## Summary
 
 A Kommander cluster keeps a single **roster** — the authoritative list of who belongs to the cluster
 and in what role. The roster is not gossiped state or a config file; it is a **committed Raft record**

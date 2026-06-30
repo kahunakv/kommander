@@ -164,6 +164,12 @@ public sealed class RaftPartitionExecutor : IDisposable
     private long _totalClientRejected;
     private long _totalBatchesExecuted;
 
+    // Pre-computed metrics tags — built once at construction time so the hot dispatch
+    // path never calls kind.ToString() or boxes the partition_id int into object? per op.
+    // Indexed by (int)RaftOperationKind (0=Control, 1=Replication, 2=Client, 3=Maintenance).
+    private readonly TagList[] _kindTags;
+    private readonly KeyValuePair<string, object?> _rejectionTag;
+
     /// <summary>Total number of operations processed by this executor since start.</summary>
     public long TotalProcessed => Interlocked.Read(ref _totalProcessed);
 
@@ -285,6 +291,17 @@ public sealed class RaftPartitionExecutor : IDisposable
         _logger = logger;
         _getGeneration = getGeneration;
         _maxClientQueueDepth = maxClientQueueDepth;
+
+        // Build per-kind TagLists and rejection tag once so the hot dispatch path pays
+        // zero allocation per op (no kind.ToString(), no boxing of partitionId).
+        _rejectionTag = new KeyValuePair<string, object?>("partition_id", partitionId);
+        _kindTags = new TagList[Enum.GetValues<RaftOperationKind>().Length];
+        foreach (RaftOperationKind k in Enum.GetValues<RaftOperationKind>())
+            _kindTags[(int)k] = new TagList
+            {
+                { "partition_id", partitionId },
+                { "operation_class", RaftOperationMapper.GetKindLabel(k) },
+            };
         _drainQuantumControl     = drainQuantumControl     > 0 ? drainQuantumControl     : (int)RaftOperationPriority.Control;
         _drainQuantumReplication = drainQuantumReplication > 0 ? drainQuantumReplication : (int)RaftOperationPriority.Replication;
         _drainQuantumClient      = drainQuantumClient      > 0 ? drainQuantumClient      : (int)RaftOperationPriority.Client;
@@ -523,8 +540,7 @@ public sealed class RaftPartitionExecutor : IDisposable
         if (kind == RaftOperationKind.Client && !_restoreCompleted)
         {
             Interlocked.Increment(ref _totalClientRejected);
-            KommanderMetrics.ExecutorRejectionsTotal.Add(1,
-                new KeyValuePair<string, object?>("partition_id", _partitionId));
+            KommanderMetrics.ExecutorRejectionsTotal.Add(1, _rejectionTag);
             reply?.TrySetResult(RaftResponseStatic.RestoreInProgressResponse);
             return;
         }
@@ -545,8 +561,7 @@ public sealed class RaftPartitionExecutor : IDisposable
             {
                 Interlocked.Decrement(ref _clientQueueDepth);
                 Interlocked.Increment(ref _totalClientRejected);
-                KommanderMetrics.ExecutorRejectionsTotal.Add(1,
-                    new KeyValuePair<string, object?>("partition_id", _partitionId));
+                KommanderMetrics.ExecutorRejectionsTotal.Add(1, _rejectionTag);
                 _logger.LogWarning(
                     "[RaftPartitionExecutor/{PartitionId}] Client queue full ({Depth}/{Capacity}); rejecting {Type}",
                     _partitionId, after - 1, _maxClientQueueDepth, request.Type);
@@ -895,9 +910,8 @@ public sealed class RaftPartitionExecutor : IDisposable
 
             double elapsedMs = sw.GetElapsedTime().TotalMilliseconds;
             RaftOperationKind kind = RaftOperationMapper.GetKind(request.Type);
-            TagList tags = new() { { "partition_id", _partitionId }, { "operation_class", kind.ToString() } };
-            KommanderMetrics.ExecutorOperationsTotal.Add(1, tags);
-            KommanderMetrics.ExecutorOperationDurationMs.Record(elapsedMs, tags);
+            KommanderMetrics.ExecutorOperationsTotal.Add(1, in _kindTags[(int)kind]);
+            KommanderMetrics.ExecutorOperationDurationMs.Record(elapsedMs, in _kindTags[(int)kind]);
             if (kind is RaftOperationKind.Client or RaftOperationKind.Replication)
                 _loadAccumulator.RecordOps(1);
             if (request.Type == RaftRequestType.ReplicateLogs)
@@ -958,9 +972,8 @@ public sealed class RaftPartitionExecutor : IDisposable
             Interlocked.Increment(ref _totalBatchesExecuted);
 
             double elapsedMs = sw.GetElapsedTime().TotalMilliseconds;
-            TagList tags = new() { { "partition_id", _partitionId }, { "operation_class", "Replication" } };
-            KommanderMetrics.ExecutorOperationsTotal.Add(ops.Count, tags);
-            KommanderMetrics.ExecutorOperationDurationMs.Record(elapsedMs, tags);
+            KommanderMetrics.ExecutorOperationsTotal.Add(ops.Count, in _kindTags[(int)RaftOperationKind.Replication]);
+            KommanderMetrics.ExecutorOperationDurationMs.Record(elapsedMs, in _kindTags[(int)RaftOperationKind.Replication]);
             _loadAccumulator.RecordOps(ops.Count);
             _logLoadAccumulator.RecordOps(ops.Count);
         }

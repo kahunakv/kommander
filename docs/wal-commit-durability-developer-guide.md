@@ -11,7 +11,7 @@ the idea up first, then walk the real flows, the configuration, and the code.
 
 ## Table of contents
 
-1. [The 60-second mental model](#the-60-second-mental-model)
+1. [Summary](#summary)
 2. [Why a committed write costs two fsyncs](#why-a-committed-write-costs-two-fsyncs)
 3. [Lever 1 — Group commit (throughput)](#lever-1--group-commit-throughput)
 4. [Lever 2 — The single-fsync fast path (latency)](#lever-2--the-single-fsync-fast-path-latency)
@@ -30,7 +30,7 @@ the idea up first, then walk the real flows, the configuration, and the code.
 
 ---
 
-## The 60-second mental model
+## Summary
 
 A Raft write is durable when a **quorum of nodes has it on disk**. Kommander commits in two phases —
 **propose** then **commit** — and on a durable backend each phase issues its own `fsync`:

@@ -13,7 +13,7 @@ it explains partitions, leaders, and the system partition, which this guide buil
 
 ## Table of contents
 
-1. [The 60-second mental model](#the-60-second-mental-model)
+1. [Summary](#summary)
 2. [The problem: why leaders pile up](#the-problem-why-leaders-pile-up)
 3. [Core concepts](#core-concepts)
 4. [How a rebalance happens, step by step](#how-a-rebalance-happens-step-by-step)
@@ -29,7 +29,7 @@ it explains partitions, leaders, and the system partition, which this guide buil
 
 ---
 
-## The 60-second mental model
+## Summary
 
 Kommander splits your data into many **partitions**. Each partition runs its own little Raft group,
 and each group elects one **leader** that does all the real work for that partition (handling writes,

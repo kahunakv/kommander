@@ -9,7 +9,7 @@ idea up first, then walk the real flows and the code.
 
 ## Table of contents
 
-1. [The 60-second mental model](#the-60-second-mental-model)
+1. [Summary](#summary)
 2. [Why backfill exists (the problem)](#why-backfill-exists-the-problem)
 3. [Two replication paths: live vs. backfill](#two-replication-paths-live-vs-backfill)
 4. [Core concepts](#core-concepts)
@@ -27,7 +27,7 @@ idea up first, then walk the real flows and the code.
 
 ---
 
-## The 60-second mental model
+## Summary
 
 A Raft follower is supposed to hold the **same log** as its leader — the same entries, in the same
 order, with no gaps. But followers fall behind: one is slow, one was briefly paused, one was

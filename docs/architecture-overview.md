@@ -16,7 +16,7 @@ ground up, then walk the main runtime flows end to end. Deeper feature guides
 
 ## Table of contents
 
-1. [The 60-second mental model](#the-60-second-mental-model)
+1. [Summary](#summary)
 2. [The problem Kommander solves](#the-problem-kommander-solves)
 3. [Core concepts (the vocabulary)](#core-concepts-the-vocabulary)
 4. [The component map](#the-component-map)
@@ -37,7 +37,7 @@ ground up, then walk the main runtime flows end to end. Deeper feature guides
 
 ---
 
-## The 60-second mental model
+## Summary
 
 Kommander keeps **the same data, in the same order, on several machines**, so that the system keeps
 working even when some machines fail.
