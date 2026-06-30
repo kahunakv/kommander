@@ -53,6 +53,7 @@ public static class RaftOperationMapper
             RaftRequestType.RollbackLogs         => RaftOperationKind.Client,
             RaftRequestType.GetNodeState              => RaftOperationKind.Client,
             RaftRequestType.GetTicketState            => RaftOperationKind.Client,
+            RaftRequestType.GetTicketWaiterTask       => RaftOperationKind.Client,
             RaftRequestType.GetFollowerCommittedIndex => RaftOperationKind.Client,
             RaftRequestType.DrainBarrier              => RaftOperationKind.Maintenance,
             RaftRequestType.RestoreLogsLoaded         => RaftOperationKind.Maintenance,
@@ -136,6 +137,7 @@ public static class RaftOperationMapper
 
             RaftRequestType.GetNodeState or
             RaftRequestType.GetTicketState or
+            RaftRequestType.GetTicketWaiterTask or
             RaftRequestType.GetFollowerCommittedIndex or
             RaftRequestType.DrainBarrier or
             RaftRequestType.RestoreLogsLoaded or

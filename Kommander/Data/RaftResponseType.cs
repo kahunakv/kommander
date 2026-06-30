@@ -7,4 +7,5 @@ public enum RaftResponseType
     NodeState,
     TicketState,
     FollowerCommittedIndex,
+    TicketWaiterTask,
 }

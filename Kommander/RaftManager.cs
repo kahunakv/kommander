@@ -2088,50 +2088,74 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
-    /// Waits for the replication proposal to be completed in the given partition
+    /// Waits for the replication proposal to be completed in the given partition using
+    /// event-driven notification rather than periodic polling.
+    /// <para>
+    /// One executor round-trip is made to obtain the proposal's completion task; subsequent
+    /// progress is delivered without executor involvement as the state machine fires
+    /// <see cref="RaftProposalQuorum.CompleteWaiter"/> on commit, rollback, or leader loss.
+    /// A 10-second timeout is enforced via <see cref="CancellationTokenSource.CancelAfter"/>
+    /// so that the caller's wait is bounded identically to the previous polling loop.
+    /// </para>
+    /// <para>
+    /// Falls back to a single <see cref="RaftPartition.GetTicketState"/> poll when the
+    /// completion task cannot be retrieved (proposal not found in <c>activeProposals</c>),
+    /// which can happen if the proposal completed and was cleaned up between the
+    /// <c>ReplicateLogs</c> response and the <c>GetTicketWaiterTask</c> request.
+    /// </para>
     /// </summary>
-    /// <param name="partition"></param>
-    /// <param name="ticketId"></param>
-    /// <param name="autoCommit"></param>
-    /// <param name="cancellationToken"></param>
-    /// <returns></returns>
     private async Task<RaftReplicationResult> WaitForQuorum(RaftPartition partition, HLCTimestamp ticketId, bool autoCommit, CancellationToken cancellationToken)
     {
-        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
+        if (!string.IsNullOrEmpty(partition.Leader) && partition.Leader != LocalEndpoint)
+            return new(false, RaftOperationStatus.NodeIsNotLeader, ticketId, -1);
 
-        while (stopwatch.GetElapsedMilliseconds() < 10000)
+        cancellationToken.ThrowIfCancellationRequested();
+
+        Task<(RaftProposalTicketState, long)>? waiterTask = null;
+
+        try
         {
-            if (!string.IsNullOrEmpty(partition.Leader) && partition.Leader != LocalEndpoint)
-                return new(false, RaftOperationStatus.NodeIsNotLeader, ticketId, -1);
+            waiterTask = await partition.GetTicketWaiterTaskAsync(ticketId).ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            Logger.LogError("WaitForQuorum: GetTicketWaiterTask failed: {Message}", e.Message);
+        }
 
-            cancellationToken.ThrowIfCancellationRequested();
-
+        if (waiterTask is null)
+        {
+            // Proposal is not in activeProposals — either it completed before we could retrieve
+            // the waiter, or it was never registered. Fall back to a single poll.
             try
             {
                 (RaftProposalTicketState state, long commitId) = await partition.GetTicketState(ticketId, autoCommit).ConfigureAwait(false);
-
-                switch (state)
-                {
-                    case RaftProposalTicketState.NotFound:
-                        return new(false, RaftOperationStatus.ReplicationFailed, ticketId, -1);
-
-                    case RaftProposalTicketState.Committed:
-                        return new(true, RaftOperationStatus.Success, ticketId, commitId);
-
-                    case RaftProposalTicketState.Proposed:
-                    default:
-                        break;
-                }
+                return state == RaftProposalTicketState.Committed
+                    ? new(true, RaftOperationStatus.Success, ticketId, commitId)
+                    : new(false, RaftOperationStatus.ReplicationFailed, ticketId, -1);
             }
             catch (Exception e) when (e is not OperationCanceledException)
             {
-                Logger.LogError("ReplicateLogs: {Message}", e.Message);
+                Logger.LogError("WaitForQuorum: GetTicketState fallback failed: {Message}", e.Message);
+                return new(false, RaftOperationStatus.ReplicationFailed, ticketId, -1);
             }
-
-            await Task.Delay(ProposalStatusPollDelay, cancellationToken).ConfigureAwait(false);
         }
 
-        return new(false, RaftOperationStatus.ProposalTimeout, ticketId, -1);
+        using CancellationTokenSource timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(10_000);
+
+        try
+        {
+            (RaftProposalTicketState ticketState, long commitIndex) = await waiterTask.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+
+            return ticketState == RaftProposalTicketState.Committed
+                ? new(true, RaftOperationStatus.Success, ticketId, commitIndex)
+                : new(false, RaftOperationStatus.ReplicationFailed, ticketId, -1);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // 10-second timeout elapsed without a terminal state transition.
+            return new(false, RaftOperationStatus.ProposalTimeout, ticketId, -1);
+        }
     }
 
     /// <summary>

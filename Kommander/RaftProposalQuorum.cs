@@ -27,6 +27,20 @@ public sealed class RaftProposalQuorum
     private bool completed;
 
     /// <summary>
+    /// Event-driven completion source for the write path. Callers that await
+    /// <see cref="GetWaiterTask"/> are unblocked as soon as the proposal reaches a
+    /// terminal state (committed, rolled-back, or invalidated by leader loss) rather
+    /// than discovering it through periodic polling.
+    /// <para>
+    /// Created eagerly so that the task is available before any terminal transition
+    /// can fire on the executor thread. Reset in <see cref="Reset"/> when the pooled
+    /// instance is reused; drained in <see cref="Clear"/> before pool return to
+    /// prevent leaks.
+    /// </para>
+    /// </summary>
+    private TaskCompletionSource<(RaftProposalTicketState, long)>? _waiter;
+
+    /// <summary>
     /// Represents the current state of the Raft proposal quorum.
     /// The state can denote whether the proposal is incomplete, completed,
     /// committed, or rolled back, based on the progression and outcome
@@ -73,11 +87,28 @@ public sealed class RaftProposalQuorum
     public RaftProposalQuorum(List<RaftLog> logs, bool autoCommit, HLCTimestamp startTimestamp)
     {
         State = RaftProposalState.Incomplete;
+        _waiter = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         Logs = logs;
         AutoCommit = autoCommit;
         StartTimestamp = startTimestamp;
     }
+
+    /// <summary>
+    /// Returns the task that completes when the proposal reaches a terminal state.
+    /// The result is <see cref="RaftProposalTicketState.Committed"/> and the commit index
+    /// on success, or <see cref="RaftProposalTicketState.NotFound"/> and -1 on failure
+    /// (rollback, leader loss, or timeout cleanup).
+    /// </summary>
+    public Task<(RaftProposalTicketState, long)> GetWaiterTask() => _waiter!.Task;
+
+    /// <summary>
+    /// Completes the event-driven waiter with the given terminal result. Called from
+    /// state-machine terminal transitions (<c>Committed</c>, <c>RolledBack</c>, leader loss).
+    /// Safe to call multiple times — <see cref="TaskCompletionSource{T}.TrySetResult"/> is idempotent.
+    /// </summary>
+    public void CompleteWaiter(RaftProposalTicketState state, long commitIndex)
+        => _waiter?.TrySetResult((state, commitIndex));
 
     /// <summary>
     /// Adds a node to the expected completions for the quorum. This method sets up the node's
@@ -146,15 +177,22 @@ public sealed class RaftProposalQuorum
     /// <param name="startTimestamp">The timestamp marking the start of the proposal.</param>
     public void Reset(List<RaftLog> logs, bool autoCommit, HLCTimestamp startTimestamp)
     {
-        State = RaftProposalState.Incomplete;        
+        // Drain any pending waiter from a previous pool use before replacing it.
+        _waiter?.TrySetResult((RaftProposalTicketState.NotFound, -1));
+        _waiter = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        State = RaftProposalState.Incomplete;
         completed = false;
         Logs = logs;
         AutoCommit = autoCommit;
-        StartTimestamp = startTimestamp;        
+        StartTimestamp = startTimestamp;
     }
 
     public void Clear()
     {
+        // Drain any pending waiter so awaiting callers are unblocked before the object is pooled.
+        _waiter?.TrySetResult((RaftProposalTicketState.NotFound, -1));
+        _waiter = null;
         Logs.Clear();
         nodes.Clear();
     }

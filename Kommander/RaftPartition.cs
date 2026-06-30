@@ -567,6 +567,28 @@ public sealed class RaftPartition : IDisposable
     }
     
     /// <summary>
+    /// Returns the event-driven completion task for the active proposal identified by
+    /// <paramref name="ticketId"/>, or <c>null</c> if the proposal is no longer in
+    /// <c>activeProposals</c>. The returned task completes when the proposal reaches a
+    /// terminal state (committed, rolled-back, or invalidated by leader loss), allowing
+    /// callers to await it directly instead of polling <see cref="GetTicketState"/>.
+    /// <para>
+    /// One executor round-trip is incurred per write call to retrieve the task; subsequent
+    /// progress is delivered without executor involvement as the state machine fires
+    /// <see cref="RaftProposalQuorum.CompleteWaiter"/> on the terminal transition.
+    /// </para>
+    /// </summary>
+    public async Task<Task<(RaftProposalTicketState, long)>?> GetTicketWaiterTaskAsync(HLCTimestamp ticketId)
+    {
+        RaftResponse? response = await executor.Ask(new(RaftRequestType.GetTicketWaiterTask, ticketId, false)).ConfigureAwait(false);
+
+        if (response is null || response.Type != RaftResponseType.TicketWaiterTask)
+            return null;
+
+        return response.WaiterTask;
+    }
+
+    /// <summary>
     /// Returns the last commit index acknowledged by <paramref name="endpoint"/> on this
     /// partition, or -1 when no <c>CompleteAppendLogs</c> has been received from that endpoint.
     /// Runs on the executor thread so it is safe to read <c>lastCommitIndexes</c>.

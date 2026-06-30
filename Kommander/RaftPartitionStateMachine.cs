@@ -317,6 +317,7 @@ public sealed class RaftPartitionStateMachine
                 nextIndex.Clear();
                 matchIndex.Clear();
                 localCommittedIndex = -1;
+                FailAllActiveProposalWaiters();
                 activeProposals.Clear();
                 lastProposalAt = HLCTimestamp.Zero;
                 SetQuiesced(false);
@@ -376,6 +377,7 @@ public sealed class RaftPartitionStateMachine
         nextIndex.Clear();
         matchIndex.Clear();
         localCommittedIndex = -1;
+        FailAllActiveProposalWaiters();
         activeProposals.Clear();
         lastProposalAt = HLCTimestamp.Zero;
         SetQuiesced(false);
@@ -442,6 +444,7 @@ public sealed class RaftPartitionStateMachine
         nextIndex.Clear();
         matchIndex.Clear();
         localCommittedIndex = -1;
+        FailAllActiveProposalWaiters();
         activeProposals.Clear();
 
         await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
@@ -610,6 +613,7 @@ public sealed class RaftPartitionStateMachine
         nextIndex.Clear();
         matchIndex.Clear();
         localCommittedIndex = -1;
+        FailAllActiveProposalWaiters();
         activeProposals.Clear();
         lastHeartbeat = HLCTimestamp.Zero;
 
@@ -1353,6 +1357,7 @@ public sealed class RaftPartitionStateMachine
             nextIndex.Clear();
             matchIndex.Clear();
             localCommittedIndex = -1;
+            FailAllActiveProposalWaiters();
             activeProposals.Clear();
             expectedLeaders[leaderTerm] = endpoint;   // overwrite any stale vote target with the real leader
             ResetPreVoteRound();                       // break the pre-vote livelock on adoption
@@ -2127,6 +2132,14 @@ public sealed class RaftPartitionStateMachine
         if (!proposal.AutoCommit)
         {
             logger.LogInfoProposalNoAutoCommit(host.LocalEndpoint, host.PartitionId, nodeState, timestamp);
+            // Manual two-phase: the public ReplicateLogs(autoCommit:false) caller awaits the
+            // propose phase, which succeeds here on propose-quorum-durable (the explicit commit
+            // comes later via CommitLogs, whose result returns through the reply-correlation path,
+            // not this waiter). CheckTicketCompletion historically reported {AutoCommit:false,
+            // Completed} as Committed, so complete the waiter the same way — otherwise the caller
+            // blocks until the 10 s timeout. CompleteLeaderCommit/Rollback fire TrySetResult again
+            // later; both are idempotent no-ops once this has run.
+            proposal.CompleteWaiter(RaftProposalTicketState.Committed, proposal.LastLogIndex);
             return;
         }
 
@@ -2354,6 +2367,9 @@ public sealed class RaftPartitionStateMachine
         }
 
         proposal.SetState(RaftProposalState.Committed);
+        // Unblock event-driven waiters on the public write path. If TryReleaseTicketOnQuorumDurable
+        // already fired on the fast path (WalSingleFsyncCommit + autoCommit), TrySetResult is a no-op.
+        proposal.CompleteWaiter(RaftProposalTicketState.Committed, completion.MaxLogIndex);
         HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
 
         if (completion.MaxLogIndex > localCommittedIndex)
@@ -2401,6 +2417,9 @@ public sealed class RaftPartitionStateMachine
         }
 
         proposal.SetState(RaftProposalState.RolledBack);
+        // Signal failure to any event-driven waiter so the public write path is unblocked
+        // immediately rather than waiting for the proposal to expire from activeProposals.
+        proposal.CompleteWaiter(RaftProposalTicketState.NotFound, -1);
 
         AppendLogsGrpcLogCache? grpcLogCache = proposal.Logs.Count > 0 ? new() : null;
 
@@ -2470,6 +2489,20 @@ public sealed class RaftPartitionStateMachine
     }
 
     /// <summary>
+    /// Returns the event-driven completion task for an active proposal so that callers can
+    /// await it directly instead of polling <see cref="CheckTicketCompletion"/>.
+    /// Returns <c>null</c> when the proposal is not found in <see cref="activeProposals"/>
+    /// (already cleaned up or never registered), in which case the caller should fall back
+    /// to a single <see cref="CheckTicketCompletion"/> poll.
+    /// </summary>
+    public Task<(RaftProposalTicketState, long)>? GetTicketWaiterTask(HLCTimestamp timestamp)
+    {
+        if (!activeProposals.TryGetValue(timestamp, out RaftProposalQuorum? proposal))
+            return null;
+        return proposal.GetWaiterTask();
+    }
+
+    /// <summary>
     /// Checks whether a proposal has been completed/committed or not.
     /// </summary>
     /// <param name="timestamp"></param>
@@ -2506,6 +2539,18 @@ public sealed class RaftPartitionStateMachine
     /// <para>No-op unless the flag is on or the proposal is not <c>autoCommit</c>; the explicit
     /// two-phase path is untouched.</para>
     /// </summary>
+    /// <summary>
+    /// Completes the event-driven waiters for all active proposals with a failure result
+    /// so that any caller awaiting them via <c>WaitForQuorum</c> is unblocked immediately
+    /// when leadership is lost. Must be called before <c>activeProposals.Clear()</c> on
+    /// every leader→follower transition so the proposal objects are still reachable.
+    /// </summary>
+    private void FailAllActiveProposalWaiters()
+    {
+        foreach (RaftProposalQuorum proposal in activeProposals.Values)
+            proposal.CompleteWaiter(RaftProposalTicketState.NotFound, -1);
+    }
+
     private void TryReleaseTicketOnQuorumDurable(RaftProposalQuorum proposal)
     {
         if (!host.Configuration.WalSingleFsyncCommit || !proposal.AutoCommit)
@@ -2515,6 +2560,9 @@ public sealed class RaftPartitionStateMachine
             localCommittedIndex = proposal.LastLogIndex;
 
         proposal.SetState(RaftProposalState.Committed);
+        // Unblock any caller awaiting event-driven completion; CompleteLeaderCommit will
+        // also fire TrySetResult, but TrySetResult is idempotent so the duplicate is safe.
+        proposal.CompleteWaiter(RaftProposalTicketState.Committed, proposal.LastLogIndex);
     }
 
     /// <summary>
