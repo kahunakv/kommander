@@ -6,81 +6,78 @@ using System.Collections;
 namespace Kommander.Support.Collections;
 
 /// <summary>
-/// Represents a single bucket in the SmallDictionary.
+/// Small dictionary backed by linear-scan lookup over a packed key array. It isn't thread-safe.
 /// </summary>
-/// <typeparam name="TKey"></typeparam>
-/// <typeparam name="TValue"></typeparam>
-public struct SmallBucket<TKey, TValue>
-{
-    public bool IsNotEmpty = false;
-    
-    public TKey Key;
-    
-    public TValue Value;
-
-    public SmallBucket()
-    {
-        IsNotEmpty = false;
-        Key = default!;
-        Value = default!;
-    }
-}
-
-/// <summary>
-/// Small dictionary backend by an array of buckets. It isn't thread-safe.
-/// </summary>
+/// <remarks>
+/// <para>Intended for tiny maps (a handful of entries, e.g. <c>RaftWriteAhead.plan</c> with three
+/// <c>RaftLogAction</c> keys) where the constant factors of a hashed <see cref="Dictionary{TKey,TValue}"/>
+/// — hashing, bucket/entry arrays, two allocations — cost more than a short linear scan. Lookup is O(n),
+/// so this only wins while <c>n</c> stays small; benchmarks put the crossover against
+/// <see cref="Dictionary{TKey,TValue}"/> at roughly 16 entries. Above that, prefer a real dictionary.</para>
+///
+/// <para><b>Layout.</b> Keys and values are held in separate arrays (structure-of-arrays) and packed
+/// densely into <c>[0, Count)</c>. A lookup scans only the live, contiguous <c>keys</c> slice — cache-dense
+/// and vectorizable by the JIT for primitive keys — without pulling values through cache. This is
+/// deliberately not an array-of-<c>KeyValuePair</c>/bucket-struct layout, which would interleave values
+/// (and formerly an occupancy flag) into every key comparison and roughly triple the bytes scanned.</para>
+///
+/// <para><b>Removal reorders.</b> <see cref="Remove"/> swaps the last live entry into the vacated slot to
+/// keep the array dense (no tombstones, so scans never pay for holes). Enumeration order is therefore
+/// insertion order only until the first removal; callers that need stable order after removals must not
+/// rely on it.</para>
+/// </remarks>
 /// <typeparam name="TKey"></typeparam>
 /// <typeparam name="TValue"></typeparam>
 public sealed class SmallDictionary<TKey, TValue> : IEnumerable<KeyValuePair<TKey, TValue>>
 {
-    private readonly SmallBucket<TKey, TValue?>[] buckets;
+    // Cached once so the EqualityComparer<TKey>.Default property fetch isn't repeated per scanned element.
+    private static readonly EqualityComparer<TKey> Comparer = EqualityComparer<TKey>.Default;
+
+    private readonly TKey[] keys;
+
+    private readonly TValue?[] values;
 
     public int Count { get; private set; }
-    
+
     public SmallDictionary(int capacity)
     {
-        buckets = new SmallBucket<TKey, TValue?>[capacity];
+        keys = new TKey[capacity];
+        values = new TValue?[capacity];
     }
 
     public void Add(TKey key, TValue value)
     {
         if (key == null)
             throw new ArgumentNullException(nameof(key));
-        
-        // Check if key already exists
-        int existingIndex = FindBucketIndex(key);
-        if (existingIndex >= 0)
+
+        if (IndexOf(key) >= 0)
             throw new ArgumentException("An item with the same key has already been added", nameof(key));
-        
-        for (int i = 0; i < buckets.Length; i++)
-        {
-            ref SmallBucket<TKey, TValue?> bucket = ref buckets[i];
-            
-            if (!bucket.IsNotEmpty)
-            {
-                bucket.IsNotEmpty = true;
-                bucket.Key = key;
-                bucket.Value = value;
-                Count++;
-                return;
-            }
-        }
-        
-        throw new ArgumentException("Not enough space in the dictionary");
+
+        int count = Count;
+        if (count >= keys.Length)
+            throw new ArgumentException("Not enough space in the dictionary");
+
+        keys[count] = key;
+        values[count] = value;
+        Count = count + 1;
     }
-    
+
     public void Remove(TKey key)
     {
         if (key == null)
             throw new ArgumentNullException(nameof(key));
-        
-        // Check if key already exists
-        int existingIndex = FindBucketIndex(key);
-        if (existingIndex >= 0)
-        {
-            buckets[existingIndex].IsNotEmpty = false;
-            Count--;
-        }
+
+        int index = IndexOf(key);
+        if (index < 0)
+            return;
+
+        // Swap-remove: pull the last live entry into the hole so [0, Count) stays dense.
+        int last = Count - 1;
+        keys[index] = keys[last];
+        values[index] = values[last];
+        keys[last] = default!;
+        values[last] = default;
+        Count = last;
     }
 
     /// <summary>
@@ -107,39 +104,30 @@ public sealed class SmallDictionary<TKey, TValue> : IEnumerable<KeyValuePair<TKe
         if (key == null)
             throw new ArgumentNullException(nameof(key));
 
-        // Check if key already exists
-        int existingIndex = FindBucketIndex(key);
-        if (existingIndex >= 0)
+        if (IndexOf(key) >= 0)
             return false;
-        
-        for (int i = 0; i < buckets.Length; i++)
-        {
-            ref SmallBucket<TKey, TValue?> bucket = ref buckets[i];
-            
-            if (!bucket.IsNotEmpty)
-            {
-                bucket.IsNotEmpty = true;
-                bucket.Key = key;
-                bucket.Value = value;
-                return true;
-            }
-        }
-        
-        throw new ArgumentException("Not enough space in the dictionary");
+
+        int count = Count;
+        if (count >= keys.Length)
+            throw new ArgumentException("Not enough space in the dictionary");
+
+        keys[count] = key;
+        values[count] = value;
+        Count = count + 1;
+        return true;
     }
-    
-    // Find the index of the bucket with the given key, or -1 if not found
-    private int FindBucketIndex(TKey key)
+
+    // Find the index of the live entry with the given key, or -1 if not found.
+    private int IndexOf(TKey key)
     {
-        if (key == null)
-            throw new ArgumentNullException(nameof(key));
-            
-        for (int i = 0; i < buckets.Length; i++)
+        TKey[] localKeys = keys;
+        int count = Count;
+        for (int i = 0; i < count; i++)
         {
-            if (buckets[i].IsNotEmpty && EqualityComparer<TKey>.Default.Equals(buckets[i].Key, key))
+            if (Comparer.Equals(localKeys[i], key))
                 return i;
         }
-        
+
         return -1;
     }
 
@@ -157,19 +145,19 @@ public sealed class SmallDictionary<TKey, TValue> : IEnumerable<KeyValuePair<TKe
     {
         get
         {
-            int index = FindBucketIndex(key);
+            int index = IndexOf(key);
             if (index < 0)
                 throw new KeyNotFoundException($"The given key '{key}' was not present in the dictionary.");
-                
-            return (TValue)buckets[index].Value!;
+
+            return values[index]!;
         }
         set
         {
-            int index = FindBucketIndex(key);
+            int index = IndexOf(key);
             if (index >= 0)
             {
                 // Update existing value
-                buckets[index].Value = value;
+                values[index] = value;
             }
             else
             {
@@ -178,11 +166,11 @@ public sealed class SmallDictionary<TKey, TValue> : IEnumerable<KeyValuePair<TKe
             }
         }
     }
-    
+
     // Check if the dictionary contains a key
     public bool ContainsKey(TKey key)
     {
-        return FindBucketIndex(key) >= 0;
+        return IndexOf(key) >= 0;
     }
 
     /// <summary>
@@ -204,46 +192,37 @@ public sealed class SmallDictionary<TKey, TValue> : IEnumerable<KeyValuePair<TKe
     /// </exception>
     public bool TryGetValue(TKey key, out TValue value)
     {
-        int index = FindBucketIndex(key);
+        int index = IndexOf(key);
         if (index >= 0)
         {
-            value = (TValue)buckets[index].Value!;
+            value = values[index]!;
             return true;
         }
-        
+
         value = default!;
         return false;
     }
 
     /// <summary>
-    /// Calculates the number of non-empty buckets in the dictionary.
+    /// Returns the number of live entries. Equivalent to <see cref="Count"/>; retained for callers that
+    /// used the explicit method form.
     /// </summary>
     /// <returns>
-    /// The number of buckets that contain at least one element.
+    /// The number of key-value pairs currently stored.
     /// </returns>
     public int GetCount()
     {
-        int counter = 0;
-
-        for (int i = 0; i < buckets.Length; i++)
-        {
-            if (buckets[i].IsNotEmpty)
-                counter++;
-        }
-
-        return counter;
+        return Count;
     }
-    
+
     // IEnumerable<KeyValuePair<TKey, TValue>> implementation
     public IEnumerator<KeyValuePair<TKey, TValue>> GetEnumerator()
     {
-        for (int i = 0; i < buckets.Length; i++)
-        {
-            if (buckets[i].IsNotEmpty)
-                yield return new(buckets[i].Key, (TValue)buckets[i].Value!);
-        }
+        int count = Count;
+        for (int i = 0; i < count; i++)
+            yield return new(keys[i], values[i]!);
     }
-    
+
     // IEnumerable implementation
     IEnumerator IEnumerable.GetEnumerator()
     {

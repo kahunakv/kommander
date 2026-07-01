@@ -7,6 +7,7 @@ using Kommander.Diagnostics;
 using Kommander.Gossip;
 using Kommander.Logging;
 using Kommander.Scheduling;
+using Kommander.Support.Collections;
 using Kommander.System;
 using Kommander.Time;
 using Kommander.WAL.Data;
@@ -1670,7 +1671,10 @@ public sealed class RaftPartitionStateMachine
     /// <exception cref="RaftException"></exception>
     public async Task ReplicateLogsBatchAsync(IReadOnlyList<(List<RaftLog>? Logs, bool AutoCommit, ulong? ReplyCorrelationId)> messages)
     {
-        Dictionary<bool, List<RaftLog>> logsPlan = new();
+        // Keyed by the two possible autoCommit values, so at most two entries — sized exactly to the
+        // bool key space. SmallDictionary avoids the hashed-dictionary bucket/entry allocation on this
+        // per-batch hot path; capacity can never be exceeded because a bool has two values.
+        SmallDictionary<bool, List<RaftLog>> logsPlan = new(2);
         
         foreach ((List<RaftLog>? logs, bool autoCommit, ulong? replyCorrelationId) message in messages)
         {
