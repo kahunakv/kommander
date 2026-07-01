@@ -121,6 +121,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// </summary>
     private readonly ConcurrentDictionary<string, MemoryStream> _pendingSnapshots = new();
 
+    private readonly object _pendingSnapshotsLock = new();
+
     /// <summary>
     /// SWIM failure-detector liveness table for this node.
     /// Tracks Alive/Suspect/Dead state for all known peers.
@@ -788,26 +790,38 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         SnapshotRequest request,
         CancellationToken cancellationToken = default)
     {
+        if (Volatile.Read(ref _disposed) != 0)
+            return new SnapshotResponse(false);
+
         IRaftStateMachineTransfer? transfer = Volatile.Read(ref _stateMachineTransfer);
         if (transfer is null)
             return new SnapshotResponse(false);
+
+        cancellationToken.ThrowIfCancellationRequested();
 
         // Idempotency: already at or past the snapshot index — accept without re-importing.
         long currentMax = walAdapter.GetMaxLog(request.PartitionId);
         if (currentMax >= request.SnapshotIndex)
             return new SnapshotResponse(true);
 
-        // Accumulate the chunk into the session buffer.
-        MemoryStream buf = _pendingSnapshots.GetOrAdd(request.SessionId, _ => new MemoryStream());
-        await buf.WriteAsync(request.Data, cancellationToken).ConfigureAwait(false);
+        MemoryStream buf;
+        lock (_pendingSnapshotsLock)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+                return new SnapshotResponse(false);
 
-        // Non-final chunks are accepted; wait for IsLast before applying.
-        if (!request.IsLast)
-            return new SnapshotResponse(true);
+            // Accumulate the chunk into the session buffer.
+            buf = _pendingSnapshots.GetOrAdd(request.SessionId, _ => new MemoryStream());
+            buf.Write(request.Data, 0, request.Data.Length);
 
-        // All chunks received — apply and clean up session state.
-        _pendingSnapshots.TryRemove(request.SessionId, out _);
-        buf.Position = 0;
+            // Non-final chunks are accepted; wait for IsLast before applying.
+            if (!request.IsLast)
+                return new SnapshotResponse(true);
+
+            // All chunks received — apply and clean up session state.
+            _pendingSnapshots.TryRemove(request.SessionId, out _);
+            buf.Position = 0;
+        }
 
         try
         {
@@ -839,6 +853,23 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         Logger.LogInfoReceiveInstallSnapshot(LocalEndpoint, request.PartitionId, request.SnapshotIndex);
 
         return new SnapshotResponse(true);
+    }
+
+    private void DisposePendingSnapshots()
+    {
+        List<MemoryStream> snapshots = [];
+
+        lock (_pendingSnapshotsLock)
+        {
+            foreach (KeyValuePair<string, MemoryStream> pending in _pendingSnapshots)
+            {
+                if (_pendingSnapshots.TryRemove(pending.Key, out MemoryStream? snapshot))
+                    snapshots.Add(snapshot);
+            }
+        }
+
+        foreach (MemoryStream snapshot in snapshots)
+            snapshot.Dispose();
     }
 
     /// <summary>
@@ -3087,6 +3118,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         // 1. Stop and dispose the timer so no new work is injected and both
         //    Timer instances are released without waiting for GC.
         timerService.Dispose();
+        DisposePendingSnapshots();
 
         // 2. Drain partition queues before stopping shared schedulers. Then stop the
         //    I/O schedulers while executors are still alive, so accepted WAL work can
@@ -3122,5 +3154,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         // 4. Dispose remaining shared resources.
         hybridLogicalClock.Dispose();
         walAdapter.Dispose();
+
+        if (discovery is IDisposable disposableDiscovery)
+            disposableDiscovery.Dispose();
     }
 }

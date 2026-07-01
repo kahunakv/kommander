@@ -97,6 +97,17 @@ public sealed class TestRaftSystemCoordinator
     private static Task WaitForIdleAsync(RaftManager manager) =>
         manager.SystemCoordinator.DrainAsync().WaitAsync(TimeSpan.FromSeconds(5));
 
+    private sealed class DisposableDiscovery : IDiscovery, IDisposable
+    {
+        public bool Disposed { get; private set; }
+
+        public Task Register(RaftConfiguration configuration) => Task.CompletedTask;
+
+        public List<RaftNode> GetNodes() => [];
+
+        public void Dispose() => Disposed = true;
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────────────
 
     [Fact]
@@ -288,6 +299,31 @@ public sealed class TestRaftSystemCoordinator
     }
 
     [Fact]
+    public void Dispose_DisposesDiscoveryWhenDiscoveryOwnsResources()
+    {
+        DisposableDiscovery discovery = new();
+        RaftConfiguration config = new()
+        {
+            Host = "localhost",
+            Port = 9000,
+            InitialPartitions = 0
+        };
+
+        RaftManager manager = new(
+            config,
+            discovery,
+            new InMemoryWAL(NullLogger<IRaft>.Instance),
+            new Kommander.Communication.Memory.InMemoryCommunication(),
+            new HybridLogicalClock(),
+            NullLogger<IRaft>.Instance
+        );
+
+        manager.Dispose();
+
+        Assert.True(discovery.Disposed);
+    }
+
+    [Fact]
     public async Task Dispose_DuringPendingMessages_DrainsThenExits()
     {
         RaftManager manager = Build();
@@ -327,7 +363,7 @@ public sealed class TestRaftSystemCoordinator
             manager.SystemCoordinator.StartPartitionsOverride = ranges =>
             {
                 activated = [..ranges];
-                manager.StartUserPartitions(ranges);
+            manager.StartUserPartitions(ranges);
                 done.TrySetResult();
             };
 
