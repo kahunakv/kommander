@@ -265,6 +265,43 @@ public class TestSnapshotInstall
         }
     }
 
+    [Fact]
+    public async Task Dispose_WithIncompleteSnapshotSession_ReleasesBufferedChunks()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        CapturingTransfer transfer = new();
+
+        using Kommander.WAL.InMemoryWAL wal = new(NullLogger<IRaft>.Instance);
+        Kommander.Discovery.StaticDiscovery discovery = new([]);
+        Kommander.Communication.Memory.InMemoryCommunication comm = new();
+        RaftConfiguration cfg = new() { NodeId = 1, Host = "localhost", Port = 9995, InitialPartitions = 1 };
+        RaftManager manager = new(cfg, discovery, wal, comm, new HybridLogicalClock(), NullLogger<IRaft>.Instance);
+        manager.RegisterStateMachineTransfer(transfer);
+
+        SnapshotResponse r = await manager.ReceiveInstallSnapshot(new SnapshotRequest
+        {
+            SessionId = "session-to-dispose", PartitionId = 1, SnapshotIndex = 400,
+            FollowerEndpoint = "x:1", ChunkIndex = 0, IsLast = false,
+            Data = [0xCC, 0xDD],
+        }, ct);
+
+        Assert.True(r.Success);
+        Assert.Equal(1, PendingSnapshotSessionCount(manager));
+
+        manager.Dispose();
+
+        Assert.Equal(0, PendingSnapshotSessionCount(manager));
+
+        SnapshotResponse afterDispose = await manager.ReceiveInstallSnapshot(new SnapshotRequest
+        {
+            SessionId = "session-to-dispose", PartitionId = 1, SnapshotIndex = 400,
+            FollowerEndpoint = "x:1", ChunkIndex = 1, IsLast = true,
+            Data = [0xEE],
+        }, ct);
+
+        Assert.False(afterDispose.Success);
+    }
+
     /// <summary>
     /// SetJoinTerminalReason/GetJoinTerminalReason round-trip: once set, the reason is
     /// retrievable and a second call to SetJoinTerminalReason for the same endpoint
@@ -400,6 +437,18 @@ public class TestSnapshotInstall
     }
 
     // ── stubs ──────────────────────────────────────────────────────────────────
+
+    private static int PendingSnapshotSessionCount(RaftManager manager)
+    {
+        global::System.Reflection.FieldInfo field = typeof(RaftManager).GetField(
+            "_pendingSnapshots",
+            global::System.Reflection.BindingFlags.NonPublic | global::System.Reflection.BindingFlags.Instance)!;
+
+        global::System.Collections.Concurrent.ConcurrentDictionary<string, MemoryStream> pending =
+            (global::System.Collections.Concurrent.ConcurrentDictionary<string, MemoryStream>)field.GetValue(manager)!;
+
+        return pending.Count;
+    }
 
     /// <summary>Captures all bytes passed to ImportRange for chunk-order assertions.</summary>
     private sealed class CapturingTransfer : IRaftStateMachineTransfer
