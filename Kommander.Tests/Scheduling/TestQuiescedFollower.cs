@@ -220,6 +220,8 @@ public class TestQuiescedFollower
 
         public IRaftStateMachineTransfer? StateMachineTransfer => null;
 
+        public IRaftSystemStateTransfer? SystemStateTransfer => null;
+
         public Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct) =>
             Task.FromResult(new SnapshotResponse(false));
     }

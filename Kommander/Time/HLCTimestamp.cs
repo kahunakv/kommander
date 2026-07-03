@@ -64,32 +64,21 @@ public readonly record struct HLCTimestamp : IComparable<HLCTimestamp>
     /// </returns>
     public int CompareTo(HLCTimestamp other)
     {
-        if (N == other.N)
-        {
-            if (L == other.L)
-            {
-                if (C == other.C)
-                    return 0;
+        // Total order by physical time, then counter, then node id. Node id is the final
+        // tie-breaker: two timestamps with the same (L, C) from different nodes are distinct
+        // (record equality includes N), so they must order consistently rather than compare as
+        // mutually "less than". This keeps CompareTo antisymmetric and consistent with Equals
+        // (returns 0 iff all three components match).
+        if (L != other.L)
+            return L < other.L ? -1 : 1;
 
-                if (C < other.C)
-                    return -1;
+        if (C != other.C)
+            return C < other.C ? -1 : 1;
 
-                if (C > other.C)
-                    return 1;
-            }
-        }
+        if (N != other.N)
+            return N < other.N ? -1 : 1;
 
-        if (L == other.L)
-        {
-            if (C > other.C)
-                return 1;            
-            return -1;
-        }
-        
-        if (L < other.L)
-            return -1;
-
-        return 1;
+        return 0;
     }
 
     /// <summary>

@@ -52,6 +52,7 @@ public sealed class TestLogOpsAccumulator
         public Task<bool> InvokeSystemReplicationReceived(int partitionId, RaftLog log) => Task.FromResult(false);
         public void InvokeReplicationError(int partitionId, RaftLog log) { }
         public IRaftStateMachineTransfer? StateMachineTransfer => null;
+        public IRaftSystemStateTransfer? SystemStateTransfer => null;
         public Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct) => Task.FromResult(new SnapshotResponse(false));
         public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;
         public List<(string, RaftResponderRequest)> EnqueuedResponses { get; } = [];

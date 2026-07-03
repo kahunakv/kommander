@@ -29,6 +29,7 @@ namespace Kommander.Communication;
 [JsonSerializable(typeof(GetFollowerLagResponse))]
 [JsonSerializable(typeof(SnapshotRequest))]
 [JsonSerializable(typeof(SnapshotResponse))]
+[JsonSerializable(typeof(SnapshotKind))]
 [JsonSerializable(typeof(GossipRequest))]
 [JsonSerializable(typeof(GossipResponse))]
 [JsonSerializable(typeof(PingRequest))]

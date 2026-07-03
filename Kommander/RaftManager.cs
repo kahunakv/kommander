@@ -102,6 +102,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     private IRaftStateMachineTransfer? _stateMachineTransfer;
 
+    private IRaftSystemStateTransfer? _systemStateTransfer;
+
     /// <summary>
     /// Per-endpoint terminal reasons set by the P0 leader when it determines a learner can
     /// never be promoted (e.g., below the WAL compaction floor with no snapshot transfer).
@@ -136,6 +138,14 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// Null when the application has not registered one (log-shipping fallback).
     /// </summary>
     internal IRaftStateMachineTransfer? StateMachineTransfer => Volatile.Read(ref _stateMachineTransfer);
+
+    /// <summary>
+    /// Optional whole-partition state-transfer implementation registered by the application for
+    /// the system partition.  Accessed by the partition state machine when a P0 follower has
+    /// fallen below the WAL compaction floor and must be repaired via a full-state snapshot.
+    /// Null when no system-state transfer has been registered (log-shipping only).
+    /// </summary>
+    internal IRaftSystemStateTransfer? SystemStateTransfer => Volatile.Read(ref _systemStateTransfer);
 
     private readonly ConcurrentDictionary<(string endpoint, int partitionId), HLCTimestamp> lastActivity = new();
 
@@ -522,13 +532,16 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         // Wait for the system coordinator to replicate the initial partition map and call
         // StartUserPartitions. On a slow or loaded host this can take longer than expected;
         // impose an explicit deadline so JoinCluster never blocks indefinitely. The 60 s
-        // hard timeout fires only when the caller does not supply their own cancellation.
+        // hard timeout is a fallback that fires only when the caller supplies no cancellation
+        // of its own; when the caller passes a cancellable token it owns the deadline (via the
+        // ThrowIfCancellationRequested below and the cancellable Task.Delay), so we do not
+        // impose an additional hardcoded limit that could cut a legitimately longer join short.
         ValueStopwatch joinStopwatch = ValueStopwatch.StartNew();
         while (!IsInitialized)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            if (joinStopwatch.GetElapsedMilliseconds() > 60_000)
+            if (!cancellationToken.CanBeCanceled && joinStopwatch.GetElapsedMilliseconds() > 60_000)
                 throw new TimeoutException("RaftManager.JoinCluster timed out after 60 s waiting for cluster initialization. The system partition may have failed to elect a leader.");
 
             await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
@@ -537,7 +550,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     /// <summary>
     /// Seed-based join: contacts each seed in turn until this node is admitted as a Learner,
-    /// then waits for automatic promotion to Voter (same 60 s deadline as <see cref="JoinCluster(CancellationToken)"/>).
+    /// then waits for automatic promotion to Voter. The 60 s deadline is a fallback that applies
+    /// only when the caller supplies no cancellation of its own (same contract as
+    /// <see cref="JoinCluster(CancellationToken)"/>); a caller that passes a cancellable token owns
+    /// the deadline itself.
     /// <para>
     /// Unlike the discovery-based overload this variant does NOT call <see cref="IDiscovery.Register"/>;
     /// it relies on the P0 leader learning of the new node via the committed roster entry so that
@@ -578,7 +594,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         while (accepted is null || !accepted.Success)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (joinStopwatch.GetElapsedMilliseconds() > 60_000)
+            if (!cancellationToken.CanBeCanceled && joinStopwatch.GetElapsedMilliseconds() > 60_000)
                 throw new TimeoutException("RaftManager.JoinCluster(seeds) timed out after 60 s before being admitted as a Learner.");
             string? leaderHint = null;
 
@@ -631,7 +647,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         while (!IsInitialized)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (joinStopwatch.GetElapsedMilliseconds() > 60_000)
+            if (!cancellationToken.CanBeCanceled && joinStopwatch.GetElapsedMilliseconds() > 60_000)
                 throw new TimeoutException("RaftManager.JoinCluster(seeds) timed out after 60 s waiting for cluster initialization.");
             await Task.Delay(500, cancellationToken).ConfigureAwait(false);
         }
@@ -640,7 +656,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         while (LocalRole != System.ClusterMemberRole.Voter)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (joinStopwatch.GetElapsedMilliseconds() > 60_000)
+            if (!cancellationToken.CanBeCanceled && joinStopwatch.GetElapsedMilliseconds() > 60_000)
                 throw new TimeoutException("RaftManager.JoinCluster(seeds) timed out after 60 s waiting for Voter promotion.");
 
             // The P0 leader signals a terminal condition (e.g., learner is below the WAL
@@ -778,9 +794,11 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <para>Large snapshots are split into bounded chunks by the sender.  Each chunk carries a
     /// <see cref="SnapshotRequest.SessionId"/> that identifies the transfer session; this method
     /// accumulates chunks in <see cref="_pendingSnapshots"/> until <see cref="SnapshotRequest.IsLast"/>
-    /// is true, then delegates to <see cref="IRaftStateMachineTransfer.ImportRange"/> and seeds the
-    /// WAL with a <c>CommittedCheckpoint</c> entry at <see cref="SnapshotRequest.SnapshotIndex"/>
-    /// so that normal backfill can resume from there.</para>
+    /// is true, then dispatches to the correct importer based on <see cref="SnapshotRequest.Kind"/>:
+    /// <see cref="SnapshotKind.Range"/> → <see cref="IRaftStateMachineTransfer.ImportRange"/>;
+    /// <see cref="SnapshotKind.SystemState"/> → <see cref="IRaftSystemStateTransfer.ImportPartitionState"/>.
+    /// Afterwards the WAL is seeded with a <c>CommittedCheckpoint</c> entry at
+    /// <see cref="SnapshotRequest.SnapshotIndex"/> so normal backfill can resume from there.</para>
     ///
     /// <para>The method is idempotent at the session boundary: if the local WAL already reflects
     /// <see cref="SnapshotRequest.SnapshotIndex"/> or higher, every chunk for that transfer returns
@@ -793,9 +811,22 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         if (Volatile.Read(ref _disposed) != 0)
             return new SnapshotResponse(false);
 
-        IRaftStateMachineTransfer? transfer = Volatile.Read(ref _stateMachineTransfer);
-        if (transfer is null)
-            return new SnapshotResponse(false);
+        // Resolve the transfer by kind up front so a request with no matching transfer fails fast.
+        bool isSystemState = request.Kind == SnapshotKind.SystemState;
+        IRaftSystemStateTransfer? systemTransfer = null;
+        IRaftStateMachineTransfer? rangeTransfer = null;
+        if (isSystemState)
+        {
+            systemTransfer = Volatile.Read(ref _systemStateTransfer);
+            if (systemTransfer is null)
+                return new SnapshotResponse(false);
+        }
+        else
+        {
+            rangeTransfer = Volatile.Read(ref _stateMachineTransfer);
+            if (rangeTransfer is null)
+                return new SnapshotResponse(false);
+        }
 
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -825,13 +856,17 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
         try
         {
-            await transfer.ImportRange(request.PartitionId, buf, cancellationToken).ConfigureAwait(false);
+            if (isSystemState)
+                await systemTransfer!.ImportPartitionState(request.PartitionId, buf, cancellationToken).ConfigureAwait(false);
+            else
+                await rangeTransfer!.ImportRange(request.PartitionId, buf, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
+            string importMethod = isSystemState ? "ImportPartitionState" : "ImportRange";
             Logger.LogError(
-                "[{Endpoint}] ReceiveInstallSnapshot: ImportRange partition={PartitionId} index={Index} failed: {Message}",
-                LocalEndpoint, request.PartitionId, request.SnapshotIndex, ex.Message);
+                "[{Endpoint}] ReceiveInstallSnapshot: {Method} partition={PartitionId} index={Index} failed: {Message}",
+                LocalEndpoint, importMethod, request.PartitionId, request.SnapshotIndex, ex.Message);
             return new SnapshotResponse(false);
         }
         finally
@@ -2904,6 +2939,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <inheritdoc/>
     public void RegisterStateMachineTransfer(IRaftStateMachineTransfer? transfer) =>
         Volatile.Write(ref _stateMachineTransfer, transfer);
+
+    /// <inheritdoc/>
+    public void RegisterSystemStateTransfer(IRaftSystemStateTransfer? transfer) =>
+        Volatile.Write(ref _systemStateTransfer, transfer);
 
     /// <summary>
     /// Called by the P0 coordinator when it determines that <paramref name="endpoint"/> can never

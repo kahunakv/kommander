@@ -532,6 +532,8 @@ public class TestSnapshotInstall
 
         public IRaftStateMachineTransfer? StateMachineTransfer => transfer;
 
+        public IRaftSystemStateTransfer? SystemStateTransfer => null;
+
         public Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct) =>
             comm?.SendInstallSnapshot(null!, node, request, ct) ?? Task.FromResult(new SnapshotResponse(false));
 
