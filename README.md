@@ -51,6 +51,7 @@ The library keeps storage, discovery, and communication pluggable. That separati
 | [Elastic Partitions Developer Guide](docs/elastic-partitions-developer-guide.md) | Creating, splitting, merging, and removing partitions at runtime, the two-phase protocols, and the generation fence. |
 | [Partition Quiescence Developer Guide](docs/partition-quiescence-developer-guide.md) | How idle partitions stop heartbeating and lean on SWIM for liveness: the quiesce/wake flows, the failover-timing rule, and the configuration knobs. |
 | [Leader Balancer Developer Guide](docs/leader-balancer-developer-guide.md) | How leaderships are spread evenly across the cluster: load reports, the global view, the two-tier (count then load) planner, the transfer-suggestion mechanism, configuration, and observability. |
+| [System-Partition State Snapshots Developer Guide](docs/system-partition-state-snapshots-developer-guide.md) | Storing cluster-wide control state on partition 0 and moving from full-snapshot-per-mutation to compaction-safe delta logs: the `IRaftSystemStateTransfer` hook, below-floor repair, cold restart, and the retain floor. |
 
 ## Packages And Targets
 

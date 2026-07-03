@@ -559,6 +559,7 @@ public sealed class RaftService : Rafter.RafterBase
             ChunkIndex = request.ChunkIndex,
             IsLast = request.IsLast,
             Data = request.Data.ToByteArray(),
+            Kind = (Data.SnapshotKind)request.Kind,
         };
 
         Data.SnapshotResponse result = await manager.ReceiveInstallSnapshot(

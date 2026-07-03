@@ -189,5 +189,6 @@ public sealed class TestBatchRequestsResponseCadence
         public int GetPartitionKey(string partitionKey) => throw new NotImplementedException();
         public int GetPrefixPartitionKey(string prefixPartitionKey) => throw new NotImplementedException();
         public void RegisterStateMachineTransfer(IRaftStateMachineTransfer? transfer) => throw new NotImplementedException();
+        public void RegisterSystemStateTransfer(IRaftSystemStateTransfer? transfer) => throw new NotImplementedException();
     }
 }

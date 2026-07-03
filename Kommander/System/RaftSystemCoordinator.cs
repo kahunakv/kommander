@@ -2132,12 +2132,14 @@ internal sealed class RaftSystemCoordinator : IDisposable
                     if (!_terminalBelowFloorEndpoints.Contains(endpoint))
                     {
                         long floor = manager.WalAdapter.GetLastCheckpoint(partitionId);
-                        if (floor > 0 && learnerCommittedNullable.Value < floor && manager.StateMachineTransfer is null)
+                        bool canRepairViaSnapshot = manager.StateMachineTransfer is not null
+                            || (partitionId == RaftSystemConfig.SystemPartition && manager.SystemStateTransfer is not null);
+                        if (floor > 0 && learnerCommittedNullable.Value < floor && !canRepairViaSnapshot)
                         {
                             string reason =
                                 $"learner is below WAL compaction floor on partition {partitionId} " +
                                 $"(learnerIndex={learnerCommittedNullable.Value}, floor={floor}). " +
-                                "Register IRaftStateMachineTransfer to enable snapshot-based catch-up.";
+                                "Register IRaftStateMachineTransfer (or IRaftSystemStateTransfer for P0) to enable snapshot-based catch-up.";
 
                             logger.LogWarning(
                                 "[RaftSystemCoordinator] Learner {Endpoint} permanently blocked: {Reason}",

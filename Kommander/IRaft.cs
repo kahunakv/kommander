@@ -604,4 +604,22 @@ public interface IRaft
     /// The registration is not replicated — each node must register independently.
     /// </summary>
     void RegisterStateMachineTransfer(IRaftStateMachineTransfer? transfer);
+
+    /// <summary>
+    /// Registers an optional <see cref="IRaftSystemStateTransfer"/> implementation that Kommander
+    /// will use to repair a system-partition (id 0) follower that has fallen below the WAL
+    /// compaction floor.  When registered, the leader calls
+    /// <see cref="IRaftSystemStateTransfer.ExportPartitionState"/> and ships the blob to the
+    /// lagging follower, which installs it via
+    /// <see cref="IRaftSystemStateTransfer.ImportPartitionState"/> and resumes log replication
+    /// from the snapshot index.
+    /// <para>
+    /// Distinct from <see cref="RegisterStateMachineTransfer"/>, which covers key-range splits
+    /// and merges.  Both may be registered simultaneously without conflict.
+    /// </para>
+    /// Pass <see langword="null"/> to clear a previously registered transfer.
+    /// Safe to call at any time, including before <see cref="JoinCluster"/>.
+    /// The registration is not replicated — each node must register independently.
+    /// </summary>
+    void RegisterSystemStateTransfer(IRaftSystemStateTransfer? transfer);
 }

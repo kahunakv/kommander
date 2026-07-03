@@ -65,6 +65,14 @@ public interface IRaftPartitionHost
     IRaftStateMachineTransfer? StateMachineTransfer { get; }
 
     /// <summary>
+    /// Returns the registered <see cref="IRaftSystemStateTransfer"/> for whole-partition
+    /// state snapshots on the system partition (id 0), or <see langword="null"/> when none has
+    /// been registered.  The state machine checks this to decide whether a below-floor P0
+    /// follower can be repaired via a full-state export rather than individual log entries.
+    /// </summary>
+    IRaftSystemStateTransfer? SystemStateTransfer { get; }
+
+    /// <summary>
     /// Sends a snapshot to <paramref name="node"/> on behalf of the partition leader.
     /// Wraps the active <see cref="Kommander.Communication.ICommunication"/> so the state machine
     /// does not need a direct reference to the transport layer.

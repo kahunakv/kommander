@@ -965,7 +965,8 @@ public sealed class RaftPartitionStateMachine
                 // prevents duplicate transfers; the postToExecutor callback will advance
                 // lastCommitIndexes[endpoint] once the follower confirms installation.
                 long lastCheckpoint = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
-                if (lastCheckpoint > 0 && host.StateMachineTransfer is not null)
+                bool p0System = host.PartitionId == RaftSystemConfig.SystemPartition && host.SystemStateTransfer is not null;
+                if (lastCheckpoint > 0 && (host.StateMachineTransfer is not null || p0System))
                 {
                     RaftNode capturedNode = node;
                     if (pendingSnapshotEndpoints.TryAdd(capturedNode.Endpoint, 0))
@@ -2585,22 +2586,50 @@ public sealed class RaftPartitionStateMachine
 
         try
         {
-            IRaftStateMachineTransfer? transfer = host.StateMachineTransfer;
-            if (transfer is null)
-                return;
+            // For the system partition (P0) with a registered system-state transfer, export the
+            // full application state.  For all other partitions (or when only a range transfer is
+            // registered), use the existing key-range export path so existing behaviour is preserved.
+            bool useSystemState = host.PartitionId == RaftSystemConfig.SystemPartition
+                                  && host.SystemStateTransfer is not null;
 
-            RaftSplitPlan plan = new() { TargetPartitionId = host.PartitionId };
             Stream snapshot;
-            try
+            SnapshotKind kind;
+            if (useSystemState)
             {
-                snapshot = await transfer.ExportRange(plan, snapshotIndex, CancellationToken.None).ConfigureAwait(false);
+                kind = SnapshotKind.SystemState;
+                try
+                {
+                    snapshot = await host.SystemStateTransfer!
+                        .ExportPartitionState(host.PartitionId, snapshotIndex, CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(
+                        "[{LocalEndpoint}/{PartitionId}/{State}] TrySendSnapshotAsync: ExportPartitionState failed for {Endpoint}: {Message}",
+                        host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, ex.Message);
+                    return;
+                }
             }
-            catch (Exception ex)
+            else
             {
-                logger.LogError(
-                    "[{LocalEndpoint}/{PartitionId}/{State}] TrySendSnapshotAsync: ExportRange failed for {Endpoint}: {Message}",
-                    host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, ex.Message);
-                return;
+                IRaftStateMachineTransfer? transfer = host.StateMachineTransfer;
+                if (transfer is null)
+                    return;
+
+                kind = SnapshotKind.Range;
+                RaftSplitPlan plan = new() { TargetPartitionId = host.PartitionId };
+                try
+                {
+                    snapshot = await transfer.ExportRange(plan, snapshotIndex, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(
+                        "[{LocalEndpoint}/{PartitionId}/{State}] TrySendSnapshotAsync: ExportRange failed for {Endpoint}: {Message}",
+                        host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, ex.Message);
+                    return;
+                }
             }
 
             string sessionId = Guid.NewGuid().ToString("N");
@@ -2624,6 +2653,7 @@ public sealed class RaftPartitionStateMachine
                         ChunkIndex = chunkIndex,
                         IsLast = isLast,
                         Data = buffer[..bytesRead],
+                        Kind = kind,
                     };
 
                     SnapshotResponse response = await host.SendInstallSnapshotAsync(node, chunk, CancellationToken.None).ConfigureAwait(false);

@@ -215,7 +215,7 @@ public class TestProposalWaiterCompletion
     // ── CompleteWaiter is idempotent ────────────────────────────────────────────
 
     [Fact]
-    public void CompleteWaiter_CalledMultipleTimes_IsIdempotent()
+    public async Task CompleteWaiter_CalledMultipleTimes_IsIdempotent()
     {
         var quorum = new RaftProposalQuorum(
             [new() { Id = 1, Term = 1 }],
@@ -228,13 +228,13 @@ public class TestProposalWaiterCompletion
         quorum.CompleteWaiter(RaftProposalTicketState.Committed, 2L); // second call is a no-op
 
         Assert.True(task.IsCompleted);
-        Assert.Equal((RaftProposalTicketState.Committed, 1L), task.Result);
+        Assert.Equal((RaftProposalTicketState.Committed, 1L), await task);
     }
 
     // ── Pool Reset drains old waiter ───────────────────────────────────────────
 
     [Fact]
-    public void PooledReset_PendingWaiterCompleted_WithNotFound()
+    public async Task PooledReset_PendingWaiterCompleted_WithNotFound()
     {
         var logs = new List<RaftLog> { new() { Id = 1, Term = 1 } };
         var quorum = new RaftProposalQuorum(logs, autoCommit: true, startTimestamp: HLCTimestamp.Zero);
@@ -246,7 +246,7 @@ public class TestProposalWaiterCompletion
         quorum.Reset(logs, autoCommit: false, startTimestamp: HLCTimestamp.Zero);
 
         Assert.True(oldTask.IsCompleted);
-        (RaftProposalTicketState state, long idx) = oldTask.Result;
+        (RaftProposalTicketState state, long idx) = await oldTask;
         Assert.Equal(RaftProposalTicketState.NotFound, state);
         Assert.Equal(-1L, idx);
 
@@ -356,6 +356,8 @@ public class TestProposalWaiterCompletion
         public void InvokeReplicationError(int partitionId, RaftLog log) { }
 
         public IRaftStateMachineTransfer? StateMachineTransfer => null;
+
+        public IRaftSystemStateTransfer? SystemStateTransfer => null;
 
         public Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct) =>
             Task.FromResult(new SnapshotResponse(false));

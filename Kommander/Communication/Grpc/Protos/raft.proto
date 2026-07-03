@@ -214,6 +214,7 @@ message GrpcInstallSnapshotRequest {
     int32 ChunkIndex = 5;
     bool IsLast = 6;
     bytes Data = 7;
+    int32 Kind = 8; // maps to SnapshotKind; 0 == Range (default, wire-compat with old peers)
 }
 
 message GrpcInstallSnapshotResponse {

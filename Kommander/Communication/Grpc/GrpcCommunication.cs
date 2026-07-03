@@ -783,6 +783,7 @@ public class GrpcCommunication : ICommunication
             Data = request.Data.Length == 0
                 ? ByteString.Empty
                 : UnsafeByteOperations.UnsafeWrap(request.Data),
+            Kind = (int)request.Kind,
         };
 
         Metadata metadata = BuildAuthMetadata(manager, "/Rafter/InstallSnapshot");
