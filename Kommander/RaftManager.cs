@@ -644,11 +644,17 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         Logger.LogInfoJoinClusterAdmittedAsLearner(accepted.MembershipVersion);
 
         // Wait for IsInitialized (system coordinator receives partition map from P0 leader).
+        // Also check for a terminal block: if the P0 leader cannot backfill this node (WAL is
+        // compacted, no snapshot transfer registered), IsInitialized will never become true and
+        // we must surface the permanent-block reason rather than spinning to the timeout.
         while (!IsInitialized)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (!cancellationToken.CanBeCanceled && joinStopwatch.GetElapsedMilliseconds() > 60_000)
                 throw new TimeoutException("RaftManager.JoinCluster(seeds) timed out after 60 s waiting for cluster initialization.");
+            string? terminalReasonInit = GetJoinTerminalReason(LocalEndpoint);
+            if (terminalReasonInit is not null)
+                throw new InvalidOperationException($"RaftManager.JoinCluster: promotion permanently blocked — {terminalReasonInit}");
             await Task.Delay(500, cancellationToken).ConfigureAwait(false);
         }
 

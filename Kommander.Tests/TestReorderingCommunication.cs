@@ -362,7 +362,12 @@ public sealed class TestReorderingCommunication
 
         long committedFrontier = committedIds.Max();
 
-        // The follower is fully caught up here, so its contiguous frontier equals the leader's max.
+        // ReplicateLogs returns Success once a quorum (leader + 1) commits; the specific
+        // followerNode may not have received the entries yet.  Wait before asserting.
+        await WaitForCondition(
+            () => followerNode.WalAdapter.GetMaxLog(1) >= committedFrontier,
+            TimeSpan.FromSeconds(10), ct);
+
         long contiguousFrontier = followerNode.WalAdapter.GetMaxLog(1);
         Assert.True(contiguousFrontier >= committedFrontier);
 
