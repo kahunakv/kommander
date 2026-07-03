@@ -788,8 +788,12 @@ public sealed class TestThreeNodeCluster
 
         IRaft decidedLeader = GetNodeByEndpoint(nodes, resumedLeaderView);
 
+        // Require the decided leader to have at least the expected number of entries before
+        // checking the follower — guards against a transient state after re-election where
+        // the newly-promoted leader has not yet replicated all prior committed entries.
         await WaitForConditionAsync(
-            () => follower.WalAdapter.GetMaxLog(1) >= decidedLeader.WalAdapter.GetMaxLog(1),
+            () => decidedLeader.WalAdapter.GetMaxLog(1) >= entries
+               && follower.WalAdapter.GetMaxLog(1) >= decidedLeader.WalAdapter.GetMaxLog(1),
             TestContext.Current.CancellationToken,
             timeoutMs: 20_000);
 

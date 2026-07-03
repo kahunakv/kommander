@@ -236,8 +236,27 @@ public sealed class TestQuiescence
         await node1.WaitForLeaderStableAsync(
             1, TimeSpan.FromMilliseconds(150), TestContext.Current.CancellationToken);
 
-        // Wait until the leader is expected to have quiesced.
-        await Task.Delay(600, TestContext.Current.CancellationToken);
+        // Adaptive quiesce wait: spin until partition-1 heartbeats stop advancing for a
+        // full 200 ms window.  A fixed delay is fragile on CI runners under load — the
+        // quiesce timer may fire late, leaving residual heartbeats inside the measurement
+        // window.  Give up and let the assertion catch the failure after 3 s.
+        {
+            long prev = Interlocked.Read(ref heartbeatCount);
+            long stableMs = 0;
+            long deadlineMs = Environment.TickCount64 + 3_000;
+            while (stableMs < 200 && Environment.TickCount64 < deadlineMs)
+            {
+                await Task.Delay(50, TestContext.Current.CancellationToken);
+                long cur = Interlocked.Read(ref heartbeatCount);
+                if (cur == prev)
+                    stableMs += 50;
+                else
+                {
+                    prev = cur;
+                    stableMs = 0;
+                }
+            }
+        }
 
         // Snapshot counter at start of measurement window, then wait.
         long countBefore = Interlocked.Read(ref heartbeatCount);

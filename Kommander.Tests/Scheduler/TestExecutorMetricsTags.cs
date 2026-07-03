@@ -156,7 +156,7 @@ public sealed class TestExecutorMetricsTags : IDisposable
         try
         {
             await executor.RestoreTask;
-            await executor.Ask(new RaftRequest(RaftRequestType.CheckLeader));
+            await executor.Ask(new RaftRequest(RaftRequestType.CheckLeader), TestContext.Current.CancellationToken);
 
             List<(string, int, string)> controlHits;
             lock (_captured)
@@ -193,8 +193,8 @@ public sealed class TestExecutorMetricsTags : IDisposable
         {
             await Task.WhenAll(ex1.RestoreTask, ex2.RestoreTask);
             await Task.WhenAll(
-                ex1.Ask(new RaftRequest(RaftRequestType.CheckLeader)),
-                ex2.Ask(new RaftRequest(RaftRequestType.CheckLeader)));
+                ex1.Ask(new RaftRequest(RaftRequestType.CheckLeader), TestContext.Current.CancellationToken),
+                ex2.Ask(new RaftRequest(RaftRequestType.CheckLeader), TestContext.Current.CancellationToken));
 
             bool sawPid1, sawPid2;
             lock (_captured)

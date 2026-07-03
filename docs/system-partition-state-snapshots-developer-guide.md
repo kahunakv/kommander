@@ -235,8 +235,9 @@ tail `(d, max]` is protected by the retain floor.
    leader notices follower F trails past the P0 compaction floor
    backfill returns empty (the needed deltas were compacted)
       │
-      ├─ system-state transfer registered?  ── no ──► F cannot be caught up
-      │                                               (would be a stuck follower — always register it)
+      ├─ system-state transfer registered?  ── no ──► F cannot be caught up; a node still
+      │                                               joining is rejected as permanently blocked
+      │                                               (its JoinCluster fails fast) — always register it
       └─ yes
           leader:   ExportPartitionState(0, checkpointIndex) ──► stream
           chunks:   shipped as SnapshotKind.SystemState over the install-snapshot path
@@ -319,7 +320,9 @@ Everything you need is on `IRaft` and two small types — no internal Kommander 
    state intact. Kommander only seeds the checkpoint **after** import returns successfully, so a failed
    import is retried cleanly — but only if you did not leave a half-applied state behind.
 3. **Register the transfer on every node.** Registration is not replicated. A node that imports without
-   the hook registered rejects the snapshot; a below-floor node that never registered it can get stuck.
+   the hook registered rejects the snapshot; a node that joins below the compaction floor without it is
+   rejected as permanently blocked — its `JoinCluster` fails fast with an `InvalidOperationException`
+   rather than converging, so it can never become a voter until the transfer is registered.
 4. **Never write the `_RaftSystem` type on P0.** It is reserved; `ReplicateLogs` throws.
 5. **Skip restored entries at or below your local snapshot index.** Apply only `RaftLog.Id > d`, or you
    double-apply.
