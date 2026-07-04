@@ -786,21 +786,21 @@ public sealed class TestThreeNodeCluster
         await follower.WaitForLeaderStableAsync(
             1, TimeSpan.FromMilliseconds(150), TestContext.Current.CancellationToken);
 
-        // Re-resolve the current leader on every poll: leadership can churn again after heal, so a
-        // once-captured leader (and a coarse GetMaxLog check) leaves a TOCTOU gap where the follower's
-        // tail is truncated and rebuilt between the wait passing and the assert reading. Poll on the
-        // exact contiguity predicate against whichever peer is leader now, so when it holds the
-        // immediately-following assert observes the same converged state.
-        IRaft LeaderNow() => nodes.FirstOrDefault(n => n != follower && n.WalAdapter.GetMaxLog(1) >= entries
-                                 && LogsContiguousAndMatching(follower, n, 1))
-                             ?? nodes.First(n => n != follower);
+        // Poll against whichever peer is leader now (leadership churns under load — this test runs
+        // aggressive election timeouts with quiescence off), checking the true convergence property:
+        // the follower's committed log is a contiguous prefix from id 1, reaches at least the 15
+        // committed entries, and agrees with the leader on every id they share. Full log equality is
+        // NOT the property here — a churning leader keeps appending fresh no-ops, and a follower
+        // lagging by less than BackfillThreshold is not actively backfilled, so the follower can
+        // legitimately settle a no-op or two behind while never diverging.
+        IRaft? PrefixLeader() => nodes.FirstOrDefault(n => n != follower && FollowerPrefixAgreesWithLeader(follower, n, 1, entries));
 
         await WaitForConditionAsync(
-            () => nodes.Any(n => n != follower && LogsContiguousAndMatching(follower, n, 1)),
+            () => PrefixLeader() is not null,
             TestContext.Current.CancellationToken,
             timeoutMs: 20_000);
 
-        AssertContiguousLog(follower, LeaderNow(), 1);
+        AssertFollowerPrefixMatchesLeader(follower, PrefixLeader() ?? nodes.First(n => n != follower), 1, entries);
 
         await node1.LeaveCluster(true, CancellationToken.None);
         await node2.LeaveCluster(true, CancellationToken.None);
@@ -1219,29 +1219,51 @@ public sealed class TestThreeNodeCluster
     /// and entries that survived with a mismatched term from a previous election.
     /// </summary>
     /// <summary>
-    /// Non-throwing sibling of <see cref="AssertContiguousLog"/> used to poll for convergence:
-    /// returns true only when the follower's committed log is contiguous from id 1 and matches the
-    /// leader's log entry-for-entry. Polling on this exact predicate (rather than a looser
-    /// <c>GetMaxLog</c> check) closes the TOCTOU gap where the follower's tail is truncated and
-    /// rebuilt by a re-election between a coarse wait passing and the assert reading.
+    /// The true post-backfill convergence property, robust to leadership churn: the follower's
+    /// committed log is a contiguous prefix from id 1, has caught up to at least
+    /// <paramref name="minEntries"/> entries, and <b>agrees</b> with the leader on every id they
+    /// share (same term and type). It does NOT require full log equality — under aggressive election
+    /// timeouts a churning leader keeps appending fresh no-ops, and a follower lagging by less than
+    /// <c>BackfillThreshold</c> is not actively backfilled, so the follower may legitimately settle
+    /// a no-op behind. Divergence is still caught: a stale follower entry at an id the leader either
+    /// lacks or holds with a different term fails agreement.
     /// </summary>
-    private static bool LogsContiguousAndMatching(IRaft follower, IRaft leader, int partitionId)
+    private static bool FollowerPrefixAgreesWithLeader(IRaft follower, IRaft leader, int partitionId, int minEntries)
     {
         List<RaftLog> followerLogs = follower.WalAdapter.ReadLogs(partitionId);
         List<RaftLog> leaderLogs   = leader.WalAdapter.ReadLogs(partitionId);
 
-        if (leaderLogs.Count == 0 || followerLogs.Count != leaderLogs.Count)
+        if (followerLogs.Count < minEntries || leaderLogs.Count < minEntries)
             return false;
+
+        Dictionary<long, RaftLog> leaderById = leaderLogs.ToDictionary(l => l.Id);
 
         for (int i = 0; i < followerLogs.Count; i++)
         {
             RaftLog f = followerLogs[i];
-            RaftLog l = leaderLogs[i];
-            if (f.Id != l.Id || f.Term != l.Term || f.Type != l.Type || f.Id != i + 1)
+            if (f.Id != i + 1)                                    // contiguous from 1, no holes
+                return false;
+            if (!leaderById.TryGetValue(f.Id, out RaftLog? l))    // leader must hold every follower id
+                return false;
+            if (f.Term != l.Term || f.Type != l.Type)             // and agree on term/type (no divergence)
                 return false;
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Throwing form of <see cref="FollowerPrefixAgreesWithLeader"/> for a descriptive final assert.
+    /// </summary>
+    private static void AssertFollowerPrefixMatchesLeader(IRaft follower, IRaft leader, int partitionId, int minEntries)
+    {
+        List<RaftLog> followerLogs = follower.WalAdapter.ReadLogs(partitionId);
+        List<RaftLog> leaderLogs   = leader.WalAdapter.ReadLogs(partitionId);
+
+        Assert.True(FollowerPrefixAgreesWithLeader(follower, leader, partitionId, minEntries),
+            $"Follower log did not converge to a contiguous prefix agreeing with the leader " +
+            $"(>= {minEntries} entries). follower ids/terms=[{string.Join(",", followerLogs.Select(x => $"{x.Id}:{x.Term}"))}] " +
+            $"leader ids/terms=[{string.Join(",", leaderLogs.Select(x => $"{x.Id}:{x.Term}"))}]");
     }
 
     private static void AssertContiguousLog(IRaft follower, IRaft leader, int partitionId)
