@@ -1,7 +1,7 @@
 
 using System.Buffers;
+using System.IO.Hashing;
 using System.Text;
-using Standart.Hash.xxHash;
 
 namespace Kommander;
 
@@ -17,9 +17,9 @@ public static class HashUtils
     /// <returns>The computed hash value as a 32-bit integer.</returns>
     public static int SmallSimpleHash(string key)
     {
-        return (int)xxHash32.ComputeHash(key);
+        return (int)XxHash32Utf8(key);
     }
-    
+
     /// <summary>
     /// Computes a hash value for the given key using xxHash64 algorithm.
     /// </summary>
@@ -27,7 +27,7 @@ public static class HashUtils
     /// <returns>The computed hash value as an unsigned 64-bit integer.</returns>
     public static ulong SimpleHash(string key)
     {
-        return xxHash64.ComputeHash(key);
+        return XxHash64Utf8(key);
     }
 
     /// <summary>
@@ -43,7 +43,7 @@ public static class HashUtils
         if (buckets <= 0)
             throw new ArgumentException("buckets must be greater than zero", nameof(buckets));
 
-        ulong computed = xxHash64.ComputeHash(key);
+        ulong computed = XxHash64Utf8(key);
         return computed % buckets;
     }
 
@@ -64,7 +64,7 @@ public static class HashUtils
         int pointer = key.IndexOf(separator);
         if (pointer == -1)
             return ConsistentHash(key, buckets);
-        
+
         string prefix = key[..pointer];
         return ConsistentHash(prefix, buckets);
     }
@@ -82,7 +82,7 @@ public static class HashUtils
         int pointer = key.IndexOf(separator);
         if (pointer == -1)
             return SimpleHash(key);
-        
+
         string prefix = key[..pointer];
         return SimpleHash(prefix);
     }
@@ -99,7 +99,7 @@ public static class HashUtils
         int pointer = key.LastIndexOf(separator);
         if (pointer == -1)
             return SimpleHash(key);
-        
+
         string prefix = key[..pointer];
         return SimpleHash(prefix);
     }
@@ -122,7 +122,7 @@ public static class HashUtils
         int pointer = key.LastIndexOf(separator);
         if (pointer == -1)
             return ConsistentHash(key, buckets);
-        
+
         string prefix = key[..pointer];
         return ConsistentHash(prefix, buckets);
     }
@@ -137,14 +137,11 @@ public static class HashUtils
     /// <returns>The computed hash value mapped to the specified range as an unsigned 64-bit integer.</returns>
     public static ulong GetHashInRange(string key, ulong min, ulong max)
     {
-        // Compute the hash value for the string.
-        ulong hash = xxHash64.ComputeHash(key);
+        ulong hash = XxHash64Utf8(key);
         ulong range = max - min + 1;
-    
-        // Map the hash to the desired range.
         return ((hash % range) + min);
     }
-    
+
     /// <summary>
     /// Returns a bucket index (0 to numBuckets-1) using Jump Consistent Hash.
     /// This version is optimized for many buckets and uses fixed seeds to ensure
@@ -159,30 +156,67 @@ public static class HashUtils
             throw new ArgumentException("numBuckets must be greater than 0", nameof(numBuckets));
 
         // Use two fixed seeds to produce two 32-bit hashes.
-        const uint seed1 = 0xAAAAAAAA;
-        const uint seed2 = 0x55555555;
+        const int seed1 = unchecked((int)0xAAAAAAAA);
+        const int seed2 = unchecked((int)0x55555555);
 
-        // Encode the key into a stack buffer (or a pooled rental for long keys) instead of allocating a
-        // fresh byte[] per call. The ReadOnlySpan xxHash overload yields the identical 32-bit value to the
-        // former byte[]/ArraySegment overload for every key (verified against a golden corpus), so neither
-        // the combined hash nor the selected bucket drifts — with one intentional improvement: the empty
-        // key, which the old ArraySegment overload threw on, now hashes cleanly.
         int maxBytes = Encoding.UTF8.GetMaxByteCount(key.Length);
         byte[]? rented = maxBytes > 256 ? ArrayPool<byte>.Shared.Rent(maxBytes) : null;
-        // The stackalloc is evaluated only when nothing was rented (?? short-circuits), so the short-key
-        // and long-key paths never both reserve a buffer.
         Span<byte> buffer = rented ?? stackalloc byte[256];
         try
         {
             int written = Encoding.UTF8.GetBytes(key, buffer);
 
-            ulong hash1 = xxHash32.ComputeHash(buffer, written, seed1);
-            ulong hash2 = xxHash32.ComputeHash(buffer, written, seed2);
+            uint hash1 = XxHash32.HashToUInt32(buffer[..written], seed1);
+            uint hash2 = XxHash32.HashToUInt32(buffer[..written], seed2);
 
             // Combine the two 32-bit hashes to form a 64-bit hash.
-            ulong combinedHash = (hash1 << 32) | hash2;
+            ulong combinedHash = ((ulong)hash1 << 32) | hash2;
 
             return JumpConsistentHash(combinedHash, numBuckets);
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>
+    /// UTF-8 encodes <paramref name="key"/> into a stack buffer (falling back to a pooled array for
+    /// keys whose worst-case byte count exceeds 256) and returns its xxHash32. Avoids the per-call
+    /// <c>byte[]</c> allocation of <c>Encoding.UTF8.GetBytes(string)</c>; the span never escapes.
+    /// </summary>
+    private static uint XxHash32Utf8(string key, uint seed = 0)
+    {
+        int maxBytes = Encoding.UTF8.GetMaxByteCount(key.Length);
+        byte[]? rented = maxBytes > 256 ? ArrayPool<byte>.Shared.Rent(maxBytes) : null;
+        Span<byte> buffer = rented ?? stackalloc byte[256];
+        try
+        {
+            int written = Encoding.UTF8.GetBytes(key, buffer);
+            return XxHash32.HashToUInt32(buffer[..written], unchecked((int)seed));
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>
+    /// UTF-8 encodes <paramref name="key"/> into a stack buffer (falling back to a pooled array for
+    /// keys whose worst-case byte count exceeds 256) and returns its xxHash64. Avoids the per-call
+    /// <c>byte[]</c> allocation of <c>Encoding.UTF8.GetBytes(string)</c>; the span never escapes.
+    /// </summary>
+    private static ulong XxHash64Utf8(string key)
+    {
+        int maxBytes = Encoding.UTF8.GetMaxByteCount(key.Length);
+        byte[]? rented = maxBytes > 256 ? ArrayPool<byte>.Shared.Rent(maxBytes) : null;
+        Span<byte> buffer = rented ?? stackalloc byte[256];
+        try
+        {
+            int written = Encoding.UTF8.GetBytes(key, buffer);
+            return XxHash64.HashToUInt64(buffer[..written]);
         }
         finally
         {

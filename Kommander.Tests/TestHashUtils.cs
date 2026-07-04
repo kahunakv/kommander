@@ -48,10 +48,10 @@ public class TestHashUtils
     public void TestPrefixedSimpleHashNoIndexOf()
     {
         ulong bucket = HashUtils.PrefixedStaticHash("hello", '/');
-        Assert.Equal(13669059543567756152UL, bucket);
-        
+        Assert.Equal(2794345569481354659UL, bucket);
+
         bucket = HashUtils.PrefixedStaticHash("hello/noise", '/');
-        Assert.Equal(13669059543567756152UL, bucket);
+        Assert.Equal(2794345569481354659UL, bucket);
     }
     
     [Fact]
@@ -96,13 +96,13 @@ public class TestHashUtils
     public void TestInversePrefixedSimpleHashNoIndexOf()
     {
         ulong bucket = HashUtils.InversePrefixedStaticHash("hello/foo/100", '/');
-        Assert.Equal(11459500365492880529UL, bucket);
+        Assert.Equal(13983403007968758177UL, bucket);
         
         bucket = HashUtils.InversePrefixedStaticHash("hello/foo/200", '/');
-        Assert.Equal(11459500365492880529UL, bucket);
+        Assert.Equal(13983403007968758177UL, bucket);
         
         bucket = HashUtils.SimpleHash("hello/foo");
-        Assert.Equal(11459500365492880529UL, bucket);
+        Assert.Equal(13983403007968758177UL, bucket);
     }
     
     [Fact]
