@@ -140,7 +140,7 @@ public sealed class TestDeltaConsumerEndToEnd
                 $"n4 must receive post-snapshot P0 deltas via backfill; only got {n4PostSnapDeltas.Count}");
 
             await joinCts.CancelAsync();
-            try { await joinTask.WaitAsync(TimeSpan.FromSeconds(5)); } catch { /* cancellation / timeout expected */ }
+            try { await joinTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken); } catch { /* cancellation / timeout expected */ }
         }
         finally
         {

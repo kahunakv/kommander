@@ -279,7 +279,7 @@ public sealed class TestSystemPartitionRetainFloor
             await WaitForAsync(() => transfer.ImportCount > 0, ct, timeoutMs: 15_000);
 
             await joinCts.CancelAsync();
-            try { await joinTask.WaitAsync(TimeSpan.FromSeconds(5)); } catch { /* cancellation / timeout expected */ }
+            try { await joinTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken); } catch { /* cancellation / timeout expected */ }
 
             Assert.True(transfer.ImportCount > 0,
                 "ImportPartitionState must have been called at least once on the learner");

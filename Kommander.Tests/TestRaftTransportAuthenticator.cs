@@ -1,5 +1,6 @@
 namespace Kommander.Tests;
 
+[Collection(AuthTestCollection.Name)]
 public sealed class TestRaftTransportAuthenticator
 {
     [Fact]

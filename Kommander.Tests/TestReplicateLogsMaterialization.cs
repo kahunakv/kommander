@@ -98,7 +98,7 @@ public sealed class TestReplicateLogsMaterialization
                 yield return Payload(i);
         }
 
-        RaftReplicationResult result = await manager.ReplicateLogs(1, "test", CountingGenerator());
+        RaftReplicationResult result = await manager.ReplicateLogs(1, "test", CountingGenerator(), cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(RaftOperationStatus.NodeIsNotLeader, result.Status);
         Assert.Equal(1, enumerationCount);
@@ -138,7 +138,7 @@ public sealed class TestReplicateLogsMaterialization
                 : (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
         };
 
-        RaftReplicationResult result = await manager.ReplicateLogs(1, "test", CountingGenerator());
+        RaftReplicationResult result = await manager.ReplicateLogs(1, "test", CountingGenerator(), cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.True(attempts >= 2, $"retry loop should have iterated at least twice; got {attempts}");
         Assert.Equal(1, enumerationCount); // materialized once, reused across every retry
@@ -163,7 +163,7 @@ public sealed class TestReplicateLogsMaterialization
         // never called — confirming no ToList() copy occurs.
         EnumerationDetector detector = new(array);
 
-        RaftReplicationResult result = await manager.ReplicateLogs(1, "test", detector);
+        RaftReplicationResult result = await manager.ReplicateLogs(1, "test", detector, cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(RaftOperationStatus.NodeIsNotLeader, result.Status);
         Assert.False(detector.WasEnumerated); // cast succeeded, no enumeration
@@ -200,7 +200,7 @@ public sealed class TestReplicateLogsMaterialization
         byte[][] payloads = [Payload(10), Payload(20)];
 
         // The IReadOnlyList<byte[]> overload must be reachable via the interface.
-        RaftReplicationResult result = await raft.ReplicateLogs(1, "test", (IReadOnlyList<byte[]>)payloads);
+        RaftReplicationResult result = await raft.ReplicateLogs(1, "test", (IReadOnlyList<byte[]>)payloads, cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(RaftOperationStatus.NodeIsNotLeader, result.Status);
     }
@@ -218,7 +218,7 @@ public sealed class TestReplicateLogsMaterialization
         byte[][] payloads = [Payload(1), Payload(2)];
         IReadOnlyList<byte[]> list = payloads; // no copy; same reference
 
-        RaftReplicationResult result = await manager.ReplicateLogs(1, "test", list);
+        RaftReplicationResult result = await manager.ReplicateLogs(1, "test", list, cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(RaftOperationStatus.NodeIsNotLeader, result.Status);
     }
