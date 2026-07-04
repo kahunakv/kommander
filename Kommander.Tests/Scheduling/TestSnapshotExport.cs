@@ -153,7 +153,7 @@ public class TestSnapshotExport
         await sm.ReceivedVoteAsync("follower:9000", voteTerm: 1, remoteMaxLogId: 0);
 
         // No transfer → no snapshot; wait a short time and verify nothing was sent.
-        await Task.Delay(100);
+        await Task.Delay(100, TestContext.Current.CancellationToken);
         Assert.Empty(comm.Captured);
     }
 

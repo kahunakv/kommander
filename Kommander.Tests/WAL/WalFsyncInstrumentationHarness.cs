@@ -158,7 +158,7 @@ public sealed class WalFsyncInstrumentationHarness
                 {
                     for (long k = 1; k <= writesPerPartition; k++)
                         await DriveCommittedWriteAsync(scheduler, partitionId, k);
-                });
+                }, TestContext.Current.CancellationToken);
             }
 
             await Task.WhenAll(writers);

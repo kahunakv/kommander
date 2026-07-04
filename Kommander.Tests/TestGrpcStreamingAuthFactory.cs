@@ -11,6 +11,7 @@ namespace Kommander.Tests;
 /// (and every EnsureHealthy re-open). These tests assert that the factory the pool invokes per slot
 /// produces distinct, individually valid credentials.
 /// </summary>
+[Collection(AuthTestCollection.Name)]
 public sealed class TestGrpcStreamingAuthFactory
 {
     private const string Secret = "top-secret-cluster-key";
