@@ -238,14 +238,18 @@ public sealed class TestQuiescence
 
         // The property under test is that an idle leader can *sustain* quiescence: after the idle
         // window elapses it stops heartbeating and stays stopped.  A truly-quiesced leader emits
-        // nothing (SendHeartbeat returns early on `quiesced`), so any heartbeat inside the
-        // measurement window means the leader de-quiesced.  On a loaded CI runner a transient SWIM
-        // suspicion flap can briefly un-quiesce the cluster and the leader resumes 50 ms
-        // heartbeats — a one-off blip, not a violation of the sustain property.  So retry the
-        // stabilize→measure cycle across an overall deadline and require that *some* 300 ms window
-        // is heartbeat-free; fail only if quiescence can never be held.
-        long overallDeadlineMs = Environment.TickCount64 + 10_000;
+        // nothing (SendHeartbeat returns early on `quiesced`), so within a window where leadership
+        // is stable, any heartbeat means the leader de-quiesced — a real violation.
+        //
+        // But on a loaded CI runner, SWIM liveness can lag enough that a follower marks the leader
+        // Suspect, un-quiesces, and triggers an election.  During that election churn the new
+        // leader/candidate heartbeats legitimately — that is an environment artifact, not a
+        // quiescence violation, and it is exactly the observed flake (a leadership change mid-window).
+        // So only a window with STABLE leadership throughout is a valid measurement: retry until we
+        // find one, and assert zero heartbeats on it.  A window spanning a leader change is discarded.
+        long overallDeadlineMs = Environment.TickCount64 + 15_000;
         long observedDelta = -1;
+        bool measured = false;
         while (Environment.TickCount64 < overallDeadlineMs)
         {
             // Spin until partition-1 heartbeats stop advancing for a full 200 ms window (quiesced).
@@ -264,16 +268,24 @@ public sealed class TestQuiescence
                 }
             }
 
-            // Measure a 300 ms window.  If the leader stayed quiesced throughout, delta is 0 and the
-            // sustain property holds; otherwise a de-quiesce blip advanced the counter — re-stabilize
-            // and try again until the overall deadline.
+            // Record the leader on both sides of a 300 ms window. If leadership changed (or no leader
+            // could be resolved), an election churned the window — discard it and re-stabilize.
+            IRaft? leaderBefore = await GetLeaderAsync(1, nodes);
             long countBefore = Interlocked.Read(ref heartbeatCount);
             await Task.Delay(300, TestContext.Current.CancellationToken);
-            observedDelta = Interlocked.Read(ref heartbeatCount) - countBefore;
-            if (observedDelta == 0)
+            long delta = Interlocked.Read(ref heartbeatCount) - countBefore;
+            IRaft? leaderAfter = await GetLeaderAsync(1, nodes);
+
+            if (leaderBefore is null || leaderAfter is null || !ReferenceEquals(leaderBefore, leaderAfter))
+                continue; // leadership not stable across the window — invalid measurement
+
+            observedDelta = delta;
+            measured = true;
+            if (delta == 0)
                 break;
         }
 
+        Assert.True(measured, "Leadership never stayed stable long enough to measure quiescence within 15 s.");
         Assert.Equal(0, observedDelta);
 
         await node1.LeaveCluster(true, CancellationToken.None);

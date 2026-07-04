@@ -873,9 +873,12 @@ public sealed class RaftPartitionExecutor : IDisposable
 
                 case RaftRequestType.RestoreLogsLoaded:
                     // Phase 2: replay logs and finalise restore on the executor thread.
+                    // NOTE: _restoreTcs is signalled *after* the _totalProcessed increment below,
+                    // not here — otherwise RestoreTask can complete while this op's own increment
+                    // is still pending, so a caller that reads TotalProcessed right after awaiting
+                    // RestoreTask races the restore op's count (observed as an off-by-one baseline).
                     await _stateMachine.CompleteRestoreAsync(request.RestoredLogs ?? []).ConfigureAwait(false);
                     _restoreCompleted = true;
-                    _restoreTcs.TrySetResult();
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
                     break;
 
@@ -914,6 +917,11 @@ public sealed class RaftPartitionExecutor : IDisposable
             }
 
             Interlocked.Increment(ref _totalProcessed);
+
+            // Signal restore completion only now that this op is counted, so a caller awaiting
+            // RestoreTask observes a settled TotalProcessed baseline (see the RestoreLogsLoaded case).
+            if (request.Type == RaftRequestType.RestoreLogsLoaded)
+                _restoreTcs.TrySetResult();
 
             double elapsedMs = sw.GetElapsedTime().TotalMilliseconds;
             RaftOperationKind kind = RaftOperationMapper.GetKind(request.Type);
