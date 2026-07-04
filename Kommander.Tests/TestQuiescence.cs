@@ -268,15 +268,24 @@ public sealed class TestQuiescence
                 }
             }
 
-            // Record the leader on both sides of a 300 ms window. If leadership changed (or no leader
-            // could be resolved), an election churned the window — discard it and re-stabilize.
-            IRaft? leaderBefore = await GetLeaderAsync(1, nodes);
+            // Measure a 300 ms window, sampling leadership every 50 ms *throughout* it (not just at
+            // the edges). An election that flips A→B→A entirely inside the window would pass an
+            // edges-only check yet still emit heartbeats, so any sample that shows a different leader,
+            // no leader, or more than one distinct leader marks the window invalid — that heartbeat
+            // traffic is election churn under CI load, not a quiescence violation. Discard and retry.
+            IRaft? leaderStart = await GetLeaderAsync(1, nodes);
             long countBefore = Interlocked.Read(ref heartbeatCount);
-            await Task.Delay(300, TestContext.Current.CancellationToken);
+            bool stableLeadership = leaderStart is not null;
+            for (int s = 0; s < 6 && stableLeadership; s++)
+            {
+                await Task.Delay(50, TestContext.Current.CancellationToken);
+                IRaft? sample = await GetLeaderAsync(1, nodes);
+                if (sample is null || !ReferenceEquals(sample, leaderStart))
+                    stableLeadership = false;
+            }
             long delta = Interlocked.Read(ref heartbeatCount) - countBefore;
-            IRaft? leaderAfter = await GetLeaderAsync(1, nodes);
 
-            if (leaderBefore is null || leaderAfter is null || !ReferenceEquals(leaderBefore, leaderAfter))
+            if (!stableLeadership)
                 continue; // leadership not stable across the window — invalid measurement
 
             observedDelta = delta;

@@ -1219,14 +1219,23 @@ public sealed class TestThreeNodeCluster
     /// and entries that survived with a mismatched term from a previous election.
     /// </summary>
     /// <summary>
-    /// The true post-backfill convergence property, robust to leadership churn: the follower's
-    /// committed log is a contiguous prefix from id 1, has caught up to at least
-    /// <paramref name="minEntries"/> entries, and <b>agrees</b> with the leader on every id they
-    /// share (same term and type). It does NOT require full log equality — under aggressive election
-    /// timeouts a churning leader keeps appending fresh no-ops, and a follower lagging by less than
-    /// <c>BackfillThreshold</c> is not actively backfilled, so the follower may legitimately settle
-    /// a no-op behind. Divergence is still caught: a stale follower entry at an id the leader either
-    /// lacks or holds with a different term fails agreement.
+    /// The true post-backfill convergence property, robust to leadership churn: the follower's log
+    /// is a contiguous prefix from id 1, has caught up to at least <paramref name="minEntries"/>
+    /// entries, and <b>agrees</b> with the leader on every id they <i>share</i> (same term and type).
+    ///
+    /// <para>It compares only the overlapping prefix, not the full logs, because
+    /// <see cref="Kommander.WAL.IWAL.ReadLogs"/> returns committed <b>and</b> proposed entries.
+    /// Both sides can legitimately run a little ahead of the other: under aggressive election
+    /// timeouts a churning leader keeps appending fresh no-ops (leader ahead), and after a heal the
+    /// leader ships the follower its uncommitted tail via AppendEntries, so a subsequent leader
+    /// change can leave the follower holding proposed entries at ids the new leader does not yet
+    /// have (follower ahead). Those trailing uncommitted entries are not part of the agreed log —
+    /// they get truncated or committed later — so requiring the leader to hold every follower id
+    /// would reject a follower that is actually correct on its committed prefix.</para>
+    ///
+    /// <para>Divergence is still caught: a mismatched term/type at any shared id fails agreement, a
+    /// hole fails contiguity, and a follower truncated too far back fails the <paramref name="minEntries"/>
+    /// floor.</para>
     /// </summary>
     private static bool FollowerPrefixAgreesWithLeader(IRaft follower, IRaft leader, int partitionId, int minEntries)
     {
@@ -1236,16 +1245,22 @@ public sealed class TestThreeNodeCluster
         if (followerLogs.Count < minEntries || leaderLogs.Count < minEntries)
             return false;
 
-        Dictionary<long, RaftLog> leaderById = leaderLogs.ToDictionary(l => l.Id);
-
+        // Follower must be contiguous from id 1 with no holes.
         for (int i = 0; i < followerLogs.Count; i++)
         {
+            if (followerLogs[i].Id != i + 1)
+                return false;
+        }
+
+        // Agree on the overlapping prefix only (ids present in both logs). Both are contiguous from
+        // 1, so the overlap is positions 0..min(count)-1; entries beyond that on either side are
+        // uncommitted tail that will be reconciled later.
+        int overlap = Math.Min(followerLogs.Count, leaderLogs.Count);
+        for (int i = 0; i < overlap; i++)
+        {
             RaftLog f = followerLogs[i];
-            if (f.Id != i + 1)                                    // contiguous from 1, no holes
-                return false;
-            if (!leaderById.TryGetValue(f.Id, out RaftLog? l))    // leader must hold every follower id
-                return false;
-            if (f.Term != l.Term || f.Type != l.Type)             // and agree on term/type (no divergence)
+            RaftLog l = leaderLogs[i];
+            if (f.Id != l.Id || f.Term != l.Term || f.Type != l.Type)
                 return false;
         }
 
