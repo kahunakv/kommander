@@ -380,6 +380,19 @@ public sealed class TestMembership
         // n3 from ever becoming the leader required to receive its own ReceiveLeave request.
         await WaitForCondition(() => n3.GetPartitionLeaderEndpoint(0) == n3.LocalEndpoint, ct);
 
+        // Also wait for n3's roster to converge to a single voter (itself). n1/n2's removals
+        // must be committed on n3's system partition before the last-voter leave, otherwise
+        // TryRemoveMember still sees a quorum of voters, skips the InsufficientVoters/Terminal
+        // branch, and spins a normal graceful leave to the 10 s deadline (the observed hang).
+        await WaitForCondition(
+            () =>
+            {
+                ClusterMembership m = n3.SystemCoordinator.GetMembership();
+                List<ClusterMember> voters = m.Members.Where(x => x.Role == ClusterMemberRole.Voter).ToList();
+                return voters.Count == 1 && voters[0].Endpoint == n3.LocalEndpoint;
+            },
+            ct);
+
         // n3 is the last voter and P0 leader.
         // TryRemoveMember returns InsufficientVoters → Terminal=true → CommitGracefulLeaveAsync
         // exits immediately.  The call must complete well under the 10 s deadline.

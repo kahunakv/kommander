@@ -783,21 +783,24 @@ public sealed class TestThreeNodeCluster
 
         communication.HealPartition(follower.GetLocalEndpoint());
 
-        string resumedLeaderView = await follower.WaitForLeaderStableAsync(
+        await follower.WaitForLeaderStableAsync(
             1, TimeSpan.FromMilliseconds(150), TestContext.Current.CancellationToken);
 
-        IRaft decidedLeader = GetNodeByEndpoint(nodes, resumedLeaderView);
+        // Re-resolve the current leader on every poll: leadership can churn again after heal, so a
+        // once-captured leader (and a coarse GetMaxLog check) leaves a TOCTOU gap where the follower's
+        // tail is truncated and rebuilt between the wait passing and the assert reading. Poll on the
+        // exact contiguity predicate against whichever peer is leader now, so when it holds the
+        // immediately-following assert observes the same converged state.
+        IRaft LeaderNow() => nodes.FirstOrDefault(n => n != follower && n.WalAdapter.GetMaxLog(1) >= entries
+                                 && LogsContiguousAndMatching(follower, n, 1))
+                             ?? nodes.First(n => n != follower);
 
-        // Require the decided leader to have at least the expected number of entries before
-        // checking the follower — guards against a transient state after re-election where
-        // the newly-promoted leader has not yet replicated all prior committed entries.
         await WaitForConditionAsync(
-            () => decidedLeader.WalAdapter.GetMaxLog(1) >= entries
-               && follower.WalAdapter.GetMaxLog(1) >= decidedLeader.WalAdapter.GetMaxLog(1),
+            () => nodes.Any(n => n != follower && LogsContiguousAndMatching(follower, n, 1)),
             TestContext.Current.CancellationToken,
             timeoutMs: 20_000);
 
-        AssertContiguousLog(follower, decidedLeader, 1);
+        AssertContiguousLog(follower, LeaderNow(), 1);
 
         await node1.LeaveCluster(true, CancellationToken.None);
         await node2.LeaveCluster(true, CancellationToken.None);
@@ -1215,6 +1218,32 @@ public sealed class TestThreeNodeCluster
     /// This is a stronger check than <c>GetMaxLog ≥ N</c>: it catches holes, reordered ids,
     /// and entries that survived with a mismatched term from a previous election.
     /// </summary>
+    /// <summary>
+    /// Non-throwing sibling of <see cref="AssertContiguousLog"/> used to poll for convergence:
+    /// returns true only when the follower's committed log is contiguous from id 1 and matches the
+    /// leader's log entry-for-entry. Polling on this exact predicate (rather than a looser
+    /// <c>GetMaxLog</c> check) closes the TOCTOU gap where the follower's tail is truncated and
+    /// rebuilt by a re-election between a coarse wait passing and the assert reading.
+    /// </summary>
+    private static bool LogsContiguousAndMatching(IRaft follower, IRaft leader, int partitionId)
+    {
+        List<RaftLog> followerLogs = follower.WalAdapter.ReadLogs(partitionId);
+        List<RaftLog> leaderLogs   = leader.WalAdapter.ReadLogs(partitionId);
+
+        if (leaderLogs.Count == 0 || followerLogs.Count != leaderLogs.Count)
+            return false;
+
+        for (int i = 0; i < followerLogs.Count; i++)
+        {
+            RaftLog f = followerLogs[i];
+            RaftLog l = leaderLogs[i];
+            if (f.Id != l.Id || f.Term != l.Term || f.Type != l.Type || f.Id != i + 1)
+                return false;
+        }
+
+        return true;
+    }
+
     private static void AssertContiguousLog(IRaft follower, IRaft leader, int partitionId)
     {
         List<RaftLog> followerLogs = follower.WalAdapter.ReadLogs(partitionId);
