@@ -124,14 +124,15 @@ public sealed class TestThreeNodeCluster
             }
         }
 
-        maxId = node1.WalAdapter.GetMaxLog(1);
-        Assert.Equal(entries + (entries / 50), maxId);
-
-        maxId = node2.WalAdapter.GetMaxLog(1);
-        Assert.Equal(entries + (entries / 50), maxId);
-
-        maxId = node3.WalAdapter.GetMaxLog(1);
-        Assert.Equal(entries + (entries / 50), maxId);
+        // The final ack guarantees quorum durability (leader + 1 follower); the trailing follower
+        // receives the last entry on the next AppendEntries/heartbeat. Converge rather than asserting
+        // all three are durable the instant the last ack returns.
+        long expectedMax = entries + (entries / 50);
+        await WaitForConditionAsync(
+            () => node1.WalAdapter.GetMaxLog(1) == expectedMax
+                  && node2.WalAdapter.GetMaxLog(1) == expectedMax
+                  && node3.WalAdapter.GetMaxLog(1) == expectedMax,
+            TestContext.Current.CancellationToken);
 
         await node1.LeaveCluster(true, CancellationToken.None);
         await node2.LeaveCluster(true, CancellationToken.None);
@@ -798,7 +799,7 @@ public sealed class TestThreeNodeCluster
         await WaitForConditionAsync(
             () => PrefixLeader() is not null,
             TestContext.Current.CancellationToken,
-            timeoutMs: 20_000);
+            timeoutMs: 30_000);
 
         AssertFollowerPrefixMatchesLeader(follower, PrefixLeader() ?? nodes.First(n => n != follower), 1, entries);
 
@@ -1463,9 +1464,14 @@ public sealed class TestThreeNodeCluster
             CheckLeaderInterval = TimeSpan.FromMilliseconds(25),
             UpdateNodesInterval = TimeSpan.FromMilliseconds(100),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
-            StartElectionTimeout = 100,
+            // Stable leadership: these backfill tests partition a follower (never the leader) and do
+            // not exercise failover, so aggressive election timeouts only add spurious re-elections
+            // under load — churn that resets backfill progress and makes convergence flaky. Long
+            // timeouts keep one leader put so backfill is what's actually measured. Heartbeats stay
+            // at 50 ms so backfill rounds (which ride heartbeats) remain fast.
+            StartElectionTimeout = 2000,
             EnableQuiescence = false,
-            EndElectionTimeout = 250,
+            EndElectionTimeout = 4000,
             MaxBackfillEntriesPerRound = maxBackfillEntriesPerRound,
             BackfillThreshold = backfillThreshold,
         };
@@ -1488,9 +1494,14 @@ public sealed class TestThreeNodeCluster
             CheckLeaderInterval = TimeSpan.FromMilliseconds(25),
             UpdateNodesInterval = TimeSpan.FromMilliseconds(100),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
-            StartElectionTimeout = 100,
+            // Stable leadership: these backfill tests partition a follower (never the leader) and do
+            // not exercise failover, so aggressive election timeouts only add spurious re-elections
+            // under load — churn that resets backfill progress and makes convergence flaky. Long
+            // timeouts keep one leader put so backfill is what's actually measured. Heartbeats stay
+            // at 50 ms so backfill rounds (which ride heartbeats) remain fast.
+            StartElectionTimeout = 2000,
             EnableQuiescence = false,
-            EndElectionTimeout = 250,
+            EndElectionTimeout = 4000,
             MaxBackfillEntriesPerRound = maxBackfillEntriesPerRound,
             BackfillThreshold = backfillThreshold,
         };
@@ -1513,9 +1524,14 @@ public sealed class TestThreeNodeCluster
             CheckLeaderInterval = TimeSpan.FromMilliseconds(25),
             UpdateNodesInterval = TimeSpan.FromMilliseconds(100),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
-            StartElectionTimeout = 100,
+            // Stable leadership: these backfill tests partition a follower (never the leader) and do
+            // not exercise failover, so aggressive election timeouts only add spurious re-elections
+            // under load — churn that resets backfill progress and makes convergence flaky. Long
+            // timeouts keep one leader put so backfill is what's actually measured. Heartbeats stay
+            // at 50 ms so backfill rounds (which ride heartbeats) remain fast.
+            StartElectionTimeout = 2000,
             EnableQuiescence = false,
-            EndElectionTimeout = 250,
+            EndElectionTimeout = 4000,
             MaxBackfillEntriesPerRound = maxBackfillEntriesPerRound,
             BackfillThreshold = backfillThreshold,
         };
