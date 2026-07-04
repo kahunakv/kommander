@@ -73,10 +73,14 @@ public sealed class SingleFsyncCommitTests
                 Assert.Equal(expectedId, response.LogIndex);
             }
 
-            // Durable log on every node matches — the acked writes are quorum-durable.
-            Assert.Equal(entries, node1.WalAdapter.GetMaxLog(1));
-            Assert.Equal(entries, node2.WalAdapter.GetMaxLog(1));
-            Assert.Equal(entries, node3.WalAdapter.GetMaxLog(1));
+            // The acked writes are quorum-durable (leader + 1 follower) at ack time; the trailing
+            // follower receives the final entry on the next AppendEntries/heartbeat, so converge
+            // rather than asserting all three are durable the instant the last ack returns.
+            await WaitForCondition(
+                () => node1.WalAdapter.GetMaxLog(1) == entries
+                      && node2.WalAdapter.GetMaxLog(1) == entries
+                      && node3.WalAdapter.GetMaxLog(1) == entries,
+                TestContext.Current.CancellationToken);
 
             // Both followers eventually observe every committed entry (commit broadcast still
             // runs on the fast path — only the leader's *ack timing* moves earlier).

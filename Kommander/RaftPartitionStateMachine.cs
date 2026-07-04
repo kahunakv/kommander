@@ -2060,7 +2060,7 @@ public sealed class RaftPartitionStateMachine
             else
                 startCommitIndexes[endpoint] = committedIndex;
 
-            logger.LogInfoSuccessfullyCompletedLogs(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, timestamp, committedIndex, (currentTime - timestamp).TotalMilliseconds);
+            logger.LogTraceSuccessfullyCompletedLogs(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, timestamp, committedIndex, (currentTime - timestamp).TotalMilliseconds);
         }
 
         if (status != RaftOperationStatus.Success)
