@@ -2457,7 +2457,16 @@ public sealed class RaftPartitionStateMachine
         string endpoint = pending!.Endpoint ?? "";
         long leaderTerm = completion.Term;
         HLCTimestamp timestamp = pending.Timestamp;
-        long committedIndex = completion.Status == RaftOperationStatus.Success ? completion.MaxLogIndex : -1;
+        // Report the WAL's gap-aware commit frontier, NOT the raw batch max (completion.MaxLogIndex).
+        // The unanchored live-propose path (prevLogIndex==0) can write a lone high entry over a gap on
+        // a behind follower without an LMP check, leaving a hole. GetMaxLog (Keys.Max) would then
+        // advertise that high id as the follower's progress, the leader's backfill gate would see the
+        // follower as caught up (localCommittedIndex - reported == 0), and the missing prefix would
+        // never be repaired — a stable non-contiguous log. GetCommitIndex stops at the hole, so the
+        // leader keeps matchIndex/nextIndex behind it and backfills the prefix forward until the log
+        // is contiguous. This drives only backfill/nextIndex bookkeeping (not quorum commit, which is
+        // the propose-ticket path), and mirrors the gap-aware heartbeat-ack report at the fast path.
+        long committedIndex = completion.Status == RaftOperationStatus.Success ? wal.GetCommitIndex() : -1;
 
         if (completion.Status == RaftOperationStatus.Success)
         {
