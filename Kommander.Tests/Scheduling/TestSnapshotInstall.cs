@@ -441,13 +441,12 @@ public class TestSnapshotInstall
     private static int PendingSnapshotSessionCount(RaftManager manager)
     {
         global::System.Reflection.FieldInfo field = typeof(RaftManager).GetField(
-            "_pendingSnapshots",
+            "snapshotReceiver",
             global::System.Reflection.BindingFlags.NonPublic | global::System.Reflection.BindingFlags.Instance)!;
 
-        global::System.Collections.Concurrent.ConcurrentDictionary<string, MemoryStream> pending =
-            (global::System.Collections.Concurrent.ConcurrentDictionary<string, MemoryStream>)field.GetValue(manager)!;
+        SnapshotReceiver receiver = (SnapshotReceiver)field.GetValue(manager)!;
 
-        return pending.Count;
+        return receiver.PendingSessionCount;
     }
 
     /// <summary>Captures all bytes passed to ImportRange for chunk-order assertions.</summary>

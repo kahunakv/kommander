@@ -115,22 +115,17 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// </summary>
     private readonly ConcurrentDictionary<string, string> _joinTerminalReasons = new();
 
-    /// <summary>
-    /// In-progress snapshot receive sessions keyed by <see cref="SnapshotRequest.SessionId"/>.
-    /// Each value is a <see cref="MemoryStream"/> accumulating chunks until <see cref="SnapshotRequest.IsLast"/>
-    /// triggers the final <c>ImportRange</c> call.  Sessions are removed on completion or on any
-    /// error so a retry always starts a clean accumulation.
-    /// </summary>
-    private readonly ConcurrentDictionary<string, MemoryStream> _pendingSnapshots = new();
+    // Snapshot-receive session buffers owned by SnapshotReceiver; initialized in constructor.
+    private readonly SnapshotReceiver snapshotReceiver;
 
-    private readonly object _pendingSnapshotsLock = new();
+    // Gossip/SWIM service — owns LivenessTable; initialized in constructor.
+    private readonly GossipService gossipService;
 
     /// <summary>
-    /// SWIM failure-detector liveness table for this node.
-    /// Tracks Alive/Suspect/Dead state for all known peers.
-    /// The P0 leader uses this table to decide which members to evict.
+    /// SWIM failure-detector liveness table. Owned by <see cref="GossipService"/>;
+    /// exposed here for callers in other subsystems (coordinator, balancer).
     /// </summary>
-    internal readonly LivenessTable Liveness = new();
+    internal LivenessTable Liveness => gossipService.Liveness;
 
     /// <summary>
     /// Optional snapshot-transfer implementation registered by the application.
@@ -147,15 +142,22 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// </summary>
     internal IRaftSystemStateTransfer? SystemStateTransfer => Volatile.Read(ref _systemStateTransfer);
 
-    private readonly ConcurrentDictionary<(string endpoint, int partitionId), HLCTimestamp> lastActivity = new();
+    // Activity/heartbeat state owned by NodeActivityTracker; initialized in constructor
+    // after LocalEndpoint is set.
+    private readonly NodeActivityTracker nodeActivityTracker;
 
-    private readonly ConcurrentDictionary<(string endpoint, int partitionId), HLCTimestamp> lastHearthBeat = new();
+    // Load-report state owned by LoadReportService; initialized in constructor.
+    private readonly LoadReportService loadReportService;
 
-    // Monotonically increasing counter for NodeLoadReport.ReportVersion.
-    // Incremented on every BuildLocalLoadReport call; never reset.
-    private long _reportVersion;
+    // Partition lifecycle delegation; no owned state. Initialized in constructor after systemCoordinator.
+    private readonly PartitionLifecycleService lifecycleService;
     
     private readonly Communication.RaftTransportDispatcher transportDispatcher;
+
+    // Event-notifier collaborator: owns the 11 application-facing event delegate chains.
+    // Initialized as a field so it is ready before the constructor body runs (the
+    // constructor subscribes internal handlers via OnXxx += which routes through the accessor).
+    private readonly RaftEventNotifier eventNotifier = new();
 
     /// <summary>
     /// Allows to retrieve the list of known nodes within the Raft cluster
@@ -275,56 +277,82 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// </summary>
     //internal RaftBatcher RaftBatcher => raftBatcher;
 
-    /// <summary>
-    /// Event when the restore process starts
-    /// </summary>
-    public event Action<int>? OnRestoreStarted;
+    /// <summary>Event when the restore process starts.</summary>
+    public event Action<int>? OnRestoreStarted
+    {
+        add => eventNotifier.OnRestoreStarted += value;
+        remove => eventNotifier.OnRestoreStarted -= value;
+    }
 
-    /// <summary>
-    /// Event when the restore process finishes from a user partition
-    /// </summary>
-    public event Action<int>? OnRestoreFinished;
+    /// <summary>Event when the restore process finishes from a user partition.</summary>
+    public event Action<int>? OnRestoreFinished
+    {
+        add => eventNotifier.OnRestoreFinished += value;
+        remove => eventNotifier.OnRestoreFinished -= value;
+    }
 
-    /// <summary>
-    /// Event when the restore process finishes from a system partition
-    /// </summary>
-    public event Action<int>? OnSystemRestoreFinished;
+    /// <summary>Event when the restore process finishes from a system partition.</summary>
+    public event Action<int>? OnSystemRestoreFinished
+    {
+        add => eventNotifier.OnSystemRestoreFinished += value;
+        remove => eventNotifier.OnSystemRestoreFinished -= value;
+    }
 
-    /// <summary>
-    /// Event when a replication log is now acknowledged by the application
-    /// </summary>
-    public event Action<int, RaftLog>? OnReplicationError;
+    /// <summary>Event when a replication log error is acknowledged by the application.</summary>
+    public event Action<int, RaftLog>? OnReplicationError
+    {
+        add => eventNotifier.OnReplicationError += value;
+        remove => eventNotifier.OnReplicationError -= value;
+    }
 
-    /// <summary>
-    /// Event when a replication log is restored from a user partition
-    /// </summary>
-    public event Func<int, RaftLog, Task<bool>>? OnLogRestored;
+    /// <summary>Event when a replication log is restored from a user partition.</summary>
+    public event Func<int, RaftLog, Task<bool>>? OnLogRestored
+    {
+        add => eventNotifier.OnLogRestored += value;
+        remove => eventNotifier.OnLogRestored -= value;
+    }
 
-    /// <summary>
-    /// Event when a replication log is restored from a system partition
-    /// </summary>
-    public event Func<int, RaftLog, Task<bool>>? OnSystemLogRestored;
+    /// <summary>Event when a replication log is restored from a system partition.</summary>
+    public event Func<int, RaftLog, Task<bool>>? OnSystemLogRestored
+    {
+        add => eventNotifier.OnSystemLogRestored += value;
+        remove => eventNotifier.OnSystemLogRestored -= value;
+    }
 
-    /// <summary>
-    /// Event when a replication log is received from a user partition
-    /// </summary>
-    public event Func<int, RaftLog, Task<bool>>? OnReplicationReceived;
+    /// <summary>Event when a replication log is received from a user partition.</summary>
+    public event Func<int, RaftLog, Task<bool>>? OnReplicationReceived
+    {
+        add => eventNotifier.OnReplicationReceived += value;
+        remove => eventNotifier.OnReplicationReceived -= value;
+    }
 
-    /// <summary>
-    /// Event when a replication log is received from a system partition
-    /// </summary>
-    public event Func<int, RaftLog, Task<bool>>? OnSystemReplicationReceived;
+    /// <summary>Event when a replication log is received from a system partition.</summary>
+    public event Func<int, RaftLog, Task<bool>>? OnSystemReplicationReceived
+    {
+        add => eventNotifier.OnSystemReplicationReceived += value;
+        remove => eventNotifier.OnSystemReplicationReceived -= value;
+    }
 
-    /// <summary>
-    /// Event called when a leader is elected on certain partition
-    /// </summary>
-    public event Func<int, string, Task<bool>>? OnLeaderChanged;
+    /// <summary>Event called when a leader is elected on a partition.</summary>
+    public event Func<int, string, Task<bool>>? OnLeaderChanged
+    {
+        add => eventNotifier.OnLeaderChanged += value;
+        remove => eventNotifier.OnLeaderChanged -= value;
+    }
 
     /// <inheritdoc/>
-    public event Action<IReadOnlyList<RaftPartitionRange>>? OnPartitionMapChanged;
+    public event Action<IReadOnlyList<RaftPartitionRange>>? OnPartitionMapChanged
+    {
+        add => eventNotifier.OnPartitionMapChanged += value;
+        remove => eventNotifier.OnPartitionMapChanged -= value;
+    }
 
     /// <inheritdoc/>
-    public event Action<System.ClusterMembership>? OnMembershipChanged;
+    public event Action<System.ClusterMembership>? OnMembershipChanged
+    {
+        add => eventNotifier.OnMembershipChanged += value;
+        remove => eventNotifier.OnMembershipChanged -= value;
+    }
 
     /// <summary>
     /// Constructor
@@ -358,9 +386,41 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         LocalNodeName = string.IsNullOrEmpty(this.configuration.NodeName) ? Environment.MachineName : this.configuration.NodeName;
         LocalNodeId = this.configuration.NodeId > 0 ? this.configuration.NodeId : HashUtils.SmallSimpleHash(LocalNodeName);
 
+        nodeActivityTracker = new NodeActivityTracker(
+            () => hybridLogicalClock.TrySendOrLocalEvent(LocalNodeId),
+            LocalEndpoint);
+
+        snapshotReceiver = new SnapshotReceiver(
+            () => Volatile.Read(ref _disposed) != 0,
+            () => Volatile.Read(ref _systemStateTransfer),
+            () => Volatile.Read(ref _stateMachineTransfer),
+            walAdapter,
+            Logger,
+            LocalEndpoint);
+
         clusterHandler = new(this, discovery);
 
+        // GossipService must be initialized before RaftSystemCoordinator because the
+        // coordinator constructor reads manager.Liveness (which forwards here).
+        // GossipService gets a lazy Func<> so it can reference systemCoordinator
+        // after both are constructed.
+        gossipService = new GossipService(
+            communication,
+            () => Nodes,
+            () => systemCoordinator!,
+            () => configuration.EnableLeaderBalancer ? loadReportService!.BuildLocalLoadReport() : null,
+            WakePartitionsForLeader,
+            configuration,
+            LocalEndpoint,
+            Logger);
+
         systemCoordinator = new RaftSystemCoordinator(this, Logger);
+
+        lifecycleService = new PartitionLifecycleService(
+            systemCoordinator,
+            () => IsInitialized,
+            AmILeader);
+
         timerService = new RaftTimerService(this, Logger, configuration);
         timerService.Start();
 
@@ -377,6 +437,15 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             configuration.MaxWalGroupBatchPartitions,
             configuration.WalGroupCommitLingerMs,
             configuration.WalSingleFsyncCommit);
+
+        loadReportService = new LoadReportService(
+            partitions,
+            walScheduler,
+            systemCoordinator.GetLoadReports,
+            () => hybridLogicalClock.TrySendOrLocalEvent(LocalNodeId),
+            GetPartitionLeaderEndpoint,
+            configuration,
+            LocalEndpoint);
 
         if (configuration.EnableSharedExecutorPool)
         {
@@ -589,13 +658,14 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         JoinResponse? accepted = null;
         ValueStopwatch joinStopwatch = ValueStopwatch.StartNew();
 
-        List<string> seedList = seeds.ToList();
+        List<string> seedList = [.. seeds];
 
         while (accepted is null || !accepted.Success)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (!cancellationToken.CanBeCanceled && joinStopwatch.GetElapsedMilliseconds() > 60_000)
                 throw new TimeoutException("RaftManager.JoinCluster(seeds) timed out after 60 s before being admitted as a Learner.");
+                
             string? leaderHint = null;
 
             foreach (string seed in seedList)
@@ -659,7 +729,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         }
 
         // Wait for promotion to Voter.
-        while (LocalRole != System.ClusterMemberRole.Voter)
+        while (LocalRole != ClusterMemberRole.Voter)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (!cancellationToken.CanBeCanceled && joinStopwatch.GetElapsedMilliseconds() > 60_000)
@@ -709,8 +779,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        systemCoordinator.Send(new System.RaftSystemRequest(
-            System.RaftSystemRequestType.AddMember,
+        systemCoordinator.Send(new RaftSystemRequest(
+            RaftSystemRequestType.AddMember,
             request.Endpoint,
             request.NodeId,
             systemCoordinator.GetMembership().MembershipVersion,
@@ -765,8 +835,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         await using CancellationTokenRegistration reg = cancellationToken.Register(
             () => tcs.TrySetCanceled(cancellationToken));
 
-        systemCoordinator.Send(new System.RaftSystemRequest(
-            System.RaftSystemRequestType.RemoveMember,
+        systemCoordinator.Send(new RaftSystemRequest(
+            RaftSystemRequestType.RemoveMember,
             request.Endpoint,
             request.NodeId,
             systemCoordinator.GetMembership().MembershipVersion,
@@ -810,108 +880,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <see cref="SnapshotRequest.SnapshotIndex"/> or higher, every chunk for that transfer returns
     /// success immediately.  On any error the partial session is removed so a retry starts clean.</para>
     /// </summary>
-    public async Task<SnapshotResponse> ReceiveInstallSnapshot(
+    public Task<SnapshotResponse> ReceiveInstallSnapshot(
         SnapshotRequest request,
-        CancellationToken cancellationToken = default)
-    {
-        if (Volatile.Read(ref _disposed) != 0)
-            return new SnapshotResponse(false);
-
-        // Resolve the transfer by kind up front so a request with no matching transfer fails fast.
-        bool isSystemState = request.Kind == SnapshotKind.SystemState;
-        IRaftSystemStateTransfer? systemTransfer = null;
-        IRaftStateMachineTransfer? rangeTransfer = null;
-        if (isSystemState)
-        {
-            systemTransfer = Volatile.Read(ref _systemStateTransfer);
-            if (systemTransfer is null)
-                return new SnapshotResponse(false);
-        }
-        else
-        {
-            rangeTransfer = Volatile.Read(ref _stateMachineTransfer);
-            if (rangeTransfer is null)
-                return new SnapshotResponse(false);
-        }
-
-        cancellationToken.ThrowIfCancellationRequested();
-
-        // Idempotency: already at or past the snapshot index — accept without re-importing.
-        long currentMax = walAdapter.GetMaxLog(request.PartitionId);
-        if (currentMax >= request.SnapshotIndex)
-            return new SnapshotResponse(true);
-
-        MemoryStream buf;
-        lock (_pendingSnapshotsLock)
-        {
-            if (Volatile.Read(ref _disposed) != 0)
-                return new SnapshotResponse(false);
-
-            // Accumulate the chunk into the session buffer.
-            buf = _pendingSnapshots.GetOrAdd(request.SessionId, _ => new MemoryStream());
-            buf.Write(request.Data, 0, request.Data.Length);
-
-            // Non-final chunks are accepted; wait for IsLast before applying.
-            if (!request.IsLast)
-                return new SnapshotResponse(true);
-
-            // All chunks received — apply and clean up session state.
-            _pendingSnapshots.TryRemove(request.SessionId, out _);
-            buf.Position = 0;
-        }
-
-        try
-        {
-            if (isSystemState)
-                await systemTransfer!.ImportPartitionState(request.PartitionId, buf, cancellationToken).ConfigureAwait(false);
-            else
-                await rangeTransfer!.ImportRange(request.PartitionId, buf, cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            string importMethod = isSystemState ? "ImportPartitionState" : "ImportRange";
-            Logger.LogError(
-                "[{Endpoint}] ReceiveInstallSnapshot: {Method} partition={PartitionId} index={Index} failed: {Message}",
-                LocalEndpoint, importMethod, request.PartitionId, request.SnapshotIndex, ex.Message);
-            return new SnapshotResponse(false);
-        }
-        finally
-        {
-            await buf.DisposeAsync().ConfigureAwait(false);
-        }
-
-        // Seed the WAL with a CommittedCheckpoint at the snapshot index so GetMaxLog reflects
-        // the installed position and normal backfill can resume from snapshotIndex + 1.
-        RaftLog checkpointLog = new()
-        {
-            Id = request.SnapshotIndex,
-            Type = RaftLogType.CommittedCheckpoint,
-            Term = walAdapter.GetCurrentTerm(request.PartitionId),
-        };
-
-        walAdapter.Write([(request.PartitionId, [checkpointLog])]);
-
-        Logger.LogInfoReceiveInstallSnapshot(LocalEndpoint, request.PartitionId, request.SnapshotIndex);
-
-        return new SnapshotResponse(true);
-    }
-
-    private void DisposePendingSnapshots()
-    {
-        List<MemoryStream> snapshots = [];
-
-        lock (_pendingSnapshotsLock)
-        {
-            foreach (KeyValuePair<string, MemoryStream> pending in _pendingSnapshots)
-            {
-                if (_pendingSnapshots.TryRemove(pending.Key, out MemoryStream? snapshot))
-                    snapshots.Add(snapshot);
-            }
-        }
-
-        foreach (MemoryStream snapshot in snapshots)
-            snapshot.Dispose();
-    }
+        CancellationToken cancellationToken = default) =>
+        snapshotReceiver.ReceiveInstallSnapshot(request, cancellationToken);
 
     /// <summary>
     /// Handles an inbound gossip digest from a peer.
@@ -926,143 +898,17 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// (posted to a channel); the caller does not need to await it before returning the ACK.
     /// </para>
     /// </summary>
-    public GossipAck ReceiveGossip(GossipMessage digest)
-    {
-        ClusterMembership local = systemCoordinator.GetMembership();
+    public GossipAck ReceiveGossip(GossipMessage digest) =>
+        gossipService.ReceiveGossip(this, digest);
 
-        // If peer has a newer committed roster, queue an update to our local cache.
-        if (digest.Roster is not null && digest.MembershipVersion > local.MembershipVersion)
-            systemCoordinator.Send(new System.RaftSystemRequest(digest.Roster));
+    public Task GossipAsync(CancellationToken cancellationToken = default) =>
+        gossipService.GossipAsync(this, cancellationToken);
 
-        // Apply piggybacked liveness updates; refute self-suspicion if required.
-        // Wake quiesced partitions for any peer that gossip reports as Suspect/Dead so
-        // their failover is bounded by gossip propagation latency, not the safety sweep.
-        (bool selfSuspected, IReadOnlyList<string> newlySuspectOrDead) =
-            Liveness.ApplyUpdates(LocalEndpoint, digest.LivenessUpdates);
+    public GossipPingResponse ReceivePing(GossipPingRequest request) =>
+        gossipService.ReceivePing(request);
 
-        if (selfSuspected)
-        {
-            long refutedInc = Liveness.RefuteSuspicion(LocalEndpoint);
-            Logger.LogInfoReceiveGossipRefuting(refutedInc);
-        }
-
-        foreach (string suspectEndpoint in newlySuspectOrDead)
-            WakePartitionsForLeader(suspectEndpoint);
-
-        // Store advisory load report when the balancer is enabled.
-        if (configuration.EnableLeaderBalancer && digest.LoadReport is { } report)
-            systemCoordinator.Send(new System.RaftSystemRequest(report));
-
-        // Respond with our current roster so the sender can catch up if we are ahead.
-        bool includeRoster = local.MembershipVersion > digest.MembershipVersion;
-        return new GossipAck(local.MembershipVersion, includeRoster ? local : null);
-    }
-
-    /// <summary>
-    /// Runs one gossip round: contacts up to <see cref="RaftConfiguration.GossipFanout"/>
-    /// randomly chosen peers from the current node list, sends a <see cref="GossipMessage"/>
-    /// carrying the locally committed roster and piggybacked liveness state, and applies any
-    /// newer roster returned in the ACK.
-    /// <para>
-    /// Called by <see cref="RaftTimerService.TriggerGossip"/> on a periodic timer.  Tests
-    /// may call it directly to drive gossip deterministically without waiting for the timer.
-    /// </para>
-    /// </summary>
-    public async Task GossipAsync(CancellationToken cancellationToken = default)
-    {
-        ClusterMembership membership = systemCoordinator.GetMembership();
-
-        // Always store the local load report so the local coordinator's view is always
-        // complete, even when gossip is skipped due to uninitialized membership.
-        // The report must be stored before the membership/fanout guards so test-driven
-        // drains always have fresh data.
-        System.NodeLoadReport? localReport = null;
-        if (configuration.EnableLeaderBalancer)
-        {
-            localReport = BuildLocalLoadReport();
-            systemCoordinator.Send(new System.RaftSystemRequest(localReport));
-        }
-
-        if (membership.MembershipVersion == 0 || configuration.GossipFanout <= 0)
-            return;
-
-        List<RaftNode> peers = [..Nodes];
-        if (peers.Count == 0)
-            return;
-
-        IReadOnlyList<MemberLivenessEntry> livenessUpdates = Liveness.GetAll();
-        GossipMessage digest = new(LocalEndpoint, membership.MembershipVersion, membership)
-        {
-            LivenessUpdates = livenessUpdates.Count > 0 ? livenessUpdates : null,
-            LoadReport = localReport,
-        };
-
-        int fanout = Math.Min(configuration.GossipFanout, peers.Count);
-
-        // Partial Fisher-Yates shuffle to pick fanout random peers.
-        for (int i = 0; i < fanout; i++)
-        {
-            int j = Random.Shared.Next(i, peers.Count);
-            (peers[i], peers[j]) = (peers[j], peers[i]);
-        }
-
-        for (int i = 0; i < fanout; i++)
-        {
-            try
-            {
-                GossipAck ack = await communication.SendGossip(this, peers[i], digest, cancellationToken).ConfigureAwait(false);
-
-                // If peer returned a newer roster, update our local cache.
-                if (ack.Roster is not null && ack.MembershipVersion > systemCoordinator.GetMembership().MembershipVersion)
-                    systemCoordinator.Send(new System.RaftSystemRequest(ack.Roster));
-            }
-            catch (Exception ex)
-            {
-                Logger.LogDebugGossipAsyncFailed(peers[i].Endpoint, ex.Message);
-            }
-        }
-    }
-
-    /// <summary>
-    /// Handles an inbound SWIM direct probe from a peer.
-    /// The receiver is always alive if it can process the message; it returns its current
-    /// incarnation so the sender can record an up-to-date Alive entry.
-    /// If our own liveness entry is Suspect (e.g. carried in a prior gossip round), we
-    /// refute immediately by bumping our incarnation.
-    /// </summary>
-    public GossipPingResponse ReceivePing(GossipPingRequest request)
-    {
-        long incarnation = Liveness.GetSelfIncarnation();
-        // If we've been marked Suspect by another node's gossip reaching us, refute.
-        if (Liveness.GetState(LocalEndpoint) >= MemberLivenessState.Suspect)
-            incarnation = Liveness.RefuteSuspicion(LocalEndpoint);
-        return new GossipPingResponse(true, incarnation);
-    }
-
-    /// <summary>
-    /// Handles an inbound SWIM indirect probe request: relays a direct
-    /// <see cref="GossipPingRequest"/> to <see cref="GossipPingReqRequest.TargetEndpoint"/> and reports
-    /// whether the target was reachable within <c>PingTimeout</c>.
-    /// </summary>
-    public async Task<GossipPingReqResponse> ReceivePingReq(GossipPingReqRequest request, CancellationToken cancellationToken = default)
-    {
-        RaftNode? targetNode = Nodes.FirstOrDefault(n => n.Endpoint == request.TargetEndpoint);
-        if (targetNode is null)
-            return new GossipPingReqResponse(false);
-
-        using CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        cts.CancelAfter(configuration.PingTimeout);
-
-        try
-        {
-            GossipPingResponse resp = await communication.SendPing(this, targetNode, new GossipPingRequest(LocalEndpoint), cts.Token).ConfigureAwait(false);
-            return new GossipPingReqResponse(resp.Alive);
-        }
-        catch
-        {
-            return new GossipPingReqResponse(false);
-        }
-    }
+    public Task<GossipPingReqResponse> ReceivePingReq(GossipPingReqRequest request, CancellationToken cancellationToken = default) =>
+        gossipService.ReceivePingReq(this, request, cancellationToken);
 
     /// <summary>
     /// Runs one SWIM probe round: picks a random peer from <see cref="Nodes"/>, sends a
@@ -1079,107 +925,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// call it directly to drive probing deterministically without waiting for the timer.
     /// </para>
     /// </summary>
-    public async Task PingAsync(CancellationToken cancellationToken = default)
-    {
-        // Advance Suspect → Dead before processing this round's probe results.
-        // Wake quiesced partitions for any newly-Dead leaders so they detect failure within
-        // the next CheckLeader tick rather than waiting for the coarse safety sweep.
-        IReadOnlyList<string> newlyDead = Liveness.AdvanceExpiry(DateTimeOffset.UtcNow, configuration.SuspicionTimeout);
-        foreach (string deadEndpoint in newlyDead)
-            WakePartitionsForLeader(deadEndpoint);
-
-        ClusterMembership membership = systemCoordinator.GetMembership();
-        if (membership.MembershipVersion == 0)
-            return;
-
-        List<RaftNode> peers = [..Nodes];
-        if (peers.Count == 0)
-            return;
-
-        // Pick one random peer to probe this round.
-        int idx = Random.Shared.Next(peers.Count);
-        RaftNode target = peers[idx];
-
-        // Direct probe.
-        bool alive = false;
-        long incarnation = 0;
-
-        using (CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
-        {
-            cts.CancelAfter(configuration.PingTimeout);
-            try
-            {
-                GossipPingResponse resp = await communication.SendPing(this, target, new GossipPingRequest(LocalEndpoint), cts.Token).ConfigureAwait(false);
-                alive = resp.Alive;
-                incarnation = resp.Incarnation;
-            }
-            catch
-            {
-                alive = false;
-            }
-        }
-
-        if (alive)
-        {
-            Liveness.MarkAlive(target.Endpoint, incarnation);
-            return;
-        }
-
-        // Indirect probe via up to IndirectPingFanout intermediaries.
-        List<RaftNode> relays = peers.Where(p => p.Endpoint != target.Endpoint).ToList();
-        int fanout = Math.Min(configuration.IndirectPingFanout, relays.Count);
-
-        // Partial Fisher-Yates shuffle for relay selection.
-        for (int i = 0; i < fanout; i++)
-        {
-            int j = Random.Shared.Next(i, relays.Count);
-            (relays[i], relays[j]) = (relays[j], relays[i]);
-        }
-
-        bool reachedViaRelay = false;
-        using (CancellationTokenSource relayCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
-        {
-            relayCts.CancelAfter(configuration.PingTimeout);
-            for (int i = 0; i < fanout && !reachedViaRelay; i++)
-            {
-                try
-                {
-                    GossipPingReqResponse relayResp = await communication.SendPingReq(
-                        this, relays[i],
-                        new GossipPingReqRequest(LocalEndpoint, target.Endpoint),
-                        relayCts.Token).ConfigureAwait(false);
-                    if (relayResp.Reached)
-                        reachedViaRelay = true;
-                }
-                catch
-                {
-                    // relay also unreachable — continue to next
-                }
-            }
-        }
-
-        if (reachedViaRelay)
-        {
-            // A relay confirmed the target is reachable.  PingReqResponse does not carry the
-            // target's incarnation, so MarkAlive(…, 0) would be silently dropped for any node
-            // whose incarnation is > 0 (e.g. after a prior refutation).  ClearSuspicion
-            // transitions Suspect→Alive while preserving the existing incarnation.
-            Liveness.ClearSuspicion(target.Endpoint);
-        }
-        else
-        {
-            // Both direct and indirect probes failed — suspect.
-            MemberLivenessState prev = Liveness.GetState(target.Endpoint);
-            Liveness.MarkSuspect(target.Endpoint);
-            if (prev == MemberLivenessState.Alive)
-            {
-                Logger.LogWarning("PingAsync: {Endpoint} failed direct and indirect probe; marked Suspect", target.Endpoint);
-                // Wake quiesced followers that believe this node is their leader so they
-                // detect the failure at the next CheckLeader tick, not the 5 s safety sweep.
-                WakePartitionsForLeader(target.Endpoint);
-            }
-        }
-    }
+    public Task PingAsync(CancellationToken cancellationToken = default) =>
+        gossipService.PingAsync(this, cancellationToken);
 
     /// <summary>
     /// Returns the last commit index acknowledged by <paramref name="endpoint"/> on the given partition,
@@ -1230,6 +977,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     {
         if (partitionId == RaftSystemConfig.SystemPartition)
             return systemPartition?.Leader;
+
         return partitions.TryGetValue(partitionId, out RaftPartition? p) ? p.Leader : null;
     }
 
@@ -1276,7 +1024,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
         IsInitialized = true;
 
-        OnPartitionMapChanged?.Invoke(GetPartitionMap());
+        eventNotifier.InvokePartitionMapChanged(GetPartitionMap());
     }
 
     /// <summary>
@@ -1393,6 +1141,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                     await AmILeaderQuick(RaftSystemConfig.SystemPartition).ConfigureAwait(false);
 
                 string? leaderEndpoint = amLeader ? LocalEndpoint : systemPartition?.Leader;
+
                 if (string.IsNullOrEmpty(leaderEndpoint))
                 {
                     if (++emptyLeaderPolls >= maxEmptyLeaderPolls)
@@ -1435,8 +1184,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 {
                     try
                     {
-                        using CancellationTokenSource hintCts =
-                            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                        using CancellationTokenSource hintCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                         hintCts.CancelAfter(attemptTimeoutMs);
 
                         RaftNode hint = new(resp.LeaderHint);
@@ -1619,47 +1367,26 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         _hotPartitions.TryRemove(partitionId, out _);
     }
 
-    // ──────────────────────────────────────────────────────────────────────
+    // ── Node activity / heartbeat — bodies live in NodeActivityTracker ────────
 
     /// <summary>
-    /// Obtains the last activity known of a specific node on any partitions
+    /// Obtains the last activity known of a specific node on a specific partition.
     /// </summary>
-    /// <param name="endpoint"></param>
-    /// <returns></returns>
-    public HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId)
-    {
-        return lastActivity.TryGetValue((endpoint, partitionId), out HLCTimestamp lastTimestamp) ? lastTimestamp : HLCTimestamp.Zero;
-    }
-
-    public HLCTimestamp GetLastNodeActivity(string endpoint)
-    {
-        HLCTimestamp max = HLCTimestamp.Zero;
-        foreach (((string ep, int _) key, HLCTimestamp ts) in lastActivity)
-        {
-            if (key.ep == endpoint && ts > max)
-                max = ts;
-        }
-        return max;
-    }
+    public HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId) =>
+        nodeActivityTracker.GetLastNodeActivity(endpoint, partitionId);
 
     /// <summary>
-    /// Updates the last activity known of a specific node on a specific partition
+    /// Obtains the last activity known of a specific node across all partitions.
     /// </summary>
-    /// <param name="nodeId"></param>
-    /// <param name="partitionId"></param>
-    /// <param name="lastTimestamp"></param>
-    internal void UpdateLastNodeActivity(string nodeId, int partitionId, HLCTimestamp lastTimestamp)
-    {
-        var key = (nodeId, partitionId);
-        if (lastActivity.TryGetValue(key, out HLCTimestamp currentTimestamp))
-        {
-            if (lastTimestamp > currentTimestamp)
-                lastActivity[key] = lastTimestamp;
-        }
-        else
-            lastActivity.TryAdd(key, lastTimestamp);
-    }
-    
+    public HLCTimestamp GetLastNodeActivity(string endpoint) =>
+        nodeActivityTracker.GetLastNodeActivity(endpoint);
+
+    /// <summary>
+    /// Updates the last activity known of a specific node on a specific partition.
+    /// </summary>
+    internal void UpdateLastNodeActivity(string nodeId, int partitionId, HLCTimestamp lastTimestamp) =>
+        nodeActivityTracker.UpdateLastNodeActivity(nodeId, partitionId, lastTimestamp);
+
     /// <summary>
     /// Obtains the last heartbeat sent to a specific node for a specific partition.
     /// The throttle key must include the partition id: a single node hosts many partitions,
@@ -1667,34 +1394,17 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// heartbeats of every other partition to the same node (within RecentHeartbeat),
     /// starving their followers and triggering perpetual re-elections.
     /// </summary>
-    /// <param name="nodeId"></param>
-    /// <param name="partitionId"></param>
-    /// <returns></returns>
-    internal HLCTimestamp GetLastNodeHearthbeat(string nodeId, int partitionId)
-    {
-        return lastHearthBeat.TryGetValue((nodeId, partitionId), out HLCTimestamp lastTimestamp) ? lastTimestamp : HLCTimestamp.Zero;
-    }
+    internal HLCTimestamp GetLastNodeHearthbeat(string nodeId, int partitionId) =>
+        nodeActivityTracker.GetLastNodeHearthbeat(nodeId, partitionId);
 
     /// <summary>
     /// Updates the last heartbeat sent to a node for a specific partition.
     /// </summary>
-    /// <param name="nodeId"></param>
-    /// <param name="partitionId"></param>
-    /// <param name="lastTimestamp"></param>
-    internal void UpdateLastHeartbeat(string nodeId, int partitionId, HLCTimestamp lastTimestamp)
-    {
-        var key = (nodeId, partitionId);
-        if (lastHearthBeat.TryGetValue(key, out HLCTimestamp currentTimestamp))
-        {
-            if (lastTimestamp > currentTimestamp)
-                lastHearthBeat[key] = lastTimestamp;
-        }
-        else
-            lastHearthBeat.TryAdd(key, lastTimestamp);
-    }
+    internal void UpdateLastHeartbeat(string nodeId, int partitionId, HLCTimestamp lastTimestamp) =>
+        nodeActivityTracker.UpdateLastHeartbeat(nodeId, partitionId, lastTimestamp);
 
     /// <summary>
-    /// Returns a list of nodes in the cluster
+    /// Returns a list of nodes in the cluster.
     /// </summary>
     public IList<RaftNode> GetNodes()
     {
@@ -1704,23 +1414,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <summary>
     /// Returns the non-local endpoints observed within the requested liveness window.
     /// </summary>
-    public IReadOnlyList<string> GetActiveNodes(TimeSpan within)
-    {
-        HLCTimestamp now = hybridLogicalClock.TrySendOrLocalEvent(LocalNodeId);
-        List<string> active = [];
-
-        foreach (((string endpoint, int _) key, HLCTimestamp lastSeen) in lastActivity)
-        {
-            if (key.endpoint == LocalEndpoint)
-                continue;
-
-            if ((now - lastSeen) <= within && !active.Contains(key.endpoint))
-                active.Add(key.endpoint);
-        }
-
-        active.Sort(StringComparer.Ordinal);
-        return active;
-    }
+    public IReadOnlyList<string> GetActiveNodes(TimeSpan within) =>
+        nodeActivityTracker.GetActiveNodes(within);
 
     /// <summary>
     /// Returns the raft partition for the given partition number
@@ -1758,52 +1453,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             partition.SetMinRetainIndex(index);
     }
 
-    /// <summary>
-    /// Builds an advisory load report for this node, covering only the partitions for which
-    /// this node is currently leader. The report is stamped with a monotonically increasing
-    /// <c>ReportVersion</c> and the local HLC time so receivers can discard stale entries.
-    /// <para>
-    /// Only called when <see cref="RaftConfiguration.EnableLeaderBalancer"/> is
-    /// <see langword="true"/>. The report is never committed to the Raft log; it is gossiped
-    /// out-of-band so a stale or dropped report only delays balancing, never violates safety.
-    /// </para>
-    /// </summary>
-    internal NodeLoadReport BuildLocalLoadReport()
-    {
-        double wOps = configuration.LeaderBalancerOpsWeight;
-        double wQueue = configuration.LeaderBalancerQueueWeight;
-        double ticksToMs = 1000.0 / global::System.Diagnostics.Stopwatch.Frequency;
-        long now = global::System.Diagnostics.Stopwatch.GetTimestamp();
-
-        List<PartitionLoad> leaderships = [];
-
-        foreach (KeyValuePair<int, RaftPartition> kv in partitions)
-        {
-            RaftPartition p = kv.Value;
-            if (!string.Equals(p.Leader, LocalEndpoint, StringComparison.Ordinal))
-                continue;
-
-            long leaderSinceMs = (long)((now - p.LeaderChangedTicks) * ticksToMs);
-
-            leaderships.Add(new PartitionLoad
-            {
-                PartitionId = p.PartitionId,
-                Load = p.GetCurrentLoad(wOps, wQueue),
-                LeaderSinceMs = leaderSinceMs > 0 ? leaderSinceMs : 0,
-                LogOpsPerSecond = p.GetLogOpsPerSecond(),
-                WalQueueDepth = walScheduler.GetPartitionDepth(p.PartitionId),
-                CommitWaitMs = walScheduler.GetPartitionCommitWaitMs(p.PartitionId),
-            });
-        }
-
-        return new NodeLoadReport
-        {
-            Endpoint = LocalEndpoint,
-            ReportVersion = Interlocked.Increment(ref _reportVersion),
-            Time = hybridLogicalClock.TrySendOrLocalEvent(LocalNodeId),
-            Leaderships = leaderships,
-        };
-    }
+    internal NodeLoadReport BuildLocalLoadReport() => loadReportService.BuildLocalLoadReport();
 
     /// <summary>
     /// Passes the Handshake to the appropriate partition
@@ -2230,158 +1880,43 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         }
     }
 
-    /// <summary>
-    /// Calls the restore started event
-    /// </summary>
-    /// <param name="partitionId"></param>
-    internal void InvokeRestoreStarted(int partitionId)
-    {
-        if (OnRestoreStarted != null)
-        {
-            Action<int>? callback = OnRestoreStarted;
-            callback?.Invoke(partitionId);
-        }
-    }
+    // ── Event dispatch — bodies live in RaftEventNotifier ─────────────────
 
-    /// <summary>
-    /// Calls the restore finished event
-    /// </summary>
-    /// <param name="partitionId"></param>
-    internal void InvokeRestoreFinished(int partitionId)
-    {
-        if (OnRestoreFinished != null)
-        {
-            Action<int>? callback = OnRestoreFinished;
-            callback?.Invoke(partitionId);
-        }
-    }
+    /// <summary>Fires <see cref="OnRestoreStarted"/> for the given partition.</summary>
+    internal void InvokeRestoreStarted(int partitionId) =>
+        eventNotifier.InvokeRestoreStarted(partitionId);
 
-    /// <summary>
-    /// Calls the restore finished event
-    /// </summary>
-    /// <param name="partitionId"></param>
-    internal void InvokeSystemRestoreFinished(int partitionId)
-    {
-        if (OnSystemRestoreFinished != null)
-        {
-            Action<int>? callback = OnSystemRestoreFinished;
-            callback?.Invoke(partitionId);
-        }
-    }
+    /// <summary>Fires <see cref="OnRestoreFinished"/> for the given partition.</summary>
+    internal void InvokeRestoreFinished(int partitionId) =>
+        eventNotifier.InvokeRestoreFinished(partitionId);
 
-    /// <summary>
-    /// Calls when a replication error occurs
-    /// </summary>
-    /// <param name="partitionId"></param>
-    /// <param name="log"></param>
-    internal void InvokeReplicationError(int partitionId, RaftLog log)
-    {
-        if (OnReplicationError != null)
-        {
-            Action<int, RaftLog>? callback = OnReplicationError;
-            callback?.Invoke(partitionId, log);
-        }
-    }
+    /// <summary>Fires <see cref="OnSystemRestoreFinished"/> for the given partition.</summary>
+    internal void InvokeSystemRestoreFinished(int partitionId) =>
+        eventNotifier.InvokeSystemRestoreFinished(partitionId);
 
-    /// <summary>
-    /// Calls the replication received event
-    /// </summary>
-    /// <param name="partitionId"></param>
-    /// <param name="log"></param>
-    /// <returns></returns>
-    internal async Task<bool> InvokeReplicationReceived(int partitionId, RaftLog log)
-    {
-        if (OnReplicationReceived != null)
-        {
-            Func<int, RaftLog, Task<bool>> callback = OnReplicationReceived;
+    /// <summary>Fires <see cref="OnReplicationError"/> for the given partition and log entry.</summary>
+    internal void InvokeReplicationError(int partitionId, RaftLog log) =>
+        eventNotifier.InvokeReplicationError(partitionId, log);
 
-            bool success = await callback(partitionId, log);
-            if (!success)
-                return false;
-        }
+    /// <summary>Fires <see cref="OnReplicationReceived"/> and returns the handler result.</summary>
+    internal Task<bool> InvokeReplicationReceived(int partitionId, RaftLog log) =>
+        eventNotifier.InvokeReplicationReceived(partitionId, log);
 
-        return true;
-    }
+    /// <summary>Fires <see cref="OnSystemReplicationReceived"/> and returns the handler result.</summary>
+    internal Task<bool> InvokeSystemReplicationReceived(int partitionId, RaftLog log) =>
+        eventNotifier.InvokeSystemReplicationReceived(partitionId, log);
 
-    /// <summary>
-    /// Calls the replication received event
-    /// </summary>
-    /// <param name="partitionId"></param>
-    /// <param name="log"></param>
-    /// <returns></returns>
-    internal async Task<bool> InvokeSystemReplicationReceived(int partitionId, RaftLog log)
-    {
-        if (OnSystemReplicationReceived != null)
-        {
-            Func<int, RaftLog, Task<bool>> callback = OnSystemReplicationReceived;
+    /// <summary>Fires <see cref="OnSystemLogRestored"/> and returns the handler result.</summary>
+    internal Task<bool> InvokeSystemLogRestored(int partitionId, RaftLog log) =>
+        eventNotifier.InvokeSystemLogRestored(partitionId, log);
 
-            bool success = await callback(partitionId, log);
-            if (!success)
-                return false;
-        }
+    /// <summary>Fires <see cref="OnLogRestored"/> and returns the handler result.</summary>
+    internal Task<bool> InvokeLogRestored(int partitionId, RaftLog log) =>
+        eventNotifier.InvokeLogRestored(partitionId, log);
 
-        return true;
-    }
-
-    /// <summary>
-    /// Calls the replication restored event on system partitions
-    /// </summary>
-    /// <param name="partitionId"></param>
-    /// <param name="log"></param>
-    /// <returns></returns>
-    internal async Task<bool> InvokeSystemLogRestored(int partitionId, RaftLog log)
-    {
-        if (OnSystemLogRestored != null)
-        {
-            Func<int, RaftLog, Task<bool>> callback = OnSystemLogRestored;
-
-            bool success = await callback(partitionId, log).ConfigureAwait(false);
-            if (!success)
-                return false;
-        }
-
-        return true;
-    }
-
-    /// <summary>
-    /// Calls the replication restored event
-    /// </summary>
-    /// <param name="partitionId"></param>
-    /// <param name="log"></param>
-    /// <returns></returns>
-    internal async Task<bool> InvokeLogRestored(int partitionId, RaftLog log)
-    {
-        if (OnLogRestored != null)
-        {
-            Func<int, RaftLog, Task<bool>> callback = OnLogRestored;
-
-            bool success = await callback(partitionId, log).ConfigureAwait(false);
-            if (!success)
-                return false;
-        }
-
-        return true;
-    }
-
-    /// <summary>
-    /// Calls the leader changed event
-    /// </summary>
-    /// <param name="partitionId"></param>
-    /// <param name="node"></param>
-    /// <returns></returns>
-    internal async Task<bool> InvokeLeaderChanged(int partitionId, string node)
-    {
-        if (OnLeaderChanged != null)
-        {
-            Func<int, string, Task<bool>> callback = OnLeaderChanged;
-
-            bool success = await callback(partitionId, node).ConfigureAwait(false);
-            if (!success)
-                return false;
-        }
-
-        return true;
-    }
+    /// <summary>Fires <see cref="OnLeaderChanged"/> and returns the handler result.</summary>
+    internal Task<bool> InvokeLeaderChanged(int partitionId, string node) =>
+        eventNotifier.InvokeLeaderChanged(partitionId, node);
 
     /// <summary>
     /// Returns the local endpoint
@@ -2795,152 +2330,34 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <inheritdoc/>
-    public async Task<RaftPartitionLifecycleResult> SplitPartitionAsync(
+    public Task<RaftPartitionLifecycleResult> SplitPartitionAsync(
         int sourcePartitionId,
         int targetPartitionId = 0,
         RaftSplitPlan? plan = null,
-        CancellationToken ct = default)
-    {
-        if (!IsInitialized)
-            throw new RaftException("System is not initialized");
-
-        if (sourcePartitionId == RaftSystemConfig.SystemPartition)
-            throw new RaftException("System partition cannot be split");
-
-        if (!await AmILeader(sourcePartitionId, ct).ConfigureAwait(false))
-            throw new RaftException("Split cannot be initiated by follower");
-
-        RaftSplitPlan effectivePlan = new()
-        {
-            // Method parameter takes precedence; fall back to plan.TargetPartitionId so a
-            // caller who passes only the plan (leaving targetPartitionId at its default 0)
-            // still has their explicit id honoured.
-            TargetPartitionId = targetPartitionId > 0 ? targetPartitionId : (plan?.TargetPartitionId ?? 0),
-            TargetRoutingMode = plan?.TargetRoutingMode ?? RaftRoutingMode.HashRange,
-            HashBoundary      = plan?.HashBoundary,
-            AutoCommit        = true
-        };
-
-        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        systemCoordinator.Send(new System.RaftSystemRequest(sourcePartitionId, effectivePlan, tcs));
-
-        (RaftOperationStatus status, long generation) = await tcs.Task.WaitAsync(ct).ConfigureAwait(false);
-        return new RaftPartitionLifecycleResult
-        {
-            Success    = status == RaftOperationStatus.Success,
-            Status     = status,
-            Generation = generation
-        };
-    }
+        CancellationToken ct = default) =>
+        lifecycleService.SplitPartitionAsync(sourcePartitionId, targetPartitionId, plan, ct);
 
     /// <inheritdoc/>
-    public async Task<RaftPartitionLifecycleResult> MergePartitionsAsync(
+    public Task<RaftPartitionLifecycleResult> MergePartitionsAsync(
         int survivorPartitionId,
         int sourcePartitionId,
         RaftMergePlan? plan = null,
-        CancellationToken ct = default)
-    {
-        if (!IsInitialized)
-            throw new RaftException("System is not initialized");
-
-        if (sourcePartitionId == RaftSystemConfig.SystemPartition || survivorPartitionId == RaftSystemConfig.SystemPartition)
-            throw new RaftException("System partition cannot be merged");
-
-        if (sourcePartitionId == survivorPartitionId)
-            throw new RaftException("Source and survivor partition must be different");
-
-        if (!await AmILeader(survivorPartitionId, ct).ConfigureAwait(false))
-            throw new RaftException("Merge cannot be initiated by follower: not leader of survivor partition");
-
-        if (!await AmILeader(sourcePartitionId, ct).ConfigureAwait(false))
-            throw new RaftException("Merge cannot be initiated by follower: not leader of source partition");
-
-        // Use the caller's plan when provided (carries any extended fields added in the future).
-        // Fall back to a default plan built from the validated method parameters.
-        RaftMergePlan effectivePlan = plan ?? new()
-        {
-            SurvivorPartitionId = survivorPartitionId,
-            SourcePartitionId   = sourcePartitionId
-        };
-
-        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        systemCoordinator.Send(new System.RaftSystemRequest(effectivePlan, tcs));
-
-        (RaftOperationStatus status, long generation) = await tcs.Task.WaitAsync(ct).ConfigureAwait(false);
-        return new RaftPartitionLifecycleResult
-        {
-            Success    = status == RaftOperationStatus.Success,
-            Status     = status,
-            Generation = generation
-        };
-    }
+        CancellationToken ct = default) =>
+        lifecycleService.MergePartitionsAsync(survivorPartitionId, sourcePartitionId, plan, ct);
 
     /// <inheritdoc/>
-    public async Task<RaftPartitionLifecycleResult> CreatePartitionAsync(
+    public Task<RaftPartitionLifecycleResult> CreatePartitionAsync(
         int partitionId,
         RaftRoutingMode mode = RaftRoutingMode.Unrouted,
         (int start, int end)? hashRange = null,
-        CancellationToken ct = default)
-    {
-        if (!IsInitialized)
-            throw new RaftException("System is not initialized");
-
-        if (partitionId == RaftSystemConfig.SystemPartition)
-            throw new RaftException("System partition cannot be created");
-
-        if (!await AmILeader(RaftSystemConfig.SystemPartition, ct).ConfigureAwait(false))
-            throw new RaftException("CreatePartition cannot be initiated by a follower");
-
-        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        systemCoordinator.Send(new System.RaftSystemRequest(
-            partitionId, mode, hashRange?.start, hashRange?.end, tcs));
-
-        (RaftOperationStatus status, long generation) = await tcs.Task.WaitAsync(ct).ConfigureAwait(false);
-        return new RaftPartitionLifecycleResult
-        {
-            Success = status == RaftOperationStatus.Success,
-            Status = status,
-            Generation = generation
-        };
-    }
+        CancellationToken ct = default) =>
+        lifecycleService.CreatePartitionAsync(partitionId, mode, hashRange, ct);
 
     /// <inheritdoc/>
-    public async Task<RaftPartitionLifecycleResult> RemovePartitionAsync(
+    public Task<RaftPartitionLifecycleResult> RemovePartitionAsync(
         int partitionId,
-        CancellationToken ct = default)
-    {
-        if (!IsInitialized)
-            throw new RaftException("System is not initialized");
-
-        if (partitionId == RaftSystemConfig.SystemPartition)
-            throw new RaftException("System partition cannot be removed");
-
-        if (!await AmILeader(RaftSystemConfig.SystemPartition, ct).ConfigureAwait(false))
-            throw new RaftException("RemovePartition cannot be initiated by a follower");
-
-        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        systemCoordinator.Send(
-            new System.RaftSystemRequest(System.RaftSystemRequestType.RemovePartition, partitionId)
-            {
-                Completion = tcs
-            });
-
-        (RaftOperationStatus status, long generation) = await tcs.Task.WaitAsync(ct).ConfigureAwait(false);
-        return new RaftPartitionLifecycleResult
-        {
-            Success = status == RaftOperationStatus.Success,
-            Status = status,
-            Generation = generation
-        };
-    }
+        CancellationToken ct = default) =>
+        lifecycleService.RemovePartitionAsync(partitionId, ct);
 
     /// <inheritdoc/>
     public void RegisterStateMachineTransfer(IRaftStateMachineTransfer? transfer) =>
@@ -2971,111 +2388,17 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         return 0;
     }
 
-    /// <summary>
-    /// Returns the best <see cref="System.NodeLoadReport"/> for the given partition from the
-    /// gossip cache: prefers the report from the endpoint that currently leads P; falls back
-    /// to the report with the greatest HLC <c>Time</c> among those containing P; returns
-    /// <c>null</c> when no gossip report mentions P at all.
-    /// Cross-endpoint <c>ReportVersion</c> is not used as a tiebreak.
-    /// </summary>
-    private System.NodeLoadReport? FindBestLoadReport(int partitionId)
-    {
-        string? leaderEndpoint = GetPartitionLeaderEndpoint(partitionId);
-        IReadOnlyList<System.NodeLoadReport> reports = systemCoordinator.GetLoadReports();
-
-        System.NodeLoadReport? best = null;
-
-        if (leaderEndpoint is not null)
-        {
-            foreach (System.NodeLoadReport r in reports)
-            {
-                if (string.Equals(r.Endpoint, leaderEndpoint, StringComparison.Ordinal))
-                {
-                    best = r;
-                    break;
-                }
-            }
-        }
-
-        // Fallback: among all reports that mention P, pick the one with the greatest HLC Time.
-        // Cross-endpoint ReportVersion is not a valid tiebreak.
-        if (best is null)
-        {
-            foreach (System.NodeLoadReport r in reports)
-            {
-                foreach (System.PartitionLoad l in r.Leaderships)
-                {
-                    if (l.PartitionId == partitionId && (best is null || r.Time > best.Time))
-                    {
-                        best = r;
-                        break;
-                    }
-                }
-            }
-        }
-
-        return best;
-    }
+    /// <inheritdoc/>
+    public double GetPartitionLogOpsPerSecond(int partitionId) =>
+        loadReportService.GetPartitionLogOpsPerSecond(partitionId);
 
     /// <inheritdoc/>
-    public double GetPartitionLogOpsPerSecond(int partitionId)
-    {
-        // Local fast-path: no gossip lag.
-        if (partitions.TryGetValue(partitionId, out RaftPartition? p) &&
-            string.Equals(p.Leader, LocalEndpoint, StringComparison.Ordinal))
-            return p.GetLogOpsPerSecond();
-
-        System.NodeLoadReport? best = FindBestLoadReport(partitionId);
-        if (best is null) return 0.0;
-
-        foreach (System.PartitionLoad l in best.Leaderships)
-        {
-            if (l.PartitionId == partitionId)
-                return l.LogOpsPerSecond;
-        }
-
-        return 0.0;
-    }
+    public int GetPartitionWalQueueDepth(int partitionId) =>
+        loadReportService.GetPartitionWalQueueDepth(partitionId);
 
     /// <inheritdoc/>
-    public int GetPartitionWalQueueDepth(int partitionId)
-    {
-        // Local fast-path: no gossip lag.
-        if (partitions.TryGetValue(partitionId, out RaftPartition? p) &&
-            string.Equals(p.Leader, LocalEndpoint, StringComparison.Ordinal))
-            return walScheduler.GetPartitionDepth(partitionId);
-
-        System.NodeLoadReport? best = FindBestLoadReport(partitionId);
-        if (best is null) return 0;
-
-        foreach (System.PartitionLoad l in best.Leaderships)
-        {
-            if (l.PartitionId == partitionId)
-                return l.WalQueueDepth;
-        }
-
-        return 0;
-    }
-
-    /// <inheritdoc/>
-    public double GetPartitionCommitWaitMs(int partitionId)
-    {
-        // Local fast-path: no gossip lag.
-        if (partitions.TryGetValue(partitionId, out RaftPartition? p) &&
-            string.Equals(p.Leader, LocalEndpoint, StringComparison.Ordinal))
-            return walScheduler.GetPartitionCommitWaitMs(partitionId);
-
-        System.NodeLoadReport? best = FindBestLoadReport(partitionId);
-        if (best is null) return 0.0;
-
-        foreach (System.PartitionLoad l in best.Leaderships)
-        {
-            if (l.PartitionId == partitionId)
-                return l.CommitWaitMs;
-        }
-
-        return 0.0;
-    }
+    public double GetPartitionCommitWaitMs(int partitionId) =>
+        loadReportService.GetPartitionCommitWaitMs(partitionId);
 
     /// <inheritdoc/>
     public System.ClusterMembership GetMembership() => systemCoordinator.GetMembership();
@@ -3086,7 +2409,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// advances to a strictly higher version.
     /// </summary>
     internal void RaiseMembershipChanged(System.ClusterMembership membership) =>
-        OnMembershipChanged?.Invoke(membership);
+        eventNotifier.RaiseMembershipChanged(membership);
 
     /// <inheritdoc/>
     public IReadOnlyList<RaftPartitionRange> GetPartitionMap()
@@ -3163,7 +2486,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         // 1. Stop and dispose the timer so no new work is injected and both
         //    Timer instances are released without waiting for GC.
         timerService.Dispose();
-        DisposePendingSnapshots();
+        snapshotReceiver.DisposePendingSnapshots();
 
         // 2. Drain partition queues before stopping shared schedulers. Then stop the
         //    I/O schedulers while executors are still alive, so accepted WAL work can
