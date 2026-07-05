@@ -12,10 +12,15 @@ namespace Kommander;
 public sealed class RaftTransportAuthenticator
 {
     private const long ReplayCachePruneIntervalMilliseconds = 30_000;
+
     private static readonly ConcurrentDictionary<string, long> ReplayCache = new();
+
     private static long nextReplayCachePruneAtUnixMilliseconds;
+
     private readonly byte[]? sharedSecretBytes;
+
     private readonly string replayCacheNamespace = "disabled";
+    
     private readonly TimeProvider timeProvider;
 
     /// <summary>

@@ -1,6 +1,5 @@
 ﻿
 using System.Buffers;
-using System.Threading;
 using Kommander.Data;
 using Kommander.Diagnostics;
 using Kommander.Logging;
@@ -140,7 +139,7 @@ public sealed class RaftWriteAhead
     public async ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync()
     {
         if (recovered)
-            return Array.Empty<RaftLog>();
+            return [];
 
         List<RaftLog> logs = await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () => walAdapter.ReadLogs(partition.PartitionId)).ConfigureAwait(false);
 

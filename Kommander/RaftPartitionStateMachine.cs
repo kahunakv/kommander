@@ -51,11 +51,11 @@ public sealed class RaftPartitionStateMachine
     private readonly Dictionary<long, Scheduling.RaftPendingWalOperation> pendingWalOperations = [];
 
     /// <summary>
-    /// Tracks in-flight snapshot transfers keyed by follower endpoint.
-    /// Prevents concurrent duplicate snapshots to the same node while one is already
-    /// in progress.  Entries are removed when the background task completes.
+    /// Encapsulates in-flight snapshot-send guard, chunked send loop, and
+    /// install-complete callback. Initialized in constructor after <c>postToExecutor</c>
+    /// is wired so the sender can always read the current value via the closure.
     /// </summary>
-    private readonly ConcurrentDictionary<string, byte> pendingSnapshotEndpoints = new();
+    private readonly SnapshotSender snapshotSender;
 
     /// <summary>
     /// Posts a <see cref="RaftRequest"/> back to the partition executor from a background thread
@@ -68,6 +68,7 @@ public sealed class RaftPartitionStateMachine
     private readonly Random random;
 
     private RaftNodeState nodeState = RaftNodeState.Follower;
+
     private long currentTerm;
 
     /// <summary>
@@ -157,6 +158,17 @@ public sealed class RaftPartitionStateMachine
         electionTimeout = TimeSpan.FromMilliseconds(random.Next(
             host.Configuration.StartElectionTimeout,
             host.Configuration.EndElectionTimeout));
+
+        snapshotSender = new SnapshotSender(
+            host,
+            logger,
+            () => nodeState,
+            () => postToExecutor,
+            (endpoint, idx) =>
+            {
+                if (!lastCommitIndexes.TryGetValue(endpoint, out long cur) || idx > cur)
+                    lastCommitIndexes[endpoint] = idx;
+            });
     }
 
     /// <summary>
@@ -181,6 +193,7 @@ public sealed class RaftPartitionStateMachine
     {
         if (quiesced == value)
             return;
+            
         quiesced = value;
         _onQuiesceChanged?.Invoke(value);
     }
@@ -968,13 +981,7 @@ public sealed class RaftPartitionStateMachine
                 bool p0System = host.PartitionId == RaftSystemConfig.SystemPartition && host.SystemStateTransfer is not null;
                 if (lastCheckpoint > 0 && (host.StateMachineTransfer is not null || p0System))
                 {
-                    RaftNode capturedNode = node;
-                    if (pendingSnapshotEndpoints.TryAdd(capturedNode.Endpoint, 0))
-                    {
-                        logger.LogInfoStartingSnapshotTransfer(host.LocalEndpoint, host.PartitionId, nodeState, capturedNode.Endpoint, lastCheckpoint);
-
-                        _ = TrySendSnapshotAsync(capturedNode, lastCheckpoint);
-                    }
+                    snapshotSender.TrySend(node, lastCheckpoint);
                 }
             }
 
@@ -2579,160 +2586,16 @@ public sealed class RaftPartitionStateMachine
         proposal.CompleteWaiter(RaftProposalTicketState.Committed, proposal.LastLogIndex);
     }
 
-    /// <summary>
-    /// Background task: exports the partition state via <see cref="IRaftStateMachineTransfer.ExportRange"/>
-    /// and ships it to the lagging follower in bounded chunks so no single message exceeds the
-    /// gRPC default receive limit.  On success it posts <see cref="RaftRequestType.SnapshotInstalled"/>
-    /// back to the executor so <see cref="CompleteSnapshotInstalled"/> can safely advance
-    /// <c>lastCommitIndexes</c> under the single-owner guarantee.
-    /// Always removes <paramref name="node"/>'s endpoint from <see cref="pendingSnapshotEndpoints"/>
-    /// when done so a retry can be attempted on the next heartbeat cycle.
-    /// </summary>
-    private async Task TrySendSnapshotAsync(RaftNode node, long snapshotIndex)
-    {
-        // Stay well under gRPC's 4 MB default with room for message framing overhead.
-        const int chunkSize = 3 * 1024 * 1024;
-
-        try
-        {
-            // For the system partition (P0) with a registered system-state transfer, export the
-            // full application state.  For all other partitions (or when only a range transfer is
-            // registered), use the existing key-range export path so existing behaviour is preserved.
-            bool useSystemState = host.PartitionId == RaftSystemConfig.SystemPartition
-                                  && host.SystemStateTransfer is not null;
-
-            Stream snapshot;
-            SnapshotKind kind;
-            if (useSystemState)
-            {
-                kind = SnapshotKind.SystemState;
-                try
-                {
-                    snapshot = await host.SystemStateTransfer!
-                        .ExportPartitionState(host.PartitionId, snapshotIndex, CancellationToken.None)
-                        .ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    logger.LogError(
-                        "[{LocalEndpoint}/{PartitionId}/{State}] TrySendSnapshotAsync: ExportPartitionState failed for {Endpoint}: {Message}",
-                        host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, ex.Message);
-                    return;
-                }
-            }
-            else
-            {
-                IRaftStateMachineTransfer? transfer = host.StateMachineTransfer;
-                if (transfer is null)
-                    return;
-
-                kind = SnapshotKind.Range;
-                RaftSplitPlan plan = new() { TargetPartitionId = host.PartitionId };
-                try
-                {
-                    snapshot = await transfer.ExportRange(plan, snapshotIndex, CancellationToken.None).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    logger.LogError(
-                        "[{LocalEndpoint}/{PartitionId}/{State}] TrySendSnapshotAsync: ExportRange failed for {Endpoint}: {Message}",
-                        host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, ex.Message);
-                    return;
-                }
-            }
-
-            string sessionId = Guid.NewGuid().ToString("N");
-            byte[] buffer = new byte[chunkSize];
-            int chunkIndex = 0;
-            bool success = false;
-
-            await using (snapshot.ConfigureAwait(false))
-            {
-                while (true)
-                {
-                    int bytesRead = await ReadExactAsync(snapshot, buffer, chunkSize, CancellationToken.None).ConfigureAwait(false);
-                    bool isLast = bytesRead < chunkSize;
-
-                    SnapshotRequest chunk = new()
-                    {
-                        SessionId = sessionId,
-                        PartitionId = host.PartitionId,
-                        SnapshotIndex = snapshotIndex,
-                        FollowerEndpoint = node.Endpoint,
-                        ChunkIndex = chunkIndex,
-                        IsLast = isLast,
-                        Data = buffer[..bytesRead],
-                        Kind = kind,
-                    };
-
-                    SnapshotResponse response = await host.SendInstallSnapshotAsync(node, chunk, CancellationToken.None).ConfigureAwait(false);
-                    if (!response.Success)
-                    {
-                        logger.LogWarning(
-                            "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot chunk {ChunkIndex} to {Endpoint} was rejected",
-                            host.LocalEndpoint, host.PartitionId, nodeState, chunkIndex, node.Endpoint);
-                        return;
-                    }
-
-                    if (isLast)
-                    {
-                        success = true;
-                        break;
-                    }
-
-                    chunkIndex++;
-                }
-            }
-
-            if (success)
-            {
-                logger.LogInfoSnapshotInstalled(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, snapshotIndex, chunkIndex + 1);
-
-                // Notify the executor thread so it can safely update lastCommitIndexes.
-                postToExecutor?.Invoke(new RaftRequest(
-                    RaftRequestType.SnapshotInstalled,
-                    commitIndex: snapshotIndex,
-                    endpoint: node.Endpoint));
-            }
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(
-                "[{LocalEndpoint}/{PartitionId}/{State}] TrySendSnapshotAsync: unhandled error for {Endpoint}: {Message}",
-                host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, ex.Message);
-        }
-        finally
-        {
-            pendingSnapshotEndpoints.TryRemove(node.Endpoint, out _);
-        }
-    }
+    // ReadExactAsync body lives in StreamUtils; forwarded here for call-site compatibility.
+    private static ValueTask<int> ReadExactAsync(Stream stream, byte[] buffer, int count, CancellationToken ct) =>
+        StreamUtils.ReadExactAsync(stream, buffer, count, ct);
 
     /// <summary>
-    /// Reads up to <paramref name="count"/> bytes from <paramref name="stream"/> into
-    /// <paramref name="buffer"/>, issuing repeated reads until the buffer is full or the
-    /// stream is exhausted.  Returns the total number of bytes read.
+    /// Advances <c>lastCommitIndexes</c> for <paramref name="endpoint"/> after the background
+    /// snapshot task confirmed successful installation. Called on the executor thread via the
+    /// <c>postToExecutor</c> callback; delegates ownership update to <see cref="snapshotSender"/>.
     /// </summary>
-    private static async ValueTask<int> ReadExactAsync(Stream stream, byte[] buffer, int count, CancellationToken ct)
-    {
-        int total = 0;
-        while (total < count)
-        {
-            int n = await stream.ReadAsync(buffer.AsMemory(total, count - total), ct).ConfigureAwait(false);
-            if (n == 0) break;
-            total += n;
-        }
-        return total;
-    }
-
-    /// <summary>
-    /// Advances <c>lastCommitIndexes</c> for <paramref name="endpoint"/> to <paramref name="snapshotIndex"/>
-    /// after the background snapshot task confirmed successful installation on the follower.
-    /// Always called on the executor thread via the <see cref="postToExecutor"/> callback.
-    /// </summary>
-    public void CompleteSnapshotInstalled(string endpoint, long snapshotIndex)
-    {
-        if (!lastCommitIndexes.TryGetValue(endpoint, out long current) || snapshotIndex > current)
-            lastCommitIndexes[endpoint] = snapshotIndex;
-    }
+    public void CompleteSnapshotInstalled(string endpoint, long snapshotIndex) =>
+        snapshotSender.CompleteSnapshotInstalled(endpoint, snapshotIndex);
 
 }
