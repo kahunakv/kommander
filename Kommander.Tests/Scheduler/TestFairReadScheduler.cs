@@ -58,6 +58,76 @@ public sealed class TestFairReadScheduler
     }
 
     /// <summary>
+    /// Operations enqueued BEFORE <see cref="FairReadScheduler.Start"/> must be parked
+    /// and then served, in submission order, once the workers spin up — not rejected.
+    /// Regression for the startup race where a consumer reads before
+    /// <c>RaftManager.JoinCluster</c> has called Start().
+    /// </summary>
+    [Fact]
+    public async Task EnqueueBeforeStart_ParkedThenServedInOrder()
+    {
+        const int opCount = 50;
+        ConcurrentQueue<int> completionOrder = new();
+
+        using FairReadScheduler scheduler = new(NullLogger<IRaft>.Instance, workerCount: 1);
+
+        // Enqueue everything BEFORE Start(): must not throw, must park.
+        List<Task<int>> tasks = new(opCount);
+        for (int i = 1; i <= opCount; i++)
+        {
+            int captured = i;
+            tasks.Add(scheduler.EnqueueTask(1, () =>
+            {
+                completionOrder.Enqueue(captured);
+                return captured;
+            }));
+        }
+
+        // Nothing should have run yet — no workers exist.
+        Assert.All(tasks, t => Assert.False(t.IsCompleted));
+
+        scheduler.Start();
+
+        int[] results = await Task.WhenAll(tasks);
+
+        Assert.Equal(opCount, results.Length);
+        for (int i = 0; i < results.Length; i++)
+            Assert.Equal(i + 1, results[i]);
+
+        // FIFO preserved across the Start() boundary.
+        int[] order = completionOrder.ToArray();
+        for (int i = 0; i < order.Length - 1; i++)
+            Assert.True(order[i] < order[i + 1], $"FIFO violated at index {i}: {order[i]} followed by {order[i + 1]}");
+    }
+
+    /// <summary>
+    /// If operations are parked before Start() and the scheduler is stopped without ever
+    /// starting, <see cref="FairReadScheduler.Stop"/> must drain them so their awaiters
+    /// complete rather than hang forever.
+    /// </summary>
+    [Fact]
+    public async Task StopWithoutStart_DrainsParkedOperations()
+    {
+        const int opCount = 20;
+        using FairReadScheduler scheduler = new(NullLogger<IRaft>.Instance, workerCount: 2);
+
+        List<Task<int>> tasks = new(opCount);
+        for (int i = 1; i <= opCount; i++)
+        {
+            int seq = i;
+            tasks.Add(scheduler.EnqueueTask(i % 3, () => seq));
+        }
+
+        // Stop() without a prior Start() must still complete every parked operation.
+        await Task.Run(scheduler.Stop, TestContext.Current.CancellationToken);
+
+        Assert.All(tasks, t => Assert.True(t.IsCompleted, "A parked operation was not completed by Stop()."));
+
+        int[] results = await Task.WhenAll(tasks);
+        Assert.Equal(opCount, results.Length);
+    }
+
+    /// <summary>
     /// Operations from different partitions can run concurrently on separate
     /// workers, so all tasks complete and each partition's results are correct.
     /// </summary>
