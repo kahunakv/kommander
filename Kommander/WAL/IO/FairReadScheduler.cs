@@ -125,9 +125,13 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
         if (_stopping)
             throw new InvalidOperationException("FairReadScheduler: scheduler is stopping; no new operations accepted.");
 
-        if (!_started)
-            throw new InvalidOperationException("FairReadScheduler: call Start() before EnqueueTask().");
-
+        // Deliberately NO "call Start() first" guard. An operation enqueued before
+        // Start() is parked in its per-partition queue (and the partition id in
+        // _readyPartitions); the worker threads created by Start() then drain it in
+        // submission order. This closes the startup race where a consumer issues a read
+        // before RaftManager.JoinCluster has called Start(): the read is served rather
+        // than rejected with a retry. Only _stopping rejects new work — see Stop(),
+        // which drains any parked operations even when Start() was never called.
         PartitionState state = _partitions.GetOrAdd(partitionId, _ => new PartitionState());
 
         TaskCompletionSource<T> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -166,7 +170,15 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
 
     // ── Lifecycle ──────────────────────────────────────────────────────────
 
-    /// <summary>Starts the worker threads. Must be called exactly once before <see cref="EnqueueTask{T}"/>.</summary>
+    /// <summary>
+    /// Starts the worker threads. Idempotent (a second call is a no-op).
+    /// <para>
+    /// Callers may <see cref="EnqueueTask{T}"/> before Start(): such operations are parked
+    /// in their per-partition queues and served, in submission order, once the workers spin
+    /// up. This avoids a startup race with consumers that read before the owning
+    /// <c>RaftManager</c> has called Start().
+    /// </para>
+    /// </summary>
     public void Start()
     {
         if (_started)
@@ -194,10 +206,20 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
     /// </summary>
     public void Stop()
     {
-        if (!_started)
-            return; // Start() was never called; nothing to stop.
-
         _stopping = true;
+
+        if (!_started)
+        {
+            // Start() was never called, but callers may have parked reads via EnqueueTask
+            // (which no longer requires Start()). Drain them synchronously on this thread so
+            // their awaiters complete instead of hanging forever. This is safe precisely
+            // because no worker threads exist: every partition has InFlight=false, so the
+            // DrainRemaining sweep processes all parked operations in submission order with
+            // no risk of concurrent execution on the same partition.
+            DrainRemaining(new List<Action>(MaxBatchSize));
+            return;
+        }
+
         _cts.Cancel();
 
         foreach (Thread worker in _workers)
