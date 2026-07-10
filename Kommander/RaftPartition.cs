@@ -383,45 +383,73 @@ public sealed class RaftPartition : IDisposable
 
     /// <summary>
     /// Commits logs for the specified ticket identifier if the current node is the leader and notifies followers.
+    /// <para>
+    /// If <paramref name="cancellationToken"/> fires while waiting on the executor, the method returns
+    /// <c>(false, <see cref="RaftOperationStatus.OperationCancelled"/>, 0)</c> rather than throwing.
+    /// The queued executor work may still apply after the caller reclaims control; re-issuing the same
+    /// ticket is a safe idempotent no-op once the executor drains.
+    /// </para>
     /// </summary>
     /// <param name="ticketId">The logical timestamp associated with the logs to be committed.</param>
+    /// <param name="cancellationToken">Optional deadline; default leaves the executor await unbounded.</param>
     /// <returns>A tuple containing a boolean indicating success, the status of the operation as <see cref="RaftOperationStatus"/>, and the commit index of the logs.</returns>
-    public async Task<(bool success, RaftOperationStatus status, long commitIndex)> CommitLogs(HLCTimestamp ticketId)
+    public async Task<(bool success, RaftOperationStatus status, long commitIndex)> CommitLogs(HLCTimestamp ticketId, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(Leader))
             return (false, RaftOperationStatus.NodeIsNotLeader, 0);
-        
+
         if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, 0);
-        
-        RaftResponse response = await executor.Ask(new(RaftRequestType.CommitLogs, ticketId, false)).ConfigureAwait(false);
-        
-        if (response.Status == RaftOperationStatus.Success)
-            return (true, response.Status, response.LogIndex);
-        
-        return (false, response.Status, 0);
+
+        try
+        {
+            RaftResponse response = await executor.Ask(new(RaftRequestType.CommitLogs, ticketId, false), cancellationToken).ConfigureAwait(false);
+
+            if (response.Status == RaftOperationStatus.Success)
+                return (true, response.Status, response.LogIndex);
+
+            return (false, response.Status, 0);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return (false, RaftOperationStatus.OperationCancelled, 0);
+        }
     }
 
     /// <summary>
     /// Attempts to roll back logs to a specific timestamp for the current Raft partition.
     /// This operation can only be performed by the leader node of the partition.
+    /// <para>
+    /// If <paramref name="cancellationToken"/> fires while waiting on the executor, the method returns
+    /// <c>(false, <see cref="RaftOperationStatus.OperationCancelled"/>, 0)</c> rather than throwing.
+    /// The queued executor work may still apply after the caller reclaims control; re-issuing the same
+    /// ticket is a safe idempotent no-op once the executor drains.
+    /// </para>
     /// </summary>
     /// <param name="ticketId">The timestamp indicating the point to roll back the logs to.</param>
+    /// <param name="cancellationToken">Optional deadline; default leaves the executor await unbounded.</param>
     /// <returns>A tuple indicating the success of the operation, the operation status, and the commit index.</returns>
-    public async Task<(bool success, RaftOperationStatus status, long commitIndex)> RollbackLogs(HLCTimestamp ticketId)
+    public async Task<(bool success, RaftOperationStatus status, long commitIndex)> RollbackLogs(HLCTimestamp ticketId, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(Leader))
             return (false, RaftOperationStatus.NodeIsNotLeader, 0);
-        
+
         if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, 0);
-        
-        RaftResponse response = await executor.Ask(new(RaftRequestType.RollbackLogs, ticketId, false)).ConfigureAwait(false);
-        
-        if (response.Status == RaftOperationStatus.Success)
-            return (true, response.Status, response.LogIndex);
-        
-        return (false, response.Status, 0);
+
+        try
+        {
+            RaftResponse response = await executor.Ask(new(RaftRequestType.RollbackLogs, ticketId, false), cancellationToken).ConfigureAwait(false);
+
+            if (response.Status == RaftOperationStatus.Success)
+                return (true, response.Status, response.LogIndex);
+
+            return (false, response.Status, 0);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return (false, RaftOperationStatus.OperationCancelled, 0);
+        }
     }
 
     /// <summary>

@@ -1820,6 +1820,14 @@ public sealed class RaftPartitionStateMachine
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Idempotent: if the proposal is already <see cref="RaftProposalState.Committed"/>, returns
+    /// <see cref="RaftOperationStatus.Success"/> with the committed index immediately (no second WAL
+    /// write).  If already <see cref="RaftProposalState.RolledBack"/>, returns
+    /// <see cref="RaftOperationStatus.Errored"/> — the settled outcome wins and a commit is not
+    /// applied.  The first terminal transition (Committed <em>or</em> RolledBack) is the one that
+    /// persists; any subsequent opposite request reflects that settled state.
+    /// </summary>
     private (RaftOperationStatus, long commitIndex) CommitLogs(
         HLCTimestamp ticketId,
         ulong? replyCorrelationId = null
@@ -1827,21 +1835,27 @@ public sealed class RaftPartitionStateMachine
     {
         if (nodeState != RaftNodeState.Leader)
             return (RaftOperationStatus.NodeIsNotLeader, 0);
-        
+
         if (!activeProposals.TryGetValue(ticketId, out RaftProposalQuorum? proposal))
             return (RaftOperationStatus.ProposalNotFound, 0);
+
+        if (proposal.State == RaftProposalState.Committed)
+            return (RaftOperationStatus.Success, proposal.LastLogIndex);
+
+        if (proposal.State == RaftProposalState.RolledBack)
+            return (RaftOperationStatus.Errored, 0);
 
         if (!proposal.HasQuorum())
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Trying to commit proposal {Timestamp} without quorum...", host.LocalEndpoint, host.PartitionId, nodeState, ticketId);
-            
+
             return (RaftOperationStatus.Errored, 0);
         }
-        
+
         if (proposal.State != RaftProposalState.Completed)
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Trying to commit proposal {Timestamp} in state {State}...", host.LocalEndpoint, host.PartitionId, nodeState, ticketId, proposal.State);
-            
+
             return (RaftOperationStatus.Errored, 0);
         }
 
@@ -1871,6 +1885,14 @@ public sealed class RaftPartitionStateMachine
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Idempotent: if the proposal is already <see cref="RaftProposalState.RolledBack"/>, returns
+    /// <see cref="RaftOperationStatus.Success"/> immediately (no second WAL write).  If already
+    /// <see cref="RaftProposalState.Committed"/>, returns <see cref="RaftOperationStatus.Errored"/>
+    /// — the settled outcome wins and a rollback is not applied.  The first terminal transition
+    /// (Committed <em>or</em> RolledBack) is the one that persists; any subsequent opposite request
+    /// reflects that settled state.
+    /// </summary>
     private (RaftOperationStatus, long commitIndex) RollbackLogs(
         HLCTimestamp ticketId,
         ulong? replyCorrelationId = null
@@ -1878,24 +1900,30 @@ public sealed class RaftPartitionStateMachine
     {
         if (nodeState != RaftNodeState.Leader)
             return (RaftOperationStatus.NodeIsNotLeader, 0);
-        
+
         if (!activeProposals.TryGetValue(ticketId, out RaftProposalQuorum? proposal))
             return (RaftOperationStatus.ProposalNotFound, 0);
-        
+
+        if (proposal.State == RaftProposalState.RolledBack)
+            return (RaftOperationStatus.Success, 0);
+
+        if (proposal.State == RaftProposalState.Committed)
+            return (RaftOperationStatus.Errored, 0);
+
         if (!proposal.HasQuorum())
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Trying to rollback proposal {Timestamp} without quorum...", host.LocalEndpoint, host.PartitionId, nodeState, ticketId);
-            
+
             return (RaftOperationStatus.Errored, 0);
         }
-        
+
         if (proposal.State != RaftProposalState.Completed)
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Trying to rollback proposal {Timestamp} in state {State}...", host.LocalEndpoint, host.PartitionId, nodeState, ticketId, proposal.State);
-            
+
             return (RaftOperationStatus.Errored, 0);
         }
-        
+
         WALWriteOperation operation = wal.EnqueueRollback(proposal.Logs);
         pendingWalOperations[operation.OperationId] = new()
         {

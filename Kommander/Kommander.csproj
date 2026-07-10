@@ -9,15 +9,15 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>Kommander</PackageId>
-    <Version>0.18.2</Version>
+    <Version>0.19.0</Version>
     <Description>Distributed consensus with Raft for C#/.NET</Description>
     <Authors>Andres Gutierrez</Authors>
     <Company>Andres Gutierrez</Company>
     <InvariantGlobalization>true</InvariantGlobalization>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageDescription>Distributed consensus with Raft</PackageDescription>
-    <PackageProjectUrl>https://github.com/andresgutierrez/kommander</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/andresgutierrez/kommander</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/kahunakv/kommander</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/kahunakv/kommander</RepositoryUrl>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageTags>raft;consensus;paxos;distributed consensus;leader election</PackageTags>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>

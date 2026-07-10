@@ -1760,11 +1760,11 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <param name="partitionId"></param>
     /// <param name="proposalIndex"></param>
     /// <returns></returns>
-    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> CommitLogs(int partitionId, HLCTimestamp ticketId)
+    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> CommitLogs(int partitionId, HLCTimestamp ticketId, CancellationToken cancellationToken = default)
     {
         RaftPartition partition = GetPartition(partitionId);
 
-        return await partition.CommitLogs(ticketId).ConfigureAwait(false);
+        return await partition.CommitLogs(ticketId, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1773,11 +1773,11 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <param name="partitionId"></param>
     /// <param name="proposalIndex"></param>
     /// <returns></returns>
-    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> RollbackLogs(int partitionId, HLCTimestamp ticketId)
+    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> RollbackLogs(int partitionId, HLCTimestamp ticketId, CancellationToken cancellationToken = default)
     {
         RaftPartition partition = GetPartition(partitionId);
 
-        return await partition.RollbackLogs(ticketId).ConfigureAwait(false);
+        return await partition.RollbackLogs(ticketId, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>

@@ -66,4 +66,12 @@ public enum RaftOperationStatus
     /// <c>nextIndex</c> for this peer.
     /// </summary>
     SnapshotRequired = 18,
+
+    /// <summary>
+    /// The caller's <see cref="System.Threading.CancellationToken"/> fired before the
+    /// operation could complete.  The caller should back off and retry the same ticket
+    /// after a delay — the queued work may still apply, and re-issuing the same ticket
+    /// is a safe idempotent no-op once the executor drains.
+    /// </summary>
+    OperationCancelled = 19,
 }
