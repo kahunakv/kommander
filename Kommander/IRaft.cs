@@ -282,20 +282,32 @@ public interface IRaft
     public Task<RaftReplicationResult> ReplicateCheckpoint(int partitionId, CancellationToken cancellationToken = default);
     
     /// <summary>
-    /// Commit logs and notify followers in the partition
+    /// Commits logs for the given ticket and notifies followers.
+    /// <para>
+    /// On cancellation, returns <c>(false, <see cref="RaftOperationStatus.OperationCancelled"/>, 0)</c>
+    /// rather than throwing; the caller should retry the same ticket after back-off because the
+    /// queued executor work may still apply (re-committing an already-committed ticket is a no-op).
+    /// </para>
     /// </summary>
     /// <param name="partitionId"></param>
     /// <param name="ticketId"></param>
+    /// <param name="cancellationToken">Optional deadline; default leaves the await unbounded.</param>
     /// <returns></returns>
-    public Task<(bool success, RaftOperationStatus status, long commitLogId)> CommitLogs(int partitionId, HLCTimestamp ticketId);
+    public Task<(bool success, RaftOperationStatus status, long commitLogId)> CommitLogs(int partitionId, HLCTimestamp ticketId, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Rollback logs and notify followers in the partition
+    /// Rolls back logs for the given ticket and notifies followers.
+    /// <para>
+    /// On cancellation, returns <c>(false, <see cref="RaftOperationStatus.OperationCancelled"/>, 0)</c>
+    /// rather than throwing; the caller should retry the same ticket after back-off because the
+    /// queued executor work may still apply (re-rolling-back an already-rolled-back ticket is a no-op).
+    /// </para>
     /// </summary>
     /// <param name="partitionId"></param>
     /// <param name="ticketId"></param>
+    /// <param name="cancellationToken">Optional deadline; default leaves the await unbounded.</param>
     /// <returns></returns>
-    public Task<(bool success, RaftOperationStatus status, long commitLogId)> RollbackLogs(int partitionId, HLCTimestamp ticketId);
+    public Task<(bool success, RaftOperationStatus status, long commitLogId)> RollbackLogs(int partitionId, HLCTimestamp ticketId, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Sets the minimum WAL log index that compaction must not truncate below on

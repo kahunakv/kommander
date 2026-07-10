@@ -51,8 +51,11 @@ internal sealed class SnapshotSender
     {
         if (pendingSnapshotEndpoints.TryAdd(node.Endpoint, 0))
         {
-            logger.LogInfoStartingSnapshotTransfer(
-                host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex);
+            // Guard the Information log so the getNodeState() delegate is not invoked when
+            // the level is disabled (CA1873).
+            if (logger.IsEnabled(LogLevel.Information))
+                logger.LogInfoStartingSnapshotTransfer(
+                    host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex);
             _ = TrySendSnapshotAsync(node, snapshotIndex);
         }
     }
@@ -159,7 +162,10 @@ internal sealed class SnapshotSender
 
             if (success)
             {
-                logger.LogInfoSnapshotInstalled(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex, chunkIndex + 1);
+                // Guard the Information log so the getNodeState() delegate is not invoked when
+                // the level is disabled (CA1873).
+                if (logger.IsEnabled(LogLevel.Information))
+                    logger.LogInfoSnapshotInstalled(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex, chunkIndex + 1);
 
                 getPostToExecutor()?.Invoke(new RaftRequest(
                     RaftRequestType.SnapshotInstalled,
