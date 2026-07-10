@@ -41,6 +41,26 @@ public interface IRaftWalFacade
     ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries);
 
     /// <summary>
+    /// Reads up to <paramref name="maxEntries"/> log entries of ANY type (Proposed,
+    /// Committed, RolledBack, etc.) with id ≥ <paramref name="startLogIndex"/>,
+    /// sorted ascending.  Unlike <see cref="GetRangeAsync"/>, uncommitted entries are
+    /// <b>not</b> filtered out.
+    ///
+    /// <para>Used on promotion to identify inherited Proposed entries from a prior term
+    /// that were committed by quorum but whose lazy-commit markers may have been lost
+    /// on the single-fsync fast path.  The state machine filters by term before
+    /// delivering them to the consumer so that in-flight current-term proposals are
+    /// never applied prematurely.</para>
+    ///
+    /// <para>The default implementation delegates to <see cref="GetRangeAsync"/>, which
+    /// returns only committed entries — sufficient for backends that never retain Proposed
+    /// entries after a crash (in-memory fakes, legacy-path WAL).  Durable backends on the
+    /// single-fsync fast path must override this to return all entry types.</para>
+    /// </summary>
+    ValueTask<List<RaftLog>> GetRangeAllTypesAsync(long startLogIndex, int maxEntries)
+        => GetRangeAsync(startLogIndex, maxEntries);
+
+    /// <summary>
     /// Returns the term of the entry at exactly <paramref name="logIndex"/>, or <c>-1</c> if
     /// no entry with that id exists.  Unlike <see cref="GetRangeAsync"/>, this reads <em>any</em>
     /// entry regardless of commit status (Proposed, Committed, etc.) so it can be used for the

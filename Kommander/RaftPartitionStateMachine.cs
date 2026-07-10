@@ -131,6 +131,20 @@ public sealed class RaftPartitionStateMachine
     /// </summary>
     private long localCommittedIndex = -1;
 
+    /// <summary>
+    /// Highest log index that has been delivered to the consumer via
+    /// <see cref="IRaftPartitionHost.InvokeReplicationReceived"/> or
+    /// <see cref="IRaftPartitionHost.InvokeSystemReplicationReceived"/>.
+    /// Initialized to -1 (nothing applied yet).
+    ///
+    /// <para>Maintained on both the follower append path and the leader commit path.
+    /// On promotion, <see cref="DrainCommittedAppliesAsync"/> uses this as the start
+    /// of a WAL range-read so that every committed entry between the current cursor
+    /// and the commit frontier is delivered to the consumer before the partition is
+    /// advertised as the serving leader.</para>
+    /// </summary>
+    private long lastAppliedIndex = -1;
+
     public RaftNodeState NodeState => nodeState;
     public long CurrentTerm => currentTerm;
 
@@ -536,14 +550,233 @@ public sealed class RaftPartitionStateMachine
     }
 
     /// <summary>
-    /// Forces the node into Leader state for the given term.  Test-only; delegates to
-    /// <see cref="BecomeLeader"/> so the test path exercises the same bookkeeping as the
-    /// real election paths.
+    /// Synchronously forces the node into Leader state for the given term.  Test-only.
+    ///
+    /// <para>Intentionally uses the synchronous <see cref="BecomeLeader"/> (no WAL drain)
+    /// rather than <see cref="BecomeLeaderAsync"/>.  Tests that use this helper are testing
+    /// quiescence, heartbeat timing, or other leader-side behaviour that does not depend on
+    /// the apply-before-leader-changed ordering guarantee.  Using the async drain path here
+    /// would introduce ReadScheduler round-trips and consumer callbacks that are irrelevant
+    /// to — and would slow — those tests.</para>
+    ///
+    /// <para>Tests that need to exercise the real promotion sequence (drain ordering,
+    /// inherited-entry delivery, etc.) must use <see cref="ForceLeaderForTestingAsync"/>
+    /// instead, which calls <see cref="BecomeLeaderAsync"/>.</para>
     /// </summary>
     public void SetLeaderForTesting(long term)
     {
         currentTerm = term;
         BecomeLeader();
+    }
+
+    /// <summary>
+    /// Promotion helper used by all real election paths. Performs the same internal
+    /// bookkeeping as <see cref="BecomeLeader"/> but defers publishing
+    /// <see cref="IRaftPartitionHost.Leader"/> until AFTER a full drain of committed
+    /// WAL entries (see <see cref="DrainCommittedAppliesAsync"/>).
+    ///
+    /// <para>This enforces the ordering invariant: by the time a caller sees
+    /// <c>host.Leader == host.LocalEndpoint</c> (the gate for <c>AmILeader</c>),
+    /// the consumer state machine has already applied every committed entry up to
+    /// the promotion commit frontier.  Inherited entries from a prior term that are
+    /// committed after promotion are delivered via <see cref="CompleteLeaderCommit"/>
+    /// through the same apply path.</para>
+    ///
+    /// <para><b>Atomicity:</b> the promotion is all-or-nothing. If the drain throws
+    /// (WAL read backpressure, scheduler shutdown, etc.), the node is reverted to
+    /// <see cref="RaftNodeState.Follower"/> so it is never left in a half-promoted
+    /// state where <c>nodeState == Leader</c> but <c>host.Leader</c> is unset and
+    /// heartbeats have not started.  The exception is re-thrown; the cluster
+    /// self-heals by electing a replacement in the next term.</para>
+    ///
+    /// <para><b>Latency note:</b> the drain holds the partition executor for the full
+    /// duration of the backlog (one <c>ReadScheduler</c> round-trip per 512-entry batch
+    /// plus one consumer callback per committed entry).  <c>SendHeartbeat</c> runs only
+    /// after this method returns, so a node with a large unapplied backlog will delay
+    /// its first heartbeat and risk triggering a further election round.  No explicit
+    /// bound on the drain is enforced today; a future improvement could cap the drain
+    /// and resume it in background once leadership is established.</para>
+    /// </summary>
+    private async Task<HLCTimestamp> BecomeLeaderAsync()
+    {
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        nodeState = RaftNodeState.Leader;
+        long commitFrontier = wal.GetCommitIndex();
+        localCommittedIndex = commitFrontier;
+        lastHeartbeat = ts;
+        lastProposalAt = ts;
+        SetQuiesced(false);
+
+        try
+        {
+            // Drain all committed entries up to the promotion frontier. By the time this
+            // returns every InvokeReplicationReceived call has completed, so the consumer
+            // projection is current before the partition is advertised as the serving leader.
+            // Consumer exceptions are caught inside ApplyLogToConsumerAsync and do not
+            // propagate here; only WAL-level errors (backpressure, shutdown) can reach this
+            // catch block.
+            await DrainCommittedAppliesAsync(commitFrontier).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Revert to Follower so the node is not left in a half-promoted state.
+            // host.Leader was never set (we had not reached that line), so the gate for
+            // AmILeader / leader-routed reads remains closed. The election timeout will
+            // trigger a new round in the next term.
+            logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Promotion drain failed — reverting to Follower. {Message}\n{Stacktrace}",
+                host.LocalEndpoint, host.PartitionId, nodeState, ex.Message, ex.StackTrace);
+            nodeState = RaftNodeState.Follower;
+            localCommittedIndex = -1;
+            throw;
+        }
+
+        // Publish leader status only after the drain. host.Leader is the gate for
+        // AmILeader, so no external observer can see leader == self while the drain
+        // is in progress.
+        host.Leader = host.LocalEndpoint;
+        return ts;
+    }
+
+    /// <summary>
+    /// Delivers every committed WAL entry from <c>lastAppliedIndex + 1</c> through
+    /// <paramref name="upToIndex"/> (inclusive) to the consumer via
+    /// <see cref="ApplyLogToConsumerAsync"/>.  Reads the WAL in bounded batches to
+    /// avoid loading the full tail into memory.
+    ///
+    /// <para>A no-op when <see cref="lastAppliedIndex"/> already covers
+    /// <paramref name="upToIndex"/> or the WAL is empty for this range.</para>
+    /// </summary>
+    private async Task DrainCommittedAppliesAsync(long upToIndex)
+    {
+        if (upToIndex < 0 || lastAppliedIndex >= upToIndex)
+            return;
+
+        const int BatchSize = 512;
+        long from = lastAppliedIndex + 1;
+
+        while (from <= upToIndex)
+        {
+            List<RaftLog> batch = await wal.GetRangeAsync(from, BatchSize).ConfigureAwait(false);
+            if (batch.Count == 0)
+                break;
+
+            foreach (RaftLog log in batch)
+            {
+                if (log.Id > upToIndex)
+                    return;
+                await ApplyLogToConsumerAsync(log).ConfigureAwait(false);
+            }
+
+            long next = lastAppliedIndex + 1;
+            if (next <= from)   // guard: lastAppliedIndex did not advance past 'from' — would loop forever
+                break;
+            from = next;
+        }
+    }
+
+    /// <summary>
+    /// Delivers a single committed WAL entry to the consumer state machine and
+    /// advances <see cref="lastAppliedIndex"/>.
+    ///
+    /// <para>Skips entries whose <see cref="RaftLog.Type"/> is not
+    /// <see cref="RaftLogType.Committed"/> (e.g. <c>CommittedCheckpoint</c>), but
+    /// still advances the cursor so they are not re-read on subsequent drain calls.</para>
+    /// </summary>
+    private async Task ApplyLogToConsumerAsync(RaftLog log)
+    {
+        if (log.Type == RaftLogType.Committed)
+        {
+            try
+            {
+                bool ok;
+                if (host.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType)
+                    ok = await host.InvokeSystemReplicationReceived(host.PartitionId, log).ConfigureAwait(false);
+                else
+                    ok = await host.InvokeReplicationReceived(host.PartitionId, log).ConfigureAwait(false);
+
+                if (!ok)
+                    host.InvokeReplicationError(host.PartitionId, log);
+            }
+            catch (Exception ex)
+            {
+                // A throwing consumer bypasses the false-return InvokeReplicationError path;
+                // catch here to ensure the error is always reported and the drain continues.
+                logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Consumer threw during apply of log {LogId}: {Message}\n{Stacktrace}",
+                    host.LocalEndpoint, host.PartitionId, nodeState, log.Id, ex.Message, ex.StackTrace);
+                host.InvokeReplicationError(host.PartitionId, log);
+            }
+        }
+
+        if (log.Id > lastAppliedIndex)
+            lastAppliedIndex = log.Id;
+    }
+
+    /// <summary>
+    /// Applies inherited Proposed entries from a prior term in the gap
+    /// [<paramref name="from"/>, <paramref name="upToIndex"/>] to the consumer state
+    /// machine.  Called at the head of <see cref="CompleteLeaderCommit"/> to deliver
+    /// entries that are committed by quorum (the new leader won election with this log)
+    /// but have no local proposal waiter and were never touched by
+    /// <see cref="CompleteFollowerAppend"/>.
+    ///
+    /// <para>Only entries from a strictly older term (<see cref="RaftLog.Term"/> &lt;
+    /// <c>currentTerm</c>) are delivered; current-term Proposed entries are in-flight
+    /// writes that have not yet reached quorum and must not be applied prematurely.</para>
+    ///
+    /// <para>Reads the WAL via <see cref="IRaftWalFacade.GetRangeAllTypesAsync"/> so that
+    /// Proposed entries (whose lazy-commit markers may be absent after a crash on the
+    /// single-fsync fast path) are visible.</para>
+    /// </summary>
+    private async Task DrainInheritedAppliesAsync(long from, long upToIndex)
+    {
+        const int BatchSize = 512;
+
+        while (from <= upToIndex)
+        {
+            List<RaftLog> batch = await wal.GetRangeAllTypesAsync(from, BatchSize).ConfigureAwait(false);
+            if (batch.Count == 0)
+                break;
+
+            foreach (RaftLog log in batch)
+            {
+                if (log.Id > upToIndex)
+                    return;
+
+                // Apply committed entries and inherited Proposed entries (prior term only).
+                // Skip current-term Proposed entries — they are in-flight proposals.
+                bool deliver = log.Type == RaftLogType.Committed ||
+                               (log.Type == RaftLogType.Proposed && log.Term < currentTerm);
+
+                if (deliver)
+                {
+                    try
+                    {
+                        bool ok;
+                        if (host.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType)
+                            ok = await host.InvokeSystemReplicationReceived(host.PartitionId, log).ConfigureAwait(false);
+                        else
+                            ok = await host.InvokeReplicationReceived(host.PartitionId, log).ConfigureAwait(false);
+
+                        if (!ok)
+                            host.InvokeReplicationError(host.PartitionId, log);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Consumer threw during inherited-entry apply of log {LogId}: {Message}\n{Stacktrace}",
+                            host.LocalEndpoint, host.PartitionId, nodeState, log.Id, ex.Message, ex.StackTrace);
+                        host.InvokeReplicationError(host.PartitionId, log);
+                    }
+                }
+
+                if (log.Id > lastAppliedIndex)
+                    lastAppliedIndex = log.Id;
+            }
+
+            long next = lastAppliedIndex + 1;
+            if (next <= from)   // guard: no progress (e.g. all entries were checkpoints or wrong term)
+                break;
+            from = next;
+        }
     }
 
     /// <summary>
@@ -670,7 +903,7 @@ public sealed class RaftPartitionStateMachine
 
         if (host.Nodes.Count == 0)
         {
-            BecomeLeader();
+            await BecomeLeaderAsync().ConfigureAwait(false);
             await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
             await SendHeartbeat(true).ConfigureAwait(false);
 
@@ -801,7 +1034,7 @@ public sealed class RaftPartitionStateMachine
         {
             nextIndex.Clear();
             matchIndex.Clear();
-            BecomeLeader();
+            await BecomeLeaderAsync().ConfigureAwait(false);
             await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
             await SendHeartbeat(true).ConfigureAwait(false);
             return;
@@ -1303,7 +1536,7 @@ public sealed class RaftPartitionStateMachine
             matchIndex[peer.Endpoint] = 0;
         }
 
-        HLCTimestamp electionTs = BecomeLeader();
+        HLCTimestamp electionTs = await BecomeLeaderAsync().ConfigureAwait(false);
 
         logger.LogInfoReceivedVoteProclaimedLeader(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, (electionTs - votingStartedAt).TotalMilliseconds, voteTerm, numberVotes, quorum, host.Nodes.Count + 1, remoteMaxLogId, maxLogResponse);
 
@@ -2283,7 +2516,7 @@ public sealed class RaftPartitionStateMachine
                 break;
 
             case WALWriteOperationType.LeaderCommit:
-                CompleteLeaderCommit(completion, pending);
+                await CompleteLeaderCommit(completion, pending).ConfigureAwait(false);
                 break;
 
             case WALWriteOperationType.LeaderRollback:
@@ -2393,8 +2626,16 @@ public sealed class RaftPartitionStateMachine
     /// propagation under load and caused proposal timeouts. Divergence is detected and repaired on
     /// the propose and backfill paths, which remain anchored.
     /// </para>
+    /// <para>
+    /// Also applies every committed consumer entry to the local consumer state machine via
+    /// <see cref="ApplyLogToConsumerAsync"/>. Followers receive these via
+    /// <see cref="CompleteFollowerAppend"/>; the leader must apply them through the same path so
+    /// its consumer projection stays consistent. This covers entries inherited from a prior term
+    /// that have no local proposal waiter on this node and would otherwise be silently absent
+    /// from the leader's consumer state.
+    /// </para>
     /// </summary>
-    private void CompleteLeaderCommit(RaftWalCompletion completion, RaftPendingWalOperation? pending)
+    private async Task CompleteLeaderCommit(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
         RaftProposalQuorum? proposal = pending?.Proposal;
         HLCTimestamp ticketId = pending?.TicketId ?? HLCTimestamp.Zero;
@@ -2422,6 +2663,20 @@ public sealed class RaftPartitionStateMachine
         // WAL stays in sync. host.Nodes already excludes self, so no self-skip is needed here.
         foreach (RaftNode node in host.Nodes)
             AppendLogToNode(node, ticketId, proposal.Logs, grpcLogCache: grpcLogCache);
+
+        // Apply any inherited Proposed entries (from a prior term) that sit between the
+        // last-applied cursor and this commit batch. These are entries proposed by the
+        // previous leader, held as Proposed in our WAL, and now committed by quorum.
+        // They have no local proposal waiter and were never delivered via CompleteFollowerAppend,
+        // so the leader's consumer would silently miss them without this drain.
+        long inheritedEnd = completion.MinLogIndex - 1;
+        if (inheritedEnd >= 0 && inheritedEnd > lastAppliedIndex)
+            await DrainInheritedAppliesAsync(lastAppliedIndex + 1, inheritedEnd).ConfigureAwait(false);
+
+        // Apply committed consumer entries to the local state machine. Mirrors the apply loop
+        // in CompleteFollowerAppend so the leader's consumer projection stays in sync.
+        foreach (RaftLog log in proposal.Logs)
+            await ApplyLogToConsumerAsync(log).ConfigureAwait(false);
 
         if (logger.IsEnabled(LogLevel.Debug))
             logger.LogDebugCommittedLogs(
@@ -2520,6 +2775,15 @@ public sealed class RaftPartitionStateMachine
                     if (!await host.InvokeReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
                         host.InvokeReplicationError(host.PartitionId, log);
                 }
+
+                // Track per-entry, not via the gap-aware committedIndex above: committedIndex
+                // is computed before this loop and is used only for backfill reporting to the
+                // leader. Using it here would cap lastAppliedIndex below entries we actually
+                // applied if a gap ever occurred (committedIndex stops at the hole; log.Id does
+                // not). Under the contiguous-prefix invariant the two values agree; this
+                // per-entry form is safer if the invariant were ever relaxed.
+                if (log.Id > lastAppliedIndex)
+                    lastAppliedIndex = log.Id;
             }
 
             wal.NotifyCommitted();

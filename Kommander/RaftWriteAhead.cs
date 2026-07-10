@@ -1088,6 +1088,19 @@ public sealed class RaftWriteAhead
     }
 
     /// <summary>
+    /// Reads up to <paramref name="maxEntries"/> log entries of ANY type (Proposed,
+    /// Committed, RolledBack, etc.) with id ≥ <paramref name="startLogIndex"/>.
+    /// Unlike <see cref="GetRangeAsync"/>, Proposed/RolledBack entries are not filtered out.
+    /// </summary>
+    public async ValueTask<List<RaftLog>> GetRangeAllTypesAsync(long startLogIndex, int maxEntries)
+    {
+        return await manager.ReadScheduler.EnqueueTask(
+            partition.PartitionId,
+            () => walAdapter.ReadLogsRange(partition.PartitionId, startLogIndex, maxEntries)
+        ).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Starts log compaction for this partition if no pass is already running.
     /// Returns immediately without waiting for the pass to finish.
     /// </summary>

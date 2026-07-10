@@ -25,6 +25,9 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
     public async ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) =>
         await wal.GetRangeAsync(startLogIndex, maxEntries).ConfigureAwait(false);
 
+    public async ValueTask<List<RaftLog>> GetRangeAllTypesAsync(long startLogIndex, int maxEntries) =>
+        await wal.GetRangeAllTypesAsync(startLogIndex, maxEntries).ConfigureAwait(false);
+
     public async ValueTask<long> GetAnyTermAtAsync(long logIndex) =>
         await wal.GetAnyTermAtAsync(logIndex).ConfigureAwait(false);
 
