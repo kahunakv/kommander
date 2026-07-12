@@ -223,8 +223,8 @@ public static class KommanderMetrics
             foreach (WeakReference<RaftPartitionExecutor> wr in _registeredExecutors)
             {
                 if (wr.TryGetTarget(out RaftPartitionExecutor? ex))
-                    result.Add(new Measurement<int>(ex.ClientQueueDepth,
-                        new KeyValuePair<string, object?>("partition_id", ex.PartitionId)));
+                    // Reuse the executor's precomputed partition_id tag — no per-scrape int boxing.
+                    result.Add(new Measurement<int>(ex.ClientQueueDepth, ex.PartitionIdTag));
                 else
                     dead.Add(wr);
             }
