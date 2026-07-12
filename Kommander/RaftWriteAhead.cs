@@ -1044,12 +1044,12 @@ public sealed class RaftWriteAhead
     /// </summary>
     public async ValueTask<long> GetAnyTermAtAsync(long logIndex)
     {
-        List<RaftLog> entries = await manager.ReadScheduler.EnqueueTask(
+        // Scalar term lookup: the backend reads a single term (point key/row) instead of
+        // materializing a full RaftLog and its payload just to discard everything but Term.
+        return await manager.ReadScheduler.EnqueueTask(
             partition.PartitionId,
-            () => walAdapter.ReadLogsRange(partition.PartitionId, logIndex, 1)
+            () => walAdapter.GetTermAt(partition.PartitionId, logIndex)
         ).ConfigureAwait(false);
-
-        return entries.Count > 0 && entries[0].Id == logIndex ? entries[0].Term : -1;
     }
 
     /// <summary>

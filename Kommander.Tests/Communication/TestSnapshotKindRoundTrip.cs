@@ -53,7 +53,7 @@ public sealed class TestSnapshotKindRoundTrip
             FollowerEndpoint = "localhost:19100",
             ChunkIndex = 0,
             IsLast = true,
-            Data = [1, 2, 3],
+            Data = new byte[] { 1, 2, 3 },
             Kind = kind,
         };
 
@@ -89,7 +89,7 @@ public sealed class TestSnapshotKindRoundTrip
             FollowerEndpoint = "localhost:19102",
             ChunkIndex = 0,
             IsLast = true,
-            Data = [7],
+            Data = new byte[] { 7 },
         };
 
         SnapshotResponse response = await comm.SendInstallSnapshot(
@@ -133,7 +133,7 @@ public sealed class TestSnapshotKindRoundTrip
             FollowerEndpoint = follower.Endpoint,
             ChunkIndex = 0,
             IsLast = true,
-            Data = [0xAB],
+            Data = new byte[] { 0xAB },
             Kind = kind,
         };
 
@@ -176,7 +176,7 @@ public sealed class TestSnapshotKindRoundTrip
             FollowerEndpoint = follower.Endpoint,
             ChunkIndex = 0,
             IsLast = true,
-            Data = [0xFF],
+            Data = new byte[] { 0xFF },
             // Kind intentionally omitted — must arrive as Range
         };
 
