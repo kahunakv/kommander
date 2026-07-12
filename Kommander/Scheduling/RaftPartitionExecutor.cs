@@ -255,6 +255,13 @@ public sealed class RaftPartitionExecutor : IDisposable
     /// <summary>Id of the partition owned by this executor.</summary>
     public int PartitionId => _partitionId;
 
+    /// <summary>
+    /// Precomputed <c>partition_id</c> metric tag (the partition id is boxed into <c>object?</c> once at
+    /// construction). Reused by the queue-depth observable gauge so a metrics scrape does not re-box the
+    /// id on every collection. It is the same value as the hot-path rejection tag.
+    /// </summary>
+    internal KeyValuePair<string, object?> PartitionIdTag => _rejectionTag;
+
     // ── Construction ──────────────────────────────────────────────────────
 
     /// <summary>

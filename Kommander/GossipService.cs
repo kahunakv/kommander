@@ -98,7 +98,10 @@ internal sealed class GossipService
         if (membership.MembershipVersion == 0 || configuration.GossipFanout <= 0)
             return;
 
-        List<RaftNode> peers = [..getNodes()];
+        // Read the roster directly — no per-round copy of the whole node list just to pick a
+        // random fan-out subset. SampleDistinctIndices draws `fanout` distinct indices into a small
+        // (stackalloc-when-small) buffer, and we index the IReadOnlyList in place.
+        IReadOnlyList<RaftNode> peers = getNodes();
         if (peers.Count == 0)
             return;
 
@@ -110,26 +113,56 @@ internal sealed class GossipService
         };
 
         int fanout = Math.Min(configuration.GossipFanout, peers.Count);
+        // A small int[fanout] (not a stackalloc: this async method awaits inside the send loop, and a
+        // Span cannot cross an await). Still bounded to the fan-out and far smaller than the previous
+        // whole-roster List<RaftNode> copy.
+        int[] picked = new int[fanout];
+        SampleDistinctIndices(picked, peers.Count);
 
         for (int i = 0; i < fanout; i++)
         {
-            int j = Random.Shared.Next(i, peers.Count);
-            (peers[i], peers[j]) = (peers[j], peers[i]);
-        }
-
-        for (int i = 0; i < fanout; i++)
-        {
+            RaftNode peer = peers[picked[i]];
             try
             {
-                GossipAck ack = await communication.SendGossip(manager, peers[i], digest, cancellationToken).ConfigureAwait(false);
+                GossipAck ack = await communication.SendGossip(manager, peer, digest, cancellationToken).ConfigureAwait(false);
 
                 if (ack.Roster is not null && ack.MembershipVersion > getCoordinator().GetMembership().MembershipVersion)
                     getCoordinator().Send(new RaftSystemRequest(ack.Roster));
             }
             catch (Exception ex)
             {
-                logger.LogDebugGossipAsyncFailed(peers[i].Endpoint, ex.Message);
+                logger.LogDebugGossipAsyncFailed(peer.Endpoint, ex.Message);
             }
+        }
+    }
+
+    /// <summary>
+    /// Fills <paramref name="destination"/> with distinct random indices in <c>[0, poolSize)</c> — a
+    /// uniform random subset in random order, equivalent to a partial Fisher-Yates over the pool but
+    /// without materializing or copying the pool. Uses rejection sampling: <paramref name="destination"/>
+    /// length (the fan-out) is expected to be small relative to <paramref name="poolSize"/>, and is at
+    /// most it, so the expected number of retries is low. The caller guarantees
+    /// <c>destination.Length &lt;= poolSize</c>.
+    /// </summary>
+    private static void SampleDistinctIndices(Span<int> destination, int poolSize)
+    {
+        int chosen = 0;
+        while (chosen < destination.Length)
+        {
+            int candidate = Random.Shared.Next(poolSize);
+
+            bool duplicate = false;
+            for (int k = 0; k < chosen; k++)
+            {
+                if (destination[k] == candidate)
+                {
+                    duplicate = true;
+                    break;
+                }
+            }
+
+            if (!duplicate)
+                destination[chosen++] = candidate;
         }
     }
 
@@ -175,7 +208,8 @@ internal sealed class GossipService
         if (membership.MembershipVersion == 0)
             return;
 
-        List<RaftNode> peers = [..getNodes()];
+        // Direct probe target: a single random index into the roster — no copy of the whole list.
+        IReadOnlyList<RaftNode> peers = getNodes();
         if (peers.Count == 0)
             return;
 

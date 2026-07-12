@@ -57,9 +57,12 @@ internal static class RaftSystemCoordinatorHelpers
     /// </summary>
     internal static byte[] Serialize(RaftSystemMessage message)
     {
-        using MemoryStream memoryStream = new();
-        message.WriteTo(memoryStream);
-        return memoryStream.ToArray();
+        // Exact-size write (same pattern as RocksDbWAL): allocate one buffer of the computed size and
+        // write straight into it — no MemoryStream, no growable backing array, no final ToArray copy.
+        int size = message.CalculateSize();
+        byte[] result = GC.AllocateUninitializedArray<byte>(size);
+        message.WriteTo(result.AsSpan());
+        return result;
     }
 
     /// <summary>
@@ -67,8 +70,8 @@ internal static class RaftSystemCoordinatorHelpers
     /// </summary>
     internal static RaftSystemMessage Unserialize(byte[] serializedData)
     {
-        using MemoryStream memoryStream = new(serializedData);
-        return RaftSystemMessage.Parser.ParseFrom(memoryStream);
+        // Parse directly from the span — no wrapping MemoryStream.
+        return RaftSystemMessage.Parser.ParseFrom(serializedData.AsSpan());
     }
 
     /// <summary>
