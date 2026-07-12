@@ -53,11 +53,10 @@ public sealed class RaftService : Rafter.RafterBase
         if (raft is not RaftManager manager)
             return;
 
-        RaftTransportSecurityOptions security = manager.Configuration.GetEffectiveTransportSecurity();
+        RaftTransportAuthenticator authenticator = manager.Configuration.GetTransportAuthenticator();
+        RaftTransportSecurityOptions security = authenticator.Options;
         if (security.NodeAuthenticationMode == RaftNodeAuthenticationMode.Disabled)
             return;
-
-        RaftTransportAuthenticator authenticator = new(security);
 
         Metadata headers = context.RequestHeaders;
         string? signature = headers.GetValue(security.HeaderName);

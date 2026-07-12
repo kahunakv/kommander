@@ -218,8 +218,8 @@ public static class RestCommunicationExtensions
         HttpContext context,
         RaftConfiguration configuration)
     {
-        RaftTransportSecurityOptions transportSecurity = configuration.GetEffectiveTransportSecurity();
-        RaftTransportAuthenticator authenticator = new(transportSecurity);
+        RaftTransportAuthenticator authenticator = configuration.GetTransportAuthenticator();
+        RaftTransportSecurityOptions transportSecurity = authenticator.Options;
 
         if (transportSecurity.NodeAuthenticationMode == RaftNodeAuthenticationMode.Disabled)
         {

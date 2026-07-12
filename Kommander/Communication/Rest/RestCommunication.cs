@@ -18,6 +18,11 @@ namespace Kommander.Communication.Rest;
 /// </summary>
 public class RestCommunication : ICommunication
 {
+    /// <summary>Shared empty header map returned when node authentication is disabled, so the
+    /// unauthenticated REST path allocates no per-request dictionary.</summary>
+    private static readonly IReadOnlyDictionary<string, string> EmptyHeaders =
+        new Dictionary<string, string>();
+
     public async Task<HandshakeResponse> Handshake(RaftManager manager, RaftNode node, HandshakeRequest request)
     {
         string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.HandshakeRequest);
@@ -350,12 +355,11 @@ public class RestCommunication : ICommunication
         string path,
         string payload)
     {
-        RaftTransportSecurityOptions transportSecurity = configuration.GetEffectiveTransportSecurity();
+        RaftTransportAuthenticator authenticator = configuration.GetTransportAuthenticator();
 
-        if (transportSecurity.NodeAuthenticationMode != RaftNodeAuthenticationMode.SharedSecret)
-            return new Dictionary<string, string>();
+        if (authenticator.Options.NodeAuthenticationMode != RaftNodeAuthenticationMode.SharedSecret)
+            return EmptyHeaders;
 
-        RaftTransportAuthenticator authenticator = new(transportSecurity);
         RaftTransportAuthenticationHeaders authHeaders = authenticator.Sign(
             method,
             path,
