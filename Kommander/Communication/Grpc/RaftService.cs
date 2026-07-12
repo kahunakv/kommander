@@ -558,7 +558,10 @@ public sealed class RaftService : Rafter.RafterBase
             FollowerEndpoint = request.FollowerEndpoint,
             ChunkIndex = request.ChunkIndex,
             IsLast = request.IsLast,
-            Data = request.Data.ToByteArray(),
+            // Zero-copy view over the incoming ByteString instead of ToByteArray(). Valid for the
+            // duration of this handler; ReceiveInstallSnapshot copies it into the receive MemoryStream
+            // synchronously (under the session lock) before this call returns.
+            Data = request.Data.Memory,
             Kind = (Data.SnapshotKind)request.Kind,
         };
 

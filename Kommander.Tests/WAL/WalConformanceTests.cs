@@ -188,6 +188,136 @@ public abstract class WalConformanceTests
         finally { cleanup(); }
     }
 
+    // ──────────────────────────── GetTermAt ─────────────────────────────────────
+
+    [Fact]
+    public void GetTermAt_EmptyPartition_ReturnsNegativeOne()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try { Assert.Equal(-1, wal.GetTermAt(96, 1)); }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void GetTermAt_ExactId_ReturnsThatEntrysTerm()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(40, [Log(id: 1, term: 3), Log(id: 2, term: 5), Log(id: 3, term: 8)])]);
+            Assert.Equal(3, wal.GetTermAt(40, 1));
+            Assert.Equal(5, wal.GetTermAt(40, 2));
+            Assert.Equal(8, wal.GetTermAt(40, 3));
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void GetTermAt_MissingIdWithinRange_ReturnsNegativeOne_NotNextEntry()
+    {
+        // A gap at id=2: GetTermAt(2) must return -1, NOT the term of the next present entry (id=3).
+        // This is the exact contract the Log Matching Property check relies on — a hole is -1.
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(41, [Log(id: 1, term: 1), Log(id: 3, term: 9)])]);
+            Assert.Equal(-1, wal.GetTermAt(41, 2));
+            Assert.Equal(9, wal.GetTermAt(41, 3));
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void GetTermAt_BeyondEnd_ReturnsNegativeOne()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(42, [Log(id: 1, term: 1), Log(id: 2, term: 1)])]);
+            Assert.Equal(-1, wal.GetTermAt(42, 99));
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void GetTermAt_AllLogTypes_ReturnTermIncludingUncommittedAnchors()
+    {
+        // The anchor entry for a Log Matching check may be uncommitted, so every type must
+        // report its term (matching ReadLogsRange's any-type behavior), not just Committed ones.
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(43, [
+                new RaftLog { Id = 1, Term = 2, Type = RaftLogType.Proposed,             LogType = "t" },
+                new RaftLog { Id = 2, Term = 2, Type = RaftLogType.Committed,            LogType = "t" },
+                new RaftLog { Id = 3, Term = 3, Type = RaftLogType.ProposedCheckpoint,   LogType = "t" },
+                new RaftLog { Id = 4, Term = 3, Type = RaftLogType.CommittedCheckpoint,  LogType = "t" },
+                new RaftLog { Id = 5, Term = 4, Type = RaftLogType.RolledBack,           LogType = "t" },
+                new RaftLog { Id = 6, Term = 4, Type = RaftLogType.RolledBackCheckpoint, LogType = "t" }
+            ])]);
+
+            Assert.Equal(2, wal.GetTermAt(43, 1));
+            Assert.Equal(2, wal.GetTermAt(43, 2));
+            Assert.Equal(3, wal.GetTermAt(43, 3));
+            Assert.Equal(3, wal.GetTermAt(43, 4));
+            Assert.Equal(4, wal.GetTermAt(43, 5));
+            Assert.Equal(4, wal.GetTermAt(43, 6));
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void GetTermAt_TermZeroEntry_ReturnsZeroNotMinusOne()
+    {
+        // An entry that exists but has term 0 must return 0 (it is present), not -1 (absent).
+        // This guards the RocksDB wire-scan path, where proto3 omits the default-valued term field:
+        // "field absent on the wire" must be read as term 0 for a present entry, distinct from a
+        // missing key which returns -1.
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(46, [new RaftLog { Id = 1, Term = 0, Type = RaftLogType.Committed, LogType = "t" }])]);
+            Assert.Equal(0, wal.GetTermAt(46, 1));   // present with term 0
+            Assert.Equal(-1, wal.GetTermAt(46, 2));  // absent
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void GetTermAt_AfterProposedUpgradedToCommitted_ReturnsTerm()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(44, [new RaftLog { Id = 1, Term = 6, Type = RaftLogType.Proposed, LogType = "t" }])]);
+            Assert.Equal(6, wal.GetTermAt(44, 1));
+
+            wal.Write([(44, [new RaftLog { Id = 1, Term = 6, Type = RaftLogType.Committed, LogType = "t" }])]);
+            Assert.Equal(6, wal.GetTermAt(44, 1));
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void GetTermAt_MatchesReadLogsRangeContract()
+    {
+        // GetTermAt must be observationally identical to the old ReadLogsRange(id, 1) path it replaced:
+        // entries[0].Id == id ? entries[0].Term : -1.
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(45, [Log(id: 2, term: 4), Log(id: 4, term: 7), Log(id: 5, term: 9)])]);
+
+            for (long id = 1; id <= 6; id++)
+            {
+                List<RaftLog> range = wal.ReadLogsRange(45, id, 1);
+                long expected = range.Count > 0 && range[0].Id == id ? range[0].Term : -1;
+                Assert.Equal(expected, wal.GetTermAt(45, id));
+            }
+        }
+        finally { cleanup(); }
+    }
+
     // ──────────────────────────── GetLastCheckpoint ─────────────────────────────
 
     [Fact]

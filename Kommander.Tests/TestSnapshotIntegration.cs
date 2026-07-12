@@ -122,7 +122,7 @@ public sealed class TestSnapshotIntegration
                 {
                     SessionId = "recheck", PartitionId = userPartitionId,
                     SnapshotIndex = floor, FollowerEndpoint = "localhost:8404",
-                    IsLast = true, Data = [0xFF],
+                    IsLast = true, Data = new byte[] { 0xFF },
                 }, ct);
             Assert.True(idempotentResp.Success, "Re-install of same index must return success");
             Assert.Equal(importsBefore, transfer.ImportCallCount);

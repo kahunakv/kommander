@@ -71,7 +71,7 @@ public class TestFollowerSnapshotInstall
                 FollowerEndpoint = "localhost:19400",
                 ChunkIndex = 0,
                 IsLast = true,
-                Data = [0xAA, 0xBB, 0xCC],
+                Data = new byte[] { 0xAA, 0xBB, 0xCC },
                 Kind = SnapshotKind.SystemState,
             };
 
@@ -109,7 +109,7 @@ public class TestFollowerSnapshotInstall
                 FollowerEndpoint = "localhost:19400",
                 ChunkIndex = 0,
                 IsLast = false,
-                Data = [0x01, 0x02],
+                Data = new byte[] { 0x01, 0x02 },
                 Kind = SnapshotKind.SystemState,
             }, ct);
 
@@ -124,7 +124,7 @@ public class TestFollowerSnapshotInstall
                 FollowerEndpoint = "localhost:19400",
                 ChunkIndex = 1,
                 IsLast = true,
-                Data = [0x03, 0x04],
+                Data = new byte[] { 0x03, 0x04 },
                 Kind = SnapshotKind.SystemState,
             }, ct);
 
@@ -164,7 +164,7 @@ public class TestFollowerSnapshotInstall
                 FollowerEndpoint = "localhost:19400",
                 ChunkIndex = 0,
                 IsLast = true,
-                Data = [0xFF],
+                Data = new byte[] { 0xFF },
                 Kind = SnapshotKind.SystemState,
             };
 
@@ -181,7 +181,7 @@ public class TestFollowerSnapshotInstall
                 FollowerEndpoint = "localhost:19400",
                 ChunkIndex = 0,
                 IsLast = true,
-                Data = [0xFF],
+                Data = new byte[] { 0xFF },
                 Kind = SnapshotKind.SystemState,
             }, ct);
             Assert.True(second.Success);
@@ -218,7 +218,7 @@ public class TestFollowerSnapshotInstall
                 FollowerEndpoint = "localhost:19400",
                 ChunkIndex = 0,
                 IsLast = true,
-                Data = [0xDE, 0xAD],
+                Data = new byte[] { 0xDE, 0xAD },
                 Kind = SnapshotKind.SystemState,
             };
 
@@ -244,7 +244,7 @@ public class TestFollowerSnapshotInstall
                 FollowerEndpoint = "localhost:19400",
                 ChunkIndex = 0,
                 IsLast = true,
-                Data = [0xDE, 0xAD],
+                Data = new byte[] { 0xDE, 0xAD },
                 Kind = SnapshotKind.SystemState,
             }, ct);
 
@@ -281,7 +281,7 @@ public class TestFollowerSnapshotInstall
                 FollowerEndpoint = "localhost:19400",
                 ChunkIndex = 0,
                 IsLast = true,
-                Data = [0x01],
+                Data = new byte[] { 0x01 },
                 Kind = SnapshotKind.SystemState,
             }, ct);
 
@@ -330,7 +330,7 @@ public class TestFollowerSnapshotInstall
             FollowerEndpoint = receiver.Endpoint,
             ChunkIndex = 0,
             IsLast = true,
-            Data = [0xAB],
+            Data = new byte[] { 0xAB },
             Kind = SnapshotKind.SystemState,
         };
 
@@ -376,7 +376,7 @@ public class TestFollowerSnapshotInstall
             FollowerEndpoint = receiver.Endpoint,
             ChunkIndex = 0,
             IsLast = true,
-            Data = [0xFF],
+            Data = new byte[] { 0xFF },
             Kind = SnapshotKind.Range,
         };
 

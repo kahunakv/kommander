@@ -78,7 +78,7 @@ internal sealed class SnapshotReceiver
                 return new SnapshotResponse(false);
 
             buf = _pendingSnapshots.GetOrAdd(request.SessionId, _ => new MemoryStream());
-            buf.Write(request.Data, 0, request.Data.Length);
+            buf.Write(request.Data.Span);
 
             if (!request.IsLast)
                 return new SnapshotResponse(true);

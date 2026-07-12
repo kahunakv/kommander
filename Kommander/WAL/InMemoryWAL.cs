@@ -71,6 +71,23 @@ public class InMemoryWAL : IWAL, IDisposable
         }
     }
 
+    public long GetTermAt(int partitionId, long logIndex)
+    {
+        rwLock.EnterReadLock();
+        try
+        {
+            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs)
+                && partitionLogs.TryGetValue(logIndex, out RaftLog? log))
+                return log.Term;
+
+            return -1;
+        }
+        finally
+        {
+            rwLock.ExitReadLock();
+        }
+    }
+
     public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs)
     {
         rwLock.EnterWriteLock();

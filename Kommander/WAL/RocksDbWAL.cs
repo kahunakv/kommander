@@ -571,10 +571,84 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <returns>
     /// The current term of the specified partition, or 0 if no logs are found.
     /// </returns>
+    /// <summary>
+    /// Point lookup of a single entry's term by exact id. Builds the fixed-width log key and issues a
+    /// direct <c>db.Get</c> instead of creating an iterator, then parses only the protobuf message to
+    /// read <c>Term</c> — it does not build a <see cref="RaftLog"/> or copy the entry's payload
+    /// <c>LogData</c>. Returns -1 when the key is absent (or, defensively, when the stored message does
+    /// not match the requested partition/id). A further optimization — a protobuf wire scan that reads
+    /// the <c>term</c> field and skips the payload <c>ByteString</c> entirely — is left as a
+    /// benchmark-gated follow-up.
+    /// </summary>
+    public long GetTermAt(int partitionId, long logIndex)
+    {
+        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+
+        byte[] key = new byte[LogKeyWidth];
+        BuildLogKey(key, partitionId, logIndex);
+
+        // Point lookup on the exact key: a hit is unambiguously the entry for (partitionId, logIndex),
+        // so no field re-validation is needed. `value` is the full serialized message (payload included)
+        // — that read cost is inherent to RocksDB storing the payload inline — but ReadTermFromWire
+        // scans only far enough to read the `term` field (field 3), which protobuf serializes before the
+        // `log` payload (field 6), so the multi-megabyte payload ByteString is never materialized.
+        byte[]? value = db.Get(key, cf: columnFamilyHandle);
+        return value is null ? -1 : ReadTermFromWire(value);
+    }
+
+    /// <summary>
+    /// Reads only the <c>term</c> field (field 3, varint) from a serialized <c>RaftLogMessage</c>,
+    /// skipping every other field — crucially the length-delimited <c>log</c> payload (field 6) —
+    /// without allocating. Returns the proto3 default (<c>0</c>) when the field is absent, which is the
+    /// correct value for an entry whose term is 0 (proto3 omits default-valued fields on the wire). The
+    /// caller has already established, via the exact-key <c>db.Get</c> hit, that the entry exists.
+    /// </summary>
+    private static long ReadTermFromWire(ReadOnlySpan<byte> data)
+    {
+        int pos = 0;
+        while (pos < data.Length)
+        {
+            ulong tag = ReadVarint(data, ref pos);
+            int fieldNumber = (int)(tag >> 3);
+            int wireType = (int)(tag & 0x7);
+
+            if (fieldNumber == 3 && wireType == 0) // term
+                return (long)ReadVarint(data, ref pos);
+
+            switch (wireType)
+            {
+                case 0: ReadVarint(data, ref pos); break;                             // varint
+                case 1: pos += 8; break;                                              // 64-bit
+                case 2: pos += (int)ReadVarint(data, ref pos); break;                 // length-delimited (skip payload)
+                case 5: pos += 4; break;                                              // 32-bit
+                default: return 0;                                                    // unknown wire type — treat as default
+            }
+        }
+
+        return 0; // term field omitted => proto3 default
+    }
+
+    /// <summary>Decodes a base-128 varint at <paramref name="pos"/>, advancing it past the value.</summary>
+    private static ulong ReadVarint(ReadOnlySpan<byte> data, ref int pos)
+    {
+        ulong result = 0;
+        int shift = 0;
+        while (pos < data.Length)
+        {
+            byte b = data[pos++];
+            result |= (ulong)(b & 0x7F) << shift;
+            if ((b & 0x80) == 0)
+                break;
+            shift += 7;
+        }
+
+        return result;
+    }
+
     public long GetCurrentTerm(int partitionId)
     {
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-        
+
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         SeekToLastPartitionKey(iterator, partitionId);
 

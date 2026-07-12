@@ -374,6 +374,28 @@ public class SqliteWAL : IWAL, IDisposable
     /// Retrieves the current term of the Raft log for the specified partition.
     /// Returns the term of the log entry with the highest id. Returns 0 if no logs exist.
     /// </summary>
+    /// <summary>
+    /// Point lookup of a single entry's term by exact id. Selects only the <c>term</c> column so the
+    /// engine never reads the payload/metadata columns that <see cref="ReadLogsRange"/> materializes.
+    /// Returns -1 when no row with that id exists (0 for the degenerate case of a persisted NULL term,
+    /// matching <see cref="GetCurrentTerm"/>).
+    /// </summary>
+    public long GetTermAt(int partitionId, long logIndex)
+    {
+        ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
+        lock (shard.Lock)
+        {
+            const string query = "SELECT term FROM logs WHERE partitionId = @partitionId AND id = @id LIMIT 1";
+            using SqliteCommand command = new(query, shard.Connection);
+            command.Parameters.AddWithValue("@partitionId", partitionId);
+            command.Parameters.AddWithValue("@id", logIndex);
+            using SqliteDataReader reader = command.ExecuteReader();
+            while (reader.Read())
+                return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
+            return -1;
+        }
+    }
+
     public long GetCurrentTerm(int partitionId)
     {
         ShardDatabase shard = TryOpenShard(ShardOf(partitionId));

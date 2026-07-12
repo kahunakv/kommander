@@ -50,6 +50,26 @@ public interface IWAL : IDisposable
     public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue);
 
     /// <summary>
+    /// Returns the <see cref="RaftLog.Term"/> of the single entry whose id equals
+    /// <paramref name="logIndex"/>, or <c>-1</c> if no entry with that exact id exists.
+    /// <para>
+    /// This is the scalar term-lookup surface behind the follower Log Matching Property check and the
+    /// leader backfill anchor. Unlike <see cref="ReadLogsRange"/> with a limit of 1, backends must not
+    /// materialize the entry's payload or a full <see cref="RaftLog"/> merely to return one term — a
+    /// point key/row lookup is expected. All entry types (Proposed, Committed, RolledBack, checkpoints)
+    /// are considered, since the anchor entry may still be uncommitted.
+    /// </para>
+    /// <para>The default implementation delegates to <see cref="ReadLogsRange"/> (limit 1) with the exact
+    /// same <c>id == logIndex ? term : -1</c> semantics, so non-durable adapters and test fakes need no
+    /// override; the durable backends override it with a direct lookup.</para>
+    /// </summary>
+    public long GetTermAt(int partitionId, long logIndex)
+    {
+        List<RaftLog> entries = ReadLogsRange(partitionId, logIndex, 1);
+        return entries.Count > 0 && entries[0].Id == logIndex ? entries[0].Term : -1;
+    }
+
+    /// <summary>
     /// Persists <paramref name="logs"/>. Atomic per partition. Overwrites any existing entry with the same
     /// (partitionId, id) key.
     /// </summary>

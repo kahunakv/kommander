@@ -52,8 +52,23 @@ public sealed class SnapshotRequest
     /// <summary>True on the final chunk; the receiver applies <c>ImportRange</c> when this is set.</summary>
     public bool IsLast { get; init; }
 
-    /// <summary>Raw bytes for this chunk; empty on the final chunk when the stream length is an exact multiple of the chunk size.</summary>
-    public byte[] Data { get; init; } = [];
+    /// <summary>
+    /// Raw bytes for this chunk; empty on the final chunk when the stream length is an exact multiple
+    /// of the chunk size.
+    /// <para>
+    /// A <see cref="ReadOnlyMemory{T}"/> rather than a <c>byte[]</c> so the sender can hand off a
+    /// zero-copy view over its reused (pooled) 3 MiB read buffer — <c>buffer.AsMemory(0, bytesRead)</c> —
+    /// instead of allocating a fresh array per chunk, and the gRPC receiver can expose the incoming
+    /// <c>ByteString.Memory</c> without a <c>ToByteArray</c> copy. <b>Lifetime:</b> the view is only
+    /// valid until the send completes — every transport consumes it synchronously (gRPC serializes via
+    /// <c>UnsafeByteOperations.UnsafeWrap</c> before the awaited unary call; REST base64-encodes it
+    /// during <c>JsonSerializer.Serialize</c>; the in-memory/​receiver path copies it into the receive
+    /// <c>MemoryStream</c> under the session lock) — and the sender awaits each send before overwriting
+    /// the buffer, so the view never outlives its backing bytes. A <c>byte[]</c> assigned to this
+    /// property (e.g. in tests) converts implicitly and owns its own storage.
+    /// </para>
+    /// </summary>
+    public ReadOnlyMemory<byte> Data { get; init; } = ReadOnlyMemory<byte>.Empty;
 
     /// <summary>
     /// Which transfer interface the follower should invoke on the final chunk.

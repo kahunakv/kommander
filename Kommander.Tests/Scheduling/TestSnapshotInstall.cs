@@ -58,7 +58,7 @@ public class TestSnapshotInstall
 
         try
         {
-            SnapshotRequest req = new() { SessionId = "s1", PartitionId = 1, SnapshotIndex = 100, FollowerEndpoint = "x:1", IsLast = true, Data = [] };
+            SnapshotRequest req = new() { SessionId = "s1", PartitionId = 1, SnapshotIndex = 100, FollowerEndpoint = "x:1", IsLast = true, Data = ReadOnlyMemory<byte>.Empty };
             SnapshotResponse resp = await manager.ReceiveInstallSnapshot(req, ct);
 
             Assert.False(resp.Success);
@@ -88,7 +88,7 @@ public class TestSnapshotInstall
 
         try
         {
-            SnapshotRequest req = new() { SessionId = "s2", PartitionId = 1, SnapshotIndex = 50, FollowerEndpoint = "x:1", IsLast = true, Data = [1, 2, 3] };
+            SnapshotRequest req = new() { SessionId = "s2", PartitionId = 1, SnapshotIndex = 50, FollowerEndpoint = "x:1", IsLast = true, Data = new byte[] { 1, 2, 3 } };
             SnapshotResponse resp = await manager.ReceiveInstallSnapshot(req, ct);
 
             Assert.True(resp.Success);
@@ -140,7 +140,7 @@ public class TestSnapshotInstall
                 SnapshotIndex = 75,
                 FollowerEndpoint = "localhost:9002",
                 IsLast = true,
-                Data = [9, 8, 7],
+                Data = new byte[] { 9, 8, 7 },
             };
 
             RaftNode followerNode = new("localhost:9002");
@@ -185,7 +185,7 @@ public class TestSnapshotInstall
             {
                 SessionId = session, PartitionId = partitionId, SnapshotIndex = snapshotIndex,
                 FollowerEndpoint = "x:1", ChunkIndex = 0, IsLast = false,
-                Data = [0x01, 0x02, 0x03],
+                Data = new byte[] { 0x01, 0x02, 0x03 },
             }, ct);
             Assert.True(r0.Success, "chunk 0 should be accepted");
             Assert.False(transfer.ImportCalled, "ImportRange must not fire on non-final chunk");
@@ -195,7 +195,7 @@ public class TestSnapshotInstall
             {
                 SessionId = session, PartitionId = partitionId, SnapshotIndex = snapshotIndex,
                 FollowerEndpoint = "x:1", ChunkIndex = 1, IsLast = false,
-                Data = [0x04, 0x05],
+                Data = new byte[] { 0x04, 0x05 },
             }, ct);
             Assert.True(r1.Success, "chunk 1 should be accepted");
             Assert.False(transfer.ImportCalled, "ImportRange must not fire on non-final chunk");
@@ -205,7 +205,7 @@ public class TestSnapshotInstall
             {
                 SessionId = session, PartitionId = partitionId, SnapshotIndex = snapshotIndex,
                 FollowerEndpoint = "x:1", ChunkIndex = 2, IsLast = true,
-                Data = [0x06],
+                Data = new byte[] { 0x06 },
             }, ct);
             Assert.True(r2.Success, "final chunk should succeed");
             Assert.True(transfer.ImportCalled, "ImportRange must fire on final chunk");
@@ -243,7 +243,7 @@ public class TestSnapshotInstall
             {
                 SessionId = "session-A", PartitionId = 1, SnapshotIndex = 300,
                 FollowerEndpoint = "x:1", ChunkIndex = 0, IsLast = false,
-                Data = [0xAA],
+                Data = new byte[] { 0xAA },
             }, ct);
             Assert.True(r.Success);
             Assert.False(transfer.ImportCalled);
@@ -253,7 +253,7 @@ public class TestSnapshotInstall
             {
                 SessionId = "session-B", PartitionId = 1, SnapshotIndex = 301,
                 FollowerEndpoint = "x:1", ChunkIndex = 0, IsLast = true,
-                Data = [0xBB],
+                Data = new byte[] { 0xBB },
             }, ct);
             Assert.True(r2.Success);
             Assert.True(transfer.ImportCalled);
@@ -282,7 +282,7 @@ public class TestSnapshotInstall
         {
             SessionId = "session-to-dispose", PartitionId = 1, SnapshotIndex = 400,
             FollowerEndpoint = "x:1", ChunkIndex = 0, IsLast = false,
-            Data = [0xCC, 0xDD],
+            Data = new byte[] { 0xCC, 0xDD },
         }, ct);
 
         Assert.True(r.Success);
@@ -296,7 +296,7 @@ public class TestSnapshotInstall
         {
             SessionId = "session-to-dispose", PartitionId = 1, SnapshotIndex = 400,
             FollowerEndpoint = "x:1", ChunkIndex = 1, IsLast = true,
-            Data = [0xEE],
+            Data = new byte[] { 0xEE },
         }, ct);
 
         Assert.False(afterDispose.Success);

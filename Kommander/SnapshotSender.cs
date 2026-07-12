@@ -1,4 +1,5 @@
 
+using System.Buffers;
 using System.Collections.Concurrent;
 using Kommander.Data;
 using Kommander.Logging;
@@ -118,46 +119,59 @@ internal sealed class SnapshotSender
             }
 
             string sessionId = Guid.NewGuid().ToString("N");
-            byte[] buffer = new byte[chunkSize];
+            // Rent the read buffer instead of allocating a fresh 3 MiB (LOH) array per transfer; return
+            // it once the transfer ends. The rented buffer may be larger than chunkSize — every read and
+            // the chunk view are bounded to chunkSize, never buffer.Length.
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(chunkSize);
             int chunkIndex = 0;
             bool success = false;
 
-            await using (snapshot.ConfigureAwait(false))
+            try
             {
-                while (true)
+                await using (snapshot.ConfigureAwait(false))
                 {
-                    int bytesRead = await StreamUtils.ReadExactAsync(snapshot, buffer, chunkSize, CancellationToken.None).ConfigureAwait(false);
-                    bool isLast = bytesRead < chunkSize;
-
-                    SnapshotRequest chunk = new()
+                    while (true)
                     {
-                        SessionId = sessionId,
-                        PartitionId = host.PartitionId,
-                        SnapshotIndex = snapshotIndex,
-                        FollowerEndpoint = node.Endpoint,
-                        ChunkIndex = chunkIndex,
-                        IsLast = isLast,
-                        Data = buffer[..bytesRead],
-                        Kind = kind,
-                    };
+                        int bytesRead = await StreamUtils.ReadExactAsync(snapshot, buffer, chunkSize, CancellationToken.None).ConfigureAwait(false);
+                        bool isLast = bytesRead < chunkSize;
 
-                    SnapshotResponse response = await host.SendInstallSnapshotAsync(node, chunk, CancellationToken.None).ConfigureAwait(false);
-                    if (!response.Success)
-                    {
-                        logger.LogWarning(
-                            "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot chunk {ChunkIndex} to {Endpoint} was rejected",
-                            host.LocalEndpoint, host.PartitionId, getNodeState(), chunkIndex, node.Endpoint);
-                        return;
+                        SnapshotRequest chunk = new()
+                        {
+                            SessionId = sessionId,
+                            PartitionId = host.PartitionId,
+                            SnapshotIndex = snapshotIndex,
+                            FollowerEndpoint = node.Endpoint,
+                            ChunkIndex = chunkIndex,
+                            IsLast = isLast,
+                            // Zero-copy view over the reused buffer. Safe because the send below is awaited
+                            // before the next iteration overwrites the buffer, and every transport consumes
+                            // Data synchronously within that send (see SnapshotRequest.Data remarks).
+                            Data = buffer.AsMemory(0, bytesRead),
+                            Kind = kind,
+                        };
+
+                        SnapshotResponse response = await host.SendInstallSnapshotAsync(node, chunk, CancellationToken.None).ConfigureAwait(false);
+                        if (!response.Success)
+                        {
+                            logger.LogWarning(
+                                "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot chunk {ChunkIndex} to {Endpoint} was rejected",
+                                host.LocalEndpoint, host.PartitionId, getNodeState(), chunkIndex, node.Endpoint);
+                            return;
+                        }
+
+                        if (isLast)
+                        {
+                            success = true;
+                            break;
+                        }
+
+                        chunkIndex++;
                     }
-
-                    if (isLast)
-                    {
-                        success = true;
-                        break;
-                    }
-
-                    chunkIndex++;
                 }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
             }
 
             if (success)
