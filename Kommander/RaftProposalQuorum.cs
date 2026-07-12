@@ -19,6 +19,17 @@ public sealed class RaftProposalQuorum
     private readonly Dictionary<string, bool> nodes = [];
 
     /// <summary>
+    /// Running count of nodes whose completion flag is currently <c>true</c>. Maintained
+    /// incrementally by <see cref="MarkNodeCompleted"/> (incremented only on a false→true
+    /// transition, so duplicate acks stay idempotent) so that <see cref="HasQuorum"/> is an
+    /// O(1) comparison rather than a per-call LINQ scan of the <see cref="nodes"/> values.
+    /// Reset in lockstep with <see cref="nodes"/>: cleared in <see cref="Reset"/> and
+    /// <see cref="Clear"/>, left untouched by <see cref="AddExpectedNodeCompletion"/> (new
+    /// nodes start incomplete).
+    /// </summary>
+    private int completedNodeCount;
+
+    /// <summary>
     /// Indicates whether the Raft proposal has been successfully completed
     /// by achieving a sufficient quorum of node completions. Once set to `true`,
     /// it signifies that the distributed consensus process for the current proposal
@@ -47,8 +58,6 @@ public sealed class RaftProposalQuorum
     /// of the distributed consensus process.
     /// </summary>
     public RaftProposalState State { get; private set; }
-
-    public List<string> Nodes => nodes.Keys.ToList();
 
     /// <summary>
     /// Contains the collection of Raft logs associated with the proposal within the quorum.
@@ -129,8 +138,15 @@ public sealed class RaftProposalQuorum
     /// <param name="nodeId">The unique identifier of the node to be marked as completed.</param>
     public void MarkNodeCompleted(string nodeId)
     {
-        if (nodes.ContainsKey(nodeId))
-            nodes[nodeId] = true;
+        // Single hash lookup via CollectionsMarshal: the ref lets us read the current flag and
+        // flip it in place. Increment the running count only on a false→true transition so that
+        // duplicate follower acks (the same node acking twice) remain idempotent.
+        ref bool flag = ref global::System.Runtime.InteropServices.CollectionsMarshal.GetValueRefOrNullRef(nodes, nodeId);
+        if (!global::System.Runtime.CompilerServices.Unsafe.IsNullRef(ref flag) && !flag)
+        {
+            flag = true;
+            completedNodeCount++;
+        }
     }
 
     /// <summary>
@@ -157,9 +173,10 @@ public sealed class RaftProposalQuorum
             return true;
         
         // nodes includes the local leader, so the standard Raft majority is
-        // floor(N / 2) + 1 for the full cluster size.
+        // floor(N / 2) + 1 for the full cluster size. completedNodeCount is maintained
+        // incrementally by MarkNodeCompleted, so this is an O(1) check rather than a scan.
         int quorum = (nodes.Count / 2) + 1;
-        if (nodes.Values.Count(x => x) >= quorum)
+        if (completedNodeCount >= quorum)
         {
             completed = true;
             return true;
@@ -183,6 +200,7 @@ public sealed class RaftProposalQuorum
 
         State = RaftProposalState.Incomplete;
         completed = false;
+        completedNodeCount = 0;
         Logs = logs;
         AutoCommit = autoCommit;
         StartTimestamp = startTimestamp;
@@ -195,5 +213,6 @@ public sealed class RaftProposalQuorum
         _waiter = null;
         Logs.Clear();
         nodes.Clear();
+        completedNodeCount = 0;
     }
 }

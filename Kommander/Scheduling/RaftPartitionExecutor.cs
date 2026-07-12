@@ -39,8 +39,16 @@ public sealed class RaftPartitionExecutor : IDisposable
 
     /// <summary>
     /// Wraps a <see cref="RaftRequest"/> together with an optional reply channel.
+    /// <para>
+    /// A <c>readonly struct</c> (two references wide, no identity, never mutated) so it is stored
+    /// inline in the operation queues, the drain scratch list, and the reply dictionary — this
+    /// removes the per-<c>Post</c>/<c>Ask</c> heap allocation that a class carried. Never compared to
+    /// <c>null</c> or read from a <c>default</c> instance: dequeue/lookup sites gate on the
+    /// <c>TryDequeue</c>/<c>Remove</c> boolean, and <see cref="Reply"/> is an ordinary nullable
+    /// reference field so the fire-and-forget (<c>Reply is null</c>) check still works.
+    /// </para>
     /// </summary>
-    private sealed class PendingOperation
+    private readonly struct PendingOperation
     {
         public RaftRequest Request { get; }
 
@@ -129,6 +137,13 @@ public sealed class RaftPartitionExecutor : IDisposable
 
     // Batch scratch list to avoid per-drain allocations.
     private readonly List<PendingOperation> _drainBatch = new(256);
+
+    // Worker-owned scratch for the coalesced replication batch passed to ReplicateLogsBatchAsync.
+    // Reused across drain cycles instead of allocating a fresh list per batch: the executor is a
+    // single owner and blocks on the batch call (GetResult) before touching this again, and the
+    // state machine only reads the list during the call — it never retains the reference — so reuse
+    // is safe. Cleared at the start of every ExecuteBatchAsync.
+    private readonly List<(List<RaftLog>? Logs, bool AutoCommit, ulong? ReplyCorrelationId)> _batchScratch = new(256);
 
     // ── Restore state ──────────────────────────────────────────────────────
 
@@ -687,7 +702,7 @@ public sealed class RaftPartitionExecutor : IDisposable
         _drainBatch.Clear();
 
         int taken = 0;
-        while (taken < maxPerCycle && queue.TryDequeue(out PendingOperation? op))
+        while (taken < maxPerCycle && queue.TryDequeue(out PendingOperation op))
         {
             _drainBatch.Add(op);
             taken++;
@@ -709,7 +724,10 @@ public sealed class RaftPartitionExecutor : IDisposable
         int dispatchStart = 0;
         if (batchEnd >= 2)
         {
-            ExecuteBatchAsync(_drainBatch.GetRange(0, batchEnd)).GetAwaiter().GetResult();
+            // Pass the leading [0, batchEnd) window by index/count — no GetRange copy. An async
+            // method cannot take a ReadOnlySpan<T>, so the (source, count) contract is the allocation-
+            // free equivalent. _drainBatch is not mutated while the batch call runs.
+            ExecuteBatchAsync(_drainBatch, batchEnd).GetAwaiter().GetResult();
             dispatchStart = batchEnd;
         }
 
@@ -956,13 +974,20 @@ public sealed class RaftPartitionExecutor : IDisposable
         }
     }
 
-    /// <summary>Batches multiple ReplicateLogs into a single state-machine call.</summary>
-    private async Task ExecuteBatchAsync(List<PendingOperation> ops)
+    /// <summary>
+    /// Batches the leading <paramref name="count"/> ReplicateLogs operations from
+    /// <paramref name="source"/> (the drain scratch list) into a single state-machine call.
+    /// Uses the (source, count) index range instead of a copied sublist, and the worker-owned
+    /// <see cref="_batchScratch"/> instead of a freshly allocated tuple list, so a warm replication
+    /// batch dispatches without list allocations.
+    /// </summary>
+    private async Task ExecuteBatchAsync(List<PendingOperation> source, int count)
     {
-        List<(List<RaftLog>? Logs, bool AutoCommit, ulong? ReplyCorrelationId)> batch = new(ops.Count);
+        _batchScratch.Clear();
 
-        foreach (PendingOperation op in ops)
+        for (int i = 0; i < count; i++)
         {
+            PendingOperation op = source[i];
             RaftRequest req = op.Request;
 
             // Mirror the generation fence in ExecuteOneAsync: a fenced write whose
@@ -976,21 +1001,21 @@ public sealed class RaftPartitionExecutor : IDisposable
                 continue;
             }
 
-            batch.Add((req.Logs, req.AutoCommit, RegisterReply(op)));
+            _batchScratch.Add((req.Logs, req.AutoCommit, RegisterReply(op)));
         }
 
         ValueStopwatch sw = ValueStopwatch.StartNew();
         try
         {
-            await _stateMachine.ReplicateLogsBatchAsync(batch).ConfigureAwait(false);
-            Interlocked.Add(ref _totalProcessed, ops.Count);
+            await _stateMachine.ReplicateLogsBatchAsync(_batchScratch).ConfigureAwait(false);
+            Interlocked.Add(ref _totalProcessed, count);
             Interlocked.Increment(ref _totalBatchesExecuted);
 
             double elapsedMs = sw.GetElapsedTime().TotalMilliseconds;
-            KommanderMetrics.ExecutorOperationsTotal.Add(ops.Count, in _kindTags[(int)RaftOperationKind.Replication]);
+            KommanderMetrics.ExecutorOperationsTotal.Add(count, in _kindTags[(int)RaftOperationKind.Replication]);
             KommanderMetrics.ExecutorOperationDurationMs.Record(elapsedMs, in _kindTags[(int)RaftOperationKind.Replication]);
-            _loadAccumulator.RecordOps(ops.Count);
-            _logLoadAccumulator.RecordOps(ops.Count);
+            _loadAccumulator.RecordOps(count);
+            _logLoadAccumulator.RecordOps(count);
         }
         catch (Exception ex)
         {
@@ -998,8 +1023,8 @@ public sealed class RaftPartitionExecutor : IDisposable
                 "[RaftPartitionExecutor/{PartitionId}] ReplicateLogsBatch error: {Message}",
                 _partitionId, ex.Message);
 
-            foreach (PendingOperation op in ops)
-                op.Reply?.TrySetException(ex);
+            for (int i = 0; i < count; i++)
+                source[i].Reply?.TrySetException(ex);
         }
     }
 
@@ -1025,7 +1050,7 @@ public sealed class RaftPartitionExecutor : IDisposable
     /// </summary>
     internal void DeliverReply(ulong correlationId, RaftResponse response)
     {
-        if (_pendingReplies.Remove(correlationId, out PendingOperation? op))
+        if (_pendingReplies.Remove(correlationId, out PendingOperation op))
             op.Reply?.TrySetResult(response);
     }
 
