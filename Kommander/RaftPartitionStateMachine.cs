@@ -50,6 +50,24 @@ public sealed class RaftPartitionStateMachine
     private readonly Dictionary<HLCTimestamp, RaftProposalQuorum> activeProposals = [];
     private readonly Dictionary<long, Scheduling.RaftPendingWalOperation> pendingWalOperations = [];
 
+    // Per-instance pool for the pending-WAL-op metadata objects. Rented on insert, returned once the
+    // completion has drained the entry. Safe without synchronization because the state machine runs
+    // single-threaded on its partition executor; bounded so a burst of in-flight ops cannot retain an
+    // unbounded number of pooled objects. A benchmark chose pooling over a struct value type, which
+    // regressed by enlarging every dictionary entry (see RaftPendingWalOperation remarks).
+    private readonly Stack<Scheduling.RaftPendingWalOperation> _pendingWalOpPool = new();
+    private const int MaxPendingWalOpPool = 256;
+
+    private Scheduling.RaftPendingWalOperation RentPendingWalOp() =>
+        _pendingWalOpPool.Count > 0 ? _pendingWalOpPool.Pop() : new();
+
+    private void ReturnPendingWalOp(Scheduling.RaftPendingWalOperation op)
+    {
+        op.Reset();
+        if (_pendingWalOpPool.Count < MaxPendingWalOpPool)
+            _pendingWalOpPool.Push(op);
+    }
+
     /// <summary>
     /// Encapsulates in-flight snapshot-send guard, chunked send loop, and
     /// install-complete callback. Initialized in constructor after <c>postToExecutor</c>
@@ -1706,13 +1724,12 @@ public sealed class RaftPartitionStateMachine
 
             if (operation is not null)
             {
-                pendingWalOperations[operation.OperationId] = new()
-                {
-                    ReplyCorrelationId = replyCorrelationId,
-                    Logs = logs,
-                    Endpoint = endpoint,
-                    Timestamp = timestamp,
-                };
+                Scheduling.RaftPendingWalOperation pendingAppend = RentPendingWalOp();
+                pendingAppend.ReplyCorrelationId = replyCorrelationId;
+                pendingAppend.Logs = logs;
+                pendingAppend.Endpoint = endpoint;
+                pendingAppend.Timestamp = timestamp;
+                pendingWalOperations[operation.OperationId] = pendingAppend;
                 return;
             }
 
@@ -1854,13 +1871,12 @@ public sealed class RaftPartitionStateMachine
                 throw;
             }
 
-            pendingWalOperations[operation.OperationId] = new()
-            {
-                ReplyCorrelationId = replyCorrelationId,
-                TicketId = currentTime,
-                Logs = logs,
-                AutoCommit = autoCommit,
-            };
+            Scheduling.RaftPendingWalOperation pendingPropose = RentPendingWalOp();
+            pendingPropose.ReplyCorrelationId = replyCorrelationId;
+            pendingPropose.TicketId = currentTime;
+            pendingPropose.Logs = logs;
+            pendingPropose.AutoCommit = autoCommit;
+            pendingWalOperations[operation.OperationId] = pendingPropose;
 
             return (RaftOperationStatus.Pending, currentTime);
         }
@@ -1993,13 +2009,12 @@ public sealed class RaftPartitionStateMachine
         }];
 
         WALWriteOperation operation = wal.EnqueuePropose(currentTerm, checkpointLogs, currentTime, true);
-        pendingWalOperations[operation.OperationId] = new()
-        {
-            ReplyCorrelationId = replyCorrelationId,
-            TicketId = currentTime,
-            Logs = checkpointLogs,
-            AutoCommit = true,
-        };
+        Scheduling.RaftPendingWalOperation pendingCheckpoint = RentPendingWalOp();
+        pendingCheckpoint.ReplyCorrelationId = replyCorrelationId;
+        pendingCheckpoint.TicketId = currentTime;
+        pendingCheckpoint.Logs = checkpointLogs;
+        pendingCheckpoint.AutoCommit = true;
+        pendingWalOperations[operation.OperationId] = pendingCheckpoint;
 
         return (RaftOperationStatus.Pending, currentTime);
         
@@ -2093,12 +2108,11 @@ public sealed class RaftPartitionStateMachine
         }
 
         WALWriteOperation operation = wal.EnqueueCommit(proposal.Logs);
-        pendingWalOperations[operation.OperationId] = new()
-        {
-            ReplyCorrelationId = replyCorrelationId,
-            Proposal = proposal,
-            TicketId = ticketId
-        };
+        Scheduling.RaftPendingWalOperation pendingCommit = RentPendingWalOp();
+        pendingCommit.ReplyCorrelationId = replyCorrelationId;
+        pendingCommit.Proposal = proposal;
+        pendingCommit.TicketId = ticketId;
+        pendingWalOperations[operation.OperationId] = pendingCommit;
 
         return (RaftOperationStatus.Pending, operation.LogIndex);
     }
@@ -2158,12 +2172,11 @@ public sealed class RaftPartitionStateMachine
         }
 
         WALWriteOperation operation = wal.EnqueueRollback(proposal.Logs);
-        pendingWalOperations[operation.OperationId] = new()
-        {
-            ReplyCorrelationId = replyCorrelationId,
-            Proposal = proposal,
-            TicketId = ticketId
-        };
+        Scheduling.RaftPendingWalOperation pendingRollback = RentPendingWalOp();
+        pendingRollback.ReplyCorrelationId = replyCorrelationId;
+        pendingRollback.Proposal = proposal;
+        pendingRollback.TicketId = ticketId;
+        pendingWalOperations[operation.OperationId] = pendingRollback;
 
         return (RaftOperationStatus.Pending, operation.LogIndex);
     }
@@ -2421,11 +2434,10 @@ public sealed class RaftPartitionStateMachine
         TryReleaseTicketOnQuorumDurable(proposal);
 
         WALWriteOperation operation = wal.EnqueueCommit(proposal.Logs);
-        pendingWalOperations[operation.OperationId] = new()
-        {
-            Proposal = proposal,
-            TicketId = timestamp
-        };
+        Scheduling.RaftPendingWalOperation pendingAutoCommit = RentPendingWalOp();
+        pendingAutoCommit.Proposal = proposal;
+        pendingAutoCommit.TicketId = timestamp;
+        pendingWalOperations[operation.OperationId] = pendingAutoCommit;
     }
 
     public async Task CompleteWalOperationAsync(RaftWalCompletion? completion)
@@ -2457,7 +2469,8 @@ public sealed class RaftPartitionStateMachine
                 "[{LocalEndpoint}/{PartitionId}/{State}] WAL completion for term {CompletionTerm} delivered in term {CurrentTerm}; discarding stale completion (op {OperationId}).",
                 host.LocalEndpoint, host.PartitionId, nodeState,
                 completion.Term, currentTerm, completion.OperationId);
-            pendingWalOperations.Remove(completion.OperationId, out _);
+            if (pendingWalOperations.Remove(completion.OperationId, out Scheduling.RaftPendingWalOperation? stalePending))
+                ReturnPendingWalOp(stalePending);
             KommanderMetrics.StaleCompletionsTotal.Add(1,
                 new KeyValuePair<string, object?>("reason", "term_mismatch"));
             return;
@@ -2532,6 +2545,13 @@ public sealed class RaftPartitionStateMachine
                 CompleteReply(pending?.ReplyCorrelationId, RaftResponseStatic.NoneResponse);
                 break;
         }
+
+        // Return the drained metadata object to the pool. Only reached on the main completion path
+        // (rare error early-returns above simply let their entry be collected); the entry was already
+        // removed from the dictionary at the fence above, and each op completes once, so there is no
+        // double-return. The Complete* handlers have finished reading `pending` by here.
+        if (found && pending is not null)
+            ReturnPendingWalOp(pending);
     }
 
     /// <summary>
@@ -2605,11 +2625,10 @@ public sealed class RaftPartitionStateMachine
                 TryReleaseTicketOnQuorumDurable(proposalQuorum);
 
                 WALWriteOperation commitOperation = wal.EnqueueCommit(proposalQuorum.Logs);
-                pendingWalOperations[commitOperation.OperationId] = new()
-                {
-                    Proposal = proposalQuorum,
-                    TicketId = ticketId
-                };
+                Scheduling.RaftPendingWalOperation pendingFollowUpCommit = RentPendingWalOp();
+                pendingFollowUpCommit.Proposal = proposalQuorum;
+                pendingFollowUpCommit.TicketId = ticketId;
+                pendingWalOperations[commitOperation.OperationId] = pendingFollowUpCommit;
             }
         }
 

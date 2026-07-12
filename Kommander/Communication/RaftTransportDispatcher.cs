@@ -92,7 +92,7 @@ internal sealed class RaftTransportDispatcher : IDisposable
 
                 // Drain whatever is immediately available to form a natural batch.
                 batch.Clear();
-                while (batch.Count < MaxBatchSize && reader.TryRead(out RaftResponderRequest? item))
+                while (batch.Count < MaxBatchSize && reader.TryRead(out RaftResponderRequest item))
                     batch.Add(item);
 
                 if (batch.Count == 0)
@@ -116,7 +116,7 @@ internal sealed class RaftTransportDispatcher : IDisposable
             // Clear first — batch may hold the last-processed set from the main loop;
             // the drain must only send messages that have NOT yet been dispatched.
             batch.Clear();
-            while (reader.TryRead(out RaftResponderRequest? remaining))
+            while (reader.TryRead(out RaftResponderRequest remaining))
             {
                 batch.Add(remaining);
 
