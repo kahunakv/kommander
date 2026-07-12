@@ -1077,14 +1077,23 @@ public sealed class RaftWriteAhead
 
         // Filter out any uncommitted entries (proposed/rolled-back) within the bounded batch.
         // The storage layer already capped the row count, so no further size check is needed.
-        List<RaftLog> result = [];
-        foreach (RaftLog log in all)
+        // `all` is a fresh list uniquely owned by this call (every backend's ReadLogsRange
+        // materializes a new list, and the RaftLog references it holds are not mutated here), so
+        // compact the committed entries in place with a write index and trim the tail — this
+        // returns the same list and backing array instead of allocating a second List<RaftLog>.
+        int write = 0;
+        for (int read = 0; read < all.Count; read++)
         {
+            RaftLog log = all[read];
             if (log.Type != RaftLogType.Committed && log.Type != RaftLogType.CommittedCheckpoint)
                 continue;
-            result.Add(log);
+            if (write != read)
+                all[write] = log;
+            write++;
         }
-        return result;
+        if (write < all.Count)
+            all.RemoveRange(write, all.Count - write);
+        return all;
     }
 
     /// <summary>
