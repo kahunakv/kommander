@@ -885,11 +885,10 @@ public class GrpcCommunication : ICommunication
 
     private static Metadata BuildAuthMetadata(RaftManager manager, string grpcMethod)
     {
-        RaftTransportSecurityOptions security = manager.Configuration.GetEffectiveTransportSecurity();
-        if (security.NodeAuthenticationMode != RaftNodeAuthenticationMode.SharedSecret)
+        RaftTransportAuthenticator authenticator = manager.Configuration.GetTransportAuthenticator();
+        if (authenticator.Options.NodeAuthenticationMode != RaftNodeAuthenticationMode.SharedSecret)
             return [];
 
-        RaftTransportAuthenticator authenticator = new(security);
         RaftTransportAuthenticationHeaders signed = authenticator.Sign("POST", grpcMethod, manager.LocalEndpoint);
 
         return

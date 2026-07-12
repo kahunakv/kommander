@@ -362,10 +362,33 @@ public sealed class RaftTransportAuthenticator
 
     private static string Base64UrlEncode(ReadOnlySpan<byte> bytes)
     {
-        return Convert.ToBase64String(bytes)
-            .TrimEnd('=')
-            .Replace('+', '-')
-            .Replace('/', '_');
+        if (bytes.IsEmpty)
+            return string.Empty;
+
+        // Encode into a stack buffer and translate to the URL alphabet in place, allocating exactly one
+        // result string — instead of the standard-base64 string plus the TrimEnd/Replace/Replace chain
+        // that produced up to three more intermediate strings.
+        int base64Length = ((bytes.Length + 2) / 3) * 4;
+        Span<char> buffer = base64Length <= 256 ? stackalloc char[base64Length] : new char[base64Length];
+
+        if (!Convert.TryToBase64Chars(bytes, buffer, out int written))
+            return string.Empty; // unreachable: buffer is exactly sized
+
+        int end = written;
+        while (end > 0 && buffer[end - 1] == '=') // strip padding
+            end--;
+
+        for (int i = 0; i < end; i++)
+        {
+            buffer[i] = buffer[i] switch
+            {
+                '+' => '-',
+                '/' => '_',
+                char c => c
+            };
+        }
+
+        return new string(buffer[..end]);
     }
 
     private static bool TryDecodeBase64Url(string value, out byte[]? decoded)
@@ -375,24 +398,34 @@ public sealed class RaftTransportAuthenticator
         if (string.IsNullOrWhiteSpace(value))
             return false;
 
-        string padded = value.Replace('-', '+').Replace('_', '/');
-        int padding = padded.Length % 4;
-
+        // Translate the URL alphabet back and re-pad into a stack buffer, then decode once — instead of
+        // building normalized + padded intermediate strings via Replace/PadRight.
+        int padding = value.Length % 4;
         if (padding == 1)
             return false;
 
-        if (padding > 0)
-            padded = padded.PadRight(padded.Length + (4 - padding), '=');
+        int paddedLength = padding == 0 ? value.Length : value.Length + (4 - padding);
+        Span<char> buffer = paddedLength <= 256 ? stackalloc char[paddedLength] : new char[paddedLength];
 
-        try
+        for (int i = 0; i < value.Length; i++)
         {
-            decoded = Convert.FromBase64String(padded);
-            return true;
+            buffer[i] = value[i] switch
+            {
+                '-' => '+',
+                '_' => '/',
+                char c => c
+            };
         }
-        catch (FormatException)
-        {
+
+        for (int i = value.Length; i < paddedLength; i++)
+            buffer[i] = '=';
+
+        byte[] output = new byte[(paddedLength / 4) * 3];
+        if (!Convert.TryFromBase64Chars(buffer, output, out int bytesWritten))
             return false;
-        }
+
+        decoded = bytesWritten == output.Length ? output : output[..bytesWritten];
+        return true;
     }
 
     private static int WriteUtf8(Span<byte> destination, string value)

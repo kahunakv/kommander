@@ -884,4 +884,44 @@ public class RaftConfiguration
             TrustedClientCertificateThumbprints = TransportSecurity.TrustedClientCertificateThumbprints
         };
     }
+
+    private volatile RaftTransportAuthenticator? _cachedAuthenticator;
+    private readonly object _authenticatorLock = new();
+
+    /// <summary>
+    /// Returns a shared <see cref="RaftTransportAuthenticator"/> for this configuration's effective
+    /// transport security, building it once and caching it.
+    /// <para>
+    /// The authenticator holds immutable signing state — the UTF-8-encoded shared secret and the
+    /// SHA-256 replay-cache namespace derived from it — so reconstructing it per request (as every
+    /// incoming/outgoing REST and unary gRPC auth path previously did) re-encoded and re-hashed the
+    /// secret each time and also allocated a fresh effective-security options object via
+    /// <see cref="GetEffectiveTransportSecurity"/>. Caching one instance removes that per-request cost;
+    /// the shared static replay cache is unaffected (it lives on the type, not the instance).
+    /// </para>
+    /// <para><b>Live reconfiguration:</b> the cached authenticator captures the effective security at
+    /// first use. If <see cref="TransportSecurity"/> (or the legacy bearer token) is mutated after the
+    /// first auth operation, call <see cref="InvalidateTransportAuthenticator"/> to force a rebuild;
+    /// there is intentionally no automatic invalidation, matching the "explicit and atomic replacement"
+    /// contract for a security-sensitive object.</para>
+    /// </summary>
+    public RaftTransportAuthenticator GetTransportAuthenticator()
+    {
+        RaftTransportAuthenticator? cached = _cachedAuthenticator;
+        if (cached is not null)
+            return cached;
+
+        lock (_authenticatorLock)
+            return _cachedAuthenticator ??= new RaftTransportAuthenticator(GetEffectiveTransportSecurity());
+    }
+
+    /// <summary>
+    /// Clears the cached <see cref="GetTransportAuthenticator"/> instance so the next call rebuilds it
+    /// from the current <see cref="TransportSecurity"/>. Call after mutating transport-security settings.
+    /// </summary>
+    public void InvalidateTransportAuthenticator()
+    {
+        lock (_authenticatorLock)
+            _cachedAuthenticator = null;
+    }
 }
