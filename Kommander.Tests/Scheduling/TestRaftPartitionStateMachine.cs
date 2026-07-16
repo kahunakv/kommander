@@ -124,26 +124,144 @@ public class TestRaftPartitionStateMachine
         Assert.Equal(t3, logs[2].Time);
     }
 
+    /// <summary>
+    /// B4 regression: a peer advertising a higher (possibly uncommitted) handshake max must NOT
+    /// suppress this node's election. The old global <c>AmIOutdatedAsync</c> veto compared the local
+    /// WAL max against the maximum ever recorded in the never-pruned <c>startCommitIndexes</c>, so a
+    /// peer that once handshook at index 42 and then failed/left permanently blocked every election —
+    /// even with a valid surviving quorum. The veto is removed: candidate eligibility is now decided
+    /// per-voter by the RequestVote log-freshness check, so this node campaigns normally.
+    /// </summary>
     [Fact]
-    public async Task ForceLeaderForTestingAsync_OutdatedNode_ReturnsReplicationFailed()
+    public async Task ForceLeaderForTestingAsync_NotVetoedByStaleHandshakeMax()
     {
         FakePartitionHost host = new();
         FakeWalFacade wal = new();
         CapturingReplySink sink = new();
         RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
 
+        // A peer handshakes with a much higher max than our local WAL (which is empty).
         sm.ReceiveHandshake(remoteNodeId: 2, endpoint: "node-b", remoteMaxLogId: 42);
 
         await sm.ForceLeaderForTestingAsync(replyCorrelationId: 9);
 
-        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        // Previously suppressed (Follower + ReplicationFailed); now the node campaigns and requests votes.
+        Assert.Equal(RaftNodeState.Candidate, sm.NodeState);
         Assert.Equal(string.Empty, host.Leader);
-        Assert.Empty(host.LeaderChanges);
+        Assert.Contains(host.EnqueuedResponses, message => message.Type == RaftResponderRequestType.RequestVotes);
         Assert.Collection(sink.Completed, reply =>
         {
             Assert.Equal((ulong)9, reply.Id);
-            Assert.Equal(RaftOperationStatus.ReplicationFailed, reply.Response.Status);
+            Assert.Equal(RaftOperationStatus.Pending, reply.Response.Status);
         });
+    }
+
+    /// <summary>
+    /// S5 regression: <c>CompleteAppendLogsAsync</c> must fence a follower ACK on
+    /// (nodeState == Leader &amp;&amp; responseTerm == currentTerm) BEFORE any mutation. A delayed old-term
+    /// ACK must be dropped so it cannot repopulate follower progress / backfill cursors (which could,
+    /// e.g., make an outdated follower look transfer-eligible). We observe the fence through
+    /// <c>UpdateLastNodeActivity</c> — the first mutation past the fence. A <c>responseTerm</c> of -1
+    /// (legacy / in-process callers that do not stamp a term) bypasses the fence, preserving prior
+    /// behaviour.
+    /// </summary>
+    /// <summary>
+    /// B2a regression: a RequestVote carrying a term higher than ours (Raft §5.1) must make a Leader
+    /// step down to Follower and adopt the new term BEFORE granting. Before the fix, the non-follower
+    /// guard only rejected the SAME term, so a higher-term vote fell through and was granted while the
+    /// node stayed a stale Leader at the old term. Here the candidate's log is fresh, so the vote is
+    /// also granted — but the key assertion is the step-down + term adoption.
+    /// </summary>
+    [Fact]
+    public async Task VoteAsync_HigherTerm_LeaderStepsDownAndAdoptsTerm()
+    {
+        FakePartitionHost host = new() { NodesOverride = [] };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        Assert.Equal(1L, sm.CurrentTerm);
+
+        host.ClearObservations();
+
+        // A higher-term (2) RequestVote arrives from a fresh candidate (empty log, same as ours).
+        await sm.VoteAsync(
+            new RaftNode("node-b"),
+            voteTerm: 2,
+            remoteMaxLogId: 0,
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId));
+
+        // Fenced: we stepped down and adopted term 2 instead of remaining a term-1 leader.
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        Assert.Equal(2L, sm.CurrentTerm);
+        Assert.Equal(string.Empty, host.Leader);
+        // Log is not behind, so the vote is granted to the higher-term candidate.
+        Assert.Contains(host.EnqueuedRequests, e =>
+            e.Request.Type == RaftResponderRequestType.Vote && !e.Request.VoteRequest!.PreVote);
+    }
+
+    /// <summary>
+    /// B2a: the higher-term step-down is UNCONDITIONAL (Raft §5.1) — it happens even when we then deny
+    /// the vote on log-freshness grounds. A stale leader must adopt the newer term and become a follower
+    /// regardless of whether it votes for that particular candidate.
+    /// </summary>
+    [Fact]
+    public async Task VoteAsync_HigherTerm_LeaderStepsDownEvenWhenVoteDenied()
+    {
+        FakePartitionHost host = new() { NodesOverride = [] };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+
+        host.ClearObservations();
+
+        // Higher term (2) but the candidate's log (-1) is behind ours (empty log reports max 0), so the
+        // real-vote log-freshness check denies the grant.
+        await sm.VoteAsync(
+            new RaftNode("node-b"),
+            voteTerm: 2,
+            remoteMaxLogId: -1,
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId));
+
+        // Stepped down and adopted the term even though no vote was granted.
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        Assert.Equal(2L, sm.CurrentTerm);
+        Assert.DoesNotContain(host.EnqueuedRequests, e => e.Request.Type == RaftResponderRequestType.Vote);
+    }
+
+    [Fact]
+    public async Task CompleteAppendLogs_StaleTerm_IsFenced_BeforeAnyMutation()
+    {
+        FakePartitionHost host = new() { NodesOverride = [] }; // single voter → ForceLeader promotes immediately
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        Assert.Equal(1L, sm.CurrentTerm);
+
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+
+        // Stale ACK from an earlier term → fenced, no mutation (activity not recorded).
+        host.ActivityUpdates.Clear();
+        await sm.CompleteAppendLogsAsync("node-b", ts, RaftOperationStatus.Success, committedIndex: 0, responseTerm: 0);
+        Assert.DoesNotContain("node-b", host.ActivityUpdates);
+
+        // Current-term ACK from the leader → accepted, mutation proceeds.
+        host.ActivityUpdates.Clear();
+        await sm.CompleteAppendLogsAsync("node-b", ts, RaftOperationStatus.Success, committedIndex: 0, responseTerm: 1);
+        Assert.Contains("node-b", host.ActivityUpdates);
+
+        // Legacy caller (responseTerm == -1) bypasses the fence → mutation proceeds.
+        host.ActivityUpdates.Clear();
+        await sm.CompleteAppendLogsAsync("node-b", ts, RaftOperationStatus.Success, committedIndex: 0, responseTerm: -1);
+        Assert.Contains("node-b", host.ActivityUpdates);
     }
 
     [Fact]
@@ -1164,7 +1282,12 @@ public class TestRaftPartitionStateMachine
 
         public void UpdateLastHeartbeat(string endpoint, int partitionId, HLCTimestamp timestamp) { }
 
-        public void UpdateLastNodeActivity(string endpoint, int partitionId, HLCTimestamp timestamp) { }
+        /// <summary>Records every UpdateLastNodeActivity call so tests can assert whether a code path
+        /// reached the first post-fence mutation in CompleteAppendLogsAsync.</summary>
+        public List<string> ActivityUpdates { get; } = [];
+
+        public void UpdateLastNodeActivity(string endpoint, int partitionId, HLCTimestamp timestamp) =>
+            ActivityUpdates.Add(endpoint);
 
         public void EnqueueResponse(string endpoint, RaftResponderRequest request)
         {

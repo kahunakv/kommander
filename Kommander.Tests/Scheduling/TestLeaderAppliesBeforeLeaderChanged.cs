@@ -345,6 +345,47 @@ public class TestLeaderAppliesBeforeLeaderChanged
     }
 
     /// <summary>
+    /// B6 regression: after a restart replays the committed log, a subsequent promotion must NOT
+    /// deliver the retained committed entries to the consumer a SECOND time. WAL restore already
+    /// delivered the committed prefix (via <c>InvokeLogRestored</c>) and <c>CompleteRestoreAsync</c>
+    /// now seeds <c>lastAppliedIndex</c> to the commit frontier. Before the fix that cursor stayed at
+    /// -1, so <c>BecomeLeaderAsync</c> re-drained the whole log from index 0 on promotion —
+    /// double-delivering every committed entry and holding the serial executor for the full replay
+    /// before the first heartbeat. Contrast with <see cref="NewLeader_HostLeaderIsSetAfterDrain"/>,
+    /// which uses the same seeded WAL WITHOUT a restore and therefore DOES apply the entries on
+    /// promotion — the two tests bracket the fix.
+    /// </summary>
+    [Fact]
+    public async Task RestoredNode_Promotion_DoesNotReapplyRetainedCommittedLog()
+    {
+        List<RaftLog> seeded =
+        [
+            new() { Id = 1, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new() { Id = 2, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new() { Id = 3, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+        ];
+
+        OrderRecordingHost host = new() { NodesOverride = [] };   // single-voter
+        SeededWalFacade wal = new(seeded);
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        // Simulate restart replay: restore seeds the applied cursor to the commit frontier (3). The
+        // real restore also delivers the prefix via a separate InvokeLogRestored path; this harness's
+        // SeededWalFacade.CompleteRestoreAsync is a no-op, so no "Applied:" events fire here — what we
+        // assert is that promotion does not now re-deliver them.
+        await sm.CompleteRestoreAsync(seeded);
+        Assert.DoesNotContain(host.EventLog, e => e.StartsWith("Applied:"));
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+
+        // Promotion advertises leadership, but the retained committed entries are NOT re-delivered:
+        // the restore-seeded cursor made the drain a no-op.
+        Assert.Equal("node-a", host.Leader);
+        Assert.DoesNotContain(host.EventLog, e => e.StartsWith("Applied:"));
+    }
+
+    /// <summary>
     /// When the WAL has no committed entries (fresh cluster), the promotion drain is
     /// a no-op and the partition is still advertised as the serving leader.
     /// </summary>

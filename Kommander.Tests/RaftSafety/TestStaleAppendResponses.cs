@@ -130,19 +130,13 @@ public class TestStaleAppendResponses
     }
 
     // ── CompleteAppendLogs fencing (same rule, completion direction) ──────
-
-    [Fact]
-    public void StaleCompleteAppend_IsIgnored_WhenCompletionTermLower()
-    {
-        // On the leader side: CompleteAppendLogs arrives from a follower with an old term.
-        // Mirror of the check: if completion.Term < currentTerm → ignore.
-        long currentTerm = 8;
-        long completionTerm = 6;
-
-        bool shouldIgnore = completionTerm < currentTerm;
-
-        Assert.True(shouldIgnore, "CompleteAppendLogs from an older term must be ignored");
-    }
+    //
+    // The real leader-side fence (a follower ACK is accepted only when
+    // nodeState == Leader && responseTerm == currentTerm, dropped otherwise) is exercised end-to-end
+    // against the state machine in
+    // Kommander.Tests.Scheduling.TestRaftPartitionStateMachine.CompleteAppendLogs_StaleTerm_IsFenced_BeforeAnyMutation.
+    // A prior boolean-only test lived here but never invoked CompleteAppendLogsAsync, so it was
+    // removed in favour of that real exercise (finding S5).
 
     // ── Scheduler harness: operation carry the right term metadata ────────
 

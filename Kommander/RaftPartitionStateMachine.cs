@@ -155,11 +155,15 @@ public sealed class RaftPartitionStateMachine
     /// <see cref="IRaftPartitionHost.InvokeSystemReplicationReceived"/>.
     /// Initialized to -1 (nothing applied yet).
     ///
-    /// <para>Maintained on both the follower append path and the leader commit path.
-    /// On promotion, <see cref="DrainCommittedAppliesAsync"/> uses this as the start
+    /// <para>Maintained on both the follower append path and the leader commit path, and
+    /// <b>seeded on restore</b>: <see cref="CompleteRestoreAsync"/> sets it to the reconstructed
+    /// commit frontier because the WAL restore already delivered every committed entry below that
+    /// frontier to the consumer. Skipping this seed would make promotion re-deliver the retained log.</para>
+    ///
+    /// <para>On promotion, <see cref="DrainCommittedAppliesAsync"/> uses this as the start
     /// of a WAL range-read so that every committed entry between the current cursor
     /// and the commit frontier is delivered to the consumer before the partition is
-    /// advertised as the serving leader.</para>
+    /// advertised as the serving leader — a no-op for entries already applied during restore.</para>
     /// </summary>
     private long lastAppliedIndex = -1;
 
@@ -276,6 +280,19 @@ public sealed class RaftPartitionStateMachine
         await wal.CompleteRestoreAsync(logs).ConfigureAwait(false);
 
         currentTerm = await wal.GetCurrentTermAsync().ConfigureAwait(false);
+
+        // Seed the applied cursor to the frontier restore just replayed. wal.CompleteRestoreAsync
+        // delivered every committed entry below the reconstructed commit frontier to the consumer (via
+        // InvokeLogRestored / InvokeSystemLogRestored), but lastAppliedIndex stayed at its -1 init.
+        // Without this seed, a restarted node that later wins an election would re-drain the entire
+        // retained log from index 0 on promotion (BecomeLeaderAsync → DrainCommittedAppliesAsync),
+        // delivering every committed entry to the consumer a SECOND time and holding the serial
+        // partition executor for the full backlog before sending its first heartbeat — long enough to
+        // risk another election round. GetCommitIndex() returns the highest committed id restore
+        // applied (0 when none, since log ids start at 1), and ApplyLogToConsumerAsync applies the
+        // identical committed-only filter, so seeding here makes that promotion drain a precise no-op
+        // for already-restored entries while still draining anything committed after restore.
+        lastAppliedIndex = wal.GetCommitIndex();
 
         logger.LogInfoWalRestored(host.LocalEndpoint, host.PartitionId, nodeState, logs.Count, 0L);
 
@@ -893,12 +910,6 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
-        if (await AmIOutdatedAsync().ConfigureAwait(false))
-        {
-            CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.ReplicationFailed, 0L));
-            return;
-        }
-
         HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
 
         expectedLeaders.Clear();
@@ -931,30 +942,6 @@ public sealed class RaftPartitionStateMachine
 
         await RequestVotesAsync(currentTime, currentTerm).ConfigureAwait(false);
         CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Pending, 0L));
-    }
-
-    /// <summary>
-    /// Compares the current log id with the log id of the other nodes in the partition to determine if the node is outdated.
-    /// An outdated node cannot become leader
-    /// </summary>
-    /// <returns></returns>
-    private async Task<bool> AmIOutdatedAsync()
-    {
-        // if we don't have info about other nodes, we can't be outdated?
-        if (startCommitIndexes.Count == 0)
-            return false;
-
-        long maxIndex = -1;
-        
-        foreach (KeyValuePair<string, long> startCommitIndex in startCommitIndexes)
-        {
-            if (startCommitIndex.Value >= maxIndex)
-                maxIndex = startCommitIndex.Value;
-        }
-        
-        long localMaxId = await wal.GetMaxLogAsync().ConfigureAwait(false);
-        
-        return localMaxId < maxIndex;
     }
 
     private long GetKnownRemoteMaxLogId(string endpoint) =>
@@ -1015,13 +1002,11 @@ public sealed class RaftPartitionStateMachine
             }
         }
 
-        if (await AmIOutdatedAsync().ConfigureAwait(false))
-        {
-            electionTimeout += TimeSpan.FromMilliseconds(random.Next(host.Configuration.StartElectionTimeoutIncrement, host.Configuration.EndElectionTimeoutIncrement));
-
-            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] We're outdated, cannot become leader...", host.LocalEndpoint, host.PartitionId, nodeState);
-            return;
-        }
+        // No global "am I outdated?" pre-election veto here (removed): candidate eligibility is decided
+        // per-voter by the RequestVote log-freshness predicate in VoteAsync. The old veto compared our
+        // WAL max against the maximum ever recorded in startCommitIndexes — a dictionary that is never
+        // pruned, so a peer that once advertised a higher (possibly uncommitted) tail and then
+        // failed/left permanently suppressed every election even when the survivors held a valid quorum.
 
         // A real election is starting: discard any open pre-vote round so a stale
         // pre-grant set for an old hypothetical term can't bleed into this one.
@@ -1099,13 +1084,11 @@ public sealed class RaftPartitionStateMachine
             }
         }
 
-        if (await AmIOutdatedAsync().ConfigureAwait(false))
-        {
-            electionTimeout += TimeSpan.FromMilliseconds(random.Next(host.Configuration.StartElectionTimeoutIncrement, host.Configuration.EndElectionTimeoutIncrement));
-
-            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] We're outdated, skipping pre-vote...", host.LocalEndpoint, host.PartitionId, nodeState);
-            return;
-        }
+        // No global "am I outdated?" pre-election veto here (removed): a pre-vote is side-effect-free by
+        // design, so a genuinely-behind node can safely probe — its peers deny the pre-vote via the
+        // per-voter log check in VoteAsync and it never reaches quorum. The old veto instead consulted
+        // the never-pruned startCommitIndexes max, which let a departed peer's stale tail suppress every
+        // pre-vote forever.
 
         // No peers to probe: there is nothing a pre-vote can tell us, so go straight to a real election.
         if (host.Nodes.Count == 0)
@@ -1429,6 +1412,37 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
+        // Raft §5.1: a RequestVote carrying a term higher than ours proves our leadership/candidacy is
+        // stale. Adopt the new term and step down to Follower BEFORE evaluating the grant, so an old
+        // leader is fenced promptly instead of continuing to heartbeat at its old term. The previous
+        // guard above only rejected a non-follower for the *same* term (voteTerm == currentTerm), so a
+        // higher-term vote used to fall through and be granted while the node stayed a stale Leader —
+        // the bug this fixes. Mirrors the step-down in the AppendLogs path, except no leader is adopted
+        // (a vote request does not identify a leader) and the vote target is left to the grant path
+        // below, which may still deny on log-freshness — the term adoption is unconditional either way.
+        // NOTE: durably persisting the adopted term before replying is deferred to B2b (hard state);
+        // this is the in-memory half. Follower-side term adoption on a higher-term vote is likewise
+        // deferred to B2b — here we only fix the Leader/Candidate fencing bug.
+        if (voteTerm > currentTerm && nodeState != RaftNodeState.Follower)
+        {
+            logger.LogInformation(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Stepping down: RequestVote from {Endpoint} carries higher Term={VoteTerm} > CurrentTerm={CurrentTerm}.",
+                host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm, currentTerm);
+
+            nodeState = RaftNodeState.Follower;
+            host.Leader = "";
+            currentTerm = voteTerm;
+            lastCommitIndexes.Clear();
+            nextIndex.Clear();
+            matchIndex.Clear();
+            localCommittedIndex = -1;
+            FailAllActiveProposalWaiters();
+            activeProposals.Clear();
+            ResetPreVoteRound();
+
+            await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
+        }
+
         string expectedLeader = expectedLeaders.GetValueOrDefault(voteTerm, "");
         
         if (!string.IsNullOrEmpty(expectedLeader) && expectedLeader != node.Endpoint)
@@ -1509,7 +1523,7 @@ public sealed class RaftPartitionStateMachine
 
             // Pre-vote quorum reached: promote to a real election (which bumps the term and casts
             // the self-vote). StartElectionAsync resets the round itself once it commits to candidacy,
-            // but it can also bail out early (e.g. the AmIOutdatedAsync guard) *before* that reset, so
+            // but it can also bail out early (e.g. a role/suppression guard) *before* that reset, so
             // we reset again here unconditionally to guarantee the round can't be tallied twice.
             HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
             await StartElectionAsync(currentTime, ignoreRecentVoteCooldown: true).ConfigureAwait(false);
@@ -2317,8 +2331,31 @@ public sealed class RaftPartitionStateMachine
     /// <param name="timestamp"></param>
     /// <param name="status"></param>
     /// <param name="committedIndex"></param>
-    public async ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex)
+    /// <param name="responseTerm">
+    /// The term the acknowledging follower stamped on its reply. A follower ACK is only meaningful to
+    /// the node that is currently the leader of that term; a delayed ACK from an earlier term must not
+    /// repopulate progress/backfill/startCommitIndexes state after a step-down or term change. A value
+    /// &lt; 0 means "not set" (legacy / in-process / test callers) and bypasses the fence, mirroring
+    /// <see cref="CompleteWalOperationAsync"/>.
+    /// </param>
+    public async ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1)
     {
+        // ── Leader + term fence ──────────────────────────────────────────────────
+        // Reject a stale ACK BEFORE any mutation (HLC receive, node activity, commit/backfill cursors,
+        // matchIndex/nextIndex, startCommitIndexes). Without this, a delayed old-term ACK could make an
+        // outdated follower look caught-up — e.g. appear eligible for a leadership transfer — or perturb
+        // a later term's catch-up. responseTerm < 0 preserves the previous behaviour for callers that do
+        // not stamp a term.
+        if (responseTerm >= 0 && (nodeState != RaftNodeState.Leader || responseTerm != currentTerm))
+        {
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Ignoring stale CompleteAppendLogs from {Endpoint}: responseTerm={ResponseTerm} currentTerm={CurrentTerm}",
+                host.LocalEndpoint, host.PartitionId, nodeState, endpoint, responseTerm, currentTerm);
+            KommanderMetrics.StaleCompletionsTotal.Add(1,
+                new KeyValuePair<string, object?>("reason", "append_ack_term_mismatch"));
+            return;
+        }
+
         HLCTimestamp currentTime = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, timestamp);
 
         if (endpoint != host.LocalEndpoint)
