@@ -79,7 +79,7 @@ public sealed class TestPhantomPeerPreVote
             // BUG: request.PreVote is not forwarded → ReceivedVoteAsync(preVote: false) is called
             // → tally is ignored because the requesting node is a Follower, not a Candidate
             // → pre-vote quorum is never reached → election never starts → JoinCluster times out.
-            manager.Vote(new(request.Partition, request.Term, request.MaxLogId, request.Time, node.Endpoint));
+            manager.Vote(new(request.Partition, request.Term, request.MaxLogId, request.LastLogTerm, request.Time, node.Endpoint));
             return s_requestVotes;
         }
 
@@ -116,7 +116,7 @@ public sealed class TestPhantomPeerPreVote
         {
             // FIX: propagate request.PreVote → ReceivedVoteAsync(preVote: true) tallies the grant
             // → pre-vote quorum is reached → real election starts → node becomes leader.
-            manager.Vote(new(request.Partition, request.Term, request.MaxLogId, request.Time, node.Endpoint, preVote: request.PreVote));
+            manager.Vote(new(request.Partition, request.Term, request.MaxLogId, request.LastLogTerm, request.Time, node.Endpoint, preVote: request.PreVote));
             return s_requestVotes;
         }
 

@@ -998,6 +998,29 @@ public sealed class RaftPartitionStateMachine
             startCommitIndexes.GetValueOrDefault(endpoint, -1));
 
     /// <summary>
+    /// Raft §5.4.1 log-freshness comparison: returns <see langword="true"/> when the candidate's
+    /// <c>(lastLogTerm, lastLogIndex)</c> is <b>strictly less up-to-date</b> than our local
+    /// <c>(localLastLogTerm, localMaxId)</c> — i.e. a strictly higher last-log term wins, and only on
+    /// an equal last-log term does the higher index win. This is the check that stops a candidate whose
+    /// larger index hides an older last term from being elected over a more current voter.
+    /// <para><b>Wire compatibility (B5 rollout):</b> a <paramref name="remoteLastLogTerm"/> ≤ 0 means the
+    /// peer predates the last-log-term field (sends 0) or genuinely has an empty log; in both cases we
+    /// cannot trust the term and fall back to index-only comparison, exactly matching the pre-B5 ordering
+    /// so a mixed-version cluster never mis-orders. An empty-log candidate (index 0) loses that fallback
+    /// against any non-empty voter anyway.</para>
+    /// </summary>
+    private static bool CandidateLogIsBehind(long remoteLastLogTerm, long remoteMaxLogId, long localLastLogTerm, long localMaxId)
+    {
+        if (remoteLastLogTerm <= 0)
+            return remoteMaxLogId < localMaxId; // legacy peer / empty candidate log → index-only
+
+        if (remoteLastLogTerm != localLastLogTerm)
+            return remoteLastLogTerm < localLastLogTerm;
+
+        return remoteMaxLogId < localMaxId;
+    }
+
+    /// <summary>
     /// Returns the last commit index for <paramref name="endpoint"/>:
     /// • If endpoint equals <see cref="IRaftHost.LocalEndpoint"/> (i.e., this is the leader asking about itself),
     ///   returns <see cref="localCommittedIndex"/> — the leader's own durable commit frontier.
@@ -1182,8 +1205,9 @@ public sealed class RaftPartitionStateMachine
         }
 
         long currentMaxLog = await wal.GetMaxLogAsync().ConfigureAwait(false);
+        long currentLastLogTerm = await wal.GetCurrentTermAsync().ConfigureAwait(false);
 
-        RequestVotesRequest request = new(host.PartitionId, term, currentMaxLog, timestamp, host.LocalEndpoint, preVote);
+        RequestVotesRequest request = new(host.PartitionId, term, currentMaxLog, currentLastLogTerm, timestamp, host.LocalEndpoint, preVote);
 
         foreach (RaftNode node in nodes)
         {
@@ -1356,10 +1380,18 @@ public sealed class RaftPartitionStateMachine
     /// </summary>
     /// <param name="node"></param>
     /// <param name="voteTerm"></param>
-    /// <param name="remoteMaxLogId"></param>
+    /// <param name="remoteMaxLogId">The candidate's last log index.</param>
+    /// <param name="remoteLastLogTerm">
+    /// The candidate's last log term, compared lexicographically before <paramref name="remoteMaxLogId"/>
+    /// (Raft §5.4.1). <c>0</c> from a peer predating this field or an empty candidate log; the freshness
+    /// check falls back to index-only comparison in that case (see <see cref="CandidateLogIsBehind"/>).
+    /// </param>
     /// <param name="timestamp"></param>
     /// <param name="preVote">When true, evaluate as a pure pre-vote probe and never persist state.</param>
-    public async Task VoteAsync(RaftNode node, long voteTerm, long remoteMaxLogId, HLCTimestamp timestamp, bool preVote = false)
+    /// <remarks><paramref name="remoteLastLogTerm"/> is placed last with a default of <c>0</c> so callers
+    /// that predate the §5.4.1 freshness key (and older tests) compile unchanged and fall back to
+    /// index-only comparison; the transport dispatch path always supplies the real value.</remarks>
+    public async Task VoteAsync(RaftNode node, long voteTerm, long remoteMaxLogId, HLCTimestamp timestamp, bool preVote = false, long remoteLastLogTerm = 0)
     {
         if (preVote)
         {
@@ -1424,10 +1456,13 @@ public sealed class RaftPartitionStateMachine
             }
 
             long preVoteLocalMaxId = await wal.GetMaxLogAsync().ConfigureAwait(false);
+            long preVoteLocalLastTerm = await wal.GetCurrentTermAsync().ConfigureAwait(false);
 
-            // The candidate's log must be at least as up-to-date. Note: `>=`, not the real-vote
-            // path's strict rejection — a pre-vote only probes electability, it doesn't elect.
-            if (remoteMaxLogId < preVoteLocalMaxId)
+            // The candidate's log must be at least as up-to-date, compared lexicographically by
+            // (lastLogTerm, lastLogIndex) per Raft §5.4.1 — NOT index alone, which would let a higher
+            // index hide a stale last term. Note this denies only when the candidate is *strictly*
+            // behind: a pre-vote probes electability, so an equal log is grantable.
+            if (CandidateLogIsBehind(remoteLastLogTerm, remoteMaxLogId, preVoteLocalLastTerm, preVoteLocalMaxId))
             {
                 logger.LogDebugDenyingPreVoteOutdatedLog(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm, remoteMaxLogId, preVoteLocalMaxId);
                 return;
@@ -1435,14 +1470,15 @@ public sealed class RaftPartitionStateMachine
 
             logger.LogDebugGrantingPreVote(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
 
-            VoteRequest preGrant = new(host.PartitionId, voteTerm, preVoteLocalMaxId, timestamp, host.LocalEndpoint, preVote: true);
+            VoteRequest preGrant = new(host.PartitionId, voteTerm, preVoteLocalMaxId, preVoteLocalLastTerm, timestamp, host.LocalEndpoint, preVote: true);
             host.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Vote, node, preGrant));
             return;
         }
 
         if (!host.IsVoter(node.Endpoint))
         {
-            logger.LogDebugDenyingVoteNotVoter(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebugDenyingVoteNotVoter(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
             return;
         }
 
@@ -1509,13 +1545,16 @@ public sealed class RaftPartitionStateMachine
         }
         
         long localMaxId = await wal.GetMaxLogAsync().ConfigureAwait(false);
+        long localLastLogTerm = await wal.GetCurrentTermAsync().ConfigureAwait(false);
 
-        if (localMaxId > remoteMaxLogId)
+        if (CandidateLogIsBehind(remoteLastLogTerm, remoteMaxLogId, localLastLogTerm, localMaxId))
         {
-            // Reject a real vote for a candidate whose log is behind ours (Raft §5.4.1). We do NOT
-            // bump our own term here: with PreVote (§9.6) in place a stale candidate can no longer
-            // reach this real-vote path with an inflated term, so the old `currentTerm++` heuristic
-            // that forced us to be elected is no longer needed and only risked spurious term churn.
+            // Reject a real vote for a candidate whose log is behind ours, compared lexicographically
+            // by (lastLogTerm, lastLogIndex) per Raft §5.4.1 — a higher index no longer overrides a
+            // stale last term. We do NOT bump our own term here: with PreVote (§9.6) in place a stale
+            // candidate can no longer reach this real-vote path with an inflated term, so the old
+            // `currentTerm++` heuristic that forced us to be elected is no longer needed and only
+            // risked spurious term churn.
             logger.LogInfoVoteOutdatedLog(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, remoteMaxLogId, localMaxId);
             return;
         }
@@ -1533,7 +1572,7 @@ public sealed class RaftPartitionStateMachine
 
         logger.LogInfoSendingVote(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
 
-        VoteRequest request = new(host.PartitionId, voteTerm, localMaxId, timestamp, host.LocalEndpoint);
+        VoteRequest request = new(host.PartitionId, voteTerm, localMaxId, localLastLogTerm, timestamp, host.LocalEndpoint);
 
         host.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Vote, node, request));
     }

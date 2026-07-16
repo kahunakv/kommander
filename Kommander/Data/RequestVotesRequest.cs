@@ -15,7 +15,18 @@ public sealed class RequestVotesRequest
     public long Term { get; set; }
     
     public long MaxLogId { get; set; }
-    
+
+    /// <summary>
+    /// Term of the candidate's last log entry (the entry at <see cref="MaxLogId"/>). Paired with
+    /// <see cref="MaxLogId"/> this is the §5.4.1 log-freshness key voters compare lexicographically
+    /// (term first, then index) — without it a candidate whose higher index hides a stale last term
+    /// could be elected over a more up-to-date voter, a Leader-Completeness violation.
+    /// <para><b>Wire compatibility:</b> a peer predating this field sends <c>0</c>. Voters treat a
+    /// non-positive last-log term as "unknown" and fall back to index-only comparison, so a
+    /// mixed-version cluster degrades to the pre-B5 ordering rather than mis-ordering.</para>
+    /// </summary>
+    public long LastLogTerm { get; set; }
+
     public HLCTimestamp Time { get; set; }
 
     public string Endpoint { get; set; }
@@ -26,12 +37,13 @@ public sealed class RequestVotesRequest
     /// </summary>
     public bool PreVote { get; set; }
 
-    public RequestVotesRequest(int partition, long term, long maxLogId, HLCTimestamp time, string endpoint, bool preVote = false)
+    public RequestVotesRequest(int partition, long term, long maxLogId, long lastLogTerm, HLCTimestamp time, string endpoint, bool preVote = false)
     {
         Partition = partition;
         Term = term;
         Time = time;
         MaxLogId = maxLogId;
+        LastLogTerm = lastLogTerm;
         Endpoint = endpoint;
         PreVote = preVote;
     }

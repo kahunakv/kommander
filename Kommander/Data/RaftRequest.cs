@@ -11,7 +11,15 @@ public sealed class RaftRequest
     public long Term { get; } = -1;
     
     public long CommitIndex { get; }
-    
+
+    /// <summary>
+    /// Term of the sender's last log entry, carried on <see cref="RaftRequestType.RequestVote"/> /
+    /// <see cref="RaftRequestType.ReceiveVote"/> alongside <see cref="CommitIndex"/> (the last log
+    /// index) so the voter can apply the lexicographic §5.4.1 freshness check. <c>0</c> from peers
+    /// predating the field; the freshness check falls back to index-only in that case.
+    /// </summary>
+    public long LastLogTerm { get; }
+
     public HLCTimestamp Timestamp { get; }
 
     public string? Endpoint { get; } 
@@ -89,12 +97,14 @@ public sealed class RaftRequest
         bool preVote = false,
         long prevLogIndex = 0,
         long prevLogTerm = 0,
-        bool quiesce = false
+        bool quiesce = false,
+        long lastLogTerm = 0
     )
     {
         Type = type;
         Term = term;
         CommitIndex = commitIndex;
+        LastLogTerm = lastLogTerm;
         Timestamp = timestamp;
         Endpoint = endpoint;
         Status = status;

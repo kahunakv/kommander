@@ -129,6 +129,7 @@ public sealed class RaftService : Rafter.RafterBase
             request.Partition,
             request.Term,
             request.MaxLogId,
+            request.LastLogTerm,
             new(request.TimeNode, request.TimePhysical, request.TimeCounter),
             request.Endpoint,
             request.PreVote
@@ -151,6 +152,7 @@ public sealed class RaftService : Rafter.RafterBase
             request.Partition,
             request.Term,
             request.MaxLogId,
+            request.LastLogTerm,
             new(request.TimeNode, request.TimePhysical, request.TimeCounter),
             request.Endpoint,
             request.PreVote
@@ -293,6 +295,7 @@ public sealed class RaftService : Rafter.RafterBase
                                     requestVotes.Partition,
                                     requestVotes.Term,
                                     requestVotes.MaxLogId,
+                                    requestVotes.LastLogTerm,
                                     new(requestVotes.TimeNode, requestVotes.TimePhysical, requestVotes.TimeCounter),
                                     requestVotes.Endpoint,
                                     requestVotes.PreVote
@@ -308,6 +311,7 @@ public sealed class RaftService : Rafter.RafterBase
                                     voteRequest.Partition,
                                     voteRequest.Term,
                                     voteRequest.MaxLogId,
+                                    voteRequest.LastLogTerm,
                                     new(voteRequest.TimeNode, voteRequest.TimePhysical, voteRequest.TimeCounter),
                                     voteRequest.Endpoint,
                                     voteRequest.PreVote

@@ -914,7 +914,8 @@ public sealed class RaftPartitionExecutor : IDisposable
                         request.Term,
                         request.CommitIndex,
                         request.Timestamp,
-                        request.PreVote
+                        request.PreVote,
+                        request.LastLogTerm
                     ).ConfigureAwait(false);
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
                     break;
