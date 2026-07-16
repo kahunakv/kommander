@@ -176,6 +176,25 @@ public sealed class RaftPartitionStateMachine
     /// </summary>
     public TimeSpan ElectionTimeout => electionTimeout;
 
+    /// <summary>
+    /// Deterministically combines the configured election seed with the partition id and local node id
+    /// so each node gets a distinct-but-reproducible election-timeout RNG sequence.
+    /// <para>Uses a fixed integer hash-combine (<c>* 397 ^ …</c>) rather than
+    /// <see cref="HashCode.Combine{T1,T2,T3}(T1,T2,T3)"/>, which seeds itself from a per-process random
+    /// value and would therefore make the "seeded" timeouts differ across restarts — breaking the
+    /// reproducibility the <see cref="RaftConfiguration.ElectionTimeoutSeed"/> knob exists to provide.</para>
+    /// </summary>
+    private static int DeriveElectionSeed(int configuredSeed, int partitionId, int localNodeId)
+    {
+        unchecked
+        {
+            int mixed = configuredSeed;
+            mixed = mixed * 397 ^ partitionId;
+            mixed = mixed * 397 ^ localNodeId;
+            return mixed;
+        }
+    }
+
     public RaftPartitionStateMachine(
         IRaftPartitionHost host,
         IRaftWalFacade wal,
@@ -187,8 +206,15 @@ public sealed class RaftPartitionStateMachine
         this.replySink = replySink;
         this.logger = logger;
 
+        // Mix a STABLE, per-node identity into the seed so nodes in the same partition don't draw an
+        // identical election-timeout sequence. The old `seed ^ partitionId` gave every node in a
+        // partition the same sequence, so after a symmetric split vote they'd keep choosing identical
+        // retry timeouts and fire simultaneously forever — defeating the randomization meant to break the
+        // tie. Folding in host.LocalNodeId gives each node its own reproducible sequence (deterministic
+        // given the node's identity, so seeded runs stay repeatable per node). Only applies when a seed is
+        // configured; the production default (null) already uses per-node Random.Shared.
         random = host.Configuration.ElectionTimeoutSeed is int seed
-            ? new Random(seed ^ host.PartitionId)
+            ? new Random(DeriveElectionSeed(seed, host.PartitionId, host.LocalNodeId))
             : Random.Shared;
 
         electionTimeout = TimeSpan.FromMilliseconds(random.Next(
@@ -280,6 +306,24 @@ public sealed class RaftPartitionStateMachine
         await wal.CompleteRestoreAsync(logs).ConfigureAwait(false);
 
         currentTerm = await wal.GetCurrentTermAsync().ConfigureAwait(false);
+
+        // B2b: seed durable Raft hard state. The term inferred from the log tail (above) can LAG the true
+        // term — a crash after a term bump or a granted vote but before the next log write leaves the tail
+        // behind. Trusting the tail alone would let the node regress its term and re-vote for a different
+        // candidate in a term it already voted in (a split-brain hazard). The persisted hard state is
+        // authoritative for the term; votedFor is restored into expectedLeaders so the "already voted for
+        // someone else this term" guard in VoteAsync rejects a different candidate after a restart.
+        // (Durability is the lighter, WAL-cadence guarantee — the very last vote before a power loss may
+        // not have reached disk; see IWAL.PersistHardState.)
+        (long CurrentTerm, string? VotedFor)? hardState = await wal.LoadHardStateAsync().ConfigureAwait(false);
+        if (hardState is { } hs)
+        {
+            if (hs.CurrentTerm > currentTerm)
+                currentTerm = hs.CurrentTerm;
+
+            if (!string.IsNullOrEmpty(hs.VotedFor))
+                expectedLeaders[hs.CurrentTerm] = hs.VotedFor;
+        }
 
         // Seed the applied cursor to the frontier restore just replayed. wal.CompleteRestoreAsync
         // delivered every committed entry below the reconstructed commit frontier to the consumer (via
@@ -928,6 +972,10 @@ public sealed class RaftPartitionStateMachine
 
         IncreaseVotes(host.LocalEndpoint, currentTerm);
 
+        // B2b: durably record the new term and our self-vote before we solicit votes or become leader, so
+        // a crash mid-election cannot restart at a stale term or let us vote for someone else this term.
+        await wal.PersistHardStateAsync(currentTerm, host.LocalEndpoint).ConfigureAwait(false);
+
         await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
 
         if (host.Nodes.Count == 0)
@@ -1022,6 +1070,10 @@ public sealed class RaftPartitionStateMachine
         currentTerm++;
 
         IncreaseVotes(host.LocalEndpoint, currentTerm);
+
+        // B2b: durably record the new term and our self-vote before soliciting votes (see the same call
+        // in ForceLeaderForTestingAsync for rationale).
+        await wal.PersistHardStateAsync(currentTerm, host.LocalEndpoint).ConfigureAwait(false);
 
         double delayMs = lastHeartbeat != HLCTimestamp.Zero
             ? (currentTime - lastHeartbeat).TotalMilliseconds
@@ -1441,6 +1493,11 @@ public sealed class RaftPartitionStateMachine
             ResetPreVoteRound();
 
             await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
+
+            // B2b: the higher term is adopted here even if we go on to DENY this candidate below (on
+            // log-freshness), so persist it now with no vote yet — otherwise a crash after step-down but
+            // before any log write would regress the term on restart. A grant below overwrites votedFor.
+            await wal.PersistHardStateAsync(currentTerm, null).ConfigureAwait(false);
         }
 
         string expectedLeader = expectedLeaders.GetValueOrDefault(voteTerm, "");
@@ -1468,10 +1525,16 @@ public sealed class RaftPartitionStateMachine
         
         expectedLeaders[voteTerm] = node.Endpoint;
 
+        // B2b: durably record who we voted for in this term BEFORE replying, so a crash right after the
+        // reply cannot let us grant a different candidate in the same term after restart (the double-vote
+        // that would let two leaders be elected for one term). The term persisted is voteTerm — the term we
+        // are voting in, which is >= currentTerm here.
+        await wal.PersistHardStateAsync(voteTerm, node.Endpoint).ConfigureAwait(false);
+
         logger.LogInfoSendingVote(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
 
         VoteRequest request = new(host.PartitionId, voteTerm, localMaxId, timestamp, host.LocalEndpoint);
-        
+
         host.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Vote, node, request));
     }
 
@@ -1661,6 +1724,11 @@ public sealed class RaftPartitionStateMachine
             ResetPreVoteRound();                       // break the pre-vote livelock on adoption
 
             await host.InvokeLeaderChanged(host.PartitionId, endpoint);
+
+            // B2b: adopting a new leader advances our term. Persist it (recording the leader as the term's
+            // vote target, matching expectedLeaders) so that a bare heartbeat carrying no log entries can't
+            // leave the advanced term un-durable and let it regress on restart.
+            await wal.PersistHardStateAsync(leaderTerm, endpoint).ConfigureAwait(false);
         }
 
         lastHeartbeat = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, timestamp);

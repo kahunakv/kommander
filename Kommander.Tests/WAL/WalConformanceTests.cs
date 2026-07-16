@@ -67,6 +67,38 @@ public abstract class WalConformanceTests
         finally { cleanup(); }
     }
 
+    // ──────────────────────────── B2b: Raft hard state ────────────────────────────
+
+    /// <summary>
+    /// B2b: <c>PersistHardState</c>/<c>TryGetHardState</c> must round-trip the (term, votedFor) pair on
+    /// every backend, namespace by partition, and store the two fields atomically (one metadata value).
+    /// </summary>
+    [Fact]
+    public void HardState_PersistThenRead_RoundTrips()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            Assert.False(wal.TryGetHardState(7, out _, out _)); // none written yet
+
+            Assert.True(wal.PersistHardState(7, currentTerm: 4, votedFor: "node-b:8000"));
+
+            Assert.True(wal.TryGetHardState(7, out long term, out string? votedFor));
+            Assert.Equal(4, term);
+            Assert.Equal("node-b:8000", votedFor);
+
+            // Overwrite with a higher term and no vote — both fields update together.
+            Assert.True(wal.PersistHardState(7, currentTerm: 5, votedFor: null));
+            Assert.True(wal.TryGetHardState(7, out term, out votedFor));
+            Assert.Equal(5, term);
+            Assert.Null(votedFor);
+
+            // Distinct partitions do not collide.
+            Assert.False(wal.TryGetHardState(8, out _, out _));
+        }
+        finally { cleanup(); }
+    }
+
     [Fact]
     public void Write_OverwriteExistingLog_ReadBackUpdatedTerm()
     {
