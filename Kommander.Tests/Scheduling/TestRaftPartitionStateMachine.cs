@@ -166,6 +166,49 @@ public class TestRaftPartitionStateMachine
     /// behaviour.
     /// </summary>
     /// <summary>
+    /// B2b regression: durable hard state prevents a double-vote across a restart. A follower grants its
+    /// vote to node-b in term 3 (persisted via the WAL). A fresh state machine constructed on the SAME
+    /// WAL (simulating a restart) restores that vote and must DENY a different candidate (node-c) in term
+    /// 3, while still granting the SAME candidate (node-b) idempotently. Without persisted votedFor, the
+    /// restarted node would forget its vote and could elect a second leader for term 3.
+    /// </summary>
+    [Fact]
+    public async Task VoteAsync_PersistedVote_SurvivesRestart_PreventsDoubleVote()
+    {
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+
+        // First lifetime: grant a vote to node-b for term 3.
+        FakePartitionHost host1 = new();
+        RaftPartitionStateMachine sm1 = new(host1, wal, sink, NullLogger<IRaft>.Instance);
+        await sm1.VoteAsync(new RaftNode("node-b"), voteTerm: 3, remoteMaxLogId: 0,
+            host1.HybridLogicalClock.TrySendOrLocalEvent(host1.LocalNodeId));
+        Assert.Contains(host1.EnqueuedRequests,
+            e => e.Endpoint == "node-b" && e.Request.Type == RaftResponderRequestType.Vote);
+
+        // Restart: a new state machine on the SAME WAL restores the persisted hard state.
+        FakePartitionHost host2 = new();
+        RaftPartitionStateMachine sm2 = new(host2, wal, sink, NullLogger<IRaft>.Instance);
+        await sm2.CompleteRestoreAsync([]);
+        Assert.Equal(3L, sm2.CurrentTerm); // term restored from hard state, not the empty log tail
+
+        host2.ClearObservations();
+
+        // A DIFFERENT candidate for the same term must be denied — the restored vote is remembered.
+        await sm2.VoteAsync(new RaftNode("node-c"), voteTerm: 3, remoteMaxLogId: 0,
+            host2.HybridLogicalClock.TrySendOrLocalEvent(host2.LocalNodeId));
+        Assert.DoesNotContain(host2.EnqueuedRequests,
+            e => e.Endpoint == "node-c" && e.Request.Type == RaftResponderRequestType.Vote);
+
+        // The SAME candidate is still granted (idempotent), confirming restore recorded node-b specifically.
+        host2.ClearObservations();
+        await sm2.VoteAsync(new RaftNode("node-b"), voteTerm: 3, remoteMaxLogId: 0,
+            host2.HybridLogicalClock.TrySendOrLocalEvent(host2.LocalNodeId));
+        Assert.Contains(host2.EnqueuedRequests,
+            e => e.Endpoint == "node-b" && e.Request.Type == RaftResponderRequestType.Vote);
+    }
+
+    /// <summary>
     /// B2a regression: a RequestVote carrying a term higher than ours (Raft §5.1) must make a Leader
     /// step down to Follower and adopt the new term BEFORE granting. Before the fix, the non-follower
     /// guard only rejected the SAME term, so a higher-term vote fell through and was granted while the
@@ -883,16 +926,38 @@ public class TestRaftPartitionStateMachine
     // ── ElectionTimeoutSeed tests ────────────────────────────────────────────
 
     /// <summary>
-    /// Two state machines on the same partition with the same seed must receive
-    /// identical initial election timeouts.
+    /// S4: two nodes in the SAME partition with the SAME seed but DIFFERENT node ids must receive
+    /// DIFFERENT initial election timeouts. Folding the node id into the seed is what breaks a symmetric
+    /// split vote — the previous <c>seed ^ partitionId</c> seed gave every node in a partition the
+    /// identical sequence, so they would keep retrying in lockstep and never converge (the bug this
+    /// fixes). This test previously asserted the buggy "identical timeout" invariant.
     /// </summary>
     [Fact]
-    public void ElectionTimeoutSeed_SamePartition_ProducesIdenticalTimeout()
+    public void ElectionTimeoutSeed_SamePartitionDifferentNodes_ProducesDifferentTimeouts()
     {
         const int seed = 42;
 
-        FakePartitionHost hostA = new() { PartitionId = 5, Configuration = { ElectionTimeoutSeed = seed } };
-        FakePartitionHost hostB = new() { PartitionId = 5, Configuration = { ElectionTimeoutSeed = seed } };
+        FakePartitionHost hostA = new() { PartitionId = 5, LocalNodeId = 1, Configuration = { ElectionTimeoutSeed = seed } };
+        FakePartitionHost hostB = new() { PartitionId = 5, LocalNodeId = 2, Configuration = { ElectionTimeoutSeed = seed } };
+
+        RaftPartitionStateMachine smA = new(hostA, new FakeWalFacade(), new CapturingReplySink(), NullLogger<IRaft>.Instance);
+        RaftPartitionStateMachine smB = new(hostB, new FakeWalFacade(), new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        Assert.NotEqual(smA.ElectionTimeout, smB.ElectionTimeout);
+    }
+
+    /// <summary>
+    /// S4: reproducibility is preserved per node — same seed + same partition + same node id yields the
+    /// identical timeout across constructions. The derivation is deterministic (a fixed hash-combine, not
+    /// the process-randomised <c>HashCode.Combine</c>), so seeded runs stay repeatable.
+    /// </summary>
+    [Fact]
+    public void ElectionTimeoutSeed_SameNode_IsReproducible()
+    {
+        const int seed = 42;
+
+        FakePartitionHost hostA = new() { PartitionId = 5, LocalNodeId = 7, Configuration = { ElectionTimeoutSeed = seed } };
+        FakePartitionHost hostB = new() { PartitionId = 5, LocalNodeId = 7, Configuration = { ElectionTimeoutSeed = seed } };
 
         RaftPartitionStateMachine smA = new(hostA, new FakeWalFacade(), new CapturingReplySink(), NullLogger<IRaft>.Instance);
         RaftPartitionStateMachine smB = new(hostB, new FakeWalFacade(), new CapturingReplySink(), NullLogger<IRaft>.Instance);
@@ -1219,7 +1284,7 @@ public class TestRaftPartitionStateMachine
 
         public string LocalEndpoint => "node-a";
 
-        public int LocalNodeId => 1;
+        public int LocalNodeId { get; init; } = 1;
 
         /// <summary>Defaults to Voter (pre-seed fallback). Override to test learner/non-member gating.</summary>
         public ClusterMemberRole LocalRole { get; set; } = ClusterMemberRole.Voter;
@@ -1330,6 +1395,20 @@ public class TestRaftPartitionStateMachine
         }
 
         public ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs) => ValueTask.CompletedTask;
+
+        // B2b: route hard state through the inner FakeWAL's metadata store so it survives across
+        // state-machine instances constructed on the SAME facade (simulating a restart).
+        public ValueTask PersistHardStateAsync(long currentTerm, string? votedFor)
+        {
+            ((Kommander.WAL.IWAL)wal).PersistHardState(partitionId: 1, currentTerm, votedFor);
+            return ValueTask.CompletedTask;
+        }
+
+        public ValueTask<(long CurrentTerm, string? VotedFor)?> LoadHardStateAsync() =>
+            ValueTask.FromResult(
+                ((Kommander.WAL.IWAL)wal).TryGetHardState(1, out long term, out string? votedFor)
+                    ? ((long CurrentTerm, string? VotedFor)?)(term, votedFor)
+                    : null);
 
         public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(wal.GetMaxLog(partitionId: 1));
 

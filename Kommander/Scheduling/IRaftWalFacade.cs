@@ -107,4 +107,20 @@ public interface IRaftWalFacade
     /// automatic compaction triggering.
     /// </summary>
     void NotifyCommitted();
+
+    /// <summary>
+    /// Persists this partition's Raft hard state — the current term and the endpoint we last granted our
+    /// vote to in that term. Durability rides the backend's existing WAL fsync cadence (no dedicated
+    /// fsync), so the last vote/term can be lost on power failure. The default is a no-op so non-durable
+    /// test fakes simply ignore hard state.
+    /// </summary>
+    ValueTask PersistHardStateAsync(long currentTerm, string? votedFor) => ValueTask.CompletedTask;
+
+    /// <summary>
+    /// Loads the persisted hard state, or <see langword="null"/> when none exists yet (fresh node or a
+    /// legacy WAL predating hard state), in which case the caller infers the term from the log tail. The
+    /// default returns <see langword="null"/> so fakes preserve their prior behaviour.
+    /// </summary>
+    ValueTask<(long CurrentTerm, string? VotedFor)?> LoadHardStateAsync()
+        => ValueTask.FromResult<(long CurrentTerm, string? VotedFor)?>(null);
 }

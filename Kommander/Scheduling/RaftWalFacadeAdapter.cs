@@ -50,4 +50,13 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
         wal.EnqueueProposeOrCommit(logs, timestamp, endpoint, term);
 
     public void NotifyCommitted() => wal.NotifyCommitted();
+
+    public ValueTask PersistHardStateAsync(long currentTerm, string? votedFor)
+    {
+        wal.PersistHardState(currentTerm, votedFor);
+        return ValueTask.CompletedTask;
+    }
+
+    public ValueTask<(long CurrentTerm, string? VotedFor)?> LoadHardStateAsync() =>
+        ValueTask.FromResult(wal.LoadHardState());
 }

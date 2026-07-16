@@ -121,6 +121,54 @@ public interface IWAL : IDisposable
 
     public bool SetMetaData(string key, string value);
 
+    /// <summary>
+    /// Persists per-partition Raft hard state — the current term and the endpoint this node last granted
+    /// its vote to in that term. Stored via the metadata primitive under a per-partition key because the
+    /// backend is shared across partitions.
+    /// <para><b>Durability:</b> this rides the backend's existing WAL fsync cadence rather than forcing a
+    /// dedicated fsync per call — a deliberate latency trade-off, so the very last vote/term can be lost
+    /// on power failure. Both fields are written as ONE metadata value so a crash can never tear the term
+    /// away from the vote. Default implementation works for every backend that implements
+    /// <see cref="SetMetaData"/>; no backend override is required.</para>
+    /// </summary>
+    public bool PersistHardState(int partitionId, long currentTerm, string? votedFor)
+        // Encoded as "term" (no vote) or "term\nvotedFor". The separator is omitted when there is no vote
+        // so the value never ends in a trailing '\n' — some backends (SQLite) strip trailing newlines on
+        // read, which would otherwise corrupt the round-trip. Endpoints never contain '\n'.
+        => SetMetaData(
+            $"raft_hardstate_p{partitionId}",
+            string.IsNullOrEmpty(votedFor) ? currentTerm.ToString() : $"{currentTerm}\n{votedFor}");
+
+    /// <summary>
+    /// Reads the persisted hard state for <paramref name="partitionId"/>. Returns <see langword="false"/>
+    /// when none has been written yet (fresh node, or a legacy WAL predating hard state), in which case
+    /// the caller falls back to inferring the term from the log tail. <paramref name="votedFor"/> is
+    /// <see langword="null"/> when the persisted vote is empty (term adopted without a granted vote).
+    /// </summary>
+    public bool TryGetHardState(int partitionId, out long currentTerm, out string? votedFor)
+    {
+        currentTerm = 0;
+        votedFor = null;
+
+        string? raw = GetMetaData($"raft_hardstate_p{partitionId}");
+        if (string.IsNullOrEmpty(raw))
+            return false;
+
+        int newline = raw.IndexOf('\n');
+        if (newline < 0)
+        {
+            // No separator → term only, no recorded vote (also covers backends that strip a trailing '\n').
+            return long.TryParse(raw, out currentTerm);
+        }
+
+        if (!long.TryParse(raw.AsSpan(0, newline), out currentTerm))
+            return false;
+
+        string vote = raw[(newline + 1)..];
+        votedFor = string.IsNullOrEmpty(vote) ? null : vote;
+        return true;
+    }
+
     /// <param name="compactNumberEntries">Maximum entries removed per internal delete batch.</param>
     /// <param name="maxTotalEntries">
     /// When set, removes up to this many entries in one storage transaction by issuing

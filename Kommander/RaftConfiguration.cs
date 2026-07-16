@@ -226,10 +226,13 @@ public class RaftConfiguration
     public int EndElectionTimeoutIncrement { get; set; } = 200;
 
     /// <summary>
-    /// When set, election timeouts are derived from <c>new Random(ElectionTimeoutSeed ^ partitionId)</c>
-    /// instead of <see cref="Random.Shared"/>, making leader election fully reproducible for a given
-    /// seed value. Each partition gets a distinct but deterministic random sequence so nodes converge
-    /// on a single leader without deadlocking. Leave <c>null</c> (the default) for normal randomised
+    /// When set, election timeouts are derived from a deterministic combination of this seed, the
+    /// partition id, and the <b>local node id</b> (rather than <see cref="Random.Shared"/>), making
+    /// leader election reproducible for a given seed. Mixing in the node id is essential: it gives each
+    /// node in a partition its <b>own</b> sequence, so a symmetric split vote is broken by the differing
+    /// per-node timeouts. Seeding on <c>seed ^ partitionId</c> alone would give every node in a partition
+    /// the identical sequence — they would keep retrying at the same instant and never converge, the
+    /// opposite of what randomisation is for. Leave <c>null</c> (the default) for normal randomised
     /// behaviour in production.
     /// </summary>
     public int? ElectionTimeoutSeed { get; set; }

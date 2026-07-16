@@ -788,6 +788,26 @@ public sealed class RaftWriteAhead
     }
 
     /// <summary>
+    /// Persists this partition's Raft hard state <c>(currentTerm, votedFor)</c> via the backend's metadata
+    /// store, namespaced by partition. Durability rides the backend's existing WAL fsync cadence (no
+    /// dedicated fsync) per the chosen lighter guarantee, so the very last write can be lost on power
+    /// failure. The metadata call is a fast, internally-synchronized in-process write, so it runs inline on
+    /// the partition executor rather than through the I/O scheduler.
+    /// </summary>
+    public void PersistHardState(long currentTerm, string? votedFor) =>
+        walAdapter.PersistHardState(partition.PartitionId, currentTerm, votedFor);
+
+    /// <summary>
+    /// Reads this partition's persisted hard state, or <see langword="null"/> when none has been written
+    /// yet (fresh node or legacy WAL). Used on restore to seed <c>currentTerm</c> and the vote record
+    /// instead of inferring the term from the log tail.
+    /// </summary>
+    public (long CurrentTerm, string? VotedFor)? LoadHardState() =>
+        walAdapter.TryGetHardState(partition.PartitionId, out long term, out string? votedFor)
+            ? (term, votedFor)
+            : null;
+
+    /// <summary>
     /// Processes a list of Raft log entries by proposing or committing them based on their type and ID.
     /// This method validates the logs, ensures ordering, handles outdated logs, and performs necessary actions
     /// such as proposing, committing, or skipping logs as required. This is typically used by replica nodes.
