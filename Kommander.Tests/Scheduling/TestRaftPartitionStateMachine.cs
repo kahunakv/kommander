@@ -634,6 +634,92 @@ public class TestRaftPartitionStateMachine
     }
 
     /// <summary>
+    /// B1 regression: a follower that just processed a leader heartbeat must DENY a challenger's
+    /// pre-vote, because it still considers that leader fresh. Before the fix the freshness guard read
+    /// the leader-side <c>lastActivity</c> table, which a follower never populates (it is written only
+    /// when a leader receives a follower ack), so the lookup was always Zero, the guard never fired,
+    /// and the follower granted the pre-vote — defeating pre-vote for exactly the asymmetric-partition
+    /// case it exists to handle. The fix reads the local <c>lastHeartbeat</c> field instead.
+    /// </summary>
+    [Fact]
+    public async Task VoteAsync_PreVote_DeniedWhenLeaderHeartbeatIsFresh()
+    {
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [new("node-b"), new("node-c")]
+        };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        // node-b is the leader for term 1; process its heartbeat so lastHeartbeat is fresh and
+        // expectedLeaders[1] == "node-b".
+        await sm.AppendLogsAsync("node-b", term: 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);
+        Assert.Equal("node-b", host.Leader);
+        Assert.Equal(1L, sm.CurrentTerm);
+
+        host.ClearObservations();
+
+        // node-c challenges with a pre-vote for the next term while the leader is still fresh.
+        await sm.VoteAsync(
+            new RaftNode("node-c"),
+            voteTerm: 2,
+            remoteMaxLogId: 0,
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            preVote: true);
+
+        // The pre-vote must be denied (no Vote reply), and — being side-effect-free — must not have
+        // mutated term or role.
+        Assert.DoesNotContain(host.EnqueuedRequests, e => e.Request.Type == RaftResponderRequestType.Vote);
+        Assert.Equal(1L, sm.CurrentTerm);
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+    }
+
+    /// <summary>
+    /// B1 (quiesced branch): a quiesced follower suppresses heartbeats by design, so
+    /// <c>lastHeartbeat</c> is not a valid freshness signal. It must defer to SWIM — deny a
+    /// challenger's pre-vote while the expected leader is Alive, and allow it once the leader becomes
+    /// Suspect/Dead. Mirrors the quiesced Follower case of the election trigger.
+    /// </summary>
+    [Fact]
+    public async Task VoteAsync_PreVote_QuiescedFollower_DefersToSwimLiveness()
+    {
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [new("node-b"), new("node-c")]
+        };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        // Quiesced follower whose expected leader (for the current term 0) is node-b.
+        sm.SetQuiescedForTesting(true, leaderEndpoint: "node-b", term: 0);
+        host.LivenessTable.MarkAlive("node-b", incarnation: 1);
+
+        // Leader Alive in SWIM → deny the challenger's pre-vote.
+        await sm.VoteAsync(
+            new RaftNode("node-c"),
+            voteTerm: 1,
+            remoteMaxLogId: 0,
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            preVote: true);
+        Assert.DoesNotContain(host.EnqueuedRequests, e => e.Request.Type == RaftResponderRequestType.Vote);
+
+        // Leader now Suspect in SWIM → the pre-vote is granted.
+        host.ClearObservations();
+        host.LivenessTable.MarkSuspect("node-b");
+
+        await sm.VoteAsync(
+            new RaftNode("node-c"),
+            voteTerm: 1,
+            remoteMaxLogId: 0,
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            preVote: true);
+        Assert.Contains(host.EnqueuedRequests, e =>
+            e.Request.Type == RaftResponderRequestType.Vote && e.Request.VoteRequest!.PreVote);
+    }
+
+    /// <summary>
     /// Reaching a pre-vote quorum (self-grant + one peer in a 3-node cluster) promotes to exactly
     /// one real election: the term increments once, the node becomes Candidate, real (non-pre-vote)
     /// RequestVotes go out, and the pre-vote round is reset so further pre-grants are ignored.

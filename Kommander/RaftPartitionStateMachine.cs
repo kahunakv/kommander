@@ -1344,14 +1344,38 @@ public sealed class RaftPartitionStateMachine
                 return;
             }
 
-            // Deny if we still consider a current leader fresh — i.e. we ourselves would not be
-            // willing to start an election right now. Mirrors the StartElectionAsync guard.
+            // Deny if we ourselves would not start an election right now: a pre-vote grant must be
+            // consistent with our own willingness to campaign, so this mirrors the Follower cases of
+            // the CheckPartitionLeadershipAsync election trigger. Both decisions rely only on LOCAL
+            // signals — the private `lastHeartbeat` field (refreshed on every accepted AppendLogs from
+            // our leader) and the SWIM failure detector.
+            //
+            // It deliberately does NOT consult host.GetLastNodeActivity: that table is written only on
+            // the leader side (CompleteAppendLogsAsync, when a leader receives a follower's ack). A
+            // follower never populates the expected leader's entry, so the lookup was always Zero and
+            // this freshness gate never fired — a follower with a perfectly fresh heartbeat still
+            // granted a challenger's pre-vote, defeating pre-vote for the asymmetric-partition case it
+            // exists to handle.
             string preVoteExpectedLeader = expectedLeaders.GetValueOrDefault(currentTerm, "");
             if (!string.IsNullOrEmpty(preVoteExpectedLeader))
             {
-                HLCTimestamp lastKnownHeartbeat = host.GetLastNodeActivity(preVoteExpectedLeader, host.PartitionId);
-                if (lastKnownHeartbeat != HLCTimestamp.Zero && ((timestamp - lastKnownHeartbeat) < electionTimeout))
+                if (quiesced && host.Configuration.EnableQuiescence)
                 {
+                    // Quiesced: the leader suppresses heartbeats by design, so `lastHeartbeat` goes
+                    // stale and is not a valid freshness signal. Defer to SWIM exactly as the quiesced
+                    // Follower election case does — while the expected leader is Alive, don't help a
+                    // challenger unseat it.
+                    if (host.GetNodeLiveness(preVoteExpectedLeader) == MemberLivenessState.Alive)
+                    {
+                        logger.LogDebugDenyingPreVoteLeaderFresh(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm, preVoteExpectedLeader);
+                        return;
+                    }
+                }
+                else if (lastHeartbeat != HLCTimestamp.Zero && ((timestamp - lastHeartbeat) < electionTimeout))
+                {
+                    // Not quiesced: a recent heartbeat from our leader means it is still live to us.
+                    // (The `timestamp - lastHeartbeat` subtraction inherits the HLC cross-node skew
+                    // sensitivity tracked separately as B3; the data source is now correct.)
                     logger.LogDebugDenyingPreVoteLeaderFresh(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm, preVoteExpectedLeader);
                     return;
                 }
