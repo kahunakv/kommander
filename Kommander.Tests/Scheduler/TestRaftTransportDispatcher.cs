@@ -174,7 +174,7 @@ public sealed class TestRaftTransportDispatcher
     private static RaftResponderRequest MakeVote(string ep, long term = 0) =>
         new(RaftResponderRequestType.Vote,
             Node(ep),
-            new VoteRequest(0, term, 0, HLCTimestamp.Zero, ep));
+            new VoteRequest(0, term, 0, 0, HLCTimestamp.Zero, ep));
 
     private static RaftResponderRequest MakeAppendLogs(string ep, long term) =>
         new(RaftResponderRequestType.AppendLogs,
@@ -189,7 +189,7 @@ public sealed class TestRaftTransportDispatcher
     private static RaftResponderRequest MakeRequestVotes(string ep) =>
         new(RaftResponderRequestType.RequestVotes,
             Node(ep),
-            new RequestVotesRequest(0, 0, 0, HLCTimestamp.Zero, ep));
+            new RequestVotesRequest(0, 0, 0, 0, HLCTimestamp.Zero, ep));
 
     private static RaftResponderRequest MakeCompleteAppendLogs(string ep) =>
         new(RaftResponderRequestType.CompleteAppendLogs,

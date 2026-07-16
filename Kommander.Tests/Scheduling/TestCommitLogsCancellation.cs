@@ -202,7 +202,7 @@ public class TestCommitLogsCancellation
             cts.Token);
 
         // Must complete within a tight deadline — no unbounded executor wait.
-        await Task.WhenAny(task, Task.Delay(500));
+        await Task.WhenAny(task, Task.Delay(500, TestContext.Current.CancellationToken));
 
         Assert.True(task.IsCompleted, "Ask should have completed promptly on a pre-cancelled token");
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => task);
@@ -224,7 +224,7 @@ public class TestCommitLogsCancellation
             new RaftRequest(RaftRequestType.RollbackLogs, HLCTimestamp.Zero, false),
             cts.Token);
 
-        await Task.WhenAny(task, Task.Delay(500));
+        await Task.WhenAny(task, Task.Delay(500, TestContext.Current.CancellationToken));
 
         Assert.True(task.IsCompleted, "Ask should have completed promptly on a pre-cancelled token");
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => task);

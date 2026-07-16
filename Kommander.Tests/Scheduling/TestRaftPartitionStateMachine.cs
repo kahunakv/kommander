@@ -1160,6 +1160,151 @@ public class TestRaftPartitionStateMachine
             r => r.Endpoint == "node-b" && r.Type == RaftResponderRequestType.Vote);
     }
 
+    // ── B5: lexicographic (lastLogTerm, lastLogIndex) freshness — Raft §5.4.1 ─────────────
+
+    private static List<RaftLog> Tail(params (long Id, long Term)[] entries) =>
+        [.. entries.Select(e => new RaftLog { Id = e.Id, Term = e.Term, Type = RaftLogType.Committed })];
+
+    /// <summary>
+    /// B5: a real-vote candidate advertising a HIGHER last-log index but an OLDER last-log term must be
+    /// denied — §5.4.1 compares term first, then index. The pre-B5 index-only check granted this, which
+    /// could elect a leader missing committed entries (a Leader-Completeness violation).
+    /// </summary>
+    [Fact]
+    public async Task VoteAsync_RealVote_HigherIndexButStaleLastTerm_IsDenied()
+    {
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [new("node-b")],
+            VoterEndpoints = ["node-a", "node-b"]
+        };
+        // Local tail: short but high-term — last entry (Id=3, Term=5).
+        FakeWalFacade wal = new() { SeedLogs = Tail((1, 5), (2, 5), (3, 5)) };
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.CompleteRestoreAsync(await sm.StartRestoreAsync());
+        host.ClearObservations();
+
+        // Candidate: long but stale — index 10 > 3, yet last term 4 < 5.
+        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 6, remoteMaxLogId: 10,
+            timestamp: host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            preVote: false, remoteLastLogTerm: 4);
+
+        Assert.DoesNotContain(host.EnqueuedRequests, e => e.Request.Type == RaftResponderRequestType.Vote);
+    }
+
+    /// <summary>
+    /// B5: with an EQUAL last-log term the higher index wins the freshness tie, so the candidate is
+    /// granted. The grant reply advertises our own last-log term for wire symmetry.
+    /// </summary>
+    [Fact]
+    public async Task VoteAsync_RealVote_EqualLastTermHigherIndex_IsGranted()
+    {
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [new("node-b")],
+            VoterEndpoints = ["node-a", "node-b"]
+        };
+        FakeWalFacade wal = new() { SeedLogs = Tail((1, 5), (2, 5), (3, 5)) };
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.CompleteRestoreAsync(await sm.StartRestoreAsync());
+        host.ClearObservations();
+
+        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 6, remoteMaxLogId: 10,
+            timestamp: host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            preVote: false, remoteLastLogTerm: 5);
+
+        (string Endpoint, RaftResponderRequest Request) grant = Assert.Single(
+            host.EnqueuedRequests.Where(e => e.Request.Type == RaftResponderRequestType.Vote));
+        Assert.Equal("node-b", grant.Endpoint);
+        Assert.False(grant.Request.VoteRequest!.PreVote);
+        Assert.Equal(5, grant.Request.VoteRequest!.LastLogTerm);
+    }
+
+    /// <summary>
+    /// B5 wire compatibility: a candidate that omits the last-log term (peer predating the field →
+    /// <c>remoteLastLogTerm == 0</c>) is compared index-only, exactly the pre-B5 behavior. Here the
+    /// legacy candidate is ahead on index and is granted.
+    /// </summary>
+    [Fact]
+    public async Task VoteAsync_RealVote_MissingLastLogTerm_AheadOnIndex_IsGranted()
+    {
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [new("node-b")],
+            VoterEndpoints = ["node-a", "node-b"]
+        };
+        FakeWalFacade wal = new() { SeedLogs = Tail((1, 5), (2, 5), (3, 5)) };
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.CompleteRestoreAsync(await sm.StartRestoreAsync());
+        host.ClearObservations();
+
+        // remoteLastLogTerm omitted (0), index 10 > local 3 → index-only fallback grants.
+        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 6, remoteMaxLogId: 10,
+            timestamp: host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            preVote: false, remoteLastLogTerm: 0);
+
+        Assert.Contains(host.EnqueuedRequests, e => e.Endpoint == "node-b" && e.Request.Type == RaftResponderRequestType.Vote);
+    }
+
+    /// <summary>
+    /// B5 wire compatibility: a legacy candidate (omitted last-log term) that is BEHIND on index is still
+    /// denied under the index-only fallback — the fallback must not blindly grant.
+    /// </summary>
+    [Fact]
+    public async Task VoteAsync_RealVote_MissingLastLogTerm_BehindOnIndex_IsDenied()
+    {
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [new("node-b")],
+            VoterEndpoints = ["node-a", "node-b"]
+        };
+        FakeWalFacade wal = new() { SeedLogs = Tail((1, 5), (2, 5), (3, 5)) };
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.CompleteRestoreAsync(await sm.StartRestoreAsync());
+        host.ClearObservations();
+
+        // remoteLastLogTerm omitted (0), index 2 < local 3 → index-only fallback denies.
+        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 6, remoteMaxLogId: 2,
+            timestamp: host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            preVote: false, remoteLastLogTerm: 0);
+
+        Assert.DoesNotContain(host.EnqueuedRequests, e => e.Request.Type == RaftResponderRequestType.Vote);
+    }
+
+    /// <summary>
+    /// B5: the same lexicographic rule governs the pre-vote probe — a candidate with a higher index but a
+    /// stale last term is not electable, so its pre-vote is denied (no grant reply).
+    /// </summary>
+    [Fact]
+    public async Task VoteAsync_PreVote_HigherIndexButStaleLastTerm_IsDenied()
+    {
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [new("node-b")],
+            VoterEndpoints = ["node-a", "node-b"]
+        };
+        FakeWalFacade wal = new() { SeedLogs = Tail((1, 5), (2, 5), (3, 5)) };
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.CompleteRestoreAsync(await sm.StartRestoreAsync());
+        host.ClearObservations();
+
+        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 6, remoteMaxLogId: 10,
+            timestamp: host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            preVote: true, remoteLastLogTerm: 4);
+
+        Assert.DoesNotContain(host.EnqueuedRequests, e => e.Request.Type == RaftResponderRequestType.Vote);
+    }
+
     [Fact]
     public async Task VoteAsync_NoRoster_TreatsAllEndpointsAsVoters()
     {
@@ -1384,13 +1529,23 @@ public class TestRaftPartitionStateMachine
     {
         private readonly FakeWAL wal = new();
 
+        /// <summary>
+        /// Optional custom log tail seeded by restore. When null a single (Id=1, Term=1) entry is
+        /// seeded (the historical default). B5 freshness tests set this to control the local node's
+        /// last-log (Id, Term) pair independently — e.g. a short high-term tail versus a long low-term
+        /// tail — to exercise the lexicographic §5.4.1 comparison.
+        /// </summary>
+        public List<RaftLog>? SeedLogs { get; init; }
+
         public void Dispose() => wal.Dispose();
 
         public ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync()
         {
-            wal.Write([(1, [new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed }])]);
+            IReadOnlyList<RaftLog> logs = SeedLogs is { } seed
+                ? seed
+                : [new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed }];
+            wal.Write([(1, [.. logs])]);
             wal.DrainAll();
-            IReadOnlyList<RaftLog> logs = [new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed }];
             return ValueTask.FromResult(logs);
         }
 

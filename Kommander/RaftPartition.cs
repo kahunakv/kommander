@@ -245,7 +245,8 @@ public sealed class RaftPartition : IDisposable
             request.MaxLogId,
             request.Time,
             request.Endpoint,
-            preVote: request.PreVote
+            preVote: request.PreVote,
+            lastLogTerm: request.LastLogTerm
         ));
     }
 
@@ -261,7 +262,8 @@ public sealed class RaftPartition : IDisposable
             request.MaxLogId,
             request.Time,
             request.Endpoint,
-            preVote: request.PreVote
+            preVote: request.PreVote,
+            lastLogTerm: request.LastLogTerm
         ));
     }
 

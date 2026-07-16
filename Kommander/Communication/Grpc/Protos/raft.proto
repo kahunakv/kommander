@@ -39,6 +39,8 @@ message GrpcVoteRequest {
     uint32 TimeCounter = 6;
     string Endpoint = 7;
     bool PreVote = 8;
+    // Term of the granter's last log entry (§5.4.1 freshness key). 0 from peers predating this field.
+    int64 LastLogTerm = 9;
 }
 
 message GrpcVoteResponse {
@@ -54,6 +56,8 @@ message GrpcRequestVotesRequest {
     uint32 TimeCounter = 6;
     string Endpoint = 7;
     bool PreVote = 8;
+    // Term of the candidate's last log entry (§5.4.1 freshness key). 0 from peers predating this field.
+    int64 LastLogTerm = 9;
 }
 
 message GrpcRequestVotesResponse {

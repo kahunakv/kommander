@@ -54,4 +54,49 @@ public class TestPreVoteWireRoundTrip
 
         Assert.False(parsed.PreVote);
     }
+
+    // ── B5: the §5.4.1 last-log term must survive the wire, and an un-upgraded peer that never
+    //        writes field 9 must deserialize as 0 (→ voter falls back to index-only comparison). ──
+
+    [Fact]
+    public void GrpcRequestVotesRequest_LastLogTerm_SurvivesRoundTrip()
+    {
+        GrpcRequestVotesRequest original = new() { Partition = 1, Term = 7, MaxLogId = 42, LastLogTerm = 5, Endpoint = "node-a" };
+
+        GrpcRequestVotesRequest parsed = GrpcRequestVotesRequest.Parser.ParseFrom(original.ToByteArray());
+
+        Assert.Equal(5, parsed.LastLogTerm);
+        Assert.Equal(42, parsed.MaxLogId);
+    }
+
+    [Fact]
+    public void GrpcRequestVotesRequest_UnsetLastLogTerm_DefaultsToZero()
+    {
+        // Simulates an un-upgraded peer that never wrote field 9.
+        GrpcRequestVotesRequest original = new() { Partition = 1, Term = 7, MaxLogId = 42, Endpoint = "node-a" };
+
+        GrpcRequestVotesRequest parsed = GrpcRequestVotesRequest.Parser.ParseFrom(original.ToByteArray());
+
+        Assert.Equal(0, parsed.LastLogTerm);
+    }
+
+    [Fact]
+    public void GrpcVoteRequest_LastLogTerm_SurvivesRoundTrip()
+    {
+        GrpcVoteRequest original = new() { Partition = 1, Term = 7, MaxLogId = 42, LastLogTerm = 5, Endpoint = "node-a" };
+
+        GrpcVoteRequest parsed = GrpcVoteRequest.Parser.ParseFrom(original.ToByteArray());
+
+        Assert.Equal(5, parsed.LastLogTerm);
+    }
+
+    [Fact]
+    public void GrpcVoteRequest_UnsetLastLogTerm_DefaultsToZero()
+    {
+        GrpcVoteRequest original = new() { Partition = 1, Term = 7, MaxLogId = 42, Endpoint = "node-a" };
+
+        GrpcVoteRequest parsed = GrpcVoteRequest.Parser.ParseFrom(original.ToByteArray());
+
+        Assert.Equal(0, parsed.LastLogTerm);
+    }
 }
