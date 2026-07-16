@@ -356,27 +356,43 @@ public sealed class TestThreeNodeCluster
     [Fact]
     public async Task TransferLeadershipAsync_StaleTarget_ReturnsReplicationFailed()
     {
+        // Seed a QUORUM (node1 + node2) with committed entries, leaving node3 empty. The quorum makes
+        // one of the seeded nodes deterministically win the election — node3 alone can never assemble a
+        // majority. Seeding only ONE node is unsafe as a test setup now that the stale-handshake
+        // election veto has been removed (B4): the two empty nodes could grant each other votes and
+        // elect a data-less leader. That state is impossible in real operation (committed ⇒ replicated
+        // to a quorum, so at most one node can be behind), which is exactly what the quorum seed models.
+        List<RaftLog> seededCommitted =
+        [
+            new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed },
+            new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed },
+        ];
+
         (IRaft node1, IRaft node2, IRaft node3) = await AssembleThreNodeCluster(
             "memory",
             1,
-            (wal1, _, _) => SeedWal(
-                wal1,
-                1,
-                [
-                    new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed },
-                    new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed },
-                ]));
+            (wal1, wal2, _) =>
+            {
+                SeedWal(wal1, 1, seededCommitted);
+                SeedWal(wal2, 1, seededCommitted);
+            });
+
+        IRaft[] nodes = [node1, node2, node3];
 
         string stableLeader = await node1.WaitForLeaderStableAsync(
             1,
             TimeSpan.FromMilliseconds(150),
             TestContext.Current.CancellationToken);
 
-        Assert.Equal(node1.GetLocalEndpoint(), stableLeader);
+        // The leader is one of the seeded quorum nodes — never the empty node3.
+        Assert.NotEqual(node3.GetLocalEndpoint(), stableLeader);
 
-        RaftOperationStatus transferStatus = await node1.TransferLeadershipAsync(
+        IRaft leaderNode = GetNodeByEndpoint(nodes, stableLeader);
+
+        // node3 is behind the leader's committed log, so transferring leadership to it must be rejected.
+        RaftOperationStatus transferStatus = await leaderNode.TransferLeadershipAsync(
             1,
-            node2.GetLocalEndpoint(),
+            node3.GetLocalEndpoint(),
             TestContext.Current.CancellationToken);
 
         Assert.Equal(RaftOperationStatus.ReplicationFailed, transferStatus);

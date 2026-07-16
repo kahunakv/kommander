@@ -296,8 +296,21 @@ public class TestTwoNodeCluster
         await node2.LeaveCluster(true, CancellationToken.None);
     }
 
+    /// <summary>
+    /// B4 + B2a regression (integration): a stale node forcing an election is no longer globally vetoed
+    /// (B4 removed the <c>AmIOutdatedAsync</c> veto that used to return <c>ReplicationFailed</c>), yet it
+    /// still cannot win. node2 (empty WAL) forces an election and sends a higher-term RequestVote; node1
+    /// (complete log) steps down and adopts the term (B2a §5.1) but denies the vote on log-freshness, then
+    /// re-wins at the next term because node2's log is behind. node2 therefore learns node1 is the leader
+    /// and the force resolves to <c>LeaderAlreadyElected</c>.
+    ///
+    /// <para>Before B2a this scenario livelocked: node1 denied node2 WITHOUT stepping down, so node1 kept
+    /// heartbeating at its old term while node2 sat as a higher-term candidate rejecting those
+    /// heartbeats, and the force never resolved (<c>Pending</c>). B2a's step-down is what lets the cluster
+    /// converge back onto node1.</para>
+    /// </summary>
     [Fact]
-    public async Task ForceLeaderForTestingAsync_StaleNode_ReturnsReplicationFailed()
+    public async Task ForceLeaderForTestingAsync_StaleNode_NotVetoed_ButCannotWin()
     {
         InMemoryCommunication communication = new();
 
@@ -319,11 +332,21 @@ public class TestTwoNodeCluster
 
         Assert.Equal(node1.GetLocalEndpoint(), stableLeader);
 
+        // The force is accepted (not vetoed), but the stale node cannot win: node1 reclaims leadership
+        // and node2 observes it, so the force resolves to LeaderAlreadyElected (never Success/ReplicationFailed).
         RaftOperationStatus forceStatus = await node2.ForceLeaderForTestingAsync(
             UserPartition,
             TestContext.Current.CancellationToken);
 
-        Assert.Equal(RaftOperationStatus.ReplicationFailed, forceStatus);
+        Assert.Equal(RaftOperationStatus.LeaderAlreadyElected, forceStatus);
+
+        // node1 is the stable leader again.
+        string leaderAfterForce = await node1.WaitForLeaderStableAsync(
+            UserPartition,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(node1.GetLocalEndpoint(), leaderAfterForce);
 
         await node1.LeaveCluster(true, CancellationToken.None);
         await node2.LeaveCluster(true, CancellationToken.None);

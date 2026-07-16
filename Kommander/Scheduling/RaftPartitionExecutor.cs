@@ -850,7 +850,8 @@ public sealed class RaftPartitionExecutor : IDisposable
                         request.Endpoint ?? "",
                         request.Timestamp,
                         request.Status,
-                        request.CommitIndex
+                        request.CommitIndex,
+                        request.Term
                     ).ConfigureAwait(false);
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
                     break;
