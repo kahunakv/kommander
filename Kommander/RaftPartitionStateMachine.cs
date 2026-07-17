@@ -110,6 +110,17 @@ public sealed class RaftPartitionStateMachine
     private HLCTimestamp lastHeartbeat = HLCTimestamp.Zero;
     private HLCTimestamp lastVotation = HLCTimestamp.Zero;
     private HLCTimestamp votingStartedAt = HLCTimestamp.Zero;
+
+    // B3: monotonic local-clock shadows of the HLC duration anchors above. Every elapsed-time GATE
+    // (follower election timeout, leader heartbeat interval, voting timeout, quiesce-after, votation
+    // back-off, the pre-vote "is our leader still fresh" check) measures against these ticks instead of
+    // subtracting HLC timestamps — HLC subtraction is frozen by a remote peer's clock skew and stalls
+    // elections. The HLC fields are retained ONLY where a timestamp is stamped onto the wire / WAL for
+    // ordering. A value of 0 means "unset" (mirrors HLCTimestamp.Zero); Stopwatch.GetTimestamp never
+    // returns 0 in practice, so the sentinel is unambiguous.
+    private long lastHeartbeatTicks;
+    private long lastVotationTicks;
+    private long votingStartedTicks;
     private TimeSpan electionTimeout;
     private bool heartbeatsSuspendedForTesting;
     private bool restored;
@@ -138,6 +149,13 @@ public sealed class RaftPartitionStateMachine
     /// the leader sends a quiesce marker and stops heartbeating.
     /// </summary>
     private HLCTimestamp lastProposalAt;
+
+    /// <summary>
+    /// B3: monotonic-tick shadow of <see cref="lastProposalAt"/> used by the quiesce-after GATE, so an
+    /// idle leader quiesces after a true local elapsed interval rather than one distorted by peer skew.
+    /// 0 until the first proposal after winning election.
+    /// </summary>
+    private long lastProposalAtTicks;
 
 
     /// <summary>
@@ -289,6 +307,7 @@ public sealed class RaftPartitionStateMachine
     public ValueTask<IReadOnlyList<RaftLog>> StartRestoreAsync()
     {
         lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        lastHeartbeatTicks = host.GetMonotonicTimestamp();
         return wal.LoadRestoreLogsAsync();
     }
 
@@ -369,6 +388,7 @@ public sealed class RaftPartitionStateMachine
     public async Task CheckPartitionLeadershipAsync()
     {
         HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        long nowTicks = host.GetMonotonicTimestamp();
 
         switch (nodeState)
         {
@@ -378,7 +398,9 @@ public sealed class RaftPartitionStateMachine
                 if (quiesced)
                     return;
 
-                if (currentTime != HLCTimestamp.Zero && ((currentTime - lastHeartbeat) >= host.Configuration.HeartbeatInterval))
+                // B3: heartbeat cadence measured on the monotonic clock — a heartbeat received from a
+                // skewed peer must not inflate the interval and suppress our own heartbeats.
+                if (currentTime != HLCTimestamp.Zero && (MonotonicElapsed(lastHeartbeatTicks, nowTicks) >= host.Configuration.HeartbeatInterval))
                 {
                     // When quiescence is on and the partition has been idle longer than QuiesceAfter,
                     // send a quiesce marker to followers and stop heartbeating.  Followers switch to
@@ -386,11 +408,12 @@ public sealed class RaftPartitionStateMachine
                     if (host.Configuration.EnableQuiescence
                         && !quiesced
                         && activeProposals.Count == 0
-                        && lastProposalAt != HLCTimestamp.Zero
-                        && (currentTime - lastProposalAt) >= host.Configuration.QuiesceAfter)
+                        && lastProposalAtTicks != 0
+                        && (MonotonicElapsed(lastProposalAtTicks, nowTicks) >= host.Configuration.QuiesceAfter))
                     {
                         SetQuiesced(true);
                         lastHeartbeat = currentTime;
+                        lastHeartbeatTicks = nowTicks;
                         SendQuiesceMarker(currentTime);
                     }
                     else
@@ -401,18 +424,20 @@ public sealed class RaftPartitionStateMachine
 
                 return;
             }
-            
+
             // Wait Configuration.VotingTimeout seconds after the voting process starts to check if a quorum is available
-            case RaftNodeState.Candidate when votingStartedAt != HLCTimestamp.Zero && (currentTime - votingStartedAt) < host.Configuration.VotingTimeout:
+            case RaftNodeState.Candidate when votingStartedTicks != 0 && MonotonicElapsed(votingStartedTicks, nowTicks) < host.Configuration.VotingTimeout:
                 return;
-            
+
             case RaftNodeState.Candidate:
-                
-                logger.LogInfoVotingConcluded(host.LocalEndpoint, host.PartitionId, nodeState, (currentTime - votingStartedAt).TotalMilliseconds);
-            
+
+                double votingElapsedMs = MonotonicElapsed(votingStartedTicks, nowTicks).TotalMilliseconds;
+                logger.LogInfoVotingConcluded(host.LocalEndpoint, host.PartitionId, nodeState, votingElapsedMs);
+
                 nodeState = RaftNodeState.Follower;
                 host.Leader = "";
                 lastHeartbeat = currentTime;
+                lastHeartbeatTicks = nowTicks;
                 // Pick a fresh random timeout in the full [StartElectionTimeout, EndElectionTimeout)
                 // range rather than capping an incremented value. Incremental backoff converges
                 // both nodes to EndElectionTimeout after just one or two failed elections, causing
@@ -427,6 +452,7 @@ public sealed class RaftPartitionStateMachine
                 FailAllActiveProposalWaiters();
                 activeProposals.Clear();
                 lastProposalAt = HLCTimestamp.Zero;
+                lastProposalAtTicks = 0;
                 SetQuiesced(false);
                 ResetPreVoteRound();
 
@@ -447,8 +473,10 @@ public sealed class RaftPartitionStateMachine
                 break;
             }
 
-            // if node is follower and leader is not sending hearthbeats, start an election
-            case RaftNodeState.Follower when (lastHeartbeat != HLCTimestamp.Zero && ((currentTime - lastHeartbeat) < electionTimeout)):
+            // if node is follower and leader is not sending hearthbeats, start an election.
+            // B3: elapsed-since-last-contact is measured on the monotonic clock, so a leader whose HLC
+            // ran ahead of ours cannot freeze this gate and delay failover for the length of the skew.
+            case RaftNodeState.Follower when (lastHeartbeatTicks != 0 && (MonotonicElapsed(lastHeartbeatTicks, nowTicks) < electionTimeout)):
                 return;
 
             case RaftNodeState.Follower:
@@ -474,11 +502,16 @@ public sealed class RaftPartitionStateMachine
         HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         RaftNode? stepDownTarget = SelectStepDownTarget();
 
+        long nowTicks = host.GetMonotonicTimestamp();
+
         nodeState = RaftNodeState.Follower;
         host.Leader = "";
         lastHeartbeat = currentTime;
         lastVotation = currentTime;
+        lastHeartbeatTicks = nowTicks;
+        lastVotationTicks = nowTicks;
         votingStartedAt = HLCTimestamp.Zero;
+        votingStartedTicks = 0;
         expectedLeaders.Clear();
         lastCommitIndexes.Clear();
         nextIndex.Clear();
@@ -487,6 +520,7 @@ public sealed class RaftPartitionStateMachine
         FailAllActiveProposalWaiters();
         activeProposals.Clear();
         lastProposalAt = HLCTimestamp.Zero;
+        lastProposalAtTicks = 0;
         SetQuiesced(false);
 
         await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
@@ -538,13 +572,17 @@ public sealed class RaftPartitionStateMachine
         }
 
         HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        long nowTicks = host.GetMonotonicTimestamp();
         long targetTerm = currentTerm + 1;
 
         nodeState = RaftNodeState.Follower;
         host.Leader = "";
         lastHeartbeat = currentTime;
         lastVotation = currentTime;
+        lastHeartbeatTicks = nowTicks;
+        lastVotationTicks = nowTicks;
         votingStartedAt = HLCTimestamp.Zero;
+        votingStartedTicks = 0;
         expectedLeaders.Clear();
         expectedLeaders[targetTerm] = targetEndpoint;
         lastCommitIndexes.Clear();
@@ -619,11 +657,14 @@ public sealed class RaftPartitionStateMachine
     private HLCTimestamp BecomeLeader()
     {
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        long nowTicks = host.GetMonotonicTimestamp();
         nodeState = RaftNodeState.Leader;
         localCommittedIndex = wal.GetCommitIndex();
         host.Leader = host.LocalEndpoint;
         lastHeartbeat = ts;
         lastProposalAt = ts;
+        lastHeartbeatTicks = nowTicks;
+        lastProposalAtTicks = nowTicks;
         SetQuiesced(false);
         return ts;
     }
@@ -679,11 +720,14 @@ public sealed class RaftPartitionStateMachine
     private async Task<HLCTimestamp> BecomeLeaderAsync()
     {
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        long nowTicks = host.GetMonotonicTimestamp();
         nodeState = RaftNodeState.Leader;
         long commitFrontier = wal.GetCommitIndex();
         localCommittedIndex = commitFrontier;
         lastHeartbeat = ts;
         lastProposalAt = ts;
+        lastHeartbeatTicks = nowTicks;
+        lastProposalAtTicks = nowTicks;
         SetQuiesced(false);
 
         try
@@ -862,7 +906,11 @@ public sealed class RaftPartitionStateMachine
     /// Resets <see cref="lastProposalAt"/> to <see cref="HLCTimestamp.Zero"/>.  Test-only;
     /// used to assert that the quiesce guard correctly blocks when no proposal history exists.
     /// </summary>
-    public void ClearLastProposalAtForTesting() => lastProposalAt = HLCTimestamp.Zero;
+    public void ClearLastProposalAtForTesting()
+    {
+        lastProposalAt = HLCTimestamp.Zero;
+        lastProposalAtTicks = 0;
+    }
 
     private RaftNode? SelectStepDownTarget()
     {
@@ -905,6 +953,7 @@ public sealed class RaftPartitionStateMachine
         host.Leader = "";
         currentTerm = Math.Max(currentTerm, request.Term);
         votingStartedAt = HLCTimestamp.Zero;
+        votingStartedTicks = 0;
         expectedLeaders.Clear();
         lastCommitIndexes.Clear();
         nextIndex.Clear();
@@ -912,6 +961,7 @@ public sealed class RaftPartitionStateMachine
         localCommittedIndex = -1;
         activeProposals.Clear();
         lastHeartbeat = HLCTimestamp.Zero;
+        lastHeartbeatTicks = 0;
 
         await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
         await StartElectionAsync(currentTime, ignoreRecentVoteCooldown: true).ConfigureAwait(false);
@@ -934,6 +984,7 @@ public sealed class RaftPartitionStateMachine
         host.Leader = "";
         currentTerm = Math.Max(currentTerm, request.Term);
         votingStartedAt = HLCTimestamp.Zero;
+        votingStartedTicks = 0;
         expectedLeaders.Clear();
         lastCommitIndexes.Clear();
         nextIndex.Clear();
@@ -942,6 +993,7 @@ public sealed class RaftPartitionStateMachine
         FailAllActiveProposalWaiters();
         activeProposals.Clear();
         lastHeartbeat = HLCTimestamp.Zero;
+        lastHeartbeatTicks = 0;
 
         await StartElectionAsync(currentTime, ignoreRecentVoteCooldown: true).ConfigureAwait(false);
     }
@@ -964,10 +1016,14 @@ public sealed class RaftPartitionStateMachine
         votes.Clear();
         activeProposals.Clear();
 
+        long nowTicks = host.GetMonotonicTimestamp();
+
         nodeState = RaftNodeState.Candidate;
         host.Leader = "";
         votingStartedAt = currentTime;
+        votingStartedTicks = nowTicks;
         lastHeartbeat = currentTime;
+        lastHeartbeatTicks = nowTicks;
         currentTerm++;
 
         IncreaseVotes(host.LocalEndpoint, currentTerm);
@@ -1009,6 +1065,15 @@ public sealed class RaftPartitionStateMachine
     /// so a mixed-version cluster never mis-orders. An empty-log candidate (index 0) loses that fallback
     /// against any non-empty voter anyway.</para>
     /// </summary>
+    /// <summary>
+    /// B3: local elapsed time since a monotonic anchor. Returns <see cref="TimeSpan.MaxValue"/> when the
+    /// anchor is unset (0) so an "unset" anchor never satisfies a "&lt; timeout" freshness guard — matching
+    /// the historical <c>lastHeartbeat != HLCTimestamp.Zero &amp;&amp; …</c> shape. Callers still gate on the
+    /// explicit <c>anchorTicks != 0</c> where the old code gated on <c>!= Zero</c>, for symmetry.
+    /// </summary>
+    private static TimeSpan MonotonicElapsed(long anchorTicks, long nowTicks) =>
+        anchorTicks == 0 ? TimeSpan.MaxValue : Stopwatch.GetElapsedTime(anchorTicks, nowTicks);
+
     private static bool CandidateLogIsBehind(long remoteLastLogTerm, long remoteMaxLogId, long localLastLogTerm, long localMaxId)
     {
         if (remoteLastLogTerm <= 0)
@@ -1055,19 +1120,29 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
+        long nowTicks = host.GetMonotonicTimestamp();
+
         if (!ignoreRecentVoteCooldown)
         {
-            if ((lastVotation != HLCTimestamp.Zero && ((currentTime - lastVotation) < (electionTimeout * 2))))
+            // B3: the recent-vote cooldown is a local elapsed interval → monotonic.
+            if (lastVotationTicks != 0 && (MonotonicElapsed(lastVotationTicks, nowTicks) < (electionTimeout * 2)))
                 return;
 
             string expectedLeader = expectedLeaders.GetValueOrDefault(currentTerm, "");
             if (!string.IsNullOrEmpty(expectedLeader))
             {
+                // NOTE (B3 residual): GetLastNodeActivity returns an HLC written locally on the last
+                // AppendLogs from this peer. The "heard from the leader recently" decision below is still an
+                // HLC subtraction and remains mildly skew-sensitive — the peer-activity store migration to
+                // monotonic ticks was deliberately deferred (contained B3 scope). On suppression we refresh
+                // BOTH the HLC anchor and its monotonic shadow so the monotonic follower election gate
+                // honours the back-off; the residual only affects whether we take this branch at all.
                 HLCTimestamp lastKnownHeartbeat = host.GetLastNodeActivity(expectedLeader, host.PartitionId);
 
                 if (lastKnownHeartbeat != HLCTimestamp.Zero && ((currentTime - lastKnownHeartbeat) < electionTimeout))
                 {
                     lastHeartbeat = lastKnownHeartbeat;
+                    lastHeartbeatTicks = nowTicks;
                     return;
                 }
             }
@@ -1087,6 +1162,7 @@ public sealed class RaftPartitionStateMachine
         host.Leader = "";
         expectedLeaders.Clear();
         votingStartedAt = currentTime;
+        votingStartedTicks = nowTicks;
 
         await host.InvokeLeaderChanged(host.PartitionId, "");
 
@@ -1098,8 +1174,8 @@ public sealed class RaftPartitionStateMachine
         // in ForceLeaderForTestingAsync for rationale).
         await wal.PersistHardStateAsync(currentTerm, host.LocalEndpoint).ConfigureAwait(false);
 
-        double delayMs = lastHeartbeat != HLCTimestamp.Zero
-            ? (currentTime - lastHeartbeat).TotalMilliseconds
+        double delayMs = lastHeartbeatTicks != 0
+            ? MonotonicElapsed(lastHeartbeatTicks, nowTicks).TotalMilliseconds
             : 0;
 
         TagList electionTags = new() { { "partition_id", host.PartitionId } };
@@ -1138,23 +1214,29 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
+        long nowTicks = host.GetMonotonicTimestamp();
+
         // Same "should I even try?" guards as a real election. These guards do NOT touch any Raft
         // consensus state (currentTerm / votes / expectedLeaders / nodeState) — that is the whole
         // point of pre-vote. The one local write below (lastHeartbeat) is a back-off bookkeeping
         // refresh on the "leader still fresh" path, mirroring StartElectionAsync, not a consensus
         // mutation: it just records that we observed the leader so we don't immediately re-trigger.
-        if (lastVotation != HLCTimestamp.Zero && ((currentTime - lastVotation) < (electionTimeout * 2)))
+        // B3: the recent-vote cooldown is a local elapsed interval → monotonic.
+        if (lastVotationTicks != 0 && (MonotonicElapsed(lastVotationTicks, nowTicks) < (electionTimeout * 2)))
             return;
 
         string expectedLeader = expectedLeaders.GetValueOrDefault(currentTerm, "");
         if (!string.IsNullOrEmpty(expectedLeader))
         {
+            // B3 residual (same as StartElectionAsync): the "heard from leader recently" test is still an
+            // HLC subtraction off the HLC peer-activity store; on back-off we refresh the monotonic shadow.
             HLCTimestamp lastKnownHeartbeat = host.GetLastNodeActivity(expectedLeader, host.PartitionId);
 
             if (lastKnownHeartbeat != HLCTimestamp.Zero && ((currentTime - lastKnownHeartbeat) < electionTimeout))
             {
                 // Intentional: back off and remember we saw the leader. Not a consensus mutation.
                 lastHeartbeat = lastKnownHeartbeat;
+                lastHeartbeatTicks = nowTicks;
                 return;
             }
         }
@@ -1242,6 +1324,7 @@ public sealed class RaftPartitionStateMachine
 
         HLCTimestamp prevHeartbeat = lastHeartbeat;
         lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        lastHeartbeatTicks = host.GetMonotonicTimestamp();
 
         if (nodeState != RaftNodeState.Leader && nodeState != RaftNodeState.Candidate)
             return;
@@ -1438,11 +1521,14 @@ public sealed class RaftPartitionStateMachine
                         return;
                     }
                 }
-                else if (lastHeartbeat != HLCTimestamp.Zero && ((timestamp - lastHeartbeat) < electionTimeout))
+                else if (lastHeartbeatTicks != 0 && (MonotonicElapsed(lastHeartbeatTicks, host.GetMonotonicTimestamp()) < electionTimeout))
                 {
                     // Not quiesced: a recent heartbeat from our leader means it is still live to us.
-                    // (The `timestamp - lastHeartbeat` subtraction inherits the HLC cross-node skew
-                    // sensitivity tracked separately as B3; the data source is now correct.)
+                    // B3: measured as local elapsed time since we last heard from the leader (monotonic),
+                    // NOT `incomingRequest.timestamp - lastHeartbeat` — that subtracted a remote HLC from a
+                    // local one and inherited the challenger's clock skew, which could make a stale
+                    // heartbeat look fresh (or vice-versa). "How long we've been without a heartbeat" is a
+                    // purely local quantity.
                     logger.LogDebugDenyingPreVoteLeaderFresh(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm, preVoteExpectedLeader);
                     return;
                 }
@@ -1561,7 +1647,13 @@ public sealed class RaftPartitionStateMachine
         
         lastHeartbeat = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, timestamp);
         lastVotation = lastHeartbeat;
-        
+
+        // B3: granting a vote counts as local activity — anchor both duration shadows to now so the
+        // follower election gate and the recent-vote cooldown measure from this moment.
+        long grantTicks = host.GetMonotonicTimestamp();
+        lastHeartbeatTicks = grantTicks;
+        lastVotationTicks = grantTicks;
+
         expectedLeaders[voteTerm] = node.Endpoint;
 
         // B2b: durably record who we voted for in this term BEFORE replying, so a crash right after the
@@ -1694,9 +1786,10 @@ public sealed class RaftPartitionStateMachine
             matchIndex[peer.Endpoint] = 0;
         }
 
-        HLCTimestamp electionTs = await BecomeLeaderAsync().ConfigureAwait(false);
+        await BecomeLeaderAsync().ConfigureAwait(false);
 
-        logger.LogInfoReceivedVoteProclaimedLeader(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, (electionTs - votingStartedAt).TotalMilliseconds, voteTerm, numberVotes, quorum, host.Nodes.Count + 1, remoteMaxLogId, maxLogResponse);
+        double electionElapsedMs = MonotonicElapsed(votingStartedTicks, host.GetMonotonicTimestamp()).TotalMilliseconds;
+        logger.LogInfoReceivedVoteProclaimedLeader(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, electionElapsedMs, voteTerm, numberVotes, quorum, host.Nodes.Count + 1, remoteMaxLogId, maxLogResponse);
 
         await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint);
 
@@ -1771,6 +1864,11 @@ public sealed class RaftPartitionStateMachine
         }
 
         lastHeartbeat = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, timestamp);
+        // B3: a received AppendLogs (heartbeat or real batch) is the primary "we heard from the leader"
+        // signal. Anchor the monotonic shadow to local now so the follower election gate measures the
+        // silence interval on the local clock — this is the exact site whose HLC subtraction used to
+        // freeze the timeout for the length of a leader's clock skew.
+        lastHeartbeatTicks = host.GetMonotonicTimestamp();
         // A quiesce-flagged message tells us to stop expecting heartbeats and gate elections
         // on SWIM liveness instead.  Any non-quiesce AppendLogs (real logs or normal heartbeat)
         // wakes us back up by clearing the flag.
@@ -1950,6 +2048,7 @@ public sealed class RaftPartitionStateMachine
 
         HLCTimestamp currentTime = host.HybridLogicalClock.SendOrLocalEvent(host.LocalNodeId);
         lastProposalAt = currentTime;
+        lastProposalAtTicks = host.GetMonotonicTimestamp(); // B3: quiesce-after measured on monotonic clock
         SetQuiesced(false); // un-quiesce on new proposal: resume normal heartbeating
 
         // Try to clear and reuse expired proposals

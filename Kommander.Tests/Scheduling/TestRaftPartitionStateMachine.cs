@@ -1305,6 +1305,88 @@ public class TestRaftPartitionStateMachine
         Assert.DoesNotContain(host.EnqueuedRequests, e => e.Request.Type == RaftResponderRequestType.Vote);
     }
 
+    // ── B3: elapsed-time gates measured on a monotonic clock, not HLC subtraction ─────────
+
+    /// <summary>
+    /// B3 repro: a follower whose leader sends a heartbeat stamped ONE HOUR in the future (its clock is
+    /// skewed ahead) used to have its election timeout frozen — <c>currentTime - lastHeartbeat</c> read
+    /// ≈0 for the whole hour because the local HLC absorbed the future physical time. With the monotonic
+    /// clock the follower measures true local elapsed silence and fails over on time, even while the HLC
+    /// stays frozen. Drives the real election gate in <see cref="RaftPartitionStateMachine.CheckPartitionLeadershipAsync"/>.
+    /// </summary>
+    [Fact]
+    public async Task Follower_ElectionTimeout_MeasuredOnMonotonicClock_NotFrozenByFutureLeaderHeartbeat()
+    {
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [new("node-b")],
+            VoterEndpoints = ["node-a", "node-b"],
+            MonotonicOverride = 1_000_000_000  // T0: arbitrary nonzero monotonic anchor
+        };
+        host.Configuration.EnableQuiescence = false; // exercise the non-quiesced follower gate (the frozen one)
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        // Leader node-b heartbeats with an HLC one hour ahead — this jumps our local HLC forward and
+        // anchors lastHeartbeat to that far-future value, while lastHeartbeatTicks records local now (T0).
+        HLCTimestamp localNow = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        HLCTimestamp futureLeaderTs = new(host.LocalNodeId, localNow.L + 3_600_000, 0); // +1 hour in ms
+        await sm.AppendLogsAsync("node-b", term: 1, futureLeaderTs, logs: null);
+
+        // Precondition: the HLC-based elapsed measure is frozen — it reads well under the election
+        // timeout even though (as we're about to assert) real local time has advanced far past it.
+        HLCTimestamp afterHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        Assert.True((afterHeartbeat - futureLeaderTs).TotalMilliseconds < host.Configuration.StartElectionTimeout,
+            "precondition: the HLC delta is still under the election timeout — the frozen-clock bug");
+
+        host.ClearObservations();
+
+        // Real local time advances past the election timeout — on the MONOTONIC clock only (HLC frozen).
+        TimeSpan advance = sm.ElectionTimeout + TimeSpan.FromSeconds(5);
+        host.MonotonicOverride += (long)(advance.TotalSeconds * Stopwatch.Frequency);
+
+        await sm.CheckPartitionLeadershipAsync();
+
+        // The follower timed out on true local elapsed time and launched a pre-vote. Pre-B3 the gate
+        // stayed frozen for the length of the skew and no election ever started.
+        Assert.Contains(host.EnqueuedRequests,
+            e => e.Endpoint == "node-b" && e.Request.Type == RaftResponderRequestType.RequestVotes);
+    }
+
+    /// <summary>
+    /// B3 converse: while real local elapsed time is still under the election timeout the follower must
+    /// NOT start an election — even if the leader's heartbeat HLC was in the future. Guards against a
+    /// monotonic gate that fires too eagerly.
+    /// </summary>
+    [Fact]
+    public async Task Follower_WithinMonotonicTimeout_DoesNotStartElection()
+    {
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [new("node-b")],
+            VoterEndpoints = ["node-a", "node-b"],
+            MonotonicOverride = 1_000_000_000
+        };
+        host.Configuration.EnableQuiescence = false;
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        HLCTimestamp localNow = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        HLCTimestamp futureLeaderTs = new(host.LocalNodeId, localNow.L + 3_600_000, 0);
+        await sm.AppendLogsAsync("node-b", term: 1, futureLeaderTs, logs: null);
+        host.ClearObservations();
+
+        // Advance only a small fraction of the election timeout on the monotonic clock.
+        host.MonotonicOverride += (long)((sm.ElectionTimeout.TotalSeconds / 4) * Stopwatch.Frequency);
+
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.DoesNotContain(host.EnqueuedRequests,
+            e => e.Request.Type == RaftResponderRequestType.RequestVotes);
+    }
+
     [Fact]
     public async Task VoteAsync_NoRoster_TreatsAllEndpointsAsVoters()
     {
@@ -1460,6 +1542,16 @@ public class TestRaftPartitionStateMachine
         }
 
         public HybridLogicalClock HybridLogicalClock { get; } = new();
+
+        /// <summary>
+        /// B3: injectable monotonic clock. When null the real <see cref="Stopwatch"/> is used (existing
+        /// tests behave unchanged). Set it to drive elapsed-time gates deterministically — e.g. to prove a
+        /// follower still times out after real local elapsed time even when its HLC was frozen by a
+        /// leader's far-future heartbeat.
+        /// </summary>
+        public long? MonotonicOverride { get; set; }
+
+        public long GetMonotonicTimestamp() => MonotonicOverride ?? Stopwatch.GetTimestamp();
 
         public IReadOnlyList<RaftNode> Nodes => NodesOverride;
 
