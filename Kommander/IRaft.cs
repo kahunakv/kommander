@@ -274,6 +274,26 @@ public interface IRaft
         => ReplicateLogs(partitionId, type, (IEnumerable<byte[]>)logs, autoCommit, expectedGeneration, cancellationToken);
 
     /// <summary>
+    /// Replicate a <b>heterogeneous, per-entry-typed</b> batch to one partition as a single proposal.
+    /// <para>
+    /// Where <see cref="ReplicateLogs(int,string,IReadOnlyList{byte[]},bool,long,CancellationToken)"/> forces
+    /// one <c>type</c> and one <c>autoCommit</c> flag across every payload, this surface accepts entries that
+    /// each carry their own <see cref="RaftProposalEntry.Type"/>, so a consumer can coalesce unrelated writes
+    /// into <b>one</b> proposal — one AppendEntries round trip and one group-committed WAL flush — while still
+    /// receiving an independent <see cref="RaftEntryResult"/> per entry (index-aligned to
+    /// <paramref name="entries"/>).
+    /// </para>
+    /// <para>
+    /// Slice-1 scope: the batch is <b>auto-commit only</b>. Any entry with
+    /// <see cref="RaftProposalEntry.AutoCommit"/> set to <see langword="false"/>, or a batch that mixes
+    /// distinct non-zero <see cref="RaftProposalEntry.ExpectedGeneration"/> values, is a batch-level rejection
+    /// (<see cref="RaftBatchReplicationResult.Success"/> is <see langword="false"/> and nothing is appended).
+    /// The generation fence is applied at batch granularity against the partition's committed generation.
+    /// </para>
+    /// </summary>
+    public Task<RaftBatchReplicationResult> ReplicateEntries(int partitionId, IReadOnlyList<RaftProposalEntry> entries, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Replicate a checkpoint to the followers in the partition
     /// </summary>
     /// <param name="partitionId"></param>

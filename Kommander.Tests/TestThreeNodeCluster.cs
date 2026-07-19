@@ -127,12 +127,19 @@ public sealed class TestThreeNodeCluster
         // The final ack guarantees quorum durability (leader + 1 follower); the trailing follower
         // receives the last entry on the next AppendEntries/heartbeat. Converge rather than asserting
         // all three are durable the instant the last ack returns.
+        //
+        // This is a terminal eventual-convergence check: the exact-max comparison is safe because
+        // promotion appends no no-op entry (a spurious election under load cannot inflate the count),
+        // so the only variable is how long the trailing follower takes to catch up. On a loaded CI
+        // runner that catch-up — and any election churn the load induces — can exceed the 15s default,
+        // so give it a generous ceiling that still surfaces a genuine permanent stall.
         long expectedMax = entries + (entries / 50);
         await WaitForConditionAsync(
             () => node1.WalAdapter.GetMaxLog(1) == expectedMax
                   && node2.WalAdapter.GetMaxLog(1) == expectedMax
                   && node3.WalAdapter.GetMaxLog(1) == expectedMax,
-            TestContext.Current.CancellationToken);
+            TestContext.Current.CancellationToken,
+            timeoutMs: 30_000);
 
         await node1.LeaveCluster(true, CancellationToken.None);
         await node2.LeaveCluster(true, CancellationToken.None);

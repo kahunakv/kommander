@@ -1755,6 +1755,199 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
+    /// Replicates a heterogeneous, per-entry-typed batch to one partition (<see cref="IRaft.ReplicateEntries"/>).
+    /// A leading auto-commit group plus an optional single <b>trailing</b> manual group (slice 2), with a
+    /// <b>per-entry</b> generation fence (slice 3). See <see cref="RaftProposalEntry"/> /
+    /// <see cref="RaftBatchReplicationResult"/>.
+    /// <para>
+    /// <b>Per-entry fence.</b> Each entry's <see cref="RaftProposalEntry.ExpectedGeneration"/> is evaluated
+    /// independently against the partition's current committed generation: a non-zero value that no longer
+    /// matches fences <i>that</i> entry out (reported <see cref="RaftOperationStatus.PartitionMoved"/>, not
+    /// appended) while its siblings proceed; zero opts the entry out of the fence entirely. A batch may thus
+    /// mix hash-routed (generation-0) entries with fenced key-range entries. The classification reads the
+    /// generation once here (it is <see cref="Interlocked"/>-published, so the read is safe off the executor
+    /// thread). To also close the classify→append window for an unambiguous key-range batch — every admitted
+    /// entry non-zero, none hash-routed — the admitted proposal carries that shared generation as an
+    /// executor-side backstop, so a split/merge landing mid-flight fences the whole admitted group rather than
+    /// admitting stale writes. A <i>mixed</i> admitted set (hash-routed + key-range) cannot use that backstop
+    /// without also fencing the hash-routed entries, so its fence is best-effort at classification time.
+    /// </para>
+    /// <para>
+    /// <b>Sequential commit.</b> The auto group commits <i>before</i> the manual group is proposed. Were they
+    /// posted concurrently to coalesce the fsync, a failure to commit the auto group after the manual propose
+    /// was already durable would let a later manual <c>CommitLogs</c> advance the commit index past the
+    /// uncommitted auto entries. Committing auto first makes the manual group a clean uncommitted suffix on a
+    /// committed prefix, so its ticket rolls back or commits without touching the auto entries. Flush
+    /// coalescing is therefore opportunistic (scheduler linger), not guaranteed.
+    /// </para>
+    /// <para>
+    /// Per-entry <see cref="RaftEntryResult.LogIndex"/> values come from the <see cref="RaftLog.Id"/> assigned
+    /// in place during propose (not from a ticket <c>commitIndex</c>): each <see cref="RaftLog"/> list built
+    /// here is the same instance set the state machine mutates, and the propose reply only resolves once those
+    /// indices are durable, so reading them back is race-free. Results are index-aligned to the input list;
+    /// fenced entries keep their input slot with <c>LogIndex = -1</c>.
+    /// </para>
+    /// </summary>
+    public async Task<RaftBatchReplicationResult> ReplicateEntries(int partitionId, IReadOnlyList<RaftProposalEntry> entries, CancellationToken cancellationToken = default)
+    {
+        if (entries is null || entries.Count == 0)
+            return new(true, RaftOperationStatus.Success, HLCTimestamp.Zero, []);
+
+        // ── Batch-level validation (shape) — reject before any append, no partial state. ──
+        // An optional auto-commit prefix followed by an optional single trailing manual group: once a manual
+        // (autoCommit:false) entry is seen, no later entry may be auto-commit, else the manual entries would
+        // not form one contiguous truncatable suffix (§3). Reserved system-log-type guard mirrors the
+        // single-type ReplicateLogs path. Generations are NOT validated here — they are fenced per entry below.
+        bool seenManual = false;
+
+        for (int i = 0; i < entries.Count; i++)
+        {
+            RaftProposalEntry entry = entries[i];
+
+            if (partitionId == RaftSystemConfig.SystemPartition && entry.Type == RaftSystemConfig.RaftLogType)
+                throw new RaftException("System log type is reserved on the system partition");
+
+            if (!entry.AutoCommit)
+                seenManual = true;
+            else if (seenManual)
+                return RejectBatch(entries.Count, RaftOperationStatus.Errored); // auto-commit after manual
+        }
+
+        RaftPartition partition = GetPartition(partitionId);
+        long currentGeneration = partition.Generation;
+
+        // ── Per-entry fence classification. Fenced entries take their result slot now (PartitionMoved) and are
+        //    excluded from the append; admitted entries are split into the auto prefix and trailing manual
+        //    group, each RaftLog carrying its input index so ids read back after propose stay index-aligned. ──
+        RaftEntryResult[] results = new RaftEntryResult[entries.Count];
+
+        List<RaftLog> autoLogs = [];
+        List<int> autoInputIndex = [];
+        List<RaftLog> manualLogs = [];
+        List<int> manualInputIndex = [];
+        bool admittedHasKeyRange = false; // any admitted entry with a non-zero (fenced) generation
+        bool admittedHasHashRouted = false; // any admitted entry with generation 0
+
+        for (int i = 0; i < entries.Count; i++)
+        {
+            RaftProposalEntry entry = entries[i];
+
+            if (entry.ExpectedGeneration != 0 && entry.ExpectedGeneration != currentGeneration)
+            {
+                results[i] = new(RaftOperationStatus.PartitionMoved, -1, HLCTimestamp.Zero);
+                continue;
+            }
+
+            RaftLog log = new() { Type = RaftLogType.Proposed, LogType = entry.Type, LogData = entry.Data };
+
+            if (entry.AutoCommit)
+            {
+                autoLogs.Add(log);
+                autoInputIndex.Add(i);
+            }
+            else
+            {
+                manualLogs.Add(log);
+                manualInputIndex.Add(i);
+            }
+
+            if (entry.ExpectedGeneration == 0)
+                admittedHasHashRouted = true;
+            else
+                admittedHasKeyRange = true;
+        }
+
+        // Admission backstop: only for an unambiguous key-range batch (all admitted entries fenced, none
+        // hash-routed) can we re-assert the generation at executor admission without wrongly fencing a
+        // hash-routed sibling. currentGeneration is safe here because every admitted key-range entry expects
+        // exactly it (any other non-zero expectation was fenced out above).
+        long admissionBackstop = admittedHasKeyRange && !admittedHasHashRouted ? currentGeneration : 0;
+
+        // Nothing admitted (every entry fenced): report PartitionMoved overall so the caller refreshes the map.
+        if (autoLogs.Count == 0 && manualLogs.Count == 0)
+            return new(false, RaftOperationStatus.PartitionMoved, HLCTimestamp.Zero, results);
+
+        HLCTimestamp batchTicket = HLCTimestamp.Zero;
+
+        // ── Auto group: propose and commit with the batch. ──
+        if (autoLogs.Count > 0)
+        {
+            (bool autoOk, RaftOperationStatus autoStatus, HLCTimestamp autoTicket) =
+                await partition.ReplicateEntries(autoLogs, admissionBackstop, autoCommit: true).ConfigureAwait(false);
+
+            if (!autoOk)
+                return FailBatch(results, autoInputIndex, manualInputIndex, autoStatus);
+
+            RaftReplicationResult autoQuorum = await WaitForQuorum(partition, autoTicket, true, cancellationToken).ConfigureAwait(false);
+
+            if (!autoQuorum.Success)
+                return FailBatch(results, autoInputIndex, manualInputIndex, autoQuorum.Status);
+
+            for (int j = 0; j < autoLogs.Count; j++)
+                results[autoInputIndex[j]] = new(RaftOperationStatus.Success, autoLogs[j].Id, HLCTimestamp.Zero);
+
+            batchTicket = autoTicket;
+        }
+
+        // ── Manual group (optional): proposed only after the auto group committed, so it is a clean suffix.
+        //    Its ticket is returned to the caller (Pending), who commits or rolls it back later. ──
+        if (manualLogs.Count > 0)
+        {
+            (bool manualOk, RaftOperationStatus manualStatus, HLCTimestamp manualTicket) =
+                await partition.ReplicateEntries(manualLogs, admissionBackstop, autoCommit: false).ConfigureAwait(false);
+
+            if (!manualOk)
+                return FailBatch(results, [], manualInputIndex, manualStatus);
+
+            // For a manual proposal, WaitForQuorum resolves at propose-quorum durability (the ticket stays
+            // live in activeProposals for the caller's later CommitLogs/RollbackLogs).
+            RaftReplicationResult manualQuorum = await WaitForQuorum(partition, manualTicket, false, cancellationToken).ConfigureAwait(false);
+
+            if (!manualQuorum.Success)
+                return FailBatch(results, [], manualInputIndex, manualQuorum.Status);
+
+            for (int j = 0; j < manualLogs.Count; j++)
+                results[manualInputIndex[j]] = new(RaftOperationStatus.Pending, manualLogs[j].Id, manualTicket);
+
+            // The manual ticket is the actionable one for the caller; surface it as the batch ticket.
+            batchTicket = manualTicket;
+        }
+
+        // Some entries may still be PartitionMoved (per-entry fence); overall success reflects that at least
+        // one entry was admitted and committed/queued.
+        return new(true, RaftOperationStatus.Success, batchTicket, results);
+    }
+
+    /// <summary>
+    /// Builds a batch-level rejection result: overall failure with <paramref name="status"/> propagated to
+    /// every entry slot and <c>LogIndex = -1</c>, signalling that nothing was appended.
+    /// </summary>
+    private static RaftBatchReplicationResult RejectBatch(int count, RaftOperationStatus status)
+    {
+        RaftEntryResult[] results = new RaftEntryResult[count];
+        for (int i = 0; i < count; i++)
+            results[i] = new(status, -1, HLCTimestamp.Zero);
+
+        return new(false, status, HLCTimestamp.Zero, results);
+    }
+
+    /// <summary>
+    /// Marks the still-in-flight admitted entries (identified by their input indices) with a proposal
+    /// <paramref name="status"/> failure while leaving already-resolved slots — per-entry
+    /// <see cref="RaftOperationStatus.PartitionMoved"/> fences and any committed auto entries — untouched.
+    /// Used when an admitted proposal fails after some entries were already accounted for.
+    /// </summary>
+    private static RaftBatchReplicationResult FailBatch(RaftEntryResult[] results, IReadOnlyList<int> autoInputIndex, IReadOnlyList<int> manualInputIndex, RaftOperationStatus status)
+    {
+        foreach (int i in autoInputIndex)
+            results[i] = new(status, -1, HLCTimestamp.Zero);
+        foreach (int i in manualInputIndex)
+            results[i] = new(status, -1, HLCTimestamp.Zero);
+
+        return new(false, status, HLCTimestamp.Zero, results);
+    }
+
+    /// <summary>
     /// Commit logs and notify followers in the partition
     /// </summary>
     /// <param name="partitionId"></param>

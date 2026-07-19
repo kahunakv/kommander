@@ -384,6 +384,40 @@ public sealed class RaftPartition : IDisposable
     }
 
     /// <summary>
+    /// Replicates a caller-built, heterogeneous <see cref="RaftLog"/> batch as a single proposal
+    /// (the <see cref="IRaft.ReplicateEntries"/> path). <paramref name="autoCommit"/> selects the commit
+    /// group: <see langword="true"/> for the auto-commit portion (commits with the batch),
+    /// <see langword="false"/> for a trailing manual group whose ticket the caller commits or rolls back later
+    /// (slice 2).
+    /// <para>
+    /// Unlike the single-type overloads, the caller owns <paramref name="logs"/> and passes the same
+    /// <see cref="RaftLog"/> instances that flow into the state machine's propose. <see cref="RaftWriteAhead"/>
+    /// assigns each entry its log index (<see cref="RaftLog.Id"/>) in place during propose, and the executor
+    /// reply resolves only once that propose is durable — so on a successful return the caller can read each
+    /// entry's assigned index straight off <paramref name="logs"/> to build its per-entry results. The list is
+    /// therefore not rebuilt or copied here; keep the reference stable across the call.
+    /// </para>
+    /// </summary>
+    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateEntries(List<RaftLog> logs, long expectedGeneration = 0, bool autoCommit = true)
+    {
+        if (string.IsNullOrEmpty(Leader))
+            return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
+
+        if (Leader != manager.LocalEndpoint)
+            return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
+
+        // Reuses the existing ReplicateLogs request path: a heterogeneous List<RaftLog> with one autoCommit
+        // flag and one generation fence is exactly what that path already accepts. RaftManager.ReplicateEntries
+        // enforces the batch shape (single trailing manual group) before splitting into auto/manual proposals.
+        RaftResponse response = await executor.Ask(new(RaftRequestType.ReplicateLogs, logs, autoCommit, expectedGeneration)).ConfigureAwait(false);
+
+        if (response.Status == RaftOperationStatus.Success)
+            return (true, response.Status, response.TicketId);
+
+        return (false, response.Status, HLCTimestamp.Zero);
+    }
+
+    /// <summary>
     /// Commits logs for the specified ticket identifier if the current node is the leader and notifies followers.
     /// <para>
     /// If <paramref name="cancellationToken"/> fires while waiting on the executor, the method returns

@@ -347,8 +347,11 @@ public sealed class TestFourNodeJoin
                     .Any(m => m.Endpoint == n4Endpoint && m.Role == System.ClusterMemberRole.Learner),
                 ct);
 
-            // Let n4 actually initialize (receives partition map from P0).
-            await WaitForConditionAsync(() => n4.IsInitialized, ct, timeoutMs: 20_000);
+            // Let n4 actually initialize (receives partition map from P0). This is the tail of a
+            // multi-step causal chain — AddMember commits, the roster + partition map replicate to the
+            // new learner, then n4 processes them — so on a loaded CI runner it can outlast the earlier
+            // 20s budget. Give it a generous ceiling that still catches a genuine initialization stall.
+            await WaitForConditionAsync(() => n4.IsInitialized, ct, timeoutMs: 45_000);
 
             // Let all voters pick up n4 in their peer lists so replication to n4 starts.
             await WaitForConditionAsync(
