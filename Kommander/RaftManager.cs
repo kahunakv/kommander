@@ -1443,6 +1443,31 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
+    /// Resolves the partition for an *inbound peer message*, tolerating a data partition that
+    /// has not been created on this node yet. Unlike <see cref="GetPartition"/> — which throws
+    /// for an unknown data partition, correctly treating that as a caller error on the local
+    /// proposal path — inbound election/replication messages legitimately arrive during cluster
+    /// assembly before this node has finished creating the target data partition.
+    /// <para>
+    /// Returning false lets the handler drop just that one message: the remote peer simply retries
+    /// on its next election timeout / heartbeat. Critically, this avoids throwing a
+    /// <see cref="RaftException"/> out of a coalesced endpoint batch — a single not-yet-created
+    /// data partition must never poison sibling messages (including system-partition heartbeats and
+    /// votes) that share the same batch, which would otherwise stall cluster assembly under load.
+    /// </para>
+    /// </summary>
+    private bool TryGetPartition(int partitionId, out RaftPartition? partition)
+    {
+        if (partitionId == RaftSystemConfig.SystemPartition)
+        {
+            partition = systemPartition;
+            return partition is not null;
+        }
+
+        return partitions.TryGetValue(partitionId, out partition);
+    }
+
+    /// <summary>
     /// Sets the minimum WAL log index that compaction must not truncate below on the given
     /// partition. No-ops silently when the partition is not hosted on this node.
     /// See <see cref="IRaft.SetMinRetainIndex"/> for full semantics.
@@ -1481,9 +1506,11 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <param name="request"></param>
     public void RequestVote(RequestVotesRequest request)
     {
-        RaftPartition partition = GetPartition(request.Partition);
-
-        partition.RequestVote(request);
+        // Tolerate a not-yet-created data partition during cluster assembly: drop the vote
+        // rather than throwing and poisoning the rest of the endpoint batch. The candidate
+        // retries on its next election timeout. See TryGetPartition for the full rationale.
+        if (TryGetPartition(request.Partition, out RaftPartition? partition))
+            partition!.RequestVote(request);
     }
 
     /// <summary>
@@ -1492,23 +1519,22 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <param name="request"></param>
     public void Vote(VoteRequest request)
     {
-        RaftPartition partition = GetPartition(request.Partition);
-
-        partition.Vote(request);
+        // See RequestVote: an inbound vote for a partition this node has not created yet is
+        // dropped, not thrown, so it cannot abort sibling messages in the same endpoint batch.
+        if (TryGetPartition(request.Partition, out RaftPartition? partition))
+            partition!.Vote(request);
     }
 
     internal void StepDownNotice(StepDownNoticeRequest request)
     {
-        RaftPartition partition = GetPartition(request.Partition);
-
-        partition.StepDownNotice(request);
+        if (TryGetPartition(request.Partition, out RaftPartition? partition))
+            partition!.StepDownNotice(request);
     }
 
     internal void TransferLeadership(TransferLeadershipRequest request)
     {
-        RaftPartition partition = GetPartition(request.Partition);
-
-        partition.TransferLeadership(request);
+        if (TryGetPartition(request.Partition, out RaftPartition? partition))
+            partition!.TransferLeadership(request);
     }
 
     /// <summary>
@@ -1599,9 +1625,11 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <returns></returns>
     public void AppendLogs(AppendLogsRequest request)
     {
-        RaftPartition partition = GetPartition(request.Partition);
-
-        partition.AppendLogs(request);
+        // Tolerate a not-yet-created data partition: dropping the append is safe because the
+        // leader retries on its next heartbeat. Throwing here would abort the rest of the
+        // coalesced endpoint batch. See TryGetPartition for the full rationale.
+        if (TryGetPartition(request.Partition, out RaftPartition? partition))
+            partition!.AppendLogs(request);
     }
 
     /// <summary>
@@ -1611,9 +1639,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <returns></returns>
     public void CompleteAppendLogs(CompleteAppendLogsRequest request)
     {
-        RaftPartition partition = GetPartition(request.Partition);
-
-        partition.CompleteAppendLogs(request);
+        // See AppendLogs: an inbound completion for a partition not created here yet is dropped,
+        // not thrown, so it cannot abort sibling messages in the same endpoint batch.
+        if (TryGetPartition(request.Partition, out RaftPartition? partition))
+            partition!.CompleteAppendLogs(request);
     }
 
     /// <summary>

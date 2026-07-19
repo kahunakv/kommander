@@ -1,6 +1,7 @@
 
 using Kommander.Data;
 using Kommander.Gossip;
+using Microsoft.Extensions.Logging;
 
 namespace Kommander.Communication.Memory;
 
@@ -244,45 +245,57 @@ public class InMemoryCommunication : ICommunication
                 {
                     foreach (BatchRequestsRequestItem item in request.Requests)
                     {
-                        switch (item.Type)
+                        // Guard each item independently: a throw on one item (e.g. a vote for a
+                        // data partition the target has not created yet) must never abort the
+                        // remaining items in the batch, which may target the system partition or
+                        // an already-live partition. Matches the per-item resilience in the gRPC
+                        // batch handler (RaftService.BatchRequests).
+                        try
                         {
-                            case BatchRequestsRequestType.Handshake:
-                                await targetNode.Handshake(item.Handshake!);
-                                break;
-                            
-                            case BatchRequestsRequestType.Vote:
-                                targetNode.Vote(item.Vote!);
-                                break;
-                            
-                            case BatchRequestsRequestType.RequestVote:
-                                targetNode.RequestVote(item.RequestVotes!);
-                                break;
+                            switch (item.Type)
+                            {
+                                case BatchRequestsRequestType.Handshake:
+                                    await targetNode.Handshake(item.Handshake!);
+                                    break;
 
-                            case BatchRequestsRequestType.StepDownNotice:
-                                if (targetNode is RaftManager targetManager)
-                                    targetManager.StepDownNotice(item.StepDownNotice!);
-                                break;
+                                case BatchRequestsRequestType.Vote:
+                                    targetNode.Vote(item.Vote!);
+                                    break;
 
-                            case BatchRequestsRequestType.TransferLeadership:
-                                if (targetNode is RaftManager transferManager)
-                                    transferManager.TransferLeadership(item.TransferLeadership!);
-                                break;
+                                case BatchRequestsRequestType.RequestVote:
+                                    targetNode.RequestVote(item.RequestVotes!);
+                                    break;
 
-                            case BatchRequestsRequestType.TransferLeadershipSuggestion:
-                                if (targetNode is RaftManager suggestionManager)
-                                    suggestionManager.ReceiveTransferLeadershipSuggestion(item.TransferLeadershipSuggestion!);
-                                break;
+                                case BatchRequestsRequestType.StepDownNotice:
+                                    if (targetNode is RaftManager targetManager)
+                                        targetManager.StepDownNotice(item.StepDownNotice!);
+                                    break;
 
-                            case BatchRequestsRequestType.AppendLogs:
-                                targetNode.AppendLogs(item.AppendLogs!);
-                                break;
-                            
-                            case BatchRequestsRequestType.CompleteAppendLogs:
-                                targetNode.CompleteAppendLogs(item.CompleteAppendLogs!);
-                                break;
-                            
-                            default:
-                                throw new ArgumentOutOfRangeException();
+                                case BatchRequestsRequestType.TransferLeadership:
+                                    if (targetNode is RaftManager transferManager)
+                                        transferManager.TransferLeadership(item.TransferLeadership!);
+                                    break;
+
+                                case BatchRequestsRequestType.TransferLeadershipSuggestion:
+                                    if (targetNode is RaftManager suggestionManager)
+                                        suggestionManager.ReceiveTransferLeadershipSuggestion(item.TransferLeadershipSuggestion!);
+                                    break;
+
+                                case BatchRequestsRequestType.AppendLogs:
+                                    targetNode.AppendLogs(item.AppendLogs!);
+                                    break;
+
+                                case BatchRequestsRequestType.CompleteAppendLogs:
+                                    targetNode.CompleteAppendLogs(item.CompleteAppendLogs!);
+                                    break;
+
+                                default:
+                                    throw new ArgumentOutOfRangeException();
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            manager.Logger.LogError("BatchRequests: {Type} {Message}\n{StackTrace}", ex.GetType().Name, ex.Message, ex.StackTrace);
                         }
                     }
                 }
