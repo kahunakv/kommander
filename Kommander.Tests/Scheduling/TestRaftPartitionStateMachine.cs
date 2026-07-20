@@ -1218,7 +1218,7 @@ public class TestRaftPartitionStateMachine
             preVote: false, remoteLastLogTerm: 5);
 
         (string Endpoint, RaftResponderRequest Request) grant = Assert.Single(
-            host.EnqueuedRequests.Where(e => e.Request.Type == RaftResponderRequestType.Vote));
+            host.EnqueuedRequests, e => e.Request.Type == RaftResponderRequestType.Vote);
         Assert.Equal("node-b", grant.Endpoint);
         Assert.False(grant.Request.VoteRequest!.PreVote);
         Assert.Equal(5, grant.Request.VoteRequest!.LastLogTerm);

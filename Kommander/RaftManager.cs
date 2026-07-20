@@ -573,6 +573,42 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
+    /// Renders a snapshot of assembly progress for the <see cref="JoinCluster(CancellationToken)"/>
+    /// watchdog. When a join stalls, the generic "may have failed to elect a leader" guess is
+    /// useless three repos downstream; this pinpoints which stage is stuck by reporting the exact
+    /// state the wait loop is blocked on.
+    /// <para>
+    /// Reads only lock-free fields (the system partition's cached leader/lifecycle state, the live
+    /// partition count, and the local role) — it deliberately never routes through the partition
+    /// executor, because the executor is precisely what may be stalled and awaiting it would hang
+    /// the diagnostic itself.
+    /// </para>
+    /// <para>
+    /// How to read it: <c>systemLeader=none</c> ⇒ the system partition never elected a leader
+    /// (stage 1); a leader is present but <c>userPartitions=0/N</c> ⇒ the leader never replicated
+    /// the initial map to this node (stage 2); <c>0&lt;userPartitions&lt;N</c> ⇒ StartUserPartitions
+    /// ran partially (stage 3).
+    /// </para>
+    /// </summary>
+    private string DescribeAssemblyState()
+    {
+        string systemLeader = systemPartition is null
+            ? "no-system-partition"
+            : string.IsNullOrEmpty(systemPartition.Leader) ? "none" : systemPartition.Leader;
+
+        string systemState = systemPartition is null ? "n/a" : systemPartition.State.ToString();
+
+        return string.Concat(
+            "local=", LocalEndpoint,
+            " role=", LocalRole.ToString(),
+            " systemLeader=", systemLeader,
+            " systemState=", systemState,
+            " userPartitions=", partitions.Count.ToString(),
+            "/", configuration.InitialPartitions.ToString(),
+            " initialized=", IsInitialized ? "true" : "false");
+    }
+
+    /// <summary>
     /// Joins the cluster
     /// </summary>
     public async Task JoinCluster(CancellationToken cancellationToken = default)
@@ -610,8 +646,17 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            if (!cancellationToken.CanBeCanceled && joinStopwatch.GetElapsedMilliseconds() > 60_000)
-                throw new TimeoutException("RaftManager.JoinCluster timed out after 60 s waiting for cluster initialization. The system partition may have failed to elect a leader.");
+            long elapsedMs = joinStopwatch.GetElapsedMilliseconds();
+
+            // Emit a per-tick snapshot so a stalled join leaves an evolving trail in the log
+            // (leader appears? partitions climb?) instead of a single opaque throw at the deadline.
+            Logger.LogWarning(
+                "JoinCluster: waiting for initialization ({ElapsedMs} ms elapsed): {State}",
+                elapsedMs, DescribeAssemblyState());
+
+            if (!cancellationToken.CanBeCanceled && elapsedMs > 60_000)
+                throw new TimeoutException(
+                    $"RaftManager.JoinCluster timed out after 60 s waiting for cluster initialization. State: {DescribeAssemblyState()}");
 
             await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
         }
@@ -721,7 +766,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (!cancellationToken.CanBeCanceled && joinStopwatch.GetElapsedMilliseconds() > 60_000)
-                throw new TimeoutException("RaftManager.JoinCluster(seeds) timed out after 60 s waiting for cluster initialization.");
+                throw new TimeoutException(
+                    $"RaftManager.JoinCluster(seeds) timed out after 60 s waiting for cluster initialization. State: {DescribeAssemblyState()}");
             string? terminalReasonInit = GetJoinTerminalReason(LocalEndpoint);
             if (terminalReasonInit is not null)
                 throw new InvalidOperationException($"RaftManager.JoinCluster: promotion permanently blocked — {terminalReasonInit}");

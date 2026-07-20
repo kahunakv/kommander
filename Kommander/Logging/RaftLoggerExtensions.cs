@@ -119,6 +119,9 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Received request to vote on previous term from {Endpoint} Term={Term}. Ignoring...")]
     public static partial void LogInfoVoteOnPreviousTerm(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long term);
 
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Stepping down: RequestVote from {Endpoint} carries higher Term={VoteTerm} > CurrentTerm={CurrentTerm}.")]
+    public static partial void LogInfoSteppingDownOnHigherVoteTerm(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long voteTerm, long currentTerm);
+
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Received request to vote from {Endpoint} but we already voted for {ExpectedLeader}. Ignoring...")]
     public static partial void LogInfoAlreadyVotedForOther(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, string expectedLeader);
 
