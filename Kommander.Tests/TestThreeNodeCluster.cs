@@ -375,14 +375,15 @@ public sealed class TestThreeNodeCluster
             new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed },
         ];
 
-        (IRaft node1, IRaft node2, IRaft node3) = await AssembleThreNodeCluster(
-            "memory",
-            1,
-            (wal1, wal2, _) =>
-            {
-                SeedWal(wal1, 1, seededCommitted);
-                SeedWal(wal2, 1, seededCommitted);
-            });
+        (IRaft node1, IRaft node2, IRaft node3, _, InMemoryCommunication communication) =
+            await AssembleThreNodeClusterWithNetwork(
+                "memory",
+                1,
+                (wal1, wal2, _) =>
+                {
+                    SeedWal(wal1, 1, seededCommitted);
+                    SeedWal(wal2, 1, seededCommitted);
+                });
 
         IRaft[] nodes = [node1, node2, node3];
 
@@ -395,6 +396,22 @@ public sealed class TestThreeNodeCluster
         Assert.NotEqual(node3.GetLocalEndpoint(), stableLeader);
 
         IRaft leaderNode = GetNodeByEndpoint(nodes, stableLeader);
+
+        // Keep node3 genuinely stale. The leader now (correctly) converges a sub-threshold follower
+        // once writes go quiet — so the empty node3 would catch up to the seeded log on its own,
+        // making a transfer to it legitimate. To exercise the rejection path we must hold node3
+        // durably behind: partition it, then commit fresh entries through the surviving quorum
+        // (node1 + node2). node3 cannot receive them while partitioned, so the leader's known remote
+        // max for node3 stays below its own — the exact condition TransferLeadershipAsync rejects.
+        communication.PartitionNode(node3.GetLocalEndpoint());
+
+        for (int i = 0; i < 3; i++)
+        {
+            RaftReplicationResult r = await leaderNode.ReplicateLogs(
+                1, "Greeting", "Hello World"u8.ToArray(),
+                cancellationToken: TestContext.Current.CancellationToken);
+            Assert.Equal(RaftOperationStatus.Success, r.Status);
+        }
 
         // node3 is behind the leader's committed log, so transferring leadership to it must be rejected.
         RaftOperationStatus transferStatus = await leaderNode.TransferLeadershipAsync(
@@ -510,7 +527,7 @@ public sealed class TestThreeNodeCluster
     [Fact]
     public async Task GetActiveNodes_UnreachableFollower_DropsAfterWindow()
     {
-        (IRaft node1, IRaft node2, IRaft node3, Dictionary<string, IRaft> network) = await AssembleThreNodeClusterWithNetwork("memory", 1);
+        (IRaft node1, IRaft node2, IRaft node3, Dictionary<string, IRaft> network, _) = await AssembleThreNodeClusterWithNetwork("memory", 1);
 
         IRaft[] nodes = [node1, node2, node3];
         string leaderEndpoint = await node1.WaitForLeaderStableAsync(
@@ -747,6 +764,95 @@ public sealed class TestThreeNodeCluster
             timeoutMs: 20_000);
 
         AssertContiguousLog(pausedNode, decidedLeader, 1);
+
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Small-tail-gap convergence after writes stop: a follower that misses only the last
+    /// entry (a gap smaller than <see cref="RaftConfiguration.BackfillThreshold"/>) while briefly
+    /// partitioned must still converge once the partition heals — even though no further writes
+    /// arrive to carry it forward on the live path.
+    ///
+    /// This is the exact shape of the flaky CI convergence failure: the leader commits an entry to
+    /// a quorum of two while the third follower is unreachable, then writes stop. Heartbeats to the
+    /// lagging follower are empty (they carry no log entries), and the backfill loop is gated on
+    /// <c>gap &gt; BackfillThreshold</c>, so a 1-entry tail gap is never re-shipped. Without a
+    /// recovery path the follower stays permanently one entry behind. The generous
+    /// timeout only surfaces a genuine permanent stall — correct behaviour converges in well
+    /// under a second.
+    /// </summary>
+    [Fact]
+    public async Task SmallTailGap_ConvergesAfterWritesStop()
+    {
+        InMemoryCommunication communication = new();
+
+        // Default-scale BackfillThreshold (10) so a 1-entry gap sits inside the un-backfilled window,
+        // reproducing the production configuration rather than the aggressive threshold=2 used by the
+        // large-gap backfill tests.
+        IRaft node1 = GetNode1WithBackfillConfig(communication, logger, maxBackfillEntriesPerRound: 5, backfillThreshold: 10);
+        IRaft node2 = GetNode2WithBackfillConfig(communication, logger, maxBackfillEntriesPerRound: 5, backfillThreshold: 10);
+        IRaft node3 = GetNode3WithBackfillConfig(communication, logger, maxBackfillEntriesPerRound: 5, backfillThreshold: 10);
+        IRaft[] nodes = [node1, node2, node3];
+
+        Dictionary<string, IRaft> network = new()
+        {
+            { "localhost:8001", node1 },
+            { "localhost:8002", node2 },
+            { "localhost:8003", node3 }
+        };
+        communication.SetNodes(network);
+
+        await node1.UpdateNodes();
+        await node2.UpdateNodes();
+        await node3.UpdateNodes();
+
+        await Task.WhenAll(
+            node1.JoinCluster(TestContext.Current.CancellationToken),
+            node2.JoinCluster(TestContext.Current.CancellationToken),
+            node3.JoinCluster(TestContext.Current.CancellationToken));
+
+        string leaderEndpoint = await node1.WaitForLeaderStableAsync(
+            1, TimeSpan.FromMilliseconds(150), TestContext.Current.CancellationToken);
+
+        IRaft leader = GetNodeByEndpoint(nodes, leaderEndpoint);
+        IRaft follower = nodes.First(n => n.GetLocalEndpoint() != leaderEndpoint);
+
+        // Seed a committed prefix that all three nodes hold.
+        byte[] data = "Seed"u8.ToArray();
+        const int seed = 5;
+        for (int i = 0; i < seed; i++)
+        {
+            RaftReplicationResult r = await leader.ReplicateLogs(1, "Seed", data,
+                cancellationToken: TestContext.Current.CancellationToken);
+            Assert.Equal(RaftOperationStatus.Success, r.Status);
+        }
+
+        await WaitForConditionAsync(
+            () => follower.WalAdapter.GetMaxLog(1) == seed,
+            TestContext.Current.CancellationToken);
+
+        // Drop only this one follower, then commit exactly one entry: the leader + the other
+        // follower form a quorum, so the write succeeds while the partitioned follower misses it.
+        communication.PartitionNode(follower.GetLocalEndpoint());
+
+        RaftReplicationResult tail = await leader.ReplicateLogs(1, "Tail", data,
+            cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal(RaftOperationStatus.Success, tail.Status);
+
+        long leaderMax = leader.WalAdapter.GetMaxLog(1);
+        Assert.Equal(seed + 1, leaderMax);
+
+        // Heal and then STOP writing. The lagging follower now depends entirely on the leader's
+        // recovery machinery (heartbeats / backfill) to receive that final entry.
+        communication.HealPartition(follower.GetLocalEndpoint());
+
+        await WaitForConditionAsync(
+            () => follower.WalAdapter.GetMaxLog(1) == leaderMax,
+            TestContext.Current.CancellationToken,
+            timeoutMs: 15_000);
 
         await node1.LeaveCluster(true, CancellationToken.None);
         await node2.LeaveCluster(true, CancellationToken.None);
@@ -1121,7 +1227,7 @@ public sealed class TestThreeNodeCluster
         int partitions,
         Action<IWAL, IWAL, IWAL>? seedWal = null)
     {
-        (IRaft node1, IRaft node2, IRaft node3, _) = await AssembleThreNodeClusterWithNetwork(
+        (IRaft node1, IRaft node2, IRaft node3, _, _) = await AssembleThreNodeClusterWithNetwork(
             walStorage,
             partitions,
             seedWal);
@@ -1129,7 +1235,7 @@ public sealed class TestThreeNodeCluster
         return (node1, node2, node3);
     }
 
-    private async Task<(IRaft, IRaft, IRaft, Dictionary<string, IRaft>)> AssembleThreNodeClusterWithNetwork(
+    private async Task<(IRaft, IRaft, IRaft, Dictionary<string, IRaft>, InMemoryCommunication)> AssembleThreNodeClusterWithNetwork(
         string walStorage,
         int partitions,
         Action<IWAL, IWAL, IWAL>? seedWal = null)
@@ -1160,7 +1266,7 @@ public sealed class TestThreeNodeCluster
         for (int i = 1; i <= partitions; i++)
             await WaitForAnyLeader([node1, node2, node3], i, TestContext.Current.CancellationToken);
 
-        return (node1, node2, node3, network);
+        return (node1, node2, node3, network, communication);
     }
 
     private static async Task WaitForAnyLeader(IRaft[] nodes, int partitionId, CancellationToken cancellationToken)

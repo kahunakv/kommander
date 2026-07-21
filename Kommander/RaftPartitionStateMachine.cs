@@ -168,6 +168,20 @@ public sealed class RaftPartitionStateMachine
     private long localCommittedIndex = -1;
 
     /// <summary>
+    /// The committed frontier captured at the moment this node became leader — the boundary between
+    /// <em>restored</em> committed entries (present in the WAL at promotion) and entries committed
+    /// <em>live</em> during this leadership term. The idle-tail backfill in <c>SendHeartbeat</c> only
+    /// re-ships a sub-threshold follower gap when <see cref="localCommittedIndex"/> has advanced past
+    /// this floor, i.e. a live commit exists that a healthy follower would already have received.
+    /// This preserves the invariant that a leader does not push restored local state to followers
+    /// until new entries are proposed, while still healing a genuinely-committed tail entry a follower
+    /// missed once writes go quiet. Re-anchored at every promotion (both <see cref="BecomeLeader"/>
+    /// paths) and only ever read while <c>nodeState == Leader</c>, so it needs no follower-side reset —
+    /// a stale value from a prior term is always overwritten before the next leader can heartbeat.
+    /// </summary>
+    private long liveCommitFloor = -1;
+
+    /// <summary>
     /// Highest log index that has been delivered to the consumer via
     /// <see cref="IRaftPartitionHost.InvokeReplicationReceived"/> or
     /// <see cref="IRaftPartitionHost.InvokeSystemReplicationReceived"/>.
@@ -660,6 +674,7 @@ public sealed class RaftPartitionStateMachine
         long nowTicks = host.GetMonotonicTimestamp();
         nodeState = RaftNodeState.Leader;
         localCommittedIndex = wal.GetCommitIndex();
+        liveCommitFloor = localCommittedIndex;
         host.Leader = host.LocalEndpoint;
         lastHeartbeat = ts;
         lastProposalAt = ts;
@@ -724,6 +739,7 @@ public sealed class RaftPartitionStateMachine
         nodeState = RaftNodeState.Leader;
         long commitFrontier = wal.GetCommitIndex();
         localCommittedIndex = commitFrontier;
+        liveCommitFloor = commitFrontier;
         lastHeartbeat = ts;
         lastProposalAt = ts;
         lastHeartbeatTicks = nowTicks;
@@ -1324,7 +1340,19 @@ public sealed class RaftPartitionStateMachine
 
         HLCTimestamp prevHeartbeat = lastHeartbeat;
         lastHeartbeat = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
-        lastHeartbeatTicks = host.GetMonotonicTimestamp();
+        long nowTicks = host.GetMonotonicTimestamp();
+        lastHeartbeatTicks = nowTicks;
+
+        // "Live replication is quiet": no proposal has been issued for at least one heartbeat
+        // interval (or we have never proposed as this leader). While writes are flowing, a follower
+        // that trails by a few entries is simply mid-flight on the live-propose broadcast and will
+        // converge on its own, so the small-gap backfill below stays disabled to avoid redundant WAL
+        // reads. Once writes pause, that live path can no longer heal a residual tail gap — a follower
+        // that missed the final committed entry (e.g. it was briefly unreachable at commit time) would
+        // otherwise stay permanently behind, because empty heartbeats carry no entries and the
+        // threshold-gated backfill never fires for a sub-threshold gap.
+        bool liveReplicationQuiet = lastProposalAtTicks == 0
+            || MonotonicElapsed(lastProposalAtTicks, nowTicks) >= host.Configuration.HeartbeatInterval;
 
         if (nodeState != RaftNodeState.Leader && nodeState != RaftNodeState.Candidate)
             return;
@@ -1351,16 +1379,29 @@ public sealed class RaftPartitionStateMachine
 
             host.UpdateLastHeartbeat(node.Endpoint, host.PartitionId, lastHeartbeat);
 
-            // Backfill: if the follower's acknowledged committed log trails the leader's committed
-            // index by more than BackfillThreshold, ship up to MaxBackfillEntriesPerRound committed
-            // entries instead of an empty heartbeat so it converges without waiting for new writes.
-            // localCommittedIndex is in-memory and always reflects only durably committed entries,
-            // so healthy followers with in-flight proposals do not trigger spurious WAL reads.
+            // Backfill: ship up to MaxBackfillEntriesPerRound committed entries instead of an empty
+            // heartbeat so the follower converges without waiting for new writes.
             // TrySendBackfillBatchAsync handles nextIndex selection and the Log Matching anchors.
+            //
+            // Two triggers:
+            //   * gap > BackfillThreshold — an actively-behind follower (join catch-up, long
+            //     partition) is streamed forward regardless of write activity.
+            //   * gap >= 1 && liveReplicationQuiet && a live commit exists above liveCommitFloor —
+            //     once writes pause, even a single missed tail entry must be re-shipped explicitly;
+            //     the live-propose broadcast is done and empty heartbeats can never deliver it. The
+            //     liveCommitFloor guard confines this to entries committed during this term: a leader
+            //     does not push merely-restored committed state to a follower until a new write occurs
+            //     (that is the highest-WAL election-preference contract). Gating on quiet also keeps
+            //     steady-state writes free of the per-heartbeat WAL read a healthy in-flight follower
+            //     would otherwise incur.
+            // localCommittedIndex is in-memory and always reflects only durably committed entries.
+            long followerGap = lastCommitIndexes.TryGetValue(node.Endpoint, out long followerMaxLog)
+                ? localCommittedIndex - followerMaxLog
+                : 0;
+            bool idleTailGap = followerGap > 0 && liveReplicationQuiet && localCommittedIndex > liveCommitFloor;
             if (nodeState == RaftNodeState.Leader
                 && localCommittedIndex >= 0
-                && lastCommitIndexes.TryGetValue(node.Endpoint, out long followerMaxLog)
-                && localCommittedIndex - followerMaxLog > host.Configuration.BackfillThreshold)
+                && (followerGap > host.Configuration.BackfillThreshold || idleTailGap))
             {
                 if (await TrySendBackfillBatchAsync(node, followerMaxLog, lastHeartbeat).ConfigureAwait(false))
                     continue;
@@ -1599,8 +1640,7 @@ public sealed class RaftPartitionStateMachine
         // deferred to B2b — here we only fix the Leader/Candidate fencing bug.
         if (voteTerm > currentTerm && nodeState != RaftNodeState.Follower)
         {
-            logger.LogInformation(
-                "[{LocalEndpoint}/{PartitionId}/{State}] Stepping down: RequestVote from {Endpoint} carries higher Term={VoteTerm} > CurrentTerm={CurrentTerm}.",
+            logger.LogInfoSteppingDownOnHigherVoteTerm(
                 host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm, currentTerm);
 
             nodeState = RaftNodeState.Follower;
