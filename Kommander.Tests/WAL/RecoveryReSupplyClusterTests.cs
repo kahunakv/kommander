@@ -157,6 +157,128 @@ public sealed class RecoveryReSupplyClusterTests
         }
     }
 
+    /// <summary>
+    /// The same crash, but the lost tail is <b>smaller than <see cref="RaftConfiguration.BackfillThreshold"/></b>
+    /// and no further writes occur after the restart.
+    ///
+    /// <para>This is the case a threshold-gated re-supply cannot repair. "A small gap rides on normal
+    /// replication" holds for a follower that is merely behind, but not for a regressed one: the missing
+    /// entries are already-committed history, so no future propose broadcast carries them, and the
+    /// idle-tail trigger in <c>SendHeartbeat</c> refuses to push merely-restored committed state
+    /// (the <c>liveCommitFloor</c> guard). Without the regression trigger the node would sit with a
+    /// truncated view of its own acknowledged writes until unrelated traffic happened to push the gap
+    /// past the threshold — unbounded on an idle cluster.</para>
+    ///
+    /// <para>Deliberately uses the <b>default</b> <c>BackfillThreshold</c> and writes nothing after the
+    /// restart, so convergence can only come from the regressed-frontier path.</para>
+    /// </summary>
+    [Fact]
+    public async Task Follower_LostSubThresholdTail_ReConvergesWithoutFurtherWrites()
+    {
+        const int total = 12;
+        const int keepCommitted = 10; // demote ids 11..12 — a gap of 2, well under the default threshold of 10
+
+        string tmpDir = Path.Combine(Path.GetTempPath(), $"kommander-resupply-small-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tmpDir);
+
+        InMemoryCommunication comm = new();
+        RaftManager?[] live = new RaftManager?[3];
+        string[][] peersById =
+        [
+            ["localhost:8002", "localhost:8003"],
+            ["localhost:8001", "localhost:8003"],
+            ["localhost:8001", "localhost:8002"],
+        ];
+
+        try
+        {
+            for (int i = 0; i < 3; i++)
+                live[i] = MakeNode(i + 1, comm, new RocksDbWAL(tmpDir, $"node{i + 1}", logger, syncWrites: true), peersById[i], backfillThreshold: null);
+
+            SetNetwork(comm, live);
+
+            await Task.WhenAll(live.Select(n => n!.UpdateNodes()));
+            await Task.WhenAll(live.Select(n => n!.JoinCluster(TestContext.Current.CancellationToken)));
+
+            await WaitForAnyLeader(live!, UserPartition, TestContext.Current.CancellationToken);
+            IRaft leader = await GetLeader(UserPartition, live!) ?? throw new InvalidOperationException("no leader");
+
+            byte[] data = "Hello World"u8.ToArray();
+            for (int i = 1; i <= total; i++)
+            {
+                RaftReplicationResult r = await leader.ReplicateLogs(UserPartition, "Greeting", data, cancellationToken: TestContext.Current.CancellationToken);
+                Assert.True(r.Success, $"replicate {i} failed: {r.Status}");
+                Assert.Equal(i, r.LogIndex);
+            }
+
+            await WaitForConditionAsync(
+                () => live.All(n => n!.WalAdapter.GetMaxLog(UserPartition) >= total),
+                TestContext.Current.CancellationToken);
+
+            int victimIdx = -1;
+            for (int i = 0; i < 3; i++)
+            {
+                if (!ReferenceEquals(live[i], leader) && !await live[i]!.AmILeaderQuick(UserPartition))
+                {
+                    victimIdx = i;
+                    break;
+                }
+            }
+            Assert.InRange(victimIdx, 0, 2);
+            int victimNodeId = victimIdx + 1;
+
+            live[victimIdx]!.Dispose();
+            live[victimIdx] = null;
+
+            DemoteCommitMarkers(tmpDir, $"node{victimNodeId}", from: keepCommitted + 1, to: total);
+
+            RaftManager restarted = MakeNode(victimNodeId, comm, new RocksDbWAL(tmpDir, $"node{victimNodeId}", logger, syncWrites: true), peersById[victimIdx], backfillThreshold: null);
+
+            ConcurrentBag<long> restoredIds = [];
+            ConcurrentBag<long> receivedIds = [];
+            restarted.OnLogRestored += (pid, log) =>
+            {
+                if (pid == UserPartition) restoredIds.Add(log.Id);
+                return Task.FromResult(true);
+            };
+            restarted.OnReplicationReceived += (pid, log) =>
+            {
+                if (pid == UserPartition) receivedIds.Add(log.Id);
+                return Task.FromResult(true);
+            };
+
+            live[victimIdx] = restarted;
+            SetNetwork(comm, live);
+
+            await restarted.UpdateNodes();
+            await restarted.JoinCluster(TestContext.Current.CancellationToken);
+
+            // No writes after this point: the sub-threshold tail can only arrive via the regressed-frontier
+            // re-supply. The restore floor is the contiguous prefix, so ids 11..12 must come from re-supply.
+            await WaitForConditionAsync(
+                () =>
+                {
+                    HashSet<long> applied = [.. restoredIds, .. receivedIds];
+                    return Enumerable.Range(1, total).All(id => applied.Contains(id));
+                },
+                TestContext.Current.CancellationToken,
+                timeoutSeconds: 25);
+
+            Assert.DoesNotContain(restoredIds, id => id > keepCommitted);
+            Assert.True(leader.WalAdapter.GetMaxLog(UserPartition) >= total);
+        }
+        finally
+        {
+            foreach (RaftManager? n in live)
+            {
+                try { n?.Dispose(); }
+                catch { /* already disposed */ }
+            }
+            try { if (Directory.Exists(tmpDir)) Directory.Delete(tmpDir, recursive: true); }
+            catch { /* best-effort */ }
+        }
+    }
+
     // ── Harness ────────────────────────────────────────────────────────────
 
     private static void SetNetwork(InMemoryCommunication comm, RaftManager?[] live)
@@ -190,7 +312,12 @@ public sealed class RecoveryReSupplyClusterTests
         Assert.Equal(RaftOperationStatus.Success, wal.Write([(UserPartition, demoted)]));
     }
 
-    private RaftManager MakeNode(int id, InMemoryCommunication communication, IWAL wal, string[] peers)
+    /// <param name="backfillThreshold">
+    /// <c>null</c> keeps the production default, which is what
+    /// <see cref="Follower_LostSubThresholdTail_ReConvergesWithoutFurtherWrites"/> needs in order to prove
+    /// the regressed-frontier path repairs a gap the threshold would otherwise ignore.
+    /// </param>
+    private RaftManager MakeNode(int id, InMemoryCommunication communication, IWAL wal, string[] peers, int? backfillThreshold = 1)
     {
         RaftConfiguration config = new()
         {
@@ -208,10 +335,11 @@ public sealed class RecoveryReSupplyClusterTests
             StartElectionTimeout = 100,
             EnableQuiescence = false,
             EndElectionTimeout = 250,
-            // Re-supply the recovered follower's regressed tail even for a small gap.
-            BackfillThreshold = 1,
             WalSingleFsyncCommit = true,
         };
+
+        if (backfillThreshold is not null)
+            config.BackfillThreshold = backfillThreshold.Value;
 
         return new RaftManager(
             config,

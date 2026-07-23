@@ -182,6 +182,22 @@ public sealed class RaftPartitionStateMachine
     private long liveCommitFloor = -1;
 
     /// <summary>
+    /// Monotonic tick of the last regressed-frontier re-supply sent to each peer, used to rate-limit
+    /// that path to at most one batch per <see cref="RaftConfiguration.HeartbeatInterval"/> per peer.
+    ///
+    /// <para>Without this, every ack already in flight when the regression is first observed triggers
+    /// its own re-supply of the same range — the follower cannot have processed the first batch yet, so
+    /// it is still reporting the low frontier — and a burst of acks re-ships the identical entries
+    /// several times. Harmless (the re-shipped <c>Committed</c> copies are idempotent upserts) but pure
+    /// waste on the WAL read path and the wire. Rate-limiting by time rather than suppressing a repeat
+    /// of the same anchor keeps the retry: if a re-supply is lost, the next heartbeat re-issues it.</para>
+    ///
+    /// <para>Entries are never explicitly evicted. The value is only ever compared against "now", so a
+    /// stale entry from a prior term can at worst delay one re-supply by a single heartbeat interval.</para>
+    /// </summary>
+    private readonly Dictionary<string, long> lastRegressionResupplyTicks = [];
+
+    /// <summary>
     /// Highest log index that has been delivered to the consumer via
     /// <see cref="IRaftPartitionHost.InvokeReplicationReceived"/> or
     /// <see cref="IRaftPartitionHost.InvokeSystemReplicationReceived"/>.
@@ -2543,9 +2559,15 @@ public sealed class RaftPartitionStateMachine
     /// <param name="followerMaxLog">The highest committed index the leader believes the follower holds;
     /// used as the fallback start when <see cref="nextIndex"/> has not been backtracked below it.</param>
     /// <param name="timestamp">HLC timestamp to stamp the outbound request.</param>
-    private async Task<bool> TrySendBackfillBatchAsync(RaftNode node, long followerMaxLog, HLCTimestamp timestamp)
+    /// <param name="anchorToFollowerFrontier">
+    /// Ignores <see cref="nextIndex"/> and starts the batch at <paramref name="followerMaxLog"/> + 1.
+    /// Required by the fast-path re-supply of a <b>regressed</b> follower: <see cref="nextIndex"/> is
+    /// derived from the monotonic <see cref="matchIndex"/> and so still points above the frontier the
+    /// follower just reported, which is precisely the range that must be re-shipped.
+    /// </param>
+    private async Task<bool> TrySendBackfillBatchAsync(RaftNode node, long followerMaxLog, HLCTimestamp timestamp, bool anchorToFollowerFrontier = false)
     {
-        long from = nextIndex.TryGetValue(node.Endpoint, out long ni) && ni <= localCommittedIndex
+        long from = !anchorToFollowerFrontier && nextIndex.TryGetValue(node.Endpoint, out long ni) && ni <= localCommittedIndex
             ? ni
             : followerMaxLog + 1;
 
@@ -2668,8 +2690,12 @@ public sealed class RaftPartitionStateMachine
         }
 
         // Success: advance matchIndex and nextIndex for this peer so the backfill loop
-        // knows the follower has caught up to at least committedIndex.
-        if (!matchIndex.TryGetValue(endpoint, out long currentMatchIndex) || committedIndex > currentMatchIndex)
+        // knows the follower has caught up to at least committedIndex. matchIndex stays monotonic
+        // (a stale in-flight ack must not drag a peer's recorded progress backwards), so the prior
+        // value is captured first — it is the only evidence of a genuine frontier regression, which
+        // the fast-path re-supply below keys on.
+        bool hadMatchIndex = matchIndex.TryGetValue(endpoint, out long priorMatchIndex);
+        if (!hadMatchIndex || committedIndex > priorMatchIndex)
             matchIndex[endpoint] = committedIndex;
         nextIndex[endpoint] = matchIndex[endpoint] + 1;
 
@@ -2694,14 +2720,45 @@ public sealed class RaftPartitionStateMachine
         // reported frontier. Idempotent: those entries are present on the follower as Proposed, and the
         // re-shipped Committed copies upsert and apply them. Confined to the fast path (flag off ⇒ a
         // heartbeat reports -1 ⇒ this never fires), so legacy replication is unchanged.
+        //
+        // BackfillThreshold must NOT gate this. That threshold encodes "a small gap rides on normal
+        // replication", which is true for a follower that is merely behind but false for a regressed
+        // one: the entries it is missing are already-committed history, so no future propose broadcast
+        // carries them, and the idle-tail trigger in SendHeartbeat cannot help either — its
+        // liveCommitFloor guard deliberately refuses to push merely-restored committed state. A
+        // sub-threshold regression would therefore never be repaired until unrelated writes happened to
+        // push the gap past the threshold, leaving the node serving a truncated view of its own
+        // acknowledged writes for an unbounded time on an idle cluster. A regression is unambiguous
+        // (a commit frontier cannot legitimately move backwards) and rare, so it is repaired at any size.
+        //
+        // The anchor matters too: nextIndex[peer] tracks the monotonic matchIndex and therefore still
+        // points ABOVE the regressed frontier, so the batch must be anchored to what the follower just
+        // reported instead — otherwise the re-supply would skip exactly the range that regressed.
         if (host.Configuration.WalSingleFsyncCommit
             && nodeState == RaftNodeState.Leader
             && committedIndex >= 0
-            && localCommittedIndex - committedIndex > host.Configuration.BackfillThreshold)
+            && localCommittedIndex > committedIndex)
         {
-            RaftNode? regressedNode = host.Nodes.FirstOrDefault(n => n.Endpoint == endpoint);
-            if (regressedNode is not null)
-                await TrySendBackfillBatchAsync(regressedNode, committedIndex, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId)).ConfigureAwait(false);
+            bool frontierRegressed = hadMatchIndex && committedIndex < priorMatchIndex;
+
+            // Rate-limit the regression path: acks already in flight when the regression is first seen
+            // all still report the low frontier, and each would otherwise re-ship the same range.
+            if (frontierRegressed)
+            {
+                long nowTicks = host.GetMonotonicTimestamp();
+                if (lastRegressionResupplyTicks.TryGetValue(endpoint, out long sentAtTicks)
+                    && MonotonicElapsed(sentAtTicks, nowTicks) < host.Configuration.HeartbeatInterval)
+                    frontierRegressed = false;
+                else
+                    lastRegressionResupplyTicks[endpoint] = nowTicks;
+            }
+
+            if (frontierRegressed || localCommittedIndex - committedIndex > host.Configuration.BackfillThreshold)
+            {
+                RaftNode? regressedNode = host.Nodes.FirstOrDefault(n => n.Endpoint == endpoint);
+                if (regressedNode is not null)
+                    await TrySendBackfillBatchAsync(regressedNode, committedIndex, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), anchorToFollowerFrontier: frontierRegressed).ConfigureAwait(false);
+            }
         }
 
         if (!activeProposals.TryGetValue(timestamp, out RaftProposalQuorum? proposal))

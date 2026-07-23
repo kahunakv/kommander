@@ -219,6 +219,16 @@ The true frontier above that lower bound is then re-supplied:
   regression (which its monotonic `matchIndex` can't see) and re-ships the still-committed tail via the
   existing backfill path. The re-shipped `Committed` copies upsert the entries already present as
   `Proposed` and apply them — idempotent.
+
+  **`BackfillThreshold` does not gate this.** The threshold encodes "a small gap rides on normal
+  replication", which is true of a follower that is merely behind and false of a regressed one: its
+  missing entries are already-committed history, so no future propose broadcast carries them, and the
+  idle-tail trigger in `SendHeartbeat` deliberately refuses to push merely-restored committed state
+  (the `liveCommitFloor` guard). A sub-threshold regression left to the threshold would only be repaired
+  when unrelated writes happened to push the gap past it — never, on an idle cluster. A commit frontier
+  cannot legitimately move backwards, so the signature is unambiguous and is repaired at any gap size.
+  The batch is anchored to the frontier the follower just reported, not to `nextIndex` — the latter
+  tracks the monotonic `matchIndex` and still points above exactly the range that regressed.
 - A restarted node that **wins election** re-commits the durable `Proposed` prefix once a current-term
   entry commits (standard Raft leader completeness).
 
@@ -254,7 +264,7 @@ In `RaftConfiguration.cs`:
 
 | Setting | Default | What it does |
 |---|---|---|
-| `WalSingleFsyncCommit` | `false` | The latency lever. Acks `autoCommit` writes on propose-quorum-durable and writes the commit marker lazily, removing one `fsync` from the critical path. Off ⇒ byte-for-byte the prior two-sync behaviour. |
+| `WalSingleFsyncCommit` | `true` | The latency lever. Acks `autoCommit` writes on propose-quorum-durable and writes the commit marker lazily, removing one `fsync` from the critical path. Off ⇒ byte-for-byte the prior two-sync behaviour. |
 | `WalGroupCommitLingerMs` | `0` | The throughput/tail lever. `> 0` lets a WAL worker linger up to this many ms to gather more ready partitions into one `fsync`. Adaptive: low-overlap load pays at most one short probe. `0` keeps purely opportunistic batching. |
 | `MaxWalGroupBatchPartitions` | `64` | Max partitions coalesced into a single `walAdapter.Write` (one `fsync` on RocksDB). |
 | `MaxWalBatchSize` | `256` | Max operations drained from one partition per write. |
@@ -262,9 +272,16 @@ In `RaftConfiguration.cs`:
 
 Tuning notes:
 
-- **`WalSingleFsyncCommit`** is the knob to reach for when **write latency** (not throughput) is the
-  problem and the backend is durable (`syncWrites: true`). Enable it, then confirm syncs-per-write drops
-  (see [Observability](#observability)). It is safe to leave off; it changes no on-disk format.
+- **`WalSingleFsyncCommit`** is **on by default**. It is what makes write latency acceptable on a durable
+  backend (`syncWrites: true`), and it changes no on-disk format, so it can be turned off again at any
+  time. Two operational notes:
+  - **Set it uniformly across the cluster.** The regressed-frontier re-supply is a follower-reports /
+    leader-reacts pair; with the flag off a follower's heartbeat ack reports `-1` instead of its real
+    frontier, so a mixed cluster leaves that channel half-wired.
+  - **Turn it off** if you need the disk alone to answer "what was committed" without help from a leader
+    — e.g. forensic single-node recovery, or an environment where a restarted node may serve reads before
+    it reconnects. On the fast path a restarted node's applied state is the *contiguous* committed prefix
+    until re-supply lands (Flow 5).
 - **`WalGroupCommitLingerMs`** helps most when writes spread across **many partitions** and arrive
   staggered (the follower append path). Start around `2` ms and measure; the win is denser batches and a
   tighter tail, not a lower median. A larger value bounds the linger; the adaptive bail keeps idle load

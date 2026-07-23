@@ -29,7 +29,8 @@ public sealed class TestLeaderBalancerIntegration
         ILogger<IRaft> logger,
         bool enableBalancer = true,
         TimeSpan suggestionTimeout = default,
-        TimeSpan moveCooldown = default)
+        TimeSpan moveCooldown = default,
+        bool singleFsyncCommit = true)
     {
         RaftConfiguration config = new()
         {
@@ -58,6 +59,7 @@ public sealed class TestLeaderBalancerIntegration
             MaxMovesPerPass = 8,
             MaxConcurrentTransfers = 8,
             CountDeadband = 0, // no deadband so we detect skew clearly
+            WalSingleFsyncCommit = singleFsyncCommit,
         };
 
         return new RaftManager(
@@ -904,9 +906,15 @@ public sealed class TestLeaderBalancerIntegration
         InMemoryCommunication comm = new();
         // InMemoryWAL (no delay): WAL writes complete in nanoseconds, so the drain rate
         // is effectively infinite — any offered rate is "below the ceiling".
-        RaftManager n1 = MakeNode(comm, "localhost", 9760, 1, ["localhost:9761", "localhost:9762"], log);
-        RaftManager n2 = MakeNode(comm, "localhost", 9761, 2, ["localhost:9760", "localhost:9762"], log);
-        RaftManager n3 = MakeNode(comm, "localhost", 9762, 3, ["localhost:9760", "localhost:9761"], log);
+        //
+        // WalSingleFsyncCommit is turned OFF here deliberately. This test's invariant — "a sequential
+        // writer never builds queue depth" — presumes the ack is the end of the write, which is only
+        // true on the two-phase path. On the fast path ReplicateLogs returns on propose-quorum-durable
+        // and the lazy Committed marker is still queued at that instant, so depth is legitimately 1.
+        // Measuring below-ceiling backlog needs the regime where depth 0 is well-defined.
+        RaftManager n1 = MakeNode(comm, "localhost", 9760, 1, ["localhost:9761", "localhost:9762"], log, singleFsyncCommit: false);
+        RaftManager n2 = MakeNode(comm, "localhost", 9761, 2, ["localhost:9760", "localhost:9762"], log, singleFsyncCommit: false);
+        RaftManager n3 = MakeNode(comm, "localhost", 9762, 3, ["localhost:9760", "localhost:9761"], log, singleFsyncCommit: false);
         RaftManager[] nodes = [n1, n2, n3];
 
         try

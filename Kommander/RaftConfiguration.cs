@@ -395,10 +395,22 @@ public class RaftConfiguration
     /// <para>Scope is strictly the <c>autoCommit</c> single-round path. The explicit
     /// two-phase (<c>!AutoCommit</c>) path keeps its separate durable commit, untouched.</para>
     ///
-    /// <para>Defaults to <c>false</c> (disabled — behaviour is byte-for-byte the prior
-    /// two-fsync commit). Enable and measure before relying on it.</para>
+    /// <para><b>Defaults to <c>true</c>.</b> The cost of the fast path is that the on-disk
+    /// entry type is no longer a reliable committed/uncommitted boundary after a crash: restore
+    /// reconstructs a conservative lower bound (the contiguous committed prefix) and the true
+    /// tail is re-supplied by the leader on reconnect, or re-committed once this node wins an
+    /// election and commits a current-term entry. A node therefore serves a briefly truncated
+    /// view of its own committed state between restore and re-supply. Set to <c>false</c> to get
+    /// byte-for-byte the prior always-sync two-fsync behaviour, where the disk alone answers
+    /// "what was committed".</para>
+    ///
+    /// <para>The flag must be set <b>uniformly across the cluster</b>: the regressed-frontier
+    /// re-supply channel is a follower-reports / leader-reacts pair (see
+    /// <c>RaftPartitionStateMachine.CompleteAppendLogsAsync</c>), and with the flag off a
+    /// follower's heartbeat ack reports <c>-1</c> instead of its real frontier, leaving the
+    /// channel half-wired.</para>
     /// </summary>
-    public bool WalSingleFsyncCommit { get; set; }
+    public bool WalSingleFsyncCommit { get; set; } = true;
 
     // ── Partition executor drain quanta ───────────────────────────────────────
 

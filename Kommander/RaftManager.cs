@@ -589,6 +589,16 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// the initial map to this node (stage 2); <c>0&lt;userPartitions&lt;N</c> ⇒ StartUserPartitions
     /// ran partially (stage 3).
     /// </para>
+    /// <para>
+    /// Stage 2 has two very different causes that look identical from the partition count alone, so
+    /// the local P0 log frontier is reported alongside it. <c>p0MaxLog=0</c> means the entries never
+    /// arrived — the leader is heartbeating us but never shipping the committed range (a leader-side
+    /// replication/backfill problem). <c>p0MaxLog&gt;0</c> with <c>userPartitions=0</c> means they
+    /// did arrive but were never applied — they are sitting in the WAL unconverted to
+    /// <c>Committed</c>, or the coordinator never processed the resulting <c>ConfigReplicated</c>
+    /// (a follower-side apply problem). Without this split, a stalled join is indistinguishable
+    /// between "nothing was sent" and "everything was sent and dropped on the floor".
+    /// </para>
     /// </summary>
     private string DescribeAssemblyState()
     {
@@ -598,11 +608,32 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
         string systemState = systemPartition is null ? "n/a" : systemPartition.State.ToString();
 
+        // Direct WAL-backend reads: synchronous, and deliberately NOT routed through the read
+        // scheduler or the partition executor, either of which may be the thing that is stuck.
+        string p0MaxLog = "n/a";
+        string p0Term = "n/a";
+
+        if (systemPartition is not null)
+        {
+            try
+            {
+                p0MaxLog = walAdapter.GetMaxLog(RaftSystemConfig.SystemPartition).ToString();
+                p0Term = walAdapter.GetCurrentTerm(RaftSystemConfig.SystemPartition).ToString();
+            }
+            catch (Exception ex)
+            {
+                // A diagnostic must never be the reason a join fails.
+                p0MaxLog = "err:" + ex.GetType().Name;
+            }
+        }
+
         return string.Concat(
             "local=", LocalEndpoint,
             " role=", LocalRole.ToString(),
             " systemLeader=", systemLeader,
             " systemState=", systemState,
+            " p0MaxLog=", p0MaxLog,
+            " p0Term=", p0Term,
             " userPartitions=", partitions.Count.ToString(),
             "/", configuration.InitialPartitions.ToString(),
             " initialized=", IsInitialized ? "true" : "false");
