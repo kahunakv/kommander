@@ -2739,7 +2739,25 @@ public sealed class RaftPartitionStateMachine
             && committedIndex >= 0
             && localCommittedIndex > committedIndex)
         {
-            bool frontierRegressed = hadMatchIndex && committedIndex < priorMatchIndex;
+            // A genuine crash-restart regression has TWO parts, and both are required. Without the
+            // second, this path also fires spuriously during ordinary catch-up.
+            //   1. The reported frontier is below what matchIndex recorded (committedIndex < priorMatchIndex).
+            //   2. The peer was ALREADY essentially caught up before the drop
+            //      (priorMatchIndex within BackfillThreshold of localCommittedIndex).
+            // Part 2 is what separates a restart from a peer that is merely mid-catch-up. A joining
+            // node — or any far-behind follower being streamed forward — advances matchIndex as acks
+            // arrive, and those acks can be REORDERED by the network/scheduler: a delayed older ack
+            // reporting a low committedIndex can land after matchIndex has already climbed higher,
+            // making part 1 true even though nothing regressed. Acting on that (anchoring a re-supply
+            // at the stale low frontier) fights the normal forward catch-up already in flight and, via
+            // the log-hole truncate path, can livelock the join — the node is repeatedly rewound and
+            // re-shipped and never converges. Requiring the peer to have been caught up first excludes
+            // every still-climbing follower, so a reordered ack mid-catch-up no longer triggers it;
+            // only a peer that reached the frontier and then dropped below it (lost lazy markers on
+            // restart) qualifies. The far-behind case is left entirely to the normal threshold path below.
+            bool frontierRegressed = hadMatchIndex
+                && committedIndex < priorMatchIndex
+                && priorMatchIndex >= localCommittedIndex - host.Configuration.BackfillThreshold;
 
             // Rate-limit the regression path: acks already in flight when the regression is first seen
             // all still report the low frontier, and each would otherwise re-ship the same range.
