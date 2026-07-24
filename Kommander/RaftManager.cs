@@ -1602,17 +1602,27 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     internal NodeLoadReport BuildLocalLoadReport() => loadReportService.BuildLocalLoadReport();
 
     /// <summary>
-    /// Passes the Handshake to the appropriate partition
+    /// Passes the Handshake to the appropriate partition.
+    /// <para>
+    /// Tolerate a not-yet-created data partition during cluster assembly: drop the handshake
+    /// rather than blocking until this node initializes. This handler runs inline on the transport
+    /// path (<c>BatchRequests</c> awaits each item in order), so blocking here head-of-line-stalls
+    /// the whole batch. A previous version spun on <c>while (!IsInitialized) await Task.Delay(100)</c>,
+    /// which deadlocked join: a user-partition handshake to a joining node blocked the
+    /// <c>AppendLogs</c>/<c>CompleteAppendLogs</c> that followed it in the same batch — the very P0
+    /// entries the node needs to reach <see cref="IsInitialized"/>. Handshake ⇒ waits for init;
+    /// init ⇒ needs those AppendLogs; AppendLogs ⇒ trapped behind the handshake. The remote re-sends
+    /// the handshake on its next round, so dropping is safe. Mirrors the resilience in
+    /// <see cref="RequestVote"/>; see <see cref="TryGetPartition"/> for the full rationale.
+    /// </para>
     /// </summary>
     /// <param name="request"></param>
-    public async Task Handshake(HandshakeRequest request)
-    {                
-        while (request.Partition != RaftSystemConfig.SystemPartition && !IsInitialized)
-            await Task.Delay(100);
-        
-        RaftPartition partition = GetPartition(request.Partition);
+    public Task Handshake(HandshakeRequest request)
+    {
+        if (TryGetPartition(request.Partition, out RaftPartition? partition))
+            partition!.Handshake(request);
 
-        partition.Handshake(request);
+        return Task.CompletedTask;
     }
 
     internal HandshakeResponse GetHandshakeResponse(int partitionId)
