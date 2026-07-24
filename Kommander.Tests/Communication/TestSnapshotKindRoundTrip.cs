@@ -38,12 +38,12 @@ public sealed class TestSnapshotKindRoundTrip
         CapturingRangeTransfer rangeTransfer = new();
 
         InMemoryCommunication comm = new();
-        RaftManager receiver = BuildInMemoryNode(comm, 19100, []);
+        using RaftManager receiver = BuildInMemoryNode(comm, 19100, []);
         receiver.RegisterStateMachineTransfer(rangeTransfer);
         receiver.RegisterSystemStateTransfer(systemTransfer);
         comm.SetNodes(new Dictionary<string, IRaft> { [$"localhost:19100"] = receiver });
 
-        RaftManager sender = BuildInMemoryNode(comm, 19101, ["localhost:19100"]);
+        using RaftManager sender = BuildInMemoryNode(comm, 19101, ["localhost:19100"]);
 
         SnapshotRequest request = new()
         {
@@ -74,11 +74,11 @@ public sealed class TestSnapshotKindRoundTrip
 
         CapturingRangeTransfer rangeTransfer = new();
         InMemoryCommunication comm = new();
-        RaftManager receiver = BuildInMemoryNode(comm, 19102, []);
+        using RaftManager receiver = BuildInMemoryNode(comm, 19102, []);
         receiver.RegisterStateMachineTransfer(rangeTransfer);
         comm.SetNodes(new Dictionary<string, IRaft> { [$"localhost:19102"] = receiver });
 
-        RaftManager sender = BuildInMemoryNode(comm, 19103, ["localhost:19102"]);
+        using RaftManager sender = BuildInMemoryNode(comm, 19103, ["localhost:19102"]);
 
         // No Kind set — should default to Range.
         SnapshotRequest request = new()
