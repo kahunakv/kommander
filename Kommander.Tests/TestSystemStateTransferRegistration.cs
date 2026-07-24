@@ -29,7 +29,7 @@ public class TestSystemStateTransferRegistration
     [Fact]
     public void RegisterSystemStateTransfer_Register_IsReadBack()
     {
-        RaftManager manager = BuildManager();
+        using RaftManager manager = BuildManager();
         FakeSystemTransfer transfer = new();
 
         manager.RegisterSystemStateTransfer(transfer);
@@ -40,7 +40,7 @@ public class TestSystemStateTransferRegistration
     [Fact]
     public void RegisterSystemStateTransfer_Replace_ReturnsNewInstance()
     {
-        RaftManager manager = BuildManager();
+        using RaftManager manager = BuildManager();
         FakeSystemTransfer first = new();
         FakeSystemTransfer second = new();
 
@@ -53,7 +53,7 @@ public class TestSystemStateTransferRegistration
     [Fact]
     public void RegisterSystemStateTransfer_ClearToNull_ReturnsNull()
     {
-        RaftManager manager = BuildManager();
+        using RaftManager manager = BuildManager();
         manager.RegisterSystemStateTransfer(new FakeSystemTransfer());
 
         manager.RegisterSystemStateTransfer(null);
@@ -66,7 +66,7 @@ public class TestSystemStateTransferRegistration
     [Fact]
     public void RegisterStateMachineTransfer_Register_IsReadBack()
     {
-        RaftManager manager = BuildManager();
+        using RaftManager manager = BuildManager();
         FakeRangeTransfer transfer = new();
 
         manager.RegisterStateMachineTransfer(transfer);
@@ -77,7 +77,7 @@ public class TestSystemStateTransferRegistration
     [Fact]
     public void RegisterStateMachineTransfer_ClearToNull_ReturnsNull()
     {
-        RaftManager manager = BuildManager();
+        using RaftManager manager = BuildManager();
         manager.RegisterStateMachineTransfer(new FakeRangeTransfer());
 
         manager.RegisterStateMachineTransfer(null);
@@ -90,7 +90,7 @@ public class TestSystemStateTransferRegistration
     [Fact]
     public void BothTransfers_AreIndependent()
     {
-        RaftManager manager = BuildManager();
+        using RaftManager manager = BuildManager();
         FakeSystemTransfer system = new();
         FakeRangeTransfer range = new();
 

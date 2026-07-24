@@ -98,6 +98,15 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     private readonly RaftTimerService timerService;
 
+    /// <summary>
+    /// Hard upper bound (ms) on how long any <see cref="JoinCluster(CancellationToken)"/> overload
+    /// will wait for cluster assembly before throwing a <see cref="TimeoutException"/>. Enforced
+    /// unconditionally — including when the caller passes a cancelable token — as a liveness safety
+    /// net so a stalled assembly can never hang indefinitely and silently. Normal assembly completes
+    /// in well under this bound; a join that exceeds it indicates a genuinely wedged cluster.
+    /// </summary>
+    private const long JoinHardCeilingMs = 60_000;
+
     private int _disposed;
 
     private IRaftStateMachineTransfer? _stateMachineTransfer;
@@ -667,11 +676,17 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
         // Wait for the system coordinator to replicate the initial partition map and call
         // StartUserPartitions. On a slow or loaded host this can take longer than expected;
-        // impose an explicit deadline so JoinCluster never blocks indefinitely. The 60 s
-        // hard timeout is a fallback that fires only when the caller supplies no cancellation
-        // of its own; when the caller passes a cancellable token it owns the deadline (via the
-        // ThrowIfCancellationRequested below and the cancellable Task.Delay), so we do not
-        // impose an additional hardcoded limit that could cut a legitimately longer join short.
+        // impose an explicit deadline so JoinCluster never blocks indefinitely.
+        //
+        // The JoinHardCeiling is enforced UNCONDITIONALLY — even when the caller passes a
+        // cancelable token. Previously the ceiling was skipped for a cancelable token ("the caller
+        // owns the deadline"), but a caller whose token never actually fires (e.g. xUnit's
+        // TestContext token with no configured test timeout) then had NO liveness bound at all, so a
+        // cluster that failed to assemble hung forever and silently — the exact all-idle,
+        // no-output, whole-suite wedge diagnosed in
+        // specs/spec-quiescence-liveness-and-catch-up-stranding.md (issue A2). A cluster that cannot
+        // reach IsInitialized within the ceiling is broken; failing loudly with a state-dump beats
+        // hanging. The caller's token still cancels EARLIER than the ceiling.
         ValueStopwatch joinStopwatch = ValueStopwatch.StartNew();
         while (!IsInitialized)
         {
@@ -685,9 +700,9 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 "JoinCluster: waiting for initialization ({ElapsedMs} ms elapsed): {State}",
                 elapsedMs, DescribeAssemblyState());
 
-            if (!cancellationToken.CanBeCanceled && elapsedMs > 60_000)
+            if (elapsedMs > JoinHardCeilingMs)
                 throw new TimeoutException(
-                    $"RaftManager.JoinCluster timed out after 60 s waiting for cluster initialization. State: {DescribeAssemblyState()}");
+                    $"RaftManager.JoinCluster timed out after {JoinHardCeilingMs / 1000} s waiting for cluster initialization. State: {DescribeAssemblyState()}");
 
             await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
         }
@@ -695,10 +710,11 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     /// <summary>
     /// Seed-based join: contacts each seed in turn until this node is admitted as a Learner,
-    /// then waits for automatic promotion to Voter. The 60 s deadline is a fallback that applies
-    /// only when the caller supplies no cancellation of its own (same contract as
-    /// <see cref="JoinCluster(CancellationToken)"/>); a caller that passes a cancellable token owns
-    /// the deadline itself.
+    /// then waits for automatic promotion to Voter. Each wait phase is bounded by
+    /// <see cref="JoinHardCeilingMs"/>, enforced unconditionally (even with a cancelable token) as a
+    /// liveness safety net; the caller's token may cancel earlier. See
+    /// <see cref="JoinCluster(CancellationToken)"/> for the rationale (issue A2: a never-firing
+    /// cancelable token previously left join with no bound, hanging forever on a stalled assembly).
     /// <para>
     /// Unlike the discovery-based overload this variant does NOT call <see cref="IDiscovery.Register"/>;
     /// it relies on the P0 leader learning of the new node via the committed roster entry so that
@@ -739,8 +755,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         while (accepted is null || !accepted.Success)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (!cancellationToken.CanBeCanceled && joinStopwatch.GetElapsedMilliseconds() > 60_000)
-                throw new TimeoutException("RaftManager.JoinCluster(seeds) timed out after 60 s before being admitted as a Learner.");
+            if (joinStopwatch.GetElapsedMilliseconds() > JoinHardCeilingMs)
+                throw new TimeoutException($"RaftManager.JoinCluster(seeds) timed out after {JoinHardCeilingMs / 1000} s before being admitted as a Learner.");
                 
             string? leaderHint = null;
 
@@ -796,9 +812,9 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         while (!IsInitialized)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (!cancellationToken.CanBeCanceled && joinStopwatch.GetElapsedMilliseconds() > 60_000)
+            if (joinStopwatch.GetElapsedMilliseconds() > JoinHardCeilingMs)
                 throw new TimeoutException(
-                    $"RaftManager.JoinCluster(seeds) timed out after 60 s waiting for cluster initialization. State: {DescribeAssemblyState()}");
+                    $"RaftManager.JoinCluster(seeds) timed out after {JoinHardCeilingMs / 1000} s waiting for cluster initialization. State: {DescribeAssemblyState()}");
             string? terminalReasonInit = GetJoinTerminalReason(LocalEndpoint);
             if (terminalReasonInit is not null)
                 throw new InvalidOperationException($"RaftManager.JoinCluster: promotion permanently blocked — {terminalReasonInit}");
@@ -809,8 +825,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         while (LocalRole != ClusterMemberRole.Voter)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (!cancellationToken.CanBeCanceled && joinStopwatch.GetElapsedMilliseconds() > 60_000)
-                throw new TimeoutException("RaftManager.JoinCluster(seeds) timed out after 60 s waiting for Voter promotion.");
+            if (joinStopwatch.GetElapsedMilliseconds() > JoinHardCeilingMs)
+                throw new TimeoutException($"RaftManager.JoinCluster(seeds) timed out after {JoinHardCeilingMs / 1000} s waiting for Voter promotion.");
 
             // The P0 leader signals a terminal condition (e.g., learner is below the WAL
             // compaction floor and no snapshot transfer is registered) so the joiner fails
