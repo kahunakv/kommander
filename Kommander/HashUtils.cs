@@ -81,10 +81,10 @@ public static class HashUtils
     {
         int pointer = key.IndexOf(separator);
         if (pointer == -1)
-            return SimpleHash(key);
+            return XxHash64Utf8(key.AsSpan());
 
-        string prefix = key[..pointer];
-        return SimpleHash(prefix);
+        // Slice into a span rather than allocating a substring; the prefix is only hashed, never retained.
+        return XxHash64Utf8(key.AsSpan(0, pointer));
     }
 
     /// <summary>
@@ -98,10 +98,10 @@ public static class HashUtils
     {
         int pointer = key.LastIndexOf(separator);
         if (pointer == -1)
-            return SimpleHash(key);
+            return XxHash64Utf8(key.AsSpan());
 
-        string prefix = key[..pointer];
-        return SimpleHash(prefix);
+        // Slice into a span rather than allocating a substring; the prefix is only hashed, never retained.
+        return XxHash64Utf8(key.AsSpan(0, pointer));
     }
 
     /// <summary>
@@ -208,7 +208,14 @@ public static class HashUtils
     /// keys whose worst-case byte count exceeds 256) and returns its xxHash64. Avoids the per-call
     /// <c>byte[]</c> allocation of <c>Encoding.UTF8.GetBytes(string)</c>; the span never escapes.
     /// </summary>
-    private static ulong XxHash64Utf8(string key)
+    private static ulong XxHash64Utf8(string key) => XxHash64Utf8(key.AsSpan());
+
+    /// <summary>
+    /// Span-based sibling of the string overload: UTF-8 encodes <paramref name="key"/> into a stack
+    /// buffer (falling back to a pooled array when the worst-case byte count exceeds 256) and returns
+    /// its xxHash64. Lets callers hash a slice of a larger string without allocating a substring.
+    /// </summary>
+    private static ulong XxHash64Utf8(ReadOnlySpan<char> key)
     {
         int maxBytes = Encoding.UTF8.GetMaxByteCount(key.Length);
         byte[]? rented = maxBytes > 256 ? ArrayPool<byte>.Shared.Rent(maxBytes) : null;
