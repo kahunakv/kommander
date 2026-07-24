@@ -48,6 +48,12 @@ public sealed class RaftPartitionStateMachine
     private readonly Dictionary<string, long> matchIndex = [];
     private readonly Dictionary<long, string> expectedLeaders = [];
     private readonly Dictionary<HLCTimestamp, RaftProposalQuorum> activeProposals = [];
+
+    // Reusable scratch buffer for PruneSettledProposals so the periodic drain does not allocate a
+    // collection every sweep. Only ever touched on the executor thread (single-threaded per partition),
+    // so it needs no synchronization; always cleared before use.
+    private readonly List<HLCTimestamp> settledProposalScratch = [];
+
     private readonly Dictionary<long, Scheduling.RaftPendingWalOperation> pendingWalOperations = [];
 
     // Per-instance pool for the pending-WAL-op metadata objects. Rented on insert, returned once the
@@ -432,6 +438,14 @@ public sealed class RaftPartitionStateMachine
                 // skewed peer must not inflate the interval and suppress our own heartbeats.
                 if (currentTime != HLCTimestamp.Zero && (MonotonicElapsed(lastHeartbeatTicks, nowTicks) >= host.Configuration.HeartbeatInterval))
                 {
+                    // Drain settled proposals on the heartbeat cadence. Under load ReplicateLogs already
+                    // sweeps; this covers the idle tail — a leader that stopped proposing would otherwise
+                    // retain its last batch's log payloads and, because a non-empty map blocks the quiesce
+                    // gate below, never quiesce. Once drained, activeProposals.Count reaches 0 and the
+                    // quiesce check can fire in this same tick.
+                    if (activeProposals.Count > 0)
+                        PruneSettledProposals(currentTime);
+
                     // When quiescence is on and the partition has been idle longer than QuiesceAfter,
                     // send a quiesce marker to followers and stop heartbeating.  Followers switch to
                     // SWIM-based election gating once they receive the marker.
@@ -2118,27 +2132,12 @@ public sealed class RaftPartitionStateMachine
         lastProposalAtTicks = host.GetMonotonicTimestamp(); // B3: quiesce-after measured on monotonic clock
         SetQuiesced(false); // un-quiesce on new proposal: resume normal heartbeating
 
-        // Try to clear and reuse expired proposals
+        // Try to clear and reuse settled proposals. Only worth scanning once a few have accumulated;
+        // the periodic Leader tick (CheckPartitionLeadershipAsync) runs the same drain unconditionally
+        // so an idle leader that stops proposing still releases its settled proposals rather than
+        // retaining their log payloads until the next leadership change.
         if (activeProposals.Count > 5)
-        {
-            TimeSpan range = TimeSpan.FromSeconds(30);
-            Dictionary<HLCTimestamp, RaftProposalQuorum> tickets = new();            
-
-            foreach (KeyValuePair<HLCTimestamp, RaftProposalQuorum> proposal in activeProposals)
-            {
-                if (proposal.Value.HasQuorum() && currentTime - proposal.Value.StartTimestamp > range)
-                    tickets.Add(proposal.Key, proposal.Value);
-            }
-
-            if (tickets.Count > 0)
-            {
-                foreach (KeyValuePair<HLCTimestamp, RaftProposalQuorum> kv in tickets)
-                {
-                    RaftProposalQuorumPool.Return(kv.Value);
-                    activeProposals.Remove(kv.Key);
-                }                               
-            }
-        }
+            PruneSettledProposals(currentTime);
 
         // No peers: a single-node leader is its own quorum. Rather than rejecting the proposal,
         // we enqueue it to the local WAL exactly like the multi-node path; CompleteLeaderPropose
@@ -2229,7 +2228,47 @@ public sealed class RaftPartitionStateMachine
 
         return (RaftOperationStatus.Success, currentTime);*/
     }
-    
+
+    /// <summary>
+    /// Releases settled proposals from <see cref="activeProposals"/>, returning each to the pool so its
+    /// log payloads (which retain the proposed <c>KeyValueEntry</c>/byte[] data) become collectible.
+    /// <para>
+    /// A proposal is settled once it has reached quorum and has aged past the retention window. The
+    /// window is a client-idempotency grace period: a committed proposal is kept briefly so a retried
+    /// <see cref="CommitLogs"/> or a late <see cref="CheckTicketCompletion"/> poll still observes the
+    /// settled result instead of <c>ProposalNotFound</c>. In-flight awaiters are unaffected — they hold
+    /// the waiter task independently of the dictionary entry — so eviction only affects later lookups
+    /// by ticket id, which the grace period covers.
+    /// </para>
+    /// <para>
+    /// Historically this ran only at the head of <see cref="ReplicateLogs"/>, so a leader that stopped
+    /// proposing never swept its last batch — the entries (and their payloads) were retained until the
+    /// next leadership change, and their non-zero count also blocked quiescence
+    /// (<see cref="CheckPartitionLeadershipAsync"/> requires <c>activeProposals.Count == 0</c>). It is
+    /// now also driven from the periodic Leader tick so an idle leader converges to an empty map.
+    /// </para>
+    /// </summary>
+    private void PruneSettledProposals(HLCTimestamp currentTime)
+    {
+        TimeSpan range = TimeSpan.FromSeconds(30);
+
+        settledProposalScratch.Clear();
+
+        foreach (KeyValuePair<HLCTimestamp, RaftProposalQuorum> proposal in activeProposals)
+        {
+            if (proposal.Value.HasQuorum() && currentTime - proposal.Value.StartTimestamp > range)
+                settledProposalScratch.Add(proposal.Key);
+        }
+
+        foreach (HLCTimestamp key in settledProposalScratch)
+        {
+            if (activeProposals.Remove(key, out RaftProposalQuorum? settled))
+                RaftProposalQuorumPool.Return(settled);
+        }
+
+        settledProposalScratch.Clear();
+    }
+
     /// <summary>
     /// Puts together a plan to replicate logs to other nodes in the cluster when the node is the leader.
     /// </summary>
