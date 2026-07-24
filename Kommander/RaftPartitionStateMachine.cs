@@ -700,6 +700,17 @@ public sealed class RaftPartitionStateMachine
     }
 
     /// <summary>
+    /// Forces the leader's committed frontier for unit testing so the quiesce gate's
+    /// <see cref="HasLaggingPeer"/> check can be exercised without driving a full propose/commit
+    /// cycle. A peer with no recorded progress counts as lagging once this is above zero, which is
+    /// what re-arms heartbeats on the periodic tick after the leader has quiesced.
+    /// </summary>
+    public void SetLocalCommittedIndexForTesting(long committedIndex)
+    {
+        localCommittedIndex = committedIndex;
+    }
+
+    /// <summary>
     /// Seeds the state shared by all become-leader paths: advances the HLC, marks the node as
     /// Leader, records the durable committed index for backfill, and starts both the heartbeat
     /// timer and the idle-quiesce clock at the same election timestamp.  Per-follower cursors

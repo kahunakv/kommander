@@ -131,30 +131,33 @@ public class TestQuiescedLeader
         Assert.NotEmpty(host.CapturedAppendLogs); // at least one heartbeat went out
     }
 
-    // ── Quiesced leader receiving a pre-vote wakes and re-asserts leadership ───
+    // ── Quiesced leader with a lagging peer wakes on the periodic tick ─────────
 
     [Fact]
-    public async Task Leader_Quiesced_ReceivingPreVote_WakesAndHeartbeats()
+    public async Task Leader_Quiesced_WithLaggingPeer_WakesAndHeartbeats()
     {
         CapturingTestHost host = MakeHost();
         using MinimalWalFacadeL wal = new();
         MinimalReplySinkL sink = new();
         RaftPartitionStateMachine sm = await MakeLeaderAsync(host, wal, sink);
 
-        // First tick quiesces the leader (marker sent, heartbeats now suppressed).
+        // First tick quiesces the leader: the partition is empty (committed frontier 0), so no peer
+        // counts as lagging and heartbeats are suppressed.
         await sm.CheckPartitionLeadershipAsync();
         Assert.Contains(host.CapturedAppendLogs, r => r.Quiesce);
         host.ClearObservations();
 
-        // A peer probing for an election means it has lost contact with us. A quiesced leader used
-        // to silently deny while sending no heartbeats, stranding that peer forever. It must instead
-        // wake up: un-quiesce and re-assert leadership with a forced (non-quiesce) heartbeat, which
-        // also hosts the only catch-up path for the lagging prober.
-        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(1);
-        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 2, remoteMaxLogId: 0, timestamp: ts, preVote: true);
+        // A peer falls behind (or a fresh node joins) AFTER we quiesced: the leader now holds a
+        // committed frontier the single peer node-b has no recorded progress for. Pre-vote is
+        // side-effect-free (Raft §9.6) and does not wake a quiesced leader, so the re-arm must come
+        // from the periodic tick's HasLaggingPeer() gate — otherwise node-b is stranded with no
+        // catch-up path on an idle partition (heartbeats host the only backfill/idle-tail re-ship).
+        sm.SetLocalCommittedIndexForTesting(5);
 
-        Assert.Equal(RaftNodeState.Leader, sm.NodeState);           // still leader — we deny the pre-vote
-        Assert.Contains(host.CapturedAppendLogs, r => !r.Quiesce);  // but no longer silent: woke and heartbeated
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);           // still leader
+        Assert.Contains(host.CapturedAppendLogs, r => !r.Quiesce);  // un-quiesced: forced heartbeat resumes catch-up
     }
 
     // ── Follower receiving quiesce-flagged AppendLogs becomes quiesced ────────
