@@ -1344,18 +1344,46 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         return false;
     }
 
+    /// <summary>
+    /// Upper bound on how long a teardown drain waits for each partition's <c>DrainBarrier</c>.
+    /// The barrier is a low-priority (Maintenance) request, so a steady stream of higher-priority
+    /// incoming AppendLogs/heartbeats from peers — heavier with the single-fsync fast path, which
+    /// generates extra replication traffic — can starve it indefinitely. An unbounded wait here let
+    /// teardown block forever, which under constrained cores compounded across many partitions/nodes
+    /// into multi-minute suite hangs. The drain is best-effort (Stop()/Dispose() forcibly halts the
+    /// executor afterward), so timing out and proceeding only abandons a few in-flight ops — exactly
+    /// what a shutdown does regardless.
+    /// </summary>
+    private static readonly TimeSpan DrainBarrierTimeout = TimeSpan.FromSeconds(3);
+
     private async Task DrainPartitions(CancellationToken cancellationToken)
     {
+        using CancellationTokenSource timeoutCts = new(DrainBarrierTimeout);
+        using CancellationTokenSource linkedCts =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+
         List<Task> drainTasks = new(partitions.Count + 1);
 
         foreach (RaftPartition partition in partitions.Values)
-            drainTasks.Add(partition.DrainAsync(cancellationToken));
+            drainTasks.Add(partition.DrainAsync(linkedCts.Token));
 
         if (systemPartition is not null)
-            drainTasks.Add(systemPartition.DrainAsync(cancellationToken));
+            drainTasks.Add(systemPartition.DrainAsync(linkedCts.Token));
 
-        if (drainTasks.Count > 0)
+        if (drainTasks.Count == 0)
+            return;
+
+        try
+        {
             await Task.WhenAll(drainTasks).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
+        {
+            // Barrier starved by higher-priority in-flight work; proceed to the forced stop below.
+            Logger.LogWarning(
+                "Teardown: partition drain barrier exceeded {TimeoutMs}ms (executor busy); proceeding to stop.",
+                DrainBarrierTimeout.TotalMilliseconds);
+        }
     }
 
     /// <summary>
@@ -2477,6 +2505,45 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         }
 
         return RaftOperationStatus.Pending;
+    }
+
+    /// <summary>
+    /// Relinquishes leadership of <paramref name="partitionId"/> WITHOUT waiting for a successor to be
+    /// elected. Used only by the self-removal teardown path (<c>StepDownSelfRemovedAsync</c>): a node that
+    /// the committed roster has already dropped from the voter set is shutting down and does not need — and
+    /// must not block on — a handoff. The remaining voters elect a new leader on their own election timeout.
+    ///
+    /// <para>This exists because the public <see cref="StepDownAsync(int,CancellationToken)"/> polls up to
+    /// 10 s for a successor to announce itself, which is correct for an in-service leadership transfer but
+    /// pathological during a coordinated shutdown: no peer campaigns for the handoff, so every partition's
+    /// step-down burns the full 10 s (spamming the executor as it stops), and across many partitions/nodes
+    /// this serialises into multi-minute teardowns. The local step-down (state → Follower, leadership
+    /// relinquished, StepDownNotice sent) is already complete when <see cref="RaftPartition.StepDownAsync"/>
+    /// returns <see cref="RaftOperationStatus.Pending"/>; we simply do not wait past that point.</para>
+    /// </summary>
+    internal async Task<RaftOperationStatus> StepDownWithoutSuccessorWaitAsync(
+        int partitionId,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Joined || !IsInitialized)
+            return RaftOperationStatus.Errored;
+
+        RaftPartition partition;
+
+        try
+        {
+            partition = GetPartition(partitionId);
+        }
+        catch (RaftException)
+        {
+            return RaftOperationStatus.Errored;
+        }
+
+        RaftOperationStatus status = await partition.StepDownAsync(cancellationToken).ConfigureAwait(false);
+
+        // Pending == the local step-down succeeded but a successor has not yet been confirmed. For the
+        // removed-and-tearing-down node that is exactly the state we want to return on; treat it as success.
+        return status == RaftOperationStatus.Pending ? RaftOperationStatus.Success : status;
     }
 
     [EditorBrowsable(EditorBrowsableState.Never)]

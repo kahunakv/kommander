@@ -1046,8 +1046,15 @@ public sealed class TestThreeNodeCluster
         // stale ids in-place, and TruncateLogsAfter removes any tail beyond the batch end.
         communication.HealPartition(follower.GetLocalEndpoint());
 
+        // Wait for ACTUAL convergence — the follower holding as many entries as the leader — not merely
+        // for its max id to reach the leader's. Max-id alone is satisfied prematurely: the unanchored
+        // live-propose broadcast delivers high ids out of order, so an orphan entry above an unfilled
+        // gap pushes GetMaxLog to the leader's value while the log still has holes that backfill has not
+        // filled yet. Asserting contiguity on that intermediate state is a race the assert wins whenever
+        // backfill is slowed (e.g. a CPU-constrained CI runner), which is exactly how this test failed
+        // intermittently. Entry count reaching parity implies the gaps are filled.
         await WaitForConditionAsync(
-            () => follower.WalAdapter.GetMaxLog(1) >= leader.WalAdapter.GetMaxLog(1),
+            () => follower.WalAdapter.ReadLogs(1).Count >= leader.WalAdapter.ReadLogs(1).Count,
             TestContext.Current.CancellationToken,
             timeoutMs: 30_000);
 

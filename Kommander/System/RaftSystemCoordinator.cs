@@ -972,7 +972,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
             try
             {
                 if (await manager.AmILeaderQuick(partitionId).ConfigureAwait(false))
-                    await manager.StepDownAsync(partitionId).ConfigureAwait(false);
+                    await manager.StepDownWithoutSuccessorWaitAsync(partitionId).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
