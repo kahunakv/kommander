@@ -12,12 +12,19 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Kommander.Tests.Scheduling;
 
 /// <summary>
-/// Regression coverage for open issue C: the ack-driven catch-up paths in
-/// <see cref="RaftPartitionStateMachine.CompleteAppendLogsAsync"/> must fall back to a snapshot
-/// transfer when the follower's needed range has been compacted past the WAL floor.
-/// Previously only the <c>SendHeartbeat</c> path did so; the ack-path re-ship ignored the empty-batch
-/// signal and had no fallback, so a below-floor follower on an idle cluster (in particular a learner
-/// reached only via ack-driven re-ship, not heartbeats) was stranded permanently.
+/// Regression coverage for open issue C: a follower whose needed range has been compacted past the
+/// WAL floor must be repaired with a snapshot transfer rather than stranded.
+/// <para>
+/// The repair path is <see cref="RaftPartitionStateMachine.SendHeartbeat"/>: an ack that reports a
+/// below-frontier committed index only <em>records</em> the follower's lag (updating
+/// <c>lastCommitIndexes</c>); the actual backfill-or-snapshot decision runs once per heartbeat, where
+/// an empty backfill batch (WAL compacted past the follower's next index) falls back to
+/// <c>snapshotSender.TrySend</c>. Doing the re-ship inline on every ack livelocked the cluster under
+/// load, so detection (ack) is split from repair (heartbeat). A below-floor follower is not stranded
+/// on an idle cluster because the leader refuses to quiesce while any peer lags
+/// (<c>HasLaggingPeer</c>), so heartbeats — which reach every node, voters and learners alike — keep
+/// flowing until the snapshot lands.
+/// </para>
 /// </summary>
 public class TestAckPathSnapshotFallback
 {
@@ -36,14 +43,20 @@ public class TestAckPathSnapshotFallback
         sm.SetLeaderForTesting(term: 1);
 
         // Follower acks at committed index 5 — far below the leader's frontier (100) and below the
-        // compaction floor. The backfill batch will come back empty, so the only repair is a snapshot.
+        // compaction floor. The ack records the lag but does not repair inline.
         await sm.CompleteAppendLogsAsync("follower:9001", host.HybridLogicalClock.TrySendOrLocalEvent(1),
             RaftOperationStatus.Success, committedIndex: 5);
+
+        // Drive a heartbeat tick: the repair runs here. The follower's gap (95) exceeds
+        // BackfillThreshold, the backfill batch comes back empty (compacted past its next index), so
+        // the only remaining repair is a snapshot. HeartbeatInterval is zero so the tick heartbeats
+        // immediately, and HasLaggingPeer keeps the leader from quiescing while node-b is behind.
+        await sm.CheckPartitionLeadershipAsync();
 
         // The snapshot transfer is fired as a detached background task; poll briefly for the send.
         bool sent = await WaitForAsync(() => !host.SnapshotRequests.IsEmpty, timeoutMs: 5_000);
 
-        Assert.True(sent, "a below-floor follower ack must trigger a snapshot transfer");
+        Assert.True(sent, "a below-floor follower must trigger a snapshot transfer on the heartbeat path");
         Assert.All(host.SnapshotRequests, r => Assert.Equal("follower:9001", r.FollowerEndpoint));
     }
 
@@ -82,6 +95,8 @@ public class TestAckPathSnapshotFallback
         public RaftConfiguration Configuration { get; } = new()
         {
             Host = "leader", Port = 9000, InitialPartitions = 1, BackfillThreshold = 10,
+            // Heartbeat immediately on the first leadership tick so the repair path runs without a wait.
+            HeartbeatInterval = TimeSpan.Zero,
         };
 
         public HybridLogicalClock HybridLogicalClock { get; } = new();
