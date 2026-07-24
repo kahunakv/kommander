@@ -1463,11 +1463,21 @@ public sealed class RaftPartitionStateMachine
                 && localCommittedIndex >= 0
                 && (followerGap > host.Configuration.BackfillThreshold || idleTailGap || regressed))
             {
-                // On an empty batch (leader compacted past followerMaxLog+1) this falls back to an
-                // async snapshot transfer; see TrySendBackfillOrSnapshotAsync. On success we skip the
-                // trailing empty heartbeat since a batch just went out.
-                if (await TrySendBackfillOrSnapshotAsync(node, followerMaxLog, lastHeartbeat).ConfigureAwait(false))
+                long anchorFrom = regressed ? regressedFrontier : followerMaxLog;
+                if (await TrySendBackfillBatchAsync(node, anchorFrom, lastHeartbeat, anchorToFollowerFrontier: regressed).ConfigureAwait(false))
                     continue;
+
+                // Empty batch: the leader has compacted past followerMaxLog+1.
+                // If a StateMachineTransfer is registered and no snapshot is already in flight
+                // for this follower, kick off an async snapshot transfer. The in-flight guard
+                // prevents duplicate transfers; the postToExecutor callback will advance
+                // lastCommitIndexes[endpoint] once the follower confirms installation.
+                long lastCheckpoint = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
+                bool p0System = host.PartitionId == RaftSystemConfig.SystemPartition && host.SystemStateTransfer is not null;
+                if (lastCheckpoint > 0 && (host.StateMachineTransfer is not null || p0System))
+                {
+                    snapshotSender.TrySend(node, lastCheckpoint);
+                }
             }
 
             AppendLogToNode(node, lastHeartbeat, null);
@@ -1618,21 +1628,6 @@ public sealed class RaftPartitionStateMachine
             // A live leader never helps a challenger unseat it.
             if (nodeState == RaftNodeState.Leader)
             {
-                // Open issue A (stranding): a *quiesced* leader neither leads nor yields — it has
-                // stopped heartbeating (SendHeartbeat returns early on `quiesced`) yet still denies
-                // every pre-vote here. If a peer is probing for an election it has lost contact with
-                // us (missed the quiesce marker, joined late, or briefly unreachable at quiesce time),
-                // and because SendHeartbeat hosts the ONLY catch-up path, staying quiesced strands that
-                // peer permanently while we refuse to let anyone else take over. Wake up: un-quiesce and
-                // resume heartbeating so we re-assert leadership AND ship the prober the entries it is
-                // missing. HasLaggingPeer() then keeps us awake until it actually converges. We still
-                // deny the pre-vote — we remain the rightful leader — but we stop being a silent one.
-                if (quiesced && host.Configuration.EnableQuiescence)
-                {
-                    SetQuiesced(false);
-                    await SendHeartbeat(true).ConfigureAwait(false);
-                }
-
                 logger.LogDebugDenyingPreVoteWeAreLeader(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
                 return;
             }
@@ -1756,11 +1751,6 @@ public sealed class RaftPartitionStateMachine
             FailAllActiveProposalWaiters();
             activeProposals.Clear();
             ResetPreVoteRound();
-            // Open issue A (stranding): a quiesced *leader* that steps down here would otherwise remain
-            // quiesced as a Follower, whose election is gated only on the old leader's SWIM liveness.
-            // Since we were the leader and are now stepping aside, there is no live leader to gate on —
-            // clear quiescence so the normal heartbeat-timed election path governs failover.
-            SetQuiesced(false);
 
             await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
 
@@ -2705,39 +2695,6 @@ public sealed class RaftPartitionStateMachine
     }
 
     /// <summary>
-    /// Ships the next bounded backfill batch to <paramref name="node"/> and, when the batch comes back
-    /// empty because the leader has compacted past the follower's frontier
-    /// (<see cref="TrySendBackfillBatchAsync"/> returned <see langword="false"/>), falls back to an
-    /// asynchronous snapshot transfer.
-    /// <para>The snapshot fallback previously lived only inline on the <see cref="SendHeartbeat"/> path,
-    /// so a follower whose needed range had been compacted away was repaired only if a heartbeat happened
-    /// to observe the gap first. The two ack-driven catch-up paths in <see cref="CompleteAppendLogsAsync"/>
-    /// — the in-progress re-ship and the regressed-frontier re-supply — both anchor at the follower's
-    /// reported frontier, which is exactly the range most likely to sit below the compaction floor, yet
-    /// they ignored the empty-batch signal and had no fallback. On an idle cluster that stranded a
-    /// below-floor follower permanently (open issue C: system-state-transfer / below-floor repair).
-    /// Centralising the fallback here closes the gap for every caller.</para>
-    /// </summary>
-    /// <returns><see langword="true"/> if a backfill batch was sent; <see langword="false"/> if the range
-    /// was compacted away — in which case a snapshot transfer was started when one is available.</returns>
-    private async Task<bool> TrySendBackfillOrSnapshotAsync(RaftNode node, long followerMaxLog, HLCTimestamp timestamp, bool anchorToFollowerFrontier = false)
-    {
-        if (await TrySendBackfillBatchAsync(node, followerMaxLog, timestamp, anchorToFollowerFrontier).ConfigureAwait(false))
-            return true;
-
-        // Empty batch: the leader has compacted past the follower's frontier. Kick off an async
-        // snapshot transfer if one is registered and none is already in flight for this follower.
-        // The in-flight guard lives in SnapshotSender.TrySend; the install completion advances
-        // lastCommitIndexes[endpoint] once the follower confirms.
-        long lastCheckpoint = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
-        bool p0System = host.PartitionId == RaftSystemConfig.SystemPartition && host.SystemStateTransfer is not null;
-        if (lastCheckpoint > 0 && (host.StateMachineTransfer is not null || p0System))
-            snapshotSender.TrySend(node, lastCheckpoint);
-
-        return false;
-    }
-
-    /// <summary>
     /// Called when a follower has acknowledged (or rejected) an AppendLogs request.
     /// On <see cref="RaftOperationStatus.Success"/> advances <see cref="matchIndex"/> and
     /// <see cref="nextIndex"/> for the peer and immediately ships the next bounded backfill
@@ -2862,7 +2819,7 @@ public sealed class RaftPartitionStateMachine
         {
             RaftNode? behindNode = host.Nodes.FirstOrDefault(n => n.Endpoint == endpoint);
             if (behindNode is not null)
-                await TrySendBackfillOrSnapshotAsync(behindNode, committedIndex, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId)).ConfigureAwait(false);
+                await TrySendBackfillBatchAsync(behindNode, committedIndex, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId)).ConfigureAwait(false);
         }
 
         // Fast-path far-behind re-supply: a follower whose reported frontier trails the leader by more
@@ -2905,21 +2862,9 @@ public sealed class RaftPartitionStateMachine
                 && priorMatchIndex >= localCommittedIndex - host.Configuration.BackfillThreshold;
 
             if (frontierRegressed)
-            {
-                long nowTicks = host.GetMonotonicTimestamp();
-                if (lastRegressionResupplyTicks.TryGetValue(endpoint, out long sentAtTicks)
-                    && MonotonicElapsed(sentAtTicks, nowTicks) < host.Configuration.HeartbeatInterval)
-                    frontierRegressed = false;
-                else
-                    lastRegressionResupplyTicks[endpoint] = nowTicks;
-            }
-
-            if (frontierRegressed || localCommittedIndex - committedIndex > host.Configuration.BackfillThreshold)
-            {
-                RaftNode? regressedNode = host.Nodes.FirstOrDefault(n => n.Endpoint == endpoint);
-                if (regressedNode is not null)
-                    await TrySendBackfillOrSnapshotAsync(regressedNode, committedIndex, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), anchorToFollowerFrontier: frontierRegressed).ConfigureAwait(false);
-            }
+                regressedFrontiers[endpoint] = committedIndex;
+            else if (committedIndex >= matchIndex[endpoint])
+                regressedFrontiers.Remove(endpoint);
         }
 
         if (!activeProposals.TryGetValue(timestamp, out RaftProposalQuorum? proposal))
