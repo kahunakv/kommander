@@ -1193,6 +1193,20 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
+        // Startup-join safety: an empty Nodes set means "single-node cluster" ONLY once discovery has
+        // actually run. A seed-joining node starts with empty Nodes until the first UpdateNodes loads
+        // its peers; self-electing in that window makes it win P0 leadership as a single-node quorum
+        // and the existing cluster then follows it — but the joiner has an empty log (no partition
+        // map), so the join deadlocks. Suppress the election until discovery reports (peers ⇒ normal
+        // quorum election; genuinely none ⇒ legitimate single-node self-election). Does not affect a
+        // real single-node cluster: its first UpdateNodes sets InitialNodesDiscovered with Nodes still
+        // empty, so the very next tick elects.
+        if (host.Nodes.Count == 0 && !host.InitialNodesDiscovered)
+        {
+            logger.LogDebugSuppressingElection(host.LocalEndpoint, host.PartitionId, nodeState, host.LocalRole);
+            return;
+        }
+
         long nowTicks = host.GetMonotonicTimestamp();
 
         if (!ignoreRecentVoteCooldown)

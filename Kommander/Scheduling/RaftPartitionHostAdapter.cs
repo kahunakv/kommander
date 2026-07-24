@@ -49,6 +49,8 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
 
     public IReadOnlyList<RaftNode> Nodes => manager.Nodes;
 
+    public bool InitialNodesDiscovered => manager.InitialNodesDiscovered;
+
     public HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId) => manager.GetLastNodeActivity(endpoint, partitionId);
 
     public HLCTimestamp GetLastNodeHearthbeat(string endpoint, int partitionId) => manager.GetLastNodeHearthbeat(endpoint, partitionId);

@@ -1411,9 +1411,19 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             return;
 
         await clusterHandler.UpdateNodes().ConfigureAwait(false);
+
+        // Mark discovery as having run at least once. Until this is set, a partition whose Nodes set
+        // is still empty must not self-elect as a single-node leader — a seed-joining node's peers are
+        // only loaded here, and self-electing in that window lets it usurp the existing cluster's P0
+        // leadership with an empty log (see IRaftPartitionHost.InitialNodesDiscovered).
+        InitialNodesDiscovered = true;
+
         await systemCoordinator.CheckLearnerPromotionsAsync().ConfigureAwait(false);
         await systemCoordinator.EvictDeadMembersAsync().ConfigureAwait(false);
     }
+
+    /// <inheritdoc />
+    public bool InitialNodesDiscovered { get; private set; }
 
     // ── IRaftTimerHost ─────────────────────────────────────────────────────
 

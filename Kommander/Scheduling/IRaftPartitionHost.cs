@@ -51,6 +51,19 @@ public interface IRaftPartitionHost
 
     IReadOnlyList<RaftNode> Nodes { get; }
 
+    /// <summary>
+    /// True once this node has completed at least one node-discovery pass (the first
+    /// <c>UpdateNodes</c>), so an empty <see cref="Nodes"/> can be trusted to mean "genuinely a
+    /// single-node cluster" rather than "peers not loaded yet". A partition must not take the
+    /// single-node self-election fast-path (<c>Nodes.Count == 0</c> ⇒ become leader) while this is
+    /// <see langword="false"/>: a seed-joining node starts with an empty <see cref="Nodes"/> until
+    /// discovery runs, and self-electing in that window makes it usurp the existing cluster's P0
+    /// leadership with an empty log — the join then deadlocks because the usurper has no partition
+    /// map to serve. Defaults to <see langword="true"/> so unit-test hosts (which wire a fixed node
+    /// set up front) are unaffected; only <c>RaftManager</c> gates on real discovery.
+    /// </summary>
+    bool InitialNodesDiscovered => true;
+
     HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId);
 
     HLCTimestamp GetLastNodeHearthbeat(string endpoint, int partitionId);
