@@ -239,10 +239,10 @@ public class RocksDbWAL : IWAL, IDisposable
 
         while (iterator.Valid())
         {
-            if (!KeyBelongsToPartition(iterator.Key(), partitionId))
+            if (!KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
                 break;
 
-            RaftLogMessage message = Unserializer(iterator.Value());
+            RaftLogMessage message = Unserializer(iterator.GetValueSpan());
             
             if (message.Partition != partitionId || message.Id < lastCheckpoint)
             {
@@ -302,10 +302,10 @@ public class RocksDbWAL : IWAL, IDisposable
 
         while (iterator.Valid())
         {
-            if (!KeyBelongsToPartition(iterator.Key(), partitionId))
+            if (!KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
                 break;
 
-            RaftLogMessage message = Unserializer(iterator.Value());
+            RaftLogMessage message = Unserializer(iterator.GetValueSpan());
 
             if (message.Partition != partitionId || message.Id < startLogIndex)
             {
@@ -546,18 +546,10 @@ public class RocksDbWAL : IWAL, IDisposable
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         SeekToLastPartitionKey(iterator, partitionId);
 
-        while (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId))
-        {
-            RaftLogMessage message = Unserializer(iterator.Value());
-            
-            if (message.Partition != partitionId)
-            {
-                iterator.Prev();
-                continue;
-            }
-            
-            return message.Id;
-        }
+        // The key alone carries the id, so the last key in the partition answers this without reading
+        // (and copying) a single value.
+        if (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
+            return ParseLogIdFromKey(iterator.GetKeySpan());
 
         return 0;
     }
@@ -628,6 +620,57 @@ public class RocksDbWAL : IWAL, IDisposable
         return 0; // term field omitted => proto3 default
     }
 
+    /// <summary>
+    /// Reads the scalar "header" fields of a serialized <c>RaftLogMessage</c> — <c>partition</c> (1),
+    /// <c>id</c> (2), <c>term</c> (3) and <c>type</c> (4) — without allocating and without materializing
+    /// the length-delimited <c>logType</c> (5) / <c>log</c> (6) fields, which are skipped by advancing
+    /// past their declared length. Scan cost is therefore bounded by the number of fields, not by the
+    /// payload size, so a backwards scan over a partition with multi-megabyte entries no longer allocates
+    /// (and copies) one <c>ByteString</c> per entry visited.
+    ///
+    /// Absent fields yield the proto3 default (<c>0</c>), which is the correct value for an entry that
+    /// genuinely stored 0. Use this only where the payload is not needed; callers that must return a
+    /// <see cref="RaftLog"/> still go through <see cref="Unserializer"/>.
+    /// </summary>
+    private static void ReadHeaderFromWire(ReadOnlySpan<byte> data, out int partition, out long id, out long term, out int type)
+    {
+        partition = 0;
+        id = 0;
+        term = 0;
+        type = 0;
+
+        int pos = 0;
+        while (pos < data.Length)
+        {
+            ulong tag = ReadVarint(data, ref pos);
+            int fieldNumber = (int)(tag >> 3);
+            int wireType = (int)(tag & 0x7);
+
+            if (wireType == 0)
+            {
+                long value = (long)ReadVarint(data, ref pos);
+
+                switch (fieldNumber)
+                {
+                    case 1: partition = (int)value; break;
+                    case 2: id = value; break;
+                    case 3: term = value; break;
+                    case 4: type = (int)value; break;
+                }
+
+                continue;
+            }
+
+            switch (wireType)
+            {
+                case 1: pos += 8; break;                                              // 64-bit
+                case 2: pos += (int)ReadVarint(data, ref pos); break;                 // length-delimited (skip payload)
+                case 5: pos += 4; break;                                              // 32-bit
+                default: return;                                                      // unknown wire type — stop, keep defaults
+            }
+        }
+    }
+
     /// <summary>Decodes a base-128 varint at <paramref name="pos"/>, advancing it past the value.</summary>
     private static ulong ReadVarint(ReadOnlySpan<byte> data, ref int pos)
     {
@@ -652,17 +695,10 @@ public class RocksDbWAL : IWAL, IDisposable
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         SeekToLastPartitionKey(iterator, partitionId);
 
-        while (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId))
+        if (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
         {
-            RaftLogMessage message = Unserializer(iterator.Value());
-            
-            if (message.Partition != partitionId)
-            {
-                iterator.Prev();
-                continue;
-            }
-            
-            return message.Term;
+            ReadHeaderFromWire(iterator.GetValueSpan(), out _, out _, out long term, out _);
+            return term;
         }
 
         return 0;
@@ -696,13 +732,10 @@ public class RocksDbWAL : IWAL, IDisposable
 
         int count = 0;
 
-        while (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId))
+        // Counting only needs partition membership, which the key prefix already establishes — no value read.
+        while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
         {
-            RaftLogMessage message = Unserializer(iterator.Value());
-
-            if (message.Partition == partitionId)
-                count++;
-
+            count++;
             iterator.Next();
         }
 
@@ -726,17 +759,9 @@ public class RocksDbWAL : IWAL, IDisposable
 
         int count = 0;
 
-        while (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId))
+        while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
         {
-            RaftLogMessage message = Unserializer(iterator.Value());
-
-            if (message.Partition != partitionId)
-            {
-                iterator.Next();
-                continue;
-            }
-
-            if (message.Id >= lastCheckpoint)
+            if (ParseLogIdFromKey(iterator.GetKeySpan()) >= lastCheckpoint)
                 break;
 
             count++;
@@ -763,22 +788,15 @@ public class RocksDbWAL : IWAL, IDisposable
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         SeekToLastPartitionKey(iterator, partitionId);
 
-        while (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId))
+        while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
         {
-            RaftLogMessage message = Unserializer(iterator.Value());
-            
-            //if (partitionId == 6)
-            //    Console.WriteLine("{0} {1} {2} {3} {4}", partitionId, message.Partition, message.Type, iterator.StringKey(), message.Id);
-            
-            if (message.Partition != partitionId)
-            {
-                iterator.Prev();
-                continue;
-            }
-            
-            if (message.Type == (int)RaftLogType.CommittedCheckpoint)
-                return message.Id;
-            
+            // `type` is only available in the value, but GetValueSpan borrows RocksDB's buffer rather than
+            // copying it out, and the wire scan skips the payload — so a long backwards scan is allocation-free.
+            ReadHeaderFromWire(iterator.GetValueSpan(), out _, out _, out _, out int type);
+
+            if (type == (int)RaftLogType.CommittedCheckpoint)
+                return ParseLogIdFromKey(iterator.GetKeySpan());
+
             iterator.Prev();
         }
 
@@ -839,7 +857,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 BuildLogKey(seekKey, partitionId, 0);
                 iterator.Seek(seekKey);
 
-                while (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId))
+                while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
                 {
                     keysToDelete.Add(iterator.Key());
                     iterator.Next();
@@ -878,7 +896,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 BuildLogKey(seekKey, partitionId, afterLogId + 1);
                 iterator.Seek(seekKey);
 
-                while (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId))
+                while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
                 {
                     keysToDelete.Add(iterator.Key());
                     iterator.Next();
@@ -959,25 +977,15 @@ public class RocksDbWAL : IWAL, IDisposable
             BuildLogKey(seekKey, partitionId, 0);
             iterator.Seek(seekKey);
 
-            while (iterator.Valid() && KeyBelongsToPartition(iterator.Key(), partitionId) && removed < passCap)
+            // Deletion is decided entirely from the key (partition prefix + id), so this pass never reads
+            // an entry's value — the payload of every compacted entry stays in RocksDB's own buffers.
+            while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId) && removed < passCap)
             {
-                RaftLogMessage message = Unserializer(iterator.Value());
-
-                if (message.Partition != partitionId)
-                {
-                    iterator.Next();
-                    continue;
-                }
-
-                if (message.Id < lastCheckpoint)
-                {
-                    writeBatch.Delete(iterator.Key(), cf: columnFamilyHandle);
-                    removed++;
-                }
-                else
-                {
+                if (ParseLogIdFromKey(iterator.GetKeySpan()) >= lastCheckpoint)
                     break;
-                }
+
+                writeBatch.Delete(iterator.GetKeySpan(), cf: columnFamilyHandle);
+                removed++;
 
                 iterator.Next();
             }
@@ -1071,6 +1079,22 @@ public class RocksDbWAL : IWAL, IDisposable
 
         ToDecimalBytes(result[..PartitionIdWidth], partitionId);
         result[PartitionIdWidth] = PartitionUpperBoundSeparator;
+    }
+
+    /// <summary>
+    /// Decodes the log id from a fixed-width WAL key without touching the stored value. The key is
+    /// authoritative for both partition and id — <see cref="BuildLogKey"/> derives it from the message's
+    /// own <c>Partition</c>/<c>Id</c> on every write — so scans that need only those two fields can skip
+    /// reading (and copying out of native memory) the entry's value entirely.
+    /// </summary>
+    private static long ParseLogIdFromKey(ReadOnlySpan<byte> key)
+    {
+        long id = 0;
+
+        for (int i = PartitionIdWidth + 1; i < key.Length; i++)
+            id = (id * 10) + (key[i] - (byte)'0');
+
+        return id;
     }
 
     private static bool KeyBelongsToPartition(ReadOnlySpan<byte> key, int partitionId)
