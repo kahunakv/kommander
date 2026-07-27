@@ -613,6 +613,43 @@ public class RaftConfiguration
     /// </summary>
     public int MaxBackfillEntriesPerRound { get; set; } = 128;
 
+    // ── Snapshot receive session ──────────────────────────────────────────────
+
+    /// <summary>
+    /// How long an in-progress snapshot-receive session may sit idle (no new chunk) before the
+    /// receiver expires and discards it, releasing its buffered bytes. Expiry is <b>lazy</b>: it runs
+    /// when the next chunk arrives (or an explicit sweep), so an abandoned session's memory is bounded
+    /// by the global caps below rather than by this TTL alone. Protects the production receive path from
+    /// a leader that starts a transfer and vanishes mid-stream. Must be positive. Default 30 s.
+    /// </summary>
+    public TimeSpan SnapshotReceiveSessionTtl { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Global cap on the number of concurrent snapshot-receive sessions across all partitions. When a new
+    /// session would exceed the cap the receiver deterministically evicts the oldest (least-recently-active,
+    /// then lowest composite key) sessions to make room, disposing their buffers. Bounds per-receiver
+    /// session bookkeeping regardless of how many leaders race to send. Must be positive. Default 8.
+    /// </summary>
+    public int SnapshotMaxPendingSessions { get; set; } = 8;
+
+    /// <summary>
+    /// Global cap on total buffered snapshot bytes across all in-progress receive sessions. A chunk that
+    /// would push the total past this bound triggers deterministic eviction of other sessions; if even then
+    /// it cannot fit (a single session larger than the whole budget) that session is rejected and removed.
+    /// This is the primary memory bound on the receive path. Must be positive. Default 512 MiB.
+    /// </summary>
+    public long SnapshotMaxPendingBytes { get; set; } = 512L * 1024 * 1024;
+
+    /// <summary>
+    /// When <see langword="true"/>, snapshot chunks whose new session-metadata fields
+    /// (<c>LeaderTerm</c>/<c>LeaderEndpoint</c>/<c>LastIncludedTerm</c>) are zero/empty are treated as a
+    /// legacy sender that pre-dates those fields and are accepted with a warning under the old behaviour.
+    /// When <see langword="false"/> (the default) new senders are expected to populate all fields. This is
+    /// a temporary compatibility switch to be removed in a later breaking release. Default
+    /// <see langword="false"/>.
+    /// </summary>
+    public bool AllowLegacySnapshotSenders { get; set; }
+
     // ── Learner promotion ──────────────────────────────────────────────────────
 
     /// <summary>
@@ -869,6 +906,21 @@ public class RaftConfiguration
                 "Quiesced followers detect leader failure via SWIM Suspect (approximately one PingInterval), " +
                 "so a PingInterval at or above StartElectionTimeout regresses quiesced failover latency. " +
                 "Lower PingInterval, raise StartElectionTimeout, or set EnableQuiescence=false.");
+
+        if (SnapshotReceiveSessionTtl <= TimeSpan.Zero)
+            throw new RaftException(
+                $"[Kommander] SnapshotReceiveSessionTtl ({SnapshotReceiveSessionTtl}) must be positive. " +
+                "It bounds how long an idle snapshot-receive session is retained before its buffer is released.");
+
+        if (SnapshotMaxPendingSessions <= 0)
+            throw new RaftException(
+                $"[Kommander] SnapshotMaxPendingSessions ({SnapshotMaxPendingSessions}) must be positive. " +
+                "It caps the number of concurrent snapshot-receive sessions on the production receive path.");
+
+        if (SnapshotMaxPendingBytes <= 0)
+            throw new RaftException(
+                $"[Kommander] SnapshotMaxPendingBytes ({SnapshotMaxPendingBytes}) must be positive. " +
+                "It caps total buffered snapshot bytes across all in-progress receive sessions.");
 
         // PartitionExecutorPoolSize: no throw needed — the RaftExecutorPool constructor
         // clamps negative values to 1 and treats 0 as ProcessorCount.  This note keeps

@@ -566,6 +566,9 @@ public sealed class RaftService : Rafter.RafterBase
             // synchronously (under the session lock) before this call returns.
             Data = request.Data.Memory,
             Kind = (Data.SnapshotKind)request.Kind,
+            LeaderTerm = request.LeaderTerm,
+            LeaderEndpoint = request.LeaderEndpoint,
+            LastIncludedTerm = request.LastIncludedTerm,
         };
 
         Data.SnapshotResponse result = await manager.ReceiveInstallSnapshot(

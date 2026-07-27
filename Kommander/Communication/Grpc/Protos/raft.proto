@@ -219,6 +219,9 @@ message GrpcInstallSnapshotRequest {
     bool IsLast = 6;
     bytes Data = 7;
     int32 Kind = 8; // maps to SnapshotKind; 0 == Range (default, wire-compat with old peers)
+    int64 LeaderTerm = 9; // sender's currentTerm at session creation; 0 == legacy sender
+    string LeaderEndpoint = 10; // claimed sender/leader; empty == legacy sender
+    int64 LastIncludedTerm = 11; // term of the entry at SnapshotIndex; 0 == legacy sender
 }
 
 message GrpcInstallSnapshotResponse {

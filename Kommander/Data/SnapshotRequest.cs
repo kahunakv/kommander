@@ -43,6 +43,33 @@ public sealed class SnapshotRequest
     /// <summary>Log index the snapshot reflects; all entries up to and including this index are captured.</summary>
     public long SnapshotIndex { get; init; }
 
+    /// <summary>
+    /// The sender's Raft <c>currentTerm</c> at the moment the transfer session was created.
+    /// Carried so the receiver can apply the same leader-RPC term rules used by AppendEntries/Vote:
+    /// a snapshot from a stale leader (<c>LeaderTerm &lt; currentTerm</c>) is rejected, and one from a
+    /// higher term drives the normal durable step-down. <b>Distinct from <see cref="LastIncludedTerm"/></b>
+    /// — this is the leader's <em>current</em> term, not the term of the entry at <see cref="SnapshotIndex"/>.
+    /// <para>Zero denotes a legacy sender that pre-dates this field; such requests are only honoured when
+    /// the receiver is configured to allow legacy senders (compatibility window).</para>
+    /// </summary>
+    public long LeaderTerm { get; init; }
+
+    /// <summary>
+    /// The claimed sending endpoint (the leader that owns the transfer). Part of the receive-session
+    /// identity key <c>(leaderEndpoint, partitionId, sessionId)</c> so two leaders cannot alias one
+    /// session id, and used to reject a chunk whose sender disagrees with the accepted leader for the term.
+    /// Empty denotes a legacy sender that pre-dates this field.
+    /// </summary>
+    public string LeaderEndpoint { get; init; } = "";
+
+    /// <summary>
+    /// The Raft term of the log entry at <see cref="SnapshotIndex"/> (the snapshot's last-included term).
+    /// Used for log matching against a retained local entry at that index and stamped onto the installed
+    /// <c>CommittedCheckpoint</c>. <b>Not</b> the same as <see cref="LeaderTerm"/>; conflating the two
+    /// corrupts the checkpoint term and the log-match decision. Zero denotes a legacy sender.
+    /// </summary>
+    public long LastIncludedTerm { get; init; }
+
     /// <summary>Endpoint of the follower that should install the snapshot.</summary>
     public string FollowerEndpoint { get; init; } = "";
 

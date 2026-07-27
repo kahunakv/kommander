@@ -405,7 +405,11 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             () => Volatile.Read(ref _stateMachineTransfer),
             walAdapter,
             Logger,
-            LocalEndpoint);
+            LocalEndpoint,
+            SnapshotReceiver.TicksForDuration(this.configuration.SnapshotReceiveSessionTtl),
+            this.configuration.SnapshotMaxPendingSessions,
+            this.configuration.SnapshotMaxPendingBytes,
+            static () => global::System.Diagnostics.Stopwatch.GetTimestamp());
 
         clusterHandler = new(this, discovery);
 

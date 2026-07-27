@@ -1501,7 +1501,11 @@ public sealed class RaftPartitionStateMachine
                 bool p0System = host.PartitionId == RaftSystemConfig.SystemPartition && host.SystemStateTransfer is not null;
                 if (lastCheckpoint > 0 && (host.StateMachineTransfer is not null || p0System))
                 {
-                    snapshotSender.TrySend(node, lastCheckpoint);
+                    // LastIncludedTerm = the term of the entry at the checkpoint index (may be -1 if
+                    // compacted away, in which case the receiver falls back to its own matching rules).
+                    // LeaderTerm = this leader's currentTerm so the follower can apply leader-RPC term rules.
+                    long lastIncludedTerm = await wal.GetAnyTermAtAsync(lastCheckpoint).ConfigureAwait(false);
+                    snapshotSender.TrySend(node, lastCheckpoint, currentTerm, lastIncludedTerm);
                 }
             }
 

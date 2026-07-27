@@ -48,7 +48,7 @@ internal sealed class SnapshotSender
     /// removed in the <c>finally</c> block of <see cref="TrySendSnapshotAsync"/> so the
     /// next heartbeat can retry on failure.
     /// </summary>
-    internal void TrySend(RaftNode node, long snapshotIndex)
+    internal void TrySend(RaftNode node, long snapshotIndex, long leaderTerm, long lastIncludedTerm)
     {
         if (pendingSnapshotEndpoints.TryAdd(node.Endpoint, 0))
         {
@@ -57,7 +57,7 @@ internal sealed class SnapshotSender
             if (logger.IsEnabled(LogLevel.Information))
                 logger.LogInfoStartingSnapshotTransfer(
                     host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex);
-            _ = TrySendSnapshotAsync(node, snapshotIndex);
+            _ = TrySendSnapshotAsync(node, snapshotIndex, leaderTerm, lastIncludedTerm);
         }
     }
 
@@ -69,7 +69,7 @@ internal sealed class SnapshotSender
     internal void CompleteSnapshotInstalled(string endpoint, long snapshotIndex) =>
         onSnapshotInstalled(endpoint, snapshotIndex);
 
-    private async Task TrySendSnapshotAsync(RaftNode node, long snapshotIndex)
+    private async Task TrySendSnapshotAsync(RaftNode node, long snapshotIndex, long leaderTerm, long lastIncludedTerm)
     {
         const int chunkSize = 3 * 1024 * 1024;
 
@@ -141,6 +141,11 @@ internal sealed class SnapshotSender
                             PartitionId = host.PartitionId,
                             SnapshotIndex = snapshotIndex,
                             FollowerEndpoint = node.Endpoint,
+                            // Session metadata — identical on every chunk of this session. The receiver
+                            // rejects a session whose later chunks disagree, so these must not vary.
+                            LeaderTerm = leaderTerm,
+                            LeaderEndpoint = host.LocalEndpoint,
+                            LastIncludedTerm = lastIncludedTerm,
                             ChunkIndex = chunkIndex,
                             IsLast = isLast,
                             // Zero-copy view over the reused buffer. Safe because the send below is awaited
