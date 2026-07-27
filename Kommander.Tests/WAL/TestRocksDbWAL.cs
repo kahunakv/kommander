@@ -163,6 +163,39 @@ public sealed class TestRocksDbWAL
         }
     }
 
+    /// <summary>
+    /// A null log type is not stored (the field is simply omitted), and an absent optional field decodes
+    /// to its proto3 default — the empty string, never null. Callers rely on the non-null result, so this
+    /// pins the behaviour of the hand-rolled wire decoder against the generated parser it replaced.
+    /// </summary>
+    [Fact]
+    public void WriteWithNullLogTypeReadsBackAsEmptyString()
+    {
+        string path = CreateTempWalPath();
+
+        try
+        {
+            using RocksDbWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false);
+
+            Assert.Equal(
+                RaftOperationStatus.Success,
+                wal.Write(
+                    new List<(int, List<RaftLog>)>
+                    {
+                        (5, [new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed, LogType = null }])
+                    }
+                )
+            );
+
+            Assert.Equal("", Assert.Single(wal.ReadLogs(5)).LogType);
+            Assert.Equal("", Assert.Single(wal.ReadLogsRange(5, 1)).LogType);
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
     private static RaftLog CreateLog(int partitionId, long id, long term, RaftLogType type = RaftLogType.Committed)
     {
         return new()

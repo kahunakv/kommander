@@ -1436,6 +1436,11 @@ public sealed class RaftPartitionStateMachine
             KommanderMetrics.HeartbeatDelayMs.Record(
                 (lastHeartbeat - prevHeartbeat).TotalMilliseconds, heartbeatTags);
 
+        // Shared across this round's followers: lagging peers are usually anchored at the same index,
+        // so the range is read from the WAL (and Protobuf-encoded) once instead of once per follower.
+        // Allocated lazily — a healthy round backfills nobody.
+        BackfillRoundBatches? backfillRound = null;
+
         foreach (RaftNode node in nodes)
         {
             if (node.Endpoint == host.LocalEndpoint)
@@ -1489,7 +1494,8 @@ public sealed class RaftPartitionStateMachine
                 && (followerGap > host.Configuration.BackfillThreshold || idleTailGap || regressed))
             {
                 long anchorFrom = regressed ? regressedFrontier : followerMaxLog;
-                if (await TrySendBackfillBatchAsync(node, anchorFrom, lastHeartbeat, anchorToFollowerFrontier: regressed).ConfigureAwait(false))
+                backfillRound ??= new();
+                if (await TrySendBackfillBatchAsync(node, anchorFrom, lastHeartbeat, anchorToFollowerFrontier: regressed, round: backfillRound).ConfigureAwait(false))
                     continue;
 
                 // Empty batch: the leader has compacted past followerMaxLog+1.
@@ -2703,23 +2709,53 @@ public sealed class RaftPartitionStateMachine
     /// derived from the monotonic <see cref="matchIndex"/> and so still points above the frontier the
     /// follower just reported, which is precisely the range that must be re-shipped.
     /// </param>
-    private async Task<bool> TrySendBackfillBatchAsync(RaftNode node, long followerMaxLog, HLCTimestamp timestamp, bool anchorToFollowerFrontier = false)
+    /// <param name="round">
+    /// Optional per-round memo (see <see cref="BackfillRoundBatches"/>). When supplied, a range already
+    /// read in this heartbeat round is reused instead of being re-read and re-decoded from the WAL for
+    /// each follower anchored at the same index — the common shape of a multi-follower catch-up. Pass
+    /// <see langword="null"/> from one-off call sites, where there is nothing to share with.
+    /// </param>
+    private async Task<bool> TrySendBackfillBatchAsync(
+        RaftNode node,
+        long followerMaxLog,
+        HLCTimestamp timestamp,
+        bool anchorToFollowerFrontier = false,
+        BackfillRoundBatches? round = null)
     {
         long from = !anchorToFollowerFrontier && nextIndex.TryGetValue(node.Endpoint, out long ni) && ni <= localCommittedIndex
             ? ni
             : followerMaxLog + 1;
 
+        long prevIdx = from - 1;
+
+        if (round is not null && round.TryGet(from, out BackfillRoundBatches.Batch? cached))
+        {
+            if (cached!.Logs.Count == 0)
+                return false;
+
+            logger.LogDebugBackfilling(host.LocalEndpoint, host.PartitionId, nodeState, cached.Logs.Count, node.Endpoint, from, prevIdx, localCommittedIndex);
+
+            AppendLogToNode(node, timestamp, cached.Logs, prevIdx, cached.PrevTerm, grpcLogCache: cached.GrpcLogCache);
+            return true;
+        }
+
         List<RaftLog> backfill = await wal.GetRangeAsync(from, host.Configuration.MaxBackfillEntriesPerRound).ConfigureAwait(false);
 
         if (backfill.Count == 0)
+        {
+            // Memoize the empty result as well: every follower anchored here would otherwise repeat the
+            // same read before falling through to the snapshot path.
+            round?.Add(from, backfill, 0);
             return false;
+        }
 
-        long prevIdx  = from - 1;
         long prevTerm = prevIdx > 0 ? await wal.GetAnyTermAtAsync(prevIdx).ConfigureAwait(false) : 0;
+
+        BackfillRoundBatches.Batch? shared = round?.Add(from, backfill, prevTerm);
 
         logger.LogDebugBackfilling(host.LocalEndpoint, host.PartitionId, nodeState, backfill.Count, node.Endpoint, from, prevIdx, localCommittedIndex);
 
-        AppendLogToNode(node, timestamp, backfill, prevIdx, prevTerm);
+        AppendLogToNode(node, timestamp, backfill, prevIdx, prevTerm, grpcLogCache: shared?.GrpcLogCache);
         return true;
     }
 
