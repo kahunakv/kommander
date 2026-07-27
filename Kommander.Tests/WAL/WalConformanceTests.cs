@@ -462,6 +462,83 @@ public abstract class WalConformanceTests
     }
 
     /// <summary>
+    /// Every field of an entry must survive a write/read round-trip — not just the ids and terms most
+    /// tests assert on. Backends that decode the stored record field by field (RocksDB parses the
+    /// Protobuf wire format by hand on this path) can silently drop or mis-tag a field without any
+    /// id-level test noticing, so the HLC components, log type and payload are checked explicitly.
+    /// </summary>
+    [Fact]
+    public void ReadLogsRange_RoundTripsEveryField()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            byte[] payload = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x7F, 0x80, 0xFF];
+
+            RaftLog written = new()
+            {
+                Id = 7,
+                Term = 9,
+                Type = RaftLogType.CommittedCheckpoint,
+                Time = new(n: 3, l: 1_700_000_000_123, c: 42),
+                LogType = "round-trip",
+                LogData = payload
+            };
+
+            wal.Write([(31, [written])]);
+
+            RaftLog read = Assert.Single(wal.ReadLogsRange(31, 1));
+
+            Assert.Equal(7, read.Id);
+            Assert.Equal(9, read.Term);
+            Assert.Equal(RaftLogType.CommittedCheckpoint, read.Type);
+            Assert.Equal(3, read.Time.N);
+            Assert.Equal(1_700_000_000_123, read.Time.L);
+            Assert.Equal(42u, read.Time.C);
+            Assert.Equal("round-trip", read.LogType);
+            Assert.Equal(payload, read.LogData);
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// A single range read mixes log types and payload shapes, which is where a per-entry decoder is
+    /// most likely to leak state between entries: a cached/reused log-type string, a payload length
+    /// carried over from the previous record, or a missing field left holding its predecessor's value.
+    /// The payloads deliberately straddle the 127-byte single-byte-varint length boundary.
+    /// </summary>
+    [Fact]
+    public void ReadLogsRange_MixedLogTypesAndPayloads_RoundTripIndependently()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            byte[] large = new byte[300];
+            for (int i = 0; i < large.Length; i++)
+                large[i] = (byte)(i % 251);
+
+            wal.Write([(32, [
+                new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed, LogType = "alpha", LogData = [1, 2, 3] },
+                new RaftLog { Id = 2, Term = 1, Type = RaftLogType.Committed, LogType = "beta",  LogData = null },
+                new RaftLog { Id = 3, Term = 1, Type = RaftLogType.Committed, LogType = "alpha", LogData = large },
+                new RaftLog { Id = 4, Term = 1, Type = RaftLogType.Committed, LogType = "gamma", LogData = [] },
+                new RaftLog { Id = 5, Term = 1, Type = RaftLogType.Committed, LogType = "alpha", LogData = [9] }
+            ])]);
+
+            List<RaftLog> read = wal.ReadLogsRange(32, 1);
+
+            Assert.Equal(5, read.Count);
+            Assert.Equal(["alpha", "beta", "alpha", "gamma", "alpha"], read.Select(l => l.LogType));
+            Assert.Equal([1, 2, 3], read[0].LogData);
+            Assert.Null(read[1].LogData);
+            Assert.Equal(large, read[2].LogData);
+            Assert.Empty(read[3].LogData!);
+            Assert.Equal([9], read[4].LogData);
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
     /// Verifies that <paramref name="maxEntries"/> is honoured at the storage level: writing 10 entries
     /// and requesting 3 must return exactly 3, not all 10. This guards against the O(n²) full-tail
     /// scan that happens when the limit is only applied in memory after reading everything.

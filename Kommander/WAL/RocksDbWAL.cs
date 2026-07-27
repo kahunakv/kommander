@@ -7,7 +7,6 @@ using Kommander.Logging;
 using Kommander.WAL.Protos;
 using RocksDbSharp;
 using System.Collections.Concurrent;
-using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
 
 namespace Kommander.WAL;
@@ -242,41 +241,19 @@ public class RocksDbWAL : IWAL, IDisposable
             if (!KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
                 break;
 
-            RaftLogMessage message = Unserializer(iterator.GetValueSpan());
-            
-            if (message.Partition != partitionId || message.Id < lastCheckpoint)
+            ReadLogFromWire(iterator.GetValueSpan(), out RaftLogWireView view);
+
+            if (view.Partition != partitionId || view.Id < lastCheckpoint)
             {
                 iterator.Next();
                 continue;
             }
 
             //if (partitionId == 1)
-            //    Console.WriteLine("{0} {1}", iterator.StringKey(), message.Id);
+            //    Console.WriteLine("{0} {1}", iterator.StringKey(), view.Id);
 
-            RaftLog raftLog = new()
-            {
-                Id = message.Id,
-                Term = message.Term,
-                Type = (RaftLogType)message.Type,
-                Time = new(message.TimeNode, message.TimePhysical, message.TimeCounter),
-                LogType = message.LogType
-            };
-            
-            if (message.HasLog)
-            {
-                // RaftLog.LogData is a byte[], and the happy path aliases the ByteString's backing array
-                // zero-copy. A non-array-backed ByteString (rare) has no array to alias and must be
-                // materialized into a byte[]; consuming it via .Span would only be .ToArray()'d straight
-                // back into LogData, an identical copy — so the ToByteArray fallback is kept on purpose
-                // because the downstream truly needs a byte[].
-                if (MemoryMarshal.TryGetArray(message.Log.Memory, out ArraySegment<byte> segment))
-                    raftLog.LogData = segment.Array;
-                else
-                    raftLog.LogData = message.Log.ToByteArray();
-            }
+            result.Add(ToRaftLog(view));
 
-            result.Add(raftLog);
-            
             iterator.Next();
         }
 
@@ -290,7 +267,10 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </summary>
     public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue)
     {
-        List<RaftLog> result = [];
+        // Presize when the caller supplied a sane bound (the common case: a bounded backfill batch),
+        // so a full batch does not walk the doubling sequence. An unbounded/absurd limit falls back
+        // to the default growth rather than reserving for entries that may not exist.
+        List<RaftLog> result = maxEntries is > 0 and <= 1024 ? new(maxEntries) : [];
 
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
@@ -305,37 +285,15 @@ public class RocksDbWAL : IWAL, IDisposable
             if (!KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
                 break;
 
-            RaftLogMessage message = Unserializer(iterator.GetValueSpan());
+            ReadLogFromWire(iterator.GetValueSpan(), out RaftLogWireView view);
 
-            if (message.Partition != partitionId || message.Id < startLogIndex)
+            if (view.Partition != partitionId || view.Id < startLogIndex)
             {
                 iterator.Next();
                 continue;
             }
 
-            RaftLog raftLog = new()
-            {
-                Id = message.Id,
-                Term = message.Term,
-                Type = (RaftLogType)message.Type,
-                Time = new(message.TimeNode, message.TimePhysical, message.TimeCounter),
-                LogType = message.LogType
-            };
-
-            if (message.HasLog)
-            {
-                // RaftLog.LogData is a byte[], and the happy path aliases the ByteString's backing array
-                // zero-copy. A non-array-backed ByteString (rare) has no array to alias and must be
-                // materialized into a byte[]; consuming it via .Span would only be .ToArray()'d straight
-                // back into LogData, an identical copy — so the ToByteArray fallback is kept on purpose
-                // because the downstream truly needs a byte[].
-                if (MemoryMarshal.TryGetArray(message.Log.Memory, out ArraySegment<byte> segment))
-                    raftLog.LogData = segment.Array;
-                else
-                    raftLog.LogData = message.Log.ToByteArray();
-            }
-
-            result.Add(raftLog);
+            result.Add(ToRaftLog(view));
 
             iterator.Next();
 
@@ -630,7 +588,7 @@ public class RocksDbWAL : IWAL, IDisposable
     ///
     /// Absent fields yield the proto3 default (<c>0</c>), which is the correct value for an entry that
     /// genuinely stored 0. Use this only where the payload is not needed; callers that must return a
-    /// <see cref="RaftLog"/> still go through <see cref="Unserializer"/>.
+    /// <see cref="RaftLog"/> go through <see cref="ReadLogFromWire"/>, which decodes every field.
     /// </summary>
     private static void ReadHeaderFromWire(ReadOnlySpan<byte> data, out int partition, out long id, out long term, out int type)
     {
@@ -669,6 +627,183 @@ public class RocksDbWAL : IWAL, IDisposable
                 default: return;                                                      // unknown wire type — stop, keep defaults
             }
         }
+    }
+
+    /// <summary>
+    /// A borrowed, non-owning view over a serialized <c>RaftLogMessage</c>. The two length-delimited
+    /// fields point straight into the caller's buffer (a live RocksDB iterator value), so a view is only
+    /// valid until that buffer moves — it must be converted with <see cref="ToRaftLog"/>, which performs
+    /// the single unavoidable payload copy, before <c>iterator.Next()</c> is called.
+    /// </summary>
+    private ref struct RaftLogWireView
+    {
+        public int Partition;
+        public long Id;
+        public long Term;
+        public int Type;
+        public ReadOnlySpan<byte> LogType;
+        public ReadOnlySpan<byte> Log;
+        public bool HasLog;
+        public int TimeNode;
+        public long TimePhysical;
+        public uint TimeCounter;
+    }
+
+    /// <summary>
+    /// Decodes every field of a serialized <c>RaftLogMessage</c> into a <see cref="RaftLogWireView"/>
+    /// without allocating. This is the read-path counterpart to <see cref="ReadHeaderFromWire"/>: it
+    /// replaces <see cref="Unserializer"/> on the hot range-scan path, where going through the generated
+    /// parser allocated a <c>RaftLogMessage</c>, a <c>ByteString</c> wrapper and a fresh <c>logType</c>
+    /// string for every entry visited — overhead that dwarfed the payload for small entries and was
+    /// paid again on each re-read of an overlapping follower backfill range.
+    ///
+    /// <para>Decoding is deliberately separated from materialization so that callers can apply their
+    /// partition/id filter against the view and skip non-matching entries without ever copying a
+    /// payload.</para>
+    ///
+    /// <para>Absent fields keep their proto3 default, matching the generated parser: in particular an
+    /// unset <c>logType</c> (5) yields <see cref="string.Empty"/>, not <see langword="null"/>, because
+    /// the generated property substitutes the default for a missing value.</para>
+    /// </summary>
+    /// <exception cref="InvalidDataException">
+    /// The value is truncated or otherwise malformed. The generated parser signalled this by throwing
+    /// <c>InvalidProtocolBufferException</c>; corrupt entries must keep failing loudly rather than being
+    /// silently decoded to defaults, which would present a torn entry as a legitimate log record.
+    /// </exception>
+    private static void ReadLogFromWire(ReadOnlySpan<byte> data, out RaftLogWireView view)
+    {
+        view = default;
+
+        int pos = 0;
+        while (pos < data.Length)
+        {
+            ulong tag = ReadVarint(data, ref pos);
+            int fieldNumber = (int)(tag >> 3);
+            int wireType = (int)(tag & 0x7);
+
+            switch (wireType)
+            {
+                case 0: // varint
+                {
+                    ulong value = ReadVarint(data, ref pos);
+
+                    switch (fieldNumber)
+                    {
+                        case 1: view.Partition = (int)value; break;
+                        case 2: view.Id = (long)value; break;
+                        case 3: view.Term = (long)value; break;
+                        case 4: view.Type = (int)value; break;
+                        case 7: view.TimeNode = (int)value; break;
+                        case 8: view.TimePhysical = (long)value; break;
+                        case 9: view.TimeCounter = (uint)value; break;
+                    }
+
+                    break;
+                }
+
+                case 2: // length-delimited
+                {
+                    int length = (int)ReadVarint(data, ref pos);
+                    if (length < 0 || pos + length > data.Length)
+                        throw new InvalidDataException($"Truncated RaftLogMessage: field {fieldNumber} declares {length} bytes but only {data.Length - pos} remain.");
+
+                    switch (fieldNumber)
+                    {
+                        case 5: view.LogType = data.Slice(pos, length); break;
+                        case 6: view.Log = data.Slice(pos, length); view.HasLog = true; break;
+                    }
+
+                    pos += length;
+                    break;
+                }
+
+                case 1: // 64-bit
+                    if (pos + 8 > data.Length)
+                        throw new InvalidDataException("Truncated RaftLogMessage: incomplete 64-bit field.");
+                    pos += 8;
+                    break;
+
+                case 5: // 32-bit
+                    if (pos + 4 > data.Length)
+                        throw new InvalidDataException("Truncated RaftLogMessage: incomplete 32-bit field.");
+                    pos += 4;
+                    break;
+
+                default:
+                    throw new InvalidDataException($"Malformed RaftLogMessage: unsupported wire type {wireType} for field {fieldNumber}.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Materializes <paramref name="view"/> into a <see cref="RaftLog"/>, copying the payload out of the
+    /// borrowed buffer. This copy is unavoidable — <see cref="RaftLog.LogData"/> is a <c>byte[]</c> that
+    /// outlives the iterator position the bytes came from — and after this change it is the only
+    /// per-entry allocation on the range-scan path apart from the <see cref="RaftLog"/> itself, since
+    /// <c>logType</c> is served from <see cref="InternLogType"/>'s cache.
+    /// </summary>
+    private static RaftLog ToRaftLog(in RaftLogWireView view)
+    {
+        return new()
+        {
+            Id = view.Id,
+            Term = view.Term,
+            Type = (RaftLogType)view.Type,
+            Time = new(view.TimeNode, view.TimePhysical, view.TimeCounter),
+            LogType = InternLogType(view.LogType),
+            LogData = view.HasLog ? (view.Log.IsEmpty ? [] : view.Log.ToArray()) : null
+        };
+    }
+
+    /// <summary>
+    /// The per-thread cache used by <see cref="InternLogType"/>. Log types form a tiny closed set (a
+    /// handful of operation names for the whole cluster), so a short linear scan comparing raw UTF-8
+    /// bytes resolves nearly every entry without decoding a new string. Kept <c>[ThreadStatic]</c>
+    /// rather than shared because range scans run concurrently on the read scheduler's worker threads
+    /// and a shared cache would need locking to publish entries safely.
+    /// </summary>
+    [ThreadStatic]
+    private static (byte[] Utf8, string Value)[]? logTypeCache;
+
+    /// <summary>The number of populated slots in <see cref="logTypeCache"/>.</summary>
+    [ThreadStatic]
+    private static int logTypeCacheCount;
+
+    /// <summary>The next slot <see cref="InternLogType"/> will write, wrapping round-robin once the cache is full.</summary>
+    [ThreadStatic]
+    private static int logTypeCacheCursor;
+
+    /// <summary>The maximum number of distinct log types cached per thread before slots are recycled.</summary>
+    private const int LogTypeCacheSize = 8;
+
+    /// <summary>
+    /// Returns the string form of a UTF-8 <c>logType</c>, reusing a previously decoded instance whenever
+    /// the same bytes are seen again. A range scan over a partition is overwhelmingly homogeneous in log
+    /// type, so this turns one string allocation per entry into one per distinct type per thread.
+    /// A miss costs an extra <c>byte[]</c> for the cached key; with more than
+    /// <see cref="LogTypeCacheSize"/> live types the oldest slot is recycled rather than growing.
+    /// </summary>
+    private static string InternLogType(ReadOnlySpan<byte> utf8)
+    {
+        if (utf8.IsEmpty)
+            return "";
+
+        (byte[] Utf8, string Value)[] cache = logTypeCache ??= new (byte[], string)[LogTypeCacheSize];
+
+        for (int i = 0; i < logTypeCacheCount; i++)
+        {
+            if (utf8.SequenceEqual(cache[i].Utf8))
+                return cache[i].Value;
+        }
+
+        string value = Encoding.UTF8.GetString(utf8);
+
+        cache[logTypeCacheCursor] = (utf8.ToArray(), value);
+        logTypeCacheCursor = (logTypeCacheCursor + 1) % LogTypeCacheSize;
+        if (logTypeCacheCount < LogTypeCacheSize)
+            logTypeCacheCount++;
+
+        return value;
     }
 
     /// <summary>Decodes a base-128 varint at <paramref name="pos"/>, advancing it past the value.</summary>
@@ -1027,27 +1162,6 @@ public class RocksDbWAL : IWAL, IDisposable
     private static void SerializeInto(RaftLogMessage message, Span<byte> destination)
     {
         message.WriteTo(destination);
-    }
-
-    /// <summary>
-    /// Deserializes a binary representation of a <see cref="RaftLogMessage"/> into its object form.
-    /// </summary>
-    /// <param name="serializedData">
-    /// The binary data representing a serialized <see cref="RaftLogMessage"/>.
-    /// </param>
-    /// <returns>
-    /// An instance of <see cref="RaftLogMessage"/> deserialized from the provided binary data.
-    /// </returns>
-    /// <remarks>
-    /// Parses directly from the caller's buffer via the Protobuf <see cref="ReadOnlySpan{T}"/> overload —
-    /// no intermediate <c>MemoryStream</c> wrapper. The parsed message is identical to the former
-    /// stream-based path for any size; Protobuf's wire decode is independent of the source kind.
-    /// <c>ParseFrom</c> copies out every byte/string field it retains, so the result is safe to use after
-    /// the source buffer is reused or released (the buffer is only borrowed for the duration of this call).
-    /// </remarks>
-    private static RaftLogMessage Unserializer(ReadOnlySpan<byte> serializedData)
-    {
-        return RaftLogMessage.Parser.ParseFrom(serializedData);
     }
 
     /// <summary>
