@@ -24,6 +24,7 @@ public sealed class ClusterInvariantChecker : IAsyncDisposable
     private readonly Func<CancellationToken, Task<ClusterView>> _sampler;
     private readonly IReadOnlyList<IClusterInvariant> _invariants;
     private readonly TimeSpan _pollInterval;
+    private readonly TimeSpan _confirmDelay;
     private readonly Channel<byte> _notifications =
         Channel.CreateBounded<byte>(new BoundedChannelOptions(1) { FullMode = BoundedChannelFullMode.DropWrite });
     private readonly CancellationTokenSource _cts = new();
@@ -41,6 +42,10 @@ public sealed class ClusterInvariantChecker : IAsyncDisposable
         _sampler = sampler;
         _invariants = invariants ?? ClusterInvariants.All;
         _pollInterval = pollInterval ?? TimeSpan.FromMilliseconds(100);
+        // Give a transient condition (leader skew, a gap-aware commit dip mid log-hole repair) time to heal
+        // before the confirmation resample: a couple of poll intervals, floored so it always clears a few
+        // heartbeats even when polling fast.
+        _confirmDelay = TimeSpan.FromMilliseconds(Math.Max(100, _pollInterval.TotalMilliseconds * 2));
     }
 
     public ClusterViolation? FirstViolation => _firstViolation;
@@ -92,7 +97,13 @@ public sealed class ClusterInvariantChecker : IAsyncDisposable
 
             if (v.RequiresConfirmation)
             {
-                // Re-sample once and re-evaluate to filter non-atomic-snapshot false positives.
+                // Re-sample and re-evaluate to filter non-atomic-snapshot false positives (transient leader
+                // skew, a gap-aware commit-frontier dip during log-hole repair). Wait briefly first so a
+                // genuinely transient condition has time to heal before we look again; a real violation
+                // persists across the wait and is recorded.
+                try { await Task.Delay(_confirmDelay, ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
+
                 ClusterView confirm;
                 try { confirm = Augment(await _sampler(ct).ConfigureAwait(false)); }
                 catch { continue; }

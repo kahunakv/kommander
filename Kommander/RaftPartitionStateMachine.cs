@@ -3348,31 +3348,23 @@ public sealed class RaftPartitionStateMachine
                     continue;
 
                 // Exactly-once apply: the leader re-sends committed entries (commit broadcast to all peers,
-                // plus backfill / idle-tail re-ship), so a follower routinely receives a Committed copy of
-                // an entry it has already applied. Deliver to the consumer only when the index is past the
-                // applied frontier; the WAL write already happened and the cursor still advances below.
-                if (log.Id > lastAppliedIndex)
+                // plus backfill / idle-tail re-ship), so a follower routinely receives a Committed copy of an
+                // entry it has already applied. Never re-deliver at or below the applied frontier.
+                if (log.Id <= lastAppliedIndex)
+                    continue;
+
+                if (host.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType)
                 {
-                    if (host.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType)
-                    {
-                        if (!await host.InvokeSystemReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
-                            host.InvokeReplicationError(host.PartitionId, log);
-                    }
-                    else
-                    {
-                        if (!await host.InvokeReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
-                            host.InvokeReplicationError(host.PartitionId, log);
-                    }
+                    if (!await host.InvokeSystemReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
+                        host.InvokeReplicationError(host.PartitionId, log);
+                }
+                else
+                {
+                    if (!await host.InvokeReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
+                        host.InvokeReplicationError(host.PartitionId, log);
                 }
 
-                // Track per-entry, not via the gap-aware committedIndex above: committedIndex
-                // is computed before this loop and is used only for backfill reporting to the
-                // leader. Using it here would cap lastAppliedIndex below entries we actually
-                // applied if a gap ever occurred (committedIndex stops at the hole; log.Id does
-                // not). Under the contiguous-prefix invariant the two values agree; this
-                // per-entry form is safer if the invariant were ever relaxed.
-                if (log.Id > lastAppliedIndex)
-                    lastAppliedIndex = log.Id;
+                lastAppliedIndex = log.Id;
             }
 
             wal.NotifyCommitted();

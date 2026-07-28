@@ -159,7 +159,9 @@ public class TestClusterInvariants
         ClusterViolation? r = new CommitMonotonicityInvariant().Evaluate(null, v);
         Assert.NotNull(r);
         Assert.Contains("regressed: 5 < 10", r!.Detail);
-        Assert.False(r.RequiresConfirmation);
+        // Gap-aware commit frontier can dip transiently under log-hole repair, so a regression is confirmed
+        // (re-sampled) before failing rather than recorded immediately.
+        Assert.True(r.RequiresConfirmation);
     }
 
     [Fact]

@@ -58,6 +58,13 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
     public IReadOnlyList<int> UserPartitions { get; private set; } = [];
     public IReadOnlyList<RaftManager> Nodes => _nodes;
 
+    /// <summary>The hash-chain observer attached to a specific (node endpoint, partition) pair.</summary>
+    public HashChainStateMachine ChainFor(string endpoint, int partition) => _chains[(endpoint, partition)];
+
+    /// <summary>Every hash-chain observer for a partition, one per node.</summary>
+    public IEnumerable<HashChainStateMachine> ChainsFor(int partition) =>
+        _chains.Where(kv => kv.Key.Partition == partition).Select(kv => kv.Value);
+
     /// <summary>
     /// Builds and starts the cluster. Returns only after endpoints/discovery are registered, all nodes share
     /// the nemesis decorator, a hash chain is attached per user partition, the cluster has joined and user
@@ -122,6 +129,9 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
             StartElectionTimeout = 100,
             EndElectionTimeout = 300,
+            // Deterministic per-node election timeouts: repeated runs of a scenario make the same election
+            // decisions, so a failure reproduces exactly (the F gate). Derived per (partition, node) internally.
+            ElectionTimeoutSeed = _seed,
             EnableQuiescence = false,
             BackfillThreshold = 0,
             MaxBackfillEntriesPerRound = 128,
@@ -158,6 +168,43 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
         if (r.Status != RaftOperationStatus.Success)
             return -1;
         return r.LogIndex;
+    }
+
+    /// <summary>
+    /// Submits a uniquely-identified write through a <b>specific</b> node (not the discovered leader). Used by
+    /// scenarios that deliberately write to an isolated/minority node and assert the write does not commit.
+    /// Returns the raw replication result so the caller can inspect <see cref="RaftOperationStatus"/>.
+    /// </summary>
+    public async Task<RaftReplicationResult> WriteViaAsync(RaftManager node, int partition, CancellationToken ct = default)
+    {
+        int seq = Interlocked.Increment(ref _writerSeq);
+        byte[] payload = Encoding.UTF8.GetBytes($"w{_seed}:{seq}");
+        return await node.ReplicateLogs(partition, "chaos", payload, cancellationToken: ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// A liveness oracle for a single stable leader: waits until exactly one node reports leadership for the
+    /// partition and that view stays single across a short confirmation window, then returns that leader.
+    /// Only meaningful after all withholding rules are healed and held messages released/dropped.
+    /// </summary>
+    public async Task<RaftManager> WaitForSingleLeaderAsync(int partition, CancellationToken ct = default)
+    {
+        RaftManager? leader = null;
+        await WaitAsync(async () =>
+        {
+            RaftManager? found = null;
+            int count = 0;
+            foreach (RaftManager n in _nodes)
+                if (await n.AmILeaderQuick(partition).ConfigureAwait(false)) { found = n; count++; }
+            if (count != 1) return false;
+            // Confirmation window: the same single leader must still hold leadership shortly after. A
+            // transiently-stale peer view is tolerated here (two-leader safety is caught continuously by the
+            // invariant checker); this oracle only needs one stable leader to make progress against.
+            leader = found;
+            await Task.Delay(200, ct).ConfigureAwait(false);
+            return await found!.AmILeaderQuick(partition).ConfigureAwait(false);
+        }, 20_000, ct).ConfigureAwait(false);
+        return leader!;
     }
 
     public async Task WaitForAppliedIndexAsync(int partition, long index, CancellationToken ct = default) =>

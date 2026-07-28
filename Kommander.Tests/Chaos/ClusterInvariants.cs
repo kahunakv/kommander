@@ -175,7 +175,17 @@ public sealed class LeaderCompletenessInvariant : IClusterInvariant
     }
 }
 
-/// <summary>Invariant 5 — commit monotonicity: a node's commit index never decreases within one process lifetime.</summary>
+/// <summary>
+/// Invariant 5 — commit monotonicity: a node's commit index never decreases within one process lifetime.
+///
+/// <para><b>Confirmation-required.</b> The observable value is the WAL's <i>gap-aware</i> commit frontier
+/// (<c>GetCommitIndex</c>), which stops at the first hole in the log. Under adversarial delivery an unanchored
+/// live-propose or a misordered append can transiently open a hole above the committed prefix, so the frontier
+/// can dip for a heartbeat or two before log-hole repair heals it — without any committed entry actually being
+/// lost. A genuine regression (real data loss) persists across a resample; a transient observational dip does
+/// not. Hence this is re-sampled before failing, unlike the strictly-historical prefix/rollback invariants
+/// (<see cref="StateMachineSafetyInvariant"/>, <see cref="NoCommittedRollbackInvariant"/>) which fail at once.</para>
+/// </summary>
 public sealed class CommitMonotonicityInvariant : IClusterInvariant
 {
     public string Name => "CommitMonotonicity";
@@ -187,7 +197,7 @@ public sealed class CommitMonotonicityInvariant : IClusterInvariant
             if (current.MaxCommitByNode.TryGetValue(v.Endpoint, out long maxSeen) && v.CommitIndex < maxSeen)
                 return new ClusterViolation(Name,
                     $"node {v.Endpoint} p{v.Partition} commit index regressed: {v.CommitIndex} < {maxSeen}",
-                    RequiresConfirmation: false);
+                    RequiresConfirmation: true);
         }
         return null;
     }
