@@ -84,6 +84,32 @@ public class TestSnapshotWireContract
         Assert.Equal(500, parsed.SnapshotIndex);
     }
 
+    [Theory]
+    [InlineData(SnapshotKind.Range)]
+    [InlineData(SnapshotKind.SystemState)]
+    public void GrpcAndRest_SnapshotKind_RoundTrips(SnapshotKind kind)
+    {
+        // gRPC protobuf round-trip.
+        GrpcInstallSnapshotRequest grpc = new()
+        {
+            SessionId = "k", PartitionId = 0, SnapshotIndex = 1,
+            IsLast = true, Data = ByteString.CopyFrom([1]), Kind = (int)kind,
+        };
+        GrpcInstallSnapshotRequest grpcParsed = GrpcInstallSnapshotRequest.Parser.ParseFrom(grpc.ToByteArray());
+        Assert.Equal((int)kind, grpcParsed.Kind);
+
+        // REST JSON round-trip.
+        SnapshotRequest rest = new()
+        {
+            SessionId = "k", PartitionId = 0, SnapshotIndex = 1, IsLast = true,
+            Data = new byte[] { 1 }, Kind = kind,
+        };
+        string json = JsonSerializer.Serialize(rest, RestJsonContext.Default.SnapshotRequest);
+        SnapshotRequest? restParsed = JsonSerializer.Deserialize(json, RestJsonContext.Default.SnapshotRequest);
+        Assert.NotNull(restParsed);
+        Assert.Equal(kind, restParsed!.Kind);
+    }
+
     [Fact]
     public void LegacyRequest_HasZeroEmptyMetadataDefaults()
     {

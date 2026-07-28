@@ -94,6 +94,19 @@ public interface IRaftWalFacade
     /// </summary>
     ValueTask<long> TruncateLogsAfterAsync(long afterLogId);
 
+    /// <summary>
+    /// Atomically installs a durable snapshot boundary at <paramref name="snapshotIndex"/> with term
+    /// <paramref name="lastIncludedTerm"/>: stamps a <c>CommittedCheckpoint</c> there, retaining the log
+    /// suffix above the index when the stored term matches (Raft log matching) and truncating it when it
+    /// conflicts. The retain-vs-truncate decision is made atomically inside the backend op. Returns
+    /// whether the suffix was truncated. Used by the follower-side snapshot install on the single-writer
+    /// executor path. The default throws so a fake that reaches this path fails loudly rather than
+    /// silently no-op'ing a durability-critical step.
+    /// </summary>
+    ValueTask<(Kommander.Data.RaftOperationStatus Status, bool SuffixTruncated)> InstallSnapshotBoundaryAsync(
+        long snapshotIndex, long lastIncludedTerm) =>
+        throw new NotSupportedException("InstallSnapshotBoundaryAsync is not implemented by this WAL facade.");
+
     WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp timestamp, bool autoCommit);
 
     WALWriteOperation EnqueueCommit(List<RaftLog> logs);

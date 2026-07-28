@@ -935,6 +935,15 @@ public sealed class RaftPartitionExecutor : IDisposable
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
                     break;
 
+                case RaftRequestType.InstallSnapshot:
+                {
+                    RaftResponse installResponse = await _stateMachine
+                        .InstallSnapshotAsync(request.SnapshotInstall!)
+                        .ConfigureAwait(false);
+                    op.Reply?.TrySetResult(installResponse);
+                    break;
+                }
+
                 default:
                     _logger.LogError(
                         "[RaftPartitionExecutor/{PartitionId}] Unrecognised request type: {Type}",

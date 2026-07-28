@@ -511,6 +511,19 @@ public sealed class RaftPartition : IDisposable
         return (false, response.Status, HLCTimestamp.Zero);
     }
 
+    /// <summary>
+    /// Installs a fully-received snapshot on this partition's single-writer executor thread and returns
+    /// whether it succeeded. Asked (not posted) so the transport-side caller learns the outcome and does
+    /// not dispose the staged buffer until the executor has finished importing from it. Intentionally
+    /// uses the no-cancellation <c>Ask</c> so a transport-side cancellation cannot complete this task
+    /// (and free the buffer) while the install is still running on the executor.
+    /// </summary>
+    internal async Task<bool> InstallSnapshotAsync(SnapshotInstallRequest request)
+    {
+        RaftResponse response = await executor.Ask(new(RaftRequestType.InstallSnapshot, request)).ConfigureAwait(false);
+        return response.Status == RaftOperationStatus.Success;
+    }
+
     public async Task<RaftOperationStatus> ForceLeaderForTestingAsync(CancellationToken cancellationToken = default)
     {
         RaftResponse response = await executor.Ask(new(RaftRequestType.ForceLeaderForTesting), cancellationToken).ConfigureAwait(false);

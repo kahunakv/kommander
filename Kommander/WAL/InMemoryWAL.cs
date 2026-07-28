@@ -299,6 +299,59 @@ public class InMemoryWAL : IWAL, IDisposable
         }
     }
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Performed under a single write-lock acquisition so the conflict check, suffix truncation, and
+    /// checkpoint upsert are atomic against the WAL write path. Does not call the sibling lock-taking
+    /// methods (the lock is <see cref="LockRecursionPolicy.NoRecursion"/>); the logic is inlined.
+    /// The <paramref name="sync"/> flag is irrelevant for this non-durable backend.
+    /// </remarks>
+    public (RaftOperationStatus Status, bool SuffixTruncated) InstallSnapshotBoundary(
+        int partitionId, long snapshotIndex, long lastIncludedTerm, bool sync)
+    {
+        rwLock.EnterWriteLock();
+        try
+        {
+            if (!allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+            {
+                partitionLogs = new SortedDictionary<long, RaftLog>();
+                allLogs[partitionId] = partitionLogs;
+            }
+
+            bool matches = partitionLogs.TryGetValue(snapshotIndex, out RaftLog? existing)
+                           && existing!.Term == lastIncludedTerm;
+
+            bool suffixTruncated = false;
+            if (!matches)
+            {
+                List<long> toRemove = [];
+                foreach (long id in partitionLogs.Keys)
+                {
+                    if (id > snapshotIndex)
+                        toRemove.Add(id);
+                }
+
+                foreach (long id in toRemove)
+                    partitionLogs.Remove(id);
+
+                suffixTruncated = toRemove.Count > 0;
+            }
+
+            partitionLogs[snapshotIndex] = new RaftLog
+            {
+                Id = snapshotIndex,
+                Term = lastIncludedTerm,
+                Type = RaftLogType.CommittedCheckpoint,
+            };
+
+            return (RaftOperationStatus.Success, suffixTruncated);
+        }
+        finally
+        {
+            rwLock.ExitWriteLock();
+        }
+    }
+
     public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(
         int partitionId,
         long lastCheckpoint,

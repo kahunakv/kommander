@@ -1,20 +1,17 @@
 
 using Kommander;
 using Kommander.Data;
-using Kommander.System;
-using Kommander.Tests.Scheduler;
-using Kommander.WAL;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Kommander.Tests.Scheduling;
 
 /// <summary>
-/// Direct unit tests for <see cref="SnapshotReceiver"/>'s session-record model and bounded buffering
-/// (increment A of the chaos-injection spec). These construct the receiver in isolation with a
-/// controllable monotonic clock and small TTL/count/byte limits so expiry and eviction are
-/// deterministic, and drive it through the chunk-protocol edge cases the spec enumerates:
-/// duplicate, skipped, reordered, mismatched-metadata, post-terminal, negative index, capacity
-/// eviction, TTL expiry, and disposal.
+/// Direct unit tests for <see cref="SnapshotReceiver"/>'s session-record model and bounded buffering.
+/// These construct the receiver in isolation with a controllable monotonic clock, small TTL/count/byte
+/// limits, and a fake install callback (standing in for the partition executor's install path) so
+/// expiry, eviction, and the chunk protocol are deterministic. The receiver itself no longer imports or
+/// touches the WAL (increment B moved that to the executor); on the terminal chunk it hands the staged
+/// buffer + metadata to the callback.
 /// </summary>
 public class TestSnapshotReceiveSession
 {
@@ -27,36 +24,37 @@ public class TestSnapshotReceiveSession
         public long Read() => Value;
     }
 
-    /// <summary>Captures the bytes handed to ImportRange for concatenation assertions.</summary>
-    private sealed class CapturingTransfer : IRaftStateMachineTransfer
+    /// <summary>
+    /// Stands in for the executor install path: records every install request and the bytes it carried,
+    /// and returns a configurable success/failure result.
+    /// </summary>
+    private sealed class CapturingInstaller
     {
-        public int ImportCallCount { get; private set; }
+        public int InstallCallCount { get; private set; }
         public byte[] ReceivedBytes { get; private set; } = [];
+        public SnapshotInstallRequest? Last { get; private set; }
+        public bool Result { get; set; } = true;
 
-        public Task<Stream> ExportRange(RaftSplitPlan plan, long upToIndex, CancellationToken ct) =>
-            Task.FromResult<Stream>(new MemoryStream());
-
-        public async Task ImportRange(int targetPartitionId, Stream snapshot, CancellationToken ct)
+        public async Task<SnapshotResponse> Install(SnapshotInstallRequest request)
         {
-            ImportCallCount++;
+            InstallCallCount++;
+            Last = request;
             using MemoryStream ms = new();
-            await snapshot.CopyToAsync(ms, ct);
+            await request.Snapshot.CopyToAsync(ms);
             ReceivedBytes = ms.ToArray();
+            return new SnapshotResponse(Result);
         }
     }
 
     private static SnapshotReceiver NewReceiver(
-        IWAL wal,
-        IRaftStateMachineTransfer? transfer,
+        Func<SnapshotInstallRequest, Task<SnapshotResponse>> installOnExecutor,
         Func<long> clock,
         long ttlTicks = 1_000_000,
         int maxSessions = 8,
         long maxBytes = 1_000_000) =>
         new(
             isDisposed: () => false,
-            getSystemTransfer: () => null,
-            getRangeTransfer: () => transfer,
-            walAdapter: wal,
+            installOnExecutor: installOnExecutor,
             logger: NullLogger<IRaft>.Instance,
             localEndpoint: "test:1",
             sessionTtlTicks: ttlTicks,
@@ -85,22 +83,43 @@ public class TestSnapshotReceiveSession
     // ── happy path ───────────────────────────────────────────────────────────
 
     [Fact]
-    public async Task InOrderChunks_ImportsOnceAndConcatenatesBytes()
+    public async Task InOrderChunks_InstallsOnceWithConcatenatedBytesAndMetadata()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
-        CapturingTransfer transfer = new();
-        FakeWAL wal = new();
-        SnapshotReceiver r = NewReceiver(wal, transfer, () => 1000);
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000);
 
+        // All chunks of a session share identical metadata (leader:1, snapshotIndex 100, terms 3/2).
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 0, false, [1, 2]), ct)).Success);
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 1, false, [3]), ct)).Success);
-        Assert.Equal(0, transfer.ImportCallCount);
+        Assert.Equal(0, installer.InstallCallCount);
 
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 2, true, [4]), ct)).Success);
-        Assert.Equal(1, transfer.ImportCallCount);
-        Assert.Equal([1, 2, 3, 4], transfer.ReceivedBytes);
+        Assert.Equal(1, installer.InstallCallCount);
+        Assert.Equal([1, 2, 3, 4], installer.ReceivedBytes);
+
+        // Session metadata (captured from the first chunk) is forwarded verbatim to the install path.
+        Assert.NotNull(installer.Last);
+        Assert.Equal(1, installer.Last!.PartitionId);
+        Assert.Equal(100, installer.Last.SnapshotIndex);
+        Assert.Equal(3, installer.Last.LeaderTerm);
+        Assert.Equal(2, installer.Last.LastIncludedTerm);
+        Assert.Equal("leader:1", installer.Last.LeaderEndpoint);
+
         Assert.Equal(0, r.PendingSessionCount);
         Assert.Equal(0, r.PendingByteCount);
+    }
+
+    [Fact]
+    public async Task InstallFailure_IsReportedAndSessionDetached()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        CapturingInstaller installer = new() { Result = false };
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000);
+
+        Assert.False((await r.ReceiveInstallSnapshot(Chunk("s", 0, true, [1]), ct)).Success);
+        Assert.Equal(1, installer.InstallCallCount);
+        Assert.Equal(0, r.PendingSessionCount);
     }
 
     // ── chunk-protocol edge cases ──────────────────────────────────────────────
@@ -109,9 +128,8 @@ public class TestSnapshotReceiveSession
     public async Task DuplicateOfPreviousChunk_IsIdempotentAndNotReAppended()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
-        CapturingTransfer transfer = new();
-        FakeWAL wal = new();
-        SnapshotReceiver r = NewReceiver(wal, transfer, () => 1000);
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000);
 
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 0, false, [1]), ct)).Success);
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 1, false, [2]), ct)).Success);
@@ -119,21 +137,20 @@ public class TestSnapshotReceiveSession
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 1, false, [2]), ct)).Success);
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 2, true, [3]), ct)).Success);
 
-        Assert.Equal([1, 2, 3], transfer.ReceivedBytes);
+        Assert.Equal([1, 2, 3], installer.ReceivedBytes);
     }
 
     [Fact]
     public async Task SkippedChunkIndex_RejectedAndSessionDropped()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
-        CapturingTransfer transfer = new();
-        FakeWAL wal = new();
-        SnapshotReceiver r = NewReceiver(wal, transfer, () => 1000);
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000);
 
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 0, false, [1]), ct)).Success);
         // Skip chunk 1 → out of order.
         Assert.False((await r.ReceiveInstallSnapshot(Chunk("s", 2, false, [9]), ct)).Success);
-        Assert.Equal(0, transfer.ImportCallCount);
+        Assert.Equal(0, installer.InstallCallCount);
         Assert.Equal(0, r.PendingSessionCount);
     }
 
@@ -141,9 +158,8 @@ public class TestSnapshotReceiveSession
     public async Task ReorderedOlderChunk_RejectedAndSessionDropped()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
-        CapturingTransfer transfer = new();
-        FakeWAL wal = new();
-        SnapshotReceiver r = NewReceiver(wal, transfer, () => 1000);
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000);
 
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 0, false, [1]), ct)).Success);
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 1, false, [2]), ct)).Success);
@@ -156,14 +172,13 @@ public class TestSnapshotReceiveSession
     public async Task MismatchedMetadata_RejectedAndSessionDropped()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
-        CapturingTransfer transfer = new();
-        FakeWAL wal = new();
-        SnapshotReceiver r = NewReceiver(wal, transfer, () => 1000);
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000);
 
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 0, false, [1], leaderTerm: 5), ct)).Success);
         // Same session id but a different LeaderTerm — a later chunk must not change metadata.
         Assert.False((await r.ReceiveInstallSnapshot(Chunk("s", 1, false, [2], leaderTerm: 6), ct)).Success);
-        Assert.Equal(0, transfer.ImportCallCount);
+        Assert.Equal(0, installer.InstallCallCount);
         Assert.Equal(0, r.PendingSessionCount);
     }
 
@@ -171,15 +186,14 @@ public class TestSnapshotReceiveSession
     public async Task PostTerminalChunk_Rejected()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
-        CapturingTransfer transfer = new();
-        FakeWAL wal = new(); // GetMaxLog stays 0 (writes are not drained), so no idempotency short-circuit.
-        SnapshotReceiver r = NewReceiver(wal, transfer, () => 1000);
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000);
 
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 0, true, [1]), ct)).Success);
-        Assert.Equal(1, transfer.ImportCallCount);
+        Assert.Equal(1, installer.InstallCallCount);
         // A chunk arriving after the terminal chunk has no live session; a non-zero opener is rejected.
         Assert.False((await r.ReceiveInstallSnapshot(Chunk("s", 1, true, [2]), ct)).Success);
-        Assert.Equal(1, transfer.ImportCallCount);
+        Assert.Equal(1, installer.InstallCallCount);
         Assert.Equal(0, r.PendingSessionCount);
     }
 
@@ -187,8 +201,8 @@ public class TestSnapshotReceiveSession
     public async Task NegativeChunkIndex_Rejected()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
-        FakeWAL wal = new();
-        SnapshotReceiver r = NewReceiver(wal, new CapturingTransfer(), () => 1000);
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000);
 
         Assert.False((await r.ReceiveInstallSnapshot(Chunk("s", -1, false, [1]), ct)).Success);
         Assert.Equal(0, r.PendingSessionCount);
@@ -198,8 +212,8 @@ public class TestSnapshotReceiveSession
     public async Task NonZeroFirstChunk_Rejected()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
-        FakeWAL wal = new();
-        SnapshotReceiver r = NewReceiver(wal, new CapturingTransfer(), () => 1000);
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000);
 
         Assert.False((await r.ReceiveInstallSnapshot(Chunk("s", 3, false, [1]), ct)).Success);
         Assert.Equal(0, r.PendingSessionCount);
@@ -211,9 +225,8 @@ public class TestSnapshotReceiveSession
     public async Task IdleSession_ExpiresAfterTtlOnSweep()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
-        FakeWAL wal = new();
         ClockBox clock = new(1000);
-        SnapshotReceiver r = NewReceiver(wal, new CapturingTransfer(), clock.Read, ttlTicks: 500);
+        SnapshotReceiver r = NewReceiver(new CapturingInstaller().Install, clock.Read, ttlTicks: 500);
 
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 0, false, [1, 2, 3]), ct)).Success);
         Assert.Equal(1, r.PendingSessionCount);
@@ -237,9 +250,8 @@ public class TestSnapshotReceiveSession
     public async Task SessionCountCap_EvictsOldestDeterministically()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
-        FakeWAL wal = new();
         ClockBox clock = new(1);
-        SnapshotReceiver r = NewReceiver(wal, new CapturingTransfer(), clock.Read, maxSessions: 2);
+        SnapshotReceiver r = NewReceiver(new CapturingInstaller().Install, clock.Read, maxSessions: 2);
 
         clock.Value = 1;
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("A", 0, false, [1], leader: "a"), ct)).Success);
@@ -262,9 +274,8 @@ public class TestSnapshotReceiveSession
     public async Task ByteCap_EvictsOldestSessionToMakeRoom()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
-        FakeWAL wal = new();
         ClockBox clock = new(1);
-        SnapshotReceiver r = NewReceiver(wal, new CapturingTransfer(), clock.Read, maxBytes: 10);
+        SnapshotReceiver r = NewReceiver(new CapturingInstaller().Install, clock.Read, maxBytes: 10);
 
         clock.Value = 1;
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("A", 0, false, new byte[6], leader: "a"), ct)).Success);
@@ -281,8 +292,7 @@ public class TestSnapshotReceiveSession
     public async Task SingleChunkLargerThanBudget_Rejected()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
-        FakeWAL wal = new();
-        SnapshotReceiver r = NewReceiver(wal, new CapturingTransfer(), () => 1, maxBytes: 4);
+        SnapshotReceiver r = NewReceiver(new CapturingInstaller().Install, () => 1, maxBytes: 4);
 
         Assert.False((await r.ReceiveInstallSnapshot(Chunk("A", 0, false, new byte[5], leader: "a"), ct)).Success);
         Assert.Equal(0, r.PendingSessionCount);
@@ -293,9 +303,8 @@ public class TestSnapshotReceiveSession
     public async Task AbandonedSessions_StayWithinCountAndByteLimits()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
-        FakeWAL wal = new();
         ClockBox clock = new(0);
-        SnapshotReceiver r = NewReceiver(wal, new CapturingTransfer(), clock.Read,
+        SnapshotReceiver r = NewReceiver(new CapturingInstaller().Install, clock.Read,
             ttlTicks: 100_000, maxSessions: 3, maxBytes: 100);
 
         // Open ten sessions that never finish, each buffering 20 bytes.
@@ -323,8 +332,7 @@ public class TestSnapshotReceiveSession
     public async Task DisposePendingSnapshots_ClearsSessionsAndResetsBytes()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
-        FakeWAL wal = new();
-        SnapshotReceiver r = NewReceiver(wal, new CapturingTransfer(), () => 1000);
+        SnapshotReceiver r = NewReceiver(new CapturingInstaller().Install, () => 1000);
 
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("A", 0, false, [1, 2], leader: "a"), ct)).Success);
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("B", 0, false, [3], leader: "b"), ct)).Success);
@@ -343,8 +351,7 @@ public class TestSnapshotReceiveSession
     public async Task SameSessionIdDifferentLeaders_AreDistinctSessions()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
-        FakeWAL wal = new();
-        SnapshotReceiver r = NewReceiver(wal, new CapturingTransfer(), () => 1000);
+        SnapshotReceiver r = NewReceiver(new CapturingInstaller().Install, () => 1000);
 
         // Identical session id "dup" but different leaders → two independent sessions, both at chunk 0.
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("dup", 0, false, [1], leader: "a"), ct)).Success);

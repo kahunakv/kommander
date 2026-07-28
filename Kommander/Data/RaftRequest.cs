@@ -86,6 +86,13 @@ public sealed class RaftRequest
     /// </summary>
     public IReadOnlyList<RaftLog>? RestoredLogs { get; }
 
+    /// <summary>
+    /// The staged snapshot to install on the single-writer path. Set when <see cref="Type"/> is
+    /// <see cref="RaftRequestType.InstallSnapshot"/>; processed by
+    /// <see cref="RaftPartitionStateMachine.InstallSnapshotAsync"/>.
+    /// </summary>
+    public SnapshotInstallRequest? SnapshotInstall { get; }
+
     public RaftRequest(
         RaftRequestType type,
         long term = -1,
@@ -184,5 +191,20 @@ public sealed class RaftRequest
     {
         Type = type;
         RestoredLogs = restoredLogs;
+    }
+
+    /// <summary>
+    /// Constructs a <see cref="RaftRequestType.InstallSnapshot"/> request carrying the staged snapshot
+    /// and its Rule-7 metadata for a follower-side install on the partition executor. <see cref="Term"/>
+    /// is set to the leader's term and <see cref="CommitIndex"/> to the snapshot index so ordinary term/
+    /// index fencing and diagnostics read consistently with other leader RPCs.
+    /// </summary>
+    public RaftRequest(RaftRequestType type, SnapshotInstallRequest snapshotInstall)
+    {
+        Type = type;
+        SnapshotInstall = snapshotInstall;
+        Term = snapshotInstall.LeaderTerm;
+        CommitIndex = snapshotInstall.SnapshotIndex;
+        Endpoint = snapshotInstall.LeaderEndpoint;
     }
 }

@@ -680,6 +680,97 @@ public class SqliteWAL : IWAL, IDisposable
         }
     }
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The term probe, suffix delete, and checkpoint upsert run inside one transaction under the shard's
+    /// write lock, so the boundary is installed atomically against the WAL write path (which serializes on
+    /// the same <c>shard.Lock</c>). <paramref name="sync"/> honours the same pragma-downgrade dance as
+    /// <see cref="Write(List{ValueTuple{int, List{RaftLog}}}, bool)"/>: when the instance is durable and
+    /// the caller opts out of fsync, <c>PRAGMA synchronous</c> is toggled OFF/FULL outside the transaction
+    /// under the lock. All statements scope by <c>partitionId</c> so co-resident partitions are unaffected.
+    /// </remarks>
+    public (RaftOperationStatus Status, bool SuffixTruncated) InstallSnapshotBoundary(
+        int partitionId, long snapshotIndex, long lastIncludedTerm, bool sync)
+    {
+        bool downgradeSync = !sync && syncWrites;
+        ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
+
+        lock (shard.Lock)
+        {
+            if (downgradeSync)
+                SetSynchronousPragma(shard.Connection, "OFF");
+
+            try
+            {
+                using SqliteTransaction transaction = shard.Connection.BeginTransaction();
+
+                try
+                {
+                    // Probe the stored term at the boundary index (no row → -1, NULL term → 0).
+                    long localTerm;
+                    using (SqliteCommand probe = new(
+                        "SELECT term FROM logs WHERE partitionId = @partitionId AND id = @id LIMIT 1",
+                        shard.Connection))
+                    {
+                        probe.Transaction = transaction;
+                        probe.Parameters.AddWithValue("@partitionId", partitionId);
+                        probe.Parameters.AddWithValue("@id", snapshotIndex);
+                        object? result = probe.ExecuteScalar();
+                        localTerm = result is null ? -1 : result is DBNull ? 0 : Convert.ToInt64(result);
+                    }
+
+                    bool suffixTruncated = false;
+                    if (localTerm != lastIncludedTerm)
+                    {
+                        using SqliteCommand delete = new(
+                            "DELETE FROM logs WHERE partitionId = @partitionId AND id > @snapshotIndex",
+                            shard.Connection);
+                        delete.Transaction = transaction;
+                        delete.Parameters.AddWithValue("@partitionId", partitionId);
+                        delete.Parameters.AddWithValue("@snapshotIndex", snapshotIndex);
+                        int removed = delete.ExecuteNonQuery();
+                        suffixTruncated = removed > 0;
+                    }
+
+                    SqliteCommand upsert = GetOrCreatePreparedUpsert(shard);
+                    upsert.Transaction = transaction;
+                    try
+                    {
+                        BindAndExecUpsert(upsert, partitionId, new RaftLog
+                        {
+                            Id = snapshotIndex,
+                            Term = lastIncludedTerm,
+                            Type = RaftLogType.CommittedCheckpoint,
+                        });
+                    }
+                    finally
+                    {
+                        upsert.Transaction = null;
+                    }
+
+                    transaction.Commit();
+                    return (RaftOperationStatus.Success, suffixTruncated);
+                }
+                catch
+                {
+                    transaction.Rollback();
+                    throw;
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("InstallSnapshotBoundary({PartitionId}, {SnapshotIndex}): {Message}",
+                    partitionId, snapshotIndex, ex.Message);
+                return (RaftOperationStatus.Errored, false);
+            }
+            finally
+            {
+                if (downgradeSync)
+                    SetSynchronousPragma(shard.Connection, "FULL");
+            }
+        }
+    }
+
     /// <summary>
     /// Compacts logs older than <paramref name="lastCheckpoint"/> for the given partition,
     /// removing up to <paramref name="compactNumberEntries"/> per internal batch, all within

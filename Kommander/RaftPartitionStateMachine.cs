@@ -3437,6 +3437,166 @@ public sealed class RaftPartitionStateMachine
         StreamUtils.ReadExactAsync(stream, buffer, count, ct);
 
     /// <summary>
+    /// Follower-side snapshot install on the single-writer executor path (Raft "Rule 7").
+    ///
+    /// <para>Runs the recoverable ordering: (1) validate the leader term and, on a higher term, take the
+    /// same durable step-down as other leader RPCs; reject a stale leader without importing; (2) short-
+    /// circuit as an idempotent success when a matching boundary is already installed at or below the
+    /// index; (3) invoke the application import; (4) install the durable WAL boundary
+    /// (<see cref="IRaftWalFacade.InstallSnapshotBoundaryAsync"/>) which retains the suffix on a matching
+    /// boundary term and truncates it on conflict; (5) reconstruct the apply cursor; (6) acknowledge.</para>
+    ///
+    /// <para>Import runs on the executor thread so the whole install is serialized against every other
+    /// partition operation. If import succeeds but the WAL write fails, the sender receives failure and
+    /// retries the same snapshot; the repeated import must be idempotent for
+    /// <c>(partition, SnapshotIndex, LastIncludedTerm)</c> per the transfer contract. Uses
+    /// <see cref="CancellationToken.None"/> for the import so the caller cannot dispose the staged buffer
+    /// while this method is still reading it.</para>
+    /// </summary>
+    public async Task<RaftResponse> InstallSnapshotAsync(SnapshotInstallRequest request)
+    {
+        string leaderEndpoint = request.LeaderEndpoint ?? "";
+        long leaderTerm = request.LeaderTerm;
+        long snapshotIndex = request.SnapshotIndex;
+
+        // Idempotency (Rule 7.4, coarse form): if our durable log already reaches this index, the snapshot
+        // is already applied. Return success early — before any term adoption/step-down — so a redundant
+        // re-install never disrupts a caught-up node. This is strictly safe: we never regress and never
+        // apply an older snapshot, and the regular AppendEntries path still handles term adoption. A term
+        // conflict at an already-covered index is pathological; keeping our more-advanced state is correct.
+        long currentMax = await wal.GetMaxLogAsync().ConfigureAwait(false);
+        if (currentMax >= snapshotIndex)
+        {
+            if (snapshotIndex > lastAppliedIndex)
+                lastAppliedIndex = snapshotIndex;
+            return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Success, snapshotIndex);
+        }
+
+        bool legacy = leaderTerm <= 0 || string.IsNullOrEmpty(leaderEndpoint);
+        if (legacy && !host.Configuration.AllowLegacySnapshotSenders)
+        {
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot rejected: legacy sender (LeaderTerm={LeaderTerm}, LeaderEndpoint='{Endpoint}') and AllowLegacySnapshotSenders is off.",
+                host.LocalEndpoint, host.PartitionId, nodeState, leaderTerm, leaderEndpoint);
+            return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Errored, -1);
+        }
+
+        // The term of the entry the checkpoint boundary is stamped with. For a legacy sender we have no
+        // authoritative last-included term, so fall back to our local current term (old behaviour).
+        long boundaryTerm = legacy ? currentTerm : request.LastIncludedTerm;
+
+        if (!legacy)
+        {
+            // Rule 7.1 — reject a stale leader without importing (mirror AppendLogsCoreAsync).
+            if (currentTerm > leaderTerm)
+            {
+                logger.LogWarning(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot from stale leader {Endpoint}: LeaderTerm={LeaderTerm} < CurrentTerm={CurrentTerm}. Rejecting.",
+                    host.LocalEndpoint, host.PartitionId, nodeState, leaderEndpoint, leaderTerm, currentTerm);
+                return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Errored, -1);
+            }
+
+            // Rule 7.3 — election safety: at equal term there is exactly one leader. If we have already
+            // adopted a different leader for this term, a snapshot from another endpoint is inconsistent.
+            // (A legitimate new leader always arrives with a higher term, which passes this check.)
+            if (currentTerm == leaderTerm && !string.IsNullOrEmpty(host.Leader) && host.Leader != leaderEndpoint)
+            {
+                logger.LogWarning(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot rejected: sender {Sender} conflicts with accepted leader {Leader} for term {Term}.",
+                    host.LocalEndpoint, host.PartitionId, nodeState, leaderEndpoint, host.Leader, leaderTerm);
+                return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Errored, -1);
+            }
+
+            // Rule 7.2 — adopt the leader / durable step-down on a valid term, identical to the
+            // AppendEntries path. A snapshot is a leader RPC, so it authoritatively identifies the term's
+            // leader regardless of our vote record (expectedLeaders constrains voting only).
+            if (host.Leader != leaderEndpoint || currentTerm != leaderTerm || nodeState != RaftNodeState.Follower)
+            {
+                logger.LogInfoLeaderIsNow(host.LocalEndpoint, host.PartitionId, nodeState, leaderEndpoint, leaderTerm);
+
+                nodeState = RaftNodeState.Follower;
+                host.Leader = leaderEndpoint;
+                currentTerm = leaderTerm;
+                lastCommitIndexes.Clear();
+                nextIndex.Clear();
+                matchIndex.Clear();
+                regressedFrontiers.Clear();
+                localCommittedIndex = -1;
+                FailAllActiveProposalWaiters();
+                activeProposals.Clear();
+                expectedLeaders[leaderTerm] = leaderEndpoint;
+                ResetPreVoteRound();
+
+                await host.InvokeLeaderChanged(host.PartitionId, leaderEndpoint);
+                await wal.PersistHardStateAsync(leaderTerm, leaderEndpoint).ConfigureAwait(false);
+            }
+        }
+
+        // Ordering step 2 — invoke the application import. Must precede the durable WAL boundary so a
+        // crash between them leaves recoverable state (import is idempotent; the boundary is not yet
+        // durable so the sender retries the whole snapshot).
+        try
+        {
+            if (request.Kind == SnapshotKind.SystemState)
+            {
+                IRaftSystemStateTransfer? systemTransfer = host.SystemStateTransfer;
+                if (systemTransfer is null)
+                {
+                    logger.LogWarning(
+                        "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot rejected: no IRaftSystemStateTransfer registered.",
+                        host.LocalEndpoint, host.PartitionId, nodeState);
+                    return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Errored, -1);
+                }
+
+                await systemTransfer.ImportPartitionState(host.PartitionId, request.Snapshot, CancellationToken.None).ConfigureAwait(false);
+            }
+            else
+            {
+                IRaftStateMachineTransfer? rangeTransfer = host.StateMachineTransfer;
+                if (rangeTransfer is null)
+                {
+                    logger.LogWarning(
+                        "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot rejected: no IRaftStateMachineTransfer registered.",
+                        host.LocalEndpoint, host.PartitionId, nodeState);
+                    return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Errored, -1);
+                }
+
+                await rangeTransfer.ImportRange(host.PartitionId, request.Snapshot, CancellationToken.None).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(
+                "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot import failed for index {Index}: {Message}",
+                host.LocalEndpoint, host.PartitionId, nodeState, snapshotIndex, ex.Message);
+            return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Errored, -1);
+        }
+
+        // Ordering step 3 + Rule 7.5/7.6 — install the durable checkpoint boundary. The backend retains
+        // the suffix above the index when its stored term matches boundaryTerm and truncates it on
+        // conflict, atomically.
+        (RaftOperationStatus boundaryStatus, bool suffixTruncated) =
+            await wal.InstallSnapshotBoundaryAsync(snapshotIndex, boundaryTerm).ConfigureAwait(false);
+        if (boundaryStatus != RaftOperationStatus.Success)
+        {
+            logger.LogError(
+                "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot WAL boundary failed for index {Index}: {Status}. Import succeeded; sender will retry.",
+                host.LocalEndpoint, host.PartitionId, nodeState, snapshotIndex, boundaryStatus);
+            return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Errored, -1);
+        }
+
+        // Ordering step 4 + Rule 7.7 — reconstruct the apply cursor from the installed boundary so a later
+        // promotion does not re-deliver the imported prefix (mirrors CompleteRestoreAsync's cursor seed).
+        if (snapshotIndex > lastAppliedIndex)
+            lastAppliedIndex = snapshotIndex;
+
+        if (logger.IsEnabled(LogLevel.Information))
+            logger.LogInfoReceiveInstallSnapshot(host.LocalEndpoint, host.PartitionId, snapshotIndex);
+
+        return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Success, snapshotIndex);
+    }
+
+    /// <summary>
     /// Advances <c>lastCommitIndexes</c> for <paramref name="endpoint"/> after the background
     /// snapshot task confirmed successful installation. Called on the executor thread via the
     /// <c>postToExecutor</c> callback; delegates ownership update to <see cref="snapshotSender"/>.

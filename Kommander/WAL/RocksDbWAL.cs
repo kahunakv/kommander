@@ -1073,6 +1073,75 @@ public class RocksDbWAL : IWAL, IDisposable
         return (status, GetMaxLog(partitionId));
     }
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The suffix deletes and the checkpoint put are staged into a single <see cref="WriteBatch"/> and
+    /// applied with one <c>db.Write</c>, so the boundary install is atomic (RocksDB applies a batch
+    /// all-or-nothing). Durability follows <paramref name="sync"/>: <c>sync:true</c> uses the instance's
+    /// sync write options, else the non-sync options. The per-partition WAL-scheduler single-writer
+    /// invariant serializes this against appends for the same partition.
+    /// </remarks>
+    public (RaftOperationStatus Status, bool SuffixTruncated) InstallSnapshotBoundary(
+        int partitionId, long snapshotIndex, long lastIncludedTerm, bool sync)
+    {
+        WriteOptions effectiveOptions = sync ? writeOptions : NonSynchronousWriteOptions;
+
+        try
+        {
+            ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+
+            byte[] boundaryKey = new byte[LogKeyWidth];
+            BuildLogKey(boundaryKey, partitionId, snapshotIndex);
+            byte[]? existing = db.Get(boundaryKey, cf: columnFamilyHandle);
+            long localTerm = existing is null ? -1 : ReadTermFromWire(existing);
+
+            using WriteBatch writeBatch = new();
+
+            bool suffixTruncated = false;
+            if (localTerm != lastIncludedTerm)
+            {
+                List<byte[]> keysToDelete = [];
+                using (Iterator? iterator = db.NewIterator(cf: columnFamilyHandle))
+                {
+                    Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+                    BuildLogKey(seekKey, partitionId, snapshotIndex + 1);
+                    iterator.Seek(seekKey);
+
+                    while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
+                    {
+                        keysToDelete.Add(iterator.Key());
+                        iterator.Next();
+                    }
+                }
+
+                foreach (byte[] key in keysToDelete)
+                    writeBatch.Delete(key, cf: columnFamilyHandle);
+
+                suffixTruncated = keysToDelete.Count > 0;
+            }
+
+            // Upsert the checkpoint marker at the boundary index (same key overwrites any existing entry).
+            RaftLogMessage checkpoint = new()
+            {
+                Partition = partitionId,
+                Id = snapshotIndex,
+                Term = lastIncludedTerm,
+                Type = (int)RaftLogType.CommittedCheckpoint,
+            };
+            PutToBatch(writeBatch, checkpoint, columnFamilyHandle);
+
+            db.Write(writeBatch, effectiveOptions);
+
+            return (RaftOperationStatus.Success, suffixTruncated);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError("InstallSnapshotBoundary({PartitionId}, {SnapshotIndex}): {Message}",
+                partitionId, snapshotIndex, ex.Message);
+            return (RaftOperationStatus.Errored, false);
+        }
+    }
+
     /// <summary>
     /// Compacts and removes logs in the Write-Ahead Log (WAL) for a specific partition that are older than the given checkpoint.
     /// </summary>

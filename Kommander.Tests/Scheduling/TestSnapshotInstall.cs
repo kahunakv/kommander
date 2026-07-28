@@ -42,11 +42,12 @@ public class TestSnapshotInstall
     }
 
     /// <summary>
-    /// When no StateMachineTransfer is registered, ReceiveInstallSnapshot returns false
-    /// immediately without attempting an import.
+    /// On a manager with no hosted partition (never joined), the terminal chunk cannot be routed to a
+    /// partition executor, so ReceiveInstallSnapshot returns false. (Post-increment-B the receiver no
+    /// longer imports directly; the install runs on the executor, which requires a live partition.)
     /// </summary>
     [Fact]
-    public async Task ReceiveInstallSnapshot_NoTransfer_ReturnsFalse()
+    public async Task ReceiveInstallSnapshot_NoHostedPartition_ReturnsFalse()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
 
@@ -62,202 +63,6 @@ public class TestSnapshotInstall
             SnapshotResponse resp = await manager.ReceiveInstallSnapshot(req, ct);
 
             Assert.False(resp.Success);
-        }
-        finally
-        {
-            manager.Dispose();
-        }
-    }
-
-    /// <summary>
-    /// When a transfer IS registered, ReceiveInstallSnapshot calls ImportRange and writes
-    /// a CommittedCheckpoint WAL entry so GetMaxLog reflects the snapshot index.
-    /// </summary>
-    [Fact]
-    public async Task ReceiveInstallSnapshot_WithTransfer_CallsImportRange()
-    {
-        CancellationToken ct = TestContext.Current.CancellationToken;
-        FakeTransfer transfer = new();
-
-        using Kommander.WAL.InMemoryWAL wal = new(NullLogger<IRaft>.Instance);
-        Kommander.Discovery.StaticDiscovery discovery = new([]);
-        Kommander.Communication.Memory.InMemoryCommunication comm = new();
-        RaftConfiguration cfg = new() { NodeId = 1, Host = "localhost", Port = 9998, InitialPartitions = 1 };
-        RaftManager manager = new(cfg, discovery, wal, comm, new HybridLogicalClock(), NullLogger<IRaft>.Instance);
-        manager.RegisterStateMachineTransfer(transfer);
-
-        try
-        {
-            SnapshotRequest req = new() { SessionId = "s2", PartitionId = 1, SnapshotIndex = 50, FollowerEndpoint = "x:1", IsLast = true, Data = new byte[] { 1, 2, 3 } };
-            SnapshotResponse resp = await manager.ReceiveInstallSnapshot(req, ct);
-
-            Assert.True(resp.Success);
-            Assert.True(transfer.ImportCalled, "ImportRange should have been called");
-            Assert.Equal(1, transfer.ImportPartitionId);
-        }
-        finally
-        {
-            manager.Dispose();
-        }
-    }
-
-    /// <summary>
-    /// InMemoryCommunication.SendInstallSnapshot routes to the target node's ReceiveInstallSnapshot.
-    /// With a FakeTransfer registered on the target, the response is Success = true.
-    /// </summary>
-    [Fact]
-    public async Task InMemoryComm_SendInstallSnapshot_RoutesToTarget()
-    {
-        CancellationToken ct = TestContext.Current.CancellationToken;
-        FakeTransfer transfer = new();
-
-        using Kommander.WAL.InMemoryWAL wal1 = new(NullLogger<IRaft>.Instance);
-        using Kommander.WAL.InMemoryWAL wal2 = new(NullLogger<IRaft>.Instance);
-        Kommander.Communication.Memory.InMemoryCommunication comm = new();
-
-        RaftConfiguration cfg1 = new() { NodeId = 1, Host = "localhost", Port = 9001, InitialPartitions = 1 };
-        RaftConfiguration cfg2 = new() { NodeId = 2, Host = "localhost", Port = 9002, InitialPartitions = 1 };
-
-        RaftManager leader = new(cfg1, new Kommander.Discovery.StaticDiscovery([new RaftNode("localhost:9002")]),
-            wal1, comm, new HybridLogicalClock(), NullLogger<IRaft>.Instance);
-        RaftManager follower = new(cfg2, new Kommander.Discovery.StaticDiscovery([new RaftNode("localhost:9001")]),
-            wal2, comm, new HybridLogicalClock(), NullLogger<IRaft>.Instance);
-
-        follower.RegisterStateMachineTransfer(transfer);
-
-        comm.SetNodes(new Dictionary<string, IRaft>
-        {
-            ["localhost:9001"] = leader,
-            ["localhost:9002"] = follower,
-        });
-
-        try
-        {
-            SnapshotRequest req = new()
-            {
-                SessionId = "s3",
-                PartitionId = 1,
-                SnapshotIndex = 75,
-                FollowerEndpoint = "localhost:9002",
-                IsLast = true,
-                Data = new byte[] { 9, 8, 7 },
-            };
-
-            RaftNode followerNode = new("localhost:9002");
-            SnapshotResponse resp = await comm.SendInstallSnapshot(leader, followerNode, req, ct);
-
-            Assert.True(resp.Success);
-            Assert.True(transfer.ImportCalled);
-        }
-        finally
-        {
-            leader.Dispose();
-            follower.Dispose();
-        }
-    }
-
-    /// <summary>
-    /// Chunked snapshot transfer: sending three chunks in order with IsLast=false on the
-    /// first two and IsLast=true on the last triggers exactly one ImportRange call, and
-    /// ImportRange receives all bytes concatenated in order.
-    /// </summary>
-    [Fact]
-    public async Task ReceiveInstallSnapshot_MultiChunk_ImportRangeReceivesAllBytes()
-    {
-        CancellationToken ct = TestContext.Current.CancellationToken;
-        CapturingTransfer transfer = new();
-
-        using Kommander.WAL.InMemoryWAL wal = new(NullLogger<IRaft>.Instance);
-        Kommander.Discovery.StaticDiscovery discovery = new([]);
-        Kommander.Communication.Memory.InMemoryCommunication comm = new();
-        RaftConfiguration cfg = new() { NodeId = 1, Host = "localhost", Port = 9997, InitialPartitions = 1 };
-        RaftManager manager = new(cfg, discovery, wal, comm, new HybridLogicalClock(), NullLogger<IRaft>.Instance);
-        manager.RegisterStateMachineTransfer(transfer);
-
-        try
-        {
-            const string session = "multi-chunk-session";
-            const int partitionId = 1;
-            const long snapshotIndex = 200;
-
-            // Chunk 0 — not final
-            SnapshotResponse r0 = await manager.ReceiveInstallSnapshot(new SnapshotRequest
-            {
-                SessionId = session, PartitionId = partitionId, SnapshotIndex = snapshotIndex,
-                FollowerEndpoint = "x:1", ChunkIndex = 0, IsLast = false,
-                Data = new byte[] { 0x01, 0x02, 0x03 },
-            }, ct);
-            Assert.True(r0.Success, "chunk 0 should be accepted");
-            Assert.False(transfer.ImportCalled, "ImportRange must not fire on non-final chunk");
-
-            // Chunk 1 — not final
-            SnapshotResponse r1 = await manager.ReceiveInstallSnapshot(new SnapshotRequest
-            {
-                SessionId = session, PartitionId = partitionId, SnapshotIndex = snapshotIndex,
-                FollowerEndpoint = "x:1", ChunkIndex = 1, IsLast = false,
-                Data = new byte[] { 0x04, 0x05 },
-            }, ct);
-            Assert.True(r1.Success, "chunk 1 should be accepted");
-            Assert.False(transfer.ImportCalled, "ImportRange must not fire on non-final chunk");
-
-            // Chunk 2 — final
-            SnapshotResponse r2 = await manager.ReceiveInstallSnapshot(new SnapshotRequest
-            {
-                SessionId = session, PartitionId = partitionId, SnapshotIndex = snapshotIndex,
-                FollowerEndpoint = "x:1", ChunkIndex = 2, IsLast = true,
-                Data = new byte[] { 0x06 },
-            }, ct);
-            Assert.True(r2.Success, "final chunk should succeed");
-            Assert.True(transfer.ImportCalled, "ImportRange must fire on final chunk");
-
-            // All bytes concatenated in order.
-            Assert.Equal([0x01, 0x02, 0x03, 0x04, 0x05, 0x06], transfer.ReceivedBytes);
-        }
-        finally
-        {
-            manager.Dispose();
-        }
-    }
-
-    /// <summary>
-    /// Intermediate chunks with IsLast=false return success but do NOT call ImportRange.
-    /// A fresh session for the same endpoint after a failed transfer starts from zero.
-    /// </summary>
-    [Fact]
-    public async Task ReceiveInstallSnapshot_PartialChunk_NoImportUntilLast()
-    {
-        CancellationToken ct = TestContext.Current.CancellationToken;
-        CapturingTransfer transfer = new();
-
-        using Kommander.WAL.InMemoryWAL wal = new(NullLogger<IRaft>.Instance);
-        Kommander.Discovery.StaticDiscovery discovery = new([]);
-        Kommander.Communication.Memory.InMemoryCommunication comm = new();
-        RaftConfiguration cfg = new() { NodeId = 1, Host = "localhost", Port = 9996, InitialPartitions = 1 };
-        RaftManager manager = new(cfg, discovery, wal, comm, new HybridLogicalClock(), NullLogger<IRaft>.Instance);
-        manager.RegisterStateMachineTransfer(transfer);
-
-        try
-        {
-            // Send only the first chunk of session A — never send IsLast.
-            SnapshotResponse r = await manager.ReceiveInstallSnapshot(new SnapshotRequest
-            {
-                SessionId = "session-A", PartitionId = 1, SnapshotIndex = 300,
-                FollowerEndpoint = "x:1", ChunkIndex = 0, IsLast = false,
-                Data = new byte[] { 0xAA },
-            }, ct);
-            Assert.True(r.Success);
-            Assert.False(transfer.ImportCalled);
-
-            // Start a fresh session B — the partial bytes from A must NOT contaminate B.
-            SnapshotResponse r2 = await manager.ReceiveInstallSnapshot(new SnapshotRequest
-            {
-                SessionId = "session-B", PartitionId = 1, SnapshotIndex = 301,
-                FollowerEndpoint = "x:1", ChunkIndex = 0, IsLast = true,
-                Data = new byte[] { 0xBB },
-            }, ct);
-            Assert.True(r2.Success);
-            Assert.True(transfer.ImportCalled);
-            Assert.Equal([0xBB], transfer.ReceivedBytes);
         }
         finally
         {
@@ -464,24 +269,6 @@ public class TestSnapshotInstall
             using MemoryStream ms = new();
             await snapshot.CopyToAsync(ms, ct);
             ReceivedBytes = ms.ToArray();
-        }
-    }
-
-    private sealed class FakeTransfer : IRaftStateMachineTransfer
-    {
-        public bool ImportCalled { get; private set; }
-        public int ImportPartitionId { get; private set; }
-
-        public Task<Stream> ExportRange(RaftSplitPlan plan, long upToIndex, CancellationToken ct)
-        {
-            return Task.FromResult<Stream>(new MemoryStream([0xAB, 0xCD]));
-        }
-
-        public Task ImportRange(int targetPartitionId, Stream snapshot, CancellationToken ct)
-        {
-            ImportCalled = true;
-            ImportPartitionId = targetPartitionId;
-            return Task.CompletedTask;
         }
     }
 

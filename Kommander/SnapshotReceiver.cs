@@ -1,8 +1,6 @@
 
 using System.Diagnostics;
 using Kommander.Data;
-using Kommander.Logging;
-using Kommander.WAL;
 using Microsoft.Extensions.Logging;
 
 namespace Kommander;
@@ -32,9 +30,10 @@ internal readonly record struct SnapshotSessionKey(string LeaderEndpoint, int Pa
 /// reclaimed on the next receipt or an explicit <see cref="SweepForTesting"/>, and is bounded in the
 /// meantime by the byte cap.</para>
 ///
-/// <para><b>Note (increment A).</b> Final validation still imports and writes the checkpoint on this
-/// path; increment B moves acceptance and WAL mutation onto the partition executor's single-writer
-/// path. Term-based rejection is therefore not yet enforced here.</para>
+/// <para><b>Note (increment B).</b> This class no longer imports or writes the WAL. On the terminal
+/// chunk it hands the staged buffer plus session metadata to <c>installOnExecutor</c>, which routes the
+/// install through the partition's single-writer executor where term validation, application import, and
+/// the durable WAL boundary run serialized against every other partition operation.</para>
 /// </summary>
 internal sealed class SnapshotReceiver
 {
@@ -43,9 +42,7 @@ internal sealed class SnapshotReceiver
     private long _totalPendingBytes;
 
     private readonly Func<bool> isDisposed;
-    private readonly Func<IRaftSystemStateTransfer?> getSystemTransfer;
-    private readonly Func<IRaftStateMachineTransfer?> getRangeTransfer;
-    private readonly IWAL walAdapter;
+    private readonly Func<SnapshotInstallRequest, Task<SnapshotResponse>> installOnExecutor;
     private readonly ILogger<IRaft> logger;
     private readonly string localEndpoint;
 
@@ -56,9 +53,7 @@ internal sealed class SnapshotReceiver
 
     internal SnapshotReceiver(
         Func<bool> isDisposed,
-        Func<IRaftSystemStateTransfer?> getSystemTransfer,
-        Func<IRaftStateMachineTransfer?> getRangeTransfer,
-        IWAL walAdapter,
+        Func<SnapshotInstallRequest, Task<SnapshotResponse>> installOnExecutor,
         ILogger<IRaft> logger,
         string localEndpoint,
         long sessionTtlTicks,
@@ -67,9 +62,7 @@ internal sealed class SnapshotReceiver
         Func<long> getMonotonicTimestamp)
     {
         this.isDisposed = isDisposed;
-        this.getSystemTransfer = getSystemTransfer;
-        this.getRangeTransfer = getRangeTransfer;
-        this.walAdapter = walAdapter;
+        this.installOnExecutor = installOnExecutor;
         this.logger = logger;
         this.localEndpoint = localEndpoint;
         this.sessionTtlTicks = sessionTtlTicks > 0 ? sessionTtlTicks : 1;
@@ -100,31 +93,10 @@ internal sealed class SnapshotReceiver
         if (isDisposed())
             return new SnapshotResponse(false);
 
-        bool isSystemState = request.Kind == SnapshotKind.SystemState;
-        IRaftSystemStateTransfer? systemTransfer = null;
-        IRaftStateMachineTransfer? rangeTransfer = null;
-        if (isSystemState)
-        {
-            systemTransfer = getSystemTransfer();
-            if (systemTransfer is null)
-                return new SnapshotResponse(false);
-        }
-        else
-        {
-            rangeTransfer = getRangeTransfer();
-            if (rangeTransfer is null)
-                return new SnapshotResponse(false);
-        }
-
         cancellationToken.ThrowIfCancellationRequested();
 
-        // Already installed at or above this index: retried chunks after a successful install are an
-        // idempotent success (the durable checkpoint is the source of truth, not the session buffer).
-        long currentMax = walAdapter.GetMaxLog(request.PartitionId);
-        if (currentMax >= request.SnapshotIndex)
-            return new SnapshotResponse(true);
-
         MemoryStream completeBuffer;
+        SnapshotReceiveSession completedSession;
         lock (_pendingSnapshotsLock)
         {
             if (isDisposed())
@@ -211,46 +183,45 @@ internal sealed class SnapshotReceiver
             if (!request.IsLast)
                 return new SnapshotResponse(true);
 
-            // Terminal chunk: detach the completed session before the (awaited) import so it is neither
-            // counted against the caps nor eligible for eviction while the import runs.
+            // Terminal chunk: detach the completed session before the (awaited) install so it is neither
+            // counted against the caps nor eligible for eviction while the install runs on the executor.
             _sessions.Remove(key);
             _totalPendingBytes -= session.AccumulatedBytes;
+            completedSession = session;
             completeBuffer = session.Buffer;
             completeBuffer.Position = 0;
         }
 
+        // Hand the staged snapshot to the partition executor's single-writer install path. All term
+        // validation, application import, and durable WAL mutation happen there — this class only buffers.
+        SnapshotInstallRequest install = new()
+        {
+            PartitionId = request.PartitionId,
+            SnapshotIndex = completedSession.SnapshotIndex,
+            LastIncludedTerm = completedSession.LastIncludedTerm,
+            LeaderTerm = completedSession.LeaderTerm,
+            LeaderEndpoint = completedSession.Key.LeaderEndpoint,
+            Kind = completedSession.Kind,
+            Snapshot = completeBuffer,
+        };
+
         try
         {
-            if (isSystemState)
-                await systemTransfer!.ImportPartitionState(request.PartitionId, completeBuffer, cancellationToken).ConfigureAwait(false);
-            else
-                await rangeTransfer!.ImportRange(request.PartitionId, completeBuffer, cancellationToken).ConfigureAwait(false);
+            return await installOnExecutor(install).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            string importMethod = isSystemState ? "ImportPartitionState" : "ImportRange";
             logger.LogError(
-                "[{Endpoint}] ReceiveInstallSnapshot: {Method} partition={PartitionId} index={Index} failed: {Message}",
-                localEndpoint, importMethod, request.PartitionId, request.SnapshotIndex, ex.Message);
+                "[{Endpoint}] ReceiveInstallSnapshot: install partition={PartitionId} index={Index} failed: {Message}",
+                localEndpoint, request.PartitionId, request.SnapshotIndex, ex.Message);
             return new SnapshotResponse(false);
         }
         finally
         {
+            // The executor read the stream to completion before installOnExecutor returned, so the buffer
+            // is safe to release here (see RaftPartition.InstallSnapshotAsync — it uses no-cancellation Ask).
             await completeBuffer.DisposeAsync().ConfigureAwait(false);
         }
-
-        RaftLog checkpointLog = new()
-        {
-            Id = request.SnapshotIndex,
-            Type = RaftLogType.CommittedCheckpoint,
-            Term = walAdapter.GetCurrentTerm(request.PartitionId),
-        };
-
-        walAdapter.Write([(request.PartitionId, [checkpointLog])]);
-
-        logger.LogInfoReceiveInstallSnapshot(localEndpoint, request.PartitionId, request.SnapshotIndex);
-
-        return new SnapshotResponse(true);
     }
 
     private static bool MetadataMatches(SnapshotReceiveSession session, SnapshotRequest request) =>

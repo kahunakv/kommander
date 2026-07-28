@@ -401,9 +401,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
         snapshotReceiver = new SnapshotReceiver(
             () => Volatile.Read(ref _disposed) != 0,
-            () => Volatile.Read(ref _systemStateTransfer),
-            () => Volatile.Read(ref _stateMachineTransfer),
-            walAdapter,
+            InstallSnapshotOnExecutorAsync,
             Logger,
             LocalEndpoint,
             SnapshotReceiver.TicksForDuration(this.configuration.SnapshotReceiveSessionTtl),
@@ -981,6 +979,21 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         SnapshotRequest request,
         CancellationToken cancellationToken = default) =>
         snapshotReceiver.ReceiveInstallSnapshot(request, cancellationToken);
+
+    /// <summary>
+    /// Routes a fully-staged snapshot to the target partition's single-writer executor for the actual
+    /// install (term validation, application import, durable WAL boundary). Invoked by
+    /// <see cref="SnapshotReceiver"/> on the terminal chunk. Returns failure if the partition is not
+    /// hosted here yet, so the leader retries once the partition exists.
+    /// </summary>
+    private async Task<SnapshotResponse> InstallSnapshotOnExecutorAsync(SnapshotInstallRequest request)
+    {
+        if (!TryGetPartition(request.PartitionId, out RaftPartition? partition) || partition is null)
+            return new SnapshotResponse(false);
+
+        bool installed = await partition.InstallSnapshotAsync(request).ConfigureAwait(false);
+        return new SnapshotResponse(installed);
+    }
 
     /// <summary>
     /// Handles an inbound gossip digest from a peer.

@@ -43,6 +43,9 @@ public static class RaftOperationMapper
             RaftRequestType.AppendLogs           => RaftOperationKind.Replication,
             RaftRequestType.CompleteAppendLogs   => RaftOperationKind.Replication,
             RaftRequestType.WriteOperationCompleted => RaftOperationKind.Replication,
+            // Follower-side snapshot install is a catch-up operation; keep it in the replication lane so
+            // client load on the partition cannot starve a below-floor follower's recovery.
+            RaftRequestType.InstallSnapshot      => RaftOperationKind.Replication,
 
             // ── Client ────────────────────────────────────────────────────────────────
             // Proposals, commits, rollbacks, checkpoints, and state/ticket reads all
@@ -149,6 +152,7 @@ public static class RaftOperationMapper
             RaftRequestType.ReplicateCheckpoint or
             RaftRequestType.CommitLogs or
             RaftRequestType.RollbackLogs or
+            RaftRequestType.InstallSnapshot or
             RaftRequestType.WriteOperationCompleted => RaftStatePriority.Mid,
 
             _ => throw new ArgumentOutOfRangeException(nameof(requestType), requestType, "Unrecognised RaftRequestType"),

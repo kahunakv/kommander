@@ -39,6 +39,10 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
     public async ValueTask<long> TruncateLogsAfterAsync(long afterLogId) =>
         await wal.TruncateLogsAfterAsync(afterLogId).ConfigureAwait(false);
 
+    public ValueTask<(RaftOperationStatus Status, bool SuffixTruncated)> InstallSnapshotBoundaryAsync(
+        long snapshotIndex, long lastIncludedTerm) =>
+        wal.InstallSnapshotBoundaryAsync(snapshotIndex, lastIncludedTerm);
+
     public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp timestamp, bool autoCommit) =>
         wal.EnqueuePropose(term, logs, timestamp, autoCommit);
 

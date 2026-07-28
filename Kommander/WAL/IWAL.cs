@@ -212,4 +212,47 @@ public interface IWAL : IDisposable
     /// <para>Returns <c>(Success, 0)</c> when the partition has no entries after truncation.</para>
     /// </summary>
     (RaftOperationStatus Status, long MaxLogId) TruncateLogsAfterAndGetMax(int partitionId, long afterLogId);
+
+    /// <summary>
+    /// Atomically installs a snapshot boundary for <paramref name="partitionId"/>: writes (upserts) a
+    /// <see cref="RaftLogType.CommittedCheckpoint"/> entry at <paramref name="snapshotIndex"/> carrying
+    /// <paramref name="lastIncludedTerm"/>, and — when the local entry at that index has a term that does
+    /// <b>not</b> match <paramref name="lastIncludedTerm"/> (a conflicting entry, or none at all) —
+    /// discards the entire suffix above the index. When the stored term already matches, the suffix above
+    /// the boundary is <b>retained</b> (Raft log matching: a matching entry implies the suffix is
+    /// consistent), and only the checkpoint marker is stamped at the boundary.
+    /// <para>The retain-vs-truncate decision is derived <b>internally</b> from the stored term at
+    /// <paramref name="snapshotIndex"/> so the read and the mutation are one atomic step — callers do not
+    /// pass it. <paramref name="sync"/> selects the backend's durable fsync (<see langword="true"/>) or
+    /// fast path (<see langword="false"/>); a snapshot boundary is normally installed with
+    /// <c>sync: true</c>. Returns the operation status and whether the suffix was truncated.</para>
+    /// <para>This <b>default implementation</b> is a non-atomic composition of <see cref="GetTermAt"/>,
+    /// <see cref="TruncateLogsAfter"/> and <see cref="Write(List{ValueTuple{int, List{RaftLog}}}, bool)"/>
+    /// intended for non-durable test fakes; the three durable backends override it with a single atomic
+    /// transaction/batch honouring their <c>syncWrites</c> contract.</para>
+    /// </summary>
+    (RaftOperationStatus Status, bool SuffixTruncated) InstallSnapshotBoundary(
+        int partitionId, long snapshotIndex, long lastIncludedTerm, bool sync)
+    {
+        long localTerm = GetTermAt(partitionId, snapshotIndex);
+        bool suffixTruncated = false;
+
+        if (localTerm != lastIncludedTerm)
+        {
+            RaftOperationStatus truncateStatus = TruncateLogsAfter(partitionId, snapshotIndex);
+            if (truncateStatus != RaftOperationStatus.Success)
+                return (truncateStatus, false);
+            suffixTruncated = true;
+        }
+
+        RaftLog checkpoint = new()
+        {
+            Id = snapshotIndex,
+            Term = lastIncludedTerm,
+            Type = RaftLogType.CommittedCheckpoint,
+        };
+
+        RaftOperationStatus writeStatus = Write([(partitionId, [checkpoint])], sync);
+        return (writeStatus, suffixTruncated);
+    }
 }

@@ -1452,6 +1452,108 @@ public abstract class WalConformanceTests
         finally { cleanup(); }
     }
 
+    // ──────────────────────── InstallSnapshotBoundary ───────────────────────────
+
+    /// <summary>
+    /// When the stored term at the boundary index matches the snapshot's last-included term, the suffix
+    /// above the index is retained and a CommittedCheckpoint is stamped at the boundary carrying that term.
+    /// </summary>
+    [Fact]
+    public void InstallSnapshotBoundary_MatchingTerm_RetainsSuffix()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(1, [Log(id: 1, term: 2), Log(id: 2, term: 2), Log(id: 3, term: 2), Log(id: 4, term: 2), Log(id: 5, term: 2)])]);
+
+            (RaftOperationStatus status, bool truncated) = wal.InstallSnapshotBoundary(1, snapshotIndex: 3, lastIncludedTerm: 2, sync: true);
+
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Assert.False(truncated);
+            // Suffix (4,5) retained; boundary index still present.
+            Assert.Equal([1L, 2L, 3L, 4L, 5L], wal.ReadLogsRange(1, 1).Select(l => l.Id));
+            Assert.Equal(5, wal.GetMaxLog(1));
+            // Checkpoint stamped at the boundary with the last-included term.
+            Assert.Equal(3, wal.GetLastCheckpoint(1));
+            Assert.Equal(2, wal.GetTermAt(1, 3));
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// When the stored term at the boundary index conflicts with the snapshot's last-included term, the
+    /// entire suffix above the index is discarded and the checkpoint carries the last-included term.
+    /// </summary>
+    [Fact]
+    public void InstallSnapshotBoundary_ConflictingTerm_TruncatesSuffix()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(1, [Log(id: 1, term: 2), Log(id: 2, term: 2), Log(id: 3, term: 2), Log(id: 4, term: 2), Log(id: 5, term: 2)])]);
+
+            (RaftOperationStatus status, bool truncated) = wal.InstallSnapshotBoundary(1, snapshotIndex: 3, lastIncludedTerm: 9, sync: true);
+
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Assert.True(truncated);
+            // Suffix (4,5) discarded; boundary is the new max, stamped with the last-included term.
+            Assert.Equal([1L, 2L, 3L], wal.ReadLogsRange(1, 1).Select(l => l.Id));
+            Assert.Equal(3, wal.GetMaxLog(1));
+            Assert.Equal(3, wal.GetLastCheckpoint(1));
+            Assert.Equal(9, wal.GetTermAt(1, 3));
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// Installing a boundary above the current max (no local entry there) stamps the checkpoint and does
+    /// not remove any lower entries, since there is no suffix above the boundary to truncate.
+    /// </summary>
+    [Fact]
+    public void InstallSnapshotBoundary_AboveMax_StampsCheckpointAndKeepsLowerEntries()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(1, [Log(id: 1, term: 2), Log(id: 2, term: 2), Log(id: 3, term: 2)])]);
+
+            (RaftOperationStatus status, bool truncated) = wal.InstallSnapshotBoundary(1, snapshotIndex: 10, lastIncludedTerm: 4, sync: true);
+
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Assert.False(truncated);          // nothing existed above 10
+            Assert.Equal(10, wal.GetMaxLog(1));
+            Assert.Equal(10, wal.GetLastCheckpoint(1));
+            Assert.Equal(4, wal.GetTermAt(1, 10));
+            // Lower entries survive (they are below the boundary).
+            Assert.Contains(1L, wal.ReadLogsRange(1, 1).Select(l => l.Id));
+        }
+        finally { cleanup(); }
+    }
+
+    /// <summary>
+    /// A boundary install on one partition must not touch any other partition's data.
+    /// </summary>
+    [Fact]
+    public void InstallSnapshotBoundary_OtherPartitions_NotAffected()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(10, [Log(id: 1, term: 2), Log(id: 2, term: 2), Log(id: 3, term: 2)])]);
+            wal.Write([(11, [Log(id: 1, term: 2), Log(id: 2, term: 2), Log(id: 3, term: 2)])]);
+            wal.Write([(12, [Log(id: 1, term: 2), Log(id: 2, term: 2), Log(id: 3, term: 2)])]);
+
+            // Conflicting-term install on 11 truncates 11's suffix only.
+            (RaftOperationStatus status, _) = wal.InstallSnapshotBoundary(11, snapshotIndex: 1, lastIncludedTerm: 9, sync: true);
+
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Assert.Equal(3, wal.ReadLogsRange(10, 1).Count);
+            Assert.Single(wal.ReadLogsRange(11, 1));   // only the boundary at id=1 survives
+            Assert.Equal(3, wal.ReadLogsRange(12, 1).Count);
+        }
+        finally { cleanup(); }
+    }
+
     // ──────────────────────────── helpers ───────────────────────────────────────
 
     protected static RaftLog Log(long id, long term = 1, RaftLogType type = RaftLogType.Committed) =>

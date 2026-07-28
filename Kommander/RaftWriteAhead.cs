@@ -764,6 +764,25 @@ public sealed class RaftWriteAhead
     }
 
     /// <summary>
+    /// Atomically installs a snapshot boundary: stamps a durable <c>CommittedCheckpoint</c> at
+    /// <paramref name="snapshotIndex"/> with term <paramref name="lastIncludedTerm"/>, retaining the
+    /// suffix above it when the stored term matches and truncating it when it conflicts. Delegates the
+    /// atomicity to the single backend <see cref="IWAL.InstallSnapshotBoundary"/> op and installs durably
+    /// (<c>sync: true</c>) — a snapshot boundary is a committed-state boundary and must survive a crash.
+    /// <para>Scheduled on the read thread so it serializes against reads; the backend's per-partition
+    /// guard is what excludes the WAL-scheduler write path, exactly as <see cref="TruncateLogsAfterAsync"/>
+    /// relies on. Returns whether the suffix was truncated.</para>
+    /// </summary>
+    public async ValueTask<(RaftOperationStatus Status, bool SuffixTruncated)> InstallSnapshotBoundaryAsync(
+        long snapshotIndex, long lastIncludedTerm)
+    {
+        return await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () =>
+            walAdapter.InstallSnapshotBoundary(
+                partition.PartitionId, snapshotIndex, lastIncludedTerm, sync: true)
+        ).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Returns the id of the last <c>CommittedCheckpoint</c> WAL entry for this partition, or
     /// -1 when no checkpoint exists.  Scheduled on the read thread so it does not race with WAL writes.
     /// </summary>

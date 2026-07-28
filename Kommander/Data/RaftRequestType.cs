@@ -64,4 +64,15 @@ public enum RaftRequestType
     /// index, allowing normal backfill to resume from the next entry.
     /// </summary>
     SnapshotInstalled,
+
+    /// <summary>
+    /// Follower-side snapshot install, asked from the transport thread once the final chunk of a
+    /// snapshot session has been received and staged. The executor runs the Raft "Rule 7" validation
+    /// (leader-term check / durable step-down), the application import, the durable WAL boundary install,
+    /// and the cursor reconstruction on the partition's single-writer path via
+    /// <see cref="RaftPartitionStateMachine.InstallSnapshotAsync"/>. The staged snapshot and its metadata
+    /// are carried on <see cref="RaftRequest.SnapshotInstall"/>. Distinct from <see cref="SnapshotInstalled"/>,
+    /// which is the leader/sender-side ACK that a follower finished installing.
+    /// </summary>
+    InstallSnapshot,
 }
