@@ -20,7 +20,7 @@ public class Scenario06_MinorityWrites
     // backfilled prefix. The safety half of this scenario (minority writes never commit) is unaffected; it is
     // the convergence half that trips the oracle. Un-skip once the delivery fix lands. See memory
     // non-contiguous-delivery-bug.
-    [Fact(Skip = "Blocked on deferred non-contiguous-delivery bug (see memory non-contiguous-delivery-bug); un-skip when fixed.")]
+    [Fact]
     public async Task IsolatedMinority_WritesNeverCommit_MajorityConvergesAfterHeal()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;

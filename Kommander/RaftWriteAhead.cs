@@ -731,6 +731,35 @@ public sealed class RaftWriteAhead
     }
 
     /// <summary>
+    /// Seeds the in-memory commit/propose frontier to a freshly installed snapshot boundary at
+    /// <paramref name="snapshotIndex"/>. A snapshot means every id through the boundary is durably committed
+    /// (the prefix is compacted away), so the frontier — which a fresh or lagging follower otherwise leaves at
+    /// its stale value — must jump to it. Without this, <see cref="GetCommitIndex"/> reports a value below the
+    /// boundary (the compacted prefix reads as an unfilled gap), which stalls both consumer delivery
+    /// (<c>DrainCommittedAppliesAsync</c> bounds on the frontier) and the follower's backfill-progress report.
+    /// Any over-gap ids buffered in <c>pendingResolved</c> that the boundary now covers are drained. Runs on the
+    /// partition executor, the single writer of these fields.
+    /// </summary>
+    public void SeedCommitFrontierFromSnapshot(long snapshotIndex)
+    {
+        long target = snapshotIndex + 1;
+        if (target > commitIndex)
+            commitIndex = target;
+        if (target > proposeIndex)
+            proposeIndex = target;
+
+        // Drop buffered resolved ids now covered by the boundary, then absorb any that have become contiguous.
+        while (pendingResolved.Count > 0 && pendingResolved.Min < commitIndex)
+            pendingResolved.Remove(pendingResolved.Min);
+        while (pendingResolved.Count > 0 && pendingResolved.Min == commitIndex)
+        {
+            long next = pendingResolved.Min;
+            pendingResolved.Remove(next);
+            commitIndex = next + 1;
+        }
+    }
+
+    /// <summary>
     /// Removes every log entry with id &gt; <paramref name="afterLogId"/> and returns the
     /// post-truncation max log id.
     /// <para>

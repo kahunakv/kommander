@@ -36,6 +36,8 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
 
     public long GetCommitIndex() => wal.GetCommitIndex();
 
+    public void SeedCommitFrontierFromSnapshot(long snapshotIndex) => wal.SeedCommitFrontierFromSnapshot(snapshotIndex);
+
     public async ValueTask<long> TruncateLogsAfterAsync(long afterLogId) =>
         await wal.TruncateLogsAfterAsync(afterLogId).ConfigureAwait(false);
 

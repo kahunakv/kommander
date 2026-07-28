@@ -85,6 +85,15 @@ public interface IRaftWalFacade
     long GetCommitIndex();
 
     /// <summary>
+    /// Seeds the in-memory commit/propose frontier to a freshly installed snapshot boundary so
+    /// <see cref="GetCommitIndex"/> reflects the compacted prefix as committed rather than an unfilled gap.
+    /// Must be called on the partition executor after the snapshot's WAL boundary is durable.
+    /// <para>Default no-op: the production <c>RaftWriteAhead</c> facade overrides this; test stubs that never
+    /// install snapshots inherit the no-op.</para>
+    /// </summary>
+    void SeedCommitFrontierFromSnapshot(long snapshotIndex) { }
+
+    /// <summary>
     /// Removes every log entry with id &gt; <paramref name="afterLogId"/> and returns the
     /// post-truncation max log id.  The truncate and the subsequent max-log read execute inside
     /// a single scheduled WAL action so the pair is atomic: no concurrent write can be

@@ -879,6 +879,25 @@ public sealed class RaftPartitionStateMachine
             {
                 if (log.Id > upToIndex)
                     return;
+                if (log.Id <= lastAppliedIndex)
+                    continue;                       // already applied (defensive; GetRangeAsync starts at 'from')
+                if (log.Id != lastAppliedIndex + 1)
+                {
+                    // The expected next id (lastAppliedIndex+1) is absent from the committed range. Classify by
+                    // the snapshot floor rather than by "does an entry exist" — the in-memory commit frontier
+                    // (upToIndex) can transiently lead the durable WAL (a Committed marker not yet landed, or an
+                    // entry that hole-repair truncated after the frontier overshot it), so an absent id is
+                    // ambiguous on its own:
+                    //   * expected ABOVE the floor → a real gap (uncommitted lag OR a truncated hole). Both are
+                    //     re-shipped by the leader's backfill, so WITHHOLD and let a later drain deliver the id
+                    //     and the tail in order. Delivering past it would skip it permanently.
+                    //   * expected AT/BELOW the floor, or the -1/0 pre-restore sentinel (below the first log id):
+                    //     the id was compacted by a snapshot or never existed. Not a gap — ACCEPT this entry as
+                    //     the next contiguous delivery (the cursor advances to it below).
+                    long floor = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
+                    if (lastAppliedIndex + 1 > 0 && lastAppliedIndex + 1 > floor)
+                        return;
+                }
                 await ApplyLogToConsumerAsync(log).ConfigureAwait(false);
             }
 
@@ -2116,31 +2135,37 @@ public sealed class RaftPartitionStateMachine
 
             long localTermAtPrev = await wal.GetAnyTermAtAsync(prevLogIndex).ConfigureAwait(false);
 
-            if (localTermAtPrev < 0)
-            {
-                // Hole: no entry exists at prevLogIndex even though prevLogIndex <= localMaxLog,
-                // so the follower's log has an internal gap. This proves the follower's truly
-                // committed prefix ends below prevLogIndex: the leader commits contiguously, so no
-                // entry above an unfilled gap can have been quorum-committed — any entry sitting
-                // above the gap is an orphan delivered out of order by the unanchored live-propose
-                // broadcast. Truncating that orphaned tail (everything after prevLogIndex-1) can
-                // therefore never discard committed data, regardless of what the in-memory
-                // commitIndex reports (it can transiently overshoot the gap when a misordered
-                // Committed delivery lands above it). Reporting the post-truncation max lets the
-                // leader heal the gap in one forward backfill pass instead of walking nextIndex
-                // down one slot at a time.
-                long newMax = await wal.TruncateLogsAfterAsync(prevLogIndex - 1).ConfigureAwait(false);
-                logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Log-hole repair from {Endpoint}: prevLogIndex={PrevLogIndex} truncated to newMax={NewMax}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, prevLogIndex, newMax);
-                host.EnqueueResponse(endpoint, new(
-                    RaftResponderRequestType.CompleteAppendLogs,
-                    new(endpoint),
-                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, newMax)
-                ));
-                return;
-            }
-
+            // Classify the anchor by TERM MATCH first, before the hole test. A shared value — including
+            // -1 == -1 — is a match and falls through to append. The -1 == -1 case is a snapshot boundary: the
+            // follower's entry at prevLogIndex is a CommittedCheckpoint whose term is unknown after compaction
+            // (LastIncludedTerm can be -1), and the leader anchors on its own equally-compacted boundary, so the
+            // snapshot-covered prefix already agrees. Testing the hole (localTermAtPrev < 0) BEFORE the match
+            // would misread that -1 boundary term as a hole and truncate the just-shipped anchored backfill,
+            // which the leader re-ships and the follower re-truncates forever — a live-lock that strands the
+            // follower exactly one entry below the boundary (and its consumer's applied prefix with it).
             if (localTermAtPrev != prevLogTerm)
             {
+                if (localTermAtPrev < 0)
+                {
+                    // Hole: no entry exists at prevLogIndex even though prevLogIndex <= localMaxLog, so the
+                    // follower's log has an internal gap. This proves the follower's truly committed prefix ends
+                    // below prevLogIndex: the leader commits contiguously, so no entry above an unfilled gap can
+                    // have been quorum-committed — any entry sitting above the gap is an orphan delivered out of
+                    // order by the unanchored live-propose broadcast. Truncating that orphaned tail (everything
+                    // after prevLogIndex-1) can therefore never discard committed data, regardless of what the
+                    // in-memory commitIndex reports (it can transiently overshoot the gap when a misordered
+                    // Committed delivery lands above it). Reporting the post-truncation max lets the leader heal
+                    // the gap in one forward backfill pass instead of walking nextIndex down one slot at a time.
+                    long newMax = await wal.TruncateLogsAfterAsync(prevLogIndex - 1).ConfigureAwait(false);
+                    logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Log-hole repair from {Endpoint}: prevLogIndex={PrevLogIndex} truncated to newMax={NewMax}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, prevLogIndex, newMax);
+                    host.EnqueueResponse(endpoint, new(
+                        RaftResponderRequestType.CompleteAppendLogs,
+                        new(endpoint),
+                        new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, newMax)
+                    ));
+                    return;
+                }
+
                 // Genuine term divergence: entry exists at prevLogIndex but belongs to a
                 // different term. Leader backtracks nextIndex and retries with an earlier anchor.
                 logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Log Matching rejection from {Endpoint}: prevLogIndex={PrevLogIndex} localTerm={LocalTerm} != prevLogTerm={PrevLogTerm}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, prevLogIndex, localTermAtPrev, prevLogTerm);
@@ -3342,30 +3367,41 @@ public sealed class RaftPartitionStateMachine
 
         if (completion.Status == RaftOperationStatus.Success)
         {
+            // Exactly-once, IN-ORDER apply, bounded by the WAL's gap-aware committed frontier
+            // (committedIndex = GetCommitIndex). Contract: deliver every committed id exactly once, in order,
+            // never over a hole. The unanchored live-propose broadcast ships prevLogIndex=0, so a behind
+            // follower can persist a high committed entry before its prefix exists; the commit frontier buffers
+            // that id over the gap (AdvanceCommitFrontier), so committedIndex stops below the hole and it is
+            // withheld until backfill fills the prefix.
+            //
+            // Fast path (no WAL read): deliver the contiguous committed prefix straight from this batch. This
+            // is the steady-state case — entries arrive in order and this delivers them without a scheduler
+            // round-trip. Stops at the first id that is not exactly frontier+1, is beyond the committed
+            // frontier, or is not yet committed (Proposed) — anything the batch cannot deliver in order.
             foreach (RaftLog log in pending.Logs ?? [])
             {
-                if (log.Type != RaftLogType.Committed)
-                    continue;
-
-                // Exactly-once apply: the leader re-sends committed entries (commit broadcast to all peers,
-                // plus backfill / idle-tail re-ship), so a follower routinely receives a Committed copy of an
-                // entry it has already applied. Never re-deliver at or below the applied frontier.
-                if (log.Id <= lastAppliedIndex)
-                    continue;
-
-                if (host.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType)
+                if (log.Id != lastAppliedIndex + 1 || log.Id > committedIndex)
+                    break;
+                if (log.Type == RaftLogType.Committed)
                 {
-                    if (!await host.InvokeSystemReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
+                    if (host.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType)
+                    {
+                        if (!await host.InvokeSystemReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
+                            host.InvokeReplicationError(host.PartitionId, log);
+                    }
+                    else if (!await host.InvokeReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
                         host.InvokeReplicationError(host.PartitionId, log);
                 }
-                else
-                {
-                    if (!await host.InvokeReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
-                        host.InvokeReplicationError(host.PartitionId, log);
-                }
-
-                lastAppliedIndex = log.Id;
+                else if (log.Type != RaftLogType.CommittedCheckpoint)
+                    break;                          // Proposed/other non-committed entry: not deliverable yet.
+                lastAppliedIndex = log.Id;          // advance over delivered entries and skipped checkpoints
             }
+
+            // Slow path (rare): the committed frontier is still ahead of the applied cursor — a hole just
+            // filled, so entries buffered by earlier out-of-order batches (no longer in this batch) became
+            // deliverable. Drain them from the WAL in order. A no-op when the fast path already caught up.
+            if (committedIndex > lastAppliedIndex)
+                await DrainCommittedAppliesAsync(committedIndex).ConfigureAwait(false);
 
             wal.NotifyCommitted();
         }
@@ -3496,6 +3532,7 @@ public sealed class RaftPartitionStateMachine
         {
             if (snapshotIndex > lastAppliedIndex)
                 lastAppliedIndex = snapshotIndex;
+            wal.SeedCommitFrontierFromSnapshot(snapshotIndex);
             return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Success, snapshotIndex);
         }
 
@@ -3613,9 +3650,12 @@ public sealed class RaftPartitionStateMachine
         }
 
         // Ordering step 4 + Rule 7.7 — reconstruct the apply cursor from the installed boundary so a later
-        // promotion does not re-deliver the imported prefix (mirrors CompleteRestoreAsync's cursor seed).
+        // promotion does not re-deliver the imported prefix (mirrors CompleteRestoreAsync's cursor seed), and
+        // advance the in-memory commit frontier to the boundary so GetCommitIndex reflects the compacted prefix
+        // as committed (otherwise post-snapshot consumer delivery and backfill reporting stall below it).
         if (snapshotIndex > lastAppliedIndex)
             lastAppliedIndex = snapshotIndex;
+        wal.SeedCommitFrontierFromSnapshot(snapshotIndex);
 
         if (logger.IsEnabled(LogLevel.Information))
             logger.LogInfoReceiveInstallSnapshot(host.LocalEndpoint, host.PartitionId, snapshotIndex);

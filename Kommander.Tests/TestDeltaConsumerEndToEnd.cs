@@ -125,6 +125,10 @@ public sealed class TestDeltaConsumerEndToEnd
 
             Assert.True(transfer.ImportCount > 0,
                 "ImportPartitionState must have been called at least once — snapshot path was not taken");
+            // ImportCount increments during ImportPartitionState (install step 2); the durable WAL boundary is a
+            // later step, so wait for the checkpoint rather than reading it in the same instant (otherwise this
+            // races the boundary write).
+            await WaitForAsync(() => innerWal4.GetLastCheckpoint(0) > 0, ct, timeoutMs: 15_000);
             Assert.True(innerWal4.GetLastCheckpoint(0) > 0,
                 "n4's P0 WAL must have a CommittedCheckpoint at the snapshot index");
 

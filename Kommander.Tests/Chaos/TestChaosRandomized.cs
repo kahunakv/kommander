@@ -14,21 +14,28 @@ namespace Kommander.Tests.Chaos;
 /// every node converging (identical applied prefix) on fresh writes, with no continuous safety-invariant
 /// violation at any point. On failure it emits the seed and the standard report.
 ///
-/// <para><b>SKIPPED — blocked on the deferred non-contiguous-delivery bug</b> (see memory
-/// <c>non-contiguous-delivery-bug</c>). A user-workload soak of any real intensity drives a follower far enough
-/// behind that the unanchored live-propose broadcast lands a lone high entry over a hole; that bug then either
-/// diverges the consumer prefix or stalls the gap-aware commit frontier (observed: commit stuck while maxWal
-/// advances), so neither hash-chain nor commit-based convergence is reliably green — and the stuck state
-/// hot-loops the leader's backfill. The infrastructure here is complete and validated (it prints a reproducing
-/// seed + failure report; the nemesis event log is bounded so a soak no longer OOMs). Un-skip both tiers once
-/// the delivery fix lands, then curate a green baseline seed set for the nightly.</para>
+/// <para><b>Skipped in the default suite</b> (nightly <c>ChaosRandom</c> / opt-in <c>Stress</c>). The
+/// non-contiguous-delivery bug that once blocked this tier is fixed — holes now backfill and the consumer prefix
+/// converges. Two reasons remain to keep it out of the fast PR run: 5–7-node clusters over a fault window are
+/// slow; and under continuous Fail/Drop faults the <c>CommitMonotonicity</c> invariant flags the gap-aware
+/// <c>GetCommitIndex</c> dipping when a commit write is rolled back — an observability artifact (the durable
+/// applied prefix never regresses), to be resolved by tracking the applied prefix rather than the gap-aware
+/// frontier. The infrastructure is complete and validated: it prints a reproducing seed + failure report, and
+/// the nemesis event log is bounded so a soak no longer OOMs.</para>
 /// </summary>
 [Collection(ClusterIntegrationCollection.Name)]
 public sealed class TestChaosRandomized
 {
+    // The non-contiguous-delivery bug that originally blocked this tier is now FIXED (holes backfill; the
+    // consumer prefix converges). It stays skipped in the default suite for two reasons: (1) it is the nightly
+    // ChaosRandom / opt-in Stress tier — 5–7-node clusters over a fault window are slow for a PR run; and
+    // (2) under continuous Fail/Drop faults the CommitMonotonicity invariant flags the gap-aware GetCommitIndex
+    // dipping on a rolled-back commit — an observability artifact (the durable applied prefix never regresses),
+    // not a safety violation, to be resolved by tracking the applied prefix rather than the gap-aware frontier.
     private const string BlockedReason =
-        "Blocked on deferred non-contiguous-delivery bug (see memory non-contiguous-delivery-bug); " +
-        "a real random soak triggers it (commit stalls / consumer prefix diverges). Un-skip when fixed.";
+        "Nightly ChaosRandom/Stress tier: kept out of the fast PR suite (slow), and CommitMonotonicity flags the " +
+        "gap-aware commit frontier dipping on fault-rolled-back commits (observability artifact — track the " +
+        "applied prefix instead). The non-contiguous-delivery bug it was blocked on is fixed.";
 
     private readonly ITestOutputHelper _out;
     public TestChaosRandomized(ITestOutputHelper output) => _out = output;

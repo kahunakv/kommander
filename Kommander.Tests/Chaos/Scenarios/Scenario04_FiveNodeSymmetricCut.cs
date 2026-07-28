@@ -18,7 +18,7 @@ public class Scenario04_FiveNodeSymmetricCut
     // prefix. The strict in-order fix regresses the legitimate deliver-over-transient-hole catch-up path
     // (TestDeltaConsumerEndToEnd), so the fix is a dedicated follow-up increment. See memory
     // non-contiguous-delivery-bug. Un-skip once that lands.
-    [Fact(Skip = "Blocked on deferred non-contiguous-delivery bug (see memory non-contiguous-delivery-bug); un-skip when fixed.")]
+    [Fact]
     public async Task SymmetricCut_MajorityKeepsCommitting_HealsAndConverges()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
