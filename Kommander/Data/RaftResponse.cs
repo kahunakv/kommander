@@ -29,7 +29,20 @@ public sealed class RaftResponse
     /// or invalidated) so callers can await it instead of polling <c>GetTicketState</c>.
     /// </summary>
     public Task<(RaftProposalTicketState, long)>? WaiterTask { get; }
-    
+
+    /// <summary>
+    /// Carries the immutable partition snapshot when <see cref="Type"/> is
+    /// <see cref="RaftResponseType.None"/> and the request was
+    /// <see cref="RaftRequestType.GetPartitionView"/> (test-only harness accessor).
+    /// </summary>
+    public RaftPartitionView? PartitionView { get; }
+
+    public RaftResponse(RaftResponseType type, RaftPartitionView partitionView)
+    {
+        Type = type;
+        PartitionView = partitionView;
+    }
+
     public RaftResponse(RaftResponseType type, RaftNodeState nodeState)
     {
         Type = type;

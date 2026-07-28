@@ -75,4 +75,11 @@ public enum RaftRequestType
     /// which is the leader/sender-side ACK that a follower finished installing.
     /// </summary>
     InstallSnapshot,
+
+    /// <summary>
+    /// Test-only: snapshots this partition's consensus state (role, term, leader, commit/applied/max-WAL
+    /// indexes, quiesced, member role) into an immutable <see cref="RaftPartitionView"/> on the executor
+    /// thread, so the chaos harness never reads mutable state-machine fields from a polling thread.
+    /// </summary>
+    GetPartitionView,
 }

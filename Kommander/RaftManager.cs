@@ -1571,6 +1571,18 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <param name="partitionId"></param>
     /// <returns></returns>
     /// <exception cref="RaftException"></exception>
+    /// <summary>
+    /// Test-only: returns an immutable snapshot of the given partition's consensus state, captured on the
+    /// partition executor thread, or <see langword="null"/> if the partition is not hosted here. Used by
+    /// the chaos harness to build a point-in-time cluster view for the invariant checker.
+    /// </summary>
+    internal async Task<RaftPartitionView?> GetPartitionViewAsync(int partitionId, CancellationToken cancellationToken = default)
+    {
+        if (!TryGetPartition(partitionId, out RaftPartition? partition) || partition is null)
+            return null;
+        return await partition.GetPartitionViewAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     private RaftPartition GetPartition(int partitionId)
     {
         if (partitionId == RaftSystemConfig.SystemPartition)

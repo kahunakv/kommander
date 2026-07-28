@@ -223,6 +223,28 @@ public sealed class RaftPartitionStateMachine
     public long CurrentTerm => currentTerm;
 
     /// <summary>
+    /// Test-only: snapshots this partition's consensus state into an immutable <see cref="RaftPartitionView"/>.
+    /// Runs on the executor's single-writer thread (dispatched via <see cref="RaftRequestType.GetPartitionView"/>),
+    /// so all mutable fields are read consistently and never observed torn by a polling thread. The WAL max
+    /// index is read through the facade on the same thread.
+    /// </summary>
+    public async Task<RaftPartitionView> GetPartitionView()
+    {
+        long maxWal = await wal.GetMaxLogAsync().ConfigureAwait(false);
+        return new RaftPartitionView(
+            Endpoint: host.LocalEndpoint,
+            Partition: host.PartitionId,
+            Role: nodeState,
+            Term: currentTerm,
+            Leader: host.Leader,
+            CommitIndex: wal.GetCommitIndex(),
+            LastAppliedIndex: lastAppliedIndex,
+            MaxWalIndex: maxWal,
+            Quiesced: quiesced,
+            MemberRole: host.LocalRole);
+    }
+
+    /// <summary>
     /// The current election timeout for this partition. Exposed so callers with access to a seeded
     /// configuration can verify reproducibility without depending on wall-clock behaviour.
     /// </summary>

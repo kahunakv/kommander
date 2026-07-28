@@ -55,6 +55,7 @@ public static class RaftOperationMapper
             RaftRequestType.CommitLogs           => RaftOperationKind.Client,
             RaftRequestType.RollbackLogs         => RaftOperationKind.Client,
             RaftRequestType.GetNodeState              => RaftOperationKind.Client,
+            RaftRequestType.GetPartitionView          => RaftOperationKind.Client,
             RaftRequestType.GetTicketState            => RaftOperationKind.Client,
             RaftRequestType.GetTicketWaiterTask       => RaftOperationKind.Client,
             RaftRequestType.GetFollowerCommittedIndex => RaftOperationKind.Client,
@@ -139,6 +140,7 @@ public static class RaftOperationMapper
             RaftRequestType.ReceiveVote => RaftStatePriority.High,
 
             RaftRequestType.GetNodeState or
+            RaftRequestType.GetPartitionView or
             RaftRequestType.GetTicketState or
             RaftRequestType.GetTicketWaiterTask or
             RaftRequestType.GetFollowerCommittedIndex or

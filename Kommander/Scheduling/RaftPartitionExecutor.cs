@@ -811,6 +811,13 @@ public sealed class RaftPartitionExecutor : IDisposable
                     op.Reply?.TrySetResult(new RaftResponse(RaftResponseType.NodeState, _stateMachine.NodeState));
                     break;
 
+                case RaftRequestType.GetPartitionView:
+                {
+                    RaftPartitionView view = await _stateMachine.GetPartitionView().ConfigureAwait(false);
+                    op.Reply?.TrySetResult(new RaftResponse(RaftResponseType.None, view));
+                    break;
+                }
+
                 case RaftRequestType.GetTicketState:
                 {
                     (RaftProposalTicketState ticketState, long commitIndex) = _stateMachine.CheckTicketCompletion(request.Timestamp);

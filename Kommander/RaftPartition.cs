@@ -530,6 +530,16 @@ public sealed class RaftPartition : IDisposable
         return response.Status;
     }
 
+    /// <summary>
+    /// Test-only: returns an immutable snapshot of this partition's consensus state, captured on the
+    /// executor thread. Used by the chaos harness's continuous invariant checker.
+    /// </summary>
+    internal async Task<RaftPartitionView?> GetPartitionViewAsync(CancellationToken cancellationToken = default)
+    {
+        RaftResponse response = await executor.Ask(new(RaftRequestType.GetPartitionView), cancellationToken).ConfigureAwait(false);
+        return response.PartitionView;
+    }
+
     public async Task<RaftOperationStatus> StepDownAsync(CancellationToken cancellationToken = default)
     {
         RaftResponse response = await executor.Ask(new(RaftRequestType.StepDown), cancellationToken).ConfigureAwait(false);
