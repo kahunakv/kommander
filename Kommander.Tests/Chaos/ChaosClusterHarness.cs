@@ -287,7 +287,7 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
         StringBuilder sb = new();
         sb.AppendLine($"=== Chaos failure report ===");
         sb.AppendLine($"scenario={_options.Scenario} seed={_seed} violated={violated}");
-        sb.AppendLine($"nemesis sequence={Nemesis.AllEvents().Count} held={Nemesis.HeldCount}");
+        sb.AppendLine($"nemesis events={Nemesis.TotalEventCount} held={Nemesis.HeldCount}");
         sb.AppendLine("-- last 20 nemesis events --");
         foreach (NemesisEvent e in Nemesis.RecentEvents())
             sb.AppendLine("  " + e);

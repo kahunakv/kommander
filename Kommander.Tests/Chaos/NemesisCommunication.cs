@@ -36,6 +36,24 @@ public sealed class NemesisCommunication : ICommunication
     private NemesisRandomProfile? _randomProfile;
     private long _seq;
 
+    // The event log is bounded: a long soak emits millions of events, so retain only a recent window (enough
+    // for RecentEvents + barrier scans) and track the true total separately. Trimmed in chunks so append stays
+    // amortized O(1). Without this the list grows unbounded and a soak run OOM/GC-thrashes.
+    private const int MaxRetainedEvents = 8192;
+    private long _totalEvents;
+
+    // Must be called under _lock.
+    private void RecordEventLocked(NemesisEvent evt)
+    {
+        _allEvents.Add(evt);
+        _totalEvents++;
+        if (_allEvents.Count >= MaxRetainedEvents * 2)
+            _allEvents.RemoveRange(0, _allEvents.Count - MaxRetainedEvents);
+    }
+
+    /// <summary>The total number of events ever recorded (the retained window may be smaller).</summary>
+    public long TotalEventCount { get { lock (_lock) return _totalEvents; } }
+
     /// <summary>
     /// Non-blocking hook fired after every event is appended (a decision, delivery, release, …). The chaos
     /// harness wires this to the invariant checker's coalesced <c>Notify</c> so invariants re-evaluate after
@@ -224,7 +242,12 @@ public sealed class NemesisCommunication : ICommunication
                 return new NemesisDecision(rule.Action, rule.Delay, rule.ExceptionFactory ?? DefaultException);
         }
 
-        if (_rng is not null && _randomProfile is not null)
+        // The random profile targets USER-partition traffic only: faulting system-partition (0) consensus or
+        // null-partition control/gossip (ping, join, leave, gossip) cluster-wide destabilizes membership and
+        // leadership everywhere, which is neither the intent of a user-workload soak nor reproducible as a
+        // scripted scenario. A scenario that wants to perturb the system partition installs an explicit scripted
+        // rule (which is matched above, before this branch) instead.
+        if (_rng is not null && _randomProfile is not null && env.Partition is int p && p != 0) // 0 = system partition
         {
             FaultAction a = _randomProfile.Roll(_rng);
             return new NemesisDecision(a, _randomProfile.DelayDuration, _randomProfile.ExceptionFactory);
@@ -240,7 +263,7 @@ public sealed class NemesisCommunication : ICommunication
         List<TaskCompletionSource>? fire = null;
         lock (_lock)
         {
-            _allEvents.Add(evt);
+            RecordEventLocked(evt);
             for (int i = _eventWaiters.Count - 1; i >= 0; i--)
             {
                 if (_eventWaiters[i].Predicate(evt.Envelope))
@@ -461,7 +484,7 @@ public sealed class NemesisCommunication : ICommunication
                 int? partition = PartitionOfBatchItem(item);
                 NemesisEnvelope env = new(++_seq, source, dest, verb, partition, item.Type.ToString());
                 NemesisDecision decision = Decide(env);
-                _allEvents.Add(new NemesisEvent(NemesisEventKind.Decision, env, decision.Action.ToString()));
+                RecordEventLocked(new NemesisEvent(NemesisEventKind.Decision, env, decision.Action.ToString()));
 
                 switch (decision.Action)
                 {
@@ -470,12 +493,12 @@ public sealed class NemesisCommunication : ICommunication
                         break;
 
                     case FaultAction.Drop:
-                        _allEvents.Add(new NemesisEvent(NemesisEventKind.Drop, env));
+                        RecordEventLocked(new NemesisEvent(NemesisEventKind.Drop, env));
                         break;
 
                     case FaultAction.Fail:
                         // No per-item response exists in a batch; a failed item is simply not delivered.
-                        _allEvents.Add(new NemesisEvent(NemesisEventKind.Fail, env));
+                        RecordEventLocked(new NemesisEvent(NemesisEventKind.Fail, env));
                         break;
 
                     case FaultAction.Hold:
@@ -486,7 +509,7 @@ public sealed class NemesisCommunication : ICommunication
                             Deliver: () => _inner.BatchRequests(manager, node, new BatchRequestsRequest { Requests = [copy] }),
                             Cancel: static () => { });
                         _held.Add(held);
-                        _allEvents.Add(new NemesisEvent(NemesisEventKind.Hold, e));
+                        RecordEventLocked(new NemesisEvent(NemesisEventKind.Hold, e));
                         break;
                     }
 
@@ -500,7 +523,7 @@ public sealed class NemesisCommunication : ICommunication
                             await Task.Delay(d).ConfigureAwait(false);
                             await _inner.BatchRequests(manager, node, new BatchRequestsRequest { Requests = [copy] }).ConfigureAwait(false);
                         }));
-                        _allEvents.Add(new NemesisEvent(NemesisEventKind.Delay, e, d.ToString()));
+                        RecordEventLocked(new NemesisEvent(NemesisEventKind.Delay, e, d.ToString()));
                         break;
                     }
 
@@ -514,7 +537,7 @@ public sealed class NemesisCommunication : ICommunication
                             await _inner.BatchRequests(manager, node, new BatchRequestsRequest { Requests = [original] }).ConfigureAwait(false);
                             await _inner.BatchRequests(manager, node, new BatchRequestsRequest { Requests = [copy] }).ConfigureAwait(false);
                         }));
-                        _allEvents.Add(new NemesisEvent(NemesisEventKind.Duplicate, e));
+                        RecordEventLocked(new NemesisEvent(NemesisEventKind.Duplicate, e));
                         break;
                     }
                 }

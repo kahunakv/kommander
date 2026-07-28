@@ -351,11 +351,27 @@ public sealed class TestNemesisCommunication : IDisposable
             (Src, Dst, NemesisVerb.CompleteAppendLogs), (Dst, Src, NemesisVerb.Handshake),
         ];
 
-        List<FaultAction> da = envelopes.Select(e => a.ClassifyForTesting(e.Item1, e.Item2, e.Item3)).ToList();
-        List<FaultAction> db = envelopes.Select(e => b.ClassifyForTesting(e.Item1, e.Item2, e.Item3)).ToList();
+        // The random profile targets user-partition traffic only (system partition 0 and null-partition control/
+        // gossip are protected), so classify against a user partition here.
+        List<FaultAction> da = envelopes.Select(e => a.ClassifyForTesting(e.Item1, e.Item2, e.Item3, partition: 1)).ToList();
+        List<FaultAction> db = envelopes.Select(e => b.ClassifyForTesting(e.Item1, e.Item2, e.Item3, partition: 1)).ToList();
 
         Assert.Equal(da, db);
         Assert.Contains(da, x => x != FaultAction.Pass); // profile actually injected something
+    }
+
+    [Fact]
+    public void RandomProfile_TargetsUserPartitionsOnly_ProtectsSystemAndControl()
+    {
+        NemesisRandomProfile profile = new() { Drop = 1.0 }; // would drop everything it applies to
+        NemesisCommunication n = new(new RecordingComm(), seed: 1);
+        n.SetRandomProfile(profile);
+
+        // System partition (0) and null-partition control/gossip are protected from the random profile.
+        Assert.Equal(FaultAction.Pass, n.ClassifyForTesting(Src, Dst, NemesisVerb.AppendLogs, partition: 0));
+        Assert.Equal(FaultAction.Pass, n.ClassifyForTesting(Src, Dst, NemesisVerb.Ping, partition: null));
+        // A user partition is subject to the profile.
+        Assert.Equal(FaultAction.Drop, n.ClassifyForTesting(Src, Dst, NemesisVerb.AppendLogs, partition: 1));
     }
 
     // ── concurrency ────────────────────────────────────────────────────────────────
