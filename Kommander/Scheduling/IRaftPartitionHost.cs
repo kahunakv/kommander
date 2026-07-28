@@ -83,6 +83,19 @@ public interface IRaftPartitionHost
     void InvokeReplicationError(int partitionId, RaftLog log);
 
     /// <summary>
+    /// Whether commit-acknowledgement observations should be emitted. False in production (the default), so
+    /// the commit path builds and forwards no observation list; a test attaches a subscriber to enable it.
+    /// </summary>
+    bool CommitAckObservationEnabled => false;
+
+    /// <summary>
+    /// Reports the acknowledgements that carried a proposal to commit quorum (one per acknowledging node,
+    /// including the leader). Default no-op; only invoked when <see cref="CommitAckObservationEnabled"/> is
+    /// true. Used by the chaos harness to feed its live quorum-discipline invariant.
+    /// </summary>
+    void ObserveCommitAcks(IReadOnlyList<Data.RaftCommitAckObservation> acks) { }
+
+    /// <summary>
     /// Returns the registered <see cref="IRaftStateMachineTransfer"/> for snapshot-based catch-up,
     /// or <see langword="null"/> when none has been registered.  The state machine uses this to
     /// determine whether a compacted follower can be recovered via snapshot transfer.

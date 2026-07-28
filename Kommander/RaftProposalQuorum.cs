@@ -150,6 +150,20 @@ public sealed class RaftProposalQuorum
     }
 
     /// <summary>
+    /// Returns the endpoints (registered voters) that have acknowledged this proposal. Excludes the local
+    /// leader (which is not registered via <see cref="AddExpectedNodeCompletion"/>) and any learner (never
+    /// registered). Used only for out-of-band commit-acknowledgement observation.
+    /// </summary>
+    public List<string> CompletedEndpoints()
+    {
+        List<string> result = [];
+        foreach (KeyValuePair<string, bool> pair in nodes)
+            if (pair.Value)
+                result.Add(pair.Key);
+        return result;
+    }
+
+    /// <summary>
     /// Sets the state of the Raft proposal within the quorum. This method updates the state
     /// of the current proposal to reflect its progress or final outcome in the Raft consensus process.
     /// </summary>

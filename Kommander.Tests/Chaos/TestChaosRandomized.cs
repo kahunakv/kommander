@@ -18,11 +18,13 @@ namespace Kommander.Tests.Chaos;
 /// blockers are fixed: the non-contiguous-delivery bug (holes backfill; the consumer prefix converges) and the
 /// <c>CommitMonotonicity</c> gap-aware-dip false positive (the invariant now compares the commit frontier
 /// against the durable applied prefix, keyed per (node, partition)). It stays skipped because it is slow for a
-/// PR run and because it now surfaces a distinct, unresolved <b>backfill liveness gap</b>: under a continuous
-/// multi-partition fault pattern a follower can end with <c>maxWal</c> ahead of a commit frontier stuck below
-/// it (a WAL-level hole that does not backfill after heal), so convergence times out. The infrastructure is
-/// complete and validated: it prints a reproducing seed + failure report, and the nemesis event log is bounded
-/// so a soak no longer OOMs.</para>
+/// PR run and because it surfaces a distinct, unresolved <b>leader-side commit hole</b>: under continuous
+/// multi-partition faults the leader's per-proposal commit path advances its in-memory frontier
+/// non-contiguously (out-of-order quorum completion jumps past a still-<c>Proposed</c> entry), stranding that
+/// entry as Proposed below the frontier. Since backfill re-ships Committed entries only, the hole can never be
+/// filled and every follower buffers later entries over it, so convergence times out. See <c>BlockedReason</c>
+/// for the full mechanism and fix direction. The infrastructure is complete and validated: it prints a
+/// reproducing seed + failure report, and the nemesis event log is bounded so a soak no longer OOMs.</para>
 /// </summary>
 [Collection(ClusterIntegrationCollection.Name)]
 public sealed class TestChaosRandomized
@@ -31,15 +33,27 @@ public sealed class TestChaosRandomized
     // converges) and the CommitMonotonicity gap-aware-dip false positive (the invariant now compares the commit
     // frontier against the durable applied prefix, per (node, partition)). The tier stays skipped in the default
     // suite because (1) it is the nightly ChaosRandom / opt-in Stress tier — 5–7-node clusters over a fault
-    // window are slow for a PR run — and (2) it now surfaces a distinct, unresolved liveness issue: under a
-    // continuous multi-partition fault pattern a follower can end with maxWal ahead of a commit frontier stuck
-    // below it (a WAL-level hole that does not backfill after heal), so convergence times out. That backfill
-    // liveness gap is the next thing to fix before this tier can be a green nightly.
+    // window are slow for a PR run — and (2) it surfaces a distinct, unresolved LEADER-SIDE commit-hole defect.
+    //
+    // Root cause (diagnosed, fix deferred): Kommander commits per proposal-ticket — each write's entry commits
+    // when ITS own quorum arrives — and the leader's commit path (RaftWriteAhead.EnqueueCommit) advances the
+    // in-memory frontier with `commitIndex = log.Id + 1`, NON-contiguously. Under faults, proposals complete
+    // out of order: entry N+1's quorum can arrive before entry N's, so the leader jumps its frontier past the
+    // still-Proposed entry N WITHOUT writing N's Committed marker. Entry N is then stranded — Proposed in the
+    // WAL but below the in-memory frontier. GetRangeAsync ships Committed entries only, so the leader can never
+    // re-ship N; every follower buffers N+1.. over the permanent hole and never converges. (Kommander's
+    // unanchored live-propose — prevLogIndex=0 — means a follower can hold N+1 without N, so N+1's quorum does
+    // not prove N reached a majority; the leader cannot simply infer N is committed from N+1.) The fix is a
+    // commit-model change (gap-aware leader commit + re-drive of stalled proposals to real quorum) and deserves
+    // its own design pass rather than a soak patch.
     private const string BlockedReason =
-        "Nightly ChaosRandom/Stress tier: slow for the PR suite, and surfaces an unresolved backfill liveness " +
-        "gap under continuous multi-partition faults (follower commit frontier stuck below maxWal after heal → " +
-        "convergence timeout). The non-contiguous-delivery bug and the CommitMonotonicity dip artifact it was " +
-        "blocked on are both fixed.";
+        "Nightly ChaosRandom/Stress tier: slow for the PR suite, and surfaces an unresolved leader-side commit " +
+        "hole under continuous multi-partition faults. Out-of-order per-proposal commit (RaftWriteAhead." +
+        "EnqueueCommit advances commitIndex non-contiguously) strands an entry as Proposed below the leader's " +
+        "in-memory frontier; GetRangeAsync (Committed-only) can never re-ship it, so followers buffer later " +
+        "entries over the permanent hole and convergence times out. Needs a commit-model fix (gap-aware leader " +
+        "commit + stalled-proposal re-drive). The non-contiguous-delivery bug and the CommitMonotonicity dip " +
+        "artifact it was previously blocked on are both fixed.";
 
     private readonly ITestOutputHelper _out;
     public TestChaosRandomized(ITestOutputHelper output) => _out = output;

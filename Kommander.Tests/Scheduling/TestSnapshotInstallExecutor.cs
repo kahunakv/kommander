@@ -103,14 +103,16 @@ public class TestSnapshotInstallExecutor
     }
 
     [Fact]
-    public async Task IdempotentWhenDurableLogAlreadyReachesIndex()
+    public async Task IdempotentWhenInstalledBoundaryCoversIndexWithMatchingTerm()
     {
         (RaftPartitionStateMachine sm, FakeHost host, CapturingFacade wal, CapturingTransfer transfer) = Build();
         sm.SetLeaderForTesting(1);
-        wal.MaxLog = 100;   // durable log already reaches index 100
+        // An installed snapshot boundary already covers the index with a matching term.
+        wal.LastCheckpoint = 100;
+        wal.TermAtIndex = 5;
 
-        // A snapshot at/below the current durable max is an idempotent success — no import, no boundary,
-        // and no step-down (checked before term adoption so a caught-up node is never disrupted).
+        // Retrying the same (index, term) is an idempotent success — no import, no boundary, and no step-down
+        // (checked before term adoption so a caught-up node is never disrupted).
         RaftResponse resp = await sm.InstallSnapshotAsync(
             Install(snapshotIndex: 50, lastIncludedTerm: 5, leaderTerm: 6, leaderEndpoint: "L:1"));
 
@@ -119,6 +121,60 @@ public class TestSnapshotInstallExecutor
         Assert.Equal(0, wal.BoundaryCallCount);
         Assert.Equal(RaftNodeState.Leader, sm.NodeState);  // not stepped down
         Assert.Equal(1, sm.CurrentTerm);
+    }
+
+    [Fact]
+    public async Task OrdinarySuffixPastIndexWithoutBoundary_StillImports()
+    {
+        (RaftPartitionStateMachine sm, FakeHost host, CapturingFacade wal, CapturingTransfer transfer) = Build();
+        sm.SetLeaderForTesting(1);
+        // Ordinary proposed/committed entries reach the index, but NO snapshot boundary is installed: the
+        // application state still needs the import, so this must NOT short-circuit.
+        wal.MaxLog = 100;
+        wal.LastCheckpoint = -1;
+
+        RaftResponse resp = await sm.InstallSnapshotAsync(
+            Install(snapshotIndex: 50, lastIncludedTerm: 5, leaderTerm: 5, leaderEndpoint: "L:1"));
+
+        Assert.Equal(RaftOperationStatus.Success, resp.Status);
+        Assert.True(transfer.ImportCalled);
+        Assert.Equal(1, wal.BoundaryCallCount);
+    }
+
+    [Fact]
+    public async Task StaleHigherIndexRequestFromOldLeader_RejectedNotIdempotent()
+    {
+        (RaftPartitionStateMachine sm, FakeHost host, CapturingFacade wal, CapturingTransfer transfer) = Build();
+        sm.SetLeaderForTesting(5); // currentTerm = 5
+        // An unrelated high WAL max but no installed boundary: a stale old-leader request must be rejected by
+        // term validation, not acknowledged idempotently off the WAL max.
+        wal.MaxLog = 100;
+        wal.LastCheckpoint = -1;
+
+        RaftResponse resp = await sm.InstallSnapshotAsync(
+            Install(snapshotIndex: 80, lastIncludedTerm: 2, leaderTerm: 3, leaderEndpoint: "old:1"));
+
+        Assert.Equal(RaftOperationStatus.Errored, resp.Status);
+        Assert.False(transfer.ImportCalled);
+        Assert.Equal(0, wal.BoundaryCallCount);
+    }
+
+    [Fact]
+    public async Task ConflictingBoundaryTermAtIndex_FallsThroughToInstall()
+    {
+        (RaftPartitionStateMachine sm, FakeHost host, CapturingFacade wal, CapturingTransfer transfer) = Build();
+        sm.SetLeaderForTesting(1);
+        // A boundary exists at the index but with a conflicting term: not the same snapshot, so it must go
+        // through a fresh install rather than short-circuit.
+        wal.LastCheckpoint = 50;
+        wal.TermAtIndex = 3;
+
+        RaftResponse resp = await sm.InstallSnapshotAsync(
+            Install(snapshotIndex: 50, lastIncludedTerm: 9, leaderTerm: 9, leaderEndpoint: "L:1"));
+
+        Assert.Equal(RaftOperationStatus.Success, resp.Status);
+        Assert.True(transfer.ImportCalled);
+        Assert.Equal(1, wal.BoundaryCallCount);
     }
 
     [Fact]

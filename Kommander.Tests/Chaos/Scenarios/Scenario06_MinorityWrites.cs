@@ -5,7 +5,7 @@ using Kommander.Data;
 namespace Kommander.Tests.Chaos.Scenarios;
 
 /// <summary>
-/// Fixed scenario 6 — minority writes. The current leader is isolated (with one companion) into a two-node
+/// Minority writes. The current leader is isolated (with one companion) into a two-node
 /// minority; the three-node majority elects a new leader. Writes submitted through the deposed leader must
 /// <b>never</b> be reported committed — the safety-critical property that a minority cannot commit. After
 /// healing, writes through the majority leader converge across all five nodes, and no committed entry is ever
@@ -15,11 +15,11 @@ namespace Kommander.Tests.Chaos.Scenarios;
 [Trait("Category", "ChaosSmoke")]
 public class Scenario06_MinorityWrites
 {
-    // SKIPPED: the post-heal convergence assertion surfaces the same deferred non-contiguous-delivery bug as
-    // scenario 4 — a fully-isolated node that rejoins ends with a contiguous WAL but a consumer that skipped the
-    // backfilled prefix. The safety half of this scenario (minority writes never commit) is unaffected; it is
-    // the convergence half that trips the oracle. Un-skip once the delivery fix lands. See memory
-    // non-contiguous-delivery-bug.
+    // SKIPPED: the post-heal convergence assertion surfaces the same deferred non-contiguous-delivery bug the
+    // symmetric-cut scenario does — a fully-isolated node that rejoins ends with a contiguous WAL but a consumer
+    // that skipped the backfilled prefix. The safety half of this scenario (minority writes never commit) is
+    // unaffected; it is the convergence half that trips the oracle. Un-skip once the delivery fix lands. See
+    // memory non-contiguous-delivery-bug.
     [Fact]
     public async Task IsolatedMinority_WritesNeverCommit_MajorityConvergesAfterHeal()
     {

@@ -30,7 +30,7 @@ internal readonly record struct SnapshotSessionKey(string LeaderEndpoint, int Pa
 /// reclaimed on the next receipt or an explicit <see cref="SweepForTesting"/>, and is bounded in the
 /// meantime by the byte cap.</para>
 ///
-/// <para><b>Note (increment B).</b> This class no longer imports or writes the WAL. On the terminal
+/// <para><b>Buffering only.</b> This class does not import or writes the WAL. On the terminal
 /// chunk it hands the staged buffer plus session metadata to <c>installOnExecutor</c>, which routes the
 /// install through the partition's single-writer executor where term validation, application import, and
 /// the durable WAL boundary run serialized against every other partition operation.</para>
@@ -40,6 +40,13 @@ internal sealed class SnapshotReceiver
     private readonly Dictionary<SnapshotSessionKey, SnapshotReceiveSession> _sessions = new();
     private readonly object _pendingSnapshotsLock = new();
     private long _totalPendingBytes;
+
+    // Bytes/count of terminal buffers that have been detached from _sessions but are still live while their
+    // install runs on the (single) partition executor. They MUST stay in the capacity accounting until the
+    // install completes and the buffer is disposed — otherwise a sender whose installs block behind the
+    // executor can retain unbounded full snapshot payloads despite the pending-session/byte caps.
+    private long _inInstallBytes;
+    private int _inInstallCount;
 
     private readonly Func<bool> isDisposed;
     private readonly Func<SnapshotInstallRequest, Task<SnapshotResponse>> installOnExecutor;
@@ -183,10 +190,15 @@ internal sealed class SnapshotReceiver
             if (!request.IsLast)
                 return new SnapshotResponse(true);
 
-            // Terminal chunk: detach the completed session before the (awaited) install so it is neither
-            // counted against the caps nor eligible for eviction while the install runs on the executor.
+            // Terminal chunk: detach the completed session from _sessions (so it is not eligible for idle
+            // eviction and a late/duplicate chunk cannot re-match it) but keep its bytes in the capacity
+            // accounting — MOVE them from the pending pool to the in-install pool rather than dropping them —
+            // so the buffer that stays live while its install runs on the executor still counts against the
+            // caps. Its bytes/count are released only when the install completes and the buffer is disposed.
             _sessions.Remove(key);
             _totalPendingBytes -= session.AccumulatedBytes;
+            _inInstallBytes += session.AccumulatedBytes;
+            _inInstallCount++;
             completedSession = session;
             completeBuffer = session.Buffer;
             completeBuffer.Position = 0;
@@ -218,8 +230,14 @@ internal sealed class SnapshotReceiver
         }
         finally
         {
-            // The executor read the stream to completion before installOnExecutor returned, so the buffer
-            // is safe to release here (see RaftPartition.InstallSnapshotAsync — it uses no-cancellation Ask).
+            // Release the in-install reservation, then dispose the buffer. The executor read the stream to
+            // completion before installOnExecutor returned, so the buffer is safe to release here (see
+            // RaftPartition.InstallSnapshotAsync — it uses no-cancellation Ask).
+            lock (_pendingSnapshotsLock)
+            {
+                _inInstallBytes -= completedSession.AccumulatedBytes;
+                _inInstallCount--;
+            }
             await completeBuffer.DisposeAsync().ConfigureAwait(false);
         }
     }
@@ -253,7 +271,9 @@ internal sealed class SnapshotReceiver
     /// <summary>Evicts oldest sessions until a new one can be added within the count cap. Must hold the lock.</summary>
     private void EvictForSessionCapacityLocked()
     {
-        while (_sessions.Count >= maxPendingSessions)
+        // In-install sessions still occupy a live buffer, so they count toward the session cap even though
+        // they are no longer in _sessions (and cannot be evicted).
+        while (_sessions.Count + _inInstallCount >= maxPendingSessions)
         {
             SnapshotReceiveSession? victim = OldestEvictableLocked(default, hasExclude: false);
             if (victim is null)
@@ -272,7 +292,10 @@ internal sealed class SnapshotReceiver
         if (incoming <= 0)
             return true;
 
-        while (_totalPendingBytes + incoming > maxPendingBytes)
+        // Total live staged bytes = pending sessions + in-install buffers. In-install buffers cannot be
+        // evicted (their install is running), so only pending sessions are eviction candidates; if the
+        // in-install pool alone leaves no room, the incoming chunk is rejected (bounded memory).
+        while (_totalPendingBytes + _inInstallBytes + incoming > maxPendingBytes)
         {
             SnapshotReceiveSession? victim = OldestEvictableLocked(currentKey, hasExclude: true);
             if (victim is null)
@@ -280,7 +303,7 @@ internal sealed class SnapshotReceiver
             RemoveSessionLocked(victim.Key, victim);
         }
 
-        return _totalPendingBytes + incoming <= maxPendingBytes;
+        return _totalPendingBytes + _inInstallBytes + incoming <= maxPendingBytes;
     }
 
     /// <summary>
@@ -335,6 +358,15 @@ internal sealed class SnapshotReceiver
     internal long PendingByteCount
     {
         get { lock (_pendingSnapshotsLock) return _totalPendingBytes; }
+    }
+
+    /// <summary>
+    /// Total live staged bytes — active sessions plus completed buffers still installing. This is what the
+    /// byte cap actually bounds. For test assertions only.
+    /// </summary>
+    internal long TotalStagedByteCount
+    {
+        get { lock (_pendingSnapshotsLock) return _totalPendingBytes + _inInstallBytes; }
     }
 
     /// <summary>

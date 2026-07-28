@@ -3003,6 +3003,23 @@ public sealed class RaftPartitionStateMachine
 
         proposal.SetState(RaftProposalState.Completed);
 
+        // Observability (off in production): report the acknowledgements that carried this proposal to commit
+        // quorum — the local leader (a voter, implicitly durable) plus every registered voter that acked.
+        // Learner acks never appear here (learners are not registered in the quorum). A live quorum-discipline
+        // checker uses these to verify each commit had a voter majority and no learner was counted.
+        if (host.CommitAckObservationEnabled)
+        {
+            long committedId = proposal.LastLogIndex;
+            int votersTotal = host.Nodes.Count(n => host.IsVoter(n.Endpoint)) + 1; // +1 for the local leader
+            List<RaftCommitAckObservation> acks =
+            [
+                new(host.PartitionId, committedId, currentTerm, host.LocalEndpoint, host.IsVoter(host.LocalEndpoint), votersTotal),
+            ];
+            foreach (string acker in proposal.CompletedEndpoints())
+                acks.Add(new RaftCommitAckObservation(host.PartitionId, committedId, currentTerm, acker, host.IsVoter(acker), votersTotal));
+            host.ObserveCommitAcks(acks);
+        }
+
         if (!proposal.AutoCommit)
         {
             logger.LogInfoProposalNoAutoCommit(host.LocalEndpoint, host.PartitionId, nodeState, timestamp);
@@ -3522,18 +3539,34 @@ public sealed class RaftPartitionStateMachine
         long leaderTerm = request.LeaderTerm;
         long snapshotIndex = request.SnapshotIndex;
 
-        // Idempotency (Rule 7.4, coarse form): if our durable log already reaches this index, the snapshot
-        // is already applied. Return success early — before any term adoption/step-down — so a redundant
-        // re-install never disrupts a caught-up node. This is strictly safe: we never regress and never
-        // apply an older snapshot, and the regular AppendEntries path still handles term adoption. A term
-        // conflict at an already-covered index is pathological; keeping our more-advanced state is correct.
-        long currentMax = await wal.GetMaxLogAsync().ConfigureAwait(false);
-        if (currentMax >= snapshotIndex)
+        // Idempotency (Rule 7.4): short-circuit ONLY when an installed snapshot BOUNDARY already covers this
+        // index with a compatible identity — never merely because ordinary log entries reach the index. A
+        // lagging follower can hold proposed/committed suffix entries through snapshotIndex while its
+        // application state still needs the import; keying idempotency on the raw WAL max would acknowledge
+        // installation without importing, and would let a stale or conflicting sender succeed off an unrelated
+        // high id (bypassing the term/leader validation below). The installed checkpoint boundary is the
+        // authoritative "already applied" signal. Return success early — before any term adoption/step-down —
+        // so a redundant re-install never disrupts a caught-up node.
+        long installedBoundary = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
+        if (installedBoundary >= snapshotIndex)
         {
-            if (snapshotIndex > lastAppliedIndex)
-                lastAppliedIndex = snapshotIndex;
-            wal.SeedCommitFrontierFromSnapshot(snapshotIndex);
-            return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Success, snapshotIndex);
+            // Confirm identity compatibility before treating this as a no-op. A newer installed boundary
+            // (installedBoundary > snapshotIndex) supersedes the request. Otherwise the stored boundary term
+            // at the index must match LastIncludedTerm; a -1 (compacted/unknown) term on either side is
+            // treated as compatible (mirrors the log-matching boundary rule). A genuine term conflict is not
+            // the same snapshot and falls through to full validation + a fresh install.
+            long boundaryTermAtIndex = await wal.GetAnyTermAtAsync(snapshotIndex).ConfigureAwait(false);
+            bool compatible = installedBoundary > snapshotIndex
+                || boundaryTermAtIndex < 0
+                || request.LastIncludedTerm < 0
+                || boundaryTermAtIndex == request.LastIncludedTerm;
+            if (compatible)
+            {
+                if (snapshotIndex > lastAppliedIndex)
+                    lastAppliedIndex = snapshotIndex;
+                wal.SeedCommitFrontierFromSnapshot(snapshotIndex);
+                return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Success, snapshotIndex);
+            }
         }
 
         bool legacy = leaderTerm <= 0 || string.IsNullOrEmpty(leaderEndpoint);

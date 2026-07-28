@@ -69,6 +69,10 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
 
     public void InvokeReplicationError(int partitionId, RaftLog log) => manager.InvokeReplicationError(partitionId, log);
 
+    public bool CommitAckObservationEnabled => manager.CommitAckObservationEnabled;
+
+    public void ObserveCommitAcks(IReadOnlyList<Data.RaftCommitAckObservation> acks) => manager.ObserveCommitAcks(acks);
+
     public IRaftStateMachineTransfer? StateMachineTransfer => manager.StateMachineTransfer;
 
     public IRaftSystemStateTransfer? SystemStateTransfer => manager.SystemStateTransfer;

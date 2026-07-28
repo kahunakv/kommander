@@ -4,7 +4,7 @@ using Kommander;
 namespace Kommander.Tests.Chaos.Scenarios;
 
 /// <summary>
-/// Fixed scenario 4 — five-node symmetric cut. With the leader deliberately placed in the majority side, a
+/// Five-node symmetric cut. With the leader deliberately placed in the majority side, a
 /// symmetric partition isolates a two-node minority from the three-node majority. Uniquely-identified writes
 /// are submitted continuously through the leader (which retains quorum) while the continuous invariant checker
 /// runs; safety must hold throughout the cut. After healing, all five nodes must converge to the final index.

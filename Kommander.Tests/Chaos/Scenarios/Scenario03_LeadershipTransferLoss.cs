@@ -5,7 +5,7 @@ using Kommander.Data;
 namespace Kommander.Tests.Chaos.Scenarios;
 
 /// <summary>
-/// Fixed scenario 3 — leadership-transfer notification loss. The leader initiates a graceful transfer to a
+/// Leadership-transfer notification loss. The leader initiates a graceful transfer to a
 /// specific follower, but the logical <c>TransferLeadership</c> batch item on that directed link is dropped.
 /// The cluster must recover through a bounded re-election to exactly one stable leader, and writes must resume
 /// and converge. This verifies the transfer path degrades safely when its notification is lost rather than

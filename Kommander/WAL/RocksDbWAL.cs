@@ -78,7 +78,25 @@ public class RocksDbWAL : IWAL, IDisposable
     private readonly string revision;
     
     private readonly ConcurrentDictionary<int, Lazy<ColumnFamilyHandle>> families = new();
-    
+
+    /// <summary>
+    /// Serializes the compound read-modify-write operations (append <c>Write</c>, <c>TruncateLogsAfter</c>,
+    /// <c>InstallSnapshotBoundary</c>) against each other. RocksDB is internally thread-safe per operation, but
+    /// the truncate/boundary ops enumerate suffix keys and then delete them in a later batch — an append
+    /// landing between the scan and the batch would survive the truncation. Those ops run on the read
+    /// scheduler while appends run on the WAL write scheduler, so they are NOT otherwise mutually excluded.
+    /// This guard makes each scan+write atomic relative to appends; it adds only an uncontended lock on the
+    /// append fast path (RocksDB already serializes the underlying writes internally).
+    /// </summary>
+    private readonly object writeGuard = new();
+
+    /// <summary>
+    /// Test-only hook fired inside <see cref="InstallSnapshotBoundary"/> after the suffix scan and while
+    /// <see cref="writeGuard"/> is held, immediately before the batch write. Lets a concurrency test prove a
+    /// racing append is excluded by the guard. Null (no-op) in production.
+    /// </summary>
+    internal Action? OnAfterBoundaryScanForTesting;
+
     private readonly ILogger<IRaft> logger;
 
     private readonly WriteOptions writeOptions;
@@ -332,6 +350,8 @@ public class RocksDbWAL : IWAL, IDisposable
 
         try
         {
+            lock (writeGuard)
+            {
             if (logs is [{ Item2.Count: 1 } _]) // fast path
             {
                 RaftLog log = logs[0].Item2[0];
@@ -444,7 +464,8 @@ public class RocksDbWAL : IWAL, IDisposable
             db.Write(writeBatch, effectiveOptions);
 
             return RaftOperationStatus.Success;
-        } 
+            }
+        }
         catch (Exception ex)
         {
             logger.LogError("Error during write: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
@@ -1021,6 +1042,8 @@ public class RocksDbWAL : IWAL, IDisposable
     {
         try
         {
+            lock (writeGuard)
+            {
             ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
             List<byte[]> keysToDelete = [];
@@ -1047,6 +1070,7 @@ public class RocksDbWAL : IWAL, IDisposable
             }
 
             return RaftOperationStatus.Success;
+            }
         }
         catch (Exception ex)
         {
@@ -1057,12 +1081,10 @@ public class RocksDbWAL : IWAL, IDisposable
 
     /// <inheritdoc/>
     /// <remarks>
-    /// RocksDB exposes no app-level per-partition write guard (it is internally thread-safe per
-    /// operation), so unlike the in-memory and SQLite backends the delete and max-read here are two
-    /// distinct operations rather than one locked section. This is acceptable: holes are effectively
-    /// absent on the fsync-paced persistent path (the storm this repair targets is in-memory only), so
-    /// this method almost never fires on RocksDB, and the single-writer-per-partition WAL-scheduler
-    /// invariant serializes appends for a given partition regardless.
+    /// The delete and the max-read are two distinct operations. The delete (<see cref="TruncateLogsAfter"/>)
+    /// is held under <see cref="writeGuard"/> so it does not interleave with a concurrent append; the max-read
+    /// that follows is a consistent point read. Holes are effectively absent on the fsync-paced persistent
+    /// path (the storm this repair targets is in-memory only), so this method almost never fires on RocksDB.
     /// </remarks>
     public (RaftOperationStatus Status, long MaxLogId) TruncateLogsAfterAndGetMax(int partitionId, long afterLogId)
     {
@@ -1078,8 +1100,11 @@ public class RocksDbWAL : IWAL, IDisposable
     /// The suffix deletes and the checkpoint put are staged into a single <see cref="WriteBatch"/> and
     /// applied with one <c>db.Write</c>, so the boundary install is atomic (RocksDB applies a batch
     /// all-or-nothing). Durability follows <paramref name="sync"/>: <c>sync:true</c> uses the instance's
-    /// sync write options, else the non-sync options. The per-partition WAL-scheduler single-writer
-    /// invariant serializes this against appends for the same partition.
+    /// sync write options, else the non-sync options. This op dispatches on the read scheduler, NOT the WAL
+    /// write scheduler, so the single-writer invariant does not exclude concurrent appends; the read of the
+    /// boundary term + the suffix enumeration + the batch write are therefore held under <see cref="writeGuard"/>
+    /// (shared with <c>Write</c> and <c>TruncateLogsAfter</c>) so an append cannot land between the scan and
+    /// the delete batch and survive the truncation.
     /// </remarks>
     public (RaftOperationStatus Status, bool SuffixTruncated) InstallSnapshotBoundary(
         int partitionId, long snapshotIndex, long lastIncludedTerm, bool sync)
@@ -1088,6 +1113,8 @@ public class RocksDbWAL : IWAL, IDisposable
 
         try
         {
+            lock (writeGuard)
+            {
             ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
             byte[] boundaryKey = new byte[LogKeyWidth];
@@ -1130,9 +1157,12 @@ public class RocksDbWAL : IWAL, IDisposable
             };
             PutToBatch(writeBatch, checkpoint, columnFamilyHandle);
 
+            OnAfterBoundaryScanForTesting?.Invoke();
+
             db.Write(writeBatch, effectiveOptions);
 
             return (RaftOperationStatus.Success, suffixTruncated);
+            }
         }
         catch (Exception ex)
         {

@@ -42,6 +42,7 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
     private readonly List<RaftManager> _nodes = [];
     private readonly Dictionary<(string Endpoint, int Partition), HashChainStateMachine> _chains = new();
     private readonly List<CommitObservation> _recordedCommits = [];
+    private readonly Dictionary<(int Partition, long Index, string Acker), CommitAck> _recordedCommitAcks = new();
     private readonly object _recordLock = new();
     private long _sampleSeq;
     private int _writerSeq;
@@ -110,6 +111,11 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
             node.OnReplicationReceived += chain.OnReplicationReceived;
         }
 
+        // Subscribe to each node's commit-quorum acknowledgements so the live quorum-discipline invariant sees
+        // real facts (who acked each commit, their voter role, the voter count) rather than an empty set.
+        foreach (RaftManager node in _nodes)
+            node.OnCommitAcksObserved += RecordCommitAcks;
+
         Checker = new ClusterInvariantChecker(SampleAsync, ClusterInvariants.All, _options.InvariantPollInterval);
         Nemesis.OnEvent = Checker.Notify;
         Checker.Start();
@@ -130,7 +136,7 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
             StartElectionTimeout = 100,
             EndElectionTimeout = 300,
             // Deterministic per-node election timeouts: repeated runs of a scenario make the same election
-            // decisions, so a failure reproduces exactly (the F gate). Derived per (partition, node) internally.
+            // decisions, so a failure reproduces exactly. Derived per (partition, node) internally.
             ElectionTimeoutSeed = _seed,
             EnableQuiescence = false,
             BackfillThreshold = 0,
@@ -241,6 +247,7 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
         List<CommitObservation> observed = DeriveObservedCommits(chains);
 
         // Record newly-observed commits cumulatively so history persists even if a node later diverges.
+        List<CommitAck> acks;
         lock (_recordLock)
         {
             HashSet<(int, long)> known = _recordedCommits.Select(c => (c.Partition, c.Index)).ToHashSet();
@@ -248,9 +255,21 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
                 if (known.Add((c.Partition, c.Index)))
                     _recordedCommits.Add(c);
             observed = [.. _recordedCommits];
+            acks = [.. _recordedCommitAcks.Values];
         }
 
-        return new ClusterView(seq, views, chains, observed, [], new Dictionary<string, long>());
+        return new ClusterView(seq, views, chains, observed, acks, new Dictionary<string, long>());
+    }
+
+    /// <summary>Records the acknowledgements that carried a commit to quorum (deduplicated per (partition, index, acker)).</summary>
+    private void RecordCommitAcks(IReadOnlyList<Kommander.Data.RaftCommitAckObservation> observations)
+    {
+        lock (_recordLock)
+        {
+            foreach (Kommander.Data.RaftCommitAckObservation o in observations)
+                _recordedCommitAcks[(o.Partition, o.Index, o.Acker)] =
+                    new CommitAck(o.Partition, o.Index, o.Acker, o.AckerIsVoter, o.VotersTotal);
+        }
     }
 
     /// <summary>An index is "observed committed" when a majority of nodes agree on its applied digest.</summary>
@@ -287,7 +306,7 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
         StringBuilder sb = new();
         sb.AppendLine($"=== Chaos failure report ===");
         sb.AppendLine($"scenario={_options.Scenario} seed={_seed} violated={violated}");
-        sb.AppendLine($"nemesis events={Nemesis.TotalEventCount} held={Nemesis.HeldCount}");
+        sb.AppendLine($"nemesis events={Nemesis.TotalEventCount} held={Nemesis.HeldCount} delayed={Nemesis.DelayedDeliveryCount}");
         sb.AppendLine("-- last 20 nemesis events --");
         foreach (NemesisEvent e in Nemesis.RecentEvents())
             sb.AppendLine("  " + e);
@@ -332,9 +351,11 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
         if (Checker is not null)
             await Checker.DisposeAsync().ConfigureAwait(false);
 
-        // 2. Heal / release nemesis state.
+        // 2. Heal / release nemesis state, and drain any in-flight delayed deliveries so none can land after
+        //    disposal (ClearRules signals cancellation; await the drain here so nothing leaks or delivers late).
         Nemesis?.ClearRules();
         Nemesis?.DropAllHeld();
+        int delayedCanceled = Nemesis is not null ? await Nemesis.CancelDelayedDeliveriesAsync().ConfigureAwait(false) : 0;
 
         // 3. Dispose nodes.
         foreach (RaftManager node in _nodes)
@@ -342,8 +363,10 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
             try { node.Dispose(); } catch { /* best effort */ }
         }
 
-        // 4. Report leaked held messages.
-        if (Nemesis is not null && Nemesis.HeldCount > 0)
-            throw new InvalidOperationException($"Chaos harness leaked {Nemesis.HeldCount} held messages on dispose.");
+        // 4. Report leaked background work.
+        if (Nemesis is not null && (Nemesis.HeldCount > 0 || Nemesis.DelayedDeliveryCount > 0))
+            throw new InvalidOperationException(
+                $"Chaos harness leaked {Nemesis.HeldCount} held + {Nemesis.DelayedDeliveryCount} delayed messages on dispose " +
+                $"(canceled {delayedCanceled} delayed during teardown).");
     }
 }

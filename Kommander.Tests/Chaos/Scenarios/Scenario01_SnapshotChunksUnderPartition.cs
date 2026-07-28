@@ -12,7 +12,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Kommander.Tests.Chaos.Scenarios;
 
 /// <summary>
-/// Fixed scenario 1 — snapshot chunks under partition. A learner joins below the compaction floor, so the
+/// Snapshot chunks under partition. A learner joins below the compaction floor, so the
 /// leader ships an install-snapshot. The nemesis drops the first snapshot chunk on the leader→learner link;
 /// because the sender re-ships on the next heartbeat, the receiver must recover: exactly one import runs, the
 /// learner is promoted to Voter, and no snapshot session or held message is leaked (bounded receiver
@@ -22,6 +22,9 @@ namespace Kommander.Tests.Chaos.Scenarios;
 [Trait("Category", "ChaosSmoke")]
 public sealed class Scenario01_SnapshotChunksUnderPartition
 {
+    private readonly ITestOutputHelper _out;
+    public Scenario01_SnapshotChunksUnderPartition(ITestOutputHelper output) => _out = output;
+
     [Fact]
     public async Task DroppedFirstChunk_ResendsAndConverges_WithBoundedResources()
     {
@@ -45,6 +48,7 @@ public sealed class Scenario01_SnapshotChunksUnderPartition
             ["localhost:8642"] = n3, ["localhost:8643"] = n4,
         });
 
+        ChaosSafetyMonitor? monitor = null;
         try
         {
             await Task.WhenAll(n1.JoinCluster(ct), n2.JoinCluster(ct), n3.JoinCluster(ct));
@@ -52,6 +56,12 @@ public sealed class Scenario01_SnapshotChunksUnderPartition
 
             RaftManager leader = await FindLeaderAsync([n1, n2, n3], ct);
             int partition = leader.Partitions.Keys.First(k => k != 0);
+
+            // Attach the safety oracles (hash-chain observers + continuous invariant checker) over all four
+            // nodes for this partition, BEFORE the first write, so every applied entry is recorded and safety
+            // is evaluated continuously across the dropped-chunk fault window. The learner (n4) has not joined
+            // the partition yet; its chain simply stays empty until it applies its post-snapshot tail.
+            monitor = new ChaosSafetyMonitor([n1, n2, n3, n4], [partition], nemesis, seed: 1001, scenario: "snapshot-chunks-under-partition");
 
             for (int i = 0; i < 5; i++)
                 await leader.ReplicateLogs(partition, "chaos", [1, 2, 3], cancellationToken: ct);
@@ -78,9 +88,21 @@ public sealed class Scenario01_SnapshotChunksUnderPartition
             Assert.Contains(nemesis.AllEvents(),
                 e => e.Kind == NemesisEventKind.Drop && e.Envelope.Verb == NemesisVerb.InstallSnapshot);
             Assert.Equal(0, nemesis.HeldCount);
+
+            // No safety invariant (two leaders, commit regression, conflicting applied prefixes, quorum
+            // discipline) was violated at any point during the fault window.
+            monitor.ThrowIfViolated();
+        }
+        catch (Exception ex)
+        {
+            if (monitor is not null)
+                _out.WriteLine(await monitor.BuildFailureReportAsync($"scenario-failure: {ex.Message}", ct));
+            throw;
         }
         finally
         {
+            if (monitor is not null)
+                await monitor.DisposeAsync();
             foreach (RaftManager n in new[] { n1, n2, n3, n4 })
                 n.Dispose();
         }

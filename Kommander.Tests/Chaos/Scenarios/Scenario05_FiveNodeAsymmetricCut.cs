@@ -4,7 +4,7 @@ using Kommander;
 namespace Kommander.Tests.Chaos.Scenarios;
 
 /// <summary>
-/// Fixed scenario 5 — five-node asymmetric cut. One-way drop rules are installed explicitly: the two minority
+/// Five-node asymmetric cut. One-way drop rules are installed explicitly: the two minority
 /// nodes can still <i>receive</i> from the majority but cannot <i>send</i> to it (their outbound links are
 /// dropped). With the leader in the majority, the three-node majority keeps quorum; the asymmetry stresses the
 /// completion/ack path rather than a clean bidirectional partition. Safety must hold throughout and, after the

@@ -7,7 +7,7 @@ using Kommander.Data;
 namespace Kommander.Tests.Scheduling;
 
 /// <summary>
-/// Wire-contract tests for the snapshot session-metadata fields added in increment A
+/// Wire-contract tests for the snapshot session-metadata fields
 /// (<c>LeaderTerm</c>, <c>LeaderEndpoint</c>, <c>LastIncludedTerm</c>). Verifies that both
 /// serialized transport representations — the gRPC protobuf message (field numbers 9/10/11) and the
 /// REST JSON body (source-generated <see cref="RestJsonContext"/>) — carry the fields through a

@@ -4,7 +4,7 @@ using Kommander;
 namespace Kommander.Tests.Chaos.Scenarios;
 
 /// <summary>
-/// Fixed scenario 7 — duplicate and reordered append/completion. Every <c>AppendLogs</c> from the leader is
+/// Duplicate and reordered append/completion. Every <c>AppendLogs</c> from the leader is
 /// delivered twice and every <c>CompleteAppendLogs</c> is delayed, so followers observe duplicated appends and
 /// reordered/stale commit acknowledgements. This exercises append idempotency and the exactly-once apply gate
 /// (the regression guard for the follower duplicate-apply bug surfaced by the hash-chain oracle): the state

@@ -178,6 +178,71 @@ public sealed class TestNemesisCommunication : IDisposable
             Assert.Contains(events, e => e.Kind == NemesisEventKind.Decision && e.Envelope.Verb == v);
     }
 
+    [Fact]
+    public async Task WhollyDroppedBatch_StillNotifiesInvariantChecker()
+    {
+        RecordingComm inner = new();
+        NemesisCommunication nem = new(inner);
+        nem.Drop(Src, Dst); // every item dropped → no delivery events, but the checker must still be woken
+
+        int notifications = 0;
+        nem.OnEvent = () => Interlocked.Increment(ref notifications);
+
+        await nem.BatchRequests(_manager, _node, new BatchRequestsRequest
+        {
+            Requests = [new() { Type = BatchRequestsRequestType.AppendLogs, AppendLogs = new AppendLogsRequest(1, 1, default, Src) }],
+        });
+
+        Assert.True(notifications > 0, "a wholly-dropped batch must notify the invariant checker of the transport state change");
+    }
+
+    [Fact]
+    public async Task BatchItem_SatisfiesEventBarrier_AndDeliveryPreservesDecisionSequence()
+    {
+        RecordingComm inner = new();
+        NemesisCommunication nem = new(inner);
+
+        // Register a barrier on the AppendLogs batch item BEFORE the batch is sent.
+        Task barrier = nem.WaitForEventAsync(e => e.Verb == NemesisVerb.AppendLogs);
+
+        await nem.BatchRequests(_manager, _node, new BatchRequestsRequest
+        {
+            Requests = [new() { Type = BatchRequestsRequestType.AppendLogs, AppendLogs = new AppendLogsRequest(1, 1, default, Src) }],
+        });
+
+        await barrier.WaitAsync(TimeSpan.FromSeconds(2)); // must complete — barriers see batch-item events
+
+        IReadOnlyList<NemesisEvent> events = nem.AllEvents();
+        NemesisEvent decision = events.First(e => e.Kind == NemesisEventKind.Decision && e.Envelope.Verb == NemesisVerb.AppendLogs);
+        NemesisEvent delivery = events.First(e => e.Kind == NemesisEventKind.Delivery && e.Envelope.Verb == NemesisVerb.AppendLogs);
+        Assert.NotEqual(0, delivery.Envelope.Sequence);                       // not the old hardcoded 0
+        Assert.Equal(decision.Envelope.Sequence, delivery.Envelope.Sequence); // decision↔delivery correlate
+    }
+
+    [Fact]
+    public async Task DelayedBatchDelivery_IsOwned_CanceledOnHeal_AndNeverDeliversAfter()
+    {
+        RecordingComm inner = new();
+        NemesisCommunication nem = new(inner);
+        // A long delay so the delivery is still pending when we heal.
+        nem.Delay(Src, Dst, TimeSpan.FromSeconds(30), verb: NemesisVerb.AppendLogs);
+
+        await nem.BatchRequests(_manager, _node, new BatchRequestsRequest
+        {
+            Requests = [new() { Type = BatchRequestsRequestType.AppendLogs, AppendLogs = new AppendLogsRequest(1, 1, default, Src) }],
+        });
+
+        Assert.Equal(1, nem.DelayedDeliveryCount);   // tracked, not fire-and-forget
+        Assert.Empty(inner.Calls);                    // not delivered yet (still delayed)
+
+        // Heal + drain: the delayed delivery is canceled and never reaches the inner transport.
+        int canceled = await nem.CancelDelayedDeliveriesAsync();
+
+        Assert.Equal(1, canceled);
+        Assert.Equal(0, nem.DelayedDeliveryCount);
+        Assert.Empty(inner.Calls);                    // canceled before delivery — nothing lands after heal
+    }
+
     // ── drop / neutral response shapes ───────────────────────────────────────────
 
     [Fact]

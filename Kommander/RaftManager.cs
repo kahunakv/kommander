@@ -349,6 +349,19 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         remove => eventNotifier.OnLeaderChanged -= value;
     }
 
+    /// <summary>
+    /// Fires when a proposal reaches commit quorum, reporting the acknowledgements (the local leader plus every
+    /// acking voter) that carried it. Off in production; a test subscribes to enable observation and feed a
+    /// live quorum-discipline check. Invoked on the partition executor thread.
+    /// </summary>
+    public event Action<IReadOnlyList<RaftCommitAckObservation>>? OnCommitAcksObserved;
+
+    /// <summary>True while a <see cref="OnCommitAcksObserved"/> subscriber is attached (gates the commit-path emission).</summary>
+    public bool CommitAckObservationEnabled => OnCommitAcksObserved is not null;
+
+    /// <summary>Forwards a commit-acknowledgement observation to any subscriber. No-op when none is attached.</summary>
+    public void ObserveCommitAcks(IReadOnlyList<RaftCommitAckObservation> acks) => OnCommitAcksObserved?.Invoke(acks);
+
     /// <inheritdoc/>
     public event Action<IReadOnlyList<RaftPartitionRange>>? OnPartitionMapChanged
     {

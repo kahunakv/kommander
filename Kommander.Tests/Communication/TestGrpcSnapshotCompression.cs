@@ -46,7 +46,7 @@ public sealed class TestGrpcSnapshotCompression
     }
 
     // Note: the over-the-wire SendInstallSnapshot_WithCompressionEnabled_SucceedsOverWire test was
-    // retired in increment B. Post-B a successful install requires a live partition executor on the
+    // retired. A successful install now requires a live partition executor on the
     // follower (the receiver no longer imports on a bare, un-joined manager), and driving that onto a
     // real consensus partition purely to assert the gzip request header is decoded is both flaky and
     // redundant: the request-encoding header construction is covered by the two unit tests above, and

@@ -10,7 +10,7 @@ namespace Kommander.Tests.Scheduling;
 /// These construct the receiver in isolation with a controllable monotonic clock, small TTL/count/byte
 /// limits, and a fake install callback (standing in for the partition executor's install path) so
 /// expiry, eviction, and the chunk protocol are deterministic. The receiver itself no longer imports or
-/// touches the WAL (increment B moved that to the executor); on the terminal chunk it hands the staged
+/// touches the WAL (the executor owns the install); on the terminal chunk it hands the staged
 /// buffer + metadata to the callback.
 /// </summary>
 public class TestSnapshotReceiveSession
@@ -357,5 +357,59 @@ public class TestSnapshotReceiveSession
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("dup", 0, false, [1], leader: "a"), ct)).Success);
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("dup", 0, false, [2], leader: "b"), ct)).Success);
         Assert.Equal(2, r.PendingSessionCount);
+    }
+
+    // ── bounded buffering across a blocked install ───────────────────────────────
+
+    [Fact]
+    public async Task CompletedBufferStillCountsAgainstCap_WhileItsInstallBlocks()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        // The first install blocks (as it would behind a busy single partition executor); later installs pass.
+        TaskCompletionSource firstInstallGate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        int installCount = 0;
+        async Task<SnapshotResponse> Installer(SnapshotInstallRequest _)
+        {
+            if (Interlocked.Increment(ref installCount) == 1)
+                await firstInstallGate.Task;
+            return new SnapshotResponse(true);
+        }
+
+        // Cap of 10 bytes; each session carries 6.
+        SnapshotReceiver r = NewReceiver(Installer, () => 1000, maxSessions: 8, maxBytes: 10);
+
+        // Session A: a single terminal chunk of 6 bytes. Its install blocks, so the completed 6-byte buffer
+        // stays live — and must remain in the accounting even though it is no longer a pending session.
+        Task<SnapshotResponse> aTask = r.ReceiveInstallSnapshot(
+            Chunk("sA", 0, isLast: true, [1, 2, 3, 4, 5, 6], leader: "A:1"), ct);
+
+        await WaitUntil(() => r.TotalStagedByteCount == 6, ct);
+        Assert.Equal(0, r.PendingByteCount);      // detached from the pending pool…
+        Assert.Equal(6, r.TotalStagedByteCount);  // …but still counted as live staged bytes.
+
+        // Session B (6 bytes) would push live staged bytes to 12 > cap(10). Because the in-install buffer
+        // still counts, B is rejected — the completed buffer did not silently escape the limit.
+        SnapshotResponse b = await r.ReceiveInstallSnapshot(
+            Chunk("sB", 0, isLast: true, [7, 8, 9, 10, 11, 12], leader: "B:1"), ct);
+        Assert.False(b.Success);
+        Assert.True(r.TotalStagedByteCount <= 10,
+            $"live staged bytes ({r.TotalStagedByteCount}) must stay within the cap while an install blocks");
+
+        // Release the first install; A completes and its reservation is freed.
+        firstInstallGate.SetResult();
+        Assert.True((await aTask).Success);
+        await WaitUntil(() => r.TotalStagedByteCount == 0, ct);
+    }
+
+    private static async Task WaitUntil(Func<bool> condition, CancellationToken ct, int timeoutMs = 5000)
+    {
+        for (int elapsed = 0; elapsed < timeoutMs; elapsed += 10)
+        {
+            if (condition())
+                return;
+            await Task.Delay(10, ct);
+        }
+        throw new TimeoutException("condition not met");
     }
 }

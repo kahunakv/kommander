@@ -29,6 +29,7 @@ public sealed class NemesisCommunication : ICommunication
     private readonly object _lock = new();
     private readonly List<NemesisRule> _rules = [];
     private readonly List<HeldItem> _held = [];
+    private readonly List<DelayedDelivery> _delayedDeliveries = [];
     private readonly List<NemesisEvent> _allEvents = [];
     private readonly List<(Func<NemesisEnvelope, bool> Predicate, TaskCompletionSource Tcs)> _eventWaiters = [];
 
@@ -124,10 +125,24 @@ public sealed class NemesisCommunication : ICommunication
         lock (_lock) _randomProfile = profile;
     }
 
-    /// <summary>Removes all scripted rules and clears the random profile (full heal).</summary>
+    /// <summary>
+    /// Removes all scripted rules and clears the random profile (full heal), and cancels any in-flight
+    /// delayed batch deliveries so a healed scenario leaves no fault-delayed message pending. The cancellation
+    /// is signalled synchronously; call <see cref="CancelDelayedDeliveriesAsync"/> to also await the drain.
+    /// </summary>
     public void ClearRules()
     {
-        lock (_lock) { _rules.Clear(); _randomProfile = null; }
+        DelayedDelivery[] pending;
+        lock (_lock)
+        {
+            _rules.Clear();
+            _randomProfile = null;
+            pending = [.. _delayedDeliveries];
+        }
+        foreach (DelayedDelivery d in pending)
+        {
+            try { d.Cts.Cancel(); } catch (ObjectDisposedException) { /* already completed */ }
+        }
     }
 
     /// <summary>Drops every held message without delivering, completing each waiter as canceled. Used on disposal.</summary>
@@ -262,17 +277,32 @@ public sealed class NemesisCommunication : ICommunication
     {
         List<TaskCompletionSource>? fire = null;
         lock (_lock)
+            RecordAndCollectBarriersLocked(evt, ref fire);
+        PublishNotifications(fire);
+    }
+
+    /// <summary>
+    /// Records an event and collects any event-barrier waiters it satisfies into <paramref name="fire"/>.
+    /// Must hold <see cref="_lock"/>. Used both by <see cref="AppendEvent"/> and by the batch path so batch
+    /// decision/drop/hold/etc. events also wake barriers and the invariant checker (via
+    /// <see cref="PublishNotifications"/> after the lock is released).
+    /// </summary>
+    private void RecordAndCollectBarriersLocked(NemesisEvent evt, ref List<TaskCompletionSource>? fire)
+    {
+        RecordEventLocked(evt);
+        for (int i = _eventWaiters.Count - 1; i >= 0; i--)
         {
-            RecordEventLocked(evt);
-            for (int i = _eventWaiters.Count - 1; i >= 0; i--)
+            if (_eventWaiters[i].Predicate(evt.Envelope))
             {
-                if (_eventWaiters[i].Predicate(evt.Envelope))
-                {
-                    (fire ??= []).Add(_eventWaiters[i].Tcs);
-                    _eventWaiters.RemoveAt(i);
-                }
+                (fire ??= []).Add(_eventWaiters[i].Tcs);
+                _eventWaiters.RemoveAt(i);
             }
         }
+    }
+
+    /// <summary>Fires collected barrier waiters and the coalesced <see cref="OnEvent"/> hook. Call OUTSIDE the lock.</summary>
+    private void PublishNotifications(List<TaskCompletionSource>? fire)
+    {
         if (fire is not null)
             foreach (TaskCompletionSource tcs in fire)
                 tcs.TrySetResult();
@@ -472,9 +502,12 @@ public sealed class NemesisCommunication : ICommunication
         string source = manager.LocalEndpoint;
         string dest = node.Endpoint;
 
-        List<BatchRequestsRequestItem> passItems = [];
-        List<(NemesisEnvelope Env, Func<Task> Deliver)> delayed = [];
+        // Each pass item keeps its decision envelope so the later Delivery event carries the SAME (nonzero)
+        // sequence — script/replay analysis correlates decision→delivery by sequence.
+        List<(BatchRequestsRequestItem Item, NemesisEnvelope Env)> passItems = [];
+        List<(NemesisEnvelope Env, Func<CancellationToken, Task> Deliver)> delayed = [];
         List<(NemesisEnvelope Env, Func<Task> Deliver)> duplicated = [];
+        List<TaskCompletionSource>? fire = null;
 
         lock (_lock)
         {
@@ -484,21 +517,23 @@ public sealed class NemesisCommunication : ICommunication
                 int? partition = PartitionOfBatchItem(item);
                 NemesisEnvelope env = new(++_seq, source, dest, verb, partition, item.Type.ToString());
                 NemesisDecision decision = Decide(env);
-                RecordEventLocked(new NemesisEvent(NemesisEventKind.Decision, env, decision.Action.ToString()));
+                // Record via the shared helper so batch events also satisfy barriers and wake the checker
+                // (published outside the lock below), not just append silently to the event log.
+                RecordAndCollectBarriersLocked(new NemesisEvent(NemesisEventKind.Decision, env, decision.Action.ToString()), ref fire);
 
                 switch (decision.Action)
                 {
                     case FaultAction.Pass:
-                        passItems.Add(item);
+                        passItems.Add((item, env));
                         break;
 
                     case FaultAction.Drop:
-                        RecordEventLocked(new NemesisEvent(NemesisEventKind.Drop, env));
+                        RecordAndCollectBarriersLocked(new NemesisEvent(NemesisEventKind.Drop, env), ref fire);
                         break;
 
                     case FaultAction.Fail:
                         // No per-item response exists in a batch; a failed item is simply not delivered.
-                        RecordEventLocked(new NemesisEvent(NemesisEventKind.Fail, env));
+                        RecordAndCollectBarriersLocked(new NemesisEvent(NemesisEventKind.Fail, env), ref fire);
                         break;
 
                     case FaultAction.Hold:
@@ -509,7 +544,7 @@ public sealed class NemesisCommunication : ICommunication
                             Deliver: () => _inner.BatchRequests(manager, node, new BatchRequestsRequest { Requests = [copy] }),
                             Cancel: static () => { });
                         _held.Add(held);
-                        RecordEventLocked(new NemesisEvent(NemesisEventKind.Hold, e));
+                        RecordAndCollectBarriersLocked(new NemesisEvent(NemesisEventKind.Hold, e), ref fire);
                         break;
                     }
 
@@ -518,12 +553,12 @@ public sealed class NemesisCommunication : ICommunication
                         BatchRequestsRequestItem copy = CloneBatchItem(item);
                         TimeSpan d = decision.Delay;
                         NemesisEnvelope e = env;
-                        delayed.Add((e, async () =>
+                        delayed.Add((e, async ct =>
                         {
-                            await Task.Delay(d).ConfigureAwait(false);
+                            await Task.Delay(d, ct).ConfigureAwait(false);
                             await _inner.BatchRequests(manager, node, new BatchRequestsRequest { Requests = [copy] }).ConfigureAwait(false);
                         }));
-                        RecordEventLocked(new NemesisEvent(NemesisEventKind.Delay, e, d.ToString()));
+                        RecordAndCollectBarriersLocked(new NemesisEvent(NemesisEventKind.Delay, e, d.ToString()), ref fire);
                         break;
                     }
 
@@ -537,12 +572,16 @@ public sealed class NemesisCommunication : ICommunication
                             await _inner.BatchRequests(manager, node, new BatchRequestsRequest { Requests = [original] }).ConfigureAwait(false);
                             await _inner.BatchRequests(manager, node, new BatchRequestsRequest { Requests = [copy] }).ConfigureAwait(false);
                         }));
-                        RecordEventLocked(new NemesisEvent(NemesisEventKind.Duplicate, e));
+                        RecordAndCollectBarriersLocked(new NemesisEvent(NemesisEventKind.Duplicate, e), ref fire);
                         break;
                     }
                 }
             }
         }
+
+        // Wake barriers + the invariant checker for the whole batch's decision/drop/fail/hold/delay/duplicate
+        // events (a wholly-dropped/held batch still notifies the checker of the transport state change).
+        PublishNotifications(fire);
 
         // Deliver duplicated items (their own single-item batches), outside the lock.
         foreach ((NemesisEnvelope env, Func<Task> deliver) in duplicated)
@@ -551,26 +590,82 @@ public sealed class NemesisCommunication : ICommunication
             AppendEvent(new NemesisEvent(NemesisEventKind.Delivery, env, "duplicated"));
         }
 
-        // Fire-and-forget the delayed single-item batches (they must not block the passing items).
-        foreach ((NemesisEnvelope env, Func<Task> deliver) in delayed)
-            _ = DeliverDelayedBatchItem(env, deliver);
+        // Delayed single-item batches run in the background (they must not block the passing items), but each
+        // is OWNED: tracked, cancellable on heal/dispose, and its exceptions are observed.
+        foreach ((NemesisEnvelope env, Func<CancellationToken, Task> deliver) in delayed)
+            TrackDelayedDelivery(env, deliver);
 
         if (passItems.Count > 0)
         {
-            BatchRequestsResponse resp = await _inner.BatchRequests(manager, node, new BatchRequestsRequest { Requests = passItems }).ConfigureAwait(false);
-            foreach (BatchRequestsRequestItem item in passItems)
-                AppendEvent(new NemesisEvent(NemesisEventKind.Delivery, new NemesisEnvelope(0, source, dest, VerbOfBatchItem(item.Type), PartitionOfBatchItem(item), item.Type.ToString())));
+            BatchRequestsResponse resp = await _inner.BatchRequests(
+                manager, node, new BatchRequestsRequest { Requests = [.. passItems.Select(p => p.Item)] }).ConfigureAwait(false);
+            foreach ((_, NemesisEnvelope env) in passItems)
+                AppendEvent(new NemesisEvent(NemesisEventKind.Delivery, env));
             return resp;
         }
 
         return new BatchRequestsResponse();
     }
 
-    private async Task DeliverDelayedBatchItem(NemesisEnvelope env, Func<Task> deliver)
+    /// <summary>A background delayed batch-item delivery, owned by the nemesis so it can be canceled/drained.</summary>
+    private sealed class DelayedDelivery
     {
-        await deliver().ConfigureAwait(false);
-        AppendEvent(new NemesisEvent(NemesisEventKind.Delivery, env, "delayed"));
+        public required NemesisEnvelope Env { get; init; }
+        public required CancellationTokenSource Cts { get; init; }
+        public Task Task { get; set; } = Task.CompletedTask;
     }
+
+    private void TrackDelayedDelivery(NemesisEnvelope env, Func<CancellationToken, Task> deliver)
+    {
+        DelayedDelivery d = new() { Env = env, Cts = new CancellationTokenSource() };
+        lock (_lock) _delayedDeliveries.Add(d);
+        d.Task = RunDelayedDeliveryAsync(deliver, d);
+    }
+
+    private async Task RunDelayedDeliveryAsync(Func<CancellationToken, Task> deliver, DelayedDelivery d)
+    {
+        try
+        {
+            await deliver(d.Cts.Token).ConfigureAwait(false);
+            AppendEvent(new NemesisEvent(NemesisEventKind.Delivery, d.Env, "delayed"));
+        }
+        catch (OperationCanceledException)
+        {
+            AppendEvent(new NemesisEvent(NemesisEventKind.Cancellation, d.Env, "delayed canceled"));
+        }
+        catch (Exception ex)
+        {
+            AppendEvent(new NemesisEvent(NemesisEventKind.Fail, d.Env, "delayed error: " + ex.Message));
+        }
+        finally
+        {
+            lock (_lock) _delayedDeliveries.Remove(d);
+            d.Cts.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Cancels every in-flight delayed delivery and awaits their completion. Called on heal/dispose so a
+    /// scenario that has cleared its rules leaves no fault-delayed message still pending. Returns the count
+    /// canceled.
+    /// </summary>
+    public async Task<int> CancelDelayedDeliveriesAsync()
+    {
+        DelayedDelivery[] pending;
+        lock (_lock) pending = [.. _delayedDeliveries];
+        foreach (DelayedDelivery d in pending)
+        {
+            try { d.Cts.Cancel(); } catch (ObjectDisposedException) { /* already completed */ }
+        }
+        foreach (DelayedDelivery d in pending)
+        {
+            try { await d.Task.ConfigureAwait(false); } catch { /* observed inside RunDelayedDeliveryAsync */ }
+        }
+        return pending.Length;
+    }
+
+    /// <summary>Number of delayed batch-item deliveries still in flight. For reports and leak checks.</summary>
+    public int DelayedDeliveryCount { get { lock (_lock) return _delayedDeliveries.Count; } }
 
     // ── mapping + cloning ─────────────────────────────────────────────────────────
 
