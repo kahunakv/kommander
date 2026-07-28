@@ -14,28 +14,32 @@ namespace Kommander.Tests.Chaos;
 /// every node converging (identical applied prefix) on fresh writes, with no continuous safety-invariant
 /// violation at any point. On failure it emits the seed and the standard report.
 ///
-/// <para><b>Skipped in the default suite</b> (nightly <c>ChaosRandom</c> / opt-in <c>Stress</c>). The
-/// non-contiguous-delivery bug that once blocked this tier is fixed — holes now backfill and the consumer prefix
-/// converges. Two reasons remain to keep it out of the fast PR run: 5–7-node clusters over a fault window are
-/// slow; and under continuous Fail/Drop faults the <c>CommitMonotonicity</c> invariant flags the gap-aware
-/// <c>GetCommitIndex</c> dipping when a commit write is rolled back — an observability artifact (the durable
-/// applied prefix never regresses), to be resolved by tracking the applied prefix rather than the gap-aware
-/// frontier. The infrastructure is complete and validated: it prints a reproducing seed + failure report, and
-/// the nemesis event log is bounded so a soak no longer OOMs.</para>
+/// <para><b>Skipped in the default suite</b> (nightly <c>ChaosRandom</c> / opt-in <c>Stress</c>). Two earlier
+/// blockers are fixed: the non-contiguous-delivery bug (holes backfill; the consumer prefix converges) and the
+/// <c>CommitMonotonicity</c> gap-aware-dip false positive (the invariant now compares the commit frontier
+/// against the durable applied prefix, keyed per (node, partition)). It stays skipped because it is slow for a
+/// PR run and because it now surfaces a distinct, unresolved <b>backfill liveness gap</b>: under a continuous
+/// multi-partition fault pattern a follower can end with <c>maxWal</c> ahead of a commit frontier stuck below
+/// it (a WAL-level hole that does not backfill after heal), so convergence times out. The infrastructure is
+/// complete and validated: it prints a reproducing seed + failure report, and the nemesis event log is bounded
+/// so a soak no longer OOMs.</para>
 /// </summary>
 [Collection(ClusterIntegrationCollection.Name)]
 public sealed class TestChaosRandomized
 {
-    // The non-contiguous-delivery bug that originally blocked this tier is now FIXED (holes backfill; the
-    // consumer prefix converges). It stays skipped in the default suite for two reasons: (1) it is the nightly
-    // ChaosRandom / opt-in Stress tier — 5–7-node clusters over a fault window are slow for a PR run; and
-    // (2) under continuous Fail/Drop faults the CommitMonotonicity invariant flags the gap-aware GetCommitIndex
-    // dipping on a rolled-back commit — an observability artifact (the durable applied prefix never regresses),
-    // not a safety violation, to be resolved by tracking the applied prefix rather than the gap-aware frontier.
+    // Two earlier blockers are now fixed: the non-contiguous-delivery bug (holes backfill; the consumer prefix
+    // converges) and the CommitMonotonicity gap-aware-dip false positive (the invariant now compares the commit
+    // frontier against the durable applied prefix, per (node, partition)). The tier stays skipped in the default
+    // suite because (1) it is the nightly ChaosRandom / opt-in Stress tier — 5–7-node clusters over a fault
+    // window are slow for a PR run — and (2) it now surfaces a distinct, unresolved liveness issue: under a
+    // continuous multi-partition fault pattern a follower can end with maxWal ahead of a commit frontier stuck
+    // below it (a WAL-level hole that does not backfill after heal), so convergence times out. That backfill
+    // liveness gap is the next thing to fix before this tier can be a green nightly.
     private const string BlockedReason =
-        "Nightly ChaosRandom/Stress tier: kept out of the fast PR suite (slow), and CommitMonotonicity flags the " +
-        "gap-aware commit frontier dipping on fault-rolled-back commits (observability artifact — track the " +
-        "applied prefix instead). The non-contiguous-delivery bug it was blocked on is fixed.";
+        "Nightly ChaosRandom/Stress tier: slow for the PR suite, and surfaces an unresolved backfill liveness " +
+        "gap under continuous multi-partition faults (follower commit frontier stuck below maxWal after heal → " +
+        "convergence timeout). The non-contiguous-delivery bug and the CommitMonotonicity dip artifact it was " +
+        "blocked on are both fixed.";
 
     private readonly ITestOutputHelper _out;
     public TestChaosRandomized(ITestOutputHelper output) => _out = output;

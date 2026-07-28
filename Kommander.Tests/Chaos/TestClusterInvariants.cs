@@ -35,9 +35,13 @@ public class TestClusterInvariants
         IEnumerable<HashChainSnapshot>? chains = null,
         IEnumerable<CommitObservation>? commits = null,
         IEnumerable<CommitAck>? acks = null,
-        IDictionary<string, long>? maxCommit = null) =>
+        IDictionary<string, long>? maxCommit = null,
+        IDictionary<string, long>? maxApplied = null) =>
         new(1, views?.ToList() ?? [], chains?.ToList() ?? [], commits?.ToList() ?? [], acks?.ToList() ?? [],
-            maxCommit is null ? new Dictionary<string, long>() : new Dictionary<string, long>(maxCommit));
+            maxCommit is null ? new Dictionary<string, long>() : new Dictionary<string, long>(maxCommit))
+        {
+            MaxAppliedByNode = maxApplied is null ? new Dictionary<string, long>() : new Dictionary<string, long>(maxApplied),
+        };
 
     // ── 1. election safety ──────────────────────────────────────────────────────
 
@@ -151,25 +155,44 @@ public class TestClusterInvariants
     // ── 5. commit monotonicity ────────────────────────────────────────────────────
 
     [Fact]
-    public void CommitMonotonicity_Regression_Fires()
+    public void CommitMonotonicity_CommitBelowAppliedPrefix_Fires()
     {
+        // Commit frontier (5) below what this (node, partition) already applied (10) — a real regression.
         ClusterView v = ViewOf(
             views: [View("a:1", RaftNodeState.Follower, 5, "b:1", commit: 5)],
-            maxCommit: new Dictionary<string, long> { ["a:1"] = 10 });
+            maxApplied: new Dictionary<string, long> { [InvariantPredicates.NodeKey("a:1", P)] = 10 });
         ClusterViolation? r = new CommitMonotonicityInvariant().Evaluate(null, v);
         Assert.NotNull(r);
-        Assert.Contains("regressed: 5 < 10", r!.Detail);
-        // Gap-aware commit frontier can dip transiently under log-hole repair, so a regression is confirmed
-        // (re-sampled) before failing rather than recorded immediately.
+        Assert.Contains("dropped below the durable applied prefix 10", r!.Detail);
         Assert.True(r.RequiresConfirmation);
     }
 
     [Fact]
-    public void CommitMonotonicity_NonDecreasing_Passes()
+    public void CommitMonotonicity_FrontierDipAboveAppliedPrefix_Passes()
     {
+        // Commit frontier dipped to 8 (below a previously-seen commit) but stays at/above the applied prefix (8):
+        // a benign gap-aware/rolled-back-commit artifact, not a regression.
         ClusterView v = ViewOf(
-            views: [View("a:1", RaftNodeState.Follower, 5, "b:1", commit: 12)],
-            maxCommit: new Dictionary<string, long> { ["a:1"] = 10 });
+            views: [View("a:1", RaftNodeState.Follower, 5, "b:1", commit: 8)],
+            maxApplied: new Dictionary<string, long> { [InvariantPredicates.NodeKey("a:1", P)] = 8 });
+        Assert.Null(new CommitMonotonicityInvariant().Evaluate(null, v));
+    }
+
+    [Fact]
+    public void CommitMonotonicity_OtherPartitionTrailing_DoesNotConflate()
+    {
+        // Same endpoint, two partitions: p2 trailing p1 must NOT read as a regression (per-partition keying).
+        ClusterView v = ViewOf(
+            views:
+            [
+                View("a:1", RaftNodeState.Leader, 5, "a:1", commit: 20, applied: 20, partition: 1),
+                View("a:1", RaftNodeState.Leader, 5, "a:1", commit: 15, applied: 15, partition: 2),
+            ],
+            maxApplied: new Dictionary<string, long>
+            {
+                [InvariantPredicates.NodeKey("a:1", 1)] = 20,
+                [InvariantPredicates.NodeKey("a:1", 2)] = 15,
+            });
         Assert.Null(new CommitMonotonicityInvariant().Evaluate(null, v));
     }
 

@@ -23,6 +23,14 @@ public sealed record ClusterView(
     IReadOnlyList<CommitAck> CommitAcks,
     IReadOnlyDictionary<string, long> MaxCommitByNode)
 {
+    /// <summary>
+    /// Highest applied index ever seen per node (injected by the checker's Augment, defaults empty). Unlike the
+    /// gap-aware commit frontier, the applied index is the durable delivered prefix and never regresses, so
+    /// commit-monotonicity compares against it — a commit-frontier dip that stays at/above what a node already
+    /// applied is a benign observability artifact (e.g. a fault-rolled-back uncommitted entry), not a violation.
+    /// </summary>
+    public IReadOnlyDictionary<string, long> MaxAppliedByNode { get; init; } = new Dictionary<string, long>();
+
     public static ClusterView Empty { get; } =
         new(0, [], [], [], [], new Dictionary<string, long>());
 }

@@ -26,6 +26,12 @@ public static class InvariantPredicates
 {
     /// <summary>Raft voter majority: <c>max(2, floor(n/2)+1)</c>, matching <c>RaftSafetyAssert.Quorum</c>.</summary>
     public static int VoterMajority(int voters) => Math.Max(2, voters / 2 + 1);
+
+    /// <summary>
+    /// Per-(node, partition) key for the running commit/applied maxima. Keying by endpoint alone conflates a
+    /// multi-partition node's partitions — one partition trailing another then reads as a regression.
+    /// </summary>
+    public static string NodeKey(string endpoint, int partition) => $"{endpoint}|p{partition}";
 }
 
 /// <summary>Invariant 1 — at most one leader per (partition, term). Transient: confirmed before failing.</summary>
@@ -176,15 +182,22 @@ public sealed class LeaderCompletenessInvariant : IClusterInvariant
 }
 
 /// <summary>
-/// Invariant 5 — commit monotonicity: a node's commit index never decreases within one process lifetime.
+/// Invariant 5 — commit monotonicity: a node's commit frontier never drops below the entries it has already
+/// durably applied.
 ///
-/// <para><b>Confirmation-required.</b> The observable value is the WAL's <i>gap-aware</i> commit frontier
-/// (<c>GetCommitIndex</c>), which stops at the first hole in the log. Under adversarial delivery an unanchored
-/// live-propose or a misordered append can transiently open a hole above the committed prefix, so the frontier
-/// can dip for a heartbeat or two before log-hole repair heals it — without any committed entry actually being
-/// lost. A genuine regression (real data loss) persists across a resample; a transient observational dip does
-/// not. Hence this is re-sampled before failing, unlike the strictly-historical prefix/rollback invariants
-/// (<see cref="StateMachineSafetyInvariant"/>, <see cref="NoCommittedRollbackInvariant"/>) which fail at once.</para>
+/// <para><b>Why compare against the applied prefix, not the max commit ever seen.</b> The observable commit
+/// value is the WAL's <i>gap-aware</i> frontier (<c>GetCommitIndex</c>), which stops at the first hole. Under
+/// fault injection it legitimately DIPS — an unanchored live-propose opens a transient hole, or a Drop/Fail
+/// rolls back a not-yet-durable commit write — and later recovers, without any <i>applied</i> (delivered,
+/// durable) entry being lost. Comparing the frontier against the max frontier ever seen therefore fires on that
+/// benign dip. The applied index never regresses (delivery only advances it, and an entry is delivered only on
+/// a committed write's completion), so it is the sound lower bound: a commit frontier below what the node
+/// already applied is a real regression, while a dip that stays at/above the applied prefix is an observability
+/// artifact. Keyed per (node, partition) so one partition trailing another on a multi-partition node is not
+/// misread as a regression.</para>
+///
+/// <para>Still confirmation-required: cluster views are not globally atomic, so a lone skewed sample is
+/// re-sampled before failing.</para>
 /// </summary>
 public sealed class CommitMonotonicityInvariant : IClusterInvariant
 {
@@ -194,9 +207,10 @@ public sealed class CommitMonotonicityInvariant : IClusterInvariant
     {
         foreach (RaftPartitionView v in current.PartitionViews)
         {
-            if (current.MaxCommitByNode.TryGetValue(v.Endpoint, out long maxSeen) && v.CommitIndex < maxSeen)
+            string key = InvariantPredicates.NodeKey(v.Endpoint, v.Partition);
+            if (current.MaxAppliedByNode.TryGetValue(key, out long maxApplied) && v.CommitIndex < maxApplied)
                 return new ClusterViolation(Name,
-                    $"node {v.Endpoint} p{v.Partition} commit index regressed: {v.CommitIndex} < {maxSeen}",
+                    $"node {v.Endpoint} p{v.Partition} commit index {v.CommitIndex} dropped below the durable applied prefix {maxApplied}",
                     RequiresConfirmation: true);
         }
         return null;

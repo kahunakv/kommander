@@ -29,6 +29,7 @@ public sealed class ClusterInvariantChecker : IAsyncDisposable
         Channel.CreateBounded<byte>(new BoundedChannelOptions(1) { FullMode = BoundedChannelFullMode.DropWrite });
     private readonly CancellationTokenSource _cts = new();
     private readonly Dictionary<string, long> _maxCommit = new();
+    private readonly Dictionary<string, long> _maxApplied = new();
 
     private Task? _loop;
     private ClusterView? _previous;
@@ -126,14 +127,25 @@ public sealed class ClusterInvariantChecker : IAsyncDisposable
     /// </summary>
     private ClusterView Augment(ClusterView view)
     {
-        Dictionary<string, long> snapshot = new(_maxCommit);
-        ClusterView augmented = view with { MaxCommitByNode = snapshot };
+        // Inject the running per-node maxima AS SEEN BEFORE this view, so the monotonicity invariant compares
+        // this view against prior history, then advance the maxima.
+        ClusterView augmented = view with
+        {
+            MaxCommitByNode = new Dictionary<string, long>(_maxCommit),
+            MaxAppliedByNode = new Dictionary<string, long>(_maxApplied),
+        };
 
         foreach (RaftPartitionView v in view.PartitionViews)
         {
-            long prior = _maxCommit.GetValueOrDefault(v.Endpoint, long.MinValue);
-            if (v.CommitIndex > prior)
-                _maxCommit[v.Endpoint] = v.CommitIndex;
+            string key = InvariantPredicates.NodeKey(v.Endpoint, v.Partition);
+
+            long priorCommit = _maxCommit.GetValueOrDefault(key, long.MinValue);
+            if (v.CommitIndex > priorCommit)
+                _maxCommit[key] = v.CommitIndex;
+
+            long priorApplied = _maxApplied.GetValueOrDefault(key, long.MinValue);
+            if (v.LastAppliedIndex > priorApplied)
+                _maxApplied[key] = v.LastAppliedIndex;
         }
         return augmented;
     }
