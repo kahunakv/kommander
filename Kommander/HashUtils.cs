@@ -31,6 +31,20 @@ public static class HashUtils
     }
 
     /// <summary>
+    /// Computes an xxHash64 digest over raw bytes. Unlike the string overloads this hashes the exact
+    /// byte content with no encoding step, so callers that build a canonical, endian-fixed, length-
+    /// delimited buffer get a stable, platform-independent digest (no <c>string.GetHashCode</c> or
+    /// process-randomized hashing). Used by the chaos hash-chain oracle to digest a log entry's
+    /// canonical encoding.
+    /// </summary>
+    /// <param name="data">The exact bytes to hash.</param>
+    /// <returns>The xxHash64 digest as an unsigned 64-bit integer.</returns>
+    public static ulong HashBytes(ReadOnlySpan<byte> data)
+    {
+        return XxHash64.HashToUInt64(data);
+    }
+
+    /// <summary>
     /// Computes a hash value for the given key using xxHash64 algorithm and
     /// maps it to a fixed number of buckets.
     /// </summary>

@@ -877,7 +877,12 @@ public sealed class RaftPartitionStateMachine
     /// </summary>
     private async Task ApplyLogToConsumerAsync(RaftLog log)
     {
-        if (log.Type == RaftLogType.Committed)
+        // Deliver each committed index to the consumer at most once. The cursor still advances below for
+        // any id past the frontier (including CommittedCheckpoint entries, which are not delivered), but a
+        // re-delivery of an already-applied index — which the follower path can see because the leader
+        // re-sends committed entries (commit broadcast + backfill/idle re-ship) — must not reach the
+        // consumer twice. See CompleteFollowerAppend for the primary site this guards.
+        if (log.Type == RaftLogType.Committed && log.Id > lastAppliedIndex)
         {
             try
             {
@@ -940,7 +945,8 @@ public sealed class RaftPartitionStateMachine
                 bool deliver = log.Type == RaftLogType.Committed ||
                                (log.Type == RaftLogType.Proposed && log.Term < currentTerm);
 
-                if (deliver)
+                // Exactly-once: only deliver entries past the applied frontier (the cursor advances below).
+                if (deliver && log.Id > lastAppliedIndex)
                 {
                     try
                     {
@@ -3319,15 +3325,22 @@ public sealed class RaftPartitionStateMachine
                 if (log.Type != RaftLogType.Committed)
                     continue;
 
-                if (host.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType)
+                // Exactly-once apply: the leader re-sends committed entries (commit broadcast to all peers,
+                // plus backfill / idle-tail re-ship), so a follower routinely receives a Committed copy of
+                // an entry it has already applied. Deliver to the consumer only when the index is past the
+                // applied frontier; the WAL write already happened and the cursor still advances below.
+                if (log.Id > lastAppliedIndex)
                 {
-                    if (!await host.InvokeSystemReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
-                        host.InvokeReplicationError(host.PartitionId, log);
-                }
-                else
-                {
-                    if (!await host.InvokeReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
-                        host.InvokeReplicationError(host.PartitionId, log);
+                    if (host.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType)
+                    {
+                        if (!await host.InvokeSystemReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
+                            host.InvokeReplicationError(host.PartitionId, log);
+                    }
+                    else
+                    {
+                        if (!await host.InvokeReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
+                            host.InvokeReplicationError(host.PartitionId, log);
+                    }
                 }
 
                 // Track per-entry, not via the gap-aware committedIndex above: committedIndex
