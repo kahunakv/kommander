@@ -270,6 +270,37 @@ public class InMemoryWAL : IWAL, IDisposable
     }
 
     /// <inheritdoc/>
+    public RaftOperationStatus TruncateProposedLogsAfter(int partitionId, long afterLogId)
+    {
+        rwLock.EnterWriteLock();
+        try
+        {
+            if (!allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+                return RaftOperationStatus.Success;
+
+            List<long> toRemove = [];
+            foreach (KeyValuePair<long, RaftLog> entry in partitionLogs)
+            {
+                if (entry.Key <= afterLogId)
+                    continue;
+                // Only unresolved (Proposed) entries are removable; resolved entries are quorum-agreed
+                // and are load-bearing for the commit frontier, so they must survive tail cleanup.
+                if (entry.Value.Type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
+                    toRemove.Add(entry.Key);
+            }
+
+            foreach (long id in toRemove)
+                partitionLogs.Remove(id);
+
+            return RaftOperationStatus.Success;
+        }
+        finally
+        {
+            rwLock.ExitWriteLock();
+        }
+    }
+
+    /// <inheritdoc/>
     public (RaftOperationStatus Status, long MaxLogId) TruncateLogsAfterAndGetMax(int partitionId, long afterLogId)
     {
         // Truncate and read-max under one write-lock acquisition so the pair is atomic against the

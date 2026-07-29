@@ -214,6 +214,34 @@ public interface IWAL : IDisposable
     (RaftOperationStatus Status, long MaxLogId) TruncateLogsAfterAndGetMax(int partitionId, long afterLogId);
 
     /// <summary>
+    /// Deletes only the <b>unresolved</b> (<see cref="RaftLogType.Proposed"/> /
+    /// <see cref="RaftLogType.ProposedCheckpoint"/>) log entries for <paramref name="partitionId"/> whose id
+    /// is strictly greater than <paramref name="afterLogId"/>, leaving every resolved
+    /// (Committed / RolledBack / their checkpoints) entry in place.
+    /// <para>
+    /// This is the follower-append tail cleanup and MUST NOT remove resolved entries. A blanket
+    /// <see cref="TruncateLogsAfter"/> here is unsafe: the propose/commit broadcast ships entries
+    /// unanchored (prevLogIndex=0) and out of order, so a low-max-id append can complete <em>after</em>
+    /// higher committed entries have already landed. Deleting those committed entries loses
+    /// quorum-acknowledged data, and — because the in-memory commit frontier advanced over them on
+    /// enqueue and is never rolled back — leaves the follower reporting a committed frontier above a
+    /// physical hole, which the leader reads as "caught up" and never backfills: a permanently divergent
+    /// replica. Only genuinely conflicting tail is uncommitted, so restricting the delete to unresolved
+    /// entries preserves the intended previous-term conflict cleanup while keeping resolved data (and the
+    /// commit frontier, which only ever counts resolved ids) consistent with the durable log.
+    /// </para>
+    /// <para>Runs under the same per-partition write guard as <see cref="TruncateLogsAfter"/> and
+    /// <see cref="Write(List{ValueTuple{int, List{RaftLog}}}, bool)"/>. Idempotent; a no-op when no
+    /// unresolved entry exists beyond <paramref name="afterLogId"/>.</para>
+    /// <para>The default delegates to the blanket <see cref="TruncateLogsAfter"/> for simple/test fakes
+    /// that do not distinguish entry types; the production backends
+    /// (<see cref="InMemoryWAL"/>, <see cref="SqliteWAL"/>, <see cref="RocksDbWAL"/>) override it to filter
+    /// by type. A fake that never exercises the out-of-order committed-tail path is unaffected either way.</para>
+    /// </summary>
+    RaftOperationStatus TruncateProposedLogsAfter(int partitionId, long afterLogId)
+        => TruncateLogsAfter(partitionId, afterLogId);
+
+    /// <summary>
     /// Atomically installs a snapshot boundary for <paramref name="partitionId"/>: writes (upserts) a
     /// <see cref="RaftLogType.CommittedCheckpoint"/> entry at <paramref name="snapshotIndex"/> carrying
     /// <paramref name="lastIncludedTerm"/>, and — when the local entry at that index has a term that does

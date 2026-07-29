@@ -43,12 +43,18 @@ public sealed class SingleFsyncCommitTests
     public async Task FastPath_AutoCommitReplicatesToQuorum_IdenticalToBaseline(bool singleFsyncCommit)
     {
         const int entries = 20;
-        (IRaft node1, IRaft node2, IRaft node3) = await AssembleCluster(singleFsyncCommit);
+        // Stable leadership keeps the burst inside a single term: aggressive election timeouts let a
+        // heartbeat slip under CI load and re-elect mid-test, which (by the highest-WAL election
+        // contract) parks a newly elected leader's re-ship of already-committed entries behind a fresh
+        // write — an orthogonal convergence delay this test is not about. Pinning leadership isolates
+        // the property under test: acked ⇒ quorum-durable, and eventual full replication on every node.
+        (IRaft node1, IRaft node2, IRaft node3) = await AssembleCluster(singleFsyncCommit, stableLeadership: true);
+        IRaft[] all = [node1, node2, node3];
 
         try
         {
-            IRaft leader = await GetLeader(1, [node1, node2, node3]) ?? throw new InvalidOperationException("no leader");
-            List<IRaft> followers = await GetFollowers(1, [node1, node2, node3]);
+            IRaft leader = await GetLeader(1, all) ?? throw new InvalidOperationException("no leader");
+            List<IRaft> followers = await GetFollowers(1, all);
             Assert.Equal(2, followers.Count);
 
             ConcurrentBag<long> followerReceived = [];
@@ -74,12 +80,13 @@ public sealed class SingleFsyncCommitTests
             }
 
             // The acked writes are quorum-durable (leader + 1 follower) at ack time; the trailing
-            // follower receives the final entry on the next AppendEntries/heartbeat, so converge
-            // rather than asserting all three are durable the instant the last ack returns.
+            // follower catches up on a later AppendEntries/heartbeat, so converge rather than asserting
+            // all three are durable the instant the last ack returns. Assert every node ends up holding
+            // the FULL CONTIGUOUS 1..entries prefix — not merely a matching max-id — so a follower that
+            // absorbed a high entry over a gap (the unanchored propose/commit broadcast ships
+            // prevLogIndex=0) is not mistaken for converged while a committed entry is missing underneath.
             await WaitForCondition(
-                () => node1.WalAdapter.GetMaxLog(1) == entries
-                      && node2.WalAdapter.GetMaxLog(1) == entries
-                      && node3.WalAdapter.GetMaxLog(1) == entries,
+                () => all.All(HasContiguousPrefix(entries)),
                 TestContext.Current.CancellationToken);
 
             // Both followers eventually observe every committed entry (commit broadcast still
@@ -332,6 +339,20 @@ public sealed class SingleFsyncCommitTests
         }
         throw new TimeoutException($"No leader elected for partition {partitionId} within 15 seconds.");
     }
+
+    /// <summary>
+    /// Predicate: node holds a gap-free durable log for ids 1..<paramref name="entries"/> on partition 1.
+    /// Checks actual persisted ids (not just the max) so a follower that absorbed a high entry over a hole
+    /// — the failure mode where a committed entry is silently missing under a matching max — is rejected.
+    /// </summary>
+    private static Func<IRaft, bool> HasContiguousPrefix(int entries) => node =>
+    {
+        HashSet<long> ids = [.. node.WalAdapter.ReadLogsRange(1, 1).Select(l => l.Id)];
+        for (int i = 1; i <= entries; i++)
+            if (!ids.Contains(i))
+                return false;
+        return true;
+    };
 
     private static async Task WaitForCondition(Func<bool> condition, CancellationToken cancellationToken)
     {

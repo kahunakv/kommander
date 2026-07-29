@@ -645,6 +645,34 @@ public class SqliteWAL : IWAL, IDisposable
     }
 
     /// <inheritdoc/>
+    public RaftOperationStatus TruncateProposedLogsAfter(int partitionId, long afterLogId)
+    {
+        ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
+        lock (shard.Lock)
+        {
+            try
+            {
+                // Only unresolved (Proposed / ProposedCheckpoint) entries above the anchor are removable;
+                // resolved entries are quorum-agreed and load-bearing for the commit frontier.
+                using SqliteCommand command = new(
+                    "DELETE FROM logs WHERE partitionId = @partitionId AND id > @afterLogId AND type IN (@proposed, @proposedCheckpoint)",
+                    shard.Connection);
+                command.Parameters.AddWithValue("@partitionId", partitionId);
+                command.Parameters.AddWithValue("@afterLogId", afterLogId);
+                command.Parameters.AddWithValue("@proposed", (int)RaftLogType.Proposed);
+                command.Parameters.AddWithValue("@proposedCheckpoint", (int)RaftLogType.ProposedCheckpoint);
+                command.ExecuteNonQuery();
+                return RaftOperationStatus.Success;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("TruncateProposedLogsAfter({PartitionId}, {AfterLogId}): {Message}", partitionId, afterLogId, ex.Message);
+                return RaftOperationStatus.Errored;
+            }
+        }
+    }
+
+    /// <inheritdoc/>
     public (RaftOperationStatus Status, long MaxLogId) TruncateLogsAfterAndGetMax(int partitionId, long afterLogId)
     {
         ShardDatabase shard = TryOpenShard(ShardOf(partitionId));

@@ -1080,6 +1080,52 @@ public class RocksDbWAL : IWAL, IDisposable
     }
 
     /// <inheritdoc/>
+    public RaftOperationStatus TruncateProposedLogsAfter(int partitionId, long afterLogId)
+    {
+        try
+        {
+            lock (writeGuard)
+            {
+                ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+
+                List<byte[]> keysToDelete = [];
+
+                using (Iterator? iterator = db.NewIterator(cf: columnFamilyHandle))
+                {
+                    Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+                    BuildLogKey(seekKey, partitionId, afterLogId + 1);
+                    iterator.Seek(seekKey);
+
+                    while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
+                    {
+                        // Only unresolved (Proposed / ProposedCheckpoint) entries are removable; resolved
+                        // entries are quorum-agreed and load-bearing for the commit frontier.
+                        ReadHeaderFromWire(iterator.GetValueSpan(), out _, out _, out _, out int type);
+                        if (type is (int)RaftLogType.Proposed or (int)RaftLogType.ProposedCheckpoint)
+                            keysToDelete.Add(iterator.Key());
+                        iterator.Next();
+                    }
+                }
+
+                if (keysToDelete.Count > 0)
+                {
+                    using WriteBatch writeBatch = new();
+                    foreach (byte[] key in keysToDelete)
+                        writeBatch.Delete(key, cf: columnFamilyHandle);
+                    db.Write(writeBatch, writeOptions);
+                }
+
+                return RaftOperationStatus.Success;
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogError("TruncateProposedLogsAfter({PartitionId}, {AfterLogId}): {Message}", partitionId, afterLogId, ex.Message);
+            return RaftOperationStatus.Errored;
+        }
+    }
+
+    /// <inheritdoc/>
     /// <remarks>
     /// The delete and the max-read are two distinct operations. The delete (<see cref="TruncateLogsAfter"/>)
     /// is held under <see cref="writeGuard"/> so it does not interleave with a concurrent append; the max-read

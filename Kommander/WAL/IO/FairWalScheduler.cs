@@ -629,8 +629,15 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             {
                 foreach (WALWriteOperation op in pidBatch)
                 {
+                    // Discard only the UNRESOLVED (Proposed) tail above this append. A blanket
+                    // TruncateLogsAfter here corrupts a follower: propose/commit broadcasts are shipped
+                    // unanchored and out of order, so a low-max-id append can complete after higher
+                    // COMMITTED entries have already landed, and deleting those loses quorum-acked data
+                    // while the commit frontier (advanced on enqueue, never rolled back) still reports
+                    // them — leaving the leader convinced the follower is caught up so it never backfills.
+                    // Resolved entries are never conflicting, so preserving them is safe and correct.
                     if (op.Type == WALWriteOperationType.FollowerAppend && op.LogIndex > 0)
-                        walAdapter.TruncateLogsAfter(pid, op.LogIndex);
+                        walAdapter.TruncateProposedLogsAfter(pid, op.LogIndex);
                 }
             }
 
