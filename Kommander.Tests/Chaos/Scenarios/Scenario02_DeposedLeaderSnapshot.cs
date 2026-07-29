@@ -74,10 +74,14 @@ public sealed class Scenario02_DeposedLeaderSnapshot
 
             RaftManager[] others = nodes.Where(n => n != deposed).ToArray();
             RaftManager receiver = others[0];
-            await WaitForAsync(() => receiver.GetPartitionViewAsync(partition, ct).GetAwaiter().GetResult() is { MaxWalIndex: >= 5 }, ct);
+            // Wait on the receiver's durable APPLIED frontier, not its raw WAL max: the term-based rejection
+            // below only needs a committed index the receiver already holds, and the applied prefix is the
+            // stable signal (a follower's WAL max can transiently trail its applied frontier under the
+            // unanchored live-propose path, which would make a MaxWalIndex wait flake).
+            await WaitForAsync(() => receiver.GetPartitionViewAsync(partition, ct).GetAwaiter().GetResult() is { LastAppliedIndex: >= 5 }, ct);
             RaftPartitionView deposedView = (await deposed.GetPartitionViewAsync(partition, ct))!;
             long oldTerm = deposedView.Term;
-            long staleIndex = (await receiver.GetPartitionViewAsync(partition, ct))!.MaxWalIndex;
+            long staleIndex = (await receiver.GetPartitionViewAsync(partition, ct))!.LastAppliedIndex;
 
             // The chunk the deposed leader had in flight when it lost leadership: its OWN endpoint and term T,
             // for an index the receiver already holds. Held in transport so it parks unapplied.

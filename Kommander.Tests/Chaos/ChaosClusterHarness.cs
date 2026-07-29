@@ -22,29 +22,25 @@ public sealed record ChaosClusterOptions
 
 /// <summary>
 /// Real-cluster chaos harness: builds N <see cref="RaftManager"/>s over a shared
-/// <see cref="NemesisCommunication"/> decorator, attaches a <see cref="HashChainStateMachine"/> to each
-/// (node, user partition), and runs a background <see cref="ClusterInvariantChecker"/> that continuously
-/// samples an immutable <see cref="ClusterView"/> and evaluates the safety invariants. It owns all
-/// background tasks and a cancellation token; disposal cancels the checker, heals/drops nemesis state,
-/// disposes the nodes, and reports any leaked held messages.
+/// <see cref="NemesisCommunication"/> decorator, then attaches a <see cref="ChaosSafetyMonitor"/> that wires
+/// the safety oracles — a <see cref="HashChainStateMachine"/> per (node, user partition), the commit-ack
+/// subscription, and a background <see cref="ClusterInvariantChecker"/> continuously sampling an immutable
+/// <see cref="ClusterView"/>. The harness owns node/nemesis lifecycle and the writer helpers; the monitor owns
+/// the sampling/checker/report machinery (shared with the fixed scenarios). Disposal stops the monitor's
+/// checker first, then heals/drops nemesis state, disposes the nodes, and reports any leaked held messages.
 ///
 /// <para><b>Live observability.</b> Partition views come from the executor thread (never a torn field
-/// read); entries "observed committed" are derived at sample time from a voter-majority of nodes agreeing
-/// on the applied digest at an index. Per-commit voter acknowledgements (for the quorum-discipline
-/// invariant) are not observable from outside the cluster without deeper instrumentation, so
-/// <see cref="ClusterView.CommitAcks"/> is left empty in the live harness; that invariant is covered by its
-/// synthetic unit test.</para>
+/// read); entries "observed committed" are derived at sample time from a voter-majority of nodes agreeing on
+/// the applied digest at an index. Per-commit voter acknowledgements populate
+/// <see cref="ClusterView.CommitAcks"/> from each node's <see cref="RaftManager.OnCommitAcksObserved"/> hook,
+/// so the quorum-discipline invariant evaluates against real acks.</para>
 /// </summary>
 public sealed class ChaosClusterHarness : IAsyncDisposable
 {
     private readonly ChaosClusterOptions _options;
     private readonly int _seed;
     private readonly List<RaftManager> _nodes = [];
-    private readonly Dictionary<(string Endpoint, int Partition), HashChainStateMachine> _chains = new();
-    private readonly List<CommitObservation> _recordedCommits = [];
-    private readonly Dictionary<(int Partition, long Index, string Acker), CommitAck> _recordedCommitAcks = new();
-    private readonly object _recordLock = new();
-    private long _sampleSeq;
+    private ChaosSafetyMonitor _monitor = null!;
     private int _writerSeq;
     private bool _disposed;
 
@@ -55,16 +51,17 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
     }
 
     public NemesisCommunication Nemesis { get; private set; } = null!;
-    public ClusterInvariantChecker Checker { get; private set; } = null!;
     public IReadOnlyList<int> UserPartitions { get; private set; } = [];
     public IReadOnlyList<RaftManager> Nodes => _nodes;
 
+    /// <summary>The continuous safety-invariant checker (owned by the attached <see cref="ChaosSafetyMonitor"/>).</summary>
+    public ClusterInvariantChecker Checker => _monitor.Checker;
+
     /// <summary>The hash-chain observer attached to a specific (node endpoint, partition) pair.</summary>
-    public HashChainStateMachine ChainFor(string endpoint, int partition) => _chains[(endpoint, partition)];
+    public HashChainStateMachine ChainFor(string endpoint, int partition) => _monitor.ChainFor(endpoint, partition);
 
     /// <summary>Every hash-chain observer for a partition, one per node.</summary>
-    public IEnumerable<HashChainStateMachine> ChainsFor(int partition) =>
-        _chains.Where(kv => kv.Key.Partition == partition).Select(kv => kv.Value);
+    public IEnumerable<HashChainStateMachine> ChainsFor(int partition) => _monitor.ChainsFor(partition);
 
     /// <summary>
     /// Builds and starts the cluster. Returns only after endpoints/discovery are registered, all nodes share
@@ -103,22 +100,12 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
         await WaitAsync(() => any.Partitions.Keys.Count(k => k != 0) >= userPartitionCount, 20_000, ct).ConfigureAwait(false);
         UserPartitions = any.Partitions.Keys.Where(k => k != 0).OrderBy(k => k).ToArray();
 
-        foreach (RaftManager node in _nodes)
-        foreach (int partition in UserPartitions)
-        {
-            HashChainStateMachine chain = new(node.LocalEndpoint, partition);
-            _chains[(node.LocalEndpoint, partition)] = chain;
-            node.OnReplicationReceived += chain.OnReplicationReceived;
-        }
-
-        // Subscribe to each node's commit-quorum acknowledgements so the live quorum-discipline invariant sees
-        // real facts (who acked each commit, their voter role, the voter count) rather than an empty set.
-        foreach (RaftManager node in _nodes)
-            node.OnCommitAcksObserved += RecordCommitAcks;
-
-        Checker = new ClusterInvariantChecker(SampleAsync, ClusterInvariants.All, _options.InvariantPollInterval);
-        Nemesis.OnEvent = Checker.Notify;
-        Checker.Start();
+        // Attach the safety oracles — a hash-chain observer per (node, user partition), the commit-ack
+        // subscription (so the quorum-discipline invariant sees real acks), and the continuous invariant
+        // checker wired to the nemesis event stream — over the joined cluster BEFORE any write, so the
+        // recorded history is complete. The monitor owns this machinery; the harness owns node/nemesis
+        // lifecycle and disposes the monitor first on teardown.
+        _monitor = new ChaosSafetyMonitor(_nodes, UserPartitions, Nemesis, _seed, _options.Scenario, _options.InvariantPollInterval);
     }
 
     private RaftManager BuildNode(int port, int nodeId, string[] peers, int initialPartitions)
@@ -214,107 +201,24 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
     }
 
     public async Task WaitForAppliedIndexAsync(int partition, long index, CancellationToken ct = default) =>
-        await WaitAsync(() => _chains.Where(kv => kv.Key.Partition == partition)
-            .All(kv => kv.Value.Snapshot().LastAppliedIndex >= index), 15_000, ct).ConfigureAwait(false);
+        await WaitAsync(() => _monitor.ChainsFor(partition)
+            .All(c => c.Snapshot().LastAppliedIndex >= index), 15_000, ct).ConfigureAwait(false);
 
     public async Task WaitForConvergenceAsync(int partition, long index, CancellationToken ct = default)
     {
         await WaitForAppliedIndexAsync(partition, index, ct).ConfigureAwait(false);
-        HashChainAssert.NoDivergence(_chains.Where(kv => kv.Key.Partition == partition).Select(kv => kv.Value), partition, _seed);
-        HashChainAssert.ConvergedToIndex(_chains.Where(kv => kv.Key.Partition == partition).Select(kv => kv.Value), partition, index, _seed);
+        HashChainAssert.NoDivergence(_monitor.ChainsFor(partition), partition, _seed);
+        HashChainAssert.ConvergedToIndex(_monitor.ChainsFor(partition), partition, index, _seed);
     }
 
-    // ── sampling ────────────────────────────────────────────────────────────────────
+    // ── sampling / failure report (delegated to the attached monitor) ────────────────
 
     /// <summary>Builds an immutable point-in-time cluster view. Never throws (transient sampling errors are swallowed).</summary>
-    public async Task<ClusterView> SampleAsync(CancellationToken ct = default)
-    {
-        long seq = Interlocked.Increment(ref _sampleSeq);
+    public Task<ClusterView> SampleAsync(CancellationToken ct = default) => _monitor.SampleAsync(ct);
 
-        List<RaftPartitionView> views = [];
-        foreach (RaftManager node in _nodes)
-        foreach (int partition in UserPartitions)
-        {
-            try
-            {
-                RaftPartitionView? v = await node.GetPartitionViewAsync(partition, ct).ConfigureAwait(false);
-                if (v is not null) views.Add(v);
-            }
-            catch { /* node mid-dispose or partition gone */ }
-        }
-
-        List<HashChainSnapshot> chains = _chains.Values.Select(c => c.Snapshot()).ToList();
-        List<CommitObservation> observed = DeriveObservedCommits(chains);
-
-        // Record newly-observed commits cumulatively so history persists even if a node later diverges.
-        List<CommitAck> acks;
-        lock (_recordLock)
-        {
-            HashSet<(int, long)> known = _recordedCommits.Select(c => (c.Partition, c.Index)).ToHashSet();
-            foreach (CommitObservation c in observed)
-                if (known.Add((c.Partition, c.Index)))
-                    _recordedCommits.Add(c);
-            observed = [.. _recordedCommits];
-            acks = [.. _recordedCommitAcks.Values];
-        }
-
-        return new ClusterView(seq, views, chains, observed, acks, new Dictionary<string, long>());
-    }
-
-    /// <summary>Records the acknowledgements that carried a commit to quorum (deduplicated per (partition, index, acker)).</summary>
-    private void RecordCommitAcks(IReadOnlyList<Kommander.Data.RaftCommitAckObservation> observations)
-    {
-        lock (_recordLock)
-        {
-            foreach (Kommander.Data.RaftCommitAckObservation o in observations)
-                _recordedCommitAcks[(o.Partition, o.Index, o.Acker)] =
-                    new CommitAck(o.Partition, o.Index, o.Acker, o.AckerIsVoter, o.VotersTotal);
-        }
-    }
-
-    /// <summary>An index is "observed committed" when a majority of nodes agree on its applied digest.</summary>
-    private List<CommitObservation> DeriveObservedCommits(IReadOnlyList<HashChainSnapshot> chains)
-    {
-        List<CommitObservation> result = [];
-        int majority = _nodes.Count / 2 + 1;
-
-        foreach (IGrouping<int, HashChainSnapshot> byPartition in chains.GroupBy(c => c.PartitionId))
-        {
-            IEnumerable<long> allIndexes = byPartition.SelectMany(c => c.MetaByIndex.Keys).Distinct();
-            foreach (long index in allIndexes)
-            {
-                var agree = byPartition
-                    .Where(c => c.MetaByIndex.ContainsKey(index))
-                    .GroupBy(c => c.MetaByIndex[index].EntryDigest)
-                    .OrderByDescending(g => g.Count())
-                    .FirstOrDefault();
-                if (agree is not null && agree.Count() >= majority)
-                {
-                    EntryMeta meta = agree.First().MetaByIndex[index];
-                    result.Add(new CommitObservation(byPartition.Key, index, meta.Term, meta.EntryDigest));
-                }
-            }
-        }
-        return result;
-    }
-
-    // ── failure report ────────────────────────────────────────────────────────────────
-
-    public async Task<string> BuildFailureReportAsync(string violated, CancellationToken ct = default)
-    {
-        ClusterView view = await SampleAsync(ct).ConfigureAwait(false);
-        StringBuilder sb = new();
-        sb.AppendLine($"=== Chaos failure report ===");
-        sb.AppendLine($"scenario={_options.Scenario} seed={_seed} violated={violated}");
-        sb.AppendLine($"nemesis events={Nemesis.TotalEventCount} held={Nemesis.HeldCount} delayed={Nemesis.DelayedDeliveryCount}");
-        sb.AppendLine("-- last 20 nemesis events --");
-        foreach (NemesisEvent e in Nemesis.RecentEvents())
-            sb.AppendLine("  " + e);
-        sb.AppendLine("-- per-node views --");
-        foreach (RaftPartitionView v in view.PartitionViews.OrderBy(v => v.Partition).ThenBy(v => v.Endpoint))
-            sb.AppendLine("  " + v);
-        return sb.ToString();
-    }
+    /// <summary>Builds the standard failure report (seed, nemesis event tail, per-node views).</summary>
+    public Task<string> BuildFailureReportAsync(string violated, CancellationToken ct = default) =>
+        _monitor.BuildFailureReportAsync(violated, ct);
 
     // ── helpers ──────────────────────────────────────────────────────────────────────
 
@@ -348,8 +252,8 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
         _disposed = true;
 
         // 1. Stop invariant polling first so it does not sample disposing nodes.
-        if (Checker is not null)
-            await Checker.DisposeAsync().ConfigureAwait(false);
+        if (_monitor is not null)
+            await _monitor.DisposeAsync().ConfigureAwait(false);
 
         // 2. Heal / release nemesis state, and drain any in-flight delayed deliveries so none can land after
         //    disposal (ClearRules signals cancellation; await the drain here so nothing leaks or delivers late).
