@@ -241,45 +241,15 @@ internal sealed class RaftTransportDispatcher : IDisposable
 
                 RaftResponderRequestType.StepDownNotice
                     when message.Node is not null && message.StepDownNoticeRequest is not null
-                    => communication.BatchRequests(manager, message.Node, new BatchRequestsRequest
-                    {
-                        Requests =
-                        [
-                            new BatchRequestsRequestItem
-                            {
-                                Type = BatchRequestsRequestType.StepDownNotice,
-                                StepDownNotice = message.StepDownNoticeRequest
-                            }
-                        ]
-                    }),
+                    => SendWrappedSingle(manager, message.Node, communication, message),
 
                 RaftResponderRequestType.TransferLeadership
                     when message.Node is not null && message.TransferLeadershipRequest is not null
-                    => communication.BatchRequests(manager, message.Node, new BatchRequestsRequest
-                    {
-                        Requests =
-                        [
-                            new BatchRequestsRequestItem
-                            {
-                                Type = BatchRequestsRequestType.TransferLeadership,
-                                TransferLeadership = message.TransferLeadershipRequest
-                            }
-                        ]
-                    }),
+                    => SendWrappedSingle(manager, message.Node, communication, message),
 
                 RaftResponderRequestType.TransferLeadershipSuggestion
                     when message.Node is not null && message.TransferLeadershipSuggestionRequest is not null
-                    => communication.BatchRequests(manager, message.Node, new BatchRequestsRequest
-                    {
-                        Requests =
-                        [
-                            new BatchRequestsRequestItem
-                            {
-                                Type = BatchRequestsRequestType.TransferLeadershipSuggestion,
-                                TransferLeadershipSuggestion = message.TransferLeadershipSuggestionRequest
-                            }
-                        ]
-                    }),
+                    => SendWrappedSingle(manager, message.Node, communication, message),
 
                 RaftResponderRequestType.AppendLogs
                     when message.Node is not null && message.AppendLogsRequest is not null
@@ -291,6 +261,56 @@ internal sealed class RaftTransportDispatcher : IDisposable
 
                 _ => Task.CompletedTask
             };
+
+        /// <summary>
+        /// Sends a control message that has no dedicated single-message RPC by wrapping it in a
+        /// one-item batch. The wrapper, item, and list come from <see cref="GrpcCommunicationPool"/>
+        /// to keep leadership-churn traffic (step-down notices, transfer requests/suggestions)
+        /// allocation-free. Pooled objects are only returned after the send completes — the
+        /// transport may reference them until <c>BatchRequests</c> finishes serializing.
+        /// </summary>
+        private static async Task SendWrappedSingle(
+            RaftManager manager,
+            RaftNode node,
+            ICommunication communication,
+            RaftResponderRequest message)
+        {
+            BatchRequestsRequestItem item = GrpcCommunicationPool.RentBatchRequestsRequestItem();
+            List<BatchRequestsRequestItem> items = GrpcCommunicationPool.RentListBatchRequestsRequestItem(1);
+            BatchRequestsRequest request = GrpcCommunicationPool.RentBatchRequestsRequest();
+
+            switch (message.Type)
+            {
+                case RaftResponderRequestType.StepDownNotice:
+                    item.Type = BatchRequestsRequestType.StepDownNotice;
+                    item.StepDownNotice = message.StepDownNoticeRequest;
+                    break;
+
+                case RaftResponderRequestType.TransferLeadership:
+                    item.Type = BatchRequestsRequestType.TransferLeadership;
+                    item.TransferLeadership = message.TransferLeadershipRequest;
+                    break;
+
+                case RaftResponderRequestType.TransferLeadershipSuggestion:
+                    item.Type = BatchRequestsRequestType.TransferLeadershipSuggestion;
+                    item.TransferLeadershipSuggestion = message.TransferLeadershipSuggestionRequest;
+                    break;
+            }
+
+            items.Add(item);
+            request.Requests = items;
+
+            try
+            {
+                await communication.BatchRequests(manager, node, request).ConfigureAwait(false);
+            }
+            finally
+            {
+                GrpcCommunicationPool.Return(request);
+                GrpcCommunicationPool.Return(items);
+                GrpcCommunicationPool.Return(item);
+            }
+        }
     }
 
     // ── Dispatcher ────────────────────────────────────────────────────────────

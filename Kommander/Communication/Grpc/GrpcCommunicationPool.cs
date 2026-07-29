@@ -35,6 +35,12 @@ public static class GrpcCommunicationPool
     private static readonly ConcurrentQueue<List<BatchRequestsRequestItem>> _batchRequestsItemPool = new();
     private static int _batchRequestsItemCount;
 
+    private static readonly ConcurrentQueue<BatchRequestsRequest> _batchRequestsPool = new();
+    private static int _batchRequestsCount;
+
+    private static readonly ConcurrentQueue<BatchRequestsRequestItem> _batchRequestsSingleItemPool = new();
+    private static int _batchRequestsSingleItemCount;
+
     public static GrpcAppendLogsRequest RentAppendLogsRequest()
     {
         if (_appendLogsPool.TryDequeue(out GrpcAppendLogsRequest? rented))
@@ -83,6 +89,65 @@ public static class GrpcCommunicationPool
         }
 
         Interlocked.Decrement(ref _completeAppendLogsCount);
+    }
+
+    public static BatchRequestsRequest RentBatchRequestsRequest()
+    {
+        if (_batchRequestsPool.TryDequeue(out BatchRequestsRequest? rented))
+        {
+            Interlocked.Decrement(ref _batchRequestsCount);
+            return rented;
+        }
+
+        return new();
+    }
+
+    public static void Return(BatchRequestsRequest obj)
+    {
+        // The Requests list is pooled separately — never return it through this overload.
+        obj.Requests = null;
+
+        if (Interlocked.Increment(ref _batchRequestsCount) <= MaxRetained)
+        {
+            _batchRequestsPool.Enqueue(obj);
+            return;
+        }
+
+        Interlocked.Decrement(ref _batchRequestsCount);
+    }
+
+    public static BatchRequestsRequestItem RentBatchRequestsRequestItem()
+    {
+        if (_batchRequestsSingleItemPool.TryDequeue(out BatchRequestsRequestItem? rented))
+        {
+            Interlocked.Decrement(ref _batchRequestsSingleItemCount);
+            return rented;
+        }
+
+        return new();
+    }
+
+    public static void Return(BatchRequestsRequestItem obj)
+    {
+        // Null every payload slot so a pooled item cannot keep a previous request
+        // (potentially a large AppendLogsRequest) alive across rentals.
+        obj.Type = default;
+        obj.Handshake = null;
+        obj.Vote = null;
+        obj.RequestVotes = null;
+        obj.StepDownNotice = null;
+        obj.TransferLeadership = null;
+        obj.AppendLogs = null;
+        obj.CompleteAppendLogs = null;
+        obj.TransferLeadershipSuggestion = null;
+
+        if (Interlocked.Increment(ref _batchRequestsSingleItemCount) <= MaxRetained)
+        {
+            _batchRequestsSingleItemPool.Enqueue(obj);
+            return;
+        }
+
+        Interlocked.Decrement(ref _batchRequestsSingleItemCount);
     }
 
     public static List<BatchRequestsRequestItem> RentListBatchRequestsRequestItem(int capacity)
