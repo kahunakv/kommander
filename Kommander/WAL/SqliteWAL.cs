@@ -49,14 +49,31 @@ public class SqliteWAL : IWAL, IDisposable
     private readonly object _metaDataLock = new();
 
     /// <summary>
-    /// Per-shard SQLite state: exclusive lock, open connection, and a lazily-created
-    /// prepared upsert reused across write transactions on that connection.
+    /// Per-shard SQLite state: exclusive lock, open connection, and a set of lazily-created
+    /// prepared commands reused across operations on that connection.
+    ///
+    /// <para>Microsoft.Data.Sqlite keeps no cross-command statement cache — a fresh
+    /// <see cref="SqliteCommand"/> re-compiles its SQL (<c>sqlite3_prepare_v2</c>) on first execute
+    /// and finalizes it on dispose. Caching one prepared command per hot query removes that
+    /// per-call compile. Every field here is only ever touched while the owning shard's
+    /// <see cref="Lock"/> is held, so a single reused instance is safe — the same invariant that
+    /// makes <see cref="PreparedUpsert"/> safe.</para>
     /// </summary>
     private sealed class ShardDatabase
     {
         public object Lock { get; } = new();
         public SqliteConnection Connection { get; }
         public SqliteCommand? PreparedUpsert { get; set; }
+
+        // Prepared read commands for the hot replication/heartbeat lookups. Each is created on
+        // first use and reused thereafter; all executions serialize on <see cref="Lock"/>.
+        public SqliteCommand? PreparedGetTermAt { get; set; }
+        public SqliteCommand? PreparedGetCurrentTerm { get; set; }
+        public SqliteCommand? PreparedGetMaxLog { get; set; }
+        public SqliteCommand? PreparedGetLastCheckpoint { get; set; }
+        public SqliteCommand? PreparedReadLogsRangeLimited { get; set; }
+        public SqliteCommand? PreparedReadLogsRangeUnlimited { get; set; }
+
         public ShardDatabase(SqliteConnection connection) => Connection = connection;
     }
 
@@ -278,7 +295,7 @@ public class SqliteWAL : IWAL, IDisposable
         lock (shard.Lock)
         {
             List<RaftLog> result = [];
-            long lastCheckpoint = GetLastCheckpointInternal(shard.Connection, partitionId);
+            long lastCheckpoint = GetLastCheckpointInternal(shard, partitionId);
 
             const string query = """
              SELECT id, term, type, logType, log, timeNode, timePhysical, timeCounter
@@ -314,26 +331,14 @@ public class SqliteWAL : IWAL, IDisposable
             List<RaftLog> result = [];
 
             bool applyLimit = maxEntries != int.MaxValue;
-            string query = applyLimit
-                ? """
-                 SELECT id, term, type, logType, log, timeNode, timePhysical, timeCounter
-                 FROM logs
-                 WHERE partitionId = @partitionId AND id >= @startIndex
-                 ORDER BY id ASC
-                 LIMIT @maxEntries;
-                 """
-                : """
-                 SELECT id, term, type, logType, log, timeNode, timePhysical, timeCounter
-                 FROM logs
-                 WHERE partitionId = @partitionId AND id >= @startIndex
-                 ORDER BY id ASC;
-                 """;
+            SqliteCommand command = applyLimit
+                ? GetOrCreateReadLogsRangeLimited(shard)
+                : GetOrCreateReadLogsRangeUnlimited(shard);
 
-            using SqliteCommand command = new(query, shard.Connection);
-            command.Parameters.AddWithValue("@partitionId", partitionId);
-            command.Parameters.AddWithValue("@startIndex", startLogIndex);
+            command.Parameters["@partitionId"].Value = partitionId;
+            command.Parameters["@startIndex"].Value = startLogIndex;
             if (applyLimit)
-                command.Parameters.AddWithValue("@maxEntries", maxEntries);
+                command.Parameters["@maxEntries"].Value = maxEntries;
 
             using SqliteDataReader reader = command.ExecuteReader();
             while (reader.Read())
@@ -354,9 +359,8 @@ public class SqliteWAL : IWAL, IDisposable
             ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
             lock (shard.Lock)
             {
-                const string query = "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId";
-                using SqliteCommand command = new(query, shard.Connection);
-                command.Parameters.AddWithValue("@partitionId", partitionId);
+                SqliteCommand command = GetOrCreateGetMaxLog(shard);
+                command.Parameters["@partitionId"].Value = partitionId;
                 using SqliteDataReader reader = command.ExecuteReader();
                 while (reader.Read())
                     return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
@@ -385,10 +389,9 @@ public class SqliteWAL : IWAL, IDisposable
         ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
         lock (shard.Lock)
         {
-            const string query = "SELECT term FROM logs WHERE partitionId = @partitionId AND id = @id LIMIT 1";
-            using SqliteCommand command = new(query, shard.Connection);
-            command.Parameters.AddWithValue("@partitionId", partitionId);
-            command.Parameters.AddWithValue("@id", logIndex);
+            SqliteCommand command = GetOrCreateGetTermAt(shard);
+            command.Parameters["@partitionId"].Value = partitionId;
+            command.Parameters["@id"].Value = logIndex;
             using SqliteDataReader reader = command.ExecuteReader();
             while (reader.Read())
                 return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
@@ -401,9 +404,8 @@ public class SqliteWAL : IWAL, IDisposable
         ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
         lock (shard.Lock)
         {
-            const string query = "SELECT term FROM logs WHERE partitionId = @partitionId ORDER BY id DESC LIMIT 1";
-            using SqliteCommand command = new(query, shard.Connection);
-            command.Parameters.AddWithValue("@partitionId", partitionId);
+            SqliteCommand command = GetOrCreateGetCurrentTerm(shard);
+            command.Parameters["@partitionId"].Value = partitionId;
             using SqliteDataReader reader = command.ExecuteReader();
             while (reader.Read())
                 return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
@@ -419,7 +421,7 @@ public class SqliteWAL : IWAL, IDisposable
     {
         ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
         lock (shard.Lock)
-            return GetLastCheckpointInternal(shard.Connection, partitionId);
+            return GetLastCheckpointInternal(shard, partitionId);
     }
 
     /// <inheritdoc/>
@@ -441,7 +443,7 @@ public class SqliteWAL : IWAL, IDisposable
         ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
         lock (shard.Lock)
         {
-            long lastCheckpoint = GetLastCheckpointInternal(shard.Connection, partitionId);
+            long lastCheckpoint = GetLastCheckpointInternal(shard, partitionId);
             if (lastCheckpoint <= 0)
                 return 0;
 
@@ -923,12 +925,15 @@ public class SqliteWAL : IWAL, IDisposable
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private static long GetLastCheckpointInternal(SqliteConnection connection, int partitionId)
+    /// <summary>
+    /// Reads the highest <see cref="RaftLogType.CommittedCheckpoint"/> id for a partition using the
+    /// shard's cached prepared command. Must be called while <see cref="ShardDatabase.Lock"/> is held.
+    /// </summary>
+    private static long GetLastCheckpointInternal(ShardDatabase shard, int partitionId)
     {
-        const string query = "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId AND type = @type";
-        using SqliteCommand command = new(query, connection);
-        command.Parameters.AddWithValue("@partitionId", partitionId);
-        command.Parameters.AddWithValue("@type", (int)RaftLogType.CommittedCheckpoint);
+        SqliteCommand command = GetOrCreateGetLastCheckpoint(shard);
+        command.Parameters["@partitionId"].Value = partitionId;
+        command.Parameters["@type"].Value = (int)RaftLogType.CommittedCheckpoint;
         using SqliteDataReader reader = command.ExecuteReader();
         while (reader.Read())
             return reader.IsDBNull(0) ? -1 : reader.GetInt64(0);
@@ -980,6 +985,67 @@ public class SqliteWAL : IWAL, IDisposable
         return shard.PreparedUpsert;
     }
 
+    /// <summary>
+    /// Builds and prepares a command whose parameters are all <see cref="SqliteType.Integer"/>.
+    /// All hot read lookups take only integer bind values (partitionId, id, term, limit), so this
+    /// covers every prepared read command below.
+    /// </summary>
+    private static SqliteCommand CreatePreparedIntParamCommand(SqliteConnection connection, string sql, params string[] intParams)
+    {
+        SqliteCommand command = new(sql, connection);
+        foreach (string parameter in intParams)
+            command.Parameters.Add(parameter, SqliteType.Integer);
+        command.Prepare();
+        return command;
+    }
+
+    private static SqliteCommand GetOrCreateGetTermAt(ShardDatabase shard) =>
+        shard.PreparedGetTermAt ??= CreatePreparedIntParamCommand(
+            shard.Connection,
+            "SELECT term FROM logs WHERE partitionId = @partitionId AND id = @id LIMIT 1",
+            "@partitionId", "@id");
+
+    private static SqliteCommand GetOrCreateGetCurrentTerm(ShardDatabase shard) =>
+        shard.PreparedGetCurrentTerm ??= CreatePreparedIntParamCommand(
+            shard.Connection,
+            "SELECT term FROM logs WHERE partitionId = @partitionId ORDER BY id DESC LIMIT 1",
+            "@partitionId");
+
+    private static SqliteCommand GetOrCreateGetMaxLog(ShardDatabase shard) =>
+        shard.PreparedGetMaxLog ??= CreatePreparedIntParamCommand(
+            shard.Connection,
+            "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId",
+            "@partitionId");
+
+    private static SqliteCommand GetOrCreateGetLastCheckpoint(ShardDatabase shard) =>
+        shard.PreparedGetLastCheckpoint ??= CreatePreparedIntParamCommand(
+            shard.Connection,
+            "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId AND type = @type",
+            "@partitionId", "@type");
+
+    private static SqliteCommand GetOrCreateReadLogsRangeLimited(ShardDatabase shard) =>
+        shard.PreparedReadLogsRangeLimited ??= CreatePreparedIntParamCommand(
+            shard.Connection,
+            """
+             SELECT id, term, type, logType, log, timeNode, timePhysical, timeCounter
+             FROM logs
+             WHERE partitionId = @partitionId AND id >= @startIndex
+             ORDER BY id ASC
+             LIMIT @maxEntries;
+             """,
+            "@partitionId", "@startIndex", "@maxEntries");
+
+    private static SqliteCommand GetOrCreateReadLogsRangeUnlimited(ShardDatabase shard) =>
+        shard.PreparedReadLogsRangeUnlimited ??= CreatePreparedIntParamCommand(
+            shard.Connection,
+            """
+             SELECT id, term, type, logType, log, timeNode, timePhysical, timeCounter
+             FROM logs
+             WHERE partitionId = @partitionId AND id >= @startIndex
+             ORDER BY id ASC;
+             """,
+            "@partitionId", "@startIndex");
+
     private static void BindAndExecUpsert(SqliteCommand cmd, int partitionId, RaftLog log)
     {
         cmd.Parameters["@id"].Value = log.Id;
@@ -1005,6 +1071,12 @@ public class SqliteWAL : IWAL, IDisposable
         foreach (ShardDatabase shard in shards.Values)
         {
             shard.PreparedUpsert?.Dispose();
+            shard.PreparedGetTermAt?.Dispose();
+            shard.PreparedGetCurrentTerm?.Dispose();
+            shard.PreparedGetMaxLog?.Dispose();
+            shard.PreparedGetLastCheckpoint?.Dispose();
+            shard.PreparedReadLogsRangeLimited?.Dispose();
+            shard.PreparedReadLogsRangeUnlimited?.Dispose();
             shard.Connection.Dispose();
         }
     }
