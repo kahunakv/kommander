@@ -81,6 +81,33 @@ public sealed class RaftWriteAhead
     /// </summary>
     private long minRetainIndex = long.MaxValue;
 
+    /// <summary>
+    /// Registry of active composable retention holds, keyed by an opaque monotonically-increasing
+    /// token so that multiple holds may sit at the same index without colliding. Guarded by
+    /// <see cref="holdsLock"/>. The effective hold floor (min over the values, or
+    /// <see cref="long.MaxValue"/> when empty) is republished to <see cref="holdFloor"/> after every
+    /// mutation so the compaction pass can read it lock-free.
+    /// <para>
+    /// This is the composable counterpart to <see cref="minRetainIndex"/>: several independent
+    /// consumers (PITR horizon, backup capture, …) each hold a floor and the WAL retains down to the
+    /// minimum of all of them. In-memory only — resets on process restart, same durability contract
+    /// as <see cref="minRetainIndex"/>.
+    /// </para>
+    /// </summary>
+    private readonly Dictionary<long, long> retentionHolds = new();
+
+    private readonly object holdsLock = new();
+
+    private long nextHoldToken;
+
+    /// <summary>
+    /// Cached minimum of <see cref="retentionHolds"/> (<see cref="long.MaxValue"/> when no holds are
+    /// active). Published with a volatile write under <see cref="holdsLock"/> and read lock-free by
+    /// <see cref="RunCompactionPassAsync"/>, mirroring the volatile-floor pattern of
+    /// <see cref="minRetainIndex"/>.
+    /// </summary>
+    private long holdFloor = long.MaxValue;
+
     // Test-only handle for WaitForCompactionIdleAsync; not a production synchronization point.
     private Task? compactionPassTask;
 
@@ -1219,8 +1246,107 @@ public sealed class RaftWriteAhead
     public void SetMinRetainIndex(long index) =>
         Volatile.Write(ref minRetainIndex, index <= 0 ? long.MaxValue : index);
 
+    /// <summary>
+    /// Acquires a composable retention hold: the WAL retains committed entries down to
+    /// <paramref name="index"/> for this partition until the returned handle is disposed. Unlike
+    /// <see cref="SetMinRetainIndex"/> (a single last-writer-wins floor), any number of holds may be
+    /// active at once and the effective floor is the <b>minimum</b> across all of them, so
+    /// independent consumers never clobber one another. <see cref="SetMinRetainIndex"/> remains an
+    /// orthogonal floor composed in as the degenerate single-value case.
+    /// <para>
+    /// Semantics: N concurrent holds ⇒ floor = min(index over holds); disposing one recomputes the
+    /// floor to the min of the rest; zero holds ⇒ no hold protection (<see cref="long.MaxValue"/>).
+    /// An <paramref name="index"/> &lt;= 0 is normalized to <see cref="long.MaxValue"/> (a hold that
+    /// contributes no protection), mirroring <see cref="SetMinRetainIndex"/>.
+    /// </para>
+    /// <para>
+    /// Thread-safe and synchronous: the recomputed floor is published with a volatile write before
+    /// the call returns, so the next compaction pass observes it with no scheduling round-trip.
+    /// In-memory — resets on process restart; consumers must re-assert holds after every node start.
+    /// </para>
+    /// <para>
+    /// <see cref="IDisposable.Dispose"/> on the returned handle is idempotent: it releases exactly
+    /// one hold and repeated calls are no-ops.
+    /// </para>
+    /// </summary>
+    public IDisposable AcquireRetentionHold(long index)
+    {
+        long normalized = index <= 0 ? long.MaxValue : index;
+
+        long token;
+        lock (holdsLock)
+        {
+            token = nextHoldToken++;
+            retentionHolds[token] = normalized;
+            RecomputeHoldFloorLocked();
+        }
+
+        return new RetentionHold(this, token);
+    }
+
+    /// <summary>
+    /// Releases the hold identified by <paramref name="token"/> and republishes the hold floor.
+    /// Idempotent — a token already removed (or never present) is ignored. Invoked only from
+    /// <see cref="RetentionHold.Dispose"/>.
+    /// </summary>
+    private void ReleaseRetentionHold(long token)
+    {
+        lock (holdsLock)
+        {
+            if (retentionHolds.Remove(token))
+                RecomputeHoldFloorLocked();
+        }
+    }
+
+    /// <summary>
+    /// Recomputes <see cref="holdFloor"/> as the minimum of the active holds (<see cref="long.MaxValue"/>
+    /// when none) and publishes it with a volatile write. Caller must hold <see cref="holdsLock"/>.
+    /// </summary>
+    private void RecomputeHoldFloorLocked()
+    {
+        long min = long.MaxValue;
+        foreach (long held in retentionHolds.Values)
+        {
+            if (held < min)
+                min = held;
+        }
+
+        Volatile.Write(ref holdFloor, min);
+    }
+
     /// <summary>Current retention floor. Diagnostics/tests only; <see cref="long.MaxValue"/> means unset.</summary>
     internal long MinRetainIndex => Volatile.Read(ref minRetainIndex);
+
+    /// <summary>
+    /// Effective retention floor actually applied by compaction (before composing with the
+    /// checkpoint): the minimum of the legacy <see cref="SetMinRetainIndex"/> floor and the
+    /// min-of-holds floor. <see cref="long.MaxValue"/> means no extra retention. Diagnostics/tests only.
+    /// </summary>
+    internal long EffectiveRetentionFloor => Math.Min(Volatile.Read(ref minRetainIndex), Volatile.Read(ref holdFloor));
+
+    /// <summary>
+    /// Handle returned by <see cref="AcquireRetentionHold"/>. Disposing releases exactly one hold;
+    /// the <see cref="Interlocked.Exchange(ref int, int)"/> guard makes repeated disposal a no-op so
+    /// a double-dispose can never release a later hold that happens to reuse bookkeeping.
+    /// </summary>
+    private sealed class RetentionHold : IDisposable
+    {
+        private readonly RaftWriteAhead owner;
+        private readonly long token;
+        private int disposed;
+
+        public RetentionHold(RaftWriteAhead owner, long token)
+        {
+            this.owner = owner;
+            this.token = token;
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref disposed, 1) == 0)
+                owner.ReleaseRetentionHold(token);
+        }
+    }
 
     private async Task RunCompactionPassAsync()
     {
@@ -1235,7 +1361,9 @@ public sealed class RaftWriteAhead
             if (lastCheckpoint <= 0)
                 return;
 
-            long retainFloor = Volatile.Read(ref minRetainIndex);
+            // Compose the legacy single floor with the min-of-holds floor: compaction must retain
+            // below whichever protected index is lowest across all consumers.
+            long retainFloor = Math.Min(Volatile.Read(ref minRetainIndex), Volatile.Read(ref holdFloor));
             long effectiveFloor = Math.Min(lastCheckpoint, retainFloor);
 
             if (effectiveFloor <= 0)

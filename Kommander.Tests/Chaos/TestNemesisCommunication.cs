@@ -203,14 +203,14 @@ public sealed class TestNemesisCommunication : IDisposable
         NemesisCommunication nem = new(inner);
 
         // Register a barrier on the AppendLogs batch item BEFORE the batch is sent.
-        Task barrier = nem.WaitForEventAsync(e => e.Verb == NemesisVerb.AppendLogs);
+        Task barrier = nem.WaitForEventAsync(e => e.Verb == NemesisVerb.AppendLogs, TestContext.Current.CancellationToken);
 
         await nem.BatchRequests(_manager, _node, new BatchRequestsRequest
         {
             Requests = [new() { Type = BatchRequestsRequestType.AppendLogs, AppendLogs = new AppendLogsRequest(1, 1, default, Src) }],
         });
 
-        await barrier.WaitAsync(TimeSpan.FromSeconds(2)); // must complete — barriers see batch-item events
+        await barrier.WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken); // must complete — barriers see batch-item events
 
         IReadOnlyList<NemesisEvent> events = nem.AllEvents();
         NemesisEvent decision = events.First(e => e.Kind == NemesisEventKind.Decision && e.Envelope.Verb == NemesisVerb.AppendLogs);
@@ -253,7 +253,7 @@ public sealed class TestNemesisCommunication : IDisposable
         nem.Drop(Src, Dst); // drop everything on this link
 
         Assert.False((await nem.SendJoin(_manager, _node, new JoinRequest(Src, 1))).Success);
-        Assert.False((await nem.SendInstallSnapshot(_manager, _node, new SnapshotRequest { SessionId = "s", PartitionId = 1, SnapshotIndex = 1, IsLast = true, Data = new byte[] { 1 } })).Success);
+        Assert.False((await nem.SendInstallSnapshot(_manager, _node, new SnapshotRequest { SessionId = "s", PartitionId = 1, SnapshotIndex = 1, IsLast = true, Data = new byte[] { 1 } }, TestContext.Current.CancellationToken)).Success);
         Assert.Null(await nem.GetRemoteFollowerLag(_manager, _node, 0, Dst));
 
         Assert.Empty(inner.Calls);  // nothing reached the inner transport
@@ -368,7 +368,7 @@ public sealed class TestNemesisCommunication : IDisposable
         byte[] pooled = [1, 2, 3, 4]; // stands in for the sender's reused pooled buffer
         SnapshotRequest req = new() { SessionId = "s", PartitionId = 1, SnapshotIndex = 1, IsLast = true, Data = pooled };
 
-        Task<SnapshotResponse> held = nem.SendInstallSnapshot(_manager, _node, req);
+        Task<SnapshotResponse> held = nem.SendInstallSnapshot(_manager, _node, req, TestContext.Current.CancellationToken);
         Assert.Equal(1, nem.HeldCount);
 
         // Sender reuses the pooled buffer while the message is held.
@@ -390,7 +390,7 @@ public sealed class TestNemesisCommunication : IDisposable
         nem.Duplicate(Src, Dst, NemesisVerb.InstallSnapshot);
 
         SnapshotRequest req = new() { SessionId = "s", PartitionId = 1, SnapshotIndex = 1, IsLast = true, Data = new byte[] { 5, 6, 7 } };
-        await nem.SendInstallSnapshot(_manager, _node, req);
+        await nem.SendInstallSnapshot(_manager, _node, req, TestContext.Current.CancellationToken);
 
         Assert.Equal(2, inner.SnapshotBytes.Count);
         Assert.Equal([5, 6, 7], inner.SnapshotBytes[0]);

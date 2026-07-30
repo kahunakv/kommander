@@ -218,6 +218,13 @@ public sealed class RaftPartition : IDisposable
     public void SetMinRetainIndex(long index) => walHandler.SetMinRetainIndex(index);
 
     /// <summary>
+    /// Acquires a composable retention hold on this partition's WAL; the effective retention floor
+    /// is the minimum across all active holds. Forwarded directly to the underlying
+    /// <see cref="RaftWriteAhead"/>. See <see cref="RaftWriteAhead.AcquireRetentionHold"/> for semantics.
+    /// </summary>
+    public IDisposable AcquireRetentionHold(long index) => walHandler.AcquireRetentionHold(index);
+
+    /// <summary>
     /// Advisory composite load score for this partition, forwarded from the executor's
     /// <see cref="Scheduling.RaftPartitionExecutor.CurrentLoad"/> accumulator.
     /// </summary>

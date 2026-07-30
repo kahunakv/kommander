@@ -349,6 +349,26 @@ public interface IRaft
     public void SetMinRetainIndex(int partitionId, long index);
 
     /// <summary>
+    /// Acquires a composable retention hold on <paramref name="partitionId"/>'s WAL: committed
+    /// entries are retained down to <paramref name="index"/> until the returned handle is disposed.
+    /// <para>
+    /// Unlike <see cref="SetMinRetainIndex"/>, which is a single last-writer-wins floor, holds
+    /// compose: any number may be active concurrently and the effective retention floor is the
+    /// <b>minimum</b> across all of them (∞ when none), so independent consumers — PITR horizon,
+    /// backup capture, and the like — never clobber one another. <see cref="SetMinRetainIndex"/>
+    /// remains an orthogonal floor composed in as the degenerate single-value case.
+    /// </para>
+    /// <para>
+    /// The call is synchronous and thread-safe; the new floor is visible to the next compaction pass
+    /// with no scheduling round-trip. If <paramref name="partitionId"/> is not hosted on this node
+    /// the call is a no-op that returns a disposable which does nothing. The floor is in-memory and
+    /// resets on process restart; consumers must re-assert holds on every node start before relying
+    /// on PITR for that node. Disposing the handle is idempotent and releases exactly one hold.
+    /// </para>
+    /// </summary>
+    public IDisposable AcquireRetentionHold(int partitionId, long index);
+
+    /// <summary>
     /// Obtains the local endpoint
     /// </summary>
     /// <returns></returns>

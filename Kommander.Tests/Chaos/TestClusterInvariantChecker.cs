@@ -44,7 +44,7 @@ public class TestClusterInvariantChecker
             pollInterval: TimeSpan.FromMilliseconds(20));
         checker.Start();
 
-        await Task.Delay(500);
+        await Task.Delay(500, TestContext.Current.CancellationToken);
         Assert.Null(checker.FirstViolation);
     }
 

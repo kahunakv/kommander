@@ -1651,6 +1651,31 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             partition.SetMinRetainIndex(index);
     }
 
+    /// <summary>
+    /// Acquires a composable retention hold on the given partition's WAL. When the partition is not
+    /// hosted on this node the call is a no-op that returns a disposable which does nothing, mirroring
+    /// the silent no-op of <see cref="SetMinRetainIndex"/>. See <see cref="IRaft.AcquireRetentionHold"/>
+    /// for full semantics.
+    /// </summary>
+    public IDisposable AcquireRetentionHold(int partitionId, long index)
+    {
+        if (partitions.TryGetValue(partitionId, out RaftPartition? partition))
+            return partition.AcquireRetentionHold(index);
+
+        return NoOpRetentionHold.Instance;
+    }
+
+    /// <summary>
+    /// No-op retention handle returned when a hold is requested for a partition not hosted here, so
+    /// callers always receive a valid <see cref="IDisposable"/> to dispose.
+    /// </summary>
+    private sealed class NoOpRetentionHold : IDisposable
+    {
+        public static readonly NoOpRetentionHold Instance = new();
+
+        public void Dispose() { }
+    }
+
     internal NodeLoadReport BuildLocalLoadReport() => loadReportService.BuildLocalLoadReport();
 
     /// <summary>

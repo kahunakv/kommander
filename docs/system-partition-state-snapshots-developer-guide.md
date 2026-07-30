@@ -284,6 +284,12 @@ The **`log.Id <= d` skip** is essential — without it you double-apply deltas a
 - **Interaction.** The effective deletion boundary is always the **lower** of the checkpoint and the
   retain floor. You cannot accidentally retain *more* by lowering the checkpoint, nor delete *more* by
   raising the floor.
+- **Composable holds.** `SetMinRetainIndex` is a single last-writer-wins floor: two independent
+  consumers overwrite each other. When more than one consumer needs to protect a prefix concurrently
+  (e.g. a PITR-horizon updater *and* a backup driver), use `IRaft.AcquireRetentionHold(0, index)`
+  instead. It returns an `IDisposable`; the effective retain floor is the **minimum across all active
+  holds** (composed with `SetMinRetainIndex` and the checkpoint as above), and disposing a handle
+  releases exactly that one hold. Same durability contract — in-memory, re-assert on restart.
 
 ```
    Ids:  1  2  3  4  5  6  7  8  9  10        checkpoint = 10, local snapshot d = 6
@@ -306,7 +312,8 @@ Everything you need is on `IRaft` and two small types — no internal Kommander 
 | `IRaft.OnReplicationReceived` / `OnLogRestored` | `Func<int, RaftLog, Task<bool>>` — live and restore delivery. |
 | `RaftLog.Id` | The committed index of the delivered entry — use it to dedup against your local baseline. |
 | `IRaft.ReplicateCheckpoint(0, …)` | Advance the P0 checkpoint so compaction can reclaim space. |
-| `IRaft.SetMinRetainIndex(0, d + 1)` | Protect un-snapshotted deltas from compaction; in-memory, re-assert on restart. |
+| `IRaft.SetMinRetainIndex(0, d + 1)` | Protect un-snapshotted deltas from compaction; single floor, in-memory, re-assert on restart. |
+| `IRaft.AcquireRetentionHold(0, index)` | Composable retain floor for concurrent consumers; effective floor = min across all holds. Returns an `IDisposable`; dispose to release. |
 | `RaftSystemConfig.SystemPartition` | The system-partition id, `0`. |
 
 ---

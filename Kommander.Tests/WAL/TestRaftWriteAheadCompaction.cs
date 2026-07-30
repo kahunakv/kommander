@@ -629,6 +629,346 @@ public sealed class TestRaftWriteAheadCompaction
         finally { DeleteTempWalPath(path); }
     }
 
+    // ── Composable retention holds (min-of-holds floor) tests ────────────────
+
+    /// <summary>
+    /// Two concurrent holds at different indices ⇒ the effective floor is the smaller of the two,
+    /// and compaction never truncates below it. Entries below the min-held index are removed;
+    /// entries at or above it survive.
+    /// </summary>
+    [Fact]
+    public async Task Holds_TwoConcurrent_FloorIsMinimum()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance);
+            const int partitionId = 1;
+            // logs 1-9 committed, checkpoint at 10
+            SeedRemovableLogs(wal, partitionId, removableCount: 9, checkpointId: 10);
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal, compactNumberEntries: 100, maxEntriesPerCompaction: 1000, compactEveryOperations: 0,
+                partitionId, out RaftManager manager, out RaftPartition partition);
+
+            try
+            {
+                // Two independent consumers hold at 5 and 8 → effective floor = min(5, 8) = 5.
+                using IDisposable holdHigh = writeAhead.AcquireRetentionHold(8);
+                using IDisposable holdLow = writeAhead.AcquireRetentionHold(5);
+                Assert.Equal(5, writeAhead.EffectiveRetentionFloor);
+
+                writeAhead.Compact();
+                await writeAhead.WaitForCompactionIdleAsync().ConfigureAwait(true);
+
+                long[] survivingIds = wal.ReadLogsRange(partitionId, 0).Select(l => l.Id).ToArray();
+
+                // ids 1-4 gone; 5-9 and checkpoint 10 retained (the lower hold is binding).
+                Assert.DoesNotContain(1L, survivingIds);
+                Assert.DoesNotContain(4L, survivingIds);
+                Assert.Contains(5L, survivingIds);
+                Assert.Contains(9L, survivingIds);
+                Assert.Contains(10L, survivingIds);
+            }
+            finally { partition.Dispose(); manager.Dispose(); }
+        }
+        finally { DeleteTempWalPath(path); }
+    }
+
+    /// <summary>
+    /// Releasing the lowest hold raises the floor to the min of the remaining holds; releasing all
+    /// holds drops back to unprotected (compaction truncates to the checkpoint).
+    /// </summary>
+    [Fact]
+    public async Task Holds_ReleasingLowest_RaisesFloorToRemainingMin()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance);
+            const int partitionId = 1;
+            // logs 1-9 committed, checkpoint at 10
+            SeedRemovableLogs(wal, partitionId, removableCount: 9, checkpointId: 10);
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal, compactNumberEntries: 100, maxEntriesPerCompaction: 1000, compactEveryOperations: 0,
+                partitionId, out RaftManager manager, out RaftPartition partition);
+
+            try
+            {
+                IDisposable holdLow = writeAhead.AcquireRetentionHold(5);
+                using IDisposable holdHigh = writeAhead.AcquireRetentionHold(8);
+                Assert.Equal(5, writeAhead.EffectiveRetentionFloor);
+
+                // Release the lower hold → floor rises to the remaining hold at 8.
+                holdLow.Dispose();
+                Assert.Equal(8, writeAhead.EffectiveRetentionFloor);
+
+                writeAhead.Compact();
+                await writeAhead.WaitForCompactionIdleAsync().ConfigureAwait(true);
+
+                long[] survivingIds = wal.ReadLogsRange(partitionId, 0).Select(l => l.Id).ToArray();
+
+                // 1-7 gone; 8, 9, checkpoint 10 retained.
+                for (long id = 1; id <= 7; id++)
+                    Assert.DoesNotContain(id, survivingIds);
+                Assert.Contains(8L, survivingIds);
+                Assert.Contains(9L, survivingIds);
+                Assert.Contains(10L, survivingIds);
+            }
+            finally { partition.Dispose(); manager.Dispose(); }
+        }
+        finally { DeleteTempWalPath(path); }
+    }
+
+    /// <summary>
+    /// Zero active holds ⇒ no hold protection: <see cref="RaftWriteAhead.EffectiveRetentionFloor"/>
+    /// is <see cref="long.MaxValue"/> and compaction truncates all committed entries below the
+    /// checkpoint, identical to the pre-holds behaviour.
+    /// </summary>
+    [Fact]
+    public async Task Holds_ReleasingAll_Unprotected()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance);
+            const int partitionId = 1;
+            const int removableCount = 9;
+
+            SeedRemovableLogs(wal, partitionId, removableCount, checkpointId: removableCount + 1);
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal, compactNumberEntries: 100, maxEntriesPerCompaction: 1000, compactEveryOperations: 0,
+                partitionId, out RaftManager manager, out RaftPartition partition);
+
+            try
+            {
+                IDisposable hold1 = writeAhead.AcquireRetentionHold(3);
+                IDisposable hold2 = writeAhead.AcquireRetentionHold(6);
+                hold1.Dispose();
+                hold2.Dispose();
+                Assert.Equal(long.MaxValue, writeAhead.EffectiveRetentionFloor);
+
+                writeAhead.Compact();
+                await writeAhead.WaitForCompactionIdleAsync().ConfigureAwait(true);
+
+                (_, int remaining) = wal.CompactLogsOlderThan(
+                    partitionId, lastCheckpoint: removableCount + 1, compactNumberEntries: 100);
+                Assert.Equal(0, remaining);
+            }
+            finally { partition.Dispose(); manager.Dispose(); }
+        }
+        finally { DeleteTempWalPath(path); }
+    }
+
+    /// <summary>
+    /// A hold acquired before a compaction pass is honored by that pass; once released, the next
+    /// pass observes the raised floor and deletes the newly-exposed prefix.
+    /// </summary>
+    [Fact]
+    public async Task Holds_HonoredByCurrentPass_ReleaseObservedByNextPass()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance);
+            const int partitionId = 1;
+            // logs 1-9 committed, checkpoint at 10
+            SeedRemovableLogs(wal, partitionId, removableCount: 9, checkpointId: 10);
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal, compactNumberEntries: 100, maxEntriesPerCompaction: 1000, compactEveryOperations: 0,
+                partitionId, out RaftManager manager, out RaftPartition partition);
+
+            try
+            {
+                // Pass 1: hold at 5 is honored → removes 1-4, retains 5-9.
+                IDisposable hold = writeAhead.AcquireRetentionHold(5);
+                writeAhead.Compact();
+                await writeAhead.WaitForCompactionIdleAsync().ConfigureAwait(true);
+
+                long[] afterPass1 = wal.ReadLogsRange(partitionId, 0).Select(l => l.Id).ToArray();
+                Assert.DoesNotContain(4L, afterPass1);
+                Assert.Contains(5L, afterPass1);
+
+                // Release the hold → Pass 2 observes no protection and truncates to the checkpoint.
+                hold.Dispose();
+                writeAhead.Compact();
+                await writeAhead.WaitForCompactionIdleAsync().ConfigureAwait(true);
+
+                (_, int remaining) = wal.CompactLogsOlderThan(
+                    partitionId, lastCheckpoint: 10, compactNumberEntries: 100);
+                Assert.Equal(0, remaining);
+            }
+            finally { partition.Dispose(); manager.Dispose(); }
+        }
+        finally { DeleteTempWalPath(path); }
+    }
+
+    /// <summary>
+    /// A single hold behaves identically to <see cref="RaftWriteAhead.SetMinRetainIndex"/> at the
+    /// same index — the composable primitive is a strict superset of the legacy floor.
+    /// </summary>
+    [Fact]
+    public async Task Holds_SingleHold_MatchesSetMinRetainIndex()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance);
+            const int partitionId = 1;
+            // logs 1-9 committed, checkpoint at 10
+            SeedRemovableLogs(wal, partitionId, removableCount: 9, checkpointId: 10);
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal, compactNumberEntries: 100, maxEntriesPerCompaction: 1000, compactEveryOperations: 0,
+                partitionId, out RaftManager manager, out RaftPartition partition);
+
+            try
+            {
+                // Single hold at 5, exactly as SetMinRetainIndex(5) in RetainFloor_BelowCheckpoint.
+                using IDisposable hold = writeAhead.AcquireRetentionHold(5);
+                Assert.Equal(5, writeAhead.EffectiveRetentionFloor);
+
+                writeAhead.Compact();
+                await writeAhead.WaitForCompactionIdleAsync().ConfigureAwait(true);
+
+                long[] survivingIds = wal.ReadLogsRange(partitionId, 0).Select(l => l.Id).ToArray();
+                Assert.DoesNotContain(1L, survivingIds);
+                Assert.DoesNotContain(4L, survivingIds);
+                Assert.Contains(5L, survivingIds);
+                Assert.Contains(9L, survivingIds);
+                Assert.Contains(10L, survivingIds);
+            }
+            finally { partition.Dispose(); manager.Dispose(); }
+        }
+        finally { DeleteTempWalPath(path); }
+    }
+
+    /// <summary>
+    /// The legacy <see cref="RaftWriteAhead.SetMinRetainIndex"/> floor and an active hold compose:
+    /// the effective floor is the minimum of the two, so neither mechanism can raise the floor above
+    /// the other's protected index.
+    /// </summary>
+    [Fact]
+    public void Holds_ComposeWithLegacyFloor_EffectiveIsMinimum()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance);
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal, compactNumberEntries: 100, maxEntriesPerCompaction: 1000, compactEveryOperations: 0,
+                partitionId: 1, out RaftManager manager, out RaftPartition partition);
+
+            try
+            {
+                // Legacy floor higher than the hold → hold binds.
+                writeAhead.SetMinRetainIndex(20);
+                using IDisposable hold = writeAhead.AcquireRetentionHold(7);
+                Assert.Equal(7, writeAhead.EffectiveRetentionFloor);
+
+                // Legacy floor lower than the hold → legacy floor binds.
+                writeAhead.SetMinRetainIndex(3);
+                Assert.Equal(3, writeAhead.EffectiveRetentionFloor);
+            }
+            finally { partition.Dispose(); manager.Dispose(); }
+        }
+        finally { DeleteTempWalPath(path); }
+    }
+
+    /// <summary>
+    /// Disposing the same handle twice releases exactly one hold — the second dispose is a no-op and
+    /// must not remove a different consumer's hold that happens to remain active.
+    /// </summary>
+    [Fact]
+    public void Holds_DisposeIsIdempotent()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance);
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal, compactNumberEntries: 100, maxEntriesPerCompaction: 1000, compactEveryOperations: 0,
+                partitionId: 1, out RaftManager manager, out RaftPartition partition);
+
+            try
+            {
+                IDisposable holdA = writeAhead.AcquireRetentionHold(5);
+                using IDisposable holdB = writeAhead.AcquireRetentionHold(9);
+                Assert.Equal(5, writeAhead.EffectiveRetentionFloor);
+
+                // Double-dispose of A must not disturb B's hold at 9.
+                holdA.Dispose();
+                holdA.Dispose();
+                Assert.Equal(9, writeAhead.EffectiveRetentionFloor);
+            }
+            finally { partition.Dispose(); manager.Dispose(); }
+        }
+        finally { DeleteTempWalPath(path); }
+    }
+
+    /// <summary>
+    /// An <c>index &lt;= 0</c> hold is normalized to no protection (<see cref="long.MaxValue"/>),
+    /// mirroring <see cref="RaftWriteAhead.SetMinRetainIndex"/>, so a consumer that has not yet
+    /// computed its protected index cannot accidentally suppress compaction.
+    /// </summary>
+    [Fact]
+    public void Holds_NonPositiveIndex_NoProtection()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance);
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal, compactNumberEntries: 100, maxEntriesPerCompaction: 1000, compactEveryOperations: 0,
+                partitionId: 1, out RaftManager manager, out RaftPartition partition);
+
+            try
+            {
+                using IDisposable holdZero = writeAhead.AcquireRetentionHold(0);
+                using IDisposable holdNeg = writeAhead.AcquireRetentionHold(-1);
+                Assert.Equal(long.MaxValue, writeAhead.EffectiveRetentionFloor);
+            }
+            finally { partition.Dispose(); manager.Dispose(); }
+        }
+        finally { DeleteTempWalPath(path); }
+    }
+
+    /// <summary>
+    /// IRaft.AcquireRetentionHold for a partition not hosted on this node must be a no-op that
+    /// returns a disposable and does not throw, mirroring <see cref="IRaft.SetMinRetainIndex"/>.
+    /// </summary>
+    [Fact]
+    public void Holds_UnknownPartition_ReturnsNoOpHandle()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance);
+
+            CreateWriteAhead(
+                wal, compactNumberEntries: 5, maxEntriesPerCompaction: 100, compactEveryOperations: 0,
+                partitionId: 1, out RaftManager manager, out RaftPartition partition);
+
+            try
+            {
+                IRaft raft = manager;
+                Exception? ex = Record.Exception(() =>
+                {
+                    using IDisposable hold = raft.AcquireRetentionHold(999, 42);
+                });
+                Assert.Null(ex);
+            }
+            finally { partition.Dispose(); manager.Dispose(); }
+        }
+        finally { DeleteTempWalPath(path); }
+    }
+
     private static RaftWriteAhead CreateWriteAhead(
         SqliteWAL wal,
         int compactNumberEntries,
