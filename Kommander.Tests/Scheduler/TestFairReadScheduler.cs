@@ -478,6 +478,125 @@ public sealed class TestFairReadScheduler
     }
 
     /// <summary>
+    /// Deterministic regression for the admission/shutdown lifecycle race: an
+    /// <see cref="FairReadScheduler.EnqueueTask{T}"/> that has passed the stopping check but
+    /// not yet published its work must not be stranded by a concurrent
+    /// <see cref="FairReadScheduler.Stop"/>. We hold one admission in flight (via the
+    /// <c>OnAfterAdmissionCheck</c> seam), call Stop() on another thread, and assert Stop
+    /// cannot complete while the admission is parked; once released, the accepted task must
+    /// complete. On the pre-fix code (stopping checked outside any lock) Stop() would drain
+    /// and join before the parked admission published, and the task would hang forever.
+    /// </summary>
+    [Fact]
+    public async Task Stop_BlocksUntilInFlightAdmissionPublishes_ThenTaskCompletes()
+    {
+        using FairReadScheduler scheduler = new(NullLogger<IRaft>.Instance, workerCount: 2);
+        scheduler.Start();
+
+        ManualResetEventSlim admissionEntered = new(false);
+        ManualResetEventSlim releaseAdmission = new(false);
+
+        // The next EnqueueTask will signal that it is past the stopping check (holding the
+        // admission read lock) and then block until the test releases it.
+        scheduler.OnAfterAdmissionCheck = () =>
+        {
+            admissionEntered.Set();
+            releaseAdmission.Wait();
+        };
+
+        // Kick off the admission on a background thread; it parks inside the seam.
+        Task<int> admitted = Task.Run(() => scheduler.EnqueueTask(7, () => 777), TestContext.Current.CancellationToken);
+
+        try
+        {
+            Assert.True(admissionEntered.Wait(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken), "Admission never reached the seam.");
+
+            // Clear the seam so Stop()'s own drain path (and nothing else) is unaffected.
+            scheduler.OnAfterAdmissionCheck = null;
+
+            // Stop() on another thread must BLOCK on the lifecycle write lock while the
+            // admission holds the read lock.
+            Task stop = Task.Run(scheduler.Stop, TestContext.Current.CancellationToken);
+
+            // Give Stop() a chance to run; it must not complete while the admission is parked.
+            await Task.WhenAny(stop, Task.Delay(TimeSpan.FromMilliseconds(300), TestContext.Current.CancellationToken));
+            Assert.False(stop.IsCompleted, "Stop() completed while an admission was still in flight.");
+            Assert.False(admitted.IsCompleted, "Task completed before its work was even published.");
+
+            // Release the admission: it publishes its work, Stop() proceeds to drain it.
+            releaseAdmission.Set();
+
+            await stop.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            int result = await admitted.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            Assert.Equal(777, result);
+        }
+        finally
+        {
+            // Always release the gate so a failed assertion cannot leave the admission thread
+            // parked (holding the read lock) and deadlock `using` disposal / test cleanup.
+            releaseAdmission.Set();
+        }
+    }
+
+    /// <summary>
+    /// Deterministic regression for the concurrent-Stop lifecycle bug: when two callers race
+    /// <see cref="FairReadScheduler.Stop"/>, the second (non-owning) caller must not return
+    /// until the owner has fully drained and joined every worker. Otherwise a caller that
+    /// treats a returned Stop() as "safe to dispose the backend" could tear down storage
+    /// while a worker is still executing I/O. We stall the owner's drain on an in-flight read
+    /// and assert the second Stop() stays blocked until that read completes.
+    /// </summary>
+    [Fact]
+    public async Task ConcurrentStop_SecondCallerWaitsForOwnerToFinishDraining()
+    {
+        using FairReadScheduler scheduler = new(NullLogger<IRaft>.Instance, workerCount: 2);
+        scheduler.Start();
+
+        ManualResetEventSlim readStarted = new(false);
+        ManualResetEventSlim releaseRead = new(false);
+        int readCompleted = 0;
+
+        // A single in-flight read that blocks the drain until the test releases it.
+        Task<int> blocked = scheduler.EnqueueTask(3, () =>
+        {
+            readStarted.Set();
+            releaseRead.Wait();
+            Interlocked.Exchange(ref readCompleted, 1);
+            return 99;
+        });
+
+        try
+        {
+            Assert.True(readStarted.Wait(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken), "Blocking read never started.");
+
+            // Two concurrent Stop() callers. Exactly one owns the drain/join; the other must
+            // block until the owner is done.
+            Task stopA = Task.Run(scheduler.Stop, TestContext.Current.CancellationToken);
+            Task stopB = Task.Run(scheduler.Stop, TestContext.Current.CancellationToken);
+
+            // Neither may complete while the read (and thus the owner's join) is still in
+            // flight — the non-owner must not sneak out early.
+            await Task.WhenAny(Task.WhenAll(stopA, stopB), Task.Delay(TimeSpan.FromMilliseconds(300), TestContext.Current.CancellationToken));
+            Assert.False(stopA.IsCompleted, "A Stop() caller returned before the owner finished draining.");
+            Assert.False(stopB.IsCompleted, "A Stop() caller returned before the owner finished draining.");
+            Assert.Equal(0, Volatile.Read(ref readCompleted));
+
+            // Let the read finish; both Stop() callers must now return.
+            releaseRead.Set();
+
+            await Task.WhenAll(stopA, stopB).WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+            // Both returned only after the worker actually finished the read.
+            Assert.Equal(1, Volatile.Read(ref readCompleted));
+            Assert.Equal(99, await blocked.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken));
+        }
+        finally
+        {
+            releaseRead.Set();
+        }
+    }
+
+    /// <summary>
     /// End-to-end fairness/liveness with worker counts &gt; 1 and enough distinct partitions
     /// to exceed the old ready-queue capacity: all accepted tasks complete and each
     /// partition runs with concurrency exactly one throughout.
