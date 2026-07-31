@@ -1061,6 +1061,14 @@ public sealed class RaftPartitionStateMachine
         if (currentTerm > request.Term)
             return;
 
+        // Membership fence: only a committed roster member can have been a leader, so a step-down
+        // notice from a non-member must not be able to clear our leader and force an election.
+        if (!host.IsMember(request.Endpoint))
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Ignoring StepDownNotice from non-member {Endpoint} Term={Term}", host.LocalEndpoint, host.PartitionId, nodeState, request.Endpoint, request.Term);
+            return;
+        }
+
         if (!string.IsNullOrEmpty(host.Leader) && host.Leader != request.Endpoint)
             return;
 
@@ -1092,6 +1100,14 @@ public sealed class RaftPartitionStateMachine
 
         if (currentTerm > request.Term)
             return;
+
+        // Membership fence: only the current leader (necessarily a roster member) may hand us
+        // leadership; a non-member must not be able to trigger a disruptive election.
+        if (!host.IsMember(request.Endpoint))
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Ignoring TransferLeadership from non-member {Endpoint} Term={Term}", host.LocalEndpoint, host.PartitionId, nodeState, request.Endpoint, request.Term);
+            return;
+        }
 
         if (!string.IsNullOrEmpty(host.Leader) && host.Leader != request.Endpoint)
             return;
@@ -1626,16 +1642,27 @@ public sealed class RaftPartitionStateMachine
     /// <param name="remoteMaxLogId"></param>
     public void ReceiveHandshake(int remoteNodeId, string endpoint, long remoteMaxLogId)
     {
+        // Membership fence: handshakes are best-effort (droppable, re-sent) and a joiner is a
+        // committed Learner before its partitions start, so a non-member's handshake can be safely
+        // ignored. Checked before the NodeId-collision exit so an unadmitted node with a duplicated
+        // NodeId cannot kill a cluster member's process, and before startCommitIndexes so a
+        // non-member never pollutes step-down target selection.
+        if (!host.IsMember(endpoint))
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Ignoring Handshake from non-member {Endpoint} NodeId={NodeId}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, remoteNodeId);
+            return;
+        }
+
         if (host.LocalNodeId == remoteNodeId)
         {
             logger.LogCritSameNodeId(host.LocalEndpoint, host.PartitionId, nodeState, host.LocalNodeId, remoteNodeId);
-            
+
             Environment.Exit(1);
             return;
         }
-        
+
         logger.LogInfoReceivedHandshake(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, remoteNodeId, remoteMaxLogId);
-        
+
         startCommitIndexes[endpoint] = remoteMaxLogId;
     }
 
@@ -2052,7 +2079,26 @@ public sealed class RaftPartitionStateMachine
             
             return;
         }
-        
+
+        // Membership fence: a valid AppendEntries authoritatively identifies a term's leader, but only a
+        // committed roster member can legitimately be one. Without this, any endpoint reachable through
+        // the transport (e.g. registered in the transport map before joining membership) could be adopted
+        // as leader merely by sending logs with a fresh term, churning an established partition's
+        // leadership. Skipped for the already-accepted leader so a roster snapshot that briefly lags a
+        // role change cannot make a follower reject its real leader.
+        if (host.Leader != endpoint && !host.IsMember(endpoint))
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Ignoring AppendLogs from non-member {Endpoint} Term={Term}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, leaderTerm);
+
+            host.EnqueueResponse(endpoint, new(
+                RaftResponderRequestType.CompleteAppendLogs,
+                new(endpoint),
+                new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogsFromAnotherLeader, -1)
+            ));
+
+            return;
+        }
+
         // leaderTerm >= currentTerm is guaranteed here (the currentTerm > leaderTerm case returned
         // above). A valid AppendEntries authoritatively identifies the single leader of leaderTerm,
         // so adopt it regardless of whom we voted for this term. Granting a vote to a candidate does
@@ -3590,6 +3636,17 @@ public sealed class RaftPartitionStateMachine
                 logger.LogWarning(
                     "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot from stale leader {Endpoint}: LeaderTerm={LeaderTerm} < CurrentTerm={CurrentTerm}. Rejecting.",
                     host.LocalEndpoint, host.PartitionId, nodeState, leaderEndpoint, leaderTerm, currentTerm);
+                return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Errored, -1);
+            }
+
+            // Membership fence — mirror AppendLogsCoreAsync: a snapshot is a leader RPC, and only a
+            // committed roster member can legitimately be a leader. Skipped for the already-accepted
+            // leader so a briefly-lagging roster snapshot cannot reject the real leader.
+            if (host.Leader != leaderEndpoint && !host.IsMember(leaderEndpoint))
+            {
+                logger.LogWarning(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot rejected: sender {Endpoint} is not a committed cluster member.",
+                    host.LocalEndpoint, host.PartitionId, nodeState, leaderEndpoint);
                 return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Errored, -1);
             }
 

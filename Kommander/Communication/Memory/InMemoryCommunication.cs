@@ -21,7 +21,14 @@ public class InMemoryCommunication : ICommunication
     
     private static readonly Task<CompleteAppendLogsResponse> completeAppendLogsResponse = Task.FromResult(new CompleteAppendLogsResponse());
     
-    private Dictionary<string, IRaft> nodes = new();
+    /// <summary>
+    /// Routing table. Volatile, and defensively copied in <see cref="SetNodes"/>: partition-executor
+    /// threads read it concurrently, so a caller re-registering nodes mid-run (e.g. adding a joiner to
+    /// an already-running cluster) must atomically publish a new dictionary — mutating a shared
+    /// instance during a resize silently drops or corrupts RPC delivery between existing members,
+    /// which manifests as spurious leadership churn.
+    /// </summary>
+    private volatile Dictionary<string, IRaft> nodes = new();
 
     /// <summary>
     /// Endpoints currently "transport-paused". A message is dropped if either its sender or its
@@ -33,7 +40,7 @@ public class InMemoryCommunication : ICommunication
 
     public void SetNodes(Dictionary<string, IRaft> nodes)
     {
-        this.nodes = nodes;
+        this.nodes = new(nodes);
     }
 
     /// <summary>

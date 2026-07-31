@@ -33,6 +33,21 @@ public interface IRaftPartitionHost
     /// </summary>
     bool IsVoter(string endpoint);
 
+    /// <summary>
+    /// Returns true if <paramref name="endpoint"/> is a committed member of the roster in <b>any</b> role
+    /// (voter or learner). Always returns true when no roster has been seeded yet (pre-seed fallback).
+    /// <para>
+    /// Used to fence inbound leadership-perturbing RPCs (AppendLogs leader adoption, StepDownNotice,
+    /// TransferLeadership, Handshake) against endpoints that are reachable through the transport but were
+    /// never admitted to membership: such an endpoint must not be able to churn an established partition's
+    /// leadership. Deliberately role-agnostic (unlike <see cref="IsVoter"/>) so a follower whose roster
+    /// briefly lags a member's promotion/demotion does not reject a legitimate peer. Defaults to
+    /// <see langword="true"/> so unit-test hosts that predate membership are unaffected; only
+    /// <c>RaftManager</c>'s adapter consults the real roster.
+    /// </para>
+    /// </summary>
+    bool IsMember(string endpoint) => true;
+
     RaftConfiguration Configuration { get; }
 
     HybridLogicalClock HybridLogicalClock { get; }

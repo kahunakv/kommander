@@ -575,15 +575,29 @@ public sealed class RaftPartition : IDisposable
         return response.Status;
     }
 
+    /// <summary>
+    /// Waits until the same non-empty leader endpoint has remained stable for at least
+    /// <paramref name="minStableFor"/>. <paramref name="minStableFor"/> is a required stability
+    /// window, not a deadline: without <paramref name="timeout"/> the only exit besides success is
+    /// the cancellation token, so a churning partition makes this wait forever. Callers must pass
+    /// a bounded <paramref name="timeout"/> (throws <see cref="TimeoutException"/> on expiry) or a
+    /// cancelling token.
+    /// </summary>
     internal async ValueTask<string> WaitForLeaderStableAsync(
         TimeSpan minStableFor,
+        TimeSpan? timeout = null,
         CancellationToken cancellationToken = default)
     {
         TimeSpan requiredStableFor = minStableFor <= TimeSpan.Zero ? TimeSpan.Zero : minStableFor;
+        long startTicks = Stopwatch.GetTimestamp();
 
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
+
+            if (timeout.HasValue && ValueStopwatch.GetElapsedTime(startTicks, Stopwatch.GetTimestamp()) >= timeout.Value)
+                throw new TimeoutException(
+                    $"Leader for partition {PartitionId} did not remain stable for {requiredStableFor.TotalMilliseconds}ms within {timeout.Value.TotalMilliseconds}ms");
 
             string leader = Leader;
 

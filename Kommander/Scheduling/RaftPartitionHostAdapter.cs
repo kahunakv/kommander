@@ -43,6 +43,14 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
         return roster.Members.Any(m => m.Endpoint == endpoint && m.Role == ClusterMemberRole.Voter);
     }
 
+    public bool IsMember(string endpoint)
+    {
+        ClusterMembership roster = manager.SystemCoordinator.GetMembership();
+        if (roster.MembershipVersion == 0)
+            return true; // pre-seed: treat all known peers as members (backward compat)
+        return roster.Members.Any(m => m.Endpoint == endpoint);
+    }
+
     public RaftConfiguration Configuration => manager.Configuration;
 
     public HybridLogicalClock HybridLogicalClock => manager.HybridLogicalClock;

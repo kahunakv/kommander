@@ -2496,7 +2496,20 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         if (!IsInitialized)
             throw new RaftException("Raft manager is not initialized");
 
-        return GetPartition(partitionId).WaitForLeaderStableAsync(minStableFor, cancellationToken);
+        return GetPartition(partitionId).WaitForLeaderStableAsync(minStableFor, timeout: null, cancellationToken);
+    }
+
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public ValueTask<string> WaitForLeaderStableAsync(
+        int partitionId,
+        TimeSpan minStableFor,
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default)
+    {
+        if (!IsInitialized)
+            throw new RaftException("Raft manager is not initialized");
+
+        return GetPartition(partitionId).WaitForLeaderStableAsync(minStableFor, timeout, cancellationToken);
     }
 
     [EditorBrowsable(EditorBrowsableState.Never)]

@@ -429,11 +429,33 @@ public interface IRaft
     /// <summary>
     /// Waits until the same non-empty leader endpoint has remained stable for at
     /// least the requested duration.
+    /// <para>
+    /// WARNING: <paramref name="minStableFor"/> is a required stability window, not a
+    /// deadline. This overload blocks until the window is satisfied or the token is
+    /// cancelled — a partition whose leadership keeps churning makes it wait forever.
+    /// Callers must supply a bounded <paramref name="cancellationToken"/>, or prefer the
+    /// overload that takes an overall <c>timeout</c> and fails fast with
+    /// <see cref="TimeoutException"/>.
+    /// </para>
     /// </summary>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public ValueTask<string> WaitForLeaderStableAsync(
         int partitionId,
         TimeSpan minStableFor,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Waits until the same non-empty leader endpoint has remained stable for at
+    /// least <paramref name="minStableFor"/>, giving up after an overall
+    /// <paramref name="timeout"/>. This is the recommended overload: a churning or
+    /// mis-elected partition produces a prompt, diagnosable <see cref="TimeoutException"/>
+    /// instead of an unbounded hang.
+    /// </summary>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public ValueTask<string> WaitForLeaderStableAsync(
+        int partitionId,
+        TimeSpan minStableFor,
+        TimeSpan timeout,
         CancellationToken cancellationToken = default);
 
     /// <summary>

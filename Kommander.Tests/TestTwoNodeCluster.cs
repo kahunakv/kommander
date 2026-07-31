@@ -250,6 +250,41 @@ public class TestTwoNodeCluster
     }
 
     [Fact]
+    public async Task WaitForLeaderStableAsync_UnsatisfiableWindow_TimesOutPromptly()
+    {
+        InMemoryCommunication communication = new();
+
+        (IRaft node1, IRaft node2) = await AssembleTwoNodeCluster(communication, logger);
+
+        // A stability window far larger than the cluster's age cannot be satisfied within the
+        // overall timeout, so the wait must fail fast instead of hanging on the ambient token.
+        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
+
+        await Assert.ThrowsAsync<TimeoutException>(async () =>
+            await node1.WaitForLeaderStableAsync(
+                UserPartition,
+                minStableFor: TimeSpan.FromMinutes(10),
+                timeout: TimeSpan.FromMilliseconds(300),
+                TestContext.Current.CancellationToken));
+
+        Assert.True(
+            stopwatch.GetElapsedMilliseconds() < 2000,
+            $"Timeout took too long: {stopwatch.GetElapsedMilliseconds()}ms");
+
+        // The success path through the timeout overload still returns the leader endpoint.
+        string stableLeader = await node1.WaitForLeaderStableAsync(
+            UserPartition,
+            minStableFor: TimeSpan.FromMilliseconds(100),
+            timeout: TimeSpan.FromSeconds(10),
+            TestContext.Current.CancellationToken);
+
+        Assert.False(string.IsNullOrEmpty(stableLeader));
+
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+    }
+
+    [Fact]
     public async Task ForceLeaderForTestingAsync_Node2_BecomesLeader_AndReplicates()
     {
         InMemoryCommunication communication = new();
