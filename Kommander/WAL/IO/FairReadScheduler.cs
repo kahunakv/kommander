@@ -113,7 +113,14 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
         if (workerCount <= 0)
             workerCount = Math.Max(1, Environment.ProcessorCount);
 
-        _readyPartitions = new BlockingCollection<int>(boundedCapacity: workerCount * 64);
+        // The ready queue is intentionally UNBOUNDED. Each partition is represented at
+        // most once (deduplicated by PartitionState.Scheduled), so the number of live
+        // entries is bounded by the count of distinct partitions — not by request rate.
+        // A previous bounded capacity (workerCount * 64) capped *distinct partitions*
+        // rather than memory, which stranded rescheduled work once the partition count
+        // exceeded it (the post-batch TryAdd could fail with no future enqueue to retry).
+        // Bounded admission is still enforced per partition via maxQueueDepthPerPartition.
+        _readyPartitions = new BlockingCollection<int>();
         _workers = new Thread[workerCount];
     }
 
@@ -157,15 +164,35 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
             state.Ops.Enqueue(work);
             state.Depth++;
 
-            if (!state.Scheduled && !state.InFlight)
-            {
-                state.Scheduled = true;
-                if (!_readyPartitions.TryAdd(partitionId))
-                    _readyPartitions.Add(partitionId, _cts.Token);
-            }
+            TryScheduleLocked(partitionId, state);
         }
 
         return tcs.Task;
+    }
+
+    /// <summary>
+    /// Atomically claims a partition into the ready queue if it has pending work that no
+    /// worker owns and it is not already scheduled. MUST be called while holding
+    /// <paramref name="state"/>.<see cref="PartitionState.Lock"/>: the same critical section
+    /// that observes <c>Ops</c>/<c>Scheduled</c>/<c>InFlight</c> also establishes ownership
+    /// (sets <c>Scheduled</c>) before releasing the lock, so two threads cannot both decide
+    /// to schedule — or drain — the same partition. Because the ready queue is unbounded,
+    /// the <see cref="BlockingCollection{T}.TryAdd(T)"/> always succeeds and never blocks,
+    /// so this is safe to invoke under the lock.
+    /// </summary>
+    /// <returns><c>true</c> if this call newly scheduled the partition.</returns>
+    private bool TryScheduleLocked(int partitionId, PartitionState state)
+    {
+        if (state.Scheduled || state.InFlight || state.Ops.Count == 0)
+            return false;
+
+        // Unbounded queue: TryAdd only fails if the collection is marked complete-for-adding,
+        // which this scheduler never does. Set Scheduled only when the id is actually present.
+        if (!_readyPartitions.TryAdd(partitionId))
+            return false;
+
+        state.Scheduled = true;
+        return true;
     }
 
     // ── Lifecycle ──────────────────────────────────────────────────────────
@@ -308,44 +335,66 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
 
         // After reads complete, decrement Depth for exactly the items processed,
         // clear InFlight, then re-schedule if new items arrived while executing.
+        // The ready queue is unbounded, so TryScheduleLocked never fails to reinsert
+        // a non-empty partition — the reschedule can no longer be stranded by a full
+        // queue waiting for a future enqueue that may never arrive.
         lock (state.Lock)
         {
             state.Depth   -= batch.Count;
             state.InFlight = false;
 
-            if (state.Ops.Count > 0 && !state.Scheduled)
-            {
-                // Only mark Scheduled=true when the partition ID is actually
-                // inserted into the ready-queue.  If the bounded queue is full,
-                // TryAdd returns false; leaving Scheduled=false lets the next
-                // EnqueueTask call re-schedule the partition rather than stranding it.
-                if (_readyPartitions.TryAdd(partitionId))
-                    state.Scheduled = true;
-            }
+            TryScheduleLocked(partitionId, state);
         }
     }
 
     private void DrainRemaining(List<Action> batch)
     {
-        while (_readyPartitions.TryTake(out int partitionId))
-            ProcessPartition(partitionId, batch);
-
-        // Sweep all partition states for items not yet in the ready-queue
-        // (guards against a rare race at shutdown).
-        // IMPORTANT: skip partitions that are currently in-flight (InFlight=true).
-        // The worker executing that batch will clear InFlight in its post-read
-        // lock section and re-add the partition to _readyPartitions if items
-        // remain; this worker's own DrainRemaining first phase (TryTake loop)
-        // will then pick it up, preserving the single-worker-per-partition
-        // invariant even during shutdown.
-        foreach (KeyValuePair<int, PartitionState> kv in _partitions)
+        // Shutdown drain. Multiple canceled workers may run this concurrently. The ONLY
+        // thing that executes a partition is an atomic TryTake of its id from the ready
+        // queue, so each partition is owned by exactly one worker at a time even here.
+        // This closes the previous two-drainer TOCTOU where the sweep checked
+        // "Ops.Count > 0 && !InFlight" under the lock, released it, and then called
+        // ProcessPartition in a separate critical section — letting two drainers split
+        // one partition's queue and execute the halves concurrently.
+        //
+        // Admission is already closed (Stop() sets _stopping before _cts.Cancel()), so the
+        // system drains monotonically. Loop until global quiescence: no partition has
+        // queued work, none is InFlight, and the ready queue is empty. A partition another
+        // worker is still executing (InFlight) is left alone; that worker re-schedules it
+        // via TryScheduleLocked on completion and one of the drain loops then claims it.
+        while (true)
         {
-            bool shouldProcess;
-            lock (kv.Value.Lock)
-                shouldProcess = kv.Value.Ops.Count > 0 && !kv.Value.InFlight;
+            // Claim every eligible partition into the ready queue (atomic under each lock).
+            foreach (KeyValuePair<int, PartitionState> kv in _partitions)
+            {
+                lock (kv.Value.Lock)
+                    TryScheduleLocked(kv.Key, kv.Value);
+            }
 
-            if (shouldProcess)
-                ProcessPartition(kv.Key, batch);
+            // Drain whatever is claimable right now.
+            while (_readyPartitions.TryTake(out int partitionId))
+                ProcessPartition(partitionId, batch);
+
+            // Quiescence check: fully drained AND nobody still executing a batch?
+            bool pendingWork = false, inFlight = false;
+            foreach (KeyValuePair<int, PartitionState> kv in _partitions)
+            {
+                lock (kv.Value.Lock)
+                {
+                    if (kv.Value.Ops.Count > 0) pendingWork = true;
+                    if (kv.Value.InFlight) inFlight = true;
+                }
+
+                if (pendingWork && inFlight)
+                    break;
+            }
+
+            if (!pendingWork && !inFlight)
+                break;
+
+            // Another worker is still finishing a batch that will re-queue its partition.
+            // Yield rather than spin so that worker can make progress and re-schedule.
+            Thread.Yield();
         }
     }
 

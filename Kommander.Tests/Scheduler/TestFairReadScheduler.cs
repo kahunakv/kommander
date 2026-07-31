@@ -297,4 +297,232 @@ public sealed class TestFairReadScheduler
         gate.Set();
         scheduler.Stop();
     }
+
+    // ── Regression: reschedule stranding & concurrent drain ────────────────
+
+    /// <summary>
+    /// Regression for the reschedule-stranding liveness bug: a partition that already has
+    /// accepted work must eventually be re-represented in the ready queue on its own —
+    /// without relying on a *future* enqueue for that partition. We stall many distinct
+    /// partitions in-flight to push the ready queue well past its old bounded capacity,
+    /// enqueue a *second* op on an already-in-flight partition, then release everything.
+    /// The follow-up op must complete even though nothing further is ever enqueued for it.
+    /// </summary>
+    [Fact]
+    public async Task Reschedule_CompletesWithoutFutureEnqueue_UnderReadyQueuePressure()
+    {
+        // With the old bound (workerCount * 64), 4 workers capped distinct partitions at
+        // 256; exceeding that stranded rescheduled work. Use well over that.
+        const int partitions = 600;
+        const int workerCount = 4;
+
+        // Gate that holds every "first" op in flight so their partitions saturate the queue.
+        ManualResetEventSlim release = new(false);
+
+        using FairReadScheduler scheduler = new(NullLogger<IRaft>.Instance, workerCount);
+        scheduler.Start();
+
+        // One stalled op per partition -> up to `partitions` distinct ids scheduled at once.
+        List<Task<int>> firstOps = new(partitions);
+        for (int p = 1; p <= partitions; p++)
+        {
+            firstOps.Add(scheduler.EnqueueTask(p, () =>
+            {
+                release.Wait();
+                return p;
+            }));
+        }
+
+        // Second op on an already-busy partition. It is appended to state.Ops while that
+        // partition is InFlight, so it only reaches the ready queue via the post-batch
+        // reschedule — the exact path that used to strand under a full queue.
+        const int busyPartition = 1;
+        Task<int> followUp = scheduler.EnqueueTask(busyPartition, () => 12345);
+
+        // Follow-up must NOT be complete yet (its partition is stalled in flight).
+        Assert.False(followUp.IsCompleted);
+
+        // Release all first ops; the reschedule must carry the follow-up to completion
+        // with no further enqueue for `busyPartition`.
+        release.Set();
+
+        int[] firstResults = await Task.WhenAll(firstOps).WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+        Assert.Equal(partitions, firstResults.Length);
+
+        int followResult = await followUp.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+        Assert.Equal(12345, followResult);
+
+        scheduler.Stop();
+    }
+
+    /// <summary>
+    /// Regression for the concurrent-drain TOCTOU: stopping a scheduler with several workers
+    /// and an unscheduled partition holding multiple batches must never let two draining
+    /// workers execute that partition's ops concurrently, and must preserve FIFO order.
+    /// A per-partition concurrency probe asserts max concurrency == 1; the completion order
+    /// asserts FIFO.
+    /// </summary>
+    [Fact]
+    public async Task Stop_DrainsSinglePartition_WithoutConcurrentExecution_AndInOrder()
+    {
+        // Several distinct partitions, each staged with more than one batch of work, all
+        // parked before Start() so every partition begins Scheduled=false. Stop() must drain
+        // them via the atomic-claim path.
+        const int partitions = 6;
+        const int opsPerPartition = 200; // > MaxBatchSize (64) -> multiple batches each
+        const int workerCount = 4;
+
+        int[] concurrent = new int[partitions + 1];
+        int[] maxConcurrent = new int[partitions + 1];
+        ConcurrentDictionary<int, ConcurrentQueue<int>> order = new();
+
+        using FairReadScheduler scheduler = new(NullLogger<IRaft>.Instance, workerCount);
+
+        List<Task<int>> tasks = new(partitions * opsPerPartition);
+        for (int p = 1; p <= partitions; p++)
+        {
+            order[p] = new ConcurrentQueue<int>();
+            for (int i = 1; i <= opsPerPartition; i++)
+            {
+                int partition = p, seq = i;
+                tasks.Add(scheduler.EnqueueTask(partition, () =>
+                {
+                    int now = Interlocked.Increment(ref concurrent[partition]);
+                    // Track the observed maximum concurrency for this partition.
+                    int prevMax;
+                    do { prevMax = Volatile.Read(ref maxConcurrent[partition]); }
+                    while (now > prevMax &&
+                           Interlocked.CompareExchange(ref maxConcurrent[partition], now, prevMax) != prevMax);
+
+                    order[partition].Enqueue(seq);
+                    Thread.SpinWait(50); // widen the window for a concurrency violation to surface
+                    Interlocked.Decrement(ref concurrent[partition]);
+                    return seq;
+                }));
+            }
+        }
+
+        // Start then immediately Stop, racing the drain against normal worker dispatch.
+        scheduler.Start();
+        await Task.Run(scheduler.Stop, TestContext.Current.CancellationToken);
+
+        Assert.All(tasks, t => Assert.True(t.IsCompleted, "A staged operation was not completed by Stop()."));
+        await Task.WhenAll(tasks);
+
+        for (int p = 1; p <= partitions; p++)
+        {
+            Assert.True(maxConcurrent[p] <= 1,
+                $"Partition {p} executed with concurrency {maxConcurrent[p]} (single-worker-per-partition violated).");
+
+            int[] seen = order[p].ToArray();
+            Assert.Equal(opsPerPartition, seen.Length);
+            for (int i = 0; i < seen.Length - 1; i++)
+                Assert.True(seen[i] < seen[i + 1], $"P{p} FIFO violated at index {i}: {seen[i]} then {seen[i + 1]}");
+        }
+    }
+
+    /// <summary>
+    /// Racing <see cref="FairReadScheduler.Stop"/> against continued enqueue pressure: every
+    /// task that was <em>accepted</em> (EnqueueTask returned without throwing) must complete
+    /// or fault — none may remain pending after Stop() returns. Enqueues that arrive after
+    /// _stopping is observed are rejected with <see cref="InvalidOperationException"/> and do
+    /// not count as accepted.
+    /// </summary>
+    [Fact]
+    public async Task Stop_RacingEnqueuePressure_CompletesEveryAcceptedTask()
+    {
+        const int workerCount = 3;
+        const int partitions = 32;
+
+        using FairReadScheduler scheduler = new(NullLogger<IRaft>.Instance, workerCount);
+        scheduler.Start();
+
+        ConcurrentBag<Task<int>> accepted = new();
+        CancellationTokenSource producerStop = new();
+
+        // Producers hammer EnqueueTask across many partitions until Stop() rejects them.
+        Task[] producers = Enumerable.Range(0, workerCount).Select(_ => Task.Run(() =>
+        {
+            int seq = 0;
+            while (!producerStop.IsCancellationRequested)
+            {
+                try
+                {
+                    int partition = (seq % partitions) + 1;
+                    int value = seq++;
+                    accepted.Add(scheduler.EnqueueTask(partition, () => value));
+                }
+                catch (InvalidOperationException)
+                {
+                    break; // scheduler is stopping; enqueue was rejected (not accepted).
+                }
+                catch (ReadBackpressureExceededException)
+                {
+                    // depth limit hit for this partition; keep producing on others.
+                }
+            }
+        })).ToArray();
+
+        // Let some work accumulate, then stop while producers are still pushing.
+        await Task.Delay(50, TestContext.Current.CancellationToken);
+        scheduler.Stop();
+        producerStop.Cancel();
+        await Task.WhenAll(producers);
+
+        Task<int>[] all = accepted.ToArray();
+        Assert.All(all, t => Assert.True(t.IsCompleted,
+            "An accepted task was still pending after Stop() returned."));
+
+        // Every accepted task completed (none faulted for these pure delegates).
+        await Task.WhenAll(all);
+    }
+
+    /// <summary>
+    /// End-to-end fairness/liveness with worker counts &gt; 1 and enough distinct partitions
+    /// to exceed the old ready-queue capacity: all accepted tasks complete and each
+    /// partition runs with concurrency exactly one throughout.
+    /// </summary>
+    [Fact]
+    public async Task ManyPartitions_ExceedingReadyCapacity_AllComplete_NoConcurrentPartition()
+    {
+        const int workerCount = 4;
+        const int partitions = 500; // > workerCount * 64 (256)
+        const int opsPerPartition = 6;
+
+        int[] concurrent = new int[partitions + 1];
+        int[] maxConcurrent = new int[partitions + 1];
+
+        using FairReadScheduler scheduler = new(NullLogger<IRaft>.Instance, workerCount);
+        scheduler.Start();
+
+        List<Task<int>> tasks = new(partitions * opsPerPartition);
+        for (int p = 1; p <= partitions; p++)
+        {
+            for (int i = 1; i <= opsPerPartition; i++)
+            {
+                int partition = p, seq = i;
+                tasks.Add(scheduler.EnqueueTask(partition, () =>
+                {
+                    int now = Interlocked.Increment(ref concurrent[partition]);
+                    int prevMax;
+                    do { prevMax = Volatile.Read(ref maxConcurrent[partition]); }
+                    while (now > prevMax &&
+                           Interlocked.CompareExchange(ref maxConcurrent[partition], now, prevMax) != prevMax);
+
+                    Thread.SpinWait(20);
+                    Interlocked.Decrement(ref concurrent[partition]);
+                    return seq;
+                }));
+            }
+        }
+
+        int[] results = await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(60), TestContext.Current.CancellationToken);
+        Assert.Equal(partitions * opsPerPartition, results.Length);
+
+        for (int p = 1; p <= partitions; p++)
+            Assert.True(maxConcurrent[p] <= 1,
+                $"Partition {p} executed with concurrency {maxConcurrent[p]} (single-worker-per-partition violated).");
+
+        scheduler.Stop();
+    }
 }
