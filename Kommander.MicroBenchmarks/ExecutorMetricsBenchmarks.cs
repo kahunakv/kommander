@@ -22,7 +22,7 @@ namespace Kommander.MicroBenchmarks;
 /// immediately after the enabled check).</para>
 /// </summary>
 [Config(typeof(InProcessConfig))]
-public class ExecutorMetricsBenchmarks
+public class ExecutorMetricsBenchmarks : IDisposable
 {
     private const int PartitionId = 1;
 
@@ -67,6 +67,16 @@ public class ExecutorMetricsBenchmarks
 
     [GlobalCleanup]
     public void Cleanup() => _listener?.Dispose();
+
+    /// <summary>
+    /// Disposes the optional <see cref="MeterListener"/>. Satisfies CA1001 since the type
+    /// owns a disposable field; <see cref="Cleanup"/> already handles the BenchmarkDotNet lifecycle.
+    /// </summary>
+    public void Dispose()
+    {
+        _listener?.Dispose();
+        GC.SuppressFinalize(this);
+    }
 
     // ── old path ─────────────────────────────────────────────────────────────
 
