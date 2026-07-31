@@ -85,6 +85,60 @@ public class TestRaftConfigurationValidation
         cfg.Validate(); // SWIM-off is fine when quiescence is off
     }
 
+    // ── Heartbeat cadence vs election timeout (always enforced) ───────────────
+    // A heartbeat cadence at or above StartElectionTimeout guarantees followers time out
+    // before the next heartbeat arrives → perpetual re-elections on every partition.
+    // Origin: a downstream harness set StartElectionTimeout=50/EndElectionTimeout=150 but
+    // left HeartbeatInterval (500 ms) and CheckLeaderInterval (250 ms) at their defaults;
+    // the cluster "assembled" (a leader existed at any instant) but never held a leader.
+
+    [Fact]
+    public void Validate_HeartbeatIntervalAtOrAboveElectionTimeout_Throws()
+    {
+        RaftConfiguration cfg = new()
+        {
+            EnableQuiescence = false,
+            StartElectionTimeout = 50,
+            EndElectionTimeout = 150,
+            CheckLeaderInterval = TimeSpan.FromMilliseconds(25),
+        };
+        // HeartbeatInterval left at its 500 ms default → >= StartElectionTimeout.
+        RaftException ex = Assert.Throws<RaftException>(cfg.Validate);
+        Assert.Contains("HeartbeatInterval", ex.Message);
+        Assert.Contains("StartElectionTimeout", ex.Message);
+    }
+
+    [Fact]
+    public void Validate_CheckLeaderIntervalAtOrAboveElectionTimeout_Throws()
+    {
+        RaftConfiguration cfg = new()
+        {
+            EnableQuiescence = false,
+            StartElectionTimeout = 50,
+            EndElectionTimeout = 150,
+            HeartbeatInterval = TimeSpan.FromMilliseconds(25),
+        };
+        // CheckLeaderInterval left at its 250 ms default → >= StartElectionTimeout, and it
+        // gates when heartbeats are actually sent regardless of HeartbeatInterval.
+        RaftException ex = Assert.Throws<RaftException>(cfg.Validate);
+        Assert.Contains("CheckLeaderInterval", ex.Message);
+    }
+
+    [Fact]
+    public void Validate_FastElectionTimersWithMatchingHeartbeatCadence_DoesNotThrow()
+    {
+        RaftConfiguration cfg = new()
+        {
+            EnableQuiescence = false,
+            StartElectionTimeout = 100,
+            EndElectionTimeout = 300,
+            HeartbeatInterval = TimeSpan.FromMilliseconds(50),
+            RecentHeartbeat = TimeSpan.FromMilliseconds(25),
+            CheckLeaderInterval = TimeSpan.FromMilliseconds(25),
+        };
+        cfg.Validate(); // must not throw
+    }
+
     // ── Quiescence knob defaults ──────────────────────────────────────────────
 
     [Fact]

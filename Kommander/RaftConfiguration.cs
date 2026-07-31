@@ -874,7 +874,14 @@ public class RaftConfiguration
     /// Validates configuration invariants at startup and throws <see cref="RaftException"/>
     /// on any violation.
     /// <para>
-    /// When <see cref="EnableQuiescence"/> is <see langword="true"/>, enforces two invariants:
+    /// Always enforces the heartbeat-vs-election-timeout relation: both
+    /// <see cref="HeartbeatInterval"/> and <see cref="CheckLeaderInterval"/> (which gates when
+    /// heartbeats are actually sent) must be below <see cref="StartElectionTimeout"/>, otherwise
+    /// every partition livelocks in perpetual re-elections — a leader is elected but followers
+    /// time out before its next heartbeat, so no leader ever holds and terms climb forever.
+    /// </para>
+    /// <para>
+    /// When <see cref="EnableQuiescence"/> is <see langword="true"/>, additionally enforces two invariants:
     /// </para>
     /// <para>
     /// 1. <c>PingInterval &gt; 0</c>: quiescence relies on the SWIM failure detector to notice a
@@ -892,6 +899,30 @@ public class RaftConfiguration
     /// <exception cref="RaftException">Thrown when a timing invariant is violated.</exception>
     public void Validate()
     {
+        // A leader only sends heartbeats from the CheckLeader timer pass, so the effective
+        // heartbeat cadence is max(HeartbeatInterval, CheckLeaderInterval). If either is at or
+        // above StartElectionTimeout, followers are guaranteed to hit their election timeout
+        // before the next heartbeat can arrive: every partition livelocks in perpetual
+        // re-elections (a leader is elected, loses authority within one follower timeout, and
+        // the term climbs forever). This is a silent total-availability failure — the cluster
+        // appears to assemble (a leader exists at any given instant) but no leader ever holds,
+        // so fail fast at startup instead.
+        if (HeartbeatInterval.TotalMilliseconds >= StartElectionTimeout)
+            throw new RaftException(
+                $"[Kommander] HeartbeatInterval ({HeartbeatInterval.TotalMilliseconds} ms) must be well below " +
+                $"StartElectionTimeout ({StartElectionTimeout} ms); a common guideline is HeartbeatInterval <= " +
+                "StartElectionTimeout / 5. With HeartbeatInterval >= StartElectionTimeout, followers always reach " +
+                "their election timeout before the leader's next heartbeat, so leadership churns indefinitely. " +
+                "Lower HeartbeatInterval or raise StartElectionTimeout.");
+
+        if (CheckLeaderInterval.TotalMilliseconds >= StartElectionTimeout)
+            throw new RaftException(
+                $"[Kommander] CheckLeaderInterval ({CheckLeaderInterval.TotalMilliseconds} ms) must be below " +
+                $"StartElectionTimeout ({StartElectionTimeout} ms). Heartbeats are sent from the CheckLeader " +
+                "timer pass, so its interval bounds the real heartbeat cadence regardless of HeartbeatInterval; " +
+                "at or above StartElectionTimeout, followers time out before the next heartbeat and leadership " +
+                "churns indefinitely. Lower CheckLeaderInterval or raise StartElectionTimeout.");
+
         if (EnableQuiescence && PingInterval <= TimeSpan.Zero)
             throw new RaftException(
                 "[Kommander] EnableQuiescence=true requires SWIM to be enabled (PingInterval > 0). " +

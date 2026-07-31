@@ -405,6 +405,81 @@ public sealed class TestFourNodeJoin
         }
     }
 
+    /// <summary>
+    /// Regression for "partition leadership churns during learner admission / voter promotion":
+    /// joining an (N+1)th node into a RUNNING, STABLE N-voter cluster must not disturb the
+    /// established leaders. Formation tests only prove a leader exists at some instant; this
+    /// test first requires a *held* stability window, then admits + promotes a 4th node and
+    /// asserts the P0 and user-partition leaders did not change across the whole join.
+    /// (The originally reported churn turned out to be a harness misconfiguration —
+    /// HeartbeatInterval/CheckLeaderInterval left at defaults above the election timeout,
+    /// now rejected by <see cref="RaftConfiguration.Validate"/> — but this test pins the
+    /// join-into-stable-cluster guarantee at the Kommander level regardless.)
+    /// </summary>
+    [Fact]
+    public async Task JoinIntoStableCluster_DoesNotDisturbEstablishedLeaders()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        InMemoryCommunication communication = new();
+
+        RaftManager node1 = BuildNode("node1", 1, 8331, ["localhost:8332", "localhost:8333"], communication, logger);
+        RaftManager node2 = BuildNode("node2", 2, 8332, ["localhost:8331", "localhost:8333"], communication, logger);
+        RaftManager node3 = BuildNode("node3", 3, 8333, ["localhost:8331", "localhost:8332"], communication, logger);
+        RaftManager node4 = BuildNode("node4", 4, 8334, ["localhost:8331", "localhost:8332", "localhost:8333"], communication, logger, initialPartitions: 0);
+        RaftManager[] voters = [node1, node2, node3];
+
+        // Mirror the downstream repro: the joiner's endpoint is routable on the shared
+        // transport BEFORE it is admitted to membership.
+        communication.SetNodes(new Dictionary<string, IRaft>
+        {
+            ["localhost:8331"] = node1,
+            ["localhost:8332"] = node2,
+            ["localhost:8333"] = node3,
+            ["localhost:8334"] = node4
+        });
+
+        try
+        {
+            await Task.WhenAll(node1.JoinCluster(ct), node2.JoinCluster(ct), node3.JoinCluster(ct));
+            await WaitForConditionAsync(() => voters.All(n => n.IsInitialized), ct);
+
+            // Require HELD stability (not just "a leader exists") on P0 and the user partition.
+            int userPartition = node1.Partitions.Keys.First(k => k != 0);
+            string p0LeaderBefore = await node1.WaitForLeaderStableAsync(
+                0, minStableFor: TimeSpan.FromMilliseconds(300), timeout: TimeSpan.FromSeconds(30), ct);
+            string userLeaderBefore = await node1.WaitForLeaderStableAsync(
+                userPartition, minStableFor: TimeSpan.FromMilliseconds(300), timeout: TimeSpan.FromSeconds(30), ct);
+
+            // LeaderChangedTicks moves only when a partition's Leader value actually changes,
+            // so equal ticks after the join prove no adoption/step-down/re-election landed.
+            long[] userTicksBefore = voters
+                .Select(n => n.Partitions[userPartition].LeaderChangedTicks)
+                .ToArray();
+
+            // Admit + promote the 4th node (blocks until it is a committed Voter).
+            await node4.JoinCluster(["localhost:8331"], ct);
+            Assert.Equal(System.ClusterMemberRole.Voter, node4.LocalRole);
+
+            // Established leaders must have survived the admission + promotion untouched.
+            for (int i = 0; i < voters.Length; i++)
+            {
+                Assert.Equal(userLeaderBefore, voters[i].Partitions[userPartition].Leader);
+                Assert.Equal(userTicksBefore[i], voters[i].Partitions[userPartition].LeaderChangedTicks);
+            }
+
+            string p0LeaderAfter = await node1.WaitForLeaderStableAsync(
+                0, minStableFor: TimeSpan.FromMilliseconds(300), timeout: TimeSpan.FromSeconds(10), ct);
+            Assert.Equal(p0LeaderBefore, p0LeaderAfter);
+        }
+        finally
+        {
+            await node4.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
+            await node3.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
+            await node2.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
+            await node1.LeaveCluster(dispose: true, cancellationToken: CancellationToken.None);
+        }
+    }
+
     private static async Task<RaftManager> WaitForLeaderExcludingAsync(
         RaftManager[] nodes, int partitionId, string excludedEndpoint, CancellationToken ct)
     {
