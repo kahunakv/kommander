@@ -234,6 +234,23 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     public bool IsInitialized { get; private set; }
 
     /// <summary>
+    /// Completed once, the first time the initial partition map is applied and
+    /// <see cref="IsInitialized"/> flips to <c>true</c> (see <see cref="StartUserPartitions"/>).
+    /// <see cref="JoinCluster(CancellationToken)"/> awaits this instead of re-polling the boolean on a
+    /// fixed 1 s tick, so a node that assembles in a few ms returns in a few ms rather than sleeping
+    /// out the remainder of the tick.
+    /// <para>
+    /// Uses <see cref="TaskCreationOptions.RunContinuationsAsynchronously"/> so a waiter's continuation
+    /// never runs inline on the thread that applied the map. This signal is awaited ONLY on the
+    /// caller's own join task — never in a transport handler — so it does not recreate the
+    /// handshake-path join deadlock documented on <see cref="Handshake"/> (see <c>RaftManager.cs</c>
+    /// Handshake summary). Because <c>IsInitialized</c> is written before this is completed, any waiter
+    /// woken by the signal observes <c>IsInitialized == true</c> on re-check.
+    /// </para>
+    /// </summary>
+    private readonly TaskCompletionSource _initializedSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>
     /// Fair read scheduler. Dispatches partition-tagged synchronous WAL reads
     /// to dedicated worker threads with fair, bounded per-partition queues.
     /// </summary>
@@ -703,6 +720,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         // reach IsInitialized within the ceiling is broken; failing loudly with a state-dump beats
         // hanging. The caller's token still cancels EARLIER than the ceiling.
         ValueStopwatch joinStopwatch = ValueStopwatch.StartNew();
+        Task initializedTask = _initializedSignal.Task;
         while (!IsInitialized)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -719,7 +737,12 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 throw new TimeoutException(
                     $"RaftManager.JoinCluster timed out after {JoinHardCeilingMs / 1000} s waiting for cluster initialization. State: {DescribeAssemblyState()}");
 
-            await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
+            // Return the instant initialization signals; otherwise re-log and ceiling-check on the
+            // next 1 s tick. Replaces a flat Task.Delay(1000) that made a node which assembles in a
+            // few ms still sleep out the rest of the tick. On cancellation the Delay completes
+            // (canceled) and the loop-top ThrowIfCancellationRequested throws — earlier than the
+            // ceiling, unchanged. The orphaned canceled Delay raises no UnobservedTaskException.
+            await Task.WhenAny(initializedTask, Task.Delay(1000, cancellationToken)).ConfigureAwait(false);
         }
     }
 
@@ -824,6 +847,14 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         // Also check for a terminal block: if the P0 leader cannot backfill this node (WAL is
         // compacted, no snapshot transfer registered), IsInitialized will never become true and
         // we must surface the permanent-block reason rather than spinning to the timeout.
+        //
+        // Unlike the discovery-based JoinCluster, this loop deliberately keeps the raw 500 ms poll
+        // rather than awaiting _initializedSignal. The seed-join learner path races the terminal-block
+        // decision (NotifyJoinBlocked) against promotion, and the terminal reason is polled here every
+        // tick; waking early on the initialize signal perturbs that interleaving enough to let a
+        // below-floor learner slip past the block (see TestSnapshotIntegration.Learner_BelowCompactionFloor_*).
+        // This path is also not latency-sensitive the way single-node boot is — a lone in-memory node is
+        // leader-from-seed via the discovery overload, never a seed-joining learner — so the poll stays.
         while (!IsInitialized)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -1146,6 +1177,12 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         }
 
         IsInitialized = true;
+
+        // Wake any JoinCluster waiter immediately instead of leaving it to notice on the next 1 s
+        // poll tick. RunContinuationsAsynchronously (on the TCS) keeps the waiter's continuation off
+        // this map-application thread. Idempotent: only the first application (the flip of
+        // IsInitialized) completes it; later map changes (splits/merges) re-enter here and no-op.
+        _initializedSignal.TrySetResult();
 
         eventNotifier.InvokePartitionMapChanged(GetPartitionMap());
     }

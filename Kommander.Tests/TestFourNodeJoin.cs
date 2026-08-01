@@ -305,6 +305,13 @@ public sealed class TestFourNodeJoin
             // Pick one user partition to use as the "remote" test partition.
             int testPartitionId = p0Leader.Partitions.Keys.First();
 
+            // Wait for testPartition to elect an initial leader before deciding whether leadership
+            // must be transferred away from the P0 node. JoinCluster now returns once the partition
+            // map is applied, which can precede a user partition electing its leader; without this
+            // wait, AmILeaderQuick below could read "no leader yet", skip the transfer, and the P0
+            // leader could then win testPartition — leaving WaitForLeaderExcludingAsync unsatisfiable.
+            await FindLeaderForPartitionAsync(voters, testPartitionId, ct);
+
             // Ensure testPartition is led by a node OTHER than the P0 leader.
             // This is required so the gate uses GetRemoteFollowerLag (the code under test)
             // rather than the local committed-index path.

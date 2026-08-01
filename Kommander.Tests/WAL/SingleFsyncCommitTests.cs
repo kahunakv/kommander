@@ -125,6 +125,10 @@ public sealed class SingleFsyncCommitTests
         {
             await node.JoinCluster(cts.Token);
             Assert.True(node.IsInitialized);
+            // JoinCluster returns once the partition map is applied (IsInitialized), which can precede
+            // partition 1 electing its leader; wait for that election rather than relying on the old
+            // fixed 1 s join-poll latency to have masked the gap.
+            await node.WaitForLeader(1, cts.Token);
             Assert.True(await node.AmILeaderQuick(1));
 
             byte[] data = "Hello World"u8.ToArray();
