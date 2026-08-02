@@ -271,27 +271,29 @@ public class RaftConfiguration
     /// Number of worker threads in the <see cref="WAL.IO.FairWalScheduler"/> pool
     /// that flush WAL write batches to storage. Each thread can hold one
     /// cross-partition group-commit batch at a time; per-partition FIFO ordering
-    /// is always preserved regardless of this value.
+    /// is always preserved regardless of this value (a partition is only ever
+    /// drained by one worker at a time).
     ///
-    /// <para>Kept at 1 by default because it matches the durability model of a
-    /// single-shared-WAL backend (RocksDB shares one WAL across all column
-    /// families, so the scheduler already coalesces every ready partition into a
-    /// single <c>db.Write</c> = one fsync). fsync-heavy writes to that shared WAL
-    /// serialize at the backend anyway: extra worker threads cannot subdivide a
-    /// fsync — they only issue additional concurrent writes that RocksDB funnels
-    /// through its own write-group mutex + WAL append + fsync, adding contention
-    /// with no throughput gain. Worse, splitting the ready partitions across
-    /// several concurrent fsyncs lowers batch density (fewer partitions per fsync),
-    /// the opposite of what group commit is for. A single worker instead lets the
-    /// in-progress fsync act as a natural linger window: partitions that become
-    /// ready mid-fsync pile up and all ride the next single fsync.</para>
+    /// <para>Defaults to 4 because RocksDB coalesces concurrent sync writes for us:
+    /// its write path elects a <em>write-group leader</em> that performs a single
+    /// WAL append + fsync covering every writer that joined the group, so multiple
+    /// in-flight <c>db.Write(sync)</c> calls ride the <em>same</em> flush rather than
+    /// each forcing its own fsync. With a single worker, WAL flushes are fully
+    /// serialized — each write (including its fsync) completes before the next
+    /// begins — so there is never a second write in flight to join the group; the
+    /// device sits idle through every fsync and throughput is fsync-latency-bound.
+    /// Several workers keep multiple writes in flight, letting RocksDB's group
+    /// commit overlap their fsync latency; benchmarks showed a single worker
+    /// materially reduced write throughput versus 4. The scheduler's per-worker
+    /// coalescing of ready partitions into one <c>db.Write</c> still applies on top
+    /// of this, giving two layers of batching.</para>
     ///
-    /// <para>Raise above 1 only for a backend whose partitions have
-    /// <em>independent</em> fsync targets (e.g. a per-partition file on separate
-    /// I/O queues), where concurrent fsyncs to different files genuinely overlap
-    /// device I/O. For any shared-WAL backend, leave this at 1.</para>
+    /// <para>4 balances write concurrency against write-group mutex contention on
+    /// the shared WAL; raise it further only if benchmarks on your storage show
+    /// additional overlap. This is safe for a shared-WAL backend precisely because
+    /// group commit merges the concurrent writes — it does not multiply fsyncs.</para>
     /// </summary>
-    public int WriteIOThreads { get; set; } = 1;
+    public int WriteIOThreads { get; set; } = 4;
 
     // ── Backpressure and admission control ────────────────────────────────────
 

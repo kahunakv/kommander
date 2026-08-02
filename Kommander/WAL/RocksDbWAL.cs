@@ -97,6 +97,23 @@ public class RocksDbWAL : IWAL, IDisposable
     private readonly object writeGuard = new();
 
     /// <summary>
+    /// Per-partition seek hint for <see cref="CompactLogsOlderThan"/>: the id the next compaction pass
+    /// should <c>Seek</c> to instead of restarting from id 0. Invariant: <b>no live deletable key exists
+    /// with id below this value</b> — everything under it was already deleted by an earlier pass. Without
+    /// it, each pass re-seeks from 0 and grinds forward over the accumulated point-delete tombstones of the
+    /// dead head (the forward analogue of the restore reverse-scan pathology), head-of-line-blocking every
+    /// other read queued on the partition's ReadScheduler lane. Absent → seek from 0.
+    ///
+    /// <para>Maintained single-writer per partition (compaction is serialized on the per-partition
+    /// ReadScheduler FIFO lane). The only operation that can invalidate the invariant is
+    /// <see cref="DeletePartitionWAL"/> — a wiped partition may be reused from low ids — which removes the
+    /// hint. Appends only ever add keys at the tail (above the hint), and a snapshot boundary only writes a
+    /// <see cref="RaftLogType.CommittedCheckpoint"/> at/above the compaction floor (never a deletable key
+    /// below the hint), so neither can break the invariant.</para>
+    /// </summary>
+    private readonly ConcurrentDictionary<int, long> compactionResumeId = new();
+
+    /// <summary>
     /// Test-only hook fired inside <see cref="InstallSnapshotBoundary"/> after the suffix scan and while
     /// <see cref="writeGuard"/> is held, immediately before the batch write. Lets a concurrency test prove a
     /// racing append is excluded by the guard. Null (no-op) in production.
@@ -1109,6 +1126,10 @@ public class RocksDbWAL : IWAL, IDisposable
                 db.Remove(LastCheckpointKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
             }
 
+            // Drop the compaction resume hint: a reused partition id may start writing from low ids again,
+            // and a stale (higher) hint would make compaction skip — and leak — those new entries.
+            compactionResumeId.TryRemove(partitionId, out _);
+
             return RaftOperationStatus.Success;
         }
         catch (Exception ex)
@@ -1363,9 +1384,14 @@ public class RocksDbWAL : IWAL, IDisposable
             using WriteBatch writeBatch = new();
             int removed = 0;
 
+            // Resume from the hint (the head of live data left by the previous pass) instead of id 0, so we
+            // do not re-scan the growing pile of point-delete tombstones below it. Everything under the hint
+            // was already deleted, so skipping straight to it is correct; see compactionResumeId.
+            long start = compactionResumeId.GetValueOrDefault(partitionId, 0);
+
             using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
             Span<byte> seekKey = stackalloc byte[LogKeyWidth];
-            BuildLogKey(seekKey, partitionId, 0);
+            BuildLogKey(seekKey, partitionId, start);
             iterator.Seek(seekKey);
 
             // Deletion is decided entirely from the key (partition prefix + id), so this pass never reads
@@ -1380,6 +1406,17 @@ public class RocksDbWAL : IWAL, IDisposable
 
                 iterator.Next();
             }
+
+            // Advance the resume hint to the first key this pass did NOT delete. When the loop stopped on a
+            // capped/checkpoint boundary the iterator sits on that surviving key; when it drained everything
+            // reachable, fall back to max(start, lastCheckpoint) — a safe lower bound on any surviving id,
+            // since nothing below lastCheckpoint remains and we began at start. Lowering the hint is always
+            // safe (at worst it re-scans some tombstones next pass); raising it past a live key is not, and
+            // cannot happen here.
+            long newResume = iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId)
+                ? ParseLogIdFromKey(iterator.GetKeySpan())
+                : Math.Max(start, lastCheckpoint);
+            compactionResumeId[partitionId] = newResume;
 
             if (removed > 0)
             {

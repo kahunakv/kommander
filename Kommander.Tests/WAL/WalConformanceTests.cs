@@ -860,6 +860,61 @@ public abstract class WalConformanceTests
         finally { cleanup(); }
     }
 
+    [Fact]
+    public void CompactLogsOlderThan_MultipleCappedPasses_RemoveAllBelowCheckpoint()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            const int p = 22;
+            // 1..5 removable, checkpoint at 6. Capped passes must resume where the previous stopped and
+            // collectively remove exactly 1..5 (guards the compaction resume-hint advancing correctly).
+            wal.Write([(p, [Log(1), Log(2), Log(3), Log(4), Log(5), Log(6, type: RaftLogType.CommittedCheckpoint)])]);
+
+            (_, int r1) = wal.CompactLogsOlderThan(p, lastCheckpoint: 6, compactNumberEntries: 2);
+            (_, int r2) = wal.CompactLogsOlderThan(p, lastCheckpoint: 6, compactNumberEntries: 2);
+            (_, int r3) = wal.CompactLogsOlderThan(p, lastCheckpoint: 6, compactNumberEntries: 2);
+            (_, int r4) = wal.CompactLogsOlderThan(p, lastCheckpoint: 6, compactNumberEntries: 2);
+
+            Assert.Equal(2, r1); // 1,2
+            Assert.Equal(2, r2); // 3,4
+            Assert.Equal(1, r3); // 5 (only one left below the checkpoint)
+            Assert.Equal(0, r4); // nothing left to remove
+            Assert.Equal([6L], wal.ReadLogs(p).Select(l => l.Id));
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void CompactLogsOlderThan_AfterDeleteAndReuse_StillCompactsFreshLowIds()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            const int p = 23;
+
+            wal.Write([(p, [Log(1), Log(2), Log(3, type: RaftLogType.CommittedCheckpoint), Log(4)])]);
+            (_, int firstRemoved) = wal.CompactLogsOlderThan(p, lastCheckpoint: 3, compactNumberEntries: 100);
+            Assert.Equal(2, firstRemoved); // 1, 2
+            Assert.Equal([3L, 4L], wal.ReadLogs(p).Select(l => l.Id));
+
+            // Wipe and reuse the same partition id from low ids again. A backend that caches a compaction
+            // resume position must reset it here; otherwise the second compaction would seek past the fresh
+            // low entries and silently leak them (remove 0).
+            wal.DeletePartitionWAL(p);
+            Assert.Empty(wal.ReadLogs(p));
+
+            wal.Write([(p, [Log(1), Log(2), Log(3, type: RaftLogType.CommittedCheckpoint), Log(4)])]);
+            (RaftOperationStatus status, int reusedRemoved) =
+                wal.CompactLogsOlderThan(p, lastCheckpoint: 3, compactNumberEntries: 100);
+
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Assert.Equal(2, reusedRemoved); // 1, 2 removed again — not skipped by a stale resume hint
+            Assert.Equal([3L, 4L], wal.ReadLogs(p).Select(l => l.Id));
+        }
+        finally { cleanup(); }
+    }
+
     // ──────────────────────────── metadata ──────────────────────────────────────
 
     [Fact]
