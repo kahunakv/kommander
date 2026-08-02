@@ -2483,8 +2483,17 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
-    /// Waits for the leader to be elected in the given partition
-    /// If the leader is already elected, it returns the leader
+    /// Waits for the leader to be elected in the given partition.
+    /// If the leader is already elected, it returns the leader.
+    ///
+    /// The method first waits for the partition's WAL restore to complete. That wait is bounded
+    /// only by <paramref name="cancellationToken"/> — never by a fixed budget — because during a
+    /// large or slow replay the partition cannot settle on a leader and <see cref="RaftNodeState"/>
+    /// stays undecided. Only after restore has finished does the fixed 10 s election budget apply,
+    /// which is its original intent (bounding genuine election latency, not restore work).
+    ///
+    /// A faulted restore surfaces to the caller as a <see cref="RaftException"/> wrapping the real
+    /// cause rather than the generic "leader couldn't be found" timeout.
     /// </summary>
     /// <param name="partitionId"></param>
     /// <param name="cancellationToken"></param>
@@ -2493,6 +2502,22 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     public async ValueTask<string> WaitForLeader(int partitionId, CancellationToken cancellationToken)
     {
         RaftPartition partition = GetPartition(partitionId);
+
+        // Wait for WAL restore before starting the election budget. This wait is bounded only by the
+        // caller's cancellation token; it is deliberately outside the poll loop's swallowing catch so
+        // a faulted restore is reported as its real cause instead of a generic election timeout.
+        try
+        {
+            await partition.RestoreTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception e)
+        {
+            throw new RaftException($"Partition {partitionId} restore failed", e);
+        }
 
         ValueStopwatch stopwatch = ValueStopwatch.StartNew();
 

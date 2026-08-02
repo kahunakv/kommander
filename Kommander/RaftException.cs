@@ -10,4 +10,13 @@ public sealed class RaftException : Exception
     {
 
     }
+
+    /// <summary>
+    /// Wraps an underlying cause (e.g. a faulted WAL restore) so callers see the
+    /// real failure rather than a generic Raft error.
+    /// </summary>
+    public RaftException(string message, Exception innerException) : base(message, innerException)
+    {
+
+    }
 }

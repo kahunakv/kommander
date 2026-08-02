@@ -269,13 +269,29 @@ public class RaftConfiguration
 
     /// <summary>
     /// Number of worker threads in the <see cref="WAL.IO.FairWalScheduler"/> pool
-    /// that flush WAL write batches to storage.  Each thread can process one
-    /// cross-partition group-commit batch concurrently.  Values above 1 allow
-    /// multiple batches to be in-flight simultaneously, but per-partition FIFO
-    /// ordering is always preserved.
-    /// Default 4.
+    /// that flush WAL write batches to storage. Each thread can hold one
+    /// cross-partition group-commit batch at a time; per-partition FIFO ordering
+    /// is always preserved regardless of this value.
+    ///
+    /// <para>Kept at 1 by default because it matches the durability model of a
+    /// single-shared-WAL backend (RocksDB shares one WAL across all column
+    /// families, so the scheduler already coalesces every ready partition into a
+    /// single <c>db.Write</c> = one fsync). fsync-heavy writes to that shared WAL
+    /// serialize at the backend anyway: extra worker threads cannot subdivide a
+    /// fsync — they only issue additional concurrent writes that RocksDB funnels
+    /// through its own write-group mutex + WAL append + fsync, adding contention
+    /// with no throughput gain. Worse, splitting the ready partitions across
+    /// several concurrent fsyncs lowers batch density (fewer partitions per fsync),
+    /// the opposite of what group commit is for. A single worker instead lets the
+    /// in-progress fsync act as a natural linger window: partitions that become
+    /// ready mid-fsync pile up and all ride the next single fsync.</para>
+    ///
+    /// <para>Raise above 1 only for a backend whose partitions have
+    /// <em>independent</em> fsync targets (e.g. a per-partition file on separate
+    /// I/O queues), where concurrent fsyncs to different files genuinely overlap
+    /// device I/O. For any shared-WAL backend, leave this at 1.</para>
     /// </summary>
-    public int WriteIOThreads { get; set; } = 4;
+    public int WriteIOThreads { get; set; } = 1;
 
     // ── Backpressure and admission control ────────────────────────────────────
 
