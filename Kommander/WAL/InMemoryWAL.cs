@@ -16,6 +16,16 @@ public class InMemoryWAL : IWAL, IDisposable
 
     private readonly Dictionary<int, SortedDictionary<long, RaftLog>> allLogs = new();
 
+    /// <summary>
+    /// Per-partition id of the highest <see cref="RaftLogType.CommittedCheckpoint"/> entry, maintained
+    /// incrementally on every mutation (write / snapshot boundary / truncation) rather than scanned. This
+    /// mirrors the durable backends (which persist the same value) so all three <see cref="IWAL"/> adapters
+    /// behave identically — including under the conformance cross-check that compares this value against an
+    /// independent full scan. A missing entry means "no checkpoint" → <see cref="GetLastCheckpoint"/>
+    /// returns -1. Guarded by <see cref="rwLock"/> like <see cref="allLogs"/>.
+    /// </summary>
+    private readonly Dictionary<int, long> lastCheckpoints = new();
+
     private readonly ILogger<IRaft> logger;
 
     public InMemoryWAL(ILogger<IRaft> logger)
@@ -95,13 +105,22 @@ public class InMemoryWAL : IWAL, IDisposable
         {
             foreach ((int partitionId, List<RaftLog> raftLogs) item in logs)
             {
+                long batchMaxCheckpoint = -1;
                 foreach (RaftLog log in item.raftLogs)
                 {
                     if (allLogs.TryGetValue(item.partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
                         partitionLogs[log.Id] = log;
                     else
                         allLogs.Add(item.partitionId, new() { { log.Id, log } });
+
+                    if (log.Type == RaftLogType.CommittedCheckpoint && log.Id > batchMaxCheckpoint)
+                        batchMaxCheckpoint = log.Id;
                 }
+
+                // max() so an out-of-order lower checkpoint never regresses the recorded id.
+                if (batchMaxCheckpoint >= 0)
+                    lastCheckpoints[item.partitionId] =
+                        Math.Max(lastCheckpoints.GetValueOrDefault(item.partitionId, -1), batchMaxCheckpoint);
             }
 
             return RaftOperationStatus.Success;
@@ -155,30 +174,31 @@ public class InMemoryWAL : IWAL, IDisposable
         rwLock.EnterReadLock();
         try
         {
-            // The checkpoint is the highest committed-checkpoint entry. A stubbed -1 here keeps the
-            // leader's snapshot fallback (gated on lastCheckpoint > 0) and the checkpoint-driven
-            // compaction pass permanently disabled, so a follower that falls behind can only be
-            // recovered by one-index-at-a-time AppendLogs backtracking — a warning storm under load.
-            // Single ascending pass: keys are sorted, so the last match is the highest. Cost is
-            // bounded by the retained window, which compaction (re-enabled by this very value) keeps small.
-            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
-            {
-                long checkpoint = -1;
-                foreach (KeyValuePair<long, RaftLog> entry in partitionLogs)
-                {
-                    if (entry.Value.Type == RaftLogType.CommittedCheckpoint)
-                        checkpoint = entry.Key;
-                }
-
-                return checkpoint;
-            }
-
-            return -1;
+            // O(1) read of the incrementally-maintained value (see lastCheckpoints); -1 when no checkpoint
+            // has been recorded for the partition.
+            return lastCheckpoints.GetValueOrDefault(partitionId, -1);
         }
         finally
         {
             rwLock.ExitReadLock();
         }
+    }
+
+    /// <summary>
+    /// Recomputes the highest <see cref="RaftLogType.CommittedCheckpoint"/> id currently present for a
+    /// partition (or -1 if none), used after a truncation removed the recorded checkpoint. Must be called
+    /// under the write lock. Keys are sorted ascending, so the last match is the highest.
+    /// </summary>
+    private static long RecomputeLastCheckpoint(SortedDictionary<long, RaftLog> partitionLogs)
+    {
+        long checkpoint = -1;
+        foreach (KeyValuePair<long, RaftLog> entry in partitionLogs)
+        {
+            if (entry.Value.Type == RaftLogType.CommittedCheckpoint)
+                checkpoint = entry.Key;
+        }
+
+        return checkpoint;
     }
 
     public int CountPersistedLogs(int partitionId)
@@ -235,6 +255,8 @@ public class InMemoryWAL : IWAL, IDisposable
         try
         {
             allLogs.Remove(partitionId);
+            // Drop the recorded checkpoint too, so a reused partition id does not inherit a stale floor.
+            lastCheckpoints.Remove(partitionId);
             return RaftOperationStatus.Success;
         }
         finally
@@ -261,12 +283,30 @@ public class InMemoryWAL : IWAL, IDisposable
             foreach (long id in toRemove)
                 partitionLogs.Remove(id);
 
+            AdjustCheckpointAfterTruncation(partitionId, partitionLogs, afterLogId);
+
             return RaftOperationStatus.Success;
         }
         finally
         {
             rwLock.ExitWriteLock();
         }
+    }
+
+    /// <summary>
+    /// If the recorded checkpoint sits above <paramref name="afterLogId"/> (a truncation just removed it),
+    /// recompute the surviving checkpoint from the remaining entries. Must run under the write lock.
+    /// </summary>
+    private void AdjustCheckpointAfterTruncation(int partitionId, SortedDictionary<long, RaftLog> partitionLogs, long afterLogId)
+    {
+        if (lastCheckpoints.GetValueOrDefault(partitionId, -1) <= afterLogId)
+            return;
+
+        long surviving = RecomputeLastCheckpoint(partitionLogs);
+        if (surviving < 0)
+            lastCheckpoints.Remove(partitionId);
+        else
+            lastCheckpoints[partitionId] = surviving;
     }
 
     /// <inheritdoc/>
@@ -292,6 +332,7 @@ public class InMemoryWAL : IWAL, IDisposable
             foreach (long id in toRemove)
                 partitionLogs.Remove(id);
 
+            // No checkpoint adjustment: only unresolved entries are removed, never a CommittedCheckpoint.
             return RaftOperationStatus.Success;
         }
         finally
@@ -320,6 +361,8 @@ public class InMemoryWAL : IWAL, IDisposable
 
             foreach (long id in toRemove)
                 partitionLogs.Remove(id);
+
+            AdjustCheckpointAfterTruncation(partitionId, partitionLogs, afterLogId);
 
             long max = partitionLogs.Count > 0 ? partitionLogs.Keys.Max() : 0;
             return (RaftOperationStatus.Success, max);
@@ -375,6 +418,12 @@ public class InMemoryWAL : IWAL, IDisposable
                 Type = RaftLogType.CommittedCheckpoint,
             };
 
+            // When the suffix was truncated, every entry (and checkpoint) above snapshotIndex is gone, so
+            // the new max is snapshotIndex; otherwise keep the greater of the existing recorded id and it.
+            lastCheckpoints[partitionId] = suffixTruncated
+                ? snapshotIndex
+                : Math.Max(lastCheckpoints.GetValueOrDefault(partitionId, -1), snapshotIndex);
+
             return (RaftOperationStatus.Success, suffixTruncated);
         }
         finally
@@ -413,6 +462,8 @@ public class InMemoryWAL : IWAL, IDisposable
             foreach (long id in toRemove)
                 partitionLogs.Remove(id);
 
+            // No checkpoint adjustment: only entries with id < lastCheckpoint are removed, so the recorded
+            // checkpoint (>= lastCheckpoint) is never affected.
             return (RaftOperationStatus.Success, toRemove.Count);
         }
         finally

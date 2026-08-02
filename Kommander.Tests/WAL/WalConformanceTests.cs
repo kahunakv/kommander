@@ -32,6 +32,14 @@ public abstract class WalConformanceTests
     /// </summary>
     protected virtual bool SupportsRemovableLogCount => true;
 
+    /// <summary>
+    /// Whether <see cref="IWAL.GetLastCheckpoint"/> reports the real last-checkpoint id. True for all
+    /// current adapters — including <see cref="InMemoryWAL"/>, which now maintains the value like the
+    /// durable backends. Distinct from <see cref="SupportsCheckpoints"/>, which also gates
+    /// <c>ReadLogs</c> checkpoint-floor filtering (InMemoryWAL returns the full log there).
+    /// </summary>
+    protected virtual bool SupportsCheckpointLookup => true;
+
     // ──────────────────────────── basic write / read ────────────────────────────
 
     [Fact]
@@ -396,6 +404,186 @@ public abstract class WalConformanceTests
                 Log(id: 4, term: 2)
             ])]);
             Assert.Equal(3, wal.GetLastCheckpoint(8));
+        }
+        finally { cleanup(); }
+    }
+
+    // ─────────── last-checkpoint persistence: cross-check vs an independent scan ───────────
+    //
+    // These guard the "persist the last-checkpoint id" feature: GetLastCheckpoint must always equal what
+    // a full scan of the log would return, after EVERY mutating operation. ScanMaxCheckpoint is an
+    // independent oracle built on ReadLogsRange (a code path untouched by the feature), so a bug in the
+    // persisted-value maintenance (a missed write path, a bad truncation adjustment) surfaces here rather
+    // than as a silent wrong replay floor at restore.
+
+    /// <summary>
+    /// Independent oracle: the highest <see cref="RaftLogType.CommittedCheckpoint"/> id physically present
+    /// in the partition, or -1. Uses <see cref="IWAL.ReadLogsRange"/> (not the checkpoint metadata) so it
+    /// cannot share a bug with <see cref="IWAL.GetLastCheckpoint"/>.
+    /// </summary>
+    private static long ScanMaxCheckpoint(IWAL wal, int partitionId)
+    {
+        long max = -1;
+        foreach (RaftLog log in wal.ReadLogsRange(partitionId, 0, int.MaxValue))
+            if (log.Type == RaftLogType.CommittedCheckpoint && log.Id > max)
+                max = log.Id;
+        return max;
+    }
+
+    private void AssertCheckpointMatchesScan(IWAL wal, int partitionId, long expected)
+    {
+        Assert.Equal(expected, ScanMaxCheckpoint(wal, partitionId));
+        Assert.Equal(expected, wal.GetLastCheckpoint(partitionId));
+    }
+
+    [Fact]
+    public void LastCheckpoint_TracksScanAcrossEveryMutation()
+    {
+        if (!SupportsCheckpointLookup) return;
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            const int p = 40;
+
+            // No checkpoint yet.
+            AssertCheckpointMatchesScan(wal, p, -1);
+
+            // Write with a checkpoint in the middle of the batch.
+            wal.Write([(p, [Log(1), Log(2, type: RaftLogType.CommittedCheckpoint), Log(3)])]);
+            AssertCheckpointMatchesScan(wal, p, 2);
+
+            // A later, higher checkpoint advances the recorded id.
+            wal.Write([(p, [Log(4), Log(5, type: RaftLogType.CommittedCheckpoint)])]);
+            AssertCheckpointMatchesScan(wal, p, 5);
+
+            // Non-checkpoint writes do not change it.
+            wal.Write([(p, [Log(6), Log(7)])]);
+            AssertCheckpointMatchesScan(wal, p, 5);
+
+            // Snapshot boundary above the tail installs a new highest checkpoint.
+            wal.InstallSnapshotBoundary(p, snapshotIndex: 9, lastIncludedTerm: 3, sync: true);
+            AssertCheckpointMatchesScan(wal, p, 9);
+
+            // Compaction removes only entries below the checkpoint — recorded id unchanged.
+            wal.CompactLogsOlderThan(p, lastCheckpoint: 9, compactNumberEntries: 100);
+            AssertCheckpointMatchesScan(wal, p, 9);
+
+            // Truncation that removes the recorded checkpoint must adjust down to the surviving one.
+            wal.Write([(p, [Log(10), Log(11, type: RaftLogType.CommittedCheckpoint), Log(12)])]);
+            AssertCheckpointMatchesScan(wal, p, 11);
+            wal.TruncateLogsAfter(p, afterLogId: 10); // drops 11 (checkpoint) and 12
+            AssertCheckpointMatchesScan(wal, p, 9);    // falls back to the 9 boundary checkpoint
+
+            // Truncation that does NOT reach the checkpoint leaves it unchanged.
+            wal.Write([(p, [Log(13), Log(14)])]);
+            wal.TruncateLogsAfter(p, afterLogId: 13); // drops only 14
+            AssertCheckpointMatchesScan(wal, p, 9);
+
+            // Truncating everything drops the recorded checkpoint entirely (→ -1).
+            wal.TruncateLogsAfter(p, afterLogId: 0);
+            AssertCheckpointMatchesScan(wal, p, -1);
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void LastCheckpoint_FarBehindLargeTail_IsStillResolvedCorrectly()
+    {
+        if (!SupportsCheckpointLookup) return;
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            const int p = 41;
+
+            // Checkpoint at id 2, then a long non-checkpoint tail. The old implementation walked this tail
+            // backwards on every read; the persisted value makes it an O(1) lookup, but the answer must be
+            // identical.
+            wal.Write([(p, [Log(1), Log(2, type: RaftLogType.CommittedCheckpoint)])]);
+
+            List<RaftLog> tail = [];
+            for (long id = 3; id <= 400; id++)
+                tail.Add(Log(id));
+            wal.Write([(p, tail)]);
+
+            AssertCheckpointMatchesScan(wal, p, 2);
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void LastCheckpoint_SnapshotBoundaryRetainingSuffix_KeepsHigherCheckpoint()
+    {
+        if (!SupportsCheckpointLookup) return;
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            const int p = 42;
+
+            // A higher checkpoint at id 5 exists; installing a boundary at a LOWER matching index must not
+            // regress the recorded checkpoint when the suffix (including id 5) is retained.
+            wal.Write([(p, [
+                Log(1),
+                Log(2, term: 4, type: RaftLogType.CommittedCheckpoint),
+                Log(3, term: 4),
+                Log(5, term: 4, type: RaftLogType.CommittedCheckpoint)
+            ])]);
+            AssertCheckpointMatchesScan(wal, p, 5);
+
+            // Boundary at id 2 with the matching term → suffix retained (id 3, 5 survive).
+            (RaftOperationStatus status, bool suffixTruncated) = wal.InstallSnapshotBoundary(
+                p, snapshotIndex: 2, lastIncludedTerm: 4, sync: true);
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Assert.False(suffixTruncated);
+
+            // The recorded checkpoint must remain the surviving higher one (id 5), matching the scan.
+            AssertCheckpointMatchesScan(wal, p, 5);
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void LastCheckpoint_ProposedTailTruncation_LeavesCheckpointIntact()
+    {
+        if (!SupportsCheckpointLookup) return;
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            const int p = 43;
+
+            wal.Write([(p, [
+                Log(1),
+                Log(2, type: RaftLogType.CommittedCheckpoint),
+                Log(3, type: RaftLogType.Proposed)
+            ])]);
+            AssertCheckpointMatchesScan(wal, p, 2);
+
+            // Removing the unresolved tail must not touch the committed checkpoint.
+            wal.TruncateProposedLogsAfter(p, afterLogId: 1);
+            AssertCheckpointMatchesScan(wal, p, 2);
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void LastCheckpoint_DeletePartitionWal_ClearsRecordedFloor()
+    {
+        if (!SupportsCheckpointLookup) return;
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            const int p = 44;
+
+            wal.Write([(p, [Log(1), Log(2, type: RaftLogType.CommittedCheckpoint)])]);
+            AssertCheckpointMatchesScan(wal, p, 2);
+
+            // Wiping the partition must clear the recorded checkpoint so a reused id does not inherit a
+            // stale replay floor (there is no scan fallback to correct it).
+            wal.DeletePartitionWAL(p);
+            Assert.Equal(-1, wal.GetLastCheckpoint(p));
+
+            // Reusing the partition id with fresh, checkpoint-free logs must still report -1.
+            wal.Write([(p, [Log(1), Log(2)])]);
+            AssertCheckpointMatchesScan(wal, p, -1);
         }
         finally { cleanup(); }
     }

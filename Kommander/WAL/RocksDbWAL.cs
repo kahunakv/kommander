@@ -73,6 +73,12 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </summary>
     private readonly RocksDb db;
 
+    /// <summary>
+    /// Cached handle to the <c>metadata</c> column family. Resolved once at construction so the hot
+    /// checkpoint-lookup / checkpoint-persist paths never re-resolve it per call.
+    /// </summary>
+    private readonly ColumnFamilyHandle metadataColumnFamily;
+
     private readonly string path;
     
     private readonly string revision;
@@ -176,7 +182,9 @@ public class RocksDbWAL : IWAL, IDisposable
         bool firstTime = !Directory.Exists(completePath);
         
         db = RocksDb.Open(dbOptions, completePath, columnFamilies);
-        
+
+        metadataColumnFamily = db.GetColumnFamily("metadata");
+
         if (firstTime)
             SetMetaData("version", FormatVersion);
         else
@@ -242,10 +250,10 @@ public class RocksDbWAL : IWAL, IDisposable
         List<RaftLog> result = [];
 
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-        
-        long lastCheckpoint = GetLastCheckpointInternal(partitionId, columnFamilyHandle);
-        
-        //Console.WriteLine($"Last checkpoint {partitionId} {lastCheckpoint}");
+
+        // O(1) point lookup — the replay floor is persisted in the metadata CF and kept in sync with every
+        // checkpoint write, so restore no longer pays a reverse scan of the post-checkpoint tail.
+        long lastCheckpoint = GetLastCheckpointFromMeta(partitionId);
 
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         
@@ -374,10 +382,25 @@ public class RocksDbWAL : IWAL, IDisposable
                 if (log.LogData != null)
                     message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
 
+                ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+
+                if (log.Type == RaftLogType.CommittedCheckpoint)
+                {
+                    // Promote the single-put fast path to a 2-op batch so the log entry and the persisted
+                    // last-checkpoint id land atomically (RocksDB applies a batch all-or-nothing). max() so a
+                    // late/duplicate lower checkpoint never regresses the recorded id.
+                    long newCheckpoint = Math.Max(GetLastCheckpointFromMeta(partitionId), log.Id);
+
+                    using WriteBatch checkpointBatch = new();
+                    PutToBatch(checkpointBatch, message, columnFamilyHandle);
+                    PutLastCheckpointToBatch(checkpointBatch, partitionId, newCheckpoint);
+                    db.Write(checkpointBatch, effectiveOptions);
+
+                    return RaftOperationStatus.Success;
+                }
+
                 Span<byte> buffer = stackalloc byte[LogKeyWidth];
                 BuildLogKey(buffer, partitionId, message.Id);
-                
-                ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
                 // RocksDB copies the value synchronously inside Put, so the rented/stack buffer is safe to
                 // release as soon as the call returns. The stackalloc is evaluated only when nothing was
@@ -400,10 +423,21 @@ public class RocksDbWAL : IWAL, IDisposable
             }
             
             Dictionary<ColumnFamilyHandle, Dictionary<int, List<RaftLog>>> plan = new();
-            
+
+            // Highest CommittedCheckpoint id seen per partition in this batch; used to stage the persisted
+            // last-checkpoint update into the SAME WriteBatch as the log puts (atomic).
+            Dictionary<int, long> checkpointMaxByPartition = new();
+
             foreach ((int partitionId, List<RaftLog> raftLog) log in logs)
             {
                 ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(log.partitionId);
+
+                foreach (RaftLog entry in log.raftLog)
+                {
+                    if (entry.Type == RaftLogType.CommittedCheckpoint &&
+                        entry.Id > checkpointMaxByPartition.GetValueOrDefault(log.partitionId, -1))
+                        checkpointMaxByPartition[log.partitionId] = entry.Id;
+                }
 
                 if (plan.TryGetValue(columnFamilyHandle, out Dictionary<int, List<RaftLog>>? raftLogsPerPartition))
                 {
@@ -460,7 +494,16 @@ public class RocksDbWAL : IWAL, IDisposable
 
                 //Console.WriteLine("Batch of {0}", count);
             }
-            
+
+            // Stage the persisted last-checkpoint update for any partition that committed a checkpoint in
+            // this batch, so it is durable atomically with the log entries. max() with the existing value so
+            // an out-of-order lower checkpoint cannot regress the recorded id.
+            foreach ((int partitionId, long batchMaxCheckpoint) in checkpointMaxByPartition)
+            {
+                long newCheckpoint = Math.Max(GetLastCheckpointFromMeta(partitionId), batchMaxCheckpoint);
+                PutLastCheckpointToBatch(writeBatch, partitionId, newCheckpoint);
+            }
+
             db.Write(writeBatch, effectiveOptions);
 
             return RaftOperationStatus.Success;
@@ -871,9 +914,7 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </returns>
     public long GetLastCheckpoint(int partitionId)
     {
-        ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-        
-        return GetLastCheckpointInternal(partitionId, columnFamilyHandle);
+        return GetLastCheckpointFromMeta(partitionId);
     }
 
     /// <inheritdoc/>
@@ -928,38 +969,6 @@ public class RocksDbWAL : IWAL, IDisposable
     }
 
     /// <summary>
-    /// Retrieves the last checkpoint ID for the specified partition using the provided column family handle.
-    /// </summary>
-    /// <param name="partitionId">
-    /// The ID of the partition for which to retrieve the last checkpoint.
-    /// </param>
-    /// <param name="columnFamilyHandle">
-    /// The column family handle associated with the specified partition in the database.
-    /// </param>
-    /// <returns>
-    /// The ID of the last checkpoint for the specified partition, or -1 if no checkpoint is found.
-    /// </returns>
-    private long GetLastCheckpointInternal(int partitionId, ColumnFamilyHandle columnFamilyHandle)
-    {
-        using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
-        SeekToLastPartitionKey(iterator, partitionId);
-
-        while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
-        {
-            // `type` is only available in the value, but GetValueSpan borrows RocksDB's buffer rather than
-            // copying it out, and the wire scan skips the payload — so a long backwards scan is allocation-free.
-            ReadHeaderFromWire(iterator.GetValueSpan(), out _, out _, out _, out int type);
-
-            if (type == (int)RaftLogType.CommittedCheckpoint)
-                return ParseLogIdFromKey(iterator.GetKeySpan());
-
-            iterator.Prev();
-        }
-
-        return -1;
-    }
-
-    /// <summary>
     /// Retrieves metadata value associated with the specified key from the database.
     /// </summary>
     /// <param name="key">
@@ -970,10 +979,8 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </returns>
     public string? GetMetaData(string key)
     {
-        ColumnFamilyHandle? metaDataColumnFamily = db.GetColumnFamily("metadata");
+        byte[] value = db.Get(Encoding.UTF8.GetBytes(key), cf: metadataColumnFamily);
 
-        byte[] value = db.Get(Encoding.UTF8.GetBytes(key), cf: metaDataColumnFamily);
-        
         return value is not null ? Encoding.UTF8.GetString(value) : null;
     }
 
@@ -991,11 +998,77 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </returns>
     public bool SetMetaData(string key, string value)
     {
-        ColumnFamilyHandle? metaDataColumnFamily = db.GetColumnFamily("metadata");
-
-        db.Put(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), cf: metaDataColumnFamily);
+        db.Put(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), cf: metadataColumnFamily);
 
         return true;
+    }
+
+    /// <summary>
+    /// Builds the metadata-CF key that stores the id of the highest <see cref="RaftLogType.CommittedCheckpoint"/>
+    /// entry for a partition. Mirrors the per-partition hard-state key convention
+    /// (<c>raft_hardstate_p{id}</c>).
+    /// </summary>
+    private static byte[] LastCheckpointKey(int partitionId) =>
+        Encoding.UTF8.GetBytes($"raft_last_checkpoint_p{partitionId}");
+
+    /// <summary>
+    /// Reads the persisted last-checkpoint id for <paramref name="partitionId"/> as an O(1) point lookup
+    /// in the metadata CF. Returns <c>-1</c> when no checkpoint has ever been recorded for the partition
+    /// (fresh partition, or one whose recorded checkpoint was truncated away). This is the authoritative
+    /// source — there is no reverse-scan fallback (see the feature spec: backwards compatibility is out of
+    /// scope, the key is maintained atomically with every checkpoint mutation).
+    /// </summary>
+    private long GetLastCheckpointFromMeta(int partitionId)
+    {
+        byte[] value = db.Get(LastCheckpointKey(partitionId), cf: metadataColumnFamily);
+
+        return value is not null && long.TryParse(Encoding.UTF8.GetString(value), out long id) ? id : -1;
+    }
+
+    /// <summary>
+    /// Stages the persisted last-checkpoint id for <paramref name="partitionId"/> into
+    /// <paramref name="writeBatch"/> so it is applied atomically with the log mutation in the same
+    /// <see cref="WriteBatch"/> (RocksDB applies a batch all-or-nothing). Every checkpoint write funnels
+    /// through here so the persisted value can never drift from the log.
+    /// </summary>
+    private void PutLastCheckpointToBatch(WriteBatch writeBatch, int partitionId, long value) =>
+        writeBatch.Put(LastCheckpointKey(partitionId), Encoding.UTF8.GetBytes(value.ToString()), cf: metadataColumnFamily);
+
+    /// <summary>
+    /// Stages deletion of the persisted last-checkpoint id (equivalent to "no checkpoint", i.e. a future
+    /// read returns <c>-1</c>) into <paramref name="writeBatch"/>. Used when a truncation removes the last
+    /// remaining checkpoint entry.
+    /// </summary>
+    private void DeleteLastCheckpointFromBatch(WriteBatch writeBatch, int partitionId) =>
+        writeBatch.Delete(LastCheckpointKey(partitionId), cf: metadataColumnFamily);
+
+    /// <summary>
+    /// Bounded reverse scan for the highest <see cref="RaftLogType.CommittedCheckpoint"/> id whose id is
+    /// <c>≤ upperIdInclusive</c>, or <c>-1</c> if none. Used ONLY on the rare truncation-adjustment path
+    /// (a truncation that removes the recorded checkpoint) to recompute the surviving checkpoint — it is
+    /// never on the restore/read hot path, which is the whole point of persisting the id. Cost is O(entries
+    /// between <paramref name="upperIdInclusive"/> and the surviving checkpoint), same as the old
+    /// GetLastCheckpoint scan but confined to an operation that essentially never fires for committed data.
+    /// </summary>
+    private long ScanHighestCheckpointAtMost(int partitionId, ColumnFamilyHandle columnFamilyHandle, long upperIdInclusive)
+    {
+        using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
+        SeekToLastPartitionKey(iterator, partitionId);
+
+        while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
+        {
+            long id = ParseLogIdFromKey(iterator.GetKeySpan());
+            if (id <= upperIdInclusive)
+            {
+                ReadHeaderFromWire(iterator.GetValueSpan(), out _, out _, out _, out int type);
+                if (type == (int)RaftLogType.CommittedCheckpoint)
+                    return id;
+            }
+
+            iterator.Prev();
+        }
+
+        return -1;
     }
 
     /// <inheritdoc/>
@@ -1020,12 +1093,20 @@ public class RocksDbWAL : IWAL, IDisposable
                 }
             }
 
+            // Always drop the persisted last-checkpoint id too: wiping the partition must not leave a stale
+            // replay floor that a subsequently-reused partition id would inherit (there is no scan fallback
+            // to correct it). Batch it with the log deletes when there are any, else delete it standalone.
             if (keysToDelete.Count > 0)
             {
                 using WriteBatch writeBatch = new();
                 foreach (byte[] key in keysToDelete)
                     writeBatch.Delete(key, cf: columnFamilyHandle);
+                writeBatch.Delete(LastCheckpointKey(partitionId), cf: metadataColumnFamily);
                 db.Write(writeBatch, writeOptions);
+            }
+            else
+            {
+                db.Remove(LastCheckpointKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
             }
 
             return RaftOperationStatus.Success;
@@ -1066,6 +1147,22 @@ public class RocksDbWAL : IWAL, IDisposable
                 using WriteBatch writeBatch = new();
                 foreach (byte[] key in keysToDelete)
                     writeBatch.Delete(key, cf: columnFamilyHandle);
+
+                // If the truncation removes the recorded checkpoint (it sits above afterLogId), recompute
+                // the surviving checkpoint id (highest CommittedCheckpoint ≤ afterLogId, or -1) and adjust
+                // the persisted value in the SAME batch. There is no scan fallback, so this must be exact.
+                // Committed checkpoints are effectively never truncated, so this reverse scan almost never
+                // runs and never touches the restore hot path.
+                long recorded = GetLastCheckpointFromMeta(partitionId);
+                if (recorded > afterLogId)
+                {
+                    long surviving = ScanHighestCheckpointAtMost(partitionId, columnFamilyHandle, afterLogId);
+                    if (surviving < 0)
+                        DeleteLastCheckpointFromBatch(writeBatch, partitionId);
+                    else
+                        PutLastCheckpointToBatch(writeBatch, partitionId, surviving);
+                }
+
                 db.Write(writeBatch, writeOptions);
             }
 
@@ -1115,6 +1212,9 @@ public class RocksDbWAL : IWAL, IDisposable
                     db.Write(writeBatch, writeOptions);
                 }
 
+                // No last-checkpoint adjustment: this only removes unresolved (Proposed / ProposedCheckpoint)
+                // entries, and a CommittedCheckpoint is resolved — so the recorded checkpoint is never among
+                // the deleted keys.
                 return RaftOperationStatus.Success;
             }
         }
@@ -1203,6 +1303,15 @@ public class RocksDbWAL : IWAL, IDisposable
             };
             PutToBatch(writeBatch, checkpoint, columnFamilyHandle);
 
+            // Persist the new last-checkpoint id atomically with the boundary install. When the suffix was
+            // truncated, every entry above snapshotIndex (including any higher checkpoint) is gone, so the
+            // new max is exactly snapshotIndex. When the suffix was retained, a higher checkpoint may still
+            // exist above the boundary, so keep the greater of the existing recorded id and snapshotIndex.
+            long newCheckpoint = suffixTruncated
+                ? snapshotIndex
+                : Math.Max(GetLastCheckpointFromMeta(partitionId), snapshotIndex);
+            PutLastCheckpointToBatch(writeBatch, partitionId, newCheckpoint);
+
             OnAfterBoundaryScanForTesting?.Invoke();
 
             db.Write(writeBatch, effectiveOptions);
@@ -1249,6 +1358,8 @@ public class RocksDbWAL : IWAL, IDisposable
         {
             ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
+            // No last-checkpoint update: compaction only removes entries with id < lastCheckpoint, so the
+            // recorded checkpoint id (which is >= lastCheckpoint) can never be among the deleted keys.
             using WriteBatch writeBatch = new();
             int removed = 0;
 

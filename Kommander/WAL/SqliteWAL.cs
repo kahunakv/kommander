@@ -196,6 +196,19 @@ public class SqliteWAL : IWAL, IDisposable
             using SqliteCommand createCmd = new(createTableQuery, connection);
             createCmd.ExecuteNonQuery();
 
+            // Per-partition last-committed-checkpoint id, co-located in the SAME shard DB as `logs` so it
+            // can be updated inside the same transaction as a log mutation (true atomicity). This replaces
+            // the old `SELECT MAX(id) ... WHERE type=checkpoint` scan with an O(1) point lookup. Absence of
+            // a row means "no checkpoint yet" → GetLastCheckpoint returns -1.
+            const string createCheckpointsQuery = """
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                partitionId INT PRIMARY KEY,
+                lastCheckpoint INT NOT NULL
+            );
+            """;
+            using SqliteCommand createCheckpointsCmd = new(createCheckpointsQuery, connection);
+            createCheckpointsCmd.ExecuteNonQuery();
+
             string synchronousMode = syncWrites ? "FULL" : "NORMAL";
             string pragmas = $"PRAGMA journal_mode=WAL; PRAGMA synchronous={synchronousMode}; PRAGMA temp_store=MEMORY;";
             using SqliteCommand pragmaCmd = new(pragmas, connection);
@@ -530,8 +543,24 @@ public class SqliteWAL : IWAL, IDisposable
                             foreach (KeyValuePair<int, List<RaftLog>> kv in shardEntry.Value)
                             {
                                 int partitionId = kv.Key;
+                                long batchMaxCheckpoint = -1;
                                 foreach (RaftLog log in kv.Value)
+                                {
                                     BindAndExecUpsert(upsert, partitionId, log);
+                                    if (log.Type == RaftLogType.CommittedCheckpoint && log.Id > batchMaxCheckpoint)
+                                        batchMaxCheckpoint = log.Id;
+                                }
+
+                                // Persist the last-checkpoint id in the SAME transaction as the log rows so
+                                // it is durable atomically. max() with the existing value so an out-of-order
+                                // lower checkpoint cannot regress the recorded id.
+                                if (batchMaxCheckpoint >= 0)
+                                {
+                                    long newCheckpoint = Math.Max(
+                                        ReadCheckpointInTransaction(shard.Connection, transaction, partitionId),
+                                        batchMaxCheckpoint);
+                                    UpsertCheckpointInTransaction(shard.Connection, transaction, partitionId, newCheckpoint);
+                                }
                             }
 
                             transaction.Commit();
@@ -605,10 +634,29 @@ public class SqliteWAL : IWAL, IDisposable
         {
             try
             {
-                using SqliteCommand command = new(
-                    "DELETE FROM logs WHERE partitionId = @partitionId", shard.Connection);
-                command.Parameters.AddWithValue("@partitionId", partitionId);
-                command.ExecuteNonQuery();
+                // Drop the logs and the persisted last-checkpoint row atomically. Wiping the partition must
+                // not leave a stale replay floor that a subsequently-reused partition id would inherit
+                // (there is no scan fallback to correct it).
+                using SqliteTransaction transaction = shard.Connection.BeginTransaction();
+                try
+                {
+                    using (SqliteCommand command = new(
+                        "DELETE FROM logs WHERE partitionId = @partitionId", shard.Connection))
+                    {
+                        command.Transaction = transaction;
+                        command.Parameters.AddWithValue("@partitionId", partitionId);
+                        command.ExecuteNonQuery();
+                    }
+
+                    DeleteCheckpointInTransaction(shard.Connection, transaction, partitionId);
+
+                    transaction.Commit();
+                }
+                catch
+                {
+                    transaction.Rollback();
+                    throw;
+                }
             }
             catch (Exception ex)
             {
@@ -630,13 +678,31 @@ public class SqliteWAL : IWAL, IDisposable
         {
             try
             {
-                using SqliteCommand command = new(
-                    "DELETE FROM logs WHERE partitionId = @partitionId AND id > @afterLogId",
-                    shard.Connection);
-                command.Parameters.AddWithValue("@partitionId", partitionId);
-                command.Parameters.AddWithValue("@afterLogId", afterLogId);
-                command.ExecuteNonQuery();
-                return RaftOperationStatus.Success;
+                // Delete + checkpoint adjustment in one transaction so the persisted last-checkpoint can
+                // never disagree with the log after a crash.
+                using SqliteTransaction transaction = shard.Connection.BeginTransaction();
+                try
+                {
+                    using (SqliteCommand command = new(
+                        "DELETE FROM logs WHERE partitionId = @partitionId AND id > @afterLogId",
+                        shard.Connection))
+                    {
+                        command.Transaction = transaction;
+                        command.Parameters.AddWithValue("@partitionId", partitionId);
+                        command.Parameters.AddWithValue("@afterLogId", afterLogId);
+                        command.ExecuteNonQuery();
+                    }
+
+                    AdjustCheckpointAfterTruncation(shard.Connection, transaction, partitionId, afterLogId);
+
+                    transaction.Commit();
+                    return RaftOperationStatus.Success;
+                }
+                catch
+                {
+                    transaction.Rollback();
+                    throw;
+                }
             }
             catch (Exception ex)
             {
@@ -644,6 +710,26 @@ public class SqliteWAL : IWAL, IDisposable
                 return RaftOperationStatus.Errored;
             }
         }
+    }
+
+    /// <summary>
+    /// If the recorded last-checkpoint sits above <paramref name="afterLogId"/> (i.e. a truncation just
+    /// removed it), recompute the surviving checkpoint (highest <see cref="RaftLogType.CommittedCheckpoint"/>
+    /// with id ≤ <paramref name="afterLogId"/>, or none → delete the row) inside the same transaction.
+    /// No-op on the overwhelmingly common case where the checkpoint is at or below the truncation point.
+    /// </summary>
+    private static void AdjustCheckpointAfterTruncation(
+        SqliteConnection connection, SqliteTransaction transaction, int partitionId, long afterLogId)
+    {
+        long recorded = ReadCheckpointInTransaction(connection, transaction, partitionId);
+        if (recorded <= afterLogId)
+            return;
+
+        long surviving = HighestCheckpointAtMostInTransaction(connection, transaction, partitionId, afterLogId);
+        if (surviving < 0)
+            DeleteCheckpointInTransaction(connection, transaction, partitionId);
+        else
+            UpsertCheckpointInTransaction(connection, transaction, partitionId, surviving);
     }
 
     /// <inheritdoc/>
@@ -664,6 +750,9 @@ public class SqliteWAL : IWAL, IDisposable
                 command.Parameters.AddWithValue("@proposed", (int)RaftLogType.Proposed);
                 command.Parameters.AddWithValue("@proposedCheckpoint", (int)RaftLogType.ProposedCheckpoint);
                 command.ExecuteNonQuery();
+
+                // No last-checkpoint adjustment: this only removes unresolved (Proposed / ProposedCheckpoint)
+                // entries, and a CommittedCheckpoint is resolved — so the recorded checkpoint is never removed.
                 return RaftOperationStatus.Success;
             }
             catch (Exception ex)
@@ -684,23 +773,40 @@ public class SqliteWAL : IWAL, IDisposable
         {
             try
             {
-                using (SqliteCommand delete = new(
-                    "DELETE FROM logs WHERE partitionId = @partitionId AND id > @afterLogId",
-                    shard.Connection))
+                using SqliteTransaction transaction = shard.Connection.BeginTransaction();
+                try
                 {
-                    delete.Parameters.AddWithValue("@partitionId", partitionId);
-                    delete.Parameters.AddWithValue("@afterLogId", afterLogId);
-                    delete.ExecuteNonQuery();
-                }
+                    using (SqliteCommand delete = new(
+                        "DELETE FROM logs WHERE partitionId = @partitionId AND id > @afterLogId",
+                        shard.Connection))
+                    {
+                        delete.Transaction = transaction;
+                        delete.Parameters.AddWithValue("@partitionId", partitionId);
+                        delete.Parameters.AddWithValue("@afterLogId", afterLogId);
+                        delete.ExecuteNonQuery();
+                    }
 
-                using SqliteCommand max = new(
-                    "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId",
-                    shard.Connection);
-                max.Parameters.AddWithValue("@partitionId", partitionId);
-                using SqliteDataReader reader = max.ExecuteReader();
-                while (reader.Read())
-                    return (RaftOperationStatus.Success, reader.IsDBNull(0) ? 0 : reader.GetInt64(0));
-                return (RaftOperationStatus.Success, 0);
+                    AdjustCheckpointAfterTruncation(shard.Connection, transaction, partitionId, afterLogId);
+
+                    long maxLogId;
+                    using (SqliteCommand max = new(
+                        "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId",
+                        shard.Connection))
+                    {
+                        max.Transaction = transaction;
+                        max.Parameters.AddWithValue("@partitionId", partitionId);
+                        object? result = max.ExecuteScalar();
+                        maxLogId = result is null or DBNull ? 0 : Convert.ToInt64(result);
+                    }
+
+                    transaction.Commit();
+                    return (RaftOperationStatus.Success, maxLogId);
+                }
+                catch
+                {
+                    transaction.Rollback();
+                    throw;
+                }
             }
             catch (Exception ex)
             {
@@ -778,6 +884,15 @@ public class SqliteWAL : IWAL, IDisposable
                         upsert.Transaction = null;
                     }
 
+                    // Persist the new last-checkpoint id atomically with the boundary install. When the
+                    // suffix was truncated, every entry above snapshotIndex (including any higher checkpoint)
+                    // is gone, so the new max is exactly snapshotIndex. When the suffix was retained, a higher
+                    // checkpoint may still exist above the boundary, so keep the greater of the two.
+                    long newCheckpoint = suffixTruncated
+                        ? snapshotIndex
+                        : Math.Max(ReadCheckpointInTransaction(shard.Connection, transaction, partitionId), snapshotIndex);
+                    UpsertCheckpointInTransaction(shard.Connection, transaction, partitionId, newCheckpoint);
+
                     transaction.Commit();
                     return (RaftOperationStatus.Success, suffixTruncated);
                 }
@@ -827,6 +942,8 @@ public class SqliteWAL : IWAL, IDisposable
 
                 try
                 {
+                    // No last-checkpoint update: compaction only removes entries with id < lastCheckpoint, so
+                    // the recorded checkpoint id (>= lastCheckpoint) can never be among the deleted rows.
                     const string deleteSql = """
                      DELETE FROM logs
                      WHERE partitionId = @partitionId
@@ -926,18 +1043,84 @@ public class SqliteWAL : IWAL, IDisposable
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Reads the highest <see cref="RaftLogType.CommittedCheckpoint"/> id for a partition using the
-    /// shard's cached prepared command. Must be called while <see cref="ShardDatabase.Lock"/> is held.
+    /// Reads the persisted last-checkpoint id for a partition as an O(1) point lookup in the
+    /// <c>checkpoints</c> table (co-located in the shard DB). Returns <c>-1</c> when no row exists
+    /// (no checkpoint ever recorded, or the recorded one was truncated away). Must be called while
+    /// <see cref="ShardDatabase.Lock"/> is held and with no active transaction on the connection.
+    /// The value is kept in sync with every checkpoint mutation inside the mutation's own transaction,
+    /// so there is no scan fallback.
     /// </summary>
     private static long GetLastCheckpointInternal(ShardDatabase shard, int partitionId)
     {
         SqliteCommand command = GetOrCreateGetLastCheckpoint(shard);
         command.Parameters["@partitionId"].Value = partitionId;
-        command.Parameters["@type"].Value = (int)RaftLogType.CommittedCheckpoint;
         using SqliteDataReader reader = command.ExecuteReader();
         while (reader.Read())
             return reader.IsDBNull(0) ? -1 : reader.GetInt64(0);
         return -1;
+    }
+
+    /// <summary>
+    /// Reads the persisted last-checkpoint id inside an active transaction (a plain command bound to
+    /// <paramref name="transaction"/>, since a prepared command with no transaction cannot run while one
+    /// is open). Returns <c>-1</c> when no row exists.
+    /// </summary>
+    private static long ReadCheckpointInTransaction(SqliteConnection connection, SqliteTransaction transaction, int partitionId)
+    {
+        using SqliteCommand command = new(
+            "SELECT lastCheckpoint FROM checkpoints WHERE partitionId = @partitionId", connection);
+        command.Transaction = transaction;
+        command.Parameters.AddWithValue("@partitionId", partitionId);
+        object? result = command.ExecuteScalar();
+        return result is null or DBNull ? -1 : Convert.ToInt64(result);
+    }
+
+    /// <summary>Upserts the persisted last-checkpoint id for a partition inside <paramref name="transaction"/>.</summary>
+    private static void UpsertCheckpointInTransaction(SqliteConnection connection, SqliteTransaction transaction, int partitionId, long value)
+    {
+        using SqliteCommand command = new(
+            """
+            INSERT INTO checkpoints (partitionId, lastCheckpoint)
+            VALUES (@partitionId, @lastCheckpoint)
+            ON CONFLICT(partitionId) DO UPDATE SET lastCheckpoint=@lastCheckpoint;
+            """, connection);
+        command.Transaction = transaction;
+        command.Parameters.AddWithValue("@partitionId", partitionId);
+        command.Parameters.AddWithValue("@lastCheckpoint", value);
+        command.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Deletes the persisted last-checkpoint row for a partition inside <paramref name="transaction"/>
+    /// (equivalent to "no checkpoint" — a subsequent read returns <c>-1</c>).
+    /// </summary>
+    private static void DeleteCheckpointInTransaction(SqliteConnection connection, SqliteTransaction transaction, int partitionId)
+    {
+        using SqliteCommand command = new(
+            "DELETE FROM checkpoints WHERE partitionId = @partitionId", connection);
+        command.Transaction = transaction;
+        command.Parameters.AddWithValue("@partitionId", partitionId);
+        command.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Highest <see cref="RaftLogType.CommittedCheckpoint"/> id whose id is <c>≤ upperIdInclusive</c>, or
+    /// <c>-1</c> if none, read inside <paramref name="transaction"/>. Used ONLY on the rare truncation
+    /// path that removes the recorded checkpoint, to recompute the surviving one — never on the read hot
+    /// path (the whole point of the persisted value).
+    /// </summary>
+    private static long HighestCheckpointAtMostInTransaction(
+        SqliteConnection connection, SqliteTransaction transaction, int partitionId, long upperIdInclusive)
+    {
+        using SqliteCommand command = new(
+            "SELECT MAX(id) FROM logs WHERE partitionId = @partitionId AND type = @type AND id <= @upper",
+            connection);
+        command.Transaction = transaction;
+        command.Parameters.AddWithValue("@partitionId", partitionId);
+        command.Parameters.AddWithValue("@type", (int)RaftLogType.CommittedCheckpoint);
+        command.Parameters.AddWithValue("@upper", upperIdInclusive);
+        object? result = command.ExecuteScalar();
+        return result is null or DBNull ? -1 : Convert.ToInt64(result);
     }
 
     private static RaftLog ReadLogRow(SqliteDataReader reader) => new()
@@ -1020,8 +1203,8 @@ public class SqliteWAL : IWAL, IDisposable
     private static SqliteCommand GetOrCreateGetLastCheckpoint(ShardDatabase shard) =>
         shard.PreparedGetLastCheckpoint ??= CreatePreparedIntParamCommand(
             shard.Connection,
-            "SELECT MAX(id) AS max FROM logs WHERE partitionId = @partitionId AND type = @type",
-            "@partitionId", "@type");
+            "SELECT lastCheckpoint FROM checkpoints WHERE partitionId = @partitionId",
+            "@partitionId");
 
     private static SqliteCommand GetOrCreateReadLogsRangeLimited(ShardDatabase shard) =>
         shard.PreparedReadLogsRangeLimited ??= CreatePreparedIntParamCommand(
