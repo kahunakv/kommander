@@ -30,6 +30,14 @@ namespace Kommander.WAL.IO;
 /// </summary>
 public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
 {
+    // Opt-in relaxation of the single-flight-per-partition invariant (see the ctor doc). When true,
+    // several workers may execute one partition's operations concurrently; FIFO *claiming* order is
+    // preserved (ops are still dequeued in submission order) but completion order is not. Safe ONLY
+    // for schedulers whose operations are mutually independent — pure point/range reads with no
+    // read-after-write ordering handled at this layer (e.g. Kahuna's KV persistence reads, where
+    // dirty in-memory entries are never served from disk, so disk is only read when authoritative).
+    private readonly bool concurrentPerPartition;
+
     // ── Constants ──────────────────────────────────────────────────────────
 
     /// <summary>Maximum number of operations drained from a partition per scheduling cycle.</summary>
@@ -50,7 +58,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
         /// <summary>Pending read actions in submission order.</summary>
         public readonly Queue<Action> Ops = new();
 
-        /// <summary>Guards <see cref="Ops"/>, <see cref="Scheduled"/>, <see cref="InFlight"/>, and <see cref="Depth"/>.</summary>
+        /// <summary>Guards <see cref="Ops"/>, <see cref="Scheduled"/>, <see cref="InFlightCount"/>, and <see cref="Depth"/>.</summary>
         public readonly object Lock = new();
 
         /// <summary>
@@ -60,12 +68,13 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
         public bool Scheduled;
 
         /// <summary>
-        /// True while a worker thread is executing reads for this partition.
-        /// A concurrent <see cref="EnqueueTask{T}"/> that sees <c>InFlight=true</c>
-        /// must NOT add the partition to <c>_readyPartitions</c>; the post-read
-        /// lock section will re-schedule once the read loop finishes.
+        /// Number of worker threads currently executing this partition's reads. In ordered mode this
+        /// is 0 or 1 and acts as the single-flight gate: an <see cref="EnqueueTask{T}"/> that sees a
+        /// non-zero count must NOT add the partition to <c>_readyPartitions</c>; the post-read lock
+        /// section re-schedules when the read loop finishes. In concurrent mode it is bounded only by
+        /// the worker count and exists for the shutdown quiescence check.
         /// </summary>
-        public bool InFlight;
+        public int InFlightCount;
 
         /// <summary>Current number of pending-or-in-flight operations.</summary>
         public int Depth;
@@ -148,13 +157,23 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
     /// Per-partition soft back-pressure limit.
     /// Defaults to <see cref="DefaultMaxQueueDepth"/>.
     /// </param>
+    /// <param name="concurrentPerPartition">
+    /// When true, drops the at-most-one-worker-per-partition invariant: multiple workers may execute
+    /// one partition's operations concurrently (submission order still decides dequeue order, but not
+    /// completion order). Motivated by single-partition standalone deployments, where the invariant
+    /// collapsed ALL backend reads onto one thread at a time — measured as the dominant statement-latency
+    /// source under cold caches. Leave false (the default) for any scheduler whose operations require
+    /// mutual ordering (WAL reads interleaved with truncations/compaction deletes).
+    /// </param>
     public FairReadScheduler(
         ILogger<IRaft> logger,
         int workerCount = 0,
-        int maxQueueDepthPerPartition = DefaultMaxQueueDepth)
+        int maxQueueDepthPerPartition = DefaultMaxQueueDepth,
+        bool concurrentPerPartition = false)
     {
         this.logger = logger;
         this.maxQueueDepthPerPartition = maxQueueDepthPerPartition;
+        this.concurrentPerPartition = concurrentPerPartition;
 
         if (workerCount <= 0)
             workerCount = Math.Max(1, Environment.ProcessorCount);
@@ -244,7 +263,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
     /// <returns><c>true</c> if this call newly scheduled the partition.</returns>
     private bool TryScheduleLocked(int partitionId, PartitionState state)
     {
-        if (state.Scheduled || state.InFlight || state.Ops.Count == 0)
+        if (state.Scheduled || (!concurrentPerPartition && state.InFlightCount > 0) || state.Ops.Count == 0)
             return false;
 
         // Unbounded queue: TryAdd only fails if the collection is marked complete-for-adding,
@@ -406,13 +425,19 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
             //   concurrent enqueue would see Scheduled=false, add the partition, and
             //   a second worker could start on the same partition concurrently.
             state.Scheduled = false;
-            state.InFlight  = true;
+            state.InFlightCount++;
+
+            // Concurrent mode: if operations remain beyond this batch, put the partition straight
+            // back in the ready queue BEFORE executing, so another worker can drain the remainder
+            // in parallel. Ordered mode must not do this — the invariant is exactly one executor.
+            if (concurrentPerPartition)
+                TryScheduleLocked(partitionId, state);
         }
 
         if (batch.Count == 0)
         {
             lock (state.Lock)
-                state.InFlight = false;
+                state.InFlightCount--;
             return;
         }
 
@@ -440,8 +465,8 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
         // queue waiting for a future enqueue that may never arrive.
         lock (state.Lock)
         {
-            state.Depth   -= batch.Count;
-            state.InFlight = false;
+            state.Depth -= batch.Count;
+            state.InFlightCount--;
 
             TryScheduleLocked(partitionId, state);
         }
@@ -493,7 +518,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
                 lock (kv.Value.Lock)
                 {
                     if (kv.Value.Ops.Count > 0) pendingWork = true;
-                    if (kv.Value.InFlight) inFlight = true;
+                    if (kv.Value.InFlightCount > 0) inFlight = true;
                 }
 
                 if (pendingWork && inFlight)
