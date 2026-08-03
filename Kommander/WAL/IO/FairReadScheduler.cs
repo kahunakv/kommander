@@ -17,6 +17,11 @@ namespace Kommander.WAL.IO;
 ///       unboundedly.</item>
 ///   <item>Graceful drain on <see cref="Stop"/> — every operation accepted before
 ///       the call completes (or faults) before workers exit.</item>
+///   <item>Opt-in read coalescing — point reads submitted via
+///       <see cref="EnqueueBatchableTask{TArg,T}"/> against one
+///       <see cref="IReadBatchExecutor{TArg,T}"/> instance are executed as a single backend
+///       call per drained run (e.g. one RocksDB <c>MultiGet</c> for a burst of point reads),
+///       without changing admission, fairness, or ordering of plain operations.</item>
 /// </list>
 ///
 /// <para><b>Usage pattern in <c>RaftWriteAhead</c>:</b></para>
@@ -55,8 +60,13 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
 
     private sealed class PartitionState
     {
-        /// <summary>Pending read actions in submission order.</summary>
-        public readonly Queue<Action> Ops = new();
+        /// <summary>
+        /// Pending read operations in submission order. Each item is either a plain
+        /// <see cref="Action"/> (from <see cref="EnqueueTask{T}"/>) or a <see cref="BatchableOp"/>
+        /// (from <see cref="EnqueueBatchableTask{TArg,T}"/>); the drain loop type-tests rather
+        /// than wrapping plain actions, so the existing path pays no extra allocation.
+        /// </summary>
+        public readonly Queue<object> Ops = new();
 
         /// <summary>Guards <see cref="Ops"/>, <see cref="Scheduled"/>, <see cref="InFlightCount"/>, and <see cref="Depth"/>.</summary>
         public readonly object Lock = new();
@@ -78,6 +88,72 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
 
         /// <summary>Current number of pending-or-in-flight operations.</summary>
         public int Depth;
+    }
+
+    /// <summary>
+    /// Non-generic view of a queued batchable operation so the drain loop can group runs of
+    /// same-executor ops without knowing their closed generic type. Grouping key is the executor
+    /// <b>instance</b>; because one executor instance only ever produces ops of one closed
+    /// generic <see cref="BatchableOp{TArg,T}"/>, every member of a group is safely castable
+    /// inside <see cref="RunGroup"/>.
+    /// </summary>
+    private abstract class BatchableOp
+    {
+        /// <summary>The executor instance; reference identity defines batch-compatibility.</summary>
+        internal abstract object ExecutorKey { get; }
+
+        /// <summary>
+        /// Executes <paramref name="count"/> ops from <paramref name="batch"/> starting at
+        /// <paramref name="start"/> (all sharing this op's executor) as one backend call, and
+        /// completes or faults each op's task. Never lets an executor exception escape: a
+        /// throwing <see cref="IReadBatchExecutor{TArg,T}.ExecuteBatch"/> faults every task in
+        /// the group instead, matching the N-individual-failed-reads semantics.
+        /// </summary>
+        internal abstract void RunGroup(List<object> batch, int start, int count);
+    }
+
+    private sealed class BatchableOp<TArg, T> : BatchableOp
+    {
+        private readonly IReadBatchExecutor<TArg, T> executor;
+        private readonly TArg arg;
+
+        internal readonly TaskCompletionSource<T> Tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal BatchableOp(IReadBatchExecutor<TArg, T> executor, TArg arg)
+        {
+            this.executor = executor;
+            this.arg = arg;
+        }
+
+        internal override object ExecutorKey => executor;
+
+        internal override void RunGroup(List<object> batch, int start, int count)
+        {
+            TArg[] args = new TArg[count];
+
+            for (int i = 0; i < count; i++)
+                args[i] = ((BatchableOp<TArg, T>)batch[start + i]).arg;
+
+            T[] results;
+
+            try
+            {
+                results = executor.ExecuteBatch(args);
+
+                if (results.Length != count)
+                    throw new InvalidOperationException($"IReadBatchExecutor returned {results.Length} results for {count} arguments.");
+            }
+            catch (Exception ex)
+            {
+                for (int i = 0; i < count; i++)
+                    ((BatchableOp<TArg, T>)batch[start + i]).Tcs.TrySetException(ex);
+
+                return;
+            }
+
+            for (int i = 0; i < count; i++)
+                ((BatchableOp<TArg, T>)batch[start + i]).Tcs.TrySetResult(results[i]);
+        }
     }
 
     private readonly ConcurrentDictionary<int, PartitionState> _partitions = new();
@@ -194,6 +270,54 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
     /// <inheritdoc/>
     public Task<T> EnqueueTask<T>(int partitionId, Func<T> operation)
     {
+        TaskCompletionSource<T> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // Capture TCS and delegate in an Action; the drain loop type-tests queue items.
+        Action work = () =>
+        {
+            try
+            {
+                tcs.TrySetResult(operation());
+            }
+            catch (Exception ex)
+            {
+                tcs.TrySetException(ex);
+            }
+        };
+
+        EnqueueCore(partitionId, work);
+
+        return tcs.Task;
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Batching happens at drain time: <see cref="ProcessPartition"/> executes each maximal
+    /// run of <b>adjacent</b> same-executor operations in its drained batch as one
+    /// <see cref="IReadBatchExecutor{TArg,T}.ExecuteBatch"/> call. Adjacency (rather than
+    /// grouping across the whole drained batch) is deliberate: it never reorders a batchable
+    /// op relative to an interleaved plain <see cref="EnqueueTask{T}"/> op, so ordered-mode
+    /// schedulers whose plain ops require mutual FIFO ordering (WAL reads vs truncations)
+    /// remain correct even if they mix in batchable reads.
+    /// </remarks>
+    public Task<T> EnqueueBatchableTask<TArg, T>(int partitionId, TArg arg, IReadBatchExecutor<TArg, T> executor)
+    {
+        BatchableOp<TArg, T> op = new(executor, arg);
+
+        EnqueueCore(partitionId, op);
+
+        return op.Tcs.Task;
+    }
+
+    /// <summary>
+    /// Shared admission path for <see cref="EnqueueTask{T}"/> and
+    /// <see cref="EnqueueBatchableTask{TArg,T}"/>. Publishes <paramref name="work"/> (an
+    /// <see cref="Action"/> or a <see cref="BatchableOp"/>) into the partition queue, or throws
+    /// without publishing (stopping / backpressure) — in which case the caller's task object is
+    /// never exposed, so nothing is stranded.
+    /// </summary>
+    private void EnqueueCore(int partitionId, object work)
+    {
         // Admission runs under the READ lock so that Stop() (WRITE lock) cannot begin
         // draining until every in-flight admission has finished publishing its work. The
         // _stopping check MUST be inside the lock: checking it outside would reintroduce the
@@ -216,21 +340,6 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
             // which drains any parked operations even when Start() was never called.
             PartitionState state = _partitions.GetOrAdd(partitionId, _ => new PartitionState());
 
-            TaskCompletionSource<T> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-            // Capture TCS and delegate in an Action so the queue is typed as Queue<Action>.
-            Action work = () =>
-            {
-                try
-                {
-                    tcs.TrySetResult(operation());
-                }
-                catch (Exception ex)
-                {
-                    tcs.TrySetException(ex);
-                }
-            };
-
             lock (state.Lock)
             {
                 if (state.Depth >= maxQueueDepthPerPartition)
@@ -241,8 +350,6 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
 
                 TryScheduleLocked(partitionId, state);
             }
-
-            return tcs.Task;
         }
         finally
         {
@@ -355,7 +462,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
                 // precisely because no worker threads exist: every partition has
                 // InFlight=false, so the drain processes all parked operations in submission
                 // order with no risk of concurrent execution on the same partition.
-                DrainRemaining(new List<Action>(MaxBatchSize));
+                DrainRemaining(new List<object>(MaxBatchSize));
                 return;
             }
 
@@ -376,7 +483,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
 
     private void WorkerLoop(int workerId)
     {
-        List<Action> batch = new(MaxBatchSize);
+        List<object> batch = new(MaxBatchSize);
         CancellationToken token = _cts.Token;
 
         while (true)
@@ -400,7 +507,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
         }
     }
 
-    private void ProcessPartition(int partitionId, List<Action> batch)
+    private void ProcessPartition(int partitionId, List<object> batch)
     {
         if (!_partitions.TryGetValue(partitionId, out PartitionState? state))
             return;
@@ -413,7 +520,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
             // completes so that Depth tracks queued-plus-in-flight operations.
             // Decrementing at dequeue time would let Depth fall to 0 before the
             // reads finish, making the backpressure limit unreliable under load.
-            while (batch.Count < MaxBatchSize && state.Ops.TryDequeue(out Action? work))
+            while (batch.Count < MaxBatchSize && state.Ops.TryDequeue(out object? work))
                 batch.Add(work);
 
             // Clear the scheduled flag and raise the in-flight flag BEFORE
@@ -441,21 +548,40 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
             return;
         }
 
-        foreach (Action work in batch)
+        for (int i = 0; i < batch.Count; )
         {
+            // Coalesce each maximal run of ADJACENT ops sharing one executor instance into a
+            // single ExecuteBatch call. Adjacency preserves the queue's total execution order
+            // relative to interleaved plain Actions — see EnqueueBatchableTask remarks.
+            int runLength = 1;
+
+            if (batch[i] is BatchableOp first)
+            {
+                while (i + runLength < batch.Count &&
+                       batch[i + runLength] is BatchableOp next &&
+                       ReferenceEquals(next.ExecutorKey, first.ExecutorKey))
+                    runLength++;
+            }
+
             try
             {
-                work(); // Sets TCS result or exception internally.
-                Interlocked.Increment(ref _totalReadsCompleted);
+                if (batch[i] is Action work)
+                    work(); // Sets TCS result or exception internally.
+                else
+                    ((BatchableOp)batch[i]).RunGroup(batch, i, runLength); // Completes/faults each op's TCS internally.
+
+                Interlocked.Add(ref _totalReadsCompleted, runLength);
             }
             catch (Exception ex)
             {
-                // Defensive: the Action lambda should never throw (it catches internally),
-                // but log just in case.
+                // Defensive: both op kinds complete their TCSes internally and should never
+                // let an exception escape, but log just in case.
                 logger.LogError(
                     "[FairReadScheduler] Unhandled exception for partition {PartitionId}: {Message}",
                     partitionId, ex.Message);
             }
+
+            i += runLength;
         }
 
         // After reads complete, decrement Depth for exactly the items processed,
@@ -478,7 +604,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
             _drainWake.Set();
     }
 
-    private void DrainRemaining(List<Action> batch)
+    private void DrainRemaining(List<object> batch)
     {
         // Exactly ONE canceled worker coordinates the shutdown drain. Others return
         // immediately: by the time a worker reaches DrainRemaining its own in-progress batch

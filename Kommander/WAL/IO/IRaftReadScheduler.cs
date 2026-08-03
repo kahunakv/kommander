@@ -39,4 +39,45 @@ public interface IRaftReadScheduler
     /// Thrown when the per-partition pending queue depth has reached its limit.
     /// </exception>
     Task<T> EnqueueTask<T>(int partitionId, Func<T> operation);
+
+    /// <summary>
+    /// Submits a point-read operation that the scheduler MAY coalesce with other pending
+    /// operations sharing the same <paramref name="executor"/> instance into a single
+    /// <see cref="IReadBatchExecutor{TArg,T}.ExecuteBatch"/> call (e.g. one RocksDB
+    /// <c>MultiGet</c> for a burst of point reads).
+    ///
+    /// <para>
+    /// Operations submitted through this method must be mutually independent — see the
+    /// contract on <see cref="IReadBatchExecutor{TArg,T}"/>. Admission semantics (partition
+    /// fairness, FIFO claiming, backpressure, drain-on-stop) are identical to
+    /// <see cref="EnqueueTask{T}"/>.
+    /// </para>
+    ///
+    /// <para>
+    /// The default implementation performs no coalescing: it forwards to
+    /// <see cref="EnqueueTask{T}"/> with a single-element batch, which is semantically
+    /// equivalent. Schedulers that can batch (see <see cref="FairReadScheduler"/>) override it.
+    /// </para>
+    /// </summary>
+    /// <typeparam name="TArg">Per-operation input (typically a storage key).</typeparam>
+    /// <typeparam name="T">Per-operation result.</typeparam>
+    /// <param name="partitionId">The Raft partition that owns the data being read.</param>
+    /// <param name="arg">The input passed to the executor for this operation.</param>
+    /// <param name="executor">
+    /// Long-lived executor performing the batched read; batching groups by reference identity
+    /// of this instance.
+    /// </param>
+    /// <returns>A <see cref="Task{T}"/> holding this operation's slot of the batch result.</returns>
+    Task<T> EnqueueBatchableTask<TArg, T>(int partitionId, TArg arg, IReadBatchExecutor<TArg, T> executor)
+    {
+        return EnqueueTask(partitionId, () =>
+        {
+            T[] results = executor.ExecuteBatch([arg]);
+
+            if (results.Length != 1)
+                throw new InvalidOperationException($"IReadBatchExecutor returned {results.Length} results for 1 argument.");
+
+            return results[0];
+        });
+    }
 }
