@@ -50,6 +50,18 @@ public enum RaftRequestType
     GetFollowerCommittedIndex,
 
     /// <summary>
+    /// Discards all per-follower replication progress the leader has recorded for the endpoint
+    /// carried on <see cref="RaftRequest.Endpoint"/>. Posted when the committed roster (re)adds a
+    /// member: any retained progress predates the (re)admission and may describe state the member
+    /// no longer holds — a node evicted during a restart typically returns with a reset log, and a
+    /// leader that still "remembers" it as caught-up would neither un-quiesce nor backfill it,
+    /// starving the member indefinitely. Clearing the entries makes the member read as
+    /// "no recorded progress = lagging", which re-arms heartbeats and anchors backfill from the
+    /// follower's actually-reported frontier.
+    /// </summary>
+    ResetFollowerProgress,
+
+    /// <summary>
     /// Returns the event-driven completion task for an active proposal ticket.
     /// The returned <see cref="System.Threading.Tasks.Task{T}"/> completes when the
     /// proposal reaches a terminal state (committed, rolled-back, or invalidated by

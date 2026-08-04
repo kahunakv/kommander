@@ -937,6 +937,11 @@ public sealed class RaftPartitionExecutor : IDisposable
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
                     break;
 
+                case RaftRequestType.ResetFollowerProgress:
+                    _stateMachine.ResetFollowerProgress(request.Endpoint ?? "");
+                    op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
+                    break;
+
                 case RaftRequestType.SnapshotInstalled:
                     _stateMachine.CompleteSnapshotInstalled(request.Endpoint ?? "", request.CommitIndex);
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);

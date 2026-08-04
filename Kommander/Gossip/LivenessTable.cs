@@ -16,8 +16,12 @@ namespace Kommander.Gossip;
 ///   <item>Higher incarnation always wins.</item>
 ///   <item>For the same incarnation, state weight Dead &gt; Suspect &gt; Alive.</item>
 ///   <item>
-///     Dead is terminal: once a node reaches Dead it stays Dead locally until evicted
-///     from the roster (after which it is simply absent).
+///     Dead is sticky but not unrecoverable: rumors (gossip) and indirect evidence can never
+///     downgrade it, but a strictly higher incarnation — produced by the node's own refutation
+///     or by <see cref="Resurrect"/> after a successful direct probe — overrides it. Without
+///     the incarnation escape hatch a node that returns after the suspicion window could never
+///     clear its Dead entry anywhere (stale Dead rumors would re-kill every refutation), and
+///     the eviction grace timer would fire against a demonstrably live member.
 ///   </item>
 /// </list>
 /// </para>
@@ -176,6 +180,37 @@ internal sealed class LivenessTable
         lock (_lock) _table.Remove(endpoint);
     }
 
+    /// <summary>
+    /// Overrides a <see cref="MemberLivenessState.Dead"/> entry with Alive after a <b>successful
+    /// direct probe</b> — authoritative proof of life that rumor-level updates don't provide.
+    /// The new incarnation is <c>max(currentIncarnation, observedIncarnation) + 1</c> so the
+    /// resurrection strictly outranks the Dead entry and any stale Dead rumors at the old
+    /// incarnation still circulating in peers' tables (see <see cref="ShouldUpdate"/>): the
+    /// Alive entry propagates via gossip piggyback and wins everywhere. Bumping another node's
+    /// incarnation from outside is a deliberate departure from strict SWIM (only the node itself
+    /// refutes); it is safe because it is only ever applied on direct-probe success, and a
+    /// restarted node's own counter resets to 0 so its self-entries simply stay stale-and-ignored
+    /// until its next refutation, which bumps past this value.
+    /// <para>Falls back to <see cref="MarkAlive"/> semantics when the entry is absent or not Dead.</para>
+    /// </summary>
+    public void Resurrect(string endpoint, long observedIncarnation)
+    {
+        lock (_lock)
+        {
+            if (_table.TryGetValue(endpoint, out Entry? current) && current.State == MemberLivenessState.Dead)
+            {
+                long newInc = Math.Max(current.Incarnation, observedIncarnation) + 1;
+                _table[endpoint] = new(MemberLivenessState.Alive, newInc, DateTimeOffset.UtcNow);
+                return;
+            }
+
+            // Not Dead (or unknown): a plain alive observation, same rules as MarkAlive.
+            if (_table.TryGetValue(endpoint, out Entry? existing) && observedIncarnation < existing.Incarnation)
+                return;
+            _table[endpoint] = new(MemberLivenessState.Alive, observedIncarnation, DateTimeOffset.UtcNow);
+        }
+    }
+
     // ── Gossip integration ─────────────────────────────────────────────────
 
     /// <summary>
@@ -278,7 +313,13 @@ internal sealed class LivenessTable
     private static bool ShouldUpdate(Entry current, MemberLivenessEntry update)
     {
         if (update.Incarnation > current.Incarnation) return true;
-        if (update.Incarnation < current.Incarnation && update.State != MemberLivenessState.Dead) return false;
+        // A stale-incarnation update never wins — including Dead. Dead previously overrode any
+        // incarnation, which made a refutation impossible to keep: stale Dead(N) rumors still
+        // circulating in peers' piggybacked tables would re-kill an Alive(N+1) entry on every
+        // gossip round, so a returned node stayed Dead cluster-wide until evicted. Incarnations
+        // only advance through the node's own refutation or a direct-probe resurrection — both
+        // proofs of life — so respecting them for Dead is safe.
+        if (update.Incarnation < current.Incarnation) return false;
         // Same incarnation: higher state weight wins (Dead=2 > Suspect=1 > Alive=0).
         return (int)update.State > (int)current.State;
     }

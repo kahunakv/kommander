@@ -823,6 +823,19 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 continue;
             }
 
+            // Last-chance verification: the grace timer keys off the Dead-transition time, so a
+            // node that returned from a restart after going Dead but before grace expiry would
+            // still be evicted here — the incident-proven race (the Dead entry could not be
+            // cleared by the node's return in time). One direct probe closes it: a response
+            // resurrects the liveness entry and skips this candidate; the next tick re-evaluates.
+            if (await manager.ProbeEndpointAliveAsync(endpoint).ConfigureAwait(false))
+            {
+                logger.LogWarning(
+                    "[RaftSystemCoordinator] Skipping eviction of {Endpoint}: responded to last-chance probe; marked Alive",
+                    endpoint);
+                continue;
+            }
+
             logger.LogWarning(
                 "[RaftSystemCoordinator] Evicting Dead member {Endpoint} (dead > {Grace:g}); roster version {Version}",
                 endpoint, grace, roster.MembershipVersion);

@@ -210,6 +210,17 @@ public sealed class RaftPartition : IDisposable
     }
 
     /// <summary>
+    /// Posts a per-follower replication-progress reset for <paramref name="endpoint"/> to the
+    /// partition's single-owner executor. Called when the committed roster (re)admits the member;
+    /// see <see cref="RaftPartitionStateMachine.ResetFollowerProgress"/> for why retained progress
+    /// must not survive a (re)admission.
+    /// </summary>
+    public void ResetFollowerProgress(string endpoint)
+    {
+        executor.Post(new(RaftRequestType.ResetFollowerProgress, endpoint: endpoint));
+    }
+
+    /// <summary>
     /// Sets the minimum WAL log index that compaction must not truncate below, regardless of
     /// the checkpoint position. Forwarded directly to the underlying <see cref="RaftWriteAhead"/>;
     /// the write is volatile so the next compaction pass observes it immediately with no

@@ -166,6 +166,37 @@ internal sealed class GossipService
         }
     }
 
+    /// <summary>
+    /// Last-chance liveness verification before an irreversible action (dead-member eviction):
+    /// sends one direct ping bounded by <see cref="RaftConfiguration.PingTimeout"/>. On success
+    /// the endpoint is resurrected in the liveness table (see <see cref="LivenessTable.Resurrect"/>)
+    /// and <see langword="true"/> is returned so the caller can skip the action. This closes the
+    /// race where a node returns from a restart after being marked Dead but before the eviction
+    /// grace expires: the grace timer keys off the Dead-transition time and nothing else on the
+    /// eviction path re-checks reality.
+    /// </summary>
+    internal async Task<bool> ProbeAndResurrectAsync(RaftManager manager, string endpoint, CancellationToken cancellationToken = default)
+    {
+        using CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(configuration.PingTimeout);
+
+        try
+        {
+            GossipPingResponse resp = await communication.SendPing(
+                manager, new RaftNode(endpoint), new GossipPingRequest(localEndpoint), cts.Token).ConfigureAwait(false);
+
+            if (!resp.Alive)
+                return false;
+
+            Liveness.Resurrect(endpoint, resp.Incarnation);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     internal GossipPingResponse ReceivePing(GossipPingRequest request)
     {
         long incarnation = Liveness.GetSelfIncarnation();
@@ -237,7 +268,12 @@ internal sealed class GossipService
 
         if (alive)
         {
-            Liveness.MarkAlive(target.Endpoint, incarnation);
+            // A direct probe response from a Dead-marked node is authoritative proof of life:
+            // resurrect (incarnation-bumped) instead of MarkAlive, which treats Dead as sticky.
+            if (Liveness.GetState(target.Endpoint) == MemberLivenessState.Dead)
+                Liveness.Resurrect(target.Endpoint, incarnation);
+            else
+                Liveness.MarkAlive(target.Endpoint, incarnation);
             return;
         }
 

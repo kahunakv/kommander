@@ -728,9 +728,29 @@ public class RaftConfiguration
     /// <summary>
     /// How long a <c>Dead</c> node must remain in that state before the P0 leader
     /// commits a <c>RemoveMember</c> entry.  A grace period absorbs transient partitions
-    /// that resolve before the eviction log entry is applied.  Default 30 seconds.
+    /// that resolve before the eviction log entry is applied.
+    /// <para>
+    /// Default 2 minutes. Eviction is an expensive one-way door — a member that misses the
+    /// window must run the Join flow again — so the default must comfortably exceed a routine
+    /// restart (image pull, cold storage open on a large store), not just a network blip.
+    /// The original 30 s default was shorter than a cold RocksDB start and evicted nodes mid
+    /// <c>docker restart</c>. The eviction path additionally re-probes the endpoint at commit
+    /// time, but the grace is the first line of defense.
+    /// </para>
     /// </summary>
-    public TimeSpan DeadMemberEvictionGrace { get; set; } = TimeSpan.FromSeconds(30);
+    public TimeSpan DeadMemberEvictionGrace { get; set; } = TimeSpan.FromMinutes(2);
+
+    /// <summary>
+    /// When enabled (default), a node that discovers it has been removed from the committed
+    /// roster — typically dead-member auto-eviction firing across a slow restart — automatically
+    /// re-runs the Join flow against the remaining members instead of parking as
+    /// <c>NotMember</c> forever (suppressed pre-votes on every partition, terminal errors to
+    /// clients, no self-recovery). Suppressed during a graceful <c>LeaveCluster</c> and before
+    /// the node has ever finished assembling (first-time joins own their admission loop).
+    /// Disable it only if an operator workflow removes live nodes remotely and expects them to
+    /// stay out while still running.
+    /// </summary>
+    public bool EnableAutoRejoin { get; set; } = true;
 
     /// <summary>
     /// Interval between SWIM ping rounds.  Each round picks one random peer to probe.

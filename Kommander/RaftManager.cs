@@ -2959,12 +2959,234 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     public System.ClusterMembership GetMembership() => systemCoordinator.GetMembership();
 
     /// <summary>
-    /// Fires <see cref="OnMembershipChanged"/> with the new roster.
+    /// Fires <see cref="OnMembershipChanged"/> with the new roster and checks whether this
+    /// node has been removed from it, which triggers the auto-rejoin driver.
     /// Called by <see cref="RaftSystemCoordinator"/> each time <c>_cachedMembership</c>
     /// advances to a strictly higher version.
     /// </summary>
-    internal void RaiseMembershipChanged(System.ClusterMembership membership) =>
+    internal void RaiseMembershipChanged(System.ClusterMembership membership)
+    {
         eventNotifier.RaiseMembershipChanged(membership);
+
+        ResetProgressForReadmittedMembers(membership);
+
+        // Record self-inclusion BEFORE the rejoin check: during startup restore the
+        // self-including roster and the eviction record arrive back-to-back on the coordinator
+        // loop, and the flag must be visible when the eviction record's event fires.
+        if (membership.Members.Any(m => m.Endpoint == LocalEndpoint))
+            _wasRosterMember = true;
+        else
+            MaybeStartAutoRejoin(membership);
+    }
+
+    /// <summary>
+    /// The <see cref="System.ClusterMember.JoinedVersion"/> last observed per endpoint, used to
+    /// detect (re)admissions. Keying on JoinedVersion rather than a previous-roster diff makes
+    /// detection robust to version jumps: the membership cache is monotonic and a node may apply
+    /// v1 → v3 directly (per-key config replication carries only the latest roster), which would
+    /// hide the intermediate eviction from a set diff — but a readmitted member always carries a
+    /// strictly higher JoinedVersion. Read and mutated only on the coordinator's event path
+    /// (single-threaded per roster version), so no synchronization is required.
+    /// </summary>
+    private readonly Dictionary<string, long> _lastSeenJoinedVersions = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Detects members the advancing roster (re)admits — a new endpoint, or a known endpoint whose
+    /// <see cref="System.ClusterMember.JoinedVersion"/> advanced — and posts a replication-progress
+    /// reset to every local partition (user partitions and the system partition alike). A leader's
+    /// retained progress for a member predates its (re)admission and may describe a log the member
+    /// no longer holds — an evicted node typically rejoins with reset state, and a leader that
+    /// still "remembers" it as caught-up neither un-quiesces nor backfills it, starving the member
+    /// indefinitely. The first observed roster only records the baseline: a node with no baseline
+    /// has no retained progress worth resetting (leaders clear per-follower state on election).
+    /// </summary>
+    private void ResetProgressForReadmittedMembers(System.ClusterMembership membership)
+    {
+        bool hasBaseline = _lastSeenJoinedVersions.Count > 0;
+
+        foreach (System.ClusterMember member in membership.Members)
+        {
+            string endpoint = member.Endpoint;
+            if (string.IsNullOrEmpty(endpoint))
+                continue;
+
+            bool known = _lastSeenJoinedVersions.TryGetValue(endpoint, out long seenVersion);
+            _lastSeenJoinedVersions[endpoint] = member.JoinedVersion;
+
+            if (endpoint == LocalEndpoint || !hasBaseline)
+                continue;
+
+            bool readmitted = known ? member.JoinedVersion > seenVersion : true;
+            if (!readmitted)
+                continue;
+
+            Logger.LogInformation(
+                "[{LocalEndpoint}] Roster v{Version} (re)admits {Endpoint} (joinedVersion={JoinedVersion}); resetting per-follower replication progress on all local partitions",
+                LocalEndpoint, membership.MembershipVersion, endpoint, member.JoinedVersion);
+
+            systemPartition?.ResetFollowerProgress(endpoint);
+
+            foreach (RaftPartition partition in partitions.Values)
+                partition.ResetFollowerProgress(endpoint);
+        }
+    }
+
+    /// <summary>
+    /// Last-chance liveness check used by the eviction path: one direct ping bounded by
+    /// <see cref="RaftConfiguration.PingTimeout"/>; a response resurrects the endpoint in the
+    /// liveness table. See <see cref="GossipService.ProbeAndResurrectAsync"/>.
+    /// </summary>
+    internal Task<bool> ProbeEndpointAliveAsync(string endpoint, CancellationToken cancellationToken = default) =>
+        gossipService.ProbeAndResurrectAsync(this, endpoint, cancellationToken);
+
+    /// <summary>
+    /// Guard flag: non-zero while <see cref="AutoRejoinLoopAsync"/> is running so roster updates
+    /// arriving mid-rejoin don't spawn a second loop.
+    /// </summary>
+    private int _autoRejoinRunning;
+
+    /// <summary>
+    /// True once any committed roster observed by this node — including one replayed from the
+    /// WAL during startup restore — contained the local endpoint. This, not
+    /// <c>IsInitialized</c>, is what distinguishes "an evicted member" from "a node that was
+    /// never admitted": a node that <b>boots into</b> an evicted roster applies the
+    /// self-excluding record during restore, before initialization completes, and no further
+    /// roster change ever arrives to re-fire the edge-triggered check — an
+    /// <c>IsInitialized</c> gate therefore deadlocked it as NotMember forever. The restore
+    /// replays the earlier self-including roster first (it precedes the eviction record in log
+    /// order), so this flag is always set by the time the eviction record is applied.
+    /// </summary>
+    private volatile bool _wasRosterMember;
+
+    /// <summary>
+    /// Starts the auto-rejoin driver when a committed roster no longer contains this node.
+    /// Eviction is otherwise a one-way door: the startup join already completed, so nothing
+    /// would ever invoke the Join RPC again and the node parks as <c>NotMember</c> forever
+    /// (pre-votes suppressed on every partition, terminal errors to clients).
+    /// <para>
+    /// Deliberately NOT triggered when: auto-rejoin is disabled; the node initiated a graceful
+    /// leave (<c>_leaving</c> — the removal is intentional); this node has never been in a
+    /// committed roster (<see cref="_wasRosterMember"/> — first-time joins own their admission
+    /// retry loop in <c>JoinCluster(seeds)</c>, and a booting learner or a bare test manager
+    /// routinely observes rosters that don't include it); or the roster is the pre-seed
+    /// version 0.
+    /// </para>
+    /// <para>
+    /// Known residual: a node whose replayed history contains <em>only</em> self-excluding
+    /// rosters (possible after a snapshot install that post-dates its own eviction) never sets
+    /// <see cref="_wasRosterMember"/> and still parks; it needs an explicit
+    /// <c>JoinCluster(seeds)</c>.
+    /// </para>
+    /// </summary>
+    private void MaybeStartAutoRejoin(System.ClusterMembership membership)
+    {
+        if (!configuration.EnableAutoRejoin)
+            return;
+        if (_leaving || Volatile.Read(ref _disposed) != 0)
+            return;
+        if (membership.MembershipVersion == 0 || !_wasRosterMember)
+            return;
+        if (membership.Members.Any(m => m.Endpoint == LocalEndpoint))
+            return;
+        if (Interlocked.CompareExchange(ref _autoRejoinRunning, 1, 0) != 0)
+            return;
+
+        _ = Task.Run(AutoRejoinLoopAsync);
+    }
+
+    /// <summary>
+    /// Background rejoin loop for an evicted member: sends the (idempotent) Join RPC to the
+    /// remaining roster members and discovery peers with exponential backoff until this node is
+    /// back in the committed roster (role leaves <c>NotMember</c> when the re-admission commit
+    /// reaches us via replication or gossip), or the node starts leaving / disposing. Re-uses
+    /// the same admission path as a first-time seed join, so the node re-enters as a Learner
+    /// and is promoted back to Voter by the normal learner-promotion machinery once caught up
+    /// — an evicted-but-live node is typically already caught up, so promotion is quick.
+    /// </summary>
+    private async Task AutoRejoinLoopAsync()
+    {
+        try
+        {
+            Logger.LogWarning(
+                "[{LocalEndpoint}] Removed from committed roster while running (likely dead-member eviction across a restart); starting auto-rejoin",
+                LocalEndpoint);
+
+            TimeSpan backoff = TimeSpan.FromSeconds(1);
+            TimeSpan maxBackoff = TimeSpan.FromSeconds(30);
+
+            while (!_leaving && Volatile.Read(ref _disposed) == 0)
+            {
+                System.ClusterMemberRole role = LocalRole;
+                if (role != System.ClusterMemberRole.NotMember)
+                {
+                    Logger.LogInformation("[{LocalEndpoint}] Auto-rejoin complete: local role is {Role}", LocalEndpoint, role);
+                    return;
+                }
+
+                // Candidate targets: the members of the roster that excluded us (they are the
+                // live cluster) plus discovery peers as a fallback.
+                List<string> targets = systemCoordinator.GetMembership().Members
+                    .Select(m => m.Endpoint)
+                    .Concat(discovery.GetNodes().Select(n => n.Endpoint))
+                    .Where(e => e != LocalEndpoint)
+                    .Distinct()
+                    .ToList();
+
+                foreach (string target in targets)
+                {
+                    if (_leaving || Volatile.Read(ref _disposed) != 0)
+                        return;
+
+                    if (await TrySendJoinAsync(target).ConfigureAwait(false))
+                        break;
+                }
+
+                await Task.Delay(backoff).ConfigureAwait(false);
+                backoff = backoff * 2 > maxBackoff ? maxBackoff : backoff * 2;
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning("[{LocalEndpoint}] Auto-rejoin loop failed: {Message}", LocalEndpoint, ex.Message);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _autoRejoinRunning, 0);
+            // A roster update that raced our exit re-triggers via MaybeStartAutoRejoin; no
+            // re-check is needed here because every roster change goes through
+            // RaiseMembershipChanged.
+        }
+    }
+
+    /// <summary>
+    /// One Join attempt against <paramref name="target"/>, following a single leader hint,
+    /// mirroring the seed-join contact loop. Returns true when a leader accepted the join
+    /// (the committed roster entry then reaches this node asynchronously).
+    /// </summary>
+    private async Task<bool> TrySendJoinAsync(string target)
+    {
+        try
+        {
+            JoinResponse resp = await communication.SendJoin(
+                this, new RaftNode(target), new JoinRequest(LocalEndpoint, LocalNodeId)).ConfigureAwait(false);
+
+            if (resp.Success)
+                return true;
+
+            if (!string.IsNullOrEmpty(resp.LeaderHint))
+            {
+                resp = await communication.SendJoin(
+                    this, new RaftNode(resp.LeaderHint), new JoinRequest(LocalEndpoint, LocalNodeId)).ConfigureAwait(false);
+                return resp.Success;
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug("[{LocalEndpoint}] Auto-rejoin: join attempt against {Target} failed: {Message}", LocalEndpoint, target, ex.Message);
+        }
+
+        return false;
+    }
 
     /// <inheritdoc/>
     public IReadOnlyList<RaftPartitionRange> GetPartitionMap()

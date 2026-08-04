@@ -1667,6 +1667,40 @@ public sealed class RaftPartitionStateMachine
     }
 
     /// <summary>
+    /// Discards every piece of per-follower replication progress recorded for
+    /// <paramref name="endpoint"/>. Invoked when the committed roster (re)admits the member:
+    /// retained progress predates the (re)admission and may describe a log the member no longer
+    /// holds (an evicted node typically rejoins with reset state). Stale progress is worse than
+    /// none — <see cref="HasLaggingPeer"/> would read the member as caught-up, keep the partition
+    /// quiesced, and starve it of the heartbeats that are its only catch-up path. After the reset
+    /// the member counts as lagging, so a quiesced leader re-arms heartbeats immediately (the
+    /// un-quiesce also re-enters the manager's hot set via the quiesce callback) and backfill
+    /// re-anchors from the frontier the follower actually reports.
+    /// No-op on non-leaders: followers/candidates rebuild this state on their next election win.
+    /// </summary>
+    public void ResetFollowerProgress(string endpoint)
+    {
+        if (nodeState != RaftNodeState.Leader || string.IsNullOrEmpty(endpoint) || endpoint == host.LocalEndpoint)
+            return;
+
+        bool hadProgress = lastCommitIndexes.Remove(endpoint);
+        nextIndex.Remove(endpoint);
+        matchIndex.Remove(endpoint);
+        regressedFrontiers.Remove(endpoint);
+        startCommitIndexes.Remove(endpoint);
+
+        if (hadProgress || quiesced)
+            logger.LogInformation(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Reset replication progress for (re)admitted member {Endpoint} (hadProgress={HadProgress}, wasQuiesced={WasQuiesced})",
+                host.LocalEndpoint, host.PartitionId, nodeState, endpoint, hadProgress, quiesced);
+
+        // Waking here (rather than waiting for the next safety sweep to notice the lagging peer)
+        // bounds the member's starvation window by the heartbeat interval instead of the sweep period.
+        if (quiesced)
+            SetQuiesced(false);
+    }
+
+    /// <summary>
     /// Sends a handshake to every node available in the cluster to verify if we have the most recent logs.
     /// </summary>
     /// <exception cref="RaftException"></exception>
@@ -1738,6 +1772,19 @@ public sealed class RaftPartitionStateMachine
             if (nodeState == RaftNodeState.Leader)
             {
                 logger.LogDebugDenyingPreVoteWeAreLeader(host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm);
+
+                // A committed member probing for votes is direct evidence it cannot see this
+                // leader. The common benign cause is a follower restart under quiescence: its
+                // in-memory quiesce flag and leader knowledge died with the process, and a
+                // quiesced leader sends no heartbeats to re-teach it — so the member loops
+                // pre-vote rounds (denied here) while its partitions never assemble. Waking
+                // re-arms heartbeats; the next interval re-establishes leadership for the
+                // member and the partition re-quiesces once every peer has converged again.
+                // (Quiescence bookkeeping is scheduling state, not Raft §3 vote state, so this
+                // does not violate the pre-vote side-effect-free contract.)
+                if (quiesced)
+                    SetQuiesced(false);
+
                 return;
             }
 
