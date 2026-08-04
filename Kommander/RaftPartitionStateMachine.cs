@@ -2541,14 +2541,23 @@ public sealed class RaftPartitionStateMachine
         // We need a proper HLC sequence to determine a consistent order of the logs
         HLCTimestamp currentTime = host.HybridLogicalClock.SendOrLocalEvent(host.LocalNodeId);
 
+        // P0 checkpoints carry the current system-configuration snapshot (roster + partition
+        // map) so a restart that replays from this checkpoint reconstructs them even after
+        // compaction removed the original config delta entries below it. The payload is inert
+        // on the live path (CommittedCheckpoint entries are never delivered to consumers) and
+        // replicates to followers like any other entry.
+        byte[]? systemPayload = host.PartitionId == RaftSystemConfig.SystemPartition
+            ? host.GetSystemCheckpointPayload()
+            : null;
+
         List<RaftLog> checkpointLogs = [new()
         {
             Id = 0,
             Term = currentTerm,
             Type = RaftLogType.ProposedCheckpoint,
             Time = currentTime,
-            LogType = "",
-            LogData = []
+            LogType = systemPayload is null ? "" : RaftSystemConfig.CheckpointLogType,
+            LogData = systemPayload ?? []
         }];
 
         WALWriteOperation operation = wal.EnqueuePropose(currentTerm, checkpointLogs, currentTime, true);

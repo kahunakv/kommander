@@ -51,6 +51,9 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
         return roster.Members.Any(m => m.Endpoint == endpoint);
     }
 
+    public byte[]? GetSystemCheckpointPayload() =>
+        manager.SystemCoordinator.GetCheckpointSnapshotPayload();
+
     public RaftConfiguration Configuration => manager.Configuration;
 
     public HybridLogicalClock HybridLogicalClock => manager.HybridLogicalClock;

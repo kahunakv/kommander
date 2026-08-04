@@ -269,6 +269,29 @@ public sealed class RaftWriteAhead
         // the frontier are deferred to leader re-supply / re-commit.
         foreach (RaftLog log in logs)
         {
+            // P0 checkpoint entries may carry a serialized system-configuration snapshot
+            // (RaftSystemConfig.CheckpointLogType). Deliver it in log order so the coordinator
+            // rebuilds the membership roster and partition map even when compaction removed the
+            // original config delta entries below this checkpoint; deltas above it are replayed
+            // afterwards and overwrite snapshot values in commit order. Payload-free checkpoints
+            // (older WALs, non-P0 partitions) fall through to the skip below, as before.
+            if (log.Type == RaftLogType.CommittedCheckpoint
+                && partition.PartitionId == RaftSystemConfig.SystemPartition
+                && log.LogType == RaftSystemConfig.CheckpointLogType
+                && log.LogData is { Length: > 0 })
+            {
+                try
+                {
+                    await manager.InvokeSystemLogRestored(partition.PartitionId, log).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    manager.Logger.LogError("[{Endpoint}/{PartitionId}] {Message}\n{Stacktrace}", manager.LocalEndpoint, partition.PartitionId, ex.Message, ex.StackTrace);
+                }
+
+                continue;
+            }
+
             if (log.Type != RaftLogType.Committed || log.Id >= commitIndex)
                 continue;
 

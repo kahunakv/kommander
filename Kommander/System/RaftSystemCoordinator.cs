@@ -20,7 +20,10 @@ internal sealed class RaftSystemCoordinator : IDisposable
 {
     private const int MaxRetries = 10;
 
-    private readonly Dictionary<string, string> systemConfiguration = new();
+    // ConcurrentDictionary, not Dictionary: all writes happen on the coordinator loop, but
+    // GetCheckpointSnapshotPayload enumerates it from the partition-executor thread when a P0
+    // checkpoint is proposed, so reads must be safe against a concurrent loop-side mutation.
+    private readonly ConcurrentDictionary<string, string> systemConfiguration = new();
 
     private readonly RaftManager manager;
 
@@ -248,6 +251,18 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
                 if (systemMessage.Key == RaftSystemConfigKeys.Members)
                     ApplyMembershipFromCache();
+            }
+            break;
+
+            case RaftSystemRequestType.ConfigCheckpointRestored:
+            {
+                if (message.LogData is null)
+                {
+                    logger.LogWarning("Checkpoint-restored message is null");
+                    return;
+                }
+
+                ApplyRestoredCheckpointSnapshot(message.LogData);
             }
             break;
 
@@ -844,6 +859,55 @@ internal sealed class RaftSystemCoordinator : IDisposable
             manager.RaiseMembershipChanged(membership);
         }
     }
+
+    /// <summary>
+    /// Applies a restored P0 checkpoint payload (a <c>RaftSystemCheckpointSnapshot</c>) to
+    /// <c>systemConfiguration</c>. Runs on the coordinator loop during WAL replay, strictly
+    /// before any <c>ConfigRestored</c> delta above the checkpoint, so later deltas overwrite
+    /// snapshot values in commit order. This is what lets a node whose P0 WAL was compacted
+    /// past the original <c>members</c>/<c>partitions</c> records still reconstruct them:
+    /// without it the node restores an empty roster (masked as Voter by the pre-seed
+    /// fallback) and an empty partition map, and a P0 leader would even reseed a version-1
+    /// roster over a mature cluster's committed membership history.
+    /// </summary>
+    private void ApplyRestoredCheckpointSnapshot(byte[] payload)
+    {
+        RaftSystemCheckpointSnapshot snapshot;
+        try
+        {
+            snapshot = RaftSystemCoordinatorHelpers.UnserializeCheckpointSnapshot(payload);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "ApplyRestoredCheckpointSnapshot: Failed to parse checkpoint snapshot payload");
+            return;
+        }
+
+        foreach (RaftSystemMessage entry in snapshot.Entries)
+        {
+            if (string.IsNullOrEmpty(entry.Key))
+                continue;
+
+            systemConfiguration[entry.Key] = entry.Value;
+            logger.LogInfoRestoredSystemConfiguration(entry.Key);
+        }
+
+        // ApplyMembershipFromCache is version-monotonic, so replaying an older snapshot after a
+        // newer delta (or after gossip already converged the cache) can never regress the roster.
+        ApplyMembershipFromCache();
+    }
+
+    /// <summary>
+    /// Builds the <c>RaftSystemCheckpointSnapshot</c> payload embedded in a P0 checkpoint
+    /// proposal, or <c>null</c> when there is no system configuration yet. Called from the
+    /// partition-executor thread at propose time (not the coordinator loop) — safe because
+    /// <c>systemConfiguration</c> is a <see cref="ConcurrentDictionary{TKey,TValue}"/> and every
+    /// value it holds is a complete committed record. A racing config commit can at worst make
+    /// the payload one record newer than the checkpoint index; replay then re-applies the same
+    /// record from the delta entry above the checkpoint, which is idempotent.
+    /// </summary>
+    internal byte[]? GetCheckpointSnapshotPayload() =>
+        RaftSystemCoordinatorHelpers.SerializeCheckpointSnapshot(systemConfiguration);
 
     /// <summary>
     /// Shared pre-flight checks for all membership mutations.

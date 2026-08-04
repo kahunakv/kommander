@@ -1,4 +1,5 @@
 
+using System.Collections.Concurrent;
 using System.Text.Json;
 using Kommander.Data;
 using Kommander.Logging;
@@ -33,7 +34,7 @@ internal sealed class SplitMergeController
     private readonly Dictionary<int, SplitInProgress> _pendingSplits = new();
     private readonly Dictionary<int, MergeInProgress> _pendingMerges = new();
 
-    private readonly Dictionary<string, string> systemConfiguration;
+    private readonly ConcurrentDictionary<string, string> systemConfiguration;
     private readonly Func<string, byte[], bool, CancellationToken, Task<RaftReplicationResult>> replicate;
     private readonly Func<int, CancellationToken, Task<RaftReplicationResult>> replicateCheckpoint;
     private readonly Action<RaftSystemRequest> send;
@@ -51,7 +52,7 @@ internal sealed class SplitMergeController
     internal Dictionary<int, MergeInProgress> PendingMerges => _pendingMerges;
 
     internal SplitMergeController(
-        Dictionary<string, string> systemConfiguration,
+        ConcurrentDictionary<string, string> systemConfiguration,
         Func<string, byte[], bool, CancellationToken, Task<RaftReplicationResult>> replicate,
         Func<int, CancellationToken, Task<RaftReplicationResult>> replicateCheckpoint,
         Action<RaftSystemRequest> send,

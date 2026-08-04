@@ -6,3 +6,10 @@ message RaftSystemMessage {
   string key = 1;
   optional string value = 2;
 }
+
+// Snapshot of the whole system-configuration key/value map (members, partitions, ...)
+// embedded in P0 CommittedCheckpoint entries so a restart that replays from a compacted
+// WAL can reconstruct the roster and partition map without the original delta entries.
+message RaftSystemCheckpointSnapshot {
+  repeated RaftSystemMessage entries = 1;
+}

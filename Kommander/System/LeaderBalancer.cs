@@ -1,4 +1,5 @@
 
+using System.Collections.Concurrent;
 using Kommander.Data;
 using Kommander.Discovery;
 using Kommander.Gossip;
@@ -23,7 +24,7 @@ internal sealed class LeaderBalancer
     private readonly Func<ClusterMembership> getMembership;
     private readonly Func<HLCTimestamp> getHlcNow;
     private readonly Func<long> getSystemTerm;
-    private readonly Dictionary<string, string> systemConfiguration;
+    private readonly ConcurrentDictionary<string, string> systemConfiguration;
     private readonly Action<string, TransferLeadershipSuggestionRequest> sendSuggestion;
     private readonly LivenessTable liveness;
     private readonly RaftConfiguration configuration;
@@ -35,7 +36,7 @@ internal sealed class LeaderBalancer
         Func<ClusterMembership> getMembership,
         Func<HLCTimestamp> getHlcNow,
         Func<long> getSystemTerm,
-        Dictionary<string, string> systemConfiguration,
+        ConcurrentDictionary<string, string> systemConfiguration,
         Action<string, TransferLeadershipSuggestionRequest> sendSuggestion,
         LivenessTable liveness,
         RaftConfiguration configuration,

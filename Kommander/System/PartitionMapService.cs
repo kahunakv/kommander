@@ -1,4 +1,5 @@
 
+using System.Collections.Concurrent;
 using System.Text.Json;
 using Kommander.Data;
 using Kommander.Logging;
@@ -28,7 +29,7 @@ namespace Kommander.System;
 /// </summary>
 internal sealed class PartitionMapService
 {
-    private readonly Dictionary<string, string> systemConfiguration;
+    private readonly ConcurrentDictionary<string, string> systemConfiguration;
     private readonly Func<string, byte[], bool, CancellationToken, Task<RaftReplicationResult>> replicate;
     private readonly Action<RaftSystemRequest> send;
     private readonly Action<List<RaftPartitionRange>> startPartitions;
@@ -44,7 +45,7 @@ internal sealed class PartitionMapService
     private readonly ILogger<IRaft> logger;
 
     internal PartitionMapService(
-        Dictionary<string, string> systemConfiguration,
+        ConcurrentDictionary<string, string> systemConfiguration,
         Func<string, byte[], bool, CancellationToken, Task<RaftReplicationResult>> replicate,
         Action<RaftSystemRequest> send,
         Action<List<RaftPartitionRange>> startPartitions,

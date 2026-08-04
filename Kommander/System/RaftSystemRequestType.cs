@@ -6,6 +6,14 @@ public enum RaftSystemRequestType
     LeaderChanged,
     RestoreCompleted,
     ConfigRestored,
+    /// <summary>
+    /// Delivers the <c>RaftSystemCheckpointSnapshot</c> payload of a restored P0
+    /// <c>CommittedCheckpoint</c> entry. The coordinator unpacks every key/value pair into
+    /// <c>systemConfiguration</c> before subsequent <see cref="ConfigRestored"/> deltas are
+    /// processed, so a replay that starts at a compacted checkpoint still reconstructs the
+    /// membership roster and partition map at their checkpoint-time versions.
+    /// </summary>
+    ConfigCheckpointRestored,
     ConfigReplicated,
     SplitPartition,
     /// <summary>

@@ -75,6 +75,39 @@ internal static class RaftSystemCoordinatorHelpers
     }
 
     /// <summary>
+    /// Serializes the current system-configuration map into a
+    /// <see cref="RaftSystemCheckpointSnapshot"/> wire payload for embedding in a P0
+    /// <c>CommittedCheckpoint</c> entry. Returns <c>null</c> when the map is empty (greenfield,
+    /// nothing worth carrying) so callers can fall back to a payload-free checkpoint.
+    /// Safe to call from any thread when <paramref name="systemConfiguration"/> is a
+    /// <see cref="global::System.Collections.Concurrent.ConcurrentDictionary{TKey,TValue}"/> —
+    /// enumeration is lock-free and each entry is a complete committed record.
+    /// </summary>
+    internal static byte[]? SerializeCheckpointSnapshot(IEnumerable<KeyValuePair<string, string>> systemConfiguration)
+    {
+        RaftSystemCheckpointSnapshot snapshot = new();
+        foreach (KeyValuePair<string, string> kv in systemConfiguration)
+            snapshot.Entries.Add(new RaftSystemMessage { Key = kv.Key, Value = kv.Value });
+
+        if (snapshot.Entries.Count == 0)
+            return null;
+
+        int size = snapshot.CalculateSize();
+        byte[] result = GC.AllocateUninitializedArray<byte>(size);
+        snapshot.WriteTo(result.AsSpan());
+        return result;
+    }
+
+    /// <summary>
+    /// Deserializes a checkpoint payload previously produced by
+    /// <see cref="SerializeCheckpointSnapshot"/>.
+    /// </summary>
+    internal static RaftSystemCheckpointSnapshot UnserializeCheckpointSnapshot(byte[] serializedData)
+    {
+        return RaftSystemCheckpointSnapshot.Parser.ParseFrom(serializedData.AsSpan());
+    }
+
+    /// <summary>
     /// Updates the <see cref="Diagnostics.KommanderMetrics"/> imbalance gauges from the
     /// current <paramref name="view"/> snapshot. Count-imbalance is max-leaders-on-one-node
     /// minus the floor target; load-imbalance is (maxLoad / meanLoad) − 1.

@@ -48,6 +48,18 @@ public interface IRaftPartitionHost
     /// </summary>
     bool IsMember(string endpoint) => true;
 
+    /// <summary>
+    /// Returns the serialized system-configuration snapshot (<c>RaftSystemCheckpointSnapshot</c>)
+    /// to embed in a P0 checkpoint proposal, or <c>null</c> when no configuration exists yet.
+    /// Only consulted for the system partition. Carrying the roster and partition map inside the
+    /// checkpoint is what keeps them durable across WAL compaction: replay starts at the last
+    /// checkpoint, so config records below it would otherwise be unrecoverable after restart.
+    /// Defaults to <see langword="null"/> (payload-free checkpoint) so unit-test hosts that
+    /// predate membership are unaffected; only <c>RaftManager</c>'s adapter consults the real
+    /// coordinator state.
+    /// </summary>
+    byte[]? GetSystemCheckpointPayload() => null;
+
     RaftConfiguration Configuration { get; }
 
     HybridLogicalClock HybridLogicalClock { get; }

@@ -578,6 +578,17 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     private Task<bool> SystemLogRestored(int partitionId, RaftLog log)
     {
+        if (log.LogType == RaftSystemConfig.CheckpointLogType && log.LogData is { Length: > 0 })
+        {
+            // A P0 checkpoint entry carrying the full system-configuration snapshot at
+            // checkpoint time. Replay delivers it before any config delta above the
+            // checkpoint, so a WAL compacted past the original members/partitions records
+            // still reconstructs the roster and partition map on restart.
+            systemCoordinator.Send(new(RaftSystemRequestType.ConfigCheckpointRestored, log.LogData));
+
+            return Task.FromResult(true);
+        }
+
         if (log.LogType != RaftSystemConfig.RaftLogType || log.LogData is null)
         {
             // Post-shared-P0: non-system P0 entries are dispatched to consumer callbacks
