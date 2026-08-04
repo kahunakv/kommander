@@ -7,9 +7,6 @@ Kommander is designed to keep the consensus core separate from storage, discover
 [![NuGet](https://img.shields.io/nuget/v/Kommander.svg?style=flat-square)](https://www.nuget.org/packages/Kommander)
 [![NuGet](https://img.shields.io/nuget/dt/Kommander)](https://www.nuget.org/packages/Kommander)
 
-> [!WARNING]
-> Kommander is beta software. APIs and operational behavior may still change between releases.
-
 ## Features
 
 - **Raft consensus algorithm:** Per-partition leader election, quorum-based proposal replication, commits, rollbacks, checkpoints, and leader change notifications.
