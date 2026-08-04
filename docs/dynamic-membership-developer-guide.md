@@ -497,9 +497,12 @@ network; "stub" means it returns a default and the feature is inert (or worse) o
 | Cross-partition lag (`GetRemoteFollowerLag`) | ✅ wired | ✅ wired | ✅ wired |
 | Gossip anti-entropy (`SendGossip`) | ✅ wired | ✅ wired | ✅ wired |
 | SWIM probes (`SendPing`/`SendPingReq`) | ✅ wired | ✅ wired | ✅ wired |
-| Snapshot install for catch-up below floor | ⛔ not yet implemented | ⛔ not yet implemented | ⛔ not yet implemented |
+| Snapshot install for catch-up below floor (`SendInstallSnapshot`) | ✅ wired | ✅ wired | ✅ wired |
 
-All three transports are fully wired. Keep this matrix in sync as capabilities land — it's the first thing a confused operator checks.
+All three built-in transports are fully wired. Note that `ICommunication.SendInstallSnapshot` ships a
+default implementation returning `SnapshotResponse(false)` — a **custom** transport that does not
+override it leaves followers below the compaction floor unable to catch up. Keep this matrix in sync
+as capabilities land — it's the first thing a confused operator checks.
 
 ---
 

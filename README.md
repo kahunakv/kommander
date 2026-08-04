@@ -54,8 +54,6 @@ The library keeps storage, discovery, and communication pluggable. That separati
 
 Kommander multi-targets `.NET 8.0` and `.NET 10.0`.
 
-Current package version in this tree: `0.17.2`.
-
 Install from NuGet:
 
 ```shell
@@ -70,21 +68,18 @@ Install-Package Kommander
 
 ## Concepts
 
-**Node:** A running `RaftManager` instance. Each node has a local endpoint built from `RaftConfiguration.Host` and `RaftConfiguration.Port`.
+| Concept | Meaning |
+| --- | --- |
+| **Node** | A running `RaftManager` instance. Each node has a local endpoint built from `RaftConfiguration.Host` and `RaftConfiguration.Port`. |
+| **Partition** | A separately elected Raft group. Partition `0` is the system partition (see below); application data normally uses user partitions, which start at `1`. |
+| **Leader** | The node currently allowed to accept proposals for a partition. |
+| **Follower** | A node that receives and persists append-log requests from a partition leader. |
+| **Proposal** | A set of log entries written by the leader and replicated to followers. A proposal is complete after quorum acknowledgment. |
+| **Commit** | The durable state transition that marks proposed logs as committed. `ReplicateLogs` auto-commits by default; callers can disable that and call `CommitLogs` or `RollbackLogs` explicitly. |
+| **Checkpoint** | A special replicated log entry used to mark a stable point in a partition log. |
+| **WAL** | The write-ahead log used to persist proposed, committed, rolled-back, and checkpoint entries. |
 
-**Partition:** A separately elected Raft group. Partition `0` is the system partition: Kommander replicates its own configuration there using the reserved `_RaftSystem` log type. Application data normally uses user partitions, which start at `1`. The system partition can also **co-locate consumer data**: entries written with any non-`_RaftSystem` log type are replicated and dispatched to the consumer callbacks just like a user partition, while Kommander's own `_RaftSystem` entries continue to drive the system coordinator. Routing on partition `0` is by log type, so the two never interfere. Partition `0` itself can never be created, split, merged, or removed.
-
-**Leader:** The node currently allowed to accept proposals for a partition.
-
-**Follower:** A node that receives and persists append-log requests from a partition leader.
-
-**Proposal:** A set of log entries written by the leader and replicated to followers. A proposal is complete after quorum acknowledgment.
-
-**Commit:** The durable state transition that marks proposed logs as committed. `ReplicateLogs` auto-commits by default; callers can disable that and call `CommitLogs` or `RollbackLogs` explicitly.
-
-**Checkpoint:** A special replicated log entry used to mark a stable point in a partition log.
-
-**WAL:** The write-ahead log used to persist proposed, committed, rolled-back, and checkpoint entries.
+Kommander replicates its own configuration on partition `0` using the reserved `_RaftSystem` log type. The system partition can also **co-locate consumer data**: entries written with any non-`_RaftSystem` log type are replicated and dispatched to the consumer callbacks just like a user partition, while Kommander's own `_RaftSystem` entries continue to drive the system coordinator. Routing on partition `0` is by log type, so the two never interfere. Partition `0` itself can never be created, split, merged, or removed.
 
 ## Quick Start
 
@@ -289,10 +284,12 @@ Use a unique `NodeId` when you can. If `NodeId` is `0`, Kommander derives one fr
 | Cluster state | `Joined`, `IsInitialized`, `GetNodes`, `GetLocalEndpoint`, `GetLocalNodeId`, `GetLocalNodeName` |
 | Leadership | `AmILeaderQuick`, `AmILeader`, `WaitForLeader`, `WaitForLeaderStableAsync` |
 | Leadership control | `StepDownAsync`, `TransferLeadershipAsync`, `SuspendHeartbeatsAsync`, `ResumeHeartbeatsAsync` |
-| Replication | `ReplicateLogs`, `ReplicateCheckpoint`, `CommitLogs`, `RollbackLogs` |
+| Replication | `ReplicateLogs`, `ReplicateEntries`, `ReplicateCheckpoint`, `CommitLogs`, `RollbackLogs` |
+| Log retention | `SetMinRetainIndex`, `AcquireRetentionHold` |
 | Catch-up observability | `GetFollowerLagAsync`, `GetActiveNodes`, `GetLastNodeActivity` |
+| Load observability | `GetPartitionLogOpsPerSecond`, `GetPartitionWalQueueDepth`, `GetPartitionCommitWaitMs` |
 | Partition routing | `GetPartitionKey`, `GetPrefixPartitionKey` |
-| Elastic partitions | `CreatePartitionAsync`, `RemovePartitionAsync`, `SplitPartitionAsync`, `MergePartitionsAsync`, `GetPartitionMap`, `GetPartitionGeneration`, `RegisterStateMachineTransfer` |
+| Elastic partitions | `CreatePartitionAsync`, `RemovePartitionAsync`, `SplitPartitionAsync`, `MergePartitionsAsync`, `GetPartitionMap`, `GetPartitionGeneration`, `RegisterStateMachineTransfer`, `RegisterSystemStateTransfer` |
 | Partition events | `OnPartitionMapChanged` |
 | Transport entry points | `Handshake`, `RequestVote`, `Vote`, `AppendLogs`, `CompleteAppendLogs` |
 | Components | `WalAdapter`, `Communication`, `Discovery`, `Configuration`, `HybridLogicalClock`, `ReadScheduler`, `WalScheduler` |
@@ -538,23 +535,31 @@ IWAL wal = new InMemoryWAL(logger);
 Custom adapters implement:
 
 ```csharp
-public interface IWAL
+public interface IWAL : IDisposable
 {
     List<RaftLog> ReadLogs(int partitionId);
-    List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex);
+    List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue);
     RaftOperationStatus Write(List<(int partitionId, List<RaftLog> logs)> logs);
     long GetMaxLog(int partitionId);
     long GetCurrentTerm(int partitionId);
     long GetLastCheckpoint(int partitionId);
+    int CountPersistedLogs(int partitionId);
+    int CountRemovableLogs(int partitionId);
     string? GetMetaData(string key);
     bool SetMetaData(string key, string value);
     (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(
         int partitionId,
         long lastCheckpoint,
         int compactNumberEntries);
-    void Dispose();
+    RaftOperationStatus DeletePartitionWAL(int partitionId);
+    RaftOperationStatus TruncateLogsAfter(int partitionId, long afterLogId);
+    (RaftOperationStatus Status, long MaxLogId) TruncateLogsAfterAndGetMax(int partitionId, long afterLogId);
 }
 ```
+
+`IWAL` also declares `RaftOperationStatus Write(List<(int, List<RaftLog>)> logs, bool sync)` with a default
+implementation that forwards to the single-argument `Write`. Adapters that can distinguish a durable
+(fsync'd) write from a buffered one should override it; adapters that cannot may leave the default in place.
 
 ## Communication Adapters
 
@@ -688,7 +693,7 @@ raft.OnMembershipChanged += membership =>
 
 Membership changes are single-server (one node added, promoted, or removed per committed step), so any two consecutive configurations always share a majority. A removal that would leave zero voters is refused with `InsufficientVoters`.
 
-> **Transport support:** the committed roster, joins, graceful leave, and cross-partition learner promotion all work on every transport (gRPC, REST, and in-memory). Gossip dissemination and the SWIM failure detector are currently wired only on the in-process (`InMemoryCommunication`) transport; on gRPC/REST those RPCs are not yet implemented, so the failure detector is **disabled by default** (`PingInterval` defaults to `TimeSpan.Zero`) to avoid evicting healthy peers. Do not enable it on a transport without working Ping support. Without gossip, roster convergence still happens via Raft replication (just not epidemically). See the developer guide's transport matrix for the current state.
+> **Transport support:** the committed roster, joins, graceful leave, and cross-partition learner promotion all work on every transport (gRPC, REST, and in-memory), as do gossip dissemination and the SWIM failure detector. gRPC carries them over the `Gossip`, `Ping`, and `PingReq` RPCs; REST over `/v1/raft/gossip`, `/v1/raft/ping`, and `/v1/raft/ping-req`. The failure detector is **enabled by default** (`PingInterval` defaults to `1 s`); set `PingInterval` to `TimeSpan.Zero` to disable it, which is only valid when `EnableQuiescence` is `false`. See the developer guide's transport matrix for the current state.
 
 See [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md) for the design motivations, the full lifecycle walkthroughs, the SWIM failure detector, configuration, the code map, an operations runbook, and the invariants to preserve when extending the system.
 
@@ -861,7 +866,7 @@ dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category!=Stress&Fu
 
 ## Current Limitations
 
-- Dynamic cluster membership is supported via `IRaft` (`JoinCluster`, `LeaveCluster`, `GetMembership`, `LocalRole`, `OnMembershipChanged`) on every transport, including graceful leave and cross-partition learner promotion over gRPC/REST. Gossip dissemination and the SWIM failure detector are wired only on the in-memory transport today; on gRPC/REST they are not yet implemented and the failure detector is disabled by default (`PingInterval = TimeSpan.Zero`). See the [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md).
+- Dynamic cluster membership is supported via `IRaft` (`JoinCluster`, `LeaveCluster`, `GetMembership`, `LocalRole`, `OnMembershipChanged`) on every transport, including graceful leave, cross-partition learner promotion, gossip dissemination, and the SWIM failure detector over gRPC/REST. See the [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md).
 - Partition `0` is the system partition: it cannot be created, split, merged, or removed, and the `_RaftSystem` log type is reserved. Application data may still be co-located there using any other log type (see Concepts).
 - RocksDB WAL format `2.0.0` is not compatible with pre-`0.10.7` id-only RocksDB WAL keys. Start with a fresh data directory or migrate existing keys.
 - WAL compaction is checkpoint-driven. Historical entries below the last committed checkpoint are removable; uncheckpointed history is retained.
