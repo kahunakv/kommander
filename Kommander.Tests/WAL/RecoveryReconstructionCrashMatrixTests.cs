@@ -99,11 +99,15 @@ public sealed class RecoveryReconstructionCrashMatrixTests
             // Only the contiguous committed prefix is delivered as committed.
             Assert.Equal(Enumerable.Range(1, committedThrough).Select(i => (long)i), restored);
 
-            // The durable Proposed tail is retained (no acked write lost) ...
-            Assert.Equal(total, maxLog);
-            // ... and a new propose lands strictly past it, never reusing — and so never overwriting —
-            // the durable tail's ids.
-            Assert.Equal(total + 1, nextId);
+            // The durable Proposed tail is retained (no acked write lost) and the promotion barrier
+            // no-op sits one past it: the recovered node holds inherited Proposed entries above its
+            // commit frontier, so BecomeLeaderAsync commits a new-term no-op (id total+1) before
+            // publishing leadership — which is also what commits the durable tail, closing the
+            // inherited-entry serving hole for these acked-but-unmarked writes.
+            Assert.Equal(total + 1, maxLog);
+            // A new propose lands strictly past the tail AND the barrier, never reusing — and so
+            // never overwriting — any durable id.
+            Assert.Equal(total + 2, nextId);
         }
         finally
         {

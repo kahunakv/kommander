@@ -16,6 +16,16 @@ public class TestRaftConfigurationValidation
         cfg.Validate();
     }
 
+    // ── LeadershipBarrierTimeout must be positive ─────────────────────────────
+
+    [Fact]
+    public void Validate_NonPositiveLeadershipBarrierTimeout_Throws()
+    {
+        RaftConfiguration cfg = new() { LeadershipBarrierTimeout = TimeSpan.Zero };
+        RaftException ex = Assert.Throws<RaftException>(cfg.Validate);
+        Assert.Contains("LeadershipBarrierTimeout", ex.Message);
+    }
+
     // ── PingInterval >= StartElectionTimeout with quiescence on → throws ──────
 
     [Fact]

@@ -295,6 +295,12 @@ public sealed class RaftWriteAhead
             if (log.Type != RaftLogType.Committed || log.Id >= commitIndex)
                 continue;
 
+            // Promotion-barrier no-ops are consensus-internal (see RaftSystemConfig
+            // .LeadershipBarrierLogType): they persist in the WAL like any committed entry but
+            // must never reach a consumer, on restore or anywhere else.
+            if (log.LogType == RaftSystemConfig.LeadershipBarrierLogType)
+                continue;
+
             try
             {
                 if (partition.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType)

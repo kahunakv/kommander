@@ -219,7 +219,40 @@ public sealed class RaftPartitionStateMachine
     /// </summary>
     private long lastAppliedIndex = -1;
 
-    public RaftNodeState NodeState => nodeState;
+    /// <summary>
+    /// Ticket of the in-flight promotion-barrier no-op, or <see cref="HLCTimestamp.Zero"/> when no
+    /// barrier is pending. Armed by <see cref="BecomeLeaderAsync"/> when the election winner's WAL
+    /// holds entries above the known commit frontier (inherited prior-term entries whose commit
+    /// broadcast never reached this node). While armed, <c>nodeState == Leader</c> but
+    /// <see cref="IRaftPartitionHost.Leader"/> stays unpublished, so <c>AmILeader</c> is false and
+    /// the node does not serve; heartbeats still flow (they key off <c>nodeState</c>) so rival
+    /// elections stay suppressed. <see cref="CompleteLeaderCommit"/> publishes leadership when the
+    /// matching commit lands — its inherited-entry drain has by then applied every prior-term entry.
+    /// Cleared on every leader→follower transition via <see cref="FailAllActiveProposalWaiters"/>.
+    /// </summary>
+    private HLCTimestamp leadershipBarrierTicket = HLCTimestamp.Zero;
+
+    /// <summary>Term the pending barrier was proposed in; the publish is fenced on it so a stale
+    /// barrier completion from a superseded term can never publish leadership.</summary>
+    private long leadershipBarrierTerm = -1;
+
+    /// <summary>Monotonic timestamp when the barrier was armed; drives the
+    /// <see cref="RaftConfiguration.LeadershipBarrierTimeout"/> revert in the leader tick.</summary>
+    private long leadershipBarrierArmedTicks;
+
+    /// <summary>
+    /// Externally visible node state (served to <c>GetNodeState</c>, which backs the
+    /// <c>AmILeader</c> fallback path). Reports <see cref="RaftNodeState.Candidate"/> while this
+    /// node has won an election but has not yet published leadership (promotion barrier pending):
+    /// the raw <c>nodeState</c> is already <c>Leader</c> so replication acks and heartbeats work,
+    /// but leaking <c>Leader</c> here would reopen the inherited-entry serving hole that gating
+    /// <see cref="IRaftPartitionHost.Leader"/> closes — <c>AmILeaderQuick</c> treats a
+    /// <c>Leader</c> state reply as authoritative.
+    /// </summary>
+    public RaftNodeState NodeState =>
+        nodeState == RaftNodeState.Leader && host.Leader != host.LocalEndpoint
+            ? RaftNodeState.Candidate
+            : nodeState;
     public long CurrentTerm => currentTerm;
 
     /// <summary>
@@ -451,6 +484,18 @@ public sealed class RaftPartitionStateMachine
             // if node is leader just send hearthbeats every Configuration.HeartbeatInterval
             case RaftNodeState.Leader:
             {
+                // Promotion-barrier liveness bound: a leader whose barrier no-op never commits
+                // (quorum lost right after the election) would otherwise heartbeat forever without
+                // ever publishing leadership — followers stay suppressed and the partition wedges
+                // with no serving leader. Revert to Follower so the election timeout can pick a
+                // replacement (or re-elect this node, which arms a fresh barrier).
+                if (leadershipBarrierTicket != HLCTimestamp.Zero
+                    && MonotonicElapsed(leadershipBarrierArmedTicks, nowTicks) >= host.Configuration.LeadershipBarrierTimeout)
+                {
+                    await RevertUnpublishedPromotionAsync("barrier commit timed out").ConfigureAwait(false);
+                    return;
+                }
+
                 if (quiesced)
                 {
                     // Gating entry into quiescence is only half the guarantee. A peer can appear or fall
@@ -783,22 +828,47 @@ public sealed class RaftPartitionStateMachine
     /// <summary>
     /// Promotion helper used by all real election paths. Performs the same internal
     /// bookkeeping as <see cref="BecomeLeader"/> but defers publishing
-    /// <see cref="IRaftPartitionHost.Leader"/> until AFTER a full drain of committed
-    /// WAL entries (see <see cref="DrainCommittedAppliesAsync"/>).
+    /// <see cref="IRaftPartitionHost.Leader"/> until the consumer projection provably
+    /// covers every entry committed before this node was promoted.
     ///
-    /// <para>This enforces the ordering invariant: by the time a caller sees
-    /// <c>host.Leader == host.LocalEndpoint</c> (the gate for <c>AmILeader</c>),
-    /// the consumer state machine has already applied every committed entry up to
-    /// the promotion commit frontier.  Inherited entries from a prior term that are
-    /// committed after promotion are delivered via <see cref="CompleteLeaderCommit"/>
-    /// through the same apply path.</para>
+    /// <para>Two cases, split on whether the WAL tail extends past the known commit frontier:</para>
     ///
-    /// <para><b>Atomicity:</b> the promotion is all-or-nothing. If the drain throws
-    /// (WAL read backpressure, scheduler shutdown, etc.), the node is reverted to
-    /// <see cref="RaftNodeState.Follower"/> so it is never left in a half-promoted
-    /// state where <c>nodeState == Leader</c> but <c>host.Leader</c> is unset and
-    /// heartbeats have not started.  The exception is re-thrown; the cluster
-    /// self-heals by electing a replacement in the next term.</para>
+    /// <para><b>No inherited tail</b> (<c>maxLog &lt;= commitFrontier</c>): every entry the previous
+    /// leader could have committed is already commit-marked locally — election log-freshness
+    /// guarantees the winner's log contains every quorum-durable entry, so an empty tail proves
+    /// there is nothing inherited. The committed drain (<see cref="DrainCommittedAppliesAsync"/>)
+    /// suffices and leadership is published before returning (<see langword="true"/>), exactly the
+    /// pre-barrier behavior. This keeps the common idle-failover and clean single-node startup at
+    /// zero added latency.</para>
+    ///
+    /// <para><b>Inherited tail present</b>: entries above the frontier are prior-term
+    /// <c>Proposed</c> entries that may be quorum-committed elsewhere (their commit broadcast never
+    /// reached this node — e.g. it raced the previous leader's death, or the single-fsync fast path
+    /// crashed before writing lazy commit markers). Serving before applying them is the
+    /// inherited-entry hole: a lock consumer would double-grant, a KV consumer would serve a stale
+    /// read. Raft's remedy is committing a no-op in the new term, which commits the whole prior-term
+    /// prefix. This method proposes that no-op (a consumer-invisible
+    /// <see cref="RaftSystemConfig.LeadershipBarrierLogType"/> entry, auto-commit) through the
+    /// normal proposal path and returns <see langword="false"/> WITHOUT publishing leadership. The
+    /// quorum acks for the no-op arrive as later executor operations, so the commit cannot be
+    /// awaited here — <see cref="CompleteLeaderCommit"/> publishes <c>host.Leader</c> when the
+    /// barrier ticket commits, after its inherited-entry drain has applied every prior-term entry.
+    /// Callers must fire <c>InvokeLeaderChanged(self)</c> only when this returns
+    /// <see langword="true"/>; the barrier completion fires it otherwise.</para>
+    ///
+    /// <para>During the barrier window <c>nodeState == Leader</c> (so acks, heartbeats and the
+    /// leader tick run — heartbeats suppress rival elections) but <c>host.Leader</c> is unset and
+    /// <see cref="NodeState"/> reports <c>Candidate</c>, so both <c>AmILeader</c> paths stay
+    /// closed. Writes routed here are refused at the manager layer for the same reason; the window
+    /// is bounded by <see cref="RaftConfiguration.LeadershipBarrierTimeout"/>, after which the
+    /// leader tick reverts the node to Follower (see <see cref="RevertUnpublishedPromotionAsync"/>).</para>
+    ///
+    /// <para><b>Atomicity:</b> the promotion is all-or-nothing. If the drain or the barrier propose
+    /// throws (WAL read backpressure, scheduler shutdown, etc.), the node is reverted to
+    /// <see cref="RaftNodeState.Follower"/> so it is never left in a half-promoted state.  The
+    /// exception is re-thrown; the cluster self-heals by electing a replacement in the next
+    /// term. Barrier failures after this method returns (propose/commit failure, rollback,
+    /// timeout) revert through <see cref="RevertUnpublishedPromotionAsync"/>.</para>
     ///
     /// <para><b>Latency note:</b> the drain holds the partition executor for the full
     /// duration of the backlog (one <c>ReadScheduler</c> round-trip per 512-entry batch
@@ -808,7 +878,10 @@ public sealed class RaftPartitionStateMachine
     /// bound on the drain is enforced today; a future improvement could cap the drain
     /// and resume it in background once leadership is established.</para>
     /// </summary>
-    private async Task<HLCTimestamp> BecomeLeaderAsync()
+    /// <returns><see langword="true"/> when leadership was published before returning;
+    /// <see langword="false"/> when a promotion barrier is pending and
+    /// <see cref="CompleteLeaderCommit"/> will publish it.</returns>
+    private async Task<bool> BecomeLeaderAsync()
     {
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         long nowTicks = host.GetMonotonicTimestamp();
@@ -822,6 +895,8 @@ public sealed class RaftPartitionStateMachine
         lastProposalAtTicks = nowTicks;
         SetQuiesced(false);
 
+        long maxLog;
+
         try
         {
             // Drain all committed entries up to the promotion frontier. By the time this
@@ -831,6 +906,8 @@ public sealed class RaftPartitionStateMachine
             // propagate here; only WAL-level errors (backpressure, shutdown) can reach this
             // catch block.
             await DrainCommittedAppliesAsync(commitFrontier).ConfigureAwait(false);
+
+            maxLog = await wal.GetMaxLogAsync().ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -845,11 +922,97 @@ public sealed class RaftPartitionStateMachine
             throw;
         }
 
-        // Publish leader status only after the drain. host.Leader is the gate for
-        // AmILeader, so no external observer can see leader == self while the drain
-        // is in progress.
-        host.Leader = host.LocalEndpoint;
-        return ts;
+        if (maxLog <= commitFrontier)
+        {
+            // No inherited tail: the drain above already proved the consumer projection complete.
+            // Publish leader status only after the drain. host.Leader is the gate for
+            // AmILeader, so no external observer can see leader == self while the drain
+            // is in progress.
+            host.Leader = host.LocalEndpoint;
+            return true;
+        }
+
+        // Inherited prior-term entries exist above the commit frontier. Commit a new-term no-op
+        // before serving: CompleteLeaderCommit's inherited drain applies the whole prefix, then
+        // publishes leadership. The entry rides the normal proposal path so quorum, durability
+        // and commit broadcast all behave exactly like a client write.
+        RaftLog barrierLog = new()
+        {
+            LogType = RaftSystemConfig.LeadershipBarrierLogType,
+            LogData = [],
+        };
+
+        RaftOperationStatus status;
+        HLCTimestamp barrierTicket;
+
+        try
+        {
+            (status, barrierTicket) = ReplicateLogs([barrierLog], autoCommit: true);
+        }
+        catch (Exception ex)
+        {
+            // Same all-or-nothing contract as the drain: a barrier that cannot even be enqueued
+            // (WAL backpressure, shutdown) must not leave a Leader that will never publish.
+            logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Promotion barrier propose failed — reverting to Follower. {Message}\n{Stacktrace}",
+                host.LocalEndpoint, host.PartitionId, nodeState, ex.Message, ex.StackTrace);
+            nodeState = RaftNodeState.Follower;
+            localCommittedIndex = -1;
+            throw;
+        }
+
+        if (status != RaftOperationStatus.Pending)
+        {
+            logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Promotion barrier propose rejected ({Status}) — reverting to Follower.",
+                host.LocalEndpoint, host.PartitionId, nodeState, status);
+            nodeState = RaftNodeState.Follower;
+            localCommittedIndex = -1;
+            throw new RaftException($"Promotion barrier propose rejected: {status}");
+        }
+
+        leadershipBarrierTicket = barrierTicket;
+        leadershipBarrierTerm = currentTerm;
+        leadershipBarrierArmedTicks = host.GetMonotonicTimestamp();
+
+        logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Promotion barrier armed at ticket {Ticket} (inherited tail {Frontier}..{MaxLog}); leadership publishes on commit",
+            host.LocalEndpoint, host.PartitionId, nodeState, barrierTicket, commitFrontier + 1, maxLog);
+
+        return false;
+    }
+
+    /// <summary>
+    /// Reverts a promoted-but-unpublished leader (promotion barrier pending) back to Follower.
+    /// Mirrors the bookkeeping of the Candidate-timeout demotion in
+    /// <see cref="CheckPartitionLeadershipAsync"/>: leadership was never published
+    /// (<c>host.Leader</c> was never set to self), so consumers already observe an empty leader —
+    /// the <c>InvokeLeaderChanged("")</c> here is a harmless re-notification kept for consistency
+    /// with every other demotion path. The election timeout then drives a fresh election in a new
+    /// term (possibly won by this same node, which will arm a new barrier).
+    /// </summary>
+    private async Task RevertUnpublishedPromotionAsync(string reason)
+    {
+        logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Reverting unpublished promotion (barrier {Ticket}, term {Term}): {Reason}",
+            host.LocalEndpoint, host.PartitionId, nodeState, leadershipBarrierTicket, leadershipBarrierTerm, reason);
+
+        HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        long nowTicks = host.GetMonotonicTimestamp();
+
+        nodeState = RaftNodeState.Follower;
+        host.Leader = "";
+        lastHeartbeat = currentTime;
+        lastHeartbeatTicks = nowTicks;
+        expectedLeaders.Clear();
+        lastCommitIndexes.Clear();
+        nextIndex.Clear();
+        matchIndex.Clear();
+        regressedFrontiers.Clear();
+        localCommittedIndex = -1;
+        FailAllActiveProposalWaiters();     // also clears the barrier fields
+        activeProposals.Clear();
+        lastProposalAt = HLCTimestamp.Zero;
+        lastProposalAtTicks = 0;
+        SetQuiesced(false);
+
+        await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
     }
 
     /// <summary>
@@ -923,7 +1086,9 @@ public sealed class RaftPartitionStateMachine
         // re-delivery of an already-applied index — which the follower path can see because the leader
         // re-sends committed entries (commit broadcast + backfill/idle re-ship) — must not reach the
         // consumer twice. See CompleteFollowerAppend for the primary site this guards.
-        if (log.Type == RaftLogType.Committed && log.Id > lastAppliedIndex)
+        // Promotion-barrier no-ops are consensus-internal: never delivered, cursor still advances.
+        if (log.Type == RaftLogType.Committed && log.Id > lastAppliedIndex
+            && log.LogType != RaftSystemConfig.LeadershipBarrierLogType)
         {
             try
             {
@@ -983,8 +1148,11 @@ public sealed class RaftPartitionStateMachine
 
                 // Apply committed entries and inherited Proposed entries (prior term only).
                 // Skip current-term Proposed entries — they are in-flight proposals.
-                bool deliver = log.Type == RaftLogType.Committed ||
-                               (log.Type == RaftLogType.Proposed && log.Term < currentTerm);
+                // Promotion-barrier no-ops (including a prior term's, from a promotion that died
+                // before committing its barrier) are consensus-internal and never delivered.
+                bool deliver = (log.Type == RaftLogType.Committed ||
+                               (log.Type == RaftLogType.Proposed && log.Term < currentTerm))
+                               && log.LogType != RaftSystemConfig.LeadershipBarrierLogType;
 
                 // Exactly-once: only deliver entries past the applied frontier (the cursor advances below).
                 if (deliver && log.Id > lastAppliedIndex)
@@ -1172,8 +1340,12 @@ public sealed class RaftPartitionStateMachine
 
         if (host.Nodes.Count == 0)
         {
-            await BecomeLeaderAsync().ConfigureAwait(false);
-            await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
+            // published == false means a promotion barrier is pending; with no peers the barrier
+            // commits locally via the WAL scheduler (self-quorum) and CompleteLeaderCommit fires
+            // both the publish and the LeaderChanged notification shortly after.
+            bool published = await BecomeLeaderAsync().ConfigureAwait(false);
+            if (published)
+                await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
             await SendHeartbeat(true).ConfigureAwait(false);
 
             CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, 0L));
@@ -1339,8 +1511,11 @@ public sealed class RaftPartitionStateMachine
             nextIndex.Clear();
             matchIndex.Clear();
             regressedFrontiers.Clear();
-            await BecomeLeaderAsync().ConfigureAwait(false);
-            await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
+            // published == false: barrier pending, self-quorum commit publishes shortly after
+            // (see CompleteLeaderCommit), which also fires the LeaderChanged notification.
+            bool published = await BecomeLeaderAsync().ConfigureAwait(false);
+            if (published)
+                await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
             await SendHeartbeat(true).ConfigureAwait(false);
             return;
         }
@@ -1689,7 +1864,7 @@ public sealed class RaftPartitionStateMachine
         regressedFrontiers.Remove(endpoint);
         startCommitIndexes.Remove(endpoint);
 
-        if (hadProgress || quiesced)
+        if ((hadProgress || quiesced) && logger.IsEnabled(LogLevel.Information))
             logger.LogInformation(
                 "[{LocalEndpoint}/{PartitionId}/{State}] Reset replication progress for (re)admitted member {Endpoint} (hadProgress={HadProgress}, wasQuiesced={WasQuiesced})",
                 host.LocalEndpoint, host.PartitionId, nodeState, endpoint, hadProgress, quiesced);
@@ -2081,12 +2256,16 @@ public sealed class RaftPartitionStateMachine
             matchIndex[peer.Endpoint] = 0;
         }
 
-        await BecomeLeaderAsync().ConfigureAwait(false);
+        bool leadershipPublished = await BecomeLeaderAsync().ConfigureAwait(false);
 
         double electionElapsedMs = MonotonicElapsed(votingStartedTicks, host.GetMonotonicTimestamp()).TotalMilliseconds;
         logger.LogInfoReceivedVoteProclaimedLeader(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, electionElapsedMs, voteTerm, numberVotes, quorum, host.Nodes.Count + 1, remoteMaxLogId, maxLogResponse);
 
-        await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint);
+        // With a promotion barrier pending, leadership is published (and LeaderChanged fired) by
+        // CompleteLeaderCommit once the barrier no-op commits; the heartbeat below still goes out
+        // immediately so followers adopt this term and rival elections stay suppressed.
+        if (leadershipPublished)
+            await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint);
 
         await SendHeartbeat(true).ConfigureAwait(false);
     }
@@ -3232,7 +3411,7 @@ public sealed class RaftPartitionStateMachine
         switch (completion.OperationType)
         {
             case WALWriteOperationType.LeaderPropose:
-                CompleteLeaderPropose(completion, pending);
+                await CompleteLeaderPropose(completion, pending).ConfigureAwait(false);
                 break;
 
             case WALWriteOperationType.LeaderCommit:
@@ -3240,7 +3419,7 @@ public sealed class RaftPartitionStateMachine
                 break;
 
             case WALWriteOperationType.LeaderRollback:
-                CompleteLeaderRollback(completion, pending);
+                await CompleteLeaderRollback(completion, pending).ConfigureAwait(false);
                 break;
 
             case WALWriteOperationType.FollowerAppend:
@@ -3274,7 +3453,7 @@ public sealed class RaftPartitionStateMachine
     /// construction on this path.
     /// </para>
     /// </summary>
-    private void CompleteLeaderPropose(RaftWalCompletion completion, RaftPendingWalOperation? pending)
+    private async Task CompleteLeaderPropose(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
         HLCTimestamp ticketId = pending?.TicketId ?? HLCTimestamp.Zero;
         List<RaftLog> logs = pending?.Logs ?? [];
@@ -3282,6 +3461,11 @@ public sealed class RaftPartitionStateMachine
 
         if (completion.Status != RaftOperationStatus.Success)
         {
+            // The promotion-barrier no-op failed to even persist locally: the barrier can never
+            // commit, so the unpublished leadership must be abandoned rather than held open.
+            if (leadershipBarrierTicket != HLCTimestamp.Zero && ticketId == leadershipBarrierTicket && nodeState == RaftNodeState.Leader)
+                await RevertUnpublishedPromotionAsync($"barrier propose failed ({completion.Status})").ConfigureAwait(false);
+
             CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, completion.Status, ticketId));
             return;
         }
@@ -3369,6 +3553,12 @@ public sealed class RaftPartitionStateMachine
         if (completion.Status != RaftOperationStatus.Success || proposal is null)
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't commit proposal {Timestamp}", host.LocalEndpoint, host.PartitionId, nodeState, ticketId);
+
+            // A failed commit of the promotion-barrier no-op means this leader can never prove its
+            // consumer projection complete: revert instead of holding unpublished leadership open.
+            if (leadershipBarrierTicket != HLCTimestamp.Zero && ticketId == leadershipBarrierTicket && nodeState == RaftNodeState.Leader)
+                await RevertUnpublishedPromotionAsync($"barrier commit failed ({completion.Status})").ConfigureAwait(false);
+
             CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, completion.Status, 0));
             return;
         }
@@ -3416,6 +3606,25 @@ public sealed class RaftPartitionStateMachine
 
         wal.NotifyCommitted();
 
+        // Promotion barrier: this commit's inherited drain (above) has applied every prior-term
+        // entry below the barrier no-op, so the consumer projection is now provably complete —
+        // publish leadership. Fenced on state and term so a stale barrier completion from a
+        // superseded promotion can never publish.
+        if (leadershipBarrierTicket != HLCTimestamp.Zero && ticketId == leadershipBarrierTicket)
+        {
+            leadershipBarrierTicket = HLCTimestamp.Zero;
+
+            if (nodeState == RaftNodeState.Leader && currentTerm == leadershipBarrierTerm)
+            {
+                host.Leader = host.LocalEndpoint;
+
+                logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Promotion barrier committed at {Ticket}; leadership published",
+                    host.LocalEndpoint, host.PartitionId, nodeState, ticketId);
+
+                await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
+            }
+        }
+
         CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, completion.MaxLogIndex));
     }
 
@@ -3425,10 +3634,15 @@ public sealed class RaftPartitionStateMachine
     /// it targets ids the follower already saw during the anchored propose, and adding a WAL term
     /// read on this completion path would stall propagation. LMP remains enforced on propose/backfill.
     /// </summary>
-    private void CompleteLeaderRollback(RaftWalCompletion completion, RaftPendingWalOperation? pending)
+    private async Task CompleteLeaderRollback(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
         RaftProposalQuorum? proposal = pending?.Proposal;
         HLCTimestamp ticketId = pending?.TicketId ?? HLCTimestamp.Zero;
+
+        // A rolled-back promotion barrier (however it got here — the barrier is auto-commit and
+        // internal, but a rollback request by ticket id is possible) can never publish leadership.
+        if (leadershipBarrierTicket != HLCTimestamp.Zero && ticketId == leadershipBarrierTicket && nodeState == RaftNodeState.Leader)
+            await RevertUnpublishedPromotionAsync("barrier proposal rolled back").ConfigureAwait(false);
 
         if (completion.Status != RaftOperationStatus.Success || proposal is null)
         {
@@ -3503,13 +3717,17 @@ public sealed class RaftPartitionStateMachine
                     break;
                 if (log.Type == RaftLogType.Committed)
                 {
-                    if (host.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType)
+                    // Promotion-barrier no-ops are consensus-internal: skip delivery, advance cursor.
+                    if (log.LogType != RaftSystemConfig.LeadershipBarrierLogType)
                     {
-                        if (!await host.InvokeSystemReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
+                        if (host.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType)
+                        {
+                            if (!await host.InvokeSystemReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
+                                host.InvokeReplicationError(host.PartitionId, log);
+                        }
+                        else if (!await host.InvokeReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
                             host.InvokeReplicationError(host.PartitionId, log);
                     }
-                    else if (!await host.InvokeReplicationReceived(host.PartitionId, log).ConfigureAwait(false))
-                        host.InvokeReplicationError(host.PartitionId, log);
                 }
                 else if (log.Type != RaftLogType.CommittedCheckpoint)
                     break;                          // Proposed/other non-committed entry: not deliverable yet.
@@ -3596,6 +3814,14 @@ public sealed class RaftPartitionStateMachine
     /// </summary>
     private void FailAllActiveProposalWaiters()
     {
+        // Every call site is a leadership-loss (or failed-candidacy) transition, so any pending
+        // promotion barrier is dead with the proposals: clear it here so no later completion for
+        // its ticket can publish leadership for a term this node no longer leads. The publish path
+        // is additionally fenced on nodeState/term, so this is defense in depth, not the only guard.
+        leadershipBarrierTicket = HLCTimestamp.Zero;
+        leadershipBarrierTerm = -1;
+        leadershipBarrierArmedTicks = 0;
+
         foreach (RaftProposalQuorum proposal in activeProposals.Values)
             proposal.CompleteWaiter(RaftProposalTicketState.NotFound, -1);
     }

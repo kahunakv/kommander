@@ -614,6 +614,21 @@ public class RaftConfiguration
     /// </summary>
     public TimeSpan QuiesceAfter { get; set; } = TimeSpan.FromMilliseconds(1500);
 
+    // ── Leadership barrier ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// How long a newly elected leader waits for its promotion-barrier no-op to commit before
+    /// giving up and reverting to Follower. The barrier is proposed when the winner inherits
+    /// uncommitted prior-term entries; until it commits, leadership is not published
+    /// (<c>AmILeader</c> stays false) but heartbeats flow, so rivals are suppressed. If the
+    /// barrier cannot commit the quorum is effectively lost for writes anyway — reverting lets
+    /// the election timeout pick a (possibly different) leader instead of leaving a node that
+    /// heartbeats forever but never serves. Keep this comfortably above the expected quorum
+    /// round-trip under load; too low a value causes needless election churn on a slow but
+    /// healthy cluster. Default 10 s.
+    /// </summary>
+    public TimeSpan LeadershipBarrierTimeout { get; set; } = TimeSpan.FromSeconds(10);
+
     // ── Bounded log backfill ──────────────────────────────────────────────────
 
     /// <summary>
@@ -975,6 +990,13 @@ public class RaftConfiguration
                 "Quiesced followers detect leader failure via SWIM Suspect (approximately one PingInterval), " +
                 "so a PingInterval at or above StartElectionTimeout regresses quiesced failover latency. " +
                 "Lower PingInterval, raise StartElectionTimeout, or set EnableQuiescence=false.");
+
+        if (LeadershipBarrierTimeout <= TimeSpan.Zero)
+            throw new RaftException(
+                "[Kommander] LeadershipBarrierTimeout must be positive. A newly elected leader that " +
+                "inherited uncommitted prior-term entries holds leadership unpublished until its barrier " +
+                "no-op commits; a non-positive timeout would make it revert to Follower immediately on " +
+                "every such promotion, so the partition could never elect a serving leader.");
 
         if (SnapshotReceiveSessionTtl <= TimeSpan.Zero)
             throw new RaftException(

@@ -235,7 +235,10 @@ public class TestSnapshotExport
         }
 
         public int PartitionId { get; }
-        public string Leader { get => ""; set { } }
+        // Must round-trip like the real RaftPartition host: the state machine's visible NodeState
+        // reports Leader only when host.Leader == LocalEndpoint (promotion-barrier gate), so a
+        // discarding setter would make a cleanly promoted leader look like a Candidate forever.
+        public string Leader { get; set; } = "";
         public string LocalEndpoint => "leader:9000";
         public int LocalNodeId => 1;
         public ClusterMemberRole LocalRole => ClusterMemberRole.Voter;

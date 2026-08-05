@@ -22,4 +22,14 @@ public static class RaftSystemConfig
     /// log type (older WALs, non-P0 partitions) carry no payload and are skipped as before.
     /// </summary>
     public const string CheckpointLogType = "_RaftSystemCheckpoint";
+
+    /// <summary>
+    /// Log type stamped on the no-op entry a newly elected leader commits in its own term before
+    /// publishing leadership (the promotion barrier). Committing it forces the inherited-entry
+    /// drain, proving the consumer projection covers every entry committed by the previous leader.
+    /// Entries of this type are internal to the consensus layer: every consumer delivery path
+    /// (leader apply, follower apply, inherited drain, WAL restore) skips them, so consumers never
+    /// observe the type and need no handling for it.
+    /// </summary>
+    public const string LeadershipBarrierLogType = "_RaftLeadershipBarrier";
 }

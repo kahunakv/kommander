@@ -3020,9 +3020,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             if (!readmitted)
                 continue;
 
-            Logger.LogInformation(
-                "[{LocalEndpoint}] Roster v{Version} (re)admits {Endpoint} (joinedVersion={JoinedVersion}); resetting per-follower replication progress on all local partitions",
-                LocalEndpoint, membership.MembershipVersion, endpoint, member.JoinedVersion);
+            if (Logger.IsEnabled(LogLevel.Information))
+                Logger.LogInformation(
+                    "[{LocalEndpoint}] Roster v{Version} (re)admits {Endpoint} (joinedVersion={JoinedVersion}); resetting per-follower replication progress on all local partitions",
+                    LocalEndpoint, membership.MembershipVersion, endpoint, member.JoinedVersion);
 
             systemPartition?.ResetFollowerProgress(endpoint);
 
@@ -3119,7 +3120,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 System.ClusterMemberRole role = LocalRole;
                 if (role != System.ClusterMemberRole.NotMember)
                 {
-                    Logger.LogInformation("[{LocalEndpoint}] Auto-rejoin complete: local role is {Role}", LocalEndpoint, role);
+                    if (Logger.IsEnabled(LogLevel.Information))
+                        Logger.LogInformation("[{LocalEndpoint}] Auto-rejoin complete: local role is {Role}", LocalEndpoint, role);
                     return;
                 }
 
@@ -3182,7 +3184,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         }
         catch (Exception ex)
         {
-            Logger.LogDebug("[{LocalEndpoint}] Auto-rejoin: join attempt against {Target} failed: {Message}", LocalEndpoint, target, ex.Message);
+            if (Logger.IsEnabled(LogLevel.Debug))
+                Logger.LogDebug("[{LocalEndpoint}] Auto-rejoin: join attempt against {Target} failed: {Message}", LocalEndpoint, target, ex.Message);
         }
 
         return false;
