@@ -162,13 +162,50 @@ public sealed class RaftWriteAhead
     /// storage through the I/O scheduler.  Returns the raw list so the caller can
     /// deliver it back to the partition executor for replay under the single-owner
     /// guarantee (correctness rule 1).
+    /// <para>
+    /// When an <see cref="IApplicationDurabilityProvider"/> is configured and reports a floor
+    /// below the last checkpoint, the read starts at <c>floor + 1</c> instead of the checkpoint,
+    /// so committed entries the application has not durably applied are redelivered on replay.
+    /// The checkpoint remains the recovery anchor for consensus state; the returned list is a
+    /// superset of the checkpoint-anchored read, never a subset, so the frontier math in
+    /// <see cref="CompleteRestoreAsync"/> is unaffected.
+    /// </para>
     /// </summary>
     public async ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync()
     {
         if (recovered)
             return [];
 
-        List<RaftLog> logs = await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () => walAdapter.ReadLogs(partition.PartitionId)).ConfigureAwait(false);
+        // Consulted before the read: at restart the provider must answer from the application's
+        // durable storage, so there is nothing to "re-assert" first (unlike the in-memory
+        // SetMinRetainIndex/AcquireRetentionHold floors, which reset on restart).
+        long durablyApplied = manager.Configuration.ApplicationDurabilityProvider
+            ?.GetDurablyAppliedIndex(partition.PartitionId) ?? -1;
+
+        long lastCheckpoint = -1;
+        long replayFloor = -1;
+
+        List<RaftLog> logs = await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () =>
+        {
+            if (durablyApplied < 0)
+                return walAdapter.ReadLogs(partition.PartitionId);
+
+            lastCheckpoint = walAdapter.GetLastCheckpoint(partition.PartitionId);
+            replayFloor = durablyApplied + 1;
+
+            // No checkpoint ⇒ ReadLogs already reads from the beginning; floor at/above the
+            // checkpoint ⇒ the checkpoint-anchored read is already wide enough. Either way the
+            // plain path is byte-for-byte the historical behavior.
+            if (lastCheckpoint <= 0 || replayFloor >= lastCheckpoint)
+                return walAdapter.ReadLogs(partition.PartitionId);
+
+            // Unbounded range read from the floor: same seek-from-id path the backends already
+            // implement, returning every entry (any type) with id >= replayFloor.
+            return walAdapter.ReadLogsRange(partition.PartitionId, replayFloor);
+        }).ConfigureAwait(false);
+
+        if (replayFloor > 0 && lastCheckpoint > 0 && replayFloor < lastCheckpoint)
+            manager.Logger.LogInfoRestoreWidenedByDurabilityFloor(manager.LocalEndpoint, partition.PartitionId, replayFloor, lastCheckpoint);
 
         if (logs.Count > 0)
             manager.Logger.LogInfoRecoveredLogs(manager.LocalEndpoint, partition.PartitionId, logs.Count);
@@ -196,8 +233,12 @@ public sealed class RaftWriteAhead
         manager.InvokeRestoreStarted(partition.PartitionId);
 
         // ── Reconstruct the commit frontier ───────────────────────────────────────────────
-        // logs is sorted ascending by id and begins at the last durable CommittedCheckpoint.
-        // We scan once to derive three quantities used below.
+        // logs is sorted ascending by id and begins at the last durable CommittedCheckpoint — or
+        // below it, at the application-durability floor + 1, when a configured
+        // IApplicationDurabilityProvider reported a floor under the checkpoint (see
+        // LoadRestoreLogsAsync). The extra pre-checkpoint entries never move the frontier: they sit
+        // below the checkpoint, which certifies its whole prefix and jumps the contiguous frontier
+        // over them regardless. We scan once to derive three quantities used below.
         long maxLogId = 0;              // highest durable id (any type) — the propose cursor floor
         long lastResolvedCommitted = 0; // id of the last Committed/CommittedCheckpoint seen (legacy path)
         long contiguousCommitted = 0;   // highest id of an unbroken committed prefix (fast path)
@@ -1390,9 +1431,34 @@ public sealed class RaftWriteAhead
             if (lastCheckpoint <= 0)
                 return;
 
-            // Compose the legacy single floor with the min-of-holds floor: compaction must retain
-            // below whichever protected index is lowest across all consumers.
-            long retainFloor = Math.Min(Volatile.Read(ref minRetainIndex), Volatile.Read(ref holdFloor));
+            // Application-durability floor: entries the application has not durably applied must
+            // never be truncated, even below the checkpoint — restart replay needs them (see
+            // LoadRestoreLogsAsync). CompactLogsOlderThan deletes strictly below its floor, so
+            // durablyApplied + 1 fences exactly the unapplied suffix while still allowing the
+            // durably-applied prefix (id <= durablyApplied) to be removed. Applies on leaders and
+            // followers alike, including the startup window before the consumer's first flush tick
+            // (the provider reads its persisted floor, so nothing needs re-asserting).
+            long durabilityFloor = long.MaxValue;
+            bool clampedByDurabilityFloor = false;
+
+            IApplicationDurabilityProvider? durabilityProvider = manager.Configuration.ApplicationDurabilityProvider;
+            if (durabilityProvider is not null)
+            {
+                long durablyApplied = durabilityProvider.GetDurablyAppliedIndex(partition.PartitionId);
+                if (durablyApplied >= 0)
+                {
+                    durabilityFloor = durablyApplied + 1;
+                    clampedByDurabilityFloor = durabilityFloor < lastCheckpoint;
+                    KommanderMetrics.RecordDurabilityFloorLag(
+                        partition.PartitionId,
+                        Math.Max(0, lastCheckpoint - durabilityFloor));
+                }
+            }
+
+            // Compose the legacy single floor with the min-of-holds floor and the
+            // application-durability floor: compaction must retain below whichever protected index
+            // is lowest across all consumers.
+            long retainFloor = Math.Min(Math.Min(Volatile.Read(ref minRetainIndex), Volatile.Read(ref holdFloor)), durabilityFloor);
             long effectiveFloor = Math.Min(lastCheckpoint, retainFloor);
 
             if (effectiveFloor <= 0)
@@ -1416,6 +1482,19 @@ public sealed class RaftWriteAhead
             }).ConfigureAwait(false);
 
             logger.LogInfoCompactionFinished(manager.LocalEndpoint, partition.PartitionId, removedTotal, effectiveFloor);
+
+            // A clamped pass that removed nothing has fully drained the durably-applied prefix and
+            // is now blocked waiting on the application's flusher. Surface it loudly: a stalled
+            // flusher otherwise grows the WAL without bound and silently.
+            if (clampedByDurabilityFloor && removedTotal == 0)
+            {
+                KommanderMetrics.RecordCompactionBlockedByDurabilityFloor(partition.PartitionId);
+                logger.LogWarnCompactionBlockedByDurabilityFloor(
+                    manager.LocalEndpoint,
+                    partition.PartitionId,
+                    durabilityFloor - 1,
+                    lastCheckpoint);
+            }
         }
         catch (Exception ex)
         {

@@ -430,6 +430,21 @@ public class RaftConfiguration
     /// </summary>
     public bool WalSingleFsyncCommit { get; set; } = true;
 
+    /// <summary>
+    /// Optional per-partition application-durability floor (see
+    /// <see cref="IApplicationDurabilityProvider"/>). When set, restart replay widens down to the
+    /// floor (committed entries above it are redelivered via <c>OnLogRestored</c> even when a
+    /// checkpoint sits above them) and WAL compaction never truncates entries above the floor —
+    /// on leaders and followers alike, including the startup window before the consumer's first
+    /// flush tick. <see langword="null"/> keeps the checkpoint-anchored behavior unchanged.
+    /// <para>
+    /// Consumers that apply committed entries asynchronously (in-memory overlay plus a background
+    /// flush) need this to avoid silently losing the flush-cadence window when a node is killed
+    /// after a checkpoint lands but before the flush runs.
+    /// </para>
+    /// </summary>
+    public IApplicationDurabilityProvider? ApplicationDurabilityProvider { get; set; }
+
     // ── Partition executor drain quanta ───────────────────────────────────────
 
     /// <summary>

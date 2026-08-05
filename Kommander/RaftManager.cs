@@ -2512,6 +2512,17 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <exception cref="RaftException"></exception>
     public async ValueTask<string> WaitForLeader(int partitionId, CancellationToken cancellationToken)
     {
+        // Before initialization the partition map hasn't been applied and user partitions don't
+        // exist yet, so GetPartition would throw "Invalid partition" for ids that are perfectly
+        // valid once assembly completes. Mirror the AmILeader/AmILeaderQuick guard, but surface
+        // the condition as a typed retryable exception instead of a silent default: this method
+        // must return a leader endpoint and has none to give. Without this guard a restarting
+        // node that already reports Joined (set at the start of both join paths) leaks the
+        // misleading "Invalid partition" error to routing callers.
+        if (!IsInitialized)
+            throw new RaftNodeNotReadyException(
+                $"Cannot resolve leader for partition {partitionId}: node has not completed cluster initialization");
+
         RaftPartition partition = GetPartition(partitionId);
 
         // Wait for WAL restore before starting the election budget. This wait is bounded only by the
@@ -2567,7 +2578,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         CancellationToken cancellationToken = default)
     {
         if (!IsInitialized)
-            throw new RaftException("Raft manager is not initialized");
+            throw new RaftNodeNotReadyException("Raft manager is not initialized");
 
         return GetPartition(partitionId).WaitForLeaderStableAsync(minStableFor, timeout: null, cancellationToken);
     }
@@ -2580,7 +2591,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         CancellationToken cancellationToken = default)
     {
         if (!IsInitialized)
-            throw new RaftException("Raft manager is not initialized");
+            throw new RaftNodeNotReadyException("Raft manager is not initialized");
 
         return GetPartition(partitionId).WaitForLeaderStableAsync(minStableFor, timeout, cancellationToken);
     }

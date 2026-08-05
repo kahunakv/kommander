@@ -973,8 +973,9 @@ public sealed class RaftPartitionStateMachine
         leadershipBarrierTerm = currentTerm;
         leadershipBarrierArmedTicks = host.GetMonotonicTimestamp();
 
-        logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Promotion barrier armed at ticket {Ticket} (inherited tail {Frontier}..{MaxLog}); leadership publishes on commit",
-            host.LocalEndpoint, host.PartitionId, nodeState, barrierTicket, commitFrontier + 1, maxLog);
+        if (logger.IsEnabled(LogLevel.Information))
+            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Promotion barrier armed at ticket {Ticket} (inherited tail {Frontier}..{MaxLog}); leadership publishes on commit",
+                host.LocalEndpoint, host.PartitionId, nodeState, barrierTicket, commitFrontier + 1, maxLog);
 
         return false;
     }
@@ -3618,8 +3619,9 @@ public sealed class RaftPartitionStateMachine
             {
                 host.Leader = host.LocalEndpoint;
 
-                logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Promotion barrier committed at {Ticket}; leadership published",
-                    host.LocalEndpoint, host.PartitionId, nodeState, ticketId);
+                if (logger.IsEnabled(LogLevel.Information))
+                    logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Promotion barrier committed at {Ticket}; leadership published",
+                        host.LocalEndpoint, host.PartitionId, nodeState, ticketId);
 
                 await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
             }

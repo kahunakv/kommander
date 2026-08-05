@@ -424,6 +424,12 @@ public interface IRaft
     /// <param name="partitionId"></param>
     /// <param name="cancellationToken"></param>
     /// <returns></returns>
+    /// <exception cref="RaftNodeNotReadyException">
+    /// The node has not completed cluster initialization, so the partition set is unknown and no
+    /// leader endpoint can be resolved. Transient and retryable — typical while a restarted node
+    /// is rejoining the cluster.
+    /// </exception>
+    /// <exception cref="RaftException">The partition id is unknown, its restore failed, or no leader could be decided in time.</exception>
     public ValueTask<string> WaitForLeader(int partitionId, CancellationToken cancellationToken);
 
     /// <summary>

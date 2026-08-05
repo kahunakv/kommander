@@ -70,6 +70,35 @@ public static class KommanderMetrics
             "raft.wal.batch_size",
             description: "Distribution of WAL write batch sizes (operations per storage flush).");
 
+    /// <summary>
+    /// Entries between the application-durability floor and the last checkpoint, sampled once per
+    /// compaction pass when an <see cref="IApplicationDurabilityProvider"/> is configured. A value
+    /// bounded by the application's flush cadence is healthy; sustained growth means the
+    /// application flusher is falling behind (or stalled) and the WAL is being retained for it.
+    /// </summary>
+    internal static readonly Histogram<long> WalDurabilityFloorLag =
+        Meter.CreateHistogram<long>(
+            "raft.wal.durability_floor_lag",
+            description: "Entries between the application-durability floor and the last checkpoint, per compaction pass.");
+
+    /// <summary>
+    /// Compaction passes that removed nothing because every remaining removable entry sits above
+    /// the application-durability floor. A sustained rate indicates a stalled application flusher
+    /// (the WAL grows without bound until the floor advances).
+    /// </summary>
+    internal static readonly Counter<long> WalCompactionBlockedByDurabilityFloorTotal =
+        Meter.CreateCounter<long>(
+            "raft.wal.compaction_blocked_by_durability_floor_total",
+            description: "Compaction passes fully blocked by the application-durability floor.");
+
+    /// <summary>Records the durability-floor lag for one compaction pass, tagged by partition.</summary>
+    internal static void RecordDurabilityFloorLag(int partitionId, long lag) =>
+        WalDurabilityFloorLag.Record(lag, new KeyValuePair<string, object?>("partition_id", partitionId));
+
+    /// <summary>Counts one compaction pass fully blocked by the durability floor, tagged by partition.</summary>
+    internal static void RecordCompactionBlockedByDurabilityFloor(int partitionId) =>
+        WalCompactionBlockedByDurabilityFloorTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
+
     // ── State machine ─────────────────────────────────────────────────────────
 
     /// <summary>

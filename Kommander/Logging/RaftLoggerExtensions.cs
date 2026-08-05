@@ -184,6 +184,12 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}/{Partition}] Compaction finished Removed={RemovedTotal} LastCheckpoint={LastCheckpoint}")]
     public static partial void LogInfoCompactionFinished(this ILogger<IRaft> logger, string endpoint, int partition, int removedTotal, long lastCheckpoint);
 
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}/{Partition}] Restore replay widened by application-durability floor: ReplayFloor={ReplayFloor} LastCheckpoint={LastCheckpoint}")]
+    public static partial void LogInfoRestoreWidenedByDurabilityFloor(this ILogger<IRaft> logger, string endpoint, int partition, long replayFloor, long lastCheckpoint);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{Endpoint}/{Partition}] Compaction blocked by application-durability floor: DurablyApplied={DurablyApplied} LastCheckpoint={LastCheckpoint} — application flusher may be stalled; WAL will grow until the floor advances")]
+    public static partial void LogWarnCompactionBlockedByDurabilityFloor(this ILogger<IRaft> logger, string endpoint, int partition, long durablyApplied, long lastCheckpoint);
+
     // ── RaftManager ───────────────────────────────────────────────────────
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "SystemLogRestored: skipping entry on system partition (LogType={LogType}, DataNull={DataNull}) — non-system types are routed to consumer callbacks upstream")]
