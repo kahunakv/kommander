@@ -2494,6 +2494,33 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
+    /// Read-index leadership confirmation for the given partition — see
+    /// <see cref="IRaft.ConfirmLeadershipAsync"/> for the contract. Unlike
+    /// <see cref="AmILeader"/> this never reports success from local belief alone: the state
+    /// machine must collect a same-term quorum ack round and catch the applied frontier up to the
+    /// confirmed commit index. Transport or executor errors map to <see langword="false"/> (the
+    /// caller's retry path), matching how a failed quorum round is reported; caller-requested
+    /// cancellation propagates as <see cref="OperationCanceledException"/>.
+    /// </summary>
+    public async ValueTask<bool> ConfirmLeadershipAsync(int partitionId, CancellationToken cancellationToken = default)
+    {
+        if (!IsInitialized)
+            return false;
+
+        RaftPartition partition = GetPartition(partitionId);
+
+        try
+        {
+            return await partition.ConfirmLeadershipAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            Logger.LogError("ConfirmLeadershipAsync: {Message}", e.Message);
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Waits for the leader to be elected in the given partition.
     /// If the leader is already elected, it returns the leader.
     ///

@@ -94,4 +94,16 @@ public enum RaftRequestType
     /// thread, so the chaos harness never reads mutable state-machine fields from a polling thread.
     /// </summary>
     GetPartitionView,
+
+    /// <summary>
+    /// Read-index leadership confirmation (Raft §6.4). Asked on behalf of a consumer that wants to
+    /// serve a local read as authoritative: the state machine captures the current commit frontier,
+    /// proves it is still the leader with a same-term quorum ack round, and completes the reply once
+    /// the applied frontier covers the captured commit index. Replies non-success when the node is
+    /// not the (published) leader or quorum cannot confirm within
+    /// <see cref="RaftConfiguration.LeadershipConfirmationTimeout"/> — a minority-partitioned leader
+    /// must fail reads the same way it fails writes instead of serving stale state.
+    /// Concurrent requests coalesce into a single in-flight ack round.
+    /// </summary>
+    ConfirmLeadership,
 }

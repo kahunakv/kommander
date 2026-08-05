@@ -419,6 +419,29 @@ public interface IRaft
     public ValueTask<bool> AmILeader(int partitionId, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Confirms this node's leadership for the partition with a same-term quorum ack round
+    /// (Raft read-index, dissertation §6.4) and waits until the local applied frontier covers the
+    /// commit index observed at confirmation time. A local read served after a <see langword="true"/>
+    /// result is linearizable.
+    /// <para><see cref="AmILeader"/>/<see cref="AmILeaderQuick"/> report pure local belief: a
+    /// minority-partitioned leader keeps believing it leads until it <i>receives</i> a higher-term
+    /// message, so gating reads on them serves stale state as an authoritative success. This method
+    /// is the read-side equivalent of what replication already enforces for writes — consumers
+    /// should gate authoritative local reads on it and surface a retry/redirect on
+    /// <see langword="false"/>.</para>
+    /// <para>Returns <see langword="false"/> when the node is not the published leader (including
+    /// while a promotion barrier is still armed), when quorum cannot confirm within
+    /// <see cref="RaftConfiguration.LeadershipConfirmationTimeout"/>, or when the request is
+    /// rejected by admission control. Concurrent callers coalesce into one in-flight ack round, and
+    /// a confirmation completed within the last heartbeat interval is reused, so steady-state cost
+    /// is ~one quorum round-trip per heartbeat interval regardless of read volume.</para>
+    /// </summary>
+    /// <param name="partitionId"></param>
+    /// <param name="cancellationToken"></param>
+    /// <returns></returns>
+    public ValueTask<bool> ConfirmLeadershipAsync(int partitionId, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Waits for the local node to check/become the leader in the given partition
     /// </summary>
     /// <param name="partitionId"></param>

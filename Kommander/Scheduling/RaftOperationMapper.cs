@@ -59,6 +59,10 @@ public static class RaftOperationMapper
             RaftRequestType.GetTicketState            => RaftOperationKind.Client,
             RaftRequestType.GetTicketWaiterTask       => RaftOperationKind.Client,
             RaftRequestType.GetFollowerCommittedIndex => RaftOperationKind.Client,
+            // Read-index confirmation is issued on behalf of an external read; classifying it as
+            // Client applies the same admission control as proposals (queue-full / restore-gate
+            // rejections surface as a failed confirmation, which callers treat as retry).
+            RaftRequestType.ConfirmLeadership         => RaftOperationKind.Client,
             RaftRequestType.DrainBarrier              => RaftOperationKind.Maintenance,
             RaftRequestType.RestoreLogsLoaded         => RaftOperationKind.Maintenance,
             RaftRequestType.SnapshotInstalled         => RaftOperationKind.Maintenance,
@@ -157,7 +161,8 @@ public static class RaftOperationMapper
             RaftRequestType.CommitLogs or
             RaftRequestType.RollbackLogs or
             RaftRequestType.InstallSnapshot or
-            RaftRequestType.WriteOperationCompleted => RaftStatePriority.Mid,
+            RaftRequestType.WriteOperationCompleted or
+            RaftRequestType.ConfirmLeadership => RaftStatePriority.Mid,
 
             _ => throw new ArgumentOutOfRangeException(nameof(requestType), requestType, "Unrecognised RaftRequestType"),
         };

@@ -644,6 +644,43 @@ public class RaftConfiguration
     /// </summary>
     public TimeSpan LeadershipBarrierTimeout { get; set; } = TimeSpan.FromSeconds(10);
 
+    // ── Read-index leadership confirmation ───────────────────────────────────
+
+    /// <summary>
+    /// Maximum time a <c>ConfirmLeadershipAsync</c> (read-index) request may wait for the
+    /// quorum ack round plus the applied-frontier catch-up before failing with a negative
+    /// result. A minority-partitioned leader never collects the acks, so this bounds how
+    /// long a quorum-confirmed read blocks before the caller can surface a retry/redirect —
+    /// it mirrors the write path's behaviour rather than serving stale local state as an
+    /// authoritative success. Keep it above one heartbeat round-trip under load; expiry is
+    /// enforced from the leader tick, so effective granularity is
+    /// <see cref="CheckLeaderInterval"/>. Default 2 s.
+    /// </summary>
+    public TimeSpan LeadershipConfirmationTimeout { get; set; } = TimeSpan.FromSeconds(2);
+
+    // ── Check-quorum ─────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// When <see langword="true"/>, a leader that has not heard a same-term append/heartbeat
+    /// ack from a majority of voters for <see cref="HeartbeatInterval"/> ×
+    /// <see cref="CheckQuorumIntervalMultiplier"/> steps down to Follower. This does not by
+    /// itself make reads safe (a stale-read window remains — that is what
+    /// <c>ConfirmLeadershipAsync</c> closes); it bounds how long a deposed or isolated leader
+    /// lingers, so minority-side writes fail fast and clients stop hammering a dead-end node.
+    /// Suspended while the leader is quiesced: a quiesced leader stops heartbeating by design,
+    /// so an absence of acks proves nothing there. Off by default to preserve existing
+    /// behaviour.
+    /// </summary>
+    public bool EnableCheckQuorum { get; set; }
+
+    /// <summary>
+    /// Number of heartbeat intervals without a majority of same-term acks after which a leader
+    /// with <see cref="EnableCheckQuorum"/> steps down. Too low a value causes spurious
+    /// step-downs when acks are merely delayed under load; the window restarts whenever a
+    /// majority is heard from, on promotion, and on un-quiesce. Default 8.
+    /// </summary>
+    public int CheckQuorumIntervalMultiplier { get; set; } = 8;
+
     // ── Bounded log backfill ──────────────────────────────────────────────────
 
     /// <summary>
@@ -1005,6 +1042,19 @@ public class RaftConfiguration
                 "Quiesced followers detect leader failure via SWIM Suspect (approximately one PingInterval), " +
                 "so a PingInterval at or above StartElectionTimeout regresses quiesced failover latency. " +
                 "Lower PingInterval, raise StartElectionTimeout, or set EnableQuiescence=false.");
+
+        if (LeadershipConfirmationTimeout <= TimeSpan.Zero)
+            throw new RaftException(
+                "[Kommander] LeadershipConfirmationTimeout must be positive. ConfirmLeadershipAsync " +
+                "(read-index) waits up to this long for a quorum ack round; a non-positive value would " +
+                "fail every confirmation immediately, making quorum-confirmed reads permanently unavailable.");
+
+        if (EnableCheckQuorum && CheckQuorumIntervalMultiplier < 2)
+            throw new RaftException(
+                "[Kommander] CheckQuorumIntervalMultiplier must be at least 2 when EnableCheckQuorum=true. " +
+                "The step-down window is HeartbeatInterval * CheckQuorumIntervalMultiplier; a window of a " +
+                "single heartbeat interval steps a healthy leader down whenever one ack round is merely " +
+                "delayed, causing spurious leadership churn under ordinary load.");
 
         if (LeadershipBarrierTimeout <= TimeSpan.Zero)
             throw new RaftException(

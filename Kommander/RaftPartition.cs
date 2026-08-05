@@ -564,6 +564,20 @@ public sealed class RaftPartition : IDisposable
         return response.Status;
     }
 
+    /// <summary>
+    /// Read-index leadership confirmation: asks the state machine to prove leadership with a
+    /// same-term quorum ack round and to wait until the applied frontier covers the commit index
+    /// captured at confirmation. Returns <see langword="true"/> only when a local read served
+    /// afterwards is linearizable; every non-success outcome (not leader, quorum timeout,
+    /// admission-control rejection, restore in progress) maps to <see langword="false"/> so the
+    /// caller retries or redirects, mirroring the write path.
+    /// </summary>
+    public async Task<bool> ConfirmLeadershipAsync(CancellationToken cancellationToken = default)
+    {
+        RaftResponse response = await executor.Ask(new(RaftRequestType.ConfirmLeadership), cancellationToken).ConfigureAwait(false);
+        return response.Status == RaftOperationStatus.Success;
+    }
+
     public async Task<RaftOperationStatus> TransferLeadershipAsync(
         string targetEndpoint,
         CancellationToken cancellationToken = default)

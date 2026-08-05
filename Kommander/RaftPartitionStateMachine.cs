@@ -241,6 +241,59 @@ public sealed class RaftPartitionStateMachine
     private long leadershipBarrierArmedTicks;
 
     /// <summary>
+    /// The in-flight read-index confirmation round, or <see langword="null"/> when none is open.
+    /// All <see cref="ConfirmLeadershipAsync"/> callers that arrive while a round is in flight
+    /// share its ack round (or chain into <see cref="readIndexPendingWaiters"/> when the commit
+    /// frontier has moved past the round's capture), so steady-state cost is ~one quorum
+    /// round-trip per heartbeat interval regardless of read volume. Failed wholesale on every
+    /// leadership-loss transition via <see cref="FailAllReadIndexWaiters"/>, so a surviving round
+    /// always belongs to <see cref="currentTerm"/>.
+    /// </summary>
+    private ReadIndexRound? readIndexRound;
+
+    /// <summary>
+    /// Confirmation callers that arrived while a round was in flight but could NOT join it because
+    /// the commit frontier had advanced past the round's captured read index — joining would let
+    /// their read miss a write that completed before the read started. They form the next round,
+    /// started as soon as the current one confirms or expires. StartedTicks is each caller's own
+    /// arrival time, so its timeout budget spans the full wait, not just its own round.
+    /// </summary>
+    private readonly List<(ulong CorrelationId, long StartedTicks)> readIndexPendingWaiters = [];
+
+    /// <summary>
+    /// Quorum-confirmed readers waiting for <see cref="lastAppliedIndex"/> to cover the commit
+    /// index captured when their round confirmed — the second half of the read-index contract:
+    /// counting acks proves leadership, but the local applied state must also contain everything
+    /// committed at capture time before a local read is linearizable.
+    /// </summary>
+    private readonly List<(ulong CorrelationId, long RequiredIndex, long StartedTicks)> readIndexApplyWaiters = [];
+
+    /// <summary>Monotonic timestamp of the last completed quorum confirmation (0 = none). A
+    /// confirmation no older than one heartbeat interval is reused as a fast path — it is exactly
+    /// as fresh as the acks it counted, and pre-vote leader stickiness prevents any rival from
+    /// assembling an election quorum inside that window.</summary>
+    private long lastLeadershipConfirmedTicks;
+
+    /// <summary>Term the last quorum confirmation was completed in; the fast path is fenced on it
+    /// so a confirmation from a previous leadership stint can never be reused.</summary>
+    private long lastLeadershipConfirmedTerm = -1;
+
+    /// <summary>
+    /// Per-peer monotonic timestamp of the last same-term successful append/heartbeat ack.
+    /// Feeds the check-quorum window (<see cref="RaftConfiguration.EnableCheckQuorum"/>): unlike
+    /// <see cref="matchIndex"/>/<see cref="lastCommitIndexes"/> these carry recency, which is what
+    /// an isolated leader lacks. Only term-stamped acks are recorded — an unstamped ack passed the
+    /// term fence by default and proves nothing about this term. Cleared on every leadership
+    /// transition.
+    /// </summary>
+    private readonly Dictionary<string, long> lastVoterAckTicks = [];
+
+    /// <summary>Monotonic timestamp when this leader last heard same-term acks from a majority of
+    /// voters (refreshed while quiesced, since a quiesced leader legitimately receives none).
+    /// When it falls behind the check-quorum window the leader steps down.</summary>
+    private long lastQuorumContactTicks;
+
+    /// <summary>
     /// Externally visible node state (served to <c>GetNodeState</c>, which backs the
     /// <c>AmILeader</c> fallback path). Reports <see cref="RaftNodeState.Candidate"/> while this
     /// node has won an election but has not yet published leadership (promotion barrier pending):
@@ -494,6 +547,48 @@ public sealed class RaftPartitionStateMachine
                 {
                     await RevertUnpublishedPromotionAsync("barrier commit timed out").ConfigureAwait(false);
                     return;
+                }
+
+                // Read-index expiry runs before the quiesced early-return: waiters must still time
+                // out even if the partition re-quiesced while a confirmation was pending.
+                if (readIndexRound is not null || readIndexPendingWaiters.Count > 0 || readIndexApplyWaiters.Count > 0)
+                    await ExpireReadIndexWaitersAsync(nowTicks).ConfigureAwait(false);
+
+                // Check-quorum: step down once no majority of voters has acked within the window.
+                // This does not close the stale-read hole (ConfirmLeadershipAsync does); it bounds
+                // how long an isolated leader lingers so minority-side callers fail fast.
+                if (host.Configuration.EnableCheckQuorum)
+                {
+                    if (quiesced)
+                    {
+                        // A quiesced leader stops heartbeating, so an absence of acks proves
+                        // nothing; keep the grace window fresh so it restarts on un-quiesce.
+                        lastQuorumContactTicks = nowTicks;
+                    }
+                    else
+                    {
+                        TimeSpan window = host.Configuration.HeartbeatInterval * host.Configuration.CheckQuorumIntervalMultiplier;
+                        int votersTotal = 1;    // the local leader
+                        int reachable = 1;
+                        foreach (RaftNode node in host.Nodes)
+                        {
+                            if (!host.IsVoter(node.Endpoint))
+                                continue;
+                            votersTotal++;
+                            if (lastVoterAckTicks.TryGetValue(node.Endpoint, out long ackTicks)
+                                && MonotonicElapsed(ackTicks, nowTicks) < window)
+                                reachable++;
+                        }
+
+                        if (reachable >= votersTotal / 2 + 1)
+                            lastQuorumContactTicks = nowTicks;
+                        else if (lastQuorumContactTicks != 0
+                            && MonotonicElapsed(lastQuorumContactTicks, nowTicks) >= window)
+                        {
+                            await StepDownOnQuorumLossAsync().ConfigureAwait(false);
+                            return;
+                        }
+                    }
                 }
 
                 if (quiesced)
@@ -801,6 +896,7 @@ public sealed class RaftPartitionStateMachine
         lastProposalAt = ts;
         lastHeartbeatTicks = nowTicks;
         lastProposalAtTicks = nowTicks;
+        ResetLeadershipConfirmationState(nowTicks);
         SetQuiesced(false);
         return ts;
     }
@@ -893,6 +989,7 @@ public sealed class RaftPartitionStateMachine
         lastProposalAt = ts;
         lastHeartbeatTicks = nowTicks;
         lastProposalAtTicks = nowTicks;
+        ResetLeadershipConfirmationState(nowTicks);
         SetQuiesced(false);
 
         long maxLog;
@@ -1114,6 +1211,8 @@ public sealed class RaftPartitionStateMachine
 
         if (log.Id > lastAppliedIndex)
             lastAppliedIndex = log.Id;
+
+        CompleteReadIndexApplyWaiters();
     }
 
     /// <summary>
@@ -1186,6 +1285,8 @@ public sealed class RaftPartitionStateMachine
                 break;
             from = next;
         }
+
+        CompleteReadIndexApplyWaiters();
     }
 
     /// <summary>
@@ -3198,6 +3299,16 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
+        // Same-term success acks double as leadership proof: they feed the read-index confirmation
+        // round and the check-quorum recency window. Only term-stamped acks count — an unstamped
+        // (-1) ack passed the term fence above by default and could belong to an earlier stint of
+        // this node's leadership.
+        if (responseTerm >= 0 && endpoint != host.LocalEndpoint && nodeState == RaftNodeState.Leader)
+        {
+            lastVoterAckTicks[endpoint] = host.GetMonotonicTimestamp();
+            await RegisterReadIndexAckAsync(endpoint).ConfigureAwait(false);
+        }
+
         // Success: advance matchIndex and nextIndex for this peer so the backfill loop
         // knows the follower has caught up to at least committedIndex. matchIndex stays monotonic
         // (a stale in-flight ack must not drag a peer's recorded progress backwards), so the prior
@@ -3820,6 +3931,11 @@ public sealed class RaftPartitionStateMachine
         // promotion barrier is dead with the proposals: clear it here so no later completion for
         // its ticket can publish leadership for a term this node no longer leads. The publish path
         // is additionally fenced on nodeState/term, so this is defense in depth, not the only guard.
+        //
+        // Read-index waiters die with leadership for the same reason: a confirmation must never
+        // survive the term it was requested in.
+        FailAllReadIndexWaiters();
+
         leadershipBarrierTicket = HLCTimestamp.Zero;
         leadershipBarrierTerm = -1;
         leadershipBarrierArmedTicks = 0;
@@ -3840,6 +3956,362 @@ public sealed class RaftPartitionStateMachine
         // Unblock any caller awaiting event-driven completion; CompleteLeaderCommit will
         // also fire TrySetResult, but TrySetResult is idempotent so the duplicate is safe.
         proposal.CompleteWaiter(RaftProposalTicketState.Committed, proposal.LastLogIndex);
+    }
+
+    /// <summary>
+    /// Bookkeeping for one read-index quorum round: the commit frontier captured at round start,
+    /// the same-term acks collected so far, and the reply correlations awaiting the result.
+    /// Only ever touched on the partition executor thread.
+    /// </summary>
+    private sealed class ReadIndexRound
+    {
+        public long Term { get; init; }
+        public long ReadIndex { get; init; }
+        public long StartedTicks { get; init; }
+        public HashSet<string> Acks { get; } = [];
+        public List<ulong> Waiters { get; } = [];
+    }
+
+    /// <summary>
+    /// Read-index leadership confirmation (Raft dissertation §6.4). Proves this node is still the
+    /// leader with a same-term quorum ack round, then completes the reply once the local applied
+    /// frontier covers the commit index captured at confirmation time. A local read served after a
+    /// successful confirmation is linearizable; without it, a minority-partitioned leader that has
+    /// not yet heard of its own deposition serves stale state as an authoritative success (writes
+    /// already fail on such a node because replication fails — this closes the read half).
+    /// <para>Fails immediately when this node is not the <b>published</b> leader: while the
+    /// promotion barrier is armed, <c>nodeState</c> is already Leader but <c>host.Leader</c> is
+    /// not, and a confirmation must not leak through before the barrier publishes.</para>
+    /// <para>Concurrent callers coalesce into the in-flight round; a confirmation completed within
+    /// the last heartbeat interval is reused outright. Expiry
+    /// (<see cref="RaftConfiguration.LeadershipConfirmationTimeout"/>) is enforced from the leader
+    /// tick; leadership loss fails all waiters via <see cref="FailAllReadIndexWaiters"/>.</para>
+    /// </summary>
+    public async Task ConfirmLeadershipAsync(ulong? replyCorrelationId)
+    {
+        if (nodeState != RaftNodeState.Leader || host.Leader != host.LocalEndpoint)
+        {
+            CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, 0L));
+            return;
+        }
+
+        // No observer: nothing to confirm for. (The public path always registers a reply.)
+        if (replyCorrelationId is null)
+            return;
+
+        long nowTicks = host.GetMonotonicTimestamp();
+
+        // Fast path: a confirmation completed within the last heartbeat interval is exactly as
+        // fresh as the acks it counted — pre-vote leader stickiness keeps any rival from winning
+        // an election quorum inside that window. The applied-frontier wait still runs against the
+        // CURRENT commit frontier (strictly stronger than the round's capture), so a write this
+        // leader committed after the confirmation is never missed by a later read.
+        if (lastLeadershipConfirmedTerm == currentTerm
+            && lastLeadershipConfirmedTicks != 0
+            && MonotonicElapsed(lastLeadershipConfirmedTicks, nowTicks) < host.Configuration.HeartbeatInterval)
+        {
+            CompleteOrParkReadIndexWaiter(replyCorrelationId.Value, localCommittedIndex, nowTicks);
+            return;
+        }
+
+        if (readIndexRound is not null)
+        {
+            // Coalesce: joining an in-flight round is only linearizable while the round's captured
+            // read index still covers the commit frontier — otherwise a write that completed after
+            // round start (but before this read began) could be missed. Late arrivals chain into
+            // the next round instead.
+            if (readIndexRound.ReadIndex >= localCommittedIndex)
+                readIndexRound.Waiters.Add(replyCorrelationId.Value);
+            else
+                readIndexPendingWaiters.Add((replyCorrelationId.Value, nowTicks));
+            return;
+        }
+
+        await StartReadIndexRoundAsync(replyCorrelationId.Value, nowTicks).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Opens a read-index round: captures <c>(currentTerm, localCommittedIndex)</c> and fires a
+    /// forced heartbeat so every peer produces a same-term ack. A quiesced leader is woken first —
+    /// the ack round itself is the leadership proof, so quiescence needs no safety carve-out, only
+    /// this wake-up; the tick then keeps heartbeating (and thus retrying the round) until the
+    /// waiters confirm or expire.
+    /// </summary>
+    private async Task StartReadIndexRoundAsync(ulong waiterCorrelationId, long startedTicks)
+    {
+        ReadIndexRound round = new()
+        {
+            Term = currentTerm,
+            ReadIndex = localCommittedIndex,
+            StartedTicks = startedTicks,
+        };
+        round.Waiters.Add(waiterCorrelationId);
+        readIndexRound = round;
+
+        // Single-voter cluster: the leader alone is the quorum — confirm without any ack round.
+        if (TryConfirmReadIndexQuorum())
+            return;
+
+        if (quiesced)
+            SetQuiesced(false);
+
+        await SendHeartbeat(true).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Confirms the in-flight round if its same-term acks (plus the leader itself) reach a
+    /// majority of voters. Voter status is re-evaluated at count time so an endpoint demoted
+    /// mid-round cannot carry the quorum. On confirmation every waiter moves to the
+    /// applied-frontier wait keyed on the round's captured read index.
+    /// </summary>
+    private bool TryConfirmReadIndexQuorum()
+    {
+        ReadIndexRound? round = readIndexRound;
+        if (round is null)
+            return false;
+
+        int votersTotal = 1;  // the local leader
+        int acked = 0;
+        foreach (RaftNode node in host.Nodes)
+        {
+            if (!host.IsVoter(node.Endpoint))
+                continue;
+            votersTotal++;
+            if (round.Acks.Contains(node.Endpoint))
+                acked++;
+        }
+
+        if (acked + 1 < votersTotal / 2 + 1)
+            return false;
+
+        readIndexRound = null;
+        lastLeadershipConfirmedTicks = host.GetMonotonicTimestamp();
+        lastLeadershipConfirmedTerm = round.Term;
+
+        foreach (ulong waiter in round.Waiters)
+            CompleteOrParkReadIndexWaiter(waiter, round.ReadIndex, round.StartedTicks);
+
+        return true;
+    }
+
+    /// <summary>
+    /// Second half of the read-index contract: the reply completes only once
+    /// <see cref="lastAppliedIndex"/> covers the captured commit index, so a local read issued
+    /// after the confirmation observes every entry committed at capture time.
+    /// </summary>
+    private void CompleteOrParkReadIndexWaiter(ulong correlationId, long requiredIndex, long startedTicks)
+    {
+        if (lastAppliedIndex >= requiredIndex)
+        {
+            CompleteReply(correlationId, new(RaftResponseType.None, RaftOperationStatus.Success, requiredIndex));
+            return;
+        }
+
+        readIndexApplyWaiters.Add((correlationId, requiredIndex, startedTicks));
+    }
+
+    /// <summary>
+    /// Feeds a same-term successful append/heartbeat ack into the in-flight read-index round.
+    /// Any such ack proves the peer still recognises this leader at <see cref="currentTerm"/>
+    /// no earlier than round start (rounds only accumulate acks while open), so heartbeat and
+    /// live-replication acks both count. Confirming may chain-start the next round for waiters
+    /// that arrived after the commit frontier moved.
+    /// </summary>
+    private async ValueTask RegisterReadIndexAckAsync(string endpoint)
+    {
+        ReadIndexRound? round = readIndexRound;
+        if (round is null || !host.IsVoter(endpoint))
+            return;
+
+        round.Acks.Add(endpoint);
+
+        if (TryConfirmReadIndexQuorum())
+            await StartPendingReadIndexRoundAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Starts a new round for the callers that could not join the previous one (the commit
+    /// frontier had moved past its capture). Their timeout budget is anchored at the earliest
+    /// caller's arrival, so chaining cannot extend a caller's wait past the configured timeout.
+    /// </summary>
+    private async ValueTask StartPendingReadIndexRoundAsync()
+    {
+        if (readIndexPendingWaiters.Count == 0 || nodeState != RaftNodeState.Leader)
+            return;
+
+        ReadIndexRound round = new()
+        {
+            Term = currentTerm,
+            ReadIndex = localCommittedIndex,
+            StartedTicks = readIndexPendingWaiters[0].StartedTicks,
+        };
+        foreach ((ulong correlationId, _) in readIndexPendingWaiters)
+            round.Waiters.Add(correlationId);
+        readIndexPendingWaiters.Clear();
+        readIndexRound = round;
+
+        if (TryConfirmReadIndexQuorum())
+            return;
+
+        if (quiesced)
+            SetQuiesced(false);
+
+        await SendHeartbeat(true).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Completes any quorum-confirmed readers whose required commit index the applied frontier
+    /// now covers. Called wherever <see cref="lastAppliedIndex"/> advances; O(1) when no reader
+    /// is parked, which is the steady state.
+    /// </summary>
+    private void CompleteReadIndexApplyWaiters()
+    {
+        if (readIndexApplyWaiters.Count == 0)
+            return;
+
+        for (int i = readIndexApplyWaiters.Count - 1; i >= 0; i--)
+        {
+            (ulong correlationId, long requiredIndex, _) = readIndexApplyWaiters[i];
+            if (lastAppliedIndex < requiredIndex)
+                continue;
+
+            CompleteReply(correlationId, new(RaftResponseType.None, RaftOperationStatus.Success, requiredIndex));
+            readIndexApplyWaiters.RemoveAt(i);
+        }
+    }
+
+    /// <summary>
+    /// Enforces <see cref="RaftConfiguration.LeadershipConfirmationTimeout"/> from the leader
+    /// tick: an expired round fails all its waiters (a minority-partitioned leader reaches this —
+    /// it can never collect the acks), pending waiters that outwaited the timeout fail
+    /// individually, and applied-frontier waiters are bounded too so a wedged consumer cannot
+    /// park readers forever. An expired round chain-starts the next one so queued callers still
+    /// get their own attempt.
+    /// </summary>
+    private async ValueTask ExpireReadIndexWaitersAsync(long nowTicks)
+    {
+        TimeSpan timeout = host.Configuration.LeadershipConfirmationTimeout;
+
+        if (readIndexRound is not null && MonotonicElapsed(readIndexRound.StartedTicks, nowTicks) >= timeout)
+        {
+            ReadIndexRound round = readIndexRound;
+            readIndexRound = null;
+
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Read-index round expired without quorum ({Waiters} waiter(s), {Acks} ack(s)). Term={CurrentTerm}",
+                host.LocalEndpoint, host.PartitionId, nodeState, round.Waiters.Count, round.Acks.Count, currentTerm);
+
+            foreach (ulong waiter in round.Waiters)
+                CompleteReply(waiter, new(RaftResponseType.None, RaftOperationStatus.ProposalTimeout, 0L));
+
+            await StartPendingReadIndexRoundAsync().ConfigureAwait(false);
+        }
+
+        for (int i = readIndexPendingWaiters.Count - 1; i >= 0; i--)
+        {
+            if (MonotonicElapsed(readIndexPendingWaiters[i].StartedTicks, nowTicks) < timeout)
+                continue;
+
+            CompleteReply(readIndexPendingWaiters[i].CorrelationId, new(RaftResponseType.None, RaftOperationStatus.ProposalTimeout, 0L));
+            readIndexPendingWaiters.RemoveAt(i);
+        }
+
+        for (int i = readIndexApplyWaiters.Count - 1; i >= 0; i--)
+        {
+            if (MonotonicElapsed(readIndexApplyWaiters[i].StartedTicks, nowTicks) < timeout)
+                continue;
+
+            CompleteReply(readIndexApplyWaiters[i].CorrelationId, new(RaftResponseType.None, RaftOperationStatus.ProposalTimeout, 0L));
+            readIndexApplyWaiters.RemoveAt(i);
+        }
+    }
+
+    /// <summary>
+    /// Fails every read-index waiter (in-flight round, chained, and applied-frontier) and resets
+    /// the confirmation fast path and check-quorum bookkeeping. Must run on every leadership-loss
+    /// transition — a confirmation must never survive the term it was requested in. Invoked from
+    /// <see cref="FailAllActiveProposalWaiters"/>, which every demotion path already calls.
+    /// </summary>
+    private void FailAllReadIndexWaiters()
+    {
+        lastLeadershipConfirmedTicks = 0;
+        lastLeadershipConfirmedTerm = -1;
+        lastVoterAckTicks.Clear();
+        lastQuorumContactTicks = 0;
+
+        if (readIndexRound is not null)
+        {
+            foreach (ulong waiter in readIndexRound.Waiters)
+                CompleteReply(waiter, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, 0L));
+            readIndexRound = null;
+        }
+
+        if (readIndexPendingWaiters.Count > 0)
+        {
+            foreach ((ulong correlationId, _) in readIndexPendingWaiters)
+                CompleteReply(correlationId, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, 0L));
+            readIndexPendingWaiters.Clear();
+        }
+
+        if (readIndexApplyWaiters.Count > 0)
+        {
+            foreach ((ulong correlationId, _, _) in readIndexApplyWaiters)
+                CompleteReply(correlationId, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, 0L));
+            readIndexApplyWaiters.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Resets read-index and check-quorum bookkeeping at the start of a leadership stint: any
+    /// remembered confirmation or ack recency belongs to a previous stint and must not be reused,
+    /// and the check-quorum grace window starts now (a fresh leader has heard from a quorum by
+    /// definition — its election — but those grants are not append acks).
+    /// </summary>
+    private void ResetLeadershipConfirmationState(long nowTicks)
+    {
+        lastLeadershipConfirmedTicks = 0;
+        lastLeadershipConfirmedTerm = -1;
+        lastVoterAckTicks.Clear();
+        lastQuorumContactTicks = nowTicks;
+    }
+
+    /// <summary>
+    /// Check-quorum step-down: this leader has not heard same-term acks from a majority of voters
+    /// for the configured window, so it is almost certainly isolated and possibly already deposed.
+    /// Mirrors the bookkeeping of <see cref="StepDownAsync"/> but sends no step-down notice — the
+    /// peers are unreachable by hypothesis, and the majority side elects on its own timeout.
+    /// Setting <c>lastHeartbeatTicks</c> here means this node waits a full election timeout before
+    /// campaigning, giving a majority-side leader time to adopt it as a follower first.
+    /// </summary>
+    private async Task StepDownOnQuorumLossAsync()
+    {
+        logger.LogWarning(
+            "[{LocalEndpoint}/{PartitionId}/{State}] Check-quorum: no majority of voter acks within {Window} — stepping down. Term={CurrentTerm}",
+            host.LocalEndpoint, host.PartitionId, nodeState,
+            host.Configuration.HeartbeatInterval * host.Configuration.CheckQuorumIntervalMultiplier, currentTerm);
+
+        HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        long nowTicks = host.GetMonotonicTimestamp();
+
+        nodeState = RaftNodeState.Follower;
+        host.Leader = "";
+        lastHeartbeat = currentTime;
+        lastVotation = currentTime;
+        lastHeartbeatTicks = nowTicks;
+        lastVotationTicks = nowTicks;
+        expectedLeaders.Clear();
+        lastCommitIndexes.Clear();
+        nextIndex.Clear();
+        matchIndex.Clear();
+        regressedFrontiers.Clear();
+        localCommittedIndex = -1;
+        FailAllActiveProposalWaiters();
+        activeProposals.Clear();
+        lastProposalAt = HLCTimestamp.Zero;
+        lastProposalAtTicks = 0;
+        SetQuiesced(false);
+
+        await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
     }
 
     // ReadExactAsync body lives in StreamUtils; forwarded here for call-site compatibility.
