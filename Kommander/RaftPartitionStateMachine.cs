@@ -997,12 +997,53 @@ public sealed class RaftPartitionStateMachine
         try
         {
             // Drain all committed entries up to the promotion frontier. By the time this
-            // returns every InvokeReplicationReceived call has completed, so the consumer
+            // succeeds every InvokeReplicationReceived call has completed, so the consumer
             // projection is current before the partition is advertised as the serving leader.
             // Consumer exceptions are caught inside ApplyLogToConsumerAsync and do not
             // propagate here; only WAL-level errors (backpressure, shutdown) can reach this
             // catch block.
-            await DrainCommittedAppliesAsync(commitFrontier).ConfigureAwait(false);
+            //
+            // The drain withholds rather than skips, so it reports whether it actually REACHED
+            // the frontier — and its backend reads race the WAL write queue (the in-memory
+            // frontiers advance at enqueue time), so an entry still queued in the write scheduler
+            // is invisible and indistinguishable from a hole. Retry until the writes land and the
+            // drain covers the frontier, bounded by the barrier timeout; each retry makes forward
+            // progress as writes apply and exits as soon as the frontier is reached, so the common
+            // case adds no latency. A frontier still unreached at the deadline means entries below
+            // it are genuinely absent or unresolved: serving would fix an incomplete consumer
+            // projection for the whole tenure — a leader is never backfilled.
+            // A sole voter (e.g. the last survivor of graceful leaves) needs only its own write
+            // queue to drain — nothing external can arrive — so its bound is short; with voter
+            // peers the full barrier timeout is worth spending, because refusing hands leadership
+            // to a peer that may hold the missing entries.
+            bool hasVoterPeers = host.Nodes.Any(n => host.IsVoter(n.Endpoint));
+            TimeSpan drainBound = hasVoterPeers ? host.Configuration.LeadershipBarrierTimeout : TimeSpan.FromMilliseconds(250);
+            long drainDeadlineTicks = Stopwatch.GetTimestamp();
+
+            while (!await DrainCommittedAppliesAsync(commitFrontier).ConfigureAwait(false))
+            {
+                if (Stopwatch.GetElapsedTime(drainDeadlineTicks) > drainBound)
+                {
+                    // Refuse only when another voter exists that could hold the missing entries —
+                    // reverting lets it win the next term with a complete log. A sole voter has no
+                    // such peer: the departed quorum took the entries with it, refusing forever
+                    // would leave the partition permanently leaderless, and the gap is
+                    // unrecoverable either way. Serve, and say so loudly.
+                    if (hasVoterPeers)
+                        throw new RaftException(
+                            $"Promotion refused: committed drain stopped at {lastAppliedIndex} below the frontier {commitFrontier}");
+
+                    logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Committed drain stopped at {LastApplied} below the frontier {Frontier} with no voter peers to defer to — proceeding as sole voter; entries in the gap are unrecoverable.",
+                        host.LocalEndpoint, host.PartitionId, nodeState, lastAppliedIndex, commitFrontier);
+
+                    // Deliver everything this survivor DOES hold past the gap, so only the
+                    // genuinely absent entries are lost rather than the whole suffix.
+                    await DrainCommittedAppliesAsync(commitFrontier, skipGaps: true).ConfigureAwait(false);
+                    break;
+                }
+
+                await Task.Delay(2).ConfigureAwait(false);
+            }
 
             maxLog = await wal.GetMaxLogAsync().ConfigureAwait(false);
         }
@@ -1136,46 +1177,76 @@ public sealed class RaftPartitionStateMachine
     /// <see cref="ApplyLogToConsumerAsync"/>.  Reads the WAL in bounded batches to
     /// avoid loading the full tail into memory.
     ///
-    /// <para>A no-op when <see cref="lastAppliedIndex"/> already covers
-    /// <paramref name="upToIndex"/> or the WAL is empty for this range.</para>
+    /// <para>Reads ALL entry types so that resolved-but-not-committed entries (rolled back)
+    /// advance the cursor instead of reading as gaps — a committed-only read made every
+    /// rolled-back id in the range look absent and withheld the drain forever behind it.
+    /// Only <c>Committed</c> entries are delivered (<see cref="ApplyLogToConsumerAsync"/>
+    /// filters); checkpoints and rolled-back entries just advance the cursor.</para>
+    ///
+    /// <para>Returns <see langword="false"/> when the drain could not reach
+    /// <paramref name="upToIndex"/>: an id absent above the snapshot floor, an unresolved
+    /// (<c>Proposed</c>) entry inside the resolved range (its commit marker not yet visible), or
+    /// a missing tail. On the follower path this is routine — reads race the write queue and the
+    /// leader's re-ship/backfill retries the drain — but at promotion (after the WAL write queue
+    /// is fenced) it means the projection genuinely cannot cover the frontier and the caller must
+    /// not serve. A no-op returning <see langword="true"/> when <see cref="lastAppliedIndex"/>
+    /// already covers <paramref name="upToIndex"/>.</para>
     /// </summary>
-    private async Task DrainCommittedAppliesAsync(long upToIndex)
+    private async Task<bool> DrainCommittedAppliesAsync(long upToIndex, bool skipGaps = false)
     {
         if (upToIndex < 0 || lastAppliedIndex >= upToIndex)
-            return;
+            return true;
 
         const int BatchSize = 512;
         long from = lastAppliedIndex + 1;
 
         while (from <= upToIndex)
         {
-            List<RaftLog> batch = await wal.GetRangeAsync(from, BatchSize).ConfigureAwait(false);
+            List<RaftLog> batch = await wal.GetRangeAllTypesAsync(from, BatchSize).ConfigureAwait(false);
             if (batch.Count == 0)
                 break;
 
             foreach (RaftLog log in batch)
             {
                 if (log.Id > upToIndex)
-                    return;
+                    return true;
                 if (log.Id <= lastAppliedIndex)
-                    continue;                       // already applied (defensive; GetRangeAsync starts at 'from')
-                if (log.Id != lastAppliedIndex + 1)
+                    continue;                       // already applied (defensive; the read starts at 'from')
+                if (log.Id != lastAppliedIndex + 1 && !skipGaps)
                 {
-                    // The expected next id (lastAppliedIndex+1) is absent from the committed range. Classify by
+                    // The expected next id (lastAppliedIndex+1) is absent from the range. Classify by
                     // the snapshot floor rather than by "does an entry exist" — the in-memory commit frontier
-                    // (upToIndex) can transiently lead the durable WAL (a Committed marker not yet landed, or an
-                    // entry that hole-repair truncated after the frontier overshot it), so an absent id is
-                    // ambiguous on its own:
-                    //   * expected ABOVE the floor → a real gap (uncommitted lag OR a truncated hole). Both are
-                    //     re-shipped by the leader's backfill, so WITHHOLD and let a later drain deliver the id
-                    //     and the tail in order. Delivering past it would skip it permanently.
+                    // (upToIndex) can transiently lead the durable WAL (a write still queued in the WAL
+                    // scheduler, or an entry that hole-repair truncated after the frontier overshot it), so an
+                    // absent id is ambiguous on its own:
+                    //   * expected ABOVE the floor → a real gap (unapplied write lag OR a truncated hole). Both
+                    //     are re-shipped by the leader's backfill, so WITHHOLD and let a later drain deliver the
+                    //     id and the tail in order. Delivering past it would skip it permanently.
                     //   * expected AT/BELOW the floor, or the -1/0 pre-restore sentinel (below the first log id):
                     //     the id was compacted by a snapshot or never existed. Not a gap — ACCEPT this entry as
                     //     the next contiguous delivery (the cursor advances to it below).
+                    // With skipGaps (a sole voter proceeding past an unrecoverable gap), every present
+                    // entry is delivered regardless of holes.
                     long floor = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
                     if (lastAppliedIndex + 1 > 0 && lastAppliedIndex + 1 > floor)
-                        return;
+                        return false;
                 }
+
+                // An unresolved entry inside the resolved range: its commit (or rollback) marker has
+                // not landed in the backend yet. Withhold — delivering past it would skip it, and
+                // advancing the cursor over it would mark it applied without delivery. With skipGaps
+                // the marker is unrecoverable (no peer will re-commit it for a sole voter mid-tenure);
+                // the entry stays undelivered but the cursor moves on.
+                if (log.Type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
+                {
+                    if (!skipGaps)
+                        return false;
+
+                    if (log.Id > lastAppliedIndex)
+                        lastAppliedIndex = log.Id;
+                    continue;
+                }
+
                 await ApplyLogToConsumerAsync(log).ConfigureAwait(false);
             }
 
@@ -1184,6 +1255,18 @@ public sealed class RaftPartitionStateMachine
                 break;
             from = next;
         }
+
+        // The loop can exit with the range uncovered (an empty batch: the tail of the range is
+        // absent). A missing tail above the floor is a gap exactly like an interior hole.
+        if (lastAppliedIndex < upToIndex && !skipGaps)
+        {
+            long expected = lastAppliedIndex + 1;
+            long floor = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
+            if (expected > 0 && expected > floor)
+                return false;
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -1256,7 +1339,7 @@ public sealed class RaftPartitionStateMachine
     /// reverts the promotion). Ids at/below the floor were compacted and are accepted, exactly as
     /// in <see cref="DrainCommittedAppliesAsync"/>.</para>
     /// </summary>
-    private async Task<bool> DrainInheritedAppliesAsync(long from, long upToIndex)
+    private async Task<bool> DrainInheritedAppliesAsync(long from, long upToIndex, bool skipGaps = false)
     {
         const int BatchSize = 512;
         long expected = from;
@@ -1272,7 +1355,7 @@ public sealed class RaftPartitionStateMachine
                 if (log.Id > upToIndex)
                     return true;
 
-                if (log.Id > expected)
+                if (log.Id > expected && !skipGaps)
                 {
                     long floor = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
                     if (expected > 0 && expected > floor)
@@ -1327,7 +1410,7 @@ public sealed class RaftPartitionStateMachine
 
         // The loop can also exit without reaching upToIndex (an empty batch: the whole tail of the
         // range is absent). A missing tail above the floor is a hole exactly like an interior gap.
-        if (expected <= upToIndex)
+        if (expected <= upToIndex && !skipGaps)
         {
             long floor = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
             if (expected > 0 && expected > floor)
@@ -3775,12 +3858,56 @@ public sealed class RaftPartitionStateMachine
         long inheritedEnd = completion.MinLogIndex - 1;
         bool inheritedDrainComplete = true;
         if (inheritedEnd >= 0 && inheritedEnd > lastAppliedIndex)
-            inheritedDrainComplete = await DrainInheritedAppliesAsync(lastAppliedIndex + 1, inheritedEnd).ConfigureAwait(false);
+        {
+            // Reads race the WAL write queue on the leader too: with pipelined proposals, an
+            // earlier entry (or its commit marker) can still sit in the write scheduler when this
+            // completion's drain reads the backend, and the absent id is indistinguishable from a
+            // real hole. Retry until the writes land and the drain covers the range, bounded by
+            // the barrier timeout — stepping down on a transient read gap would churn leadership
+            // under ordinary pipelined load. The loop exits as soon as the range is covered, so
+            // the common case adds no latency.
+            // Same bounds as the promotion drain: a sole voter only needs its own write queue to
+            // drain, so its bound is short; with voter peers the full barrier timeout is worth
+            // spending before stepping down.
+            bool drainHasVoterPeers = host.Nodes.Any(n => host.IsVoter(n.Endpoint));
+            TimeSpan inheritedDrainBound = drainHasVoterPeers ? host.Configuration.LeadershipBarrierTimeout : TimeSpan.FromMilliseconds(250);
+            long drainStartTicks = Stopwatch.GetTimestamp();
+
+            while (!(inheritedDrainComplete =
+                       await DrainInheritedAppliesAsync(lastAppliedIndex + 1, inheritedEnd).ConfigureAwait(false)))
+            {
+                if (Stopwatch.GetElapsedTime(drainStartTicks) > inheritedDrainBound)
+                {
+                    // Same sole-voter escape as the promotion drain: with no voter peer to defer
+                    // to, stepping down just re-elects this node into the same gap forever. The
+                    // gap is unrecoverable either way — keep serving and say so loudly.
+                    if (!drainHasVoterPeers)
+                    {
+                        logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Inherited-entry drain incomplete with no voter peers to defer to — proceeding as sole voter; entries in the gap are unrecoverable.",
+                            host.LocalEndpoint, host.PartitionId, nodeState);
+
+                        // Deliver everything this survivor DOES hold past the gap, so only the
+                        // genuinely absent entries are lost rather than the whole suffix.
+                        await DrainInheritedAppliesAsync(lastAppliedIndex + 1, inheritedEnd, skipGaps: true).ConfigureAwait(false);
+                        inheritedDrainComplete = true;
+                    }
+
+                    break;
+                }
+
+                await Task.Delay(2).ConfigureAwait(false);
+            }
+        }
 
         // Apply committed consumer entries to the local state machine. Mirrors the apply loop
-        // in CompleteFollowerAppend so the leader's consumer projection stays in sync.
-        foreach (RaftLog log in proposal.Logs)
-            await ApplyLogToConsumerAsync(log).ConfigureAwait(false);
+        // in CompleteFollowerAppend so the leader's consumer projection stays in sync. When the
+        // inherited drain could not cover its range, delivering this batch would advance the
+        // apply cursor over the withheld entries and orphan them permanently — skip it; this
+        // leader steps down below and the next leader (or a later drain) delivers everything in
+        // order.
+        if (inheritedDrainComplete)
+            foreach (RaftLog log in proposal.Logs)
+                await ApplyLogToConsumerAsync(log).ConfigureAwait(false);
 
         if (logger.IsEnabled(LogLevel.Debug))
             logger.LogDebugCommittedLogs(
@@ -3822,6 +3949,18 @@ public sealed class RaftPartitionStateMachine
                     await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
                 }
             }
+        }
+        else if (!inheritedDrainComplete && nodeState == RaftNodeState.Leader)
+        {
+            // A hole below an ORDINARY commit is equally disqualifying: this leader's consumer
+            // projection cannot cover the committed range and it is never backfilled, so every
+            // grant it serves is minted from incomplete state. Ignoring the incomplete drain here
+            // (while the batch apply advanced the cursor) is what silently orphaned the whole
+            // inherited range. Step down; the entries this commit made durable are quorum-safe and
+            // the next leader delivers them in order.
+            logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Inherited-entry drain incomplete on a leader commit — stepping down.",
+                host.LocalEndpoint, host.PartitionId, nodeState);
+            await RevertUnpublishedPromotionAsync("inherited-entry drain incomplete on a leader commit").ConfigureAwait(false);
         }
 
         CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, completion.MaxLogIndex));

@@ -44,6 +44,9 @@ public class TestHoleyLogElection
             InitialPartitions = 1,
             StartElectionTimeout = 50,
             EndElectionTimeout = 100,
+            // Keep the drain-retry loops short: these tests seed genuine holes, so the loops
+            // always run to their bound before refusing/escaping.
+            LeadershipBarrierTimeout = TimeSpan.FromMilliseconds(300),
         };
 
         public int PartitionId { get; init; } = 1;
@@ -294,7 +297,8 @@ public class TestHoleyLogElection
     /// When the facade does not track presence (the promotion gate cannot fire), the inherited
     /// drain itself must detect the hole: entries above the gap are NOT applied (silently skipping
     /// them was the corruption — they were marked applied forever), and the barrier completion
-    /// reverts the promotion instead of publishing over an incomplete projection.
+    /// reverts the promotion instead of publishing over an incomplete projection — provided a
+    /// voter peer exists that could hold the missing entries.
     /// </summary>
     [Fact]
     public async Task BarrierPromotion_InheritedDrainHole_RevertsInsteadOfPublishing()
@@ -309,13 +313,16 @@ public class TestHoleyLogElection
         CapturingHost host = new();
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
 
-        // Promote: maxLog (3) > commit frontier (0) arms the barrier; leadership is unpublished.
+        // Promote peerless (the single-voter path arms the barrier and self-commits): maxLog (3) >
+        // commit frontier (0) arms the barrier; leadership is unpublished.
         await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
         Assert.NotEqual("node-a", host.Leader);
 
-        // Drive the barrier no-op (id 4) through propose + commit. The inherited drain runs at the
-        // commit completion, hits the hole at 2, and the barrier must revert the promotion.
+        // Drive the barrier no-op (id 4) through propose, then make a voter peer visible before
+        // the commit completes: the hole verdict depends on whether a peer could hold the missing
+        // entries at the moment the drain fails.
         await sm.CompleteWalOperationAsync(ProposeCompletion(host.PartitionId, logIndex: 4));
+        host.Nodes = [new RaftNode("node-b")];
         await sm.CompleteWalOperationAsync(CommitCompletion(host.PartitionId, minLogIndex: 4, maxLogIndex: 4));
 
         // Entry 1 (below the hole) may be applied; entry 3 (above it) must never be — applying it
@@ -325,6 +332,91 @@ public class TestHoleyLogElection
         // The promotion reverted: leadership never published, node back to Follower.
         Assert.NotEqual("node-a", host.Leader);
         Assert.DoesNotContain("LeaderChanged:node-a", host.EventLog);
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+    }
+
+    /// <summary>
+    /// The sole-voter escape: with NO voter peer to defer to (e.g. the last survivor of graceful
+    /// leaves), refusing to serve over a hole would leave the partition permanently leaderless —
+    /// the departed quorum took the missing entries with it. After the bounded drain retry the
+    /// node publishes anyway, delivering every entry it DOES hold past the gap, so only the
+    /// genuinely absent entries are lost rather than the whole suffix.
+    /// </summary>
+    [Fact]
+    public async Task BarrierPromotion_InheritedDrainHole_SoleVoterServesAfterBoundedWait()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 3, CommitIndexValue = 0 };   // PresentId = -1: untracked
+        wal.Entries.AddRange(
+        [
+            new RaftLog { Id = 1, Term = 0, Type = RaftLogType.Proposed, LogType = "t" },
+            new RaftLog { Id = 3, Term = 0, Type = RaftLogType.Proposed, LogType = "t" },   // hole at 2
+        ]);
+        wal.SeedNextId(4);
+        CapturingHost host = new();   // Nodes stays empty: sole voter throughout
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        await sm.CompleteWalOperationAsync(ProposeCompletion(host.PartitionId, logIndex: 4));
+        await sm.CompleteWalOperationAsync(CommitCompletion(host.PartitionId, minLogIndex: 4, maxLogIndex: 4));
+
+        // Both present inherited entries were delivered — the skip-gaps drain covers the suffix
+        // past the unrecoverable hole at 2.
+        Assert.Contains("Applied:1", host.EventLog);
+        Assert.Contains("Applied:3", host.EventLog);
+
+        // And leadership published: availability wins when no peer can have the missing entries.
+        Assert.Equal("node-a", host.Leader);
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        Assert.Contains("LeaderChanged:node-a", host.EventLog);
+    }
+
+    /// <summary>
+    /// A hole below an ORDINARY leader commit (not the promotion barrier) must also disqualify
+    /// the leader: previously the incomplete inherited drain was ignored while the commit's own
+    /// batch apply advanced the cursor over the withheld range, permanently orphaning it — the
+    /// leader kept serving grants minted from a projection missing an arbitrary committed range.
+    /// Now the batch is not delivered over the hole and the leader steps down.
+    /// </summary>
+    [Fact]
+    public async Task OrdinaryCommit_InheritedDrainHole_StepsDownWithoutDeliveringBatch()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 0, CommitIndexValue = 0 };   // PresentId = -1: untracked
+        wal.SeedNextId(1);
+        CapturingHost host = new();
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        // Promote over an empty WAL: no inherited tail, publishes immediately.
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        Assert.Equal("node-a", host.Leader);
+
+        // Manufacture the post-promotion hole: prior-term entries 1 and 3 land in the WAL (id 2
+        // missing — the unanchored broadcast shape), then the leader proposes and commits its own
+        // entry at id 4. The commit's inherited drain must hit the hole at 2.
+        wal.Entries.AddRange(
+        [
+            new RaftLog { Id = 1, Term = 0, Type = RaftLogType.Proposed, LogType = "t" },
+            new RaftLog { Id = 3, Term = 0, Type = RaftLogType.Proposed, LogType = "t" },
+        ]);
+        wal.SeedNextId(4);
+
+        (RaftOperationStatus status, _) = sm.ReplicateLogs(
+            [new RaftLog { LogType = "t", LogData = [1] }], autoCommit: true);
+        Assert.Equal(RaftOperationStatus.Pending, status);
+
+        await sm.CompleteWalOperationAsync(ProposeCompletion(host.PartitionId, logIndex: 4));
+
+        // Make a voter peer visible before the commit completes: the hole verdict depends on
+        // whether a peer could hold the missing entries at the moment the drain fails.
+        host.Nodes = [new RaftNode("node-b")];
+        await sm.CompleteWalOperationAsync(CommitCompletion(host.PartitionId, minLogIndex: 4, maxLogIndex: 4));
+
+        // Entry 3 (above the hole) and the committed batch (id 4) must not have been delivered —
+        // delivering id 4 would advance the apply cursor over the withheld range.
+        Assert.DoesNotContain("Applied:3", host.EventLog);
+        Assert.DoesNotContain("Applied:4", host.EventLog);
+
+        // The leader stepped down instead of continuing to serve from an incomplete projection.
+        Assert.NotEqual("node-a", host.Leader);
         Assert.Equal(RaftNodeState.Follower, sm.NodeState);
     }
 }
