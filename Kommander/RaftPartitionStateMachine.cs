@@ -1019,6 +1019,23 @@ public sealed class RaftPartitionStateMachine
             throw;
         }
 
+        // Completeness gate: a WAL hole below maxLog means this node is missing entries that may be
+        // committed elsewhere (the lone-high-entry-over-a-gap shape the unanchored live-propose
+        // broadcast can leave). Serving as leader would fix an incomplete consumer projection for
+        // the whole tenure — a leader is never backfilled, and neither drain can deliver entries it
+        // does not have. Revert so a node with a contiguous log wins the next term; the gap-aware
+        // election freshness normally prevents this node from winning at all, so this gate is the
+        // defense-in-depth backstop (e.g. a hole opened by an append that raced the election).
+        long presentId = wal.GetPresentIndex();
+        if (presentId >= 0 && presentId < maxLog)
+        {
+            logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Promotion refused: WAL has a hole below the max id (contiguous through {PresentId}, max {MaxLog}) — reverting to Follower.",
+                host.LocalEndpoint, host.PartitionId, nodeState, presentId, maxLog);
+            nodeState = RaftNodeState.Follower;
+            localCommittedIndex = -1;
+            throw new RaftException($"Promotion refused: WAL hole below max id (contiguous through {presentId}, max {maxLog})");
+        }
+
         if (maxLog <= commitFrontier)
         {
             // No inherited tail: the drain above already proved the consumer projection complete.
@@ -1230,10 +1247,19 @@ public sealed class RaftPartitionStateMachine
     /// <para>Reads the WAL via <see cref="IRaftWalFacade.GetRangeAllTypesAsync"/> so that
     /// Proposed entries (whose lazy-commit markers may be absent after a crash on the
     /// single-fsync fast path) are visible.</para>
+    ///
+    /// <para><b>Gap contract:</b> returns <see langword="false"/> when an id in the range is absent
+    /// above the snapshot floor — a WAL hole. Advancing over it (the old behavior) would silently
+    /// skip entries that may be committed elsewhere and mark them applied forever, leaving the
+    /// consumer projection permanently incomplete on this node. The caller must not treat a
+    /// <see langword="false"/> drain as proof of projection completeness (the barrier completion
+    /// reverts the promotion). Ids at/below the floor were compacted and are accepted, exactly as
+    /// in <see cref="DrainCommittedAppliesAsync"/>.</para>
     /// </summary>
-    private async Task DrainInheritedAppliesAsync(long from, long upToIndex)
+    private async Task<bool> DrainInheritedAppliesAsync(long from, long upToIndex)
     {
         const int BatchSize = 512;
+        long expected = from;
 
         while (from <= upToIndex)
         {
@@ -1244,7 +1270,20 @@ public sealed class RaftPartitionStateMachine
             foreach (RaftLog log in batch)
             {
                 if (log.Id > upToIndex)
-                    return;
+                    return true;
+
+                if (log.Id > expected)
+                {
+                    long floor = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
+                    if (expected > 0 && expected > floor)
+                    {
+                        logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Inherited-entry drain found a WAL hole: expected {Expected}, next present {Present} (floor {Floor}).",
+                            host.LocalEndpoint, host.PartitionId, nodeState, expected, log.Id, floor);
+                        return false;
+                    }
+                    // Compacted below the floor: accept this entry as the next contiguous delivery.
+                }
+                expected = log.Id + 1;
 
                 // Apply committed entries and inherited Proposed entries (prior term only).
                 // Skip current-term Proposed entries — they are in-flight proposals.
@@ -1286,7 +1325,21 @@ public sealed class RaftPartitionStateMachine
             from = next;
         }
 
+        // The loop can also exit without reaching upToIndex (an empty batch: the whole tail of the
+        // range is absent). A missing tail above the floor is a hole exactly like an interior gap.
+        if (expected <= upToIndex)
+        {
+            long floor = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
+            if (expected > 0 && expected > floor)
+            {
+                logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Inherited-entry drain missing the range tail: expected through {UpToIndex}, present through {Expected} (floor {Floor}).",
+                    host.LocalEndpoint, host.PartitionId, nodeState, upToIndex, expected - 1, floor);
+                return false;
+            }
+        }
+
         CompleteReadIndexApplyWaiters();
+        return true;
     }
 
     /// <summary>
@@ -1493,6 +1546,28 @@ public sealed class RaftPartitionStateMachine
             return remoteLastLogTerm < localLastLogTerm;
 
         return remoteMaxLogId < localMaxId;
+    }
+
+    /// <summary>
+    /// The (index, term) log position this node advertises — and compares against — for Raft §5.4.1
+    /// election freshness. Uses the WAL's contiguous-presence frontier, NOT the raw max id: the
+    /// unanchored live-propose broadcast can write a lone high entry over a gap on a behind
+    /// follower, and a raw-max comparison would let that node win an election while missing an
+    /// arbitrary committed range — it would then serve as leader with an incomplete consumer
+    /// projection (the §5.4.1 proof assumes contiguous logs). Falls back to the raw max id and
+    /// last-entry term when the facade does not track presence (test stubs), preserving the legacy
+    /// ordering there.
+    /// </summary>
+    private async ValueTask<(long MaxLogId, long LastLogTerm)> GetFreshnessLogPositionAsync()
+    {
+        long presentId = wal.GetPresentIndex();
+        if (presentId >= 0)
+            return (presentId, wal.GetPresentTerm());
+
+        return (
+            await wal.GetMaxLogAsync().ConfigureAwait(false),
+            await wal.GetCurrentTermAsync().ConfigureAwait(false)
+        );
     }
 
     /// <summary>
@@ -1714,8 +1789,7 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
-        long currentMaxLog = await wal.GetMaxLogAsync().ConfigureAwait(false);
-        long currentLastLogTerm = await wal.GetCurrentTermAsync().ConfigureAwait(false);
+        (long currentMaxLog, long currentLastLogTerm) = await GetFreshnessLogPositionAsync().ConfigureAwait(false);
 
         RequestVotesRequest request = new(host.PartitionId, term, currentMaxLog, currentLastLogTerm, timestamp, host.LocalEndpoint, preVote);
 
@@ -2112,8 +2186,7 @@ public sealed class RaftPartitionStateMachine
                 return;
             }
 
-            long preVoteLocalMaxId = await wal.GetMaxLogAsync().ConfigureAwait(false);
-            long preVoteLocalLastTerm = await wal.GetCurrentTermAsync().ConfigureAwait(false);
+            (long preVoteLocalMaxId, long preVoteLocalLastTerm) = await GetFreshnessLogPositionAsync().ConfigureAwait(false);
 
             // The candidate's log must be at least as up-to-date, compared lexicographically by
             // (lastLogTerm, lastLogIndex) per Raft §5.4.1 — NOT index alone, which would let a higher
@@ -2201,8 +2274,7 @@ public sealed class RaftPartitionStateMachine
             return;
         }
         
-        long localMaxId = await wal.GetMaxLogAsync().ConfigureAwait(false);
-        long localLastLogTerm = await wal.GetCurrentTermAsync().ConfigureAwait(false);
+        (long localMaxId, long localLastLogTerm) = await GetFreshnessLogPositionAsync().ConfigureAwait(false);
 
         if (CandidateLogIsBehind(remoteLastLogTerm, remoteMaxLogId, localLastLogTerm, localMaxId))
         {
@@ -2317,7 +2389,10 @@ public sealed class RaftPartitionStateMachine
             return;
         }
         
-        long maxLogResponse = await wal.GetMaxLogAsync().ConfigureAwait(false);
+        // Compare like against like: the granting voter now reports its contiguous-presence
+        // position, so the local side of this guard must use the same metric — a raw max id here
+        // could mask a hole in our own log and accept leadership we should not claim.
+        (long maxLogResponse, _) = await GetFreshnessLogPositionAsync().ConfigureAwait(false);
 
         if (maxLogResponse < remoteMaxLogId)
         {
@@ -3698,8 +3773,9 @@ public sealed class RaftPartitionStateMachine
         // They have no local proposal waiter and were never delivered via CompleteFollowerAppend,
         // so the leader's consumer would silently miss them without this drain.
         long inheritedEnd = completion.MinLogIndex - 1;
+        bool inheritedDrainComplete = true;
         if (inheritedEnd >= 0 && inheritedEnd > lastAppliedIndex)
-            await DrainInheritedAppliesAsync(lastAppliedIndex + 1, inheritedEnd).ConfigureAwait(false);
+            inheritedDrainComplete = await DrainInheritedAppliesAsync(lastAppliedIndex + 1, inheritedEnd).ConfigureAwait(false);
 
         // Apply committed consumer entries to the local state machine. Mirrors the apply loop
         // in CompleteFollowerAppend so the leader's consumer projection stays in sync.
@@ -3721,20 +3797,30 @@ public sealed class RaftPartitionStateMachine
         // Promotion barrier: this commit's inherited drain (above) has applied every prior-term
         // entry below the barrier no-op, so the consumer projection is now provably complete —
         // publish leadership. Fenced on state and term so a stale barrier completion from a
-        // superseded promotion can never publish.
+        // superseded promotion can never publish. An incomplete inherited drain (a WAL hole in the
+        // inherited range) disproves projection completeness: publishing anyway would serve an
+        // arbitrary missing committed range for the whole tenure (a leader is never backfilled),
+        // so revert and let a node with a contiguous log win the next term.
         if (leadershipBarrierTicket != HLCTimestamp.Zero && ticketId == leadershipBarrierTicket)
         {
             leadershipBarrierTicket = HLCTimestamp.Zero;
 
             if (nodeState == RaftNodeState.Leader && currentTerm == leadershipBarrierTerm)
             {
-                host.Leader = host.LocalEndpoint;
+                if (!inheritedDrainComplete)
+                {
+                    await RevertUnpublishedPromotionAsync("inherited-entry drain found a WAL hole").ConfigureAwait(false);
+                }
+                else
+                {
+                    host.Leader = host.LocalEndpoint;
 
-                if (logger.IsEnabled(LogLevel.Information))
-                    logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Promotion barrier committed at {Ticket}; leadership published",
-                        host.LocalEndpoint, host.PartitionId, nodeState, ticketId);
+                    if (logger.IsEnabled(LogLevel.Information))
+                        logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Promotion barrier committed at {Ticket}; leadership published",
+                            host.LocalEndpoint, host.PartitionId, nodeState, ticketId);
 
-                await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
+                    await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
+                }
             }
         }
 
@@ -4366,7 +4452,7 @@ public sealed class RaftPartitionStateMachine
             {
                 if (snapshotIndex > lastAppliedIndex)
                     lastAppliedIndex = snapshotIndex;
-                wal.SeedCommitFrontierFromSnapshot(snapshotIndex);
+                wal.SeedCommitFrontierFromSnapshot(snapshotIndex, Math.Max(boundaryTermAtIndex, 0));
                 return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Success, snapshotIndex);
             }
         }
@@ -4501,7 +4587,7 @@ public sealed class RaftPartitionStateMachine
         // as committed (otherwise post-snapshot consumer delivery and backfill reporting stall below it).
         if (snapshotIndex > lastAppliedIndex)
             lastAppliedIndex = snapshotIndex;
-        wal.SeedCommitFrontierFromSnapshot(snapshotIndex);
+        wal.SeedCommitFrontierFromSnapshot(snapshotIndex, Math.Max(boundaryTerm, 0));
 
         if (logger.IsEnabled(LogLevel.Information))
             logger.LogInfoReceiveInstallSnapshot(host.LocalEndpoint, host.PartitionId, snapshotIndex);

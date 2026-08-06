@@ -64,6 +64,26 @@ public sealed class RaftWriteAhead
     // only after the WAL enqueue succeeds, so a backpressure rejection needs no frontier rollback.
     private readonly List<long> resolvedThisBatch = [];
 
+    // ── Contiguous-presence frontier ─────────────────────────────────────────────────────────────
+    // The next slot after the largest id L such that every id through L is durably present in the
+    // WAL (any entry type — Proposed, Committed, RolledBack, checkpoints). Unlike the raw max id
+    // (Keys.Max), this can never overshoot a hole: the unanchored live-propose broadcast can write
+    // a lone high entry over a gap on a behind follower, and the raw max would then advertise log
+    // freshness this node does not have. Election freshness (Raft §5.4.1) assumes the candidate's
+    // index describes a contiguous log — comparing raw max ids lets a node with holes win an
+    // election while missing committed entries, and then serve with an incomplete consumer
+    // projection. Advanced on the partition's serialized executor path, like commitIndex.
+    private long presentIndex = 1;
+
+    /// <summary>Term of the entry at the presence frontier (<see cref="presentIndex"/> − 1), so a
+    /// candidate advertises a (term, index) pair that describes the same log position. 0 when the
+    /// frontier has no entry (empty log).</summary>
+    private long presentTerm;
+
+    // Out-of-order present ids (with their terms) buffered until the gap below them fills — the
+    // presence analog of pendingResolved.
+    private readonly SortedDictionary<long, long> pendingPresent = new();
+
     private int operations;
 
     private long walOperationSequence;
@@ -242,6 +262,8 @@ public sealed class RaftWriteAhead
         long maxLogId = 0;              // highest durable id (any type) — the propose cursor floor
         long lastResolvedCommitted = 0; // id of the last Committed/CommittedCheckpoint seen (legacy path)
         long contiguousCommitted = 0;   // highest id of an unbroken committed prefix (fast path)
+        long contiguousPresent = 0;     // highest id of an unbroken present prefix (any type)
+        long contiguousPresentTerm = 0; // term of the entry at contiguousPresent
         bool any = false;
 
         foreach (RaftLog log in logs)
@@ -249,6 +271,18 @@ public sealed class RaftWriteAhead
             any = true;
             if (log.Id > maxLogId)
                 maxLogId = log.Id;
+
+            // A checkpoint certifies its whole prefix (it is the durable recovery anchor), so it
+            // may jump the presence frontier; every other type only extends an unbroken run — a
+            // missing id (e.g. a hole left by an out-of-order append) stops it, exactly like the
+            // committed frontier below.
+            if (log.Type == RaftLogType.CommittedCheckpoint
+                ? log.Id > contiguousPresent
+                : log.Id == contiguousPresent + 1)
+            {
+                contiguousPresent = log.Id;
+                contiguousPresentTerm = log.Term;
+            }
 
             switch (log.Type)
             {
@@ -303,6 +337,12 @@ public sealed class RaftWriteAhead
             commitIndex = any ? lastResolvedCommitted + 1 : await GetMaxLog().ConfigureAwait(false) + 1;
             proposeIndex = any ? lastResolvedCommitted + 1 : commitIndex;
         }
+
+        // Presence frontier: the last id of the unbroken durable prefix (any type), independent of
+        // the commit-marker reconstruction above. With no entries, mirror the commit frontier (a
+        // term of 0 makes the freshness comparison fall back to index-only, the legacy ordering).
+        presentIndex = any ? contiguousPresent + 1 : commitIndex;
+        presentTerm = any ? contiguousPresentTerm : 0;
 
         // ── Replay the committed prefix to the application ─────────────────────────────────
         // Apply only committed data entries strictly below the reconstructed frontier. Checkpoints carry
@@ -485,6 +525,12 @@ public sealed class RaftWriteAhead
                 }
                 throw;
             }
+
+            // Enqueue succeeded: the proposed entries are on their way to durable storage, so the
+            // presence frontier advances over them. A leader writes sequential ids, but a node
+            // that recently followed can still carry a hole below — the frontier buffers over it.
+            for (int i = 0; i < count; i++)
+                AdvancePresenceFrontier(ordered[i].Id, ordered[i].Term);
 
             // Count the durable phase from the producer side (inert unless instrumentation
             // is enabled): one LeaderPropose enqueue per single-round committed write.
@@ -828,6 +874,52 @@ public sealed class RaftWriteAhead
     }
 
     /// <summary>
+    /// Returns the highest log id known to be durably present with no holes below it (any entry
+    /// type). This is the log position a node may advertise for election freshness: unlike
+    /// <see cref="GetMaxLog"/>, it can never overshoot a gap left by an out-of-order append, so a
+    /// node missing a committed range cannot look fresher than a node that actually holds it.
+    /// Synchronous: reads an in-memory counter, no WAL/scheduler round-trip.
+    /// </summary>
+    public long GetPresentIndex() => presentIndex - 1;
+
+    /// <summary>
+    /// Returns the term of the log entry at <see cref="GetPresentIndex"/> — the pair a candidate
+    /// or voter uses for the Raft §5.4.1 comparison. 0 when the log is empty at the frontier.
+    /// </summary>
+    public long GetPresentTerm() => presentTerm;
+
+    /// <summary>
+    /// Advances the contiguous presence frontier to absorb a durably written entry (any type).
+    /// The presence analog of <see cref="AdvanceCommitFrontier"/>: an id below the frontier is a
+    /// duplicate re-ship (ignored), an id above it sits over an unfilled gap and is buffered with
+    /// its term until the gap closes, and an id that fills the next slot advances the frontier and
+    /// drains any buffered successors that have become contiguous.
+    /// </summary>
+    private void AdvancePresenceFrontier(long id, long term)
+    {
+        if (id < presentIndex)
+        {
+            // The legacy (two-fsync) recovery path discards the proposed tail and lets a later
+            // propose reuse its ids. An overwrite of the frontier entry itself must refresh the
+            // advertised term so the (term, index) freshness pair keeps describing the real entry.
+            if (id == presentIndex - 1)
+                presentTerm = term;
+            return;
+        }
+
+        if (id > presentIndex)
+        {
+            pendingPresent[id] = term;
+            return;
+        }
+
+        presentIndex = id + 1;
+        presentTerm = term;
+
+        DrainPendingPresent();
+    }
+
+    /// <summary>
     /// Seeds the in-memory commit/propose frontier to a freshly installed snapshot boundary at
     /// <paramref name="snapshotIndex"/>. A snapshot means every id through the boundary is durably committed
     /// (the prefix is compacted away), so the frontier — which a fresh or lagging follower otherwise leaves at
@@ -837,13 +929,22 @@ public sealed class RaftWriteAhead
     /// Any over-gap ids buffered in <c>pendingResolved</c> that the boundary now covers are drained. Runs on the
     /// partition executor, the single writer of these fields.
     /// </summary>
-    public void SeedCommitFrontierFromSnapshot(long snapshotIndex)
+    public void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0)
     {
         long target = snapshotIndex + 1;
         if (target > commitIndex)
             commitIndex = target;
         if (target > proposeIndex)
             proposeIndex = target;
+
+        // The snapshot boundary certifies its whole prefix, so the presence frontier jumps too —
+        // otherwise a snapshot-installed follower would advertise a stale (pre-snapshot) log
+        // position for election freshness and could never be elected despite being caught up.
+        if (target > presentIndex)
+        {
+            presentIndex = target;
+            presentTerm = snapshotTerm;
+        }
 
         // Drop buffered resolved ids now covered by the boundary, then absorb any that have become contiguous.
         while (pendingResolved.Count > 0 && pendingResolved.Min < commitIndex)
@@ -853,6 +954,39 @@ public sealed class RaftWriteAhead
             long next = pendingResolved.Min;
             pendingResolved.Remove(next);
             commitIndex = next + 1;
+        }
+
+        DrainPendingPresent();
+    }
+
+    /// <summary>
+    /// Drops buffered present ids already covered by the frontier, then absorbs any that have
+    /// become contiguous. Shared by the snapshot seed and (indirectly) the frontier advance.
+    /// </summary>
+    private void DrainPendingPresent()
+    {
+        while (pendingPresent.Count > 0)
+        {
+            long next = -1;
+            long nextTerm = 0;
+            foreach (KeyValuePair<long, long> kv in pendingPresent)
+            {
+                next = kv.Key;
+                nextTerm = kv.Value;
+                break;                          // SortedDictionary: first key is the minimum
+            }
+
+            if (next < presentIndex)
+            {
+                pendingPresent.Remove(next);
+                continue;
+            }
+            if (next > presentIndex)
+                break;
+
+            pendingPresent.Remove(next);
+            presentIndex = next + 1;
+            presentTerm = nextTerm;
         }
     }
 
@@ -885,6 +1019,28 @@ public sealed class RaftWriteAhead
         // FollowerAppend is touching pendingResolved.
         while (pendingResolved.Count > 0 && pendingResolved.Max > afterLogId)
             pendingResolved.Remove(pendingResolved.Max);
+
+        // Same for the presence frontier: clamp it to the truncation boundary and drop buffered
+        // ids above it. The term at the new frontier is re-read from the surviving entry so the
+        // advertised (term, index) pair stays consistent — truncation is a rare repair path, so
+        // the extra read is not a hot-path cost.
+        while (pendingPresent.Count > 0)
+        {
+            long maxPending = -1;
+            foreach (KeyValuePair<long, long> kv in pendingPresent)
+                maxPending = kv.Key;            // SortedDictionary: last key is the maximum
+            if (maxPending <= afterLogId)
+                break;
+            pendingPresent.Remove(maxPending);
+        }
+
+        if (presentIndex > afterLogId + 1)
+        {
+            presentIndex = Math.Max(afterLogId, 0) + 1;
+            presentTerm = afterLogId > 0 ? await GetAnyTermAtAsync(afterLogId).ConfigureAwait(false) : 0;
+            if (presentTerm < 0)
+                presentTerm = 0;                // boundary entry compacted/absent: legacy index-only ordering
+        }
 
         return maxLogId;
     }
@@ -1168,6 +1324,12 @@ public sealed class RaftWriteAhead
         // any id that sits above an unfilled gap so the frontier never overshoots a hole.
         foreach (long id in resolvedThisBatch)
             AdvanceCommitFrontier(id);
+
+        // Every written entry (any type) is now durably present; the presence frontier likewise
+        // buffers over any gap, so a lone high entry from the unanchored live-propose broadcast
+        // never inflates this node's advertised log freshness.
+        foreach (RaftLog log in logsToWrite)
+            AdvancePresenceFrontier(log.Id, log.Term);
 
         // Follower-side durable phase. Followers fsync on the propose quorum's critical
         // path, so this phase's latency is measured symmetrically with the leader's.

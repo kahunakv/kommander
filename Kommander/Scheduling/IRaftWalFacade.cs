@@ -85,13 +85,31 @@ public interface IRaftWalFacade
     long GetCommitIndex();
 
     /// <summary>
+    /// Highest log id durably present with <b>no holes below it</b> (any entry type), or -1 when the
+    /// facade does not track presence (test stubs). Unlike <see cref="GetMaxLogAsync"/>, this can
+    /// never overshoot a gap left by an out-of-order append (the unanchored live-propose broadcast
+    /// can write a lone high entry over a hole on a behind follower), so it is the log position a
+    /// node must use for Raft §5.4.1 election freshness — comparing raw max ids would let a node
+    /// with holes win an election while missing committed entries. Synchronous in-memory read.
+    /// </summary>
+    long GetPresentIndex() => -1;
+
+    /// <summary>
+    /// Term of the entry at <see cref="GetPresentIndex"/> (the §5.4.1 pair must describe the same
+    /// log position), or -1 when the facade does not track presence.
+    /// </summary>
+    long GetPresentTerm() => -1;
+
+    /// <summary>
     /// Seeds the in-memory commit/propose frontier to a freshly installed snapshot boundary so
     /// <see cref="GetCommitIndex"/> reflects the compacted prefix as committed rather than an unfilled gap.
+    /// <paramref name="snapshotTerm"/> carries the boundary's last-included term so the presence
+    /// frontier's advertised (term, index) pair stays consistent after the jump.
     /// Must be called on the partition executor after the snapshot's WAL boundary is durable.
     /// <para>Default no-op: the production <c>RaftWriteAhead</c> facade overrides this; test stubs that never
     /// install snapshots inherit the no-op.</para>
     /// </summary>
-    void SeedCommitFrontierFromSnapshot(long snapshotIndex) { }
+    void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0) { }
 
     /// <summary>
     /// Removes every log entry with id &gt; <paramref name="afterLogId"/> and returns the
