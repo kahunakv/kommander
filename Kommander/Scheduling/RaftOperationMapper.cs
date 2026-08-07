@@ -63,6 +63,10 @@ public static class RaftOperationMapper
             // Client applies the same admission control as proposals (queue-full / restore-gate
             // rejections surface as a failed confirmation, which callers treat as retry).
             RaftRequestType.ConfirmLeadership         => RaftOperationKind.Client,
+            // Same rationale as ConfirmLeadership: the local applied-frontier wait is issued on
+            // behalf of an external caller, and the restore gate's RestoreInProgress rejection is
+            // exactly the "restore in progress → false" contract of ConfirmLocalApplicationAsync.
+            RaftRequestType.WaitLocalApplication      => RaftOperationKind.Client,
             RaftRequestType.DrainBarrier              => RaftOperationKind.Maintenance,
             RaftRequestType.RestoreLogsLoaded         => RaftOperationKind.Maintenance,
             RaftRequestType.SnapshotInstalled         => RaftOperationKind.Maintenance,
@@ -162,7 +166,8 @@ public static class RaftOperationMapper
             RaftRequestType.RollbackLogs or
             RaftRequestType.InstallSnapshot or
             RaftRequestType.WriteOperationCompleted or
-            RaftRequestType.ConfirmLeadership => RaftStatePriority.Mid,
+            RaftRequestType.ConfirmLeadership or
+            RaftRequestType.WaitLocalApplication => RaftStatePriority.Mid,
 
             _ => throw new ArgumentOutOfRangeException(nameof(requestType), requestType, "Unrecognised RaftRequestType"),
         };

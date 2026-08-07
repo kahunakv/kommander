@@ -464,7 +464,7 @@ public sealed class TestReplicaPlacement
                 ReplicationFactorValue = 5,
                 Completion = tcs
             });
-            (RaftOperationStatus status, long generation) = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            (RaftOperationStatus status, long generation) = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
             Assert.Equal(RaftOperationStatus.Success, status);
             Assert.Equal(9, generation); // routing unchanged — fence deliberately not invalidated

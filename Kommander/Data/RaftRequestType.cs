@@ -106,4 +106,16 @@ public enum RaftRequestType
     /// Concurrent requests coalesce into a single in-flight ack round.
     /// </summary>
     ConfirmLeadership,
+
+    /// <summary>
+    /// Follower half of the non-leader read-index primitive
+    /// (<c>IRaft.ConfirmLocalApplicationAsync</c>): waits until this node's applied frontier
+    /// covers the leader-confirmed commit index carried on <see cref="RaftRequest.CommitIndex"/>.
+    /// The safety proof lives on the leader side (the quorum ack round that produced the index) —
+    /// this operation only supplies the bounded local wait, so it is valid in any node state.
+    /// Replies non-success on expiry (<c>RaftConfiguration.LeadershipConfirmationTimeout</c>) or
+    /// when a leadership transition fails all read-index waiters — callers must treat that as
+    /// "not confirmed" and skip their destructive action.
+    /// </summary>
+    WaitLocalApplication,
 }

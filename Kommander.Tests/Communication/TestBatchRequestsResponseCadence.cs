@@ -128,6 +128,7 @@ public sealed class TestBatchRequestsResponseCadence
         public void CompleteAppendLogs(CompleteAppendLogsRequest request) => CompleteAppendLogsCount++;
 
         public ValueTask<bool> ConfirmLeadershipAsync(int partitionId, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public ValueTask<bool> ConfirmLocalApplicationAsync(int partitionId, CancellationToken cancellationToken = default) => throw new NotImplementedException();
         public bool Joined => throw new NotImplementedException();
         public IWAL WalAdapter => throw new NotImplementedException();
         public ICommunication Communication => throw new NotImplementedException();

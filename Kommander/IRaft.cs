@@ -442,6 +442,31 @@ public interface IRaft
     public ValueTask<bool> ConfirmLeadershipAsync(int partitionId, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Follower catch-up confirmation: proves this node's <b>applied</b> state for the partition
+    /// covers everything committed cluster-wide before the call began, whether or not this node
+    /// is the leader. Returns <see langword="true"/> only when a leader-confirmed commit index —
+    /// captured by a same-term quorum ack round started after this call — has been applied to
+    /// this node's state machines (Raft dissertation §6.4, the follower read).
+    /// <para><see cref="ConfirmLeadershipAsync"/> answers this question for the leader only.
+    /// Consumers that act <i>destructively</i> on locally-applied replicated state from a
+    /// non-leader (e.g. pruning local disk based on a replicated registry) must gate on this
+    /// instead: a lagging replica sees a stale projection, and forwarding node-local maintenance
+    /// to the leader is not an option. On the leader this call degenerates to
+    /// <see cref="ConfirmLeadershipAsync"/>.</para>
+    /// <para>Every non-success outcome — no leader known, quorum round failed on the leader,
+    /// transport error, restore in progress, applied-frontier wait timeout
+    /// (<see cref="RaftConfiguration.LeadershipConfirmationTimeout"/>) — returns
+    /// <see langword="false"/>: the caller must skip or defer its destructive action (fail
+    /// closed). No retries happen inside the primitive; the caller owns retry cadence.</para>
+    /// <para>Freshness contract: entries committed <i>after</i> the call began may or may not be
+    /// visible — identical to a leader-side confirmed read.</para>
+    /// </summary>
+    /// <param name="partitionId"></param>
+    /// <param name="cancellationToken"></param>
+    /// <returns></returns>
+    public ValueTask<bool> ConfirmLocalApplicationAsync(int partitionId, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Waits for the local node to check/become the leader in the given partition
     /// </summary>
     /// <param name="partitionId"></param>

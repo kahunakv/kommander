@@ -770,6 +770,41 @@ public class GrpcCommunication : ICommunication
         }
     }
 
+    /// <summary>
+    /// Fetches a quorum-confirmed read index from <paramref name="node"/> (believed partition
+    /// leader) via the <c>GetReadIndex</c> gRPC RPC on behalf of a non-leader running
+    /// <c>ConfirmLocalApplicationAsync</c>. Every transport failure maps to a failed response —
+    /// the caller must fail closed, so no error may surface as an exception here.
+    /// </summary>
+    public async Task<GetReadIndexResponse> GetReadIndex(
+        RaftManager manager, RaftNode node, GetReadIndexRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
+
+        GrpcGetReadIndexRequest grpcRequest = new()
+        {
+            PartitionId = request.PartitionId
+        };
+
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/GetReadIndex");
+        try
+        {
+            GrpcGetReadIndexResponse response = await client
+                .GetReadIndexAsync(grpcRequest, new CallOptions(metadata, cancellationToken: cancellationToken))
+                .ResponseAsync
+                .ConfigureAwait(false);
+
+            return new GetReadIndexResponse(response.Success, response.ReadIndex);
+        }
+        catch (Exception ex)
+        {
+            manager.Logger.LogWarning("GetReadIndex from {Endpoint} partition {PartitionId}: {Message}",
+                node.Endpoint, request.PartitionId, ex.Message);
+            return new GetReadIndexResponse(false);
+        }
+    }
+
     public async Task<SnapshotResponse> SendInstallSnapshot(
         RaftManager manager, RaftNode node, SnapshotRequest request,
         CancellationToken cancellationToken = default)

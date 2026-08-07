@@ -277,7 +277,10 @@ public sealed class TestEvictionRejoin
                     n3.GossipAsync(ct).GetAwaiter().GetResult();
                     return n1.GetMembership().Members.Any(m => m.Endpoint == ep3);
                 },
-                ct, timeoutMs: 20_000);
+                // 30 s: the auto-rejoin driver runs on background timers whose cadence stretches
+                // under the residual load of the class's two ~30 s quiesced-restart tests; 20 s
+                // was observed to flake when this test ran right after them.
+                ct, timeoutMs: 30_000);
 
             Assert.True(n1.GetMembership().MembershipVersion > evictedVersion,
                 "re-admission must commit a new roster version");
@@ -286,7 +289,7 @@ public sealed class TestEvictionRejoin
             // promotion, Voter).
             await WaitForCondition(
                 () => n3.LocalRole != ClusterMemberRole.NotMember,
-                ct, timeoutMs: 20_000);
+                ct, timeoutMs: 30_000);
 
             Assert.Contains(n3.GetMembership().Members, m => m.Endpoint == ep3);
         }
@@ -640,6 +643,106 @@ public sealed class TestEvictionRejoin
             // The restarted member must re-learn partition 1's leader and reach its frontier —
             // judged from its OWN view. Without the deny-path wake the quiesced leader never
             // heartbeats it and this times out with the node stuck in pre-vote rounds.
+            await WaitForCondition(
+                () =>
+                {
+                    RaftPartitionView? v = toJoin.GetPartitionViewAsync(1, ct).GetAwaiter().GetResult();
+                    return v is not null && v.CommitIndex >= leaderCommitted && !string.IsNullOrEmpty(v.Leader);
+                },
+                ct, timeoutMs: 30_000);
+
+            try { await joinTask.WaitAsync(TimeSpan.FromSeconds(30), ct); } catch (TimeoutException) { /* convergence verified above */ }
+        }
+        finally
+        {
+            n1.Dispose(); n2.Dispose(); n3.Dispose(); restarted?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The self-leader variant of the quiesced restart: the node that restarts IS the partition's
+    /// quiesced leader. Its leadership state dies with the process, but the survivors' quiesced
+    /// pre-vote gate defers to SWIM — and the restarted process is Alive as a node — so without
+    /// the candidate-is-expected-leader exemption in VoteAsync both survivors deny the ex-leader
+    /// its own vacated leadership forever, their own election trigger stays calm for the same
+    /// reason, and the partition wedges leaderless with nobody heartbeating the restarted node
+    /// (the GA-only failure mode of the sibling test above: leadership migrated onto the
+    /// restarting node during the idle window before quiescence). With the exemption the
+    /// ex-leader's pre-vote reaches quorum and a normal election re-establishes a leader.
+    /// Asserted from the restarted node's own partition view.
+    /// </summary>
+    [Fact]
+    public async Task QuiescedLeader_LeaderItselfRestarts_LeadershipReestablishedAndConverges()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        InMemoryCommunication comm = new();
+
+        const int basePort = 8960;
+        string ep1 = $"localhost:{basePort}", ep2 = $"localhost:{basePort + 1}", ep3 = $"localhost:{basePort + 2}";
+
+        InMemoryWAL innerWal3 = new(logger);
+        NonDisposingWAL wal3 = new(innerWal3);
+
+        RaftManager n1 = MakeSwimNode(comm, "localhost", basePort, 1, [ep2, ep3], logger, enableQuiescence: true);
+        RaftManager n2 = MakeSwimNode(comm, "localhost", basePort + 1, 2, [ep1, ep3], logger, enableQuiescence: true);
+        RaftManager n3 = MakeSwimNode(comm, "localhost", basePort + 2, 3, [ep1, ep2], logger, wal3, enableQuiescence: true);
+        RaftManager? restarted = null;
+
+        comm.SetNodes(new Dictionary<string, IRaft> { [ep1] = n1, [ep2] = n2, [ep3] = n3 });
+
+        try
+        {
+            await n1.UpdateNodes();
+            await n2.UpdateNodes();
+            await n3.UpdateNodes();
+            await Task.WhenAll(n1.JoinCluster(ct), n2.JoinCluster(ct), n3.JoinCluster(ct));
+            await WaitForCondition(
+                () => n1.GetMembership().MembershipVersion > 0
+                   && n2.GetMembership().MembershipVersion > 0
+                   && n3.GetMembership().MembershipVersion > 0,
+                ct);
+
+            // Force partition 1 leadership ONTO the node that will restart. ForceLeaderForTesting
+            // runs a real election at term+1, which the peers grant (equal logs, unvoted term), so
+            // this settles deterministically where a step-down lottery would not.
+            await WaitForPartitionLeader(1, ct, n1, n2, n3);
+            long forceDeadline = Environment.TickCount64 + 15_000;
+            while (!await n3.AmILeaderQuick(1))
+            {
+                if (Environment.TickCount64 > forceDeadline)
+                    throw new TimeoutException("Partition 1 leadership never settled on n3.");
+                await n3.ForceLeaderForTestingAsync(1, ct);
+                await Task.Delay(100, ct);
+            }
+
+            for (int i = 0; i < 5; i++)
+            {
+                RaftReplicationResult result = await n3.ReplicateLogs(1, "test", [1, 2, 3], cancellationToken: ct);
+                Assert.Equal(RaftOperationStatus.Success, result.Status);
+            }
+
+            long leaderCommitted = await n3.GetFollowerCommittedIndexAsync(1, n3.LocalEndpoint);
+            await WaitForFollowerIndex(n3, ep1, leaderCommitted, ct);
+            await WaitForFollowerIndex(n3, ep2, leaderCommitted, ct);
+
+            // Wait for demonstrable quiescence (settled proposals retained ~30 s block the gate).
+            await WaitForCondition(
+                () => n3.GetPartitionViewAsync(1, ct).GetAwaiter().GetResult()?.Quiesced == true,
+                ct, timeoutMs: 45_000);
+
+            // Fast restart of the quiesced LEADER over the SAME WAL: no eviction, roster unchanged.
+            n3.Dispose();
+            restarted = MakeSwimNode(comm, "localhost", basePort + 2, 3, [ep1, ep2], logger, wal3, enableQuiescence: true);
+            comm.SetNodes(new Dictionary<string, IRaft> { [ep1] = n1, [ep2] = n2, [ep3] = restarted });
+
+            await restarted.UpdateNodes();
+            RaftManager toJoin = restarted;
+            Task joinTask = Task.Run(() => toJoin.JoinCluster(ct), ct);
+
+            // The partition must re-establish a leader visible from the restarted node's own view
+            // (typically the ex-leader reclaims it via a normal election) and reach the old commit
+            // frontier. Without the candidate-is-expected-leader exemption this stalls forever in
+            // denied pre-vote rounds.
             await WaitForCondition(
                 () =>
                 {

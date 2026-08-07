@@ -542,6 +542,26 @@ public sealed class RaftService : Rafter.RafterBase
     }
 
     /// <summary>
+    /// Answers a non-leader's read-index fetch (<c>ConfirmLocalApplicationAsync</c>): runs the
+    /// local read-index confirmation machinery and returns the quorum-confirmed commit frontier.
+    /// A node that is not (or no longer) the partition leader answers <c>Success = false</c> —
+    /// its ack round cannot complete — which the caller treats as "not confirmed".
+    /// </summary>
+    public override async Task<GrpcGetReadIndexResponse> GetReadIndex(GrpcGetReadIndexRequest request, ServerCallContext context)
+    {
+        ValidateAuth(context);
+
+        if (raft is not RaftManager manager)
+            return new GrpcGetReadIndexResponse { Success = false, ReadIndex = -1 };
+
+        Data.GetReadIndexResponse response = await manager
+            .ReceiveGetReadIndex(new Data.GetReadIndexRequest(request.PartitionId), context.CancellationToken)
+            .ConfigureAwait(false);
+
+        return new GrpcGetReadIndexResponse { Success = response.Success, ReadIndex = response.ReadIndex };
+    }
+
+    /// <summary>
     /// Handles an <c>InstallSnapshot</c> RPC from the partition leader.
     /// Delegates to <see cref="RaftManager.ReceiveInstallSnapshot"/> which imports the state
     /// and seeds the WAL with a <c>CommittedCheckpoint</c> at the snapshot index.

@@ -578,6 +578,35 @@ public sealed class RaftPartition : IDisposable
         return response.Status == RaftOperationStatus.Success;
     }
 
+    /// <summary>
+    /// Leader-side answer to a non-leader's read-index fetch: runs the same confirmation as
+    /// <see cref="ConfirmLeadershipAsync"/> but surfaces the quorum-confirmed commit index the
+    /// round captured (carried on the reply's <see cref="RaftResponse.LogIndex"/>) so a remote
+    /// follower can wait its own applied frontier up to it. Coalesces with concurrent local
+    /// confirmations — remote fetches add no extra ack rounds.
+    /// </summary>
+    internal async Task<(RaftOperationStatus Status, long ReadIndex)> GetConfirmedReadIndexAsync(CancellationToken cancellationToken = default)
+    {
+        RaftResponse response = await executor.Ask(new(RaftRequestType.ConfirmLeadership), cancellationToken).ConfigureAwait(false);
+        return (response.Status, response.LogIndex);
+    }
+
+    /// <summary>
+    /// Non-leader half of <c>IRaft.ConfirmLocalApplicationAsync</c>: waits (bounded by
+    /// <see cref="RaftConfiguration.LeadershipConfirmationTimeout"/>, enforced from the partition
+    /// tick) until this node's applied frontier covers <paramref name="requiredIndex"/> — a commit
+    /// index the partition leader confirmed via a quorum ack round. Non-success (timeout,
+    /// leadership transition, restore in progress, admission control) maps to
+    /// <see langword="false"/>: the caller must skip its destructive action.
+    /// </summary>
+    internal async Task<bool> WaitLocalApplicationAsync(long requiredIndex, CancellationToken cancellationToken = default)
+    {
+        RaftResponse response = await executor.Ask(
+            new(RaftRequestType.WaitLocalApplication, commitIndex: requiredIndex),
+            cancellationToken).ConfigureAwait(false);
+        return response.Status == RaftOperationStatus.Success;
+    }
+
     public async Task<RaftOperationStatus> TransferLeadershipAsync(
         string targetEndpoint,
         CancellationToken cancellationToken = default)

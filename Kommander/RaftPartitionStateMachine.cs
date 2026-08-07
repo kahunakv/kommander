@@ -261,10 +261,13 @@ public sealed class RaftPartitionStateMachine
     private readonly List<(ulong CorrelationId, long StartedTicks)> readIndexPendingWaiters = [];
 
     /// <summary>
-    /// Quorum-confirmed readers waiting for <see cref="lastAppliedIndex"/> to cover the commit
-    /// index captured when their round confirmed — the second half of the read-index contract:
-    /// counting acks proves leadership, but the local applied state must also contain everything
-    /// committed at capture time before a local read is linearizable.
+    /// Readers waiting for <see cref="lastAppliedIndex"/> to cover a quorum-confirmed commit
+    /// index — the second half of the read-index contract: counting acks proves leadership, but
+    /// the local applied state must also contain everything committed at capture time before a
+    /// local read is linearizable. Shared by two producers: leader-side
+    /// <see cref="ConfirmLeadershipAsync"/> waiters (their round confirmed here) and
+    /// non-leader <see cref="WaitLocalApplication"/> waiters (their index was confirmed on the
+    /// remote leader), so expiry must run from the tick in every node state, not just Leader.
     /// </summary>
     private readonly List<(ulong CorrelationId, long RequiredIndex, long StartedTicks)> readIndexApplyWaiters = [];
 
@@ -532,6 +535,14 @@ public sealed class RaftPartitionStateMachine
         HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         long nowTicks = host.GetMonotonicTimestamp();
 
+        // Read-index expiry runs in every node state, before any early return (including the
+        // leader's quiesced one): on the leader it bounds rounds and chained waiters; on
+        // followers it bounds WaitLocalApplication applied-frontier waiters — a stable follower
+        // whose apply stalls has no leadership-loss transition to fail them, so the tick is the
+        // only bound on their wait.
+        if (readIndexRound is not null || readIndexPendingWaiters.Count > 0 || readIndexApplyWaiters.Count > 0)
+            await ExpireReadIndexWaitersAsync(nowTicks).ConfigureAwait(false);
+
         switch (nodeState)
         {
             // if node is leader just send hearthbeats every Configuration.HeartbeatInterval
@@ -548,11 +559,6 @@ public sealed class RaftPartitionStateMachine
                     await RevertUnpublishedPromotionAsync("barrier commit timed out").ConfigureAwait(false);
                     return;
                 }
-
-                // Read-index expiry runs before the quiesced early-return: waiters must still time
-                // out even if the partition re-quiesced while a confirmation was pending.
-                if (readIndexRound is not null || readIndexPendingWaiters.Count > 0 || readIndexApplyWaiters.Count > 0)
-                    await ExpireReadIndexWaitersAsync(nowTicks).ConfigureAwait(false);
 
                 // Check-quorum: step down once no majority of voters has acked within the window.
                 // This does not close the stale-read hole (ConfirmLeadershipAsync does); it bounds
@@ -2240,8 +2246,17 @@ public sealed class RaftPartitionStateMachine
             // this freshness gate never fired — a follower with a perfectly fresh heartbeat still
             // granted a challenger's pre-vote, defeating pre-vote for the asymmetric-partition case it
             // exists to handle.
+            // The candidate being the expected leader itself is proof the leadership is vacated:
+            // a live leader never solicits votes, so this is a leader that restarted (or stepped
+            // down) and lost its in-memory state. The freshness deny below must not apply — under
+            // quiescence it consults SWIM, and the restarted process IS Alive as a node, so every
+            // quiesced follower would deny the ex-leader its own vacated leadership forever while
+            // their own election trigger stays calm for the same reason: a permanent leaderless
+            // livelock with nobody heartbeating the restarted node. Fall through to the term/log
+            // checks instead so the ex-leader can win a normal election (or lose it to a fresher
+            // peer, which equally re-establishes a leader).
             string preVoteExpectedLeader = expectedLeaders.GetValueOrDefault(currentTerm, "");
-            if (!string.IsNullOrEmpty(preVoteExpectedLeader))
+            if (!string.IsNullOrEmpty(preVoteExpectedLeader) && preVoteExpectedLeader != node.Endpoint)
             {
                 if (quiesced && host.Configuration.EnableQuiescence)
                 {
@@ -4339,6 +4354,25 @@ public sealed class RaftPartitionStateMachine
         }
 
         readIndexApplyWaiters.Add((correlationId, requiredIndex, startedTicks));
+    }
+
+    /// <summary>
+    /// Non-leader half of <c>IRaft.ConfirmLocalApplicationAsync</c>: parks the caller until
+    /// <see cref="lastAppliedIndex"/> covers <paramref name="requiredIndex"/> — a commit index the
+    /// partition leader confirmed with a same-term quorum ack round <b>after the caller's request
+    /// began</b>. The leadership proof already happened remotely, so no node-state guard applies
+    /// here; this method only supplies the local applied-frontier wait, reusing
+    /// <see cref="readIndexApplyWaiters"/> (completed wherever the applied frontier advances,
+    /// expired from the tick in every node state, failed on leadership transitions). A non-success
+    /// reply means "not confirmed" — the caller must skip or defer its destructive action, never
+    /// treat it as "confirmed enough".
+    /// </summary>
+    public void WaitLocalApplication(long requiredIndex, ulong? replyCorrelationId)
+    {
+        if (replyCorrelationId is null)
+            return;
+
+        CompleteOrParkReadIndexWaiter(replyCorrelationId.Value, requiredIndex, host.GetMonotonicTimestamp());
     }
 
     /// <summary>

@@ -188,6 +188,23 @@ public class InMemoryCommunication : ICommunication
         return Task.FromResult(new Gossip.PingReqResponse(false));
     }
 
+    /// <summary>
+    /// In-process follower read-index fetch: routes the request to the target node's
+    /// <see cref="RaftManager.ReceiveGetReadIndex"/>, whose read-index round supplies the
+    /// leadership proof. A partitioned or unknown target returns a failed response — the
+    /// caller must fail closed exactly as it would on a network error.
+    /// </summary>
+    public async Task<GetReadIndexResponse> GetReadIndex(RaftManager manager, RaftNode node, GetReadIndexRequest request, CancellationToken cancellationToken = default)
+    {
+        if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))
+            return new GetReadIndexResponse(false);
+
+        if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode) && targetNode is RaftManager targetManager)
+            return await targetManager.ReceiveGetReadIndex(request, cancellationToken).ConfigureAwait(false);
+
+        return new GetReadIndexResponse(false);
+    }
+
     public async Task<long?> GetRemoteFollowerLag(RaftManager manager, RaftNode node, int partitionId, string followerEndpoint)
     {
         if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))

@@ -11,6 +11,7 @@ service Rafter {
     rpc Join (GrpcJoinRequest) returns (GrpcJoinResponse);
     rpc Leave (GrpcLeaveRequest) returns (GrpcLeaveResponse);
     rpc GetFollowerLag (GrpcGetFollowerLagRequest) returns (GrpcGetFollowerLagResponse);
+    rpc GetReadIndex (GrpcGetReadIndexRequest) returns (GrpcGetReadIndexResponse);
     rpc InstallSnapshot (GrpcInstallSnapshotRequest) returns (GrpcInstallSnapshotResponse);
     rpc Gossip (GrpcGossipRequest) returns (GrpcGossipResponse);
     rpc Ping (GrpcPingRequest) returns (GrpcPingResponse);
@@ -208,6 +209,19 @@ message GrpcGetFollowerLagRequest {
 message GrpcGetFollowerLagResponse {
     bool HasValue = 1;
     int64 Value = 2;
+}
+
+// Follower read-index fetch (non-leader read gate). The responder answers through its
+// read-index confirmation machinery, so Success=true carries a quorum-confirmed commit
+// frontier captured after the request arrived; any failure must be treated as
+// "not confirmed" by the caller.
+message GrpcGetReadIndexRequest {
+    int32 PartitionId = 1;
+}
+
+message GrpcGetReadIndexResponse {
+    bool Success = 1;
+    int64 ReadIndex = 2;
 }
 
 message GrpcInstallSnapshotRequest {

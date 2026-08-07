@@ -1295,9 +1295,11 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 await partition.DrainAsync(CancellationToken.None).ConfigureAwait(false);
                 partition.Stop();
                 walAdapter.DeletePartitionWAL(partitionId);
-                Logger.LogInformation(
-                    "[{Endpoint}] Stopped hosting partition {PartitionId} (no longer a replica); WAL reclaimed",
-                    LocalEndpoint, partitionId);
+
+                if (Logger.IsEnabled(LogLevel.Information))
+                    Logger.LogInformation(
+                        "[{Endpoint}] Stopped hosting partition {PartitionId} (no longer a replica); WAL reclaimed",
+                        LocalEndpoint, partitionId);
             }
             catch (Exception ex)
             {
@@ -2761,6 +2763,81 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         {
             Logger.LogError("ConfirmLeadershipAsync: {Message}", e.Message);
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Follower catch-up confirmation — see <see cref="IRaft.ConfirmLocalApplicationAsync"/> for
+    /// the contract. On the (believed) leader the call degenerates to
+    /// <see cref="ConfirmLeadershipAsync"/>: the leader's own applied-frontier wait is the same
+    /// proof. Otherwise the classic §6.4 follower read runs: fetch a quorum-confirmed commit
+    /// index from the leader (<see cref="ICommunication.GetReadIndex"/> — trustworthy because a
+    /// deposed leader's ack round cannot complete), then wait until the local applied frontier
+    /// covers it. No leader known, failed fetch, transport error, wait timeout, or restore in
+    /// progress all map to <see langword="false"/>; no retries happen inside the primitive — the
+    /// caller owns retry cadence, mirroring <see cref="ConfirmLeadershipAsync"/>.
+    /// <para>The leader-belief routing is a fast path, not a correctness gate: a stale belief
+    /// either fails the local confirmation (this node is not really the leader) or fails the
+    /// remote fetch (the target is not really the leader) — both land on
+    /// <see langword="false"/>, never on a false confirmation.</para>
+    /// </summary>
+    public async ValueTask<bool> ConfirmLocalApplicationAsync(int partitionId, CancellationToken cancellationToken = default)
+    {
+        if (!IsInitialized)
+            return false;
+
+        try
+        {
+            RaftPartition partition = GetPartition(partitionId);
+
+            string leader = partition.Leader;
+            if (leader == LocalEndpoint)
+                return await partition.ConfirmLeadershipAsync(cancellationToken).ConfigureAwait(false);
+
+            if (string.IsNullOrEmpty(leader))
+                return false;
+
+            GetReadIndexResponse response = await communication.GetReadIndex(
+                this, new RaftNode(leader), new GetReadIndexRequest(partitionId), cancellationToken).ConfigureAwait(false);
+
+            if (!response.Success || response.ReadIndex < 0)
+                return false;
+
+            return await partition.WaitLocalApplicationAsync(response.ReadIndex, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            Logger.LogError("ConfirmLocalApplicationAsync: {Message}", e.Message);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Serves a non-leader's read-index fetch (<see cref="ICommunication.GetReadIndex"/>): runs
+    /// this node's read-index confirmation round for the partition and returns the captured
+    /// commit index on success. Failure — including this node not being the partition leader —
+    /// returns an unsuccessful response so the remote caller fails closed.
+    /// </summary>
+    public async ValueTask<GetReadIndexResponse> ReceiveGetReadIndex(GetReadIndexRequest request, CancellationToken cancellationToken = default)
+    {
+        if (!IsInitialized)
+            return new GetReadIndexResponse(false);
+
+        try
+        {
+            RaftPartition partition = GetPartition(request.PartitionId);
+
+            (RaftOperationStatus status, long readIndex) = await partition
+                .GetConfirmedReadIndexAsync(cancellationToken).ConfigureAwait(false);
+
+            return status == RaftOperationStatus.Success && readIndex >= 0
+                ? new GetReadIndexResponse(true, readIndex)
+                : new GetReadIndexResponse(false);
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            Logger.LogError("ReceiveGetReadIndex: {Message}", e.Message);
+            return new GetReadIndexResponse(false);
         }
     }
 

@@ -131,6 +131,23 @@ public interface ICommunication
         => Task.CompletedTask;
 
     /// <summary>
+    /// Asks <paramref name="node"/> (believed to be the partition leader) for a quorum-confirmed
+    /// read index on behalf of a non-leader running
+    /// <c>IRaft.ConfirmLocalApplicationAsync</c>.  The remote node answers through its
+    /// read-index confirmation machinery, so a deposed leader cannot hand out a stale index —
+    /// its ack round fails and the response carries <c>Success = false</c>.
+    /// <para>
+    /// Implementations that do not support this RPC return a failed response, which the caller
+    /// maps to "not confirmed" (fail closed): the destructive local action is skipped, never
+    /// performed on possibly-stale state.
+    /// </para>
+    /// </summary>
+    public Task<GetReadIndexResponse> GetReadIndex(
+        RaftManager manager, RaftNode node, GetReadIndexRequest request,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(new GetReadIndexResponse(false));
+
+    /// <summary>
     /// Forwards a client <c>ReplicateLogs</c> proposal to <paramref name="node"/> — used by a
     /// node that is not a replica of the target range under per-partition placement. The remote
     /// node runs the proposal through its own <c>ReplicateLogs</c> path, so the generation fence

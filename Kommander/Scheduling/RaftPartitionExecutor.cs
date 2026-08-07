@@ -789,6 +789,10 @@ public sealed class RaftPartitionExecutor : IDisposable
                     await _stateMachine.ConfirmLeadershipAsync(RegisterReply(op)).ConfigureAwait(false);
                     break;
 
+                case RaftRequestType.WaitLocalApplication:
+                    _stateMachine.WaitLocalApplication(request.CommitIndex, RegisterReply(op));
+                    break;
+
                 case RaftRequestType.TransferLeadership:
                     await _stateMachine.TransferLeadershipAsync(request.Endpoint ?? "", RegisterReply(op)).ConfigureAwait(false);
                     break;
