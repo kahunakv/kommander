@@ -174,6 +174,35 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     internal List<RaftNode> Nodes { get; set; } = [];
 
     /// <summary>
+    /// Snapshot of the last committed partition map applied via <see cref="StartUserPartitions"/>,
+    /// including ranges this node does <b>not</b> host. Under per-partition placement the local
+    /// <see cref="partitions"/> dictionary only holds replicated ranges, so routing
+    /// (<see cref="GetPartitionKey"/>, <see cref="GetPartitionMap"/>) must read this global view
+    /// instead of the hosted set. Replaced wholesale on every map application; readers take the
+    /// reference once and iterate their own immutable snapshot.
+    /// </summary>
+    private volatile List<RaftPartitionRange> committedRanges = [];
+
+    /// <summary>
+    /// Per-partition placement resolution derived from <see cref="committedRanges"/>: the range's
+    /// peer set (replicas minus self) and voter endpoints. Only populated for ranges with a
+    /// non-empty replica set — absence means legacy full replication and the whole-cluster
+    /// fallback applies. Rebuilt on every map application.
+    /// </summary>
+    private readonly ConcurrentDictionary<int, PartitionPlacement> partitionPlacements = new();
+
+    /// <summary>
+    /// Immutable per-range placement view consumed by the quorum seam
+    /// (<see cref="GetPartitionPeers"/> / <see cref="IsPartitionVoter"/>).
+    /// </summary>
+    private sealed class PartitionPlacement
+    {
+        internal required IReadOnlyList<RaftNode> Peers { get; init; }
+        internal required HashSet<string> VoterEndpoints { get; init; }
+        internal required IReadOnlyList<System.RaftReplica> Replicas { get; init; }
+    }
+
+    /// <summary>
     /// Set to true by <see cref="LeaveCluster"/> before the removal is committed so that
     /// <see cref="LocalRole"/> immediately returns <see cref="System.ClusterMemberRole.Leaving"/>
     /// and the election / pre-vote gate suppresses campaigning on all partitions.
@@ -1148,15 +1177,61 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     /// <summary>
     /// Start the user partitions
+    /// <para>
+    /// Applies the committed map: refreshes the global routing snapshot
+    /// (<see cref="committedRanges"/> / <see cref="partitionPlacements"/>), then materializes a
+    /// <see cref="RaftPartition"/> only for ranges this node hosts. A range with a non-empty
+    /// replica set is hosted only when the local endpoint appears in it (any role); an empty
+    /// replica set means legacy full replication and is hosted unconditionally. A partition this
+    /// node stopped being a replica of is drained, stopped, and its WAL reclaimed — safe because
+    /// the absence from the committed replica set is exactly the final <c>RemoveReplica</c>
+    /// commit, so no later configuration of the range can need this node's copy.
+    /// </para>
     /// </summary>
     /// <param name="ranges"></param>
     internal void StartUserPartitions(List<RaftPartitionRange> ranges)
     {
+        committedRanges = ranges;
+
+        foreach (RaftPartitionRange range in ranges)
+        {
+            if (range.Replicas.Count > 0 && range.State != RaftPartitionState.Removed)
+            {
+                List<RaftNode> peers = new(range.Replicas.Count);
+                HashSet<string> voters = new(StringComparer.Ordinal);
+                foreach (System.RaftReplica replica in range.Replicas)
+                {
+                    if (replica.Endpoint != LocalEndpoint)
+                        peers.Add(new RaftNode(replica.Endpoint));
+                    if (replica.Role == System.RaftReplicaRole.Voter)
+                        voters.Add(replica.Endpoint);
+                }
+
+                partitionPlacements[range.PartitionId] = new PartitionPlacement
+                {
+                    Peers = peers,
+                    VoterEndpoints = voters,
+                    Replicas = range.Replicas.ToList()
+                };
+            }
+            else
+                partitionPlacements.TryRemove(range.PartitionId, out _);
+        }
+
         foreach (RaftPartitionRange range in ranges)
         {
             // Tombstone entries must never re-create a stopped partition.
             if (range.State == RaftPartitionState.Removed)
                 continue;
+
+            bool hostsIt = range.Replicas.Count == 0 // legacy full replication
+                           || range.Replicas.Any(r => r.Endpoint == LocalEndpoint);
+
+            if (!hostsIt)
+            {
+                StopUnhostedPartition(range.PartitionId);
+                continue;
+            }
 
             if (partitions.TryGetValue(range.PartitionId, out RaftPartition? partition))
             {
@@ -1196,6 +1271,106 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         _initializedSignal.TrySetResult();
 
         eventNotifier.InvokePartitionMapChanged(GetPartitionMap());
+    }
+
+    /// <summary>
+    /// Stops hosting a partition this node is no longer a replica of: the partition is removed
+    /// from the routing dictionaries immediately (no new proposals land on it), then drained,
+    /// stopped, and its WAL reclaimed in the background. Reclaiming here is safe because the
+    /// committed map no longer lists this node in the range's replica set — the final
+    /// <c>RemoveReplica</c> commit — so no future configuration of the range can require this
+    /// node's copy. Runs off the coordinator loop so map application never blocks on a drain.
+    /// </summary>
+    private void StopUnhostedPartition(int partitionId)
+    {
+        if (!partitions.TryGetValue(partitionId, out RaftPartition? partition))
+            return;
+
+        RemovePartition(partitionId);
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await partition.DrainAsync(CancellationToken.None).ConfigureAwait(false);
+                partition.Stop();
+                walAdapter.DeletePartitionWAL(partitionId);
+                Logger.LogInformation(
+                    "[{Endpoint}] Stopped hosting partition {PartitionId} (no longer a replica); WAL reclaimed",
+                    LocalEndpoint, partitionId);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(
+                    "StopUnhostedPartition: partition {PartitionId}: {Message}",
+                    partitionId, ex.Message);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Returns the peer set for one partition: the range's replica set (minus self) when the
+    /// committed map assigns it one, otherwise the whole-cluster node list (legacy full
+    /// replication and the system partition, which always replicates everywhere). This is the
+    /// seam that makes quorum per-partition — <see cref="RaftPartitionStateMachine"/> computes
+    /// every quorum from <c>host.Nodes</c> filtered by <c>host.IsVoter</c>.
+    /// </summary>
+    internal IReadOnlyList<RaftNode> GetPartitionPeers(int partitionId)
+    {
+        if (partitionId != RaftSystemConfig.SystemPartition &&
+            partitionPlacements.TryGetValue(partitionId, out PartitionPlacement? placement))
+            return placement.Peers;
+
+        return Nodes;
+    }
+
+    /// <summary>
+    /// Returns true when <paramref name="endpoint"/> counts toward <paramref name="partitionId"/>'s
+    /// quorum. For a range with an assigned replica set this is membership in the range's
+    /// <see cref="System.RaftReplicaRole.Voter"/> replicas — Learner and Removing replicas are
+    /// peers but excluded from the quorum denominator. For legacy ranges and the system partition
+    /// it falls back to the committed roster's voter set (pre-seed: everyone is a voter).
+    /// </summary>
+    internal bool IsPartitionVoter(int partitionId, string endpoint)
+    {
+        if (partitionId != RaftSystemConfig.SystemPartition &&
+            partitionPlacements.TryGetValue(partitionId, out PartitionPlacement? placement))
+            return placement.VoterEndpoints.Contains(endpoint);
+
+        System.ClusterMembership roster = systemCoordinator.GetMembership();
+        if (roster.MembershipVersion == 0)
+            return true; // pre-seed: treat all known peers as voters (backward compat)
+        return roster.Members.Any(m => m.Endpoint == endpoint && m.Role == System.ClusterMemberRole.Voter);
+    }
+
+    /// <summary>
+    /// Returns the committed replica set of <paramref name="partitionId"/>, or an empty list for
+    /// legacy full replication (every roster voter hosts the range) and unknown partitions.
+    /// The returned list is a snapshot; it never mutates after being returned.
+    /// </summary>
+    public IReadOnlyList<System.RaftReplica> GetPartitionReplicas(int partitionId)
+    {
+        if (partitionPlacements.TryGetValue(partitionId, out PartitionPlacement? placement))
+            return placement.Replicas;
+
+        return [];
+    }
+
+    /// <summary>
+    /// Returns the effective replication factor for <paramref name="partitionId"/>: the range's
+    /// override when set, otherwise <see cref="RaftConfiguration.ReplicationFactor"/>.
+    /// 0 means full replication.
+    /// </summary>
+    public int GetEffectiveReplicationFactor(int partitionId)
+    {
+        List<RaftPartitionRange> ranges = committedRanges;
+        foreach (RaftPartitionRange range in ranges)
+        {
+            if (range.PartitionId == partitionId && range.ReplicationFactor > 0)
+                return range.ReplicationFactor;
+        }
+
+        return configuration.ReplicationFactor;
     }
 
     /// <summary>
@@ -1522,8 +1697,13 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     Task Scheduling.IRaftTimerHost.PingAsync(CancellationToken cancellationToken) => PingAsync(cancellationToken);
 
-    void Scheduling.IRaftTimerHost.TriggerBalancerPass() =>
+    void Scheduling.IRaftTimerHost.TriggerBalancerPass()
+    {
         systemCoordinator.Send(new System.RaftSystemRequest(System.RaftSystemRequestType.RunBalancerPass));
+        // Replica placement shares the balancer cadence: the pass self-gates on P0 leadership
+        // and no-ops when no range has an assigned replica set.
+        systemCoordinator.Send(new System.RaftSystemRequest(System.RaftSystemRequestType.RunPlacementPass));
+    }
 
     /// <summary>
     /// Adds <paramref name="partitionId"/> to the hot set so it receives targeted
@@ -1947,6 +2127,14 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         if (partitionId == RaftSystemConfig.SystemPartition && type == RaftSystemConfig.RaftLogType)
             throw new RaftException("System log type is reserved on the system partition");
 
+        if (partitionId != RaftSystemConfig.SystemPartition && !partitions.ContainsKey(partitionId))
+        {
+            RaftReplicationResult? forwarded = await ForwardToReplicaAsync(
+                partitionId, type, [data], autoCommit, expectedGeneration, cancellationToken).ConfigureAwait(false);
+            if (forwarded is not null)
+                return forwarded;
+        }
+
         RaftPartition partition = GetPartition(partitionId);
 
         bool success;
@@ -2013,6 +2201,14 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         if (partitionId == RaftSystemConfig.SystemPartition && type == RaftSystemConfig.RaftLogType)
             throw new RaftException("System log type is reserved on the system partition");
 
+        if (partitionId != RaftSystemConfig.SystemPartition && !partitions.ContainsKey(partitionId))
+        {
+            RaftReplicationResult? forwarded = await ForwardToReplicaAsync(
+                partitionId, type, logs, autoCommit, expectedGeneration, cancellationToken).ConfigureAwait(false);
+            if (forwarded is not null)
+                return forwarded;
+        }
+
         RaftPartition partition = GetPartition(partitionId);
 
         bool success;
@@ -2037,6 +2233,54 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             return new(success, status, ticketId, -1);
 
         return await WaitForQuorum(partition, ticketId, autoCommit, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Forwards a proposal for a range this node does not host to one of the range's replicas
+    /// (voters first — the leader is always a voter). Each attempt runs through the remote
+    /// node's own <c>ReplicateLogs</c> path, so leader checks and the generation fence apply
+    /// there; <c>NodeIsNotLeader</c> moves on to the next replica, any other outcome is final.
+    /// Returns <see langword="null"/> when the range has no committed replica set (legacy
+    /// full replication — the local "invalid partition" throw is the right diagnosis) or the
+    /// transport does not support forwarding, in which case consumers must route directly via
+    /// <see cref="GetPartitionReplicas"/>.
+    /// </summary>
+    private async Task<RaftReplicationResult?> ForwardToReplicaAsync(
+        int partitionId,
+        string type,
+        IReadOnlyList<byte[]> logs,
+        bool autoCommit,
+        long expectedGeneration,
+        CancellationToken cancellationToken)
+    {
+        if (!partitionPlacements.TryGetValue(partitionId, out PartitionPlacement? placement))
+            return null;
+
+        RaftReplicationResult? lastRejection = null;
+
+        foreach (System.RaftReplica replica in placement.Replicas
+                     .OrderBy(r => r.Role == System.RaftReplicaRole.Voter ? 0 : 1))
+        {
+            if (replica.Endpoint == LocalEndpoint)
+                continue;
+
+            RaftReplicationResult? result = await communication.ForwardReplicateLogs(
+                this, new RaftNode(replica.Endpoint), partitionId, type, logs,
+                autoCommit, expectedGeneration, cancellationToken).ConfigureAwait(false);
+
+            if (result is null)
+                continue; // unreachable or transport lacks forwarding — try the next replica
+
+            if (result.Status == RaftOperationStatus.NodeIsNotLeader)
+            {
+                lastRejection = result;
+                continue;
+            }
+
+            return result;
+        }
+
+        return lastRejection;
     }
 
     /// <summary>
@@ -2953,6 +3197,39 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         lifecycleService.RemovePartitionAsync(partitionId, ct);
 
     /// <inheritdoc/>
+    public Task<RaftPartitionLifecycleResult> SetReplicationFactorAsync(
+        int partitionId,
+        int replicationFactor,
+        CancellationToken ct = default) =>
+        lifecycleService.SetReplicationFactorAsync(partitionId, replicationFactor, ct);
+
+    /// <summary>
+    /// Commits an <c>AddReplica</c> mutation: adds <paramref name="endpoint"/> as a Learner
+    /// replica of the range. P0-leader-only. Test/operator surface; automatic placement uses
+    /// the controller.
+    /// </summary>
+    internal Task<RaftPartitionLifecycleResult> AddReplicaAsync(
+        int partitionId, string endpoint, int nodeId = 0, CancellationToken ct = default) =>
+        lifecycleService.ChangeReplicaAsync(System.RaftSystemRequestType.AddReplica, partitionId, endpoint, nodeId, ct);
+
+    /// <summary>
+    /// Commits a <c>PromoteReplica</c> mutation: promotes a Learner replica of the range to
+    /// Voter — the commit point at which it enters the range's quorum. P0-leader-only.
+    /// </summary>
+    internal Task<RaftPartitionLifecycleResult> PromoteReplicaAsync(
+        int partitionId, string endpoint, int nodeId = 0, CancellationToken ct = default) =>
+        lifecycleService.ChangeReplicaAsync(System.RaftSystemRequestType.PromoteReplica, partitionId, endpoint, nodeId, ct);
+
+    /// <summary>
+    /// Commits the two-step <c>RemoveReplica</c> mutation: the replica is first marked Removing
+    /// (leaving quorum), then dropped; the departing node drains and reclaims its WAL.
+    /// P0-leader-only.
+    /// </summary>
+    internal Task<RaftPartitionLifecycleResult> RemoveReplicaAsync(
+        int partitionId, string endpoint, int nodeId = 0, CancellationToken ct = default) =>
+        lifecycleService.ChangeReplicaAsync(System.RaftSystemRequestType.RemoveReplica, partitionId, endpoint, nodeId, ct);
+
+    /// <inheritdoc/>
     public void RegisterStateMachineTransfer(IRaftStateMachineTransfer? transfer) =>
         Volatile.Write(ref _stateMachineTransfer, transfer);
 
@@ -2977,6 +3254,15 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     {
         if (partitions.TryGetValue(partitionId, out RaftPartition? partition))
             return partition.Generation;
+
+        // Non-hosted ranges (per-partition placement) still expose the committed generation so
+        // callers on non-replica nodes can build a correctly-fenced forwarded proposal.
+        List<RaftPartitionRange> ranges = committedRanges;
+        foreach (RaftPartitionRange range in ranges)
+        {
+            if (range.PartitionId == partitionId)
+                return range.Generation;
+        }
 
         return 0;
     }
@@ -3232,6 +3518,41 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <inheritdoc/>
     public IReadOnlyList<RaftPartitionRange> GetPartitionMap()
     {
+        // Prefer the committed map: under per-partition placement the local `partitions`
+        // dictionary only holds hosted ranges, but routing must see every range.
+        List<RaftPartitionRange> ranges = committedRanges;
+        if (ranges.Count > 0)
+        {
+            List<RaftPartitionRange> mapSnapshot = new(ranges.Count);
+            foreach (RaftPartitionRange range in ranges)
+            {
+                if (range.State == RaftPartitionState.Removed)
+                    continue;
+
+                mapSnapshot.Add(new RaftPartitionRange
+                {
+                    PartitionId = range.PartitionId,
+                    StartRange = range.StartRange,
+                    EndRange = range.EndRange,
+                    RoutingMode = range.RoutingMode,
+                    Generation = range.Generation,
+                    State = range.State,
+                    ReplicationFactor = range.ReplicationFactor,
+                    Replicas = range.Replicas.Select(r => new System.RaftReplica
+                    {
+                        Endpoint = r.Endpoint,
+                        NodeId = r.NodeId,
+                        Role = r.Role,
+                        SinceGeneration = r.SinceGeneration
+                    }).ToList()
+                });
+            }
+
+            return mapSnapshot;
+        }
+
+        // Fallback for hosts that never applied a committed map (unit-test harnesses that
+        // populate `partitions` directly).
         List<RaftPartitionRange> snapshot = new(partitions.Count);
 
         foreach (KeyValuePair<int, RaftPartition> kv in partitions)
@@ -3262,6 +3583,35 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         if (rangeId < 0)
             rangeId = -rangeId;
 
+        int? partitionId = ResolveRangeId(rangeId);
+        if (partitionId is not null)
+            return partitionId.Value;
+
+        throw new RaftException("Couldn't find partition range for: " + partitionKey + " " + rangeId);
+    }
+
+    /// <summary>
+    /// Resolves a hash range id to its partition id using the committed map when available —
+    /// required under per-partition placement, where a non-replica node must still route any
+    /// key even though it hosts no <see cref="RaftPartition"/> for the range — falling back to
+    /// the hosted set for hosts that never applied a committed map.
+    /// </summary>
+    private int? ResolveRangeId(int rangeId)
+    {
+        List<RaftPartitionRange> ranges = committedRanges;
+        if (ranges.Count > 0)
+        {
+            foreach (RaftPartitionRange range in ranges)
+            {
+                if (range.State != RaftPartitionState.Removed &&
+                    range.RoutingMode == RaftRoutingMode.HashRange &&
+                    range.StartRange <= rangeId && range.EndRange >= rangeId)
+                    return range.PartitionId;
+            }
+
+            return null;
+        }
+
         foreach (KeyValuePair<int, RaftPartition> partition in partitions)
         {
             if (partition.Value.RoutingMode == RaftRoutingMode.HashRange &&
@@ -3269,7 +3619,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 return partition.Key;
         }
 
-        throw new RaftException("Couldn't find partition range for: " + partitionKey + " " + rangeId);
+        return null;
     }
     
     /// <summary>
@@ -3283,12 +3633,9 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         if (rangeId < 0)
             rangeId = -rangeId;
 
-        foreach (KeyValuePair<int, RaftPartition> partition in partitions)
-        {
-            if (partition.Value.RoutingMode == RaftRoutingMode.HashRange &&
-                partition.Value.StartRange <= rangeId && partition.Value.EndRange >= rangeId)
-                return partition.Key;
-        }
+        int? partitionId = ResolveRangeId(rangeId);
+        if (partitionId is not null)
+            return partitionId.Value;
 
         throw new RaftException("Couldn't find partition range for: " + prefixPartitionKey + " " + rangeId);
     }

@@ -96,6 +96,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
     // ── Partition map and split/merge collaborators ────────────────────────
     private readonly SplitMergeController _splitMerge;
     private readonly PartitionMapService _partitionMap;
+    private readonly ReplicaPlacementService _replicaPlacement;
 
     // Exposed so tests can await clean loop exit after Stop().
     internal Task LoopTask => _loop;
@@ -141,9 +142,32 @@ internal sealed class RaftSystemCoordinator : IDisposable
             partitionId => manager.Partitions.TryGetValue(partitionId, out RaftPartition? p) ? p : null,
             manager.RemovePartition,
             manager.Configuration.InitialPartitions,
+            manager.Configuration,
+            () => manager.Discovery.GetNodes(),
+            manager.LocalEndpoint,
+            manager.LocalNodeId,
             TrySeedInitialMembership,
+            GetMembership,
             _splitMerge.PendingSplits,
             _splitMerge.PendingMerges,
+            () => RetryDelay,
+            MaxRetries,
+            logger);
+
+        _replicaPlacement = new ReplicaPlacementService(
+            systemConfiguration,
+            Replicate,
+            Send,
+            StartPartitions,
+            GetMembership,
+            manager.AmILeaderQuick,
+            manager.GetPartitionLeaderEndpoint,
+            manager.GetFollowerCommittedIndexNullableAsync,
+            (node, partitionId, endpoint) => manager.Communication.GetRemoteFollowerLag(manager, node, partitionId, endpoint),
+            endpoint => manager.Liveness.GetState(endpoint),
+            async (partitionId, target, ct) => await manager.TransferLeadershipAsync(partitionId, target, ct).ConfigureAwait(false),
+            manager.Configuration,
+            manager.LocalEndpoint,
             () => RetryDelay,
             MaxRetries,
             logger);
@@ -338,6 +362,26 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
             case RaftSystemRequestType.RemovePartition:
                 await _partitionMap.TryRemovePartition(message, cancellationToken).ConfigureAwait(false);
+                break;
+
+            case RaftSystemRequestType.AddReplica:
+                await _replicaPlacement.TryAddReplica(message, cancellationToken).ConfigureAwait(false);
+                break;
+
+            case RaftSystemRequestType.PromoteReplica:
+                await _replicaPlacement.TryPromoteReplica(message, cancellationToken).ConfigureAwait(false);
+                break;
+
+            case RaftSystemRequestType.RemoveReplica:
+                await _replicaPlacement.TryRemoveReplica(message, cancellationToken).ConfigureAwait(false);
+                break;
+
+            case RaftSystemRequestType.SetReplicationFactor:
+                await _replicaPlacement.TrySetReplicationFactor(message, cancellationToken).ConfigureAwait(false);
+                break;
+
+            case RaftSystemRequestType.RunPlacementPass:
+                await _replicaPlacement.RunPlacementPassAsync(cancellationToken).ConfigureAwait(false);
                 break;
 
             case RaftSystemRequestType.AddMember:

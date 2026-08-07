@@ -68,9 +68,35 @@ public sealed class RaftSystemRequest
     /// </summary>
     public NodeLoadReport? GossipedLoadReport { get; init; }
 
+    /// <summary>
+    /// Desired replication factor for <see cref="RaftSystemRequestType.SetReplicationFactor"/>
+    /// requests; 0 clears the per-range override (inherit the global configuration).
+    /// </summary>
+    public int ReplicationFactorValue { get; init; }
+
     public RaftSystemRequest(RaftSystemRequestType type)
     {
         Type = type;
+    }
+
+    /// <summary>
+    /// Constructor for <see cref="RaftSystemRequestType.AddReplica"/>,
+    /// <see cref="RaftSystemRequestType.PromoteReplica"/>, and
+    /// <see cref="RaftSystemRequestType.RemoveReplica"/> requests: a replica-lifecycle mutation
+    /// of one range's replica set, serialized on the coordinator loop.
+    /// </summary>
+    public RaftSystemRequest(
+        RaftSystemRequestType type,
+        int partitionId,
+        string endpoint,
+        int nodeId,
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)>? completion = null)
+    {
+        Type = type;
+        PartitionId = partitionId;
+        MemberEndpoint = endpoint;
+        MemberNodeId = nodeId;
+        Completion = completion;
     }
 
     public RaftSystemRequest(RaftSystemRequestType type, byte[] logData)

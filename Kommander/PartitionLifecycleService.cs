@@ -107,6 +107,78 @@ internal sealed class PartitionLifecycleService
         };
     }
 
+    /// <summary>
+    /// Commits a per-range replication-factor override. P0-leader-only like every map mutation;
+    /// the placement controller converges the range toward the new target on later passes.
+    /// </summary>
+    internal async Task<RaftPartitionLifecycleResult> SetReplicationFactorAsync(
+        int partitionId,
+        int replicationFactor,
+        CancellationToken ct = default)
+    {
+        if (!isInitialized())
+            throw new RaftException("System is not initialized");
+
+        if (partitionId == RaftSystemConfig.SystemPartition)
+            throw new RaftException("System partition placement cannot be changed");
+
+        if (!await amILeader(RaftSystemConfig.SystemPartition, ct).ConfigureAwait(false))
+            throw new RaftException("SetReplicationFactor cannot be initiated by a follower");
+
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        systemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.SetReplicationFactor, partitionId)
+        {
+            ReplicationFactorValue = replicationFactor,
+            Completion = tcs
+        });
+
+        (RaftOperationStatus status, long generation) = await tcs.Task.WaitAsync(ct).ConfigureAwait(false);
+        return new RaftPartitionLifecycleResult
+        {
+            Success    = status == RaftOperationStatus.Success,
+            Status     = status,
+            Generation = generation
+        };
+    }
+
+    /// <summary>
+    /// Drives one replica-lifecycle mutation (<c>AddReplica</c> / <c>PromoteReplica</c> /
+    /// <c>RemoveReplica</c>) through the coordinator and awaits the committed outcome.
+    /// P0-leader-only. Intended for tests and operator tooling; the placement controller uses
+    /// the same request path fire-and-forget.
+    /// </summary>
+    internal async Task<RaftPartitionLifecycleResult> ChangeReplicaAsync(
+        RaftSystemRequestType type,
+        int partitionId,
+        string endpoint,
+        int nodeId,
+        CancellationToken ct = default)
+    {
+        if (!isInitialized())
+            throw new RaftException("System is not initialized");
+
+        if (partitionId == RaftSystemConfig.SystemPartition)
+            throw new RaftException("System partition placement cannot be changed");
+
+        if (!await amILeader(RaftSystemConfig.SystemPartition, ct).ConfigureAwait(false))
+            throw new RaftException("Replica changes cannot be initiated by a follower");
+
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        systemCoordinator.Send(new RaftSystemRequest(type, partitionId, endpoint, nodeId, tcs));
+
+        (RaftOperationStatus status, long generation) = await tcs.Task.WaitAsync(ct).ConfigureAwait(false);
+        return new RaftPartitionLifecycleResult
+        {
+            Success    = status == RaftOperationStatus.Success,
+            Status     = status,
+            Generation = generation
+        };
+    }
+
     internal async Task<RaftPartitionLifecycleResult> CreatePartitionAsync(
         int partitionId,
         RaftRoutingMode mode = RaftRoutingMode.Unrouted,

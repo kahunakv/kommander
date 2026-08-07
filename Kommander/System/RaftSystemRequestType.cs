@@ -81,6 +81,47 @@ public enum RaftSystemRequestType
     ApplyGossipLoadReport,
 
     /// <summary>
+    /// Adds a node as a per-partition <see cref="RaftReplicaRole.Learner"/> replica of one range.
+    /// One committed map mutation; the range's <c>Generation</c> is bumped and the new replica
+    /// starts catching up via the existing backfill/snapshot-transfer path. Rejected when the
+    /// range already has a transitional replica (single-mover per range).
+    /// </summary>
+    AddReplica,
+
+    /// <summary>
+    /// Promotes a per-partition <see cref="RaftReplicaRole.Learner"/> replica to
+    /// <see cref="RaftReplicaRole.Voter"/>. The node enters the range's quorum at the commit
+    /// point of this map mutation.
+    /// </summary>
+    PromoteReplica,
+
+    /// <summary>
+    /// Removes a replica from one range in two committed steps processed by a single handler
+    /// call: first the replica is marked <see cref="RaftReplicaRole.Removing"/> (it leaves the
+    /// quorum denominator but still serves), then a second commit drops it from the set — at
+    /// which point the node drains the partition and reclaims its WAL. A crash between the two
+    /// commits leaves a <c>Removing</c> replica that the placement controller re-drives
+    /// idempotently.
+    /// </summary>
+    RemoveReplica,
+
+    /// <summary>
+    /// Sets the per-range replication-factor override (<see cref="RaftPartitionRange.ReplicationFactor"/>).
+    /// Bumps <c>MapVersion</c> only — routing and placement are unchanged until the placement
+    /// controller acts on the new target, so consumer generation fences are not invalidated.
+    /// </summary>
+    SetReplicationFactor,
+
+    /// <summary>
+    /// Triggers one replica-placement controller pass on the P0 leader: drives in-flight replica
+    /// transitions to completion (learner promotion, removal finalization) and — when
+    /// <see cref="RaftConfiguration.EnablePlacementRebalancer"/> is on — plans and dispatches
+    /// rebalancing moves. Sent by the timer service alongside <see cref="RunBalancerPass"/>;
+    /// silently ignored when this node is not the P0 leader.
+    /// </summary>
+    RunPlacementPass,
+
+    /// <summary>
     /// Triggers one leader-balancer planning pass on the P0 leader.
     /// Reduces retained load reports into a <see cref="GlobalLeadershipView"/>, runs the
     /// two-tier planner, dispatches suggestions for each planned move, and updates the

@@ -20,4 +20,18 @@ public sealed class RaftPartitionRange
 
     /// <summary>Routing mode; Unrouted entries are excluded from GetPartitionKey hash routing.</summary>
     public RaftRoutingMode RoutingMode { get; set; }
+
+    /// <summary>
+    /// The nodes hosting this range and their per-range roles. An <b>empty list means legacy
+    /// full replication</b> — every roster voter hosts the range — so pre-existing maps keep
+    /// working until a placement is assigned (ADR 0006). Quorum for the range is computed over
+    /// its <see cref="RaftReplicaRole.Voter"/> replicas only.
+    /// </summary>
+    public List<RaftReplica> Replicas { get; set; } = [];
+
+    /// <summary>
+    /// Desired number of voter replicas for this range; 0 inherits
+    /// <see cref="RaftConfiguration.ReplicationFactor"/>.
+    /// </summary>
+    public int ReplicationFactor { get; set; }
 }

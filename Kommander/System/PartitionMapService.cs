@@ -37,7 +37,12 @@ internal sealed class PartitionMapService
     private readonly Func<int, RaftPartition?> getPartition;
     private readonly Action<int> removePartition;
     private readonly int initialPartitions;
+    private readonly RaftConfiguration configuration;
+    private readonly Func<List<RaftNode>> getDiscoveredNodes;
+    private readonly string localEndpoint;
+    private readonly int localNodeId;
     private readonly Func<CancellationToken, Task> seedInitialMembership;
+    private readonly Func<ClusterMembership> getMembership;
     private readonly Dictionary<int, SplitInProgress> pendingSplits;
     private readonly Dictionary<int, MergeInProgress> pendingMerges;
     private readonly Func<TimeSpan> getRetryDelay;
@@ -53,7 +58,12 @@ internal sealed class PartitionMapService
         Func<int, RaftPartition?> getPartition,
         Action<int> removePartition,
         int initialPartitions,
+        RaftConfiguration configuration,
+        Func<List<RaftNode>> getDiscoveredNodes,
+        string localEndpoint,
+        int localNodeId,
         Func<CancellationToken, Task> seedInitialMembership,
+        Func<ClusterMembership> getMembership,
         Dictionary<int, SplitInProgress> pendingSplits,
         Dictionary<int, MergeInProgress> pendingMerges,
         Func<TimeSpan> getRetryDelay,
@@ -68,7 +78,12 @@ internal sealed class PartitionMapService
         this.getPartition = getPartition;
         this.removePartition = removePartition;
         this.initialPartitions = initialPartitions;
+        this.configuration = configuration;
+        this.getDiscoveredNodes = getDiscoveredNodes;
+        this.localEndpoint = localEndpoint;
+        this.localNodeId = localNodeId;
         this.seedInitialMembership = seedInitialMembership;
+        this.getMembership = getMembership;
         this.pendingSplits = pendingSplits;
         this.pendingMerges = pendingMerges;
         this.getRetryDelay = getRetryDelay;
@@ -202,6 +217,8 @@ internal sealed class PartitionMapService
 
         List<RaftPartitionRange> initialRanges = RaftSystemCoordinator.DivideIntoRanges(initialPartitions);
 
+        AssignInitialPlacement(initialRanges);
+
         RaftPartitionMap newMap = new() { MapVersion = 1, Partitions = initialRanges };
 
         RaftSystemMessage message = new()
@@ -257,6 +274,56 @@ internal sealed class PartitionMapService
         systemConfiguration[RaftSystemConfigKeys.Partitions] = message.Value;
         startPartitions(initialRanges);
         await seedInitialMembership(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// When <see cref="RaftConfiguration.ReplicationFactor"/> &gt; 0, assigns each initial range
+    /// an RF-sized replica set (all Voter — the founding configuration needs no catch-up) spread
+    /// round-robin across the nodes visible at bootstrap (discovery peers plus self, the same
+    /// set the membership seed captures). A cluster with fewer nodes than the factor leaves the
+    /// replica sets empty — the RF floor degrades to legacy full replication with no loss of
+    /// safety, and the placement controller expands placement as voters join.
+    /// </summary>
+    private void AssignInitialPlacement(List<RaftPartitionRange> ranges)
+    {
+        if (configuration.ReplicationFactor <= 0)
+            return;
+
+        List<Placement.CandidateNode> nodes =
+        [
+            new() { Endpoint = localEndpoint, NodeId = localNodeId, Zone = configuration.Zone },
+            ..getDiscoveredNodes()
+                .Where(n => n.Endpoint != localEndpoint)
+                .DistinctBy(n => n.Endpoint)
+                .Select(n => new Placement.CandidateNode { Endpoint = n.Endpoint })
+        ];
+
+        Dictionary<int, List<Placement.CandidateNode>> assignment = Placement.PlacementPlanner.AssignInitial(
+            ranges.Select(r => r.PartitionId).ToList(),
+            nodes,
+            configuration.ReplicationFactor);
+
+        if (assignment.Count == 0)
+        {
+            logger.LogWarning(
+                "AssignInitialPlacement: cluster has {Nodes} node(s), replication factor {Rf} — degrading to full replication",
+                nodes.Count, configuration.ReplicationFactor);
+            return;
+        }
+
+        foreach (RaftPartitionRange range in ranges)
+        {
+            if (!assignment.TryGetValue(range.PartitionId, out List<Placement.CandidateNode>? replicas))
+                continue;
+
+            range.Replicas = replicas.Select(n => new RaftReplica
+            {
+                Endpoint = n.Endpoint,
+                NodeId = n.NodeId,
+                Role = RaftReplicaRole.Voter,
+                SinceGeneration = range.Generation
+            }).ToList();
+        }
     }
 
     internal async Task TryCreatePartition(RaftSystemRequest message, CancellationToken cancellationToken)
@@ -339,15 +406,17 @@ internal sealed class PartitionMapService
             }
         }
 
-        map.Partitions.Add(new RaftPartitionRange
+        RaftPartitionRange newRange = new()
         {
             PartitionId = message.PartitionId,
             StartRange = newStart,
             EndRange = newEnd,
             Generation = 1,
             State = RaftPartitionState.Active,
-            RoutingMode = message.RoutingMode
-        });
+            RoutingMode = message.RoutingMode,
+            Replicas = PickReplicasForNewRange(map)
+        };
+        map.Partitions.Add(newRange);
         map.MapVersion++;
 
         RaftSystemMessage sysMessage = new()
@@ -401,6 +470,53 @@ internal sealed class PartitionMapService
         systemConfiguration[RaftSystemConfigKeys.Partitions] = sysMessage.Value;
         startPartitions(map.Partitions);
         completion?.TrySetResult((RaftOperationStatus.Success, 1));
+    }
+
+    /// <summary>
+    /// Chooses the replica set for a dynamically-created partition when
+    /// <see cref="RaftConfiguration.ReplicationFactor"/> &gt; 0: the RF least-loaded committed
+    /// roster voters (replica load counted from the current map), founding configuration all
+    /// Voter. Returns an empty list — legacy full replication — when RF is 0 or the voter count
+    /// does not exceed RF.
+    /// </summary>
+    private List<RaftReplica> PickReplicasForNewRange(RaftPartitionMap map)
+    {
+        int rf = configuration.ReplicationFactor;
+        if (rf <= 0)
+            return [];
+
+        List<ClusterMember> voters = getMembership().Members
+            .Where(m => m.Role == ClusterMemberRole.Voter)
+            .ToList();
+
+        if (voters.Count <= rf)
+            return [];
+
+        Dictionary<string, int> load = voters.ToDictionary(v => v.Endpoint, _ => 0, StringComparer.Ordinal);
+        foreach (RaftPartitionRange range in map.Partitions)
+        {
+            if (range.State == RaftPartitionState.Removed)
+                continue;
+
+            foreach (RaftReplica replica in range.Replicas)
+            {
+                if (load.TryGetValue(replica.Endpoint, out int count))
+                    load[replica.Endpoint] = count + 1;
+            }
+        }
+
+        return voters
+            .OrderBy(v => load[v.Endpoint])
+            .ThenBy(v => v.Endpoint, StringComparer.Ordinal)
+            .Take(rf)
+            .Select(v => new RaftReplica
+            {
+                Endpoint = v.Endpoint,
+                NodeId = v.NodeId,
+                Role = RaftReplicaRole.Voter,
+                SinceGeneration = 1
+            })
+            .ToList();
     }
 
     internal async Task TryRemovePartition(RaftSystemRequest message, CancellationToken cancellationToken)

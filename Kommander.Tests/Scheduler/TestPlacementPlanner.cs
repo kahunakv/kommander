@@ -1,0 +1,264 @@
+using Kommander.System.Placement;
+
+namespace Kommander.Tests.Scheduler;
+
+/// <summary>
+/// Unit tests for the pure <see cref="PlacementPlanner"/>: initial even-spread assignment,
+/// repair/trim/balance priorities, single-mover and budget caps, and stability (a balanced
+/// view must yield no moves — churn costs more than perfection).
+/// </summary>
+public sealed class TestPlacementPlanner
+{
+    private static CandidateNode Node(string endpoint, bool alive = true, string? zone = null) =>
+        new() { Endpoint = endpoint, Alive = alive, Zone = zone };
+
+    private static RangePlacement Range(
+        int id, int rf, string[] voters, string[]? learners = null, bool transitional = false, string? leader = null) =>
+        new()
+        {
+            PartitionId = id,
+            ReplicationFactor = rf,
+            VoterEndpoints = voters,
+            LearnerEndpoints = learners ?? [],
+            HasTransitionalReplica = transitional,
+            LeaderEndpoint = leader
+        };
+
+    // ── AssignInitial ─────────────────────────────────────────────────────────
+
+    [Fact]
+    public void AssignInitial_SixNodesFourRangesRf3_EvenSpread()
+    {
+        // The spec's canonical example: 6 nodes, 4 ranges, RF=3 — each range gets three distinct
+        // replicas, each node hosts exactly two ranges (12 replicas / 6 nodes), no node hosts all.
+        List<CandidateNode> nodes = [.. Enumerable.Range(1, 6).Select(i => Node($"n{i}:1"))];
+
+        Dictionary<int, List<CandidateNode>> assignment =
+            PlacementPlanner.AssignInitial([1, 2, 3, 4], nodes, 3);
+
+        Assert.Equal(4, assignment.Count);
+
+        Dictionary<string, int> perNode = nodes.ToDictionary(n => n.Endpoint, _ => 0);
+        foreach ((int partitionId, List<CandidateNode> replicas) in assignment)
+        {
+            Assert.Equal(3, replicas.Count);
+            Assert.Equal(3, replicas.Select(r => r.Endpoint).Distinct().Count()); // anti-affinity
+            foreach (CandidateNode replica in replicas)
+                perNode[replica.Endpoint]++;
+        }
+
+        Assert.All(perNode.Values, count => Assert.Equal(2, count));
+    }
+
+    [Fact]
+    public void AssignInitial_SubRfCluster_DegradesToFullReplication()
+    {
+        // 3 nodes at RF=3: full replication is equivalent and cheaper — empty assignment keeps
+        // the legacy empty-Replicas encoding.
+        List<CandidateNode> nodes = [Node("a:1"), Node("b:1"), Node("c:1")];
+
+        Assert.Empty(PlacementPlanner.AssignInitial([1, 2], nodes, 3));
+        Assert.Empty(PlacementPlanner.AssignInitial([1, 2], [Node("a:1")], 3));
+        Assert.Empty(PlacementPlanner.AssignInitial([1, 2], nodes, 0));
+    }
+
+    [Fact]
+    public void AssignInitial_IsDeterministic()
+    {
+        List<CandidateNode> nodes = [Node("b:1"), Node("a:1"), Node("d:1"), Node("c:1")];
+
+        Dictionary<int, List<CandidateNode>> first = PlacementPlanner.AssignInitial([1, 2, 3], nodes, 3);
+        Dictionary<int, List<CandidateNode>> second = PlacementPlanner.AssignInitial([1, 2, 3], [.. nodes.AsEnumerable().Reverse()], 3);
+
+        foreach (int id in first.Keys)
+            Assert.Equal(
+                first[id].Select(n => n.Endpoint).Order(),
+                second[id].Select(n => n.Endpoint).Order());
+    }
+
+    // ── Plan: repair ──────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Plan_UnderReplicatedRange_AddsOnLeastLoadedNode()
+    {
+        PlacementView view = new()
+        {
+            Ranges =
+            [
+                Range(1, 3, ["a:1", "b:1"]),                   // under-replicated (2 < 3)
+                Range(2, 3, ["a:1", "b:1", "c:1"]),
+                Range(3, 3, ["a:1", "b:1", "c:1"])
+            ],
+            Nodes = [Node("a:1"), Node("b:1"), Node("c:1"), Node("d:1")],
+            MaxMoves = 2,
+            TransferBudget = 2
+        };
+
+        List<PlacementMove> moves = PlacementPlanner.Plan(view);
+
+        PlacementMove repair = Assert.Single(moves);
+        Assert.Equal(1, repair.PartitionId);
+        Assert.Equal(PlacementMoveKind.AddReplica, repair.Kind);
+        Assert.Equal("d:1", repair.Endpoint); // least loaded (0 replicas) and not already a replica
+    }
+
+    [Fact]
+    public void Plan_ReplicaOnDeadNode_TriggersRepairElsewhere()
+    {
+        PlacementView view = new()
+        {
+            Ranges = [Range(1, 3, ["a:1", "b:1", "dead:1"])],
+            Nodes = [Node("a:1"), Node("b:1"), Node("dead:1", alive: false), Node("c:1")],
+            MaxMoves = 2,
+            TransferBudget = 2
+        };
+
+        List<PlacementMove> moves = PlacementPlanner.Plan(view);
+
+        // Only 2 healthy voters < RF 3: re-replicate onto the live spare. The dead replica is
+        // trimmed on a later pass once the add promotes (single mover per range).
+        PlacementMove repair = Assert.Single(moves);
+        Assert.Equal(PlacementMoveKind.AddReplica, repair.Kind);
+        Assert.Equal("c:1", repair.Endpoint);
+    }
+
+    [Fact]
+    public void Plan_EvictedNodeReplica_ShedOnceRfSatisfied()
+    {
+        // "gone:1" is no longer in the roster at all, but three healthy voters already satisfy
+        // RF — shed the dead-weight replica.
+        PlacementView view = new()
+        {
+            Ranges = [Range(1, 3, ["a:1", "b:1", "c:1", "gone:1"])],
+            Nodes = [Node("a:1"), Node("b:1"), Node("c:1")],
+            MaxMoves = 2,
+            TransferBudget = 2
+        };
+
+        List<PlacementMove> moves = PlacementPlanner.Plan(view);
+
+        PlacementMove trim = Assert.Single(moves);
+        Assert.Equal(PlacementMoveKind.RemoveReplica, trim.Kind);
+        Assert.Equal("gone:1", trim.Endpoint);
+    }
+
+    // ── Plan: trim ────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Plan_OverReplicatedRange_RemovesMostLoadedNonLeader()
+    {
+        PlacementView view = new()
+        {
+            Ranges =
+            [
+                Range(1, 3, ["a:1", "b:1", "c:1", "d:1"], leader: "d:1"), // 4 voters > RF 3
+                Range(2, 3, ["d:1", "b:1", "c:1"]),
+                Range(3, 3, ["d:1", "b:1", "c:1"])
+            ],
+            Nodes = [Node("a:1"), Node("b:1"), Node("c:1"), Node("d:1")],
+            MaxMoves = 2,
+            TransferBudget = 2
+        };
+
+        List<PlacementMove> moves = PlacementPlanner.Plan(view);
+
+        // d:1 is the most loaded (3 ranges) but leads range 1 — the trim prefers a non-leader
+        // victim, so the next-loaded of {b,c} goes.
+        PlacementMove trim = Assert.Single(moves);
+        Assert.Equal(1, trim.PartitionId);
+        Assert.Equal(PlacementMoveKind.RemoveReplica, trim.Kind);
+        Assert.Equal("b:1", trim.Endpoint);
+    }
+
+    // ── Plan: stability and caps ──────────────────────────────────────────────
+
+    [Fact]
+    public void Plan_BalancedView_YieldsNoMoves()
+    {
+        // The even-spread optimum from AssignInitial must be a fixed point of the planner.
+        List<CandidateNode> nodes = [.. Enumerable.Range(1, 6).Select(i => Node($"n{i}:1"))];
+        Dictionary<int, List<CandidateNode>> assignment = PlacementPlanner.AssignInitial([1, 2, 3, 4], nodes, 3);
+
+        PlacementView view = new()
+        {
+            Ranges = [.. assignment.Select(kv => Range(kv.Key, 3, [.. kv.Value.Select(n => n.Endpoint)]))],
+            Nodes = nodes,
+            MaxMoves = 4,
+            TransferBudget = 4
+        };
+
+        Assert.Empty(PlacementPlanner.Plan(view));
+    }
+
+    [Fact]
+    public void Plan_TransitionalRange_IsNeverTouched()
+    {
+        PlacementView view = new()
+        {
+            Ranges = [Range(1, 3, ["a:1"], learners: ["b:1"], transitional: true)], // under-replicated but mid-move
+            Nodes = [Node("a:1"), Node("b:1"), Node("c:1"), Node("d:1")],
+            MaxMoves = 4,
+            TransferBudget = 4
+        };
+
+        Assert.Empty(PlacementPlanner.Plan(view));
+    }
+
+    [Fact]
+    public void Plan_ZeroTransferBudget_YieldsNoMoves()
+    {
+        PlacementView view = new()
+        {
+            Ranges = [Range(1, 3, ["a:1", "b:1"])],
+            Nodes = [Node("a:1"), Node("b:1"), Node("c:1"), Node("d:1")],
+            MaxMoves = 4,
+            TransferBudget = 0
+        };
+
+        Assert.Empty(PlacementPlanner.Plan(view));
+    }
+
+    [Fact]
+    public void Plan_MovesAreCappedByMaxMoves()
+    {
+        PlacementView view = new()
+        {
+            Ranges =
+            [
+                Range(1, 3, ["a:1", "b:1"]),
+                Range(2, 3, ["a:1", "b:1"]),
+                Range(3, 3, ["a:1", "b:1"])
+            ],
+            Nodes = [Node("a:1"), Node("b:1"), Node("c:1"), Node("d:1")],
+            MaxMoves = 2,
+            TransferBudget = 8
+        };
+
+        Assert.Equal(2, PlacementPlanner.Plan(view).Count);
+    }
+
+    // ── Plan: zone spread ─────────────────────────────────────────────────────
+
+    [Fact]
+    public void Plan_RepairPrefersUncoveredZone()
+    {
+        PlacementView view = new()
+        {
+            Ranges = [Range(1, 3, ["a:1", "b:1"])], // both replicas in zone z1
+            Nodes =
+            [
+                Node("a:1", zone: "z1"),
+                Node("b:1", zone: "z1"),
+                Node("c:1", zone: "z1"),
+                Node("d:1", zone: "z2")
+            ],
+            MaxMoves = 1,
+            TransferBudget = 1
+        };
+
+        List<PlacementMove> moves = PlacementPlanner.Plan(view);
+
+        PlacementMove repair = Assert.Single(moves);
+        Assert.Equal("d:1", repair.Endpoint); // z2 not yet covered beats equally-loaded z1 node
+    }
+}

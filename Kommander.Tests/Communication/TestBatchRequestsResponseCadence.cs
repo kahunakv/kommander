@@ -186,6 +186,9 @@ public sealed class TestBatchRequestsResponseCadence
         public Task<RaftPartitionLifecycleResult> SplitPartitionAsync(int sourcePartitionId, int targetPartitionId = 0, RaftSplitPlan? plan = null, CancellationToken ct = default) => throw new NotImplementedException();
         public Task<RaftPartitionLifecycleResult> MergePartitionsAsync(int survivorPartitionId, int sourcePartitionId, RaftMergePlan? plan = null, CancellationToken ct = default) => throw new NotImplementedException();
         public long GetPartitionGeneration(int partitionId) => throw new NotImplementedException();
+        public IReadOnlyList<RaftReplica> GetPartitionReplicas(int partitionId) => throw new NotImplementedException();
+        public int GetEffectiveReplicationFactor(int partitionId) => throw new NotImplementedException();
+        public Task<RaftPartitionLifecycleResult> SetReplicationFactorAsync(int partitionId, int replicationFactor, CancellationToken ct = default) => throw new NotImplementedException();
         public double GetPartitionLogOpsPerSecond(int partitionId) => throw new NotImplementedException();
         public int GetPartitionWalQueueDepth(int partitionId) => throw new NotImplementedException();
         public double GetPartitionCommitWaitMs(int partitionId) => throw new NotImplementedException();

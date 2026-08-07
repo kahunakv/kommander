@@ -194,6 +194,17 @@ internal sealed class SplitMergeController
             Generation  = 1,
             State       = RaftPartitionState.Splitting,
             RoutingMode = targetRoutingMode,
+            // Per-partition placement: the child inherits the parent's replica set — the data
+            // already lives on those nodes, so the child reaches RF with no transfer. The
+            // placement rebalancer may spread it later. Empty stays empty (full replication).
+            ReplicationFactor = partitionRange.ReplicationFactor,
+            Replicas = partitionRange.Replicas.Select(r => new RaftReplica
+            {
+                Endpoint = r.Endpoint,
+                NodeId = r.NodeId,
+                Role = r.Role,
+                SinceGeneration = 1
+            }).ToList(),
         };
 
         ranges.Add(newRange);
@@ -578,6 +589,25 @@ internal sealed class SplitMergeController
         {
             surv.StartRange = Math.Min(surv.StartRange, src.StartRange);
             surv.EndRange   = Math.Max(surv.EndRange,   src.EndRange);
+        }
+
+        // Per-partition placement: the survivor takes the union of both replica sets so every
+        // node that holds either range's data keeps serving it; the placement rebalancer trims
+        // back to RF later (over-replication is a planner priority). Only meaningful when the
+        // survivor already has an assigned set — a legacy (empty) survivor stays legacy.
+        if (surv.Replicas.Count > 0)
+        {
+            foreach (RaftReplica replica in src.Replicas)
+            {
+                if (surv.Replicas.All(r => r.Endpoint != replica.Endpoint))
+                    surv.Replicas.Add(new RaftReplica
+                    {
+                        Endpoint = replica.Endpoint,
+                        NodeId = replica.NodeId,
+                        Role = replica.Role,
+                        SinceGeneration = surv.Generation + 1
+                    });
+            }
         }
 
         surv.Generation++;

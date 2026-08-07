@@ -35,13 +35,10 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
 
     public ClusterMemberRole LocalRole => manager.LocalRole;
 
-    public bool IsVoter(string endpoint)
-    {
-        ClusterMembership roster = manager.SystemCoordinator.GetMembership();
-        if (roster.MembershipVersion == 0)
-            return true; // pre-seed: treat all known peers as voters (backward compat)
-        return roster.Members.Any(m => m.Endpoint == endpoint && m.Role == ClusterMemberRole.Voter);
-    }
+    public bool IsVoter(string endpoint) =>
+        // Per-partition: for a range with an assigned replica set this is membership in the
+        // range's Voter replicas; legacy ranges and P0 fall back to the roster's voter set.
+        manager.IsPartitionVoter(partition.PartitionId, endpoint);
 
     public bool IsMember(string endpoint)
     {
@@ -58,7 +55,7 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
 
     public HybridLogicalClock HybridLogicalClock => manager.HybridLogicalClock;
 
-    public IReadOnlyList<RaftNode> Nodes => manager.Nodes;
+    public IReadOnlyList<RaftNode> Nodes => manager.GetPartitionPeers(partition.PartitionId);
 
     public bool InitialNodesDiscovered => manager.InitialNodesDiscovered;
 

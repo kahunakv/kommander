@@ -937,6 +937,58 @@ public class RaftConfiguration
     /// </summary>
     public TimeSpan SuggestionTimeout { get; set; } = TimeSpan.FromSeconds(15);
 
+    // ── Replica placement (replication factor) ────────────────────────────────
+
+    /// <summary>
+    /// Desired number of voter replicas per partition range. <b>0 (the default) means full
+    /// replication</b> — every roster voter hosts every range, today's behavior. When &gt; 0,
+    /// initial placement assigns each range a replica set of this size (spread evenly across
+    /// voters) and quorum is computed per range over its voter replicas only. A cluster with
+    /// fewer voters than the factor degrades to full replication with no loss of safety.
+    /// <para>Even values give a fragile quorum (3-of-4 tolerates the same single failure as
+    /// 2-of-3); prefer odd values.</para>
+    /// </summary>
+    public int ReplicationFactor { get; set; }
+
+    /// <summary>
+    /// Master switch for the continual replica-placement rebalancer on the P0 leader.
+    /// When <see langword="false"/> (the default) no rebalancing moves are planned; in-flight
+    /// replica transitions (learner promotion, removal completion) are still driven to
+    /// completion so a crash mid-move can always converge. Initial placement at
+    /// <see cref="ReplicationFactor"/> is applied regardless of this flag.
+    /// </summary>
+    public bool EnablePlacementRebalancer { get; set; }
+
+    /// <summary>
+    /// Maximum number of new replica moves (add or remove sequences) initiated per
+    /// placement-controller pass. Bounds the blast radius of a bad plan.
+    /// <para>Default is <b>2</b>.</para>
+    /// </summary>
+    public int MaxReplicaMovesPerPass { get; set; } = 2;
+
+    /// <summary>
+    /// Maximum number of ranges with an in-flight transitional replica (Learner catching up or
+    /// Removing awaiting final drop) at any time. Caps concurrent backfill/snapshot transfers
+    /// so rebalancing never starves client traffic.
+    /// <para>Default is <b>1</b>.</para>
+    /// </summary>
+    public int MaxConcurrentReplicaTransfers { get; set; } = 1;
+
+    /// <summary>
+    /// Minimum per-node replica-count imbalance (above the even-spread ceiling) before the
+    /// placement planner emits balancing moves. Prevents ping-ponging a replica between two
+    /// nodes around a perfectly balanced distribution. Under-replicated ranges bypass the
+    /// deadband — restoring the replication factor is always highest priority.
+    /// <para>Default is <b>1</b>.</para>
+    /// </summary>
+    public int ReplicaCountDeadband { get; set; } = 1;
+
+    /// <summary>
+    /// Optional locality hint (zone/rack) for the local node. When set, the placement planner
+    /// prefers spreading a range's replicas across distinct zones.
+    /// </summary>
+    public string? Zone { get; set; }
+
     // ── WAL compaction ────────────────────────────────────────────────────────
 
     /// <summary>

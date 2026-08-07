@@ -598,6 +598,36 @@ public interface IRaft
     public long GetPartitionGeneration(int partitionId);
 
     /// <summary>
+    /// Returns the committed replica set of the given partition for consumer-side routing:
+    /// which nodes host the range and each replica's role. An <b>empty list means legacy full
+    /// replication</b> — every roster voter hosts the range (also returned for unknown
+    /// partitions). Consumers should cache the set keyed by the range's generation and refresh
+    /// on <see cref="OnPartitionMapChanged"/> or a <see cref="Data.RaftOperationStatus.PartitionMoved"/>
+    /// rejection — the same fence discipline that guards split/merge cutovers.
+    /// </summary>
+    public IReadOnlyList<System.RaftReplica> GetPartitionReplicas(int partitionId);
+
+    /// <summary>
+    /// Returns the effective replication factor for the partition: its per-range override when
+    /// set, otherwise <see cref="RaftConfiguration.ReplicationFactor"/>. 0 means full
+    /// replication (every roster voter hosts the range).
+    /// </summary>
+    public int GetEffectiveReplicationFactor(int partitionId);
+
+    /// <summary>
+    /// Commits a per-range replication-factor override (0 clears it, inheriting the global
+    /// configuration). Leader-only (P0). The change adjusts the target only — the placement
+    /// controller moves replicas toward it on subsequent passes when
+    /// <see cref="RaftConfiguration.EnablePlacementRebalancer"/> is on. Deliberately does not
+    /// bump the range's generation: routing is unchanged until replicas actually move, so
+    /// consumer fences stay valid.
+    /// </summary>
+    public Task<Data.RaftPartitionLifecycleResult> SetReplicationFactorAsync(
+        int partitionId,
+        int replicationFactor,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// Returns the EWMA rate of <c>ReplicateLogs</c> operations per second for
     /// <paramref name="partitionId"/>, as measured by whichever node currently leads it.
     /// <para>

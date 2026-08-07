@@ -1682,7 +1682,11 @@ public sealed class RaftPartitionStateMachine
 
     private async Task StartElectionAsync(HLCTimestamp currentTime, bool ignoreRecentVoteCooldown)
     {
-        if (host.LocalRole != ClusterMemberRole.Voter)
+        // Two gates: the roster role (a cluster Learner/Leaving node never campaigns anywhere)
+        // and the per-partition voter check (under replica placement a roster Voter may be only
+        // a Learner/Removing replica of THIS range — campaigning would inflate the range's
+        // quorum with a vote the committed replica set does not grant it).
+        if (host.LocalRole != ClusterMemberRole.Voter || !host.IsVoter(host.LocalEndpoint))
         {
             logger.LogDebugSuppressingElection(host.LocalEndpoint, host.PartitionId, nodeState, host.LocalRole);
             return;
@@ -1794,7 +1798,9 @@ public sealed class RaftPartitionStateMachine
     /// </summary>
     private async Task StartPreVoteAsync(HLCTimestamp currentTime)
     {
-        if (host.LocalRole != ClusterMemberRole.Voter)
+        // Mirrors StartElectionAsync: roster role plus per-partition voter check — a node that
+        // is not a Voter replica of this range must not campaign for it.
+        if (host.LocalRole != ClusterMemberRole.Voter || !host.IsVoter(host.LocalEndpoint))
         {
             logger.LogDebugSuppressingPreVote(host.LocalEndpoint, host.PartitionId, nodeState, host.LocalRole);
             return;

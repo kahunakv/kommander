@@ -239,6 +239,25 @@ public class InMemoryCommunication : ICommunication
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// In-process forwarding: runs the proposal through the target node's own
+    /// <c>ReplicateLogs</c> path so leader checks and the generation fence apply there.
+    /// Returns null when the target is unknown or transport-partitioned, which the caller
+    /// treats the same as an unreachable replica (try the next one).
+    /// </summary>
+    public async Task<RaftReplicationResult?> ForwardReplicateLogs(
+        RaftManager manager, RaftNode node, int partitionId, string type,
+        IReadOnlyList<byte[]> logs, bool autoCommit, long expectedGeneration,
+        CancellationToken cancellationToken = default)
+    {
+        if (IsPartitioned(manager.LocalEndpoint, node.Endpoint) || !nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
+            return null;
+
+        return await targetNode.ReplicateLogs(
+            partitionId, type, logs, autoCommit, expectedGeneration, cancellationToken
+        ).ConfigureAwait(false);
+    }
+
     public async Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)
     {
         if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))

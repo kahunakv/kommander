@@ -278,6 +278,23 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "TryRemoveMember: Removing {Endpoint} at version {Version}")]
     public static partial void LogInfoRemoveMember(this ILogger<IRaft> logger, string endpoint, long version);
 
+    // ── Replica placement ─────────────────────────────────────────────────
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] AddReplica: partition {Id} += {Endpoint} (Learner), generation {Generation}")]
+    public static partial void LogInfoAddReplica(this ILogger<IRaft> logger, string local, int id, string endpoint, long generation);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] PromoteReplica: partition {Id} {Endpoint} Learner -> Voter, generation {Generation}")]
+    public static partial void LogInfoPromoteReplica(this ILogger<IRaft> logger, string local, int id, string endpoint, long generation);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] RemoveReplica: partition {Id} {Endpoint} -> Removing, generation {Generation}")]
+    public static partial void LogInfoRemoveReplicaMarking(this ILogger<IRaft> logger, string local, int id, string endpoint, long generation);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] RemoveReplica: partition {Id} -= {Endpoint}, generation {Generation}")]
+    public static partial void LogInfoRemoveReplicaDropped(this ILogger<IRaft> logger, string local, int id, string endpoint, long generation);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] Placement move: {Kind} partition {Id} {Endpoint}")]
+    public static partial void LogInfoPlacementMove(this ILogger<IRaft> logger, string local, Kommander.System.Placement.PlacementMoveKind kind, int id, string endpoint);
+
     // ── RestCommunication ─────────────────────────────────────────────────
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "[{Endpoint}/{Partition}] Logs replicated to {RemoteEndpoint}")]

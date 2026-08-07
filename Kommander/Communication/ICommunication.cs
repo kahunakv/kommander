@@ -129,4 +129,23 @@ public interface ICommunication
         RaftManager manager, string targetEndpoint, string reason,
         CancellationToken cancellationToken = default)
         => Task.CompletedTask;
+
+    /// <summary>
+    /// Forwards a client <c>ReplicateLogs</c> proposal to <paramref name="node"/> — used by a
+    /// node that is not a replica of the target range under per-partition placement. The remote
+    /// node runs the proposal through its own <c>ReplicateLogs</c> path, so the generation fence
+    /// and leader checks apply there; a <c>NodeIsNotLeader</c> result tells the caller to try
+    /// another replica.
+    /// <para>
+    /// The default implementation returns <see langword="null"/> (forwarding unsupported):
+    /// transports without a dedicated RPC leave the caller to fail with
+    /// <see cref="Kommander.RaftException"/>, and consumers on those transports should route
+    /// directly to a replica using <c>IRaft.GetPartitionReplicas</c>.
+    /// </para>
+    /// </summary>
+    public Task<RaftReplicationResult?> ForwardReplicateLogs(
+        RaftManager manager, RaftNode node, int partitionId, string type,
+        IReadOnlyList<byte[]> logs, bool autoCommit, long expectedGeneration,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult<RaftReplicationResult?>(null);
 }
