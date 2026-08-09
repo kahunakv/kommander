@@ -92,6 +92,7 @@ public sealed class TestReorderingCommunication
 
     private static async Task WaitForCondition(Func<bool> condition, TimeSpan timeout, CancellationToken ct)
     {
+        timeout = TestTimeouts.Scale(timeout);
         using CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(timeout);
         while (!cts.Token.IsCancellationRequested)

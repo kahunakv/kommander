@@ -374,6 +374,7 @@ public sealed class RecoveryReSupplyClusterTests
 
     private static async Task WaitForConditionAsync(Func<bool> condition, CancellationToken cancellationToken, int timeoutSeconds = 15)
     {
+        timeoutSeconds = TestTimeouts.Scale(timeoutSeconds);
         for (int i = 0; i < timeoutSeconds * 40; i++)
         {
             if (condition())

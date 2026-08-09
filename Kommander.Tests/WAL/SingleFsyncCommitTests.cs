@@ -331,7 +331,7 @@ public sealed class SingleFsyncCommitTests
     private static async Task WaitForAnyLeader(IRaft[] nodes, int partitionId, CancellationToken cancellationToken)
     {
         ValueStopwatch stopwatch = ValueStopwatch.StartNew();
-        while (stopwatch.GetElapsedMilliseconds() < 15_000)
+        while (stopwatch.GetElapsedMilliseconds() < TestTimeouts.Scale(15_000))
         {
             cancellationToken.ThrowIfCancellationRequested();
             foreach (IRaft node in nodes)
@@ -361,7 +361,7 @@ public sealed class SingleFsyncCommitTests
     private static async Task WaitForCondition(Func<bool> condition, CancellationToken cancellationToken)
     {
         ValueStopwatch stopwatch = ValueStopwatch.StartNew();
-        while (stopwatch.GetElapsedMilliseconds() < 15_000)
+        while (stopwatch.GetElapsedMilliseconds() < TestTimeouts.Scale(15_000))
         {
             if (condition())
                 return;

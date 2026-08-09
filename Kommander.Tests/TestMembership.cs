@@ -113,6 +113,7 @@ public sealed class TestMembership
 
     private static async Task WaitForCondition(Func<bool> cond, CancellationToken ct, int timeoutMs = 10_000, Func<Task>? tickAction = null)
     {
+        timeoutMs = TestTimeouts.Scale(timeoutMs);
         ValueStopwatch sw = ValueStopwatch.StartNew();
         while (sw.GetElapsedMilliseconds() < timeoutMs)
         {

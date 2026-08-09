@@ -28,6 +28,7 @@ public sealed class TestNonMemberIsolation
 
     private static async Task WaitForConditionAsync(Func<bool> condition, CancellationToken ct, int timeoutMs = 30_000)
     {
+        timeoutMs = TestTimeouts.Scale(timeoutMs);
         long deadline = Environment.TickCount64 + timeoutMs;
         while (Environment.TickCount64 < deadline)
         {

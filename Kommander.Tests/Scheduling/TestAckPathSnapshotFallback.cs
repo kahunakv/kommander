@@ -62,6 +62,7 @@ public class TestAckPathSnapshotFallback
 
     private static async Task<bool> WaitForAsync(Func<bool> cond, int timeoutMs)
     {
+        timeoutMs = TestTimeouts.Scale(timeoutMs);
         ValueStopwatch sw = ValueStopwatch.StartNew();
         while (sw.GetElapsedMilliseconds() < timeoutMs)
         {

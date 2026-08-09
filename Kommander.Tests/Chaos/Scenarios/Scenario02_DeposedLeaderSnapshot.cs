@@ -184,6 +184,7 @@ public sealed class Scenario02_DeposedLeaderSnapshot
 
     private static async Task WaitForAsync(Func<bool> cond, CancellationToken ct, int timeoutMs = 15_000)
     {
+        timeoutMs = TestTimeouts.Scale(timeoutMs);
         ValueStopwatch sw = ValueStopwatch.StartNew();
         while (sw.GetElapsedMilliseconds() < timeoutMs)
         {

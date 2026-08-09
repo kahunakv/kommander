@@ -1463,6 +1463,7 @@ public sealed class TestThreeNodeCluster
         CancellationToken cancellationToken,
         int timeoutMs = 15_000)
     {
+        timeoutMs = TestTimeouts.Scale(timeoutMs);
         ValueStopwatch stopwatch = ValueStopwatch.StartNew();
 
         while (stopwatch.GetElapsedMilliseconds() < timeoutMs)

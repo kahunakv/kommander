@@ -152,6 +152,7 @@ public sealed class TestEvictionRejoin
 
     private static async Task WaitForCondition(Func<bool> cond, CancellationToken ct, int timeoutMs = 15_000)
     {
+        timeoutMs = TestTimeouts.Scale(timeoutMs);
         long deadline = Environment.TickCount64 + timeoutMs;
         while (Environment.TickCount64 < deadline)
         {
@@ -762,6 +763,7 @@ public sealed class TestEvictionRejoin
     /// <summary>Polls until the leader's recorded committed index for <paramref name="endpoint"/> on partition 1 reaches <paramref name="target"/>.</summary>
     private static async Task WaitForFollowerIndex(RaftManager leader, string endpoint, long target, CancellationToken ct, int timeoutMs = 15_000)
     {
+        timeoutMs = TestTimeouts.Scale(timeoutMs);
         long deadline = Environment.TickCount64 + timeoutMs;
         while (Environment.TickCount64 < deadline)
         {

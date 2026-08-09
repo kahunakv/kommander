@@ -482,6 +482,7 @@ public class TestReplicateEntries
 
     private static async Task WaitForAsync(Func<bool> condition, int attempts = 200, int delayMs = 10)
     {
+        attempts = TestTimeouts.Scale(attempts);
         for (int i = 0; i < attempts; i++)
         {
             if (condition())

@@ -76,6 +76,7 @@ public sealed class TestGracefulLeave
 
     private static async Task WaitForCondition(Func<bool> cond, CancellationToken ct, int timeoutMs = 10_000)
     {
+        timeoutMs = TestTimeouts.Scale(timeoutMs);
         ValueStopwatch sw = ValueStopwatch.StartNew();
         while (sw.GetElapsedMilliseconds() < timeoutMs)
         {

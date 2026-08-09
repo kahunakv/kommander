@@ -23,6 +23,7 @@ public sealed class TestFourNodeJoin
 
     private static async Task WaitForConditionAsync(Func<bool> condition, CancellationToken ct, int timeoutMs = 30_000)
     {
+        timeoutMs = TestTimeouts.Scale(timeoutMs);
         long deadline = Environment.TickCount64 + timeoutMs;
         while (Environment.TickCount64 < deadline)
         {
@@ -179,13 +180,28 @@ public sealed class TestFourNodeJoin
 
             // Admit node4 as a Learner via the P0 leader. We do NOT use JoinCluster(seeds) here
             // because that blocks until promotion to Voter — node4 must remain a Learner.
+            //
+            // AddMember is a versioned CAS on the roster: it carries the MembershipVersion read
+            // just before the send and returns StaleMembership when a concurrent roster commit
+            // (e.g. an assembly-time voter registration still landing) bumps the version in
+            // between. That is the CAS working as designed, not the condition under test — so
+            // re-read the version and retry instead of flaking under load.
             RaftManager p0Leader = await FindLeaderForPartitionAsync(voters, 0, ct);
-            TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
-                new(TaskCreationOptions.RunContinuationsAsynchronously);
-            p0Leader.SystemCoordinator.Send(new System.RaftSystemRequest(
-                System.RaftSystemRequestType.AddMember, "localhost:8224", 4,
-                p0Leader.SystemCoordinator.GetMembership().MembershipVersion, tcs));
-            (RaftOperationStatus addStatus, _) = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+            RaftOperationStatus addStatus = RaftOperationStatus.Errored;
+            for (int attempt = 0; attempt < 10; attempt++)
+            {
+                TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
+                    new(TaskCreationOptions.RunContinuationsAsynchronously);
+                p0Leader.SystemCoordinator.Send(new System.RaftSystemRequest(
+                    System.RaftSystemRequestType.AddMember, "localhost:8224", 4,
+                    p0Leader.SystemCoordinator.GetMembership().MembershipVersion, tcs));
+                (addStatus, _) = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+
+                if (addStatus != RaftOperationStatus.StaleMembership)
+                    break;
+
+                await Task.Delay(50, ct);
+            }
             Assert.Equal(RaftOperationStatus.Success, addStatus);
 
             // Wait until every voter's derived peer set includes the Learner — whichever voter is
@@ -341,11 +357,23 @@ public sealed class TestFourNodeJoin
             // resolves once P0 replicates the partition map to it after AddMember).
             Task n4Runtime = n4.JoinCluster(ct);
 
-            TaskCompletionSource<(RaftOperationStatus, long)> addTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            p0Leader.SystemCoordinator.Send(new System.RaftSystemRequest(
-                System.RaftSystemRequestType.AddMember, n4Endpoint, 4,
-                p0Leader.SystemCoordinator.GetMembership().MembershipVersion, addTcs));
-            (RaftOperationStatus addStatus, _) = await addTcs.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
+            // Versioned-CAS retry on StaleMembership — same rationale as the learner-quorum test
+            // above: a concurrent assembly-time roster commit bumping the version is the CAS
+            // working as designed, not the condition under test.
+            RaftOperationStatus addStatus = RaftOperationStatus.Errored;
+            for (int attempt = 0; attempt < 10; attempt++)
+            {
+                TaskCompletionSource<(RaftOperationStatus, long)> addTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                p0Leader.SystemCoordinator.Send(new System.RaftSystemRequest(
+                    System.RaftSystemRequestType.AddMember, n4Endpoint, 4,
+                    p0Leader.SystemCoordinator.GetMembership().MembershipVersion, addTcs));
+                (addStatus, _) = await addTcs.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
+
+                if (addStatus != RaftOperationStatus.StaleMembership)
+                    break;
+
+                await Task.Delay(50, ct);
+            }
             Assert.Equal(RaftOperationStatus.Success, addStatus);
 
             // n4 is now in the roster as Learner and the P0 leader will start replicating to it.

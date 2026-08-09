@@ -127,6 +127,7 @@ public sealed class TestSharedSystemPartition
     private static async Task WaitForConditionAsync(
         Func<bool> condition, CancellationToken ct, int timeoutMs = 10_000)
     {
+        timeoutMs = TestTimeouts.Scale(timeoutMs);
         ValueStopwatch sw = ValueStopwatch.StartNew();
         while (sw.GetElapsedMilliseconds() < timeoutMs)
         {

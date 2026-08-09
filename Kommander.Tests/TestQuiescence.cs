@@ -476,6 +476,7 @@ public sealed class TestQuiescence
         CancellationToken cancellationToken,
         int timeoutMs = 15_000)
     {
+        timeoutMs = TestTimeouts.Scale(timeoutMs);
         long startMs = Environment.TickCount64;
         while (Environment.TickCount64 - startMs < timeoutMs)
         {
@@ -492,6 +493,7 @@ public sealed class TestQuiescence
         CancellationToken cancellationToken,
         int timeoutMs = 15_000)
     {
+        timeoutMs = TestTimeouts.Scale(timeoutMs);
         long startMs = Environment.TickCount64;
         while (Environment.TickCount64 - startMs < timeoutMs)
         {

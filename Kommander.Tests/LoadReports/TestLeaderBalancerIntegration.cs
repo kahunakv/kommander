@@ -73,6 +73,7 @@ public sealed class TestLeaderBalancerIntegration
 
     private static async Task WaitForCondition(Func<bool> cond, CancellationToken ct, int timeoutMs = 15_000)
     {
+        timeoutMs = TestTimeouts.Scale(timeoutMs);
         long deadline = Environment.TickCount64 + timeoutMs;
         while (Environment.TickCount64 < deadline)
         {
