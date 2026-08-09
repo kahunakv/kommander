@@ -58,6 +58,30 @@ public sealed class TestExecutorMetricsTags : IDisposable
 
     public void Dispose() => _listener.Dispose();
 
+    /// <summary>
+    /// Waits until <paramref name="predicate"/> matches a snapshot of the captured
+    /// measurements, or the deadline expires. Required because the executor completes
+    /// the caller's reply *before* emitting the operation metric (reply latency is not
+    /// taxed with bookkeeping), so an immediate post-<c>Ask</c> check races the
+    /// executor thread's <c>Counter.Add</c> and flakes under CI load.
+    /// </summary>
+    private async Task<List<(string instrument, int partitionId, string opClass)>> WaitForCapturedAsync(
+        Func<List<(string instrument, int partitionId, string opClass)>, bool> predicate)
+    {
+        ValueStopwatch sw = ValueStopwatch.StartNew();
+        while (true)
+        {
+            List<(string, int, string)> snapshot;
+            lock (_captured)
+                snapshot = [.. _captured];
+
+            if (predicate(snapshot) || sw.GetElapsedMilliseconds() > 5000)
+                return snapshot;
+
+            await Task.Delay(20, TestContext.Current.CancellationToken);
+        }
+    }
+
     // ── Stubs (mirrors TestRaftPartitionExecutor helper pattern) ───────────
 
     private sealed class StubHost : IRaftPartitionHost
@@ -158,11 +182,10 @@ public sealed class TestExecutorMetricsTags : IDisposable
             await executor.RestoreTask;
             await executor.Ask(new RaftRequest(RaftRequestType.CheckLeader), TestContext.Current.CancellationToken);
 
-            List<(string, int, string)> controlHits;
-            lock (_captured)
-                controlHits = _captured
-                    .Where(c => c.partitionId == pid && c.opClass == "Control")
-                    .ToList();
+            List<(string, int, string)> controlHits = (await WaitForCapturedAsync(
+                    s => s.Any(c => c.partitionId == pid && c.opClass == "Control")))
+                .Where(c => c.partitionId == pid && c.opClass == "Control")
+                .ToList();
 
             Assert.NotEmpty(controlHits);
             Assert.All(controlHits, h =>
@@ -196,12 +219,11 @@ public sealed class TestExecutorMetricsTags : IDisposable
                 ex1.Ask(new RaftRequest(RaftRequestType.CheckLeader), TestContext.Current.CancellationToken),
                 ex2.Ask(new RaftRequest(RaftRequestType.CheckLeader), TestContext.Current.CancellationToken));
 
-            bool sawPid1, sawPid2;
-            lock (_captured)
-            {
-                sawPid1 = _captured.Any(c => c.partitionId == pid1);
-                sawPid2 = _captured.Any(c => c.partitionId == pid2);
-            }
+            List<(string instrument, int partitionId, string opClass)> snapshot = await WaitForCapturedAsync(
+                s => s.Any(c => c.partitionId == pid1) && s.Any(c => c.partitionId == pid2));
+
+            bool sawPid1 = snapshot.Any(c => c.partitionId == pid1);
+            bool sawPid2 = snapshot.Any(c => c.partitionId == pid2);
 
             Assert.True(sawPid1, "Expected metrics for partition 201");
             Assert.True(sawPid2, "Expected metrics for partition 202");
