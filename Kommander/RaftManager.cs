@@ -3333,12 +3333,14 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             return partition.Generation;
 
         // Non-hosted ranges (per-partition placement) still expose the committed generation so
-        // callers on non-replica nodes can build a correctly-fenced forwarded proposal.
+        // callers on non-replica nodes can build a correctly-fenced forwarded proposal. Removed
+        // entries are tombstones: no proposal can target them, so they report 0 like any other
+        // non-existent partition instead of leaking the tombstone's generation.
         List<RaftPartitionRange> ranges = committedRanges;
         foreach (RaftPartitionRange range in ranges)
         {
             if (range.PartitionId == partitionId)
-                return range.Generation;
+                return range.State == RaftPartitionState.Removed ? 0 : range.Generation;
         }
 
         return 0;

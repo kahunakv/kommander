@@ -264,6 +264,30 @@ public sealed class TestGenerationFence
         Assert.Equal(2, manager.GetPartitionMap().Count);
     }
 
+    /// <summary>
+    /// A removed partition leaves a tombstone in the committed map (its entry is kept with
+    /// <see cref="RaftPartitionState.Removed"/> and a bumped generation) but is no longer
+    /// hosted. <see cref="IRaft.GetPartitionGeneration"/> must report 0 for it — the
+    /// non-hosted fallback exists to fence forwarded proposals, and no proposal can target
+    /// a removed partition, so a tombstone must look identical to a partition that never
+    /// existed.
+    /// </summary>
+    [Fact]
+    public async Task GetPartitionGeneration_RemovedTombstone_ReportsZero()
+    {
+        using RaftManager manager = Build();
+
+        manager.SystemCoordinator.Send(MakeConfigReplicated(
+        [
+            new() { PartitionId = 1, StartRange = 0,           EndRange = 500_000_000,  Generation = 3, State = RaftPartitionState.Active,  RoutingMode = RaftRoutingMode.HashRange },
+            new() { PartitionId = 2, StartRange = 500_000_001, EndRange = int.MaxValue, Generation = 2, State = RaftPartitionState.Removed, RoutingMode = RaftRoutingMode.Unrouted }
+        ]));
+        await WaitForIdleAsync(manager);
+
+        Assert.Equal(3, manager.GetPartitionGeneration(1));
+        Assert.Equal(0, manager.GetPartitionGeneration(2));
+    }
+
     // ── OnPartitionMapChanged ─────────────────────────────────────────────────
     //
     // Acceptance criterion: a subscriber registered before a partition map
