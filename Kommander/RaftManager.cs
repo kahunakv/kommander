@@ -1342,7 +1342,17 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         System.ClusterMembership roster = systemCoordinator.GetMembership();
         if (roster.MembershipVersion == 0)
             return true; // pre-seed: treat all known peers as voters (backward compat)
-        return roster.Members.Any(m => m.Endpoint == endpoint && m.Role == System.ClusterMemberRole.Voter);
+
+        // Plain loop, not LINQ Any: this runs per peer per check-quorum tick and per propose
+        // broadcast on P0/legacy ranges — the capturing lambda would allocate on every call.
+        foreach (System.ClusterMember member in roster.Members)
+        {
+            if (member.Role == System.ClusterMemberRole.Voter &&
+                string.Equals(member.Endpoint, endpoint, StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -1684,14 +1694,27 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     RaftPartition? Scheduling.IRaftTimerHost.SystemPartition => systemPartition;
 
-    IEnumerable<RaftPartition> Scheduling.IRaftTimerHost.GetUserPartitions() => partitions.Values;
+    // Iterator rather than partitions.Values: ConcurrentDictionary.Values acquires every bucket
+    // lock and materializes a fresh List on each access — this fires every CheckLeader tick
+    // (default 250 ms) and would contend with MarkPartitionHot/Cool writers. The dictionary's own
+    // enumerator is lock-free and allocation-light.
+    IEnumerable<RaftPartition> Scheduling.IRaftTimerHost.GetUserPartitions()
+    {
+        foreach (KeyValuePair<int, RaftPartition> kv in partitions)
+            yield return kv.Value;
+    }
 
     /// <summary>
     /// Returns only the hot (non-quiesced) partitions for targeted <c>CheckLeader</c> ticks.
     /// Updated by <see cref="MarkPartitionHot"/> / <see cref="MarkPartitionCool"/> which are
     /// wired from each <see cref="RaftPartitionStateMachine"/>'s quiesce callback.
     /// </summary>
-    IEnumerable<RaftPartition> Scheduling.IRaftTimerHost.GetHotUserPartitions() => _hotPartitions.Values;
+    IEnumerable<RaftPartition> Scheduling.IRaftTimerHost.GetHotUserPartitions()
+    {
+        // Same rationale as GetUserPartitions: avoid the Values snapshot per tick.
+        foreach (KeyValuePair<int, RaftPartition> kv in _hotPartitions)
+            yield return kv.Value;
+    }
 
     Task Scheduling.IRaftTimerHost.UpdateNodes() => UpdateNodes();
 
@@ -2129,7 +2152,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         if (partitionId == RaftSystemConfig.SystemPartition && type == RaftSystemConfig.RaftLogType)
             throw new RaftException("System log type is reserved on the system partition");
 
-        if (partitionId != RaftSystemConfig.SystemPartition && !partitions.ContainsKey(partitionId))
+        // Single TryGetValue instead of ContainsKey + GetPartition re-lookup on the per-write path.
+        RaftPartition? partition = null;
+
+        if (partitionId != RaftSystemConfig.SystemPartition && !partitions.TryGetValue(partitionId, out partition))
         {
             RaftReplicationResult? forwarded = await ForwardToReplicaAsync(
                 partitionId, type, [data], autoCommit, expectedGeneration, cancellationToken).ConfigureAwait(false);
@@ -2137,7 +2163,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 return forwarded;
         }
 
-        RaftPartition partition = GetPartition(partitionId);
+        partition ??= GetPartition(partitionId);
 
         bool success;
         HLCTimestamp ticketId;
@@ -2203,7 +2229,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         if (partitionId == RaftSystemConfig.SystemPartition && type == RaftSystemConfig.RaftLogType)
             throw new RaftException("System log type is reserved on the system partition");
 
-        if (partitionId != RaftSystemConfig.SystemPartition && !partitions.ContainsKey(partitionId))
+        // Single TryGetValue instead of ContainsKey + GetPartition re-lookup on the per-write path.
+        RaftPartition? partition = null;
+
+        if (partitionId != RaftSystemConfig.SystemPartition && !partitions.TryGetValue(partitionId, out partition))
         {
             RaftReplicationResult? forwarded = await ForwardToReplicaAsync(
                 partitionId, type, logs, autoCommit, expectedGeneration, cancellationToken).ConfigureAwait(false);
@@ -2211,7 +2240,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 return forwarded;
         }
 
-        RaftPartition partition = GetPartition(partitionId);
+        partition ??= GetPartition(partitionId);
 
         bool success;
         HLCTimestamp ticketId;
@@ -2586,18 +2615,20 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             }
         }
 
-        using CancellationTokenSource timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(10_000);
-
         try
         {
-            (RaftProposalTicketState ticketState, long commitIndex) = await waiterTask.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+            // WaitAsync(TimeSpan, token) rides the shared timer queue — the previous linked
+            // CancellationTokenSource allocated a CTS + registration + timer per successful
+            // proposal. Caller cancellation still surfaces as OperationCanceledException;
+            // the elapsed timeout surfaces as TimeoutException instead of a filtered OCE.
+            (RaftProposalTicketState ticketState, long commitIndex) = await waiterTask
+                .WaitAsync(TimeSpan.FromMilliseconds(10_000), cancellationToken).ConfigureAwait(false);
 
             return ticketState == RaftProposalTicketState.Committed
                 ? new(true, RaftOperationStatus.Success, ticketId, commitIndex)
                 : new(false, RaftOperationStatus.ReplicationFailed, ticketId, -1);
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (TimeoutException)
         {
             // 10-second timeout elapsed without a terminal state transition.
             return new(false, RaftOperationStatus.ProposalTimeout, ticketId, -1);

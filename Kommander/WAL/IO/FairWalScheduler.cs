@@ -627,18 +627,30 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
             if (status == RaftOperationStatus.Success)
             {
+                // Discard only the UNRESOLVED (Proposed) tail above this append. A blanket
+                // TruncateLogsAfter here corrupts a follower: propose/commit broadcasts are shipped
+                // unanchored and out of order, so a low-max-id append can complete after higher
+                // COMMITTED entries have already landed, and deleting those loses quorum-acked data
+                // while the commit frontier (advanced on enqueue, never rolled back) still reports
+                // them — leaving the leader convinced the follower is caught up so it never backfills.
+                // Resolved entries are never conflicting, so preserving them is safe and correct.
+                //
+                // One truncate at the MINIMUM index instead of one per op: the calls are cumulative and
+                // idempotent (truncating after X₁ then X₂ deletes exactly the proposed tail above
+                // min(X₁,X₂)), and nothing writes to the partition between them (same worker, sequential,
+                // after the batch write) — so the coalesced call yields the identical final state while
+                // paying one scan+delete (and, on RocksDB, one synced write) instead of up to
+                // maxBatchSize of them.
+                long minTruncateIndex = long.MaxValue;
+
                 foreach (WALWriteOperation op in pidBatch)
                 {
-                    // Discard only the UNRESOLVED (Proposed) tail above this append. A blanket
-                    // TruncateLogsAfter here corrupts a follower: propose/commit broadcasts are shipped
-                    // unanchored and out of order, so a low-max-id append can complete after higher
-                    // COMMITTED entries have already landed, and deleting those loses quorum-acked data
-                    // while the commit frontier (advanced on enqueue, never rolled back) still reports
-                    // them — leaving the leader convinced the follower is caught up so it never backfills.
-                    // Resolved entries are never conflicting, so preserving them is safe and correct.
-                    if (op.Type == WALWriteOperationType.FollowerAppend && op.LogIndex > 0)
-                        walAdapter.TruncateProposedLogsAfter(pid, op.LogIndex);
+                    if (op.Type == WALWriteOperationType.FollowerAppend && op.LogIndex > 0 && op.LogIndex < minTruncateIndex)
+                        minTruncateIndex = op.LogIndex;
                 }
+
+                if (minTruncateIndex != long.MaxValue)
+                    walAdapter.TruncateProposedLogsAfter(pid, minTruncateIndex);
             }
 
             foreach (WALWriteOperation op in pidBatch)

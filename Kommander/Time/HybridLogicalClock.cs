@@ -32,26 +32,73 @@ namespace Kommander.Time;
 
 public sealed class HybridLogicalClock : IDisposable
 {
-    // Immutable state holder for the clock.
-    private sealed class ClockState
-    {
-        public readonly long L;  // Logical (or physical) clock value
-        public readonly uint C;  // Counter
+    // ── Packed state ──────────────────────────────────────────────────────────
+    //
+    // (L, C) is packed into ONE long — L in the high 42 bits, C in the low 22 — so every clock
+    // event is a single lock-free CAS on a long with ZERO allocation. The previous representation
+    // (an immutable ClockState reference swapped by CAS) allocated a gen-0 object per event
+    // (including per CAS retry), and this clock is shared by every partition: one event fires per
+    // AppendLogs sent, per ack received, per propose, per heartbeat — making it the largest
+    // steady-state allocation source in replication.
+    //
+    // Width reasoning:
+    //  * L is unix-epoch milliseconds: 2^42 ms ≈ year 2109. MaxL guards the unreachable overflow
+    //    (a wildly wrong system clock) with the same RaftException the corruption check uses.
+    //  * C resets to 0 whenever L advances, so 22 bits allows ~4.19M events within one physical
+    //    millisecond before overflow — orders of magnitude beyond reachable throughput. A remote
+    //    message CAN carry an arbitrary large C (it is a uint on the wire), so counter overflow is
+    //    handled, not assumed away: the clock rolls to (L+1, 0), which is strictly greater than
+    //    both the local state and the message in HLC order — causality holds, and L running ahead
+    //    of physical time is what HLC's logical component exists to tolerate.
+    //  * The packed long is used ONLY for CAS identity, never compared/ordered, so the sign bit
+    //    carries no meaning and unpacking uses the unsigned shift.
+    //
+    // Reads use Volatile.Read: unlike the old reference field, a plain long read may tear on
+    // 32-bit platforms, and the acquire fence preserves the old reference-swap visibility.
 
-        public ClockState(long l, uint c)
-        {
-            L = l;
-            C = c;
-        }
-    }
+    private const int CounterBits = 22;
 
-    // The clock state is stored as an atomic reference.
-    private ClockState _state;
+    private const long CounterMask = (1L << CounterBits) - 1;
+
+    /// <summary>Exclusive upper bound on the physical/logical component (fits year ~2109).</summary>
+    private const long MaxL = 1L << (64 - CounterBits);
+
+    private long _state;
 
     public HybridLogicalClock()
     {
-        long initialTime = GetPhysicalTime();
-        _state = new(initialTime, 0);
+        _state = Pack(GetPhysicalTime(), 0);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long Pack(long l, long c)
+    {
+        if (l is <= 0 or >= MaxL)
+            throw new RaftException("Corrupted HLC clock");
+
+        return (l << CounterBits) | c;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long UnpackL(long state) => state >>> CounterBits;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static uint UnpackC(long state) => (uint)(state & CounterMask);
+
+    /// <summary>
+    /// Applies the counter-overflow rollover: an increment that no longer fits the packed counter
+    /// field advances L by one and resets C. (L+1, 0) is strictly greater than (L, anything) in
+    /// HLC order, so causality is preserved; L transiently running ahead of physical time is
+    /// normal HLC behavior and self-corrects once the wall clock catches up.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void Normalize(ref long l, ref long c)
+    {
+        if (c > CounterMask)
+        {
+            l += 1;
+            c = 0;
+        }
     }
 
     /// <summary>
@@ -61,20 +108,16 @@ public sealed class HybridLogicalClock : IDisposable
     {
         while (true)
         {
-            ClockState current = _state;
+            long current = Volatile.Read(ref _state);
+            long currentL = UnpackL(current);
             long physicalTime = GetPhysicalTime();
-            long newL = Math.Max(current.L, physicalTime);
-            uint newC = (newL == current.L) ? current.C + 1 : 0;
+            long newL = Math.Max(currentL, physicalTime);
+            long newC = (newL == currentL) ? (long)UnpackC(current) + 1 : 0;
+            Normalize(ref newL, ref newC);
 
-            if (newL == 0)
-                throw new RaftException("Corrupted HLC clock");
+            if (Interlocked.CompareExchange(ref _state, Pack(newL, newC), current) == current)
+                return new(nodeId, newL, (uint)newC);
 
-            ClockState newState = new(newL, newC);
-            
-            // Try to atomically update the state.
-            if (Interlocked.CompareExchange(ref _state, newState, current) == current)
-                return new(nodeId, newL, newC);
-            
             // Otherwise, another thread has updated the state; try again.
         }
     }
@@ -86,22 +129,24 @@ public sealed class HybridLogicalClock : IDisposable
     /// </summary>
     public HLCTimestamp TrySendOrLocalEvent(int nodeId)
     {
-        // Read the current state.
-        ClockState current = _state;
+        long current = Volatile.Read(ref _state);
+        long currentL = UnpackL(current);
         long physicalTime = GetPhysicalTime();
-        long candidateL = Math.Max(current.L, physicalTime);
-        uint candidateC = (candidateL == current.L) ? current.C + 1 : 0;
-        ClockState candidate = new(candidateL, candidateC);
+        long candidateL = Math.Max(currentL, physicalTime);
+        long candidateC = (candidateL == currentL) ? (long)UnpackC(current) + 1 : 0;
+        Normalize(ref candidateL, ref candidateC);
 
         // Attempt one CAS update.
-        if (Interlocked.CompareExchange(ref _state, candidate, current) == current)
-            return new(nodeId, candidateL, candidateC); // Successfully updated state.
-        
+        if (Interlocked.CompareExchange(ref _state, Pack(candidateL, candidateC), current) == current)
+            return new(nodeId, candidateL, (uint)candidateC); // Successfully updated state.
+
         // CAS failed; get the latest state and compute a timestamp that's higher.
-        ClockState updatedState = _state; // Read the updated state.
-        long newL = Math.Max(updatedState.L, physicalTime);
-        uint newC = (newL == updatedState.L) ? updatedState.C + 1 : 0;
-        return new(nodeId, newL, newC);
+        long updated = Volatile.Read(ref _state);
+        long updatedL = UnpackL(updated);
+        long newL = Math.Max(updatedL, physicalTime);
+        long newC = (newL == updatedL) ? (long)UnpackC(updated) + 1 : 0;
+        Normalize(ref newL, ref newC);
+        return new(nodeId, newL, (uint)newC);
     }
 
     /// <summary>
@@ -112,30 +157,7 @@ public sealed class HybridLogicalClock : IDisposable
         if (m.L == 0)
             throw new RaftException("Invalid HLC timestamp argument");
 
-        while (true)
-        {
-            ClockState current = _state;
-            long physicalTime = GetPhysicalTime();
-            long newL = Math.Max(current.L, Math.Max(m.L, physicalTime));
-            uint newC;
-
-            if (newL == current.L && newL == m.L)
-                newC = Math.Max(current.C, m.C) + 1;
-            else if (newL == current.L)
-                newC = current.C + 1;
-            else if (newL == m.L)
-                newC = m.C + 1;
-            else
-                newC = 0;
-
-            if (newL == 0)
-                throw new RaftException("Corrupted HLC clock");
-
-            ClockState newState = new(newL, newC);
-            
-            if (Interlocked.CompareExchange(ref _state, newState, current) == current)
-                return new(nodeId, newL, newC);
-        }
+        return ReceiveEventInternal(nodeId, m.L, m.C);
     }
 
     /// <summary>
@@ -146,31 +168,36 @@ public sealed class HybridLogicalClock : IDisposable
         if (m.L == 0)
             throw new RaftException("Invalid HLC timestamp argument");
 
+        return ReceiveEventInternal(nodeId, m.L, m.C);
+    }
+
+    private HLCTimestamp ReceiveEventInternal(int nodeId, long messageL, uint messageC)
+    {
         while (true)
         {
-            ClockState current = _state;
+            long current = Volatile.Read(ref _state);
+            long currentL = UnpackL(current);
+            uint currentC = UnpackC(current);
             long physicalTime = GetPhysicalTime();
-            long newL = Math.Max(current.L, Math.Max(m.L, physicalTime));
-            uint newC;
+            long newL = Math.Max(currentL, Math.Max(messageL, physicalTime));
+            long newC;
 
-            if (newL == current.L && newL == m.L)
-                newC = Math.Max(current.C, m.C) + 1;
-            else if (newL == current.L)
-                newC = current.C + 1;
-            else if (newL == m.L)
-                newC = m.C + 1;
+            if (newL == currentL && newL == messageL)
+                newC = (long)Math.Max(currentC, messageC) + 1;
+            else if (newL == currentL)
+                newC = (long)currentC + 1;
+            else if (newL == messageL)
+                newC = (long)messageC + 1;
             else
                 newC = 0;
 
-            if (newL == 0)
-                throw new RaftException("Corrupted HLC clock");
+            Normalize(ref newL, ref newC);
 
-            ClockState newState = new(newL, newC);
-            if (Interlocked.CompareExchange(ref _state, newState, current) == current)
-                return new(nodeId, newL, newC);
+            if (Interlocked.CompareExchange(ref _state, Pack(newL, newC), current) == current)
+                return new(nodeId, newL, (uint)newC);
         }
     }
-    
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static long GetPhysicalTime()
     {

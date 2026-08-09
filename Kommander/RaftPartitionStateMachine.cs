@@ -1022,7 +1022,7 @@ public sealed class RaftPartitionStateMachine
             // queue to drain — nothing external can arrive — so its bound is short; with voter
             // peers the full barrier timeout is worth spending, because refusing hands leadership
             // to a peer that may hold the missing entries.
-            bool hasVoterPeers = host.Nodes.Any(n => host.IsVoter(n.Endpoint));
+            bool hasVoterPeers = HasVoterPeer();
             TimeSpan drainBound = hasVoterPeers ? host.Configuration.LeadershipBarrierTimeout : TimeSpan.FromMilliseconds(250);
             long drainDeadlineTicks = Stopwatch.GetTimestamp();
 
@@ -2978,34 +2978,41 @@ public sealed class RaftPartitionStateMachine
     /// <exception cref="RaftException"></exception>
     public async Task ReplicateLogsBatchAsync(IReadOnlyList<(List<RaftLog>? Logs, bool AutoCommit, ulong? ReplyCorrelationId)> messages)
     {
-        // Keyed by the two possible autoCommit values, so at most two entries — sized exactly to the
-        // bool key space. SmallDictionary avoids the hashed-dictionary bucket/entry allocation on this
-        // per-batch hot path; capacity can never be exceeded because a bool has two values.
-        SmallDictionary<bool, List<RaftLog>> logsPlan = new(2);
-        
+        // Determine which autoCommit values to dispatch, in first-seen order among messages that carry
+        // logs — a batch whose messages all have null/empty logs dispatches nothing. Only the KEYS drive
+        // the dispatch loop below (each message keeps its own log list), so no per-key log aggregation
+        // is needed on this per-batch hot path.
+        bool sawFirstKey = false;
+        bool sawSecondKey = false;
+        bool firstKey = false;
+
         foreach ((List<RaftLog>? logs, bool autoCommit, ulong? replyCorrelationId) message in messages)
         {
-            if (logsPlan.TryGetValue(message.autoCommit, out List<RaftLog>? logs))
+            if (message.logs is null || message.logs.Count == 0)
+                continue;
+
+            if (!sawFirstKey)
             {
-                if (message.logs is not null && message.logs.Count > 0)
-                    logs.AddRange(message.logs);
+                sawFirstKey = true;
+                firstKey = message.autoCommit;
             }
-            else
-            {
-                if (message.logs is not null && message.logs.Count > 0)
-                {
-                    logs = [];
-                    logs.AddRange(message.logs);
-                    logsPlan.Add(message.autoCommit, logs);
-                }
-            }
+            else if (message.autoCommit != firstKey)
+                sawSecondKey = true;
         }
 
-        foreach (KeyValuePair<bool, List<RaftLog>> kv in logsPlan)
+        for (int keyIndex = 0; keyIndex < 2; keyIndex++)
         {
+            if (keyIndex == 0 && !sawFirstKey)
+                break;
+
+            if (keyIndex == 1 && !sawSecondKey)
+                break;
+
+            bool key = keyIndex == 0 ? firstKey : !firstKey;
+
             foreach ((List<RaftLog>? logs, bool autoCommit, ulong? replyCorrelationId) item in messages)
             {
-                if (item.autoCommit == kv.Key)
+                if (item.autoCommit == key)
                     await ReplicateLogsAsync(item.logs, item.autoCommit, item.replyCorrelationId).ConfigureAwait(false);
             }
         }
@@ -3395,6 +3402,37 @@ public sealed class RaftPartitionStateMachine
     /// &lt; 0 means "not set" (legacy / in-process / test callers) and bypasses the fence, mirroring
     /// <see cref="CompleteWalOperationAsync"/>.
     /// </param>
+    /// <summary>
+    /// True when at least one peer is a voter. Replaces LINQ <c>Any</c> with a plain loop on
+    /// paths that run per propose/commit — the capturing lambda allocated a closure per call.
+    /// </summary>
+    private bool HasVoterPeer()
+    {
+        IReadOnlyList<RaftNode> nodes = host.Nodes;
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            if (host.IsVoter(nodes[i].Endpoint))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Ordinal linear lookup of a peer by endpoint. Used on per-ack paths instead of LINQ
+    /// <c>FirstOrDefault</c>, whose capturing lambda allocates a closure per call.
+    /// </summary>
+    private static RaftNode? FindNodeByEndpoint(IReadOnlyList<RaftNode> nodes, string endpoint)
+    {
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            if (string.Equals(nodes[i].Endpoint, endpoint, StringComparison.Ordinal))
+                return nodes[i];
+        }
+
+        return null;
+    }
+
     public async ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1)
     {
         // ── Leader + term fence ──────────────────────────────────────────────────
@@ -3493,10 +3531,17 @@ public sealed class RaftPartitionStateMachine
         // (a stale in-flight ack must not drag a peer's recorded progress backwards), so the prior
         // value is captured first — it is the only evidence of a genuine frontier regression, which
         // the fast-path re-supply below keys on.
+        // newMatchIndex mirrors matchIndex[endpoint] locally — this method previously re-read the
+        // dictionary up to four more times below (a string hash + compare each) for a value fully
+        // determined right here on the highest-frequency inbound message a leader handles.
         bool hadMatchIndex = matchIndex.TryGetValue(endpoint, out long priorMatchIndex);
+        long newMatchIndex = priorMatchIndex;
         if (!hadMatchIndex || committedIndex > priorMatchIndex)
+        {
+            newMatchIndex = committedIndex;
             matchIndex[endpoint] = committedIndex;
-        nextIndex[endpoint] = matchIndex[endpoint] + 1;
+        }
+        nextIndex[endpoint] = newMatchIndex + 1;
 
         // Immediately ship the next bounded batch only while an active catch-up is in progress,
         // so a multi-batch backfill converges without stalling a full heartbeat per batch. This
@@ -3505,9 +3550,9 @@ public sealed class RaftPartitionStateMachine
         // replication), and eagerly catching it up here would, e.g., make a barely-behind node look
         // fresh enough to receive a leadership transfer it should not.
         if (nodeState == RaftNodeState.Leader
-            && localCommittedIndex - matchIndex[endpoint] > host.Configuration.BackfillThreshold)
+            && localCommittedIndex - newMatchIndex > host.Configuration.BackfillThreshold)
         {
-            RaftNode? behindNode = host.Nodes.FirstOrDefault(n => n.Endpoint == endpoint);
+            RaftNode? behindNode = FindNodeByEndpoint(host.Nodes, endpoint);
             if (behindNode is not null)
                 await TrySendBackfillBatchAsync(behindNode, committedIndex, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId)).ConfigureAwait(false);
         }
@@ -3522,7 +3567,7 @@ public sealed class RaftPartitionStateMachine
             && committedIndex >= 0
             && localCommittedIndex - committedIndex > host.Configuration.BackfillThreshold)
         {
-            RaftNode? behindNode2 = host.Nodes.FirstOrDefault(n => n.Endpoint == endpoint);
+            RaftNode? behindNode2 = FindNodeByEndpoint(host.Nodes, endpoint);
             if (behindNode2 is not null)
                 await TrySendBackfillBatchAsync(behindNode2, committedIndex, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId)).ConfigureAwait(false);
         }
@@ -3553,7 +3598,7 @@ public sealed class RaftPartitionStateMachine
 
             if (frontierRegressed)
                 regressedFrontiers[endpoint] = committedIndex;
-            else if (committedIndex >= matchIndex[endpoint])
+            else if (committedIndex >= newMatchIndex)
                 regressedFrontiers.Remove(endpoint);
         }
 
@@ -3688,7 +3733,15 @@ public sealed class RaftPartitionStateMachine
         // ── Min-log cross-check against pending entry ──────────────────────────
         if (pending?.Logs is { Count: > 0 } pendingLogs && completion.MinLogIndex >= 0)
         {
-            long actualMin = pendingLogs.Min(l => l.Id);
+            // Indexed loop, not Enumerable.Min: this runs on every WAL completion (propose,
+            // commit, rollback, follower append) and the LINQ path boxes the list enumerator.
+            long actualMin = pendingLogs[0].Id;
+            for (int i = 1; i < pendingLogs.Count; i++)
+            {
+                if (pendingLogs[i].Id < actualMin)
+                    actualMin = pendingLogs[i].Id;
+            }
+
             if (actualMin != completion.MinLogIndex)
             {
                 logger.LogWarning(
@@ -3771,6 +3824,10 @@ public sealed class RaftPartitionStateMachine
 
         AppendLogsGrpcLogCache? grpcLogCache = logs.Count > 0 ? new() : null;
 
+        // Recorded while the loop already visits every peer, so the single-voter check below
+        // does not re-scan host.Nodes with a closure-allocating LINQ Any on every propose.
+        bool hasVoterPeer = false;
+
         foreach (RaftNode node in host.Nodes)
         {
             if (node.Endpoint == host.LocalEndpoint)
@@ -3779,7 +3836,10 @@ public sealed class RaftPartitionStateMachine
             // Learners receive log entries for catch-up but must not count toward quorum.
             // Only add voters to the quorum set; AppendLogToNode is called for all nodes.
             if (host.IsVoter(node.Endpoint))
+            {
+                hasVoterPeer = true;
                 proposalQuorum.AddExpectedNodeCompletion(node.Endpoint);
+            }
             AppendLogToNode(node, ticketId, logs, grpcLogCache: grpcLogCache);
         }
 
@@ -3796,7 +3856,7 @@ public sealed class RaftPartitionStateMachine
         // quorum, but no voter ack will arrive to drive CompleteAppendLogsAsync. Drive the
         // Completed → (auto)commit transition here. Guarded to voter-only peers so learner-only
         // peers (which never ack for quorum) don't silently prevent single-voter commit.
-        if (!host.Nodes.Any(n => host.IsVoter(n.Endpoint)))
+        if (!hasVoterPeer)
         {
             proposalQuorum.SetState(RaftProposalState.Completed);
 
@@ -3890,7 +3950,7 @@ public sealed class RaftPartitionStateMachine
             // Same bounds as the promotion drain: a sole voter only needs its own write queue to
             // drain, so its bound is short; with voter peers the full barrier timeout is worth
             // spending before stepping down.
-            bool drainHasVoterPeers = host.Nodes.Any(n => host.IsVoter(n.Endpoint));
+            bool drainHasVoterPeers = HasVoterPeer();
             TimeSpan inheritedDrainBound = drainHasVoterPeers ? host.Configuration.LeadershipBarrierTimeout : TimeSpan.FromMilliseconds(250);
             long drainStartTicks = Stopwatch.GetTimestamp();
 

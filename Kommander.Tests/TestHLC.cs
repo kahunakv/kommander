@@ -116,6 +116,77 @@ public class TestHLC
         Assert.Equal(expected, stamps);
     }
 
+    [Fact]
+    public void ReceiveEvent_ResultDominatesBothClockAndMessage()
+    {
+        HybridLogicalClock clock = new();
+        HLCTimestamp local = clock.SendOrLocalEvent(0);
+
+        HLCTimestamp m = new(1, GetCurrentTime() + 5, 17);
+        HLCTimestamp result = clock.ReceiveEvent(0, m);
+
+        // HLC contract: the merged timestamp is strictly greater than both inputs.
+        Assert.True(result.CompareTo(local) > 0);
+        Assert.True(result.L > m.L || (result.L == m.L && result.C > m.C));
+    }
+
+    [Fact]
+    public void ReceiveEvent_HugeWireCounter_RollsIntoLWithoutLosingCausality()
+    {
+        // The packed-state clock stores C in 22 bits; a wire message may carry any uint counter.
+        // An increment that no longer fits must roll into (L+1, 0) — still strictly greater than
+        // the message in HLC order — rather than silently truncating the counter.
+        HybridLogicalClock clock = new();
+
+        long messageL = GetCurrentTime() + 60_000; // future L so the message dominates physical time
+        HLCTimestamp m = new(1, messageL, uint.MaxValue);
+
+        HLCTimestamp result = clock.ReceiveEvent(0, m);
+
+        Assert.True(result.L > messageL || (result.L == messageL && result.C > uint.MaxValue));
+        Assert.Equal(messageL + 1, result.L);
+        Assert.Equal(0u, result.C);
+
+        // The clock keeps ticking correctly past the rollover.
+        HLCTimestamp next = clock.SendOrLocalEvent(0);
+        Assert.True(next.CompareTo(result) > 0);
+    }
+
+    [Fact]
+    public async Task SendOrLocalEvent_ConcurrentCallers_ProduceUniqueMonotonicTimestamps()
+    {
+        // The lock-free packed CAS must hand out globally unique (L, C) pairs under contention —
+        // duplicates would collide proposal ticket ids.
+        HybridLogicalClock clock = new();
+        const int threads = 8;
+        const int perThread = 20_000;
+
+        HLCTimestamp[][] results = new HLCTimestamp[threads][];
+
+        await Task.WhenAll(Enumerable.Range(0, threads).Select(t => Task.Run(() =>
+        {
+            HLCTimestamp[] mine = new HLCTimestamp[perThread];
+            for (int i = 0; i < perThread; i++)
+                mine[i] = clock.SendOrLocalEvent(0);
+            results[t] = mine;
+        })));
+
+        HashSet<HLCTimestamp> unique = [];
+        foreach (HLCTimestamp[] batch in results)
+        {
+            HLCTimestamp previous = HLCTimestamp.Zero;
+            foreach (HLCTimestamp ts in batch)
+            {
+                // Per-thread monotonicity: each successive call observes a strictly greater stamp.
+                Assert.True(ts.CompareTo(previous) > 0);
+                previous = ts;
+                Assert.True(unique.Add(ts));
+            }
+        }
+
+        Assert.Equal(threads * perThread, unique.Count);
+    }
+
     private static long GetCurrentTime()
     {
         return ((DateTimeOffset)DateTime.UtcNow).ToUnixTimeMilliseconds();

@@ -58,10 +58,17 @@ public sealed class RaftPartitionExecutor : IDisposable
         /// </summary>
         public TaskCompletionSource<RaftResponse>? Reply { get; }
 
-        public PendingOperation(RaftRequest request, TaskCompletionSource<RaftResponse>? reply)
+        /// <summary>
+        /// The operation class, computed once in <c>Enqueue</c> and carried inline so the dispatch
+        /// path does not re-run <see cref="RaftOperationMapper.GetKind"/>'s switch per operation.
+        /// </summary>
+        public RaftOperationKind Kind { get; }
+
+        public PendingOperation(RaftRequest request, TaskCompletionSource<RaftResponse>? reply, RaftOperationKind kind)
         {
             Request = request;
             Reply = reply;
+            Kind = kind;
         }
     }
 
@@ -395,7 +402,22 @@ public sealed class RaftPartitionExecutor : IDisposable
         TaskCompletionSource<RaftResponse> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         if (cancellationToken.CanBeCanceled)
-            cancellationToken.Register(() => tcs.TrySetCanceled(cancellationToken));
+        {
+            // UnsafeRegister with static state instead of a capturing lambda, and dispose the
+            // registration once the operation settles: a long-lived caller token (host/request
+            // scope reused across many Asks) would otherwise accumulate one registration — and
+            // pin one TaskCompletionSource — per call for the token's whole lifetime.
+            CancellationTokenRegistration registration = cancellationToken.UnsafeRegister(
+                static (state, ct) => ((TaskCompletionSource<RaftResponse>)state!).TrySetCanceled(ct),
+                tcs);
+
+            tcs.Task.ContinueWith(
+                static (_, state) => ((CancellationTokenRegistration)state!).Dispose(),
+                registration,
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
 
         Enqueue(request, tcs);
         return tcs.Task;
@@ -592,12 +614,12 @@ public sealed class RaftPartitionExecutor : IDisposable
             }
 
             // Slot claimed — enqueue and signal runnable.
-            _clientQueue.Enqueue(new PendingOperation(request, reply));
+            _clientQueue.Enqueue(new PendingOperation(request, reply, kind));
             MarkRunnable();
             return;
         }
 
-        PendingOperation op = new(request, reply);
+        PendingOperation op = new(request, reply, kind);
 
         switch (kind)
         {
@@ -640,14 +662,41 @@ public sealed class RaftPartitionExecutor : IDisposable
                 break;
             }
 
-            // Drain all queues in weighted-fair order.
-            DrainQueues();
+            // Drain to empty, then absorb the surplus semaphore permits before re-parking.
+            // MarkRunnable releases one permit per enqueue but a single weighted-fair
+            // DrainQueues cycle consumes up to 8+4+2+1 items, so a K-item burst used to leave
+            // ~K surplus permits and the worker paid ~K wakeups (each probing four empty
+            // queues) for one useful drain. The surplus permits were also what re-drove the
+            // loop for backlogs deeper than one cycle — hence the explicit inner drain loop.
+            //
+            // No wakeup can be lost: producers enqueue BEFORE releasing. An item enqueued
+            // before the AreQueuesEmpty() check is seen by the check and re-drained; an item
+            // enqueued after it has its Release strictly after the absorb loop, so that
+            // permit survives for the outer Wait. Worst residual cost is one spurious wake
+            // per burst (a permit released between an item's dequeue and the absorb).
+            while (true)
+            {
+                // Drain all queues in weighted-fair order.
+                DrainQueues();
+
+                while (_workAvailable.Wait(0))
+                {
+                    // Absorbing surplus permits; nothing to do per permit.
+                }
+
+                if (token.IsCancellationRequested || AreQueuesEmpty())
+                    break;
+            }
 
             if (token.IsCancellationRequested && AreQueuesEmpty())
             {
                 CancelPendingReplies();
                 break;
             }
+
+            // Cancelled with items still queued: fall through to Wait, which throws
+            // OperationCanceledException and runs the DrainAll cleanup path above —
+            // the same route the pre-collapse loop took.
         }
     }
 
@@ -661,7 +710,8 @@ public sealed class RaftPartitionExecutor : IDisposable
             // (dedicated mode) or pool thread (pool mode).
             _maintenanceQueue.Enqueue(new PendingOperation(
                 new RaftRequest(RaftRequestType.RestoreLogsLoaded, logs),
-                reply: null));
+                reply: null,
+                RaftOperationMapper.GetKind(RaftRequestType.RestoreLogsLoaded)));
             MarkRunnable();
         }
         catch (Exception ex) when (!token.IsCancellationRequested)
@@ -980,7 +1030,7 @@ public sealed class RaftPartitionExecutor : IDisposable
                 _restoreTcs.TrySetResult();
 
             double elapsedMs = sw.GetElapsedTime().TotalMilliseconds;
-            RaftOperationKind kind = RaftOperationMapper.GetKind(request.Type);
+            RaftOperationKind kind = op.Kind;
             KommanderMetrics.ExecutorOperationsTotal.Add(1, in _kindTags[(int)kind]);
             KommanderMetrics.ExecutorOperationDurationMs.Record(elapsedMs, in _kindTags[(int)kind]);
             if (kind is RaftOperationKind.Client or RaftOperationKind.Replication)
@@ -1002,12 +1052,17 @@ public sealed class RaftPartitionExecutor : IDisposable
         }
         finally
         {
-            long elapsedMs = sw.GetElapsedMilliseconds();
-            if (_slowThresholdMs > 0 && elapsedMs > _slowThresholdMs)
+            // Threshold check first: with slow-dispatch logging disabled (the default), the
+            // clock must not be read a third time on every operation just to discard it.
+            if (_slowThresholdMs > 0)
             {
-                _logger.LogWarning(
-                    "[RaftPartitionExecutor/{PartitionId}] Slow dispatch: {Type} took {ElapsedMs}ms",
-                    _partitionId, request.Type, elapsedMs);
+                long elapsedMs = sw.GetElapsedMilliseconds();
+                if (elapsedMs > _slowThresholdMs)
+                {
+                    _logger.LogWarning(
+                        "[RaftPartitionExecutor/{PartitionId}] Slow dispatch: {Type} took {ElapsedMs}ms",
+                        _partitionId, request.Type, elapsedMs);
+                }
             }
         }
     }

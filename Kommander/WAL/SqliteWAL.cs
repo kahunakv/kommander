@@ -74,6 +74,21 @@ public class SqliteWAL : IWAL, IDisposable
         public SqliteCommand? PreparedReadLogsRangeLimited { get; set; }
         public SqliteCommand? PreparedReadLogsRangeUnlimited { get; set; }
 
+        // Checkpoint read/upsert/delete run inside the write transaction — on the fsync-critical
+        // span of every checkpoint-bearing group commit — so they are prepared like the upsert
+        // (Transaction assigned per use, reset after; see BindAndExecUpsert's contract).
+        public SqliteCommand? PreparedCheckpointRead { get; set; }
+        public SqliteCommand? PreparedCheckpointUpsert { get; set; }
+        public SqliteCommand? PreparedCheckpointDelete { get; set; }
+
+        // The single-fsync commit path toggles PRAGMA synchronous OFF/FULL around every lazy
+        // commit-marker batch; these two are the only modes ever used.
+        public SqliteCommand? PreparedPragmaSyncOff { get; set; }
+        public SqliteCommand? PreparedPragmaSyncFull { get; set; }
+
+        // Post-batch proposed-tail cleanup on the follower append path (once per group batch).
+        public SqliteCommand? PreparedTruncateProposed { get; set; }
+
         public ShardDatabase(SqliteConnection connection) => Connection = connection;
     }
 
@@ -310,16 +325,11 @@ public class SqliteWAL : IWAL, IDisposable
             List<RaftLog> result = [];
             long lastCheckpoint = GetLastCheckpointInternal(shard, partitionId);
 
-            const string query = """
-             SELECT id, term, type, logType, log, timeNode, timePhysical, timeCounter
-             FROM logs
-             WHERE partitionId = @partitionId AND id >= @lastCheckpoint
-             ORDER BY id ASC;
-             """;
-
-            using SqliteCommand command = new(query, shard.Connection);
-            command.Parameters.AddWithValue("@partitionId", partitionId);
-            command.Parameters.AddWithValue("@lastCheckpoint", lastCheckpoint);
+            // Same SQL as the unlimited range read modulo the parameter name, so reuse its cached
+            // prepared command — this was the only read on the class paying a per-call compile.
+            SqliteCommand command = GetOrCreateReadLogsRangeUnlimited(shard);
+            command.Parameters[0].Value = partitionId;
+            command.Parameters[1].Value = lastCheckpoint;
 
             using SqliteDataReader reader = command.ExecuteReader();
             while (reader.Read())
@@ -348,10 +358,10 @@ public class SqliteWAL : IWAL, IDisposable
                 ? GetOrCreateReadLogsRangeLimited(shard)
                 : GetOrCreateReadLogsRangeUnlimited(shard);
 
-            command.Parameters["@partitionId"].Value = partitionId;
-            command.Parameters["@startIndex"].Value = startLogIndex;
+            command.Parameters[0].Value = partitionId;
+            command.Parameters[1].Value = startLogIndex;
             if (applyLimit)
-                command.Parameters["@maxEntries"].Value = maxEntries;
+                command.Parameters[2].Value = maxEntries;
 
             using SqliteDataReader reader = command.ExecuteReader();
             while (reader.Read())
@@ -373,7 +383,7 @@ public class SqliteWAL : IWAL, IDisposable
             lock (shard.Lock)
             {
                 SqliteCommand command = GetOrCreateGetMaxLog(shard);
-                command.Parameters["@partitionId"].Value = partitionId;
+                command.Parameters[0].Value = partitionId;
                 using SqliteDataReader reader = command.ExecuteReader();
                 while (reader.Read())
                     return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
@@ -403,8 +413,8 @@ public class SqliteWAL : IWAL, IDisposable
         lock (shard.Lock)
         {
             SqliteCommand command = GetOrCreateGetTermAt(shard);
-            command.Parameters["@partitionId"].Value = partitionId;
-            command.Parameters["@id"].Value = logIndex;
+            command.Parameters[0].Value = partitionId;
+            command.Parameters[1].Value = logIndex;
             using SqliteDataReader reader = command.ExecuteReader();
             while (reader.Read())
                 return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
@@ -418,7 +428,7 @@ public class SqliteWAL : IWAL, IDisposable
         lock (shard.Lock)
         {
             SqliteCommand command = GetOrCreateGetCurrentTerm(shard);
-            command.Parameters["@partitionId"].Value = partitionId;
+            command.Parameters[0].Value = partitionId;
             using SqliteDataReader reader = command.ExecuteReader();
             while (reader.Read())
                 return reader.IsDBNull(0) ? 0 : reader.GetInt64(0);
@@ -530,7 +540,7 @@ public class SqliteWAL : IWAL, IDisposable
                 lock (shard.Lock)
                 {
                     if (downgradeSync)
-                        SetSynchronousPragma(shard.Connection, "OFF");
+                        SetSynchronousPragma(shard, off: true);
 
                     try
                     {
@@ -557,9 +567,9 @@ public class SqliteWAL : IWAL, IDisposable
                                 if (batchMaxCheckpoint >= 0)
                                 {
                                     long newCheckpoint = Math.Max(
-                                        ReadCheckpointInTransaction(shard.Connection, transaction, partitionId),
+                                        ReadCheckpointInTransaction(shard, transaction, partitionId),
                                         batchMaxCheckpoint);
-                                    UpsertCheckpointInTransaction(shard.Connection, transaction, partitionId, newCheckpoint);
+                                    UpsertCheckpointInTransaction(shard, transaction, partitionId, newCheckpoint);
                                 }
                             }
 
@@ -578,7 +588,7 @@ public class SqliteWAL : IWAL, IDisposable
                     finally
                     {
                         if (downgradeSync)
-                            SetSynchronousPragma(shard.Connection, "FULL");
+                            SetSynchronousPragma(shard, off: false);
                     }
                 }
             }
@@ -595,15 +605,27 @@ public class SqliteWAL : IWAL, IDisposable
     }
 
     /// <summary>
-    /// Sets <c>PRAGMA synchronous</c> on <paramref name="connection"/> to <paramref name="mode"/>
-    /// (e.g. <c>OFF</c> / <c>FULL</c>). Must be called outside a transaction and while holding the
-    /// shard's write lock. Used by the sync-off branch of <see cref="Write(List{ValueTuple{int, List{RaftLog}}}, bool)"/>
+    /// Sets <c>PRAGMA synchronous</c> on the shard's connection to <c>OFF</c> (<paramref name="off"/>
+    /// true) or <c>FULL</c>. Must be called outside a transaction and while holding the shard's
+    /// write lock. Used by the sync-off branch of <see cref="Write(List{ValueTuple{int, List{RaftLog}}}, bool)"/>
     /// to skip the per-commit fsync for lazy commit-marker writes.
     /// </summary>
-    private static void SetSynchronousPragma(SqliteConnection connection, string mode)
+    private static void SetSynchronousPragma(ShardDatabase shard, bool off)
     {
-        using SqliteCommand pragma = new($"PRAGMA synchronous={mode};", connection);
+        // OFF and FULL are the only modes ever used, so both are cached prepared commands — the
+        // sync-off branch toggles the pragma twice per lazy commit-marker batch, and building the
+        // interpolated SQL + compiling it per toggle was pure per-batch churn.
+        SqliteCommand pragma = off
+            ? shard.PreparedPragmaSyncOff ??= CreatePreparedPragma(shard.Connection, "OFF")
+            : shard.PreparedPragmaSyncFull ??= CreatePreparedPragma(shard.Connection, "FULL");
         pragma.ExecuteNonQuery();
+    }
+
+    private static SqliteCommand CreatePreparedPragma(SqliteConnection connection, string mode)
+    {
+        SqliteCommand command = new($"PRAGMA synchronous={mode};", connection);
+        command.Prepare();
+        return command;
     }
 
     // ── IWAL — partition lifecycle ────────────────────────────────────────────
@@ -648,7 +670,7 @@ public class SqliteWAL : IWAL, IDisposable
                         command.ExecuteNonQuery();
                     }
 
-                    DeleteCheckpointInTransaction(shard.Connection, transaction, partitionId);
+                    DeleteCheckpointInTransaction(shard, transaction, partitionId);
 
                     transaction.Commit();
                 }
@@ -693,7 +715,7 @@ public class SqliteWAL : IWAL, IDisposable
                         command.ExecuteNonQuery();
                     }
 
-                    AdjustCheckpointAfterTruncation(shard.Connection, transaction, partitionId, afterLogId);
+                    AdjustCheckpointAfterTruncation(shard, transaction, partitionId, afterLogId);
 
                     transaction.Commit();
                     return RaftOperationStatus.Success;
@@ -719,17 +741,17 @@ public class SqliteWAL : IWAL, IDisposable
     /// No-op on the overwhelmingly common case where the checkpoint is at or below the truncation point.
     /// </summary>
     private static void AdjustCheckpointAfterTruncation(
-        SqliteConnection connection, SqliteTransaction transaction, int partitionId, long afterLogId)
+        ShardDatabase shard, SqliteTransaction transaction, int partitionId, long afterLogId)
     {
-        long recorded = ReadCheckpointInTransaction(connection, transaction, partitionId);
+        long recorded = ReadCheckpointInTransaction(shard, transaction, partitionId);
         if (recorded <= afterLogId)
             return;
 
-        long surviving = HighestCheckpointAtMostInTransaction(connection, transaction, partitionId, afterLogId);
+        long surviving = HighestCheckpointAtMostInTransaction(shard.Connection, transaction, partitionId, afterLogId);
         if (surviving < 0)
-            DeleteCheckpointInTransaction(connection, transaction, partitionId);
+            DeleteCheckpointInTransaction(shard, transaction, partitionId);
         else
-            UpsertCheckpointInTransaction(connection, transaction, partitionId, surviving);
+            UpsertCheckpointInTransaction(shard, transaction, partitionId, surviving);
     }
 
     /// <inheritdoc/>
@@ -742,13 +764,12 @@ public class SqliteWAL : IWAL, IDisposable
             {
                 // Only unresolved (Proposed / ProposedCheckpoint) entries above the anchor are removable;
                 // resolved entries are quorum-agreed and load-bearing for the commit frontier.
-                using SqliteCommand command = new(
-                    "DELETE FROM logs WHERE partitionId = @partitionId AND id > @afterLogId AND type IN (@proposed, @proposedCheckpoint)",
-                    shard.Connection);
-                command.Parameters.AddWithValue("@partitionId", partitionId);
-                command.Parameters.AddWithValue("@afterLogId", afterLogId);
-                command.Parameters.AddWithValue("@proposed", (int)RaftLogType.Proposed);
-                command.Parameters.AddWithValue("@proposedCheckpoint", (int)RaftLogType.ProposedCheckpoint);
+                // Prepared + cached: this fires once per follower group batch in steady state.
+                SqliteCommand command = GetOrCreateTruncateProposed(shard);
+                command.Parameters[0].Value = partitionId;
+                command.Parameters[1].Value = afterLogId;
+                command.Parameters[2].Value = (int)RaftLogType.Proposed;
+                command.Parameters[3].Value = (int)RaftLogType.ProposedCheckpoint;
                 command.ExecuteNonQuery();
 
                 // No last-checkpoint adjustment: this only removes unresolved (Proposed / ProposedCheckpoint)
@@ -786,7 +807,7 @@ public class SqliteWAL : IWAL, IDisposable
                         delete.ExecuteNonQuery();
                     }
 
-                    AdjustCheckpointAfterTruncation(shard.Connection, transaction, partitionId, afterLogId);
+                    AdjustCheckpointAfterTruncation(shard, transaction, partitionId, afterLogId);
 
                     long maxLogId;
                     using (SqliteCommand max = new(
@@ -834,7 +855,7 @@ public class SqliteWAL : IWAL, IDisposable
         lock (shard.Lock)
         {
             if (downgradeSync)
-                SetSynchronousPragma(shard.Connection, "OFF");
+                SetSynchronousPragma(shard, off: true);
 
             try
             {
@@ -890,8 +911,8 @@ public class SqliteWAL : IWAL, IDisposable
                     // checkpoint may still exist above the boundary, so keep the greater of the two.
                     long newCheckpoint = suffixTruncated
                         ? snapshotIndex
-                        : Math.Max(ReadCheckpointInTransaction(shard.Connection, transaction, partitionId), snapshotIndex);
-                    UpsertCheckpointInTransaction(shard.Connection, transaction, partitionId, newCheckpoint);
+                        : Math.Max(ReadCheckpointInTransaction(shard, transaction, partitionId), snapshotIndex);
+                    UpsertCheckpointInTransaction(shard, transaction, partitionId, newCheckpoint);
 
                     transaction.Commit();
                     return (RaftOperationStatus.Success, suffixTruncated);
@@ -911,7 +932,7 @@ public class SqliteWAL : IWAL, IDisposable
             finally
             {
                 if (downgradeSync)
-                    SetSynchronousPragma(shard.Connection, "FULL");
+                    SetSynchronousPragma(shard, off: false);
             }
         }
     }
@@ -1053,7 +1074,7 @@ public class SqliteWAL : IWAL, IDisposable
     private static long GetLastCheckpointInternal(ShardDatabase shard, int partitionId)
     {
         SqliteCommand command = GetOrCreateGetLastCheckpoint(shard);
-        command.Parameters["@partitionId"].Value = partitionId;
+        command.Parameters[0].Value = partitionId;
         using SqliteDataReader reader = command.ExecuteReader();
         while (reader.Read())
             return reader.IsDBNull(0) ? -1 : reader.GetInt64(0);
@@ -1061,46 +1082,62 @@ public class SqliteWAL : IWAL, IDisposable
     }
 
     /// <summary>
-    /// Reads the persisted last-checkpoint id inside an active transaction (a plain command bound to
-    /// <paramref name="transaction"/>, since a prepared command with no transaction cannot run while one
-    /// is open). Returns <c>-1</c> when no row exists.
+    /// Reads the persisted last-checkpoint id inside an active transaction. Uses the shard's cached
+    /// prepared command with <c>Transaction</c> assigned for the call and reset after (the same
+    /// discipline as <see cref="GetOrCreatePreparedUpsert"/>) — this runs inside every
+    /// checkpoint-bearing write transaction, so a per-call compile would sit on the fsync-critical
+    /// span. Returns <c>-1</c> when no row exists.
     /// </summary>
-    private static long ReadCheckpointInTransaction(SqliteConnection connection, SqliteTransaction transaction, int partitionId)
+    private static long ReadCheckpointInTransaction(ShardDatabase shard, SqliteTransaction transaction, int partitionId)
     {
-        using SqliteCommand command = new(
-            "SELECT lastCheckpoint FROM checkpoints WHERE partitionId = @partitionId", connection);
+        SqliteCommand command = GetOrCreateCheckpointRead(shard);
         command.Transaction = transaction;
-        command.Parameters.AddWithValue("@partitionId", partitionId);
-        object? result = command.ExecuteScalar();
-        return result is null or DBNull ? -1 : Convert.ToInt64(result);
+        try
+        {
+            command.Parameters[0].Value = partitionId;
+            object? result = command.ExecuteScalar();
+            return result is null or DBNull ? -1 : Convert.ToInt64(result);
+        }
+        finally
+        {
+            command.Transaction = null;
+        }
     }
 
     /// <summary>Upserts the persisted last-checkpoint id for a partition inside <paramref name="transaction"/>.</summary>
-    private static void UpsertCheckpointInTransaction(SqliteConnection connection, SqliteTransaction transaction, int partitionId, long value)
+    private static void UpsertCheckpointInTransaction(ShardDatabase shard, SqliteTransaction transaction, int partitionId, long value)
     {
-        using SqliteCommand command = new(
-            """
-            INSERT INTO checkpoints (partitionId, lastCheckpoint)
-            VALUES (@partitionId, @lastCheckpoint)
-            ON CONFLICT(partitionId) DO UPDATE SET lastCheckpoint=@lastCheckpoint;
-            """, connection);
+        SqliteCommand command = GetOrCreateCheckpointUpsert(shard);
         command.Transaction = transaction;
-        command.Parameters.AddWithValue("@partitionId", partitionId);
-        command.Parameters.AddWithValue("@lastCheckpoint", value);
-        command.ExecuteNonQuery();
+        try
+        {
+            command.Parameters[0].Value = partitionId;
+            command.Parameters[1].Value = value;
+            command.ExecuteNonQuery();
+        }
+        finally
+        {
+            command.Transaction = null;
+        }
     }
 
     /// <summary>
     /// Deletes the persisted last-checkpoint row for a partition inside <paramref name="transaction"/>
     /// (equivalent to "no checkpoint" — a subsequent read returns <c>-1</c>).
     /// </summary>
-    private static void DeleteCheckpointInTransaction(SqliteConnection connection, SqliteTransaction transaction, int partitionId)
+    private static void DeleteCheckpointInTransaction(ShardDatabase shard, SqliteTransaction transaction, int partitionId)
     {
-        using SqliteCommand command = new(
-            "DELETE FROM checkpoints WHERE partitionId = @partitionId", connection);
+        SqliteCommand command = GetOrCreateCheckpointDelete(shard);
         command.Transaction = transaction;
-        command.Parameters.AddWithValue("@partitionId", partitionId);
-        command.ExecuteNonQuery();
+        try
+        {
+            command.Parameters[0].Value = partitionId;
+            command.ExecuteNonQuery();
+        }
+        finally
+        {
+            command.Transaction = null;
+        }
     }
 
     /// <summary>
@@ -1229,17 +1266,50 @@ public class SqliteWAL : IWAL, IDisposable
              """,
             "@partitionId", "@startIndex");
 
+    private static SqliteCommand GetOrCreateCheckpointRead(ShardDatabase shard) =>
+        shard.PreparedCheckpointRead ??= CreatePreparedIntParamCommand(
+            shard.Connection,
+            "SELECT lastCheckpoint FROM checkpoints WHERE partitionId = @partitionId",
+            "@partitionId");
+
+    private static SqliteCommand GetOrCreateCheckpointUpsert(ShardDatabase shard) =>
+        shard.PreparedCheckpointUpsert ??= CreatePreparedIntParamCommand(
+            shard.Connection,
+            """
+            INSERT INTO checkpoints (partitionId, lastCheckpoint)
+            VALUES (@partitionId, @lastCheckpoint)
+            ON CONFLICT(partitionId) DO UPDATE SET lastCheckpoint=@lastCheckpoint;
+            """,
+            "@partitionId", "@lastCheckpoint");
+
+    private static SqliteCommand GetOrCreateCheckpointDelete(ShardDatabase shard) =>
+        shard.PreparedCheckpointDelete ??= CreatePreparedIntParamCommand(
+            shard.Connection,
+            "DELETE FROM checkpoints WHERE partitionId = @partitionId",
+            "@partitionId");
+
+    private static SqliteCommand GetOrCreateTruncateProposed(ShardDatabase shard) =>
+        shard.PreparedTruncateProposed ??= CreatePreparedIntParamCommand(
+            shard.Connection,
+            "DELETE FROM logs WHERE partitionId = @partitionId AND id > @afterLogId AND type IN (@proposed, @proposedCheckpoint)",
+            "@partitionId", "@afterLogId", "@proposed", "@proposedCheckpoint");
+
+    // Parameters are bound by ordinal below: SqliteParameterCollection's string indexer does a
+    // linear case-insensitive name scan per access, which multiplied out to 9 scans per upserted
+    // row. The ordinals follow the creation order in CreatePreparedUpsert /
+    // CreatePreparedIntParamCommand, which is fixed by construction.
     private static void BindAndExecUpsert(SqliteCommand cmd, int partitionId, RaftLog log)
     {
-        cmd.Parameters["@id"].Value = log.Id;
-        cmd.Parameters["@partitionId"].Value = partitionId;
-        cmd.Parameters["@term"].Value = log.Term;
-        cmd.Parameters["@type"].Value = log.Type;
-        cmd.Parameters["@logType"].Value = log.LogType is null ? DBNull.Value : (object)log.LogType;
-        cmd.Parameters["@log"].Value = log.LogData is null ? DBNull.Value : (object)log.LogData;
-        cmd.Parameters["@timeNode"].Value = log.Time.N;
-        cmd.Parameters["@timePhysical"].Value = log.Time.L;
-        cmd.Parameters["@timeCounter"].Value = log.Time.C;
+        SqliteParameterCollection parameters = cmd.Parameters;
+        parameters[0].Value = log.Id;
+        parameters[1].Value = partitionId;
+        parameters[2].Value = log.Term;
+        parameters[3].Value = log.Type;
+        parameters[4].Value = log.LogType is null ? DBNull.Value : (object)log.LogType;
+        parameters[5].Value = log.LogData is null ? DBNull.Value : (object)log.LogData;
+        parameters[6].Value = log.Time.N;
+        parameters[7].Value = log.Time.L;
+        parameters[8].Value = log.Time.C;
         cmd.ExecuteNonQuery();
     }
 
@@ -1260,6 +1330,12 @@ public class SqliteWAL : IWAL, IDisposable
             shard.PreparedGetLastCheckpoint?.Dispose();
             shard.PreparedReadLogsRangeLimited?.Dispose();
             shard.PreparedReadLogsRangeUnlimited?.Dispose();
+            shard.PreparedCheckpointRead?.Dispose();
+            shard.PreparedCheckpointUpsert?.Dispose();
+            shard.PreparedCheckpointDelete?.Dispose();
+            shard.PreparedPragmaSyncOff?.Dispose();
+            shard.PreparedPragmaSyncFull?.Dispose();
+            shard.PreparedTruncateProposed?.Dispose();
             shard.Connection.Dispose();
         }
     }

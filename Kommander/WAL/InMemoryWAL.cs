@@ -26,6 +26,18 @@ public class InMemoryWAL : IWAL, IDisposable
     /// </summary>
     private readonly Dictionary<int, long> lastCheckpoints = new();
 
+    /// <summary>
+    /// Per-partition highest log id currently present, maintained incrementally on every mutation (same
+    /// pattern as <see cref="lastCheckpoints"/>). <see cref="GetMaxLog"/> and <see cref="GetCurrentTerm"/>
+    /// are per-append/per-heartbeat reads; without this cache they scanned the whole retained log
+    /// (<c>Keys.Max()</c> is O(n)) while holding the read lock, extending the window writers must wait
+    /// for as the log grows. A missing entry means the partition holds no logs (max = 0). Removal paths
+    /// only recompute when the highest removed id equals the recorded max, so the O(n) rescan is confined
+    /// to the rare truncation that actually removes the tail. Guarded by <see cref="rwLock"/> like
+    /// <see cref="allLogs"/>.
+    /// </summary>
+    private readonly Dictionary<int, long> maxLogIds = new();
+
     private readonly ILogger<IRaft> logger;
 
     public InMemoryWAL(ILogger<IRaft> logger)
@@ -106,6 +118,7 @@ public class InMemoryWAL : IWAL, IDisposable
             foreach ((int partitionId, List<RaftLog> raftLogs) item in logs)
             {
                 long batchMaxCheckpoint = -1;
+                long batchMaxId = 0;
                 foreach (RaftLog log in item.raftLogs)
                 {
                     if (allLogs.TryGetValue(item.partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
@@ -113,9 +126,16 @@ public class InMemoryWAL : IWAL, IDisposable
                     else
                         allLogs.Add(item.partitionId, new() { { log.Id, log } });
 
+                    if (log.Id > batchMaxId)
+                        batchMaxId = log.Id;
+
                     if (log.Type == RaftLogType.CommittedCheckpoint && log.Id > batchMaxCheckpoint)
                         batchMaxCheckpoint = log.Id;
                 }
+
+                // Writes only ever add or overwrite entries, so the max can only grow.
+                if (batchMaxId > maxLogIds.GetValueOrDefault(item.partitionId, 0))
+                    maxLogIds[item.partitionId] = batchMaxId;
 
                 // max() so an out-of-order lower checkpoint never regresses the recorded id.
                 if (batchMaxCheckpoint >= 0)
@@ -136,13 +156,9 @@ public class InMemoryWAL : IWAL, IDisposable
         rwLock.EnterReadLock();
         try
         {
-            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
-            {
-                if (partitionLogs.Count > 0)
-                    return partitionLogs.Keys.Max();
-            }
-
-            return 0;
+            // O(1) read of the incrementally-maintained value (see maxLogIds); 0 when the partition
+            // holds no logs.
+            return maxLogIds.GetValueOrDefault(partitionId, 0);
         }
         finally
         {
@@ -155,11 +171,10 @@ public class InMemoryWAL : IWAL, IDisposable
         rwLock.EnterReadLock();
         try
         {
-            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
-            {
-                if (partitionLogs.Count > 0)
-                    return partitionLogs[partitionLogs.Keys.Max()].Term;
-            }
+            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs)
+                && maxLogIds.TryGetValue(partitionId, out long maxLogId)
+                && partitionLogs.TryGetValue(maxLogId, out RaftLog? log))
+                return log.Term;
 
             return 0;
         }
@@ -199,6 +214,30 @@ public class InMemoryWAL : IWAL, IDisposable
         }
 
         return checkpoint;
+    }
+
+    /// <summary>
+    /// Refreshes <see cref="maxLogIds"/> after entries were removed from a partition. Must run under the
+    /// write lock. O(1) when the tail survived: <paramref name="removedAscending"/> is built by ascending
+    /// key iteration, so its last element is the highest removed id — only when that equals the recorded
+    /// max can the max have changed, and only then is the remaining log rescanned.
+    /// </summary>
+    private void UpdateMaxAfterRemoval(int partitionId, SortedDictionary<long, RaftLog> partitionLogs, List<long> removedAscending)
+    {
+        if (removedAscending.Count == 0)
+            return;
+
+        if (removedAscending[^1] != maxLogIds.GetValueOrDefault(partitionId, 0))
+            return;
+
+        long max = 0;
+        foreach (long id in partitionLogs.Keys)
+            max = id;
+
+        if (max == 0)
+            maxLogIds.Remove(partitionId);
+        else
+            maxLogIds[partitionId] = max;
     }
 
     public int CountPersistedLogs(int partitionId)
@@ -257,6 +296,7 @@ public class InMemoryWAL : IWAL, IDisposable
             allLogs.Remove(partitionId);
             // Drop the recorded checkpoint too, so a reused partition id does not inherit a stale floor.
             lastCheckpoints.Remove(partitionId);
+            maxLogIds.Remove(partitionId);
             return RaftOperationStatus.Success;
         }
         finally
@@ -284,6 +324,7 @@ public class InMemoryWAL : IWAL, IDisposable
                 partitionLogs.Remove(id);
 
             AdjustCheckpointAfterTruncation(partitionId, partitionLogs, afterLogId);
+            UpdateMaxAfterRemoval(partitionId, partitionLogs, toRemove);
 
             return RaftOperationStatus.Success;
         }
@@ -332,6 +373,8 @@ public class InMemoryWAL : IWAL, IDisposable
             foreach (long id in toRemove)
                 partitionLogs.Remove(id);
 
+            UpdateMaxAfterRemoval(partitionId, partitionLogs, toRemove);
+
             // No checkpoint adjustment: only unresolved entries are removed, never a CommittedCheckpoint.
             return RaftOperationStatus.Success;
         }
@@ -363,9 +406,9 @@ public class InMemoryWAL : IWAL, IDisposable
                 partitionLogs.Remove(id);
 
             AdjustCheckpointAfterTruncation(partitionId, partitionLogs, afterLogId);
+            UpdateMaxAfterRemoval(partitionId, partitionLogs, toRemove);
 
-            long max = partitionLogs.Count > 0 ? partitionLogs.Keys.Max() : 0;
-            return (RaftOperationStatus.Success, max);
+            return (RaftOperationStatus.Success, maxLogIds.GetValueOrDefault(partitionId, 0));
         }
         finally
         {
@@ -424,6 +467,12 @@ public class InMemoryWAL : IWAL, IDisposable
                 ? snapshotIndex
                 : Math.Max(lastCheckpoints.GetValueOrDefault(partitionId, -1), snapshotIndex);
 
+            // Same reasoning for the max-id cache; the boundary entry itself guarantees the partition is
+            // non-empty at snapshotIndex.
+            maxLogIds[partitionId] = suffixTruncated
+                ? snapshotIndex
+                : Math.Max(maxLogIds.GetValueOrDefault(partitionId, 0), snapshotIndex);
+
             return (RaftOperationStatus.Success, suffixTruncated);
         }
         finally
@@ -461,6 +510,8 @@ public class InMemoryWAL : IWAL, IDisposable
 
             foreach (long id in toRemove)
                 partitionLogs.Remove(id);
+
+            UpdateMaxAfterRemoval(partitionId, partitionLogs, toRemove);
 
             // No checkpoint adjustment: only entries with id < lastCheckpoint are removed, so the recorded
             // checkpoint (>= lastCheckpoint) is never affected.

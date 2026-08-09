@@ -86,15 +86,24 @@ public class RocksDbWAL : IWAL, IDisposable
     private readonly ConcurrentDictionary<int, Lazy<ColumnFamilyHandle>> families = new();
 
     /// <summary>
-    /// Serializes the compound read-modify-write operations (append <c>Write</c>, <c>TruncateLogsAfter</c>,
-    /// <c>InstallSnapshotBoundary</c>) against each other. RocksDB is internally thread-safe per operation, but
-    /// the truncate/boundary ops enumerate suffix keys and then delete them in a later batch — an append
-    /// landing between the scan and the batch would survive the truncation. Those ops run on the read
-    /// scheduler while appends run on the WAL write scheduler, so they are NOT otherwise mutually excluded.
-    /// This guard makes each scan+write atomic relative to appends; it adds only an uncontended lock on the
-    /// append fast path (RocksDB already serializes the underlying writes internally).
+    /// Guards the compound read-modify-write operations against appends. The truncate/boundary ops
+    /// (<c>TruncateLogsAfter</c>, <c>TruncateProposedLogsAfter</c>, <c>InstallSnapshotBoundary</c>)
+    /// enumerate suffix keys and then delete them in a later batch — an append landing between the scan
+    /// and the batch would survive the truncation. Those ops run on the read scheduler while appends run
+    /// on the WAL write scheduler, so they are NOT otherwise mutually excluded.
+    ///
+    /// <para>A reader/writer lock rather than a mutex so that plain appends (the hot path) hold only the
+    /// READ lock and may overlap: RocksDB is internally thread-safe per operation and its WriteThread
+    /// coalesces concurrent synced writes into one write group with a single fsync — a mutex here would
+    /// serialize the fsyncs and defeat group commit across scheduler workers. The scan+delete ops take the
+    /// WRITE lock, preserving the original exclusion. Appends that carry a <c>CommittedCheckpoint</c> also
+    /// take the WRITE lock: they read-modify-write the persisted last-checkpoint metadata
+    /// (<c>GetLastCheckpointFromMeta</c> + <c>Math.Max</c> staged into the batch), and two overlapping
+    /// same-partition checkpoint writers could otherwise regress the recorded id if their <c>db.Write</c>
+    /// calls complete out of order. Checkpoints are rare (once per checkpoint interval), so the hot append
+    /// path keeps full concurrency.</para>
     /// </summary>
-    private readonly object writeGuard = new();
+    private readonly ReaderWriterLockSlim writeGuard = new(LockRecursionPolicy.NoRecursion);
 
     /// <summary>
     /// Per-partition seek hint for <see cref="CompactLogsOlderThan"/>: the id the next compaction pass
@@ -279,9 +288,12 @@ public class RocksDbWAL : IWAL, IDisposable
         BuildLogKey(seekKey, partitionId, startLogId);
         iterator.Seek(seekKey);
 
+        Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
+        BuildPartitionPrefix(partitionPrefix, partitionId);
+
         while (iterator.Valid())
         {
-            if (!KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
+            if (!iterator.GetKeySpan().StartsWith(partitionPrefix))
                 break;
 
             ReadLogFromWire(iterator.GetValueSpan(), out RaftLogWireView view);
@@ -323,9 +335,12 @@ public class RocksDbWAL : IWAL, IDisposable
         BuildLogKey(seekKey, partitionId, Math.Max(0, startLogIndex));
         iterator.Seek(seekKey);
 
+        Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
+        BuildPartitionPrefix(partitionPrefix, partitionId);
+
         while (iterator.Valid())
         {
-            if (!KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
+            if (!iterator.GetKeySpan().StartsWith(partitionPrefix))
                 break;
 
             ReadLogFromWire(iterator.GetValueSpan(), out RaftLogWireView view);
@@ -373,9 +388,19 @@ public class RocksDbWAL : IWAL, IDisposable
     {
         WriteOptions effectiveOptions = sync ? writeOptions : NonSynchronousWriteOptions;
 
+        // Checkpoint-bearing batches read-modify-write the persisted last-checkpoint metadata and must be
+        // fully exclusive; plain appends only need exclusion against the scan+delete ops, so they share
+        // the read lock and keep RocksDB's group commit across workers — see writeGuard.
+        bool exclusive = ContainsCommittedCheckpoint(logs);
+
         try
         {
-            lock (writeGuard)
+            if (exclusive)
+                writeGuard.EnterWriteLock();
+            else
+                writeGuard.EnterReadLock();
+
+            try
             {
             if (logs is [{ Item2.Count: 1 } _]) // fast path
             {
@@ -525,6 +550,13 @@ public class RocksDbWAL : IWAL, IDisposable
 
             return RaftOperationStatus.Success;
             }
+            finally
+            {
+                if (exclusive)
+                    writeGuard.ExitWriteLock();
+                else
+                    writeGuard.ExitReadLock();
+            }
         }
         catch (Exception ex)
         {
@@ -532,6 +564,25 @@ public class RocksDbWAL : IWAL, IDisposable
                     
             return RaftOperationStatus.Errored;
         }
+    }
+
+    /// <summary>
+    /// True when any entry in the batch is a <see cref="RaftLogType.CommittedCheckpoint"/>. Such batches
+    /// read-modify-write the persisted last-checkpoint metadata inside <see cref="Write(List{ValueTuple{int, List{RaftLog}}}, bool)"/>
+    /// and must therefore hold the exclusive side of <see cref="writeGuard"/>; plain appends share the read lock.
+    /// </summary>
+    private static bool ContainsCommittedCheckpoint(List<(int, List<RaftLog>)> logs)
+    {
+        foreach ((int _, List<RaftLog> raftLogs) in logs)
+        {
+            foreach (RaftLog log in raftLogs)
+            {
+                if (log.Type == RaftLogType.CommittedCheckpoint)
+                    return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -946,8 +997,11 @@ public class RocksDbWAL : IWAL, IDisposable
 
         int count = 0;
 
+        Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
+        BuildPartitionPrefix(partitionPrefix, partitionId);
+
         // Counting only needs partition membership, which the key prefix already establishes — no value read.
-        while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
+        while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix))
         {
             count++;
             iterator.Next();
@@ -973,7 +1027,10 @@ public class RocksDbWAL : IWAL, IDisposable
 
         int count = 0;
 
-        while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
+        Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
+        BuildPartitionPrefix(partitionPrefix, partitionId);
+
+        while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix))
         {
             if (ParseLogIdFromKey(iterator.GetKeySpan()) >= lastCheckpoint)
                 break;
@@ -1025,8 +1082,13 @@ public class RocksDbWAL : IWAL, IDisposable
     /// entry for a partition. Mirrors the per-partition hard-state key convention
     /// (<c>raft_hardstate_p{id}</c>).
     /// </summary>
-    private static byte[] LastCheckpointKey(int partitionId) =>
-        Encoding.UTF8.GetBytes($"raft_last_checkpoint_p{partitionId}");
+    private byte[] LastCheckpointKey(int partitionId) =>
+        // Cached: this key is rebuilt (interpolated string + UTF-8 encode) on every checkpoint
+        // read/write and inside every ReadLogs restore; the partition set is small and stable.
+        lastCheckpointKeys.GetOrAdd(partitionId, static pid => Encoding.UTF8.GetBytes($"raft_last_checkpoint_p{pid}"));
+
+    /// <summary>Cache for <see cref="LastCheckpointKey"/>; key bytes are immutable once built.</summary>
+    private readonly ConcurrentDictionary<int, byte[]> lastCheckpointKeys = new();
 
     /// <summary>
     /// Reads the persisted last-checkpoint id for <paramref name="partitionId"/> as an O(1) point lookup
@@ -1095,7 +1157,11 @@ public class RocksDbWAL : IWAL, IDisposable
         {
             ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
-            List<byte[]> keysToDelete = [];
+            // Deletes are staged straight into the WriteBatch while iterating — WriteBatch copies the
+            // key and nothing is applied until db.Write — so no per-key byte[] list is materialized
+            // (the same shape CompactLogsOlderThan uses).
+            using WriteBatch writeBatch = new();
+            int staged = 0;
 
             using (Iterator? iterator = db.NewIterator(cf: columnFamilyHandle))
             {
@@ -1103,9 +1169,13 @@ public class RocksDbWAL : IWAL, IDisposable
                 BuildLogKey(seekKey, partitionId, 0);
                 iterator.Seek(seekKey);
 
-                while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
+                Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
+                BuildPartitionPrefix(partitionPrefix, partitionId);
+
+                while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix))
                 {
-                    keysToDelete.Add(iterator.Key());
+                    writeBatch.Delete(iterator.GetKeySpan(), cf: columnFamilyHandle);
+                    staged++;
                     iterator.Next();
                 }
             }
@@ -1113,11 +1183,8 @@ public class RocksDbWAL : IWAL, IDisposable
             // Always drop the persisted last-checkpoint id too: wiping the partition must not leave a stale
             // replay floor that a subsequently-reused partition id would inherit (there is no scan fallback
             // to correct it). Batch it with the log deletes when there are any, else delete it standalone.
-            if (keysToDelete.Count > 0)
+            if (staged > 0)
             {
-                using WriteBatch writeBatch = new();
-                foreach (byte[] key in keysToDelete)
-                    writeBatch.Delete(key, cf: columnFamilyHandle);
                 writeBatch.Delete(LastCheckpointKey(partitionId), cf: metadataColumnFamily);
                 db.Write(writeBatch, writeOptions);
             }
@@ -1144,11 +1211,14 @@ public class RocksDbWAL : IWAL, IDisposable
     {
         try
         {
-            lock (writeGuard)
+            writeGuard.EnterWriteLock();
+            try
             {
             ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
-            List<byte[]> keysToDelete = [];
+            // Staged directly into the batch — see DeletePartitionWAL for the rationale.
+            using WriteBatch writeBatch = new();
+            int staged = 0;
 
             using (Iterator? iterator = db.NewIterator(cf: columnFamilyHandle))
             {
@@ -1156,19 +1226,19 @@ public class RocksDbWAL : IWAL, IDisposable
                 BuildLogKey(seekKey, partitionId, afterLogId + 1);
                 iterator.Seek(seekKey);
 
-                while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
+                Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
+                BuildPartitionPrefix(partitionPrefix, partitionId);
+
+                while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix))
                 {
-                    keysToDelete.Add(iterator.Key());
+                    writeBatch.Delete(iterator.GetKeySpan(), cf: columnFamilyHandle);
+                    staged++;
                     iterator.Next();
                 }
             }
 
-            if (keysToDelete.Count > 0)
+            if (staged > 0)
             {
-                using WriteBatch writeBatch = new();
-                foreach (byte[] key in keysToDelete)
-                    writeBatch.Delete(key, cf: columnFamilyHandle);
-
                 // If the truncation removes the recorded checkpoint (it sits above afterLogId), recompute
                 // the surviving checkpoint id (highest CommittedCheckpoint ≤ afterLogId, or -1) and adjust
                 // the persisted value in the SAME batch. There is no scan fallback, so this must be exact.
@@ -1189,6 +1259,10 @@ public class RocksDbWAL : IWAL, IDisposable
 
             return RaftOperationStatus.Success;
             }
+            finally
+            {
+                writeGuard.ExitWriteLock();
+            }
         }
         catch (Exception ex)
         {
@@ -1202,11 +1276,15 @@ public class RocksDbWAL : IWAL, IDisposable
     {
         try
         {
-            lock (writeGuard)
+            writeGuard.EnterWriteLock();
+            try
             {
                 ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
-                List<byte[]> keysToDelete = [];
+                // Staged directly into the batch — see DeletePartitionWAL for the rationale. This runs
+                // once per follower group batch in steady state, so the per-key byte[] churn mattered.
+                using WriteBatch writeBatch = new();
+                int staged = 0;
 
                 using (Iterator? iterator = db.NewIterator(cf: columnFamilyHandle))
                 {
@@ -1214,29 +1292,34 @@ public class RocksDbWAL : IWAL, IDisposable
                     BuildLogKey(seekKey, partitionId, afterLogId + 1);
                     iterator.Seek(seekKey);
 
-                    while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
+                    Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
+                    BuildPartitionPrefix(partitionPrefix, partitionId);
+
+                    while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix))
                     {
                         // Only unresolved (Proposed / ProposedCheckpoint) entries are removable; resolved
                         // entries are quorum-agreed and load-bearing for the commit frontier.
                         ReadHeaderFromWire(iterator.GetValueSpan(), out _, out _, out _, out int type);
                         if (type is (int)RaftLogType.Proposed or (int)RaftLogType.ProposedCheckpoint)
-                            keysToDelete.Add(iterator.Key());
+                        {
+                            writeBatch.Delete(iterator.GetKeySpan(), cf: columnFamilyHandle);
+                            staged++;
+                        }
                         iterator.Next();
                     }
                 }
 
-                if (keysToDelete.Count > 0)
-                {
-                    using WriteBatch writeBatch = new();
-                    foreach (byte[] key in keysToDelete)
-                        writeBatch.Delete(key, cf: columnFamilyHandle);
+                if (staged > 0)
                     db.Write(writeBatch, writeOptions);
-                }
 
                 // No last-checkpoint adjustment: this only removes unresolved (Proposed / ProposedCheckpoint)
                 // entries, and a CommittedCheckpoint is resolved — so the recorded checkpoint is never among
                 // the deleted keys.
                 return RaftOperationStatus.Success;
+            }
+            finally
+            {
+                writeGuard.ExitWriteLock();
             }
         }
         catch (Exception ex)
@@ -1280,7 +1363,8 @@ public class RocksDbWAL : IWAL, IDisposable
 
         try
         {
-            lock (writeGuard)
+            writeGuard.EnterWriteLock();
+            try
             {
             ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
@@ -1294,24 +1378,26 @@ public class RocksDbWAL : IWAL, IDisposable
             bool suffixTruncated = false;
             if (localTerm != lastIncludedTerm)
             {
-                List<byte[]> keysToDelete = [];
+                // Staged directly into the batch — see DeletePartitionWAL for the rationale.
+                int staged = 0;
                 using (Iterator? iterator = db.NewIterator(cf: columnFamilyHandle))
                 {
                     Span<byte> seekKey = stackalloc byte[LogKeyWidth];
                     BuildLogKey(seekKey, partitionId, snapshotIndex + 1);
                     iterator.Seek(seekKey);
 
-                    while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
+                    Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
+                    BuildPartitionPrefix(partitionPrefix, partitionId);
+
+                    while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix))
                     {
-                        keysToDelete.Add(iterator.Key());
+                        writeBatch.Delete(iterator.GetKeySpan(), cf: columnFamilyHandle);
+                        staged++;
                         iterator.Next();
                     }
                 }
 
-                foreach (byte[] key in keysToDelete)
-                    writeBatch.Delete(key, cf: columnFamilyHandle);
-
-                suffixTruncated = keysToDelete.Count > 0;
+                suffixTruncated = staged > 0;
             }
 
             // Upsert the checkpoint marker at the boundary index (same key overwrites any existing entry).
@@ -1338,6 +1424,10 @@ public class RocksDbWAL : IWAL, IDisposable
             db.Write(writeBatch, effectiveOptions);
 
             return (RaftOperationStatus.Success, suffixTruncated);
+            }
+            finally
+            {
+                writeGuard.ExitWriteLock();
             }
         }
         catch (Exception ex)
@@ -1394,9 +1484,12 @@ public class RocksDbWAL : IWAL, IDisposable
             BuildLogKey(seekKey, partitionId, start);
             iterator.Seek(seekKey);
 
+            Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
+            BuildPartitionPrefix(partitionPrefix, partitionId);
+
             // Deletion is decided entirely from the key (partition prefix + id), so this pass never reads
             // an entry's value — the payload of every compacted entry stays in RocksDB's own buffers.
-            while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId) && removed < passCap)
+            while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix) && removed < passCap)
             {
                 if (ParseLogIdFromKey(iterator.GetKeySpan()) >= lastCheckpoint)
                     break;
@@ -1413,7 +1506,7 @@ public class RocksDbWAL : IWAL, IDisposable
             // since nothing below lastCheckpoint remains and we began at start. Lowering the hint is always
             // safe (at worst it re-scans some tombstones next pass); raising it past a live key is not, and
             // cannot happen here.
-            long newResume = iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId)
+            long newResume = iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix)
                 ? ParseLogIdFromKey(iterator.GetKeySpan())
                 : Math.Max(start, lastCheckpoint);
             compactionResumeId[partitionId] = newResume;
@@ -1504,11 +1597,25 @@ public class RocksDbWAL : IWAL, IDisposable
         return id;
     }
 
-    private static bool KeyBelongsToPartition(ReadOnlySpan<byte> key, int partitionId)
+    /// <summary>Width of the partition prefix of a log key: the padded partition id plus separator.</summary>
+    private const int PartitionPrefixWidth = PartitionIdWidth + 1;
+
+    /// <summary>
+    /// Fills <paramref name="prefix"/> (exactly <see cref="PartitionPrefixWidth"/> bytes) with the
+    /// partition's log-key prefix. Per-entry scan loops build this once before the loop and compare
+    /// with <c>StartsWith</c> directly — the prefix is loop-invariant, and rebuilding it per scanned
+    /// entry (as <see cref="KeyBelongsToPartition"/> does) costs a 10-byte fill + digit loop each time.
+    /// </summary>
+    private static void BuildPartitionPrefix(Span<byte> prefix, int partitionId)
     {
-        Span<byte> prefix = stackalloc byte[PartitionIdWidth + 1];
         ToDecimalBytes(prefix[..PartitionIdWidth], partitionId);
         prefix[PartitionIdWidth] = LogKeySeparator;
+    }
+
+    private static bool KeyBelongsToPartition(ReadOnlySpan<byte> key, int partitionId)
+    {
+        Span<byte> prefix = stackalloc byte[PartitionPrefixWidth];
+        BuildPartitionPrefix(prefix, partitionId);
 
         return key.StartsWith(prefix);
     }
@@ -1559,7 +1666,8 @@ public class RocksDbWAL : IWAL, IDisposable
     public void Dispose()
     {
         GC.SuppressFinalize(this);
-        
-        db.Dispose();        
+
+        db.Dispose();
+        writeGuard.Dispose();
     }
 }

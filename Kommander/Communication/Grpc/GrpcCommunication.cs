@@ -5,6 +5,7 @@ using System.Runtime.CompilerServices;
 using Google.Protobuf;
 using Google.Protobuf.Collections;
 using Grpc.Core;
+using Grpc.Net.Client;
 using Kommander.Data;
 using Kommander.Gossip;
 using Microsoft.Extensions.Logging;
@@ -51,6 +52,45 @@ public class GrpcCommunication : ICommunication
         public required Func<Metadata?>? Factory { get; init; }
     }
 
+    // Per-manager cached transport state for the per-message send path.
+    //
+    // GetEffectiveTransportSecurity() allocates a fresh RaftTransportSecurityOptions on every
+    // call, and the resulting GrpcChannelPoolOptions is only ever consumed when a channel pool
+    // is first created — on the warm path it would be built and discarded once per outbound RPC.
+    // Endpoint URLs (scheme + endpoint) are likewise stable per node. Both are derived from
+    // configuration that is immutable after RaftManager construction (same contract the
+    // streamingAuthByManager cache above relies on), so caching them per manager is safe; the
+    // DEBUG-only AssertConsistentPoolConfig in SharedChannels still enforces the
+    // one-transport-config-per-URL invariant.
+    private static readonly ConditionalWeakTable<RaftManager, TransportCache> transportCacheByManager = new();
+
+    private sealed class TransportCache
+    {
+        public required GrpcChannelPoolOptions PoolOptions { get; init; }
+
+        public readonly ConcurrentDictionary<string, string> EndpointUrls = new();
+    }
+
+    // The generated RafterClient is a stateless, thread-safe wrapper over its channel; caching one
+    // per channel avoids re-allocating it on every unary RPC (pings, gossip, and read-index probes
+    // fire per peer on timers). Keyed weakly so disposed channels do not pin clients.
+    private static readonly ConditionalWeakTable<GrpcChannel, Rafter.RafterClient> clientByChannel = new();
+
+    private static Rafter.RafterClient GetClient(RaftManager manager, RaftNode node) =>
+        clientByChannel.GetValue(
+            SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)),
+            static channel => new Rafter.RafterClient(channel));
+
+    private static TransportCache GetTransportCache(RaftManager manager) =>
+        transportCacheByManager.GetValue(manager, static m => new TransportCache
+        {
+            PoolOptions = new(
+                m.Configuration.GetEffectiveGrpcChannelsPerNode(),
+                m.Configuration.GrpcEnableMultipleHttp2Connections,
+                m.Configuration.GetEffectiveTransportSecurity(),
+                m.Configuration.GrpcEnableSnapshotCompression)
+        });
+
     //private static readonly SemaphoreSlim semaphore = new(1, 1);
 
     /// <summary>
@@ -63,7 +103,7 @@ public class GrpcCommunication : ICommunication
     /// <returns></returns>
     public async Task<HandshakeResponse> Handshake(RaftManager manager, RaftNode node, HandshakeRequest request)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
+        Rafter.RafterClient client = GetClient(manager, node);
 
         GrpcHandshakeRequest handshake = new()
         {
@@ -338,7 +378,9 @@ public class GrpcCommunication : ICommunication
         if (!semaphore.Wait(0))
             return;
 
-        List<GrpcAppendLogsRequest> toReturn = [];
+        // Pre-sized to the batch cap: starting at capacity 0 costs ~9 growth reallocations
+        // per flush cycle when the backlog reaches maxBatch (default 256).
+        List<GrpcAppendLogsRequest> toReturn = new(maxBatch);
         try
         {
             do
@@ -461,16 +503,18 @@ public class GrpcCommunication : ICommunication
             GetStreamingAuthFactory(manager),
             GetPoolOptions(manager));
         
-        RepeatedField<GrpcBatchRequestsRequestItem> items = new();
-            
+        // Items are added straight into the outgoing message's own RepeatedField — an intermediate
+        // RepeatedField would be copied element-by-element into the message afterwards for nothing.
+        GrpcBatchRequestsRequest batchRequests = new();
+
         foreach (BatchRequestsRequestItem requestItem in request.Requests)
         {
             GrpcBatchRequestsRequestItem item = new()
             {
                 Type = (GrpcBatchRequestsRequestType) requestItem.Type
             };
-            
-            items.Add(item);
+
+            batchRequests.Requests.Add(item);
 
             if (requestItem.Handshake is not null)
             {
@@ -597,16 +641,12 @@ public class GrpcCommunication : ICommunication
             }
         }
         
-        GrpcBatchRequestsRequest batchRequests = new();
-        
-        batchRequests.Requests.AddRange(items);
-        
         try
         {
             await streaming.Semaphore.WaitAsync();
-            
+
             await streaming.Streaming.RequestStream.WriteAsync(batchRequests);
-        } 
+        }
         finally
         {
             streaming.Semaphore.Release();
@@ -622,7 +662,7 @@ public class GrpcCommunication : ICommunication
     /// </summary>
     public async Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
+        Rafter.RafterClient client = GetClient(manager, node);
 
         GrpcLeaveRequest grpcRequest = new()
         {
@@ -654,7 +694,7 @@ public class GrpcCommunication : ICommunication
     /// </summary>
     public async Task<GossipAck> SendGossip(RaftManager manager, RaftNode node, GossipMessage digest, CancellationToken cancellationToken = default)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
+        Rafter.RafterClient client = GetClient(manager, node);
 
         GrpcGossipRequest grpcRequest = new()
         {
@@ -696,7 +736,7 @@ public class GrpcCommunication : ICommunication
     /// </summary>
     public async Task<Gossip.PingResponse> SendPing(RaftManager manager, RaftNode node, Gossip.PingRequest request, CancellationToken cancellationToken = default)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
+        Rafter.RafterClient client = GetClient(manager, node);
         GrpcPingRequest grpcRequest = new() { SenderEndpoint = request.SenderEndpoint };
         Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Ping");
         try
@@ -719,7 +759,7 @@ public class GrpcCommunication : ICommunication
     /// </summary>
     public async Task<Gossip.PingReqResponse> SendPingReq(RaftManager manager, RaftNode node, Gossip.PingReqRequest request, CancellationToken cancellationToken = default)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
+        Rafter.RafterClient client = GetClient(manager, node);
         GrpcPingReqRequest grpcRequest = new() { SenderEndpoint = request.SenderEndpoint, TargetEndpoint = request.TargetEndpoint };
         Metadata metadata = BuildAuthMetadata(manager, "/Rafter/PingReq");
         try
@@ -744,7 +784,7 @@ public class GrpcCommunication : ICommunication
     /// </summary>
     public async Task<long?> GetRemoteFollowerLag(RaftManager manager, RaftNode node, int partitionId, string followerEndpoint)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
+        Rafter.RafterClient client = GetClient(manager, node);
 
         GrpcGetFollowerLagRequest grpcRequest = new()
         {
@@ -780,7 +820,7 @@ public class GrpcCommunication : ICommunication
         RaftManager manager, RaftNode node, GetReadIndexRequest request,
         CancellationToken cancellationToken = default)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
+        Rafter.RafterClient client = GetClient(manager, node);
 
         GrpcGetReadIndexRequest grpcRequest = new()
         {
@@ -809,7 +849,7 @@ public class GrpcCommunication : ICommunication
         RaftManager manager, RaftNode node, SnapshotRequest request,
         CancellationToken cancellationToken = default)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
+        Rafter.RafterClient client = GetClient(manager, node);
 
         GrpcInstallSnapshotRequest grpcRequest = new()
         {
@@ -852,7 +892,7 @@ public class GrpcCommunication : ICommunication
 
     public async Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
     {
-        Rafter.RafterClient client = new(SharedChannels.GetChannel(GetEndpointUrl(manager, node), GetPoolOptions(manager)));
+        Rafter.RafterClient client = GetClient(manager, node);
 
         GrpcJoinRequest grpcRequest = new()
         {
@@ -959,22 +999,25 @@ public class GrpcCommunication : ICommunication
         return new CallOptions(metadata, cancellationToken: cancellationToken);
     }
 
-    private static RaftTransportSecurityOptions GetSecurityOptions(RaftManager manager) =>
-        manager.Configuration.GetEffectiveTransportSecurity();
-
     private static GrpcChannelPoolOptions GetPoolOptions(RaftManager manager) =>
-        new(manager.Configuration.GetEffectiveGrpcChannelsPerNode(),
-            manager.Configuration.GrpcEnableMultipleHttp2Connections,
-            GetSecurityOptions(manager),
-            manager.Configuration.GrpcEnableSnapshotCompression);
+        GetTransportCache(manager).PoolOptions;
 
     /// <summary>
     /// Builds the full URL for <paramref name="node"/> by prepending the configured
     /// <see cref="RaftConfiguration.GrpcScheme"/>.  Defaults to <c>https://</c>; set
     /// <c>GrpcScheme = "http://"</c> (plus <c>Http2UnencryptedSupport</c>) for tests.
+    /// Memoized per manager+endpoint — the composed string is hashed and prefix-tested by
+    /// SharedChannels on every send, so allocating it fresh per message is pure churn.
     /// </summary>
-    private static string GetEndpointUrl(RaftManager manager, RaftNode node) =>
-        manager.Configuration.GrpcScheme + node.Endpoint;
+    private static string GetEndpointUrl(RaftManager manager, RaftNode node)
+    {
+        ConcurrentDictionary<string, string> urls = GetTransportCache(manager).EndpointUrls;
+
+        if (urls.TryGetValue(node.Endpoint, out string? url))
+            return url;
+
+        return urls.GetOrAdd(node.Endpoint, manager.Configuration.GrpcScheme + node.Endpoint);
+    }
 
     private static void AddGrpcLogs(RepeatedField<GrpcRaftLog> target, AppendLogsRequest request)
     {

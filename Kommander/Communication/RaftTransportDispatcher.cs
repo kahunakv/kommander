@@ -162,60 +162,84 @@ internal sealed class RaftTransportDispatcher : IDisposable
 
             logger.LogTraceSendingBatch(node.Endpoint, messages.Count);
 
+            // Items and wrapper are rented from GrpcCommunicationPool with the same lifecycle as
+            // SendWrappedSingle: everything is returned only after BatchRequests completes, since
+            // the transport may reference them until serialization finishes.
             List<BatchRequestsRequestItem> items =
                 GrpcCommunicationPool.RentListBatchRequestsRequestItem(messages.Count);
+            BatchRequestsRequest request = GrpcCommunicationPool.RentBatchRequestsRequest();
 
             try
             {
                 foreach (RaftResponderRequest msg in messages)
                 {
+                    BatchRequestsRequestItem item = GrpcCommunicationPool.RentBatchRequestsRequestItem();
+
                     switch (msg.Type)
                     {
                         case RaftResponderRequestType.Handshake:
-                            items.Add(new() { Type = BatchRequestsRequestType.Handshake, Handshake = msg.HandshakeRequest });
+                            item.Type = BatchRequestsRequestType.Handshake;
+                            item.Handshake = msg.HandshakeRequest;
                             break;
 
                         case RaftResponderRequestType.Vote:
-                            items.Add(new() { Type = BatchRequestsRequestType.Vote, Vote = msg.VoteRequest });
+                            item.Type = BatchRequestsRequestType.Vote;
+                            item.Vote = msg.VoteRequest;
                             break;
 
                         case RaftResponderRequestType.RequestVotes:
-                            items.Add(new() { Type = BatchRequestsRequestType.RequestVote, RequestVotes = msg.RequestVotesRequest });
+                            item.Type = BatchRequestsRequestType.RequestVote;
+                            item.RequestVotes = msg.RequestVotesRequest;
                             break;
 
                         case RaftResponderRequestType.StepDownNotice:
-                            items.Add(new() { Type = BatchRequestsRequestType.StepDownNotice, StepDownNotice = msg.StepDownNoticeRequest });
+                            item.Type = BatchRequestsRequestType.StepDownNotice;
+                            item.StepDownNotice = msg.StepDownNoticeRequest;
                             break;
 
                         case RaftResponderRequestType.TransferLeadership:
-                            items.Add(new() { Type = BatchRequestsRequestType.TransferLeadership, TransferLeadership = msg.TransferLeadershipRequest });
+                            item.Type = BatchRequestsRequestType.TransferLeadership;
+                            item.TransferLeadership = msg.TransferLeadershipRequest;
                             break;
 
                         case RaftResponderRequestType.TransferLeadershipSuggestion:
-                            items.Add(new() { Type = BatchRequestsRequestType.TransferLeadershipSuggestion, TransferLeadershipSuggestion = msg.TransferLeadershipSuggestionRequest });
+                            item.Type = BatchRequestsRequestType.TransferLeadershipSuggestion;
+                            item.TransferLeadershipSuggestion = msg.TransferLeadershipSuggestionRequest;
                             break;
 
                         case RaftResponderRequestType.AppendLogs:
-                            items.Add(new() { Type = BatchRequestsRequestType.AppendLogs, AppendLogs = msg.AppendLogsRequest });
+                            item.Type = BatchRequestsRequestType.AppendLogs;
+                            item.AppendLogs = msg.AppendLogsRequest;
                             break;
 
                         case RaftResponderRequestType.CompleteAppendLogs:
-                            items.Add(new() { Type = BatchRequestsRequestType.CompleteAppendLogs, CompleteAppendLogs = msg.CompleteAppendLogsRequest });
+                            item.Type = BatchRequestsRequestType.CompleteAppendLogs;
+                            item.CompleteAppendLogs = msg.CompleteAppendLogsRequest;
                             break;
 
                         default:
+                            GrpcCommunicationPool.Return(item);
                             logger.LogError(
                                 "[RaftTransportDispatcher/{Endpoint}] Unsupported message type {Type}",
                                 node.Endpoint, msg.Type);
-                            break;
+                            continue;
                     }
+
+                    items.Add(item);
                 }
 
-                await communication.BatchRequests(manager, node, new() { Requests = items })
+                request.Requests = items;
+
+                await communication.BatchRequests(manager, node, request)
                     .ConfigureAwait(false);
             }
             finally
             {
+                GrpcCommunicationPool.Return(request);
+
+                foreach (BatchRequestsRequestItem item in items)
+                    GrpcCommunicationPool.Return(item);
+
                 GrpcCommunicationPool.Return(items);
             }
         }
@@ -341,9 +365,13 @@ internal sealed class RaftTransportDispatcher : IDisposable
         if (_stopped)
             return;
 
-        EndpointWorker worker = _workers.GetOrAdd(
-            endpoint,
-            ep => new EndpointWorker(_manager, new RaftNode(ep), _communication, _logger));
+        // TryGetValue fast path: this runs once per outbound message and the worker
+        // always exists after the first send to a peer; calling GetOrAdd directly would
+        // allocate the capturing factory closure on every enqueue.
+        if (!_workers.TryGetValue(endpoint, out EndpointWorker? worker))
+            worker = _workers.GetOrAdd(
+                endpoint,
+                ep => new EndpointWorker(_manager, new RaftNode(ep), _communication, _logger));
 
         worker.Enqueue(request);
     }

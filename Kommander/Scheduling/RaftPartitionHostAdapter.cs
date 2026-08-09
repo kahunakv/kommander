@@ -45,7 +45,16 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
         ClusterMembership roster = manager.SystemCoordinator.GetMembership();
         if (roster.MembershipVersion == 0)
             return true; // pre-seed: treat all known peers as members (backward compat)
-        return roster.Members.Any(m => m.Endpoint == endpoint);
+
+        // Plain loop, not LINQ Any: on the inbound AppendLogs/handshake path the capturing
+        // lambda would allocate per message.
+        foreach (ClusterMember member in roster.Members)
+        {
+            if (string.Equals(member.Endpoint, endpoint, StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
     }
 
     public byte[]? GetSystemCheckpointPayload() =>

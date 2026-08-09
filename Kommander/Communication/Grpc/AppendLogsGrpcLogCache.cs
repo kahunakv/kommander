@@ -12,7 +12,10 @@ public sealed class AppendLogsGrpcLogCache
 {
     private readonly object _lock = new();
 
-    private RepeatedField<GrpcRaftLog>? _logs;
+    // volatile: the lock-free fast-path read in GetOrCreate is classic double-checked locking —
+    // without the barrier a reader on a weak memory model could observe the reference before the
+    // list's contents are fully published. Free on x64; required for correctness elsewhere.
+    private volatile RepeatedField<GrpcRaftLog>? _logs;
 
     /// <summary>For tests: how many times the protobuf log list was materialized.</summary>
     internal int BuildCount { get; private set; }

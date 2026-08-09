@@ -19,6 +19,19 @@ public sealed class RaftPartition : IDisposable
 {
     private static readonly RaftRequest RaftStateRequest = new(RaftRequestType.GetNodeState);
 
+    // Shared singletons for the parameterless request types (RaftRequest is immutable, so one
+    // instance can serve every post/ask). CheckLeaderRequest is the load-bearing one — it is
+    // posted to every hot partition on every CheckLeaderInterval tick; the rest follow the same
+    // pattern for consistency.
+    private static readonly RaftRequest CheckLeaderRequest = new(RaftRequestType.CheckLeader);
+    private static readonly RaftRequest ReplicateCheckpointRequest = new(RaftRequestType.ReplicateCheckpoint);
+    private static readonly RaftRequest ForceLeaderForTestingRequest = new(RaftRequestType.ForceLeaderForTesting);
+    private static readonly RaftRequest GetPartitionViewRequest = new(RaftRequestType.GetPartitionView);
+    private static readonly RaftRequest StepDownRequest = new(RaftRequestType.StepDown);
+    private static readonly RaftRequest ConfirmLeadershipRequest = new(RaftRequestType.ConfirmLeadership);
+    private static readonly RaftRequest SuspendHeartbeatsRequest = new(RaftRequestType.SuspendHeartbeats);
+    private static readonly RaftRequest ResumeHeartbeatsRequest = new(RaftRequestType.ResumeHeartbeats);
+
     /// <summary>
     /// Relay sink that breaks the circular dependency between
     /// <see cref="RaftPartitionStateMachine"/> (needs a sink at construction) and
@@ -521,7 +534,7 @@ public sealed class RaftPartition : IDisposable
         if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
         
-        RaftResponse response = await executor.Ask(new(RaftRequestType.ReplicateCheckpoint)).ConfigureAwait(false);
+        RaftResponse response = await executor.Ask(ReplicateCheckpointRequest).ConfigureAwait(false);
         
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
@@ -544,7 +557,7 @@ public sealed class RaftPartition : IDisposable
 
     public async Task<RaftOperationStatus> ForceLeaderForTestingAsync(CancellationToken cancellationToken = default)
     {
-        RaftResponse response = await executor.Ask(new(RaftRequestType.ForceLeaderForTesting), cancellationToken).ConfigureAwait(false);
+        RaftResponse response = await executor.Ask(ForceLeaderForTestingRequest, cancellationToken).ConfigureAwait(false);
         return response.Status;
     }
 
@@ -554,13 +567,13 @@ public sealed class RaftPartition : IDisposable
     /// </summary>
     internal async Task<RaftPartitionView?> GetPartitionViewAsync(CancellationToken cancellationToken = default)
     {
-        RaftResponse response = await executor.Ask(new(RaftRequestType.GetPartitionView), cancellationToken).ConfigureAwait(false);
+        RaftResponse response = await executor.Ask(GetPartitionViewRequest, cancellationToken).ConfigureAwait(false);
         return response.PartitionView;
     }
 
     public async Task<RaftOperationStatus> StepDownAsync(CancellationToken cancellationToken = default)
     {
-        RaftResponse response = await executor.Ask(new(RaftRequestType.StepDown), cancellationToken).ConfigureAwait(false);
+        RaftResponse response = await executor.Ask(StepDownRequest, cancellationToken).ConfigureAwait(false);
         return response.Status;
     }
 
@@ -574,7 +587,7 @@ public sealed class RaftPartition : IDisposable
     /// </summary>
     public async Task<bool> ConfirmLeadershipAsync(CancellationToken cancellationToken = default)
     {
-        RaftResponse response = await executor.Ask(new(RaftRequestType.ConfirmLeadership), cancellationToken).ConfigureAwait(false);
+        RaftResponse response = await executor.Ask(ConfirmLeadershipRequest, cancellationToken).ConfigureAwait(false);
         return response.Status == RaftOperationStatus.Success;
     }
 
@@ -587,7 +600,7 @@ public sealed class RaftPartition : IDisposable
     /// </summary>
     internal async Task<(RaftOperationStatus Status, long ReadIndex)> GetConfirmedReadIndexAsync(CancellationToken cancellationToken = default)
     {
-        RaftResponse response = await executor.Ask(new(RaftRequestType.ConfirmLeadership), cancellationToken).ConfigureAwait(false);
+        RaftResponse response = await executor.Ask(ConfirmLeadershipRequest, cancellationToken).ConfigureAwait(false);
         return (response.Status, response.LogIndex);
     }
 
@@ -619,13 +632,13 @@ public sealed class RaftPartition : IDisposable
 
     public async Task<RaftOperationStatus> SuspendHeartbeatsAsync(CancellationToken cancellationToken = default)
     {
-        RaftResponse response = await executor.Ask(new(RaftRequestType.SuspendHeartbeats), cancellationToken).ConfigureAwait(false);
+        RaftResponse response = await executor.Ask(SuspendHeartbeatsRequest, cancellationToken).ConfigureAwait(false);
         return response.Status;
     }
 
     public async Task<RaftOperationStatus> ResumeHeartbeatsAsync(CancellationToken cancellationToken = default)
     {
-        RaftResponse response = await executor.Ask(new(RaftRequestType.ResumeHeartbeats), cancellationToken).ConfigureAwait(false);
+        RaftResponse response = await executor.Ask(ResumeHeartbeatsRequest, cancellationToken).ConfigureAwait(false);
         return response.Status;
     }
 
@@ -782,7 +795,7 @@ public sealed class RaftPartition : IDisposable
     /// </summary>
     public void CheckLeader()
     {
-        executor.Post(new(RaftRequestType.CheckLeader));
+        executor.Post(CheckLeaderRequest);
     }
 
     /// <summary>

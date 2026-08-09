@@ -221,18 +221,21 @@ public static class SharedChannels
 
     internal static GrpcChannel GetChannel(string url, GrpcChannelPoolOptions opts)
     {
-        if (!url.StartsWith("https://") && !url.StartsWith("http://"))
+        if (!url.StartsWith("https://", StringComparison.Ordinal) && !url.StartsWith("http://", StringComparison.Ordinal))
             url = "https://" + url;
 
-        Lazy<List<GrpcChannel>> urlChannelsLazy = channels.GetOrAdd(
-            url,
-            k => new Lazy<List<GrpcChannel>>(() =>
-            {
-                // Record the winning opts inside the factory so registeredPoolConfig always
-                // reflects the opts the pool was actually built with, not a racing caller's.
-                registeredPoolConfig.TryAdd(k, (opts.ChannelsPerNode, opts.EnableMultipleHttp2Connections));
-                return CreateSharedChannels(k, opts);
-            }));
+        // TryGetValue fast path: on the warm per-message path the entry always exists, and
+        // calling GetOrAdd directly would allocate the capturing factory closure on every hit.
+        if (!channels.TryGetValue(url, out Lazy<List<GrpcChannel>>? urlChannelsLazy))
+            urlChannelsLazy = channels.GetOrAdd(
+                url,
+                k => new Lazy<List<GrpcChannel>>(() =>
+                {
+                    // Record the winning opts inside the factory so registeredPoolConfig always
+                    // reflects the opts the pool was actually built with, not a racing caller's.
+                    registeredPoolConfig.TryAdd(k, (opts.ChannelsPerNode, opts.EnableMultipleHttp2Connections));
+                    return CreateSharedChannels(k, opts);
+                }));
 
         List<GrpcChannel> urlChannels = urlChannelsLazy.Value;
         AssertConsistentPoolConfig(url, opts);
@@ -243,16 +246,17 @@ public static class SharedChannels
 
     internal static List<GrpcChannel> GetAllChannels(string url, GrpcChannelPoolOptions opts)
     {
-        if (!url.StartsWith("https://") && !url.StartsWith("http://"))
+        if (!url.StartsWith("https://", StringComparison.Ordinal) && !url.StartsWith("http://", StringComparison.Ordinal))
             url = "https://" + url;
 
-        Lazy<List<GrpcChannel>> urlChannelsLazy = channels.GetOrAdd(
-            url,
-            k => new Lazy<List<GrpcChannel>>(() =>
-            {
-                registeredPoolConfig.TryAdd(k, (opts.ChannelsPerNode, opts.EnableMultipleHttp2Connections));
-                return CreateSharedChannels(k, opts);
-            }));
+        if (!channels.TryGetValue(url, out Lazy<List<GrpcChannel>>? urlChannelsLazy))
+            urlChannelsLazy = channels.GetOrAdd(
+                url,
+                k => new Lazy<List<GrpcChannel>>(() =>
+                {
+                    registeredPoolConfig.TryAdd(k, (opts.ChannelsPerNode, opts.EnableMultipleHttp2Connections));
+                    return CreateSharedChannels(k, opts);
+                }));
 
         List<GrpcChannel> urlChannels = urlChannelsLazy.Value;
         AssertConsistentPoolConfig(url, opts);
@@ -261,13 +265,15 @@ public static class SharedChannels
 
     internal static GrpcInterSharedStreaming GetStreaming(string url, Func<Metadata?>? metadataFactory, GrpcChannelPoolOptions opts)
     {
-        if (!url.StartsWith("https://") && !url.StartsWith("http://"))
+        if (!url.StartsWith("https://", StringComparison.Ordinal) && !url.StartsWith("http://", StringComparison.Ordinal))
             url = "https://" + url;
 
-        Lazy<List<GrpcInterSharedStreaming>> lazyStreaming = streamings.GetOrAdd(
-            url,
-            k => new Lazy<List<GrpcInterSharedStreaming>>(
-                () => CreateAsyncDuplexStreamingCallInternal(k, metadataFactory, opts)));
+        // TryGetValue fast path — see GetChannel: avoids the per-message closure allocation.
+        if (!streamings.TryGetValue(url, out Lazy<List<GrpcInterSharedStreaming>>? lazyStreaming))
+            lazyStreaming = streamings.GetOrAdd(
+                url,
+                k => new Lazy<List<GrpcInterSharedStreaming>>(
+                    () => CreateAsyncDuplexStreamingCallInternal(k, metadataFactory, opts)));
 
         List<GrpcInterSharedStreaming> streamingList = lazyStreaming.Value;
         AssertConsistentPoolConfig(url, opts);
@@ -337,7 +343,7 @@ public static class SharedChannels
         Func<Metadata?>? metadataFactory,
         GrpcChannelPoolOptions opts)
     {
-        if (!url.StartsWith("https://") && !url.StartsWith("http://"))
+        if (!url.StartsWith("https://", StringComparison.Ordinal) && !url.StartsWith("http://", StringComparison.Ordinal))
             url = "https://" + url;
 
         Lazy<List<GrpcChannel>> urlChannelsLazy = channels.GetOrAdd(
