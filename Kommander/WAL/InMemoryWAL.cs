@@ -7,6 +7,15 @@ namespace Kommander.WAL;
 /// <summary>
 /// Keeps a log of all Raft operations in memory.
 /// Useful for testing and debugging.
+///
+/// <para>Per-partition storage is a <see cref="SortedList{TKey,TValue}"/> rather than a
+/// <see cref="SortedDictionary{TKey,TValue}"/>: its indexable key list allows the range reads on
+/// the follower-backfill path (<see cref="ReadLogsRange"/>) to binary-search the start position
+/// and the max-id recompute to read the last key in O(1), where the tree previously forced an
+/// O(n) walk of the whole retained prefix under the read lock. The trade-off is O(n) element
+/// shifts for mid-list inserts and head removals — appends land at the tail (O(1) amortized) and
+/// the truncate paths remove in descending key order so suffix removal shifts nothing; only head
+/// compaction pays shifts, at the modest sizes this test backend sees.</para>
 /// </summary>
 public class InMemoryWAL : IWAL, IDisposable
 {
@@ -14,7 +23,7 @@ public class InMemoryWAL : IWAL, IDisposable
 
     private readonly Dictionary<string, string> allConfigs = new();
 
-    private readonly Dictionary<int, SortedDictionary<long, RaftLog>> allLogs = new();
+    private readonly Dictionary<int, SortedList<long, RaftLog>> allLogs = new();
 
     /// <summary>
     /// Per-partition id of the highest <see cref="RaftLogType.CommittedCheckpoint"/> entry, maintained
@@ -52,7 +61,7 @@ public class InMemoryWAL : IWAL, IDisposable
         {
             List<RaftLog> result = [];
 
-            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+            if (allLogs.TryGetValue(partitionId, out SortedList<long, RaftLog>? partitionLogs))
             {
                 foreach (KeyValuePair<long, RaftLog> keyValue in partitionLogs)
                     result.Add(keyValue.Value);
@@ -73,13 +82,17 @@ public class InMemoryWAL : IWAL, IDisposable
         {
             List<RaftLog> result = [];
 
-            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+            if (allLogs.TryGetValue(partitionId, out SortedList<long, RaftLog>? partitionLogs))
             {
-                foreach (KeyValuePair<long, RaftLog> keyValue in partitionLogs)
+                // Binary-search the first key >= startLogIndex instead of walking the whole
+                // retained prefix — this is the follower-backfill read, called repeatedly for a
+                // small window near the tail while holding the read lock.
+                IList<long> keys = partitionLogs.Keys;
+                IList<RaftLog> values = partitionLogs.Values;
+
+                for (int i = LowerBound(keys, startLogIndex); i < keys.Count; i++)
                 {
-                    if (keyValue.Key < startLogIndex)
-                        continue;
-                    result.Add(keyValue.Value);
+                    result.Add(values[i]);
                     if (result.Count >= maxEntries)
                         break;
                 }
@@ -98,7 +111,7 @@ public class InMemoryWAL : IWAL, IDisposable
         rwLock.EnterReadLock();
         try
         {
-            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs)
+            if (allLogs.TryGetValue(partitionId, out SortedList<long, RaftLog>? partitionLogs)
                 && partitionLogs.TryGetValue(logIndex, out RaftLog? log))
                 return log.Term;
 
@@ -121,7 +134,7 @@ public class InMemoryWAL : IWAL, IDisposable
                 long batchMaxId = 0;
                 foreach (RaftLog log in item.raftLogs)
                 {
-                    if (allLogs.TryGetValue(item.partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+                    if (allLogs.TryGetValue(item.partitionId, out SortedList<long, RaftLog>? partitionLogs))
                         partitionLogs[log.Id] = log;
                     else
                         allLogs.Add(item.partitionId, new() { { log.Id, log } });
@@ -171,7 +184,7 @@ public class InMemoryWAL : IWAL, IDisposable
         rwLock.EnterReadLock();
         try
         {
-            if (allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs)
+            if (allLogs.TryGetValue(partitionId, out SortedList<long, RaftLog>? partitionLogs)
                 && maxLogIds.TryGetValue(partitionId, out long maxLogId)
                 && partitionLogs.TryGetValue(maxLogId, out RaftLog? log))
                 return log.Term;
@@ -202,27 +215,51 @@ public class InMemoryWAL : IWAL, IDisposable
     /// <summary>
     /// Recomputes the highest <see cref="RaftLogType.CommittedCheckpoint"/> id currently present for a
     /// partition (or -1 if none), used after a truncation removed the recorded checkpoint. Must be called
-    /// under the write lock. Keys are sorted ascending, so the last match is the highest.
+    /// under the write lock. Scans descending so it exits at the first (= highest) match.
     /// </summary>
-    private static long RecomputeLastCheckpoint(SortedDictionary<long, RaftLog> partitionLogs)
+    private static long RecomputeLastCheckpoint(SortedList<long, RaftLog> partitionLogs)
     {
-        long checkpoint = -1;
-        foreach (KeyValuePair<long, RaftLog> entry in partitionLogs)
+        IList<long> keys = partitionLogs.Keys;
+        IList<RaftLog> values = partitionLogs.Values;
+
+        for (int i = keys.Count - 1; i >= 0; i--)
         {
-            if (entry.Value.Type == RaftLogType.CommittedCheckpoint)
-                checkpoint = entry.Key;
+            if (values[i].Type == RaftLogType.CommittedCheckpoint)
+                return keys[i];
         }
 
-        return checkpoint;
+        return -1;
+    }
+
+    /// <summary>
+    /// Index of the first key in <paramref name="keys"/> that is ≥ <paramref name="value"/>
+    /// (or <c>keys.Count</c> when none is). <paramref name="keys"/> must be sorted ascending,
+    /// which <see cref="SortedList{TKey,TValue}.Keys"/> guarantees.
+    /// </summary>
+    private static int LowerBound(IList<long> keys, long value)
+    {
+        int lo = 0;
+        int hi = keys.Count;
+
+        while (lo < hi)
+        {
+            int mid = (lo + hi) >> 1;
+            if (keys[mid] < value)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+
+        return lo;
     }
 
     /// <summary>
     /// Refreshes <see cref="maxLogIds"/> after entries were removed from a partition. Must run under the
-    /// write lock. O(1) when the tail survived: <paramref name="removedAscending"/> is built by ascending
-    /// key iteration, so its last element is the highest removed id — only when that equals the recorded
-    /// max can the max have changed, and only then is the remaining log rescanned.
+    /// write lock. <paramref name="removedAscending"/> is built by ascending key iteration, so its last
+    /// element is the highest removed id — only when that equals the recorded max can the max have
+    /// changed, and the surviving max is then the SortedList's last key, read in O(1).
     /// </summary>
-    private void UpdateMaxAfterRemoval(int partitionId, SortedDictionary<long, RaftLog> partitionLogs, List<long> removedAscending)
+    private void UpdateMaxAfterRemoval(int partitionId, SortedList<long, RaftLog> partitionLogs, List<long> removedAscending)
     {
         if (removedAscending.Count == 0)
             return;
@@ -230,9 +267,7 @@ public class InMemoryWAL : IWAL, IDisposable
         if (removedAscending[^1] != maxLogIds.GetValueOrDefault(partitionId, 0))
             return;
 
-        long max = 0;
-        foreach (long id in partitionLogs.Keys)
-            max = id;
+        long max = partitionLogs.Count > 0 ? partitionLogs.Keys[partitionLogs.Count - 1] : 0;
 
         if (max == 0)
             maxLogIds.Remove(partitionId);
@@ -245,7 +280,7 @@ public class InMemoryWAL : IWAL, IDisposable
         rwLock.EnterReadLock();
         try
         {
-            if (!allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+            if (!allLogs.TryGetValue(partitionId, out SortedList<long, RaftLog>? partitionLogs))
                 return 0;
 
             return partitionLogs.Count;
@@ -310,7 +345,7 @@ public class InMemoryWAL : IWAL, IDisposable
         rwLock.EnterWriteLock();
         try
         {
-            if (!allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+            if (!allLogs.TryGetValue(partitionId, out SortedList<long, RaftLog>? partitionLogs))
                 return RaftOperationStatus.Success;
 
             List<long> toRemove = [];
@@ -320,8 +355,10 @@ public class InMemoryWAL : IWAL, IDisposable
                     toRemove.Add(id);
             }
 
-            foreach (long id in toRemove)
-                partitionLogs.Remove(id);
+            // Descending so suffix removal always deletes the current last element — a SortedList
+            // shifts every element after the removed index, so ascending order would be O(m²).
+            for (int i = toRemove.Count - 1; i >= 0; i--)
+                partitionLogs.Remove(toRemove[i]);
 
             AdjustCheckpointAfterTruncation(partitionId, partitionLogs, afterLogId);
             UpdateMaxAfterRemoval(partitionId, partitionLogs, toRemove);
@@ -338,7 +375,7 @@ public class InMemoryWAL : IWAL, IDisposable
     /// If the recorded checkpoint sits above <paramref name="afterLogId"/> (a truncation just removed it),
     /// recompute the surviving checkpoint from the remaining entries. Must run under the write lock.
     /// </summary>
-    private void AdjustCheckpointAfterTruncation(int partitionId, SortedDictionary<long, RaftLog> partitionLogs, long afterLogId)
+    private void AdjustCheckpointAfterTruncation(int partitionId, SortedList<long, RaftLog> partitionLogs, long afterLogId)
     {
         if (lastCheckpoints.GetValueOrDefault(partitionId, -1) <= afterLogId)
             return;
@@ -356,7 +393,7 @@ public class InMemoryWAL : IWAL, IDisposable
         rwLock.EnterWriteLock();
         try
         {
-            if (!allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+            if (!allLogs.TryGetValue(partitionId, out SortedList<long, RaftLog>? partitionLogs))
                 return RaftOperationStatus.Success;
 
             List<long> toRemove = [];
@@ -370,8 +407,10 @@ public class InMemoryWAL : IWAL, IDisposable
                     toRemove.Add(entry.Key);
             }
 
-            foreach (long id in toRemove)
-                partitionLogs.Remove(id);
+            // Descending so suffix removal always deletes the current last element — a SortedList
+            // shifts every element after the removed index, so ascending order would be O(m²).
+            for (int i = toRemove.Count - 1; i >= 0; i--)
+                partitionLogs.Remove(toRemove[i]);
 
             UpdateMaxAfterRemoval(partitionId, partitionLogs, toRemove);
 
@@ -392,7 +431,7 @@ public class InMemoryWAL : IWAL, IDisposable
         rwLock.EnterWriteLock();
         try
         {
-            if (!allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+            if (!allLogs.TryGetValue(partitionId, out SortedList<long, RaftLog>? partitionLogs))
                 return (RaftOperationStatus.Success, 0);
 
             List<long> toRemove = [];
@@ -402,8 +441,10 @@ public class InMemoryWAL : IWAL, IDisposable
                     toRemove.Add(id);
             }
 
-            foreach (long id in toRemove)
-                partitionLogs.Remove(id);
+            // Descending so suffix removal always deletes the current last element — a SortedList
+            // shifts every element after the removed index, so ascending order would be O(m²).
+            for (int i = toRemove.Count - 1; i >= 0; i--)
+                partitionLogs.Remove(toRemove[i]);
 
             AdjustCheckpointAfterTruncation(partitionId, partitionLogs, afterLogId);
             UpdateMaxAfterRemoval(partitionId, partitionLogs, toRemove);
@@ -429,9 +470,9 @@ public class InMemoryWAL : IWAL, IDisposable
         rwLock.EnterWriteLock();
         try
         {
-            if (!allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+            if (!allLogs.TryGetValue(partitionId, out SortedList<long, RaftLog>? partitionLogs))
             {
-                partitionLogs = new SortedDictionary<long, RaftLog>();
+                partitionLogs = new SortedList<long, RaftLog>();
                 allLogs[partitionId] = partitionLogs;
             }
 
@@ -492,7 +533,7 @@ public class InMemoryWAL : IWAL, IDisposable
         rwLock.EnterWriteLock();
         try
         {
-            if (!allLogs.TryGetValue(partitionId, out SortedDictionary<long, RaftLog>? partitionLogs))
+            if (!allLogs.TryGetValue(partitionId, out SortedList<long, RaftLog>? partitionLogs))
                 return (RaftOperationStatus.Success, 0);
 
             List<long> toRemove = [];
@@ -508,8 +549,10 @@ public class InMemoryWAL : IWAL, IDisposable
                     break;
             }
 
-            foreach (long id in toRemove)
-                partitionLogs.Remove(id);
+            // Descending so suffix removal always deletes the current last element — a SortedList
+            // shifts every element after the removed index, so ascending order would be O(m²).
+            for (int i = toRemove.Count - 1; i >= 0; i--)
+                partitionLogs.Remove(toRemove[i]);
 
             UpdateMaxAfterRemoval(partitionId, partitionLogs, toRemove);
 

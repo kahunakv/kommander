@@ -1,5 +1,6 @@
 
 using System.Buffers;
+using System.Runtime.CompilerServices;
 using System.Text;
 using Google.Protobuf;
 using Kommander.Data;
@@ -406,23 +407,6 @@ public class RocksDbWAL : IWAL, IDisposable
             {
                 RaftLog log = logs[0].Item2[0];
                 int partitionId = logs[0].Item1;
-                
-                RaftLogMessage message = new()
-                {
-                    Partition = partitionId,
-                    Id = log.Id,
-                    Term = log.Term,
-                    Type = (int)log.Type,
-                    TimeNode = log.Time.N,
-                    TimePhysical = log.Time.L,
-                    TimeCounter = log.Time.C
-                };
-
-                if (log.LogType != null)
-                    message.LogType = log.LogType;
-
-                if (log.LogData != null)
-                    message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
 
                 ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
@@ -434,7 +418,7 @@ public class RocksDbWAL : IWAL, IDisposable
                     long newCheckpoint = Math.Max(GetLastCheckpointFromMeta(partitionId), log.Id);
 
                     using WriteBatch checkpointBatch = new();
-                    PutToBatch(checkpointBatch, message, columnFamilyHandle);
+                    PutLogToBatch(checkpointBatch, partitionId, log, columnFamilyHandle);
                     PutLastCheckpointToBatch(checkpointBatch, partitionId, newCheckpoint);
                     db.Write(checkpointBatch, effectiveOptions);
 
@@ -442,17 +426,18 @@ public class RocksDbWAL : IWAL, IDisposable
                 }
 
                 Span<byte> buffer = stackalloc byte[LogKeyWidth];
-                BuildLogKey(buffer, partitionId, message.Id);
+                BuildLogKey(buffer, partitionId, log.Id);
 
                 // RocksDB copies the value synchronously inside Put, so the rented/stack buffer is safe to
                 // release as soon as the call returns. The stackalloc is evaluated only when nothing was
                 // rented (?? short-circuits), so small and large messages never both reserve a buffer.
-                int size = message.CalculateSize();
+                // Serialization is hand-rolled straight from the RaftLog — see MeasureLogEntry.
+                int size = MeasureLogEntry(partitionId, log, out int logTypeByteCount);
                 byte[]? rented = size > StackallocThreshold ? ArrayPool<byte>.Shared.Rent(size) : null;
                 Span<byte> valueBuffer = (rented ?? stackalloc byte[StackallocThreshold])[..size];
                 try
                 {
-                    SerializeInto(message, valueBuffer);
+                    WriteLogEntry(valueBuffer, partitionId, log, logTypeByteCount);
                     db.Put(buffer, valueBuffer, columnFamilyHandle, effectiveOptions);
                 }
                 finally
@@ -470,6 +455,13 @@ public class RocksDbWAL : IWAL, IDisposable
             // last-checkpoint update into the SAME WriteBatch as the log puts (atomic).
             Dictionary<int, long> checkpointMaxByPartition = new();
 
+            // Copy-on-second-sight: a partition that appears exactly once (the overwhelmingly common
+            // shape of a scheduler group batch) stores the CALLER'S list in the plan directly — the
+            // plan is only read below, and the caller owns the batch until Write returns. Only when
+            // the same partition appears again is an owned merged copy materialized; ownedLists
+            // (reference-identity set, lazily allocated) records which stored lists we own.
+            HashSet<List<RaftLog>>? ownedLists = null;
+
             foreach ((int partitionId, List<RaftLog> raftLog) log in logs)
             {
                 ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(log.partitionId);
@@ -484,19 +476,25 @@ public class RocksDbWAL : IWAL, IDisposable
                 if (plan.TryGetValue(columnFamilyHandle, out Dictionary<int, List<RaftLog>>? raftLogsPerPartition))
                 {
                     if (raftLogsPerPartition.TryGetValue(log.partitionId, out List<RaftLog>? raftLogs))
-                        raftLogs.AddRange(log.raftLog);
-                    else
                     {
-                        raftLogs = new(log.raftLog.Count);
+                        ownedLists ??= [];
+                        if (!ownedLists.Contains(raftLogs))
+                        {
+                            List<RaftLog> owned = new(raftLogs.Count + log.raftLog.Count);
+                            owned.AddRange(raftLogs);
+                            raftLogsPerPartition[log.partitionId] = owned;
+                            ownedLists.Add(owned);
+                            raftLogs = owned;
+                        }
+
                         raftLogs.AddRange(log.raftLog);
-                        raftLogsPerPartition.Add(log.partitionId, raftLogs);
                     }
+                    else
+                        raftLogsPerPartition.Add(log.partitionId, log.raftLog);
                 }
                 else
                 {
-                    List<RaftLog> raftLogs = new(log.raftLog.Count);
-                    raftLogs.AddRange(log.raftLog);
-                    raftLogsPerPartition = new() { { log.partitionId, raftLogs } };
+                    raftLogsPerPartition = new() { { log.partitionId, log.raftLog } };
                     plan.Add(columnFamilyHandle, raftLogsPerPartition);
                 }
             }
@@ -510,28 +508,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 foreach (KeyValuePair<int, List<RaftLog>> kv in raftLogs)
                 {
                     foreach (RaftLog log in kv.Value)
-                    {                                               
-                        RaftLogMessage message = new()
-                        {
-                            Partition = kv.Key,
-                            Id = log.Id,
-                            Term = log.Term,
-                            Type = (int)log.Type,
-                            TimeNode = log.Time.N,
-                            TimePhysical = log.Time.L,
-                            TimeCounter = log.Time.C
-                        };
-
-                        if (log.LogType != null)
-                            message.LogType = log.LogType;
-
-                        if (log.LogData != null)
-                            message.Log = UnsafeByteOperations.UnsafeWrap(log.LogData);
-
-                        PutToBatch(writeBatch, message, key);
-
-                        //count++;
-                    }
+                        PutLogToBatch(writeBatch, kv.Key, log, key);
                 }
 
                 //Console.WriteLine("Batch of {0}", count);
@@ -597,6 +574,180 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <param name="columnFamilyHandle">
     /// The handle to the column family in which the record should be stored.
     /// </param>
+    // ── Hand-rolled RaftLogMessage writer ─────────────────────────────────────
+    //
+    // The append hot paths serialize each entry directly from the RaftLog into the destination
+    // span, mirroring the hand-rolled reader (ReadLogFromWire). Going through the generated
+    // serializer allocated a RaftLogMessage plus a ByteString wrapper per appended entry solely to
+    // flatten it. Byte identity with RaftLogMessage.WriteTo is guaranteed by construction —
+    // protobuf's canonical encoding writes fields in ascending field-number order with minimal
+    // varints — and pinned by RocksDbSerializeAllocationTests' byte-identity cases.
+    //
+    // Presence rules match the message the old code built:
+    //  * proto3 scalars (1,2,3,4,7,8,9) are omitted when zero;
+    //  * `optional` logType (5) / log (6) use explicit presence — written, even when empty,
+    //    iff the corresponding RaftLog reference is non-null;
+    //  * negative int32s (1,4,7) sign-extend to 64 bits (10-byte varints), like the generated code.
+
+    /// <summary>
+    /// Serialized size of the <c>RaftLogMessage</c> encoding of (<paramref name="partitionId"/>,
+    /// <paramref name="log"/>), exactly matching the generated <c>CalculateSize</c>.
+    /// <paramref name="logTypeByteCount"/> carries the UTF-8 length of <c>LogType</c> (-1 when
+    /// absent) so <see cref="WriteLogEntry"/> does not measure the string twice.
+    /// </summary>
+    internal static int MeasureLogEntry(int partitionId, RaftLog log, out int logTypeByteCount)
+    {
+        int size = 0;
+
+        if (partitionId != 0)
+            size += 1 + VarintSize((ulong)(long)partitionId);
+        if (log.Id != 0)
+            size += 1 + VarintSize((ulong)log.Id);
+        if (log.Term != 0)
+            size += 1 + VarintSize((ulong)log.Term);
+        if ((int)log.Type != 0)
+            size += 1 + VarintSize((ulong)(long)(int)log.Type);
+
+        logTypeByteCount = -1;
+        if (log.LogType is not null)
+        {
+            logTypeByteCount = Encoding.UTF8.GetByteCount(log.LogType);
+            size += 1 + VarintSize((ulong)logTypeByteCount) + logTypeByteCount;
+        }
+
+        if (log.LogData is not null)
+            size += 1 + VarintSize((ulong)log.LogData.Length) + log.LogData.Length;
+
+        if (log.Time.N != 0)
+            size += 1 + VarintSize((ulong)(long)log.Time.N);
+        if (log.Time.L != 0)
+            size += 1 + VarintSize((ulong)log.Time.L);
+        if (log.Time.C != 0)
+            size += 1 + VarintSize(log.Time.C);
+
+        return size;
+    }
+
+    /// <summary>
+    /// Writes the canonical protobuf encoding of (<paramref name="partitionId"/>, <paramref name="log"/>)
+    /// into <paramref name="destination"/>, which must be exactly <see cref="MeasureLogEntry"/> bytes.
+    /// All field tags are single-byte (fields 1–9). <paramref name="logTypeByteCount"/> must be the
+    /// value returned by <see cref="MeasureLogEntry"/> for the same log.
+    /// </summary>
+    internal static void WriteLogEntry(Span<byte> destination, int partitionId, RaftLog log, int logTypeByteCount)
+    {
+        int pos = 0;
+
+        if (partitionId != 0)
+        {
+            destination[pos++] = 0x08; // field 1, varint
+            WriteVarint(destination, ref pos, (ulong)(long)partitionId);
+        }
+
+        if (log.Id != 0)
+        {
+            destination[pos++] = 0x10; // field 2, varint
+            WriteVarint(destination, ref pos, (ulong)log.Id);
+        }
+
+        if (log.Term != 0)
+        {
+            destination[pos++] = 0x18; // field 3, varint
+            WriteVarint(destination, ref pos, (ulong)log.Term);
+        }
+
+        if ((int)log.Type != 0)
+        {
+            destination[pos++] = 0x20; // field 4, varint
+            WriteVarint(destination, ref pos, (ulong)(long)(int)log.Type);
+        }
+
+        if (log.LogType is not null)
+        {
+            destination[pos++] = 0x2A; // field 5, length-delimited
+            WriteVarint(destination, ref pos, (ulong)logTypeByteCount);
+            pos += Encoding.UTF8.GetBytes(log.LogType, destination[pos..]);
+        }
+
+        if (log.LogData is not null)
+        {
+            destination[pos++] = 0x32; // field 6, length-delimited
+            WriteVarint(destination, ref pos, (ulong)log.LogData.Length);
+            log.LogData.CopyTo(destination[pos..]);
+            pos += log.LogData.Length;
+        }
+
+        if (log.Time.N != 0)
+        {
+            destination[pos++] = 0x38; // field 7, varint
+            WriteVarint(destination, ref pos, (ulong)(long)log.Time.N);
+        }
+
+        if (log.Time.L != 0)
+        {
+            destination[pos++] = 0x40; // field 8, varint
+            WriteVarint(destination, ref pos, (ulong)log.Time.L);
+        }
+
+        if (log.Time.C != 0)
+        {
+            destination[pos++] = 0x48; // field 9, varint
+            WriteVarint(destination, ref pos, log.Time.C);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int VarintSize(ulong value)
+    {
+        int size = 1;
+        while (value >= 0x80)
+        {
+            size++;
+            value >>= 7;
+        }
+
+        return size;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void WriteVarint(Span<byte> destination, ref int pos, ulong value)
+    {
+        while (value >= 0x80)
+        {
+            destination[pos++] = (byte)(value | 0x80);
+            value >>= 7;
+        }
+
+        destination[pos++] = (byte)value;
+    }
+
+    /// <summary>
+    /// Serializes (<paramref name="partitionId"/>, <paramref name="log"/>) via the hand-rolled
+    /// writer and stages it into <paramref name="writeBatch"/> — the allocation-free counterpart of
+    /// <see cref="PutToBatch"/> used by the append hot paths, so no RaftLogMessage/ByteString
+    /// intermediates exist per entry. WriteBatch.Put copies the value synchronously, so the
+    /// rented/stack buffer is safe to release as soon as the call returns.
+    /// </summary>
+    private static void PutLogToBatch(WriteBatch writeBatch, int partitionId, RaftLog log, ColumnFamilyHandle columnFamilyHandle)
+    {
+        Span<byte> keyBuffer = stackalloc byte[LogKeyWidth];
+        BuildLogKey(keyBuffer, partitionId, log.Id);
+
+        int size = MeasureLogEntry(partitionId, log, out int logTypeByteCount);
+        byte[]? rented = size > StackallocThreshold ? ArrayPool<byte>.Shared.Rent(size) : null;
+        Span<byte> valueBuffer = (rented ?? stackalloc byte[StackallocThreshold])[..size];
+        try
+        {
+            WriteLogEntry(valueBuffer, partitionId, log, logTypeByteCount);
+            writeBatch.Put(keyBuffer, valueBuffer, cf: columnFamilyHandle);
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
     private static void PutToBatch(WriteBatch writeBatch, RaftLogMessage message, ColumnFamilyHandle columnFamilyHandle)
     {
         Span<byte> buffer = stackalloc byte[LogKeyWidth];
@@ -666,16 +817,28 @@ public class RocksDbWAL : IWAL, IDisposable
     {
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
-        byte[] key = new byte[LogKeyWidth];
+        Span<byte> key = stackalloc byte[LogKeyWidth];
         BuildLogKey(key, partitionId, logIndex);
 
         // Point lookup on the exact key: a hit is unambiguously the entry for (partitionId, logIndex),
-        // so no field re-validation is needed. `value` is the full serialized message (payload included)
-        // — that read cost is inherent to RocksDB storing the payload inline — but ReadTermFromWire
-        // scans only far enough to read the `term` field (field 3), which protobuf serializes before the
-        // `log` payload (field 6), so the multi-megabyte payload ByteString is never materialized.
-        byte[]? value = db.Get(key, cf: columnFamilyHandle);
-        return value is null ? -1 : ReadTermFromWire(value);
+        // so no field re-validation is needed. The span-deserializer overload hands ReadTermFromWire
+        // the value directly in RocksDB's native buffer — the previous byte[] Get copied the FULL
+        // serialized message (multi-megabyte payload included) into managed memory just to read the
+        // `term` varint near the front. The Found flag disambiguates a missing key from a stored
+        // term of 0 (the deserializer only runs on a hit; a miss yields the tuple's default).
+        (bool found, long term) = db.Get(key, TermSpanDeserializer.Instance, cf: columnFamilyHandle);
+        return found ? term : -1;
+    }
+
+    /// <summary>
+    /// Cached singleton (allocating one per call would defeat the point) that reads only the
+    /// <c>term</c> field from the value span in place via <see cref="ReadTermFromWire"/>.
+    /// </summary>
+    private sealed class TermSpanDeserializer : ISpanDeserializer<(bool Found, long Term)>
+    {
+        public static readonly TermSpanDeserializer Instance = new();
+
+        public (bool Found, long Term) Deserialize(ReadOnlySpan<byte> buffer) => (true, ReadTermFromWire(buffer));
     }
 
     /// <summary>

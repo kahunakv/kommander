@@ -167,6 +167,61 @@ public sealed class RocksDbSerializeAllocationTests
         }
     }
 
+    /// <summary>
+    /// Pins the hand-rolled append writer to Google.Protobuf's canonical encoding: for every edge
+    /// shape (empty message, presence-vs-absence of logType/log, negatives, max values, multi-byte
+    /// UTF-8), MeasureLogEntry + WriteLogEntry must produce byte-for-byte the output of the
+    /// RaftLogMessage the append path used to build. The on-disk format must never drift.
+    /// </summary>
+    [Theory]
+    [InlineData(0, 0L, 0L, (int)0, null, false, 0, 0L, 0u)]                       // all defaults → empty message
+    [InlineData(3, 5L, 7L, (int)2, "kv", true, 1, 1234L, 9u)]                     // typical entry
+    [InlineData(3, 5L, 7L, (int)2, "", true, 1, 1234L, 9u)]                       // present-but-empty logType
+    [InlineData(3, 5L, 7L, (int)2, null, false, 1, 1234L, 9u)]                    // absent logType and payload
+    [InlineData(-1, -1L, -1L, (int)-1, "neg", true, -1, -1L, uint.MaxValue)]      // sign-extended negatives
+    [InlineData(int.MaxValue, long.MaxValue, long.MaxValue, int.MaxValue, "ünïcødé-ログ", true, int.MaxValue, long.MaxValue, uint.MaxValue)]
+    public void HandRolledWriter_ByteIdenticalToGeneratedSerializer(
+        int partitionId, long id, long term, int type, string? logType, bool hasPayload, int timeNode, long timePhysical, uint timeCounter)
+    {
+        byte[]? payload = hasPayload ? [1, 2, 3, 250, 251, 252] : null;
+
+        RaftLog log = new()
+        {
+            Id = id,
+            Term = term,
+            Type = (RaftLogType)type,
+            Time = new HLCTimestamp(timeNode, timePhysical, timeCounter),
+            LogType = logType,
+            LogData = payload
+        };
+
+        // The message exactly as the pre-hand-rolled append path constructed it.
+        Kommander.WAL.Protos.RaftLogMessage message = new()
+        {
+            Partition = partitionId,
+            Id = log.Id,
+            Term = log.Term,
+            Type = (int)log.Type,
+            TimeNode = log.Time.N,
+            TimePhysical = log.Time.L,
+            TimeCounter = log.Time.C
+        };
+        if (log.LogType is not null)
+            message.LogType = log.LogType;
+        if (log.LogData is not null)
+            message.Log = Google.Protobuf.ByteString.CopyFrom(log.LogData);
+
+        byte[] expected = Google.Protobuf.MessageExtensions.ToByteArray(message);
+
+        int size = RocksDbWAL.MeasureLogEntry(partitionId, log, out int logTypeByteCount);
+        Assert.Equal(expected.Length, size);
+
+        byte[] actual = new byte[size];
+        RocksDbWAL.WriteLogEntry(actual, partitionId, log, logTypeByteCount);
+
+        Assert.Equal(expected, actual);
+    }
+
     private static void AssertEqualLog(RaftLog expected, RaftLog actual)
     {
         Assert.Equal(expected.Id, actual.Id);

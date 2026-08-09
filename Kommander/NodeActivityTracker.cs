@@ -7,12 +7,22 @@ namespace Kommander;
 /// <summary>
 /// Owns the per-node activity and heartbeat timestamp tables for <see cref="RaftManager"/>.
 /// Thread-safe by construction: both tables are <see cref="ConcurrentDictionary{TKey,TValue}"/>
-/// instances that are written and read concurrently without external locking.
+/// instances that are written and read concurrently without external locking. Updates are
+/// intentionally racy-but-benign: two concurrent writers may briefly interleave, but the
+/// read-compare-write only ever moves a timestamp forward from the value it observed, and
+/// readers tolerate slightly stale values.
+///
+/// <para>Keyed endpoint → (partition → timestamp) rather than by a flat
+/// <c>(endpoint, partition)</c> tuple: the update paths run per follower per heartbeat round and
+/// per inbound ack, and the tuple key hashed the endpoint string on every probe (2–3 of them per
+/// update). The nested layout hashes the string once and the partition id (an int) for the rest,
+/// and lets the per-endpoint aggregations (<see cref="GetLastNodeActivity(string)"/>,
+/// <see cref="GetActiveNodes"/>) read one endpoint's bucket instead of scanning the whole table.</para>
 /// </summary>
 internal sealed class NodeActivityTracker
 {
-    private readonly ConcurrentDictionary<(string endpoint, int partitionId), HLCTimestamp> lastActivity = new();
-    private readonly ConcurrentDictionary<(string endpoint, int partitionId), HLCTimestamp> lastHearthBeat = new();
+    private readonly ConcurrentDictionary<string, ConcurrentDictionary<int, HLCTimestamp>> lastActivity = new();
+    private readonly ConcurrentDictionary<string, ConcurrentDictionary<int, HLCTimestamp>> lastHearthBeat = new();
     private readonly Func<HLCTimestamp> getNow;
     private readonly string localEndpoint;
 
@@ -23,44 +33,59 @@ internal sealed class NodeActivityTracker
     }
 
     internal HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId) =>
-        lastActivity.TryGetValue((endpoint, partitionId), out HLCTimestamp ts) ? ts : HLCTimestamp.Zero;
+        lastActivity.TryGetValue(endpoint, out ConcurrentDictionary<int, HLCTimestamp>? partitions)
+        && partitions.TryGetValue(partitionId, out HLCTimestamp ts)
+            ? ts
+            : HLCTimestamp.Zero;
 
     internal HLCTimestamp GetLastNodeActivity(string endpoint)
     {
         HLCTimestamp max = HLCTimestamp.Zero;
-        foreach (((string ep, int _) key, HLCTimestamp ts) in lastActivity)
+
+        if (lastActivity.TryGetValue(endpoint, out ConcurrentDictionary<int, HLCTimestamp>? partitions))
         {
-            if (key.ep == endpoint && ts > max)
-                max = ts;
+            foreach (KeyValuePair<int, HLCTimestamp> kv in partitions)
+            {
+                if (kv.Value > max)
+                    max = kv.Value;
+            }
         }
+
         return max;
     }
 
-    internal void UpdateLastNodeActivity(string nodeId, int partitionId, HLCTimestamp lastTimestamp)
-    {
-        var key = (nodeId, partitionId);
-        if (lastActivity.TryGetValue(key, out HLCTimestamp currentTimestamp))
-        {
-            if (lastTimestamp > currentTimestamp)
-                lastActivity[key] = lastTimestamp;
-        }
-        else
-            lastActivity.TryAdd(key, lastTimestamp);
-    }
+    internal void UpdateLastNodeActivity(string nodeId, int partitionId, HLCTimestamp lastTimestamp) =>
+        Update(lastActivity, nodeId, partitionId, lastTimestamp);
 
     internal HLCTimestamp GetLastNodeHearthbeat(string nodeId, int partitionId) =>
-        lastHearthBeat.TryGetValue((nodeId, partitionId), out HLCTimestamp ts) ? ts : HLCTimestamp.Zero;
+        lastHearthBeat.TryGetValue(nodeId, out ConcurrentDictionary<int, HLCTimestamp>? partitions)
+        && partitions.TryGetValue(partitionId, out HLCTimestamp ts)
+            ? ts
+            : HLCTimestamp.Zero;
 
-    internal void UpdateLastHeartbeat(string nodeId, int partitionId, HLCTimestamp lastTimestamp)
+    internal void UpdateLastHeartbeat(string nodeId, int partitionId, HLCTimestamp lastTimestamp) =>
+        Update(lastHearthBeat, nodeId, partitionId, lastTimestamp);
+
+    private static void Update(
+        ConcurrentDictionary<string, ConcurrentDictionary<int, HLCTimestamp>> table,
+        string nodeId,
+        int partitionId,
+        HLCTimestamp lastTimestamp)
     {
-        var key = (nodeId, partitionId);
-        if (lastHearthBeat.TryGetValue(key, out HLCTimestamp currentTimestamp))
+        // TryGetValue fast path: after the first heartbeat the endpoint bucket always exists, and
+        // GetOrAdd alone would evaluate its (non-capturing, but still) factory path on every call.
+        if (!table.TryGetValue(nodeId, out ConcurrentDictionary<int, HLCTimestamp>? partitions))
+            partitions = table.GetOrAdd(nodeId, static _ => new ConcurrentDictionary<int, HLCTimestamp>());
+
+        // Same monotonic read-compare-write the flat table used: only move forward from the value
+        // observed; a concurrent interleaving is benign (see class remarks).
+        if (partitions.TryGetValue(partitionId, out HLCTimestamp currentTimestamp))
         {
             if (lastTimestamp > currentTimestamp)
-                lastHearthBeat[key] = lastTimestamp;
+                partitions[partitionId] = lastTimestamp;
         }
         else
-            lastHearthBeat.TryAdd(key, lastTimestamp);
+            partitions.TryAdd(partitionId, lastTimestamp);
     }
 
     /// <summary>
@@ -73,13 +98,19 @@ internal sealed class NodeActivityTracker
         HLCTimestamp now = getNow();
         List<string> active = [];
 
-        foreach (((string endpoint, int _) key, HLCTimestamp lastSeen) in lastActivity)
+        foreach (KeyValuePair<string, ConcurrentDictionary<int, HLCTimestamp>> node in lastActivity)
         {
-            if (key.endpoint == localEndpoint)
+            if (node.Key == localEndpoint)
                 continue;
 
-            if ((now - lastSeen) <= within && !active.Contains(key.endpoint))
-                active.Add(key.endpoint);
+            foreach (KeyValuePair<int, HLCTimestamp> kv in node.Value)
+            {
+                if ((now - kv.Value) <= within)
+                {
+                    active.Add(node.Key);
+                    break;
+                }
+            }
         }
 
         active.Sort(StringComparer.Ordinal);

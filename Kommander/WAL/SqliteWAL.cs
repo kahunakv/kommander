@@ -509,7 +509,13 @@ public class SqliteWAL : IWAL, IDisposable
         bool downgradeSync = !sync && syncWrites;
 
         // Group by shard, then merge same-partition entries within each shard.
+        //
+        // Copy-on-second-sight: a partition appearing once (the common batch shape) stores the
+        // caller's list directly — the plan is only read below and the caller owns the batch for
+        // the duration of the call. An owned merged copy is materialized only when the same
+        // partition appears again; ownedLists (reference identity, lazy) tracks ownership.
         Dictionary<int, Dictionary<int, List<RaftLog>>> shardPlan = new();
+        HashSet<List<RaftLog>>? ownedLists = null;
 
         foreach ((int partitionId, List<RaftLog> raftLogs) in logs)
         {
@@ -522,13 +528,21 @@ public class SqliteWAL : IWAL, IDisposable
             }
 
             if (partitionPlan.TryGetValue(partitionId, out List<RaftLog>? existing))
-                existing.AddRange(raftLogs);
-            else
             {
-                List<RaftLog> copy = new(raftLogs.Count);
-                copy.AddRange(raftLogs);
-                partitionPlan[partitionId] = copy;
+                ownedLists ??= [];
+                if (!ownedLists.Contains(existing))
+                {
+                    List<RaftLog> owned = new(existing.Count + raftLogs.Count);
+                    owned.AddRange(existing);
+                    partitionPlan[partitionId] = owned;
+                    ownedLists.Add(owned);
+                    existing = owned;
+                }
+
+                existing.AddRange(raftLogs);
             }
+            else
+                partitionPlan[partitionId] = raftLogs;
         }
 
         try

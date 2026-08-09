@@ -143,16 +143,23 @@ internal readonly record struct GrpcChannelPoolOptions(
 /// </summary>
 public static class SharedChannels
 {
-    private static readonly ConcurrentDictionary<string, Lazy<List<GrpcChannel>>> channels = new();
+    /// <summary>
+    /// One cached entry per normalized URL: the lazily-built slot list plus its round-robin
+    /// cursor. Combining them means the per-message send path performs ONE string-keyed
+    /// dictionary lookup instead of two (the counters previously lived in a parallel dictionary
+    /// keyed by the same URL). Counter wraparound through int.MaxValue → int.MinValue is
+    /// harmless: the uint cast before the modulo keeps the index in [0, count).
+    /// </summary>
+    private sealed class UrlPool<T>
+    {
+        public required Lazy<List<T>> Slots { get; init; }
 
-    private static readonly ConcurrentDictionary<string, Lazy<List<GrpcInterSharedStreaming>>> streamings = new();
+        public int Counter;
+    }
 
-    // Per-URL round-robin counters for channel and streaming pool selection.
-    // Each entry is a single-element int[] so Interlocked.Increment can be used without boxing.
-    // Counter wraparound through int.MaxValue → int.MinValue is harmless: the uint cast before
-    // the modulo ensures the index is always in [0, count).
-    private static readonly ConcurrentDictionary<string, int[]> channelCounters = new();
-    private static readonly ConcurrentDictionary<string, int[]> streamingCounters = new();
+    private static readonly ConcurrentDictionary<string, UrlPool<GrpcChannel>> channels = new();
+
+    private static readonly ConcurrentDictionary<string, UrlPool<GrpcInterSharedStreaming>> streamings = new();
 
     // Tracks the scalar pool options (ChannelsPerNode, EnableMultipleHttp2Connections) that were
     // used to create each normalized URL's channel pool.  Debug builds assert that no second caller
@@ -226,21 +233,23 @@ public static class SharedChannels
 
         // TryGetValue fast path: on the warm per-message path the entry always exists, and
         // calling GetOrAdd directly would allocate the capturing factory closure on every hit.
-        if (!channels.TryGetValue(url, out Lazy<List<GrpcChannel>>? urlChannelsLazy))
-            urlChannelsLazy = channels.GetOrAdd(
+        if (!channels.TryGetValue(url, out UrlPool<GrpcChannel>? pool))
+            pool = channels.GetOrAdd(
                 url,
-                k => new Lazy<List<GrpcChannel>>(() =>
+                k => new UrlPool<GrpcChannel>
                 {
-                    // Record the winning opts inside the factory so registeredPoolConfig always
-                    // reflects the opts the pool was actually built with, not a racing caller's.
-                    registeredPoolConfig.TryAdd(k, (opts.ChannelsPerNode, opts.EnableMultipleHttp2Connections));
-                    return CreateSharedChannels(k, opts);
-                }));
+                    Slots = new Lazy<List<GrpcChannel>>(() =>
+                    {
+                        // Record the winning opts inside the factory so registeredPoolConfig always
+                        // reflects the opts the pool was actually built with, not a racing caller's.
+                        registeredPoolConfig.TryAdd(k, (opts.ChannelsPerNode, opts.EnableMultipleHttp2Connections));
+                        return CreateSharedChannels(k, opts);
+                    })
+                });
 
-        List<GrpcChannel> urlChannels = urlChannelsLazy.Value;
+        List<GrpcChannel> urlChannels = pool.Slots.Value;
         AssertConsistentPoolConfig(url, opts);
-        int[] counter = channelCounters.GetOrAdd(url, _ => new int[1]);
-        int idx = (int)((uint)Interlocked.Increment(ref counter[0]) % urlChannels.Count);
+        int idx = (int)((uint)Interlocked.Increment(ref pool.Counter) % urlChannels.Count);
         return urlChannels[idx];
     }
 
@@ -249,16 +258,19 @@ public static class SharedChannels
         if (!url.StartsWith("https://", StringComparison.Ordinal) && !url.StartsWith("http://", StringComparison.Ordinal))
             url = "https://" + url;
 
-        if (!channels.TryGetValue(url, out Lazy<List<GrpcChannel>>? urlChannelsLazy))
-            urlChannelsLazy = channels.GetOrAdd(
+        if (!channels.TryGetValue(url, out UrlPool<GrpcChannel>? pool))
+            pool = channels.GetOrAdd(
                 url,
-                k => new Lazy<List<GrpcChannel>>(() =>
+                k => new UrlPool<GrpcChannel>
                 {
-                    registeredPoolConfig.TryAdd(k, (opts.ChannelsPerNode, opts.EnableMultipleHttp2Connections));
-                    return CreateSharedChannels(k, opts);
-                }));
+                    Slots = new Lazy<List<GrpcChannel>>(() =>
+                    {
+                        registeredPoolConfig.TryAdd(k, (opts.ChannelsPerNode, opts.EnableMultipleHttp2Connections));
+                        return CreateSharedChannels(k, opts);
+                    })
+                });
 
-        List<GrpcChannel> urlChannels = urlChannelsLazy.Value;
+        List<GrpcChannel> urlChannels = pool.Slots.Value;
         AssertConsistentPoolConfig(url, opts);
         return urlChannels;
     }
@@ -269,16 +281,18 @@ public static class SharedChannels
             url = "https://" + url;
 
         // TryGetValue fast path — see GetChannel: avoids the per-message closure allocation.
-        if (!streamings.TryGetValue(url, out Lazy<List<GrpcInterSharedStreaming>>? lazyStreaming))
-            lazyStreaming = streamings.GetOrAdd(
+        if (!streamings.TryGetValue(url, out UrlPool<GrpcInterSharedStreaming>? pool))
+            pool = streamings.GetOrAdd(
                 url,
-                k => new Lazy<List<GrpcInterSharedStreaming>>(
-                    () => CreateAsyncDuplexStreamingCallInternal(k, metadataFactory, opts)));
+                k => new UrlPool<GrpcInterSharedStreaming>
+                {
+                    Slots = new Lazy<List<GrpcInterSharedStreaming>>(
+                        () => CreateAsyncDuplexStreamingCallInternal(k, metadataFactory, opts))
+                });
 
-        List<GrpcInterSharedStreaming> streamingList = lazyStreaming.Value;
+        List<GrpcInterSharedStreaming> streamingList = pool.Slots.Value;
         AssertConsistentPoolConfig(url, opts);
-        int[] counter = streamingCounters.GetOrAdd(url, _ => new int[1]);
-        int idx = (int)((uint)Interlocked.Increment(ref counter[0]) % streamingList.Count);
+        int idx = (int)((uint)Interlocked.Increment(ref pool.Counter) % streamingList.Count);
         GrpcInterSharedStreaming selected = streamingList[idx];
         // Self-heal: if this slot's stream faulted (peer reset, keepalive timeout, connection
         // fault), recreate it before handing it out instead of returning a permanently dead stream.
@@ -346,15 +360,18 @@ public static class SharedChannels
         if (!url.StartsWith("https://", StringComparison.Ordinal) && !url.StartsWith("http://", StringComparison.Ordinal))
             url = "https://" + url;
 
-        Lazy<List<GrpcChannel>> urlChannelsLazy = channels.GetOrAdd(
+        UrlPool<GrpcChannel> channelPool = channels.GetOrAdd(
             url,
-            k => new Lazy<List<GrpcChannel>>(() =>
+            k => new UrlPool<GrpcChannel>
             {
-                registeredPoolConfig.TryAdd(k, (opts.ChannelsPerNode, opts.EnableMultipleHttp2Connections));
-                return CreateSharedChannels(k, opts);
-            }));
+                Slots = new Lazy<List<GrpcChannel>>(() =>
+                {
+                    registeredPoolConfig.TryAdd(k, (opts.ChannelsPerNode, opts.EnableMultipleHttp2Connections));
+                    return CreateSharedChannels(k, opts);
+                })
+            });
 
-        List<GrpcChannel> urlChannels = urlChannelsLazy.Value;
+        List<GrpcChannel> urlChannels = channelPool.Slots.Value;
 
         // Streaming pool is sized to match the cached channel pool exactly so urlChannels[i]
         // never indexes out of range — the channel pool was created by whoever first called
