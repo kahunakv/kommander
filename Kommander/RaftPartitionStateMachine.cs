@@ -787,7 +787,14 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
+        // The adapter read races the WAL write queue (appends still queued in the write scheduler
+        // are invisible to it), so take the enqueue-advanced presence frontier when it is higher —
+        // an understated local max would hand leadership to a target that is actually behind.
         long localMaxLogId = await wal.GetMaxLogAsync().ConfigureAwait(false);
+        long presentIndex = wal.GetPresentIndex();
+        if (presentIndex > localMaxLogId)
+            localMaxLogId = presentIndex;
+
         long targetMaxLogId = GetKnownRemoteMaxLogId(targetEndpoint);
         if (targetMaxLogId < localMaxLogId)
         {
@@ -935,7 +942,7 @@ public sealed class RaftPartitionStateMachine
     ///
     /// <para>Two cases, split on whether the WAL tail extends past the known commit frontier:</para>
     ///
-    /// <para><b>No inherited tail</b> (<c>maxLog &lt;= commitFrontier</c>): every entry the previous
+    /// <para><b>No inherited tail</b> (presence frontier &lt;= commit frontier): every entry the previous
     /// leader could have committed is already commit-marked locally — election log-freshness
     /// guarantees the winner's log contains every quorum-durable entry, so an empty tail proves
     /// there is nothing inherited. The committed drain (<see cref="DrainCommittedAppliesAsync"/>)
@@ -1083,7 +1090,18 @@ public sealed class RaftPartitionStateMachine
             throw new RaftException($"Promotion refused: WAL hole below max id (contiguous through {presentId}, max {maxLog})");
         }
 
-        if (maxLog <= commitFrontier)
+        // The inherited-tail decision must come from the enqueue-advanced presence frontier, not
+        // the adapter read: GetMaxLogAsync goes through the ReadScheduler straight to the backend
+        // and cannot see an append still queued in the write scheduler, so under write-worker
+        // latency it under-reports and would skip the barrier — publishing leadership while a
+        // prior-term entry that is committed on quorum sits unapplied for the entire tenure (a
+        // leader is never backfilled). GetPresentIndex advances at enqueue time and can never
+        // under-report a queued append, and the hole gate above already established
+        // presentId >= maxLog whenever presence is tracked. Facades that do not track presence
+        // (presentId == -1, test stubs) fall back to the adapter read, which is exact for them.
+        long inheritedTail = presentId >= 0 ? presentId : maxLog;
+
+        if (inheritedTail <= commitFrontier)
         {
             // No inherited tail: the drain above already proved the consumer projection complete.
             // Publish leader status only after the drain. host.Leader is the gate for
@@ -1136,7 +1154,7 @@ public sealed class RaftPartitionStateMachine
 
         if (logger.IsEnabled(LogLevel.Information))
             logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Promotion barrier armed at ticket {Ticket} (inherited tail {Frontier}..{MaxLog}); leadership publishes on commit",
-                host.LocalEndpoint, host.PartitionId, nodeState, barrierTicket, commitFrontier + 1, maxLog);
+                host.LocalEndpoint, host.PartitionId, nodeState, barrierTicket, commitFrontier + 1, inheritedTail);
 
         return false;
     }
@@ -2700,6 +2718,28 @@ public sealed class RaftPartitionStateMachine
             {
                 if (localTermAtPrev < 0)
                 {
+                    // Stale-read guard: the backend reads race the WAL write queue, so an entry whose
+                    // physical append is still queued reads as absent (-1) — a FALSE hole. The presence
+                    // frontier advances at enqueue time and is contiguous, so it covering prevLogIndex
+                    // proves an entry exists there; truncating on that stale read would enqueue the
+                    // delete BEHIND the pending append and discard a possibly-committed entry. Report
+                    // "behind" instead and let the leader retry against the durable log. Unreachable
+                    // under strict per-partition write FIFO (the prevLogIndex > localMaxLog pre-check
+                    // fires first) — kept as defense in depth because the truncate is irreversible.
+                    long presentIndexAtAnchor = wal.GetPresentIndex();
+                    if (presentIndexAtAnchor >= prevLogIndex)
+                    {
+                        if (logger.IsEnabled(LogLevel.Debug))
+                            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] False-hole read at prevLogIndex={PrevLogIndex} (presence frontier {PresentIndex} covers it; append still queued) — deferring to backfill retry instead of truncating.",
+                                host.LocalEndpoint, host.PartitionId, nodeState, prevLogIndex, presentIndexAtAnchor);
+                        host.EnqueueResponse(endpoint, new(
+                            RaftResponderRequestType.CompleteAppendLogs,
+                            new(endpoint),
+                            new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, localMaxLog)
+                        ));
+                        return;
+                    }
+
                     // Hole: no entry exists at prevLogIndex even though prevLogIndex <= localMaxLog, so the
                     // follower's log has an internal gap. This proves the follower's truly committed prefix ends
                     // below prevLogIndex: the leader commits contiguously, so no entry above an unfilled gap can

@@ -35,6 +35,71 @@ namespace Kommander.Scheduling;
 /// </summary>
 public sealed class RaftPartitionExecutor : IDisposable
 {
+    // ── Ask reply channel ──────────────────────────────────────────────────
+
+    /// <summary>
+    /// Reply channel for <see cref="Ask"/>: a <see cref="TaskCompletionSource{TResult}"/> paired
+    /// with the caller-token cancellation registration, unregistered synchronously at the moment
+    /// the reply settles.
+    /// <para>
+    /// Why this shape: the registration must not outlive the reply (a completed Ask whose caller
+    /// token lives on — Kahuna's AmILeader polling loop reuses one long-lived token — pins the TCS
+    /// and its response in the token's registration list, an unbounded memory amplifier on slow
+    /// runners), but it also must not be disposed via <c>tcs.Task.ContinueWith</c>: with
+    /// <see cref="TaskCreationOptions.RunContinuationsAsynchronously"/> that queued one extra
+    /// thread-pool work item per Ask, and a hot Ask loop flooded the pool and starved
+    /// timer/election work into a leadership livelock (the 5c6c6ac regression). Settling always
+    /// flows through these methods on the executor/worker path, so
+    /// <see cref="CancellationTokenRegistration.Unregister"/> here is synchronous, non-blocking,
+    /// and adds no scheduled work. <c>Unregister</c> (not <c>Dispose</c>) is deliberate: it never
+    /// waits for an in-flight cancellation callback, so the cancel/settle race stays lock-free —
+    /// both settle paths are idempotent.
+    /// </para>
+    /// </summary>
+    internal sealed class AskReplySource
+    {
+        private readonly TaskCompletionSource<RaftResponse> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        private CancellationTokenRegistration registration;
+
+        public Task<RaftResponse> Task => tcs.Task;
+
+        /// <summary>
+        /// Stores the caller-token registration so settling can unlink it. Called once, before the
+        /// operation is enqueued; if the token was already cancelled the callback has run and the
+        /// registration is inert, so storing it late is harmless.
+        /// </summary>
+        public void AttachRegistration(CancellationTokenRegistration value) => registration = value;
+
+        public bool TrySetResult(RaftResponse response)
+        {
+            bool set = tcs.TrySetResult(response);
+            registration.Unregister();
+            return set;
+        }
+
+        public bool TrySetCanceled()
+        {
+            bool set = tcs.TrySetCanceled();
+            registration.Unregister();
+            return set;
+        }
+
+        public bool TrySetCanceled(CancellationToken cancellationToken)
+        {
+            bool set = tcs.TrySetCanceled(cancellationToken);
+            registration.Unregister();
+            return set;
+        }
+
+        public bool TrySetException(Exception exception)
+        {
+            bool set = tcs.TrySetException(exception);
+            registration.Unregister();
+            return set;
+        }
+    }
+
     // ── Operation envelope ─────────────────────────────────────────────────
 
     /// <summary>
@@ -56,7 +121,7 @@ public sealed class RaftPartitionExecutor : IDisposable
         /// Non-null when the caller awaits a reply (Ask pattern).
         /// Null for fire-and-forget (Post pattern).
         /// </summary>
-        public TaskCompletionSource<RaftResponse>? Reply { get; }
+        public AskReplySource? Reply { get; }
 
         /// <summary>
         /// The operation class, computed once in <c>Enqueue</c> and carried inline so the dispatch
@@ -64,7 +129,7 @@ public sealed class RaftPartitionExecutor : IDisposable
         /// </summary>
         public RaftOperationKind Kind { get; }
 
-        public PendingOperation(RaftRequest request, TaskCompletionSource<RaftResponse>? reply, RaftOperationKind kind)
+        public PendingOperation(RaftRequest request, AskReplySource? reply, RaftOperationKind kind)
         {
             Request = request;
             Reply = reply;
@@ -399,23 +464,21 @@ public sealed class RaftPartitionExecutor : IDisposable
     {
         ThrowIfNotReady();
 
-        TaskCompletionSource<RaftResponse> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        AskReplySource tcs = new();
 
         if (cancellationToken.CanBeCanceled)
         {
             // UnsafeRegister with static state instead of a capturing lambda avoids the per-call
-            // closure allocation. The registration is deliberately NOT disposed on completion:
-            // an earlier version disposed it via tcs.Task.ContinueWith, and because the TCS uses
-            // RunContinuationsAsynchronously that queued one extra thread-pool work item per Ask.
-            // Under a hot Ask loop (e.g. a caller polling AmILeader without delay) those dispose
-            // continuations flooded the thread pool and starved timer/election work, livelocking
-            // leadership convergence (observed as a permanent 500%+-CPU hang in Kahuna's
-            // integration suite). Leaving the registration attached simply pins the TCS until the
-            // caller's token is cancelled or collected — the same lifetime the pre-optimization
-            // Register call had.
-            cancellationToken.UnsafeRegister(
-                static (state, ct) => ((TaskCompletionSource<RaftResponse>)state!).TrySetCanceled(ct),
-                tcs);
+            // closure allocation. The registration is unlinked synchronously inside the
+            // AskReplySource settle methods — NEVER via tcs.Task.ContinueWith: with
+            // RunContinuationsAsynchronously that queued one extra thread-pool work item per Ask,
+            // and under a hot Ask loop (e.g. a caller polling AmILeader without delay) those
+            // dispose continuations flooded the thread pool and starved timer/election work,
+            // livelocking leadership convergence (observed as a permanent 500%+-CPU hang in
+            // Kahuna's integration suite). See the AskReplySource summary before changing this.
+            tcs.AttachRegistration(cancellationToken.UnsafeRegister(
+                static (state, ct) => ((AskReplySource)state!).TrySetCanceled(ct),
+                tcs));
         }
 
         Enqueue(request, tcs);
@@ -572,7 +635,7 @@ public sealed class RaftPartitionExecutor : IDisposable
             throw new InvalidOperationException($"RaftPartitionExecutor({_partitionId}): executor is stopping; no new operations accepted.");
     }
 
-    private void Enqueue(RaftRequest request, TaskCompletionSource<RaftResponse>? reply)
+    private void Enqueue(RaftRequest request, AskReplySource? reply)
     {
         RaftOperationKind kind = RaftOperationMapper.GetKind(request.Type);
 
