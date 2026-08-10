@@ -403,20 +403,19 @@ public sealed class RaftPartitionExecutor : IDisposable
 
         if (cancellationToken.CanBeCanceled)
         {
-            // UnsafeRegister with static state instead of a capturing lambda, and dispose the
-            // registration once the operation settles: a long-lived caller token (host/request
-            // scope reused across many Asks) would otherwise accumulate one registration — and
-            // pin one TaskCompletionSource — per call for the token's whole lifetime.
-            CancellationTokenRegistration registration = cancellationToken.UnsafeRegister(
+            // UnsafeRegister with static state instead of a capturing lambda avoids the per-call
+            // closure allocation. The registration is deliberately NOT disposed on completion:
+            // an earlier version disposed it via tcs.Task.ContinueWith, and because the TCS uses
+            // RunContinuationsAsynchronously that queued one extra thread-pool work item per Ask.
+            // Under a hot Ask loop (e.g. a caller polling AmILeader without delay) those dispose
+            // continuations flooded the thread pool and starved timer/election work, livelocking
+            // leadership convergence (observed as a permanent 500%+-CPU hang in Kahuna's
+            // integration suite). Leaving the registration attached simply pins the TCS until the
+            // caller's token is cancelled or collected — the same lifetime the pre-optimization
+            // Register call had.
+            cancellationToken.UnsafeRegister(
                 static (state, ct) => ((TaskCompletionSource<RaftResponse>)state!).TrySetCanceled(ct),
                 tcs);
-
-            tcs.Task.ContinueWith(
-                static (_, state) => ((CancellationTokenRegistration)state!).Dispose(),
-                registration,
-                CancellationToken.None,
-                TaskContinuationOptions.ExecuteSynchronously,
-                TaskScheduler.Default);
         }
 
         Enqueue(request, tcs);
