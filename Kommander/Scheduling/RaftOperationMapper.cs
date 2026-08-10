@@ -54,6 +54,12 @@ public static class RaftOperationMapper
             RaftRequestType.ReplicateCheckpoint  => RaftOperationKind.Client,
             RaftRequestType.CommitLogs           => RaftOperationKind.Client,
             RaftRequestType.RollbackLogs         => RaftOperationKind.Client,
+            // Client (not Control) is deliberate and stays that way: state reads must never share a
+            // drain quantum with election/heartbeat traffic, or a hot poller would delay elections
+            // outright. The hot path no longer reaches the executor at all — RaftPartition.GetState
+            // answers from a volatile role snapshot — so this classification now only governs the
+            // explicit GetStateSlow round-trip, where client-class admission control (restore gate,
+            // queue-depth rejection) is exactly the desired behaviour.
             RaftRequestType.GetNodeState              => RaftOperationKind.Client,
             RaftRequestType.GetPartitionView          => RaftOperationKind.Client,
             RaftRequestType.GetTicketState            => RaftOperationKind.Client,

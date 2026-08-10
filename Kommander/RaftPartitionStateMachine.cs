@@ -91,7 +91,25 @@ public sealed class RaftPartitionStateMachine
 
     private readonly Random random;
 
-    private RaftNodeState nodeState = RaftNodeState.Follower;
+    /// <summary>
+    /// Volatile backing store for <see cref="nodeState"/>. The state machine itself only ever
+    /// mutates this from the executor's single-writer thread, but <see cref="NodeState"/> is read
+    /// off-thread by <c>RaftPartition.GetState</c> (the snapshot path that keeps hot
+    /// <c>AmILeader</c> pollers off the executor queue), so every transition must be published
+    /// with release semantics rather than left in a core-local write buffer.
+    /// </summary>
+    private volatile int nodeStateValue = (int)RaftNodeState.Follower;
+
+    /// <summary>
+    /// The raw role of this node. Kept as a property over a volatile field so that all the
+    /// existing <c>nodeState = ...</c> transition sites publish the new role to off-thread
+    /// readers automatically — do not reintroduce a plain field here.
+    /// </summary>
+    private RaftNodeState nodeState
+    {
+        get => (RaftNodeState)nodeStateValue;
+        set => nodeStateValue = (int)value;
+    }
 
     private long currentTerm;
 
@@ -304,6 +322,12 @@ public sealed class RaftPartitionStateMachine
     /// but leaking <c>Leader</c> here would reopen the inherited-entry serving hole that gating
     /// <see cref="IRaftPartitionHost.Leader"/> closes — <c>AmILeaderQuick</c> treats a
     /// <c>Leader</c> state reply as authoritative.
+    /// <para>Safe to read from any thread: <see cref="nodeState"/> is volatile-published and
+    /// <see cref="IRaftPartitionHost.Leader"/> is a volatile reference, so an off-thread reader
+    /// sees a recent (possibly one-transition-stale) role but never a torn or resurrected one.
+    /// The <c>Leader != LocalEndpoint</c> demotion to <c>Candidate</c> is what makes the
+    /// off-thread read safe to expose: a role read that races ahead of the leadership
+    /// publication point degrades to <c>Candidate</c>, never to a premature <c>Leader</c>.</para>
     /// </summary>
     public RaftNodeState NodeState =>
         nodeState == RaftNodeState.Leader && host.Leader != host.LocalEndpoint

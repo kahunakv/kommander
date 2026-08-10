@@ -50,13 +50,25 @@ public sealed class RaftPartition : IDisposable
 
     private readonly RaftPartitionExecutor executor;
 
+    /// <summary>
+    /// The per-partition state machine. Held here only so <see cref="GetState()"/> can read the
+    /// volatile role snapshot without an executor round-trip; every mutation still goes through
+    /// the executor's single-writer queue.
+    /// </summary>
+    private readonly RaftPartitionStateMachine stateMachine;
+
     private readonly RaftManager manager;
 
     private readonly RaftWriteAhead walHandler;
 
     private int _disposed;
 
-    private string _leader = "";
+    /// <summary>
+    /// Written by the executor's single-writer thread, read by arbitrary caller threads through
+    /// <see cref="Leader"/> and by the <see cref="GetState()"/> snapshot path — volatile so a hot
+    /// poller observes the publication instead of a cached core-local value.
+    /// </summary>
+    private volatile string _leader = "";
     private long _leaderChangedTicks = Stopwatch.GetTimestamp();
 
     internal string Leader
@@ -175,7 +187,7 @@ public sealed class RaftPartition : IDisposable
 
         IRaftPartitionHost host = new RaftPartitionHostAdapter(manager, this);
         IRaftWalFacade wal = new RaftWalFacadeAdapter(walHandler);
-        RaftPartitionStateMachine stateMachine = new(host, wal, replySink, logger);
+        stateMachine = new(host, wal, replySink, logger);
 
         executor = new RaftPartitionExecutor(
             stateMachine,
@@ -699,21 +711,55 @@ public sealed class RaftPartition : IDisposable
     /// Retrieves the current state of the Raft node.
     /// </summary>
     /// <returns>The current state of the node as <see cref="RaftNodeState"/>.</returns>
+    public ValueTask<RaftNodeState> GetState() => GetState(CancellationToken.None);
+
+    /// <summary>
+    /// Reads the node's role from the volatile snapshot published by the state machine — no
+    /// executor round-trip. This is deliberate: <c>GetState</c> backs
+    /// <c>AmILeader</c>/<c>AmILeaderQuick</c>, and a caller polling those in a delay-free loop
+    /// used to enqueue an unbounded stream of <c>GetNodeState</c> Asks whose scheduling churn
+    /// starved election/heartbeat work, livelocking the very leadership convergence the caller
+    /// was waiting on (observed as a permanent 500%+-CPU hang). Serving the role from a snapshot
+    /// makes hot pollers cost nothing on the executor.
+    /// <para>Semantics: the answer is a point-in-time snapshot, not a happens-after barrier over
+    /// previously enqueued executor work. It never reports <see cref="RaftNodeState.Leader"/>
+    /// earlier than the Ask-served answer would — <see cref="RaftPartitionStateMachine.NodeState"/>
+    /// reports <c>Candidate</c> until leadership is published — but it may report a role one
+    /// transition stale. Callers that need the queued-work ordering must use
+    /// <see cref="GetStateSlow"/>.</para>
+    /// </summary>
+    public ValueTask<RaftNodeState> GetState(CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested)
+            return ValueTask.FromCanceled<RaftNodeState>(cancellationToken);
+
+        if (!string.IsNullOrEmpty(Leader) && Leader == manager.LocalEndpoint)
+            return new(RaftNodeState.Leader);
+
+        return new(stateMachine.NodeState);
+    }
+
+    /// <summary>
+    /// Executor-served variant of <see cref="GetState()"/>: the reply is produced on the
+    /// single-writer thread, so it observes every operation enqueued before this call. Costs one
+    /// round-trip and shares the client queue with proposals — never call it in a poll loop; use
+    /// <see cref="GetState()"/> instead.
+    /// <para>Because the request is client-class it is also subject to the executor's restore gate:
+    /// until the partition finishes replaying its log the Ask is answered with
+    /// <see cref="RaftOperationStatus.RestoreInProgress"/>, which surfaces here as a
+    /// <see cref="RaftException"/>. The snapshot path has no such window — another reason
+    /// <see cref="GetState()"/> is the right call for anything resembling a poll.</para>
+    /// </summary>
     /// <exception cref="RaftException">
     /// Thrown if the response is invalid or cannot determine the node state.
     /// </exception>
-    public ValueTask<RaftNodeState> GetState() => GetState(CancellationToken.None);
-
-    public async ValueTask<RaftNodeState> GetState(CancellationToken cancellationToken)
+    public async ValueTask<RaftNodeState> GetStateSlow(CancellationToken cancellationToken = default)
     {
-        if (!string.IsNullOrEmpty(Leader) && Leader == manager.LocalEndpoint)
-            return RaftNodeState.Leader;
-
         RaftResponse? response = await executor.Ask(RaftStateRequest, cancellationToken).ConfigureAwait(false);
-        
+
         if (response is null)
             throw new RaftException("Unknown response (1)");
-        
+
         if (response.Type != RaftResponseType.NodeState)
             throw new RaftException("Unknown response (2)");
 

@@ -404,7 +404,11 @@ public interface IRaft
     public ValueTask<long?> GetFollowerLagAsync(int partitionId, string followerEndpoint);
 
     /// <summary>
-    /// Checks if the local node is the leader in the given partition
+    /// Checks if the local node is the leader in the given partition.
+    /// <para>Answered from published local state (leader endpoint, then the partition's role
+    /// snapshot) without an executor round-trip, so polling this is cheap and — unlike the previous
+    /// Ask-per-poll implementation — cannot starve the election and heartbeat work a caller waiting
+    /// for a leader depends on. Callers should still back off between polls.</para>
     /// </summary>
     /// <param name="partitionId"></param>
     /// <returns></returns>
