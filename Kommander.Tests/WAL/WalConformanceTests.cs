@@ -1797,6 +1797,101 @@ public abstract class WalConformanceTests
         finally { cleanup(); }
     }
 
+    // ─────────────── max-log-id cache vs. recomputed max (all mutation paths) ───────────────
+
+    /// <summary>
+    /// Drives every mutation kind the adapter exposes and, after each one, cross-checks the
+    /// incrementally-maintained answers (<see cref="IWAL.GetMaxLog"/>/<see cref="IWAL.GetCurrentTerm"/>)
+    /// against an independent full read. This guards the two failure directions a cached max can drift
+    /// into: stale-HIGH makes <c>GetCurrentTerm</c> silently return 0 (the lookup at the cached id
+    /// misses and falls through), corrupting lastLogTerm comparisons in elections; stale-LOW lets the
+    /// promotion catch-up barrier conclude early, so a freshly promoted leader serves before applying
+    /// inherited committed entries.
+    /// </summary>
+    [Fact]
+    public void MaxLogAndCurrentTerm_StayConsistentWithFullScan_AcrossAllMutationPaths()
+    {
+        const int p = 77;
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            void AssertConsistent()
+            {
+                List<RaftLog> logs = wal.ReadLogs(p);
+                long expectedMax = logs.Count > 0 ? logs.Max(l => l.Id) : 0;
+                long reportedMax = wal.GetMaxLog(p);
+                Assert.Equal(expectedMax, reportedMax);
+
+                long expectedTerm = logs.Count > 0 ? logs.First(l => l.Id == expectedMax).Term : 0;
+                Assert.Equal(expectedTerm, wal.GetCurrentTerm(p));
+
+                // Stale-high detector independent of ReadLogs: the id GetMaxLog reports must exist.
+                if (reportedMax > 0)
+                    Assert.NotEqual(-1, wal.GetTermAt(p, reportedMax));
+            }
+
+            AssertConsistent(); // empty partition: max 0, term 0
+
+            wal.Write([(p, [
+                Log(id: 1, term: 1), Log(id: 2, term: 1), Log(id: 3, term: 1),
+                Log(id: 4, term: 1), Log(id: 5, term: 1), Log(id: 6, term: 2), Log(id: 7, term: 2),
+                Log(id: 8, term: 2, type: RaftLogType.Proposed),
+                Log(id: 9, term: 2, type: RaftLogType.Proposed),
+                Log(id: 10, term: 2, type: RaftLogType.Proposed)])]);
+            AssertConsistent();
+
+            // Proposed-tail cleanup removes the current max (8..10) — max must fall back to 7.
+            Assert.Equal(RaftOperationStatus.Success, wal.TruncateProposedLogsAfter(p, 7));
+            AssertConsistent();
+            Assert.Equal(7, wal.GetMaxLog(p));
+
+            wal.Write([(p, [Log(id: 8, term: 3), Log(id: 9, term: 3), Log(id: 10, term: 3),
+                Log(id: 11, term: 3), Log(id: 12, term: 3)])]);
+            AssertConsistent();
+
+            Assert.Equal(RaftOperationStatus.Success, wal.TruncateLogsAfter(p, 9));
+            AssertConsistent();
+            Assert.Equal(9, wal.GetMaxLog(p));
+
+            // The combined truncate+read must report the same max the queries then see.
+            (RaftOperationStatus status, long combinedMax) = wal.TruncateLogsAfterAndGetMax(p, 5);
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Assert.Equal(5, combinedMax);
+            AssertConsistent();
+
+            // Boundary term (2) mismatches the stored entry at id 4 (term 1) → suffix truncation:
+            // everything above 4 goes, and the boundary entry itself becomes the max.
+            (status, _) = wal.InstallSnapshotBoundary(p, snapshotIndex: 4, lastIncludedTerm: 2, sync: false);
+            Assert.Equal(RaftOperationStatus.Success, status);
+            AssertConsistent();
+            Assert.Equal(4, wal.GetMaxLog(p));
+
+            wal.Write([(p, [Log(id: 5, term: 4), Log(id: 6, term: 4), Log(id: 7, term: 4),
+                Log(id: 8, term: 4), Log(id: 9, term: 4)])]);
+            AssertConsistent();
+
+            // Head compaction never touches the tail — max must survive whatever was removed.
+            (status, _) = wal.CompactLogsOlderThan(p, lastCheckpoint: 7, compactNumberEntries: 100);
+            Assert.Equal(RaftOperationStatus.Success, status);
+            AssertConsistent();
+            Assert.Equal(9, wal.GetMaxLog(p));
+
+            // Truncate-to-empty: the cached max must not survive the last entry's removal.
+            Assert.Equal(RaftOperationStatus.Success, wal.TruncateLogsAfter(p, 0));
+            AssertConsistent();
+            Assert.Equal(0, wal.GetMaxLog(p));
+            Assert.Equal(0, wal.GetCurrentTerm(p));
+
+            wal.Write([(p, [Log(id: 1, term: 5)])]);
+            AssertConsistent();
+
+            Assert.Equal(RaftOperationStatus.Success, wal.DeletePartitionWAL(p));
+            AssertConsistent();
+            Assert.Equal(0, wal.GetMaxLog(p));
+        }
+        finally { cleanup(); }
+    }
+
     // ──────────────────────────── helpers ───────────────────────────────────────
 
     protected static RaftLog Log(long id, long term = 1, RaftLogType type = RaftLogType.Committed) =>

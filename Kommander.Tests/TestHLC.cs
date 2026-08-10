@@ -187,6 +187,46 @@ public class TestHLC
         Assert.Equal(threads * perThread, unique.Count);
     }
 
+    [Fact]
+    public async Task TrySendOrLocalEvent_ConcurrentCallers_ProduceUniqueMonotonicTimestamps()
+    {
+        // Regression guard: TrySendOrLocalEvent used to return a computed-but-not-installed stamp
+        // when its single CAS lost, and the next event could then mint the SAME stamp — under
+        // contention two calls returned equal (L, C). Consumers that order same-key mutations by
+        // timestamp with >= (Kahuna's lock cache-coherence guard) then drop the later mutation.
+        // Every returned stamp must be installed, so uniqueness must hold even when Try callers
+        // race Send callers on the same clock.
+        HybridLogicalClock clock = new();
+        const int threads = 8;
+        const int perThread = 20_000;
+
+        HLCTimestamp[][] results = new HLCTimestamp[threads][];
+
+        await Task.WhenAll(Enumerable.Range(0, threads).Select(t => Task.Run(() =>
+        {
+            HLCTimestamp[] mine = new HLCTimestamp[perThread];
+            for (int i = 0; i < perThread; i++)
+                mine[i] = (t & 1) == 0
+                    ? clock.TrySendOrLocalEvent(0)
+                    : clock.SendOrLocalEvent(0);
+            results[t] = mine;
+        })));
+
+        HashSet<HLCTimestamp> unique = [];
+        foreach (HLCTimestamp[] batch in results)
+        {
+            HLCTimestamp previous = HLCTimestamp.Zero;
+            foreach (HLCTimestamp ts in batch)
+            {
+                Assert.True(ts.CompareTo(previous) > 0);
+                previous = ts;
+                Assert.True(unique.Add(ts));
+            }
+        }
+
+        Assert.Equal(threads * perThread, unique.Count);
+    }
+
     private static long GetCurrentTime()
     {
         return ((DateTimeOffset)DateTime.UtcNow).ToUnixTimeMilliseconds();

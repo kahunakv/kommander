@@ -75,10 +75,17 @@ public class TestLeadershipBarrier
             return Task.CompletedTask;
         }
 
-        public Task<bool> InvokeReplicationReceived(int p, RaftLog log)
+        /// <summary>Per-entry consumer apply latency; the storm test uses it to model a slow
+        /// state machine so the barrier window is wide, not instantaneous.</summary>
+        public TimeSpan ConsumerDelay { get; set; } = TimeSpan.Zero;
+
+        public async Task<bool> InvokeReplicationReceived(int p, RaftLog log)
         {
+            if (ConsumerDelay > TimeSpan.Zero)
+                await Task.Delay(ConsumerDelay);
+
             EventLog.Add($"Applied:{log.Id}");
-            return Task.FromResult(true);
+            return true;
         }
 
         public Task<bool> InvokeSystemReplicationReceived(int p, RaftLog log)
@@ -121,6 +128,25 @@ public class TestLeadershipBarrier
             InheritedProposed.AddRange(inherited);
             _commitIndex = 0;
             _nextId = inherited.Length > 0 ? inherited.Max(l => l.Id) + 1 : 1;
+        }
+
+        /// <summary>
+        /// Appends further inherited prior-term Proposed entries at the next log positions WITHOUT
+        /// resetting the commit frontier — the mid-life shape the step-down storm exercises: a
+        /// re-promoted node that already applied earlier rounds finds a fresh un-broadcast tail
+        /// above its (advanced) frontier.
+        /// </summary>
+        public List<RaftLog> SeedMoreInherited(int count, long term)
+        {
+            List<RaftLog> added = [];
+            for (int i = 0; i < count; i++)
+            {
+                RaftLog log = new() { Id = _nextId++, Term = term, Type = RaftLogType.Proposed, LogType = "t" };
+                InheritedProposed.Add(log);
+                added.Add(log);
+            }
+
+            return added;
         }
 
         public long GetCommitIndex() => _commitIndex;
@@ -380,5 +406,85 @@ public class TestLeadershipBarrier
         await sm.CompleteWalOperationAsync(CommitCompletion(host.PartitionId, minLogIndex: 4, maxLogIndex: 4));
         Assert.NotEqual("node-a", host.Leader);
         Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+    }
+
+    // ── adversarial: repeated step-down/re-promotion with a slow consumer ──────
+
+    /// <summary>
+    /// The Kahuna lock-failover canary shape: the SAME node is promoted, serves, steps down, and is
+    /// re-promoted over a fresh inherited tail, many times in a row, with a slow consumer widening
+    /// the barrier window. Every round must uphold the barrier invariant — leadership is published
+    /// only after that round's inherited entries reached the consumer, in log order — and no
+    /// state carried over from the previous tenure (applied frontier, barrier bookkeeping,
+    /// proposal maps) may let a later promotion publish early or re-deliver an entry. Leader ticks
+    /// are interleaved mid-barrier the way the real executor serializes them. A promoted node
+    /// answering from a projection that missed the previous tenure's tail is exactly the
+    /// released-lock-resurfaces-as-held failure this guards against.
+    /// </summary>
+    [Fact]
+    public async Task PromotionStepDownStorm_SlowConsumer_NeverPublishesBeforeInheritedApplies()
+    {
+        InheritedTailWalFacade wal = new();
+        wal.Seed();   // empty log, ids start at 1
+        BarrierRecordingHost host = new() { ConsumerDelay = TimeSpan.FromMilliseconds(2) };
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        HashSet<long> everApplied = [];
+
+        for (int round = 0; round < 12; round++)
+        {
+            List<RaftLog> inherited = wal.SeedMoreInherited(count: 3, term: 0);
+            long barrierId = inherited[^1].Id + 1;
+            int eventsBefore = host.EventLog.Count;
+
+            await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+
+            // Barrier armed: nothing published, node state does not leak Leader.
+            Assert.NotEqual("node-a", host.Leader);
+            Assert.Equal(RaftNodeState.Candidate, sm.NodeState);
+
+            // Leader ticks inside the barrier window must neither publish nor revert.
+            await sm.CheckPartitionLeadershipAsync();
+
+            await sm.CompleteWalOperationAsync(ProposeCompletion(host.PartitionId, logIndex: barrierId));
+            await sm.CheckPartitionLeadershipAsync();
+            await sm.CompleteWalOperationAsync(CommitCompletion(host.PartitionId, minLogIndex: barrierId, maxLogIndex: barrierId));
+
+            Assert.Equal("node-a", host.Leader);
+            Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+
+            // Within this round's events: every inherited entry applied, in order, strictly
+            // before the leadership publish; the barrier no-op never delivered.
+            List<string> events = host.EventLog.Skip(eventsBefore).ToList();
+            int leaderChangedIdx = events.IndexOf("LeaderChanged:node-a");
+            Assert.True(leaderChangedIdx >= 0, $"round {round}: leadership never published; events: {string.Join(",", events)}");
+
+            int previousApplyIdx = -1;
+            foreach (RaftLog log in inherited)
+            {
+                int applyIdx = events.IndexOf($"Applied:{log.Id}");
+                Assert.True(applyIdx >= 0, $"round {round}: entry {log.Id} never applied; events: {string.Join(",", events)}");
+                Assert.True(applyIdx < leaderChangedIdx,
+                    $"round {round}: entry {log.Id} applied at {applyIdx} AFTER publish at {leaderChangedIdx}");
+                Assert.True(applyIdx > previousApplyIdx, $"round {round}: entry {log.Id} applied out of order");
+                previousApplyIdx = applyIdx;
+
+                // Cross-round exactly-once: no tenure may re-deliver a previous tenure's entries.
+                Assert.True(everApplied.Add(log.Id), $"round {round}: entry {log.Id} delivered twice across tenures");
+            }
+
+            Assert.DoesNotContain($"Applied:{barrierId}", host.EventLog);
+
+            await sm.StepDownAsync(replyCorrelationId: null);
+            Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+            Assert.NotEqual("node-a", host.Leader);
+        }
+
+        // Nothing was ever delivered twice in the whole storm (any duplicate would have
+        // produced two Applied:<id> events for some id).
+        List<string> applies = host.EventLog.Where(e => e.StartsWith("Applied:")).ToList();
+        Assert.Equal(applies.Count, applies.Distinct().Count());
+        Assert.Equal(12 * 3, applies.Count);
     }
 }

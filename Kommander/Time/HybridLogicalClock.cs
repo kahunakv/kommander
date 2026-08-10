@@ -123,30 +123,18 @@ public sealed class HybridLogicalClock : IDisposable
     }
 
     /// <summary>
-    /// If it succeeds, it returns the new timestamp and updates the global clock. If it fails, it immediately
-    /// reads the latest state and computes a timestamp that is guaranteed to be higher than
-    /// the current state even though it does not update the state itself.
+    /// Mints and installs a new timestamp, exactly like <see cref="SendOrLocalEvent"/>.
+    /// Historically this method attempted ONE CAS and, on failure, returned a computed-but-not-installed
+    /// timestamp. That is unsound: a stamp the clock never recorded can be minted AGAIN by the next
+    /// event (the loser computes (L, C+1) from the updated state, then another thread CASes the same
+    /// (L, C+1) in), producing duplicate timestamps under contention. Consumers that order same-key
+    /// mutations by timestamp (e.g. Kahuna's lock cache-coherence guard, which compares with &gt;=)
+    /// then drop the later mutation — a released lock resurfacing as held. Every returned stamp must
+    /// therefore be installed, which requires retrying the CAS until it lands.
     /// </summary>
     public HLCTimestamp TrySendOrLocalEvent(int nodeId)
     {
-        long current = Volatile.Read(ref _state);
-        long currentL = UnpackL(current);
-        long physicalTime = GetPhysicalTime();
-        long candidateL = Math.Max(currentL, physicalTime);
-        long candidateC = (candidateL == currentL) ? (long)UnpackC(current) + 1 : 0;
-        Normalize(ref candidateL, ref candidateC);
-
-        // Attempt one CAS update.
-        if (Interlocked.CompareExchange(ref _state, Pack(candidateL, candidateC), current) == current)
-            return new(nodeId, candidateL, (uint)candidateC); // Successfully updated state.
-
-        // CAS failed; get the latest state and compute a timestamp that's higher.
-        long updated = Volatile.Read(ref _state);
-        long updatedL = UnpackL(updated);
-        long newL = Math.Max(updatedL, physicalTime);
-        long newC = (newL == updatedL) ? (long)UnpackC(updated) + 1 : 0;
-        Normalize(ref newL, ref newC);
-        return new(nodeId, newL, (uint)newC);
+        return SendOrLocalEvent(nodeId);
     }
 
     /// <summary>
