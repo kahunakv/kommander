@@ -277,6 +277,97 @@ public class TestRaftPartitionStateMachine
         Assert.DoesNotContain(host.EnqueuedRequests, e => e.Request.Type == RaftResponderRequestType.Vote);
     }
 
+    /// <summary>
+    /// Follower-side §5.1 regression (the Jepsen linearizability finding): a FOLLOWER that grants a
+    /// higher-term vote must adopt that term in memory at grant time, so the deposed leader's old-term
+    /// AppendLogs are rejected with <see cref="RaftOperationStatus.LeaderInOldTerm"/> instead of ACKed.
+    /// Before the fix the whole higher-term block was gated on <c>nodeState != Follower</c>, so the
+    /// follower stayed at the old term and kept feeding the deposed leader a phantom quorum — it went
+    /// on committing acknowledged writes that the newly elected leader then overwrote.
+    /// </summary>
+    [Fact]
+    public async Task VoteAsync_HigherTerm_FollowerAdoptsTerm_AndFencesDeposedLeader()
+    {
+        FakePartitionHost host = new() { NodesOverride = [] };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        // Become a follower of node-l at term 1 via a normal heartbeat.
+        await sm.AppendLogsAsync("node-l", term: 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        Assert.Equal(1L, sm.CurrentTerm);
+        Assert.Equal("node-l", host.Leader);
+
+        host.ClearObservations();
+
+        // A candidate solicits a real vote for term 2 with an up-to-date log → granted.
+        await sm.VoteAsync(new RaftNode("node-c"), voteTerm: 2, remoteMaxLogId: 0,
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId));
+
+        Assert.Contains(host.EnqueuedRequests, e =>
+            e.Endpoint == "node-c" && e.Request.Type == RaftResponderRequestType.Vote && !e.Request.VoteRequest!.PreVote);
+
+        // The term is adopted in memory at grant time — this is the fence. The follower does NOT
+        // step down (it already is one) and keeps its old leader knowledge until the new term's
+        // real leader announces itself, so no spurious leader-changed event fires.
+        Assert.Equal(2L, sm.CurrentTerm);
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        Assert.Equal("node-l", host.Leader);
+        Assert.Empty(host.LeaderChanges);
+
+        host.ClearObservations();
+
+        // The deposed term-1 leader keeps replicating → must be rejected with LeaderInOldTerm, never
+        // ACKed. An ACK here is the phantom-quorum vote that let it keep committing acknowledged writes.
+        await sm.AppendLogsAsync("node-l", term: 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);
+
+        Assert.Contains(host.EnqueuedRequests, e =>
+            e.Endpoint == "node-l"
+            && e.Request.Type == RaftResponderRequestType.CompleteAppendLogs
+            && e.Request.CompleteAppendLogsRequest!.Status == RaftOperationStatus.LeaderInOldTerm);
+        Assert.Equal(2L, sm.CurrentTerm);
+    }
+
+    /// <summary>
+    /// Follower-side §5.1: the term adoption is unconditional — it happens even when the follower then
+    /// DENIES the vote on log-freshness. The fence against the deposed leader must not depend on the
+    /// vote being granted.
+    /// </summary>
+    [Fact]
+    public async Task VoteAsync_HigherTerm_FollowerAdoptsTermEvenWhenVoteDenied()
+    {
+        FakePartitionHost host = new() { NodesOverride = [] };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.AppendLogsAsync("node-l", term: 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        Assert.Equal(1L, sm.CurrentTerm);
+
+        host.ClearObservations();
+
+        // Higher term (2) but the candidate's log (-1) is behind ours (empty log reports max 0), so the
+        // real-vote log-freshness check denies the grant — yet the term must still be adopted.
+        await sm.VoteAsync(new RaftNode("node-c"), voteTerm: 2, remoteMaxLogId: -1,
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId));
+
+        Assert.DoesNotContain(host.EnqueuedRequests, e => e.Request.Type == RaftResponderRequestType.Vote);
+        Assert.Equal(2L, sm.CurrentTerm);
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+
+        host.ClearObservations();
+
+        // The deposed term-1 leader is fenced here too.
+        await sm.AppendLogsAsync("node-l", term: 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);
+
+        Assert.Contains(host.EnqueuedRequests, e =>
+            e.Endpoint == "node-l"
+            && e.Request.Type == RaftResponderRequestType.CompleteAppendLogs
+            && e.Request.CompleteAppendLogsRequest!.Status == RaftOperationStatus.LeaderInOldTerm);
+    }
+
     [Fact]
     public async Task CompleteAppendLogs_StaleTerm_IsFenced_BeforeAnyMutation()
     {

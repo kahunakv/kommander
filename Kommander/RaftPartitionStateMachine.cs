@@ -2376,35 +2376,51 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
-        // Raft §5.1: a RequestVote carrying a term higher than ours proves our leadership/candidacy is
-        // stale. Adopt the new term and step down to Follower BEFORE evaluating the grant, so an old
-        // leader is fenced promptly instead of continuing to heartbeat at its old term. The previous
-        // guard above only rejected a non-follower for the *same* term (voteTerm == currentTerm), so a
-        // higher-term vote used to fall through and be granted while the node stayed a stale Leader —
-        // the bug this fixes. Mirrors the step-down in the AppendLogs path, except no leader is adopted
-        // (a vote request does not identify a leader) and the vote target is left to the grant path
-        // below, which may still deny on log-freshness — the term adoption is unconditional either way.
-        // NOTE: durably persisting the adopted term before replying is deferred to B2b (hard state);
-        // this is the in-memory half. Follower-side term adoption on a higher-term vote is likewise
-        // deferred to B2b — here we only fix the Leader/Candidate fencing bug.
-        if (voteTerm > currentTerm && nodeState != RaftNodeState.Follower)
+        // Raft §5.1: a RequestVote carrying a term higher than ours makes us adopt that term
+        // REGARDLESS of our current state. The adoption is what arms the `currentTerm > leaderTerm`
+        // fence in AppendLogsCoreAsync against a deposed leader still replicating at its old term.
+        // Gating adoption on `nodeState != Follower` (the original B2a scope) left a hole: a FOLLOWER
+        // that granted a higher-term vote kept its in-memory term at the old value and went on ACKing
+        // the deposed leader's appends — handing it a phantom quorum that kept committing acknowledged
+        // writes the new leader then overwrote (observed as a Jepsen linearizability violation; the
+        // grant path already persisted the new term to hard state, so a restart fenced correctly while
+        // the live node did not). Only the leader/candidate step-down bookkeeping stays gated on state;
+        // a follower keeps its (now old-term) leader knowledge until the new term's real leader
+        // announces itself via AppendLogs. The vote target is left to the grant path below, which may
+        // still deny on log-freshness — the term adoption happens either way.
+        if (voteTerm > currentTerm)
         {
-            logger.LogInfoSteppingDownOnHigherVoteTerm(
-                host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm, currentTerm);
+            bool stepDown = nodeState != RaftNodeState.Follower;
 
-            nodeState = RaftNodeState.Follower;
-            host.Leader = "";
+            if (stepDown)
+            {
+                logger.LogInfoSteppingDownOnHigherVoteTerm(
+                    host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, voteTerm, currentTerm);
+
+                // Mirrors the step-down in the AppendLogs path, except no leader is adopted (a vote
+                // request does not identify a leader).
+                nodeState = RaftNodeState.Follower;
+                host.Leader = "";
+                lastCommitIndexes.Clear();
+                nextIndex.Clear();
+                matchIndex.Clear();
+                regressedFrontiers.Clear();
+                localCommittedIndex = -1;
+                FailAllActiveProposalWaiters();
+                activeProposals.Clear();
+            }
+
             currentTerm = voteTerm;
-            lastCommitIndexes.Clear();
-            nextIndex.Clear();
-            matchIndex.Clear();
-            regressedFrontiers.Clear();
-            localCommittedIndex = -1;
-            FailAllActiveProposalWaiters();
-            activeProposals.Clear();
+
+            // An open pre-vote round targets `oldTerm + 1`, which the adopted term makes stale — and a
+            // follower CAN have one open (pre-vote runs in Follower state), so this must not be gated
+            // on the step-down. Without it a completing round could promote to a disruptive election
+            // against the very candidate we may be about to vote for. Mirrors the reset in the
+            // AppendLogs leader-adoption path.
             ResetPreVoteRound();
 
-            await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
+            if (stepDown)
+                await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
 
             // B2b: the higher term is adopted here even if we go on to DENY this candidate below (on
             // log-freshness), so persist it now with no vote yet — otherwise a crash after step-down but
