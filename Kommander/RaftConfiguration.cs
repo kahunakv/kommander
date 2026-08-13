@@ -692,6 +692,27 @@ public class RaftConfiguration
     public int BackfillThreshold { get; set; } = 10;
 
     /// <summary>
+    /// How long a leader stops sending backfill batches to a peer after that peer reports
+    /// <see cref="Data.RaftOperationStatus.FollowerWalSaturated"/>. Default 1 s.
+    /// </summary>
+    /// <remarks>
+    /// Without this the saturation status is information the leader never acts on, and
+    /// answering a full queue is no better than throwing at it: the follower rejects exactly
+    /// as fast as the leader re-sends, the queue never gets an interval in which to drain, and
+    /// the follower does not converge even after the workload stops. A measured run showed an
+    /// *idle*, fully healed cluster accelerating from ~1,000 to ~7,800 rejected batches per
+    /// minute over three minutes, peaking at 2,365 in one second, while no replica advanced a
+    /// single log index.
+    ///
+    /// Only entry-carrying backfill is suppressed. Heartbeats continue, because they are what
+    /// hold leadership and suppressing them would trade a stalled follower for an election.
+    /// The window wants to be long enough for the WAL queue to drain a meaningful part of
+    /// <see cref="MaxWalQueueDepthPerPartition"/> and short enough not to delay a genuine
+    /// catch-up; a second is roughly a heartbeat pair and errs toward the latter.
+    /// </remarks>
+    public TimeSpan FollowerSaturationBackoff { get; set; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>
     /// Maximum number of committed entries shipped to a single stale follower per
     /// heartbeat interval. Bounds the per-round WAL read and network payload so that
     /// backfill cannot starve concurrent client writes. Default 128.

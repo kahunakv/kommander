@@ -46,6 +46,21 @@ public sealed class RaftPartitionStateMachine
     /// (<c>matchIndex[peer] == leaderMaxLog</c>).
     /// </summary>
     private readonly Dictionary<string, long> matchIndex = [];
+    /// <summary>
+    /// Per-follower backfill cooldown: the monotonic tick before which this leader will not
+    /// send another entry-carrying batch to that peer, set when the peer reports
+    /// <see cref="RaftOperationStatus.FollowerWalSaturated"/>.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately *not* cleared on a leader transition, unlike <see cref="nextIndex"/> and
+    /// <see cref="matchIndex"/>. Those are Raft state and a stale value is a correctness
+    /// hazard; this is a transient throttle whose entries are absolute deadlines, so a stale
+    /// one expires on its own within the backoff window and can at worst delay one batch. The
+    /// alternative — clearing it at all thirteen sites that reset peer progress — buys nothing
+    /// and is one forgotten site away from a bug.
+    /// </remarks>
+    private readonly Dictionary<string, long> backfillPausedUntilTicks = [];
+
     private readonly Dictionary<long, string> expectedLeaders = [];
     private readonly Dictionary<HLCTimestamp, RaftProposalQuorum> activeProposals = [];
 
@@ -62,6 +77,15 @@ public sealed class RaftPartitionStateMachine
     // (single-threaded per partition), so neither field needs synchronization.
     private long lastWalSaturatedLogTicks;
     private int suppressedWalSaturatedLogs;
+
+    // Same throttle on the leader's side of the same conversation. A saturated follower rejects
+    // every batch it is sent, and the leader logged one warning per rejection: 15,484 in a run,
+    // 2,365 within a single second. Keyed on the status so a *different* failure appearing during
+    // a saturation storm is still reported at once rather than swallowed by the window. Only
+    // touched on the executor thread, as above.
+    private RaftOperationStatus? lastLoggedAckStatus;
+    private long lastFailedAckLogTicks;
+    private int suppressedFailedAckLogs;
 
     private readonly Dictionary<long, Scheduling.RaftPendingWalOperation> pendingWalOperations = [];
 
@@ -3077,6 +3101,43 @@ public sealed class RaftPartitionStateMachine
     }
 
     /// <summary>
+    /// Reports a failed AppendLogs acknowledgement, collapsing consecutive acks carrying the
+    /// same status into one line per second with the count suppressed since the last.
+    /// </summary>
+    /// <remarks>
+    /// The leader mirror of <see cref="LogWalSaturated"/>, and it exists for the same reason: a
+    /// follower that cannot accept a batch cannot accept the next one either, so the failure
+    /// arrives once per attempt and the attempts are frequent. Keyed on the status so a new
+    /// kind of failure during a storm is still surfaced immediately.
+    /// </remarks>
+    private void LogFailedAppendAck(RaftOperationStatus status, string endpoint, HLCTimestamp timestamp, long committedIndex)
+    {
+        long now = Stopwatch.GetTimestamp();
+
+        if (lastLoggedAckStatus == status && (now - lastFailedAckLogTicks) < Stopwatch.Frequency)
+        {
+            suppressedFailedAckLogs++;
+            return;
+        }
+
+        logger.LogWarning(
+            "[{LocalEndpoint}/{PartitionId}/{State}] Got {Status} from {Endpoint} Timestamp={Timestamp} CommittedIndex={CommittedIndex} suppressedSinceLastLine={Suppressed}",
+            host.LocalEndpoint,
+            host.PartitionId,
+            nodeState,
+            status,
+            endpoint,
+            timestamp,
+            committedIndex,
+            suppressedFailedAckLogs
+        );
+
+        lastLoggedAckStatus   = status;
+        lastFailedAckLogTicks = now;
+        suppressedFailedAckLogs = 0;
+    }
+
+    /// <summary>
     /// Replicates logs to other nodes in the cluster when the node is the leader.
     /// </summary>
     /// <param name="logs"></param>
@@ -3622,6 +3683,25 @@ public sealed class RaftPartitionStateMachine
         bool anchorToFollowerFrontier = false,
         BackfillRoundBatches? round = null)
     {
+        // Saturation backoff. This peer refused a batch because its WAL queue was full, and it
+        // needs an interval in which to drain before another one arrives. Checked here rather
+        // than at the call sites because this is the single choke point every entry-carrying
+        // batch passes through — the heartbeat round, the ack fast-path re-supply, and the
+        // forced heartbeat that follows every leadership publication all funnel into it. That
+        // last one matters: the observed storm was driven by election churn, not by a timer, so
+        // a throttle attached to the heartbeat interval would not have caught it.
+        //
+        // Returning false is the same answer this method gives when the WAL read comes back
+        // empty: nothing was sent. Callers already treat that as "no batch this round" and try
+        // again later, which is exactly the desired behaviour.
+        if (backfillPausedUntilTicks.TryGetValue(node.Endpoint, out long pausedUntil))
+        {
+            if (host.GetMonotonicTimestamp() < pausedUntil)
+                return false;
+
+            backfillPausedUntilTicks.Remove(node.Endpoint);
+        }
+
         long from = !anchorToFollowerFrontier && nextIndex.TryGetValue(node.Endpoint, out long ni) && ni <= localCommittedIndex
             ? ni
             : followerMaxLog + 1;
@@ -3780,16 +3860,17 @@ public sealed class RaftPartitionStateMachine
 
         if (status != RaftOperationStatus.Success)
         {
-            logger.LogWarning(
-                "[{LocalEndpoint}/{PartitionId}/{State}] Got {Status} from {Endpoint} Timestamp={Timestamp} CommittedIndex={CommittedIndex}",
-                host.LocalEndpoint,
-                host.PartitionId,
-                nodeState,
-                status,
-                endpoint,
-                timestamp,
-                committedIndex
-            );
+            // A saturated follower is the one rejection that must change the leader's behaviour
+            // rather than just its logs. Every other status here is a condition the next batch
+            // might resolve; this one is the follower saying it has no room, so re-sending
+            // immediately is what keeps it from ever having room. Pause entry-carrying backfill
+            // to this peer for a window and let its queue drain.
+            if (status == RaftOperationStatus.FollowerWalSaturated)
+                backfillPausedUntilTicks[endpoint] =
+                    host.GetMonotonicTimestamp()
+                    + (long)(host.Configuration.FollowerSaturationBackoff.TotalSeconds * Stopwatch.Frequency);
+
+            LogFailedAppendAck(status, endpoint, timestamp, committedIndex);
 
             return;
         }
