@@ -631,6 +631,31 @@ public sealed class RaftPartitionStateMachine
         if (readIndexRound is not null || readIndexPendingWaiters.Count > 0 || readIndexApplyWaiters.Count > 0)
             await ExpireReadIndexWaitersAsync(nowTicks).ConfigureAwait(false);
 
+        // Retry a withheld committed drain. DrainCommittedAppliesAsync stops without delivering
+        // when the next id is absent above the snapshot floor or is still Proposed — correct, since
+        // delivering past it would skip it — on the understanding that a later drain picks the
+        // entries up. On a follower the *only* thing that starts a drain is a WAL write completing
+        // for this partition, and that is precisely what stops arriving: the leader ships entries
+        // until the follower's commit index catches up, which happens whether or not anything was
+        // applied, and from then on sends empty heartbeats that enqueue no write and complete
+        // nothing. The blocking condition clears with nothing left to notice, and the applied
+        // frontier stays where it stopped for good.
+        //
+        // Observed in Jepsen run 31750742525 as a node holding 74 entries having delivered none of
+        // them, while the leader correctly computed gap=0 from the commit index that follower
+        // itself reported. Every one of the 889 losses in that run was of this kind.
+        //
+        // Leaders are excluded: their mid-tenure delivery runs through CompleteLeaderCommit and the
+        // deferred-applies buffer, and a second drain racing that is how the finding-1 hole was
+        // created in the first place. This is a no-op when the frontier is already covered.
+        if (nodeState != RaftNodeState.Leader)
+        {
+            long commitFrontier = wal.GetCommitIndex();
+
+            if (commitFrontier > lastAppliedIndex)
+                await DrainCommittedAppliesAsync(commitFrontier).ConfigureAwait(false);
+        }
+
         switch (nodeState)
         {
             // if node is leader just send hearthbeats every Configuration.HeartbeatInterval
