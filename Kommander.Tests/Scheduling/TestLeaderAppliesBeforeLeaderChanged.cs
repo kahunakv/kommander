@@ -598,6 +598,14 @@ public class TestLeaderAppliesBeforeLeaderChanged
     /// Current-term Proposed entries that have NOT yet been committed (still in-flight)
     /// must NOT be applied during the inherited-entry drain.  Only prior-term Proposed
     /// entries are eligible.
+    ///
+    /// <para>The batch committed ABOVE the in-flight entry must be withheld too (deferred
+    /// until the in-flight entry resolves), not applied over it: applying it would advance
+    /// the applied cursor past the in-flight entry, and the exactly-once guard would then
+    /// suppress that entry's own delivery when its commit completes — the leader-only
+    /// applied-sequence hole found by the Jepsen log-append workload. The full
+    /// deferral-and-flush flow is covered in <c>TestLeaderOutOfOrderCommitApplies</c>;
+    /// here the in-flight entry never resolves, so the batch stays withheld.</para>
     /// </summary>
     [Fact]
     public async Task PromotedLeader_DoesNotApply_CurrentTermInFlightProposals()
@@ -627,10 +635,13 @@ public class TestLeaderAppliesBeforeLeaderChanged
         await sm.CompleteWalOperationAsync(MakeCommitCompletion(host.PartitionId, minLogIndex: 3, maxLogIndex: 3));
 
         // Only entry 1 (term 0 < currentTerm 1) should have been applied from the gap.
-        // Entry 2 (term 1 == currentTerm) must NOT be applied.
+        // Entry 2 (term 1 == currentTerm) must NOT be applied — it is an in-flight proposal.
+        // Entry 3 must be withheld (deferred) rather than applied over the in-flight entry 2:
+        // delivering it would advance the applied cursor past 2 and permanently suppress 2's
+        // own apply when its commit later completes.
         Assert.Contains("Applied:1", host.EventLog);
         Assert.DoesNotContain("Applied:2", host.EventLog);
-        Assert.Contains("Applied:3", host.EventLog);
+        Assert.DoesNotContain("Applied:3", host.EventLog);
     }
 
     // ── System-partition self-apply tests ──────────────────────────────────────

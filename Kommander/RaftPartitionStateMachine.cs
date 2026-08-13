@@ -238,6 +238,29 @@ public sealed class RaftPartitionStateMachine
     private long lastAppliedIndex = -1;
 
     /// <summary>
+    /// Leader batches whose WAL completion arrived while an earlier current-term proposal was
+    /// still unresolved below them, keyed by the batch's lowest log id. With pipelined proposals,
+    /// quorum acks complete in network order, not log order: a later proposal can commit while an
+    /// earlier one is still in flight. Delivering the later batch immediately would advance
+    /// <see cref="lastAppliedIndex"/> over the in-flight entry, and the exactly-once guard in
+    /// <see cref="ApplyLogToConsumerAsync"/> would then suppress that entry's own delivery forever —
+    /// a permanent hole in the leader's applied sequence (the Jepsen Log Matching violation).
+    /// Batches parked here are flushed in id order by <see cref="FlushDeferredLeaderAppliesAsync"/>
+    /// as the blocking proposals resolve (commit or rollback).
+    /// </summary>
+    private readonly SortedDictionary<long, List<RaftLog>> deferredLeaderApplies = [];
+
+    /// <summary>
+    /// Term the entries in <see cref="deferredLeaderApplies"/> were deferred in. A term change
+    /// invalidates the buffer: after a step-down the WAL-based drains (follower append or the next
+    /// promotion) own in-order delivery, and a rolled-back id from the stale tenure could be
+    /// re-proposed with a different payload, so flushing stale advance-only ranges would skip real
+    /// entries. Checked lazily on every defer/flush rather than at each of the many
+    /// leader→follower transition sites.
+    /// </summary>
+    private long deferredLeaderAppliesTerm = -1;
+
+    /// <summary>
     /// Ticket of the in-flight promotion-barrier no-op, or <see cref="HLCTimestamp.Zero"/> when no
     /// barrier is pending. Armed by <see cref="BecomeLeaderAsync"/> when the election winner's WAL
     /// holds entries above the known commit frontier (inherited prior-term entries whose commit
@@ -1379,15 +1402,24 @@ public sealed class RaftPartitionStateMachine
     /// Proposed entries (whose lazy-commit markers may be absent after a crash on the
     /// single-fsync fast path) are visible.</para>
     ///
-    /// <para><b>Gap contract:</b> returns <see langword="false"/> when an id in the range is absent
-    /// above the snapshot floor — a WAL hole. Advancing over it (the old behavior) would silently
-    /// skip entries that may be committed elsewhere and mark them applied forever, leaving the
-    /// consumer projection permanently incomplete on this node. The caller must not treat a
-    /// <see langword="false"/> drain as proof of projection completeness (the barrier completion
+    /// <para><b>Gap contract:</b> returns <see cref="InheritedDrainStatus.Hole"/> when an id in the
+    /// range is absent above the snapshot floor — a WAL hole. Advancing over it (the old behavior)
+    /// would silently skip entries that may be committed elsewhere and mark them applied forever,
+    /// leaving the consumer projection permanently incomplete on this node. The caller must not
+    /// treat a <c>Hole</c> drain as proof of projection completeness (the barrier completion
     /// reverts the promotion). Ids at/below the floor were compacted and are accepted, exactly as
     /// in <see cref="DrainCommittedAppliesAsync"/>.</para>
+    ///
+    /// <para><b>In-flight contract:</b> returns <see cref="InheritedDrainStatus.BlockedByInFlight"/>
+    /// (without advancing the cursor) when it reaches a current-term <c>Proposed</c> entry. That is
+    /// not an inherited orphan but a pipelined proposal still awaiting quorum, and its own
+    /// commit/rollback completion delivers it. Advancing the cursor over it here would make that
+    /// later delivery hit the exactly-once guard in <see cref="ApplyLogToConsumerAsync"/> and skip
+    /// the entry permanently — the leader-only applied-sequence hole found by Jepsen. This applies
+    /// even with <paramref name="skipGaps"/>: a sole voter's in-flight proposals still resolve via
+    /// self-quorum, so they must not be advanced over either.</para>
     /// </summary>
-    private async Task<bool> DrainInheritedAppliesAsync(long from, long upToIndex, bool skipGaps = false)
+    private async Task<InheritedDrainStatus> DrainInheritedAppliesAsync(long from, long upToIndex, bool skipGaps = false)
     {
         const int BatchSize = 512;
         long expected = from;
@@ -1401,7 +1433,7 @@ public sealed class RaftPartitionStateMachine
             foreach (RaftLog log in batch)
             {
                 if (log.Id > upToIndex)
-                    return true;
+                    return InheritedDrainStatus.Covered;
 
                 if (log.Id > expected && !skipGaps)
                 {
@@ -1410,10 +1442,17 @@ public sealed class RaftPartitionStateMachine
                     {
                         logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Inherited-entry drain found a WAL hole: expected {Expected}, next present {Present} (floor {Floor}).",
                             host.LocalEndpoint, host.PartitionId, nodeState, expected, log.Id, floor);
-                        return false;
+                        return InheritedDrainStatus.Hole;
                     }
                     // Compacted below the floor: accept this entry as the next contiguous delivery.
                 }
+
+                // A current-term unresolved entry is a pipelined proposal still in flight, not an
+                // inherited orphan: stop without advancing the cursor over it (see the in-flight
+                // contract in the summary). The caller defers its batch until this entry resolves.
+                if (log.Type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint && log.Term >= currentTerm)
+                    return InheritedDrainStatus.BlockedByInFlight;
+
                 expected = log.Id + 1;
 
                 // Apply committed entries and inherited Proposed entries (prior term only).
@@ -1465,12 +1504,93 @@ public sealed class RaftPartitionStateMachine
             {
                 logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Inherited-entry drain missing the range tail: expected through {UpToIndex}, present through {Expected} (floor {Floor}).",
                     host.LocalEndpoint, host.PartitionId, nodeState, upToIndex, expected - 1, floor);
-                return false;
+                return InheritedDrainStatus.Hole;
             }
         }
 
         CompleteReadIndexApplyWaiters();
-        return true;
+        return InheritedDrainStatus.Covered;
+    }
+
+    /// <summary>
+    /// Result of <see cref="DrainInheritedAppliesAsync"/>. The three outcomes demand different
+    /// caller responses, which is why this is not a bool: <see cref="Hole"/> is retryable (a write
+    /// may still be queued behind the read) and disqualifying if it persists, while
+    /// <see cref="BlockedByInFlight"/> is neither — retrying cannot resolve an in-flight proposal
+    /// (its own completion does), and treating it as disqualifying would step the leader down on
+    /// ordinary pipelined load.
+    /// </summary>
+    private enum InheritedDrainStatus
+    {
+        /// <summary>The cursor covers the requested range; the caller's batch can be applied.</summary>
+        Covered,
+
+        /// <summary>An id in the range is absent above the snapshot floor — a genuine WAL hole or a
+        /// write still queued in the WAL scheduler; indistinguishable from the read side.</summary>
+        Hole,
+
+        /// <summary>The drain reached a current-term Proposed entry: a pipelined proposal still in
+        /// flight. The cursor was NOT advanced over it; the caller must defer its batch via
+        /// <see cref="DeferLeaderApplies"/> until the in-flight entry resolves.</summary>
+        BlockedByInFlight,
+    }
+
+    /// <summary>
+    /// Parks a leader batch (committed or rolled-back entries) whose completion arrived while an
+    /// earlier current-term proposal was still unresolved below it. Flushed in id order by
+    /// <see cref="FlushDeferredLeaderAppliesAsync"/> once the applied cursor reaches the batch.
+    /// Copies the list: proposals and their pending-operation envelopes are pooled, so retaining
+    /// <c>proposal.Logs</c> itself would alias a buffer that gets recycled. The <see cref="RaftLog"/>
+    /// instances are safe to retain (not pooled), and <see cref="RaftWriteAhead.EnqueueCommit"/> /
+    /// <c>EnqueueRollback</c> already stamped their final types, so a later flush delivers (or
+    /// advances over) them correctly.
+    /// </summary>
+    private void DeferLeaderApplies(long minLogIndex, List<RaftLog> logs)
+    {
+        if (deferredLeaderAppliesTerm != currentTerm)
+        {
+            deferredLeaderApplies.Clear();
+            deferredLeaderAppliesTerm = currentTerm;
+        }
+
+        deferredLeaderApplies[minLogIndex] = new List<RaftLog>(logs);
+
+        if (logger.IsEnabled(LogLevel.Debug))
+            logger.LogDebug("[{LocalEndpoint}/{PartitionId}/{State}] Deferring apply of batch starting at {MinLogIndex}: an earlier proposal below it is still in flight (applied cursor {LastApplied}).",
+                host.LocalEndpoint, host.PartitionId, nodeState, minLogIndex, lastAppliedIndex);
+    }
+
+    /// <summary>
+    /// Delivers deferred out-of-order leader batches that have become contiguous with the applied
+    /// cursor, in id order. Called wherever the leader path advances the cursor (commit and
+    /// rollback completions): the batch just applied may have been the in-flight blocker that
+    /// earlier out-of-order completions deferred behind. Per-log exactly-once is preserved by the
+    /// cursor guard inside <see cref="ApplyLogToConsumerAsync"/>. Clears the buffer wholesale when
+    /// the term has moved on — the WAL-based drains own delivery after a step-down, and a stale
+    /// rolled-back range could since have been re-proposed at the same ids.
+    /// </summary>
+    private async ValueTask FlushDeferredLeaderAppliesAsync()
+    {
+        if (deferredLeaderApplies.Count == 0)
+            return;
+
+        if (deferredLeaderAppliesTerm != currentTerm)
+        {
+            deferredLeaderApplies.Clear();
+            return;
+        }
+
+        while (deferredLeaderApplies.Count > 0)
+        {
+            KeyValuePair<long, List<RaftLog>> next = deferredLeaderApplies.First();
+            if (next.Key > lastAppliedIndex + 1)
+                break;
+
+            deferredLeaderApplies.Remove(next.Key);
+
+            foreach (RaftLog log in next.Value)
+                await ApplyLogToConsumerAsync(log).ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -3975,6 +4095,14 @@ public sealed class RaftPartitionStateMachine
     /// that have no local proposal waiter on this node and would otherwise be silently absent
     /// from the leader's consumer state.
     /// </para>
+    /// <para>
+    /// Applies are strictly in log order, exactly like the follower path. Pipelined proposals
+    /// reach quorum in network order, so this completion can arrive while an earlier proposal is
+    /// still in flight below it; the batch is then deferred (<see cref="DeferLeaderApplies"/>)
+    /// rather than applied, because applying it would advance the cursor over the in-flight entry
+    /// and permanently suppress its later delivery. The blocker's own completion flushes deferred
+    /// batches in order via <see cref="FlushDeferredLeaderAppliesAsync"/>.
+    /// </para>
     /// </summary>
     private async Task CompleteLeaderCommit(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
@@ -4017,7 +4145,7 @@ public sealed class RaftPartitionStateMachine
         // They have no local proposal waiter and were never delivered via CompleteFollowerAppend,
         // so the leader's consumer would silently miss them without this drain.
         long inheritedEnd = completion.MinLogIndex - 1;
-        bool inheritedDrainComplete = true;
+        InheritedDrainStatus drainStatus = InheritedDrainStatus.Covered;
         if (inheritedEnd >= 0 && inheritedEnd > lastAppliedIndex)
         {
             // Reads race the WAL write queue on the leader too: with pipelined proposals, an
@@ -4025,8 +4153,9 @@ public sealed class RaftPartitionStateMachine
             // completion's drain reads the backend, and the absent id is indistinguishable from a
             // real hole. Retry until the writes land and the drain covers the range, bounded by
             // the barrier timeout — stepping down on a transient read gap would churn leadership
-            // under ordinary pipelined load. The loop exits as soon as the range is covered, so
-            // the common case adds no latency.
+            // under ordinary pipelined load. The loop exits as soon as the range is covered (or
+            // the drain hits a current-term in-flight proposal, which retrying cannot resolve),
+            // so the common case adds no latency.
             // Same bounds as the promotion drain: a sole voter only needs its own write queue to
             // drain, so its bound is short; with voter peers the full barrier timeout is worth
             // spending before stepping down.
@@ -4034,8 +4163,8 @@ public sealed class RaftPartitionStateMachine
             TimeSpan inheritedDrainBound = drainHasVoterPeers ? host.Configuration.LeadershipBarrierTimeout : TimeSpan.FromMilliseconds(250);
             long drainStartTicks = Stopwatch.GetTimestamp();
 
-            while (!(inheritedDrainComplete =
-                       await DrainInheritedAppliesAsync(lastAppliedIndex + 1, inheritedEnd).ConfigureAwait(false)))
+            while ((drainStatus =
+                       await DrainInheritedAppliesAsync(lastAppliedIndex + 1, inheritedEnd).ConfigureAwait(false)) == InheritedDrainStatus.Hole)
             {
                 if (Stopwatch.GetElapsedTime(drainStartTicks) > inheritedDrainBound)
                 {
@@ -4048,9 +4177,10 @@ public sealed class RaftPartitionStateMachine
                             host.LocalEndpoint, host.PartitionId, nodeState);
 
                         // Deliver everything this survivor DOES hold past the gap, so only the
-                        // genuinely absent entries are lost rather than the whole suffix.
-                        await DrainInheritedAppliesAsync(lastAppliedIndex + 1, inheritedEnd, skipGaps: true).ConfigureAwait(false);
-                        inheritedDrainComplete = true;
+                        // genuinely absent entries are lost rather than the whole suffix. The
+                        // skip-gaps drain still stops at a current-term in-flight proposal
+                        // (self-quorum resolves those), so it reports Covered or BlockedByInFlight.
+                        drainStatus = await DrainInheritedAppliesAsync(lastAppliedIndex + 1, inheritedEnd, skipGaps: true).ConfigureAwait(false);
                     }
 
                     break;
@@ -4061,14 +4191,31 @@ public sealed class RaftPartitionStateMachine
         }
 
         // Apply committed consumer entries to the local state machine. Mirrors the apply loop
-        // in CompleteFollowerAppend so the leader's consumer projection stays in sync. When the
-        // inherited drain could not cover its range, delivering this batch would advance the
-        // apply cursor over the withheld entries and orphan them permanently — skip it; this
-        // leader steps down below and the next leader (or a later drain) delivers everything in
-        // order.
-        if (inheritedDrainComplete)
-            foreach (RaftLog log in proposal.Logs)
-                await ApplyLogToConsumerAsync(log).ConfigureAwait(false);
+        // in CompleteFollowerAppend so the leader's consumer projection stays in sync — including
+        // its in-order discipline:
+        //   * Covered — the cursor is contiguous up to this batch: apply it, then flush any
+        //     out-of-order batches that deferred behind an entry this batch just resolved.
+        //   * BlockedByInFlight — an earlier pipelined proposal is still awaiting quorum below
+        //     this batch. Applying now would advance the cursor over that entry and its own
+        //     completion would then be suppressed by the exactly-once guard, silently skipping a
+        //     committed, client-acknowledged write on the leader alone (the Jepsen hole). Defer
+        //     this batch; the blocker's completion flushes it in order.
+        //   * Hole — delivering would advance the cursor over withheld entries and orphan them
+        //     permanently: skip; this leader steps down below and the next leader (or a later
+        //     drain) delivers everything in order.
+        switch (drainStatus)
+        {
+            case InheritedDrainStatus.Covered:
+                foreach (RaftLog log in proposal.Logs)
+                    await ApplyLogToConsumerAsync(log).ConfigureAwait(false);
+
+                await FlushDeferredLeaderAppliesAsync().ConfigureAwait(false);
+                break;
+
+            case InheritedDrainStatus.BlockedByInFlight:
+                DeferLeaderApplies(completion.MinLogIndex, proposal.Logs);
+                break;
+        }
 
         if (logger.IsEnabled(LogLevel.Debug))
             logger.LogDebugCommittedLogs(
@@ -4095,9 +4242,12 @@ public sealed class RaftPartitionStateMachine
 
             if (nodeState == RaftNodeState.Leader && currentTerm == leadershipBarrierTerm)
             {
-                if (!inheritedDrainComplete)
+                // BlockedByInFlight cannot legitimately happen here (the barrier is the first
+                // proposal of the term, so nothing current-term sits below it), but if it ever
+                // does the projection is just as unproven as with a hole: revert either way.
+                if (drainStatus != InheritedDrainStatus.Covered)
                 {
-                    await RevertUnpublishedPromotionAsync("inherited-entry drain found a WAL hole").ConfigureAwait(false);
+                    await RevertUnpublishedPromotionAsync("inherited-entry drain could not cover the pre-barrier range").ConfigureAwait(false);
                 }
                 else
                 {
@@ -4111,14 +4261,15 @@ public sealed class RaftPartitionStateMachine
                 }
             }
         }
-        else if (!inheritedDrainComplete && nodeState == RaftNodeState.Leader)
+        else if (drainStatus == InheritedDrainStatus.Hole && nodeState == RaftNodeState.Leader)
         {
             // A hole below an ORDINARY commit is equally disqualifying: this leader's consumer
             // projection cannot cover the committed range and it is never backfilled, so every
             // grant it serves is minted from incomplete state. Ignoring the incomplete drain here
             // (while the batch apply advanced the cursor) is what silently orphaned the whole
             // inherited range. Step down; the entries this commit made durable are quorum-safe and
-            // the next leader delivers them in order.
+            // the next leader delivers them in order. BlockedByInFlight deliberately does NOT step
+            // down: it is routine pipelining, and its batch was deferred above, not orphaned.
             logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Inherited-entry drain incomplete on a leader commit — stepping down.",
                 host.LocalEndpoint, host.PartitionId, nodeState);
             await RevertUnpublishedPromotionAsync("inherited-entry drain incomplete on a leader commit").ConfigureAwait(false);
@@ -4160,6 +4311,39 @@ public sealed class RaftPartitionStateMachine
         // Same as CompleteLeaderCommit: deliver rollback to all peers, not just quorum voters.
         foreach (RaftNode node in host.Nodes)
             AppendLogToNode(node, ticketId, proposal.Logs, grpcLogCache: grpcLogCache);
+
+        // Resolve the rolled-back range for apply ordering. Rolled-back ids are advance-only for
+        // the applied cursor (ApplyLogToConsumerAsync never delivers non-Committed types), and a
+        // pipelined batch that committed out of order above this range may be parked in
+        // deferredLeaderApplies waiting for it — without this, that batch would only flush when a
+        // later commit's inherited drain happened to read the rollback markers back from the WAL.
+        // Uses the same drain gate as CompleteLeaderCommit so the pre-first-id sentinel and
+        // compacted prefixes are classified by the snapshot floor, not by naive contiguity, but
+        // with a single attempt and no step-down: a rollback is not a serving decision, so on
+        // Hole (a write still queued behind the read) we simply leave the range for a later
+        // commit's retrying drain instead of stalling this completion.
+        // Term-fenced by CompleteWalOperationAsync, so a stale tenure's rollback never runs this.
+        if (nodeState == RaftNodeState.Leader && proposal.Logs.Count > 0 && completion.MinLogIndex >= 0)
+        {
+            long rolledBackInheritedEnd = completion.MinLogIndex - 1;
+            InheritedDrainStatus rollbackDrainStatus = InheritedDrainStatus.Covered;
+            if (rolledBackInheritedEnd >= 0 && rolledBackInheritedEnd > lastAppliedIndex)
+                rollbackDrainStatus = await DrainInheritedAppliesAsync(lastAppliedIndex + 1, rolledBackInheritedEnd).ConfigureAwait(false);
+
+            switch (rollbackDrainStatus)
+            {
+                case InheritedDrainStatus.Covered:
+                    foreach (RaftLog log in proposal.Logs)
+                        await ApplyLogToConsumerAsync(log).ConfigureAwait(false);
+
+                    await FlushDeferredLeaderAppliesAsync().ConfigureAwait(false);
+                    break;
+
+                case InheritedDrainStatus.BlockedByInFlight:
+                    DeferLeaderApplies(completion.MinLogIndex, proposal.Logs);
+                    break;
+            }
+        }
 
         if (logger.IsEnabled(LogLevel.Debug))
             logger.LogDebugRolledbackLogs(
