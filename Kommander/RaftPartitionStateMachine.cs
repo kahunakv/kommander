@@ -54,6 +54,15 @@ public sealed class RaftPartitionStateMachine
     // so it needs no synchronization; always cleared before use.
     private readonly List<HLCTimestamp> settledProposalScratch = [];
 
+    // WAL-saturation log throttle. A saturated partition rejects every inbound append, so the
+    // condition is worth one line a second carrying a count, not one line per rejection: the log
+    // is I/O contending with the very WAL writes whose slowness caused the saturation, so logging
+    // each occurrence makes the condition it reports worse. 0 means "never logged" (mirrors the
+    // Stopwatch-tick convention used elsewhere in this class). Only touched on the executor thread
+    // (single-threaded per partition), so neither field needs synchronization.
+    private long lastWalSaturatedLogTicks;
+    private int suppressedWalSaturatedLogs;
+
     private readonly Dictionary<long, Scheduling.RaftPendingWalOperation> pendingWalOperations = [];
 
     // Per-instance pool for the pending-WAL-op metadata objects. Rented on insert, returned once the
@@ -2944,7 +2953,37 @@ public sealed class RaftPartitionStateMachine
                     string.Join(',', logs.Select(x => x.Id.ToString()))
                 );
 
-            WALWriteOperation? operation = wal.EnqueueProposeOrCommit(logs, timestamp, endpoint, leaderTerm);
+            WALWriteOperation? operation;
+
+            try
+            {
+                operation = wal.EnqueueProposeOrCommit(logs, timestamp, endpoint, leaderTerm);
+            }
+            catch (WAL.IO.BackpressureExceededException ex)
+            {
+                // The WAL queue for this partition is full, so these entries were not
+                // accepted. Answer the leader instead of letting the exception escape to
+                // the executor's catch-all: an unanswered append is indistinguishable from
+                // a dropped message, so the leader re-sends on its next tick with no idea
+                // the follower is saturated — and each escaped exception also costs a
+                // logged stack trace, which is I/O this node is already short of.
+                //
+                // Reporting the local max lets the leader anchor its next attempt without
+                // walking nextIndex backwards, exactly as the Log Matching rejections above
+                // do. nextIndex is deliberately not advanced by this status on the leader,
+                // so the retry rides the normal heartbeat/backfill cadence rather than
+                // spinning against a queue that never gets a chance to drain.
+                long saturatedMax = await wal.GetMaxLogAsync().ConfigureAwait(false);
+
+                LogWalSaturated(endpoint, ex.CurrentDepth, saturatedMax);
+
+                host.EnqueueResponse(endpoint, new(
+                    RaftResponderRequestType.CompleteAppendLogs,
+                    new(endpoint),
+                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.FollowerWalSaturated, saturatedMax)
+                ));
+                return;
+            }
 
             if (operation is not null)
             {
@@ -2996,6 +3035,45 @@ public sealed class RaftPartitionStateMachine
         ));
 
         CompleteReply(replyCorrelationId, RaftResponseStatic.NoneResponse);
+    }
+
+    /// <summary>
+    /// Reports that this follower rejected a replicated batch because its WAL queue is full,
+    /// at most once per second per partition and carrying the count suppressed since the last
+    /// line.
+    /// </summary>
+    /// <remarks>
+    /// Throttled deliberately. Saturation rejects on every inbound append, so a per-occurrence
+    /// log turns one slow disk into a second, larger source of disk pressure — the amplification
+    /// is not hypothetical: a run that logged each rejection with a stack trace produced 238k
+    /// entries and a 251 MB log on a single node. Aggregating loses nothing that matters here,
+    /// because the useful facts are that the partition is saturated and roughly how hard, not
+    /// the identity of any individual rejected batch.
+    /// </remarks>
+    private void LogWalSaturated(string endpoint, int depth, long localMaxLog)
+    {
+        long now = Stopwatch.GetTimestamp();
+
+        if (lastWalSaturatedLogTicks != 0 && (now - lastWalSaturatedLogTicks) < Stopwatch.Frequency)
+        {
+            suppressedWalSaturatedLogs++;
+            return;
+        }
+
+        lastWalSaturatedLogTicks = now;
+
+        logger.LogWarning(
+            "[{LocalEndpoint}/{PartitionId}/{State}] WAL saturated, rejecting append from {Endpoint}: depth={Depth} localMaxLog={LocalMaxLog} suppressedSinceLastLine={Suppressed}",
+            host.LocalEndpoint,
+            host.PartitionId,
+            nodeState,
+            endpoint,
+            depth,
+            localMaxLog,
+            suppressedWalSaturatedLogs
+        );
+
+        suppressedWalSaturatedLogs = 0;
     }
 
     /// <summary>

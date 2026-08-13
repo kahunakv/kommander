@@ -205,6 +205,17 @@ public sealed class RaftPartitionExecutor : IDisposable
 
     // Reply correlation: maps correlationId -> PendingOperation that expects a reply.
     private readonly Dictionary<ulong, PendingOperation> _pendingReplies = [];
+
+    // Repeat-exception log throttle for the catch-all in ExecuteOneAsync. That handler logs a full
+    // stack trace per failed operation, which turns one persistently failing operation into a second,
+    // independent problem: a saturated-WAL run wrote 238k stack traces and a 251 MB log on a node
+    // whose actual fault was that it could not keep up with disk writes, so the logging competed for
+    // the very resource that was short. The first occurrence of each exception type is still logged
+    // in full — that is the copy with diagnostic value — and identical consecutive repeats collapse
+    // into one line per second carrying a count. Touched only under _runLock, like _pendingReplies.
+    private string? _lastLoggedExceptionType;
+    private long _lastExceptionLogTicks;
+    private int _suppressedExceptionLogs;
     private ulong _nextCorrelationId = 1;
 
     // Batch scratch list to avoid per-drain allocations.
@@ -1102,9 +1113,7 @@ public sealed class RaftPartitionExecutor : IDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogError(
-                "[RaftPartitionExecutor/{PartitionId}] {Name}: {Message}\n{StackTrace}",
-                _partitionId, ex.GetType().Name, ex.Message, ex.StackTrace);
+            LogOperationFailure(ex);
 
             // If restore Phase 2 itself throws, fault the restore task so waiters don't block.
             if (request.Type == RaftRequestType.RestoreLogsLoaded)
@@ -1127,6 +1136,42 @@ public sealed class RaftPartitionExecutor : IDisposable
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Logs an operation failure, collapsing consecutive failures of the same exception type
+    /// into one line per second carrying the number suppressed since the last line.
+    /// </summary>
+    /// <remarks>
+    /// The first failure of a given type is always logged with its stack trace, so the copy that
+    /// carries diagnostic value is never the one dropped. What is dropped is the two-hundred-
+    /// thousandth repeat of a trace already on record — which is not free, because writing it
+    /// costs disk I/O on a node that, in the case this was written for, was failing precisely
+    /// because it could not keep up with disk I/O.
+    ///
+    /// Keyed on the exception type rather than a flat interval so that a *new* fault appearing
+    /// during an ongoing storm is still reported immediately instead of being swallowed by the
+    /// storm's throttle window.
+    /// </remarks>
+    private void LogOperationFailure(Exception ex)
+    {
+        string exceptionType = ex.GetType().Name;
+        long now = Stopwatch.GetTimestamp();
+
+        if (exceptionType == _lastLoggedExceptionType &&
+            (now - _lastExceptionLogTicks) < Stopwatch.Frequency)
+        {
+            _suppressedExceptionLogs++;
+            return;
+        }
+
+        _logger.LogError(
+            "[RaftPartitionExecutor/{PartitionId}] {Name}: {Message} (suppressedSinceLastLine={Suppressed})\n{StackTrace}",
+            _partitionId, exceptionType, ex.Message, _suppressedExceptionLogs, ex.StackTrace);
+
+        _lastLoggedExceptionType = exceptionType;
+        _lastExceptionLogTicks   = now;
+        _suppressedExceptionLogs = 0;
     }
 
     /// <summary>

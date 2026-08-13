@@ -102,6 +102,49 @@ public sealed class TestBackpressureAndAdmissionControl
     }
 
     /// <summary>
+    /// A WAL whose queue is permanently full: every replicated batch is refused with
+    /// <see cref="BackpressureExceededException"/>, exactly as <see cref="FairWalScheduler"/>
+    /// does once a partition reaches its depth limit.
+    /// </summary>
+    private sealed class SaturatedWal : IRaftWalFacade
+    {
+        private readonly long _localMaxLog;
+
+        public SaturatedWal(long localMaxLog) => _localMaxLog = localMaxLog;
+
+        public int EnqueueAttempts { get; private set; }
+
+        public WALWriteOperation? EnqueueProposeOrCommit(
+            List<RaftLog>? logs, HLCTimestamp timestamp = default,
+            string? endpoint = null, long term = -1)
+        {
+            EnqueueAttempts++;
+            throw new BackpressureExceededException(partitionId: 0, currentDepth: 4096);
+        }
+
+        public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(_localMaxLog);
+
+        public ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync() => ValueTask.FromResult<IReadOnlyList<RaftLog>>([]);
+        public ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs) => ValueTask.CompletedTask;
+        public ValueTask<long> TruncateLogsAfterAsync(long afterLogId) => ValueTask.FromResult(afterLogId);
+        public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(0L);
+        public ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) => ValueTask.FromResult(new List<RaftLog>());
+        public ValueTask<long> GetAnyTermAtAsync(long logIndex) => ValueTask.FromResult(-1L);
+        public ValueTask<long> GetLastCheckpointAsync() => ValueTask.FromResult(-1L);
+        public long GetCommitIndex() => 0;
+        public void NotifyCommitted() { }
+
+        public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp ts, bool autoCommit)
+            => throw new BackpressureExceededException(partitionId: 0, currentDepth: 4096);
+
+        public WALWriteOperation EnqueueCommit(List<RaftLog> logs)
+            => throw new BackpressureExceededException(partitionId: 0, currentDepth: 4096);
+
+        public WALWriteOperation EnqueueRollback(List<RaftLog> logs)
+            => throw new BackpressureExceededException(partitionId: 0, currentDepth: 4096);
+    }
+
+    /// <summary>
     /// Routes state-machine replies back to the executor so Ask() tasks resolve.
     /// This is the same wiring that <see cref="RaftPartition"/> does in production.
     /// </summary>
@@ -381,6 +424,51 @@ public sealed class TestBackpressureAndAdmissionControl
         Assert.Equal(partitionId, caught!.PartitionId);
         Assert.True(caught.CurrentDepth >= maxDepth,
             $"Expected CurrentDepth >= {maxDepth}, got {caught.CurrentDepth}");
+    }
+
+    /// <summary>
+    /// A follower whose WAL queue is saturated must answer its leader with
+    /// <see cref="RaftOperationStatus.FollowerWalSaturated"/> rather than letting the
+    /// backpressure exception escape.
+    /// </summary>
+    /// <remarks>
+    /// The escape is what makes saturation permanent rather than transient. An append that
+    /// throws produces no reply, and no reply is indistinguishable from a lost message: the
+    /// leader re-sends on its next tick, having learned nothing, and the follower rejects the
+    /// re-send just as fast. Neither side makes progress and the follower never converges —
+    /// observed as a replica still 40+ entries behind after three minutes of a fully healed,
+    /// completely idle cluster. Answering is what converts that livelock into paced retry.
+    /// </remarks>
+    [Fact]
+    public async Task Follower_WhenWalSaturated_AnswersLeaderInsteadOfThrowing()
+    {
+        StubHost host = new(partitionId: 3) { Leader = "leader-node" };
+        SaturatedWal wal = new(localMaxLog: 17);
+        RelayReplySink sink = new();
+
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        // Must not throw: the whole point is that saturation becomes a reply, not an escape.
+        await sm.AppendLogsAsync(
+            endpoint: "leader-node",
+            term: 1,
+            timestamp: host.HybridLogicalClock.TrySendOrLocalEvent(1),
+            logs: [new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed, LogType = "test" }],
+            prevLogIndex: 0,
+            prevLogTerm: 0);
+
+        Assert.Equal(1, wal.EnqueueAttempts);
+
+        (string endpoint, RaftResponderRequest request) = Assert.Single(host.EnqueuedResponses);
+        Assert.Equal("leader-node", endpoint);
+        Assert.Equal(RaftResponderRequestType.CompleteAppendLogs, request.Type);
+
+        CompleteAppendLogsRequest reply = Assert.IsType<CompleteAppendLogsRequest>(request.CompleteAppendLogsRequest);
+        Assert.Equal(RaftOperationStatus.FollowerWalSaturated, reply.Status);
+
+        // The follower's local max, so the leader can anchor its retry without walking
+        // nextIndex backwards one slot at a time.
+        Assert.Equal(17L, reply.CommitIndex);
     }
 
     /// <summary>

@@ -74,4 +74,26 @@ public enum RaftOperationStatus
     /// is a safe idempotent no-op once the executor drains.
     /// </summary>
     OperationCancelled = 19,
+
+    /// <summary>
+    /// A follower's WAL write queue for this partition is saturated, so the replicated
+    /// entries could not be queued for durable write.  Nothing was appended and nothing
+    /// was lost: the leader must re-send this prefix later rather than treat the batch as
+    /// delivered.
+    /// </summary>
+    /// <remarks>
+    /// Distinct from <see cref="ProposalQueueFull"/>, which is *admission* control — a
+    /// leader refusing new client work it has not yet accepted.  This one is a follower
+    /// pushing back on replication it is already obliged to take, and the two need
+    /// opposite responses: shedding a client proposal costs one request, while shedding
+    /// replication costs the cluster a replica until the follower catches up.
+    ///
+    /// A leader must therefore pace its retries after seeing this.  Re-sending
+    /// immediately keeps the follower's queue at the limit and neither side makes
+    /// progress: the follower rejects exactly as fast as the leader retries, and the
+    /// follower never converges even after the workload stops. <c>nextIndex</c> is
+    /// deliberately left untouched on this status so the normal heartbeat/backfill cycle
+    /// re-sends at its own cadence.
+    /// </remarks>
+    FollowerWalSaturated = 20,
 }
