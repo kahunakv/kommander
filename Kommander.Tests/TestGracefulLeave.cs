@@ -1,5 +1,6 @@
 
 using Kommander.Communication.Memory;
+using Kommander.Data;
 using Kommander.Diagnostics;
 using Kommander.Discovery;
 using Kommander.System;
@@ -240,5 +241,131 @@ public sealed class TestGracefulLeave
 
         await n2.LeaveCluster(dispose: true, cancellationToken: ct);
         await n1.LeaveCluster(dispose: true, cancellationToken: ct);
+    }
+
+    // ── Runtime decommission: RequestLeaveAsync ──────────────────────────────
+
+    /// <summary>
+    /// A running node asked to leave reports the committed roster version, the survivors drop it,
+    /// and — unlike <c>LeaveCluster</c> — it is still up afterwards: asking again is idempotent,
+    /// and it must not re-admit itself through auto-rejoin even though it keeps running as a
+    /// non-member observing a roster that excludes it.
+    /// </summary>
+    [Fact]
+    public async Task RequestLeave_CommitsAndLeavesNodeRunning()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        InMemoryCommunication comm = new();
+        RaftManager n1 = MakeNode(comm, "localhost", 9230, 1, ["localhost:9231", "localhost:9232"], _logger);
+        RaftManager n2 = MakeNode(comm, "localhost", 9231, 2, ["localhost:9230", "localhost:9232"], _logger);
+        RaftManager n3 = MakeNode(comm, "localhost", 9232, 3, ["localhost:9230", "localhost:9231"], _logger);
+
+        comm.SetNodes(new Dictionary<string, IRaft>
+        {
+            ["localhost:9230"] = n1,
+            ["localhost:9231"] = n2,
+            ["localhost:9232"] = n3,
+        });
+
+        await n1.UpdateNodes();
+        await n2.UpdateNodes();
+        await n3.UpdateNodes();
+
+        await Task.WhenAll(n1.JoinCluster(ct), n2.JoinCluster(ct), n3.JoinCluster(ct));
+        await WaitForLeader([n1, n2, n3], partitionId: 1, ct);
+
+        await WaitForCondition(
+            () => n1.SystemCoordinator.GetMembership().MembershipVersion > 0 &&
+                  n2.SystemCoordinator.GetMembership().MembershipVersion > 0 &&
+                  n3.SystemCoordinator.GetMembership().MembershipVersion > 0, ct);
+
+        string n3Endpoint = n3.LocalEndpoint;
+        long versionBefore = n1.SystemCoordinator.GetMembership().MembershipVersion;
+
+        LeaveClusterResult result = await n3.RequestLeaveAsync(ct);
+
+        Assert.Equal(LeaveClusterOutcome.Committed, result.Outcome);
+        Assert.True(result.Left);
+        Assert.False(result.Terminal);
+        Assert.True(result.MembershipVersion > versionBefore,
+            $"Expected a roster version above {versionBefore}, got {result.MembershipVersion}.");
+
+        await WaitForCondition(
+            () => !n1.SystemCoordinator.GetMembership().Members.Any(m => m.Endpoint == n3Endpoint) &&
+                  !n2.SystemCoordinator.GetMembership().Members.Any(m => m.Endpoint == n3Endpoint),
+            ct, timeoutMs: 15_000);
+
+        // Still running: a second request is answered rather than faulting, and reports the
+        // node is already out.
+        LeaveClusterResult again = await n3.RequestLeaveAsync(ct);
+        Assert.Equal(LeaveClusterOutcome.NotAMember, again.Outcome);
+        Assert.True(again.Left);
+
+        // Auto-rejoin (on by default) must stay suppressed for a node that left on purpose.
+        await Task.Delay(2_000, ct);
+        Assert.DoesNotContain(n1.SystemCoordinator.GetMembership().Members, m => m.Endpoint == n3Endpoint);
+
+        n3.Dispose();
+        await n2.LeaveCluster(dispose: true, cancellationToken: ct);
+        await n1.LeaveCluster(dispose: true, cancellationToken: ct);
+    }
+
+    /// <summary>
+    /// The last voter cannot leave — the removal would strand the cluster without a quorum. The
+    /// refusal must be reported as terminal, and the refused node must go on serving: it stays a
+    /// Voter and keeps its partition leadership rather than parking in Leaving forever.
+    /// </summary>
+    [Fact]
+    public async Task RequestLeave_LastVoter_IsRefusedAndNodeKeepsServing()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        InMemoryCommunication comm = new();
+        RaftManager node = MakeNode(comm, "localhost", 9240, 1, [], _logger);
+        comm.SetNodes(new Dictionary<string, IRaft> { ["localhost:9240"] = node });
+
+        await node.UpdateNodes();
+        await node.JoinCluster(ct);
+
+        await WaitForCondition(
+            () => node.SystemCoordinator.GetMembership().MembershipVersion > 0, ct);
+        await WaitForLeader([node], partitionId: 1, ct);
+
+        long versionBefore = node.SystemCoordinator.GetMembership().MembershipVersion;
+
+        LeaveClusterResult result = await node.RequestLeaveAsync(ct);
+
+        Assert.Equal(LeaveClusterOutcome.RefusedInsufficientVoters, result.Outcome);
+        Assert.True(result.Terminal);
+        Assert.False(result.Left);
+
+        // Nothing was committed and the node is unchanged.
+        Assert.Equal(versionBefore, node.SystemCoordinator.GetMembership().MembershipVersion);
+        Assert.Equal(ClusterMemberRole.Voter, node.LocalRole);
+        Assert.True(await node.AmILeaderQuick(1),
+            "A node refused permission to leave must keep leading its partitions.");
+
+        node.Dispose();
+    }
+
+    /// <summary>
+    /// A node that has not joined a cluster has no roster entry to remove, and must say so instead
+    /// of spinning to the attempt deadline.
+    /// </summary>
+    [Fact]
+    public async Task RequestLeave_BeforeInitialization_ReportsNotInitialized()
+    {
+        InMemoryCommunication comm = new();
+        RaftManager node = MakeNode(comm, "localhost", 9250, 1, [], _logger);
+        comm.SetNodes(new Dictionary<string, IRaft> { ["localhost:9250"] = node });
+
+        LeaveClusterResult result = await node.RequestLeaveAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(LeaveClusterOutcome.NotInitialized, result.Outcome);
+        Assert.False(result.Left);
+        Assert.False(result.Terminal);
+
+        node.Dispose();
     }
 }

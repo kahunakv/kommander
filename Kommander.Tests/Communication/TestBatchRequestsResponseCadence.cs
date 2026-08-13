@@ -152,6 +152,7 @@ public sealed class TestBatchRequestsResponseCadence
         public Task JoinCluster(CancellationToken cancellationToken = default) => throw new NotImplementedException();
         public Task JoinCluster(IEnumerable<string> seeds, CancellationToken cancellationToken = default) => throw new NotImplementedException();
         public Task LeaveCluster(bool dispose = false, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task<LeaveClusterResult> RequestLeaveAsync(CancellationToken cancellationToken = default) => throw new NotImplementedException();
         public Task UpdateNodes() => throw new NotImplementedException();
         public ClusterMembership GetMembership() => throw new NotImplementedException();
         public IList<RaftNode> GetNodes() => throw new NotImplementedException();

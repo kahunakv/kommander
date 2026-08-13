@@ -199,6 +199,7 @@ message GrpcLeaveResponse {
     bool Success = 1;
     string LeaderHint = 2;
     bool Terminal = 3;
+    int64 MembershipVersion = 4;
 }
 
 message GrpcGetFollowerLagRequest {

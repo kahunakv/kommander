@@ -16,5 +16,10 @@ namespace Kommander.Data;
 /// <c>InsufficientVoters</c>) from a transient "leader unknown" response that shares the
 /// same null-hint shape.  When <c>true</c>, the caller must not retry.
 /// </para>
+/// <para>
+/// <see cref="MembershipVersion"/> carries the roster version the leader committed the removal at,
+/// so a departing node can report the resulting version without waiting for the new roster to
+/// propagate back to it.  It is 0 when the removal did not commit.
+/// </para>
 /// </summary>
-public sealed record LeaveResponse(bool Success, string? LeaderHint = null, bool Terminal = false);
+public sealed record LeaveResponse(bool Success, string? LeaderHint = null, bool Terminal = false, long MembershipVersion = 0);

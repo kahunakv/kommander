@@ -447,7 +447,8 @@ public sealed class RaftService : Rafter.RafterBase
         {
             Success = response.Success,
             LeaderHint = response.LeaderHint ?? "",
-            Terminal = response.Terminal
+            Terminal = response.Terminal,
+            MembershipVersion = response.MembershipVersion
         };
     }
 

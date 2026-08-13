@@ -206,8 +206,31 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// Set to true by <see cref="LeaveCluster"/> before the removal is committed so that
     /// <see cref="LocalRole"/> immediately returns <see cref="System.ClusterMemberRole.Leaving"/>
     /// and the election / pre-vote gate suppresses campaigning on all partitions.
+    /// <para>
+    /// <see cref="RequestLeaveAsync"/> raises it only once the removal has committed: until then
+    /// the node is still a full member, and it may need to win the system-partition election in
+    /// order to commit its own removal at all.
+    /// </para>
     /// </summary>
     private volatile bool _leaving;
+
+    /// <summary>
+    /// Set by the first <see cref="RequestLeaveAsync"/> and never cleared, even when that attempt
+    /// fails. Departure was requested by an operator, so this node must never re-admit itself: the
+    /// removal can still land after a timed-out attempt, and auto-rejoin would silently undo the
+    /// decommission the operator asked for. Election suppression (<see cref="_leaving"/>) is
+    /// deliberately <i>not</i> sticky — a node that was refused is still a full member and must keep
+    /// campaigning.
+    /// </summary>
+    private volatile bool _leaveRequested;
+
+    /// <summary>
+    /// Serializes <see cref="RequestLeaveAsync"/> so two concurrent callers cannot run overlapping
+    /// commit loops for the same removal; the second one then observes the node already absent and
+    /// answers idempotently. The teardown path deliberately does not take it: shutdown must never
+    /// queue behind an API-initiated attempt.
+    /// </summary>
+    private readonly SemaphoreSlim leaveRequestLock = new(1, 1);
 
     /// <summary>
     /// Returns the local node's role in the committed cluster roster:
@@ -1023,10 +1046,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
         try
         {
-            (RaftOperationStatus status, long _) = await tcs.Task.ConfigureAwait(false);
+            (RaftOperationStatus status, long version) = await tcs.Task.ConfigureAwait(false);
 
             if (status == RaftOperationStatus.Success)
-                return new LeaveResponse(true);
+                return new LeaveResponse(true, null, false, version);
 
             // InsufficientVoters is a permanent condition: removal would brick the cluster.
             // Terminal=true prevents CommitGracefulLeaveAsync from retrying.
@@ -1403,7 +1426,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// </param>
     public async Task LeaveCluster(bool dispose = false, CancellationToken cancellationToken = default)
     {
-        // Suppress elections on all partitions immediately.
+        // Suppress elections on all partitions immediately: teardown follows unconditionally, so
+        // this node must not win a leadership it is about to abandon.
         _leaving = true;
 
         // If we are part of a committed roster AND there is at least one other Voter peer,
@@ -1457,6 +1481,82 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
+    /// Asks the cluster to remove this node from the committed roster and reports what happened,
+    /// <b>without</b> tearing the node down.
+    /// <para>
+    /// This is the decommission primitive an operator drives at runtime: the caller learns whether
+    /// the removal committed, was permanently refused (removing the last voter), or could not be
+    /// attempted, and only then decides whether to stop the process. <see cref="LeaveCluster"/>
+    /// remains the shutdown-coupled variant that always proceeds to stop.
+    /// </para>
+    /// <para>
+    /// Campaigning is left alone until the removal commits, and suppressed for good afterwards: a
+    /// node that was refused — or whose attempt failed — is still a full member and must keep
+    /// participating, while one that left must not contend for leadership it no longer has a claim
+    /// to.
+    /// </para>
+    /// <para>
+    /// Concurrent calls are serialized and idempotent: the second caller observes the node already
+    /// absent from the roster and returns <see cref="LeaveClusterOutcome.NotAMember"/>.
+    /// </para>
+    /// </summary>
+    /// <param name="cancellationToken">
+    /// Bounds the attempt. Cancelling yields <see cref="LeaveClusterOutcome.Timeout"/> — the removal
+    /// may still commit, so the caller must re-read the roster before concluding anything.
+    /// </param>
+    public async Task<LeaveClusterResult> RequestLeaveAsync(CancellationToken cancellationToken = default)
+    {
+        if (systemPartition is null || !IsInitialized)
+            return new(LeaveClusterOutcome.NotInitialized, 0);
+
+        await leaveRequestLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            // Recorded before anything can short-circuit: even an attempt answered "you are already
+            // out" is an operator asking this node to go, and a node that then re-admitted itself
+            // would undo the decommission just as surely as one that never left.
+            _leaveRequested = true;
+
+            System.ClusterMembership roster = systemCoordinator.GetMembership();
+
+            // No committed roster yet (pre-seed transient): there is no membership entry to remove,
+            // and the node cannot be counted towards anyone's quorum until seeding completes.
+            if (roster.MembershipVersion == 0 || !clusterHandler.Joined)
+                return new(LeaveClusterOutcome.NotInitialized, roster.MembershipVersion);
+
+            if (!roster.Members.Any(m => string.Equals(m.Endpoint, LocalEndpoint, StringComparison.Ordinal)))
+                return new(LeaveClusterOutcome.NotAMember, roster.MembershipVersion);
+
+            // Campaigning is deliberately NOT suppressed while the attempt is in flight. The node
+            // is still a full member until the removal commits, and the removal is committed by the
+            // system-partition leader — so a node that has to win that election first (the last
+            // voter answering its own request, or any node during a leadership gap) must be allowed
+            // to. Suppressing here deadlocked exactly that case into a timeout.
+            LeaveClusterResult result = await CommitGracefulLeaveAsync(cancellationToken).ConfigureAwait(false);
+
+            // A leader acknowledgement can be lost in transit or arrive after the deadline, leaving
+            // an attempt reported as timed out even though the removal committed. Re-reading the
+            // roster resolves that in the caller's favour whenever the new roster is already here.
+            if (!result.Left &&
+                !systemCoordinator.GetMembership().Members.Any(m => string.Equals(m.Endpoint, LocalEndpoint, StringComparison.Ordinal)))
+                result = new(LeaveClusterOutcome.Committed, systemCoordinator.GetMembership().MembershipVersion);
+
+            // Only a departure that actually happened stops the node campaigning, and it stops it
+            // for good: it is out of the roster and must not contend for leadership it no longer
+            // has a claim to.
+            if (result.Left)
+                _leaving = true;
+
+            return result;
+        }
+        finally
+        {
+            leaveRequestLock.Release();
+        }
+    }
+
+    /// <summary>
     /// Sends a <c>RemoveMember(self)</c> to the P0 leader, retrying until the removal commits or
     /// a 10 s deadline expires.  Each individual <c>SendLeave</c> call is bounded by a 3 s
     /// per-attempt token so a stopped or unreachable node never blocks indefinitely.
@@ -1470,9 +1570,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <b>Cancellation:</b> <paramref name="cancellationToken"/> is observed in all waits so a
     /// tearing-down host returns promptly.
     /// </para>
-    /// Failures are logged but never thrown — the caller always proceeds to stop afterwards.
+    /// Failures are logged and reported through the returned outcome, never thrown — the shutdown
+    /// caller always proceeds to stop afterwards regardless of what happened here.
     /// </summary>
-    private async Task CommitGracefulLeaveAsync(CancellationToken cancellationToken)
+    private async Task<LeaveClusterResult> CommitGracefulLeaveAsync(CancellationToken cancellationToken)
     {
         const int deadlineMs = 10_000;
         const int attemptTimeoutMs = 3_000;
@@ -1488,8 +1589,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         {
             if (cancellationToken.IsCancellationRequested)
             {
-                Logger.LogInformation("LeaveCluster: graceful leave cancelled; proceeding to stop.");
-                return;
+                Logger.LogInformation("LeaveCluster: graceful leave cancelled.");
+                return Unconfirmed(LeaveClusterOutcome.Timeout);
             }
 
             try
@@ -1505,7 +1606,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                     if (++emptyLeaderPolls >= maxEmptyLeaderPolls)
                     {
                         Logger.LogInfoLeaveClusterLeaderUnknown(emptyLeaderPolls);
-                        return;
+                        return Unconfirmed(LeaveClusterOutcome.NoLeader);
                     }
 
                     await Task.Delay(200, cancellationToken).ConfigureAwait(false);
@@ -1519,13 +1620,19 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                     CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 attemptCts.CancelAfter(attemptTimeoutMs);
 
-                RaftNode leaderNode = new(leaderEndpoint);
-                LeaveResponse resp = await communication.SendLeave(this, leaderNode, request, attemptCts.Token).ConfigureAwait(false);
+                // When we are the leader, apply the removal here rather than sending it to
+                // ourselves: the transport cannot always reach the local endpoint (a standalone or
+                // embedded node has no peer registry to route through), and a self-directed round
+                // trip would fail there and spin to the deadline instead of getting the leader's
+                // real answer — including the refusal that protects the last voter.
+                LeaveResponse resp = amLeader
+                    ? await ReceiveLeave(request, attemptCts.Token).ConfigureAwait(false)
+                    : await communication.SendLeave(this, new RaftNode(leaderEndpoint), request, attemptCts.Token).ConfigureAwait(false);
 
                 if (resp.Success)
                 {
                     await WaitForRosterRemovalAsync(sw, deadlineMs, cancellationToken).ConfigureAwait(false);
-                    return;
+                    return Committed(resp);
                 }
 
                 // Terminal = permanently blocked (e.g. InsufficientVoters) — give up immediately.
@@ -1533,8 +1640,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 // in progress); the loop continues and retries within the 10 s deadline.
                 if (resp.Terminal)
                 {
-                    Logger.LogInformation("LeaveCluster: leave permanently rejected; proceeding to stop.");
-                    return;
+                    Logger.LogInformation("LeaveCluster: leave permanently rejected.");
+                    return Unconfirmed(LeaveClusterOutcome.RefusedInsufficientVoters);
                 }
 
                 // Not the leader — follow the hint if it differs from the endpoint we just tried.
@@ -1545,24 +1652,25 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                         using CancellationTokenSource hintCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                         hintCts.CancelAfter(attemptTimeoutMs);
 
-                        RaftNode hint = new(resp.LeaderHint);
-                        LeaveResponse hintResp = await communication.SendLeave(this, hint, request, hintCts.Token).ConfigureAwait(false);
+                        LeaveResponse hintResp = string.Equals(resp.LeaderHint, LocalEndpoint, StringComparison.Ordinal)
+                            ? await ReceiveLeave(request, hintCts.Token).ConfigureAwait(false)
+                            : await communication.SendLeave(this, new RaftNode(resp.LeaderHint), request, hintCts.Token).ConfigureAwait(false);
                         if (hintResp.Success)
                         {
                             await WaitForRosterRemovalAsync(sw, deadlineMs, cancellationToken).ConfigureAwait(false);
-                            return;
+                            return Committed(hintResp);
                         }
 
                         if (hintResp.Terminal)
                         {
                             Logger.LogInfoLeaveClusterRejectedByHint(resp.LeaderHint);
-                            return;
+                            return Unconfirmed(LeaveClusterOutcome.RefusedInsufficientVoters);
                         }
                     }
                     catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                     {
-                        Logger.LogInformation("LeaveCluster: graceful leave cancelled during hint attempt; proceeding to stop.");
-                        return;
+                        Logger.LogInformation("LeaveCluster: graceful leave cancelled during hint attempt.");
+                        return Unconfirmed(LeaveClusterOutcome.Timeout);
                     }
                     catch (Exception ex)
                     {
@@ -1574,8 +1682,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                Logger.LogInformation("LeaveCluster: graceful leave cancelled; proceeding to stop.");
-                return;
+                Logger.LogInformation("LeaveCluster: graceful leave cancelled.");
+                return Unconfirmed(LeaveClusterOutcome.Timeout);
             }
             catch (Exception ex)
             {
@@ -1587,13 +1695,26 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
                 }
                 catch (OperationCanceledException)
                 {
-                    Logger.LogInformation("LeaveCluster: graceful leave cancelled; proceeding to stop.");
-                    return;
+                    Logger.LogInformation("LeaveCluster: graceful leave cancelled.");
+                    return Unconfirmed(LeaveClusterOutcome.Timeout);
                 }
             }
         }
 
-        Logger.LogWarning("LeaveCluster: graceful leave timed out; proceeding to stop without committed removal.");
+        Logger.LogWarning("LeaveCluster: graceful leave timed out without a committed removal.");
+        return Unconfirmed(LeaveClusterOutcome.Timeout);
+
+        // The leader reports the version it committed the removal at, which is authoritative even
+        // when the new roster has not propagated back here yet; fall back to the local view when an
+        // older peer omits it.
+        LeaveClusterResult Committed(LeaveResponse response) => new(
+            LeaveClusterOutcome.Committed,
+            response.MembershipVersion > 0
+                ? response.MembershipVersion
+                : systemCoordinator.GetMembership().MembershipVersion);
+
+        LeaveClusterResult Unconfirmed(LeaveClusterOutcome outcome) =>
+            new(outcome, systemCoordinator.GetMembership().MembershipVersion);
     }
 
     /// <summary>
@@ -3500,7 +3621,9 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// (pre-votes suppressed on every partition, terminal errors to clients).
     /// <para>
     /// Deliberately NOT triggered when: auto-rejoin is disabled; the node initiated a graceful
-    /// leave (<c>_leaving</c> — the removal is intentional); this node has never been in a
+    /// leave (<c>_leaving</c> — the removal is intentional — or <c>_leaveRequested</c>, which stays
+    /// set even for an attempt that reported failure, because the removal may still land later and
+    /// re-admitting would undo an operator-ordered decommission); this node has never been in a
     /// committed roster (<see cref="_wasRosterMember"/> — first-time joins own their admission
     /// retry loop in <c>JoinCluster(seeds)</c>, and a booting learner or a bare test manager
     /// routinely observes rosters that don't include it); or the roster is the pre-seed
@@ -3517,7 +3640,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     {
         if (!configuration.EnableAutoRejoin)
             return;
-        if (_leaving || Volatile.Read(ref _disposed) != 0)
+        if (_leaving || _leaveRequested || Volatile.Read(ref _disposed) != 0)
             return;
         if (membership.MembershipVersion == 0 || !_wasRosterMember)
             return;
@@ -3797,6 +3920,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         // 4. Dispose remaining shared resources.
         hybridLogicalClock.Dispose();
         walAdapter.Dispose();
+        leaveRequestLock.Dispose();
 
         if (discovery is IDisposable disposableDiscovery)
             disposableDiscovery.Dispose();

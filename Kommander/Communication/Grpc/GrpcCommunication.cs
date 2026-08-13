@@ -678,7 +678,11 @@ public class GrpcCommunication : ICommunication
                 .ResponseAsync
                 .ConfigureAwait(false);
 
-            return new LeaveResponse(response.Success, string.IsNullOrEmpty(response.LeaderHint) ? null : response.LeaderHint, response.Terminal);
+            return new LeaveResponse(
+                response.Success,
+                string.IsNullOrEmpty(response.LeaderHint) ? null : response.LeaderHint,
+                response.Terminal,
+                response.MembershipVersion);
         }
         catch (Exception ex)
         {

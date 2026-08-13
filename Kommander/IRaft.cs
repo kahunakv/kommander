@@ -178,6 +178,32 @@ public interface IRaft
     public Task LeaveCluster(bool dispose = false, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Asks the cluster to remove this node from the committed roster and reports the outcome,
+    /// <b>without</b> stopping the node.
+    /// <para>
+    /// Use this to decommission a running node: the caller learns whether the removal committed,
+    /// was permanently refused because it would remove the last voter
+    /// (<see cref="LeaveClusterOutcome.RefusedInsufficientVoters"/>), or could not be attempted, and
+    /// only then decides whether to stop the process. <see cref="LeaveCluster"/> is the
+    /// shutdown-coupled variant that tears the node down regardless of the result.
+    /// </para>
+    /// <para>
+    /// The node stops campaigning once the removal commits, and not before: until then it is still
+    /// a full member, and it may have to win the system-partition election to commit its own
+    /// removal. A refused or failed attempt therefore leaves it participating normally.
+    /// </para>
+    /// <para>
+    /// Idempotent: calling it again after a successful leave returns
+    /// <see cref="LeaveClusterOutcome.NotAMember"/>.
+    /// </para>
+    /// </summary>
+    /// <param name="cancellationToken">
+    /// Bounds the attempt. Cancelling yields <see cref="LeaveClusterOutcome.Timeout"/>; the removal
+    /// may still commit, so re-read the roster before concluding anything.
+    /// </param>
+    public Task<LeaveClusterResult> RequestLeaveAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Updates the active Raft cluster nodes
     /// </summary>
     /// <returns></returns>
