@@ -87,6 +87,14 @@ public sealed class RaftPartitionStateMachine
     private long lastFailedAckLogTicks;
     private int suppressedFailedAckLogs;
 
+    // Diagnostic throttles for the two backfill probes. Both fire on hot paths (once per peer per
+    // heartbeat round, and once per discarded ack), so both collapse to one line a second. Executor
+    // thread only, as with the throttles above.
+    private long lastBackfillTraceTicks;
+    private int suppressedBackfillTraces;
+    private long lastAckIgnoredTicks;
+    private int suppressedAckIgnored;
+
     private readonly Dictionary<long, Scheduling.RaftPendingWalOperation> pendingWalOperations = [];
 
     // Per-instance pool for the pending-WAL-op metadata objects. Rented on insert, returned once the
@@ -2193,9 +2201,18 @@ public sealed class RaftPartitionStateMachine
             if (regressed)
                 regressedFrontiers.Remove(node.Endpoint);
 
-            if (nodeState == RaftNodeState.Leader
+            bool willBackfill = nodeState == RaftNodeState.Leader
                 && localCommittedIndex >= 0
-                && (followerGap > host.Configuration.BackfillThreshold || idleTailGap || regressed))
+                && (followerGap > host.Configuration.BackfillThreshold || idleTailGap || regressed);
+
+            // DIAGNOSTIC (see FINDINGS.md #3/#5): records every input to the decision above, so a
+            // run in which replicas stop advancing can be read for *why* the leader sent nothing
+            // rather than inferred from its silence. `followerMaxLog` is the interesting one — it
+            // is the leader's belief about the peer, and every trigger here is derived from it.
+            LogBackfillDecision(node.Endpoint, willBackfill, followerMaxLog, followerGap,
+                                idleTailGap, regressed, liveReplicationQuiet);
+
+            if (willBackfill)
             {
                 long anchorFrom = regressed ? regressedFrontier : followerMaxLog;
                 backfillRound ??= new();
@@ -2697,9 +2714,10 @@ public sealed class RaftPartitionStateMachine
         
         if (nodeState == RaftNodeState.Leader)
         {
-            lastCommitIndexes[endpoint] = remoteMaxLogId;
+            // lastCommitIndexes is deliberately not written here — see the note at the quorum
+            // seeding below. A vote reports a log id, not a committed frontier.
             startCommitIndexes[endpoint] = remoteMaxLogId;
-            
+
             logger.LogInfoReceivedVoteAlreadyLeader(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, voteTerm);
             return;
         }
@@ -2728,7 +2746,27 @@ public sealed class RaftPartitionStateMachine
         int voterTotal = host.Nodes.Count(n => host.IsVoter(n.Endpoint)) + 1; // +1 for self
         int quorum = Math.Max(2, (voterTotal / 2) + 1);
 
-        lastCommitIndexes[endpoint] = remoteMaxLogId;
+        // lastCommitIndexes is NOT seeded from the vote. It means "the committed frontier this
+        // follower last reported about itself", and a vote carries the voter's highest *log id* —
+        // which sits at or above that frontier, because a log holds entries not yet applied.
+        //
+        // Recording the higher number here is not merely imprecise, it is unrecoverable.
+        // CompleteAppendLogsAsync only raises this value, so every subsequent acknowledgement
+        // carrying the follower's true, lower frontier is discarded as stale; SendHeartbeat then
+        // computes followerGap against the over-estimate, concludes the peer is current, and sends
+        // nothing. The peer reports the truth on every heartbeat, is ignored every time, and is
+        // never sent another entry — which is precisely a replica that applies nothing for minutes
+        // on a healed, idle cluster.
+        //
+        // Leaving the key absent is the conservative choice and self-heals in one round: the
+        // backfill decision treats an unknown peer as having no gap, the peer's first ack records
+        // where it actually is, and the next heartbeat catches it up from there. Seeding 0 would
+        // *not* be conservative — nextIndex is optimistic (leaderMaxLog + 1) and therefore above
+        // localCommittedIndex, so TrySendBackfillBatchAsync falls back to followerMaxLog + 1 and a
+        // zero seed would re-ship every follower's log from index 1 on every election.
+        //
+        // startCommitIndexes keeps the vote's value: it records where a peer's log started this
+        // term, which is what a log id is.
         startCommitIndexes[endpoint] = remoteMaxLogId;
 
         logger.LogInfoReceivedVote(host.LocalEndpoint, host.PartitionId, nodeState, endpoint, voteTerm, numberVotes, quorum, voterTotal, remoteMaxLogId, maxLogResponse);
@@ -3135,6 +3173,66 @@ public sealed class RaftPartitionStateMachine
         lastLoggedAckStatus   = status;
         lastFailedAckLogTicks = now;
         suppressedFailedAckLogs = 0;
+    }
+
+    /// <summary>
+    /// DIAGNOSTIC. Records that a follower's reported commit frontier was discarded because this
+    /// leader already holds a higher value for that peer.
+    /// </summary>
+    /// <remarks>
+    /// Temporary, and pointed at one question: whether the leader's recorded frontier for a peer
+    /// can become an over-estimate that no subsequent acknowledgement is able to correct. If it
+    /// can, <c>followerGap</c> understates the peer's true lag permanently and the peer is never
+    /// backfilled — which would explain a replica that applies nothing for minutes on a healthy,
+    /// idle cluster. Remove once that is settled either way.
+    /// </remarks>
+    private void LogAckFrontierIgnored(string endpoint, long reported, long recorded)
+    {
+        long now = Stopwatch.GetTimestamp();
+
+        if (lastAckIgnoredTicks != 0 && (now - lastAckIgnoredTicks) < Stopwatch.Frequency)
+        {
+            suppressedAckIgnored++;
+            return;
+        }
+
+        logger.LogWarning(
+            "[{LocalEndpoint}/{PartitionId}/{State}] DIAG ack-frontier-ignored from {Endpoint}: reported={Reported} recorded={Recorded} behindBy={BehindBy} localCommitted={LocalCommitted} suppressedSinceLastLine={Suppressed}",
+            host.LocalEndpoint, host.PartitionId, nodeState, endpoint,
+            reported, recorded, recorded - reported, localCommittedIndex, suppressedAckIgnored);
+
+        lastAckIgnoredTicks  = now;
+        suppressedAckIgnored = 0;
+    }
+
+    /// <summary>
+    /// DIAGNOSTIC. Records the inputs to one peer's backfill decision in a heartbeat round.
+    /// </summary>
+    /// <remarks>
+    /// Temporary. A leader that sends nothing looks identical in the logs to a leader with nothing
+    /// to send, and telling those apart is the whole question when replicas stop advancing. Every
+    /// trigger here derives from <paramref name="followerMaxLog"/> — the leader's belief about the
+    /// peer — so that value is what the trace exists to expose. Remove once answered.
+    /// </remarks>
+    private void LogBackfillDecision(string endpoint, bool willBackfill, long followerMaxLog,
+                                     long followerGap, bool idleTailGap, bool regressed, bool liveQuiet)
+    {
+        long now = Stopwatch.GetTimestamp();
+
+        if (lastBackfillTraceTicks != 0 && (now - lastBackfillTraceTicks) < Stopwatch.Frequency)
+        {
+            suppressedBackfillTraces++;
+            return;
+        }
+
+        logger.LogInformation(
+            "[{LocalEndpoint}/{PartitionId}/{State}] DIAG backfill-decision peer={Endpoint} send={Send} followerMaxLog={FollowerMaxLog} localCommitted={LocalCommitted} gap={Gap} threshold={Threshold} idleTailGap={IdleTailGap} regressed={Regressed} liveQuiet={LiveQuiet} liveCommitFloor={LiveCommitFloor} suppressedSinceLastLine={Suppressed}",
+            host.LocalEndpoint, host.PartitionId, nodeState, endpoint, willBackfill,
+            followerMaxLog, localCommittedIndex, followerGap, host.Configuration.BackfillThreshold,
+            idleTailGap, regressed, liveQuiet, liveCommitFloor, suppressedBackfillTraces);
+
+        lastBackfillTraceTicks   = now;
+        suppressedBackfillTraces = 0;
     }
 
     /// <summary>
@@ -3819,6 +3917,15 @@ public sealed class RaftPartitionStateMachine
         // the TryGetValue check in SendHeartbeat would fail and backfill would never fire.
         if (!lastCommitIndexes.TryGetValue(endpoint, out long currentIndex) || committedIndex > currentIndex)
             lastCommitIndexes[endpoint] = committedIndex;
+        else if (committedIndex < currentIndex)
+            // DIAGNOSTIC (see FINDINGS.md #3/#5): the follower just reported a frontier BELOW what
+            // this leader has recorded for it, and the monotonic guard above discards that report.
+            // If the recorded value is an over-estimate — ReceivedVoteAsync seeds it from the
+            // voter's max *log* id, which is at or above its applied frontier — then no later ack
+            // can ever correct it, `followerGap` in SendHeartbeat stays at ~0, and the peer is
+            // never backfilled however far behind it actually is. Logged to establish whether that
+            // is what happens in a run where replicas freeze; remove once answered.
+            LogAckFrontierIgnored(endpoint, committedIndex, currentIndex);
 
         // LogMismatch: the follower's log diverges at the prevLogIndex we sent.
         // committedIndex carries the follower's local max log at the time of rejection.

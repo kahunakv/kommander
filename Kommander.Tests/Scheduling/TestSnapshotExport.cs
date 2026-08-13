@@ -25,26 +25,36 @@ public class TestSnapshotExport
     // ── helpers ───────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Drives the state machine to Leader with the given follower node, seeds lastCommitIndexes
-    /// for that follower via ReceivedVoteAsync, then fires CheckPartitionLeadershipAsync so the
-    /// backfill path runs (GetRangeAsync returns [] → floor exceeded → snapshot triggered).
-    /// Returns all SnapshotRequest chunks captured by <paramref name="comm"/>.
+    /// Drives the state machine to Leader with the given follower node, has that follower report
+    /// its committed frontier, then fires CheckPartitionLeadershipAsync so the backfill path runs
+    /// (GetRangeAsync returns [] → floor exceeded → snapshot triggered). Returns all
+    /// SnapshotRequest chunks captured by <paramref name="comm"/>.
     /// </summary>
     private static async Task<List<SnapshotRequest>> DriveSnapshotAsync(
         RaftPartitionStateMachine sm,
         string followerEndpoint,
-        CapturingComm comm)
+        CapturingComm comm,
+        HybridLogicalClock clock)
     {
         // Start an election as Candidate, then grant quorum so the node becomes Leader.
-        // ReceivedVoteAsync seeds lastCommitIndexes[followerEndpoint] = 0 and, once quorum
-        // is reached, calls BecomeLeader() → SendHeartbeat(true), which triggers the snapshot.
         await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
         Assert.Equal(RaftNodeState.Candidate, sm.NodeState);
 
         // Grant the deciding vote. currentTerm was incremented to 1 by ForceLeader; voteTerm=1 matches.
-        // ReceivedVoteAsync reaches quorum → BecomeLeader → SendHeartbeat(true) → TrySendSnapshotAsync.
         await sm.ReceivedVoteAsync(followerEndpoint, voteTerm: 1, remoteMaxLogId: 0);
         Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+
+        // The follower reports its own committed frontier, and the next heartbeat round acts on it:
+        // gap > BackfillThreshold → TrySendBackfillBatchAsync → WAL floor exceeded → snapshot.
+        //
+        // The acknowledgement is required rather than incidental. A vote no longer seeds
+        // lastCommitIndexes (see ReceivedVoteAsync): a vote carries the voter's max *log id*, and
+        // recording that as a committed frontier over-states it in a way no later acknowledgement
+        // can lower, which strands the peer. So the leader now learns where a follower is from the
+        // follower, which is also what happens in a live cluster on the first heartbeat.
+        await sm.CompleteAppendLogsAsync(followerEndpoint, clock.TrySendOrLocalEvent(1),
+                                         RaftOperationStatus.Success, committedIndex: 0);
+        await sm.CheckPartitionLeadershipAsync();
 
         // TrySendSnapshotAsync is fire-and-forget; wait for the capturing comm to capture.
         List<SnapshotRequest> chunks = await comm.WaitForChunksAsync(TimeSpan.FromSeconds(5));
@@ -64,7 +74,7 @@ public class TestSnapshotExport
         RaftPartitionStateMachine sm = new(host, wal, new CapturingSink(), NullLogger<IRaft>.Instance);
         sm.SetPostToExecutor(_ => { });
 
-        List<SnapshotRequest> chunks = await DriveSnapshotAsync(sm, "follower:9000", comm);
+        List<SnapshotRequest> chunks = await DriveSnapshotAsync(sm, "follower:9000", comm, host.HybridLogicalClock);
 
         Assert.NotEmpty(chunks);
         Assert.All(chunks, c => Assert.Equal(SnapshotKind.SystemState, c.Kind));
@@ -86,7 +96,7 @@ public class TestSnapshotExport
         RaftPartitionStateMachine sm = new(host, wal, new CapturingSink(), NullLogger<IRaft>.Instance);
         sm.SetPostToExecutor(_ => { });
 
-        List<SnapshotRequest> chunks = await DriveSnapshotAsync(sm, "follower:9000", comm);
+        List<SnapshotRequest> chunks = await DriveSnapshotAsync(sm, "follower:9000", comm, host.HybridLogicalClock);
 
         Assert.True(chunks.Count >= 2, "large payload must produce multiple chunks");
         Assert.All(chunks, c => Assert.Equal(SnapshotKind.SystemState, c.Kind));
@@ -107,7 +117,7 @@ public class TestSnapshotExport
         RaftPartitionStateMachine sm = new(host, wal, new CapturingSink(), NullLogger<IRaft>.Instance);
         sm.SetPostToExecutor(_ => { });
 
-        List<SnapshotRequest> chunks = await DriveSnapshotAsync(sm, "follower:9000", comm);
+        List<SnapshotRequest> chunks = await DriveSnapshotAsync(sm, "follower:9000", comm, host.HybridLogicalClock);
 
         Assert.NotEmpty(chunks);
         Assert.All(chunks, c => Assert.Equal(SnapshotKind.Range, c.Kind));
@@ -129,7 +139,7 @@ public class TestSnapshotExport
         RaftPartitionStateMachine sm = new(host, wal, new CapturingSink(), NullLogger<IRaft>.Instance);
         sm.SetPostToExecutor(_ => { });
 
-        List<SnapshotRequest> chunks = await DriveSnapshotAsync(sm, "follower:9000", comm);
+        List<SnapshotRequest> chunks = await DriveSnapshotAsync(sm, "follower:9000", comm, host.HybridLogicalClock);
 
         Assert.NotEmpty(chunks);
         Assert.All(chunks, c => Assert.Equal(SnapshotKind.Range, c.Kind));
