@@ -83,6 +83,12 @@ public sealed class RaftPartitionStateMachine
     // so it needs no synchronization; always cleared before use.
     private readonly List<HLCTimestamp> settledProposalScratch = [];
 
+    /// <summary>
+    /// Scratch buffer for <see cref="RetryUnresolvedProposals"/>: the not-yet-acked voter
+    /// endpoints of one proposal. Executor thread only, cleared before each use.
+    /// </summary>
+    private readonly List<string> proposalResendScratch = [];
+
     // WAL-saturation log throttle. A saturated partition rejects every inbound append, so the
     // condition is worth one line a second carrying a count, not one line per rejection: the log
     // is I/O contending with the very WAL writes whose slowness caused the saturation, so logging
@@ -2242,6 +2248,13 @@ public sealed class RaftPartitionStateMachine
         if (nodeState != RaftNodeState.Leader && nodeState != RaftNodeState.Candidate)
             return;
 
+        // Raft leaders retry replication until it succeeds; the live-propose broadcast alone is
+        // one-shot. Riding the heartbeat keeps the retry paced, and a partition with unresolved
+        // proposals can never quiesce (the quiesce gate requires activeProposals empty), so this
+        // site is always reached while anything needs retrying.
+        if (nodeState == RaftNodeState.Leader)
+            RetryUnresolvedProposals(lastHeartbeat);
+
         TagList heartbeatTags = new() { { "partition_id", host.PartitionId } };
         KommanderMetrics.HeartbeatsSentTotal.Add(1, heartbeatTags);
 
@@ -3196,29 +3209,34 @@ public sealed class RaftPartitionStateMachine
                 return;
             }
 
-            /*(RaftOperationStatus Status, long Index) response = await wal.ProposeOrCommit(logs).ConfigureAwait(false);
-            
-            if (response.Status != RaftOperationStatus.Success)
+            // Duplicate batch: the WAL planned nothing because every entry is already present (or
+            // already resolved) locally. Do NOT stay silent — the proposal-retry path re-sends a
+            // batch whose original ack may have been lost in a fault window, and without a fresh
+            // ack the leader can never credit this peer and the proposal can never reach quorum.
+            // Durability gate: re-ack only when the batch's max id is already durable in the
+            // backend (GetMaxLogAsync reads durable rows, and the per-partition write FIFO means
+            // everything below it landed too). If the original append is still queued, its own
+            // completion will carry the ack — re-acking early would claim a durability the disk
+            // does not yet have, and the single-fsync ticket releases on propose-quorum-DURABLE.
+            long alreadyHeldMax = -1;
+            foreach (RaftLog held in logs)
             {
-                logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't append logs from leader {Endpoint} with Term={Term} Status={Status} Logs={Logs}", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, leaderTerm, response.Status, logs.Count);
-                
-                host.EnqueueResponse(endpoint, new(
-                    RaftResponderRequestType.CompleteAppendLogs, 
-                    new(endpoint), 
-                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, response.Status, -1)
-                ));
-                return;
+                if (held.Id > alreadyHeldMax)
+                    alreadyHeldMax = held.Id;
             }
-            
-            foreach (HLCTimestamp logTimestamp in logs.Select(x => x.Time).Distinct())
+
+            long durableMax = await wal.GetMaxLogAsync().ConfigureAwait(false);
+            if (durableMax >= alreadyHeldMax)
             {
                 host.EnqueueResponse(endpoint, new(
-                    RaftResponderRequestType.CompleteAppendLogs, 
-                    new(endpoint), 
-                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, logTimestamp, host.LocalEndpoint, RaftOperationStatus.Success, response.Index)
-                ));    
-            }*/
-            
+                    RaftResponderRequestType.CompleteAppendLogs,
+                    new(endpoint),
+                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.Success,
+                        host.Configuration.WalSingleFsyncCommit ? wal.GetCommitIndex() : -1)
+                ));
+            }
+
+            CompleteReply(replyCorrelationId, RaftResponseStatic.NoneResponse);
             return;
         }
         
@@ -3496,6 +3514,74 @@ public sealed class RaftPartitionStateMachine
     /// now also driven from the periodic Leader tick so an idle leader converges to an empty map.
     /// </para>
     /// </summary>
+    /// <summary>
+    /// Re-sends every unresolved proposal's entries to the registered voters that have not yet
+    /// acknowledged them. Raft's leader retries AppendEntries indefinitely; Kommander's
+    /// live-propose broadcast fired exactly once, and the backfill path re-ships only COMMITTED
+    /// entries — so a propose lost to a fault window had no second chance, the proposal could
+    /// never reach quorum, and its WAL rows stayed durably <c>Proposed</c> with no path that ever
+    /// resolves them (no rollback, no sweep). Every drain then correctly blocks at the first such
+    /// entry and the partition wedges at the index below it — the Jepsen one-stuck-entry shape,
+    /// including the <c>boundary=1</c> case where a partition's very first proposal never
+    /// resolves and nothing ever commits.
+    ///
+    /// Retry (not rollback) is the only safe resolution: a peer may hold the entry durably with
+    /// only the ack lost, and a holder can win a later election and commit the entry via its
+    /// promotion barrier — a leader that had meanwhile rolled the entry back would have forked
+    /// the committed history. Re-sending is idempotent: a peer that already holds the batch
+    /// re-acks it once the entries are durable (see the duplicate re-ack in
+    /// <see cref="AppendLogsCoreAsync"/>), and one that lost it appends it normally.
+    ///
+    /// Paced by the heartbeat tick, gated on proposal age (one heartbeat interval — younger
+    /// proposals are still riding the original broadcast), and capped per round so a fault-window
+    /// backlog retries across successive beats instead of flooding the transport. Proposals stay
+    /// in <see cref="activeProposals"/> until they resolve or leadership changes (which clears
+    /// the map), so the retry naturally stops at both terminal outcomes.
+    /// </summary>
+    private void RetryUnresolvedProposals(HLCTimestamp currentTime)
+    {
+        const int MaxProposalsPerRound = 8;
+
+        if (activeProposals.Count == 0)
+            return;
+
+        TimeSpan minAge = host.Configuration.HeartbeatInterval;
+        int retried = 0;
+
+        foreach (KeyValuePair<HLCTimestamp, RaftProposalQuorum> entry in activeProposals)
+        {
+            RaftProposalQuorum proposal = entry.Value;
+
+            if (proposal.State != RaftProposalState.Incomplete || proposal.HasQuorum())
+                continue;
+
+            if (currentTime - proposal.StartTimestamp < minAge)
+                continue;
+
+            proposalResendScratch.Clear();
+            proposal.CollectPendingEndpoints(proposalResendScratch);
+            if (proposalResendScratch.Count == 0)
+                continue;
+
+            foreach (string endpoint in proposalResendScratch)
+            {
+                RaftNode? node = FindNodeByEndpoint(host.Nodes, endpoint);
+                if (node is not null)
+                    AppendLogToNode(node, entry.Key, proposal.Logs);
+            }
+
+            if (logger.IsEnabled(LogLevel.Information))
+                logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Retrying unresolved proposal {Ticket} ({Count} entries, first {FirstId}) to {Pending} pending voter(s)",
+                    host.LocalEndpoint, host.PartitionId, nodeState, entry.Key, proposal.Logs.Count,
+                    proposal.Logs.Count > 0 ? proposal.Logs[0].Id : -1, proposalResendScratch.Count);
+
+            if (++retried >= MaxProposalsPerRound)
+                break;
+        }
+
+        proposalResendScratch.Clear();
+    }
+
     private void PruneSettledProposals(HLCTimestamp currentTime)
     {
         TimeSpan range = TimeSpan.FromSeconds(30);

@@ -164,6 +164,21 @@ public sealed class RaftProposalQuorum
     }
 
     /// <summary>
+    /// Appends to <paramref name="into"/> every registered participant that has NOT yet
+    /// acknowledged this proposal — the targets of the leader's replication retry. The local
+    /// leader registers itself pre-completed, so it never appears. A shared scratch list is
+    /// filled instead of allocating: the retry runs on the heartbeat tick.
+    /// </summary>
+    public void CollectPendingEndpoints(List<string> into)
+    {
+        foreach (KeyValuePair<string, bool> pair in nodes)
+        {
+            if (!pair.Value)
+                into.Add(pair.Key);
+        }
+    }
+
+    /// <summary>
     /// Sets the state of the Raft proposal within the quorum. This method updates the state
     /// of the current proposal to reflect its progress or final outcome in the Raft consensus process.
     /// </summary>
