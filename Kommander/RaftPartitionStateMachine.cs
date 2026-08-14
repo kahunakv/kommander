@@ -27,6 +27,20 @@ public sealed class RaftPartitionStateMachine
     private readonly ILogger<IRaft> logger;
 
     private readonly Dictionary<long, HashSet<string>> votes = [];
+
+    /// <summary>
+    /// Per-peer commit frontier as the peer last reported it about itself: the highest log id the
+    /// follower's gap-aware WAL frontier had committed when it acknowledged an AppendLogs.
+    /// This is what <see cref="SendHeartbeat"/> computes <c>followerGap</c> from, so every backfill
+    /// trigger derives from it. Invariants: written only from a <see cref="RaftOperationStatus.Success"/>
+    /// ack's self-report (or a confirmed snapshot install boundary) — never from a rejection ack,
+    /// whose committedIndex field carries the follower's raw max log id, an over-estimate of the
+    /// frontier whenever the log has an uncommitted or non-contiguous tail — and last-writer-wins,
+    /// so a genuinely regressed follower (crash-restart) can lower it and become visible as behind
+    /// again. Violating either invariant pins an over-estimate no later ack can correct, and the
+    /// peer is then never backfilled however far behind it really is (Jepsen stranded-replica
+    /// findings: commit frontier stalls while the log keeps growing and the leader sees no gap).
+    /// </summary>
     private readonly Dictionary<string, long> lastCommitIndexes = [];
     private readonly Dictionary<string, long> startCommitIndexes = [];
 
@@ -87,13 +101,11 @@ public sealed class RaftPartitionStateMachine
     private long lastFailedAckLogTicks;
     private int suppressedFailedAckLogs;
 
-    // Diagnostic throttles for the two backfill probes. Both fire on hot paths (once per peer per
-    // heartbeat round, and once per discarded ack), so both collapse to one line a second. Executor
-    // thread only, as with the throttles above.
+    // Diagnostic throttle for the backfill-decision probe. It fires on a hot path (once per peer
+    // per heartbeat round), so it collapses to one line a second. Executor thread only, as with
+    // the throttles above.
     private long lastBackfillTraceTicks;
     private int suppressedBackfillTraces;
-    private long lastAckIgnoredTicks;
-    private int suppressedAckIgnored;
 
     private readonly Dictionary<long, Scheduling.RaftPendingWalOperation> pendingWalOperations = [];
 
@@ -2775,13 +2787,13 @@ public sealed class RaftPartitionStateMachine
         // follower last reported about itself", and a vote carries the voter's highest *log id* —
         // which sits at or above that frontier, because a log holds entries not yet applied.
         //
-        // Recording the higher number here is not merely imprecise, it is unrecoverable.
-        // CompleteAppendLogsAsync only raises this value, so every subsequent acknowledgement
-        // carrying the follower's true, lower frontier is discarded as stale; SendHeartbeat then
-        // computes followerGap against the over-estimate, concludes the peer is current, and sends
-        // nothing. The peer reports the truth on every heartbeat, is ignored every time, and is
-        // never sent another entry — which is precisely a replica that applies nothing for minutes
-        // on a healed, idle cluster.
+        // Recording the higher number here would poison the map with a value the peer never
+        // reported. CompleteAppendLogsAsync now records Success self-reports last-writer-wins, so
+        // the peer's first ack would overwrite a vote seed anyway — but a log id is simply not a
+        // frontier report, and writing one here would make the leader believe, for the window
+        // until that first ack, that the peer is current when it may be arbitrarily far behind
+        // (SendHeartbeat computes followerGap from this map, so a seeded over-estimate suppresses
+        // exactly the backfill that would repair the peer).
         //
         // Leaving the key absent is the conservative choice and self-heals in one round: the
         // backfill decision treats an unknown peer as having no gap, the peer's first ack records
@@ -3198,36 +3210,6 @@ public sealed class RaftPartitionStateMachine
         lastLoggedAckStatus   = status;
         lastFailedAckLogTicks = now;
         suppressedFailedAckLogs = 0;
-    }
-
-    /// <summary>
-    /// DIAGNOSTIC. Records that a follower's reported commit frontier was discarded because this
-    /// leader already holds a higher value for that peer.
-    /// </summary>
-    /// <remarks>
-    /// Temporary, and pointed at one question: whether the leader's recorded frontier for a peer
-    /// can become an over-estimate that no subsequent acknowledgement is able to correct. If it
-    /// can, <c>followerGap</c> understates the peer's true lag permanently and the peer is never
-    /// backfilled — which would explain a replica that applies nothing for minutes on a healthy,
-    /// idle cluster. Remove once that is settled either way.
-    /// </remarks>
-    private void LogAckFrontierIgnored(string endpoint, long reported, long recorded)
-    {
-        long now = Stopwatch.GetTimestamp();
-
-        if (lastAckIgnoredTicks != 0 && (now - lastAckIgnoredTicks) < Stopwatch.Frequency)
-        {
-            suppressedAckIgnored++;
-            return;
-        }
-
-        logger.LogWarning(
-            "[{LocalEndpoint}/{PartitionId}/{State}] DIAG ack-frontier-ignored from {Endpoint}: reported={Reported} recorded={Recorded} behindBy={BehindBy} localCommitted={LocalCommitted} suppressedSinceLastLine={Suppressed}",
-            host.LocalEndpoint, host.PartitionId, nodeState, endpoint,
-            reported, recorded, recorded - reported, localCommittedIndex, suppressedAckIgnored);
-
-        lastAckIgnoredTicks  = now;
-        suppressedAckIgnored = 0;
     }
 
     /// <summary>
@@ -3937,21 +3919,6 @@ public sealed class RaftPartitionStateMachine
         if (endpoint != host.LocalEndpoint)
             host.UpdateLastNodeActivity(endpoint, host.PartitionId, currentTime);
         
-        // Always register the follower's committed index so the backfill loop can detect lag
-        // via TryGetValue. A fresh follower with no log entries reports -1; without this
-        // the TryGetValue check in SendHeartbeat would fail and backfill would never fire.
-        if (!lastCommitIndexes.TryGetValue(endpoint, out long currentIndex) || committedIndex > currentIndex)
-            lastCommitIndexes[endpoint] = committedIndex;
-        else if (committedIndex < currentIndex)
-            // DIAGNOSTIC (see FINDINGS.md #3/#5): the follower just reported a frontier BELOW what
-            // this leader has recorded for it, and the monotonic guard above discards that report.
-            // If the recorded value is an over-estimate — ReceivedVoteAsync seeds it from the
-            // voter's max *log* id, which is at or above its applied frontier — then no later ack
-            // can ever correct it, `followerGap` in SendHeartbeat stays at ~0, and the peer is
-            // never backfilled however far behind it actually is. Logged to establish whether that
-            // is what happens in a run where replicas freeze; remove once answered.
-            LogAckFrontierIgnored(endpoint, committedIndex, currentIndex);
-
         // LogMismatch: the follower's log diverges at the prevLogIndex we sent.
         // committedIndex carries the follower's local max log at the time of rejection.
         // Backtrack formula: max(1, min(nextIndex[peer]-1, committedIndex+1)).
@@ -3979,7 +3946,7 @@ public sealed class RaftPartitionStateMachine
 
         if (committedIndex > 0)
         {
-            if (startCommitIndexes.TryGetValue(endpoint, out currentIndex))
+            if (startCommitIndexes.TryGetValue(endpoint, out long currentIndex))
             {
                 if (committedIndex > currentIndex)
                     startCommitIndexes[endpoint] = committedIndex;
@@ -4006,6 +3973,31 @@ public sealed class RaftPartitionStateMachine
 
             return;
         }
+
+        // Record the follower's self-reported commit frontier — SUCCESS acks only. The
+        // committedIndex field is overloaded: on Success it carries the follower's gap-aware
+        // committed frontier (or -1: "nothing committed" on the single-fsync path, "no report"
+        // from a legacy-path heartbeat ack), while rejection acks reuse the same field for the
+        // follower's raw max log id (the LogMismatch backtrack anchor, the saturation report).
+        // A raw max log sits arbitrarily far ABOVE the committed frontier whenever the log has
+        // an uncommitted or non-contiguous tail — precisely the state of a follower whose
+        // frontier stalled behind a lost commit marker while the unanchored live-propose
+        // broadcast keeps growing its log. Folding a rejection's value into this map therefore
+        // pinned an over-estimate that no later truthful (lower) report could correct, so
+        // SendHeartbeat computed followerGap ≈ 0 and never backfilled the peer: its commit
+        // frontier stalled forever while its log grew (the Jepsen stranded-replica findings).
+        //
+        // The update is last-writer-wins, not monotonic, for the same reason. The follower is
+        // the only authority on its own frontier, and a genuine regression (crash-restart that
+        // lost lazy commit markers) must be able to LOWER the record so the gap becomes visible
+        // to the heartbeat backfill gate again. A reordered stale ack can transiently lower it
+        // too — that costs one redundant, idempotent backfill batch and self-corrects on the
+        // peer's next ack, whereas refusing lower reports cost a permanently stranded replica.
+        // -1 is recorded only as an initial seed: a fresh follower must still enter the map so
+        // SendHeartbeat's TryGetValue lag check sees it at all, but a legacy heartbeat ack's
+        // "no report" must not erase a real frontier already recorded from an append ack.
+        if (committedIndex >= 0 || !lastCommitIndexes.ContainsKey(endpoint))
+            lastCommitIndexes[endpoint] = committedIndex;
 
         // Same-term success acks double as leadership proof: they feed the read-index confirmation
         // round and the check-quorum recency window. Only term-stamped acks count — an unstamped
