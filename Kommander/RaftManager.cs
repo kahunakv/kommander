@@ -2026,6 +2026,19 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
+    /// Returns the given partition's committed frontier (highest contiguously committed log id),
+    /// or -1 when the partition is not hosted on this node or has committed nothing. See
+    /// <see cref="IRaft.GetCommitIndex"/> for why this differs from the raw max log id.
+    /// </summary>
+    public long GetCommitIndex(int partitionId)
+    {
+        if (partitions.TryGetValue(partitionId, out RaftPartition? partition))
+            return partition.GetCommitIndex();
+
+        return -1;
+    }
+
+    /// <summary>
     /// Acquires a composable retention hold on the given partition's WAL. When the partition is not
     /// hosted on this node the call is a no-op that returns a disposable which does nothing, mirroring
     /// the silent no-op of <see cref="SetMinRetainIndex"/>. See <see cref="IRaft.AcquireRetentionHold"/>

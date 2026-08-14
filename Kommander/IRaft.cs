@@ -375,6 +375,15 @@ public interface IRaft
     public void SetMinRetainIndex(int partitionId, long index);
 
     /// <summary>
+    /// Returns the highest log id known committed on <paramref name="partitionId"/> — the gap-aware
+    /// contiguous commit frontier — or -1 when the partition is not hosted on this node (or nothing
+    /// has committed). Unlike the raw max log id, this excludes proposed-but-uncommitted tail
+    /// entries and anything sitting above an unfilled hole, so observers can tell "entries present
+    /// but uncommitted" apart from "committed but not yet applied". In-memory read; safe anywhere.
+    /// </summary>
+    public long GetCommitIndex(int partitionId);
+
+    /// <summary>
     /// Acquires a composable retention hold on <paramref name="partitionId"/>'s WAL: committed
     /// entries are retained down to <paramref name="index"/> until the returned handle is disposed.
     /// <para>
