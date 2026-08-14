@@ -3250,11 +3250,14 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
-        logger.LogInformation(
-            "[{LocalEndpoint}/{PartitionId}/{State}] DIAG backfill-decision peer={Endpoint} send={Send} followerMaxLog={FollowerMaxLog} localCommitted={LocalCommitted} gap={Gap} threshold={Threshold} idleTailGap={IdleTailGap} regressed={Regressed} liveQuiet={LiveQuiet} liveCommitFloor={LiveCommitFloor} suppressedSinceLastLine={Suppressed}",
-            host.LocalEndpoint, host.PartitionId, nodeState, endpoint, willBackfill,
-            followerMaxLog, localCommittedIndex, followerGap, host.Configuration.BackfillThreshold,
-            idleTailGap, regressed, liveQuiet, liveCommitFloor, suppressedBackfillTraces);
+        if (logger.IsEnabled(LogLevel.Information))
+        {
+            logger.LogInformation(
+                "[{LocalEndpoint}/{PartitionId}/{State}] DIAG backfill-decision peer={Endpoint} send={Send} followerMaxLog={FollowerMaxLog} localCommitted={LocalCommitted} gap={Gap} threshold={Threshold} idleTailGap={IdleTailGap} regressed={Regressed} liveQuiet={LiveQuiet} liveCommitFloor={LiveCommitFloor} suppressedSinceLastLine={Suppressed}",
+                host.LocalEndpoint, host.PartitionId, nodeState, endpoint, willBackfill,
+                followerMaxLog, localCommittedIndex, followerGap, host.Configuration.BackfillThreshold,
+                idleTailGap, regressed, liveQuiet, liveCommitFloor, suppressedBackfillTraces);
+        }
 
         lastBackfillTraceTicks   = now;
         suppressedBackfillTraces = 0;
