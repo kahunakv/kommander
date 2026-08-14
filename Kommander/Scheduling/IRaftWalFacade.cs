@@ -95,6 +95,15 @@ public interface IRaftWalFacade
     long GetPresentIndex() => -1;
 
     /// <summary>
+    /// Seeds the propose-id allocator at promotion to exactly <paramref name="nextId"/> —
+    /// one above the promotion-time log tail — so a new leader stamps client writes at
+    /// <c>lastLogIndex + 1</c> (Raft §5.3) and can neither reissue a durably occupied index
+    /// (two values committing at one index) nor open a hole by allocating above the tail.
+    /// Default no-op for facades that do not allocate ids (test stubs).
+    /// </summary>
+    void SeedProposeAllocator(long nextId) { }
+
+    /// <summary>
     /// Term of the entry at <see cref="GetPresentIndex"/> (the §5.4.1 pair must describe the same
     /// log position), or -1 when the facade does not track presence.
     /// </summary>

@@ -155,6 +155,66 @@ public sealed class TestStaleProposedRegression
         }
     }
 
+    /// <summary>
+    /// The propose-id ALLOCATOR must be monotonic: accepting a low-id Proposed row (an unresolved
+    /// band from an earlier term, delivered late) must not drag it backwards. Before the fix the
+    /// arm did <c>proposeIndex = log.Id + 1</c> unconditionally, so the next client write was
+    /// stamped onto an index already durably occupied — committing two different values at the
+    /// same index on whichever replicas had a hole there (the Jepsen Log Matching violation of
+    /// run 31805148040, p2/211..218).
+    /// </summary>
+    [Fact]
+    public void LowUnresolvedProposedRow_DoesNotRegressTheAllocator()
+    {
+        RaftWriteAhead writeAhead = CreateWriteAhead(out RaftManager manager, out RaftPartition partition);
+
+        try
+        {
+            Append(writeAhead, Proposed(5));   // allocator → 6
+            Append(writeAhead, Proposed(2));   // unresolved low id: accepted, must NOT regress it
+
+            RaftLog stamped = new() { LogType = "test", LogData = [1] };
+            writeAhead.EnqueuePropose(1, [stamped], HLCTimestamp.Zero, autoCommit: true);
+
+            Assert.Equal(6, stamped.Id);
+        }
+        finally
+        {
+            partition.Dispose();
+            manager.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The exact last-non-skipped-id-wins shape from the ticket: with the allocator at 9
+    /// (Proposed 6 and 8 held), a late unresolved Proposed 7 arrives. Before the fix it dragged
+    /// the allocator to 8, and the next client write was stamped 8 — reissuing the id the durable
+    /// Proposed row 8 already occupies.
+    /// </summary>
+    [Fact]
+    public void LateUnresolvedRowBelowHeldProposes_DoesNotCauseAnIdReissue()
+    {
+        RaftWriteAhead writeAhead = CreateWriteAhead(out RaftManager manager, out RaftPartition partition);
+
+        try
+        {
+            Append(writeAhead, Committed(1), Committed(2), Committed(3), Committed(4), Committed(5));
+            Append(writeAhead, Proposed(6));
+            Append(writeAhead, Proposed(8));   // allocator → 9 (8 held durably)
+            Append(writeAhead, Proposed(7));   // late fill of the gap: must not regress to 8
+
+            RaftLog stamped = new() { LogType = "test", LogData = [1] };
+            writeAhead.EnqueuePropose(1, [stamped], HLCTimestamp.Zero, autoCommit: true);
+
+            Assert.Equal(9, stamped.Id);
+        }
+        finally
+        {
+            partition.Dispose();
+            manager.Dispose();
+        }
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     private static void Append(RaftWriteAhead writeAhead, params RaftLog[] logs) =>

@@ -273,4 +273,144 @@ public class TestPromotionBarrierRealWal
             manager.Dispose();
         }
     }
+
+    /// <summary>
+    /// The restart-convergence payoff of the inherited-re-commit work (spec: "converge the
+    /// persistent WAL commit frontier over inherited entries on the leader", T3): after a
+    /// promotion commits an inherited prior-term Proposed band, the band's rows must be durably
+    /// re-marked Committed — so a RESTART recomputes the commit frontier at the promoted value
+    /// instead of regressing below the band, and the next promotion finds nothing inherited (the
+    /// no-tail fast path publishes immediately, with no barrier round).
+    ///
+    /// <para>Before the durable re-commit, the band stayed Proposed on disk: restore reconstructed
+    /// the frontier BELOW it, the consumer projection regressed, and — worse — the leader's
+    /// backfill could never re-ship the band (the committed-only range read skipped it), wedging
+    /// every follower behind a gap the leader did not believe existed.</para>
+    ///
+    /// <para>Runs on <see cref="RocksDbWAL"/> deliberately: <see cref="InMemoryWAL"/> returns its
+    /// STORED instances from reads, so <c>EnqueueCommit</c>'s in-place type flip mutates the
+    /// backend directly and masks a re-commit whose physical write never happens — the exact
+    /// masking that let the empty-payload bug (feature 25016232 round 4) through every in-memory
+    /// test. A serializing backend is the only honest witness for the row flip.</para>
+    /// </summary>
+    [Fact]
+    public async Task RestartAfterInheritedCommit_FrontierDoesNotRegress()
+    {
+        const int partitionId = 1;
+
+        RaftConfiguration config = new()
+        {
+            Host = "localhost",
+            Port = 9014,
+            InitialPartitions = 0,
+        };
+
+        string walDir = Path.Combine(Path.GetTempPath(), $"kommander-t3-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(walDir);
+        RocksDbWAL wal = new(walDir, "wal", NullLogger<IRaft>.Instance, syncWrites: false);
+
+        RaftManager manager = new(
+            config,
+            new StaticDiscovery([]),
+            wal,
+            new InMemoryCommunication(),
+            new HybridLogicalClock(),
+            NullLogger<IRaft>.Instance);
+
+        ((FairReadScheduler)manager.ReadScheduler).Start();
+        ((FairWalScheduler)manager.WalScheduler).Start();
+
+        RaftPartition partition = new(
+            manager,
+            wal,
+            partitionId,
+            startRange: 0,
+            endRange: 0,
+            NullLogger<IRaft>.Instance);
+
+        ConcurrentQueue<RaftWalCompletion> completions = new();
+        RaftWriteAhead writeAhead = new(manager, completions.Enqueue, partition, wal);
+
+        RecordingHost host = new();
+        RaftPartitionStateMachine sm = new(host, new RaftWalFacadeAdapter(writeAhead), new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        try
+        {
+            // Pre-crash history: 1..2 committed with durable markers; 3..5 arrive Proposed from a
+            // prior term whose commit broadcast was lost with the old leader.
+            writeAhead.EnqueueProposeOrCommit([
+                new RaftLog { Id = 1, Term = 0, Type = RaftLogType.Committed, LogType = "t", LogData = [1] },
+                new RaftLog { Id = 2, Term = 0, Type = RaftLogType.Committed, LogType = "t", LogData = [1] },
+            ]);
+            writeAhead.EnqueueProposeOrCommit([
+                new RaftLog { Id = 3, Term = 0, Type = RaftLogType.Proposed, LogType = "t", LogData = [1] },
+                new RaftLog { Id = 4, Term = 0, Type = RaftLogType.Proposed, LogType = "t", LogData = [1] },
+                new RaftLog { Id = 5, Term = 0, Type = RaftLogType.Proposed, LogType = "t", LogData = [1] },
+            ]);
+
+            // Promote: the barrier commits the inherited band and (the fix under test) durably
+            // re-marks rows 3..5 Committed. Pump completions until leadership publishes.
+            await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+
+            TimeSpan budget = TestTimeouts.Scale(TimeSpan.FromSeconds(10));
+            long started = Stopwatch.GetTimestamp();
+
+            while (!host.EventLog.Contains("LeaderChanged:node-a"))
+            {
+                if (Stopwatch.GetElapsedTime(started) > budget)
+                    Assert.Fail($"Barrier never completed; events: [{string.Join(",", host.EventLog)}]");
+
+                if (completions.TryDequeue(out RaftWalCompletion? completion))
+                    await sm.CompleteWalOperationAsync(completion);
+                else
+                    await Task.Delay(5, TestContext.Current.CancellationToken);
+            }
+
+            // Drain the re-commit's own completion and wait for the physical writes to settle:
+            // rows 3..5 (re-marked) and 6 (the committed barrier no-op) must read Committed.
+            while (Stopwatch.GetElapsedTime(started) < budget)
+            {
+                while (completions.TryDequeue(out RaftWalCompletion? completion))
+                    await sm.CompleteWalOperationAsync(completion);
+
+                List<RaftLog> committedTail = await writeAhead.GetRangeAsync(3, 10);
+                if (committedTail.Count(l => l.Id is >= 3 and <= 6) == 4)
+                    break;
+
+                await Task.Delay(5, TestContext.Current.CancellationToken);
+            }
+
+            // ── "Restart": a fresh RaftWriteAhead over the SAME backend re-runs restore. ──
+            RaftWriteAhead restarted = new(manager, _ => { }, partition, wal);
+            IReadOnlyList<RaftLog> restoreLogs = await restarted.LoadRestoreLogsAsync();
+            await restarted.CompleteRestoreAsync(restoreLogs);
+
+            // THE acceptance assert: the frontier does not regress below the promoted value.
+            // Pre-fix the band 3..5 read Proposed and restore stopped at 2.
+            Assert.Equal(6, restarted.GetCommitIndex());
+
+            // And the next promotion finds nothing inherited: a state machine restored over the
+            // same backend publishes leadership IMMEDIATELY (no-tail fast path, no barrier).
+            RecordingHost hostB = new();
+            RaftPartitionStateMachine smB = new(hostB, new RaftWalFacadeAdapter(restarted), new CapturingReplySink(), NullLogger<IRaft>.Instance);
+            await smB.ForceLeaderForTestingAsync(replyCorrelationId: null);
+
+            Assert.Equal("node-a", hostB.Leader);
+            Assert.Equal(RaftNodeState.Leader, smB.NodeState);
+        }
+        finally
+        {
+            partition.Dispose();
+            manager.Dispose();
+
+            try
+            {
+                Directory.Delete(walDir, recursive: true);
+            }
+            catch
+            {
+                // Best-effort temp cleanup; the OS temp dir reaps leftovers.
+            }
+        }
+    }
 }

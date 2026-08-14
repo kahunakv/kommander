@@ -70,6 +70,10 @@ public sealed class RaftWriteAhead
     // first reordered entry. Touched only on the partition's serialized executor path.
     private readonly SortedSet<long> pendingResolved = new();
 
+    /// <summary>Throttle for <see cref="LogStaleProposedSkipped"/>: executor thread only.</summary>
+    private long lastStaleProposedLogTicks;
+    private int suppressedStaleProposedLogs;
+
     // Reused across follower appends to collect this batch's resolved ids; applied to the frontier
     // only after the WAL enqueue succeeds, so a backpressure rejection needs no frontier rollback.
     private readonly List<long> resolvedThisBatch = [];
@@ -490,6 +494,20 @@ public sealed class RaftWriteAhead
         IReadOnlyList<RaftLog> ordered = OrderById(logs);
         int count = ordered.Count;
 
+        // Index-allocation invariant (Raft §5.3): a leader appends only at lastLogIndex + 1.
+        // An allocator at or below the highest durably present id would stamp this proposal onto
+        // an index that is already occupied — the reissued slot then commits a second value at
+        // the same index on whichever replicas happen to have a hole there (the Log Matching
+        // violation of Jepsen run 31805148040). The monotonic follower arms and the promotion
+        // seeding should make this unreachable; if it fires anyway, self-heal past the presence
+        // frontier and say so loudly rather than issue a colliding id.
+        if (presentIndex >= 0 && proposeIndex < presentIndex)
+        {
+            logger.LogError("[{Endpoint}/{Partition}] Propose allocator at {ProposeIndex} is BELOW the presence frontier {PresentIndex} — refusing to reissue occupied indices; skipping forward.",
+                manager.LocalEndpoint, partition.PartitionId, proposeIndex, presentIndex);
+            proposeIndex = presentIndex;
+        }
+
         // Snapshot mutable state before mutation so we can roll back atomically if the scheduler
         // rejects the operation (e.g. BackpressureExceededException). The id/term snapshots use
         // pooled value buffers (no GC references): rented and returned within this call, never
@@ -853,6 +871,48 @@ public sealed class RaftWriteAhead
     /// Synchronous: it reads an in-memory counter, no WAL/scheduler round-trip.
     /// </summary>
     public long GetCommitIndex() => commitIndex - 1;
+
+    /// <summary>
+    /// Records that an incoming Proposed/ProposedCheckpoint row was skipped because its id is
+    /// already resolved locally (the stale-duplicate guard). Observability requested by the
+    /// index-reissue investigation: the skip is the only trace that a stale duplicate arrived,
+    /// and it is exactly the event that used to regress the propose allocator — so it must be
+    /// visible in a run's logs, throttled to one line a second.
+    /// </summary>
+    private void LogStaleProposedSkipped(long id)
+    {
+        long now = global::System.Diagnostics.Stopwatch.GetTimestamp();
+
+        if (lastStaleProposedLogTicks != 0 && (now - lastStaleProposedLogTicks) < global::System.Diagnostics.Stopwatch.Frequency)
+        {
+            suppressedStaleProposedLogs++;
+            return;
+        }
+
+        if (logger.IsEnabled(LogLevel.Information))
+            logger.LogInformation("[{Endpoint}/{Partition}] Skipped stale Proposed duplicate of resolved id {Id} (suppressedSinceLastLine={Suppressed})",
+                manager.LocalEndpoint, partition.PartitionId, id, suppressedStaleProposedLogs);
+
+        lastStaleProposedLogTicks = now;
+        suppressedStaleProposedLogs = 0;
+    }
+
+    /// <summary>
+    /// Seeds the propose-id ALLOCATOR at promotion: a new leader appends at
+    /// <c>lastLogIndex + 1</c> (Raft §5.3), so the allocator is set to exactly
+    /// <paramref name="nextId"/> — one above the promotion-time presence frontier / commit
+    /// frontier maximum. Both directions matter: a follower stint can leave the allocator LOW
+    /// (an unresolved prior-term band moved it backwards before the arms became monotonic, or
+    /// legitimately when the band was the tail) — stamping from there reissues durably occupied
+    /// indices and commits two values at one index; and stale high proposes later truncated away
+    /// can leave it HIGH — stamping from there opens a permanent hole below the new entry. The
+    /// promotion hole-gate has already proven the log contiguous through the seed point, which is
+    /// what makes the exact (non-monotonic) set safe HERE and nowhere else.
+    /// </summary>
+    public void SeedProposeAllocator(long nextId)
+    {
+        proposeIndex = nextId;
+    }
 
     /// <summary>
     /// Advances the contiguous commit frontier to absorb a resolved (Committed/RolledBack) id.
@@ -1224,7 +1284,10 @@ public sealed class RaftWriteAhead
                     // Checks both the contiguous frontier and the resolved-above-gap buffer, so a
                     // resolved-but-buffered id is protected too.
                     if (log.Id < commitIndex || pendingResolved.Contains(log.Id))
+                    {
+                        LogStaleProposedSkipped(log.Id);
                         break;
+                    }
 
                     if (plan.TryGetValue(RaftLogAction.Propose, out List<RaftLog> proposeActions))
                         proposeActions.Add(log);
@@ -1233,7 +1296,16 @@ public sealed class RaftWriteAhead
 
                     logger.LogDebugProposedLogs(manager.LocalEndpoint, partition.PartitionId, log.Id);
 
-                    proposeIndex = log.Id + 1;
+                    // MONOTONIC, never a plain assignment: proposeIndex is the id ALLOCATOR the
+                    // node stamps client writes from when it is (or becomes) leader. A low-id
+                    // Proposed row — an unresolved band from an earlier term, a stale duplicate
+                    // that predates the resolved-id guard — must never drag it backwards: a
+                    // regressed allocator makes a later leader reissue indices that are already
+                    // durably occupied elsewhere, committing two different values at one index
+                    // (the Jepsen Log Matching violation, run 31805148040 p2/211..218). Every
+                    // sibling frontier in this file is monotonic; this was the one that was not.
+                    if (log.Id + 1 > proposeIndex)
+                        proposeIndex = log.Id + 1;
                 }
                 break;
 
@@ -1268,7 +1340,10 @@ public sealed class RaftWriteAhead
                     // Same resolved-id guard as the Proposed case above: a resolved checkpoint id
                     // must never regress to ProposedCheckpoint on disk.
                     if (log.Id < commitIndex || pendingResolved.Contains(log.Id))
+                    {
+                        LogStaleProposedSkipped(log.Id);
                         break;
+                    }
 
                     if (plan.TryGetValue(RaftLogAction.Propose, out List<RaftLog> proposeActions))
                         proposeActions.Add(log);
@@ -1277,7 +1352,9 @@ public sealed class RaftWriteAhead
 
                     logger.LogDebugProposedCheckpointLog(manager.LocalEndpoint, partition.PartitionId, log.Id);
 
-                    proposeIndex = log.Id + 1;
+                    // Monotonic for the same reason as the Proposed arm above.
+                    if (log.Id + 1 > proposeIndex)
+                        proposeIndex = log.Id + 1;
                 } 
                 break;
 

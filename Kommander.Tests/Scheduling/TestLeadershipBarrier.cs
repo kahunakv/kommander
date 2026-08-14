@@ -131,11 +131,31 @@ public class TestLeadershipBarrier
         private long _commitIndex;
         private long _nextId;
 
+        /// <summary>
+        /// Highest log id present, tracked separately from the allocator (<see cref="_nextId"/>):
+        /// the promotion-seeding test regresses the ALLOCATOR while the LOG must keep reporting
+        /// its real tail, exactly as the real facade's max-log read does.
+        /// </summary>
+        private long _maxId;
+
+        /// <summary>Last value passed to <see cref="SeedProposeAllocator"/>; -1 when never seeded.</summary>
+        public long SeededAllocator { get; private set; } = -1;
+
+        /// <summary>Simulates a follower stint that dragged the propose allocator backwards.</summary>
+        public void RegressAllocatorForTesting(long nextId) => _nextId = nextId;
+
+        public void SeedProposeAllocator(long nextId)
+        {
+            SeededAllocator = nextId;
+            _nextId = nextId;
+        }
+
         public void Seed(params RaftLog[] inherited)
         {
             InheritedProposed.AddRange(inherited);
             _commitIndex = 0;
             _nextId = inherited.Length > 0 ? inherited.Max(l => l.Id) + 1 : 1;
+            _maxId = _nextId - 1;
         }
 
         /// <summary>
@@ -150,6 +170,8 @@ public class TestLeadershipBarrier
             for (int i = 0; i < count; i++)
             {
                 RaftLog log = new() { Id = _nextId++, Term = term, Type = RaftLogType.Proposed, LogType = "t" };
+                if (log.Id > _maxId)
+                    _maxId = log.Id;
                 InheritedProposed.Add(log);
                 added.Add(log);
             }
@@ -158,7 +180,7 @@ public class TestLeadershipBarrier
         }
 
         public long GetCommitIndex() => _commitIndex;
-        public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(_nextId - 1);
+        public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(_maxId);
 
         public ValueTask<List<RaftLog>> GetRangeAsync(long start, int max)
             => ValueTask.FromResult(Committed.Where(l => l.Id >= start).Take(max).ToList());
@@ -177,6 +199,8 @@ public class TestLeadershipBarrier
             {
                 log.Id = _nextId++;
                 log.Term = term;
+                if (log.Id > _maxId)
+                    _maxId = log.Id;
             }
 
             long maxId = logs.Count > 0 ? logs.Max(l => l.Id) : 0;
@@ -358,6 +382,38 @@ public class TestLeadershipBarrier
         // 31766873204 (rows re-committed in memory, never flipped on disk).
         Assert.NotEmpty(wal.CommitPayloads);
         Assert.All(wal.CommitPayloads, payload => Assert.NotEmpty(payload));
+    }
+
+    /// <summary>
+    /// Promotion must seed the propose-id allocator to exactly one above the log tail (Raft §5.3:
+    /// a leader appends at lastLogIndex + 1). A follower stint can leave the allocator INSIDE an
+    /// inherited band it later commits — and a leader stamping client writes from there reissues
+    /// indices that are already durably occupied, committing two different values at the same
+    /// index (the Jepsen Log Matching violation of run 31805148040: n2 committed its inherited
+    /// band 211..218 at promotion, then acked new client writes at 211..218 one second later).
+    /// </summary>
+    [Fact]
+    public async Task Promotion_SeedsTheProposeAllocatorAboveTheInheritedTail()
+    {
+        (BarrierRecordingHost host, InheritedTailWalFacade wal, RaftPartitionStateMachine sm) = MakeInheritedTailFixture();
+
+        // The follower stint left the allocator regressed INTO the inherited band 1..3.
+        wal.RegressAllocatorForTesting(2);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+
+        // The promotion seeded the allocator one above the tail, BEFORE proposing the barrier —
+        // so the barrier no-op itself was stamped at 4, not onto the occupied id 2.
+        Assert.Equal(4, wal.SeededAllocator);
+
+        await sm.CompleteWalOperationAsync(ProposeCompletion(host.PartitionId, logIndex: 4));
+        await sm.CompleteWalOperationAsync(CommitCompletion(host.PartitionId, minLogIndex: 4, maxLogIndex: 4));
+        Assert.Equal("node-a", host.Leader);
+
+        // And the first client write after promotion allocates above the whole band.
+        RaftLog stamped = new() { LogType = "t", LogData = [1] };
+        wal.EnqueuePropose(sm.CurrentTerm, [stamped], HLCTimestamp.Zero, autoCommit: true);
+        Assert.Equal(5, stamped.Id);
     }
 
     // ── no-tail fast path: zero added latency ─────────────────────────────────

@@ -38,6 +38,8 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
 
     public long GetPresentIndex() => wal.GetPresentIndex();
 
+    public void SeedProposeAllocator(long nextId) => wal.SeedProposeAllocator(nextId);
+
     public long GetPresentTerm() => wal.GetPresentTerm();
 
     public void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0) =>

@@ -1232,6 +1232,17 @@ public sealed class RaftPartitionStateMachine
         // (presentId == -1, test stubs) fall back to the adapter read, which is exact for them.
         long inheritedTail = presentId >= 0 ? presentId : maxLog;
 
+        // Seed the propose-id allocator to exactly one above this node's log tail (Raft §5.3: a
+        // leader appends at lastLogIndex + 1). A follower stint can leave the allocator anywhere —
+        // LOW after accepting an unresolved prior-term band (stamping from there reissues durably
+        // occupied indices, committing two different values at one index: the Jepsen Log Matching
+        // violation of run 31805148040), or HIGH after truncated-away stale proposes (stamping
+        // from there opens a permanent hole below the first new entry). The hole gate above has
+        // already proven the log contiguous through the tail, which is what makes the exact set
+        // safe at this point and nowhere else. Seeded BEFORE the barrier propose so the barrier
+        // no-op itself is stamped correctly.
+        wal.SeedProposeAllocator(Math.Max(inheritedTail, commitFrontier) + 1);
+
         if (inheritedTail <= commitFrontier)
         {
             // No inherited tail: the drain above already proved the consumer projection complete.
