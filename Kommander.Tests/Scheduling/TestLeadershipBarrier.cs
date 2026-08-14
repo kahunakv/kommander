@@ -120,6 +120,14 @@ public class TestLeadershipBarrier
 
         public List<RaftLog> Committed { get; } = [];
 
+        /// <summary>
+        /// The exact list references handed to <see cref="EnqueueCommit"/>. The real WAL pipeline
+        /// serializes an operation's payload on a worker thread LATER, so a caller that clears or
+        /// reuses the list after enqueue silently writes nothing — a synchronous stub cannot catch
+        /// that unless the test re-checks these references after the flow completes.
+        /// </summary>
+        public List<List<RaftLog>> CommitPayloads { get; } = [];
+
         private long _commitIndex;
         private long _nextId;
 
@@ -177,6 +185,8 @@ public class TestLeadershipBarrier
 
         public WALWriteOperation EnqueueCommit(List<RaftLog> logs)
         {
+            CommitPayloads.Add(logs);
+
             // Mirror RaftWriteAhead.EnqueueCommit: flip Proposed → Committed and advance the frontier.
             foreach (RaftLog log in logs)
             {
@@ -341,6 +351,13 @@ public class TestLeadershipBarrier
         // ...and the backfill read now returns the range, so a follower missing it can be repaired.
         List<RaftLog> backfillView = await ((IRaftWalFacade)wal).GetRangeAsync(1, 10);
         Assert.Equal([1L, 2L, 3L], backfillView.Where(l => l.Id <= 3).Select(l => l.Id).Order().ToList());
+
+        // The payload lists handed to EnqueueCommit must still be populated: the real pipeline
+        // serializes them on a worker thread LATER, so clearing/reusing the list after enqueue
+        // writes NOTHING while logging success — the silent leader-side wedge of Jepsen run
+        // 31766873204 (rows re-committed in memory, never flipped on disk).
+        Assert.NotEmpty(wal.CommitPayloads);
+        Assert.All(wal.CommitPayloads, payload => Assert.NotEmpty(payload));
     }
 
     // ── no-tail fast path: zero added latency ─────────────────────────────────

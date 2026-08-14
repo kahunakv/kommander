@@ -60,7 +60,7 @@ public class TestProposalRetry
         List<RaftResponderRequest> resent = EntryBatches(host);
         Assert.Equal(2, resent.Count);
         Assert.All(resent, r => Assert.Equal(ticket, r.AppendLogsRequest!.Time));
-        Assert.All(resent, r => Assert.Equal(1, r.AppendLogsRequest!.Logs!.Count));
+        Assert.All(resent, r => Assert.Single(r.AppendLogsRequest!.Logs!));
 
         // One late ack completes the quorum (leader + VoterA of 3 voters) and auto-commits.
         await sm.CompleteAppendLogsAsync(VoterA, ticket, RaftOperationStatus.Success, committedIndex: 0);

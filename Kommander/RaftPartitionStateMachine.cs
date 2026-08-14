@@ -1631,8 +1631,16 @@ public sealed class RaftPartitionStateMachine
     /// skip it and the partition wedges (see the note at the collection site). Lazy like all commit
     /// markers on the single-fsync path: the enqueue is not awaited for durability, and a
     /// backpressure rejection only defers the repair to the next drain — delivery already happened,
-    /// so failing the drain over it would be strictly worse. Clears the list so the multiple drain
-    /// exit paths cannot double-enqueue.
+    /// so failing the drain over it would be strictly worse.
+    ///
+    /// OWNERSHIP: the list is handed to the WAL operation, which holds the REFERENCE until a
+    /// worker thread serializes it later — the caller must neither clear nor reuse it after this
+    /// call. An earlier version called <c>inherited.Clear()</c> here "for safety": the async write
+    /// then drained an empty payload, wrote nothing, and completed Success — the re-commit logged
+    /// as done while the rows stayed <c>Proposed</c> on disk, which is exactly the silent
+    /// leader-side wedge observed in Jepsen run 31766873204 (n3/p2, rows 180..181, 4.7k backfill
+    /// refusals). Every drain exit returns immediately after calling this, so no double-enqueue
+    /// is possible without the clear.
     /// </summary>
     private void EnqueueInheritedRecommitMarkers(List<RaftLog>? inherited)
     {
@@ -1656,8 +1664,6 @@ public sealed class RaftPartitionStateMachine
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Could not enqueue durable re-commit of {Count} inherited entries ({Message}) — the on-disk range stays Proposed and unbackfillable until the next promotion retries.",
                 host.LocalEndpoint, host.PartitionId, nodeState, inherited.Count, ex.Message);
         }
-
-        inherited.Clear();
     }
 
     /// <summary>
