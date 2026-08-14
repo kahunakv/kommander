@@ -169,6 +169,7 @@ public sealed class TestBatchRequestsResponseCadence
         public Task<(bool success, RaftOperationStatus status, long commitLogId)> RollbackLogs(int partitionId, HLCTimestamp ticketId, CancellationToken cancellationToken = default) => throw new NotImplementedException();
         public void SetMinRetainIndex(int partitionId, long index) => throw new NotImplementedException();
         public long GetCommitIndex(int partitionId) => throw new NotImplementedException();
+        public long GetStaleProposedSkippedCount(int partitionId) => throw new NotImplementedException();
         public IDisposable AcquireRetentionHold(int partitionId, long index) => throw new NotImplementedException();
         public string GetLocalEndpoint() => throw new NotImplementedException();
         public int GetLocalNodeId() => throw new NotImplementedException();
