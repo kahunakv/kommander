@@ -40,6 +40,15 @@ public sealed class RaftWriteAhead
     /// persistence (rocksdb or sqlite) in a more efficient way.
     /// </summary>
     private readonly SmallDictionary<RaftLogAction, List<RaftLog>> plan = new(3);
+
+    /// <summary>
+    /// The order <see cref="EnqueueProposeOrCommit"/> flattens the write plan: proposes first,
+    /// resolutions last, so within one physical batch the resolved row state always wins over a
+    /// stale duplicate Proposed copy of the same id (last put wins). See the note at the flatten
+    /// loop for why iterating the reused dictionary directly was order-nondeterministic.
+    /// </summary>
+    private static readonly RaftLogAction[] PlanFlattenOrder =
+        [RaftLogAction.Propose, RaftLogAction.Rollback, RaftLogAction.Commit];
     
     private readonly int compactEveryOperations;
     
@@ -1202,6 +1211,21 @@ public sealed class RaftWriteAhead
             {
                 case RaftLogType.Proposed: /* when log.Id >= proposeIndex: */
                 {
+                    // A locally RESOLVED id must never be written as Proposed again. Resolution
+                    // (commit or rollback) is terminal; the only sender of a Proposed copy for a
+                    // resolved id is a stale duplicate — a deposed leader's in-flight broadcast or
+                    // a proposal retry that raced its own commit. Writing it would regress the
+                    // on-disk row from Committed back to Proposed while the in-memory frontier
+                    // (which never re-reads rows) stays past it — and the write pipeline's
+                    // post-append TruncateProposedLogsAfter then silently DELETES the regressed
+                    // row, leaving a permanent hole below the advertised frontier: the follower
+                    // reports itself caught up, the leader never backfills, and the apply drain
+                    // blocks on the absent row forever (the Jepsen frozen-replica residue).
+                    // Checks both the contiguous frontier and the resolved-above-gap buffer, so a
+                    // resolved-but-buffered id is protected too.
+                    if (log.Id < commitIndex || pendingResolved.Contains(log.Id))
+                        break;
+
                     if (plan.TryGetValue(RaftLogAction.Propose, out List<RaftLog> proposeActions))
                         proposeActions.Add(log);
                     else
@@ -1241,6 +1265,11 @@ public sealed class RaftWriteAhead
 
                 case RaftLogType.ProposedCheckpoint: /* when log.Id >= proposeIndex: */
                 {
+                    // Same resolved-id guard as the Proposed case above: a resolved checkpoint id
+                    // must never regress to ProposedCheckpoint on disk.
+                    if (log.Id < commitIndex || pendingResolved.Contains(log.Id))
+                        break;
+
                     if (plan.TryGetValue(RaftLogAction.Propose, out List<RaftLog> proposeActions))
                         proposeActions.Add(log);
                     else
@@ -1290,9 +1319,19 @@ public sealed class RaftWriteAhead
         // the max over logsToWrite, so logIndex is identical to the previous code.
         long maxLogId = -1;
 
-        foreach (KeyValuePair<RaftLogAction, List<RaftLog>> keyValue in plan)
+        // EXPLICIT flatten order — proposes first, resolutions last. The physical write applies
+        // the flattened list in order and the last put for a key wins, so when one batch carries
+        // both a (stale duplicate) Proposed copy and the resolution of the same id, the resolved
+        // row must be what lands. Iterating `plan` directly made the order an accident of which
+        // action key was inserted first in this instance's lifetime (keys are never removed from
+        // the reused dictionary) — a partition whose first-ever batch was a commit marker would
+        // flatten Commit before Propose forever, letting a same-batch duplicate leave the row
+        // Proposed, where the post-append truncation can silently delete it.
+        foreach (RaftLogAction action in PlanFlattenOrder)
         {
-            List<RaftLog> group = keyValue.Value;
+            if (!plan.TryGetValue(action, out List<RaftLog> group))
+                continue;
+
             for (int i = 0; i < group.Count; i++)
             {
                 RaftLog log = group[i];

@@ -558,6 +558,31 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         if (groupBatches.Count == 0)
             return;
 
+        // ── Phase 1.5: proposed-tail truncation, BEFORE the batch write ────
+        // One truncate at the minimum FollowerAppend index per partition, run before the batch's
+        // rows land. Running it AFTER the write (as this originally did) breaks the sequential
+        // equivalence its comment claimed: executed one op at a time, an op's truncation runs
+        // BEFORE later ops write their rows, so those rows survive — but write-everything-then-
+        // truncate-at-the-batch-min deleted Proposed rows the SAME batch had just written
+        // (a fresh propose coalesced behind a lower-anchored append), silently discarding
+        // entries whose presence/commit bookkeeping had already advanced at enqueue. Truncating
+        // first keeps the pre-existing-orphan cleanup (those rows predate every op in the batch,
+        // so the batch minimum is exactly their sequential fate) while every row written by this
+        // batch survives it; a genuine orphan among them is cleaned by a later batch's pass.
+        foreach ((int pid, List<WALWriteOperation> pidBatch) in groupBatches)
+        {
+            long minTruncateIndex = long.MaxValue;
+
+            foreach (WALWriteOperation op in pidBatch)
+            {
+                if (op.Type == WALWriteOperationType.FollowerAppend && op.LogIndex > 0 && op.LogIndex < minTruncateIndex)
+                    minTruncateIndex = op.LogIndex;
+            }
+
+            if (minTruncateIndex != long.MaxValue)
+                walAdapter.TruncateProposedLogsAfter(pid, minTruncateIndex);
+        }
+
         // ── Phase 2: single cross-partition WAL write ──────────────────────
         RaftOperationStatus status;
 
@@ -623,34 +648,6 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                         WalPhaseInstrumentation.RecordDurable(op.Type, opWaitMs);
                 }
                 waitState.CommitWait.RecordWaitMs(totalWaitMs / pidBatch.Count);
-            }
-
-            if (status == RaftOperationStatus.Success)
-            {
-                // Discard only the UNRESOLVED (Proposed) tail above this append. A blanket
-                // TruncateLogsAfter here corrupts a follower: propose/commit broadcasts are shipped
-                // unanchored and out of order, so a low-max-id append can complete after higher
-                // COMMITTED entries have already landed, and deleting those loses quorum-acked data
-                // while the commit frontier (advanced on enqueue, never rolled back) still reports
-                // them — leaving the leader convinced the follower is caught up so it never backfills.
-                // Resolved entries are never conflicting, so preserving them is safe and correct.
-                //
-                // One truncate at the MINIMUM index instead of one per op: the calls are cumulative and
-                // idempotent (truncating after X₁ then X₂ deletes exactly the proposed tail above
-                // min(X₁,X₂)), and nothing writes to the partition between them (same worker, sequential,
-                // after the batch write) — so the coalesced call yields the identical final state while
-                // paying one scan+delete (and, on RocksDB, one synced write) instead of up to
-                // maxBatchSize of them.
-                long minTruncateIndex = long.MaxValue;
-
-                foreach (WALWriteOperation op in pidBatch)
-                {
-                    if (op.Type == WALWriteOperationType.FollowerAppend && op.LogIndex > 0 && op.LogIndex < minTruncateIndex)
-                        minTruncateIndex = op.LogIndex;
-                }
-
-                if (minTruncateIndex != long.MaxValue)
-                    walAdapter.TruncateProposedLogsAfter(pid, minTruncateIndex);
             }
 
             foreach (WALWriteOperation op in pidBatch)
