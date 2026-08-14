@@ -361,8 +361,10 @@ The key design choices, so you do not get surprised when reading the code:
   broadcast path (ordinary proposals/commits) is intentionally not anchored, because anchoring the live
   path can reject transiently-behind followers with no recovery and stall progress.
 - **If a follower is so far behind that the leader has already compacted the entries it needs**, backfill
-  cannot help (the data is gone). The leader signals `SnapshotRequired`, and catch-up switches to
-  installing a snapshot instead (Flow 6).
+  cannot help (the data is gone). The leader detects the empty backfill read at the compaction floor and
+  switches to installing a snapshot instead (Flow 6) — an internal handoff on the leader's heartbeat
+  path, not a wire status. A follower whose snapshot cannot be produced or delivered is retried with
+  exponential backoff and reported through `IRaft.GetSnapshotStatuses`.
 
 For a full walkthrough, see the [Log Catch-Up & Backfill Developer Guide](log-backfill-developer-guide.md).
 

@@ -22,14 +22,15 @@ their learner/promotion lifecycle and their planner/controller pattern, applied 
 4. [The one behavioral pivot: per-partition peers and quorum](#the-one-behavioral-pivot-per-partition-peers-and-quorum)
 5. [Partial materialization: hosting only what you replicate](#partial-materialization-hosting-only-what-you-replicate)
 6. [How a replica moves, step by step](#how-a-replica-moves-step-by-step)
-7. [The placement planner and the P0 controller](#the-placement-planner-and-the-p0-controller)
-8. [Routing and forwarding](#routing-and-forwarding)
-9. [Interplay: initial placement, split/merge, membership](#interplay-initial-placement-splitmerge-membership)
-10. [Using it: configuration](#using-it-configuration)
-11. [Safety: invariants you must not break](#safety-invariants-you-must-not-break)
-12. [Code map — where everything lives](#code-map--where-everything-lives)
-13. [Known limitations](#known-limitations)
-14. [FAQ](#faq)
+7. [Seeding a new replica: whole-partition snapshots](#seeding-a-new-replica-whole-partition-snapshots)
+8. [The placement planner and the P0 controller](#the-placement-planner-and-the-p0-controller)
+9. [Routing and forwarding](#routing-and-forwarding)
+10. [Interplay: initial placement, split/merge, membership](#interplay-initial-placement-splitmerge-membership)
+11. [Using it: configuration](#using-it-configuration)
+12. [Safety: invariants you must not break](#safety-invariants-you-must-not-break)
+13. [Code map — where everything lives](#code-map--where-everything-lives)
+14. [Known limitations](#known-limitations)
+15. [FAQ](#faq)
 
 ---
 
@@ -230,6 +231,47 @@ A move is nothing new: *add X (learner → voter), then remove Y* — never both
 
 ---
 
+## Seeding a new replica: whole-partition snapshots
+
+Step 2 of an add — "X catches up via the normal backfill / snapshot path" — has a catch: in the
+steady state the range's WAL prefix is compacted, so a freshly added replica **cannot** be
+bootstrapped by log backfill alone. It needs a whole-partition state snapshot from the leader.
+Register the transfer that produces one:
+
+```csharp
+public interface IRaftPartitionStateTransfer
+{
+    // Export the WHOLE application state of the partition, reflecting AT LEAST everything
+    // applied at `upToIndex`. Newer committed state may be included (an MVCC store snapshots
+    // by timestamp and cannot cut an exact as-of-index export): Kommander seeds the receiver's
+    // checkpoint at `upToIndex` and replays retained log entries above it, so re-applying an
+    // already-reflected entry must be a no-op (idempotent apply).
+    Task<Stream> ExportPartitionState(int partitionId, long upToIndex, CancellationToken ct);
+
+    // Atomically replace this node's state for the partition with the exported blob. May run
+    // more than once for the same snapshot (the sender retries when the durable boundary write
+    // fails after a successful import), so repeated import must be idempotent.
+    Task ImportPartitionState(int partitionId, Stream snapshot, CancellationToken ct);
+}
+
+raft.RegisterPartitionStateTransfer(new MyPartitionStateTransfer());
+```
+
+Register it on **every** node that can host or lead user partitions — the leader needs the export,
+the new replica needs the import, and registration is not replicated. Transfers produced through
+this interface travel with `SnapshotKind.PartitionState`, so every node must run a Kommander
+version that understands that kind before the transfer is registered.
+
+Without this registration, the catch-up path falls back to calling
+`IRaftStateMachineTransfer.ExportRange` with a *boundless* plan (only `TargetPartitionId` set,
+meaning "the entire partition"). That works only for applications whose split/merge range transfer
+can also serve whole-partition exports; if yours rejects a boundless plan, a below-floor replica
+can never be seeded until the dedicated transfer is registered. This mirrors what
+`IRaftSystemStateTransfer` already does for the system partition (id 0) — see the system partition
+state snapshots guide for the P0 story.
+
+---
+
 ## The placement planner and the P0 controller
 
 The design copies the leader balancer's proven shape: a **pure planner** over an immutable view,
@@ -285,7 +327,14 @@ the local node may not *host* that partition. Two paths:
 - **Consumer routes directly (the fast path).** `IRaft.GetPartitionReplicas(partitionId)` returns the
   range's committed replica set (empty = every voter). Consumers cache it — refreshed on the existing
   `OnPartitionMapChanged` event or on a `PartitionMoved` rejection — and send operations straight to
-  a replica, preferably the leader.
+  a replica, preferably the leader. To pick *which* replica leads,
+  `IRaft.GetPartitionLeaderHint(partitionId)` answers even for a range this node does not host: it is
+  reduced from gossiped load reports (each node advertises the partitions it believes it leads,
+  newest fresh claim wins), so a non-replica node can forward in one hop instead of two.
+  Contractually best-effort — the hint may be null, stale, or wrong; the receiving node re-checks
+  leadership on every forwarded operation, so use it as the first target and fall back to the
+  replica set on a miss. Load-report gossip is on whenever placement, the leader balancer, or
+  `EnableLoadReports` is enabled (`RaftConfiguration.LoadReportsEnabled`).
 
 - **Local forward fallback.** `ReplicateLogs` called on a non-replica node forwards the proposal to
   the range's replicas (voters first — the leader is always a voter), trying the next replica on a
@@ -333,7 +382,7 @@ All knobs live on `RaftConfiguration`:
 | `MaxReplicaMovesPerPass` | `2` | New moves initiated per controller pass. Bounds the blast radius of a bad plan. |
 | `MaxConcurrentReplicaTransfers` | `1` | Ranges allowed mid-transition at once. Caps concurrent backfill/snapshot traffic so rebalancing never starves client writes. |
 | `ReplicaCountDeadband` | `1` | Per-node replica-count imbalance tolerated before balancing moves are emitted. Prevents ping-ponging around an already-even spread. Repairs ignore it. |
-| `Zone` | `null` | Optional locality hint for the local node; the planner prefers spreading a range's replicas across distinct zones. |
+| `Zone` | `null` | Optional locality hint for the local node, gossiped on its load reports so the planner sees every node's zone; the planner (and the bootstrap assignment) prefer spreading a range's replicas across distinct zones. Whitespace-only values are normalized to null at `Validate()`. |
 
 Per-range overrides go through `IRaft.SetReplicationFactorAsync(partitionId, rf)` (P0-leader-only;
 `0` clears the override). Changing an override adjusts the *target* only — replicas move on later
@@ -405,7 +454,7 @@ that).
 | `Kommander/RaftManager.cs` | `GetPartitionPeers` / `IsPartitionVoter`, committed-map routing, partial materialization, un-host teardown, forwarding |
 | `Kommander/Scheduling/RaftPartitionHostAdapter.cs` | The two-line seam: `Nodes` / `IsVoter` become per-partition |
 | `Kommander/RaftPartitionStateMachine.cs` | Campaign gates also check the local node's per-range voter role |
-| `Kommander/IRaft.cs` | `GetPartitionReplicas`, `GetEffectiveReplicationFactor`, `SetReplicationFactorAsync` |
+| `Kommander/IRaft.cs` | `GetPartitionReplicas`, `GetPartitionLeaderHint`, `HostsPartition`, `GetEffectiveReplicationFactor`, `SetReplicationFactorAsync` |
 | `Kommander/Communication/ICommunication.cs` | `ForwardReplicateLogs` (in-memory transport implements it) |
 | `Kommander.Tests/Scheduler/TestPlacementPlanner.cs` | Pure planner tests (even spread, repair, trim, stability, zones) |
 | `Kommander.Tests/Scheduler/TestReplicaPlacement.cs` | Lifecycle, partial materialization, peer/quorum seam, initial placement |
@@ -417,9 +466,10 @@ that).
 - **Wire forwarding.** The non-replica `ReplicateLogs` fallback is implemented for the in-memory
   transport only; gRPC/REST transports report "unsupported" and the call fails as an unknown
   partition. Consumers on those transports must route directly using `GetPartitionReplicas`.
-- **Remote zone hints.** Only the local node's `Zone` is known to the planner today; other nodes'
-  zones are not yet gossiped, so zone-aware spread is effective mainly in embedded/in-process
-  deployments until the load report carries zones.
+- **Zone at bootstrap.** Remote zones travel on gossiped load reports, so during initial cluster
+  assembly the bootstrap assignment may not have seen every node's zone yet and falls back to
+  even spread for the unknown ones; the rebalancer improves the zone spread on later passes as
+  reports flow. A durable alternative (zone as a committed roster property) remains a follow-up.
 - **Batch proposals.** `ReplicateEntries` (the heterogeneous batch API) does not forward from
   non-replica nodes; batch producers should route directly.
 

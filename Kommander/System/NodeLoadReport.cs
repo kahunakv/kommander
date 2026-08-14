@@ -36,6 +36,18 @@ public sealed class NodeLoadReport
     public HLCTimestamp Time { get; set; }
 
     /// <summary>
+    /// The sender's locality hint (<see cref="RaftConfiguration.Zone"/>), or null when it has
+    /// none configured. Carried so every node — the P0 placement planner in particular — learns
+    /// remote nodes' zones without a committed roster change; without this only the local node's
+    /// zone was known and zone-aware replica spread was inert on multi-process clusters.
+    /// The report travels as JSON inside the gossip envelope, so absent/older senders simply
+    /// deserialize as null (no wire change). Unlike the load figures, a zone is topology and
+    /// effectively immutable for a node's lifetime, so consumers may use it from a report that
+    /// has aged past the load-freshness TTL.
+    /// </summary>
+    public string? Zone { get; set; }
+
+    /// <summary>
     /// Load snapshots for every partition this node currently leads.
     /// Partitions for which another node is leader are absent — the receiver
     /// must not infer "no leadership" from a missing entry; it must consult the

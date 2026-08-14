@@ -258,6 +258,55 @@ public class TestSnapshotInstallExecutor
     }
 
     [Fact]
+    public async Task PartitionStateKind_RoutesToPartitionImporter()
+    {
+        (RaftPartitionStateMachine sm, FakeHost host, CapturingFacade wal, CapturingTransfer transfer) = Build();
+        sm.SetLeaderForTesting(1);
+
+        RaftResponse resp = await sm.InstallSnapshotAsync(new SnapshotInstallRequest
+        {
+            PartitionId = 1,
+            SnapshotIndex = 100,
+            LastIncludedTerm = 3,
+            LeaderTerm = 3,
+            LeaderEndpoint = "L:1",
+            Kind = SnapshotKind.PartitionState,
+            Snapshot = new MemoryStream([1, 2, 3]),
+        });
+
+        Assert.Equal(RaftOperationStatus.Success, resp.Status);
+        Assert.Equal(1, host.PartitionTransfer.ImportCount);   // routed to the new importer
+        Assert.False(transfer.ImportCalled);                   // NOT the range importer
+        Assert.Equal(0, host.SystemTransfer.ImportCount);      // NOT the system importer
+        Assert.Equal(1, wal.BoundaryCallCount);
+    }
+
+    [Fact]
+    public async Task PartitionStateKind_NoPartitionTransfer_Rejected()
+    {
+        (RaftPartitionStateMachine sm, FakeHost host, CapturingFacade wal, CapturingTransfer transfer) = Build();
+        host.PartitionTransferEnabled = false;
+        sm.SetLeaderForTesting(1);
+
+        RaftResponse resp = await sm.InstallSnapshotAsync(new SnapshotInstallRequest
+        {
+            PartitionId = 1,
+            SnapshotIndex = 100,
+            LastIncludedTerm = 3,
+            LeaderTerm = 3,
+            LeaderEndpoint = "L:1",
+            Kind = SnapshotKind.PartitionState,
+            Snapshot = new MemoryStream([1, 2, 3]),
+        });
+
+        // A PartitionState blob must never fall through to ImportRange — the payloads are not
+        // interchangeable — so a missing registration is a rejection, and no boundary is written.
+        Assert.Equal(RaftOperationStatus.Errored, resp.Status);
+        Assert.False(transfer.ImportCalled);
+        Assert.Equal(0, wal.BoundaryCallCount);
+    }
+
+    [Fact]
     public async Task RangeKind_NoStateMachineTransfer_Rejected()
     {
         (RaftPartitionStateMachine sm, FakeHost host, CapturingFacade wal, CapturingTransfer transfer) = Build();
@@ -417,12 +466,28 @@ public class TestSnapshotInstallExecutor
         }
     }
 
+    private sealed class CapturingPartitionStateTransfer : IRaftPartitionStateTransfer
+    {
+        public int ImportCount { get; private set; }
+
+        public Task<Stream> ExportPartitionState(int partitionId, long upToIndex, CancellationToken ct) =>
+            Task.FromResult<Stream>(new MemoryStream());
+
+        public Task ImportPartitionState(int partitionId, Stream snapshot, CancellationToken ct)
+        {
+            ImportCount++;
+            return Task.CompletedTask;
+        }
+    }
+
     private sealed class FakeHost : IRaftPartitionHost
     {
         private readonly IRaftStateMachineTransfer transfer;
         public CapturingSystemTransfer SystemTransfer { get; } = new();
+        public CapturingPartitionStateTransfer PartitionTransfer { get; } = new();
         public bool SystemTransferEnabled { get; set; } = true;
         public bool RangeTransferEnabled { get; set; } = true;
+        public bool PartitionTransferEnabled { get; set; } = true;
         public FakeHost(IRaftStateMachineTransfer transfer) => this.transfer = transfer;
 
         public int PartitionId => 1;
@@ -446,6 +511,7 @@ public class TestSnapshotInstallExecutor
         public void InvokeReplicationError(int p, RaftLog l) { }
         public IRaftStateMachineTransfer? StateMachineTransfer => RangeTransferEnabled ? transfer : null;
         public IRaftSystemStateTransfer? SystemStateTransfer => SystemTransferEnabled ? SystemTransfer : null;
+        public IRaftPartitionStateTransfer? PartitionStateTransfer => PartitionTransferEnabled ? PartitionTransfer : null;
         public Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct) =>
             Task.FromResult(new SnapshotResponse(false));
         public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;

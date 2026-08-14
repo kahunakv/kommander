@@ -1,14 +1,20 @@
 
+using System.Collections.Concurrent;
+
 namespace Kommander.System;
 
 /// <summary>
 /// Owns and manages the per-node load-report cache on behalf of
-/// <see cref="RaftSystemCoordinator"/>. All methods are invoked exclusively on the
-/// coordinator's single-consumer channel loop — no locking is required.
+/// <see cref="RaftSystemCoordinator"/>. Mutations (<see cref="Apply"/>, <see cref="EvictStale"/>)
+/// are invoked exclusively on the coordinator's single-consumer channel loop, so writes never
+/// race each other — but <see cref="GetAll"/> is called from arbitrary threads (load metrics,
+/// leader hints), so the backing map is a <see cref="ConcurrentDictionary{TKey,TValue}"/> to make
+/// those cross-thread enumerations safe. (It was previously a plain dictionary, which made every
+/// external snapshot a torn-enumeration hazard against the loop's writes.)
 /// </summary>
 internal sealed class LoadReportStore
 {
-    private readonly Dictionary<string, NodeLoadReport> _loadReports = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, NodeLoadReport> _loadReports = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Returns a point-in-time snapshot of all current load reports as a new list,
@@ -25,6 +31,8 @@ internal sealed class LoadReportStore
     /// <summary>
     /// Removes entries whose HLC age exceeds <paramref name="ttl"/> × 3. Called by the
     /// balancer pass before consuming store contents to avoid planning moves based on stale data.
+    /// Note this runs only on the P0 leader with the balancer enabled — every other consumer of
+    /// <see cref="GetAll"/> must apply its own freshness filter rather than rely on eviction.
     /// </summary>
     internal void EvictStale(TimeSpan ttl, Time.HLCTimestamp now)
     {
@@ -38,12 +46,23 @@ internal sealed class LoadReportStore
         if (stale is null)
             return;
         foreach (string endpoint in stale)
-            _loadReports.Remove(endpoint);
+            _loadReports.TryRemove(endpoint, out _);
     }
 
     /// <summary>
+    /// Returns the zone the given endpoint last advertised on its load report, or null when the
+    /// endpoint has never reported (or reported no zone). Deliberately not TTL-filtered: a zone
+    /// is topology, effectively immutable for a node's lifetime, so a report too old for load
+    /// planning still carries a valid zone — filtering would randomly blind zone-aware placement
+    /// during gossip gaps.
+    /// </summary>
+    internal string? GetNodeZone(string endpoint) =>
+        _loadReports.TryGetValue(endpoint, out NodeLoadReport? report) ? report.Zone : null;
+
+    /// <summary>
     /// Ingests a gossiped load report, retaining only the entry with the highest
-    /// <see cref="NodeLoadReport.ReportVersion"/> per sender endpoint.
+    /// <see cref="NodeLoadReport.ReportVersion"/> per sender endpoint. The check-then-set is safe
+    /// without a compare-exchange because the coordinator loop is the only writer.
     /// </summary>
     internal void Apply(RaftSystemRequest request)
     {

@@ -43,6 +43,7 @@ internal sealed class PartitionMapService
     private readonly int localNodeId;
     private readonly Func<CancellationToken, Task> seedInitialMembership;
     private readonly Func<ClusterMembership> getMembership;
+    private readonly Func<string, string?> getNodeZone;
     private readonly Dictionary<int, SplitInProgress> pendingSplits;
     private readonly Dictionary<int, MergeInProgress> pendingMerges;
     private readonly Func<TimeSpan> getRetryDelay;
@@ -64,6 +65,7 @@ internal sealed class PartitionMapService
         int localNodeId,
         Func<CancellationToken, Task> seedInitialMembership,
         Func<ClusterMembership> getMembership,
+        Func<string, string?> getNodeZone,
         Dictionary<int, SplitInProgress> pendingSplits,
         Dictionary<int, MergeInProgress> pendingMerges,
         Func<TimeSpan> getRetryDelay,
@@ -84,6 +86,7 @@ internal sealed class PartitionMapService
         this.localNodeId = localNodeId;
         this.seedInitialMembership = seedInitialMembership;
         this.getMembership = getMembership;
+        this.getNodeZone = getNodeZone;
         this.pendingSplits = pendingSplits;
         this.pendingMerges = pendingMerges;
         this.getRetryDelay = getRetryDelay;
@@ -295,7 +298,11 @@ internal sealed class PartitionMapService
             ..getDiscoveredNodes()
                 .Where(n => n.Endpoint != localEndpoint)
                 .DistinctBy(n => n.Endpoint)
-                .Select(n => new Placement.CandidateNode { Endpoint = n.Endpoint })
+                // Remote zones are best-effort at bootstrap: they come from gossiped load
+                // reports, which may not have arrived yet during assembly. Nodes with no known
+                // zone still get assigned; the rebalancer improves the spread later as reports
+                // flow.
+                .Select(n => new Placement.CandidateNode { Endpoint = n.Endpoint, Zone = getNodeZone(n.Endpoint) })
         ];
 
         Dictionary<int, List<Placement.CandidateNode>> assignment = Placement.PlacementPlanner.AssignInitial(

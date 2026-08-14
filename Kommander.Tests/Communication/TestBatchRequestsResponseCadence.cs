@@ -190,7 +190,9 @@ public sealed class TestBatchRequestsResponseCadence
         public Task<RaftPartitionLifecycleResult> SplitPartitionAsync(int sourcePartitionId, int targetPartitionId = 0, RaftSplitPlan? plan = null, CancellationToken ct = default) => throw new NotImplementedException();
         public Task<RaftPartitionLifecycleResult> MergePartitionsAsync(int survivorPartitionId, int sourcePartitionId, RaftMergePlan? plan = null, CancellationToken ct = default) => throw new NotImplementedException();
         public long GetPartitionGeneration(int partitionId) => throw new NotImplementedException();
+        public bool HostsPartition(int partitionId) => throw new NotImplementedException();
         public IReadOnlyList<RaftReplica> GetPartitionReplicas(int partitionId) => throw new NotImplementedException();
+        public string? GetPartitionLeaderHint(int partitionId) => throw new NotImplementedException();
         public int GetEffectiveReplicationFactor(int partitionId) => throw new NotImplementedException();
         public Task<RaftPartitionLifecycleResult> SetReplicationFactorAsync(int partitionId, int replicationFactor, CancellationToken ct = default) => throw new NotImplementedException();
         public double GetPartitionLogOpsPerSecond(int partitionId) => throw new NotImplementedException();
@@ -201,5 +203,7 @@ public sealed class TestBatchRequestsResponseCadence
         public int GetPrefixPartitionKey(string prefixPartitionKey) => throw new NotImplementedException();
         public void RegisterStateMachineTransfer(IRaftStateMachineTransfer? transfer) => throw new NotImplementedException();
         public void RegisterSystemStateTransfer(IRaftSystemStateTransfer? transfer) => throw new NotImplementedException();
+        public void RegisterPartitionStateTransfer(IRaftPartitionStateTransfer? transfer) => throw new NotImplementedException();
+        public IReadOnlyList<RaftSnapshotStatus> GetSnapshotStatuses(int partitionId) => throw new NotImplementedException();
     }
 }

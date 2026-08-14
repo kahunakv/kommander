@@ -33,8 +33,12 @@ internal sealed class BackfillRoundBatches
     /// A batch shared by every follower anchored at the same start index. <see cref="Logs"/> is handed
     /// to multiple outbound requests, so it must be treated as read-only once memoized;
     /// <see cref="GrpcLogCache"/> ensures the Protobuf form is built once for the whole fan-out.
+    /// <see cref="EmptyResult"/> preserves <em>why</em> an empty batch was empty (compaction floor
+    /// vs. the anchor-contiguity refusal) so a cache hit reports the same cause as the original
+    /// read — the snapshot-fallback decision at the call site depends on it.
     /// </summary>
-    internal sealed record Batch(long From, List<RaftLog> Logs, long PrevTerm, AppendLogsGrpcLogCache? GrpcLogCache);
+    internal sealed record Batch(long From, List<RaftLog> Logs, long PrevTerm, AppendLogsGrpcLogCache? GrpcLogCache,
+        BackfillSendResult EmptyResult = BackfillSendResult.CompactionFloor);
 
     // A round touches at most one entry per node, and nodes anchored at the same index collapse onto a
     // single entry, so a linear scan over a handful of items beats a dictionary's hashing and allocation.
@@ -58,11 +62,13 @@ internal sealed class BackfillRoundBatches
 
     /// <summary>
     /// Memoizes the batch read for <paramref name="from"/> and returns it. A gRPC cache is attached only
-    /// for non-empty batches, since an empty one is never shipped.
+    /// for non-empty batches, since an empty one is never shipped. <paramref name="emptyResult"/> records
+    /// the cause when <paramref name="logs"/> is empty; it is meaningless for non-empty batches.
     /// </summary>
-    internal Batch Add(long from, List<RaftLog> logs, long prevTerm)
+    internal Batch Add(long from, List<RaftLog> logs, long prevTerm,
+        BackfillSendResult emptyResult = BackfillSendResult.CompactionFloor)
     {
-        Batch batch = new(from, logs, prevTerm, logs.Count > 0 ? new AppendLogsGrpcLogCache() : null);
+        Batch batch = new(from, logs, prevTerm, logs.Count > 0 ? new AppendLogsGrpcLogCache() : null, emptyResult);
         batches.Add(batch);
         return batch;
     }

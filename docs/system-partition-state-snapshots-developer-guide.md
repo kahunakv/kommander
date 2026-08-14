@@ -142,7 +142,9 @@ public sealed class MyP0StateTransfer : IRaftSystemStateTransfer
     private readonly MyStateMachine _state;
 
     // Export the WHOLE application state as of committed index `upToIndex`.
-    // The blob must reflect exactly the state after `upToIndex` is applied — nothing above it.
+    // The blob must reflect AT LEAST the state after `upToIndex` is applied; newer committed
+    // state may be included — the receiver replays retained log entries above the boundary,
+    // so re-applying an already-reflected entry must be a no-op.
     public Task<Stream> ExportPartitionState(int partitionId, long upToIndex, CancellationToken ct)
     {
         // Serialize a consistent snapshot of state at (or after) upToIndex.
@@ -320,9 +322,11 @@ Everything you need is on `IRaft` and two small types — no internal Kommander 
 
 ## Invariants you must not break
 
-1. **`ExportPartitionState` must reflect exactly `upToIndex`.** Include every committed change at or
-   below it, nothing above. Kommander seeds the receiver's checkpoint at this index; an off-by-one
-   here silently corrupts catch-up.
+1. **`ExportPartitionState` must cover `upToIndex`.** Include every committed change at or below
+   it — a snapshot reflecting *less* silently corrupts catch-up. Newer committed state is allowed
+   (an MVCC store snapshotting by timestamp cannot cut an exact as-of-index export): Kommander
+   seeds the receiver's checkpoint at this index and replays any retained log entries above it,
+   so applying an entry already reflected in the snapshot must be a no-op (idempotent apply).
 2. **`ImportPartitionState` must be atomic.** A crash or exception mid-import must leave the prior
    state intact. Kommander only seeds the checkpoint **after** import returns successfully, so a failed
    import is retried cleanly — but only if you did not leave a half-applied state behind.

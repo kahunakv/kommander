@@ -856,12 +856,39 @@ public class RaftConfiguration
 
     /// <summary>
     /// Master switch for the advisory leader-balancing feature.
-    /// When <see langword="false"/> (the default), no load reports are built or gossiped,
-    /// no transfer suggestions are sent, and the balancer loop never runs.
+    /// When <see langword="false"/> (the default), no transfer suggestions are sent and the
+    /// balancer loop never runs. Load-report gossip is governed separately by
+    /// <see cref="LoadReportsEnabled"/> — enabling the balancer implies it, but placement and
+    /// <see cref="EnableLoadReports"/> keep reports flowing without the balancer.
     /// Flip to <see langword="true"/> only after all nodes in the cluster are on a version
     /// that supports the feature; it is independently revertible at runtime via rolling restart.
     /// </summary>
     public bool EnableLeaderBalancer { get; set; }
+
+    /// <summary>
+    /// Explicitly enables the gossip exchange of <c>NodeLoadReport</c>s (each node's believed
+    /// partition leaderships and load figures) independently of the leader balancer. The reports
+    /// feed <see cref="IRaft.GetPartitionLeaderHint"/> and the remote-node load metrics
+    /// (<see cref="IRaft.GetPartitionLogOpsPerSecond"/> and friends).
+    /// <para>Rarely needed directly: report exchange is already implied by
+    /// <see cref="EnableLeaderBalancer"/>, <see cref="EnablePlacementRebalancer"/>, or a global
+    /// <see cref="ReplicationFactor"/> &gt; 0 (see <see cref="LoadReportsEnabled"/>). Set this
+    /// when none of those apply but leader hints are still wanted — e.g. placement driven purely
+    /// by per-range <c>SetReplicationFactorAsync</c> overrides with the global factor at 0.</para>
+    /// </summary>
+    public bool EnableLoadReports { get; set; }
+
+    /// <summary>
+    /// Effective switch for load-report gossip: reports are built, gossiped, and ingested when
+    /// this is <see langword="true"/>. Derived — reports flow whenever anything that consumes
+    /// them is on: the leader balancer, the placement rebalancer, a non-zero global replication
+    /// factor (placement deployments route with leader hints), or the explicit
+    /// <see cref="EnableLoadReports"/> opt-in. Previously the exchange was gated on
+    /// <see cref="EnableLeaderBalancer"/> alone, which silently starved
+    /// placement-without-balancing deployments of leader hints.
+    /// </summary>
+    public bool LoadReportsEnabled =>
+        EnableLoadReports || EnableLeaderBalancer || EnablePlacementRebalancer || ReplicationFactor > 0;
 
     /// <summary>
     /// How often each node emits a <c>NodeLoadReport</c> on the gossip path.
@@ -1005,8 +1032,13 @@ public class RaftConfiguration
     public int ReplicaCountDeadband { get; set; } = 1;
 
     /// <summary>
-    /// Optional locality hint (zone/rack) for the local node. When set, the placement planner
-    /// prefers spreading a range's replicas across distinct zones.
+    /// Optional locality hint (zone/rack) for the local node. When set, it is gossiped on this
+    /// node's load reports and the placement planner prefers spreading a range's replicas across
+    /// distinct zones. Zone-aware spread therefore needs load-report gossip
+    /// (<see cref="LoadReportsEnabled"/> — implied by placement) to see remote nodes' zones.
+    /// Normalized by <see cref="Validate"/>: whitespace-only values become null (the planner
+    /// treats empty as "no zone" anyway, so a stray <c>""</c> would otherwise silently disable
+    /// the hint while looking configured).
     /// </summary>
     public string? Zone { get; set; }
 
@@ -1077,6 +1109,11 @@ public class RaftConfiguration
     /// <exception cref="RaftException">Thrown when a timing invariant is violated.</exception>
     public void Validate()
     {
+        // Normalize the locality hint: the planner guards with IsNullOrEmpty, so a whitespace
+        // zone would silently behave as "no zone" while looking configured. Trim it to the
+        // canonical form here (null = no zone) so every consumer sees the same value.
+        Zone = string.IsNullOrWhiteSpace(Zone) ? null : Zone.Trim();
+
         // A leader only sends heartbeats from the CheckLeader timer pass, so the effective
         // heartbeat cadence is max(HeartbeatInterval, CheckLeaderInterval). If either is at or
         // above StartElectionTimeout, followers are guaranteed to hit their election timeout

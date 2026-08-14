@@ -84,9 +84,20 @@ public class TestSnapshotWireContract
         Assert.Equal(500, parsed.SnapshotIndex);
     }
 
+    [Fact]
+    public void SnapshotKind_ValuesAreStable()
+    {
+        // The kind travels as a raw int (gRPC field 8 / REST "kind"); renumbering breaks
+        // rolling upgrades, so pin every value.
+        Assert.Equal(0, (int)SnapshotKind.Range);
+        Assert.Equal(1, (int)SnapshotKind.SystemState);
+        Assert.Equal(2, (int)SnapshotKind.PartitionState);
+    }
+
     [Theory]
     [InlineData(SnapshotKind.Range)]
     [InlineData(SnapshotKind.SystemState)]
+    [InlineData(SnapshotKind.PartitionState)]
     public void GrpcAndRest_SnapshotKind_RoundTrips(SnapshotKind kind)
     {
         // gRPC protobuf round-trip.

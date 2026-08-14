@@ -76,7 +76,7 @@ internal sealed class GossipService
         foreach (string suspectEndpoint in newlySuspectOrDead)
             wakePartitionsForLeader(suspectEndpoint);
 
-        if (configuration.EnableLeaderBalancer && digest.LoadReport is { } report)
+        if (configuration.LoadReportsEnabled && digest.LoadReport is { } report)
             getCoordinator().Send(new RaftSystemRequest(report));
 
         bool includeRoster = local.MembershipVersion > digest.MembershipVersion;
@@ -88,7 +88,7 @@ internal sealed class GossipService
         ClusterMembership membership = getCoordinator().GetMembership();
 
         NodeLoadReport? localReport = null;
-        if (configuration.EnableLeaderBalancer)
+        if (configuration.LoadReportsEnabled)
         {
             localReport = buildLocalLoadReport();
             if (localReport is not null)

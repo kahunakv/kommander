@@ -63,6 +63,77 @@ public sealed class TestPlacementPlanner
     }
 
     [Fact]
+    public void AssignInitial_NoZones_KeepsLegacyRoundRobinExactly()
+    {
+        // With no zones anywhere the historical cursor round-robin must be preserved
+        // bit-for-bit: 5 nodes, RF=3 → p1: n1,n2,n3; p2: n4,n5,n1; p3: n2,n3,n4.
+        List<CandidateNode> nodes = [.. Enumerable.Range(1, 5).Select(i => Node($"n{i}:1"))];
+
+        Dictionary<int, List<CandidateNode>> assignment =
+            PlacementPlanner.AssignInitial([1, 2, 3], nodes, 3);
+
+        Assert.Equal(["n1:1", "n2:1", "n3:1"], assignment[1].Select(n => n.Endpoint));
+        Assert.Equal(["n4:1", "n5:1", "n1:1"], assignment[2].Select(n => n.Endpoint));
+        Assert.Equal(["n2:1", "n3:1", "n4:1"], assignment[3].Select(n => n.Endpoint));
+    }
+
+    [Fact]
+    public void AssignInitial_ZonesKnown_EachRangeSpansDistinctZones()
+    {
+        // 6 nodes across 3 zones (2 per zone), 4 ranges, RF=3: every range must land on three
+        // distinct zones AND the even spread must hold (each node hosts exactly 2 ranges) —
+        // zone spread bends to the load balance, and here both are satisfiable.
+        List<CandidateNode> nodes =
+        [
+            Node("n1:1", zone: "z-a"), Node("n2:1", zone: "z-b"), Node("n3:1", zone: "z-c"),
+            Node("n4:1", zone: "z-a"), Node("n5:1", zone: "z-b"), Node("n6:1", zone: "z-c"),
+        ];
+
+        Dictionary<int, List<CandidateNode>> assignment =
+            PlacementPlanner.AssignInitial([1, 2, 3, 4], nodes, 3);
+
+        Assert.Equal(4, assignment.Count);
+
+        Dictionary<string, int> perNode = nodes.ToDictionary(n => n.Endpoint, _ => 0);
+        foreach ((int _, List<CandidateNode> replicas) in assignment)
+        {
+            Assert.Equal(3, replicas.Select(r => r.Endpoint).Distinct().Count()); // anti-affinity
+            Assert.Equal(3, replicas.Select(r => r.Zone).Distinct().Count());     // zone spread
+            foreach (CandidateNode replica in replicas)
+                perNode[replica.Endpoint]++;
+        }
+
+        Assert.All(perNode.Values, count => Assert.Equal(2, count));
+    }
+
+    [Fact]
+    public void AssignInitial_PartialZones_StillAssignsAndStaysEven()
+    {
+        // Best-effort at bootstrap: some nodes' zones are not yet gossiped. Zoneless nodes
+        // still get assigned, anti-affinity holds, and loads stay even (12 replicas / 6 nodes).
+        List<CandidateNode> nodes =
+        [
+            Node("n1:1", zone: "z-a"), Node("n2:1"), Node("n3:1", zone: "z-b"),
+            Node("n4:1"), Node("n5:1", zone: "z-a"), Node("n6:1"),
+        ];
+
+        Dictionary<int, List<CandidateNode>> assignment =
+            PlacementPlanner.AssignInitial([1, 2, 3, 4], nodes, 3);
+
+        Assert.Equal(4, assignment.Count);
+
+        Dictionary<string, int> perNode = nodes.ToDictionary(n => n.Endpoint, _ => 0);
+        foreach ((int _, List<CandidateNode> replicas) in assignment)
+        {
+            Assert.Equal(3, replicas.Select(r => r.Endpoint).Distinct().Count());
+            foreach (CandidateNode replica in replicas)
+                perNode[replica.Endpoint]++;
+        }
+
+        Assert.All(perNode.Values, count => Assert.Equal(2, count));
+    }
+
+    [Fact]
     public void AssignInitial_IsDeterministic()
     {
         List<CandidateNode> nodes = [Node("b:1"), Node("a:1"), Node("d:1"), Node("c:1")];

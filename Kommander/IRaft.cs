@@ -275,6 +275,11 @@ public interface IRaft
     /// Zero disables the fence (default behavior).
     /// </param>
     /// <returns></returns>
+    /// <exception cref="PartitionNotHostedException">
+    /// The partition is in the committed map but not materialized on this node (and forwarding to
+    /// a replica was unavailable) — normal under replica placement; route to a node that hosts
+    /// the range (<see cref="GetPartitionReplicas"/>).
+    /// </exception>
     public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -317,6 +322,10 @@ public interface IRaft
     /// The generation fence is applied at batch granularity against the partition's committed generation.
     /// </para>
     /// </summary>
+    /// <exception cref="PartitionNotHostedException">
+    /// The partition is in the committed map but not materialized on this node — normal under
+    /// replica placement; route to a node that hosts the range (<see cref="GetPartitionReplicas"/>).
+    /// </exception>
     public Task<RaftBatchReplicationResult> ReplicateEntries(int partitionId, IReadOnlyList<RaftProposalEntry> entries, CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -325,6 +334,10 @@ public interface IRaft
     /// <param name="partitionId"></param>
     /// <param name="cancellationToken"></param>
     /// <returns></returns>
+    /// <exception cref="PartitionNotHostedException">
+    /// The partition is in the committed map but not materialized on this node — normal under
+    /// replica placement; route to a node that hosts the range (<see cref="GetPartitionReplicas"/>).
+    /// </exception>
     public Task<RaftReplicationResult> ReplicateCheckpoint(int partitionId, CancellationToken cancellationToken = default);
     
     /// <summary>
@@ -339,6 +352,10 @@ public interface IRaft
     /// <param name="ticketId"></param>
     /// <param name="cancellationToken">Optional deadline; default leaves the await unbounded.</param>
     /// <returns></returns>
+    /// <exception cref="PartitionNotHostedException">
+    /// The partition is in the committed map but not materialized on this node — normal under
+    /// replica placement; route to a node that hosts the range (<see cref="GetPartitionReplicas"/>).
+    /// </exception>
     public Task<(bool success, RaftOperationStatus status, long commitLogId)> CommitLogs(int partitionId, HLCTimestamp ticketId, CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -353,6 +370,10 @@ public interface IRaft
     /// <param name="ticketId"></param>
     /// <param name="cancellationToken">Optional deadline; default leaves the await unbounded.</param>
     /// <returns></returns>
+    /// <exception cref="PartitionNotHostedException">
+    /// The partition is in the committed map but not materialized on this node — normal under
+    /// replica placement; route to a node that hosts the range (<see cref="GetPartitionReplicas"/>).
+    /// </exception>
     public Task<(bool success, RaftOperationStatus status, long commitLogId)> RollbackLogs(int partitionId, HLCTimestamp ticketId, CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -405,6 +426,22 @@ public interface IRaft
     /// nodes must filter the former.</para>
     /// </remarks>
     public long GetStaleProposedSkippedCount(int partitionId);
+
+    /// <summary>
+    /// Returns this node's leader-side snapshot-transfer status per follower on the given
+    /// partition: which followers have an in-flight transfer, how many consecutive attempts have
+    /// failed, the last error, and whether the cause is permanent for this configuration
+    /// (<see cref="Data.RaftSnapshotStatus.Unproducible"/> — no snapshot transfer registered, or
+    /// the application rejected the export). A follower below the WAL compaction floor can only
+    /// catch up via snapshot install, so a persistent entry here means that follower is stuck —
+    /// this is the queryable form of the condition, which previously surfaced only as leader log
+    /// lines. Failed transfers are retried with exponential backoff (capped at 30&#160;s) rather
+    /// than every heartbeat.
+    /// <para>Empty when the partition is not hosted on this node, this node is not the sender for
+    /// it, or every follower is healthy. Entries clear on the next successful transfer.
+    /// Diagnostic only — never gate correctness on it.</para>
+    /// </summary>
+    public IReadOnlyList<Data.RaftSnapshotStatus> GetSnapshotStatuses(int partitionId);
 
     /// <summary>
     /// Acquires a composable retention hold on <paramref name="partitionId"/>'s WAL: committed
@@ -470,6 +507,10 @@ public interface IRaft
     /// </summary>
     /// <param name="partitionId"></param>
     /// <returns></returns>
+    /// <exception cref="PartitionNotHostedException">
+    /// The partition is in the committed map but not materialized on this node — normal under
+    /// replica placement; route to a node that hosts the range (<see cref="GetPartitionReplicas"/>).
+    /// </exception>
     public ValueTask<bool> AmILeaderQuick(int partitionId);
 
     /// <summary>
@@ -478,6 +519,10 @@ public interface IRaft
     /// <param name="partitionId"></param>
     /// <param name="cancellationToken"></param>
     /// <returns></returns>
+    /// <exception cref="PartitionNotHostedException">
+    /// The partition is in the committed map but not materialized on this node — normal under
+    /// replica placement; route to a node that hosts the range (<see cref="GetPartitionReplicas"/>).
+    /// </exception>
     public ValueTask<bool> AmILeader(int partitionId, CancellationToken cancellationToken);
 
     /// <summary>
@@ -501,6 +546,10 @@ public interface IRaft
     /// <param name="partitionId"></param>
     /// <param name="cancellationToken"></param>
     /// <returns></returns>
+    /// <exception cref="PartitionNotHostedException">
+    /// The partition is in the committed map but not materialized on this node — normal under
+    /// replica placement; route to a node that hosts the range (<see cref="GetPartitionReplicas"/>).
+    /// </exception>
     public ValueTask<bool> ConfirmLeadershipAsync(int partitionId, CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -516,10 +565,12 @@ public interface IRaft
     /// to the leader is not an option. On the leader this call degenerates to
     /// <see cref="ConfirmLeadershipAsync"/>.</para>
     /// <para>Every non-success outcome — no leader known, quorum round failed on the leader,
-    /// transport error, restore in progress, applied-frontier wait timeout
-    /// (<see cref="RaftConfiguration.LeadershipConfirmationTimeout"/>) — returns
+    /// transport error, restore in progress, partition not hosted on this node, applied-frontier
+    /// wait timeout (<see cref="RaftConfiguration.LeadershipConfirmationTimeout"/>) — returns
     /// <see langword="false"/>: the caller must skip or defer its destructive action (fail
-    /// closed). No retries happen inside the primitive; the caller owns retry cadence.</para>
+    /// closed). No retries happen inside the primitive; the caller owns retry cadence. Unlike the
+    /// other per-partition APIs this never raises <see cref="PartitionNotHostedException"/> —
+    /// not-hosted is just another fail-closed <see langword="false"/>.</para>
     /// <para>Freshness contract: entries committed <i>after</i> the call began may or may not be
     /// visible — identical to a leader-side confirmed read.</para>
     /// </summary>
@@ -539,7 +590,11 @@ public interface IRaft
     /// leader endpoint can be resolved. Transient and retryable — typical while a restarted node
     /// is rejoining the cluster.
     /// </exception>
-    /// <exception cref="RaftException">The partition id is unknown, its restore failed, or no leader could be decided in time.</exception>
+    /// <exception cref="PartitionNotHostedException">
+    /// The partition is in the committed map but not materialized on this node — normal under
+    /// replica placement; route to a node that hosts the range (<see cref="GetPartitionReplicas"/>).
+    /// </exception>
+    /// <exception cref="RaftException">The partition id is unknown to the committed map, its restore failed, or no leader could be decided in time.</exception>
     public ValueTask<string> WaitForLeader(int partitionId, CancellationToken cancellationToken);
 
     /// <summary>
@@ -685,6 +740,23 @@ public interface IRaft
     public long GetPartitionGeneration(int partitionId);
 
     /// <summary>
+    /// Returns whether the given partition is materialized on this node — i.e. whether the
+    /// per-partition APIs (<see cref="AmILeader"/>, <see cref="WaitForLeader"/>,
+    /// <see cref="ReplicateLogs(int,string,byte[],bool,long,CancellationToken)"/>, …) can run
+    /// locally instead of raising <see cref="PartitionNotHostedException"/>. Under replica
+    /// placement "not hosted here" is the common case for most partitions on most nodes.
+    /// <para>Reads the same materialized-partition dictionary those APIs resolve through, so a
+    /// <see langword="true"/> is authoritative at read time — unlike
+    /// <see cref="GetPartitionReplicas"/>, which reflects the <i>committed map</i> and can
+    /// disagree in the window between a map commit and the coordinator materializing (or
+    /// stopping) the partition locally. Hosting can still change right after the call (a replica
+    /// move can un-host the range), so this predicate is a routing fast-path, not a correctness
+    /// gate: callers must keep treating <see cref="PartitionNotHostedException"/> as the
+    /// retryable, authoritative answer.</para>
+    /// </summary>
+    public bool HostsPartition(int partitionId);
+
+    /// <summary>
     /// Returns the committed replica set of the given partition for consumer-side routing:
     /// which nodes host the range and each replica's role. An <b>empty list means legacy full
     /// replication</b> — every roster voter hosts the range (also returned for unknown
@@ -693,6 +765,28 @@ public interface IRaft
     /// rejection — the same fence discipline that guards split/merge cutovers.
     /// </summary>
     public IReadOnlyList<System.RaftReplica> GetPartitionReplicas(int partitionId);
+
+    /// <summary>
+    /// Best-effort hint for which endpoint currently leads the given partition, answerable even
+    /// for a partition this node does not host. <see cref="GetPartitionReplicas"/> says who
+    /// <i>hosts</i> a range; this says who <i>leads</i> it, so a non-replica node can forward an
+    /// operation straight to the leader (one hop) instead of routing blind through an arbitrary
+    /// voter and letting it re-forward (two hops).
+    /// <para>For a locally hosted partition the answer is this node's own leader belief. Otherwise
+    /// it is reduced from gossiped <c>NodeLoadReport</c>s — each node advertises the partitions it
+    /// believes it leads — taking the newest fresh claim
+    /// (within <see cref="RaftConfiguration.LeaderBalancerReportTtl"/>).</para>
+    /// <para><b>Contractually best-effort, never a correctness gate.</b> Returns
+    /// <see langword="null"/> when nothing is known — including when load-report gossip is off
+    /// (see <see cref="RaftConfiguration.LoadReportsEnabled"/>: on whenever the leader balancer,
+    /// the placement rebalancer, a non-zero replication factor, or the explicit
+    /// <see cref="RaftConfiguration.EnableLoadReports"/> opt-in is set). Gossip is random
+    /// fan-out, so the view is partial and lagging: the hint may be stale or wrong, and a
+    /// <see langword="null"/> does not mean the partition has no leader. Receivers re-check
+    /// leadership on every forwarded operation anyway; use the hint to pick the first target and
+    /// fall back to the replica set when it misses.</para>
+    /// </summary>
+    public string? GetPartitionLeaderHint(int partitionId);
 
     /// <summary>
     /// Returns the effective replication factor for the partition: its per-range override when
@@ -842,4 +936,27 @@ public interface IRaft
     /// The registration is not replicated — each node must register independently.
     /// </summary>
     void RegisterSystemStateTransfer(IRaftSystemStateTransfer? transfer);
+
+    /// <summary>
+    /// Registers an optional <see cref="IRaftPartitionStateTransfer"/> implementation that
+    /// Kommander will use to repair a <em>user data partition</em> follower that has fallen below
+    /// the WAL compaction floor: the leader calls
+    /// <see cref="IRaftPartitionStateTransfer.ExportPartitionState"/> and ships the blob to the
+    /// lagging follower, which installs it via
+    /// <see cref="IRaftPartitionStateTransfer.ImportPartitionState"/> and resumes log replication
+    /// from the snapshot index. This is the primary seeding path under replica placement — a
+    /// freshly added replica whose range's WAL is already compacted can only catch up this way.
+    /// <para>
+    /// Distinct from <see cref="RegisterStateMachineTransfer"/> (key-range slices for
+    /// split/merge) and <see cref="RegisterSystemStateTransfer"/> (the system partition, id 0);
+    /// all three may be registered simultaneously. When this transfer is <em>not</em> registered,
+    /// the catch-up path falls back to <see cref="IRaftStateMachineTransfer.ExportRange"/> with a
+    /// boundless plan (legacy behaviour). Every node that can host or lead user partitions must
+    /// register it — the sender needs the export and the receiver needs the import.
+    /// </para>
+    /// Pass <see langword="null"/> to clear a previously registered transfer.
+    /// Safe to call at any time, including before <see cref="JoinCluster"/>.
+    /// The registration is not replicated — each node must register independently.
+    /// </summary>
+    void RegisterPartitionStateTransfer(IRaftPartitionStateTransfer? transfer);
 }

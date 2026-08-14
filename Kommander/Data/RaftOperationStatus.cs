@@ -60,10 +60,13 @@ public enum RaftOperationStatus
     LogMismatch = 17,
 
     /// <summary>
-    /// The entry the leader needs to send has been compacted below the follower's
-    /// <c>nextIndex</c>.  The leader cannot backfill via normal AppendEntries and must
-    /// instead install a snapshot.  The leader must not keep decrementing
-    /// <c>nextIndex</c> for this peer.
+    /// Reserved: "the entry the leader needs is compacted; a snapshot install is required."
+    /// <b>Never produced anywhere in the current implementation</b> — the value exists only for
+    /// wire compatibility, so do not write code that waits for it. The actual handoff is
+    /// internal: when the leader's backfill read comes back empty at the compaction floor, the
+    /// heartbeat path falls through to the snapshot sender directly, and the condition (including
+    /// "a snapshot is required but cannot be produced") is observable through
+    /// <see cref="IRaft.GetSnapshotStatuses"/>.
     /// </summary>
     SnapshotRequired = 18,
 

@@ -552,7 +552,9 @@ An application can register a faster path — **snapshot transfer** — by imple
 ```csharp
 public interface IRaftStateMachineTransfer
 {
-    // Export state from the source partition up to (and including) the given log index.
+    // Export state for the plan's key range, reflecting AT LEAST everything applied at the
+    // given log index (newer committed state may be included — the receiver replays retained
+    // entries above the boundary, so re-applying a reflected entry must be a no-op).
     // Return a readable stream. The coordinator disposes the stream after transfer.
     Task<Stream> ExportRange(RaftSplitPlan plan, long upToIndex, CancellationToken ct);
 
@@ -561,6 +563,13 @@ public interface IRaftStateMachineTransfer
     Task ImportRange(int targetPartitionId, Stream snapshot, CancellationToken ct);
 }
 ```
+
+> **Not just splits:** when a follower falls below the leader's WAL compaction floor and no
+> `IRaftPartitionStateTransfer` is registered, the catch-up path also calls `ExportRange` with a
+> *boundless* plan (only `TargetPartitionId` set, meaning "the entire partition") and installs it
+> on the follower via `ImportRange`. If your range transfer cannot serve whole-partition exports,
+> register `IRaftPartitionStateTransfer` (see the replica placement guide) — the catch-up path
+> prefers it and then never touches this interface.
 
 ### Transfer Sequence (runs between Phase 1 and Phase 2)
 

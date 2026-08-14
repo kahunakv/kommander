@@ -42,8 +42,8 @@ partitioned for a few seconds, one just joined the cluster.
 > the follower is caught up.
 
 If the follower has fallen so far behind that the leader has already **compacted** the entries it needs,
-backfill can't help — the data is gone. The leader then signals `SnapshotRequired` and catch-up hands
-off to snapshot install.
+backfill can't help — the data is gone. The leader detects the empty backfill read and catch-up hands
+off to snapshot install internally, on the leader's own heartbeat path.
 
 ```
    LEADER log:   1 2 3 4 5 6 7 8 9 10
@@ -116,7 +116,7 @@ Why the live path is deliberately *not* anchored is covered in [its own section]
 | **Backtrack** | On a Log Matching rejection, the leader lowers `nextIndex` and retries from an earlier point. |
 | **Divergent tail** | Uncommitted entries on a follower that don't match the leader's — truncated and replaced during backfill. |
 | **Compaction floor** | The earliest index the leader still retains after compaction. Below it, only a snapshot can help. |
-| **`SnapshotRequired`** | The status the leader returns when a follower needs entries below the compaction floor. |
+| **`SnapshotRequired`** | Reserved enum value — never produced. The floor→snapshot handoff is internal to the leader; see `IRaft.GetSnapshotStatuses` for observing it. |
 
 ---
 
@@ -258,7 +258,7 @@ trimmed. Backfill is out of options:
    follower needs:                     20, 21, ...   ← below the floor, GONE
         │
         ▼
-   leader can't read them → returns SnapshotRequired
+   leader can't read them → backfill read comes back EMPTY
         │
         ▼
    catch-up switches to SNAPSHOT INSTALL:
@@ -266,10 +266,21 @@ trimmed. Backfill is out of options:
         → resume normal replication from the snapshot point
 ```
 
-`SnapshotRequired` is the handoff signal. Snapshot install is a separate mechanism (its own RPC and
-follower-side state replacement); backfill's job is just to *detect* the floor and hand off cleanly.
-Brand-new nodes joining a long-running cluster typically hit this path first, then switch to backfill
-once they're above the floor.
+The empty backfill read at the compaction floor is the handoff signal — it is internal to the leader's
+heartbeat path; no status crosses the wire for it. Snapshot install is a separate mechanism (its own
+RPC and follower-side state replacement); backfill's job is just to *detect* the floor and hand off
+cleanly. Brand-new nodes joining a long-running cluster typically hit this path first, then switch to
+backfill once they're above the floor.
+
+Two operational notes on the handoff:
+
+- A follower whose snapshot **fails** (the export throws, a chunk is rejected) is retried with
+  exponential backoff — heartbeat-interval base, capped at 30 s — instead of once per heartbeat, and a
+  follower that is merely **saturated** (pausing entry batches to drain its WAL queue) is never
+  escalated to a snapshot at all.
+- A follower that needs a snapshot when **no snapshot transfer is registered** cannot catch up; the
+  condition is recorded once per episode and reported — together with in-flight transfers, attempt
+  counts and last errors — through `IRaft.GetSnapshotStatuses(partitionId)`.
 
 ---
 
@@ -339,7 +350,7 @@ Kommander/
 │     └─ GetAnyTermAtAsync               read the term at an index (for the anchor)
 ├─ Data/
 │     ├─ AppendLogsRequest.cs            carries PrevLogIndex / PrevLogTerm
-│     └─ RaftOperationStatus.cs          LogMismatch, SnapshotRequired
+│     └─ RaftOperationStatus.cs          LogMismatch (SnapshotRequired is reserved, never produced)
 ├─ WAL/IO/FairWalScheduler.cs           applies divergent-tail truncation
 └─ RaftConfiguration.cs                 BackfillThreshold, MaxBackfillEntriesPerRound
 
@@ -367,8 +378,8 @@ how far a follower is behind.
    reintroduces the `ProposalTimeout` livelock (see [its section](#why-the-live-path-is-not-anchored)).
 4. **Backfill is bounded.** Honour `MaxBackfillEntriesPerRound` and one-round-in-flight; backfill must
    never starve live replication.
-5. **Below the floor, hand off — don't fake it.** If entries are below the compaction floor, return
-   `SnapshotRequired`. Never try to synthesize missing entries.
+5. **Below the floor, hand off — don't fake it.** If entries are below the compaction floor, hand off
+   to the snapshot path. Never try to synthesize missing entries.
 
 ---
 
@@ -409,7 +420,7 @@ dotnet test Kommander.Tests/Kommander.Tests.csproj --filter FullyQualifiedName~B
 - **Live path** — the normal, unanchored broadcast of new entries to keeping-up followers.
 - **Log Matching Property (LMP)** — accept entries only if the entry at `PrevLogIndex` has `PrevLogTerm`.
 - **`matchIndex` / `nextIndex`** — per-follower progress markers the leader maintains.
-- **`SnapshotRequired`** — the signal that a follower needs entries below the compaction floor.
+- **`SnapshotRequired`** — reserved enum value, never produced; the floor→snapshot handoff is internal.
 
 ---
 

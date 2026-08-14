@@ -439,7 +439,7 @@ string endpoint = await raft.WaitForLeader(1, cancellationToken);
 | `ReplicationFailed` | Replication failed before commit. |
 | `Pending` | Internal state used while asynchronous work is in progress. |
 | `LogMismatch` | A follower rejected a backfill batch because it does not hold the anchored preceding entry; the leader backtracks and retries lower. |
-| `SnapshotRequired` | A follower needs entries below the leader's compaction floor; catch-up switches from backfill to snapshot install. |
+| `SnapshotRequired` | Reserved for wire compatibility — never produced. The backfill→snapshot handoff happens internally on the leader; observe it via `GetSnapshotStatuses`. |
 
 ## Partition Routing
 
@@ -651,6 +651,10 @@ For large datasets, register a snapshot transfer implementation to copy state fr
 
 ```csharp
 raft.RegisterStateMachineTransfer(new MySnapshotTransfer());
+
+// Separately, whole-partition snapshots seed a follower that has fallen below the WAL
+// compaction floor (e.g. a freshly placed replica) — see the replica placement guide.
+raft.RegisterPartitionStateTransfer(new MyPartitionStateTransfer());
 ```
 
 See [Elastic Partitions Developer Guide](docs/elastic-partitions-developer-guide.md) for a full walkthrough of the two-phase protocols, crash recovery, routing, the generation fence, snapshot transfer, and how to extend the system.
@@ -706,7 +710,7 @@ A follower can fall behind its leader — it was slow, briefly partitioned, paus
 - The **live path** broadcasts each new proposal/commit to followers that are keeping up. It is intentionally unanchored, so a transiently-behind follower never stalls a live proposal.
 - The **backfill path** engages once a follower lags by more than `BackfillThreshold`. The leader reads the missing range from its own log and ships it in bounded chunks (`MaxBackfillEntriesPerRound`), each **anchored** with the preceding entry's index and term. The follower enforces the Log Matching Property: it applies a chunk only if it already holds that anchor, otherwise it rejects with `LogMismatch` and the leader backtracks. This is what guarantees a follower's log never grows a gap or keeps a divergent tail.
 
-If a follower needs entries the leader has already compacted away (below the **compaction floor**), backfill cannot help; the leader returns `SnapshotRequired` and catch-up hands off to snapshot install.
+If a follower needs entries the leader has already compacted away (below the **compaction floor**), backfill cannot help; the leader's heartbeat path detects the empty backfill read and hands off to snapshot install internally (no status crosses the wire for this). Failed snapshot transfers are retried with exponential backoff, and `raft.GetSnapshotStatuses(partitionId)` reports any follower whose snapshot keeps failing — including the permanent case where no snapshot transfer implementation is registered.
 
 Backfill is automatic and needs no application calls. You can observe how far a follower is behind:
 

@@ -113,6 +113,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     private IRaftSystemStateTransfer? _systemStateTransfer;
 
+    private IRaftPartitionStateTransfer? _partitionStateTransfer;
+
     /// <summary>
     /// Per-endpoint terminal reasons set by the P0 leader when it determines a learner can
     /// never be promoted (e.g., below the WAL compaction floor with no snapshot transfer).
@@ -150,6 +152,15 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// Null when no system-state transfer has been registered (log-shipping only).
     /// </summary>
     internal IRaftSystemStateTransfer? SystemStateTransfer => Volatile.Read(ref _systemStateTransfer);
+
+    /// <summary>
+    /// Optional whole-partition state-transfer implementation registered by the application for
+    /// user data partitions. When set, the leader-side catch-up path prefers it over the
+    /// split-shaped <see cref="StateMachineTransfer"/> fallback for seeding a below-floor
+    /// follower, and stamps the transfer <see cref="SnapshotKind.PartitionState"/>.
+    /// Null when none has been registered.
+    /// </summary>
+    internal IRaftPartitionStateTransfer? PartitionStateTransfer => Volatile.Read(ref _partitionStateTransfer);
 
     // Activity/heartbeat state owned by NodeActivityTracker; initialized in constructor
     // after LocalEndpoint is set.
@@ -501,7 +512,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             communication,
             () => Nodes,
             () => systemCoordinator!,
-            () => configuration.EnableLeaderBalancer ? loadReportService!.BuildLocalLoadReport() : null,
+            () => configuration.LoadReportsEnabled ? loadReportService!.BuildLocalLoadReport() : null,
             WakePartitionsForLeader,
             configuration,
             LocalEndpoint,
@@ -1074,7 +1085,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// accumulates chunks in <see cref="_pendingSnapshots"/> until <see cref="SnapshotRequest.IsLast"/>
     /// is true, then dispatches to the correct importer based on <see cref="SnapshotRequest.Kind"/>:
     /// <see cref="SnapshotKind.Range"/> → <see cref="IRaftStateMachineTransfer.ImportRange"/>;
-    /// <see cref="SnapshotKind.SystemState"/> → <see cref="IRaftSystemStateTransfer.ImportPartitionState"/>.
+    /// <see cref="SnapshotKind.SystemState"/> → <see cref="IRaftSystemStateTransfer.ImportPartitionState"/>;
+    /// <see cref="SnapshotKind.PartitionState"/> → <see cref="IRaftPartitionStateTransfer.ImportPartitionState"/>.
     /// Afterwards the WAL is seeded with a <c>CommittedCheckpoint</c> entry at
     /// <see cref="SnapshotRequest.SnapshotIndex"/> so normal backfill can resume from there.</para>
     ///
@@ -1376,6 +1388,21 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Returns whether the partition is materialized on this node — see
+    /// <see cref="IRaft.HostsPartition"/> for the contract. Reads the same dictionary the
+    /// per-partition APIs resolve through, so a <see langword="true"/> is authoritative at read
+    /// time; it can still be invalidated by a concurrent replica move, so callers must keep
+    /// treating <see cref="PartitionNotHostedException"/> as retryable.
+    /// </summary>
+    public bool HostsPartition(int partitionId)
+    {
+        if (partitionId == RaftSystemConfig.SystemPartition)
+            return systemPartition is not null;
+
+        return partitions.ContainsKey(partitionId);
     }
 
     /// <summary>
@@ -1980,13 +2007,33 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             return systemPartition;
         }
 
-        //if (partitionId < 0 || partitionId > partitions.Count)
-        //    throw new RaftException("Invalid partition: " + partitionId);
-
         if (!partitions.TryGetValue(partitionId, out RaftPartition? partition))
-            throw new RaftException("Invalid partition: " + partitionId);
+            throw BuildUnknownPartitionException(partitionId);
 
         return partition;
+    }
+
+    /// <summary>
+    /// Classifies a data-partition miss on the local proposal path. A partition present in the
+    /// committed map but not materialized here is a routing condition, not a caller error: under
+    /// replica placement most ranges live on other nodes, and even a range this node hosts can be
+    /// looked up in the window between the map commit and the coordinator applying it in
+    /// <see cref="StartUserPartitions"/>. Both cases get the typed, retryable
+    /// <see cref="PartitionNotHostedException"/> so consumers can route elsewhere without matching
+    /// message strings. An id absent from the committed map (or tombstoned
+    /// <see cref="RaftPartitionState.Removed"/>) keeps the plain <see cref="RaftException"/> —
+    /// no node hosts it, so retrying elsewhere cannot help.
+    /// </summary>
+    private RaftException BuildUnknownPartitionException(int partitionId)
+    {
+        List<RaftPartitionRange> ranges = committedRanges;
+        foreach (RaftPartitionRange range in ranges)
+        {
+            if (range.PartitionId == partitionId && range.State != RaftPartitionState.Removed)
+                return new PartitionNotHostedException(partitionId);
+        }
+
+        return new RaftException("Invalid partition: " + partitionId);
     }
 
     /// <summary>
@@ -2051,6 +2098,19 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             return partition.GetStaleProposedSkippedCount();
 
         return -1;
+    }
+
+    /// <summary>
+    /// Returns the leader-side snapshot-transfer status per follower for the given partition —
+    /// see <see cref="IRaft.GetSnapshotStatuses"/>. Empty when the partition is not hosted here,
+    /// this node is not producing snapshot transfers for it, or every follower is healthy.
+    /// </summary>
+    public IReadOnlyList<Data.RaftSnapshotStatus> GetSnapshotStatuses(int partitionId)
+    {
+        if (partitions.TryGetValue(partitionId, out RaftPartition? partition))
+            return partition.GetSnapshotStatuses();
+
+        return [];
     }
 
     /// <summary>
@@ -2985,6 +3045,14 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
             return await partition.WaitLocalApplicationAsync(response.ReadIndex, cancellationToken).ConfigureAwait(false);
         }
+        catch (PartitionNotHostedException e)
+        {
+            // Expected under replica placement — this node simply isn't a replica of the range.
+            // Fail closed without error-level noise: routers probe this per request.
+            if (Logger.IsEnabled(LogLevel.Debug))
+                Logger.LogDebug("ConfirmLocalApplicationAsync: {Message}", e.Message);
+            return false;
+        }
         catch (Exception e) when (e is not OperationCanceledException)
         {
             Logger.LogError("ConfirmLocalApplicationAsync: {Message}", e.Message);
@@ -3494,6 +3562,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     public void RegisterSystemStateTransfer(IRaftSystemStateTransfer? transfer) =>
         Volatile.Write(ref _systemStateTransfer, transfer);
 
+    /// <inheritdoc/>
+    public void RegisterPartitionStateTransfer(IRaftPartitionStateTransfer? transfer) =>
+        Volatile.Write(ref _partitionStateTransfer, transfer);
+
     /// <summary>
     /// Called by the P0 coordinator when it determines that <paramref name="endpoint"/> can never
     /// be promoted (e.g., below WAL compaction floor with no snapshot transfer registered).
@@ -3537,6 +3609,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <inheritdoc/>
     public double GetPartitionCommitWaitMs(int partitionId) =>
         loadReportService.GetPartitionCommitWaitMs(partitionId);
+
+    /// <inheritdoc/>
+    public string? GetPartitionLeaderHint(int partitionId) =>
+        loadReportService.GetPartitionLeaderHint(partitionId);
 
     /// <inheritdoc/>
     public System.ClusterMembership GetMembership() => systemCoordinator.GetMembership();

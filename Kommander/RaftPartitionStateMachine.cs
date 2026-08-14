@@ -2347,23 +2347,45 @@ public sealed class RaftPartitionStateMachine
             {
                 long anchorFrom = regressed ? regressedFrontier : followerMaxLog;
                 backfillRound ??= new();
-                if (await TrySendBackfillBatchAsync(node, anchorFrom, lastHeartbeat, anchorToFollowerFrontier: regressed, round: backfillRound).ConfigureAwait(false))
+                BackfillSendResult backfillResult = await TrySendBackfillBatchAsync(
+                    node, anchorFrom, lastHeartbeat, anchorToFollowerFrontier: regressed, round: backfillRound).ConfigureAwait(false);
+                if (backfillResult == BackfillSendResult.Sent)
                     continue;
 
-                // Empty batch: the leader has compacted past followerMaxLog+1.
-                // If a StateMachineTransfer is registered and no snapshot is already in flight
-                // for this follower, kick off an async snapshot transfer. The in-flight guard
-                // prevents duplicate transfers; the postToExecutor callback will advance
-                // lastCommitIndexes[endpoint] once the follower confirms installation.
-                long lastCheckpoint = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
-                bool p0System = host.PartitionId == RaftSystemConfig.SystemPartition && host.SystemStateTransfer is not null;
-                if (lastCheckpoint > 0 && (host.StateMachineTransfer is not null || p0System))
+                // Nothing was shipped — react by cause. Only the compaction floor (and the
+                // deliberate non-contiguous refusal, which routes here by design while the
+                // inherited-tail re-commit repairs the range) may escalate to a snapshot
+                // transfer. A saturation pause must NOT: the follower is draining its WAL
+                // queue, not missing compacted entries, and a full snapshot would only add
+                // to the load that caused the pause.
+                if (backfillResult != BackfillSendResult.SaturationPaused)
                 {
-                    // LastIncludedTerm = the term of the entry at the checkpoint index (may be -1 if
-                    // compacted away, in which case the receiver falls back to its own matching rules).
-                    // LeaderTerm = this leader's currentTerm so the follower can apply leader-RPC term rules.
-                    long lastIncludedTerm = await wal.GetAnyTermAtAsync(lastCheckpoint).ConfigureAwait(false);
-                    snapshotSender.TrySend(node, lastCheckpoint, currentTerm, lastIncludedTerm);
+                    long lastCheckpoint = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
+                    bool p0System = host.PartitionId == RaftSystemConfig.SystemPartition && host.SystemStateTransfer is not null;
+                    if (lastCheckpoint > 0)
+                    {
+                        if (host.PartitionStateTransfer is not null || host.StateMachineTransfer is not null || p0System)
+                        {
+                            // The in-flight guard prevents duplicate transfers; the postToExecutor
+                            // callback advances lastCommitIndexes[endpoint] once the follower
+                            // confirms installation.
+                            // LastIncludedTerm = the term of the entry at the checkpoint index (may
+                            // be -1 if compacted away, in which case the receiver falls back to its
+                            // own matching rules). LeaderTerm = this leader's currentTerm so the
+                            // follower can apply leader-RPC term rules.
+                            long lastIncludedTerm = await wal.GetAnyTermAtAsync(lastCheckpoint).ConfigureAwait(false);
+                            snapshotSender.TrySend(node, lastCheckpoint, currentTerm, lastIncludedTerm);
+                        }
+                        else
+                        {
+                            // The follower needs a snapshot and none can be produced: previously
+                            // this skipped SILENTLY and the follower was stranded with no evidence
+                            // anywhere. Record the condition (one Warning per episode, queryable
+                            // via GetSnapshotStatuses) so an operator can see it and register a
+                            // transfer.
+                            snapshotSender.ReportUnproducible(node);
+                        }
+                    }
                 }
             }
 
@@ -3968,9 +3990,12 @@ public sealed class RaftPartitionStateMachine
     /// <summary>
     /// Reads a bounded committed range for <paramref name="node"/> from the WAL and ships it via
     /// <see cref="AppendLogToNode"/> with the correct Log Matching anchors.
-    /// Returns <see langword="true"/> when at least one entry was sent; <see langword="false"/> when
-    /// the WAL read returns empty (compaction floor reached — caller decides whether to fall back to
-    /// a snapshot transfer).
+    /// Returns <see cref="BackfillSendResult.Sent"/> when at least one entry was shipped; otherwise
+    /// the specific reason nothing was sent, because the causes demand different reactions at the
+    /// heartbeat call site: only <see cref="BackfillSendResult.CompactionFloor"/> and the deliberate
+    /// <see cref="BackfillSendResult.NonContiguous"/> refusal may fall back to a snapshot transfer,
+    /// while <see cref="BackfillSendResult.SaturationPaused"/> must simply wait — a saturated
+    /// follower is not below the floor, and shipping it a full snapshot only adds load.
     /// </summary>
     /// <param name="node">The peer to send the batch to.</param>
     /// <param name="followerMaxLog">The highest committed index the leader believes the follower holds;
@@ -3988,7 +4013,7 @@ public sealed class RaftPartitionStateMachine
     /// each follower anchored at the same index — the common shape of a multi-follower catch-up. Pass
     /// <see langword="null"/> from one-off call sites, where there is nothing to share with.
     /// </param>
-    private async Task<bool> TrySendBackfillBatchAsync(
+    private async Task<BackfillSendResult> TrySendBackfillBatchAsync(
         RaftNode node,
         long followerMaxLog,
         HLCTimestamp timestamp,
@@ -4002,14 +4027,10 @@ public sealed class RaftPartitionStateMachine
         // forced heartbeat that follows every leadership publication all funnel into it. That
         // last one matters: the observed storm was driven by election churn, not by a timer, so
         // a throttle attached to the heartbeat interval would not have caught it.
-        //
-        // Returning false is the same answer this method gives when the WAL read comes back
-        // empty: nothing was sent. Callers already treat that as "no batch this round" and try
-        // again later, which is exactly the desired behaviour.
         if (backfillPausedUntilTicks.TryGetValue(node.Endpoint, out long pausedUntil))
         {
             if (host.GetMonotonicTimestamp() < pausedUntil)
-                return false;
+                return BackfillSendResult.SaturationPaused;
 
             backfillPausedUntilTicks.Remove(node.Endpoint);
         }
@@ -4023,12 +4044,12 @@ public sealed class RaftPartitionStateMachine
         if (round is not null && round.TryGet(from, out BackfillRoundBatches.Batch? cached))
         {
             if (cached!.Logs.Count == 0)
-                return false;
+                return cached.EmptyResult;
 
             logger.LogDebugBackfilling(host.LocalEndpoint, host.PartitionId, nodeState, cached.Logs.Count, node.Endpoint, from, prevIdx, localCommittedIndex);
 
             AppendLogToNode(node, timestamp, cached.Logs, prevIdx, cached.PrevTerm, grpcLogCache: cached.GrpcLogCache);
-            return true;
+            return BackfillSendResult.Sent;
         }
 
         List<RaftLog> backfill = await wal.GetRangeAsync(from, host.Configuration.MaxBackfillEntriesPerRound).ConfigureAwait(false);
@@ -4038,7 +4059,7 @@ public sealed class RaftPartitionStateMachine
             // Memoize the empty result as well: every follower anchored here would otherwise repeat the
             // same read before falling through to the snapshot path.
             round?.Add(from, backfill, 0);
-            return false;
+            return BackfillSendResult.CompactionFloor;
         }
 
         // Anchor-contiguity guard: an anchored batch asserts, via (prevIdx, prevTerm), that its
@@ -4047,16 +4068,16 @@ public sealed class RaftPartitionStateMachine
         // were lost and not yet re-committed) yields a batch whose first id is ABOVE `from` —
         // shipping it anchored at from-1 would land it over the follower's gap, advance nothing,
         // and repeat forever with no error anywhere (the observed Jepsen wedge). Refuse to ship:
-        // returning false routes the heartbeat path to its snapshot fallback, and the log line
-        // makes the state visible instead of silent. The inherited-tail re-commit in
+        // NonContiguous deliberately routes the heartbeat path to its snapshot fallback, and the
+        // log line makes the state visible instead of silent. The inherited-tail re-commit in
         // DrainInheritedAppliesAsync repairs the underlying range, so this firing at all means
         // that repair has not landed (or a new gap source exists) — never suppress the log.
         if (backfill[0].Id != from)
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Backfill read for {Endpoint} anchored at {From} returned committed entries starting at {FirstId} — uncommitted entries below block re-supply; refusing non-contiguous batch.",
                 host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, from, backfill[0].Id);
-            round?.Add(from, [], 0);
-            return false;
+            round?.Add(from, [], 0, BackfillSendResult.NonContiguous);
+            return BackfillSendResult.NonContiguous;
         }
 
         long prevTerm = prevIdx > 0 ? await wal.GetAnyTermAtAsync(prevIdx).ConfigureAwait(false) : 0;
@@ -4066,7 +4087,7 @@ public sealed class RaftPartitionStateMachine
         logger.LogDebugBackfilling(host.LocalEndpoint, host.PartitionId, nodeState, backfill.Count, node.Endpoint, from, prevIdx, localCommittedIndex);
 
         AppendLogToNode(node, timestamp, backfill, prevIdx, prevTerm, grpcLogCache: shared?.GrpcLogCache);
-        return true;
+        return BackfillSendResult.Sent;
     }
 
     /// <summary>
@@ -5618,6 +5639,19 @@ public sealed class RaftPartitionStateMachine
 
                 await systemTransfer.ImportPartitionState(host.PartitionId, request.Snapshot, CancellationToken.None).ConfigureAwait(false);
             }
+            else if (request.Kind == SnapshotKind.PartitionState)
+            {
+                IRaftPartitionStateTransfer? partitionTransfer = host.PartitionStateTransfer;
+                if (partitionTransfer is null)
+                {
+                    logger.LogWarning(
+                        "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot rejected: no IRaftPartitionStateTransfer registered.",
+                        host.LocalEndpoint, host.PartitionId, nodeState);
+                    return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Errored, -1);
+                }
+
+                await partitionTransfer.ImportPartitionState(host.PartitionId, request.Snapshot, CancellationToken.None).ConfigureAwait(false);
+            }
             else
             {
                 IRaftStateMachineTransfer? rangeTransfer = host.StateMachineTransfer;
@@ -5674,5 +5708,11 @@ public sealed class RaftPartitionStateMachine
     /// </summary>
     public void CompleteSnapshotInstalled(string endpoint, long snapshotIndex) =>
         snapshotSender.CompleteSnapshotInstalled(endpoint, snapshotIndex);
+
+    /// <summary>
+    /// Leader-side snapshot-transfer status per follower — see <see cref="IRaft.GetSnapshotStatuses"/>.
+    /// Reads thread-safe sender state directly; safe to call off the executor thread.
+    /// </summary>
+    public IReadOnlyList<RaftSnapshotStatus> GetSnapshotStatuses() => snapshotSender.GetStatuses();
 
 }

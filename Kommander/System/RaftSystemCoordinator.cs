@@ -148,6 +148,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
             manager.LocalNodeId,
             TrySeedInitialMembership,
             GetMembership,
+            GetNodeZone,
             _splitMerge.PendingSplits,
             _splitMerge.PendingMerges,
             () => RetryDelay,
@@ -165,6 +166,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
             manager.GetFollowerCommittedIndexNullableAsync,
             (node, partitionId, endpoint) => manager.Communication.GetRemoteFollowerLag(manager, node, partitionId, endpoint),
             endpoint => manager.Liveness.GetState(endpoint),
+            GetNodeZone,
             async (partitionId, target, ct) => await manager.TransferLeadershipAsync(partitionId, target, ct).ConfigureAwait(false),
             manager.Configuration,
             manager.LocalEndpoint,
@@ -554,6 +556,14 @@ internal sealed class RaftSystemCoordinator : IDisposable
     /// </summary>
     internal IReadOnlyList<NodeLoadReport> GetLoadReports() =>
         _loadReportStore.GetAll();
+
+    /// <summary>
+    /// Returns the zone the given endpoint last advertised on its load report, or null when
+    /// unknown — see <see cref="LoadReportStore.GetNodeZone"/>. Feeds zone-aware placement
+    /// (planner candidates and initial assignment) with remote nodes' zones.
+    /// </summary>
+    internal string? GetNodeZone(string endpoint) =>
+        _loadReportStore.GetNodeZone(endpoint);
 
     private void EvictStaleLoadReports(TimeSpan ttl, Time.HLCTimestamp now) =>
         _loadReportStore.EvictStale(ttl, now);

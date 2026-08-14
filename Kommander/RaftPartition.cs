@@ -278,6 +278,13 @@ public sealed class RaftPartition : IDisposable
     public long GetStaleProposedSkippedCount() => walHandler.GetStaleProposedSkippedCount();
 
     /// <summary>
+    /// Leader-side snapshot-transfer status per follower for this partition — see
+    /// <see cref="IRaft.GetSnapshotStatuses"/>. Empty on a healthy partition; a plain thread-safe
+    /// read, no executor round-trip.
+    /// </summary>
+    public IReadOnlyList<Data.RaftSnapshotStatus> GetSnapshotStatuses() => stateMachine.GetSnapshotStatuses();
+
+    /// <summary>
     /// Advisory composite load score for this partition, forwarded from the executor's
     /// <see cref="Scheduling.RaftPartitionExecutor.CurrentLoad"/> accumulator.
     /// </summary>

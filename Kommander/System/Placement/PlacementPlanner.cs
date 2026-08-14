@@ -202,10 +202,14 @@ public static class PlacementPlanner
 
     /// <summary>
     /// Initial even-spread assignment used by <c>TrySetInitialPartitions</c> when
-    /// <c>ReplicationFactor &gt; 0</c>: deterministic round-robin over the sorted node list so
-    /// each range gets <paramref name="replicationFactor"/> distinct nodes and node loads differ
-    /// by at most one. Returns an empty assignment (legacy full replication) when there are
-    /// fewer nodes than the factor — the RF floor degrades to full replication.
+    /// <c>ReplicationFactor &gt; 0</c>: each range gets <paramref name="replicationFactor"/>
+    /// distinct nodes with node loads differing by at most one, deterministically. When no
+    /// candidate carries a zone the historical round-robin over the sorted node list is used
+    /// unchanged; when zones are known the picks additionally prefer zones the range does not
+    /// cover yet (same best-effort tiebreak as <see cref="PickAddTarget"/> — node
+    /// anti-affinity stays absolute, zone spread bends to the load balance). Returns an empty
+    /// assignment (legacy full replication) when there are fewer nodes than the factor — the RF
+    /// floor degrades to full replication.
     /// </summary>
     public static Dictionary<int, List<CandidateNode>> AssignInitial(
         IReadOnlyList<int> partitionIds,
@@ -221,14 +225,50 @@ public static class PlacementPlanner
         if (replicationFactor <= 0 || sorted.Count <= replicationFactor)
             return assignment; // sub-RF cluster: legacy full replication (empty replica sets)
 
-        int cursor = 0;
+        // No zones anywhere (single-zone deployments, or zones not yet gossiped at bootstrap):
+        // keep the historical cursor round-robin bit-for-bit so existing deployments and their
+        // deterministic expectations are untouched.
+        if (sorted.All(n => string.IsNullOrEmpty(n.Zone)))
+        {
+            int cursor = 0;
+            foreach (int partitionId in partitionIds.OrderBy(id => id))
+            {
+                List<CandidateNode> replicas = new(replicationFactor);
+                for (int i = 0; i < replicationFactor; i++)
+                    replicas.Add(sorted[(cursor + i) % sorted.Count]);
+
+                cursor = (cursor + replicationFactor) % sorted.Count;
+                assignment[partitionId] = replicas;
+            }
+
+            return assignment;
+        }
+
+        // Zone-aware greedy: pick one replica at a time, preferring an uncovered zone, then the
+        // least-assigned node, then endpoint order — the same preference stack as PickAddTarget,
+        // so bootstrap and later rebalancing agree on what "well placed" means.
+        Dictionary<string, int> assignedCount = sorted.ToDictionary(n => n.Endpoint, _ => 0, StringComparer.Ordinal);
+
         foreach (int partitionId in partitionIds.OrderBy(id => id))
         {
             List<CandidateNode> replicas = new(replicationFactor);
-            for (int i = 0; i < replicationFactor; i++)
-                replicas.Add(sorted[(cursor + i) % sorted.Count]);
+            HashSet<string> coveredZones = new(StringComparer.Ordinal);
 
-            cursor = (cursor + replicationFactor) % sorted.Count;
+            for (int i = 0; i < replicationFactor; i++)
+            {
+                CandidateNode pick = sorted
+                    .Where(n => !replicas.Contains(n))
+                    .OrderBy(n => !string.IsNullOrEmpty(n.Zone) && coveredZones.Contains(n.Zone!) ? 1 : 0)
+                    .ThenBy(n => assignedCount[n.Endpoint])
+                    .ThenBy(n => n.Endpoint, StringComparer.Ordinal)
+                    .First();
+
+                replicas.Add(pick);
+                assignedCount[pick.Endpoint]++;
+                if (!string.IsNullOrEmpty(pick.Zone))
+                    coveredZones.Add(pick.Zone!);
+            }
+
             assignment[partitionId] = replicas;
         }
 

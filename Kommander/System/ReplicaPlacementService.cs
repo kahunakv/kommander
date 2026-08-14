@@ -40,6 +40,7 @@ internal sealed class ReplicaPlacementService
     private readonly Func<int, string, ValueTask<long?>> getFollowerCommitted;
     private readonly Func<RaftNode, int, string, Task<long?>> getRemoteFollowerLag;
     private readonly Func<string, MemberLivenessState> getNodeLiveness;
+    private readonly Func<string, string?> getNodeZone;
     private readonly Func<int, string, CancellationToken, Task> transferLeadership;
     private readonly RaftConfiguration configuration;
     private readonly string localEndpoint;
@@ -62,6 +63,7 @@ internal sealed class ReplicaPlacementService
         Func<int, string, ValueTask<long?>> getFollowerCommitted,
         Func<RaftNode, int, string, Task<long?>> getRemoteFollowerLag,
         Func<string, MemberLivenessState> getNodeLiveness,
+        Func<string, string?> getNodeZone,
         Func<int, string, CancellationToken, Task> transferLeadership,
         RaftConfiguration configuration,
         string localEndpoint,
@@ -79,6 +81,7 @@ internal sealed class ReplicaPlacementService
         this.getFollowerCommitted = getFollowerCommitted;
         this.getRemoteFollowerLag = getRemoteFollowerLag;
         this.getNodeLiveness = getNodeLiveness;
+        this.getNodeZone = getNodeZone;
         this.transferLeadership = transferLeadership;
         this.configuration = configuration;
         this.localEndpoint = localEndpoint;
@@ -564,7 +567,10 @@ internal sealed class ReplicaPlacementService
                 Endpoint = m.Endpoint,
                 NodeId = m.NodeId,
                 Alive = m.Endpoint == localEndpoint || getNodeLiveness(m.Endpoint) == MemberLivenessState.Alive,
-                Zone = m.Endpoint == localEndpoint ? configuration.Zone : null
+                // Remote zones come from each node's gossiped load report (the committed roster
+                // carries no zone); best-effort — a node that never reported has a null zone and
+                // simply doesn't participate in the zone-spread tiebreak.
+                Zone = m.Endpoint == localEndpoint ? configuration.Zone : getNodeZone(m.Endpoint)
             })
             .ToList();
 

@@ -138,6 +138,17 @@ public interface IRaftPartitionHost
     IRaftSystemStateTransfer? SystemStateTransfer { get; }
 
     /// <summary>
+    /// Returns the registered <see cref="IRaftPartitionStateTransfer"/> for whole-partition state
+    /// snapshots on user data partitions, or <see langword="null"/> when none has been
+    /// registered. When present, the catch-up snapshot path prefers it over
+    /// <see cref="StateMachineTransfer"/> and stamps transfers
+    /// <see cref="Data.SnapshotKind.PartitionState"/>. Default implementation returns
+    /// <see langword="null"/> so existing test hosts keep compiling; the production adapter
+    /// overrides it.
+    /// </summary>
+    IRaftPartitionStateTransfer? PartitionStateTransfer => null;
+
+    /// <summary>
     /// Sends a snapshot to <paramref name="node"/> on behalf of the partition leader.
     /// Wraps the active <see cref="Kommander.Communication.ICommunication"/> so the state machine
     /// does not need a direct reference to the transport layer.

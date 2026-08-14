@@ -99,6 +99,25 @@ public static class KommanderMetrics
     internal static void RecordCompactionBlockedByDurabilityFloor(int partitionId) =>
         WalCompactionBlockedByDurabilityFloorTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
 
+    // ── Snapshot transfer ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Failed leader→follower snapshot transfer attempts, tagged by <c>partition_id</c> and
+    /// <c>cause</c> (export failure, chunk rejection, no transfer registered, …). A sustained rate
+    /// for one partition means a below-floor follower cannot be seeded — pair with
+    /// <see cref="IRaft.GetSnapshotStatuses"/> for the stuck endpoint and last error.
+    /// </summary>
+    internal static readonly Counter<long> SnapshotTransferFailuresTotal =
+        Meter.CreateCounter<long>(
+            "raft.snapshot.transfer_failures_total",
+            description: "Failed leader-to-follower snapshot transfer attempts, by cause.");
+
+    /// <summary>Counts one failed snapshot transfer attempt, tagged by partition and cause.</summary>
+    internal static void RecordSnapshotTransferFailure(int partitionId, string cause) =>
+        SnapshotTransferFailuresTotal.Add(1,
+            new KeyValuePair<string, object?>("partition_id", partitionId),
+            new KeyValuePair<string, object?>("cause", cause));
+
     // ── State machine ─────────────────────────────────────────────────────────
 
     /// <summary>

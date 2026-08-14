@@ -1,0 +1,47 @@
+
+namespace Kommander.Data;
+
+/// <summary>
+/// Leader-side diagnostic view of one follower's snapshot-transfer condition on a partition,
+/// returned by <see cref="IRaft.GetSnapshotStatuses"/>. An entry exists only while the leader has
+/// an in-flight transfer to the follower or has recorded transfer failures for it — a healthy
+/// partition reports an empty list. This is the queryable form of "follower X requires a snapshot
+/// and the last attempt failed with …", which previously existed only as a log line per heartbeat.
+/// <para>
+/// Diagnostic only: values are point-in-time reads of state mutated concurrently by background
+/// transfer tasks, and the entry disappears as soon as a transfer to the follower succeeds. Never
+/// gate correctness on it.
+/// </para>
+/// </summary>
+public sealed class RaftSnapshotStatus
+{
+    /// <summary>The follower endpoint the leader is trying to seed.</summary>
+    public required string FollowerEndpoint { get; init; }
+
+    /// <summary>Consecutive failed transfer attempts in the current episode (0 while a first attempt is in flight).</summary>
+    public int FailedAttempts { get; init; }
+
+    /// <summary>Human-readable message of the most recent failure, or null when none has been recorded.</summary>
+    public string? LastError { get; init; }
+
+    /// <summary>
+    /// True when the failure cause is permanent for this configuration — no snapshot transfer is
+    /// registered, or the application rejected the export as unsupported
+    /// (<see cref="NotSupportedException"/>). The follower cannot catch up until the operator
+    /// registers a working transfer (see <see cref="IRaft.RegisterPartitionStateTransfer"/>);
+    /// retries are paced at the maximum backoff rather than stopped, so registration is picked up.
+    /// </summary>
+    public bool Unproducible { get; init; }
+
+    /// <summary>True while a transfer to this follower is currently in flight.</summary>
+    public bool InFlight { get; init; }
+
+    /// <summary>When the current failure episode started (UTC), or null if nothing has failed.</summary>
+    public DateTimeOffset? FirstFailureAt { get; init; }
+
+    /// <summary>When the most recent failure was recorded (UTC), or null if nothing has failed.</summary>
+    public DateTimeOffset? LastFailureAt { get; init; }
+
+    /// <summary>Time remaining before the next transfer attempt is allowed; zero when not backing off.</summary>
+    public TimeSpan RetryBackoffRemaining { get; init; }
+}

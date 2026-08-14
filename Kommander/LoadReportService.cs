@@ -77,8 +77,47 @@ internal sealed class LoadReportService
             Endpoint = localEndpoint,
             ReportVersion = Interlocked.Increment(ref _reportVersion),
             Time = getHlcNow(),
+            Zone = configuration.Zone,
             Leaderships = leaderships,
         };
+    }
+
+    /// <summary>
+    /// Best-effort leader hint for <paramref name="partitionId"/> — see
+    /// <see cref="IRaft.GetPartitionLeaderHint"/> for the contract. Local belief wins when the
+    /// partition is hosted here; otherwise the newest fresh gossiped
+    /// <see cref="NodeLoadReport"/> claiming the partition provides the answer.
+    /// <para>Freshness is enforced here with <see cref="RaftConfiguration.LeaderBalancerReportTtl"/>
+    /// rather than left to <see cref="LoadReportStore.EvictStale"/>, because eviction runs only on
+    /// the P0 leader's balancer pass — on every other node reports accumulate forever, and an
+    /// unfiltered scan would keep returning a dead node's endpoint indefinitely.</para>
+    /// </summary>
+    internal string? GetPartitionLeaderHint(int partitionId)
+    {
+        string? local = getPartitionLeaderEndpoint(partitionId);
+        if (!string.IsNullOrEmpty(local))
+            return local;
+
+        HLCTimestamp now = getHlcNow();
+        TimeSpan ttl = configuration.LeaderBalancerReportTtl;
+
+        NodeLoadReport? best = null;
+        foreach (NodeLoadReport r in getLoadReports())
+        {
+            if ((now - r.Time) > ttl)
+                continue;
+
+            foreach (PartitionLoad l in r.Leaderships)
+            {
+                if (l.PartitionId == partitionId && (best is null || r.Time > best.Time))
+                {
+                    best = r;
+                    break;
+                }
+            }
+        }
+
+        return best?.Endpoint;
     }
 
     private NodeLoadReport? FindBestLoadReport(int partitionId)

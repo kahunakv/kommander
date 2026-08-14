@@ -147,6 +147,56 @@ public class TestSnapshotExport
         Assert.False(systemTransfer.ExportCalled, "ExportPartitionState must NOT be called for non-P0");
     }
 
+    // ── Non-P0 with PartitionStateTransfer → ExportPartitionState + Kind=PartitionState ──
+
+    [Fact]
+    public async Task NonP0_WithPartitionTransfer_PrefersExportPartitionState()
+    {
+        // Both user-partition transfers registered: the dedicated whole-partition transfer must
+        // win over the split-shaped ExportRange fallback. The range transfer throws for a
+        // boundless plan (the Kahuna shape: a correct split-only implementation rejects "export
+        // the entire partition"), so any fallback into it fails the test loudly.
+        CapturingPartitionTransfer partitionTransfer = new();
+        CapturingRangeTransfer rangeTransfer = new(throwNotSupported: true);
+        CapturingComm comm = new();
+
+        FakeSnapshotHost host = new(partitionId: 1, systemTransfer: null, rangeTransfer: rangeTransfer,
+            comm: comm, partitionTransfer: partitionTransfer);
+        FloorWal wal = new(floor: 100, commitIndex: 100);
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingSink(), NullLogger<IRaft>.Instance);
+        sm.SetPostToExecutor(_ => { });
+
+        List<SnapshotRequest> chunks = await DriveSnapshotAsync(sm, "follower:9000", comm, host.HybridLogicalClock);
+
+        Assert.NotEmpty(chunks);
+        Assert.All(chunks, c => Assert.Equal(SnapshotKind.PartitionState, c.Kind));
+        Assert.True(partitionTransfer.ExportCalled, "ExportPartitionState must be called");
+        Assert.Equal(1, partitionTransfer.ExportedPartitionId);
+        Assert.Equal(100L, partitionTransfer.ExportedUpToIndex);
+        Assert.False(rangeTransfer.ExportCalled, "the split-shaped fallback must not run when the dedicated transfer is registered");
+    }
+
+    [Fact]
+    public async Task NonP0_WithPartitionTransferOnly_TriggersSnapshot()
+    {
+        // The heartbeat trigger gate must fire when ONLY the new interface is registered — an
+        // application that never implements the split transfer still gets below-floor seeding.
+        CapturingPartitionTransfer partitionTransfer = new();
+        CapturingComm comm = new();
+
+        FakeSnapshotHost host = new(partitionId: 1, systemTransfer: null, rangeTransfer: null,
+            comm: comm, partitionTransfer: partitionTransfer);
+        FloorWal wal = new(floor: 100, commitIndex: 100);
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingSink(), NullLogger<IRaft>.Instance);
+        sm.SetPostToExecutor(_ => { });
+
+        List<SnapshotRequest> chunks = await DriveSnapshotAsync(sm, "follower:9000", comm, host.HybridLogicalClock);
+
+        Assert.NotEmpty(chunks);
+        Assert.All(chunks, c => Assert.Equal(SnapshotKind.PartitionState, c.Kind));
+        Assert.True(partitionTransfer.ExportCalled);
+    }
+
     // ── P0 with neither transfer → no snapshot triggered ──────────────────────
 
     [Fact]
@@ -191,13 +241,37 @@ public class TestSnapshotExport
             Task.CompletedTask;
     }
 
-    private sealed class CapturingRangeTransfer : IRaftStateMachineTransfer
+    private sealed class CapturingPartitionTransfer : IRaftPartitionStateTransfer
     {
         public bool ExportCalled { get; private set; }
+        public int ExportedPartitionId { get; private set; }
+        public long ExportedUpToIndex { get; private set; }
+
+        public Task<Stream> ExportPartitionState(int partitionId, long upToIndex, CancellationToken ct)
+        {
+            ExportCalled = true;
+            ExportedPartitionId = partitionId;
+            ExportedUpToIndex = upToIndex;
+            return Task.FromResult<Stream>(new MemoryStream([0x44, 0x55, 0x66]));
+        }
+
+        public Task ImportPartitionState(int partitionId, Stream snapshot, CancellationToken ct) =>
+            Task.CompletedTask;
+    }
+
+    private sealed class CapturingRangeTransfer : IRaftStateMachineTransfer
+    {
+        private readonly bool _throwNotSupported;
+        public bool ExportCalled { get; private set; }
+
+        public CapturingRangeTransfer(bool throwNotSupported = false) =>
+            _throwNotSupported = throwNotSupported;
 
         public Task<Stream> ExportRange(RaftSplitPlan plan, long upToIndex, CancellationToken ct)
         {
             ExportCalled = true;
+            if (_throwNotSupported)
+                throw new NotSupportedException("boundless plan: whole-partition export unsupported");
             return Task.FromResult<Stream>(new MemoryStream([0x11, 0x22, 0x33]));
         }
 
@@ -233,14 +307,17 @@ public class TestSnapshotExport
     {
         private readonly IRaftSystemStateTransfer? _systemTransfer;
         private readonly IRaftStateMachineTransfer? _rangeTransfer;
+        private readonly IRaftPartitionStateTransfer? _partitionTransfer;
         private readonly CapturingComm _comm;
 
         public FakeSnapshotHost(int partitionId, IRaftSystemStateTransfer? systemTransfer,
-            IRaftStateMachineTransfer? rangeTransfer, CapturingComm comm)
+            IRaftStateMachineTransfer? rangeTransfer, CapturingComm comm,
+            IRaftPartitionStateTransfer? partitionTransfer = null)
         {
             PartitionId = partitionId;
             _systemTransfer = systemTransfer;
             _rangeTransfer = rangeTransfer;
+            _partitionTransfer = partitionTransfer;
             _comm = comm;
         }
 
@@ -277,6 +354,7 @@ public class TestSnapshotExport
 
         public IRaftStateMachineTransfer? StateMachineTransfer => _rangeTransfer;
         public IRaftSystemStateTransfer? SystemStateTransfer => _systemTransfer;
+        public IRaftPartitionStateTransfer? PartitionStateTransfer => _partitionTransfer;
 
         public Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct) =>
             _comm.SendInstallSnapshotAsync(node, request, ct);

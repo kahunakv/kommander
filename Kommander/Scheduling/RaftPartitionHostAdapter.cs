@@ -94,6 +94,8 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
 
     public IRaftSystemStateTransfer? SystemStateTransfer => manager.SystemStateTransfer;
 
+    public IRaftPartitionStateTransfer? PartitionStateTransfer => manager.PartitionStateTransfer;
+
     public Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct) =>
         manager.Communication.SendInstallSnapshot(manager, node, request, ct);
 

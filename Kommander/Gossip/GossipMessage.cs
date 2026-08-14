@@ -43,9 +43,11 @@ public sealed record GossipMessage(
 
     /// <summary>
     /// Advisory load report for the sender node, piggybacked on the gossip round.
-    /// Present only when <c>EnableLeaderBalancer</c> is true on the sender.
+    /// Present only when <see cref="RaftConfiguration.LoadReportsEnabled"/> is true on the sender
+    /// (leader balancer, placement, or the explicit load-report opt-in).
     /// The receiver forwards it to the system coordinator, which retains the
-    /// highest <see cref="NodeLoadReport.ReportVersion"/> per endpoint for planning.
+    /// highest <see cref="NodeLoadReport.ReportVersion"/> per endpoint for planning
+    /// and leader hints.
     /// </summary>
     public NodeLoadReport? LoadReport { get; init; }
 };

@@ -20,6 +20,18 @@ public enum SnapshotKind
     /// The follower dispatches to <see cref="IRaftSystemStateTransfer.ImportPartitionState"/>.
     /// </summary>
     SystemState = 1,
+
+    /// <summary>
+    /// Whole-partition application-state snapshot for a user data partition (below-floor
+    /// follower catch-up). The follower dispatches to
+    /// <see cref="IRaftPartitionStateTransfer.ImportPartitionState"/>.
+    /// <para>Only produced when the sender has an <see cref="IRaftPartitionStateTransfer"/>
+    /// registered. A receiver that pre-dates this value falls into its Range arm and hands the
+    /// blob to <see cref="IRaftStateMachineTransfer.ImportRange"/> — an application-level
+    /// mismatch, so in a mixed-version cluster do not register the partition-state transfer
+    /// until every node understands this kind.</para>
+    /// </summary>
+    PartitionState = 2,
 }
 
 /// <summary>
