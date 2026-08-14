@@ -2863,11 +2863,19 @@ public sealed class RaftPartitionStateMachine
         if (currentTerm > leaderTerm)
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from a leader {Endpoint} with old ReceivedTerm={Term} CurrentTerm={CurrentTerm}. Ignoring...", host.LocalEndpoint, host.PartitionId, nodeState, endpoint, leaderTerm, currentTerm);
-            
+
+            // The rejection carries THIS node's currentTerm (not an echo of the sender's stale term):
+            // it is the only channel through which a deposed leader can learn a higher term exists.
+            // A node whose term was bumped by a failed election rejects every AppendLogs here — before
+            // the WAL is ever touched — so if this reply echoed the stale term, the sender would keep
+            // shipping batches forever ("send=True" every round) while this node's committed frontier
+            // stays frozen, and pre-vote (correctly) prevents the higher term from propagating by
+            // election against a healthy leader. Raft §5.1 closes the loop on the receiving side:
+            // CompleteAppendLogsAsync steps down and adopts any response term above its own.
             host.EnqueueResponse(endpoint, new(
                 RaftResponderRequestType.CompleteAppendLogs, 
                 new(endpoint), 
-                new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LeaderInOldTerm, -1)
+                new CompleteAppendLogsRequest(host.PartitionId, currentTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LeaderInOldTerm, -1)
             ));
             
             return;
@@ -3901,6 +3909,53 @@ public sealed class RaftPartitionStateMachine
 
     public async ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1)
     {
+        // ── Raft §5.1: a response stamped with a HIGHER term deposes us ─────────────────────────
+        // Terms only enter a node through elections, so a higher response term proves a newer term
+        // exists — this leader (or candidate) is stale and must step down and adopt it BEFORE the
+        // fence below, which would discard the ack as "not my term" and learn nothing.
+        //
+        // This is the only repair channel for a per-partition term wedge (the Jepsen frozen-frontier
+        // stall): a follower whose term was bumped by a failed election rejects every AppendLogs with
+        // LeaderInOldTerm carrying its higher term, while pre-vote (correctly) keeps it from winning
+        // an election against our still-healthy quorum — so without this step-down the leader ships
+        // backfill forever, the follower rejects it forever, and that partition's replica on the
+        // bumped node never commits another entry. Stepping down lets the next election converge the
+        // term (either we re-win at a higher term and re-ship, or the bumped node's log wins).
+        // Mirrors the higher-voteTerm adoption in VoteAsync: bookkeeping is gated on state, the term
+        // adoption is not, and the adopted term is persisted with no vote so a crash cannot regress it.
+        // Membership-fenced like inbound AppendLogs: only a committed roster member can depose a
+        // leader, so an endpoint outside membership cannot churn leadership with a fabricated term.
+        if (responseTerm > currentTerm && host.IsMember(endpoint))
+        {
+            bool stepDown = nodeState != RaftNodeState.Follower;
+
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Stepping down on higher-term append ack from {Endpoint}: responseTerm={ResponseTerm} currentTerm={CurrentTerm} Status={Status}",
+                host.LocalEndpoint, host.PartitionId, nodeState, endpoint, responseTerm, currentTerm, status);
+
+            if (stepDown)
+            {
+                nodeState = RaftNodeState.Follower;
+                host.Leader = "";
+                lastCommitIndexes.Clear();
+                nextIndex.Clear();
+                matchIndex.Clear();
+                regressedFrontiers.Clear();
+                localCommittedIndex = -1;
+                FailAllActiveProposalWaiters();
+                activeProposals.Clear();
+            }
+
+            currentTerm = responseTerm;
+            ResetPreVoteRound();
+
+            if (stepDown)
+                await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
+
+            await wal.PersistHardStateAsync(currentTerm, null).ConfigureAwait(false);
+            return;
+        }
+
         // ── Leader + term fence ──────────────────────────────────────────────────
         // Reject a stale ACK BEFORE any mutation (HLC receive, node activity, commit/backfill cursors,
         // matchIndex/nextIndex, startCommitIndexes). Without this, a delayed old-term ACK could make an

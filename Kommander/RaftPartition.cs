@@ -261,6 +261,15 @@ public sealed class RaftPartition : IDisposable
     public IDisposable AcquireRetentionHold(long index) => walHandler.AcquireRetentionHold(index);
 
     /// <summary>
+    /// Highest log id known committed on this partition's WAL — the gap-aware contiguous commit
+    /// frontier, which unlike the raw max log excludes proposed-but-uncommitted tail entries and
+    /// anything above a hole. A plain in-memory read (no scheduler round-trip), safe on any path.
+    /// Exposed so external observers (health checks, test harnesses) can distinguish "entries
+    /// present but uncommitted" from "committed but unapplied" — the raw max log conflates them.
+    /// </summary>
+    public long GetCommitIndex() => walHandler.GetCommitIndex();
+
+    /// <summary>
     /// Advisory composite load score for this partition, forwarded from the executor's
     /// <see cref="Scheduling.RaftPartitionExecutor.CurrentLoad"/> accumulator.
     /// </summary>

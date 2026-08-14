@@ -142,6 +142,36 @@ public class TestAckFrontierSemantics
         Assert.Equal(365, sm.GetFollowerCommittedIndex(VoterA));
     }
 
+    /// <summary>
+    /// The quiesce gate reads the same frontier map, and quiescing is the most catastrophic
+    /// consumer of a polluted record: <c>HasLaggingPeer</c> deciding "nobody lags" stops
+    /// heartbeats entirely, which also stops the very acks whose truthful reports could correct
+    /// the record — an absolute strand, not just a delayed one. A rejection ack that reported the
+    /// stalled peer's max log must therefore not keep a quiesced leader asleep.
+    /// </summary>
+    [Fact]
+    public async Task QuiescedLeader_RearmsWhenAPeersTruthfulFrontierLags()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host) = await BuildLeader(commitIndex: 383);
+
+        // Shrink to the two peers with recorded progress: an unseeded peer counts as lagging by
+        // design, which would re-arm heartbeats regardless and mask what this test pins.
+        host.Nodes = [new(VoterA), new(VoterB)];
+
+        await Ack(sm, host, VoterB, RaftOperationStatus.Success, 383);   // genuinely caught up
+        await Ack(sm, host, VoterA, RaftOperationStatus.Success, 365);   // stalled frontier
+        await Ack(sm, host, VoterA, RaftOperationStatus.LogMismatch, 383); // its grown max log
+
+        sm.SetQuiescedForTesting(true);
+
+        host.Requests.Clear();
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.True(BatchesTo(host, VoterA) > 0,
+            "a quiesced leader must re-arm heartbeats while a peer's self-reported frontier lags; " +
+            "believing a rejection ack's max log here silences the partition permanently");
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     private static async Task<(RaftPartitionStateMachine, CapturingHost)> BuildLeader(long commitIndex)
@@ -192,7 +222,7 @@ public class TestAckFrontierSemantics
         };
 
         public HybridLogicalClock HybridLogicalClock { get; } = new();
-        public IReadOnlyList<RaftNode> Nodes => [new(VoterA), new(VoterB), new(NonVoter), new(NonVoter2)];
+        public IReadOnlyList<RaftNode> Nodes { get; set; } = [new(VoterA), new(VoterB), new(NonVoter), new(NonVoter2)];
         public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;
 
         public HLCTimestamp GetLastNodeActivity(string e, int p) => HLCTimestamp.Zero;
