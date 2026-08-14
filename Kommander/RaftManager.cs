@@ -2039,6 +2039,20 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
+    /// Returns the lifetime number of stale <c>Proposed</c> duplicates of already-resolved ids
+    /// refused on <paramref name="partitionId"/>, or -1 when the partition is not hosted on this
+    /// node. See <see cref="IRaft.GetStaleProposedSkippedCount"/>; -1 and 0 mean different things
+    /// and must not be conflated by a caller aggregating across nodes.
+    /// </summary>
+    public long GetStaleProposedSkippedCount(int partitionId)
+    {
+        if (partitions.TryGetValue(partitionId, out RaftPartition? partition))
+            return partition.GetStaleProposedSkippedCount();
+
+        return -1;
+    }
+
+    /// <summary>
     /// Acquires a composable retention hold on the given partition's WAL. When the partition is not
     /// hosted on this node the call is a no-op that returns a disposable which does nothing, mirroring
     /// the silent no-op of <see cref="SetMinRetainIndex"/>. See <see cref="IRaft.AcquireRetentionHold"/>

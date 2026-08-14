@@ -74,6 +74,17 @@ public sealed class RaftWriteAhead
     private long lastStaleProposedLogTicks;
     private int suppressedStaleProposedLogs;
 
+    /// <summary>
+    /// Lifetime count of stale-duplicate skips, as opposed to the per-window
+    /// <see cref="suppressedStaleProposedLogs"/> which resets on every emitted line. Surfaced
+    /// through <see cref="GetStaleProposedSkippedCount"/> so a test harness can assert on the
+    /// total rather than reconstructing it by parsing throttled log lines — the distinction that
+    /// matters diagnostically is zero versus non-zero versus a storm, and only a running total
+    /// answers that from a single observation. Written on the executor thread, read from
+    /// arbitrary threads; see the accessor for the read discipline.
+    /// </summary>
+    private long staleProposedSkipped;
+
     // Reused across follower appends to collect this batch's resolved ids; applied to the frontier
     // only after the WAL enqueue succeeds, so a backpressure rejection needs no frontier rollback.
     private readonly List<long> resolvedThisBatch = [];
@@ -881,6 +892,9 @@ public sealed class RaftWriteAhead
     /// </summary>
     private void LogStaleProposedSkipped(long id)
     {
+        // Counted before the throttle: the log line is sampled, the counter is not.
+        staleProposedSkipped++;
+
         long now = global::System.Diagnostics.Stopwatch.GetTimestamp();
 
         if (lastStaleProposedLogTicks != 0 && (now - lastStaleProposedLogTicks) < global::System.Diagnostics.Stopwatch.Frequency)
@@ -896,6 +910,22 @@ public sealed class RaftWriteAhead
         lastStaleProposedLogTicks = now;
         suppressedStaleProposedLogs = 0;
     }
+
+    /// <summary>
+    /// Lifetime number of incoming <c>Proposed</c>/<c>ProposedCheckpoint</c> rows this partition
+    /// refused to write because their id was already resolved locally — the stale-duplicate guard.
+    /// </summary>
+    /// <remarks>
+    /// A non-zero count is NOT a fault: under a partition a deposed leader keeps broadcasting
+    /// in-flight proposals and the heartbeat-driven proposal retry can race its own commit, so
+    /// duplicates of resolved ids arrive legitimately. What the number is for is telling apart
+    /// three states that look identical from the outside when a hole-below-the-frontier defect is
+    /// being chased — the guard never fired, fired occasionally, or fired constantly. Read with
+    /// <see cref="Volatile.Read(ref long)"/> because the writer is the partition executor thread
+    /// and callers (diagnostics endpoints, tests) are not; the value is monotonic, so a slightly
+    /// stale read is meaningful and only ever under-reports.
+    /// </remarks>
+    public long GetStaleProposedSkippedCount() => Volatile.Read(ref staleProposedSkipped);
 
     /// <summary>
     /// Seeds the propose-id ALLOCATOR at promotion: a new leader appends at

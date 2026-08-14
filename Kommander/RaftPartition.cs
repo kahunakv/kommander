@@ -270,6 +270,14 @@ public sealed class RaftPartition : IDisposable
     public long GetCommitIndex() => walHandler.GetCommitIndex();
 
     /// <summary>
+    /// Lifetime number of stale <c>Proposed</c> duplicates of already-resolved ids this partition
+    /// refused to write. Diagnostic only — see
+    /// <see cref="RaftWriteAhead.GetStaleProposedSkippedCount"/> for what the number does and does
+    /// not mean.
+    /// </summary>
+    public long GetStaleProposedSkippedCount() => walHandler.GetStaleProposedSkippedCount();
+
+    /// <summary>
     /// Advisory composite load score for this partition, forwarded from the executor's
     /// <see cref="Scheduling.RaftPartitionExecutor.CurrentLoad"/> accumulator.
     /// </summary>

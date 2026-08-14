@@ -384,6 +384,21 @@ public interface IRaft
     public long GetCommitIndex(int partitionId);
 
     /// <summary>
+    /// Returns the lifetime number of incoming <c>Proposed</c>/<c>ProposedCheckpoint</c> rows that
+    /// <paramref name="partitionId"/> refused to write because their id was already resolved here
+    /// (the stale-duplicate guard), or -1 when the partition is not hosted on this node.
+    /// </summary>
+    /// <remarks>
+    /// Diagnostic, not a health signal: a non-zero count is expected under partitions, where a
+    /// deposed leader keeps broadcasting in-flight proposals and the proposal retry can race its
+    /// own commit. Its value is in separating "the guard never fired" from "the guard fired
+    /// constantly" in a single observation — the two point at opposite causes when a hole below a
+    /// replica's advertised frontier is being investigated. Note -1 (not hosted) is distinct from
+    /// 0 (hosted, never fired); a caller summing across nodes must filter the former.
+    /// </remarks>
+    public long GetStaleProposedSkippedCount(int partitionId);
+
+    /// <summary>
     /// Acquires a composable retention hold on <paramref name="partitionId"/>'s WAL: committed
     /// entries are retained down to <paramref name="index"/> until the returned handle is disposed.
     /// <para>
