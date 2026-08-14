@@ -75,13 +75,14 @@ public sealed class RaftWriteAhead
     private int suppressedStaleProposedLogs;
 
     /// <summary>
-    /// Lifetime count of stale-duplicate skips, as opposed to the per-window
-    /// <see cref="suppressedStaleProposedLogs"/> which resets on every emitted line. Surfaced
-    /// through <see cref="GetStaleProposedSkippedCount"/> so a test harness can assert on the
-    /// total rather than reconstructing it by parsing throttled log lines — the distinction that
-    /// matters diagnostically is zero versus non-zero versus a storm, and only a running total
-    /// answers that from a single observation. Written on the executor thread, read from
-    /// arbitrary threads; see the accessor for the read discipline.
+    /// Running count of stale-duplicate skips since this instance was constructed, as opposed to
+    /// the per-window <see cref="suppressedStaleProposedLogs"/> which resets on every emitted line.
+    /// Surfaced through <see cref="GetStaleProposedSkippedCount"/> so a harness can read the total
+    /// rather than reconstructing it by parsing throttled log lines — "fired occasionally" versus
+    /// "fired constantly" is the distinction that matters, and only a running total answers it from
+    /// a single observation. In memory, so it starts again at zero on every restart: it is a floor,
+    /// not a lifetime total, and the log lines are the record that survives a crash. Written on the
+    /// executor thread, read from arbitrary threads; see the accessor for the read discipline.
     /// </summary>
     private long staleProposedSkipped;
 
@@ -912,18 +913,25 @@ public sealed class RaftWriteAhead
     }
 
     /// <summary>
-    /// Lifetime number of incoming <c>Proposed</c>/<c>ProposedCheckpoint</c> rows this partition
-    /// refused to write because their id was already resolved locally — the stale-duplicate guard.
+    /// Number of incoming <c>Proposed</c>/<c>ProposedCheckpoint</c> rows this partition has refused
+    /// to write because their id was already resolved locally — the stale-duplicate guard — since
+    /// this partition last started.
     /// </summary>
     /// <remarks>
-    /// A non-zero count is NOT a fault: under a partition a deposed leader keeps broadcasting
+    /// <para>A non-zero count is NOT a fault: under a partition a deposed leader keeps broadcasting
     /// in-flight proposals and the heartbeat-driven proposal retry can race its own commit, so
     /// duplicates of resolved ids arrive legitimately. What the number is for is telling apart
-    /// three states that look identical from the outside when a hole-below-the-frontier defect is
-    /// being chased — the guard never fired, fired occasionally, or fired constantly. Read with
-    /// <see cref="Volatile.Read(ref long)"/> because the writer is the partition executor thread
-    /// and callers (diagnostics endpoints, tests) are not; the value is monotonic, so a slightly
-    /// stale read is meaningful and only ever under-reports.
+    /// "fired occasionally" from "fired constantly" when a hole-below-the-frontier defect is being
+    /// chased — those point at opposite causes.</para>
+    /// <para><b>Zero is not evidence the guard never fired.</b> The count is in memory and restarts
+    /// at zero with the process, so under a crash-fault workload a node that skipped duplicates and
+    /// was then killed reports 0 — measured on the Jepsen kill jobs, where this reads BELOW the
+    /// number of log lines the same run emitted. Treat it as a floor since the last start. The
+    /// throttled <c>"Skipped stale Proposed duplicate"</c> log lines are the record that survives a
+    /// restart; this counter is the one that is cheap to read.</para>
+    /// <para>Read with <see cref="Volatile.Read(ref long)"/> because the writer is the partition
+    /// executor thread and callers (diagnostics endpoints, tests) are not; the value is monotonic
+    /// between restarts, so a slightly stale read only ever under-reports.</para>
     /// </remarks>
     public long GetStaleProposedSkippedCount() => Volatile.Read(ref staleProposedSkipped);
 

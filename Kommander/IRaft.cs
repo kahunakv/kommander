@@ -384,17 +384,25 @@ public interface IRaft
     public long GetCommitIndex(int partitionId);
 
     /// <summary>
-    /// Returns the lifetime number of incoming <c>Proposed</c>/<c>ProposedCheckpoint</c> rows that
-    /// <paramref name="partitionId"/> refused to write because their id was already resolved here
-    /// (the stale-duplicate guard), or -1 when the partition is not hosted on this node.
+    /// Returns the number of incoming <c>Proposed</c>/<c>ProposedCheckpoint</c> rows that
+    /// <paramref name="partitionId"/> has refused to write because their id was already resolved
+    /// here (the stale-duplicate guard) <b>since this partition last started</b>, or -1 when the
+    /// partition is not hosted on this node.
     /// </summary>
     /// <remarks>
-    /// Diagnostic, not a health signal: a non-zero count is expected under partitions, where a
-    /// deposed leader keeps broadcasting in-flight proposals and the proposal retry can race its
-    /// own commit. Its value is in separating "the guard never fired" from "the guard fired
-    /// constantly" in a single observation — the two point at opposite causes when a hole below a
-    /// replica's advertised frontier is being investigated. Note -1 (not hosted) is distinct from
-    /// 0 (hosted, never fired); a caller summing across nodes must filter the former.
+    /// <para>Diagnostic, not a health signal: a non-zero count is expected under partitions, where
+    /// a deposed leader keeps broadcasting in-flight proposals and the proposal retry can race its
+    /// own commit. Its value is in separating "fired occasionally" from "fired constantly" in a
+    /// single observation — the two point at opposite causes when a hole below a replica's
+    /// advertised frontier is being investigated.</para>
+    /// <para><b>Zero does not mean the guard never fired.</b> The count lives in memory and starts
+    /// again from zero whenever the process restarts or the partition is re-hosted, so a node that
+    /// skipped duplicates and then restarted reports 0. It is a floor since the last start, never a
+    /// process- or cluster-lifetime total. Where a durable record is required — a crash-fault test
+    /// run, for instance — the throttled <c>"Skipped stale Proposed duplicate"</c> log lines survive
+    /// restarts and this counter does not.</para>
+    /// <para>-1 (not hosted) is distinct from 0 (hosted, none since start); a caller summing across
+    /// nodes must filter the former.</para>
     /// </remarks>
     public long GetStaleProposedSkippedCount(int partitionId);
 

@@ -270,10 +270,10 @@ public sealed class RaftPartition : IDisposable
     public long GetCommitIndex() => walHandler.GetCommitIndex();
 
     /// <summary>
-    /// Lifetime number of stale <c>Proposed</c> duplicates of already-resolved ids this partition
-    /// refused to write. Diagnostic only — see
-    /// <see cref="RaftWriteAhead.GetStaleProposedSkippedCount"/> for what the number does and does
-    /// not mean.
+    /// Number of stale <c>Proposed</c> duplicates of already-resolved ids this partition has
+    /// refused to write since it last started — a floor, not a lifetime total. Diagnostic only —
+    /// see <see cref="RaftWriteAhead.GetStaleProposedSkippedCount"/> for what the number does and
+    /// does not mean, in particular why zero is not evidence the guard never fired.
     /// </summary>
     public long GetStaleProposedSkippedCount() => walHandler.GetStaleProposedSkippedCount();
 

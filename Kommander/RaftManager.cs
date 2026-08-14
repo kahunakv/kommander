@@ -2039,10 +2039,11 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
-    /// Returns the lifetime number of stale <c>Proposed</c> duplicates of already-resolved ids
-    /// refused on <paramref name="partitionId"/>, or -1 when the partition is not hosted on this
-    /// node. See <see cref="IRaft.GetStaleProposedSkippedCount"/>; -1 and 0 mean different things
-    /// and must not be conflated by a caller aggregating across nodes.
+    /// Returns the number of stale <c>Proposed</c> duplicates of already-resolved ids refused on
+    /// <paramref name="partitionId"/> since it last started, or -1 when the partition is not hosted
+    /// on this node. See <see cref="IRaft.GetStaleProposedSkippedCount"/>: it is a floor, not a
+    /// lifetime total (the count restarts with the process), and -1 and 0 mean different things and
+    /// must not be conflated by a caller aggregating across nodes.
     /// </summary>
     public long GetStaleProposedSkippedCount(int partitionId)
     {
