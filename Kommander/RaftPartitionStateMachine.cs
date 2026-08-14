@@ -1502,6 +1502,16 @@ public sealed class RaftPartitionStateMachine
         const int BatchSize = 512;
         long expected = from;
 
+        // Prior-term entries this drain advances over while they are still Proposed on disk. The
+        // drain treats them as committed (delivers them to the consumer; the caller serves reads
+        // from that state), so their WAL records must be committed DURABLY as well — collected here
+        // and re-committed at every exit. Leaving them Proposed is not merely a restart hazard: the
+        // backfill read (GetRangeAsync) filters uncommitted entries, so a leader whose inherited
+        // range is Proposed on disk silently ships followers an anchored batch that SKIPS that
+        // range — the batch lands above the followers' gap, no frontier ever advances, and the
+        // partition wedges with no error anywhere (the Jepsen one-stuck-entry shape).
+        List<RaftLog>? recommit = null;
+
         while (from <= upToIndex)
         {
             List<RaftLog> batch = await wal.GetRangeAllTypesAsync(from, BatchSize).ConfigureAwait(false);
@@ -1511,7 +1521,10 @@ public sealed class RaftPartitionStateMachine
             foreach (RaftLog log in batch)
             {
                 if (log.Id > upToIndex)
+                {
+                    EnqueueInheritedRecommitMarkers(recommit);
                     return InheritedDrainStatus.Covered;
+                }
 
                 if (log.Id > expected && !skipGaps)
                 {
@@ -1520,6 +1533,7 @@ public sealed class RaftPartitionStateMachine
                     {
                         logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Inherited-entry drain found a WAL hole: expected {Expected}, next present {Present} (floor {Floor}).",
                             host.LocalEndpoint, host.PartitionId, nodeState, expected, log.Id, floor);
+                        EnqueueInheritedRecommitMarkers(recommit);
                         return InheritedDrainStatus.Hole;
                     }
                     // Compacted below the floor: accept this entry as the next contiguous delivery.
@@ -1529,9 +1543,19 @@ public sealed class RaftPartitionStateMachine
                 // inherited orphan: stop without advancing the cursor over it (see the in-flight
                 // contract in the summary). The caller defers its batch until this entry resolves.
                 if (log.Type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint && log.Term >= currentTerm)
+                {
+                    EnqueueInheritedRecommitMarkers(recommit);
                     return InheritedDrainStatus.BlockedByInFlight;
+                }
 
                 expected = log.Id + 1;
+
+                // Advancing over a prior-term Proposed entry commits it (Raft §5.4.2: the
+                // current-term commit above it proves the prefix); record it for the durable
+                // re-commit. Includes prior-term barrier no-ops — never delivered, but the durable
+                // frontier must still pass them.
+                if (log.Type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
+                    (recommit ??= []).Add(log);
 
                 // Apply committed entries and inherited Proposed entries (prior term only).
                 // Skip current-term Proposed entries — they are in-flight proposals.
@@ -1573,6 +1597,8 @@ public sealed class RaftPartitionStateMachine
             from = next;
         }
 
+        EnqueueInheritedRecommitMarkers(recommit);
+
         // The loop can also exit without reaching upToIndex (an empty batch: the whole tail of the
         // range is absent). A missing tail above the floor is a hole exactly like an interior gap.
         if (expected <= upToIndex && !skipGaps)
@@ -1588,6 +1614,44 @@ public sealed class RaftPartitionStateMachine
 
         CompleteReadIndexApplyWaiters();
         return InheritedDrainStatus.Covered;
+    }
+
+    /// <summary>
+    /// Durably commits inherited prior-term entries the drain advanced over: writes their commit
+    /// markers via <see cref="IRaftWalFacade.EnqueueCommit"/> so the on-disk log converges with the
+    /// in-memory decision that they are committed. Without this, the entries stay Proposed on disk:
+    /// a leader crash re-loses the applied projection they back, and — worse — the backfill read
+    /// filters them out, so followers missing the range are shipped anchored batches that silently
+    /// skip it and the partition wedges (see the note at the collection site). Lazy like all commit
+    /// markers on the single-fsync path: the enqueue is not awaited for durability, and a
+    /// backpressure rejection only defers the repair to the next drain — delivery already happened,
+    /// so failing the drain over it would be strictly worse. Clears the list so the multiple drain
+    /// exit paths cannot double-enqueue.
+    /// </summary>
+    private void EnqueueInheritedRecommitMarkers(List<RaftLog>? inherited)
+    {
+        if (inherited is null || inherited.Count == 0)
+            return;
+
+        try
+        {
+            WALWriteOperation operation = wal.EnqueueCommit(inherited);
+
+            Scheduling.RaftPendingWalOperation pending = RentPendingWalOp();
+            pending.IsInheritedRecommit = true;
+            pendingWalOperations[operation.OperationId] = pending;
+
+            if (logger.IsEnabled(LogLevel.Information))
+                logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Durably re-committing {Count} inherited prior-term entries ({First}..{Last})",
+                    host.LocalEndpoint, host.PartitionId, nodeState, inherited.Count, inherited[0].Id, inherited[^1].Id);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Could not enqueue durable re-commit of {Count} inherited entries ({Message}) — the on-disk range stays Proposed and unbackfillable until the next promotion retries.",
+                host.LocalEndpoint, host.PartitionId, nodeState, inherited.Count, ex.Message);
+        }
+
+        inherited.Clear();
     }
 
     /// <summary>
@@ -3045,6 +3109,35 @@ public sealed class RaftPartitionStateMachine
                 ));
                 return;
             }
+
+            // Anchor-contiguity check (AppendEntries semantics: entries[] immediately follows
+            // prevLogIndex). A matching anchor proves the shared prefix through prevLogIndex —
+            // nothing more. A batch whose first entry sits ABOVE prevLogIndex+1 would be written
+            // over a gap the anchor never vouched for; accepting it strands this follower's commit
+            // frontier below the gap while its log grows (the Jepsen one-stuck-entry wedge) with
+            // no signal anywhere. Only the backfill path sends anchored batches and it sends them
+            // contiguous by construction, so this firing means the sender's read skipped entries
+            // it believes committed but holds uncommitted — reject loudly and let it repair.
+            // The unanchored live-propose broadcast (prevLogIndex == 0) is exempt by the enclosing
+            // guard: out-of-order lone-high deliveries are its documented, frontier-buffered shape.
+            long firstIncomingId = long.MaxValue;
+            foreach (RaftLog incoming in logs)
+            {
+                if (incoming.Id < firstIncomingId)
+                    firstIncomingId = incoming.Id;
+            }
+
+            if (firstIncomingId != prevLogIndex + 1)
+            {
+                logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Non-contiguous anchored batch from {Endpoint}: prevLogIndex={PrevLogIndex} but first entry is {FirstId} — rejecting.",
+                    host.LocalEndpoint, host.PartitionId, nodeState, endpoint, prevLogIndex, firstIncomingId);
+                host.EnqueueResponse(endpoint, new(
+                    RaftResponderRequestType.CompleteAppendLogs,
+                    new(endpoint),
+                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, localMaxLog)
+                ));
+                return;
+            }
         }
 
         if (logs is not null && logs.Count > 0)
@@ -3845,6 +3938,24 @@ public sealed class RaftPartitionStateMachine
             return false;
         }
 
+        // Anchor-contiguity guard: an anchored batch asserts, via (prevIdx, prevTerm), that its
+        // entries IMMEDIATELY follow the anchor. GetRangeAsync filters uncommitted entries, so a
+        // Proposed run starting exactly at `from` (e.g. an inherited range whose commit markers
+        // were lost and not yet re-committed) yields a batch whose first id is ABOVE `from` —
+        // shipping it anchored at from-1 would land it over the follower's gap, advance nothing,
+        // and repeat forever with no error anywhere (the observed Jepsen wedge). Refuse to ship:
+        // returning false routes the heartbeat path to its snapshot fallback, and the log line
+        // makes the state visible instead of silent. The inherited-tail re-commit in
+        // DrainInheritedAppliesAsync repairs the underlying range, so this firing at all means
+        // that repair has not landed (or a new gap source exists) — never suppress the log.
+        if (backfill[0].Id != from)
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Backfill read for {Endpoint} anchored at {From} returned committed entries starting at {FirstId} — uncommitted entries below block re-supply; refusing non-contiguous batch.",
+                host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, from, backfill[0].Id);
+            round?.Add(from, [], 0);
+            return false;
+        }
+
         long prevTerm = prevIdx > 0 ? await wal.GetAnyTermAtAsync(prevIdx).ConfigureAwait(false) : 0;
 
         BackfillRoundBatches.Batch? shared = round?.Add(from, backfill, prevTerm);
@@ -4447,6 +4558,20 @@ public sealed class RaftPartitionStateMachine
     /// </summary>
     private async Task CompleteLeaderCommit(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
+        // Inherited-tail re-commit (see EnqueueInheritedRecommitMarkers): no proposal ticket, no
+        // client waiter, no commit broadcast — the markers are lazy durability for entries already
+        // committed and applied. Success needs nothing further; failure only means the on-disk
+        // range stays Proposed (and therefore unbackfillable) until a later drain retries, which
+        // is worth a log line but must not run the ordinary null-proposal failure handling below
+        // (that path can revert an armed promotion).
+        if (pending is { IsInheritedRecommit: true })
+        {
+            if (completion.Status != RaftOperationStatus.Success)
+                logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Durable re-commit of inherited entries failed ({Status}) — the range stays Proposed on disk and cannot be backfilled until a later drain retries.",
+                    host.LocalEndpoint, host.PartitionId, nodeState, completion.Status);
+            return;
+        }
+
         RaftProposalQuorum? proposal = pending?.Proposal;
         HLCTimestamp ticketId = pending?.TicketId ?? HLCTimestamp.Zero;
 

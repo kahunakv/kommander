@@ -645,15 +645,21 @@ public sealed class RaftWriteAhead
 
                 switch (log.Type)
                 {
+                    // Monotonic, not a plain assignment: the inherited-tail re-commit (see
+                    // DrainInheritedAppliesAsync) durably commits PRIOR-term entries after the
+                    // promotion barrier's own commit has already advanced the frontier past them,
+                    // so a lower id here must never drag the frontier backwards.
                     case RaftLogType.Proposed:
                         log.Type = RaftLogType.Committed;
-                        commitIndex = log.Id + 1;
+                        if (log.Id + 1 > commitIndex)
+                            commitIndex = log.Id + 1;
                         lastCommitIndex = log.Id;
                         break;
 
                     case RaftLogType.ProposedCheckpoint:
                         log.Type = RaftLogType.CommittedCheckpoint;
-                        commitIndex = log.Id + 1;
+                        if (log.Id + 1 > commitIndex)
+                            commitIndex = log.Id + 1;
                         lastCommitIndex = log.Id;
                         break;
                 }

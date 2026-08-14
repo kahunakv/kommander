@@ -51,6 +51,14 @@ public sealed class RaftPendingWalOperation
     /// </summary>
     public HLCTimestamp Timestamp { get; set; }
 
+    /// <summary>
+    /// True when this <c>LeaderCommit</c> operation is the durable re-commit of INHERITED
+    /// prior-term entries issued by the inherited-entry drain (not a client proposal's commit).
+    /// Its completion carries no proposal ticket and must not run the ordinary leader-commit
+    /// handling — it only confirms that the lazily written commit markers reached the WAL queue.
+    /// </summary>
+    public bool IsInheritedRecommit { get; set; }
+
     /// <summary>Clears every field before the instance is returned to the pool.</summary>
     internal void Reset()
     {
@@ -61,5 +69,6 @@ public sealed class RaftPendingWalOperation
         AutoCommit = false;
         Endpoint = null;
         Timestamp = default;
+        IsInheritedRecommit = false;
     }
 }

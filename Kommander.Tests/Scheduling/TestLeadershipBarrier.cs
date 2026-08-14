@@ -315,6 +315,34 @@ public class TestLeadershipBarrier
         Assert.DoesNotContain(host.EventLog, e => e.StartsWith("Applied:"));
     }
 
+    /// <summary>
+    /// The inherited entries must be durably COMMITTED, not merely applied. The drain treats them
+    /// as committed (delivers them, and the leader serves reads from that state), but before this
+    /// fix their WAL records stayed <c>Proposed</c> — so the backfill read (which filters
+    /// uncommitted entries) could never re-ship them to followers missing the range: the leader
+    /// shipped anchored batches that silently skipped the range, followers buffered them above
+    /// their gap, and the partition wedged with every frontier frozen one index below the first
+    /// missing entry (the Jepsen one-stuck-entry shape). After the barrier commits, the inherited
+    /// range must be visible to <see cref="IRaftWalFacade.GetRangeAsync"/> as committed.
+    /// </summary>
+    [Fact]
+    public async Task PromotedLeader_DurablyRecommitsInheritedEntries()
+    {
+        (BarrierRecordingHost host, InheritedTailWalFacade wal, RaftPartitionStateMachine sm) = MakeInheritedTailFixture();
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        await sm.CompleteWalOperationAsync(ProposeCompletion(host.PartitionId, logIndex: 4));
+        await sm.CompleteWalOperationAsync(CommitCompletion(host.PartitionId, minLogIndex: 4, maxLogIndex: 4));
+        Assert.Equal("node-a", host.Leader);
+
+        // Every inherited entry's WAL record was upgraded to Committed...
+        Assert.All(wal.InheritedProposed, l => Assert.Equal(RaftLogType.Committed, l.Type));
+
+        // ...and the backfill read now returns the range, so a follower missing it can be repaired.
+        List<RaftLog> backfillView = await ((IRaftWalFacade)wal).GetRangeAsync(1, 10);
+        Assert.Equal([1L, 2L, 3L], backfillView.Where(l => l.Id <= 3).Select(l => l.Id).Order().ToList());
+    }
+
     // ── no-tail fast path: zero added latency ─────────────────────────────────
 
     /// <summary>
