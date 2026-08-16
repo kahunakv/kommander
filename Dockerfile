@@ -48,8 +48,13 @@ INSECURE_FLAG=""
 if [ "\$KOMMANDER_ALLOW_INSECURE_CERT" = "true" ]; then
   INSECURE_FLAG="--allow-insecure-certificate-validation true"
 fi
-echo "kommander --raft-nodename $KOMMANDER_RAFT_NODENAME --raft-nodeid $KOMMANDER_RAFT_NODEID --raft-host $KOMMANDER_RAFT_HOST --raft-port $KOMMANDER_RAFT_PORT --http-ports $KOMMANDER_HTTP_PORTS --https-ports $KOMMANDER_HTTPS_PORTS --https-certificate /app/certificate.pfx --initial-cluster $KOMMANDER_INITIAL_CLUSTER --sqlite-wal-path /app/data --sqlite-wal-revision v2 \$INSECURE_FLAG"
-dotnet /app/Kommander.Server.dll --raft-nodename $KOMMANDER_RAFT_NODENAME --raft-nodeid $KOMMANDER_RAFT_NODEID --raft-host $KOMMANDER_RAFT_HOST --raft-port $KOMMANDER_RAFT_PORT --http-ports $KOMMANDER_HTTP_PORTS --https-ports $KOMMANDER_HTTPS_PORTS --https-certificate /app/certificate.pfx --initial-cluster $KOMMANDER_INITIAL_CLUSTER --sqlite-wal-path /app/data --sqlite-wal-revision v2 \$INSECURE_FLAG
+# This compose cluster runs with --node-auth-mode Disabled on a container network, and maps the
+# cleartext ports to the host for manual poking. Both are fail-closed by default now, so the dev
+# setup has to opt in explicitly. Neither flag belongs in a real deployment: set --node-auth-mode
+# to SharedSecret or MutualTls there and drop both.
+DEV_INSECURE_FLAGS="--allow-unauthenticated-cluster --allow-plaintext-listener"
+echo "kommander --raft-nodename $KOMMANDER_RAFT_NODENAME --raft-nodeid $KOMMANDER_RAFT_NODEID --raft-host $KOMMANDER_RAFT_HOST --raft-port $KOMMANDER_RAFT_PORT --http-ports $KOMMANDER_HTTP_PORTS --https-ports $KOMMANDER_HTTPS_PORTS --https-certificate /app/certificate.pfx --initial-cluster $KOMMANDER_INITIAL_CLUSTER --sqlite-wal-path /app/data --sqlite-wal-revision v2 \$DEV_INSECURE_FLAGS \$INSECURE_FLAG"
+dotnet /app/Kommander.Server.dll --raft-nodename $KOMMANDER_RAFT_NODENAME --raft-nodeid $KOMMANDER_RAFT_NODEID --raft-host $KOMMANDER_RAFT_HOST --raft-port $KOMMANDER_RAFT_PORT --http-ports $KOMMANDER_HTTP_PORTS --https-ports $KOMMANDER_HTTPS_PORTS --https-certificate /app/certificate.pfx --initial-cluster $KOMMANDER_INITIAL_CLUSTER --sqlite-wal-path /app/data --sqlite-wal-revision v2 \$DEV_INSECURE_FLAGS \$INSECURE_FLAG
 EOT
 
 # when starting the container, run dotnet with the built dll

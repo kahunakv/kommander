@@ -8,6 +8,12 @@ public sealed class KommanderCommandLineOptions
     [Option('h', "host", Required = false, HelpText = "Host to bind incoming connections to", Default = "*")]
     public string Host { get; set; } = "*";
 
+    [Option("allow-unauthenticated-cluster", Required = false, HelpText = "Permit --node-auth-mode Disabled on a non-loopback bind (development only)", Default = false)]
+    public bool AllowUnauthenticatedCluster { get; set; }
+
+    [Option("allow-plaintext-listener", Required = false, HelpText = "Bind the cleartext HTTP listener even when an HTTPs certificate is configured. Rejected in MutualTls mode", Default = false)]
+    public bool AllowPlaintextListener { get; set; }
+
     [Option('p', "http-ports", Required = false, HelpText = "Ports to bind incoming HTTP connections to")]
     public IEnumerable<string>? HttpPorts { get; set; }
 
@@ -70,4 +76,10 @@ public sealed class KommanderCommandLineOptions
 
     [Option("trusted-client-cert-thumbprint", Required = false, HelpText = "Trusted client certificate thumbprints (hex)")]
     public IEnumerable<string>? TrustedClientCertThumbprints { get; set; }
+
+    [Option("client-certificate", Required = false, HelpText = "Path to the PKCS#12 client certificate presented for mTLS (MutualTls mode). Defaults to --https-certificate when omitted")]
+    public string ClientCertificate { get; set; } = "";
+
+    [Option("client-certificate-password", Required = false, HelpText = "Password for the client certificate", Default = "")]
+    public string ClientCertificatePassword { get; set; } = "";
 }

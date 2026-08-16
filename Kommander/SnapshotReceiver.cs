@@ -1,5 +1,6 @@
 
 using System.Diagnostics;
+using System.Security.Cryptography;
 using Kommander.Data;
 using Microsoft.Extensions.Logging;
 
@@ -57,6 +58,7 @@ internal sealed class SnapshotReceiver
     private readonly int maxPendingSessions;
     private readonly long maxPendingBytes;
     private readonly Func<long> getMonotonicTimestamp;
+    private readonly Func<bool> allowLegacySenders;
 
     internal SnapshotReceiver(
         Func<bool> isDisposed,
@@ -66,7 +68,8 @@ internal sealed class SnapshotReceiver
         long sessionTtlTicks,
         int maxPendingSessions,
         long maxPendingBytes,
-        Func<long> getMonotonicTimestamp)
+        Func<long> getMonotonicTimestamp,
+        Func<bool>? allowLegacySenders = null)
     {
         this.isDisposed = isDisposed;
         this.installOnExecutor = installOnExecutor;
@@ -76,6 +79,9 @@ internal sealed class SnapshotReceiver
         this.maxPendingSessions = maxPendingSessions > 0 ? maxPendingSessions : 1;
         this.maxPendingBytes = maxPendingBytes > 0 ? maxPendingBytes : 1;
         this.getMonotonicTimestamp = getMonotonicTimestamp;
+        // Read through a delegate rather than captured once: the flag lives on RaftConfiguration,
+        // which tests flip after construction (see the legacy-sender cases in TestSnapshotInstallExecutor).
+        this.allowLegacySenders = allowLegacySenders ?? (static () => false);
     }
 
     /// <summary>Converts a wall-clock duration to the <see cref="Stopwatch"/>-tick units used for TTL.</summary>
@@ -140,6 +146,7 @@ internal sealed class SnapshotReceiver
                     Kind = request.Kind,
                     NextExpectedChunkIndex = 0,
                     Buffer = new MemoryStream(),
+                    Hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256),
                     CreatedTimestamp = now,
                     LastActivityTimestamp = now,
                 };
@@ -180,6 +187,10 @@ internal sealed class SnapshotReceiver
             if (incoming > 0)
             {
                 session.Buffer.Write(request.Data.Span);
+                // Hashed on the same branch that appends, so the digest tracks exactly the bytes that
+                // were staged: the duplicate-chunk and reject paths above return before reaching here
+                // and so must not advance the hash either.
+                session.Hash.AppendData(request.Data.Span);
                 session.AccumulatedBytes += incoming;
                 _totalPendingBytes += incoming;
             }
@@ -189,6 +200,16 @@ internal sealed class SnapshotReceiver
 
             if (!request.IsLast)
                 return new SnapshotResponse(true);
+
+            // Integrity gate, immediately before the assembled bytes become eligible for install.
+            // Everything checked until now is structural (term, fence, chunk order) and says nothing
+            // about content, so this is the only check that would catch a tampered payload or a
+            // silently truncated transfer that still satisfied the index rules.
+            if (!VerifyChecksumLocked(session, request))
+            {
+                RemoveSessionLocked(key, session);
+                return new SnapshotResponse(false);
+            }
 
             // Terminal chunk: detach the completed session from _sessions (so it is not eligible for idle
             // eviction and a late/duplicate chunk cannot re-match it) but keep its bytes in the capacity
@@ -239,7 +260,76 @@ internal sealed class SnapshotReceiver
                 _inInstallCount--;
             }
             await completeBuffer.DisposeAsync().ConfigureAwait(false);
+            // The completed session was detached from _sessions above, so RemoveSessionLocked never
+            // runs for it and this is the only place its hash is released.
+            completedSession.Hash.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Verifies the digest carried on the terminal chunk against the bytes actually staged. Must hold
+    /// the lock. Returns false when the transfer must be rejected.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A missing digest is a legacy sender. It is refused unless <c>AllowLegacySnapshotSenders</c> is
+    /// on, matching how the other post-hoc session fields (leader term, leader endpoint, last-included
+    /// term) are handled — the alternative, accepting unverified snapshots by default, would leave the
+    /// control with no effect on exactly the deployments that never set the flag.
+    /// </para>
+    /// <para>
+    /// Compared with <see cref="CryptographicOperations.FixedTimeEquals"/> over the raw digests rather
+    /// than by string comparison. The timing channel is not the real concern here — a snapshot digest
+    /// is not a secret — but decoding first also rejects malformed hex outright instead of letting a
+    /// case or formatting difference read as a content mismatch.
+    /// </para>
+    /// </remarks>
+    private bool VerifyChecksumLocked(SnapshotReceiveSession session, SnapshotRequest request)
+    {
+        byte[] actual = session.Hash.GetHashAndReset();
+
+        if (string.IsNullOrEmpty(request.SnapshotChecksum))
+        {
+            if (allowLegacySenders())
+            {
+                logger.LogWarning(
+                    "[{Endpoint}] ReceiveInstallSnapshot: partition={PartitionId} index={Index} arrived with no "
+                    + "checksum (legacy sender) and was accepted unverified because AllowLegacySnapshotSenders is on.",
+                    localEndpoint, request.PartitionId, request.SnapshotIndex);
+                return true;
+            }
+
+            logger.LogWarning(
+                "[{Endpoint}] ReceiveInstallSnapshot rejected: partition={PartitionId} index={Index} carries no "
+                + "SnapshotChecksum (legacy sender) and AllowLegacySnapshotSenders is off.",
+                localEndpoint, request.PartitionId, request.SnapshotIndex);
+            return false;
+        }
+
+        byte[] expected;
+
+        try
+        {
+            expected = Convert.FromHexString(request.SnapshotChecksum);
+        }
+        catch (FormatException)
+        {
+            logger.LogWarning(
+                "[{Endpoint}] ReceiveInstallSnapshot rejected: partition={PartitionId} index={Index} carries a "
+                + "malformed SnapshotChecksum.",
+                localEndpoint, request.PartitionId, request.SnapshotIndex);
+            return false;
+        }
+
+        if (CryptographicOperations.FixedTimeEquals(actual, expected))
+            return true;
+
+        logger.LogWarning(
+            "[{Endpoint}] ReceiveInstallSnapshot rejected: partition={PartitionId} index={Index} failed its "
+            + "integrity check over {Bytes} staged bytes — the snapshot was corrupted or tampered with in transit.",
+            localEndpoint, request.PartitionId, request.SnapshotIndex, session.AccumulatedBytes);
+
+        return false;
     }
 
     private static bool MetadataMatches(SnapshotReceiveSession session, SnapshotRequest request) =>
@@ -346,6 +436,7 @@ internal sealed class SnapshotReceiver
         if (_sessions.Remove(key))
             _totalPendingBytes -= session.AccumulatedBytes;
         session.Buffer.Dispose();
+        session.Hash.Dispose();
     }
 
     /// <summary>Returns the count of active receive sessions. For test assertions only.</summary>
@@ -387,19 +478,22 @@ internal sealed class SnapshotReceiver
     /// </summary>
     internal void DisposePendingSnapshots()
     {
-        List<MemoryStream> snapshots = [];
+        List<SnapshotReceiveSession> pendingSessions = [];
 
         lock (_pendingSnapshotsLock)
         {
             foreach (KeyValuePair<SnapshotSessionKey, SnapshotReceiveSession> pending in _sessions)
-                snapshots.Add(pending.Value.Buffer);
+                pendingSessions.Add(pending.Value);
 
             _sessions.Clear();
             _totalPendingBytes = 0;
         }
 
-        foreach (MemoryStream snapshot in snapshots)
-            snapshot.Dispose();
+        foreach (SnapshotReceiveSession session in pendingSessions)
+        {
+            session.Buffer.Dispose();
+            session.Hash.Dispose();
+        }
     }
 
     /// <summary>
@@ -414,6 +508,14 @@ internal sealed class SnapshotReceiver
         internal required long SnapshotIndex { get; init; }
         internal required SnapshotKind Kind { get; init; }
         internal required MemoryStream Buffer { get; init; }
+
+        /// <summary>
+        /// Running SHA-256 over the staged bytes, advanced on every appended chunk and compared
+        /// against the sender's digest on the terminal chunk. Hashing incrementally avoids a second
+        /// pass over an assembled snapshot that may be hundreds of megabytes.
+        /// </summary>
+        internal required IncrementalHash Hash { get; init; }
+
         internal required long CreatedTimestamp { get; init; }
         internal int NextExpectedChunkIndex;
         internal long AccumulatedBytes;

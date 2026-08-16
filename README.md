@@ -22,7 +22,7 @@ Kommander is designed to keep the consensus core separate from storage, discover
 - **Testing-friendly in-memory components:** `InMemoryWAL`, `InMemoryCommunication`, and focused test utilities support fast local simulations without external infrastructure.
 - **Cluster discovery options:** Static discovery for fixed clusters, dynamic discovery for application-managed membership lists, and multicast discovery for local-network discovery.
 - **Transport choices:** gRPC for networked clusters, REST/JSON for HTTP-based integration and debugging, and in-memory communication for tests.
-- **Node authentication:** Shared-secret HMAC authentication for node-to-node REST and gRPC traffic, with optional server certificate thumbprint pinning.
+- **Node authentication:** Shared-secret HMAC or mutual TLS authentication for node-to-node REST and gRPC traffic, with optional server certificate thumbprint pinning.
 - **Batch replication:** Replicate multiple log entries in a single proposal to reduce coordination overhead.
 - **Manual proposal control:** Use automatic commits for the common path, or disable auto-commit and explicitly call `CommitLogs` or `RollbackLogs`.
 - **Hybrid logical clocks:** Proposal tickets use HLC timestamps to preserve causality across physical time and logical counters.
@@ -197,7 +197,7 @@ In-memory communication (used in tests) is excluded from these requirements.
 | --- | --- |
 | `Disabled` | No authentication. Existing unauthenticated clusters keep working. A warning is logged at startup. |
 | `SharedSecret` | HMAC-SHA256 per-request signature derived from a shared cluster secret. Recommended for production. |
-| `MutualTls` | mTLS client certificate validation. Not yet implemented. |
+| `MutualTls` | Mutual TLS. Both sides authenticate during the handshake; no per-request signature is sent. See [Mutual TLS](#mutual-tls). |
 
 ### Shared Secret Protocol
 
@@ -230,6 +230,101 @@ RaftConfiguration configuration = new()
 
 Generate at least 256 bits of random secret material and distribute it through a secret manager, Docker secret, Kubernetes Secret, or environment variable. Do not put the secret in source control.
 
+### Mutual TLS
+
+In `MutualTls` mode both sides authenticate during the TLS handshake: the client validates the
+server certificate and the server requires and validates a client certificate. No HMAC header is
+sent or checked, so there is no shared secret to distribute or rotate through configuration, and no
+per-request replay window to reason about.
+
+```csharp
+RaftConfiguration configuration = new()
+{
+    Host = "node-1",
+    Port = 8001,
+    TransportSecurity = new RaftTransportSecurityOptions
+    {
+        NodeAuthenticationMode = RaftNodeAuthenticationMode.MutualTls,
+        ClientCertificatePath = "/etc/kommander/node-1.pfx",
+        ClientCertificatePassword = Environment.GetEnvironmentVariable("NODE_CERT_PASSWORD"),
+        TrustedClientCertificateThumbprints =
+        [
+            "5E9B...", // node-1
+            "A31C...", // node-2
+            "7F02..."  // node-3
+        ]
+    }
+};
+```
+
+Or with the `Kommander.Server` host:
+
+```shell
+dotnet run --project Kommander.Server -- \
+  --node-auth-mode MutualTls \
+  --https-certificate /etc/kommander/node-1.pfx \
+  --https-certificate-password "$NODE_CERT_PASSWORD" \
+  --client-certificate /etc/kommander/node-1.pfx \
+  --client-certificate-password "$NODE_CERT_PASSWORD" \
+  --trusted-client-cert-thumbprint 5E9B... A31C... 7F02...
+```
+
+The published container passes the same flags to `dotnet /app/Kommander.Server.dll`.
+
+`--client-certificate` may be omitted, in which case the node presents its `--https-certificate`.
+
+#### Computing thumbprints
+
+Thumbprints are **uppercase hex of the SHA-256 hash over the DER-encoded certificate, with no
+separators**. Two common values do *not* work and will silently never match:
+
+- `X509Certificate2.Thumbprint` in .NET is SHA-1.
+- `openssl x509 -fingerprint -sha256` prints colon-separated hex.
+
+Colon-separated and lower-case values are normalized on input, so pasting `openssl` output works.
+To compute the canonical form directly:
+
+```sh
+openssl pkcs12 -in node-1.pfx -clcerts -nokeys -passin pass: \
+  | openssl x509 -outform DER \
+  | shasum -a 256 | cut -d' ' -f1 | tr 'a-f' 'A-F'
+```
+
+#### Shared vs. per-node certificates
+
+| Approach | Identity proven | Cost |
+| --- | --- | --- |
+| **Shared** — every node presents the same `.pfx` | Membership in the cluster, *not* which node is calling. Any holder of the file can impersonate any node. | One certificate to distribute. |
+| **Per-node** — each node has its own certificate, and every node lists the others' thumbprints | Genuine per-node identity; a single compromised node can be revoked by removing one thumbprint. | N thumbprints to distribute, updated on membership changes. |
+
+The shared approach has the same trust granularity as a shared secret, with better key handling and
+no header-level replay surface. Leaving `TrustedClientCertificateThumbprints` empty accepts any
+client certificate that completes the handshake; a warning is logged at startup.
+
+#### Rotating certificates
+
+With thumbprint pinning, rotation is a two-phase rollout. Skipping the first phase partitions the
+cluster as soon as the first node rotates:
+
+1. Add the new certificate's thumbprint to **every** node's `TrustedClientCertificateThumbprints`,
+   so both old and new are accepted. Restart each node.
+2. Switch each node's `ClientCertificatePath` to the new certificate, one node at a time.
+3. Remove the old thumbprint from every node.
+
+#### Operational consequences
+
+Two effects of requiring client certificates are worth planning for:
+
+- **The HTTPS port becomes cluster-internal.** Client certificates must be requested during the
+  initial TLS handshake, because HTTP/2 forbids the renegotiation that optional certificates rely on
+  and HTTP/3 has no equivalent. Kestrel therefore requires a certificate from *every* caller on that
+  listener, not only on `/v1/raft/*`. Bind a separate listener for any public HTTPS surface.
+- **HTTP/3 is disabled** on HTTPS listeners in this mode, for the same reason. This is logged once at
+  startup.
+
+`MutualTls` cannot be combined with `AllowInsecureCertificateValidation`; the combination throws at
+startup, since it would disable exactly the validation the mode depends on.
+
 ### Certificate Validation
 
 | Option | Default | Description |
@@ -237,7 +332,7 @@ Generate at least 256 bits of random secret material and distribute it through a
 | `RequireTls` | `true` | Reject requests that arrive over plain HTTP. Throws at startup if `HttpScheme` is `http://`. |
 | `AllowInsecureCertificateValidation` | `false` | Skip remote certificate validation. Development only. A warning is logged at startup. |
 | `TrustedServerCertificateThumbprints` | empty | SHA-256 hex thumbprints of accepted server certificates. When set, only pinned certificates are accepted regardless of chain trust. |
-| `TrustedClientCertificateThumbprints` | empty | Reserved for future mTLS client certificate pinning. |
+| `TrustedClientCertificateThumbprints` | empty | SHA-256 hex thumbprints of accepted **client** certificates, used in `MutualTls` mode. When empty, any client certificate that completes the handshake is accepted. |
 
 When neither `AllowInsecureCertificateValidation` nor thumbprints are set, the platform default certificate chain and hostname validation applies.
 
@@ -250,7 +345,9 @@ When neither `AllowInsecureCertificateValidation` nor thumbprints are set, the p
 | `--node-auth-header` | Override the default `X-Kommander-Cluster-Auth` header name. |
 | `--allow-insecure-certificate-validation` | Skip TLS certificate validation. Development only. |
 | `--trusted-server-cert-thumbprint` | One or more trusted server certificate SHA-256 thumbprints (hex). |
-| `--trusted-client-cert-thumbprint` | Reserved for future mTLS use. |
+| `--trusted-client-cert-thumbprint` | One or more trusted client certificate SHA-256 thumbprints (hex). Used in `MutualTls` mode. |
+| `--client-certificate` | Path to the PKCS#12 client certificate presented in `MutualTls` mode. Defaults to `--https-certificate`. |
+| `--client-certificate-password` | Password for the client certificate. |
 
 ### Secret Rotation
 

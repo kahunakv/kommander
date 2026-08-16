@@ -1,5 +1,6 @@
 
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using Kommander;
 using Kommander.Communication.Memory;
 using Kommander.Data;
@@ -123,6 +124,9 @@ public sealed class TestSnapshotIntegration
                     SessionId = "recheck", PartitionId = userPartitionId,
                     SnapshotIndex = floor, FollowerEndpoint = "localhost:8404",
                     IsLast = true, Data = new byte[] { 0xFF },
+                    // Terminal chunk, so it must carry the digest a real sender would compute over
+                    // the staged bytes — here the single chunk is the whole snapshot.
+                    SnapshotChecksum = Convert.ToHexString(SHA256.HashData(new byte[] { 0xFF })),
                 }, ct);
             Assert.True(idempotentResp.Success, "Re-install of same index must return success");
             Assert.Equal(importsBefore, transfer.ImportCallCount);

@@ -113,7 +113,7 @@ public class GrpcCommunication : ICommunication
             Endpoint = request.Endpoint
         };
 
-        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Handshake");
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Handshake", handshake);
         GrpcHandshakeResponse response = await client
             .HandshakeAsync(handshake, new CallOptions(metadata))
             .ResponseAsync
@@ -670,7 +670,7 @@ public class GrpcCommunication : ICommunication
             NodeId = request.NodeId
         };
 
-        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Leave");
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Leave", grpcRequest);
         try
         {
             GrpcLeaveResponse response = await client
@@ -712,7 +712,7 @@ public class GrpcCommunication : ICommunication
                 : ByteString.Empty,
         };
 
-        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Gossip");
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Gossip", grpcRequest);
         try
         {
             GrpcGossipResponse response = await client
@@ -742,7 +742,7 @@ public class GrpcCommunication : ICommunication
     {
         Rafter.RafterClient client = GetClient(manager, node);
         GrpcPingRequest grpcRequest = new() { SenderEndpoint = request.SenderEndpoint };
-        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Ping");
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Ping", grpcRequest);
         try
         {
             GrpcPingResponse response = await client
@@ -765,7 +765,7 @@ public class GrpcCommunication : ICommunication
     {
         Rafter.RafterClient client = GetClient(manager, node);
         GrpcPingReqRequest grpcRequest = new() { SenderEndpoint = request.SenderEndpoint, TargetEndpoint = request.TargetEndpoint };
-        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/PingReq");
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/PingReq", grpcRequest);
         try
         {
             GrpcPingReqResponse response = await client
@@ -796,7 +796,7 @@ public class GrpcCommunication : ICommunication
             FollowerEndpoint = followerEndpoint
         };
 
-        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/GetFollowerLag");
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/GetFollowerLag", grpcRequest);
         try
         {
             GrpcGetFollowerLagResponse response = await client
@@ -831,7 +831,7 @@ public class GrpcCommunication : ICommunication
             PartitionId = request.PartitionId
         };
 
-        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/GetReadIndex");
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/GetReadIndex", grpcRequest);
         try
         {
             GrpcGetReadIndexResponse response = await client
@@ -870,9 +870,10 @@ public class GrpcCommunication : ICommunication
             LeaderTerm = request.LeaderTerm,
             LeaderEndpoint = request.LeaderEndpoint,
             LastIncludedTerm = request.LastIncludedTerm,
+            SnapshotChecksum = request.SnapshotChecksum,
         };
 
-        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/InstallSnapshot");
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/InstallSnapshot", grpcRequest);
         CallOptions callOptions = BuildInstallSnapshotCallOptions(
             manager.Configuration,
             metadata,
@@ -904,7 +905,7 @@ public class GrpcCommunication : ICommunication
             NodeId = request.NodeId
         };
 
-        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Join");
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/Join", grpcRequest);
         try
         {
             GrpcJoinResponse response = await client
@@ -969,13 +970,30 @@ public class GrpcCommunication : ICommunication
         };
     }
 
-    private static Metadata BuildAuthMetadata(RaftManager manager, string grpcMethod)
+    /// <summary>
+    /// Builds the signed metadata for a unary call, binding <paramref name="request"/> into the
+    /// signature.
+    /// </summary>
+    /// <remarks>
+    /// The message must be fully populated before this is called — it is digested here, so any field
+    /// assigned afterwards travels unsigned and the receiver rejects the call as
+    /// <c>InvalidSignature</c>. Every call site therefore builds its request first and passes the
+    /// same instance it is about to send.
+    /// </remarks>
+    private static Metadata BuildAuthMetadata(RaftManager manager, string grpcMethod, IMessage request)
     {
         RaftTransportAuthenticator authenticator = manager.Configuration.GetTransportAuthenticator();
         if (authenticator.Options.NodeAuthenticationMode != RaftNodeAuthenticationMode.SharedSecret)
             return [];
 
-        RaftTransportAuthenticationHeaders signed = authenticator.Sign("POST", grpcMethod, manager.LocalEndpoint);
+        Span<byte> bodyHash = stackalloc byte[GrpcMessageBodyHash.HashSizeInBytes];
+        GrpcMessageBodyHash.Compute(request, bodyHash);
+
+        RaftTransportAuthenticationHeaders signed = authenticator.SignWithBodyHash(
+            "POST",
+            grpcMethod,
+            manager.LocalEndpoint,
+            bodyHash);
 
         return
         [

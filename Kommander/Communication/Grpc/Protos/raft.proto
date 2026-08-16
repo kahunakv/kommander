@@ -237,6 +237,7 @@ message GrpcInstallSnapshotRequest {
     int64 LeaderTerm = 9; // sender's currentTerm at session creation; 0 == legacy sender
     string LeaderEndpoint = 10; // claimed sender/leader; empty == legacy sender
     int64 LastIncludedTerm = 11; // term of the entry at SnapshotIndex; 0 == legacy sender
+    string SnapshotChecksum = 12; // hex SHA-256 over the whole snapshot, terminal chunk only; empty == legacy sender
 }
 
 message GrpcInstallSnapshotResponse {

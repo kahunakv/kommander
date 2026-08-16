@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Globalization;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 
 namespace Kommander;
@@ -51,6 +52,45 @@ public sealed class RaftTransportAuthenticator
     public RaftTransportSecurityOptions Options { get; }
 
     /// <summary>
+    /// Length in bytes of the body digest bound into a signature.
+    /// </summary>
+    public const int BodyHashSizeInBytes = 32;
+
+    /// <summary>
+    /// Creates signed authentication headers for an outgoing request, binding a body the caller has
+    /// already digested.
+    /// </summary>
+    /// <remarks>
+    /// Exists for transports that can hash their payload without first materializing it as a
+    /// <c>byte[]</c> — the gRPC path serializes into a pooled buffer, so handing over a 32-byte digest
+    /// avoids an allocation the size of the message (up to a 3 MiB snapshot chunk) on every call.
+    /// The digest must be SHA-256 over the exact bytes the peer will verify; see
+    /// <c>GrpcMessageBodyHash</c> for the gRPC definition of "exact bytes".
+    /// </remarks>
+    /// <param name="bodyHash">SHA-256 of the request body; must be <see cref="BodyHashSizeInBytes"/> long.</param>
+    public RaftTransportAuthenticationHeaders SignWithBodyHash(
+        string method,
+        string pathOrGrpcMethod,
+        string senderNode,
+        ReadOnlySpan<byte> bodyHash,
+        long? timestampUnixMilliseconds = null,
+        string? nonce = null)
+    {
+        if (Options.NodeAuthenticationMode is RaftNodeAuthenticationMode.Disabled
+            or RaftNodeAuthenticationMode.MutualTls)
+        {
+            return new RaftTransportAuthenticationHeaders
+            {
+                SignatureHeaderName = Options.HeaderName
+            };
+        }
+
+        ValidateBodyHashLength(bodyHash);
+
+        return SignCore(method, pathOrGrpcMethod, senderNode, bodyHash, timestampUnixMilliseconds, nonce);
+    }
+
+    /// <summary>
     /// Creates signed authentication headers for an outgoing request.
     /// </summary>
     public RaftTransportAuthenticationHeaders Sign(
@@ -61,7 +101,11 @@ public sealed class RaftTransportAuthenticator
         long? timestampUnixMilliseconds = null,
         string? nonce = null)
     {
-        if (Options.NodeAuthenticationMode == RaftNodeAuthenticationMode.Disabled)
+        // MutualTls authenticates the connection during the TLS handshake, so there is nothing to
+        // sign and no header to attach — the same shape as Disabled. Signing is not a security
+        // decision (validation is), so returning empty headers here is safe.
+        if (Options.NodeAuthenticationMode is RaftNodeAuthenticationMode.Disabled
+            or RaftNodeAuthenticationMode.MutualTls)
         {
             return new RaftTransportAuthenticationHeaders
             {
@@ -69,7 +113,20 @@ public sealed class RaftTransportAuthenticator
             };
         }
 
-        EnsureSharedSecretMode();
+        Span<byte> bodyHash = stackalloc byte[BodyHashSizeInBytes];
+        SHA256.HashData(bodyBytes ?? [], bodyHash);
+
+        return SignCore(method, pathOrGrpcMethod, senderNode, bodyHash, timestampUnixMilliseconds, nonce);
+    }
+
+    private RaftTransportAuthenticationHeaders SignCore(
+        string method,
+        string pathOrGrpcMethod,
+        string senderNode,
+        ReadOnlySpan<byte> bodyHash,
+        long? timestampUnixMilliseconds,
+        string? nonce)
+    {
         ValidateInputs(method, pathOrGrpcMethod, senderNode);
 
         long timestamp = timestampUnixMilliseconds ?? GetUtcNowUnixMilliseconds();
@@ -80,7 +137,7 @@ public sealed class RaftTransportAuthenticator
             senderNode,
             timestamp,
             authNonce,
-            bodyBytes);
+            bodyHash);
 
         return new RaftTransportAuthenticationHeaders
         {
@@ -107,6 +164,76 @@ public sealed class RaftTransportAuthenticator
         string? nonce,
         bool isSecureTransport)
     {
+        RaftTransportAuthenticationResult? modeRejection = CheckMode();
+        if (modeRejection is not null)
+            return modeRejection;
+
+        // Hashed after the mode checks so a Disabled or MutualTls caller never pays for digesting a
+        // body its mode does not consult.
+        Span<byte> bodyHash = stackalloc byte[BodyHashSizeInBytes];
+        SHA256.HashData(bodyBytes ?? [], bodyHash);
+
+        return ValidateCore(
+            method,
+            pathOrGrpcMethod,
+            bodyHash,
+            signature,
+            senderNode,
+            timestampUnixMilliseconds,
+            nonce,
+            isSecureTransport);
+    }
+
+    /// <summary>
+    /// Validates signed authentication fields against a body the caller has already digested.
+    /// </summary>
+    /// <remarks>
+    /// The counterpart to <see cref="SignWithBodyHash"/>, for transports that digest their payload
+    /// without materializing it. Both sides must derive the digest the same way or every request
+    /// fails with <see cref="RaftTransportAuthenticationStatus.InvalidSignature"/> — which is the
+    /// correct direction to fail, but makes a mismatch look like an attack rather than a bug, so the
+    /// derivation belongs in one shared helper per transport.
+    /// </remarks>
+    /// <param name="bodyHash">SHA-256 of the request body; must be <see cref="BodyHashSizeInBytes"/> long.</param>
+    public RaftTransportAuthenticationResult ValidateWithBodyHash(
+        string method,
+        string pathOrGrpcMethod,
+        ReadOnlySpan<byte> bodyHash,
+        string? signature,
+        string? senderNode,
+        string? timestampUnixMilliseconds,
+        string? nonce,
+        bool isSecureTransport)
+    {
+        RaftTransportAuthenticationResult? modeRejection = CheckMode();
+        if (modeRejection is not null)
+            return modeRejection;
+
+        ValidateBodyHashLength(bodyHash);
+
+        return ValidateCore(
+            method,
+            pathOrGrpcMethod,
+            bodyHash,
+            signature,
+            senderNode,
+            timestampUnixMilliseconds,
+            nonce,
+            isSecureTransport);
+    }
+
+    /// <summary>
+    /// Returns a rejection for the authentication modes that must not reach HMAC verification, or null
+    /// when signature validation should proceed.
+    /// </summary>
+    /// <remarks>
+    /// Fail closed in MutualTls mode: these overloads authenticate an HMAC signature, which mTLS never
+    /// sends, so reaching one means a transport did not route to <see cref="ValidatePeerCertificate"/>.
+    /// Returning Success here would hand a caller authentication without any certificate ever being
+    /// presented.
+    /// </remarks>
+    private RaftTransportAuthenticationResult? CheckMode()
+    {
         if (Options.NodeAuthenticationMode == RaftNodeAuthenticationMode.Disabled)
         {
             return new RaftTransportAuthenticationResult
@@ -115,8 +242,37 @@ public sealed class RaftTransportAuthenticator
             };
         }
 
-        EnsureSharedSecretMode();
+        if (Options.NodeAuthenticationMode == RaftNodeAuthenticationMode.MutualTls)
+        {
+            return new RaftTransportAuthenticationResult
+            {
+                Status = RaftTransportAuthenticationStatus.CertificateRequired
+            };
+        }
 
+        return null;
+    }
+
+    private static void ValidateBodyHashLength(ReadOnlySpan<byte> bodyHash)
+    {
+        if (bodyHash.Length != BodyHashSizeInBytes)
+        {
+            throw new ArgumentException(
+                $"Body hash must be {BodyHashSizeInBytes} bytes (SHA-256), got {bodyHash.Length}.",
+                nameof(bodyHash));
+        }
+    }
+
+    private RaftTransportAuthenticationResult ValidateCore(
+        string method,
+        string pathOrGrpcMethod,
+        ReadOnlySpan<byte> bodyHash,
+        string? signature,
+        string? senderNode,
+        string? timestampUnixMilliseconds,
+        string? nonce,
+        bool isSecureTransport)
+    {
         if (Options.RequireTls && !isSecureTransport)
         {
             return new RaftTransportAuthenticationResult
@@ -179,7 +335,7 @@ public sealed class RaftTransportAuthenticator
             senderNode,
             timestamp,
             nonce,
-            bodyBytes);
+            bodyHash);
 
         if (!FixedTimeEquals(providedSignature, expectedSignature))
         {
@@ -204,6 +360,64 @@ public sealed class RaftTransportAuthenticator
     }
 
     /// <summary>
+    /// Validates a MutualTls peer certificate for an incoming request.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Deliberately separate from the HMAC-shaped <see cref="Validate"/> overload rather than folded
+    /// into it. The two modes authenticate different things — a per-request signature versus a
+    /// per-connection certificate — and a single entry point that accepted either would make it
+    /// possible to reach <see cref="RaftTransportAuthenticationStatus.Success"/> in MutualTls mode
+    /// without a certificate ever being presented.
+    /// </para>
+    /// <para>
+    /// The TLS handshake has already authenticated the connection before this runs; what remains is
+    /// the application-level trust decision (validity window and thumbprint allow-list), which Kestrel
+    /// cannot make because it would have to reject self-signed per-node certificates first.
+    /// </para>
+    /// </remarks>
+    /// <param name="peerCertificate">Client certificate presented on the connection, if any.</param>
+    /// <param name="isSecureTransport">Whether the request arrived over TLS.</param>
+    public RaftTransportAuthenticationResult ValidatePeerCertificate(
+        X509Certificate2? peerCertificate,
+        bool isSecureTransport)
+    {
+        if (Options.NodeAuthenticationMode == RaftNodeAuthenticationMode.Disabled)
+        {
+            return new RaftTransportAuthenticationResult
+            {
+                Status = RaftTransportAuthenticationStatus.Disabled
+            };
+        }
+
+        // Wrong door: shared-secret callers must go through the signature overload. Reported as a
+        // rejection rather than an exception so a mis-wired transport degrades to "unauthenticated"
+        // instead of faulting every request.
+        if (Options.NodeAuthenticationMode == RaftNodeAuthenticationMode.SharedSecret)
+        {
+            return new RaftTransportAuthenticationResult
+            {
+                Status = RaftTransportAuthenticationStatus.MissingFields
+            };
+        }
+
+        // mTLS over cleartext is a contradiction: with no handshake there is no peer identity to
+        // check, so a null certificate would otherwise be the only signal.
+        if (Options.RequireTls && !isSecureTransport)
+        {
+            return new RaftTransportAuthenticationResult
+            {
+                Status = RaftTransportAuthenticationStatus.TlsRequired
+            };
+        }
+
+        return new RaftTransportAuthenticationResult
+        {
+            Status = RaftClientCertificateValidator.Validate(peerCertificate, Options, timeProvider)
+        };
+    }
+
+    /// <summary>
     /// Compares two byte arrays using a fixed-time algorithm.
     /// </summary>
     public static bool FixedTimeEquals(byte[]? left, byte[]? right)
@@ -222,12 +436,6 @@ public sealed class RaftTransportAuthenticator
 
     private long GetUtcNowUnixMilliseconds() =>
         timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
-
-    private void EnsureSharedSecretMode()
-    {
-        if (Options.NodeAuthenticationMode == RaftNodeAuthenticationMode.MutualTls)
-            throw new NotSupportedException("Mutual TLS authentication is not implemented yet.");
-    }
 
     private static void ValidateInputs(string method, string pathOrGrpcMethod, string senderNode)
     {
@@ -251,7 +459,7 @@ public sealed class RaftTransportAuthenticator
         string senderNode,
         long timestampUnixMilliseconds,
         string nonce,
-        byte[]? bodyBytes)
+        ReadOnlySpan<byte> bodyHash)
     {
         int methodByteCount = Encoding.UTF8.GetByteCount(method);
         int pathByteCount = Encoding.UTF8.GetByteCount(pathOrGrpcMethod);
@@ -294,7 +502,7 @@ public sealed class RaftTransportAuthenticator
             buffer[offset++] = (byte)'\n';
             offset += WriteUtf8(buffer[offset..], nonce);
             buffer[offset++] = (byte)'\n';
-            offset += WriteSha256HexLower(buffer[offset..], bodyBytes);
+            offset += WriteHexLower(buffer[offset..], bodyHash);
 
             return HMACSHA256.HashData(sharedSecretBytes!, buffer[..offset]);
         }
@@ -438,11 +646,8 @@ public sealed class RaftTransportAuthenticator
         return Encoding.UTF8.GetBytes(value, destination);
     }
 
-    private static int WriteSha256HexLower(Span<byte> destination, byte[]? bodyBytes)
+    private static int WriteHexLower(Span<byte> destination, ReadOnlySpan<byte> hash)
     {
-        Span<byte> hash = stackalloc byte[32];
-        SHA256.HashData(bodyBytes ?? [], hash);
-
         for (int i = 0; i < hash.Length; i++)
         {
             byte value = hash[i];

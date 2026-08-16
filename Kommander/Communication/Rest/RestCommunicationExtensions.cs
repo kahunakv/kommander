@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Kommander.Data;
@@ -241,7 +243,30 @@ public static class RestCommunicationExtensions
             };
         }
 
-        byte[] bodyBytes = await ReadRequestBodyAsync(context.Request).ConfigureAwait(false);
+        // Checked before the body is read: certificate validation does not consult the payload, so
+        // buffering it first would be wasted work on exactly the path that rejects.
+        if (transportSecurity.NodeAuthenticationMode == RaftNodeAuthenticationMode.MutualTls)
+        {
+            return authenticator.ValidatePeerCertificate(
+                context.Connection.ClientCertificate,
+                context.Request.IsHttps);
+        }
+
+        // Digest the body without materializing it: the pre-auth path must not commit memory
+        // proportional to an unauthenticated caller's payload, let alone to the length it merely
+        // claims. Returns false when the body exceeds the pre-auth ceiling.
+        byte[] bodyHash = new byte[RaftTransportAuthenticator.BodyHashSizeInBytes];
+
+        if (!await TryComputeBodyHashAsync(
+                context.Request,
+                configuration.MaxPreAuthRequestBodyBytes,
+                bodyHash).ConfigureAwait(false))
+        {
+            return new RaftTransportAuthenticationResult
+            {
+                Status = RaftTransportAuthenticationStatus.RequestBodyTooLarge
+            };
+        }
 
         context.Request.Headers.TryGetValue(transportSecurity.HeaderName, out var signatureValues);
         context.Request.Headers.TryGetValue(
@@ -254,10 +279,10 @@ public static class RestCommunicationExtensions
             RaftTransportAuthenticationHeaders.NonceHeaderName,
             out var nonceValues);
 
-        return authenticator.Validate(
+        return authenticator.ValidateWithBodyHash(
             context.Request.Method,
             context.Request.Path.Value ?? string.Empty,
-            bodyBytes,
+            bodyHash,
             signatureValues.ToString(),
             senderNodeValues.ToString(),
             timestampValues.ToString(),
@@ -279,35 +304,93 @@ public static class RestCommunicationExtensions
         if (authenticationResult.IsAuthenticated)
             return true;
 
-        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        // An oversized body is a size problem, not a credential problem, and saying so keeps an
+        // operator from chasing a signature mismatch that never happened.
+        context.Response.StatusCode =
+            authenticationResult.Status == RaftTransportAuthenticationStatus.RequestBodyTooLarge
+                ? StatusCodes.Status413PayloadTooLarge
+                : StatusCodes.Status401Unauthorized;
+
         return false;
     }
 
     /// <summary>
-    /// Reads the full request body into a byte[] for signature verification, leaving the body buffered and
-    /// rewound so the downstream handler can re-read it. When <see cref="HttpRequest.ContentLength"/> is
-    /// known the body is read straight into a single right-sized array via <c>ReadExactlyAsync</c>, avoiding
-    /// the <see cref="MemoryStream"/> growth churn and the extra <c>ToArray()</c> copy of the previous
-    /// implementation (~50% less allocation, measured). Falls back to the buffering copy when the length is
-    /// unknown (e.g. chunked transfer). The returned bytes are identical either way.
+    /// Size of the pooled read buffer used to digest a request body. Independent of the body size —
+    /// that is the point.
     /// </summary>
-    private static async Task<byte[]> ReadRequestBodyAsync(HttpRequest request)
+    private const int BodyReadBufferSize = 64 * 1024;
+
+    /// <summary>
+    /// Computes the SHA-256 of the request body for signature verification, leaving the body buffered
+    /// and rewound so the downstream handler can re-read it. Returns false when the body exceeds
+    /// <paramref name="maxBytes"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This runs <b>before</b> the signature is verified, so everything it does is reachable by an
+    /// unauthenticated caller and must be bounded accordingly. The previous implementation allocated
+    /// a <c>byte[]</c> sized from the request's <em>declared</em> <c>Content-Length</c> before reading
+    /// a single byte, so a client could commit tens of megabytes per connection — on the large-object
+    /// heap — by announcing a large body and then dribbling it out.
+    /// </para>
+    /// <para>
+    /// Hashing incrementally through a small pooled buffer makes pre-auth memory a function of the
+    /// buffer size rather than of the payload, and a declared length now costs nothing until the bytes
+    /// actually arrive. Only the digest is retained; the signature format binds a hash of the body,
+    /// never the body itself, so nothing downstream needs the full array.
+    /// </para>
+    /// <para>
+    /// <c>EnableBuffering</c> is still required — the handler re-reads the body after authentication
+    /// succeeds — and past its memory threshold it spills to a temp file. That residual pre-auth cost
+    /// is inherent to verifying a signature over a payload that must survive to the handler; it is
+    /// bounded by <paramref name="maxBytes"/> and by the host's own request-size limit.
+    /// </para>
+    /// </remarks>
+    private static async Task<bool> TryComputeBodyHashAsync(
+        HttpRequest request,
+        long maxBytes,
+        Memory<byte> hashDestination)
     {
+        // Reject on the declared length first when it is present: no reason to stream bytes we have
+        // already been told will be refused.
+        if (request.ContentLength is { } declaredLength && declaredLength > maxBytes)
+            return false;
+
         request.EnableBuffering();
 
-        long? contentLength = request.ContentLength;
-        if (contentLength is >= 0 and <= int.MaxValue)
-        {
-            byte[] body = contentLength == 0 ? [] : new byte[(int)contentLength];
-            if (body.Length > 0)
-                await request.Body.ReadExactlyAsync(body).ConfigureAwait(false);
-            request.Body.Position = 0;
-            return body;
-        }
+        using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(BodyReadBufferSize);
 
-        using MemoryStream buffer = new();
-        await request.Body.CopyToAsync(buffer).ConfigureAwait(false);
-        request.Body.Position = 0;
-        return buffer.ToArray();
+        try
+        {
+            long total = 0;
+
+            while (true)
+            {
+                int read = await request.Body
+                    .ReadAsync(buffer.AsMemory(0, BodyReadBufferSize))
+                    .ConfigureAwait(false);
+
+                if (read == 0)
+                    break;
+
+                total += read;
+
+                // Enforced against bytes actually received, not the declared length, so a chunked
+                // body (which declares nothing) is bounded on the same terms.
+                if (total > maxBytes)
+                    return false;
+
+                hash.AppendData(buffer, 0, read);
+            }
+
+            hash.GetHashAndReset(hashDestination.Span);
+            return true;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+            request.Body.Position = 0;
+        }
     }
 }

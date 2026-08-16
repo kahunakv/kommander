@@ -115,4 +115,31 @@ public sealed class SnapshotRequest
     /// (older senders, REST bodies that omit the property) keep today's behaviour.
     /// </summary>
     public SnapshotKind Kind { get; init; } = SnapshotKind.Range;
+
+    /// <summary>
+    /// Uppercase hex SHA-256 over the concatenated bytes of the whole snapshot, set on the
+    /// <see cref="IsLast"/> chunk only. Empty on every other chunk, and empty throughout from a
+    /// legacy sender that pre-dates this field.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The transfer is otherwise validated only structurally — term, membership fence, session
+    /// metadata, chunk-index monotonicity — none of which constrains the payload's <em>content</em>.
+    /// A snapshot install writes arbitrary bytes into the application state machine and seeds a WAL
+    /// checkpoint at the snapshot index, so it is the highest-leverage message in the protocol and
+    /// the one most worth binding to a digest.
+    /// </para>
+    /// <para>
+    /// Carried on the terminal chunk rather than the opener so neither side needs a pre-pass: the
+    /// sender hashes each chunk as it streams and knows the total only when the stream ends, and the
+    /// receiver hashes incrementally as chunks arrive. Requiring it up front would force the sender
+    /// to read the whole snapshot twice, or to buffer it.
+    /// </para>
+    /// <para>
+    /// Whether an empty value on the terminal chunk is tolerated is governed by
+    /// <c>RaftConfiguration.AllowLegacySnapshotSenders</c>, the same compatibility switch that
+    /// governs the other post-hoc session fields.
+    /// </para>
+    /// </remarks>
+    public string SnapshotChecksum { get; init; } = "";
 }

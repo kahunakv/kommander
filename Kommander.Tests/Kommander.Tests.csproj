@@ -31,6 +31,10 @@
 
     <ItemGroup>
       <ProjectReference Include="..\Kommander\Kommander.csproj" />
+      <!-- Kommander.Server is referenced for KommanderServerBindingPolicy: the fail-closed startup
+           rules (unauthenticated exposure, mTLS trust anchors, cleartext listener) are security
+           policy and must be testable, which top-level statements in Program.cs are not. -->
+      <ProjectReference Include="..\Kommander.Server\Kommander.Server.csproj" />
     </ItemGroup>
 
     <ItemGroup>

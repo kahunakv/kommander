@@ -1,4 +1,5 @@
 
+using System.Security.Cryptography;
 using Kommander;
 using Kommander.Data;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -51,7 +52,8 @@ public class TestSnapshotReceiveSession
         Func<long> clock,
         long ttlTicks = 1_000_000,
         int maxSessions = 8,
-        long maxBytes = 1_000_000) =>
+        long maxBytes = 1_000_000,
+        bool allowLegacySenders = false) =>
         new(
             isDisposed: () => false,
             installOnExecutor: installOnExecutor,
@@ -60,12 +62,26 @@ public class TestSnapshotReceiveSession
             sessionTtlTicks: ttlTicks,
             maxPendingSessions: maxSessions,
             maxPendingBytes: maxBytes,
-            getMonotonicTimestamp: clock);
+            getMonotonicTimestamp: clock,
+            allowLegacySenders: () => allowLegacySenders);
 
+    /// <summary>
+    /// Builds one chunk as a sender would, including the integrity digest on the terminal chunk.
+    /// </summary>
+    /// <param name="wholeSnapshot">
+    /// The bytes the receiver is expected to have staged across the whole session, used for the
+    /// terminal chunk's checksum. Defaults to <paramref name="data"/>, which is correct for a
+    /// single-chunk session; multi-chunk sessions must pass the concatenation.
+    /// </param>
+    /// <param name="checksumOverride">
+    /// Replaces the computed digest verbatim — for the legacy-sender (empty) and malformed-value
+    /// cases, which cannot be expressed by choosing different bytes.
+    /// </param>
     private static SnapshotRequest Chunk(
         string session, int chunkIndex, bool isLast, byte[] data,
         string leader = "leader:1", int partitionId = 1, long snapshotIndex = 100,
-        long leaderTerm = 3, long lastIncludedTerm = 2) =>
+        long leaderTerm = 3, long lastIncludedTerm = 2, byte[]? wholeSnapshot = null,
+        string? checksumOverride = null) =>
         new()
         {
             SessionId = session,
@@ -78,7 +94,11 @@ public class TestSnapshotReceiveSession
             ChunkIndex = chunkIndex,
             IsLast = isLast,
             Data = data,
+            SnapshotChecksum = checksumOverride ?? (isLast ? Checksum(wholeSnapshot ?? data) : ""),
         };
+
+    /// <summary>Digest in the wire encoding the receiver expects: uppercase hex SHA-256.</summary>
+    private static string Checksum(byte[] snapshot) => Convert.ToHexString(SHA256.HashData(snapshot));
 
     // ── happy path ───────────────────────────────────────────────────────────
 
@@ -94,7 +114,7 @@ public class TestSnapshotReceiveSession
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 1, false, [3]), ct)).Success);
         Assert.Equal(0, installer.InstallCallCount);
 
-        Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 2, true, [4]), ct)).Success);
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 2, true, [4], wholeSnapshot: [1, 2, 3, 4]), ct)).Success);
         Assert.Equal(1, installer.InstallCallCount);
         Assert.Equal([1, 2, 3, 4], installer.ReceivedBytes);
 
@@ -135,7 +155,7 @@ public class TestSnapshotReceiveSession
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 1, false, [2]), ct)).Success);
         // Exact duplicate of the immediately-previous chunk: idempotent success, not appended again.
         Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 1, false, [2]), ct)).Success);
-        Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 2, true, [3]), ct)).Success);
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 2, true, [3], wholeSnapshot: [1, 2, 3]), ct)).Success);
 
         Assert.Equal([1, 2, 3], installer.ReceivedBytes);
     }
@@ -180,6 +200,183 @@ public class TestSnapshotReceiveSession
         Assert.False((await r.ReceiveInstallSnapshot(Chunk("s", 1, false, [2], leaderTerm: 6), ct)).Success);
         Assert.Equal(0, installer.InstallCallCount);
         Assert.Equal(0, r.PendingSessionCount);
+    }
+
+    // ── integrity ──────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The H6 core case: bytes that do not match the sender's digest must never reach the install
+    /// path. Everything else the receiver checks is structural — term, fence, chunk order — and a
+    /// tampered or corrupted payload satisfies all of it.
+    /// </summary>
+    [Fact]
+    public async Task TamperedPayload_RejectedBeforeInstall()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000);
+
+        // The digest claims [1, 2, 3]; the bytes actually staged are [1, 2, 99].
+        SnapshotRequest tampered = Chunk("s", 0, true, [1, 2, 99], wholeSnapshot: [1, 2, 3]);
+
+        Assert.False((await r.ReceiveInstallSnapshot(tampered, ct)).Success);
+        Assert.Equal(0, installer.InstallCallCount);
+        Assert.Equal(0, r.PendingSessionCount);
+        Assert.Equal(0, r.PendingByteCount);
+    }
+
+    /// <summary>
+    /// Tampering with an earlier chunk is caught too — the digest covers the whole session, not just
+    /// the terminal chunk, so a mid-transfer rewrite cannot slip through by leaving the last chunk
+    /// intact.
+    /// </summary>
+    [Fact]
+    public async Task TamperedEarlierChunk_RejectedAtTerminalChunk()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000);
+
+        // Chunk 0 was rewritten in flight: [9] instead of the [1] the sender hashed.
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 0, false, [9]), ct)).Success);
+
+        SnapshotRequest terminal = Chunk("s", 1, true, [2], wholeSnapshot: [1, 2]);
+
+        Assert.False((await r.ReceiveInstallSnapshot(terminal, ct)).Success);
+        Assert.Equal(0, installer.InstallCallCount);
+        Assert.Equal(0, r.PendingSessionCount);
+    }
+
+    /// <summary>
+    /// A truncated transfer that still satisfies the chunk-index rules — the sender's last chunk was
+    /// lost and an earlier one was marked terminal — is caught by the digest. No adversary required;
+    /// this is the silent-corruption case.
+    /// </summary>
+    [Fact]
+    public async Task TruncatedTransfer_RejectedByDigest()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000);
+
+        // Digest is over [1, 2, 3] but only [1, 2] ever arrives, with chunk 1 flagged terminal.
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 0, false, [1]), ct)).Success);
+        Assert.False((await r.ReceiveInstallSnapshot(
+            Chunk("s", 1, true, [2], wholeSnapshot: [1, 2, 3]), ct)).Success);
+
+        Assert.Equal(0, installer.InstallCallCount);
+    }
+
+    /// <summary>
+    /// A sender that predates the checksum field is refused by default, matching how the other
+    /// post-hoc session fields are handled. Accepting unverified snapshots by default would leave
+    /// the check with no effect on the deployments that never touch the compatibility switch.
+    /// </summary>
+    [Fact]
+    public async Task MissingChecksum_RejectedWhenLegacySendersDisallowed()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000);
+
+        SnapshotRequest legacy = Chunk("s", 0, true, [1, 2, 3], checksumOverride: "");
+
+        Assert.False((await r.ReceiveInstallSnapshot(legacy, ct)).Success);
+        Assert.Equal(0, installer.InstallCallCount);
+    }
+
+    /// <summary>
+    /// …and accepted when the operator has opted into the compatibility window, so a mixed-version
+    /// cluster has a way through.
+    /// </summary>
+    [Fact]
+    public async Task MissingChecksum_AcceptedWhenLegacySendersAllowed()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000, allowLegacySenders: true);
+
+        SnapshotRequest legacy = Chunk("s", 0, true, [1, 2, 3], checksumOverride: "");
+
+        Assert.True((await r.ReceiveInstallSnapshot(legacy, ct)).Success);
+        Assert.Equal(1, installer.InstallCallCount);
+        Assert.Equal([1, 2, 3], installer.ReceivedBytes);
+    }
+
+    /// <summary>
+    /// The legacy switch is an escape hatch for a <i>missing</i> digest, not a licence to ignore one
+    /// that is present and wrong.
+    /// </summary>
+    [Fact]
+    public async Task TamperedPayload_StillRejectedWhenLegacySendersAllowed()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000, allowLegacySenders: true);
+
+        SnapshotRequest tampered = Chunk("s", 0, true, [1, 2, 99], wholeSnapshot: [1, 2, 3]);
+
+        Assert.False((await r.ReceiveInstallSnapshot(tampered, ct)).Success);
+        Assert.Equal(0, installer.InstallCallCount);
+    }
+
+    /// <summary>
+    /// A malformed digest is rejected outright rather than being compared and reported as a content
+    /// mismatch, so an operator reading the log can tell a wire-format problem from a corrupt payload.
+    /// </summary>
+    [Theory]
+    [InlineData("nothexatall")]
+    [InlineData("ABC")]              // odd length
+    [InlineData("AABBCCDD")]         // well-formed hex, wrong length for SHA-256
+    public async Task MalformedChecksum_Rejected(string checksum)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000);
+
+        SnapshotRequest bad = Chunk("s", 0, true, [1, 2, 3], checksumOverride: checksum);
+
+        Assert.False((await r.ReceiveInstallSnapshot(bad, ct)).Success);
+        Assert.Equal(0, installer.InstallCallCount);
+    }
+
+    /// <summary>
+    /// Digest comparison is case-insensitive in effect: it decodes the hex rather than comparing the
+    /// strings, so a peer that emits lowercase is not rejected as corrupt.
+    /// </summary>
+    [Fact]
+    public async Task LowercaseChecksum_Accepted()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000);
+
+        SnapshotRequest lowercase = Chunk(
+            "s", 0, true, [1, 2, 3], checksumOverride: Checksum([1, 2, 3]).ToLowerInvariant());
+
+        Assert.True((await r.ReceiveInstallSnapshot(lowercase, ct)).Success);
+        Assert.Equal(1, installer.InstallCallCount);
+    }
+
+    /// <summary>
+    /// The duplicate-chunk fast path must not advance the running digest: it does not append the
+    /// bytes either, and a hash that counted them would reject every retried transfer.
+    /// </summary>
+    [Fact]
+    public async Task DuplicateChunk_DoesNotCorruptTheDigest()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000);
+
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 0, false, [1]), ct)).Success);
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 1, false, [2]), ct)).Success);
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 1, false, [2]), ct)).Success);
+
+        Assert.True((await r.ReceiveInstallSnapshot(
+            Chunk("s", 2, true, [3], wholeSnapshot: [1, 2, 3]), ct)).Success);
+
+        Assert.Equal([1, 2, 3], installer.ReceivedBytes);
     }
 
     [Fact]

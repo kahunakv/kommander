@@ -500,7 +500,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             SnapshotReceiver.TicksForDuration(this.configuration.SnapshotReceiveSessionTtl),
             this.configuration.SnapshotMaxPendingSessions,
             this.configuration.SnapshotMaxPendingBytes,
-            static () => global::System.Diagnostics.Stopwatch.GetTimestamp());
+            static () => global::System.Diagnostics.Stopwatch.GetTimestamp(),
+            () => this.configuration.AllowLegacySnapshotSenders);
 
         clusterHandler = new(this, discovery);
 

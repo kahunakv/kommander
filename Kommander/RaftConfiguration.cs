@@ -756,6 +756,33 @@ public class RaftConfiguration
     /// </summary>
     public bool AllowLegacySnapshotSenders { get; set; }
 
+    /// <summary>
+    /// Maximum REST request body, in bytes, that will be read and digested before its signature has
+    /// been verified. Larger bodies are refused with 413 and
+    /// <see cref="RaftTransportAuthenticationStatus.RequestBodyTooLarge"/>. Default 32 MiB.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This bounds work an <b>unauthenticated</b> caller can cause: verifying a signature means
+    /// reading the body first, so every byte below this ceiling is streamed and buffered on the
+    /// strength of an unproven credential.
+    /// </para>
+    /// <para>
+    /// The body is digested through a small pooled buffer, so exceeding this limit is not a
+    /// memory-exhaustion risk on its own — the ceiling exists to bound the buffering the downstream
+    /// handler requires (which spills to a temp file past its threshold), and to give operators a
+    /// limit independent of the host's.
+    /// </para>
+    /// <para>
+    /// The default sits just above ASP.NET Core's own ~28.6 MB request-size limit, so on a default
+    /// host that limit binds first and this one changes nothing. It matters when the host's limit has
+    /// been raised. Lower it to the largest legitimate signed Raft request for a tighter bound —
+    /// remember that snapshot chunks travel base64-encoded over REST, so a 3 MiB chunk is ~4 MiB on
+    /// the wire.
+    /// </para>
+    /// </remarks>
+    public long MaxPreAuthRequestBodyBytes { get; set; } = 32L * 1024 * 1024;
+
     // ── Learner promotion ──────────────────────────────────────────────────────
 
     /// <summary>
@@ -1188,6 +1215,32 @@ public class RaftConfiguration
                 $"[Kommander] SnapshotMaxPendingBytes ({SnapshotMaxPendingBytes}) must be positive. " +
                 "It caps total buffered snapshot bytes across all in-progress receive sessions.");
 
+        if (TransportSecurity.NodeAuthenticationMode == RaftNodeAuthenticationMode.MutualTls)
+        {
+            // Mirrors the Kommander.Server startup checks so embedded hosts that never parse a command
+            // line get the same fail-fast. Without it the first symptom is a peer that cannot connect,
+            // which reads as a network fault rather than a configuration error.
+            if (TransportSecurity.AllowInsecureCertificateValidation)
+                throw new RaftException(
+                    "[Kommander] AllowInsecureCertificateValidation cannot be combined with " +
+                    "NodeAuthenticationMode.MutualTls. mTLS derives all of its security from validating " +
+                    "the peer certificate, so bypassing that validation leaves the transport unauthenticated " +
+                    "while appearing to be configured for mutual TLS.");
+
+            if (TransportSecurity.ClientCertificate is null
+                && string.IsNullOrWhiteSpace(TransportSecurity.ClientCertificatePath))
+            {
+                throw new RaftException(
+                    "[Kommander] NodeAuthenticationMode.MutualTls requires a client certificate. Set " +
+                    "TransportSecurity.ClientCertificatePath (or TransportSecurity.ClientCertificate for an " +
+                    "already-loaded instance); without one this node cannot complete a TLS client handshake " +
+                    "against its peers.");
+            }
+
+            // Resolve now so a bad path or password surfaces here rather than at first replication.
+            TransportSecurity.GetClientCertificate();
+        }
+
         // PartitionExecutorPoolSize: no throw needed — the RaftExecutorPool constructor
         // clamps negative values to 1 and treats 0 as ProcessorCount.  This note keeps
         // validation self-documenting for readers who look here expecting to find all
@@ -1201,9 +1254,16 @@ public class RaftConfiguration
     /// </summary>
     public RaftTransportSecurityOptions GetEffectiveTransportSecurity()
     {
-        string? sharedSecret = string.IsNullOrWhiteSpace(TransportSecurity.SharedSecret)
-            ? HttpAuthBearerToken
-            : TransportSecurity.SharedSecret;
+        bool mutualTls = TransportSecurity.NodeAuthenticationMode == RaftNodeAuthenticationMode.MutualTls;
+
+        // The legacy bearer token is only a shared-secret alias. Folding it in under MutualTls would
+        // populate a secret the mode never consults, leaving it to be transmitted or logged for no
+        // benefit.
+        string? sharedSecret = mutualTls
+            ? TransportSecurity.SharedSecret
+            : string.IsNullOrWhiteSpace(TransportSecurity.SharedSecret)
+                ? HttpAuthBearerToken
+                : TransportSecurity.SharedSecret;
 
         return new RaftTransportSecurityOptions
         {
@@ -1213,8 +1273,20 @@ public class RaftConfiguration
             RequireTls = TransportSecurity.RequireTls,
             AllowInsecureCertificateValidation = TransportSecurity.AllowInsecureCertificateValidation,
             AllowedClockSkew = TransportSecurity.AllowedClockSkew,
-            TrustedServerCertificateThumbprints = TransportSecurity.TrustedServerCertificateThumbprints,
-            TrustedClientCertificateThumbprints = TransportSecurity.TrustedClientCertificateThumbprints
+            // Normalized once here so every transport compares against the same canonical form, rather
+            // than each call site re-deriving it (or forgetting to).
+            TrustedServerCertificateThumbprints =
+                RaftClientCertificateValidator.NormalizeAll(TransportSecurity.TrustedServerCertificateThumbprints),
+            TrustedClientCertificateThumbprints =
+                RaftClientCertificateValidator.NormalizeAll(TransportSecurity.TrustedClientCertificateThumbprints),
+            ClientCertificatePath = TransportSecurity.ClientCertificatePath,
+            ClientCertificatePassword = TransportSecurity.ClientCertificatePassword,
+            // This method allocates a fresh options object per call, so resolving the certificate from
+            // the source instance keeps a single loaded X509Certificate2 shared across every derived
+            // copy. Letting each copy lazily load its own would open one key container per copy.
+            ClientCertificate = mutualTls
+                ? TransportSecurity.GetClientCertificate()
+                : TransportSecurity.ClientCertificate
         };
     }
 

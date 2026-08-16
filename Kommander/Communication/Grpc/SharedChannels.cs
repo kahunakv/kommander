@@ -5,7 +5,7 @@ using System.Diagnostics;
 using System.IO.Compression;
 using System.Net.Security;
 using System.Collections.Concurrent;
-using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using Grpc.Core;
 
 namespace Kommander.Communication.Grpc;
@@ -167,7 +167,7 @@ public static class SharedChannels
     // process, so a mismatch indicates a mis-wired call site.  SecurityOptions and streaming
     // metadata are intentionally excluded: they are reference types whose instance identity is
     // unreliable for comparison purposes here.
-    private static readonly ConcurrentDictionary<string, (int ChannelsPerNode, bool EnableMultipleHttp2Connections)> registeredPoolConfig = new();
+    private static readonly ConcurrentDictionary<string, (int ChannelsPerNode, bool EnableMultipleHttp2Connections, RaftNodeAuthenticationMode NodeAuthenticationMode)> registeredPoolConfig = new();
 
     // Process-wide defaults used by the public (securityOptions-only) overloads.
     // Packed into a single immutable reference so readers always observe a consistent
@@ -200,23 +200,35 @@ public static class SharedChannels
     // racing caller — eliminating the TOCTOU that existed when GetOrAdd was used before
     // the pool was created.
     //
-    // SecurityOptions and streaming Metadata are intentionally excluded from the check.
-    // Both are reference types whose instance identity is unreliable for equality comparison,
+    // The rest of SecurityOptions and the streaming Metadata are intentionally excluded from the
+    // check.  Both are reference types whose instance identity is unreliable for equality comparison,
     // and Kommander guarantees a single transport configuration per process: every node in a
     // cluster uses the same TLS/secret settings, so a per-URL security mismatch is a
     // deployment misconfiguration not detectable here.  The single-config-per-process
     // invariant is enforced at the Configure()/GetPoolOptions() layer instead.
+    //
+    // NodeAuthenticationMode is the exception, because it is a value type that compares reliably and
+    // because getting it wrong is silent rather than noisy: a pool first built for a Disabled or
+    // SharedSecret manager carries no client certificate, so a MutualTls manager that later reuses it
+    // for the same URL would connect without presenting one and fail authentication at the peer for
+    // reasons that point nowhere near the pool.  In-process test suites that construct managers in
+    // different modes are exactly where this happens.
     [Conditional("DEBUG")]
     private static void AssertConsistentPoolConfig(string normalizedUrl, GrpcChannelPoolOptions opts)
     {
-        if (!registeredPoolConfig.TryGetValue(normalizedUrl, out (int ChannelsPerNode, bool EnableMultipleHttp2Connections) stored))
+        if (!registeredPoolConfig.TryGetValue(normalizedUrl, out (int ChannelsPerNode, bool EnableMultipleHttp2Connections, RaftNodeAuthenticationMode NodeAuthenticationMode) stored))
             return;
 
+        RaftNodeAuthenticationMode requestedAuthMode =
+            opts.SecurityOptions?.NodeAuthenticationMode ?? RaftNodeAuthenticationMode.Disabled;
+
         Debug.Assert(
-            stored.ChannelsPerNode == opts.ChannelsPerNode && stored.EnableMultipleHttp2Connections == opts.EnableMultipleHttp2Connections,
+            stored.ChannelsPerNode == opts.ChannelsPerNode
+            && stored.EnableMultipleHttp2Connections == opts.EnableMultipleHttp2Connections
+            && stored.NodeAuthenticationMode == requestedAuthMode,
             $"SharedChannels: conflicting pool options for {normalizedUrl}. " +
-            $"Pool built with ChannelsPerNode={stored.ChannelsPerNode}, EnableMultipleHttp2Connections={stored.EnableMultipleHttp2Connections}. " +
-            $"This caller requested ChannelsPerNode={opts.ChannelsPerNode}, EnableMultipleHttp2Connections={opts.EnableMultipleHttp2Connections}. " +
+            $"Pool built with ChannelsPerNode={stored.ChannelsPerNode}, EnableMultipleHttp2Connections={stored.EnableMultipleHttp2Connections}, NodeAuthenticationMode={stored.NodeAuthenticationMode}. " +
+            $"This caller requested ChannelsPerNode={opts.ChannelsPerNode}, EnableMultipleHttp2Connections={opts.EnableMultipleHttp2Connections}, NodeAuthenticationMode={requestedAuthMode}. " +
             "Kommander supports one transport configuration per URL per process.");
     }
 
@@ -242,7 +254,7 @@ public static class SharedChannels
                     {
                         // Record the winning opts inside the factory so registeredPoolConfig always
                         // reflects the opts the pool was actually built with, not a racing caller's.
-                        registeredPoolConfig.TryAdd(k, (opts.ChannelsPerNode, opts.EnableMultipleHttp2Connections));
+                        registeredPoolConfig.TryAdd(k, (opts.ChannelsPerNode, opts.EnableMultipleHttp2Connections, opts.SecurityOptions?.NodeAuthenticationMode ?? RaftNodeAuthenticationMode.Disabled));
                         return CreateSharedChannels(k, opts);
                     })
                 });
@@ -265,7 +277,7 @@ public static class SharedChannels
                 {
                     Slots = new Lazy<List<GrpcChannel>>(() =>
                     {
-                        registeredPoolConfig.TryAdd(k, (opts.ChannelsPerNode, opts.EnableMultipleHttp2Connections));
+                        registeredPoolConfig.TryAdd(k, (opts.ChannelsPerNode, opts.EnableMultipleHttp2Connections, opts.SecurityOptions?.NodeAuthenticationMode ?? RaftNodeAuthenticationMode.Disabled));
                         return CreateSharedChannels(k, opts);
                     })
                 });
@@ -366,7 +378,7 @@ public static class SharedChannels
             {
                 Slots = new Lazy<List<GrpcChannel>>(() =>
                 {
-                    registeredPoolConfig.TryAdd(k, (opts.ChannelsPerNode, opts.EnableMultipleHttp2Connections));
+                    registeredPoolConfig.TryAdd(k, (opts.ChannelsPerNode, opts.EnableMultipleHttp2Connections, opts.SecurityOptions?.NodeAuthenticationMode ?? RaftNodeAuthenticationMode.Disabled));
                     return CreateSharedChannels(k, opts);
                 })
             });
@@ -406,21 +418,30 @@ public static class SharedChannels
     {
         SslClientAuthenticationOptions sslOptions = new();
 
+        // Presenting our own certificate is independent of how we validate theirs: the branches below
+        // configure RemoteCertificateValidationCallback (the server side), so this is set first and
+        // composes with whichever of them applies.
+        if (securityOptions?.NodeAuthenticationMode == RaftNodeAuthenticationMode.MutualTls)
+        {
+            X509Certificate2? clientCertificate = securityOptions.GetClientCertificate();
+
+            if (clientCertificate is not null)
+                sslOptions.ClientCertificates = [clientCertificate];
+        }
+
         if (securityOptions?.AllowInsecureCertificateValidation == true)
         {
             sslOptions.RemoteCertificateValidationCallback = delegate { return true; };
         }
         else if (securityOptions?.TrustedServerCertificateThumbprints is { Count: > 0 } thumbprints)
         {
+            // Thumbprint *and* validity window: pinning alone accepted an expired server certificate,
+            // while the server side rejected an expired client certificate.
             sslOptions.RemoteCertificateValidationCallback = (_, certificate, _, _) =>
-            {
-                if (certificate is null)
-                    return false;
-
-                byte[] hash = SHA256.HashData(certificate.GetRawCertData());
-                string thumbprint = Convert.ToHexString(hash);
-                return thumbprints.Any(t => string.Equals(t, thumbprint, StringComparison.OrdinalIgnoreCase));
-            };
+                RaftClientCertificateValidator.IsServerCertificateTrusted(
+                    certificate,
+                    thumbprints,
+                    TimeProvider.System);
         }
 
         return sslOptions;

@@ -1,6 +1,9 @@
+using System.Runtime.CompilerServices;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using Flurl.Http;
+using Flurl.Http.Configuration;
 using Kommander.Data;
 using Kommander.Gossip;
 using Kommander.Logging;
@@ -376,23 +379,117 @@ public class RestCommunication : ICommunication
         };
     }
 
-    private static IFlurlRequest CreateRaftRequest(
+    /// <summary>
+    /// Per-manager REST clients, configured from the manager's transport security settings.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Cluster traffic goes through these rather than Flurl's process-wide defaults. The certificate
+    /// policy — presenting a client certificate under mTLS, pinning the peer's server certificate, or
+    /// the development bypass that accepts anything — belongs to this cluster's configuration, and
+    /// installing it on <c>FlurlHttp.Clients</c> applied it to every Flurl call anywhere in the
+    /// process, including calls made by an application that merely hosts Kommander. The insecure
+    /// bypass in particular then silently disabled certificate validation for unrelated HTTP clients.
+    /// </para>
+    /// <para>
+    /// Owning it here also means an embedded host gets the same policy as <c>Kommander.Server</c>:
+    /// previously the client certificate and pinning were wired up in that project's startup, so a
+    /// library consumer using <see cref="RestCommunication"/> got neither.
+    /// </para>
+    /// <para>
+    /// Keyed weakly so per-test managers do not leak clients. Security options and endpoints are
+    /// immutable after <see cref="RaftManager"/> construction, which is the same contract the gRPC
+    /// channel pool's per-manager caches rely on.
+    /// </para>
+    /// </remarks>
+    private static readonly ConditionalWeakTable<RaftManager, IFlurlClientCache> clientsByManager = new();
+
+    private static IFlurlClient GetClient(RaftManager manager, RaftNode node)
+    {
+        IFlurlClientCache cache = clientsByManager.GetValue(
+            manager,
+            static _ => new FlurlClientCache());
+
+        RaftConfiguration configuration = manager.Configuration;
+        string baseUrl = configuration.HttpScheme + node.Endpoint;
+
+        return cache.GetOrAdd(
+            node.Endpoint,
+            baseUrl,
+            builder => ConfigureClient(builder, configuration.GetEffectiveTransportSecurity()));
+    }
+
+    /// <summary>
+    /// Applies this cluster's certificate policy to a REST client.
+    /// </summary>
+    /// <remarks>
+    /// Presenting our certificate and validating theirs are independent, so the mTLS branch composes
+    /// with whichever validation branch applies. The ordering of the validation branches matters:
+    /// the insecure bypass wins over pinning, because an operator who set both has asked for the
+    /// bypass explicitly and silently pinning instead would be a surprising override.
+    /// </remarks>
+    private static void ConfigureClient(IFlurlClientBuilder builder, RaftTransportSecurityOptions security)
+    {
+        builder.ConfigureInnerHandler(handler =>
+        {
+            if (security.NodeAuthenticationMode == RaftNodeAuthenticationMode.MutualTls)
+            {
+                X509Certificate2? clientCertificate = security.GetClientCertificate();
+
+                if (clientCertificate is not null)
+                    handler.ClientCertificates.Add(clientCertificate);
+            }
+
+            if (security.AllowInsecureCertificateValidation)
+            {
+                handler.ServerCertificateCustomValidationCallback = (_, _, _, _) => true;
+                return;
+            }
+
+            if (security.TrustedServerCertificateThumbprints.Count > 0)
+            {
+                IReadOnlyCollection<string> thumbprints = security.TrustedServerCertificateThumbprints;
+
+                handler.ServerCertificateCustomValidationCallback = (_, certificate, _, _) =>
+                    RaftClientCertificateValidator.IsServerCertificateTrusted(
+                        certificate,
+                        thumbprints,
+                        TimeProvider.System);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Builds a signed request against the per-manager client for <paramref name="node"/>.
+    /// </summary>
+    /// <remarks>
+    /// Internal so the URL it composes can be asserted directly: routing moved from Flurl's
+    /// string extensions (which resolve through the process-wide client cache) to a scoped client
+    /// with a base URL, and a mistake there would silently retarget cluster traffic.
+    /// </remarks>
+    internal static IFlurlRequest CreateRaftRequest(
         RaftManager manager,
         RaftNode node,
         string path,
         string payload)
     {
         RaftConfiguration configuration = manager.Configuration;
-        IFlurlRequest request = (configuration.HttpScheme + node.Endpoint)
+        IFlurlRequest request = GetClient(manager, node)
+            .Request(path.Trim('/').Split('/'))
             .WithHeader("Accept", "application/json")
             .WithHeader("Content-Type", "application/json")
             .WithTimeout(configuration.HttpTimeout)
-            .WithSettings(o => o.HttpVersion = configuration.HttpVersion)
-            .AppendPathSegments(path.Trim('/').Split('/'));
+            .WithSettings(o => o.HttpVersion = configuration.HttpVersion);
 
 #pragma warning disable CS0618
-        if (!string.IsNullOrWhiteSpace(configuration.HttpAuthBearerToken))
+        // Suppressed under MutualTls: the mode authenticates at the handshake and never reads this
+        // header, so sending it would put a leftover legacy credential on every Raft request for no
+        // benefit.
+        if (!string.IsNullOrWhiteSpace(configuration.HttpAuthBearerToken)
+            && configuration.TransportSecurity.NodeAuthenticationMode != RaftNodeAuthenticationMode.MutualTls)
+        {
             request = request.WithOAuthBearerToken(configuration.HttpAuthBearerToken);
+        }
 #pragma warning restore CS0618
 
         foreach ((string headerName, string headerValue) in BuildAuthenticationHeaders(

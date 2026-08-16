@@ -2,7 +2,9 @@
 using Grpc.Core;
 using Kommander.Data;
 using Kommander.Gossip;
+using Google.Protobuf;
 using Google.Protobuf.Collections;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using System.Runtime.InteropServices;
 using ClusterMembership = Kommander.System.ClusterMembership;
@@ -48,7 +50,26 @@ public sealed class RaftService : Rafter.RafterBase
         this.logger = logger;
     }
 
-    private void ValidateAuth(ServerCallContext context)
+    /// <summary>
+    /// Authenticates an inbound call, binding <paramref name="request"/> into the verified signature.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <paramref name="request"/> is the deserialized request message, digested via
+    /// <see cref="GrpcMessageBodyHash"/> so the shared-secret signature covers the payload and not
+    /// just the method and headers. Without it a signature authenticates only "an authorized node
+    /// called this method recently", leaving an on-path attacker free to rewrite the protobuf body —
+    /// log entries, vote terms, snapshot bytes — while the signature stays valid.
+    /// </para>
+    /// <para>
+    /// Pass null only where there is genuinely no single request message to bind: the duplex
+    /// <c>BatchRequests</c> stream authenticates once at establishment, before any message is read,
+    /// so its per-message integrity rests on the transport rather than on the signature. Every unary
+    /// method must pass its request, and the client must sign the same message, or the call is
+    /// rejected as <c>InvalidSignature</c>.
+    /// </para>
+    /// </remarks>
+    private void ValidateAuth(ServerCallContext context, IMessage? request)
     {
         if (raft is not RaftManager manager)
             return;
@@ -58,19 +79,59 @@ public sealed class RaftService : Rafter.RafterBase
         if (security.NodeAuthenticationMode == RaftNodeAuthenticationMode.Disabled)
             return;
 
+        // Sits here rather than in each of the service methods so every current and future caller of
+        // ValidateAuth inherits it. The certificate is a property of the connection, so the duplex
+        // batch stream is covered by the single check it already performs before consuming its
+        // request stream; a certificate expiring mid-stream is not re-validated, matching how TLS
+        // sessions behave generally.
+        if (security.NodeAuthenticationMode == RaftNodeAuthenticationMode.MutualTls)
+        {
+            HttpContext? httpContext = TryGetHttpContext(context);
+
+            RaftTransportAuthenticationResult certificateResult = authenticator.ValidatePeerCertificate(
+                httpContext?.Connection.ClientCertificate,
+                isSecureTransport: httpContext?.Request.IsHttps ?? false);
+
+            if (!certificateResult.IsAuthenticated)
+            {
+                logger.LogWarning(
+                    "[RaftService] gRPC mTLS auth rejected for {Method}: {Status}",
+                    context.Method,
+                    certificateResult.Status);
+
+                throw new RpcException(new Status(
+                    StatusCode.Unauthenticated,
+                    certificateResult.Status.ToString()));
+            }
+
+            return;
+        }
+
         Metadata headers = context.RequestHeaders;
         string? signature = headers.GetValue(security.HeaderName);
         string? senderNode = headers.GetValue(RaftTransportAuthenticationHeaders.SenderNodeHeaderName);
         string? timestamp = headers.GetValue(RaftTransportAuthenticationHeaders.TimestampHeaderName);
         string? nonce = headers.GetValue(RaftTransportAuthenticationHeaders.NonceHeaderName);
 
-        bool isSecure = context.Host?.StartsWith("https://", StringComparison.OrdinalIgnoreCase) != false
-            || context.Peer?.StartsWith("ipv4:", StringComparison.OrdinalIgnoreCase) == false;
+        // Read from the HttpContext, exactly as the MutualTls branch above does, so the two modes
+        // cannot disagree about what "arrived over TLS" means.
+        //
+        // The previous heuristic inferred this from context.Host and context.Peer and was wrong in
+        // both directions: Host is the :authority (host:port) and is never scheme-prefixed, so a
+        // null authority or a non-ipv4 peer reported "secure" for cleartext traffic and bypassed
+        // RequireTls, while an ipv4 peer reported "insecure" and had its calls rejected with
+        // TlsRequired even over TLS.
+        //
+        // No HttpContext means no evidence of TLS, so the null case fails closed.
+        bool isSecure = TryGetHttpContext(context)?.Request.IsHttps ?? false;
 
-        RaftTransportAuthenticationResult result = authenticator.Validate(
+        Span<byte> bodyHash = stackalloc byte[GrpcMessageBodyHash.HashSizeInBytes];
+        GrpcMessageBodyHash.Compute(request, bodyHash);
+
+        RaftTransportAuthenticationResult result = authenticator.ValidateWithBodyHash(
             "POST",
             context.Method,
-            bodyBytes: null,
+            bodyHash,
             signature,
             senderNode,
             timestamp,
@@ -85,6 +146,31 @@ public sealed class RaftService : Rafter.RafterBase
     }
 
     /// <summary>
+    /// Returns the ASP.NET Core <see cref="HttpContext"/> backing this call, or null when the call
+    /// is not hosted by ASP.NET Core.
+    /// </summary>
+    /// <remarks>
+    /// Grpc.AspNetCore's <c>GetHttpContext()</c> throws off-host rather than returning null, despite
+    /// its nullable-looking usage. Both authentication branches must fail closed there — with no
+    /// HttpContext neither the TLS state nor the client certificate can be observed, so there is no
+    /// evidence on which to authenticate anyone — and converting the throw to null lets them reject
+    /// with a proper Unauthenticated status instead of faulting the call with an opaque Internal
+    /// error. The try block costs nothing when the exception does not occur, which is every request
+    /// under Kestrel.
+    /// </remarks>
+    private static HttpContext? TryGetHttpContext(ServerCallContext context)
+    {
+        try
+        {
+            return context.GetHttpContext();
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Handles a handshake request by delegating to the IRaft implementation, using the details provided in the request.
     /// </summary>
     /// <param name="request">The handshake request containing the partition ID, maximum log ID, and endpoint details.</param>
@@ -92,7 +178,7 @@ public sealed class RaftService : Rafter.RafterBase
     /// <returns>A task representing the asynchronous operation, with a result of type GrpcHandshakeResponse.</returns>
     public override async Task<GrpcHandshakeResponse> Handshake(GrpcHandshakeRequest request, ServerCallContext context)
     {
-        ValidateAuth(context);
+        ValidateAuth(context, request);
 
         await raft.Handshake(new(
             request.NodeId,
@@ -123,7 +209,7 @@ public sealed class RaftService : Rafter.RafterBase
     /// <returns>A task representing the asynchronous operation, with a result of type GrpcVoteResponse.</returns>
     public override Task<GrpcVoteResponse> Vote(GrpcVoteRequest request, ServerCallContext context)
     {
-        ValidateAuth(context);
+        ValidateAuth(context, request);
 
         raft.Vote(new(
             request.Partition,
@@ -146,7 +232,7 @@ public sealed class RaftService : Rafter.RafterBase
     /// <returns>A task that represents the asynchronous operation, returning a response of type GrpcRequestVotesResponse.</returns>
     public override Task<GrpcRequestVotesResponse> RequestVotes(GrpcRequestVotesRequest request, ServerCallContext context)
     {
-        ValidateAuth(context);
+        ValidateAuth(context, request);
 
         raft.RequestVote(new(
             request.Partition,
@@ -169,7 +255,7 @@ public sealed class RaftService : Rafter.RafterBase
     /// <returns>A task representing the asynchronous operation, with a result of type GrpcAppendLogsResponse.</returns>
     public override Task<GrpcAppendLogsResponse> AppendLogs(GrpcAppendLogsRequest request, ServerCallContext context)
     {
-        ValidateAuth(context);
+        ValidateAuth(context, request);
 
         raft.AppendLogs(new(
             request.Partition,
@@ -186,7 +272,7 @@ public sealed class RaftService : Rafter.RafterBase
     
     public override Task<GrpcCompleteAppendLogsResponse> CompleteAppendLogs(GrpcCompleteAppendLogsRequest request, ServerCallContext context)
     {
-        ValidateAuth(context);
+        ValidateAuth(context, request);
 
         raft.CompleteAppendLogs(new(
             request.Partition, 
@@ -247,7 +333,10 @@ public sealed class RaftService : Rafter.RafterBase
         if (raft is null)
             throw new InvalidOperationException("Raft is null");
 
-        ValidateAuth(context);
+        // Null body: the stream is authenticated once here, before any message is read, so there is
+        // no single request to bind. Per-message integrity on this path rests on the transport — see
+        // the ValidateAuth remarks.
+        ValidateAuth(context, request: null);
 
         try
         {
@@ -434,7 +523,7 @@ public sealed class RaftService : Rafter.RafterBase
     /// </summary>
     public override async Task<GrpcLeaveResponse> Leave(GrpcLeaveRequest request, ServerCallContext context)
     {
-        ValidateAuth(context);
+        ValidateAuth(context, request);
 
         if (raft is not RaftManager manager)
             return new GrpcLeaveResponse { Success = false };
@@ -458,7 +547,7 @@ public sealed class RaftService : Rafter.RafterBase
     /// </summary>
     public override Task<GrpcPingResponse> Ping(GrpcPingRequest request, ServerCallContext context)
     {
-        ValidateAuth(context);
+        ValidateAuth(context, request);
 
         if (raft is not RaftManager manager)
             return Task.FromResult(new GrpcPingResponse { Alive = false });
@@ -474,7 +563,7 @@ public sealed class RaftService : Rafter.RafterBase
     /// </summary>
     public override async Task<GrpcPingReqResponse> PingReq(GrpcPingReqRequest request, ServerCallContext context)
     {
-        ValidateAuth(context);
+        ValidateAuth(context, request);
 
         if (raft is not RaftManager manager)
             return new GrpcPingReqResponse { Reached = false };
@@ -493,7 +582,7 @@ public sealed class RaftService : Rafter.RafterBase
     /// </summary>
     public override Task<GrpcGossipResponse> Gossip(GrpcGossipRequest request, ServerCallContext context)
     {
-        ValidateAuth(context);
+        ValidateAuth(context, request);
 
         if (raft is not RaftManager manager)
             return Task.FromResult(new GrpcGossipResponse());
@@ -530,7 +619,7 @@ public sealed class RaftService : Rafter.RafterBase
     /// </summary>
     public override async Task<GrpcGetFollowerLagResponse> GetFollowerLag(GrpcGetFollowerLagRequest request, ServerCallContext context)
     {
-        ValidateAuth(context);
+        ValidateAuth(context, request);
 
         if (raft is not RaftManager manager)
             return new GrpcGetFollowerLagResponse { HasValue = false };
@@ -550,7 +639,7 @@ public sealed class RaftService : Rafter.RafterBase
     /// </summary>
     public override async Task<GrpcGetReadIndexResponse> GetReadIndex(GrpcGetReadIndexRequest request, ServerCallContext context)
     {
-        ValidateAuth(context);
+        ValidateAuth(context, request);
 
         if (raft is not RaftManager manager)
             return new GrpcGetReadIndexResponse { Success = false, ReadIndex = -1 };
@@ -569,7 +658,7 @@ public sealed class RaftService : Rafter.RafterBase
     /// </summary>
     public override async Task<GrpcInstallSnapshotResponse> InstallSnapshot(GrpcInstallSnapshotRequest request, ServerCallContext context)
     {
-        ValidateAuth(context);
+        ValidateAuth(context, request);
 
         if (raft is not RaftManager manager)
             return new GrpcInstallSnapshotResponse { Success = false };
@@ -590,6 +679,7 @@ public sealed class RaftService : Rafter.RafterBase
             LeaderTerm = request.LeaderTerm,
             LeaderEndpoint = request.LeaderEndpoint,
             LastIncludedTerm = request.LastIncludedTerm,
+            SnapshotChecksum = request.SnapshotChecksum,
         };
 
         Data.SnapshotResponse result = await manager.ReceiveInstallSnapshot(
@@ -604,7 +694,7 @@ public sealed class RaftService : Rafter.RafterBase
     /// </summary>
     public override async Task<GrpcJoinResponse> Join(GrpcJoinRequest request, ServerCallContext context)
     {
-        ValidateAuth(context);
+        ValidateAuth(context, request);
 
         if (raft is not RaftManager manager)
             return new GrpcJoinResponse { Success = false };

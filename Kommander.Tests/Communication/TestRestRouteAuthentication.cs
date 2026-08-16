@@ -220,6 +220,143 @@ public sealed class TestRestRouteAuthentication
         Assert.NotEqual(StatusCodes.Status403Forbidden, authenticatedContext.Response.StatusCode);
     }
 
+    // ── pre-authentication body ceiling ────────────────────────────────────────
+
+    /// <summary>
+    /// A body larger than the pre-auth ceiling is refused on its declared length, before any of it is
+    /// read. This is the shape that mattered: the reader used to allocate from the declared
+    /// Content-Length up front, so announcing a large body was enough to commit the memory.
+    /// </summary>
+    [Fact]
+    public async Task AuthenticateRequestAsync_RejectsBodyOverCap_OnDeclaredLength()
+    {
+        RaftConfiguration configuration = CreateSharedSecretConfiguration();
+        configuration.MaxPreAuthRequestBodyBytes = 1024;
+
+        DefaultHttpContext context = CreateContext(
+            method: "POST",
+            path: "/v1/raft/append-logs",
+            body: new string('x', 4096),
+            isHttps: true);
+
+        RaftTransportAuthenticationResult result =
+            await RestCommunicationExtensions.AuthenticateRequestAsync(context, configuration);
+
+        Assert.Equal(RaftTransportAuthenticationStatus.RequestBodyTooLarge, result.Status);
+        Assert.False(result.IsAuthenticated);
+    }
+
+    /// <summary>
+    /// A body that declares nothing — chunked transfer — is bounded by the bytes that actually
+    /// arrive, so the ceiling cannot be sidestepped by omitting Content-Length.
+    /// </summary>
+    [Fact]
+    public async Task AuthenticateRequestAsync_RejectsBodyOverCap_WhenLengthUndeclared()
+    {
+        RaftConfiguration configuration = CreateSharedSecretConfiguration();
+        configuration.MaxPreAuthRequestBodyBytes = 1024;
+
+        DefaultHttpContext context = CreateContext(
+            method: "POST",
+            path: "/v1/raft/append-logs",
+            body: new string('x', 4096),
+            isHttps: true);
+
+        // Chunked request: the length is unknown until the body ends.
+        context.Request.ContentLength = null;
+
+        RaftTransportAuthenticationResult result =
+            await RestCommunicationExtensions.AuthenticateRequestAsync(context, configuration);
+
+        Assert.Equal(RaftTransportAuthenticationStatus.RequestBodyTooLarge, result.Status);
+    }
+
+    /// <summary>
+    /// A body exactly at the ceiling is allowed through to signature verification — the bound is
+    /// inclusive, and an off-by-one here would reject legitimate maximum-size requests.
+    /// </summary>
+    [Fact]
+    public async Task AuthenticateRequestAsync_AllowsBodyExactlyAtCap()
+    {
+        RaftConfiguration configuration = CreateSharedSecretConfiguration();
+        string body = new('x', 1024);
+        configuration.MaxPreAuthRequestBodyBytes = body.Length;
+
+        DefaultHttpContext context = CreateContext(
+            method: "POST",
+            path: "/v1/raft/append-logs",
+            body: body,
+            isHttps: true);
+
+        foreach ((string key, string value) in RestCommunication.BuildAuthenticationHeaders(
+                     configuration, "node-a:5000", "POST", "/v1/raft/append-logs", body))
+        {
+            context.Request.Headers[key] = value;
+        }
+
+        RaftTransportAuthenticationResult result =
+            await RestCommunicationExtensions.AuthenticateRequestAsync(context, configuration);
+
+        Assert.Equal(RaftTransportAuthenticationStatus.Success, result.Status);
+    }
+
+    /// <summary>
+    /// Digesting the body must leave it rewound and intact for the handler that runs after
+    /// authentication. Streaming the body to hash it and forgetting to rewind would present every
+    /// handler with an empty request.
+    /// </summary>
+    [Fact]
+    public async Task AuthenticateRequestAsync_LeavesBodyReadableForTheHandler()
+    {
+        RaftConfiguration configuration = CreateSharedSecretConfiguration();
+        const string body = "{\"ok\":true}";
+
+        DefaultHttpContext context = CreateContext(
+            method: "POST",
+            path: "/v1/raft/append-logs",
+            body: body,
+            isHttps: true);
+
+        foreach ((string key, string value) in RestCommunication.BuildAuthenticationHeaders(
+                     configuration, "node-a:5000", "POST", "/v1/raft/append-logs", body))
+        {
+            context.Request.Headers[key] = value;
+        }
+
+        RaftTransportAuthenticationResult result =
+            await RestCommunicationExtensions.AuthenticateRequestAsync(context, configuration);
+
+        Assert.Equal(RaftTransportAuthenticationStatus.Success, result.Status);
+
+        using StreamReader reader = new(context.Request.Body, Encoding.UTF8);
+        Assert.Equal(body, await reader.ReadToEndAsync());
+    }
+
+    /// <summary>
+    /// An oversized body answers 413, not 401: the caller may hold a perfectly good credential, and
+    /// reporting it as an authentication failure sends an operator hunting a mismatch that never
+    /// happened.
+    /// </summary>
+    [Fact]
+    public async Task AuthorizeRequestAsync_AnswersPayloadTooLarge_ForOversizedBody()
+    {
+        RaftConfiguration configuration = CreateSharedSecretConfiguration();
+        configuration.MaxPreAuthRequestBodyBytes = 1024;
+
+        DefaultHttpContext context = CreateContext(
+            method: "POST",
+            path: "/v1/raft/append-logs",
+            body: new string('x', 4096),
+            isHttps: true);
+
+        bool allowed = await RestCommunicationExtensions.AuthorizeRequestAsync(
+            context,
+            CreateManager(configuration));
+
+        Assert.False(allowed);
+        Assert.Equal(StatusCodes.Status413PayloadTooLarge, context.Response.StatusCode);
+    }
+
     private static DefaultHttpContext CreateContext(string method, string path, string body, bool isHttps)
     {
         DefaultHttpContext context = new();

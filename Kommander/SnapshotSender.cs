@@ -2,6 +2,7 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Security.Cryptography;
 using Kommander.Data;
 using Kommander.Diagnostics;
 using Kommander.Logging;
@@ -322,6 +323,11 @@ internal sealed class SnapshotSender
             int chunkIndex = 0;
             bool success = false;
 
+            // Hashed incrementally as the snapshot streams, so the digest costs one pass over bytes
+            // already in hand rather than a second read of the whole snapshot. The receiver hashes
+            // the same way, which is why the digest can only travel on the terminal chunk.
+            using IncrementalHash snapshotHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+
             try
             {
                 await using (snapshot.ConfigureAwait(false))
@@ -330,6 +336,9 @@ internal sealed class SnapshotSender
                     {
                         int bytesRead = await StreamUtils.ReadExactAsync(snapshot, buffer, chunkSize, CancellationToken.None).ConfigureAwait(false);
                         bool isLast = bytesRead < chunkSize;
+
+                        if (bytesRead > 0)
+                            snapshotHash.AppendData(buffer, 0, bytesRead);
 
                         SnapshotRequest chunk = new()
                         {
@@ -349,6 +358,12 @@ internal sealed class SnapshotSender
                             // Data synchronously within that send (see SnapshotRequest.Data remarks).
                             Data = buffer.AsMemory(0, bytesRead),
                             Kind = kind,
+                            // Terminal chunk only: this is the first point at which the digest over
+                            // the whole snapshot is known. GetHashAndReset is safe to call here
+                            // because the loop breaks immediately after a successful last chunk.
+                            SnapshotChecksum = isLast
+                                ? Convert.ToHexString(snapshotHash.GetHashAndReset())
+                                : "",
                         };
 
                         SnapshotResponse response = await host.SendInstallSnapshotAsync(node, chunk, CancellationToken.None).ConfigureAwait(false);
