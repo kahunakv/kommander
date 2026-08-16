@@ -129,16 +129,36 @@ try
 
     Console.WriteLine("Kommander! {0} {1}", configuration.Host, configuration.Port);
 
+    // Resolved here, before the host is built, so an unknown adapter name fails at startup with a
+    // message naming the flag rather than inside the DI factory on first resolution.
+    KommanderWalSelection walSelection = KommanderWalConfiguration.Resolve(
+        opts.WalAdapter,
+        opts.RocksDbWalPath,
+        opts.RocksDbWalRevision,
+        opts.SqliteWalPath,
+        opts.SqliteWalRevision);
+
+    if (KommanderWalConfiguration.DescribeMismatch(walSelection) is { } walWarning)
+        Console.WriteLine(walWarning);
+
     WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 
     builder.Services.AddSingleton<IRaft>(services =>
     {
         ILogger<IRaft> logger = services.GetRequiredService<ILogger<IRaft>>();
-        
+
+        // --wal-adapter is now honoured. It used to be parsed and ignored: RocksDB was constructed
+        // unconditionally, and from the sqlite-named options, so --rocksdb-wal-path did nothing.
+        IWAL wal = walSelection.Adapter switch
+        {
+            KommanderWalAdapter.Sqlite => new SqliteWAL(walSelection.Path, walSelection.Revision, logger),
+            _ => new RocksDbWAL(walSelection.Path, walSelection.Revision, logger),
+        };
+
         RaftManager node = new(
             configuration,
             new StaticDiscovery(nodes),
-            new RocksDbWAL(path: opts.SqliteWalPath, revision: opts.SqliteWalRevision, logger),
+            wal,
             new GrpcCommunication(),
             new HybridLogicalClock(),
             logger
@@ -265,7 +285,18 @@ try
 
     app.Run();
 }
+catch (RaftException ex)
+{
+    // A configuration problem. The message is written to name the offending flag and what to do
+    // about it, so the stack trace adds nothing an operator can act on while disclosing source paths
+    // and assembly layout to whoever reads the container log.
+    Console.Error.WriteLine("[Kommander] {0}", ex.Message);
+    Environment.ExitCode = 1;
+}
 catch (Exception ex)
 {
-    Console.WriteLine("{0}\n{1}", ex.Message, ex.StackTrace);
+    // Anything else is a fault rather than a misconfiguration, and the trace is the only way to
+    // diagnose it — so it is kept, on stderr.
+    Console.Error.WriteLine("[Kommander] Unexpected startup failure: {0}: {1}\n{2}", ex.GetType().Name, ex.Message, ex.StackTrace);
+    Environment.ExitCode = 1;
 }

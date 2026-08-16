@@ -8,6 +8,32 @@ namespace Kommander.Communication.Grpc;
 /// Cached protobuf log entries for one Raft batch fanned out to multiple followers.
 /// Built once per replication round; gRPC copies references into each outbound request.
 /// </summary>
+/// <remarks>
+/// <para>
+/// <b>Ownership contract.</b> The cached messages wrap each <see cref="RaftLog.LogData"/> array
+/// zero-copy via <see cref="UnsafeByteOperations.UnsafeWrap"/> — they alias the caller's arrays
+/// rather than copying them. The caller therefore hands ownership of those arrays to this cache for
+/// its lifetime, and must treat them as frozen:
+/// </para>
+/// <list type="bullet">
+/// <item>do not mutate a <c>LogData</c> array after passing its <see cref="RaftLog"/> here;</item>
+/// <item>do not return one to an <see cref="System.Buffers.ArrayPool{T}"/>, where a later renter
+/// would overwrite it.</item>
+/// </list>
+/// <para>
+/// Violating that does not fail loudly. The cache outlives a single send — that is its whole
+/// purpose, since one built batch is fanned out to every follower and re-sent on retry — so a
+/// mutation between sends means two followers silently receive <em>different bytes</em> under the
+/// same log id and term. There is no checksum on the append path to catch it, so the first symptom
+/// would be a replica divergence far from the cause.
+/// </para>
+/// <para>
+/// No runtime guard is installed deliberately. A defensive copy would remove the allocation saving
+/// this type exists for, and verifying a digest per entry per follower would put hashing on the
+/// replication fan-out path. The contract is enforced by review, and by the fact that every current
+/// producer of these arrays allocates them fresh per batch.
+/// </para>
+/// </remarks>
 public sealed class AppendLogsGrpcLogCache
 {
     private readonly object _lock = new();
@@ -24,6 +50,10 @@ public sealed class AppendLogsGrpcLogCache
     /// Returns the cached <see cref="GrpcRaftLog"/> list for <paramref name="source"/>,
     /// building it on first use. Thread-safe for concurrent follower sends.
     /// </summary>
+    /// <param name="source">
+    /// Log entries for this batch. Their <see cref="RaftLog.LogData"/> arrays are aliased, not
+    /// copied, and must not be mutated or pool-returned afterwards — see the type-level remarks.
+    /// </param>
     internal RepeatedField<GrpcRaftLog> GetOrCreate(IReadOnlyList<RaftLog> source)
     {
         if (_logs is not null)

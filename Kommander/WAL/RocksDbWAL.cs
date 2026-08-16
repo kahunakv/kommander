@@ -164,6 +164,11 @@ public class RocksDbWAL : IWAL, IDisposable
         bool syncWrites = true,
         RocksDbSharedResources? sharedResources = null)
     {
+        // Validated before the path is composed below: the revision is a single directory name under
+        // the WAL path, and a separator or relative segment would silently open the database
+        // somewhere else entirely.
+        WalStoragePaths.ValidateRevision(revision, nameof(revision));
+
         this.path = path;
         this.revision = revision;
         this.logger = logger;
@@ -205,9 +210,15 @@ public class RocksDbWAL : IWAL, IDisposable
             columnFamilies.Add("shard" + i, ApplyCfOptions(new(), sharedBbto));
 
         string completePath = $"{path}/{revision}";
-        
+
         bool firstTime = !Directory.Exists(completePath);
-        
+
+        // Created here, restricted to the owning user, rather than left to RocksDb.Open: the engine
+        // creates and rotates many files inside this directory, so restricting the directory itself
+        // is what actually covers the replicated state at rest. Must run before Open, and the
+        // firstTime probe above must run before this, since creating the directory would answer it.
+        WalStoragePaths.EnsureDirectory(completePath);
+
         db = RocksDb.Open(dbOptions, completePath, columnFamilies);
 
         metadataColumnFamily = db.GetColumnFamily("metadata");

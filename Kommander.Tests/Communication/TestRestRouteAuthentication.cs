@@ -329,7 +329,7 @@ public sealed class TestRestRouteAuthentication
         Assert.Equal(RaftTransportAuthenticationStatus.Success, result.Status);
 
         using StreamReader reader = new(context.Request.Body, Encoding.UTF8);
-        Assert.Equal(body, await reader.ReadToEndAsync());
+        Assert.Equal(body, await reader.ReadToEndAsync(TestContext.Current.CancellationToken));
     }
 
     /// <summary>

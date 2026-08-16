@@ -160,6 +160,11 @@ public class SqliteWAL : IWAL, IDisposable
     /// </exception>
     public SqliteWAL(string path, string revision, ILogger<IRaft> logger, bool syncWrites = true, int shardCount = 0)
     {
+        // Validated at construction rather than at first open: a revision that would escape the data
+        // directory should fail while the operator is still looking at the startup output, not on the
+        // first write to some shard.
+        WalStoragePaths.ValidateRevision(revision, nameof(revision));
+
         this.path = path;
         this.revision = revision;
         this.logger = logger;
@@ -186,6 +191,10 @@ public class SqliteWAL : IWAL, IDisposable
         {
             if (shards.TryGetValue(shardId, out shard))
                 return shard;
+
+            // Restricts the data directory to the owning user on first creation: these shards, and
+            // the -wal/-shm sidecars SQLite makes alongside them, hold the full replicated state.
+            WalStoragePaths.EnsureDirectory(path);
 
             string completePath = $"{path}/raft_shard{shardId}_{revision}.db";
             // Pooling=False: ensure Dispose() physically closes the file handle instead of
@@ -288,6 +297,10 @@ public class SqliteWAL : IWAL, IDisposable
     {
         if (metaDataConnection is not null)
             return metaDataConnection;
+
+        // The metadata DB can be opened before any shard, so the directory guard is needed on both
+        // entry points, not just the shard one.
+        WalStoragePaths.EnsureDirectory(path);
 
         string completePath = $"{path}/raft_metadata_{revision}.db";
         // Pooling=False: same as the shard connections — physical close on Dispose.

@@ -80,10 +80,23 @@ public sealed class RaftTransportSecurityOptions
     /// neither <see cref="ClientCertificate"/> nor <see cref="ClientCertificatePath"/> is configured.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The returned instance is cached and shared: both the gRPC channel pool's
     /// <see cref="System.Net.Security.SslClientAuthenticationOptions"/> and the REST handler retain it
     /// for the process lifetime. Loading a PKCS#12 archive opens a key container, so re-loading per
     /// call would leak key handles rather than merely cost time.
+    /// </para>
+    /// <para>
+    /// <b>Rotation requires a restart.</b> Changing <see cref="ClientCertificatePath"/> after first
+    /// use has no effect: this method keeps returning the loaded instance. There is deliberately no
+    /// invalidation hook to mirror <c>RaftConfiguration.InvalidateTransportAuthenticator</c>, because
+    /// it could not do the job — the certificate is captured into the transport handlers when they are
+    /// built (per-channel <c>SslClientAuthenticationOptions</c>, per-peer REST handler), and those
+    /// outlive any change here. Clearing this cache would swap the certificate for connections opened
+    /// afterwards while established ones kept presenting the old one, which is a worse position than
+    /// an honest restart. Roll the allow-list first, then restart the node — see the transport
+    /// authentication developer guide.
+    /// </para>
     /// </remarks>
     /// <exception cref="RaftException">
     /// The file is missing, is not a readable PKCS#12 archive, the password does not match, or the

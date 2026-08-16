@@ -17,10 +17,36 @@ namespace Kommander.Communication.Rest;
 
 public static class RestCommunicationExtensions
 {
+    /// <summary>
+    /// Path prefix that every Kommander REST endpoint lives under, and that the authentication
+    /// middleware guards.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Authentication is scoped by path prefix rather than applied to the whole pipeline because
+    /// <see cref="MapRestRaftRoutes"/> is called on the host's own <see cref="WebApplication"/>: an
+    /// application that embeds Kommander alongside its own API would otherwise find every one of its
+    /// endpoints demanding a cluster credential.
+    /// </para>
+    /// <para>
+    /// The cost of that scoping is that a Kommander route mapped outside this prefix — a typo, or a
+    /// new endpoint added without thinking about it — would be silently unauthenticated. Nothing
+    /// would fail; it would simply be open. Routing every endpoint through this one constant makes
+    /// the prefix impossible to drift by accident, and
+    /// <c>TestRestRoutesAreAuthenticated</c> enumerates the mapped endpoints and fails if any
+    /// Kommander route falls outside it, which turns "silently open" into a red test.
+    /// </para>
+    /// </remarks>
+    internal const string RaftRoutePrefix = "/v1/raft";
+
     public static void MapRestRaftRoutes(this WebApplication app)
     {
+        // Middleware, not an endpoint filter: minimal-API filters run after parameter binding, which
+        // would mean deserializing an unauthenticated caller's JSON body before checking its
+        // signature — and would leave the body stream already consumed when the signature check tried
+        // to read it.
         app.UseWhen(
-            context => context.Request.Path.StartsWithSegments("/v1/raft"),
+            context => context.Request.Path.StartsWithSegments(RaftRoutePrefix),
             branch => branch.Use(async (context, next) =>
             {
                 IRaft? raft = context.RequestServices.GetService(typeof(IRaft)) as IRaft;
@@ -30,7 +56,7 @@ public static class RestCommunicationExtensions
                 await next(context).ConfigureAwait(false);
             }));
 
-        app.MapPost("/v1/raft/handshake", async (HandshakeRequest request, IRaft raft) =>
+        app.MapPost($"{RaftRoutePrefix}/handshake", async (HandshakeRequest request, IRaft raft) =>
         {
             await raft.Handshake(request);
             if (raft is RaftManager manager)
@@ -38,13 +64,13 @@ public static class RestCommunicationExtensions
             return new HandshakeResponse();
         });
         
-        app.MapPost("/v1/raft/append-logs", (AppendLogsRequest request, IRaft raft) =>
+        app.MapPost($"{RaftRoutePrefix}/append-logs", (AppendLogsRequest request, IRaft raft) =>
         {
             raft.AppendLogs(request);
             return new AppendLogsResponse();
         });
         
-        app.MapPost("/v1/raft/append-logs-batch", (AppendLogsBatchRequest request, IRaft raft) =>
+        app.MapPost($"{RaftRoutePrefix}/append-logs-batch", (AppendLogsBatchRequest request, IRaft raft) =>
         {
             if (request.AppendLogs is not null)
             {
@@ -55,14 +81,14 @@ public static class RestCommunicationExtensions
             return new AppendLogsBatchResponse();
         });
         
-        app.MapPost("/v1/raft/complete-append-logs", (CompleteAppendLogsRequest request, IRaft raft) =>
+        app.MapPost($"{RaftRoutePrefix}/complete-append-logs", (CompleteAppendLogsRequest request, IRaft raft) =>
         {
             raft.CompleteAppendLogs(request);
 
             return new AppendLogsResponse();
         });
         
-        app.MapPost("/v1/raft/complete-append-logs-batch", (CompleteAppendLogsBatchRequest request, IRaft raft) =>
+        app.MapPost($"{RaftRoutePrefix}/complete-append-logs-batch", (CompleteAppendLogsBatchRequest request, IRaft raft) =>
         {
             if (request.CompleteLogs is not null)
             {
@@ -73,7 +99,7 @@ public static class RestCommunicationExtensions
             return new CompleteAppendLogsBatchResponse();
         });
         
-        app.MapPost("/v1/raft/batch-requests", async (BatchRequestsRequest request, IRaft raft) =>
+        app.MapPost($"{RaftRoutePrefix}/batch-requests", async (BatchRequestsRequest request, IRaft raft) =>
         {
             if (request.Requests is not null)
             {
@@ -136,26 +162,28 @@ public static class RestCommunicationExtensions
             return new CompleteAppendLogsBatchResponse();
         });
 
-        app.MapPost("/v1/raft/request-vote", (RequestVotesRequest request, IRaft raft) =>
+        app.MapPost($"{RaftRoutePrefix}/request-vote", (RequestVotesRequest request, IRaft raft) =>
         {
             raft.RequestVote(request);
             
             return new RequestVotesResponse();
         });
 
-        app.MapPost("/v1/raft/vote", (VoteRequest request, IRaft raft) =>
+        app.MapPost($"{RaftRoutePrefix}/vote", (VoteRequest request, IRaft raft) =>
         {
             raft.Vote(request);
             
             return new VoteResponse();
         });
         
-        app.MapGet("/v1/raft/get-leader/{partitionId}", async (int partitionId, IRaft raft) =>
+        // {{partitionId}} escapes the route parameter so it survives string interpolation as a
+        // literal brace rather than being read as a hole.
+        app.MapGet($"{RaftRoutePrefix}/get-leader/{{partitionId}}", async (int partitionId, IRaft raft) =>
         {
             return await raft.WaitForLeader(partitionId, CancellationToken.None).ConfigureAwait(false);
         });
 
-        app.MapPost("/v1/raft/leave", async (LeaveRequest request, IRaft raft, HttpContext httpContext) =>
+        app.MapPost($"{RaftRoutePrefix}/leave", async (LeaveRequest request, IRaft raft, HttpContext httpContext) =>
         {
             if (raft is not RaftManager manager)
                 return new LeaveResponse(false);
@@ -163,7 +191,7 @@ public static class RestCommunicationExtensions
             return await manager.ReceiveLeave(request, httpContext.RequestAborted).ConfigureAwait(false);
         });
 
-        app.MapPost("/v1/raft/get-follower-lag", async (GetFollowerLagRequest request, IRaft raft) =>
+        app.MapPost($"{RaftRoutePrefix}/get-follower-lag", async (GetFollowerLagRequest request, IRaft raft) =>
         {
             if (raft is not RaftManager manager)
                 return new GetFollowerLagResponse(false);
@@ -172,7 +200,7 @@ public static class RestCommunicationExtensions
             return lag.HasValue ? new GetFollowerLagResponse(true, lag.Value) : new GetFollowerLagResponse(false);
         });
 
-        app.MapPost("/v1/raft/install-snapshot", async (SnapshotRequest request, IRaft raft) =>
+        app.MapPost($"{RaftRoutePrefix}/install-snapshot", async (SnapshotRequest request, IRaft raft) =>
         {
             if (raft is not RaftManager manager)
                 return new SnapshotResponse(false);
@@ -180,7 +208,7 @@ public static class RestCommunicationExtensions
             return await manager.ReceiveInstallSnapshot(request).ConfigureAwait(false);
         });
 
-        app.MapPost("/v1/raft/gossip", (GossipRequest request, IRaft raft) =>
+        app.MapPost($"{RaftRoutePrefix}/gossip", (GossipRequest request, IRaft raft) =>
         {
             if (raft is not RaftManager manager)
                 return new GossipResponse(0, null);
@@ -206,7 +234,7 @@ public static class RestCommunicationExtensions
             return new GossipResponse(ack.MembershipVersion, ackRosterJson);
         });
 
-        app.MapPost("/v1/raft/ping", (WirePingRequest request, IRaft raft) =>
+        app.MapPost($"{RaftRoutePrefix}/ping", (WirePingRequest request, IRaft raft) =>
         {
             if (raft is not RaftManager manager)
                 return new WirePingResponse(false, 0);
@@ -215,7 +243,7 @@ public static class RestCommunicationExtensions
             return new WirePingResponse(resp.Alive, resp.Incarnation);
         });
 
-        app.MapPost("/v1/raft/ping-req", async (WirePingReqRequest request, IRaft raft, HttpContext httpContext) =>
+        app.MapPost($"{RaftRoutePrefix}/ping-req", async (WirePingReqRequest request, IRaft raft, HttpContext httpContext) =>
         {
             if (raft is not RaftManager manager)
                 return new WirePingReqResponse(false);

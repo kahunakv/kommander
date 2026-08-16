@@ -313,10 +313,24 @@ public sealed class RaftService : Rafter.RafterBase
             // allocates a fresh array per message and never recycles it. If a pooled-buffer message
             // serializer is ever adopted, this alias becomes a use-after-free/corruption hazard and the
             // happy path must copy (ToByteArray) instead.
-            if (MemoryMarshal.TryGetArray(requestLog.Data.Memory, out ArraySegment<byte> segment))
-                raftLog.LogData = segment.Array;
+            //
+            // The offset/length check enforces the second half of that assumption rather than trusting
+            // it. A ByteString backed by a slice of a larger array — a non-zero Offset, or a Count
+            // shorter than the array — would otherwise alias the WHOLE backing array, so the entry
+            // persisted to the WAL would carry bytes belonging to other messages. That is durable log
+            // corruption, not a transient misread, and nothing downstream would detect it. Failing the
+            // check costs one copy on a path that does not currently occur.
+            if (MemoryMarshal.TryGetArray(requestLog.Data.Memory, out ArraySegment<byte> segment)
+                && segment.Array is { } backingArray
+                && segment.Offset == 0
+                && segment.Count == backingArray.Length)
+            {
+                raftLog.LogData = backingArray;
+            }
             else
+            {
                 raftLog.LogData = requestLog.Data.ToByteArray();
+            }
             
             logs.Add(raftLog);
         }

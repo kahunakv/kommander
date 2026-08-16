@@ -17,4 +17,13 @@
         <ProjectReference Include="..\Kommander\Kommander.csproj" />
     </ItemGroup>
 
+    <!-- Startup policy (bind exposure, WAL selection) is decided in internal helpers here rather
+         than in Program.cs, because top-level statements cannot be unit tested. Mirrors the same
+         attribute in Kommander.csproj. -->
+    <ItemGroup>
+        <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+            <_Parameter1>Kommander.Tests</_Parameter1>
+        </AssemblyAttribute>
+    </ItemGroup>
+
 </Project>

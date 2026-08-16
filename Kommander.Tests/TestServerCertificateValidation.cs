@@ -135,7 +135,7 @@ public sealed class TestServerCertificateValidation
         using X509Certificate2 certificate = CreateCertificate("node-a");
 
         // A base X509Certificate carrying the same DER bytes, as SslStream may hand over.
-        using X509Certificate baseTyped = new(certificate.RawData);
+        using X509Certificate baseTyped = CreateBaseTyped(certificate);
 
         Assert.True(RaftClientCertificateValidator.IsServerCertificateTrusted(
             baseTyped,
@@ -155,12 +155,29 @@ public sealed class TestServerCertificateValidation
             notBefore: Now.AddDays(-10),
             notAfter: Now.AddDays(-1));
 
-        using X509Certificate baseTyped = new(certificate.RawData);
+        using X509Certificate baseTyped = CreateBaseTyped(certificate);
 
         Assert.False(RaftClientCertificateValidator.IsServerCertificateTrusted(
             baseTyped,
             [Thumbprint(certificate)],
             Clock()));
+    }
+
+    /// <summary>
+    /// Produces an instance of the <b>base</b> <see cref="X509Certificate"/> type, which is what
+    /// <c>SslClientAuthenticationOptions</c>' validation callback is typed to receive.
+    /// </summary>
+    /// <remarks>
+    /// The obsolete constructor is used deliberately and cannot be replaced by
+    /// <c>X509CertificateLoader</c>: the loader returns an <see cref="X509Certificate2"/>, which the
+    /// validator's <c>as X509Certificate2</c> fast path would match — so the tests would silently
+    /// stop covering the base-type branch they exist to cover.
+    /// </remarks>
+    private static X509Certificate CreateBaseTyped(X509Certificate2 certificate)
+    {
+#pragma warning disable SYSLIB0057
+        return new X509Certificate(certificate.RawData);
+#pragma warning restore SYSLIB0057
     }
 
     private static TimeProvider Clock() => new FixedTimeProvider(Now);

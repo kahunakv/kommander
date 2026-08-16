@@ -53,8 +53,11 @@ fi
 # setup has to opt in explicitly. Neither flag belongs in a real deployment: set --node-auth-mode
 # to SharedSecret or MutualTls there and drop both.
 DEV_INSECURE_FLAGS="--allow-unauthenticated-cluster --allow-plaintext-listener"
-echo "kommander --raft-nodename $KOMMANDER_RAFT_NODENAME --raft-nodeid $KOMMANDER_RAFT_NODEID --raft-host $KOMMANDER_RAFT_HOST --raft-port $KOMMANDER_RAFT_PORT --http-ports $KOMMANDER_HTTP_PORTS --https-ports $KOMMANDER_HTTPS_PORTS --https-certificate /app/certificate.pfx --initial-cluster $KOMMANDER_INITIAL_CLUSTER --sqlite-wal-path /app/data --sqlite-wal-revision v2 \$DEV_INSECURE_FLAGS \$INSECURE_FLAG"
-dotnet /app/Kommander.Server.dll --raft-nodename $KOMMANDER_RAFT_NODENAME --raft-nodeid $KOMMANDER_RAFT_NODEID --raft-host $KOMMANDER_RAFT_HOST --raft-port $KOMMANDER_RAFT_PORT --http-ports $KOMMANDER_HTTP_PORTS --https-ports $KOMMANDER_HTTPS_PORTS --https-certificate /app/certificate.pfx --initial-cluster $KOMMANDER_INITIAL_CLUSTER --sqlite-wal-path /app/data --sqlite-wal-revision v2 \$DEV_INSECURE_FLAGS \$INSECURE_FLAG
+# --wal-adapter is honoured now, and rocksdb reads the --rocksdb-* options. This used to pass
+# --sqlite-wal-* because that was the only thing the server actually read.
+WAL_FLAGS="--wal-adapter rocksdb --rocksdb-wal-path /app/data --rocksdb-wal-revision v2"
+echo "kommander --raft-nodename $KOMMANDER_RAFT_NODENAME --raft-nodeid $KOMMANDER_RAFT_NODEID --raft-host $KOMMANDER_RAFT_HOST --raft-port $KOMMANDER_RAFT_PORT --http-ports $KOMMANDER_HTTP_PORTS --https-ports $KOMMANDER_HTTPS_PORTS --https-certificate /app/certificate.pfx --initial-cluster $KOMMANDER_INITIAL_CLUSTER \$WAL_FLAGS \$DEV_INSECURE_FLAGS \$INSECURE_FLAG"
+dotnet /app/Kommander.Server.dll --raft-nodename $KOMMANDER_RAFT_NODENAME --raft-nodeid $KOMMANDER_RAFT_NODEID --raft-host $KOMMANDER_RAFT_HOST --raft-port $KOMMANDER_RAFT_PORT --http-ports $KOMMANDER_HTTP_PORTS --https-ports $KOMMANDER_HTTPS_PORTS --https-certificate /app/certificate.pfx --initial-cluster $KOMMANDER_INITIAL_CLUSTER \$WAL_FLAGS \$DEV_INSECURE_FLAGS \$INSECURE_FLAG
 EOT
 
 # when starting the container, run dotnet with the built dll
