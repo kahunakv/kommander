@@ -3910,6 +3910,29 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         return snapshot;
     }
 
+    /// <inheritdoc/>
+    public int GetNextAvailablePartitionId()
+    {
+        // Unlike GetPartitionMap this keeps Removed entries: a tombstoned id can never be recreated,
+        // so it is spent and the allocator has to step past it.
+        List<RaftPartitionRange> ranges = committedRanges;
+        if (ranges.Count > 0)
+            return RaftPartitionMap.NextAvailablePartitionId(ranges);
+
+        // Fallback for hosts that never applied a committed map (unit-test harnesses that
+        // populate `partitions` directly). No tombstones exist there — a removal takes the
+        // partition out of the dictionary — so this is the best the local view can do.
+        int maxPartitionId = RaftSystemConfig.SystemPartition;
+
+        foreach (int partitionId in partitions.Keys)
+        {
+            if (partitionId > maxPartitionId)
+                maxPartitionId = partitionId;
+        }
+
+        return maxPartitionId + 1;
+    }
+
     /// <summary>
     /// Returns the number of the partition for the given partition key
     /// </summary>

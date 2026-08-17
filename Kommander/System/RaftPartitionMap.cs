@@ -16,4 +16,24 @@ public sealed class RaftPartitionMap
     public long MapVersion { get; set; }
 
     public List<RaftPartitionRange> Partitions { get; set; } = [];
+
+    /// <summary>
+    /// One past the highest partition id in <paramref name="ranges"/>, counting entries in
+    /// <b>every</b> lifecycle state, floored just above the system partition. A removed partition
+    /// keeps its entry forever and can never be recreated, so its id is spent and must be skipped —
+    /// which is why this counts tombstones while routing views filter them out. This is the single
+    /// definition of "next id" for every allocator, inside the library and out.
+    /// </summary>
+    public static int NextAvailablePartitionId(IEnumerable<RaftPartitionRange> ranges)
+    {
+        int maxPartitionId = RaftSystemConfig.SystemPartition;
+
+        foreach (RaftPartitionRange range in ranges)
+        {
+            if (range.PartitionId > maxPartitionId)
+                maxPartitionId = range.PartitionId;
+        }
+
+        return maxPartitionId + 1;
+    }
 }

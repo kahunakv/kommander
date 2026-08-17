@@ -136,17 +136,9 @@ internal sealed class SplitMergeController
             return;
         }
 
-        RaftPartitionRange? maxPartition = ranges.MaxBy(r => r.PartitionId);
-        if (maxPartition is null)
-        {
-            logger.LogError("TrySplitPartition: Couldn't find next partition");
-            completion?.TrySetResult((RaftOperationStatus.Errored, 0));
-            return;
-        }
-
         int targetPartitionId = (plan?.TargetPartitionId > 0)
             ? plan.TargetPartitionId
-            : maxPartition.PartitionId + 1;
+            : RaftPartitionMap.NextAvailablePartitionId(ranges);
 
         if (ranges.Any(r => r.PartitionId == targetPartitionId))
         {
