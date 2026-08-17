@@ -1,10 +1,13 @@
 using System.Text.Json;
+using Kommander.Communication;
 using Kommander.Data;
 using Kommander.Discovery;
+using Kommander.Gossip;
 using Kommander.System;
 using Kommander.System.Protos;
 using Kommander.Time;
 using Kommander.WAL;
+using Kommander.WAL.IO;
 using Microsoft.Extensions.Logging.Abstractions;
 using Google.Protobuf;
 
@@ -25,20 +28,27 @@ public sealed class TestReplicaPlacement
 {
     private const string Local = "localhost:9000";
 
-    private static RaftManager Build(int replicationFactor = 0, List<RaftNode>? peers = null, int initialPartitions = 0)
+    private static RaftManager Build(
+        int replicationFactor = 0, List<RaftNode>? peers = null, int initialPartitions = 0,
+        bool enablePlacementRebalancer = false,
+        Kommander.Communication.Memory.InMemoryCommunication? communication = null,
+        TimeSpan? learnerPromotionStableWindow = null)
     {
         RaftConfiguration config = new()
         {
             Host = "localhost",
             Port = 9000,
             InitialPartitions = initialPartitions,
-            ReplicationFactor = replicationFactor
+            ReplicationFactor = replicationFactor,
+            EnablePlacementRebalancer = enablePlacementRebalancer
         };
+        if (learnerPromotionStableWindow is { } window)
+            config.LearnerPromotionStableWindow = window;
         return new(
             config,
             new StaticDiscovery(peers ?? []),
             new InMemoryWAL(NullLogger<IRaft>.Instance),
-            new Kommander.Communication.Memory.InMemoryCommunication(),
+            communication ?? new Kommander.Communication.Memory.InMemoryCommunication(),
             new HybridLogicalClock(),
             NullLogger<IRaft>.Instance
         );
@@ -531,6 +541,338 @@ public sealed class TestReplicaPlacement
             Assert.Equal(2, map.Count);
             Assert.All(map, range => Assert.Empty(range.Replicas));
             Assert.Equal(2, manager.Partitions.Count);
+        }
+    }
+
+    // ── Placement-controller pass (RunPlacementPass) ─────────────────────────
+
+    /// <summary>
+    /// Makes the harness manager pass <c>AmILeaderQuick(P0)</c> — the gate the placement pass
+    /// self-checks. The harness never joins a cluster, so there is no system partition to lead;
+    /// the test hook stands in for it. Scoped to P0 only so range-partition leadership checks
+    /// (learner lag measurement) keep their real answer.
+    /// </summary>
+    private static void ForceP0Leadership(RaftManager manager) =>
+        manager._amILeaderQuickHookForTesting =
+            partitionId => ValueTask.FromResult(partitionId == RaftSystemConfig.SystemPartition);
+
+    private static RaftSystemRequest MakeMembersReplicated(params string[] voterEndpoints)
+    {
+        Kommander.System.ClusterMembership membership = new()
+        {
+            MembershipVersion = 1,
+            Members =
+            [
+                .. voterEndpoints.Select((endpoint, i) => new Kommander.System.ClusterMember
+                {
+                    Endpoint = endpoint, NodeId = i + 1, Role = Kommander.System.ClusterMemberRole.Voter, JoinedVersion = 1
+                })
+            ]
+        };
+
+        return new RaftSystemRequest(
+            RaftSystemRequestType.ConfigReplicated,
+            SerializeMessage(RaftSystemConfigKeys.Members, JsonSerializer.Serialize(membership)));
+    }
+
+    /// <summary>
+    /// Drains the coordinator twice: the placement pass self-enqueues its planned replica
+    /// mutations behind the first drain sentinel, so a second drain is needed before the
+    /// committed map reflects them.
+    /// </summary>
+    private static async Task RunEnqueuedPassToCompletionAsync(RaftManager manager)
+    {
+        await WaitForIdleAsync(manager);
+        await WaitForIdleAsync(manager);
+    }
+
+    [Fact]
+    public async Task RunPlacementPass_RebalancerOff_DrivesInterruptedRemovalToFinalDrop()
+    {
+        // The documented contract of EnablePlacementRebalancer=false: no new moves are planned,
+        // but in-flight transitions still converge. Before placement got its own scheduling this
+        // was silently false — nothing ever dispatched the pass without the leader balancer.
+        RaftManager manager = Build(); // rebalancer off
+        using (manager)
+        {
+            AcceptReplication(manager);
+            manager.SystemCoordinator.Send(MakeConfigReplicated(
+                PlacedRange(1, 2, Replica(Local), Replica("b:1"), Replica("c:1", RaftReplicaRole.Removing))));
+            await WaitForIdleAsync(manager);
+
+            ForceP0Leadership(manager);
+
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+
+            // The pass re-drove the interrupted two-commit removal to its final drop.
+            Assert.DoesNotContain(MapEntry(manager, 1).Replicas, r => r.Endpoint == "c:1");
+        }
+    }
+
+    [Fact]
+    public async Task SetReplicationFactor_CommitKicksPassAndConvergesOverride()
+    {
+        // End-to-end through the event-driven kick: committing an RF override must trigger a
+        // placement pass immediately (no timer tick is ever sent here), and repeated passes must
+        // converge the range from 3 voters to the overridden target of 1.
+        RaftManager manager = Build(replicationFactor: 3, enablePlacementRebalancer: true);
+        using (manager)
+        {
+            AcceptReplication(manager);
+            manager.SystemCoordinator.Send(MakeMembersReplicated(Local, "b:1", "c:1"));
+            manager.SystemCoordinator.Send(MakeConfigReplicated(
+                PlacedRange(1, 1, Replica(Local), Replica("b:1"), Replica("c:1"))));
+            await WaitForIdleAsync(manager);
+
+            ForceP0Leadership(manager);
+
+            TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.SetReplicationFactor, 1)
+            {
+                ReplicationFactorValue = 1,
+                Completion = tcs
+            });
+            (RaftOperationStatus status, _) = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            Assert.Equal(RaftOperationStatus.Success, status);
+
+            // No RunPlacementPass is sent by the test: the commit itself kicked one, which
+            // planned a single trim (one move per range per pass) and committed the two-step
+            // removal of the ordinal-first non-leader victim.
+            await RunEnqueuedPassToCompletionAsync(manager);
+            Assert.Equal(2, MapEntry(manager, 1).Replicas.Count);
+            Assert.DoesNotContain(MapEntry(manager, 1).Replicas, r => r.Endpoint == "b:1");
+
+            // The next pass (the 5 s timer in production) trims the remaining excess voter.
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+
+            RaftReplica survivor = Assert.Single(MapEntry(manager, 1).Replicas);
+            Assert.Equal(Local, survivor.Endpoint);
+        }
+    }
+
+    // ── Ranges the P0 leader does not host ───────────────────────────────────
+
+    /// <summary>
+    /// The P0 leader must answer "not the leader" for a committed range it does not host —
+    /// this is the normal case under per-partition placement, where the placement controller
+    /// reasons about ranges living entirely on other nodes. It used to throw
+    /// <see cref="PartitionNotHostedException"/> out of the internal partition lookup, which
+    /// aborted every placement pass that had a learner to evaluate on such a range.
+    /// </summary>
+    [Fact]
+    public async Task AmILeaderQuick_CommittedRangeNotHostedLocally_ReturnsFalseWithoutThrowing()
+    {
+        RaftManager manager = Build();
+        using (manager)
+        {
+            manager.SystemCoordinator.Send(MakeConfigReplicated(
+                PlacedRange(1, 1, Replica("b:1"), Replica("c:1"), Replica("d:1"))));
+            await WaitForIdleAsync(manager);
+
+            // The guard must be exercised through the real implementation, past IsInitialized.
+            Assert.True(manager.IsInitialized);
+            Assert.False(manager.HostsPartition(1));
+
+            Assert.False(await manager.AmILeaderQuick(1));
+        }
+    }
+
+    /// <summary>
+    /// Minimal remote node for the in-memory transport: answers only the follower-lag probe
+    /// (<see cref="ICommunication"/> routes <c>GetRemoteFollowerLag</c> through
+    /// <see cref="IRaft.GetFollowerLagAsync"/> on the target) and throws for everything else.
+    /// </summary>
+    private sealed class FollowerLagRaft : IRaft
+    {
+        public required Func<int, string, long?> Lag { get; init; }
+
+        public ValueTask<long?> GetFollowerLagAsync(int partitionId, string followerEndpoint) =>
+            ValueTask.FromResult(Lag(partitionId, followerEndpoint));
+
+        public ValueTask<bool> ConfirmLeadershipAsync(int partitionId, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public ValueTask<bool> ConfirmLocalApplicationAsync(int partitionId, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public bool Joined => throw new NotImplementedException();
+        public IWAL WalAdapter => throw new NotImplementedException();
+        public ICommunication Communication => throw new NotImplementedException();
+        public IDiscovery Discovery => throw new NotImplementedException();
+        public RaftConfiguration Configuration => throw new NotImplementedException();
+        public HybridLogicalClock HybridLogicalClock => throw new NotImplementedException();
+        public IRaftReadScheduler ReadScheduler => throw new NotImplementedException();
+        public IRaftWalScheduler WalScheduler => throw new NotImplementedException();
+        public bool IsInitialized => throw new NotImplementedException();
+        public ClusterMemberRole LocalRole => throw new NotImplementedException();
+
+        public event Action<int>? OnRestoreStarted { add { } remove { } }
+        public event Action<int>? OnRestoreFinished { add { } remove { } }
+        public event Action<int, RaftLog>? OnReplicationError { add { } remove { } }
+        public event Func<int, RaftLog, Task<bool>>? OnLogRestored { add { } remove { } }
+        public event Func<int, RaftLog, Task<bool>>? OnReplicationReceived { add { } remove { } }
+        public event Func<int, string, Task<bool>>? OnLeaderChanged { add { } remove { } }
+        public event Action<IReadOnlyList<RaftPartitionRange>>? OnPartitionMapChanged { add { } remove { } }
+        public event Action<ClusterMembership>? OnMembershipChanged { add { } remove { } }
+
+        public Task JoinCluster(CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task JoinCluster(IEnumerable<string> seeds, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task LeaveCluster(bool dispose = false, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task<LeaveClusterResult> RequestLeaveAsync(CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task UpdateNodes() => throw new NotImplementedException();
+        public ClusterMembership GetMembership() => throw new NotImplementedException();
+        public IList<RaftNode> GetNodes() => throw new NotImplementedException();
+        public HLCTimestamp GetLastNodeActivity(string endpoint) => throw new NotImplementedException();
+        public IReadOnlyList<string> GetActiveNodes(TimeSpan within) => throw new NotImplementedException();
+        public Task Handshake(HandshakeRequest request) => throw new NotImplementedException();
+        public void RequestVote(RequestVotesRequest request) => throw new NotImplementedException();
+        public void Vote(VoteRequest request) => throw new NotImplementedException();
+        public void AppendLogs(AppendLogsRequest request) => throw new NotImplementedException();
+        public void CompleteAppendLogs(CompleteAppendLogsRequest request) => throw new NotImplementedException();
+        public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task<RaftBatchReplicationResult> ReplicateEntries(int partitionId, IReadOnlyList<RaftProposalEntry> entries, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task<RaftReplicationResult> ReplicateCheckpoint(int partitionId, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task<(bool success, RaftOperationStatus status, long commitLogId)> CommitLogs(int partitionId, HLCTimestamp ticketId, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task<(bool success, RaftOperationStatus status, long commitLogId)> RollbackLogs(int partitionId, HLCTimestamp ticketId, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public void SetMinRetainIndex(int partitionId, long index) => throw new NotImplementedException();
+        public long GetCommitIndex(int partitionId) => throw new NotImplementedException();
+        public long GetStaleProposedSkippedCount(int partitionId) => throw new NotImplementedException();
+        public IDisposable AcquireRetentionHold(int partitionId, long index) => throw new NotImplementedException();
+        public string GetLocalEndpoint() => throw new NotImplementedException();
+        public int GetLocalNodeId() => throw new NotImplementedException();
+        public string GetLocalNodeName() => throw new NotImplementedException();
+        public ValueTask<bool> AmILeaderQuick(int partitionId) => throw new NotImplementedException();
+        public ValueTask<bool> AmILeader(int partitionId, CancellationToken cancellationToken) => throw new NotImplementedException();
+        public ValueTask<string> WaitForLeader(int partitionId, CancellationToken cancellationToken) => throw new NotImplementedException();
+        public ValueTask<string> WaitForLeaderStableAsync(int partitionId, TimeSpan minStableFor, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public ValueTask<string> WaitForLeaderStableAsync(int partitionId, TimeSpan minStableFor, TimeSpan timeout, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task<RaftOperationStatus> ForceLeaderForTestingAsync(int partitionId, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task<RaftOperationStatus> StepDownAsync(int partitionId, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task<RaftOperationStatus> TransferLeadershipAsync(int partitionId, string targetEndpoint, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task<RaftOperationStatus> SuspendHeartbeatsAsync(int partitionId, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task<RaftOperationStatus> ResumeHeartbeatsAsync(int partitionId, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task<RaftPartitionLifecycleResult> CreatePartitionAsync(int partitionId, RaftRoutingMode mode = RaftRoutingMode.Unrouted, (int start, int end)? hashRange = null, CancellationToken ct = default) => throw new NotImplementedException();
+        public Task<RaftPartitionLifecycleResult> RemovePartitionAsync(int partitionId, CancellationToken ct = default) => throw new NotImplementedException();
+        public Task<RaftPartitionLifecycleResult> SplitPartitionAsync(int sourcePartitionId, int targetPartitionId = 0, RaftSplitPlan? plan = null, CancellationToken ct = default) => throw new NotImplementedException();
+        public Task<RaftPartitionLifecycleResult> MergePartitionsAsync(int survivorPartitionId, int sourcePartitionId, RaftMergePlan? plan = null, CancellationToken ct = default) => throw new NotImplementedException();
+        public long GetPartitionGeneration(int partitionId) => throw new NotImplementedException();
+        public bool HostsPartition(int partitionId) => throw new NotImplementedException();
+        public IReadOnlyList<RaftReplica> GetPartitionReplicas(int partitionId) => throw new NotImplementedException();
+        public string? GetPartitionLeaderHint(int partitionId) => throw new NotImplementedException();
+        public int GetEffectiveReplicationFactor(int partitionId) => throw new NotImplementedException();
+        public Task<RaftPartitionLifecycleResult> SetReplicationFactorAsync(int partitionId, int replicationFactor, CancellationToken ct = default) => throw new NotImplementedException();
+        public double GetPartitionLogOpsPerSecond(int partitionId) => throw new NotImplementedException();
+        public int GetPartitionWalQueueDepth(int partitionId) => throw new NotImplementedException();
+        public double GetPartitionCommitWaitMs(int partitionId) => throw new NotImplementedException();
+        public IReadOnlyList<RaftPartitionRange> GetPartitionMap() => throw new NotImplementedException();
+        public int GetPartitionKey(string partitionKey) => throw new NotImplementedException();
+        public int GetPrefixPartitionKey(string prefixPartitionKey) => throw new NotImplementedException();
+        public void RegisterStateMachineTransfer(IRaftStateMachineTransfer? transfer) => throw new NotImplementedException();
+        public void RegisterSystemStateTransfer(IRaftSystemStateTransfer? transfer) => throw new NotImplementedException();
+        public void RegisterPartitionStateTransfer(IRaftPartitionStateTransfer? transfer) => throw new NotImplementedException();
+        public IReadOnlyList<RaftSnapshotStatus> GetSnapshotStatuses(int partitionId) => throw new NotImplementedException();
+    }
+
+    /// <summary>
+    /// Seeds the gossip-reduced leader hint for a range this node does not host, by ingesting a
+    /// load report in which <paramref name="leaderEndpoint"/> claims <paramref name="partitionId"/>.
+    /// Requires <see cref="RaftConfiguration.LoadReportsEnabled"/> (implied by placement).
+    /// </summary>
+    private static async Task SeedLeaderHintAsync(RaftManager manager, string leaderEndpoint, int partitionId)
+    {
+        manager.SystemCoordinator.Send(new RaftSystemRequest(new NodeLoadReport
+        {
+            Endpoint = leaderEndpoint,
+            ReportVersion = 1,
+            Time = manager.HybridLogicalClock.SendOrLocalEvent(0),
+            Leaderships = [new PartitionLoad { PartitionId = partitionId }]
+        }));
+        await WaitForIdleAsync(manager);
+    }
+
+    /// <summary>
+    /// The Kahuna 1.2.3-validation incident: the P0 leader repairs a range it does not host.
+    /// The learner-lag probe must take the remote branch — leader endpoint from the gossiped
+    /// hint, lag from the remote leader's follower-progress table — and promote the caught-up
+    /// learner. Before the fix the pass threw at the leadership check and the replica set
+    /// stayed {Voter, Learner} forever.
+    /// </summary>
+    [Fact]
+    public async Task RunPlacementPass_LearnerOnRangeNotHostedByP0Leader_PromotesViaRemoteLag()
+    {
+        Kommander.Communication.Memory.InMemoryCommunication communication = new();
+        // RF > 0 turns on load-report ingest (the hint's data source under placement).
+        RaftManager manager = Build(
+            replicationFactor: 3, communication: communication,
+            learnerPromotionStableWindow: TimeSpan.Zero);
+        using (manager)
+        {
+            communication.SetNodes(new Dictionary<string, IRaft>
+            {
+                // The range leader: reports itself and the learner at the same committed index.
+                ["b:1"] = new FollowerLagRaft { Lag = (_, _) => 100 }
+            });
+
+            AcceptReplication(manager);
+            manager.SystemCoordinator.Send(MakeConfigReplicated(
+                PlacedRange(1, 2, Replica("b:1"), Replica("c:1", RaftReplicaRole.Learner))));
+            await WaitForIdleAsync(manager);
+            Assert.False(manager.HostsPartition(1));
+
+            await SeedLeaderHintAsync(manager, "b:1", 1);
+            ForceP0Leadership(manager);
+
+            // Pass 1 observes the learner caught up and opens the stable window; pass 2
+            // promotes (window is zero here). Neither throws.
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+
+            RaftReplica promoted = Assert.Single(MapEntry(manager, 1).Replicas, r => r.Endpoint == "c:1");
+            Assert.Equal(RaftReplicaRole.Voter, promoted.Role);
+        }
+    }
+
+    /// <summary>
+    /// Per-range fault isolation: one range whose lag probe fails must not abort the pass —
+    /// before the fix the exception escaped <c>RunPlacementPassAsync</c> and starved every
+    /// other range's transition re-drive on every tick.
+    /// </summary>
+    [Fact]
+    public async Task RunPlacementPass_OneRangeProbeThrows_OtherRangesStillDriven()
+    {
+        Kommander.Communication.Memory.InMemoryCommunication communication = new();
+        RaftManager manager = Build(replicationFactor: 3, communication: communication);
+        using (manager)
+        {
+            communication.SetNodes(new Dictionary<string, IRaft>
+            {
+                ["b:1"] = new FollowerLagRaft { Lag = (_, _) => throw new InvalidOperationException("probe boom") }
+            });
+
+            AcceptReplication(manager);
+            List<RaftPartitionRange> ranges =
+            [
+                // Range 1: learner on a non-hosted range whose remote probe throws.
+                ..PlacedRange(1, 2, Replica("b:1"), Replica("c:1", RaftReplicaRole.Learner)),
+                // Range 2: interrupted removal that must still be re-driven to its final drop.
+                ..PlacedRange(2, 2, Replica(Local), Replica("b:1"), Replica("d:1", RaftReplicaRole.Removing))
+            ];
+            ranges[1].StartRange = 100; // avoid overlapping hash ranges in the same map
+
+            manager.SystemCoordinator.Send(MakeConfigReplicated(ranges));
+            await WaitForIdleAsync(manager);
+
+            await SeedLeaderHintAsync(manager, "b:1", 1);
+            ForceP0Leadership(manager);
+
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+
+            // Range 1 was skipped for this pass; range 2's Removing replica completed its drop.
+            Assert.DoesNotContain(MapEntry(manager, 2).Replicas, r => r.Endpoint == "d:1");
+            Assert.Contains(MapEntry(manager, 1).Replicas, r => r.Endpoint == "c:1");
         }
     }
 

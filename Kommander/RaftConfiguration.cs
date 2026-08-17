@@ -1035,19 +1035,77 @@ public class RaftConfiguration
     public bool EnablePlacementRebalancer { get; set; }
 
     /// <summary>
-    /// Maximum number of new replica moves (add or remove sequences) initiated per
-    /// placement-controller pass. Bounds the blast radius of a bad plan.
-    /// <para>Default is <b>2</b>.</para>
+    /// Effective switch for scheduling placement-controller passes: the placement timer runs
+    /// whenever anything can create placement work — a non-zero global
+    /// <see cref="ReplicationFactor"/> or the rebalancer flag. Derived rather than gated on
+    /// <see cref="ReplicationFactor"/> &gt; 0 alone because a supported deployment runs the
+    /// global factor at 0 with per-range <c>SetReplicationFactorAsync</c> overrides (see
+    /// <see cref="EnableLoadReports"/>) — such a cluster still needs passes. Mirrors
+    /// <see cref="LoadReportsEnabled"/>. Not gated on <see cref="EnablePlacementRebalancer"/>
+    /// alone either: the pass drives in-flight transitions (learner promotion, removal
+    /// completion) even with the rebalancer off, which is the documented contract of that flag.
     /// </summary>
-    public int MaxReplicaMovesPerPass { get; set; } = 2;
+    public bool PlacementPassEnabled => ReplicationFactor > 0 || EnablePlacementRebalancer;
+
+    /// <summary>
+    /// How often the P0 leader runs a placement-controller pass
+    /// (<c>RunPlacementPass</c>: drive in-flight transitions, plan rebalancing moves).
+    /// Deliberately independent of <see cref="LeaderBalancerInterval"/> — placement used to ride
+    /// the leader balancer's timer, which meant no pass ever ran with
+    /// <see cref="EnableLeaderBalancer"/> off. A relocation costs ~3 passes (add learner →
+    /// observe caught up → promote after <see cref="LearnerPromotionStableWindow"/>) plus a trim
+    /// pass, so this interval bounds convergence speed; an idle pass costs one P0-leadership
+    /// check and a map load. Non-positive disables the timer (event-driven kicks still fire).
+    /// <para>Default is <b>5 seconds</b>.</para>
+    /// </summary>
+    public TimeSpan PlacementPassInterval { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Maximum number of new replica moves (add or remove sequences) initiated per
+    /// placement-controller pass, across all priorities. Bounds the blast radius of a bad plan.
+    /// Keep at least <see cref="MaxConcurrentReplicaRepairs"/> +
+    /// <see cref="MaxConcurrentReplicaTransfers"/>, otherwise it binds before the per-class
+    /// budgets and silently starves repairs.
+    /// <para>Default is <b>4</b> (= default repairs 3 + default transfers 1).</para>
+    /// </summary>
+    public int MaxReplicaMovesPerPass { get; set; } = 4;
 
     /// <summary>
     /// Maximum number of ranges with an in-flight transitional replica (Learner catching up or
-    /// Removing awaiting final drop) at any time. Caps concurrent backfill/snapshot transfers
-    /// so rebalancing never starves client traffic.
+    /// Removing awaiting final drop) initiated by priority-3 <b>balance</b> moves (cosmetic skew
+    /// spreading) at any time. Durability work is budgeted separately by
+    /// <see cref="MaxConcurrentReplicaRepairs"/> so a low setting here never rate-limits repair.
+    /// Caps concurrent backfill/snapshot transfers so rebalancing never starves client traffic.
     /// <para>Default is <b>1</b>.</para>
     /// </summary>
     public int MaxConcurrentReplicaTransfers { get; set; } = 1;
+
+    /// <summary>
+    /// Maximum number of in-flight <b>repair</b> moves (priority-1 re-replication of
+    /// under-replicated ranges and priority-2 shedding of replicas stranded on evicted nodes) at
+    /// any time. Split from <see cref="MaxConcurrentReplicaTransfers"/> so restoring durability
+    /// after a node loss is not serialized behind the cosmetic-balance budget of 1 — at the old
+    /// shared budget, draining several nodes took ~2 minutes per replica, serialized.
+    /// Any in-flight transitional replica counts against <i>both</i> budgets (a transfer consumes
+    /// bandwidth regardless of why it started), so worst-case concurrent transitions are bounded
+    /// by the larger of the two budgets, and balance moves pause entirely during a repair wave.
+    /// <para>Default is <b>3</b>.</para>
+    /// </summary>
+    public int MaxConcurrentReplicaRepairs { get; set; } = 3;
+
+    /// <summary>
+    /// Upper bound on how long <see cref="RaftManager.RequestLeaveAsync"/> waits for the
+    /// placement pass to evacuate this node's replicas after committing the
+    /// <see cref="System.ClusterMemberRole.Leaving"/> roster role. On expiry the role is rolled
+    /// back to Voter and the caller gets <see cref="Data.LeaveClusterOutcome.DrainTimedOut"/>
+    /// (unless the pass finished first — removal wins). Size it from the data: an evacuation
+    /// costs ~3 passes per range (add learner → observe caught up for
+    /// <see cref="LearnerPromotionStableWindow"/> → promote, then trim), with up to
+    /// <see cref="MaxConcurrentReplicaRepairs"/> ranges in flight — minutes for real data sets,
+    /// which is why this is a config knob and not the 10 s commit deadline.
+    /// <para>Default is <b>2 minutes</b>.</para>
+    /// </summary>
+    public TimeSpan DecommissionDrainTimeout { get; set; } = TimeSpan.FromMinutes(2);
 
     /// <summary>
     /// Minimum per-node replica-count imbalance (above the even-spread ceiling) before the

@@ -22,14 +22,26 @@ public sealed class PlacementView
     /// <summary>Replica-count imbalance tolerated above the even-spread ceiling before balancing moves are emitted.</summary>
     public int ReplicaCountDeadband { get; init; } = 1;
 
-    /// <summary>Maximum number of moves emitted in one plan.</summary>
-    public int MaxMoves { get; init; } = 2;
+    /// <summary>Maximum number of moves emitted in one plan, across all priorities.</summary>
+    public int MaxMoves { get; init; } = 4;
 
     /// <summary>
-    /// Remaining transitional-replica slots (max concurrent transfers minus ranges already
-    /// mid-move). Each emitted move consumes one; 0 yields an empty plan.
+    /// Remaining <b>balance</b>-class slots (<see cref="RaftConfiguration.MaxConcurrentReplicaTransfers"/>
+    /// minus ranges already mid-move). Consumed by priority-3 skew moves and priority-2 trims of
+    /// cosmetically-excess voters. Repair-class moves emitted in the same plan also count against
+    /// it — any transfer consumes bandwidth — so at the default of 1, balance work pauses
+    /// entirely while a repair wave is in flight.
     /// </summary>
     public int TransferBudget { get; init; } = 1;
+
+    /// <summary>
+    /// Remaining <b>repair</b>-class slots (<see cref="RaftConfiguration.MaxConcurrentReplicaRepairs"/>
+    /// minus ranges already mid-move). Consumed by priority-1 re-replication of under-replicated
+    /// ranges and priority-2 sheds of replicas stranded on nodes that left the roster — the
+    /// durability-relevant moves, budgeted separately so they are never serialized behind the
+    /// cosmetic-balance budget.
+    /// </summary>
+    public int RepairBudget { get; init; } = 3;
 }
 
 /// <summary>One range's current placement as seen by the planner.</summary>

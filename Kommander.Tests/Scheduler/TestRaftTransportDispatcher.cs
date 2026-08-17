@@ -131,6 +131,9 @@ public sealed class TestRaftTransportDispatcher
         public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default)
             => Task.FromResult(new LeaveResponse(false));
 
+        public Task<SetMemberRoleResponse> SendSetMemberRole(RaftManager manager, RaftNode node, SetMemberRoleRequest request, CancellationToken cancellationToken = default)
+            => Task.FromResult(new SetMemberRoleResponse(false, Status: RaftOperationStatus.Errored));
+
         public Task<GossipAck> SendGossip(RaftManager manager, RaftNode node, GossipMessage digest, CancellationToken cancellationToken = default)
             => Task.FromResult(new GossipAck(0, null));
     }

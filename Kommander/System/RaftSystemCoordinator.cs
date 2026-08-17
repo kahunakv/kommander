@@ -162,7 +162,12 @@ internal sealed class RaftSystemCoordinator : IDisposable
             StartPartitions,
             GetMembership,
             manager.AmILeaderQuick,
-            manager.GetPartitionLeaderEndpoint,
+            // The hint, not GetPartitionLeaderEndpoint: the P0 controller routinely reasons about
+            // ranges this node does not host, where the local Leader field does not exist and the
+            // gossiped load-report claim is the only leader source (hosted ranges keep the local
+            // belief — the hint's fast path). Without this, learner-lag measurement and the
+            // trim/removal leader checks are blind for every non-hosted range.
+            manager.GetPartitionLeaderHint,
             manager.GetFollowerCommittedIndexNullableAsync,
             (node, partitionId, endpoint) => manager.Communication.GetRemoteFollowerLag(manager, node, partitionId, endpoint),
             endpoint => manager.Liveness.GetState(endpoint),
@@ -396,6 +401,10 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
             case RaftSystemRequestType.RemoveMember:
                 await TryRemoveMember(message, cancellationToken).ConfigureAwait(false);
+                break;
+
+            case RaftSystemRequestType.SetMemberRole:
+                await TrySetMemberRole(message, cancellationToken).ConfigureAwait(false);
                 break;
 
             case RaftSystemRequestType.ApplyGossipRoster:
@@ -1071,6 +1080,16 @@ internal sealed class RaftSystemCoordinator : IDisposable
             // Raft §6 self-removal: if this node is no longer a voter in the new
             // configuration, step down from every partition it currently leads so
             // followers can elect a new leader without waiting for a heartbeat timeout.
+            //
+            // Deliberate: this also fires when the P0 leader commits its OWN Voter -> Leaving
+            // (decommission drain), not only on removal. A leader that is no longer a roster
+            // voter must not keep committing on roster-quorum partitions, and stepping down is
+            // the conservative §6 answer. The collateral is accepted: a draining ex-leader also
+            // loses its user-range leaderships and — because the campaign gates require
+            // LocalRole == Voter — cannot re-win them; each range's surviving voters elect a new
+            // leader, which then serves as the evacuation's replication source. Only the node
+            // executing ReplicateMembership (the P0 leader) takes this path; a draining follower
+            // applies the roster via ApplyMembershipFromCache and keeps all its leaderships.
             if (!newMembership.Members.Any(m => m.Endpoint == manager.LocalEndpoint && m.Role == ClusterMemberRole.Voter))
                 _ = StepDownSelfRemovedAsync();
 
@@ -1230,6 +1249,131 @@ internal sealed class RaftSystemCoordinator : IDisposable
     }
 
     /// <summary>
+    /// Commits a roster role transition for the decommission drain:
+    /// <c>Voter → Leaving</c> starts a drain, <c>Leaving → Voter</c> rolls one back.
+    /// <para>
+    /// Guards, in order: idempotent success when the member already holds the target role (the
+    /// caller's retry loop may re-send after a lost response); only one member may be
+    /// <c>Leaving</c> at a time — enforced against the <b>committed roster</b>, not
+    /// <see cref="_membershipChangePending"/>, because a drain lasts minutes while the latch only
+    /// covers one replication window; and <c>Voter → Leaving</c> must leave at least one voter
+    /// (the transition removes the node from roster-level quorum at its commit point, exactly
+    /// like a removal).
+    /// </para>
+    /// <para>
+    /// <see cref="RaftOperationStatus.MemberNotFound"/> on a rollback means the placement pass
+    /// already committed the final removal — the race is resolved in favour of the removal, and
+    /// the caller must treat the node as departed.
+    /// </para>
+    /// </summary>
+    private async Task TrySetMemberRole(RaftSystemRequest message, CancellationToken cancellationToken)
+    {
+        TaskCompletionSource<(RaftOperationStatus, long)>? completion = message.Completion;
+
+        if (!ValidateMembershipRequest(message.ExpectedMembershipVersion, completion))
+            return;
+
+        string endpoint = message.MemberEndpoint ?? "";
+        ClusterMemberRole targetRole = message.MemberTargetRole;
+
+        ClusterMember? member = _cachedMembership.Members.FirstOrDefault(m => m.Endpoint == endpoint);
+        if (member is null)
+        {
+            logger.LogWarning("TrySetMemberRole: Endpoint {Endpoint} not found in roster", endpoint);
+            completion?.TrySetResult((RaftOperationStatus.MemberNotFound, _cachedMembership.MembershipVersion));
+            return;
+        }
+
+        if (member.Role == targetRole)
+        {
+            // Idempotent: a previous SetMemberRole committed but the response was lost and the
+            // caller retried. Report success at the current version so the retry loop proceeds.
+            completion?.TrySetResult((RaftOperationStatus.Success, _cachedMembership.MembershipVersion));
+            return;
+        }
+
+        switch (targetRole)
+        {
+            case ClusterMemberRole.Leaving:
+                if (member.Role != ClusterMemberRole.Voter)
+                {
+                    // A Learner has nothing to drain — remove it directly.
+                    logger.LogError("TrySetMemberRole: {Endpoint} is {Role}; only a Voter can start draining", endpoint, member.Role);
+                    completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+                    return;
+                }
+
+                // One drain at a time, enforced on committed state: two concurrent Leaving
+                // members would shrink the voter set by two before either evacuation completes.
+                // Deliberately NOT _membershipChangePending — that latch only covers a single
+                // replication window (seconds), while a drain holds the role for minutes.
+                if (_cachedMembership.Members.Any(m => m.Role == ClusterMemberRole.Leaving))
+                {
+                    logger.LogWarning("TrySetMemberRole: another member is already Leaving; refusing drain of {Endpoint}", endpoint);
+                    completion?.TrySetResult((RaftOperationStatus.DrainInProgress, 0));
+                    return;
+                }
+
+                // Mirror TryRemoveMember's quorum-safety precondition: the voter set shrinks at
+                // this commit point, so refuse a transition that would leave zero voters.
+                int remainingVoters = _cachedMembership.Members.Count(m => m.Role == ClusterMemberRole.Voter && m.Endpoint != endpoint);
+                if (remainingVoters < 1)
+                {
+                    logger.LogError("TrySetMemberRole: Refusing to drain {Endpoint} — would leave {Remaining} voter(s)", endpoint, remainingVoters);
+                    completion?.TrySetResult((RaftOperationStatus.InsufficientVoters, 0));
+                    return;
+                }
+
+                break;
+
+            case ClusterMemberRole.Voter:
+                if (member.Role != ClusterMemberRole.Leaving)
+                {
+                    // Learner → Voter stays on the PromoteMember path (it has catch-up gating).
+                    logger.LogError("TrySetMemberRole: {Endpoint} is {Role}; only a Leaving member can roll back to Voter", endpoint, member.Role);
+                    completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+                    return;
+                }
+
+                break;
+
+            default:
+                logger.LogError("TrySetMemberRole: target role {Role} is not a valid transition", targetRole);
+                completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+                return;
+        }
+
+        long newVersion = _cachedMembership.MembershipVersion + 1;
+
+        ClusterMembership newMembership = new()
+        {
+            MembershipVersion = newVersion,
+            Members = _cachedMembership.Members
+                .Select(m => m.Endpoint == endpoint
+                    ? new ClusterMember { Endpoint = m.Endpoint, NodeId = m.NodeId, Role = targetRole, JoinedVersion = m.JoinedVersion }
+                    : m)
+                .ToList()
+        };
+
+        _membershipChangePending = true;
+        logger.LogInfoSetMemberRole(endpoint, member.Role, targetRole, newVersion);
+
+        try
+        {
+            await ReplicateMembership(newMembership, completion, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _membershipChangePending = false;
+        }
+
+        // A committed Leaving role creates evacuation work now — kick one pass instead of
+        // waiting up to a full PlacementPassInterval (same pattern as TryRemoveMember below).
+        if (targetRole == ClusterMemberRole.Leaving && _cachedMembership.MembershipVersion >= newVersion)
+            Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+    }
+
+    /// <summary>
     /// Removes a node from the committed roster (graceful leave or failure-driven eviction).
     /// Quorum shrinks at the commit point; single-server safety is preserved because
     /// changes are applied one node at a time.
@@ -1291,6 +1435,15 @@ internal sealed class RaftSystemCoordinator : IDisposable
         {
             _membershipChangePending = false;
         }
+
+        // A committed removal makes every range that had a replica on the departed node
+        // under-replicated — kick one placement pass now instead of waiting up to a full
+        // PlacementPassInterval. This site also covers dead-node eviction, which enqueues its
+        // RemoveMember through this handler. ReplicateMembership returns void; success is
+        // observable as the cache having adopted the new version. Self-enqueue is safe (the
+        // channel is unbounded) and the pass is idempotent.
+        if (_cachedMembership.MembershipVersion >= newVersion)
+            Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
     }
 
     // ── Static helpers (bodies live in RaftSystemCoordinatorHelpers) ──────────

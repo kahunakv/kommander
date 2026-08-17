@@ -304,13 +304,31 @@ is trivially unit-testable and a new P0 leader loses nothing.
 
 ### The controller (`RunPlacementPass`)
 
-The pass rides the leader balancer's timer cadence and self-gates on P0 leadership. Each pass:
+The pass runs on its own timer — every `PlacementPassInterval` (default 5 s) whenever placement is
+in play (`ReplicationFactor > 0` or `EnablePlacementRebalancer`) — and self-gates on P0 leadership.
+It is fully independent of the leader balancer's timer, so a placed cluster that keeps
+`EnableLeaderBalancer` off still converges. On top of the tick cadence, a pass is kicked
+immediately after the commits that create placement work: a replication-factor override and a
+member removal (graceful leave or dead-node eviction). Each pass:
 
 1. **Drives transitions to completion** — re-issues the final drop for any `Removing` replica and
    promotes learners that have stayed caught-up for the stable window. This part runs **even when
    the rebalancer is disabled**, so an interrupted move always converges.
-2. **Plans new moves** — only when `EnablePlacementRebalancer` is on, and only with transfer budget
-   to spare (`MaxConcurrentReplicaTransfers` minus ranges already mid-transition).
+2. **Plans new moves** — only when `EnablePlacementRebalancer` is on, and only with budget to
+   spare. Moves are budgeted by class: **repairs** (re-replicating an under-replicated range,
+   shedding a replica stranded on an evicted node) draw on `MaxConcurrentReplicaRepairs`, while
+   **balance** moves (cosmetic trims and skew spreading) draw on `MaxConcurrentReplicaTransfers`
+   and additionally yield to any repair in flight — durability work is never throttled by the
+   cosmetic budget, and total in-flight transitions stay bounded by the larger of the two.
+
+**Worst-case convergence bound.** One relocation costs ~3 passes (add learner → observe caught up →
+promote after `LearnerPromotionStableWindow`) plus one trim pass, i.e. ~4 × `PlacementPassInterval`
+per batch of concurrent moves (~20 s at the defaults). Repairs proceed `MaxConcurrentReplicaRepairs`
+at a time, so re-replicating *N* under-replicated ranges takes on the order of
+`ceil(N / MaxConcurrentReplicaRepairs) × 4 × PlacementPassInterval` — at the defaults, ~20 s per
+batch of 3 ranges — plus the actual data-transfer time for each learner to catch up, which dominates
+for large ranges. Under the pre-split shared budget of 1 at the balancer's 30 s cadence the same
+drain ran at ≈ 2 minutes per replica, fully serialized.
 
 Learner lag is measured from the range leader's follower-progress table — directly when the P0 leader
 happens to lead the range, remotely otherwise. Unlike the cluster-membership promotion driver, a
@@ -369,6 +387,30 @@ that had a replica there under-replicated; the planner re-replicates them at top
 promoted voter is a fresh target for spreading. Placement and roster changes are serialized on the
 same P0 loop, so they compose without racing.
 
+**Decommission drain (`RequestLeaveAsync`).** A *planned* departure inverts the repair order:
+instead of removing the member and repairing post-hoc (which can leave a range below quorum the
+moment the departing process stops), the node first commits the `Leaving` roster role and the pass
+evacuates its replicas **while it still serves**. No new planner input exists for this: a `Leaving`
+member simply drops out of the candidate set, so priority 1 already counts its ranges as
+under-replicated (the add draws on the repair budget) and the trim of its now-off-roster replica is
+classified as repair too. Three drain-specific rules live in the controller:
+
+- A transitional **learner sitting on the leaver is dropped, not promoted** — promoting it would
+  make the leaver a voter the next pass has to evacuate again.
+- The pass **completes the removal itself**: once no non-`Removed` range names a `Leaving` member,
+  it commits the final `RemoveMember`. The drain is a property of committed state, not of a live
+  waiter — a departing node that crashes after `Leaving` commits (or a P0 leadership change) still
+  converges.
+- Only **one member may be `Leaving` at a time**, guarded on roster state — two concurrent drains
+  would shrink the voter set by two before either evacuation completes.
+
+A drain that cannot finish within `DecommissionDrainTimeout` rolls the role back to `Voter` (the
+campaign gates otherwise keep a `Leaving` node from ever campaigning again); if the pass's removal
+races that rollback, removal wins and the leave reports completed. Known limitation: a range whose
+*only* voter is the leaver (RF 1) can only drain while the leaver retains that range's leadership —
+if leadership is lost mid-drain the range has no electable voter until the drain times out and
+rolls back. Treat RF 1 decommission as unsupported.
+
 ---
 
 ## Using it: configuration
@@ -379,8 +421,10 @@ All knobs live on `RaftConfiguration`:
 |---|---|---|
 | `ReplicationFactor` | `0` | Target voter copies per range. **0 = full replication (feature off).** Prefer odd values: RF 4 needs 3-of-4 to commit — the same failure tolerance as RF 3, with an extra copy's cost. |
 | `EnablePlacementRebalancer` | `false` | Master switch for *ongoing* rebalancing (repair, trim, skew). Initial placement at RF applies regardless; in-flight transitions always complete regardless. |
-| `MaxReplicaMovesPerPass` | `2` | New moves initiated per controller pass. Bounds the blast radius of a bad plan. |
-| `MaxConcurrentReplicaTransfers` | `1` | Ranges allowed mid-transition at once. Caps concurrent backfill/snapshot traffic so rebalancing never starves client writes. |
+| `PlacementPassInterval` | `5 s` | Cadence of the controller pass on the P0 leader, independent of the leader balancer's timer. Bounds convergence speed (see the worst-case bound above). Non-positive disables the timer; event-driven kicks still fire. |
+| `MaxReplicaMovesPerPass` | `4` | New moves initiated per controller pass, across all priorities. Bounds the blast radius of a bad plan. Keep ≥ `MaxConcurrentReplicaRepairs` + `MaxConcurrentReplicaTransfers` or it binds before the per-class budgets. |
+| `MaxConcurrentReplicaTransfers` | `1` | Balance-class moves (cosmetic trims, skew spreading) allowed mid-transition at once. Caps concurrent backfill/snapshot traffic so rebalancing never starves client writes. Repairs in flight count against it too, so balance work pauses during a repair wave. |
+| `MaxConcurrentReplicaRepairs` | `3` | Repair-class moves (re-replication of under-replicated ranges, sheds of replicas on evicted nodes) allowed mid-transition at once. Split from the transfer budget so restoring durability is never serialized behind it. |
 | `ReplicaCountDeadband` | `1` | Per-node replica-count imbalance tolerated before balancing moves are emitted. Prevents ping-ponging around an already-even spread. Repairs ignore it. |
 | `Zone` | `null` | Optional locality hint for the local node, gossiped on its load reports so the planner sees every node's zone; the planner (and the bootstrap assignment) prefer spreading a range's replicas across distinct zones. Whitespace-only values are normalized to null at `Validate()`. |
 

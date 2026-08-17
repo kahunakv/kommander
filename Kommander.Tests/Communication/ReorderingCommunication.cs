@@ -219,6 +219,9 @@ internal sealed class ReorderingCommunication : ICommunication
     public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default) =>
         _inner.SendLeave(manager, node, request, cancellationToken);
 
+    public Task<SetMemberRoleResponse> SendSetMemberRole(RaftManager manager, RaftNode node, SetMemberRoleRequest request, CancellationToken cancellationToken = default) =>
+        _inner.SendSetMemberRole(manager, node, request, cancellationToken);
+
     public Task<GossipAck> SendGossip(RaftManager manager, RaftNode node, GossipMessage digest, CancellationToken cancellationToken = default) =>
         _inner.SendGossip(manager, node, digest, cancellationToken);
 

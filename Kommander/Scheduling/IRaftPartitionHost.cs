@@ -24,6 +24,13 @@ public interface IRaftPartitionHost
     /// <summary>
     /// The local node's role in the committed membership roster.
     /// Returns <see cref="ClusterMemberRole.Voter"/> when no roster exists yet (pre-seed fallback).
+    /// <para>
+    /// The campaign gates suppress elections and pre-votes whenever this is not Voter — which
+    /// now includes a committed <see cref="ClusterMemberRole.Leaving"/> during a decommission
+    /// drain, not only the local teardown latch. A draining node therefore keeps any leaderships
+    /// it already holds (the gates are campaign-only) but cannot win new ones until the drain
+    /// completes or rolls back.
+    /// </para>
     /// </summary>
     ClusterMemberRole LocalRole { get; }
 

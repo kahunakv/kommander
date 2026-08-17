@@ -10,6 +10,7 @@ service Rafter {
     rpc BatchRequests (stream GrpcBatchRequestsRequest) returns (stream GrpcBatchRequestsResponse);
     rpc Join (GrpcJoinRequest) returns (GrpcJoinResponse);
     rpc Leave (GrpcLeaveRequest) returns (GrpcLeaveResponse);
+    rpc SetMemberRole (GrpcSetMemberRoleRequest) returns (GrpcSetMemberRoleResponse);
     rpc GetFollowerLag (GrpcGetFollowerLagRequest) returns (GrpcGetFollowerLagResponse);
     rpc GetReadIndex (GrpcGetReadIndexRequest) returns (GrpcGetReadIndexResponse);
     rpc InstallSnapshot (GrpcInstallSnapshotRequest) returns (GrpcInstallSnapshotResponse);
@@ -199,6 +200,25 @@ message GrpcLeaveResponse {
     bool Success = 1;
     string LeaderHint = 2;
     bool Terminal = 3;
+    int64 MembershipVersion = 4;
+}
+
+// Roster role transition for the decommission drain. A deliberate new RPC rather than a new
+// field on Leave: a pre-drain peer must fail this call loudly (UNIMPLEMENTED) instead of
+// silently committing an immediate removal, so a drain can never degrade into an undrained
+// leave on a mixed-version cluster.
+message GrpcSetMemberRoleRequest {
+    string Endpoint = 1;
+    int32 NodeId = 2;
+    // ClusterMemberRole ordinal: 0=Learner, 1=Voter, 2=Leaving.
+    int32 TargetRole = 3;
+}
+
+message GrpcSetMemberRoleResponse {
+    bool Success = 1;
+    string LeaderHint = 2;
+    // RaftOperationStatus ordinal carrying the coordinator's verdict.
+    int32 Status = 3;
     int64 MembershipVersion = 4;
 }
 

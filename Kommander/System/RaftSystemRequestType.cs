@@ -64,6 +64,17 @@ public enum RaftSystemRequestType
     RemoveMember,
 
     /// <summary>
+    /// Commits a roster role transition for the decommission drain:
+    /// <see cref="ClusterMemberRole.Voter"/> → <see cref="ClusterMemberRole.Leaving"/> starts a
+    /// drain (the voter set shrinks by one at the commit point, so this is a real membership
+    /// change and obeys the one-at-a-time rule), and the reverse rolls back a drain that timed
+    /// out or was cancelled. Only one member may be <c>Leaving</c> at a time — the guard is
+    /// roster state, not the in-flight latch, because a drain outlives any single commit window.
+    /// Learner promotion stays on <see cref="PromoteMember"/>.
+    /// </summary>
+    SetMemberRole,
+
+    /// <summary>
     /// Applies a gossiped roster to the local membership cache when its version is
     /// strictly newer than the locally committed version.
     /// This path never writes to the Raft log — it only converges the local cache so
@@ -116,8 +127,13 @@ public enum RaftSystemRequestType
     /// Triggers one replica-placement controller pass on the P0 leader: drives in-flight replica
     /// transitions to completion (learner promotion, removal finalization) and — when
     /// <see cref="RaftConfiguration.EnablePlacementRebalancer"/> is on — plans and dispatches
-    /// rebalancing moves. Sent by the timer service alongside <see cref="RunBalancerPass"/>;
-    /// silently ignored when this node is not the P0 leader.
+    /// rebalancing moves. Sent by the timer service every
+    /// <see cref="RaftConfiguration.PlacementPassInterval"/> whenever
+    /// <see cref="RaftConfiguration.PlacementPassEnabled"/> is true (independent of
+    /// <see cref="RaftConfiguration.EnableLeaderBalancer"/>), and additionally kicked once after
+    /// commits that create placement work (a replication-factor override, a member removal).
+    /// The pass is idempotent and silently ignored when this node is not the P0 leader, so
+    /// redundant sends are harmless.
     /// </summary>
     RunPlacementPass,
 

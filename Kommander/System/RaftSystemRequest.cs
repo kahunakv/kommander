@@ -42,8 +42,15 @@ public sealed class RaftSystemRequest
     /// </summary>
     public RaftSplitPlan? SplitPlan { get; init; }
 
-    /// <summary>Node endpoint (host:port) for AddMember / PromoteMember / RemoveMember requests.</summary>
+    /// <summary>Node endpoint (host:port) for AddMember / PromoteMember / RemoveMember / SetMemberRole requests.</summary>
     public string? MemberEndpoint { get; init; }
+
+    /// <summary>
+    /// Target roster role for <see cref="RaftSystemRequestType.SetMemberRole"/> requests:
+    /// <see cref="ClusterMemberRole.Leaving"/> to start a decommission drain,
+    /// <see cref="ClusterMemberRole.Voter"/> to roll one back.
+    /// </summary>
+    public ClusterMemberRole MemberTargetRole { get; init; }
 
     /// <summary>Node id for AddMember requests.</summary>
     public int MemberNodeId { get; init; }
@@ -180,6 +187,28 @@ public sealed class RaftSystemRequest
         MemberEndpoint = endpoint;
         MemberNodeId = nodeId;
         ExpectedMembershipVersion = expectedMembershipVersion;
+        Completion = completion;
+    }
+
+    /// <summary>
+    /// Constructor for <see cref="RaftSystemRequestType.SetMemberRole"/> requests: a roster role
+    /// transition for the decommission drain. <paramref name="expectedMembershipVersion"/> must
+    /// match the committed <see cref="ClusterMembership.MembershipVersion"/> or the coordinator
+    /// rejects the change with <see cref="RaftOperationStatus.StaleMembership"/>.
+    /// </summary>
+    public RaftSystemRequest(
+        RaftSystemRequestType type,
+        string endpoint,
+        int nodeId,
+        long expectedMembershipVersion,
+        ClusterMemberRole targetRole,
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)>? completion = null)
+    {
+        Type = type;
+        MemberEndpoint = endpoint;
+        MemberNodeId = nodeId;
+        ExpectedMembershipVersion = expectedMembershipVersion;
+        MemberTargetRole = targetRole;
         Completion = completion;
     }
 

@@ -38,6 +38,16 @@ public interface ICommunication
     public Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Sends a <see cref="SetMemberRoleRequest"/> to <paramref name="node"/> asking the P0 leader
+    /// to commit a roster role transition (start or roll back a decommission drain). If the
+    /// target is not the P0 leader it returns <see cref="SetMemberRoleResponse.LeaderHint"/> so
+    /// the caller can retry. A pre-drain peer fails this call (the RPC does not exist there),
+    /// which is deliberate: a drain must never silently degrade into an immediate removal on a
+    /// mixed-version cluster.
+    /// </summary>
+    public Task<SetMemberRoleResponse> SendSetMemberRole(RaftManager manager, RaftNode node, SetMemberRoleRequest request, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Sends a <see cref="GossipMessage"/> to <paramref name="node"/> for membership anti-entropy.
     /// The receiver applies the roster to its local cache when the sender's version is strictly
     /// higher, and responds with its own roster when it holds newer data, enabling push-pull

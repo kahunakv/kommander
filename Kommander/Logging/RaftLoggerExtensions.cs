@@ -278,6 +278,9 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "TryRemoveMember: Removing {Endpoint} at version {Version}")]
     public static partial void LogInfoRemoveMember(this ILogger<IRaft> logger, string endpoint, long version);
 
+    [LoggerMessage(Level = LogLevel.Information, Message = "TrySetMemberRole: {Endpoint} {FromRole} -> {ToRole} at version {Version}")]
+    public static partial void LogInfoSetMemberRole(this ILogger<IRaft> logger, string endpoint, Kommander.System.ClusterMemberRole fromRole, Kommander.System.ClusterMemberRole toRole, long version);
+
     // ── Replica placement ─────────────────────────────────────────────────
 
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] AddReplica: partition {Id} += {Endpoint} (Learner), generation {Generation}")]
@@ -294,6 +297,9 @@ public static partial class RaftLoggerExtensions
 
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] Placement move: {Kind} partition {Id} {Endpoint}")]
     public static partial void LogInfoPlacementMove(this ILogger<IRaft> logger, string local, Kommander.System.Placement.PlacementMoveKind kind, int id, string endpoint);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] Placement drain of {Endpoint} complete (no range names it); committing removal")]
+    public static partial void LogInfoPlacementDrainComplete(this ILogger<IRaft> logger, string local, string endpoint);
 
     // ── RestCommunication ─────────────────────────────────────────────────
 

@@ -175,6 +175,33 @@ public class RestCommunication : ICommunication
     }
 
     /// <summary>
+    /// Sends a <see cref="SetMemberRoleRequest"/> to <paramref name="node"/> via the
+    /// <c>POST /v1/raft/set-member-role</c> REST endpoint. A pre-drain peer answers 404, which
+    /// surfaces here as a failed response — the drain fails loudly instead of silently degrading
+    /// into an immediate removal. Returns failure on any transport or HTTP error.
+    /// </summary>
+    public async Task<SetMemberRoleResponse> SendSetMemberRole(RaftManager manager, RaftNode node, SetMemberRoleRequest request, CancellationToken cancellationToken = default)
+    {
+        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.SetMemberRoleRequest);
+
+        try
+        {
+            SetMemberRoleResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/set-member-role", payload)
+                .PostStringAsync(payload, cancellationToken: cancellationToken)
+                .ReceiveJson<SetMemberRoleResponse>()
+                .ConfigureAwait(false);
+
+            return response ?? new SetMemberRoleResponse(false, Status: RaftOperationStatus.Errored);
+        }
+        catch (Exception e)
+        {
+            manager.Logger.LogError("[{Endpoint}] SendSetMemberRole: {Message}", manager.LocalEndpoint, e.Message);
+        }
+
+        return new SetMemberRoleResponse(false, Status: RaftOperationStatus.Errored);
+    }
+
+    /// <summary>
     /// Sends a gossip push to a peer via <c>POST /v1/raft/gossip</c>.
     /// The roster is encoded as JSON in <see cref="GossipRequest.RosterJson"/> so that
     /// <see cref="ClusterMembership"/> does not need to be registered in <see cref="RestJsonContext"/>.

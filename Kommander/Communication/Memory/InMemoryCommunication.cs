@@ -155,6 +155,18 @@ public class InMemoryCommunication : ICommunication
         return new LeaveResponse(false);
     }
 
+    public async Task<SetMemberRoleResponse> SendSetMemberRole(RaftManager manager, RaftNode node, SetMemberRoleRequest request, CancellationToken cancellationToken = default)
+    {
+        if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))
+            return new SetMemberRoleResponse(false, Status: RaftOperationStatus.Errored);
+
+        if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode) && targetNode is RaftManager targetManager)
+            return await targetManager.ReceiveSetMemberRole(request, cancellationToken).ConfigureAwait(false);
+
+        Console.WriteLine("SendSetMemberRole Unknown node: " + node.Endpoint);
+        return new SetMemberRoleResponse(false, Status: RaftOperationStatus.Errored);
+    }
+
     public Task<GossipAck> SendGossip(RaftManager manager, RaftNode node, GossipMessage digest, CancellationToken cancellationToken = default)
     {
         if (IsPartitioned(manager.LocalEndpoint, node.Endpoint))

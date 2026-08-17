@@ -25,6 +25,8 @@ namespace Kommander.Communication;
 [JsonSerializable(typeof(JoinResponse))]
 [JsonSerializable(typeof(LeaveRequest))]
 [JsonSerializable(typeof(LeaveResponse))]
+[JsonSerializable(typeof(SetMemberRoleRequest))]
+[JsonSerializable(typeof(SetMemberRoleResponse))]
 [JsonSerializable(typeof(GetFollowerLagRequest))]
 [JsonSerializable(typeof(GetFollowerLagResponse))]
 [JsonSerializable(typeof(SnapshotRequest))]

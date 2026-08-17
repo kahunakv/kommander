@@ -43,7 +43,24 @@ public enum LeaveClusterOutcome
     /// the caller cancelled the request. The removal may or may not have committed — the caller
     /// must re-read the roster before deciding.
     /// </summary>
-    Timeout = 5
+    Timeout = 5,
+
+    /// <summary>
+    /// Another member is already draining (its roster role is <c>Leaving</c>), and only one
+    /// decommission drain may run at a time — two concurrent drains would shrink the voter set
+    /// by two before either evacuation completes. Nothing was committed; the node keeps serving
+    /// as a Voter. Retry after the in-flight drain finishes.
+    /// </summary>
+    RefusedDrainInProgress = 6,
+
+    /// <summary>
+    /// The <c>Leaving</c> role committed and evacuation started, but the drain did not complete
+    /// within <see cref="RaftConfiguration.DecommissionDrainTimeout"/> and the role was rolled
+    /// back to <c>Voter</c>. The node keeps serving and campaigning; some of its replicas may
+    /// already have moved. Retrying resumes the drain (replicas already evacuated stay
+    /// evacuated).
+    /// </summary>
+    DrainTimedOut = 7
 }
 
 /// <summary>
@@ -55,7 +72,15 @@ public enum LeaveClusterOutcome
 /// this is the version that no longer contains the local endpoint; for every other outcome it is the
 /// last roster version known locally (0 when none is known).
 /// </param>
-public readonly record struct LeaveClusterResult(LeaveClusterOutcome Outcome, long MembershipVersion)
+/// <param name="Drained">
+/// True when the committed partition map stopped naming this endpoint before the removal — i.e.
+/// every replica the node hosted was evacuated onto a survivor first. False when the node left
+/// without a drain (no range named it, e.g. full-replication clusters where every survivor
+/// already holds the data) or when the outcome is not a departure at all. Callers deciding when
+/// it is safe to stop the process should require <see cref="Left"/>; <c>Drained</c> additionally
+/// says whether per-partition durability was preserved by evacuation.
+/// </param>
+public readonly record struct LeaveClusterResult(LeaveClusterOutcome Outcome, long MembershipVersion, bool Drained = false)
 {
     /// <summary>
     /// True when the node is out of the committed roster — either because the removal committed or

@@ -337,6 +337,9 @@ internal sealed class ReplicaPlacementService
     /// Both commits run inside this handler call; a crash between them leaves a Removing replica
     /// that <see cref="RunPlacementPassAsync"/> re-drives idempotently. When the victim currently
     /// leads the range, leadership is transferred away (best-effort) before the first commit.
+    /// Removing the range's transitional Learner is permitted despite the single-mover rule —
+    /// it cancels the in-flight add without touching the quorum denominator (used when the
+    /// learner's host starts a decommission drain).
     /// </summary>
     internal async Task TryRemoveReplica(RaftSystemRequest message, CancellationToken cancellationToken)
     {
@@ -365,7 +368,12 @@ internal sealed class ReplicaPlacementService
             return;
         }
 
-        if (replica.Role != RaftReplicaRole.Removing && GetTransitionalReplica(range) is { } transitional)
+        // Single mover per range — but removing the transitional replica ITSELF is allowed:
+        // that is the cancel of an in-flight add (e.g. the learner sits on a node that started
+        // draining), and a Learner is not in the quorum denominator, so dropping it keeps the
+        // one-quorum-change-per-commit discipline intact.
+        if (replica.Role != RaftReplicaRole.Removing && GetTransitionalReplica(range) is { } transitional
+            && transitional.Endpoint != endpoint)
         {
             logger.LogWarning(
                 "TryRemoveReplica: Partition {Id} already has transitional replica {Endpoint} ({Role}); single mover per range",
@@ -477,7 +485,14 @@ internal sealed class ReplicaPlacementService
         map.MapVersion++;
 
         if (await ReplicateMapAsync(map, completion, cancellationToken).ConfigureAwait(false))
+        {
             completion?.TrySetResult((RaftOperationStatus.Success, range.Generation));
+
+            // A new target creates placement work now — kick one pass instead of waiting up to
+            // a full PlacementPassInterval. Safe self-enqueue: the coordinator channel is
+            // unbounded, and the pass is idempotent and self-gates on P0 leadership.
+            send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+        }
     }
 
     // ── Placement controller ───────────────────────────────────────────────
@@ -504,6 +519,46 @@ internal sealed class ReplicaPlacementService
         if (map is null)
             return;
 
+        // Roster snapshot for this pass. Safe to read once: membership mutations run on the same
+        // single-reader coordinator loop, so it cannot change underneath a pass.
+        ClusterMembership roster = getMembership();
+
+        // ── Decommission drain completion ──────────────────────────────────
+        // A Leaving member whose endpoint no longer appears in any live range's replica set is
+        // fully evacuated — commit its removal here. This makes the drain a property of
+        // committed state rather than of a live waiter: a departing node that crashed (or a P0
+        // leadership change) after Leaving committed still converges to removal on the next
+        // pass. Same predicate as RaftManager.CommittedMapNamesLocalEndpoint (Removed ranges are
+        // ignored) so the local waiter and this sweep can never disagree about "drained".
+        // Deliberately BEFORE the placed.Count early-return: a cluster whose ranges never named
+        // the leaver must still complete the removal. TryRemoveMember does not quorum-gate
+        // non-Voter removals, and treats an already-absent member as success, so racing the
+        // departing node's own RemoveMember is harmless.
+        if (roster.MembershipVersion > 0)
+        {
+            foreach (ClusterMember member in roster.Members)
+            {
+                if (member.Role != ClusterMemberRole.Leaving)
+                    continue;
+
+                bool named = map.Partitions.Any(r =>
+                    r.State != RaftPartitionState.Removed &&
+                    r.Replicas.Any(x => x.Endpoint == member.Endpoint));
+
+                if (!named)
+                {
+                    logger.LogInfoPlacementDrainComplete(localEndpoint, member.Endpoint);
+                    send(new RaftSystemRequest(
+                        RaftSystemRequestType.RemoveMember, member.Endpoint, member.NodeId, roster.MembershipVersion));
+                }
+            }
+        }
+
+        HashSet<string> leavingEndpoints = roster.Members
+            .Where(m => m.Role == ClusterMemberRole.Leaving)
+            .Select(m => m.Endpoint)
+            .ToHashSet(StringComparer.Ordinal);
+
         List<RaftPartitionRange> placed = map.Partitions
             .Where(r => r.State == RaftPartitionState.Active && r.Replicas.Count > 0)
             .ToList();
@@ -525,38 +580,63 @@ internal sealed class ReplicaPlacementService
 
             transitionalCount++;
 
-            if (transitional.Role == RaftReplicaRole.Removing)
+            // Per-range fault isolation: the lag probes below do remote I/O and one failing
+            // range must not abort the whole pass — before this guard a single throwing range
+            // starved every other range's transition re-drive and all planning, every tick,
+            // for as long as the range stayed transitional (the P0-leader-does-not-host-the-
+            // range incident). Log, skip the range, and let the next pass retry it.
+            try
             {
-                // Crash-recovery re-drive: finish the interrupted two-commit removal.
-                send(new RaftSystemRequest(
-                    RaftSystemRequestType.RemoveReplica, range.PartitionId, transitional.Endpoint, transitional.NodeId));
-                continue;
-            }
-
-            // Learner: promote once caught up for the stable window.
-            if (await IsLearnerCaughtUp(range.PartitionId, transitional.Endpoint).ConfigureAwait(false))
-            {
-                (int, string) key = (range.PartitionId, transitional.Endpoint);
-                DateTimeOffset now = DateTimeOffset.UtcNow;
-
-                if (!_replicaCaughtUpSince.TryGetValue(key, out DateTimeOffset since))
-                    _replicaCaughtUpSince[key] = now;
-                else if (now - since >= configuration.LearnerPromotionStableWindow)
+                if (transitional.Role == RaftReplicaRole.Removing)
                 {
-                    _replicaCaughtUpSince.Remove(key);
+                    // Crash-recovery re-drive: finish the interrupted two-commit removal.
                     send(new RaftSystemRequest(
-                        RaftSystemRequestType.PromoteReplica, range.PartitionId, transitional.Endpoint, transitional.NodeId));
+                        RaftSystemRequestType.RemoveReplica, range.PartitionId, transitional.Endpoint, transitional.NodeId));
+                    continue;
                 }
+
+                // A learner replica sitting ON a draining node is work the drain would immediately
+                // undo: promoting it makes the leaver a voter of this range, which the next pass
+                // then has to evacuate again. Drop it instead — the range returns to its
+                // pre-transfer replica set and the planner re-targets a survivor.
+                if (leavingEndpoints.Contains(transitional.Endpoint))
+                {
+                    _replicaCaughtUpSince.Remove((range.PartitionId, transitional.Endpoint));
+                    send(new RaftSystemRequest(
+                        RaftSystemRequestType.RemoveReplica, range.PartitionId, transitional.Endpoint, transitional.NodeId));
+                    continue;
+                }
+
+                // Learner: promote once caught up for the stable window.
+                if (await IsLearnerCaughtUp(range.PartitionId, transitional.Endpoint).ConfigureAwait(false))
+                {
+                    (int, string) key = (range.PartitionId, transitional.Endpoint);
+                    DateTimeOffset now = DateTimeOffset.UtcNow;
+
+                    if (!_replicaCaughtUpSince.TryGetValue(key, out DateTimeOffset since))
+                        _replicaCaughtUpSince[key] = now;
+                    else if (now - since >= configuration.LearnerPromotionStableWindow)
+                    {
+                        _replicaCaughtUpSince.Remove(key);
+                        send(new RaftSystemRequest(
+                            RaftSystemRequestType.PromoteReplica, range.PartitionId, transitional.Endpoint, transitional.NodeId));
+                    }
+                }
+                else
+                    _replicaCaughtUpSince.Remove((range.PartitionId, transitional.Endpoint));
             }
-            else
-                _replicaCaughtUpSince.Remove((range.PartitionId, transitional.Endpoint));
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogWarning(
+                    "RunPlacementPass: skipping partition {Id} this pass — transition drive failed for {Endpoint}: {Message}",
+                    range.PartitionId, transitional.Endpoint, ex.Message);
+            }
         }
 
         // ── Plan rebalancing moves ─────────────────────────────────────────
         if (!configuration.EnablePlacementRebalancer)
             return;
 
-        ClusterMembership roster = getMembership();
         if (roster.MembershipVersion == 0)
             return;
 
@@ -588,7 +668,11 @@ internal sealed class ReplicaPlacementService
             Nodes = candidates,
             ReplicaCountDeadband = configuration.ReplicaCountDeadband,
             MaxMoves = configuration.MaxReplicaMovesPerPass,
-            TransferBudget = Math.Max(0, configuration.MaxConcurrentReplicaTransfers - transitionalCount)
+            // Every in-flight transitional counts against both budgets — a transfer consumes
+            // bandwidth regardless of which class initiated it — so total in-flight transitions
+            // stay bounded by max(MaxConcurrentReplicaRepairs, MaxConcurrentReplicaTransfers).
+            TransferBudget = Math.Max(0, configuration.MaxConcurrentReplicaTransfers - transitionalCount),
+            RepairBudget = Math.Max(0, configuration.MaxConcurrentReplicaRepairs - transitionalCount)
         };
 
         foreach (PlacementMove move in PlacementPlanner.Plan(view))
@@ -608,7 +692,12 @@ internal sealed class ReplicaPlacementService
     /// <summary>
     /// Measures the learner replica's commit lag on its range, from the range leader's
     /// follower-progress table (directly when this node leads the range, via
-    /// <c>GetRemoteFollowerLag</c> otherwise). Unlike the roster promotion driver, a null
+    /// <c>GetRemoteFollowerLag</c> otherwise). The remote branch is the <b>normal</b> case
+    /// under per-partition placement — the P0 leader usually does not host the range it is
+    /// repairing — and its leader endpoint comes from <c>getPartitionLeader</c>, wired to the
+    /// gossiped leader hint precisely because the local Leader field does not exist for a
+    /// non-hosted range. Returns false on any probe failure (no hint, no answer, lagging):
+    /// the next pass simply re-measures. Unlike the roster promotion driver, a null
     /// learner index counts as <b>not caught up</b>: under per-partition placement the learner
     /// is explicitly expected to ack this range, so "never acked" means replication has not
     /// reached it yet — the expected-partition-set distinction the join-all model couldn't make.

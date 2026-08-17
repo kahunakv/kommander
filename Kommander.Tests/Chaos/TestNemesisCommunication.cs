@@ -79,6 +79,7 @@ public sealed class TestNemesisCommunication : IDisposable
         }
         public Task<JoinResponse> SendJoin(RaftManager m, RaftNode n, JoinRequest r) { Record(NemesisVerb.Join, n.Endpoint); return Task.FromResult(new JoinResponse(true)); }
         public Task<LeaveResponse> SendLeave(RaftManager m, RaftNode n, LeaveRequest r, CancellationToken ct = default) { Record(NemesisVerb.Leave, n.Endpoint); return Task.FromResult(new LeaveResponse(true)); }
+        public Task<SetMemberRoleResponse> SendSetMemberRole(RaftManager m, RaftNode n, SetMemberRoleRequest r, CancellationToken ct = default) { Record(NemesisVerb.Leave, n.Endpoint); return Task.FromResult(new SetMemberRoleResponse(true)); }
         public Task<GossipAck> SendGossip(RaftManager m, RaftNode n, GossipMessage d, CancellationToken ct = default) { Record(NemesisVerb.Gossip, n.Endpoint); return Task.FromResult(new GossipAck(1, null)); }
         public Task<Gossip.PingResponse> SendPing(RaftManager m, RaftNode n, Gossip.PingRequest r, CancellationToken ct = default) { Record(NemesisVerb.Ping, n.Endpoint); return Task.FromResult(new Gossip.PingResponse(true, 1)); }
         public Task<Gossip.PingReqResponse> SendPingReq(RaftManager m, RaftNode n, Gossip.PingReqRequest r, CancellationToken ct = default) { Record(NemesisVerb.PingReq, n.Endpoint); return Task.FromResult(new Gossip.PingReqResponse(true)); }

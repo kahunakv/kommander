@@ -570,6 +570,7 @@ public sealed class TestFourNodeJoin
         public Task<BatchRequestsResponse> BatchRequests(RaftManager m, RaftNode n, BatchRequestsRequest r) => inner.BatchRequests(m, n, r);
         public Task<JoinResponse> SendJoin(RaftManager m, RaftNode n, JoinRequest r) => inner.SendJoin(m, n, r);
         public Task<LeaveResponse> SendLeave(RaftManager m, RaftNode n, LeaveRequest r, CancellationToken ct) => inner.SendLeave(m, n, r, ct);
+        public Task<SetMemberRoleResponse> SendSetMemberRole(RaftManager m, RaftNode n, SetMemberRoleRequest r, CancellationToken ct = default) => inner.SendSetMemberRole(m, n, r, ct);
         public Task<Gossip.GossipAck> SendGossip(RaftManager m, RaftNode n, Gossip.GossipMessage r, CancellationToken ct) => inner.SendGossip(m, n, r, ct);
         public Task<Gossip.PingResponse> SendPing(RaftManager m, RaftNode n, Gossip.PingRequest r, CancellationToken ct) => inner.SendPing(m, n, r, ct);
         public Task<Gossip.PingReqResponse> SendPingReq(RaftManager m, RaftNode n, Gossip.PingReqRequest r, CancellationToken ct) => inner.SendPingReq(m, n, r, ct);

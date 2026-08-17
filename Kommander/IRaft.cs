@@ -111,9 +111,11 @@ public interface IRaft
     /// <see cref="System.ClusterMemberRole.Voter"/>, <see cref="System.ClusterMemberRole.Learner"/>,
     /// <see cref="System.ClusterMemberRole.Leaving"/>, or <see cref="System.ClusterMemberRole.NotMember"/>.
     /// <para>
-    /// Returns <see cref="System.ClusterMemberRole.Leaving"/> immediately when
-    /// <see cref="LeaveCluster"/> has been called, even before the removal commits, so
-    /// election gates suppress campaigning during the drain window.
+    /// <see cref="System.ClusterMemberRole.Leaving"/> can arrive two ways: as the <b>committed
+    /// roster role</b> while a decommission drain is evacuating this node's replicas (see
+    /// <see cref="RequestLeaveAsync"/> — reversible, the node keeps serving), or immediately and
+    /// locally when <see cref="LeaveCluster"/> has been called, even before any removal commits.
+    /// Either way the election gates suppress campaigning while the role is not Voter.
     /// </para>
     /// <para>
     /// Returns <see cref="System.ClusterMemberRole.Voter"/> during the pre-seed transient
@@ -188,9 +190,21 @@ public interface IRaft
     /// shutdown-coupled variant that tears the node down regardless of the result.
     /// </para>
     /// <para>
-    /// The node stops campaigning once the removal commits, and not before: until then it is still
-    /// a full member, and it may have to win the system-partition election to commit its own
-    /// removal. A refused or failed attempt therefore leaves it participating normally.
+    /// <b>Drain-before-removal:</b> when per-partition replica placement is active (the committed
+    /// map names this endpoint and <see cref="RaftConfiguration.EnablePlacementRebalancer"/> is
+    /// on), the node first commits the <see cref="System.ClusterMemberRole.Leaving"/> roster role
+    /// and its replicas are evacuated onto survivors before the removal commits;
+    /// <see cref="LeaveClusterResult.Drained"/> reports whether that happened. A drain that
+    /// cannot start is refused and the node keeps serving as a Voter; one that exceeds
+    /// <see cref="RaftConfiguration.DecommissionDrainTimeout"/> rolls back to Voter and returns
+    /// <see cref="LeaveClusterOutcome.DrainTimedOut"/> (retrying resumes the drain — already
+    /// evacuated replicas stay evacuated).
+    /// </para>
+    /// <para>
+    /// The node stops campaigning for good only once the removal commits — but note a draining
+    /// node is suppressed <i>while</i> its committed role is Leaving (reversibly: a refusal or
+    /// rollback restores Voter and with it the ability to campaign). A refused or failed attempt
+    /// leaves it participating normally.
     /// </para>
     /// <para>
     /// Idempotent: calling it again after a successful leave returns
@@ -198,8 +212,9 @@ public interface IRaft
     /// </para>
     /// </summary>
     /// <param name="cancellationToken">
-    /// Bounds the attempt. Cancelling yields <see cref="LeaveClusterOutcome.Timeout"/>; the removal
-    /// may still commit, so re-read the roster before concluding anything.
+    /// Bounds the attempt. Cancelling yields <see cref="LeaveClusterOutcome.Timeout"/> (or a
+    /// drain rollback); the removal may still commit, so re-read the roster before concluding
+    /// anything.
     /// </param>
     public Task<LeaveClusterResult> RequestLeaveAsync(CancellationToken cancellationToken = default);
 

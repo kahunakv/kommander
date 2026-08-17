@@ -179,9 +179,16 @@ public sealed class ClusterMember
 - **Learner** — receives replication so it can catch up; does **not** count toward quorum and may not
   start or win elections.
 - **Voter** — full participant: counts toward quorum, can campaign, can be elected.
-- **Leaving** — a node that has begun a graceful leave. It still counts toward quorum until its
-  `RemoveMember` commits (so a leave-in-progress never shrinks the effective quorum prematurely), but
-  it stops *starting* elections.
+- **Leaving** — a committed roster state for a node whose decommission drain is in progress
+  (`RequestLeaveAsync` with replica placement active). The transition `Voter → Leaving` is a real
+  membership change: the node leaves the roster-level quorum at the commit point, exactly like a
+  removal — but it stays in every peer list (replication keeps flowing, which is what lets the
+  evacuating learners catch up from it) and it keeps counting toward the quorum of any *range*
+  whose committed replica set still names it, until that replica is explicitly dropped. It stops
+  campaigning while in this state, **reversibly**: a drain that is refused or times out rolls the
+  role back to `Voter`. Only one member may be `Leaving` at a time. (`LeaveCluster` also reports
+  `LocalRole == Leaving` locally via a latch, without any committed role change — that variant
+  does not drain.)
 - **NotMember** — not a stored role; it's the value `RaftManager.LocalRole` returns when the local
   node isn't in the committed roster at all.
 
@@ -205,8 +212,12 @@ because a user partition's quorum doesn't depend on the new member until *after*
 
 ### How the voter set is derived
 
-`RaftManager.Nodes` (the peer set every partition uses for quorum) is a **projection of the committed
-roster**: members with `Role == Voter`, excluding self. `ClusterHandler.UpdateNodes()` recomputes it
+`RaftManager.Nodes` (the peer set every partition uses for replication) is a **projection of the
+committed roster**: members with `Role == Voter`, `Learner`, or `Leaving`, excluding self. Learners
+receive replication without counting toward quorum; a `Leaving` member must stay in the peer set or
+its decommission drain wedges (the learners evacuating its ranges could never catch up). Quorum is
+never derived from this list directly — voter tallies always filter through the per-range committed
+replica set or the roster's `Voter` roles. `ClusterHandler.UpdateNodes()` recomputes it
 from the roster on each tick. Learners are included in the *replication* peer set (so the leader ships
 them entries) but are excluded from quorum math.
 
@@ -285,10 +296,51 @@ tighter control. Internally, `JoinCluster(seeds)`:
 await raft.LeaveCluster(dispose: true);
 ```
 
-`LeaveCluster` marks the node `Leaving` (so it stops campaigning immediately), commits a
+`LeaveCluster` marks the node `Leaving` locally (so it stops campaigning immediately), commits a
 `RemoveMember(self)` on P0, waits up to ~10 s for the removal to propagate back, then tears the node
 down regardless. If this node is the P0 leader, it commits its own removal under the old quorum and
-steps down so another node takes over.
+steps down so another node takes over. It never drains replicas — it is the shutdown-coupled
+variant.
+
+### Decommission a node (drain, then leave)
+
+```csharp
+LeaveClusterResult result = await raft.RequestLeaveAsync(ct);
+if (result.Left)
+    Environment.Exit(0);        // safe to stop: the roster no longer names this node
+```
+
+`RequestLeaveAsync` is the operator-driven decommission primitive. When per-partition replica
+placement is active (the committed map names this endpoint and `EnablePlacementRebalancer` is on),
+it runs a **drain-before-removal** sequence:
+
+1. Commits `Voter → Leaving` on the roster (refused with `RefusedDrainInProgress` if another
+   member is already draining, or `RefusedInsufficientVoters` if this is the last voter — in both
+   cases nothing changes and the node keeps serving).
+2. Waits — up to `DecommissionDrainTimeout`, default 2 minutes — while the placement pass on the
+   P0 leader evacuates every replica this node hosts onto survivors (add learner → catch up →
+   promote → shed the leaver's replica; one replica per range at a time, so no range ever drops
+   below its quorum mid-move).
+3. Commits `RemoveMember(self)` only once no range names the endpoint. The result carries
+   `Drained == true`.
+
+A drain that exceeds the timeout rolls the role back to `Voter` and returns `DrainTimedOut`; the
+node keeps serving and campaigning, and calling `RequestLeaveAsync` again **resumes** the drain
+(replicas already evacuated stay evacuated). If the placement pass finishes the evacuation and
+commits the removal while the timeout is firing, removal wins: the rollback observes the node
+already absent and the call reports `Committed` — a node never keeps serving while out of the
+committed roster. A node that crashes after `Leaving` commits is finished off by the pass itself:
+the next pass on the (possibly new) P0 leader keeps evacuating it and commits the final removal
+once no range names it.
+
+Clusters without placed replica sets (full replication, RF 0) or with the rebalancer off skip the
+drain and keep the historical direct-removal behaviour.
+
+> ⚠️ **Rolling-upgrade hazard:** a peer running a pre-drain version drops `Leaving` members from
+> its peer list (its `UpdateNodes` filter predates the role), which severs replication to the
+> draining node and wedges the drain. The drain's role-transition RPC (`SetMemberRole`) also does
+> not exist on old peers — it fails loudly there rather than silently degrading into an undrained
+> removal. Do not start a decommission drain against a mixed-version cluster.
 
 ---
 
@@ -319,18 +371,47 @@ New node                    P0 leader                      Other voters
 The key invariant: **quorum is unaffected during catch-up.** The original voters keep committing
 throughout; the new node is a pure receiver until promotion.
 
-### Leaving (graceful)
+### Leaving (graceful, shutdown-coupled — `LeaveCluster`)
 
 ```
 Leaving node                P0 leader
    |                            |
-   |  LocalRole = Leaving (stops campaigning, still counts to quorum)
+   |  LocalRole = Leaving (local latch: stops campaigning; no committed role change)
    |--LeaveRequest(endpoint)--->|
    |                            |--AppendLogs(RemoveMember)-->voters
    |                            |<--ack majority → commit → roster shrinks
    |<--LeaveResponse(ok)--------|
    |  shutdown
 ```
+
+### Leaving (decommission drain — `RequestLeaveAsync` with placement active)
+
+```
+Leaving node                P0 leader                       Survivors
+   |                            |                               |
+   |--SetMemberRole(Leaving)--->|                               |
+   |                            |--AppendLogs(members)--------->|   Voter → Leaving commits;
+   |<--ok-----------------------|                               |   only one drain at a time
+   |                            |                               |
+   |        [placement passes: per range hosted by the leaver]  |
+   |                            |--AddReplica(survivor)-------->|   learner catches up FROM the
+   |<====== replication ======> |                               |   leaver (it stays in Nodes)
+   |                            |--PromoteReplica-------------->|   survivor enters range quorum
+   |                            |--RemoveReplica(leaver)------->|   leaver's replica shed
+   |                            |                               |
+   |  [map no longer names the leaver — observed locally]       |
+   |--LeaveRequest(endpoint)--->|                               |
+   |                            |--AppendLogs(RemoveMember)---->|   roster shrinks
+   |<--LeaveResponse(ok)--------|                               |
+   |  caller decides when to stop the process (Drained == true) |
+```
+
+If the drain cannot complete within `DecommissionDrainTimeout`, the node sends
+`SetMemberRole(Voter)` to roll back and returns `DrainTimedOut` — unless the pass already
+committed the final removal, in which case the rollback finds the member absent and the leave
+reports `Committed` (removal wins). A P0 leader draining **itself** steps down from every
+partition it leads the moment its `Leaving` commits (Raft §6: a non-voter leader must not keep
+committing); the surviving voters elect a new P0 leader whose passes finish the drain.
 
 A removal that would drop the cluster below a viable quorum (zero voters) is refused with
 `InsufficientVoters` — a terminal status, so the caller gives up instead of retrying. (Going from 2
@@ -454,6 +535,11 @@ When you need to change or debug membership, start here.
 - `Kommander/RaftManager.cs`:
   - `JoinCluster` (both overloads), `ReceiveJoin` — join client + server.
   - `LeaveCluster`, `ReceiveLeave`, `CommitGracefulLeaveAsync` — graceful leave.
+  - `RequestLeaveAsync`, `DrainBeforeLeaveAsync`, `RollBackDrainAsync`, `CommitRoleTransitionAsync`,
+    `ReceiveSetMemberRole` — the decommission drain (client + P0-leader server).
+  - `RaftSystemCoordinator.TrySetMemberRole` — the committed `Voter ⇄ Leaving` transition and its
+    guards; `ReplicaPlacementService.RunPlacementPassAsync` — evacuation, the drop of a leaver's
+    transitional learner, and the drain-completion sweep that removes a fully evacuated member.
   - `GossipAsync`, `ReceiveGossip` — one gossip round + receiver.
   - `PingAsync`, `ReceivePing`, `ReceivePingReq` — one SWIM probe round + receivers.
   - `LocalRole`, `GetMembership`, `OnMembershipChanged` — the public surface.
@@ -494,6 +580,7 @@ network; "stub" means it returns a default and the feature is inert (or worse) o
 | Roster commit / replication (Add/Promote/Remove) | ✅ wired | ✅ wired | ✅ wired |
 | Join RPC | ✅ wired | ✅ wired | ✅ wired |
 | Graceful leave RPC (`SendLeave`) | ✅ wired | ✅ wired | ✅ wired |
+| Drain role transition (`SendSetMemberRole`) | ✅ wired | ✅ wired | ✅ wired |
 | Cross-partition lag (`GetRemoteFollowerLag`) | ✅ wired | ✅ wired | ✅ wired |
 | Gossip anti-entropy (`SendGossip`) | ✅ wired | ✅ wired | ✅ wired |
 | SWIM probes (`SendPing`/`SendPingReq`) | ✅ wired | ✅ wired | ✅ wired |
@@ -514,12 +601,20 @@ as capabilities land — it's the first thing a confused operator checks.
 3. Confirm: `raft.GetMembership()` on any node shows the new endpoint with `Role == Voter`.
 
 ### Remove a node (planned)
-1. Call `LeaveCluster(dispose: true)` on the node being retired. This works on every transport —
-   it commits a `RemoveMember` on P0 before the node stops.
-2. Confirm the roster on a surviving node no longer lists it and `MembershipVersion` advanced.
-3. If a node crashes without a graceful leave, the SWIM failure detector will evict it automatically
+1. Prefer `RequestLeaveAsync()` on the node being retired: with replica placement active it
+   evacuates the node's replicas onto survivors **before** committing the removal, and its result
+   says when stopping the process is safe (`result.Left`, with `result.Drained` reporting whether
+   evacuation happened). Handle `RefusedDrainInProgress` (another decommission is running — retry
+   later) and `DrainTimedOut` (role rolled back; the node is still a full member — retry resumes
+   the drain). Decommission one node at a time.
+2. `LeaveCluster(dispose: true)` remains the shutdown-coupled variant — it commits a
+   `RemoveMember` on P0 before the node stops, without draining replicas.
+3. Confirm the roster on a surviving node no longer lists it and `MembershipVersion` advanced.
+4. If a node crashes without a graceful leave, the SWIM failure detector will evict it automatically
    after `SuspicionTimeout` + `DeadMemberEvictionGrace`. You can also force removal with an explicit
-   `LeaveCluster` call from any surviving node.
+   `LeaveCluster` call from any surviving node. A node that crashes mid-drain (roster role stuck at
+   `Leaving`) is finished off by the placement pass: it keeps evacuating and commits the removal
+   once no range names the endpoint.
 
 ### Replace a dead node
 1. The SWIM detector evicts the dead endpoint automatically after `SuspicionTimeout` + `DeadMemberEvictionGrace`.

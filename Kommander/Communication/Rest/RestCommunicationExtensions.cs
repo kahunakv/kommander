@@ -191,6 +191,14 @@ public static class RestCommunicationExtensions
             return await manager.ReceiveLeave(request, httpContext.RequestAborted).ConfigureAwait(false);
         });
 
+        app.MapPost($"{RaftRoutePrefix}/set-member-role", async (SetMemberRoleRequest request, IRaft raft, HttpContext httpContext) =>
+        {
+            if (raft is not RaftManager manager)
+                return new SetMemberRoleResponse(false, Status: RaftOperationStatus.Errored);
+
+            return await manager.ReceiveSetMemberRole(request, httpContext.RequestAborted).ConfigureAwait(false);
+        });
+
         app.MapPost($"{RaftRoutePrefix}/get-follower-lag", async (GetFollowerLagRequest request, IRaft raft) =>
         {
             if (raft is not RaftManager manager)

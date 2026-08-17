@@ -40,6 +40,7 @@ public sealed class RaftTimerService : IDisposable
     private Timer? _gossipTimer;
     private Timer? _pingTimer;
     private Timer? _balancerTimer;
+    private Timer? _placementTimer;
 
     private volatile bool _started;
     private volatile bool _stopped;
@@ -70,6 +71,8 @@ public sealed class RaftTimerService : IDisposable
     private readonly TimeSpan _pingInterval;
     private readonly TimeSpan _balancerInterval;
     private readonly bool _balancerEnabled;
+    private readonly TimeSpan _placementInterval;
+    private readonly bool _placementEnabled;
     private readonly TimeSpan _initialDelay;
 
     public RaftTimerService(
@@ -87,6 +90,8 @@ public sealed class RaftTimerService : IDisposable
         _pingInterval = configuration.PingInterval;
         _balancerInterval = configuration.LeaderBalancerInterval;
         _balancerEnabled = configuration.EnableLeaderBalancer;
+        _placementInterval = configuration.PlacementPassInterval;
+        _placementEnabled = configuration.PlacementPassEnabled;
         _initialDelay = initialDelay ?? configuration.TimerInitialDelay;
         _enableHotSet = configuration.EnableSharedExecutorPool;
         // Safety sweep every ~UpdateNodesInterval (e.g. 5 s / 250 ms = 20 ticks), minimum 1.
@@ -147,6 +152,19 @@ public sealed class RaftTimerService : IDisposable
                 _balancerInterval
             );
         }
+
+        // Replica placement runs on its own cadence, independent of the leader balancer —
+        // gated on PlacementPassEnabled (RF > 0 or the rebalancer flag), with a non-positive
+        // interval treated as disabled, like the SWIM PingInterval above.
+        if (_placementEnabled && _placementInterval > TimeSpan.Zero)
+        {
+            _placementTimer = new Timer(
+                _ => TriggerPlacement(),
+                null,
+                _initialDelay,
+                _placementInterval
+            );
+        }
     }
 
     /// <summary>
@@ -164,6 +182,7 @@ public sealed class RaftTimerService : IDisposable
         _gossipTimer?.Change(Timeout.Infinite, Timeout.Infinite);
         _pingTimer?.Change(Timeout.Infinite, Timeout.Infinite);
         _balancerTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+        _placementTimer?.Change(Timeout.Infinite, Timeout.Infinite);
     }
 
     /// <summary>
@@ -340,6 +359,22 @@ public sealed class RaftTimerService : IDisposable
         _host.TriggerBalancerPass();
     }
 
+    /// <summary>
+    /// Enqueues one replica-placement controller pass into the system coordinator.
+    ///
+    /// <para>Invoked by the internal placement timer, but public so tests can drive
+    /// a pass deterministically without waiting for a real timer tick. Like
+    /// <see cref="TriggerBalancer"/> it only enqueues into the coordinator's unbounded
+    /// channel, so no overlapping-tick interlock is needed.</para>
+    /// </summary>
+    public void TriggerPlacement()
+    {
+        if (_stopped || !_host.Joined)
+            return;
+
+        _host.TriggerPlacementPass();
+    }
+
     public void Dispose()
     {
         GC.SuppressFinalize(this);
@@ -349,5 +384,6 @@ public sealed class RaftTimerService : IDisposable
         _gossipTimer?.Dispose();
         _pingTimer?.Dispose();
         _balancerTimer?.Dispose();
+        _placementTimer?.Dispose();
     }
 }

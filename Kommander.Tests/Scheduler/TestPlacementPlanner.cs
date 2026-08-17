@@ -276,17 +276,126 @@ public sealed class TestPlacementPlanner
     }
 
     [Fact]
-    public void Plan_ZeroTransferBudget_YieldsNoMoves()
+    public void Plan_ZeroBudgets_YieldNoMoves()
     {
         PlacementView view = new()
         {
             Ranges = [Range(1, 3, ["a:1", "b:1"])],
             Nodes = [Node("a:1"), Node("b:1"), Node("c:1"), Node("d:1")],
             MaxMoves = 4,
-            TransferBudget = 0
+            TransferBudget = 0,
+            RepairBudget = 0
         };
 
         Assert.Empty(PlacementPlanner.Plan(view));
+    }
+
+    // ── Plan: repair vs balance budgets ───────────────────────────────────────
+
+    [Fact]
+    public void Plan_ZeroTransferBudget_RepairStillEmitted()
+    {
+        // Durability work must not be rate-limited by the cosmetic-balance budget: a repair
+        // proceeds even when the transfer budget is exhausted.
+        PlacementView view = new()
+        {
+            Ranges = [Range(1, 3, ["a:1", "b:1"])],
+            Nodes = [Node("a:1"), Node("b:1"), Node("c:1"), Node("d:1")],
+            MaxMoves = 4,
+            TransferBudget = 0,
+            RepairBudget = 1
+        };
+
+        PlacementMove repair = Assert.Single(PlacementPlanner.Plan(view));
+        Assert.Equal(PlacementMoveKind.AddReplica, repair.Kind);
+    }
+
+    [Fact]
+    public void Plan_RepairBudget_AllowsConcurrentRepairs()
+    {
+        // The old shared budget of 1 serialized a multi-node drain to ~one relocation per
+        // 3-pass cycle. Three under-replicated ranges with RepairBudget=3 must all repair in
+        // one plan even though the balance budget is 1.
+        PlacementView view = new()
+        {
+            Ranges =
+            [
+                Range(1, 3, ["a:1", "b:1"]),
+                Range(2, 3, ["a:1", "b:1"]),
+                Range(3, 3, ["a:1", "b:1"])
+            ],
+            Nodes = [Node("a:1"), Node("b:1"), Node("c:1"), Node("d:1")],
+            MaxMoves = 4,
+            TransferBudget = 1,
+            RepairBudget = 3
+        };
+
+        List<PlacementMove> moves = PlacementPlanner.Plan(view);
+
+        Assert.Equal(3, moves.Count);
+        Assert.All(moves, m => Assert.Equal(PlacementMoveKind.AddReplica, m.Kind));
+    }
+
+    [Fact]
+    public void Plan_RepairsConsumeTransferBudget_BalanceYieldsDuringRepairWave()
+    {
+        // Any emitted repair consumes transfer bandwidth, so with TransferBudget=1 a single
+        // repair suppresses the cosmetic trim of the over-replicated range in the same plan.
+        PlacementView view = new()
+        {
+            Ranges =
+            [
+                Range(1, 3, ["a:1", "b:1"]),               // under-replicated → repair
+                Range(2, 3, ["a:1", "b:1", "c:1", "d:1"])  // over-replicated → cosmetic trim
+            ],
+            Nodes = [Node("a:1"), Node("b:1"), Node("c:1"), Node("d:1")],
+            MaxMoves = 4,
+            TransferBudget = 1,
+            RepairBudget = 3
+        };
+
+        PlacementMove move = Assert.Single(PlacementPlanner.Plan(view));
+        Assert.Equal(1, move.PartitionId);
+        Assert.Equal(PlacementMoveKind.AddReplica, move.Kind);
+    }
+
+    [Fact]
+    public void Plan_EvictedShed_DrawsOnRepairBudget()
+    {
+        // Shedding a replica stranded on an evicted node completes a repair — it must proceed
+        // on the repair budget even with the transfer budget exhausted.
+        PlacementView view = new()
+        {
+            Ranges = [Range(1, 3, ["a:1", "b:1", "c:1", "gone:1"])],
+            Nodes = [Node("a:1"), Node("b:1"), Node("c:1")],
+            MaxMoves = 4,
+            TransferBudget = 0,
+            RepairBudget = 1
+        };
+
+        PlacementMove shed = Assert.Single(PlacementPlanner.Plan(view));
+        Assert.Equal(PlacementMoveKind.RemoveReplica, shed.Kind);
+        Assert.Equal("gone:1", shed.Endpoint);
+    }
+
+    [Fact]
+    public void Plan_CosmeticTrim_DrawsOnTransferBudgetOnly()
+    {
+        // A trim of a cosmetically-excess healthy voter is balance work: it proceeds with the
+        // repair budget at 0, and is blocked when the transfer budget is 0.
+        PlacementView Trim(int transferBudget) => new()
+        {
+            Ranges = [Range(1, 3, ["a:1", "b:1", "c:1", "d:1"])],
+            Nodes = [Node("a:1"), Node("b:1"), Node("c:1"), Node("d:1")],
+            MaxMoves = 4,
+            TransferBudget = transferBudget,
+            RepairBudget = 0
+        };
+
+        PlacementMove trim = Assert.Single(PlacementPlanner.Plan(Trim(1)));
+        Assert.Equal(PlacementMoveKind.RemoveReplica, trim.Kind);
+
+        Assert.Empty(PlacementPlanner.Plan(Trim(0)));
     }
 
     [Fact]

@@ -19,9 +19,14 @@ namespace Kommander.System.Placement;
 /// </list>
 /// Stability rules: never more than one move per range per plan (single mover), never a move for
 /// a range that already has a transitional replica, prefer the current placement on ties (churn
-/// costs more than perfection), and cap the plan at <see cref="PlacementView.MaxMoves"/> /
-/// <see cref="PlacementView.TransferBudget"/>. The planner holds no state — determinism comes
-/// from ordering by partition id and endpoint.
+/// costs more than perfection), and cap the plan at <see cref="PlacementView.MaxMoves"/> total.
+/// Moves are budgeted by class: repairs (priority 1, and priority-2 sheds of replicas on nodes
+/// that left the roster) draw on <see cref="PlacementView.RepairBudget"/>; balance moves
+/// (priority-2 cosmetic trims and priority-3 skew adds) draw on
+/// <see cref="PlacementView.TransferBudget"/>, against which repairs emitted in the same plan
+/// also count — so durability work is never throttled by the balance budget, while balance work
+/// yields to an in-flight repair wave. The planner holds no state — determinism comes from
+/// ordering by partition id and endpoint.
 /// </para>
 /// </summary>
 public static class PlacementPlanner
@@ -30,8 +35,15 @@ public static class PlacementPlanner
     {
         List<PlacementMove> moves = [];
 
-        int budget = Math.Min(view.MaxMoves, view.TransferBudget);
-        if (budget <= 0)
+        // Per-class budgets: repairs consume repairBudget only; balance moves are additionally
+        // capped so that repairs + balance emitted here never exceed TransferBudget — any
+        // transfer consumes bandwidth regardless of class, so total in-flight transitions stay
+        // bounded by max(MaxConcurrentReplicaRepairs, MaxConcurrentReplicaTransfers).
+        int repairsUsed = 0;
+        bool RepairAllowed() => moves.Count < view.MaxMoves && repairsUsed < view.RepairBudget;
+        bool BalanceAllowed() => moves.Count < view.MaxMoves && moves.Count < view.TransferBudget;
+
+        if (view.MaxMoves <= 0 || (view.RepairBudget <= 0 && view.TransferBudget <= 0))
             return moves;
 
         List<CandidateNode> alive = view.Nodes
@@ -66,11 +78,11 @@ public static class PlacementPlanner
 
         HashSet<int> touched = [];
 
-        // ── Priority 1: repair under-replication ─────────────────────────────
+        // ── Priority 1: repair under-replication (repair budget) ─────────────
         foreach (RangePlacement range in actionable)
         {
-            if (moves.Count >= budget)
-                return moves;
+            if (!RepairAllowed())
+                break;
 
             int effectiveRf = Math.Min(range.ReplicationFactor, alive.Count);
             int healthyVoters = range.VoterEndpoints.Count(aliveEndpoints.Contains);
@@ -83,6 +95,7 @@ public static class PlacementPlanner
                 continue;
 
             moves.Add(new PlacementMove(range.PartitionId, PlacementMoveKind.AddReplica, target));
+            repairsUsed++;
             replicaCount[target]++;
             touched.Add(range.PartitionId);
         }
@@ -90,8 +103,8 @@ public static class PlacementPlanner
         // ── Priority 2: trim over-replication (incl. replicas on dead/evicted nodes) ──
         foreach (RangePlacement range in actionable)
         {
-            if (moves.Count >= budget)
-                return moves;
+            if (!RepairAllowed() && !BalanceAllowed())
+                break;
 
             if (touched.Contains(range.PartitionId))
                 continue;
@@ -101,6 +114,7 @@ public static class PlacementPlanner
 
             // A replica on a node no longer in the roster is dead weight; shed it as soon as
             // the healthy voters alone satisfy RF (otherwise priority 1 repairs first).
+            // This shed completes a repair, so it draws on the repair budget.
             string? evicted = range.VoterEndpoints
                 .Where(e => !rosterEndpoints.Contains(e))
                 .OrderBy(e => e, StringComparer.Ordinal)
@@ -108,12 +122,20 @@ public static class PlacementPlanner
 
             if (evicted is not null && healthyVoters >= effectiveRf)
             {
+                if (!RepairAllowed())
+                    continue;
+
                 moves.Add(new PlacementMove(range.PartitionId, PlacementMoveKind.RemoveReplica, evicted));
+                repairsUsed++;
                 touched.Add(range.PartitionId);
                 continue;
             }
 
             if (healthyVoters <= effectiveRf)
+                continue;
+
+            // Shedding a cosmetically-excess healthy voter is balance work.
+            if (!BalanceAllowed())
                 continue;
 
             // Most-loaded healthy voter, preferring non-leader victims.
@@ -132,7 +154,7 @@ public static class PlacementPlanner
             touched.Add(range.PartitionId);
         }
 
-        // ── Priority 3: balance replica-count skew (deadband-gated) ──────────
+        // ── Priority 3: balance replica-count skew (deadband-gated, balance budget) ──
         int totalReplicas = replicaCount.Values.Sum();
         int ceiling = (totalReplicas + alive.Count - 1) / alive.Count; // even-spread ceiling
 
@@ -140,7 +162,7 @@ public static class PlacementPlanner
                      .OrderByDescending(n => replicaCount.GetValueOrDefault(n.Endpoint))
                      .ThenBy(n => n.Endpoint, StringComparer.Ordinal))
         {
-            if (moves.Count >= budget)
+            if (!BalanceAllowed())
                 return moves;
 
             if (replicaCount.GetValueOrDefault(donor.Endpoint) <= ceiling + view.ReplicaCountDeadband)

@@ -44,6 +44,14 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// </summary>
     internal Func<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)>? _replicateAttemptHookForTesting;
 
+    /// <summary>
+    /// Test-only seam. When non-null, replaces <see cref="AmILeaderQuick"/> so coordinator
+    /// harness tests (which never call <see cref="JoinCluster(CancellationToken)"/> and therefore
+    /// have no system partition) can exercise P0-leader-gated paths such as the replica-placement
+    /// controller pass. Left null in production; the only cost is one field read per call.
+    /// </summary>
+    internal Func<int, ValueTask<bool>>? _amILeaderQuickHookForTesting;
+
     internal readonly string LocalEndpoint;
 
     internal readonly string LocalNodeName;
@@ -1078,6 +1086,72 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
+    /// Handles an inbound <see cref="SetMemberRoleRequest"/>: a roster role transition for the
+    /// decommission drain (<c>Voter → Leaving</c> to start, <c>Leaving → Voter</c> to roll back).
+    /// <para>
+    /// Mirrors <see cref="ReceiveLeave"/>: only the P0 leader commits; a non-leader returns
+    /// <see cref="SetMemberRoleResponse.LeaderHint"/>. The coordinator's verdict travels back in
+    /// <see cref="SetMemberRoleResponse.Status"/> so the caller can tell a retryable rejection
+    /// (concurrent change) from a permanent one (insufficient voters, drain already in flight)
+    /// and — critically for the rollback race — from
+    /// <see cref="RaftOperationStatus.MemberNotFound"/>, which means the placement pass already
+    /// committed the final removal and the node must treat itself as departed.
+    /// </para>
+    /// </summary>
+    public async Task<SetMemberRoleResponse> ReceiveSetMemberRole(SetMemberRoleRequest request, CancellationToken cancellationToken = default)
+    {
+        // Fail-fast when this node has already stopped — the coordinator channel is closed
+        // and posting to it would block until the per-attempt CTS fires.
+        if (systemCoordinator.IsStopped)
+            return new SetMemberRoleResponse(false, Status: RaftOperationStatus.Errored);
+
+        if (systemPartition is null || !IsInitialized)
+            return new SetMemberRoleResponse(false, Status: RaftOperationStatus.Errored);
+
+        bool isLeader = await AmILeaderQuick(RaftSystemConfig.SystemPartition).ConfigureAwait(false);
+        if (!isLeader)
+        {
+            string leaderHint = systemPartition.Leader;
+            return new SetMemberRoleResponse(false, string.IsNullOrEmpty(leaderHint) ? null : leaderHint, RaftOperationStatus.NodeIsNotLeader);
+        }
+
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using CancellationTokenRegistration reg = cancellationToken.Register(
+            () => tcs.TrySetCanceled(cancellationToken));
+
+        systemCoordinator.Send(new RaftSystemRequest(
+            RaftSystemRequestType.SetMemberRole,
+            request.Endpoint,
+            request.NodeId,
+            systemCoordinator.GetMembership().MembershipVersion,
+            request.TargetRole,
+            tcs));
+
+        try
+        {
+            (RaftOperationStatus status, long version) = await tcs.Task.ConfigureAwait(false);
+
+            if (status == RaftOperationStatus.Success)
+                return new SetMemberRoleResponse(true, null, RaftOperationStatus.Success, version);
+
+            // Terminal verdicts carry no hint — retrying against any leader cannot change them.
+            if (status is RaftOperationStatus.InsufficientVoters or RaftOperationStatus.MemberNotFound or RaftOperationStatus.DrainInProgress)
+                return new SetMemberRoleResponse(false, null, status, version);
+
+            // Concurrent change or stale version — caller retries with the current leader.
+            return new SetMemberRoleResponse(false, LocalEndpoint, status, version);
+        }
+        catch (OperationCanceledException)
+        {
+            // Per-attempt timeout or caller cancelled — caller retries or gives up.
+        }
+
+        return new SetMemberRoleResponse(false, LocalEndpoint, RaftOperationStatus.Errored);
+    }
+
+    /// <summary>
     /// Installs a partition snapshot received from the partition leader.
     /// Called on a follower when the leader delivers one chunk of a snapshot transfer.
     ///
@@ -1440,9 +1514,12 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// Leaves the cluster.
     /// <para>
     /// When the local node is part of a committed roster (MembershipVersion &gt; 0) this method
-    /// first transitions the node to the <see cref="System.ClusterMemberRole.Leaving"/> role
-    /// (suppressing elections immediately), commits a <c>RemoveMember</c> entry on P0, and
+    /// first sets the <b>local</b> <see cref="_leaving"/> latch — <see cref="LocalRole"/> then
+    /// reports <see cref="System.ClusterMemberRole.Leaving"/>, suppressing elections immediately;
+    /// this is not a committed roster change and no replica drain happens — commits a
+    /// <c>RemoveMember</c> entry on P0, and
     /// waits up to 10 s for the removal to propagate back to this node before tearing down.
+    /// Use <see cref="RequestLeaveAsync"/> for a decommission that evacuates replicas first.
     /// If the cluster has no committed roster (pre-seed transient or test teardown path), or if
     /// the roster contains no other <c>Voter</c> peer, the round-trip is skipped and the node
     /// stops immediately (single-voter short-circuit — no 10 s spin).
@@ -1518,6 +1595,21 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// remains the shutdown-coupled variant that always proceeds to stop.
     /// </para>
     /// <para>
+    /// <b>Drain-before-removal:</b> when the committed partition map names this endpoint in any
+    /// replica set, the method first commits the <see cref="System.ClusterMemberRole.Leaving"/>
+    /// roster role and waits (up to <see cref="RaftConfiguration.DecommissionDrainTimeout"/>) for
+    /// the placement pass to evacuate every replica onto survivors; only then does it commit the
+    /// removal, and the result carries <see cref="LeaveClusterResult.Drained"/> = true. A drain
+    /// that cannot start is refused (<see cref="LeaveClusterOutcome.RefusedDrainInProgress"/> /
+    /// <see cref="LeaveClusterOutcome.RefusedInsufficientVoters"/>) and the node keeps serving; a
+    /// drain that times out rolls the role back to Voter
+    /// (<see cref="LeaveClusterOutcome.DrainTimedOut"/>) — unless the placement pass finished the
+    /// evacuation and committed the removal first, in which case removal wins and the result is
+    /// <see cref="LeaveClusterOutcome.Committed"/>. Full-replication clusters (no replica sets)
+    /// and deployments with <see cref="RaftConfiguration.EnablePlacementRebalancer"/> off (no
+    /// evacuation machinery exists there) keep the historical direct-removal behaviour unchanged.
+    /// </para>
+    /// <para>
     /// Campaigning is left alone until the removal commits, and suppressed for good afterwards: a
     /// node that was refused — or whose attempt failed — is still a full member and must keep
     /// participating, while one that left must not contend for leadership it no longer has a claim
@@ -1556,6 +1648,38 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             if (!roster.Members.Any(m => string.Equals(m.Endpoint, LocalEndpoint, StringComparison.Ordinal)))
                 return new(LeaveClusterOutcome.NotAMember, roster.MembershipVersion);
 
+            // ── Decommission drain ────────────────────────────────────────────────────
+            // Only when the committed map actually names this endpoint in a replica set (or a
+            // previous drain is being resumed — the role is already Leaving). Full-replication
+            // clusters (RF 0) have nothing to evacuate: every survivor already holds the data,
+            // so they keep the historical direct-removal path bit-for-bit.
+            //
+            // Also gated on EnablePlacementRebalancer: evacuation is planned by the placement
+            // rebalancer (priority-1 repair adds + the trim of the leaver's replica), so with
+            // the flag off a committed Leaving role would sit un-evacuated until the drain
+            // timeout and roll back — a guaranteed 2-minute wedge. Such deployments keep the
+            // historical direct removal (and its historical consequence: repairs are manual).
+            bool drained = false;
+            System.ClusterMemberRole selfRole =
+                roster.Members.First(m => string.Equals(m.Endpoint, LocalEndpoint, StringComparison.Ordinal)).Role;
+
+            if (configuration.EnablePlacementRebalancer &&
+                (CommittedMapNamesLocalEndpoint() || selfRole == System.ClusterMemberRole.Leaving))
+            {
+                LeaveClusterResult? drainOutcome = await DrainBeforeLeaveAsync(selfRole, cancellationToken).ConfigureAwait(false);
+                if (drainOutcome is { } terminal)
+                {
+                    // A departure completed by the placement pass (removal won the race) must
+                    // stop campaigning for good, exactly like the normal removal path below.
+                    if (terminal.Left)
+                        _leaving = true;
+
+                    return terminal;
+                }
+
+                drained = true;
+            }
+
             // Campaigning is deliberately NOT suppressed while the attempt is in flight. The node
             // is still a full member until the removal commits, and the removal is committed by the
             // system-partition leader — so a node that has to win that election first (the last
@@ -1576,12 +1700,258 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             if (result.Left)
                 _leaving = true;
 
-            return result;
+            return drained ? result with { Drained = true } : result;
         }
         finally
         {
             leaveRequestLock.Release();
         }
+    }
+
+    /// <summary>
+    /// True when any committed range's replica set names the local endpoint (in any replica
+    /// role). Removed ranges are ignored — their replica sets are historical. This is the
+    /// drain-completion predicate: the decommission may commit its final <c>RemoveMember</c>
+    /// only once this turns false, and the placement pass uses the same rule for its
+    /// crash-resumption auto-removal so the two can never disagree.
+    /// </summary>
+    private bool CommittedMapNamesLocalEndpoint()
+    {
+        List<RaftPartitionRange> ranges = committedRanges;
+
+        foreach (RaftPartitionRange range in ranges)
+        {
+            if (range.State == RaftPartitionState.Removed)
+                continue;
+
+            foreach (RaftReplica replica in range.Replicas)
+            {
+                if (string.Equals(replica.Endpoint, LocalEndpoint, StringComparison.Ordinal))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// The drain leg of <see cref="RequestLeaveAsync"/>: commits <c>Voter → Leaving</c>, then
+    /// waits for the placement pass to evacuate every replica this node hosts.
+    /// <para>
+    /// Returns <c>null</c> when the drain completed and the caller should proceed to the normal
+    /// <c>RemoveMember</c> commit; returns a terminal <see cref="LeaveClusterResult"/> for every
+    /// other outcome — a refusal (nothing committed, the node keeps serving as a Voter), a
+    /// timeout (role rolled back to Voter so the campaign gates release the node), or a
+    /// departure already completed by the placement pass (removal won the rollback race).
+    /// </para>
+    /// <para>
+    /// Resumable: when <paramref name="selfRole"/> is already <c>Leaving</c> (a previous attempt
+    /// crashed or timed out without managing to roll back) the commit step is skipped and the
+    /// wait picks the drain up where it left off.
+    /// </para>
+    /// </summary>
+    private async Task<LeaveClusterResult?> DrainBeforeLeaveAsync(System.ClusterMemberRole selfRole, CancellationToken cancellationToken)
+    {
+        if (selfRole == System.ClusterMemberRole.Voter)
+        {
+            // Local fast-path guards for an immediate, actionable answer; the leader re-enforces
+            // both authoritatively inside TrySetMemberRole.
+            System.ClusterMembership roster = systemCoordinator.GetMembership();
+
+            if (roster.Members.Any(m => m.Role == System.ClusterMemberRole.Leaving))
+                return new(LeaveClusterOutcome.RefusedDrainInProgress, roster.MembershipVersion);
+
+            if (!roster.Members.Any(m => m.Role == System.ClusterMemberRole.Voter &&
+                                         !string.Equals(m.Endpoint, LocalEndpoint, StringComparison.Ordinal)))
+                return new(LeaveClusterOutcome.RefusedInsufficientVoters, roster.MembershipVersion);
+
+            (RaftOperationStatus status, _) = await CommitRoleTransitionAsync(System.ClusterMemberRole.Leaving, cancellationToken).ConfigureAwait(false);
+
+            switch (status)
+            {
+                case RaftOperationStatus.Success:
+                    break;
+
+                case RaftOperationStatus.InsufficientVoters:
+                    return new(LeaveClusterOutcome.RefusedInsufficientVoters, systemCoordinator.GetMembership().MembershipVersion);
+
+                case RaftOperationStatus.DrainInProgress:
+                    return new(LeaveClusterOutcome.RefusedDrainInProgress, systemCoordinator.GetMembership().MembershipVersion);
+
+                case RaftOperationStatus.MemberNotFound:
+                    // Already out of the roster — a previous removal committed. Departed.
+                    return new(LeaveClusterOutcome.Committed, systemCoordinator.GetMembership().MembershipVersion);
+
+                default:
+                    // Timeout / no leader / pre-drain peer (the RPC failed loudly). The commit
+                    // may still have landed — proceed only if the roster already shows Leaving,
+                    // otherwise report an unconfirmed attempt: nothing changed, the node keeps
+                    // serving. This is also the mixed-version escape hatch: a cluster whose P0
+                    // leader predates SetMemberRole refuses the drain here instead of silently
+                    // removing the node undrained.
+                    System.ClusterMember? self = systemCoordinator.GetMembership().Members
+                        .FirstOrDefault(m => string.Equals(m.Endpoint, LocalEndpoint, StringComparison.Ordinal));
+
+                    if (self?.Role != System.ClusterMemberRole.Leaving)
+                        return new(LeaveClusterOutcome.Timeout, systemCoordinator.GetMembership().MembershipVersion);
+
+                    break;
+            }
+        }
+
+        // ── Wait for evacuation ──────────────────────────────────────────────
+        // The placement pass on the P0 leader does the work; this loop only observes committed
+        // state. Two exits besides timeout: the map stops naming us (drained — proceed to the
+        // final removal), or the roster stops naming us (the pass finished the drain AND
+        // committed the removal itself — crash-resumption path, nothing left to do).
+        ValueStopwatch drainStopwatch = ValueStopwatch.StartNew();
+        long drainDeadlineMs = (long)configuration.DecommissionDrainTimeout.TotalMilliseconds;
+
+        while (true)
+        {
+            if (!systemCoordinator.GetMembership().Members.Any(m => string.Equals(m.Endpoint, LocalEndpoint, StringComparison.Ordinal)))
+                return new(LeaveClusterOutcome.Committed, systemCoordinator.GetMembership().MembershipVersion, Drained: true);
+
+            if (!CommittedMapNamesLocalEndpoint())
+                return null;
+
+            if (cancellationToken.IsCancellationRequested || drainStopwatch.GetElapsedMilliseconds() > drainDeadlineMs)
+                return await RollBackDrainAsync().ConfigureAwait(false);
+
+            try
+            {
+                await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return await RollBackDrainAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Rolls a timed-out or cancelled drain back to <c>Voter</c> so the campaign gates release
+    /// the node. Runs on <see cref="CancellationToken.None"/> deliberately: the rollback must be
+    /// attempted even when the caller's token already fired, or the node is left durably
+    /// <c>Leaving</c> and never campaigns again.
+    /// <para>
+    /// Removal-wins precedence: if the placement pass committed the final <c>RemoveMember</c>
+    /// while the timeout was firing, the rollback observes
+    /// <see cref="RaftOperationStatus.MemberNotFound"/> (or the roster no longer names us) and
+    /// reports the leave as <b>completed</b> — the node must never keep serving while out of the
+    /// committed roster.
+    /// </para>
+    /// </summary>
+    private async Task<LeaveClusterResult> RollBackDrainAsync()
+    {
+        (RaftOperationStatus status, _) = await CommitRoleTransitionAsync(System.ClusterMemberRole.Voter, CancellationToken.None).ConfigureAwait(false);
+
+        System.ClusterMembership after = systemCoordinator.GetMembership();
+        bool stillPresent = after.Members.Any(m => string.Equals(m.Endpoint, LocalEndpoint, StringComparison.Ordinal));
+
+        if (status == RaftOperationStatus.MemberNotFound || !stillPresent)
+            return new(LeaveClusterOutcome.Committed, after.MembershipVersion, Drained: true);
+
+        if (status != RaftOperationStatus.Success)
+            // The rollback itself could not be confirmed (e.g. no reachable P0 leader). The node
+            // may be durably Leaving: it keeps serving its ranges but cannot campaign, and the
+            // next placement pass keeps evacuating it. Retrying RequestLeaveAsync resumes the
+            // drain; the warning is the operator's cue that this node needs attention.
+            Logger.LogWarning("RequestLeaveAsync: drain timed out and the rollback to Voter was not confirmed ({Status}); the roster may still show this node as Leaving.", status);
+
+        return new(LeaveClusterOutcome.DrainTimedOut, after.MembershipVersion);
+    }
+
+    /// <summary>
+    /// Commits a roster role transition for the local node, retrying against the current P0
+    /// leader until it commits or a 10 s deadline expires — the same discipline as
+    /// <see cref="CommitGracefulLeaveAsync"/> (self fast-path when this node is the leader,
+    /// 3 s per-attempt bound, capped polling while the leader is unknown).
+    /// <para>
+    /// Returns the coordinator's verdict. Terminal verdicts
+    /// (<see cref="RaftOperationStatus.InsufficientVoters"/>,
+    /// <see cref="RaftOperationStatus.DrainInProgress"/>,
+    /// <see cref="RaftOperationStatus.MemberNotFound"/>) are returned immediately;
+    /// retryable rejections keep looping within the deadline. An expired deadline returns
+    /// <see cref="RaftOperationStatus.ProposalTimeout"/> — the commit may still have landed, so
+    /// callers must re-read the roster before concluding anything.
+    /// </para>
+    /// </summary>
+    private async Task<(RaftOperationStatus Status, long Version)> CommitRoleTransitionAsync(
+        System.ClusterMemberRole targetRole,
+        CancellationToken cancellationToken)
+    {
+        const int deadlineMs = 10_000;
+        const int attemptTimeoutMs = 3_000;
+        const int maxEmptyLeaderPolls = 5;
+
+        ValueStopwatch sw = ValueStopwatch.StartNew();
+        SetMemberRoleRequest request = new(LocalEndpoint, configuration.NodeId, targetRole);
+        int emptyLeaderPolls = 0;
+
+        while (sw.GetElapsedMilliseconds() < deadlineMs)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return (RaftOperationStatus.OperationCancelled, 0);
+
+            try
+            {
+                bool amLeader = systemPartition is not null &&
+                    await AmILeaderQuick(RaftSystemConfig.SystemPartition).ConfigureAwait(false);
+
+                string? leaderEndpoint = amLeader ? LocalEndpoint : systemPartition?.Leader;
+
+                if (string.IsNullOrEmpty(leaderEndpoint))
+                {
+                    if (++emptyLeaderPolls >= maxEmptyLeaderPolls)
+                        return (RaftOperationStatus.NodeIsNotLeader, 0);
+
+                    await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+
+                emptyLeaderPolls = 0;
+
+                using CancellationTokenSource attemptCts =
+                    CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                attemptCts.CancelAfter(attemptTimeoutMs);
+
+                // Self fast-path mirrors CommitGracefulLeaveAsync: the transport cannot always
+                // route to the local endpoint.
+                SetMemberRoleResponse resp = amLeader
+                    ? await ReceiveSetMemberRole(request, attemptCts.Token).ConfigureAwait(false)
+                    : await communication.SendSetMemberRole(this, new RaftNode(leaderEndpoint), request, attemptCts.Token).ConfigureAwait(false);
+
+                if (resp.Success)
+                    return (RaftOperationStatus.Success, resp.MembershipVersion);
+
+                if (resp.Status is RaftOperationStatus.InsufficientVoters
+                    or RaftOperationStatus.DrainInProgress
+                    or RaftOperationStatus.MemberNotFound)
+                    return (resp.Status, resp.MembershipVersion);
+
+                await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return (RaftOperationStatus.OperationCancelled, 0);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("CommitRoleTransition({TargetRole}): {Message}", targetRole, ex.Message);
+
+                try
+                {
+                    await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return (RaftOperationStatus.OperationCancelled, 0);
+                }
+            }
+        }
+
+        return (RaftOperationStatus.ProposalTimeout, 0);
     }
 
     /// <summary>
@@ -1874,8 +2244,13 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     void Scheduling.IRaftTimerHost.TriggerBalancerPass()
     {
         systemCoordinator.Send(new System.RaftSystemRequest(System.RaftSystemRequestType.RunBalancerPass));
-        // Replica placement shares the balancer cadence: the pass self-gates on P0 leadership
-        // and no-ops when no range has an assigned replica set.
+    }
+
+    void Scheduling.IRaftTimerHost.TriggerPlacementPass()
+    {
+        // Deliberately not sent from TriggerBalancerPass: placement runs on its own
+        // PlacementPassInterval cadence so it works with the leader balancer disabled.
+        // The pass self-gates on P0 leadership and no-ops when no range has replicas.
         systemCoordinator.Send(new System.RaftSystemRequest(System.RaftSystemRequestType.RunPlacementPass));
     }
 
@@ -2911,12 +3286,19 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
-    /// Checks if the local node is the leader in the given partition
+    /// Checks if the local node is the leader in the given partition. Throws the typed
+    /// <see cref="PartitionNotHostedException"/> for a committed range this node does not host
+    /// (the documented routing contract — see <c>TestPartitionNotHosted</c>), so callers that
+    /// legitimately ask about non-hosted ranges (e.g. the P0 placement controller) must gate on
+    /// <see cref="HostsPartition"/> first instead of calling blind.
     /// </summary>
     /// <param name="partitionId"></param>
     /// <returns></returns>
     public async ValueTask<bool> AmILeaderQuick(int partitionId)
     {
+        if (_amILeaderQuickHookForTesting is { } hook)
+            return await hook(partitionId).ConfigureAwait(false);
+
         if (!IsInitialized)
             return false;
 

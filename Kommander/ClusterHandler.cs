@@ -70,11 +70,22 @@ public sealed class ClusterHandler
 
         if (roster.MembershipVersion > 0)
         {
-            // Roster is committed — include Voters and Learners (excluding self) so that
-            // the leader sends heartbeats and replication traffic to joining nodes.
-            // Learners participate in log replication but not in quorum calculation.
+            // Roster is committed — include Voters, Learners, and Leaving members (excluding
+            // self) so that the leader sends heartbeats and replication traffic to joining and
+            // departing nodes alike. Learners participate in log replication but not in quorum
+            // calculation.
+            //
+            // Leaving looks like a correctness downgrade here but is the opposite: a draining
+            // node must stay in every peer list or the decommission wedges. The instant Leaving
+            // commits, the placement pass adds learners to evacuate the leaver's ranges — and
+            // those learners catch up FROM the leaver (or from a leader that still replicates to
+            // it). Dropping it from Nodes severs heartbeats and replication both ways, the
+            // evacuating learner never reaches the promotion lag, and the drain stalls forever.
+            // Quorum safety is unaffected: roster-level quorums count Voter roles only, and
+            // per-range quorums resolve against the committed replica set, which still names the
+            // leaver until its replica is explicitly dropped.
             manager.Nodes = roster.Members
-                .Where(m => (m.Role == ClusterMemberRole.Voter || m.Role == ClusterMemberRole.Learner)
+                .Where(m => (m.Role == ClusterMemberRole.Voter || m.Role == ClusterMemberRole.Learner || m.Role == ClusterMemberRole.Leaving)
                          && m.Endpoint != manager.LocalEndpoint)
                 .Select(m => new RaftNode(m.Endpoint))
                 .ToList();

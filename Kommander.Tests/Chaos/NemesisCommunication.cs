@@ -456,6 +456,14 @@ public sealed class NemesisCommunication : ICommunication
             () => () => _inner.SendLeave(manager, node, request, cancellationToken),
             new LeaveResponse(false), cancellationToken);
 
+    // Role transitions ride the Leave verb: they are the drain leg of the same decommission
+    // protocol, so a nemesis that drops/delays leaves perturbs the drain identically.
+    public Task<SetMemberRoleResponse> SendSetMemberRole(RaftManager manager, RaftNode node, SetMemberRoleRequest request, CancellationToken cancellationToken = default) =>
+        InterceptAsync(manager.LocalEndpoint, node.Endpoint, NemesisVerb.Leave, null, request.Endpoint,
+            () => _inner.SendSetMemberRole(manager, node, request, cancellationToken),
+            () => () => _inner.SendSetMemberRole(manager, node, request, cancellationToken),
+            new SetMemberRoleResponse(false, Status: RaftOperationStatus.Errored), cancellationToken);
+
     public Task<GossipAck> SendGossip(RaftManager manager, RaftNode node, GossipMessage digest, CancellationToken cancellationToken = default) =>
         InterceptAsync(manager.LocalEndpoint, node.Endpoint, NemesisVerb.Gossip, null, null,
             () => _inner.SendGossip(manager, node, digest, cancellationToken),

@@ -692,6 +692,44 @@ public class GrpcCommunication : ICommunication
     }
 
     /// <summary>
+    /// Sends a <see cref="SetMemberRoleRequest"/> to <paramref name="node"/> via the
+    /// <c>SetMemberRole</c> gRPC RPC. A pre-drain peer answers UNIMPLEMENTED, which surfaces
+    /// here as a failed response — the drain then fails loudly instead of silently degrading
+    /// into an immediate removal.
+    /// </summary>
+    public async Task<SetMemberRoleResponse> SendSetMemberRole(RaftManager manager, RaftNode node, SetMemberRoleRequest request, CancellationToken cancellationToken = default)
+    {
+        Rafter.RafterClient client = GetClient(manager, node);
+
+        GrpcSetMemberRoleRequest grpcRequest = new()
+        {
+            Endpoint = request.Endpoint,
+            NodeId = request.NodeId,
+            TargetRole = (int)request.TargetRole
+        };
+
+        Metadata metadata = BuildAuthMetadata(manager, "/Rafter/SetMemberRole", grpcRequest);
+        try
+        {
+            GrpcSetMemberRoleResponse response = await client
+                .SetMemberRoleAsync(grpcRequest, new CallOptions(metadata, cancellationToken: cancellationToken))
+                .ResponseAsync
+                .ConfigureAwait(false);
+
+            return new SetMemberRoleResponse(
+                response.Success,
+                string.IsNullOrEmpty(response.LeaderHint) ? null : response.LeaderHint,
+                (RaftOperationStatus)response.Status,
+                response.MembershipVersion);
+        }
+        catch (Exception ex)
+        {
+            manager.Logger.LogWarning("SendSetMemberRole to {Endpoint}: {Message}", node.Endpoint, ex.Message);
+            return new SetMemberRoleResponse(false, Status: RaftOperationStatus.Errored);
+        }
+    }
+
+    /// <summary>
     /// Sends the local membership roster to <paramref name="node"/> for gossip anti-entropy.
     /// The receiver applies it when it is newer and replies with its own roster when it is
     /// strictly ahead, enabling push-pull convergence in one round trip.

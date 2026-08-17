@@ -556,6 +556,31 @@ public sealed class RaftService : Rafter.RafterBase
     }
 
     /// <summary>
+    /// Handles a <c>SetMemberRole</c> RPC: a roster role transition for the decommission drain
+    /// (start a drain with <c>Voter → Leaving</c>, or roll one back). Committed only on the P0
+    /// leader; otherwise returns the current leader as a hint.
+    /// </summary>
+    public override async Task<GrpcSetMemberRoleResponse> SetMemberRole(GrpcSetMemberRoleRequest request, ServerCallContext context)
+    {
+        ValidateAuth(context, request);
+
+        if (raft is not RaftManager manager)
+            return new GrpcSetMemberRoleResponse { Success = false, Status = (int)Data.RaftOperationStatus.Errored };
+
+        Data.SetMemberRoleResponse response = await manager.ReceiveSetMemberRole(
+            new Data.SetMemberRoleRequest(request.Endpoint, request.NodeId, (System.ClusterMemberRole)request.TargetRole),
+            context.CancellationToken).ConfigureAwait(false);
+
+        return new GrpcSetMemberRoleResponse
+        {
+            Success = response.Success,
+            LeaderHint = response.LeaderHint ?? "",
+            Status = (int)response.Status,
+            MembershipVersion = response.MembershipVersion
+        };
+    }
+
+    /// <summary>
     /// Handles a direct SWIM probe.  The receiver replies with its current incarnation so the
     /// sender can record a fresh <c>Alive</c> liveness entry without a full gossip round.
     /// </summary>

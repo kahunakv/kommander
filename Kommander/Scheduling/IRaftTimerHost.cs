@@ -49,7 +49,21 @@ public interface IRaftTimerHost
     /// The pass runs inside the coordinator's single-consumer loop so it is
     /// serialized with all other coordinator state mutations.
     /// No-op when <see cref="RaftConfiguration.EnableLeaderBalancer"/> is false
-    /// or when the node is not the P0 leader.
+    /// or when the node is not the P0 leader. Drives leadership balancing only —
+    /// replica placement has its own trigger, <see cref="TriggerPlacementPass"/>,
+    /// on its own <see cref="RaftConfiguration.PlacementPassInterval"/> cadence.
     /// </summary>
     void TriggerBalancerPass();
+
+    /// <summary>
+    /// Enqueues one replica-placement controller pass into the system coordinator's channel,
+    /// serialized with all other coordinator state mutations. The pass self-gates on P0
+    /// leadership and is idempotent, so redundant triggers are harmless.
+    ///
+    /// <para>The default implementation is a no-op so existing <see cref="IRaftTimerHost"/>
+    /// implementations outside this assembly keep compiling (the
+    /// <see cref="GetHotUserPartitions"/> precedent); a stub must override it for the timer
+    /// service to actually drive placement.</para>
+    /// </summary>
+    void TriggerPlacementPass() { }
 }

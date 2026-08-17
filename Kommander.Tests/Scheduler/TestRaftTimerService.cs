@@ -90,6 +90,28 @@ public sealed class TestRaftTimerService
         public void TriggerBalancerPass() { }
     }
 
+    /// <summary>
+    /// Counts <see cref="IRaftTimerHost.TriggerBalancerPass"/> and
+    /// <see cref="IRaftTimerHost.TriggerPlacementPass"/> invocations, so tests can assert
+    /// which timers <see cref="RaftTimerService.Start"/> actually created — the scheduling
+    /// gap this pins (placement riding the balancer timer) shipped precisely because nothing
+    /// asserted the pass was ever triggered.
+    /// </summary>
+    private sealed class PassTrackingHost : IRaftTimerHost
+    {
+        public bool Joined { get; set; } = true;
+        public RaftPartition? SystemPartition => null;
+        public int BalancerPassCount;
+        public int PlacementPassCount;
+
+        public IEnumerable<RaftPartition> GetUserPartitions() => [];
+        public Task UpdateNodes() => Task.CompletedTask;
+        public Task GossipAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task PingAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public void TriggerBalancerPass() => Interlocked.Increment(ref BalancerPassCount);
+        public void TriggerPlacementPass() => Interlocked.Increment(ref PlacementPassCount);
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────
 
     private static RaftConfiguration MakeConfig(
@@ -410,5 +432,115 @@ public sealed class TestRaftTimerService
 
         Assert.Equal(5, host.FullSweepCount);
         Assert.Equal(0, host.HotSetCount);
+    }
+
+    // ── Placement pass scheduling ──────────────────────────────────────────
+
+    private static async Task WaitForAsync(Func<bool> condition)
+    {
+        // Bounded wall-clock wait, only used by the tests that must observe a *real* timer
+        // fire — timer creation in Start() cannot be asserted through the trigger methods.
+        for (int i = 0; i < 200 && !condition(); i++)
+            await Task.Delay(25, TestContext.Current.CancellationToken);
+        Assert.True(condition());
+    }
+
+    /// <summary>
+    /// The original defect: with the leader balancer off and placement on, no timer existed and
+    /// no pass ever ran. A placement-only config must fire TriggerPlacementPass on its own
+    /// cadence — and must not fire the balancer, in either direction.
+    /// </summary>
+    [Fact]
+    public async Task Start_PlacementOnlyConfig_FiresPlacementPassNotBalancer()
+    {
+        PassTrackingHost host = new();
+        RaftConfiguration config = new()
+        {
+            StartElectionTimeout = 50,
+            EndElectionTimeout = 100,
+            ReplicationFactor = 3,
+            EnablePlacementRebalancer = true,
+            EnableLeaderBalancer = false,
+            PlacementPassInterval = TimeSpan.FromMilliseconds(25),
+        };
+
+        using RaftTimerService svc = new(host, NullLogger<IRaft>.Instance, config, TimeSpan.Zero);
+        svc.Start();
+
+        await WaitForAsync(() => Volatile.Read(ref host.PlacementPassCount) >= 2);
+        Assert.Equal(0, Volatile.Read(ref host.BalancerPassCount));
+    }
+
+    /// <summary>
+    /// Pins the PlacementPassEnabled predicate: a deployment with the global factor at 0 that
+    /// drives placement purely via per-range overrides (rebalancer on) still gets the timer.
+    /// </summary>
+    [Fact]
+    public async Task Start_GlobalRfZeroWithRebalancer_StillSchedulesPlacement()
+    {
+        PassTrackingHost host = new();
+        RaftConfiguration config = new()
+        {
+            StartElectionTimeout = 50,
+            EndElectionTimeout = 100,
+            ReplicationFactor = 0,
+            EnablePlacementRebalancer = true,
+            PlacementPassInterval = TimeSpan.FromMilliseconds(25),
+        };
+
+        using RaftTimerService svc = new(host, NullLogger<IRaft>.Instance, config, TimeSpan.Zero);
+        svc.Start();
+
+        await WaitForAsync(() => Volatile.Read(ref host.PlacementPassCount) >= 1);
+    }
+
+    /// <summary>
+    /// The two cadences are independent in the other direction too: the balancer timer alone
+    /// must not drive placement passes (it used to send RunPlacementPass piggybacked).
+    /// </summary>
+    [Fact]
+    public async Task Start_BalancerOnPlacementOff_NeverFiresPlacementPass()
+    {
+        PassTrackingHost host = new();
+        RaftConfiguration config = new()
+        {
+            StartElectionTimeout = 50,
+            EndElectionTimeout = 100,
+            ReplicationFactor = 0,
+            EnablePlacementRebalancer = false,
+            EnableLeaderBalancer = true,
+            LeaderBalancerInterval = TimeSpan.FromMilliseconds(25),
+            PlacementPassInterval = TimeSpan.FromMilliseconds(25),
+        };
+
+        using RaftTimerService svc = new(host, NullLogger<IRaft>.Instance, config, TimeSpan.Zero);
+        svc.Start();
+
+        await WaitForAsync(() => Volatile.Read(ref host.BalancerPassCount) >= 2);
+        Assert.Equal(0, Volatile.Read(ref host.PlacementPassCount));
+    }
+
+    /// <summary>
+    /// TriggerPlacement follows the same guards as TriggerBalancer: joined and not stopped.
+    /// </summary>
+    [Fact]
+    public void TriggerPlacement_Guards_JoinedAndNotStopped()
+    {
+        PassTrackingHost host = new() { Joined = false };
+        RaftConfiguration config = MakeConfig();
+        config.ReplicationFactor = 3;
+
+        using RaftTimerService svc = BuildService(host, config, initialDelay: Timeout.InfiniteTimeSpan);
+
+        svc.TriggerPlacement();
+        Assert.Equal(0, host.PlacementPassCount);
+
+        host.Joined = true;
+        svc.TriggerPlacement();
+        Assert.Equal(1, host.PlacementPassCount);
+
+        svc.Stop();
+        svc.TriggerPlacement();
+        Assert.Equal(1, host.PlacementPassCount);
     }
 }

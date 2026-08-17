@@ -99,4 +99,21 @@ public enum RaftOperationStatus
     /// re-sends at its own cadence.
     /// </remarks>
     FollowerWalSaturated = 20,
+
+    /// <summary>
+    /// The membership operation named an endpoint that is not present in the committed roster.
+    /// For a decommission rollback (<c>Leaving → Voter</c>) this is not an error: it means the
+    /// removal already committed (the placement pass finished the drain first), so the caller
+    /// must treat the node as departed rather than retry.
+    /// </summary>
+    MemberNotFound = 21,
+
+    /// <summary>
+    /// Another member's roster role is already <c>Leaving</c>, so a second decommission drain
+    /// was refused. Distinct from <see cref="ConcurrentMembershipChange"/> on purpose: that one
+    /// is the in-flight replication latch (clears within seconds — retry immediately), while a
+    /// drain holds the roster state for minutes — the caller should surface a refusal to the
+    /// operator and retry only after the in-flight drain completes or rolls back.
+    /// </summary>
+    DrainInProgress = 22,
 }
