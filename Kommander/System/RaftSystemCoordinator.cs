@@ -162,6 +162,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
             StartPartitions,
             GetMembership,
             manager.AmILeaderQuick,
+            manager.HostsPartition,
             // The hint, not GetPartitionLeaderEndpoint: the P0 controller routinely reasons about
             // ranges this node does not host, where the local Leader field does not exist and the
             // gossiped load-report claim is the only leader source (hosted ranges keep the local

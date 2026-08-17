@@ -549,12 +549,19 @@ public sealed class TestReplicaPlacement
     /// <summary>
     /// Makes the harness manager pass <c>AmILeaderQuick(P0)</c> — the gate the placement pass
     /// self-checks. The harness never joins a cluster, so there is no system partition to lead;
-    /// the test hook stands in for it. Scoped to P0 only so range-partition leadership checks
-    /// (learner lag measurement) keep their real answer.
+    /// the test hook stands in for it. For data ranges the hook mirrors the real contract
+    /// faithfully: <c>AmILeaderQuick</c> throws the typed <see cref="PartitionNotHostedException"/>
+    /// for a range this node does not host (see <see cref="TestPartitionNotHosted"/>), so any
+    /// placement code path that calls it blind on a non-hosted range fails in these tests exactly
+    /// as it did in production.
     /// </summary>
     private static void ForceP0Leadership(RaftManager manager) =>
-        manager._amILeaderQuickHookForTesting =
-            partitionId => ValueTask.FromResult(partitionId == RaftSystemConfig.SystemPartition);
+        manager._amILeaderQuickHookForTesting = partitionId =>
+            partitionId == RaftSystemConfig.SystemPartition
+                ? ValueTask.FromResult(true)
+                : manager.HostsPartition(partitionId)
+                    ? ValueTask.FromResult(false)
+                    : throw new PartitionNotHostedException(partitionId);
 
     private static RaftSystemRequest MakeMembersReplicated(params string[] voterEndpoints)
     {
@@ -654,31 +661,6 @@ public sealed class TestReplicaPlacement
     }
 
     // ── Ranges the P0 leader does not host ───────────────────────────────────
-
-    /// <summary>
-    /// The P0 leader must answer "not the leader" for a committed range it does not host —
-    /// this is the normal case under per-partition placement, where the placement controller
-    /// reasons about ranges living entirely on other nodes. It used to throw
-    /// <see cref="PartitionNotHostedException"/> out of the internal partition lookup, which
-    /// aborted every placement pass that had a learner to evaluate on such a range.
-    /// </summary>
-    [Fact]
-    public async Task AmILeaderQuick_CommittedRangeNotHostedLocally_ReturnsFalseWithoutThrowing()
-    {
-        RaftManager manager = Build();
-        using (manager)
-        {
-            manager.SystemCoordinator.Send(MakeConfigReplicated(
-                PlacedRange(1, 1, Replica("b:1"), Replica("c:1"), Replica("d:1"))));
-            await WaitForIdleAsync(manager);
-
-            // The guard must be exercised through the real implementation, past IsInitialized.
-            Assert.True(manager.IsInitialized);
-            Assert.False(manager.HostsPartition(1));
-
-            Assert.False(await manager.AmILeaderQuick(1));
-        }
-    }
 
     /// <summary>
     /// Minimal remote node for the in-memory transport: answers only the follower-lag probe

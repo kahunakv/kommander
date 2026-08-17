@@ -36,6 +36,12 @@ internal sealed class ReplicaPlacementService
     private readonly Action<List<RaftPartitionRange>> startPartitions;
     private readonly Func<ClusterMembership> getMembership;
     private readonly Func<int, ValueTask<bool>> amILeaderQuick;
+
+    // Guards every amILeaderQuick call on a data range: AmILeaderQuick throws the typed
+    // PartitionNotHostedException for a committed range this node does not host (the public
+    // routing contract), and the P0 controller routinely reasons about exactly such ranges.
+    private readonly Func<int, bool> hostsPartition;
+
     private readonly Func<int, string?> getPartitionLeader;
     private readonly Func<int, string, ValueTask<long?>> getFollowerCommitted;
     private readonly Func<RaftNode, int, string, Task<long?>> getRemoteFollowerLag;
@@ -59,6 +65,7 @@ internal sealed class ReplicaPlacementService
         Action<List<RaftPartitionRange>> startPartitions,
         Func<ClusterMembership> getMembership,
         Func<int, ValueTask<bool>> amILeaderQuick,
+        Func<int, bool> hostsPartition,
         Func<int, string?> getPartitionLeader,
         Func<int, string, ValueTask<long?>> getFollowerCommitted,
         Func<RaftNode, int, string, Task<long?>> getRemoteFollowerLag,
@@ -77,6 +84,7 @@ internal sealed class ReplicaPlacementService
         this.startPartitions = startPartitions;
         this.getMembership = getMembership;
         this.amILeaderQuick = amILeaderQuick;
+        this.hostsPartition = hostsPartition;
         this.getPartitionLeader = getPartitionLeader;
         this.getFollowerCommitted = getFollowerCommitted;
         this.getRemoteFollowerLag = getRemoteFollowerLag;
@@ -707,7 +715,12 @@ internal sealed class ReplicaPlacementService
         long leaderCommitted;
         long? learnerCommitted;
 
-        if (await amILeaderQuick(partitionId).ConfigureAwait(false))
+        // The hosted gate must come first: AmILeaderQuick throws the typed
+        // PartitionNotHostedException for a range this node does not host — calling it blind
+        // here wedged every pass that had a learner on a non-hosted range (the normal case
+        // for the P0 controller), leaving the remote-lag branch below dead code exactly when
+        // it was needed.
+        if (hostsPartition(partitionId) && await amILeaderQuick(partitionId).ConfigureAwait(false))
         {
             long? own = await getFollowerCommitted(partitionId, localEndpoint).ConfigureAwait(false);
             if (own is null or < 0)
