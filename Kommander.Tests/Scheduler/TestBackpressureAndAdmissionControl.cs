@@ -382,12 +382,18 @@ public sealed class TestBackpressureAndAdmissionControl
     /// <summary>
     /// The WAL scheduler throws <see cref="BackpressureExceededException"/> when the
     /// per-partition queue is at capacity, carrying the correct partition id and depth.
+    ///
+    /// Uses a blocking WAL stub to pin the partition's depth at the cap while the
+    /// over-limit Enqueue runs. Depth counts pending-or-in-flight ops and is only
+    /// decremented after Write() completes, so holding Write() open makes the test
+    /// deterministic — without it, a fast worker can drain the fill ops before the
+    /// over-limit Enqueue and no exception is ever thrown (observed as a GA flake).
     /// </summary>
     [Fact]
     public void WalScheduler_WhenQueueFull_ThrowsBackpressureExceededException()
     {
         const int maxDepth = 2;
-        using InMemoryWAL wal = new(NullLogger<IRaft>.Instance);
+        using BlockingWal wal = new();
         using FairWalScheduler scheduler = new(
             wal,
             NullLogger<IRaft>.Instance,
@@ -405,11 +411,12 @@ public sealed class TestBackpressureAndAdmissionControl
                 WALWriteOperationType.LeaderPropose,
                 (partitionId, [new RaftLog { Id = 1 }]));
 
-        // Fill the queue.
+        // Fill the queue. The worker blocks inside Write(), so every op stays
+        // pending-or-in-flight and the partition's depth is pinned at maxDepth.
         for (int i = 0; i < maxDepth; i++)
             scheduler.Enqueue(MakeOp());
 
-        // The next enqueue must throw.
+        // The next enqueue must throw — depth is still at the cap.
         BackpressureExceededException? caught = null;
         try
         {
@@ -418,6 +425,10 @@ public sealed class TestBackpressureAndAdmissionControl
         catch (BackpressureExceededException ex)
         {
             caught = ex;
+        }
+        finally
+        {
+            wal.Release(); // unblock the worker so the scheduler can shut down cleanly
         }
 
         Assert.NotNull(caught);
