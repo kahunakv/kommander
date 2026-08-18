@@ -617,6 +617,36 @@ public sealed class TestReplicaPlacement
         }
     }
 
+    /// <summary>
+    /// A transitional Learner whose host vanished from the committed roster (evicted, or removed
+    /// while the add was in flight) can never be promoted — no leader will ever report progress
+    /// for it — so leaving it in place keeps the range transitional across every future pass, the
+    /// same closed loop as the never-promoted learner. The pass must drop it; a Learner is outside
+    /// the quorum denominator, so the drop is always safe.
+    /// </summary>
+    [Fact]
+    public async Task RunPlacementPass_LearnerHostGoneFromRoster_IsDropped()
+    {
+        RaftManager manager = Build(); // rebalancer off — the transition drive alone must handle it
+        using (manager)
+        {
+            AcceptReplication(manager);
+            // Roster names the two voters but NOT the learner's host c:1.
+            manager.SystemCoordinator.Send(MakeMembersReplicated(Local, "b:1"));
+            manager.SystemCoordinator.Send(MakeConfigReplicated(
+                PlacedRange(1, 2, Replica(Local), Replica("b:1"), Replica("c:1", RaftReplicaRole.Learner))));
+            await WaitForIdleAsync(manager);
+
+            ForceP0Leadership(manager);
+
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+
+            Assert.DoesNotContain(MapEntry(manager, 1).Replicas, r => r.Endpoint == "c:1");
+            Assert.Equal(2, MapEntry(manager, 1).Replicas.Count);
+        }
+    }
+
     [Fact]
     public async Task SetReplicationFactor_CommitKicksPassAndConvergesOverride()
     {

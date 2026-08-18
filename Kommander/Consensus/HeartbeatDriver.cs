@@ -151,10 +151,20 @@ internal sealed class HeartbeatDriver
             //     steady-state writes free of the per-heartbeat WAL read a healthy in-flight follower
             //     would otherwise incur.
             // coreState.LocalCommittedIndex is in-memory and always reflects only durably committed entries.
+            //
+            // Non-voter peers (a placement Learner, a roster Learner on a legacy range) are exempt
+            // from the coreState.LiveCommitFloor confinement: the floor exists so a leader does not push
+            // merely-RESTORED committed state at voters, whose logs were populated under the previous
+            // leadership and whose divergence the highest-WAL election preference arbitrates. A
+            // learner starts empty and is explicitly expected to receive this range's full log —
+            // without the exemption, a learner added to an idle range whose leader was elected after
+            // the last write (frontier == floor) with a gap at or under BackfillThreshold was never
+            // shipped anything, and the placement promotion driver waited on its lag forever.
             long followerGap = tracker.TryGetCommitFrontier(node.Endpoint, out long followerMaxLog)
                 ? coreState.LocalCommittedIndex - followerMaxLog
                 : 0;
-            bool idleTailGap = followerGap > 0 && liveReplicationQuiet && coreState.LocalCommittedIndex > coreState.LiveCommitFloor;
+            bool idleTailGap = followerGap > 0 && liveReplicationQuiet
+                && (coreState.LocalCommittedIndex > coreState.LiveCommitFloor || !host.IsVoter(node.Endpoint));
 
             // Crash-restart re-supply (paced): CompleteAppendLogsAsync recorded that this peer reported a
             // committed frontier below its recorded matchIndex (lost lazy markers on restart). The repair
@@ -235,7 +245,8 @@ internal sealed class HeartbeatDriver
 
     /// <summary>
     /// True when at least one peer is known — or not yet known — to hold less than this leader's
-    /// committed frontier. Gates quiescence.
+    /// committed frontier. Gates quiescence, on both entry (the idle check) and re-arm (the
+    /// quiesced leader's periodic tick).
     ///
     /// <para><b>Why this gate is load-bearing.</b> Quiescing stops <see cref="SendHeartbeat"/>, and
     /// <see cref="SendHeartbeat"/> hosts the <em>only</em> catch-up path (both the
@@ -246,23 +257,27 @@ internal sealed class HeartbeatDriver
     /// exact signature of the hang this guard fixes. Only quiesce once every peer has demonstrably
     /// reached our frontier.</para>
     ///
-    /// <para>A peer with no recorded progress counts as lagging: absence of evidence is not evidence of
-    /// convergence, and treating it as caught-up is what would strand a freshly-joined learner. The
-    /// <c>LocalCommittedIndex &lt;= 0</c> short-circuit keeps a genuinely empty partition (elected but
-    /// never written) quiescible, which is the common idle case quiescence exists to serve.</para>
+    /// <para>A peer with no recorded progress counts as lagging <b>unconditionally</b> — even on a
+    /// partition with nothing committed. An earlier version short-circuited on
+    /// <c>LocalCommittedIndex &lt;= 0</c> to keep an empty partition quiescible, but that made every
+    /// peer invisible to this gate: a placement-added Learner joining an idle, never-written range
+    /// whose leader had already quiesced was never contacted, so the leader's progress table never
+    /// gained an entry for it, the placement promotion driver (which reads that table) measured
+    /// "never acked" forever, and the range stayed transitional until the decommission drain timed
+    /// out (the Jepsen <c>register/placement</c> finding). First contact is required from every peer
+    /// before quiescing; the empty partition still quiesces one ack round-trip later, because a
+    /// contacted peer's reported frontier (clamped at 0 — a fresh peer's seed report is −1) is never
+    /// below an empty leader's frontier of 0.</para>
     /// </summary>
     public bool HasLaggingPeer()
     {
-        if (coreState.LocalCommittedIndex <= 0)
-            return false;
-
         foreach (RaftNode node in host.Nodes)
         {
             if (node.Endpoint == host.LocalEndpoint)
                 continue;
 
             if (!tracker.TryGetCommitFrontier(node.Endpoint, out long peerCommittedIndex)
-                || peerCommittedIndex < coreState.LocalCommittedIndex)
+                || Math.Max(0, peerCommittedIndex) < coreState.LocalCommittedIndex)
                 return true;
         }
 

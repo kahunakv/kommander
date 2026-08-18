@@ -184,7 +184,8 @@ internal sealed class ElectionCoordinator
         // quorum with a vote the committed replica set does not grant it).
         if (host.LocalRole != ClusterMemberRole.Voter || !host.IsVoter(host.LocalEndpoint))
         {
-            logger.LogDebugSuppressingElection(host.LocalEndpoint, host.PartitionId, coreState.NodeState, host.LocalRole);
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebugSuppressingElection(host.LocalEndpoint, host.PartitionId, coreState.NodeState, host.LocalRole, host.IsVoter(host.LocalEndpoint));
             return;
         }
 
@@ -198,7 +199,8 @@ internal sealed class ElectionCoordinator
         // empty, so the very next tick elects.
         if (host.Nodes.Count == 0 && !host.InitialNodesDiscovered)
         {
-            logger.LogDebugSuppressingElection(host.LocalEndpoint, host.PartitionId, coreState.NodeState, host.LocalRole);
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebugSuppressingElection(host.LocalEndpoint, host.PartitionId, coreState.NodeState, host.LocalRole, host.IsVoter(host.LocalEndpoint));
             return;
         }
 
@@ -296,7 +298,8 @@ internal sealed class ElectionCoordinator
         // is not a Voter replica of this range must not campaign for it.
         if (host.LocalRole != ClusterMemberRole.Voter || !host.IsVoter(host.LocalEndpoint))
         {
-            logger.LogDebugSuppressingPreVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, host.LocalRole);
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebugSuppressingPreVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, host.LocalRole, host.IsVoter(host.LocalEndpoint));
             return;
         }
 

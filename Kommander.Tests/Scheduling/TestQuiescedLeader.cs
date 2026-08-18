@@ -47,6 +47,17 @@ public class TestQuiescedLeader
         return sm;
     }
 
+    /// <summary>
+    /// Simulates the peer's Success ack of an (empty) heartbeat, which records its commit frontier
+    /// in the leader's progress table. Quiescing requires first contact from every peer — a peer
+    /// with no recorded frontier counts as lagging unconditionally, because a quiesced leader is
+    /// the only catch-up path a silent peer has (see <c>HeartbeatDriver.HasLaggingPeer</c>).
+    /// </summary>
+    private static ValueTask AckHeartbeatAsync(
+        RaftPartitionStateMachine sm, CapturingTestHost host, string endpoint, long committedIndex = 0) =>
+        sm.CompleteAppendLogsAsync(endpoint, host.HybridLogicalClock.TrySendOrLocalEvent(1),
+            RaftOperationStatus.Success, committedIndex);
+
     // ── Idle leader quiesces and sends quiesce marker ─────────────────────────
 
     [Fact]
@@ -59,7 +70,9 @@ public class TestQuiescedLeader
 
         // SetLeaderForTesting delegates to BecomeLeader(), which seeds lastProposalAt at the
         // election timestamp — the same path real election wins take.  With HeartbeatInterval=0
-        // and QuiesceAfter=0, the idle threshold is met immediately on the first leadership check.
+        // and QuiesceAfter=0, the idle threshold is met immediately on the first leadership check
+        // once the peer has made first contact (an uncontacted peer blocks quiescence).
+        await AckHeartbeatAsync(sm, host, host.Peer);
         await sm.CheckPartitionLeadershipAsync();
 
         AppendLogsRequest? quiesceMsg = host.CapturedAppendLogs
@@ -82,6 +95,7 @@ public class TestQuiescedLeader
         // The guard must block quiescence in this case.
         RaftPartitionStateMachine sm = await MakeLeaderAsync(host, wal, sink);
         sm.SetLeaderForTesting(term: 1);     // BecomeLeader → lastProposalAt seeded
+        await AckHeartbeatAsync(sm, host, host.Peer); // first contact — isolate the guard under test
         sm.ClearLastProposalAtForTesting();  // force back to Zero to assert the guard
         host.ClearObservations();
 
@@ -100,7 +114,8 @@ public class TestQuiescedLeader
         MinimalReplySinkL sink = new();
         RaftPartitionStateMachine sm = await MakeLeaderAsync(host, wal, sink);
 
-        // First tick quiesces the leader.
+        // First tick after the peer's first contact quiesces the leader.
+        await AckHeartbeatAsync(sm, host, host.Peer);
         await sm.CheckPartitionLeadershipAsync();
         Assert.Contains(host.CapturedAppendLogs, r => r.Quiesce);
 
@@ -141,23 +156,81 @@ public class TestQuiescedLeader
         MinimalReplySinkL sink = new();
         RaftPartitionStateMachine sm = await MakeLeaderAsync(host, wal, sink);
 
-        // First tick quiesces the leader: the partition is empty (committed frontier 0), so no peer
-        // counts as lagging and heartbeats are suppressed.
+        // First tick after the peer's first contact quiesces the leader: the partition is empty
+        // (committed frontier 0), the contacted peer reported frontier 0, so nothing lags and
+        // heartbeats are suppressed.
+        await AckHeartbeatAsync(sm, host, host.Peer);
         await sm.CheckPartitionLeadershipAsync();
         Assert.Contains(host.CapturedAppendLogs, r => r.Quiesce);
         host.ClearObservations();
 
-        // A peer falls behind (or a fresh node joins) AFTER we quiesced: the leader now holds a
-        // committed frontier the single peer node-b has no recorded progress for. Pre-vote is
-        // side-effect-free (Raft §9.6) and does not wake a quiesced leader, so the re-arm must come
-        // from the periodic tick's HasLaggingPeer() gate — otherwise node-b is stranded with no
-        // catch-up path on an idle partition (heartbeats host the only backfill/idle-tail re-ship).
+        // The leader's frontier advances past the peer's recorded one AFTER we quiesced. Pre-vote
+        // is side-effect-free (Raft §9.6) and does not wake a quiesced leader, so the re-arm must
+        // come from the periodic tick's HasLaggingPeer() gate — otherwise node-b is stranded with
+        // no catch-up path on an idle partition (heartbeats host the only backfill/idle-tail
+        // re-ship).
         sm.SetLocalCommittedIndexForTesting(5);
 
         await sm.CheckPartitionLeadershipAsync();
 
         Assert.Equal(RaftNodeState.Leader, sm.NodeState);           // still leader
         Assert.Contains(host.CapturedAppendLogs, r => !r.Quiesce);  // un-quiesced: forced heartbeat resumes catch-up
+    }
+
+    // ── Quiesced leader wakes when a never-contacted peer appears ─────────────
+
+    /// <summary>
+    /// The Jepsen <c>register/placement</c> wedge: a placement <c>AddReplica</c> materializes a
+    /// Learner on an idle, never-written range whose leader already quiesced. The new peer has no
+    /// recorded progress and the partition's committed frontier is 0 — the old
+    /// <c>LocalCommittedIndex &lt;= 0</c> short-circuit in <c>HasLaggingPeer</c> made the peer
+    /// invisible, so the leader never heartbeat it, its lag was never measurable, and the range
+    /// stayed transitional until the decommission drain timed out. A never-contacted peer must
+    /// count as lagging even at frontier 0, so the tick re-arms heartbeats.
+    /// </summary>
+    [Fact]
+    public async Task Leader_Quiesced_NewPeerAppears_WakesAndHeartbeatsIt()
+    {
+        CapturingTestHost host = MakeHost();
+        using MinimalWalFacadeL wal = new();
+        MinimalReplySinkL sink = new();
+        RaftPartitionStateMachine sm = await MakeLeaderAsync(host, wal, sink);
+
+        await AckHeartbeatAsync(sm, host, host.Peer);
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.Contains(host.CapturedAppendLogs, r => r.Quiesce);
+        host.ClearObservations();
+
+        // A committed map application adds a learner replica to this range's peer set.
+        host.PeerNodes.Add(new RaftNode("node-c"));
+
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        Assert.Contains(host.CapturedAppendLogs, r => !r.Quiesce);
+        Assert.Contains("node-c", host.CapturedEndpoints); // the new peer itself was contacted
+    }
+
+    // ── Empty partition does not quiesce before first contact ─────────────────
+
+    /// <summary>
+    /// Quiescing requires evidence of convergence from every peer, even on a partition with
+    /// nothing committed: an uncontacted peer might be a fresh learner whose promotion depends on
+    /// the leader's progress table gaining an entry for it. The leader keeps heartbeating until
+    /// the peer acks once; the empty partition then quiesces on the next tick (previous tests).
+    /// </summary>
+    [Fact]
+    public async Task Leader_EmptyPartition_UncontactedPeer_DoesNotQuiesce()
+    {
+        CapturingTestHost host = MakeHost();
+        using MinimalWalFacadeL wal = new();
+        MinimalReplySinkL sink = new();
+        RaftPartitionStateMachine sm = await MakeLeaderAsync(host, wal, sink);
+
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.DoesNotContain(host.CapturedAppendLogs, r => r.Quiesce);
+        Assert.Contains(host.CapturedAppendLogs, r => !r.Quiesce); // still probing the silent peer
     }
 
     // ── Follower receiving quiesce-flagged AppendLogs becomes quiesced ────────
@@ -212,7 +285,13 @@ public class TestQuiescedLeader
 
         public HybridLogicalClock HybridLogicalClock { get; } = new();
 
-        public IReadOnlyList<RaftNode> Nodes => [new(Peer)];
+        /// <summary>Mutable so a test can simulate a committed map application growing the
+        /// peer set mid-run (a placement AddReplica materializing a learner).</summary>
+        public List<RaftNode> PeerNodes { get; }
+
+        public IReadOnlyList<RaftNode> Nodes => PeerNodes;
+
+        public CapturingTestHost() => PeerNodes = [new(Peer)];
 
         public LivenessTable LivenessTable { get; } = new();
 
@@ -220,11 +299,13 @@ public class TestQuiescedLeader
 
         public List<AppendLogsRequest> CapturedAppendLogs { get; } = [];
         public List<RaftResponderRequestType> CapturedTypes { get; } = [];
+        public List<string> CapturedEndpoints { get; } = [];
 
         public void ClearObservations()
         {
             CapturedAppendLogs.Clear();
             CapturedTypes.Clear();
+            CapturedEndpoints.Clear();
         }
 
         public HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId) => HLCTimestamp.Zero;
@@ -238,6 +319,7 @@ public class TestQuiescedLeader
         public void EnqueueResponse(string endpoint, RaftResponderRequest request)
         {
             CapturedTypes.Add(request.Type);
+            CapturedEndpoints.Add(endpoint);
             if (request.AppendLogsRequest is not null)
                 CapturedAppendLogs.Add(request.AppendLogsRequest);
         }

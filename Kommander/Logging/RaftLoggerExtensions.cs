@@ -62,11 +62,11 @@ public static partial class RaftLoggerExtensions
 
     // ── RaftPartitionStateMachine ─────────────────────────────────────────
 
-    [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Suppressing election: local role is {Role}, not Voter")]
-    public static partial void LogDebugSuppressingElection(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, ClusterMemberRole role);
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Suppressing election: roster role {Role}, voter of this partition={PartitionVoter}")]
+    public static partial void LogDebugSuppressingElection(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, ClusterMemberRole role, bool partitionVoter);
 
-    [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Suppressing pre-vote: local role is {Role}, not Voter")]
-    public static partial void LogDebugSuppressingPreVote(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, ClusterMemberRole role);
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Suppressing pre-vote: roster role {Role}, voter of this partition={PartitionVoter}")]
+    public static partial void LogDebugSuppressingPreVote(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, ClusterMemberRole role, bool partitionVoter);
 
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Starting pre-vote round for Term={PreVoteTerm}")]
     public static partial void LogInfoStartingPreVoteRound(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, long preVoteTerm);
@@ -321,6 +321,9 @@ public static partial class RaftLoggerExtensions
 
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] Placement drain of {Endpoint} complete (no range names it); committing removal")]
     public static partial void LogInfoPlacementDrainComplete(this ILogger<IRaft> logger, string local, string endpoint);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] Dropping learner {Endpoint} of partition {Id}: host is no longer a roster member")]
+    public static partial void LogInfoPlacementLearnerHostGone(this ILogger<IRaft> logger, string local, string endpoint, int id);
 
     // ── RestCommunication ─────────────────────────────────────────────────
 

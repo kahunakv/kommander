@@ -507,8 +507,9 @@ internal sealed class ReplicaPlacementService
 
     /// <summary>
     /// One P0 placement-controller pass. Always drives in-flight transitions to completion —
-    /// re-issues the final drop for Removing replicas and promotes Learner replicas that have
-    /// stayed within <see cref="RaftConfiguration.LearnerPromotionLag"/> for the stable window —
+    /// re-issues the final drop for Removing replicas, promotes Learner replicas that have
+    /// stayed within <see cref="RaftConfiguration.LearnerPromotionLag"/> for the stable window,
+    /// and drops Learner replicas whose host is Leaving or gone from the committed roster —
     /// so a crash mid-move converges regardless of configuration. Rebalancing moves (repair
     /// under-replication, trim over-replication, spread skew) are planned by
     /// <see cref="PlacementPlanner"/> and dispatched only when
@@ -607,8 +608,21 @@ internal sealed class ReplicaPlacementService
                 // undo: promoting it makes the leaver a voter of this range, which the next pass
                 // then has to evacuate again. Drop it instead — the range returns to its
                 // pre-transfer replica set and the planner re-targets a survivor.
-                if (leavingEndpoints.Contains(transitional.Endpoint))
+                //
+                // A learner whose host is no longer in the committed roster at all (evicted, or
+                // removed while the add was in flight) gets the same treatment: its lag probe can
+                // never answer and TryAddReplica would refuse it today, so leaving it in place
+                // keeps the range transitional across every future pass — the same closed loop as
+                // the never-promoted learner, with no exit but a drain timeout. Dropping a Learner
+                // never touches the quorum denominator, so this is always safe.
+                bool learnerHostGone = roster.MembershipVersion > 0 &&
+                    roster.Members.All(m => m.Endpoint != transitional.Endpoint);
+
+                if (learnerHostGone || leavingEndpoints.Contains(transitional.Endpoint))
                 {
+                    if (learnerHostGone)
+                        logger.LogInfoPlacementLearnerHostGone(localEndpoint, transitional.Endpoint, range.PartitionId);
+
                     _replicaCaughtUpSince.Remove((range.PartitionId, transitional.Endpoint));
                     send(new RaftSystemRequest(
                         RaftSystemRequestType.RemoveReplica, range.PartitionId, transitional.Endpoint, transitional.NodeId));
