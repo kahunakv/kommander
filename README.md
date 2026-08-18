@@ -968,6 +968,14 @@ dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category!=Stress&Fu
 dotnet test Kommander.Tests/Kommander.Tests.csproj --filter "Category!=Stress&FullyQualifiedName~TestThreeNodeCluster"
 ```
 
+## Jepsen Tests
+
+Kommander is tested with [Jepsen](https://jepsen.io), the gold standard for verifying the correctness of distributed systems under real-world failure conditions. The Jepsen test suite subjects Kommander clusters to network partitions, process crashes, clock skew, and other fault injections while checking that the system upholds its safety guarantees — linearizability of committed operations, the Raft Log Matching Property, and leader election consistency.
+
+Running Jepsen against Kommander provides confidence that the consensus implementation is correct not just in happy-path unit tests but under the kind of adversarial conditions that expose subtle bugs in leader election, log replication, and membership changes — bugs that conventional testing rarely catches.
+
+The Jepsen test suite is maintained in a separate repository: **[kommander-jepsen](https://github.com/kahunakv/kommander-jepsen)**.
+
 ## Current Limitations
 
 - Dynamic cluster membership is supported via `IRaft` (`JoinCluster`, `LeaveCluster`, `GetMembership`, `LocalRole`, `OnMembershipChanged`) on every transport, including graceful leave, cross-partition learner promotion, gossip dissemination, and the SWIM failure detector over gRPC/REST. See the [Dynamic Membership Developer Guide](docs/dynamic-membership-developer-guide.md).

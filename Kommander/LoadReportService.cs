@@ -1,5 +1,4 @@
 
-using System.Collections.Concurrent;
 using Kommander.System;
 using Kommander.Time;
 using Kommander.WAL.IO;
@@ -9,16 +8,16 @@ namespace Kommander;
 
 /// <summary>
 /// Owns the <c>_reportVersion</c> counter and provides local and gossip-based
-/// load-report queries for <see cref="RaftManager"/>. Reads partition state
-/// directly from the <c>partitions</c> dictionary via <see cref="RaftPartition"/>
-/// references and delegates remote-node fallback to the coordinator's
-/// <see cref="LoadReportStore"/> snapshot.
+/// load-report queries for <see cref="RaftManager"/>. Reads partition state through
+/// <see cref="IPartitionProvider"/> — the manager keeps sole ownership of the registry,
+/// so this service never holds a reference to the live dictionary — and delegates
+/// remote-node fallback to the coordinator's <see cref="LoadReportStore"/> snapshot.
 /// </summary>
 internal sealed class LoadReportService
 {
     private long _reportVersion;
 
-    private readonly ConcurrentDictionary<int, RaftPartition> partitions;
+    private readonly IPartitionProvider partitionProvider;
     private readonly FairWalScheduler walScheduler;
     private readonly Func<IReadOnlyList<NodeLoadReport>> getLoadReports;
     private readonly Func<HLCTimestamp> getHlcNow;
@@ -27,7 +26,7 @@ internal sealed class LoadReportService
     private readonly string localEndpoint;
 
     internal LoadReportService(
-        ConcurrentDictionary<int, RaftPartition> partitions,
+        IPartitionProvider partitionProvider,
         FairWalScheduler walScheduler,
         Func<IReadOnlyList<NodeLoadReport>> getLoadReports,
         Func<HLCTimestamp> getHlcNow,
@@ -35,7 +34,7 @@ internal sealed class LoadReportService
         RaftConfiguration configuration,
         string localEndpoint)
     {
-        this.partitions = partitions;
+        this.partitionProvider = partitionProvider;
         this.walScheduler = walScheduler;
         this.getLoadReports = getLoadReports;
         this.getHlcNow = getHlcNow;
@@ -53,9 +52,8 @@ internal sealed class LoadReportService
 
         List<PartitionLoad> leaderships = [];
 
-        foreach (KeyValuePair<int, RaftPartition> kv in partitions)
+        foreach (RaftPartition p in partitionProvider.DataPartitions)
         {
-            RaftPartition p = kv.Value;
             if (!string.Equals(p.Leader, localEndpoint, StringComparison.Ordinal))
                 continue;
 
@@ -159,7 +157,7 @@ internal sealed class LoadReportService
 
     internal double GetPartitionLogOpsPerSecond(int partitionId)
     {
-        if (partitions.TryGetValue(partitionId, out RaftPartition? p) &&
+        if (partitionProvider.TryGetDataPartition(partitionId, out RaftPartition? p) && p is not null &&
             string.Equals(p.Leader, localEndpoint, StringComparison.Ordinal))
             return p.GetLogOpsPerSecond();
 
@@ -177,7 +175,7 @@ internal sealed class LoadReportService
 
     internal int GetPartitionWalQueueDepth(int partitionId)
     {
-        if (partitions.TryGetValue(partitionId, out RaftPartition? p) &&
+        if (partitionProvider.TryGetDataPartition(partitionId, out RaftPartition? p) && p is not null &&
             string.Equals(p.Leader, localEndpoint, StringComparison.Ordinal))
             return walScheduler.GetPartitionDepth(partitionId);
 
@@ -195,7 +193,7 @@ internal sealed class LoadReportService
 
     internal double GetPartitionCommitWaitMs(int partitionId)
     {
-        if (partitions.TryGetValue(partitionId, out RaftPartition? p) &&
+        if (partitionProvider.TryGetDataPartition(partitionId, out RaftPartition? p) && p is not null &&
             string.Equals(p.Leader, localEndpoint, StringComparison.Ordinal))
             return walScheduler.GetPartitionCommitWaitMs(partitionId);
 

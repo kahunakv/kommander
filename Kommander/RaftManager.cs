@@ -29,11 +29,8 @@ namespace Kommander;
 /// It coordinates cluster nodes, handles log replication, voting processes, and partition management
 /// associated with a Raft-based architecture.
 /// </summary>
-public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
+public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTimerHost, IDisposable
 {
-    private static readonly TimeSpan ProposalRetryDelay = TimeSpan.FromMilliseconds(10);
-    private static readonly TimeSpan ProposalStatusPollDelay = TimeSpan.FromMilliseconds(10);
-
     /// <summary>
     /// Test-only seam. When non-null, replaces the per-attempt partition call inside the
     /// <see cref="ReplicateLogs(int,string,IReadOnlyList{byte[]},bool,long,CancellationToken)"/>
@@ -42,7 +39,11 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// across retries (not re-enumerated). Left null in production; the only production cost is one
     /// field read per replication call.
     /// </summary>
-    internal Func<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)>? _replicateAttemptHookForTesting;
+    internal Func<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)>? _replicateAttemptHookForTesting
+    {
+        get => replicationGateway.ReplicateAttemptHookForTesting;
+        set => replicationGateway.ReplicateAttemptHookForTesting = value;
+    }
 
     /// <summary>
     /// Test-only seam. When non-null, replaces <see cref="AmILeaderQuick"/> so coordinator
@@ -50,7 +51,11 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// have no system partition) can exercise P0-leader-gated paths such as the replica-placement
     /// controller pass. Left null in production; the only cost is one field read per call.
     /// </summary>
-    internal Func<int, ValueTask<bool>>? _amILeaderQuickHookForTesting;
+    internal Func<int, ValueTask<bool>>? _amILeaderQuickHookForTesting
+    {
+        get => leadershipService.AmILeaderQuickHookForTesting;
+        set => leadershipService.AmILeaderQuickHookForTesting = value;
+    }
 
     internal readonly string LocalEndpoint;
 
@@ -106,15 +111,6 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     private readonly RaftTimerService timerService;
 
-    /// <summary>
-    /// Hard upper bound (ms) on how long any <see cref="JoinCluster(CancellationToken)"/> overload
-    /// will wait for cluster assembly before throwing a <see cref="TimeoutException"/>. Enforced
-    /// unconditionally — including when the caller passes a cancelable token — as a liveness safety
-    /// net so a stalled assembly can never hang indefinitely and silently. Normal assembly completes
-    /// in well under this bound; a join that exceeds it indicates a genuinely wedged cluster.
-    /// </summary>
-    private const long JoinHardCeilingMs = 60_000;
-
     private int _disposed;
 
     private IRaftStateMachineTransfer? _stateMachineTransfer;
@@ -122,17 +118,6 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     private IRaftSystemStateTransfer? _systemStateTransfer;
 
     private IRaftPartitionStateTransfer? _partitionStateTransfer;
-
-    /// <summary>
-    /// Per-endpoint terminal reasons set by the P0 leader when it determines a learner can
-    /// never be promoted (e.g., below the WAL compaction floor with no snapshot transfer).
-    /// The entry for the local endpoint is checked inside <see cref="JoinCluster(IEnumerable{string}, CancellationToken)"/>
-    /// so the joiner fails fast with a descriptive error rather than spinning to the timeout.
-    /// Written by the coordinator, read by the joining node's <c>JoinCluster</c> loop.
-    /// Only the local node's entry matters on the follower side; leader entries are noise-free
-    /// because the leader never waits for its own promotion.
-    /// </summary>
-    private readonly ConcurrentDictionary<string, string> _joinTerminalReasons = new();
 
     // Snapshot-receive session buffers owned by SnapshotReceiver; initialized in constructor.
     private readonly SnapshotReceiver snapshotReceiver;
@@ -182,6 +167,30 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     
     private readonly Communication.RaftTransportDispatcher transportDispatcher;
 
+    // Inbound consensus RPC routing; no owned state. Initialized in constructor after transportDispatcher.
+    private readonly RaftRpcRouter rpcRouter;
+
+    // Leadership belief, proof, waiting and handover. Initialized in constructor.
+    private readonly LeadershipService leadershipService;
+
+    // The consensus write path: propose, quorum-wait, commit/rollback, forward. Initialized in constructor.
+    private readonly ReplicationGateway replicationGateway;
+
+    // Re-admission driver for a node the committed roster evicted. Initialized in constructor.
+    private readonly AutoRejoinDriver autoRejoinDriver;
+
+    // Roster-advance reactions: application event, follower-progress repair, eviction handling.
+    // Initialized in constructor after autoRejoinDriver.
+    private readonly MembershipChangeHandler membershipChangeHandler;
+
+    // Departure protocol: decommission drain, roster removal, and the leave latches.
+    // Initialized in constructor.
+    private readonly ClusterLeaveService leaveService;
+
+    // Admission protocol: both join overloads, the leader-side join handler, and the
+    // promotion-blocked reasons. Initialized in constructor.
+    private readonly ClusterJoinService joinService;
+
     // Event-notifier collaborator: owns the 11 application-facing event delegate chains.
     // Initialized as a field so it is ready before the constructor body runs (the
     // constructor subscribes internal handlers via OnXxx += which routes through the accessor).
@@ -192,64 +201,9 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// </summary>
     internal List<RaftNode> Nodes { get; set; } = [];
 
-    /// <summary>
-    /// Snapshot of the last committed partition map applied via <see cref="StartUserPartitions"/>,
-    /// including ranges this node does <b>not</b> host. Under per-partition placement the local
-    /// <see cref="partitions"/> dictionary only holds replicated ranges, so routing
-    /// (<see cref="GetPartitionKey"/>, <see cref="GetPartitionMap"/>) must read this global view
-    /// instead of the hosted set. Replaced wholesale on every map application; readers take the
-    /// reference once and iterate their own immutable snapshot.
-    /// </summary>
-    private volatile List<RaftPartitionRange> committedRanges = [];
-
-    /// <summary>
-    /// Per-partition placement resolution derived from <see cref="committedRanges"/>: the range's
-    /// peer set (replicas minus self) and voter endpoints. Only populated for ranges with a
-    /// non-empty replica set — absence means legacy full replication and the whole-cluster
-    /// fallback applies. Rebuilt on every map application.
-    /// </summary>
-    private readonly ConcurrentDictionary<int, PartitionPlacement> partitionPlacements = new();
-
-    /// <summary>
-    /// Immutable per-range placement view consumed by the quorum seam
-    /// (<see cref="GetPartitionPeers"/> / <see cref="IsPartitionVoter"/>).
-    /// </summary>
-    private sealed class PartitionPlacement
-    {
-        internal required IReadOnlyList<RaftNode> Peers { get; init; }
-        internal required HashSet<string> VoterEndpoints { get; init; }
-        internal required IReadOnlyList<System.RaftReplica> Replicas { get; init; }
-    }
-
-    /// <summary>
-    /// Set to true by <see cref="LeaveCluster"/> before the removal is committed so that
-    /// <see cref="LocalRole"/> immediately returns <see cref="System.ClusterMemberRole.Leaving"/>
-    /// and the election / pre-vote gate suppresses campaigning on all partitions.
-    /// <para>
-    /// <see cref="RequestLeaveAsync"/> raises it only once the removal has committed: until then
-    /// the node is still a full member, and it may need to win the system-partition election in
-    /// order to commit its own removal at all.
-    /// </para>
-    /// </summary>
-    private volatile bool _leaving;
-
-    /// <summary>
-    /// Set by the first <see cref="RequestLeaveAsync"/> and never cleared, even when that attempt
-    /// fails. Departure was requested by an operator, so this node must never re-admit itself: the
-    /// removal can still land after a timed-out attempt, and auto-rejoin would silently undo the
-    /// decommission the operator asked for. Election suppression (<see cref="_leaving"/>) is
-    /// deliberately <i>not</i> sticky — a node that was refused is still a full member and must keep
-    /// campaigning.
-    /// </summary>
-    private volatile bool _leaveRequested;
-
-    /// <summary>
-    /// Serializes <see cref="RequestLeaveAsync"/> so two concurrent callers cannot run overlapping
-    /// commit loops for the same removal; the second one then observes the node already absent and
-    /// answers idempotently. The teardown path deliberately does not take it: shutdown must never
-    /// queue behind an API-initiated attempt.
-    /// </summary>
-    private readonly SemaphoreSlim leaveRequestLock = new(1, 1);
+    // Committed-map view and every routing answer derived from it; owns the committed ranges and
+    // per-partition placements. Initialized in constructor.
+    private readonly PartitionRoutingTable routingTable;
 
     /// <summary>
     /// Returns the local node's role in the committed cluster roster:
@@ -269,7 +223,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     {
         get
         {
-            if (_leaving)
+            if (leaveService.IsLeaving)
                 return System.ClusterMemberRole.Leaving;
 
             System.ClusterMembership roster = systemCoordinator.GetMembership();
@@ -527,6 +481,58 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             LocalEndpoint,
             Logger);
 
+        joinService = new ClusterJoinService(
+            this,
+            configuration,
+            clusterHandler,
+            walAdapter,
+            () => systemCoordinator!,
+            partitionId => leadershipService!.AmILeaderQuick(partitionId),
+            () => IsInitialized,
+            () => _initializedSignal.Task,
+            () => LocalRole,
+            StartSystemPartition,
+            (node, request) => communication.SendJoin(this, node, request),
+            Logger,
+            LocalEndpoint,
+            LocalNodeId);
+
+        leaveService = new ClusterLeaveService(
+            this,
+            configuration,
+            clusterHandler,
+            () => systemCoordinator!,
+            partitionId => leadershipService!.AmILeaderQuick(partitionId),
+            () => routingTable!.CommittedMapNamesEndpoint(LocalEndpoint),
+            () => IsInitialized,
+            (node, request, ct) => communication.SendLeave(this, node, request, ct),
+            (node, request, ct) => communication.SendSetMemberRole(this, node, request, ct),
+            TearDownAfterLeaveAsync,
+            Logger,
+            LocalEndpoint);
+
+        autoRejoinDriver = new AutoRejoinDriver(
+            configuration,
+            discovery,
+            () => systemCoordinator!.GetMembership(),
+            () => LocalRole,
+            () => leaveService.IsLeaving,
+            () => leaveService.IsLeaveRequested,
+            () => Volatile.Read(ref _disposed) != 0,
+            (node, request) => communication.SendJoin(this, node, request),
+            Logger,
+            LocalEndpoint,
+            LocalNodeId);
+
+        // Built before the coordinator: the coordinator raises roster events, and every one of
+        // them routes straight into this handler.
+        membershipChangeHandler = new MembershipChangeHandler(
+            this,
+            eventNotifier,
+            autoRejoinDriver,
+            Logger,
+            LocalEndpoint);
+
         systemCoordinator = new RaftSystemCoordinator(this, Logger);
 
         lifecycleService = new PartitionLifecycleService(
@@ -534,10 +540,44 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             () => IsInitialized,
             AmILeader);
 
-        timerService = new RaftTimerService(this, Logger, configuration);
-        timerService.Start();
-
         transportDispatcher = new Communication.RaftTransportDispatcher(this, communication, Logger);
+
+        rpcRouter = new RaftRpcRouter(
+            this,
+            walAdapter,
+            () => systemCoordinator.GetMembership(),
+            () => Liveness,
+            transportDispatcher.Enqueue,
+            Logger,
+            LocalEndpoint,
+            LocalNodeId);
+
+        leadershipService = new LeadershipService(
+            this,
+            walAdapter,
+            () => IsInitialized,
+            () => Joined,
+            () => Nodes,
+            (node, request, ct) => communication.GetReadIndex(this, node, request, ct),
+            (node, request) => communication.Handshake(this, node, request),
+            Logger,
+            LocalEndpoint,
+            LocalNodeId);
+
+        routingTable = new PartitionRoutingTable(
+            this,
+            () => Nodes,
+            () => systemCoordinator.GetMembership(),
+            configuration,
+            LocalEndpoint);
+
+        replicationGateway = new ReplicationGateway(
+            this,
+            routingTable,
+            (node, partitionId, type, logs, autoCommit, expectedGeneration, ct) =>
+                communication.ForwardReplicateLogs(this, node, partitionId, type, logs, autoCommit, expectedGeneration, ct),
+            Logger,
+            LocalEndpoint);
 
         readScheduler = new(logger, configuration.ReadIOThreads);
         walScheduler = new(
@@ -552,7 +592,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             configuration.WalSingleFsyncCommit);
 
         loadReportService = new LoadReportService(
-            partitions,
+            this,
             walScheduler,
             systemCoordinator.GetLoadReports,
             () => hybridLogicalClock.TrySendOrLocalEvent(LocalNodeId),
@@ -573,6 +613,12 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             // starting early is cheap. Start() is idempotent.
             executorPool.Start();
         }
+
+        // Started last, after every collaborator a tick can reach is constructed: the timer fires
+        // UpdateNodes / gossip / balancer / placement callbacks that route straight back into this
+        // manager, so starting it mid-wiring would let a tick observe a half-built node.
+        timerService = new RaftTimerService(this, Logger, configuration);
+        timerService.Start();
 
         OnSystemLogRestored += SystemLogRestored;
         OnSystemReplicationReceived += SystemReplicationReceived;
@@ -697,326 +743,50 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
-    /// Renders a snapshot of assembly progress for the <see cref="JoinCluster(CancellationToken)"/>
-    /// watchdog. When a join stalls, the generic "may have failed to elect a leader" guess is
-    /// useless three repos downstream; this pinpoints which stage is stuck by reporting the exact
-    /// state the wait loop is blocked on.
-    /// <para>
-    /// Reads only lock-free fields (the system partition's cached leader/lifecycle state, the live
-    /// partition count, and the local role) — it deliberately never routes through the partition
-    /// executor, because the executor is precisely what may be stalled and awaiting it would hang
-    /// the diagnostic itself.
-    /// </para>
-    /// <para>
-    /// How to read it: <c>systemLeader=none</c> ⇒ the system partition never elected a leader
-    /// (stage 1); a leader is present but <c>userPartitions=0/N</c> ⇒ the leader never replicated
-    /// the initial map to this node (stage 2); <c>0&lt;userPartitions&lt;N</c> ⇒ StartUserPartitions
-    /// ran partially (stage 3).
-    /// </para>
-    /// <para>
-    /// Stage 2 has two very different causes that look identical from the partition count alone, so
-    /// the local P0 log frontier is reported alongside it. <c>p0MaxLog=0</c> means the entries never
-    /// arrived — the leader is heartbeating us but never shipping the committed range (a leader-side
-    /// replication/backfill problem). <c>p0MaxLog&gt;0</c> with <c>userPartitions=0</c> means they
-    /// did arrive but were never applied — they are sitting in the WAL unconverted to
-    /// <c>Committed</c>, or the coordinator never processed the resulting <c>ConfigReplicated</c>
-    /// (a follower-side apply problem). Without this split, a stalled join is indistinguishable
-    /// between "nothing was sent" and "everything was sent and dropped on the floor".
-    /// </para>
+    /// Starts the shared executor pool and I/O schedulers and materializes the system partition,
+    /// once. Owned here rather than by <see cref="ClusterJoinService"/> because the pool, the
+    /// schedulers and the partition registry all belong to this class; both join overloads call
+    /// it as their first step.
     /// </summary>
-    private string DescribeAssemblyState()
+    private void StartSystemPartition()
     {
-        string systemLeader = systemPartition is null
-            ? "no-system-partition"
-            : string.IsNullOrEmpty(systemPartition.Leader) ? "none" : systemPartition.Leader;
-
-        string systemState = systemPartition is null ? "n/a" : systemPartition.State.ToString();
-
-        // Direct WAL-backend reads: synchronous, and deliberately NOT routed through the read
-        // scheduler or the partition executor, either of which may be the thing that is stuck.
-        string p0MaxLog = "n/a";
-        string p0Term = "n/a";
-
         if (systemPartition is not null)
-        {
-            try
-            {
-                p0MaxLog = walAdapter.GetMaxLog(RaftSystemConfig.SystemPartition).ToString();
-                p0Term = walAdapter.GetCurrentTerm(RaftSystemConfig.SystemPartition).ToString();
-            }
-            catch (Exception ex)
-            {
-                // A diagnostic must never be the reason a join fails.
-                p0MaxLog = "err:" + ex.GetType().Name;
-            }
-        }
+            return;
 
-        return string.Concat(
-            "local=", LocalEndpoint,
-            " role=", LocalRole.ToString(),
-            " systemLeader=", systemLeader,
-            " systemState=", systemState,
-            " p0MaxLog=", p0MaxLog,
-            " p0Term=", p0Term,
-            " userPartitions=", partitions.Count.ToString(),
-            "/", configuration.InitialPartitions.ToString(),
-            " initialized=", IsInitialized ? "true" : "false");
+        executorPool?.Start();
+        readScheduler.Start();
+        walScheduler.Start();
+
+        systemPartition = new(
+            this,
+            walAdapter,
+            RaftSystemConfig.SystemPartition,
+            0,
+            0,
+            Logger,
+            executorPool
+        );
     }
 
     /// <summary>
     /// Joins the cluster
     /// </summary>
-    public async Task JoinCluster(CancellationToken cancellationToken = default)
-    {
-        // Registers itself at the discovery service
-        await clusterHandler.JoinCluster(configuration).ConfigureAwait(false);
-
-        if (systemPartition is null)
-        {
-            executorPool?.Start();
-            readScheduler.Start();
-            walScheduler.Start();
-
-            // Add system partition
-            systemPartition = new(
-                this,
-                walAdapter,
-                RaftSystemConfig.SystemPartition,
-                0,
-                0,
-                Logger,
-                executorPool
-            );
-        }
-
-        // Wait for the system coordinator to replicate the initial partition map and call
-        // StartUserPartitions. On a slow or loaded host this can take longer than expected;
-        // impose an explicit deadline so JoinCluster never blocks indefinitely.
-        //
-        // The JoinHardCeiling is enforced UNCONDITIONALLY — even when the caller passes a
-        // cancelable token. Previously the ceiling was skipped for a cancelable token ("the caller
-        // owns the deadline"), but a caller whose token never actually fires (e.g. xUnit's
-        // TestContext token with no configured test timeout) then had NO liveness bound at all, so a
-        // cluster that failed to assemble hung forever and silently — the exact all-idle,
-        // no-output, whole-suite wedge diagnosed in
-        // specs/spec-quiescence-liveness-and-catch-up-stranding.md (issue A2). A cluster that cannot
-        // reach IsInitialized within the ceiling is broken; failing loudly with a state-dump beats
-        // hanging. The caller's token still cancels EARLIER than the ceiling.
-        ValueStopwatch joinStopwatch = ValueStopwatch.StartNew();
-        Task initializedTask = _initializedSignal.Task;
-        while (!IsInitialized)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            long elapsedMs = joinStopwatch.GetElapsedMilliseconds();
-
-            // Emit a per-tick snapshot so a stalled join leaves an evolving trail in the log
-            // (leader appears? partitions climb?) instead of a single opaque throw at the deadline.
-            Logger.LogWarning(
-                "JoinCluster: waiting for initialization ({ElapsedMs} ms elapsed): {State}",
-                elapsedMs, DescribeAssemblyState());
-
-            if (elapsedMs > JoinHardCeilingMs)
-                throw new TimeoutException(
-                    $"RaftManager.JoinCluster timed out after {JoinHardCeilingMs / 1000} s waiting for cluster initialization. State: {DescribeAssemblyState()}");
-
-            // Return the instant initialization signals; otherwise re-log and ceiling-check on the
-            // next 1 s tick. Replaces a flat Task.Delay(1000) that made a node which assembles in a
-            // few ms still sleep out the rest of the tick. On cancellation the Delay completes
-            // (canceled) and the loop-top ThrowIfCancellationRequested throws — earlier than the
-            // ceiling, unchanged. The orphaned canceled Delay raises no UnobservedTaskException.
-            await Task.WhenAny(initializedTask, Task.Delay(1000, cancellationToken)).ConfigureAwait(false);
-        }
-    }
+    public Task JoinCluster(CancellationToken cancellationToken = default) =>
+        joinService.JoinCluster(cancellationToken);
 
     /// <summary>
     /// Seed-based join: contacts each seed in turn until this node is admitted as a Learner,
-    /// then waits for automatic promotion to Voter. Each wait phase is bounded by
-    /// <see cref="JoinHardCeilingMs"/>, enforced unconditionally (even with a cancelable token) as a
-    /// liveness safety net; the caller's token may cancel earlier. See
-    /// <see cref="JoinCluster(CancellationToken)"/> for the rationale (issue A2: a never-firing
-    /// cancelable token previously left join with no bound, hanging forever on a stalled assembly).
-    /// <para>
-    /// Unlike the discovery-based overload this variant does NOT call <see cref="IDiscovery.Register"/>;
-    /// it relies on the P0 leader learning of the new node via the committed roster entry so that
-    /// the leader's next <c>UpdateNodes</c> tick includes this endpoint in its peer set and begins
-    /// sending P0 heartbeats.  Once the system-partition logs are replicated the coordinator calls
-    /// <see cref="StartUserPartitions"/> and <see cref="IsInitialized"/> becomes <c>true</c>.
-    /// </para>
+    /// then waits for automatic promotion to Voter. See <see cref="ClusterJoinService"/> for the
+    /// deadline contract.
     /// </summary>
-    public async Task JoinCluster(IEnumerable<string> seeds, CancellationToken cancellationToken = default)
-    {
-        // Start schedulers and the system partition exactly as the discovery-based join does.
-        if (systemPartition is null)
-        {
-            executorPool?.Start();
-            readScheduler.Start();
-            walScheduler.Start();
-
-            systemPartition = new(
-                this,
-                walAdapter,
-                RaftSystemConfig.SystemPartition,
-                0,
-                0,
-                Logger,
-                executorPool
-            );
-        }
-
-        // Mark as joined so timer UpdateNodes ticks start firing once the roster has us.
-        clusterHandler.MarkJoined();
-
-        // Contact seeds until a P0 leader accepts us as a Learner.
-        JoinResponse? accepted = null;
-        ValueStopwatch joinStopwatch = ValueStopwatch.StartNew();
-
-        List<string> seedList = [.. seeds];
-
-        while (accepted is null || !accepted.Success)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (joinStopwatch.GetElapsedMilliseconds() > JoinHardCeilingMs)
-                throw new TimeoutException($"RaftManager.JoinCluster(seeds) timed out after {JoinHardCeilingMs / 1000} s before being admitted as a Learner.");
-                
-            string? leaderHint = null;
-
-            foreach (string seed in seedList)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                string target = leaderHint ?? seed;
-                RaftNode node = new(target);
-                try
-                {
-                    JoinResponse resp = await communication.SendJoin(this, node, new JoinRequest(LocalEndpoint, LocalNodeId)).ConfigureAwait(false);
-                    if (resp.Success)
-                    {
-                        accepted = resp;
-                        break;
-                    }
-                    if (!string.IsNullOrEmpty(resp.LeaderHint))
-                    {
-                        leaderHint = resp.LeaderHint;
-                        // Retry immediately against the leader hint.
-                        try
-                        {
-                            RaftNode leaderNode = new(leaderHint);
-                            resp = await communication.SendJoin(this, leaderNode, new JoinRequest(LocalEndpoint, LocalNodeId)).ConfigureAwait(false);
-                            if (resp.Success)
-                            {
-                                accepted = resp;
-                                break;
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Logger.LogWarning("JoinCluster: failed to contact leader hint {Hint}: {Message}", leaderHint, ex.Message);
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Logger.LogWarning("JoinCluster: failed to contact seed {Seed}: {Message}", seed, ex.Message);
-                }
-            }
-
-            if (accepted is null || !accepted.Success)
-                await Task.Delay(500, cancellationToken).ConfigureAwait(false);
-        }
-
-        Logger.LogInfoJoinClusterAdmittedAsLearner(accepted.MembershipVersion);
-
-        // Wait for IsInitialized (system coordinator receives partition map from P0 leader).
-        // Also check for a terminal block: if the P0 leader cannot backfill this node (WAL is
-        // compacted, no snapshot transfer registered), IsInitialized will never become true and
-        // we must surface the permanent-block reason rather than spinning to the timeout.
-        //
-        // Unlike the discovery-based JoinCluster, this loop deliberately keeps the raw 500 ms poll
-        // rather than awaiting _initializedSignal. The seed-join learner path races the terminal-block
-        // decision (NotifyJoinBlocked) against promotion, and the terminal reason is polled here every
-        // tick; waking early on the initialize signal perturbs that interleaving enough to let a
-        // below-floor learner slip past the block (see TestSnapshotIntegration.Learner_BelowCompactionFloor_*).
-        // This path is also not latency-sensitive the way single-node boot is — a lone in-memory node is
-        // leader-from-seed via the discovery overload, never a seed-joining learner — so the poll stays.
-        while (!IsInitialized)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (joinStopwatch.GetElapsedMilliseconds() > JoinHardCeilingMs)
-                throw new TimeoutException(
-                    $"RaftManager.JoinCluster(seeds) timed out after {JoinHardCeilingMs / 1000} s waiting for cluster initialization. State: {DescribeAssemblyState()}");
-            string? terminalReasonInit = GetJoinTerminalReason(LocalEndpoint);
-            if (terminalReasonInit is not null)
-                throw new InvalidOperationException($"RaftManager.JoinCluster: promotion permanently blocked — {terminalReasonInit}");
-            await Task.Delay(500, cancellationToken).ConfigureAwait(false);
-        }
-
-        // Wait for promotion to Voter.
-        while (LocalRole != ClusterMemberRole.Voter)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (joinStopwatch.GetElapsedMilliseconds() > JoinHardCeilingMs)
-                throw new TimeoutException($"RaftManager.JoinCluster(seeds) timed out after {JoinHardCeilingMs / 1000} s waiting for Voter promotion.");
-
-            // The P0 leader signals a terminal condition (e.g., learner is below the WAL
-            // compaction floor and no snapshot transfer is registered) so the joiner fails
-            // fast with a descriptive error rather than spinning to the 60 s deadline.
-            string? terminalReason = GetJoinTerminalReason(LocalEndpoint);
-            if (terminalReason is not null)
-                throw new InvalidOperationException($"RaftManager.JoinCluster: promotion permanently blocked — {terminalReason}");
-
-            await Task.Delay(500, cancellationToken).ConfigureAwait(false);
-        }
-
-        Logger.LogInformation("JoinCluster: promoted to Voter; join complete");
-    }
+    public Task JoinCluster(IEnumerable<string> seeds, CancellationToken cancellationToken = default) =>
+        joinService.JoinCluster(seeds, cancellationToken);
 
     /// <summary>
-    /// Handles an inbound <see cref="JoinRequest"/> from a joining node.
-    /// <para>
-    /// If this node is the P0 leader it commits the joiner as a <see cref="ClusterMemberRole.Learner"/>
-    /// and returns <see cref="JoinResponse.Success"/> = <c>true</c>.
-    /// Otherwise it returns <see cref="JoinResponse.Success"/> = <c>false</c> with the current
-    /// P0 leader endpoint in <see cref="JoinResponse.LeaderHint"/> so the caller can retry directly
-    /// against the leader.
-    /// </para>
-    /// <para>
-    /// <b>Idempotency:</b> if the endpoint is already committed in the roster (e.g. a previous
-    /// <c>AddMember</c> committed but the response was lost before the joiner saw it), this
-    /// method returns <c>Success</c> with the current roster version rather than an error.  This
-    /// prevents the joiner's retry loop from spinning to the 60 s timeout.
-    /// </para>
+    /// Handles an inbound <see cref="JoinRequest"/> from a joining node: the leader commits the
+    /// joiner as a <see cref="ClusterMemberRole.Learner"/>, a non-leader answers with a hint.
     /// </summary>
-    public async Task<JoinResponse> ReceiveJoin(JoinRequest request)
-    {
-        if (systemPartition is null || !IsInitialized)
-            return new JoinResponse(false);
-
-        bool isLeader = await AmILeaderQuick(RaftSystemConfig.SystemPartition).ConfigureAwait(false);
-        if (!isLeader)
-        {
-            string leaderHint = systemPartition.Leader;
-            return new JoinResponse(false, string.IsNullOrEmpty(leaderHint) ? null : leaderHint);
-        }
-
-        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        systemCoordinator.Send(new RaftSystemRequest(
-            RaftSystemRequestType.AddMember,
-            request.Endpoint,
-            request.NodeId,
-            systemCoordinator.GetMembership().MembershipVersion,
-            tcs));
-
-        (RaftOperationStatus status, long version) = await tcs.Task.ConfigureAwait(false);
-
-        if (status == RaftOperationStatus.Success)
-            return new JoinResponse(true, null, version);
-
-        // Another membership change was in flight or version mismatch — return current leader so
-        // the caller can retry after a brief backoff.
-        return new JoinResponse(false, LocalEndpoint);
-    }
+    public Task<JoinResponse> ReceiveJoin(JoinRequest request) => joinService.ReceiveJoin(request);
 
     /// <summary>
     /// Handles an inbound <see cref="LeaveRequest"/> from a departing node.
@@ -1032,124 +802,16 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// to timeout.
     /// </para>
     /// </summary>
-    public async Task<LeaveResponse> ReceiveLeave(LeaveRequest request, CancellationToken cancellationToken = default)
-    {
-        // Fail-fast when this node has already stopped — the coordinator channel is closed
-        // and posting to it would block until the per-attempt CTS fires (3 s per attempt).
-        if (systemCoordinator.IsStopped)
-            return new LeaveResponse(false);
-
-        if (systemPartition is null || !IsInitialized)
-            return new LeaveResponse(false);
-
-        bool isLeader = await AmILeaderQuick(RaftSystemConfig.SystemPartition).ConfigureAwait(false);
-        if (!isLeader)
-        {
-            string leaderHint = systemPartition.Leader;
-            return new LeaveResponse(false, string.IsNullOrEmpty(leaderHint) ? null : leaderHint);
-        }
-
-        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        // Cancel the TCS if the caller's token fires (e.g., per-attempt timeout) so this
-        // method never blocks indefinitely when the coordinator has already been stopped.
-        await using CancellationTokenRegistration reg = cancellationToken.Register(
-            () => tcs.TrySetCanceled(cancellationToken));
-
-        systemCoordinator.Send(new RaftSystemRequest(
-            RaftSystemRequestType.RemoveMember,
-            request.Endpoint,
-            request.NodeId,
-            systemCoordinator.GetMembership().MembershipVersion,
-            tcs));
-
-        try
-        {
-            (RaftOperationStatus status, long version) = await tcs.Task.ConfigureAwait(false);
-
-            if (status == RaftOperationStatus.Success)
-                return new LeaveResponse(true, null, false, version);
-
-            // InsufficientVoters is a permanent condition: removal would brick the cluster.
-            // Terminal=true prevents CommitGracefulLeaveAsync from retrying.
-            if (status == RaftOperationStatus.InsufficientVoters)
-                return new LeaveResponse(false, null, Terminal: true);
-        }
-        catch (OperationCanceledException)
-        {
-            // Per-attempt timeout or caller cancelled — return false so caller retries or gives up.
-        }
-
-        // Concurrent change, stale version, or timeout — caller retries with current leader.
-        return new LeaveResponse(false, LocalEndpoint);
-    }
+    public Task<LeaveResponse> ReceiveLeave(LeaveRequest request, CancellationToken cancellationToken = default) =>
+        leaveService.ReceiveLeave(request, cancellationToken);
 
     /// <summary>
     /// Handles an inbound <see cref="SetMemberRoleRequest"/>: a roster role transition for the
     /// decommission drain (<c>Voter → Leaving</c> to start, <c>Leaving → Voter</c> to roll back).
-    /// <para>
-    /// Mirrors <see cref="ReceiveLeave"/>: only the P0 leader commits; a non-leader returns
-    /// <see cref="SetMemberRoleResponse.LeaderHint"/>. The coordinator's verdict travels back in
-    /// <see cref="SetMemberRoleResponse.Status"/> so the caller can tell a retryable rejection
-    /// (concurrent change) from a permanent one (insufficient voters, drain already in flight)
-    /// and — critically for the rollback race — from
-    /// <see cref="RaftOperationStatus.MemberNotFound"/>, which means the placement pass already
-    /// committed the final removal and the node must treat itself as departed.
-    /// </para>
+    /// Only the system-partition leader commits; a non-leader returns a leader hint.
     /// </summary>
-    public async Task<SetMemberRoleResponse> ReceiveSetMemberRole(SetMemberRoleRequest request, CancellationToken cancellationToken = default)
-    {
-        // Fail-fast when this node has already stopped — the coordinator channel is closed
-        // and posting to it would block until the per-attempt CTS fires.
-        if (systemCoordinator.IsStopped)
-            return new SetMemberRoleResponse(false, Status: RaftOperationStatus.Errored);
-
-        if (systemPartition is null || !IsInitialized)
-            return new SetMemberRoleResponse(false, Status: RaftOperationStatus.Errored);
-
-        bool isLeader = await AmILeaderQuick(RaftSystemConfig.SystemPartition).ConfigureAwait(false);
-        if (!isLeader)
-        {
-            string leaderHint = systemPartition.Leader;
-            return new SetMemberRoleResponse(false, string.IsNullOrEmpty(leaderHint) ? null : leaderHint, RaftOperationStatus.NodeIsNotLeader);
-        }
-
-        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        await using CancellationTokenRegistration reg = cancellationToken.Register(
-            () => tcs.TrySetCanceled(cancellationToken));
-
-        systemCoordinator.Send(new RaftSystemRequest(
-            RaftSystemRequestType.SetMemberRole,
-            request.Endpoint,
-            request.NodeId,
-            systemCoordinator.GetMembership().MembershipVersion,
-            request.TargetRole,
-            tcs));
-
-        try
-        {
-            (RaftOperationStatus status, long version) = await tcs.Task.ConfigureAwait(false);
-
-            if (status == RaftOperationStatus.Success)
-                return new SetMemberRoleResponse(true, null, RaftOperationStatus.Success, version);
-
-            // Terminal verdicts carry no hint — retrying against any leader cannot change them.
-            if (status is RaftOperationStatus.InsufficientVoters or RaftOperationStatus.MemberNotFound or RaftOperationStatus.DrainInProgress)
-                return new SetMemberRoleResponse(false, null, status, version);
-
-            // Concurrent change or stale version — caller retries with the current leader.
-            return new SetMemberRoleResponse(false, LocalEndpoint, status, version);
-        }
-        catch (OperationCanceledException)
-        {
-            // Per-attempt timeout or caller cancelled — caller retries or gives up.
-        }
-
-        return new SetMemberRoleResponse(false, LocalEndpoint, RaftOperationStatus.Errored);
-    }
+    public Task<SetMemberRoleResponse> ReceiveSetMemberRole(SetMemberRoleRequest request, CancellationToken cancellationToken = default) =>
+        leaveService.ReceiveSetMemberRole(request, cancellationToken);
 
     /// <summary>
     /// Installs a partition snapshot received from the partition leader.
@@ -1288,8 +950,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <summary>
     /// Start the user partitions
     /// <para>
-    /// Applies the committed map: refreshes the global routing snapshot
-    /// (<see cref="committedRanges"/> / <see cref="partitionPlacements"/>), then materializes a
+    /// Applies the committed map: refreshes the global routing snapshot in
+    /// <see cref="PartitionRoutingTable"/>, then materializes a
     /// <see cref="RaftPartition"/> only for ranges this node hosts. A range with a non-empty
     /// replica set is hosted only when the local endpoint appears in it (any role); an empty
     /// replica set means legacy full replication and is hosted unconditionally. A partition this
@@ -1301,32 +963,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <param name="ranges"></param>
     internal void StartUserPartitions(List<RaftPartitionRange> ranges)
     {
-        committedRanges = ranges;
-
-        foreach (RaftPartitionRange range in ranges)
-        {
-            if (range.Replicas.Count > 0 && range.State != RaftPartitionState.Removed)
-            {
-                List<RaftNode> peers = new(range.Replicas.Count);
-                HashSet<string> voters = new(StringComparer.Ordinal);
-                foreach (System.RaftReplica replica in range.Replicas)
-                {
-                    if (replica.Endpoint != LocalEndpoint)
-                        peers.Add(new RaftNode(replica.Endpoint));
-                    if (replica.Role == System.RaftReplicaRole.Voter)
-                        voters.Add(replica.Endpoint);
-                }
-
-                partitionPlacements[range.PartitionId] = new PartitionPlacement
-                {
-                    Peers = peers,
-                    VoterEndpoints = voters,
-                    Replicas = range.Replicas.ToList()
-                };
-            }
-            else
-                partitionPlacements.TryRemove(range.PartitionId, out _);
-        }
+        routingTable.ApplyCommittedMap(ranges);
 
         foreach (RaftPartitionRange range in ranges)
         {
@@ -1427,14 +1064,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// seam that makes quorum per-partition — <see cref="RaftPartitionStateMachine"/> computes
     /// every quorum from <c>host.Nodes</c> filtered by <c>host.IsVoter</c>.
     /// </summary>
-    internal IReadOnlyList<RaftNode> GetPartitionPeers(int partitionId)
-    {
-        if (partitionId != RaftSystemConfig.SystemPartition &&
-            partitionPlacements.TryGetValue(partitionId, out PartitionPlacement? placement))
-            return placement.Peers;
-
-        return Nodes;
-    }
+    internal IReadOnlyList<RaftNode> GetPartitionPeers(int partitionId) =>
+        routingTable.GetPartitionPeers(partitionId);
 
     /// <summary>
     /// Returns true when <paramref name="endpoint"/> counts toward <paramref name="partitionId"/>'s
@@ -1443,27 +1074,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// peers but excluded from the quorum denominator. For legacy ranges and the system partition
     /// it falls back to the committed roster's voter set (pre-seed: everyone is a voter).
     /// </summary>
-    internal bool IsPartitionVoter(int partitionId, string endpoint)
-    {
-        if (partitionId != RaftSystemConfig.SystemPartition &&
-            partitionPlacements.TryGetValue(partitionId, out PartitionPlacement? placement))
-            return placement.VoterEndpoints.Contains(endpoint);
-
-        System.ClusterMembership roster = systemCoordinator.GetMembership();
-        if (roster.MembershipVersion == 0)
-            return true; // pre-seed: treat all known peers as voters (backward compat)
-
-        // Plain loop, not LINQ Any: this runs per peer per check-quorum tick and per propose
-        // broadcast on P0/legacy ranges — the capturing lambda would allocate on every call.
-        foreach (System.ClusterMember member in roster.Members)
-        {
-            if (member.Role == System.ClusterMemberRole.Voter &&
-                string.Equals(member.Endpoint, endpoint, StringComparison.Ordinal))
-                return true;
-        }
-
-        return false;
-    }
+    internal bool IsPartitionVoter(int partitionId, string endpoint) =>
+        routingTable.IsPartitionVoter(partitionId, endpoint);
 
     /// <summary>
     /// Returns whether the partition is materialized on this node — see
@@ -1485,78 +1097,38 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// legacy full replication (every roster voter hosts the range) and unknown partitions.
     /// The returned list is a snapshot; it never mutates after being returned.
     /// </summary>
-    public IReadOnlyList<System.RaftReplica> GetPartitionReplicas(int partitionId)
-    {
-        if (partitionPlacements.TryGetValue(partitionId, out PartitionPlacement? placement))
-            return placement.Replicas;
-
-        return [];
-    }
+    public IReadOnlyList<System.RaftReplica> GetPartitionReplicas(int partitionId) =>
+        routingTable.GetPartitionReplicas(partitionId);
 
     /// <summary>
     /// Returns the effective replication factor for <paramref name="partitionId"/>: the range's
     /// override when set, otherwise <see cref="RaftConfiguration.ReplicationFactor"/>.
     /// 0 means full replication.
     /// </summary>
-    public int GetEffectiveReplicationFactor(int partitionId)
-    {
-        List<RaftPartitionRange> ranges = committedRanges;
-        foreach (RaftPartitionRange range in ranges)
-        {
-            if (range.PartitionId == partitionId && range.ReplicationFactor > 0)
-                return range.ReplicationFactor;
-        }
-
-        return configuration.ReplicationFactor;
-    }
+    public int GetEffectiveReplicationFactor(int partitionId) =>
+        routingTable.GetEffectiveReplicationFactor(partitionId);
 
     /// <summary>
-    /// Leaves the cluster.
-    /// <para>
-    /// When the local node is part of a committed roster (MembershipVersion &gt; 0) this method
-    /// first sets the <b>local</b> <see cref="_leaving"/> latch — <see cref="LocalRole"/> then
-    /// reports <see cref="System.ClusterMemberRole.Leaving"/>, suppressing elections immediately;
-    /// this is not a committed roster change and no replica drain happens — commits a
-    /// <c>RemoveMember</c> entry on P0, and
-    /// waits up to 10 s for the removal to propagate back to this node before tearing down.
-    /// Use <see cref="RequestLeaveAsync"/> for a decommission that evacuates replicas first.
-    /// If the cluster has no committed roster (pre-seed transient or test teardown path), or if
-    /// the roster contains no other <c>Voter</c> peer, the round-trip is skipped and the node
-    /// stops immediately (single-voter short-circuit — no 10 s spin).
-    /// </para>
+    /// Leaves the cluster and tears the node down. See <see cref="ClusterLeaveService.LeaveCluster"/>;
+    /// this node's ordered teardown is supplied to that service as <see cref="TearDownAfterLeaveAsync"/>.
     /// </summary>
     /// <param name="dispose">If true, also disposes the manager</param>
     /// <param name="cancellationToken">
     /// When cancelled, aborts any in-progress graceful-leave attempt immediately.
     /// </param>
-    public async Task LeaveCluster(bool dispose = false, CancellationToken cancellationToken = default)
+    public Task LeaveCluster(bool dispose = false, CancellationToken cancellationToken = default) =>
+        leaveService.LeaveCluster(dispose, cancellationToken);
+
+    /// <summary>
+    /// Stops everything this manager owns, in the one order that is safe: timer first (no new work
+    /// injected), drain partition queues, stop the shared I/O schedulers while partition executors
+    /// are still alive so WAL completions can be posted back, drain those completions, then stop
+    /// executor threads, the pool, the dispatcher and the coordinator. Owned here rather than by
+    /// the leave service because every resource in the sequence belongs to this class.
+    /// </summary>
+    private async Task TearDownAfterLeaveAsync(bool dispose)
     {
-        // Suppress elections on all partitions immediately: teardown follows unconditionally, so
-        // this node must not win a leadership it is about to abandon.
-        _leaving = true;
-
-        // If we are part of a committed roster AND there is at least one other Voter peer,
-        // commit the removal before stopping so surviving nodes drop us from their peer list
-        // at the consensus level.
-        // Short-circuit: a single-voter roster (embedded/standalone) has no quorum peer to
-        // commit the removal — skipping saves the 10 s deadline spin on every dispose.
-        System.ClusterMembership roster = systemCoordinator.GetMembership();
-        bool hasOtherVoter = roster.Members.Any(m =>
-            m.Role == System.ClusterMemberRole.Voter &&
-            !string.Equals(m.Endpoint, LocalEndpoint, StringComparison.Ordinal));
-
-        if (roster.MembershipVersion > 0 && clusterHandler.Joined && hasOtherVoter)
-        {
-            await CommitGracefulLeaveAsync(cancellationToken).ConfigureAwait(false);
-        }
-
-        await clusterHandler.LeaveCluster(configuration).ConfigureAwait(false);
-
-        // Stop in the correct order: timer first (no new work injected), drain
-        // partition queues, stop shared I/O schedulers while partition executors are
-        // still alive so WAL completions can be posted back, drain those completions,
-        // then stop executor threads. RaftTimerService.Dispose() is idempotent and
-        // safe to call again from RaftManager.Dispose() if that path is taken.
+        // RaftTimerService.Dispose() is idempotent and safe to call again from Dispose() below.
         timerService.Dispose();
 
         await DrainPartitions(CancellationToken.None).ConfigureAwait(false);
@@ -1587,562 +1159,15 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
 
     /// <summary>
     /// Asks the cluster to remove this node from the committed roster and reports what happened,
-    /// <b>without</b> tearing the node down.
-    /// <para>
-    /// This is the decommission primitive an operator drives at runtime: the caller learns whether
-    /// the removal committed, was permanently refused (removing the last voter), or could not be
-    /// attempted, and only then decides whether to stop the process. <see cref="LeaveCluster"/>
-    /// remains the shutdown-coupled variant that always proceeds to stop.
-    /// </para>
-    /// <para>
-    /// <b>Drain-before-removal:</b> when the committed partition map names this endpoint in any
-    /// replica set, the method first commits the <see cref="System.ClusterMemberRole.Leaving"/>
-    /// roster role and waits (up to <see cref="RaftConfiguration.DecommissionDrainTimeout"/>) for
-    /// the placement pass to evacuate every replica onto survivors; only then does it commit the
-    /// removal, and the result carries <see cref="LeaveClusterResult.Drained"/> = true. A drain
-    /// that cannot start is refused (<see cref="LeaveClusterOutcome.RefusedDrainInProgress"/> /
-    /// <see cref="LeaveClusterOutcome.RefusedInsufficientVoters"/>) and the node keeps serving; a
-    /// drain that times out rolls the role back to Voter
-    /// (<see cref="LeaveClusterOutcome.DrainTimedOut"/>) — unless the placement pass finished the
-    /// evacuation and committed the removal first, in which case removal wins and the result is
-    /// <see cref="LeaveClusterOutcome.Committed"/>. Full-replication clusters (no replica sets)
-    /// and deployments with <see cref="RaftConfiguration.EnablePlacementRebalancer"/> off (no
-    /// evacuation machinery exists there) keep the historical direct-removal behaviour unchanged.
-    /// </para>
-    /// <para>
-    /// Campaigning is left alone until the removal commits, and suppressed for good afterwards: a
-    /// node that was refused — or whose attempt failed — is still a full member and must keep
-    /// participating, while one that left must not contend for leadership it no longer has a claim
-    /// to.
-    /// </para>
-    /// <para>
-    /// Concurrent calls are serialized and idempotent: the second caller observes the node already
-    /// absent from the roster and returns <see cref="LeaveClusterOutcome.NotAMember"/>.
-    /// </para>
+    /// <b>without</b> tearing the node down — see <see cref="ClusterLeaveService.RequestLeaveAsync"/>
+    /// for the drain-before-removal contract and the full set of outcomes.
     /// </summary>
     /// <param name="cancellationToken">
     /// Bounds the attempt. Cancelling yields <see cref="LeaveClusterOutcome.Timeout"/> — the removal
     /// may still commit, so the caller must re-read the roster before concluding anything.
     /// </param>
-    public async Task<LeaveClusterResult> RequestLeaveAsync(CancellationToken cancellationToken = default)
-    {
-        if (systemPartition is null || !IsInitialized)
-            return new(LeaveClusterOutcome.NotInitialized, 0);
-
-        await leaveRequestLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-
-        try
-        {
-            // Recorded before anything can short-circuit: even an attempt answered "you are already
-            // out" is an operator asking this node to go, and a node that then re-admitted itself
-            // would undo the decommission just as surely as one that never left.
-            _leaveRequested = true;
-
-            System.ClusterMembership roster = systemCoordinator.GetMembership();
-
-            // No committed roster yet (pre-seed transient): there is no membership entry to remove,
-            // and the node cannot be counted towards anyone's quorum until seeding completes.
-            if (roster.MembershipVersion == 0 || !clusterHandler.Joined)
-                return new(LeaveClusterOutcome.NotInitialized, roster.MembershipVersion);
-
-            if (!roster.Members.Any(m => string.Equals(m.Endpoint, LocalEndpoint, StringComparison.Ordinal)))
-                return new(LeaveClusterOutcome.NotAMember, roster.MembershipVersion);
-
-            // ── Decommission drain ────────────────────────────────────────────────────
-            // Only when the committed map actually names this endpoint in a replica set (or a
-            // previous drain is being resumed — the role is already Leaving). Full-replication
-            // clusters (RF 0) have nothing to evacuate: every survivor already holds the data,
-            // so they keep the historical direct-removal path bit-for-bit.
-            //
-            // Also gated on EnablePlacementRebalancer: evacuation is planned by the placement
-            // rebalancer (priority-1 repair adds + the trim of the leaver's replica), so with
-            // the flag off a committed Leaving role would sit un-evacuated until the drain
-            // timeout and roll back — a guaranteed 2-minute wedge. Such deployments keep the
-            // historical direct removal (and its historical consequence: repairs are manual).
-            bool drained = false;
-            System.ClusterMemberRole selfRole =
-                roster.Members.First(m => string.Equals(m.Endpoint, LocalEndpoint, StringComparison.Ordinal)).Role;
-
-            if (configuration.EnablePlacementRebalancer &&
-                (CommittedMapNamesLocalEndpoint() || selfRole == System.ClusterMemberRole.Leaving))
-            {
-                LeaveClusterResult? drainOutcome = await DrainBeforeLeaveAsync(selfRole, cancellationToken).ConfigureAwait(false);
-                if (drainOutcome is { } terminal)
-                {
-                    // A departure completed by the placement pass (removal won the race) must
-                    // stop campaigning for good, exactly like the normal removal path below.
-                    if (terminal.Left)
-                        _leaving = true;
-
-                    return terminal;
-                }
-
-                drained = true;
-            }
-
-            // Campaigning is deliberately NOT suppressed while the attempt is in flight. The node
-            // is still a full member until the removal commits, and the removal is committed by the
-            // system-partition leader — so a node that has to win that election first (the last
-            // voter answering its own request, or any node during a leadership gap) must be allowed
-            // to. Suppressing here deadlocked exactly that case into a timeout.
-            LeaveClusterResult result = await CommitGracefulLeaveAsync(cancellationToken).ConfigureAwait(false);
-
-            // A leader acknowledgement can be lost in transit or arrive after the deadline, leaving
-            // an attempt reported as timed out even though the removal committed. Re-reading the
-            // roster resolves that in the caller's favour whenever the new roster is already here.
-            if (!result.Left &&
-                !systemCoordinator.GetMembership().Members.Any(m => string.Equals(m.Endpoint, LocalEndpoint, StringComparison.Ordinal)))
-                result = new(LeaveClusterOutcome.Committed, systemCoordinator.GetMembership().MembershipVersion);
-
-            // Only a departure that actually happened stops the node campaigning, and it stops it
-            // for good: it is out of the roster and must not contend for leadership it no longer
-            // has a claim to.
-            if (result.Left)
-                _leaving = true;
-
-            return drained ? result with { Drained = true } : result;
-        }
-        finally
-        {
-            leaveRequestLock.Release();
-        }
-    }
-
-    /// <summary>
-    /// True when any committed range's replica set names the local endpoint (in any replica
-    /// role). Removed ranges are ignored — their replica sets are historical. This is the
-    /// drain-completion predicate: the decommission may commit its final <c>RemoveMember</c>
-    /// only once this turns false, and the placement pass uses the same rule for its
-    /// crash-resumption auto-removal so the two can never disagree.
-    /// </summary>
-    private bool CommittedMapNamesLocalEndpoint()
-    {
-        List<RaftPartitionRange> ranges = committedRanges;
-
-        foreach (RaftPartitionRange range in ranges)
-        {
-            if (range.State == RaftPartitionState.Removed)
-                continue;
-
-            foreach (RaftReplica replica in range.Replicas)
-            {
-                if (string.Equals(replica.Endpoint, LocalEndpoint, StringComparison.Ordinal))
-                    return true;
-            }
-        }
-
-        return false;
-    }
-
-    /// <summary>
-    /// The drain leg of <see cref="RequestLeaveAsync"/>: commits <c>Voter → Leaving</c>, then
-    /// waits for the placement pass to evacuate every replica this node hosts.
-    /// <para>
-    /// Returns <c>null</c> when the drain completed and the caller should proceed to the normal
-    /// <c>RemoveMember</c> commit; returns a terminal <see cref="LeaveClusterResult"/> for every
-    /// other outcome — a refusal (nothing committed, the node keeps serving as a Voter), a
-    /// timeout (role rolled back to Voter so the campaign gates release the node), or a
-    /// departure already completed by the placement pass (removal won the rollback race).
-    /// </para>
-    /// <para>
-    /// Resumable: when <paramref name="selfRole"/> is already <c>Leaving</c> (a previous attempt
-    /// crashed or timed out without managing to roll back) the commit step is skipped and the
-    /// wait picks the drain up where it left off.
-    /// </para>
-    /// </summary>
-    private async Task<LeaveClusterResult?> DrainBeforeLeaveAsync(System.ClusterMemberRole selfRole, CancellationToken cancellationToken)
-    {
-        if (selfRole == System.ClusterMemberRole.Voter)
-        {
-            // Local fast-path guards for an immediate, actionable answer; the leader re-enforces
-            // both authoritatively inside TrySetMemberRole.
-            System.ClusterMembership roster = systemCoordinator.GetMembership();
-
-            if (roster.Members.Any(m => m.Role == System.ClusterMemberRole.Leaving))
-                return new(LeaveClusterOutcome.RefusedDrainInProgress, roster.MembershipVersion);
-
-            if (!roster.Members.Any(m => m.Role == System.ClusterMemberRole.Voter &&
-                                         !string.Equals(m.Endpoint, LocalEndpoint, StringComparison.Ordinal)))
-                return new(LeaveClusterOutcome.RefusedInsufficientVoters, roster.MembershipVersion);
-
-            (RaftOperationStatus status, _) = await CommitRoleTransitionAsync(System.ClusterMemberRole.Leaving, cancellationToken).ConfigureAwait(false);
-
-            switch (status)
-            {
-                case RaftOperationStatus.Success:
-                    break;
-
-                case RaftOperationStatus.InsufficientVoters:
-                    return new(LeaveClusterOutcome.RefusedInsufficientVoters, systemCoordinator.GetMembership().MembershipVersion);
-
-                case RaftOperationStatus.DrainInProgress:
-                    return new(LeaveClusterOutcome.RefusedDrainInProgress, systemCoordinator.GetMembership().MembershipVersion);
-
-                case RaftOperationStatus.MemberNotFound:
-                    // Already out of the roster — a previous removal committed. Departed.
-                    return new(LeaveClusterOutcome.Committed, systemCoordinator.GetMembership().MembershipVersion);
-
-                default:
-                    // Timeout / no leader / pre-drain peer (the RPC failed loudly). The commit
-                    // may still have landed — proceed only if the roster already shows Leaving,
-                    // otherwise report an unconfirmed attempt: nothing changed, the node keeps
-                    // serving. This is also the mixed-version escape hatch: a cluster whose P0
-                    // leader predates SetMemberRole refuses the drain here instead of silently
-                    // removing the node undrained.
-                    System.ClusterMember? self = systemCoordinator.GetMembership().Members
-                        .FirstOrDefault(m => string.Equals(m.Endpoint, LocalEndpoint, StringComparison.Ordinal));
-
-                    if (self?.Role != System.ClusterMemberRole.Leaving)
-                        return new(LeaveClusterOutcome.Timeout, systemCoordinator.GetMembership().MembershipVersion);
-
-                    break;
-            }
-        }
-
-        // ── Wait for evacuation ──────────────────────────────────────────────
-        // The placement pass on the P0 leader does the work; this loop only observes committed
-        // state. Two exits besides timeout: the map stops naming us (drained — proceed to the
-        // final removal), or the roster stops naming us (the pass finished the drain AND
-        // committed the removal itself — crash-resumption path, nothing left to do).
-        ValueStopwatch drainStopwatch = ValueStopwatch.StartNew();
-        long drainDeadlineMs = (long)configuration.DecommissionDrainTimeout.TotalMilliseconds;
-
-        while (true)
-        {
-            if (!systemCoordinator.GetMembership().Members.Any(m => string.Equals(m.Endpoint, LocalEndpoint, StringComparison.Ordinal)))
-                return new(LeaveClusterOutcome.Committed, systemCoordinator.GetMembership().MembershipVersion, Drained: true);
-
-            if (!CommittedMapNamesLocalEndpoint())
-                return null;
-
-            if (cancellationToken.IsCancellationRequested || drainStopwatch.GetElapsedMilliseconds() > drainDeadlineMs)
-                return await RollBackDrainAsync().ConfigureAwait(false);
-
-            try
-            {
-                await Task.Delay(250, cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                return await RollBackDrainAsync().ConfigureAwait(false);
-            }
-        }
-    }
-
-    /// <summary>
-    /// Rolls a timed-out or cancelled drain back to <c>Voter</c> so the campaign gates release
-    /// the node. Runs on <see cref="CancellationToken.None"/> deliberately: the rollback must be
-    /// attempted even when the caller's token already fired, or the node is left durably
-    /// <c>Leaving</c> and never campaigns again.
-    /// <para>
-    /// Removal-wins precedence: if the placement pass committed the final <c>RemoveMember</c>
-    /// while the timeout was firing, the rollback observes
-    /// <see cref="RaftOperationStatus.MemberNotFound"/> (or the roster no longer names us) and
-    /// reports the leave as <b>completed</b> — the node must never keep serving while out of the
-    /// committed roster.
-    /// </para>
-    /// </summary>
-    private async Task<LeaveClusterResult> RollBackDrainAsync()
-    {
-        (RaftOperationStatus status, _) = await CommitRoleTransitionAsync(System.ClusterMemberRole.Voter, CancellationToken.None).ConfigureAwait(false);
-
-        System.ClusterMembership after = systemCoordinator.GetMembership();
-        bool stillPresent = after.Members.Any(m => string.Equals(m.Endpoint, LocalEndpoint, StringComparison.Ordinal));
-
-        if (status == RaftOperationStatus.MemberNotFound || !stillPresent)
-            return new(LeaveClusterOutcome.Committed, after.MembershipVersion, Drained: true);
-
-        if (status != RaftOperationStatus.Success)
-            // The rollback itself could not be confirmed (e.g. no reachable P0 leader). The node
-            // may be durably Leaving: it keeps serving its ranges but cannot campaign, and the
-            // next placement pass keeps evacuating it. Retrying RequestLeaveAsync resumes the
-            // drain; the warning is the operator's cue that this node needs attention.
-            Logger.LogWarning("RequestLeaveAsync: drain timed out and the rollback to Voter was not confirmed ({Status}); the roster may still show this node as Leaving.", status);
-
-        return new(LeaveClusterOutcome.DrainTimedOut, after.MembershipVersion);
-    }
-
-    /// <summary>
-    /// Commits a roster role transition for the local node, retrying against the current P0
-    /// leader until it commits or a 10 s deadline expires — the same discipline as
-    /// <see cref="CommitGracefulLeaveAsync"/> (self fast-path when this node is the leader,
-    /// 3 s per-attempt bound, capped polling while the leader is unknown).
-    /// <para>
-    /// Returns the coordinator's verdict. Terminal verdicts
-    /// (<see cref="RaftOperationStatus.InsufficientVoters"/>,
-    /// <see cref="RaftOperationStatus.DrainInProgress"/>,
-    /// <see cref="RaftOperationStatus.MemberNotFound"/>) are returned immediately;
-    /// retryable rejections keep looping within the deadline. An expired deadline returns
-    /// <see cref="RaftOperationStatus.ProposalTimeout"/> — the commit may still have landed, so
-    /// callers must re-read the roster before concluding anything.
-    /// </para>
-    /// </summary>
-    private async Task<(RaftOperationStatus Status, long Version)> CommitRoleTransitionAsync(
-        System.ClusterMemberRole targetRole,
-        CancellationToken cancellationToken)
-    {
-        const int deadlineMs = 10_000;
-        const int attemptTimeoutMs = 3_000;
-        const int maxEmptyLeaderPolls = 5;
-
-        ValueStopwatch sw = ValueStopwatch.StartNew();
-        SetMemberRoleRequest request = new(LocalEndpoint, configuration.NodeId, targetRole);
-        int emptyLeaderPolls = 0;
-
-        while (sw.GetElapsedMilliseconds() < deadlineMs)
-        {
-            if (cancellationToken.IsCancellationRequested)
-                return (RaftOperationStatus.OperationCancelled, 0);
-
-            try
-            {
-                bool amLeader = systemPartition is not null &&
-                    await AmILeaderQuick(RaftSystemConfig.SystemPartition).ConfigureAwait(false);
-
-                string? leaderEndpoint = amLeader ? LocalEndpoint : systemPartition?.Leader;
-
-                if (string.IsNullOrEmpty(leaderEndpoint))
-                {
-                    if (++emptyLeaderPolls >= maxEmptyLeaderPolls)
-                        return (RaftOperationStatus.NodeIsNotLeader, 0);
-
-                    await Task.Delay(200, cancellationToken).ConfigureAwait(false);
-                    continue;
-                }
-
-                emptyLeaderPolls = 0;
-
-                using CancellationTokenSource attemptCts =
-                    CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                attemptCts.CancelAfter(attemptTimeoutMs);
-
-                // Self fast-path mirrors CommitGracefulLeaveAsync: the transport cannot always
-                // route to the local endpoint.
-                SetMemberRoleResponse resp = amLeader
-                    ? await ReceiveSetMemberRole(request, attemptCts.Token).ConfigureAwait(false)
-                    : await communication.SendSetMemberRole(this, new RaftNode(leaderEndpoint), request, attemptCts.Token).ConfigureAwait(false);
-
-                if (resp.Success)
-                    return (RaftOperationStatus.Success, resp.MembershipVersion);
-
-                if (resp.Status is RaftOperationStatus.InsufficientVoters
-                    or RaftOperationStatus.DrainInProgress
-                    or RaftOperationStatus.MemberNotFound)
-                    return (resp.Status, resp.MembershipVersion);
-
-                await Task.Delay(200, cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                return (RaftOperationStatus.OperationCancelled, 0);
-            }
-            catch (Exception ex)
-            {
-                Logger.LogWarning("CommitRoleTransition({TargetRole}): {Message}", targetRole, ex.Message);
-
-                try
-                {
-                    await Task.Delay(200, cancellationToken).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    return (RaftOperationStatus.OperationCancelled, 0);
-                }
-            }
-        }
-
-        return (RaftOperationStatus.ProposalTimeout, 0);
-    }
-
-    /// <summary>
-    /// Sends a <c>RemoveMember(self)</c> to the P0 leader, retrying until the removal commits or
-    /// a 10 s deadline expires.  Each individual <c>SendLeave</c> call is bounded by a 3 s
-    /// per-attempt token so a stopped or unreachable node never blocks indefinitely.
-    /// <para>
-    /// <b>Empty-leader cap:</b> when the P0 leader cannot be resolved (election in progress or
-    /// partition still starting), the loop polls at most <c>maxEmptyLeaderPolls</c> times before
-    /// giving up. This prevents the 10 s spin during shutdown when the system partition is already
-    /// draining and will never elect a new leader.
-    /// </para>
-    /// <para>
-    /// <b>Cancellation:</b> <paramref name="cancellationToken"/> is observed in all waits so a
-    /// tearing-down host returns promptly.
-    /// </para>
-    /// Failures are logged and reported through the returned outcome, never thrown — the shutdown
-    /// caller always proceeds to stop afterwards regardless of what happened here.
-    /// </summary>
-    private async Task<LeaveClusterResult> CommitGracefulLeaveAsync(CancellationToken cancellationToken)
-    {
-        const int deadlineMs = 10_000;
-        const int attemptTimeoutMs = 3_000;
-        // After this many consecutive "leader unknown" polls (5 × 200 ms = 1 s), give up.
-        // The full deadlineMs only applies while we are actively contacting a known leader.
-        const int maxEmptyLeaderPolls = 5;
-
-        ValueStopwatch sw = ValueStopwatch.StartNew();
-        LeaveRequest request = new(LocalEndpoint, configuration.NodeId);
-        int emptyLeaderPolls = 0;
-
-        while (sw.GetElapsedMilliseconds() < deadlineMs)
-        {
-            if (cancellationToken.IsCancellationRequested)
-            {
-                Logger.LogInformation("LeaveCluster: graceful leave cancelled.");
-                return Unconfirmed(LeaveClusterOutcome.Timeout);
-            }
-
-            try
-            {
-                // Find the current P0 leader. Try self first (fast path when we are the leader).
-                bool amLeader = systemPartition is not null &&
-                    await AmILeaderQuick(RaftSystemConfig.SystemPartition).ConfigureAwait(false);
-
-                string? leaderEndpoint = amLeader ? LocalEndpoint : systemPartition?.Leader;
-
-                if (string.IsNullOrEmpty(leaderEndpoint))
-                {
-                    if (++emptyLeaderPolls >= maxEmptyLeaderPolls)
-                    {
-                        Logger.LogInfoLeaveClusterLeaderUnknown(emptyLeaderPolls);
-                        return Unconfirmed(LeaveClusterOutcome.NoLeader);
-                    }
-
-                    await Task.Delay(200, cancellationToken).ConfigureAwait(false);
-                    continue;
-                }
-
-                // We have a leader — reset the empty-leader counter.
-                emptyLeaderPolls = 0;
-
-                using CancellationTokenSource attemptCts =
-                    CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                attemptCts.CancelAfter(attemptTimeoutMs);
-
-                // When we are the leader, apply the removal here rather than sending it to
-                // ourselves: the transport cannot always reach the local endpoint (a standalone or
-                // embedded node has no peer registry to route through), and a self-directed round
-                // trip would fail there and spin to the deadline instead of getting the leader's
-                // real answer — including the refusal that protects the last voter.
-                LeaveResponse resp = amLeader
-                    ? await ReceiveLeave(request, attemptCts.Token).ConfigureAwait(false)
-                    : await communication.SendLeave(this, new RaftNode(leaderEndpoint), request, attemptCts.Token).ConfigureAwait(false);
-
-                if (resp.Success)
-                {
-                    await WaitForRosterRemovalAsync(sw, deadlineMs, cancellationToken).ConfigureAwait(false);
-                    return Committed(resp);
-                }
-
-                // Terminal = permanently blocked (e.g. InsufficientVoters) — give up immediately.
-                // A null-hint without Terminal means the leader is unknown right now (election
-                // in progress); the loop continues and retries within the 10 s deadline.
-                if (resp.Terminal)
-                {
-                    Logger.LogInformation("LeaveCluster: leave permanently rejected.");
-                    return Unconfirmed(LeaveClusterOutcome.RefusedInsufficientVoters);
-                }
-
-                // Not the leader — follow the hint if it differs from the endpoint we just tried.
-                if (!string.IsNullOrEmpty(resp.LeaderHint) && resp.LeaderHint != leaderEndpoint)
-                {
-                    try
-                    {
-                        using CancellationTokenSource hintCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                        hintCts.CancelAfter(attemptTimeoutMs);
-
-                        LeaveResponse hintResp = string.Equals(resp.LeaderHint, LocalEndpoint, StringComparison.Ordinal)
-                            ? await ReceiveLeave(request, hintCts.Token).ConfigureAwait(false)
-                            : await communication.SendLeave(this, new RaftNode(resp.LeaderHint), request, hintCts.Token).ConfigureAwait(false);
-                        if (hintResp.Success)
-                        {
-                            await WaitForRosterRemovalAsync(sw, deadlineMs, cancellationToken).ConfigureAwait(false);
-                            return Committed(hintResp);
-                        }
-
-                        if (hintResp.Terminal)
-                        {
-                            Logger.LogInfoLeaveClusterRejectedByHint(resp.LeaderHint);
-                            return Unconfirmed(LeaveClusterOutcome.RefusedInsufficientVoters);
-                        }
-                    }
-                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                    {
-                        Logger.LogInformation("LeaveCluster: graceful leave cancelled during hint attempt.");
-                        return Unconfirmed(LeaveClusterOutcome.Timeout);
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.LogWarning("LeaveCluster: failed to contact leader hint {Hint}: {Message}", resp.LeaderHint, ex.Message);
-                    }
-                }
-
-                await Task.Delay(200, cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                Logger.LogInformation("LeaveCluster: graceful leave cancelled.");
-                return Unconfirmed(LeaveClusterOutcome.Timeout);
-            }
-            catch (Exception ex)
-            {
-                Logger.LogWarning("LeaveCluster: error during graceful leave: {Message}", ex.Message);
-
-                try
-                {
-                    await Task.Delay(200, cancellationToken).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    Logger.LogInformation("LeaveCluster: graceful leave cancelled.");
-                    return Unconfirmed(LeaveClusterOutcome.Timeout);
-                }
-            }
-        }
-
-        Logger.LogWarning("LeaveCluster: graceful leave timed out without a committed removal.");
-        return Unconfirmed(LeaveClusterOutcome.Timeout);
-
-        // The leader reports the version it committed the removal at, which is authoritative even
-        // when the new roster has not propagated back here yet; fall back to the local view when an
-        // older peer omits it.
-        LeaveClusterResult Committed(LeaveResponse response) => new(
-            LeaveClusterOutcome.Committed,
-            response.MembershipVersion > 0
-                ? response.MembershipVersion
-                : systemCoordinator.GetMembership().MembershipVersion);
-
-        LeaveClusterResult Unconfirmed(LeaveClusterOutcome outcome) =>
-            new(outcome, systemCoordinator.GetMembership().MembershipVersion);
-    }
-
-    /// <summary>
-    /// Polls the local roster cache until the local endpoint is absent (removal propagated) or
-    /// the overall deadline or <paramref name="cancellationToken"/> is reached.
-    /// Returns <c>true</c> if the removal was observed locally.
-    /// </summary>
-    private async Task<bool> WaitForRosterRemovalAsync(ValueStopwatch sw, int deadlineMs, CancellationToken cancellationToken)
-    {
-        while (sw.GetElapsedMilliseconds() < deadlineMs)
-        {
-            if (cancellationToken.IsCancellationRequested)
-                return false;
-
-            if (!systemCoordinator.GetMembership().Members.Any(m => m.Endpoint == LocalEndpoint))
-                return true;
-
-            try
-            {
-                await Task.Delay(50, cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                return false;
-            }
-        }
-
-        Logger.LogWarning("LeaveCluster: removal committed but roster propagation timed out; proceeding to stop.");
-        return false;
-    }
+    public Task<LeaveClusterResult> RequestLeaveAsync(CancellationToken cancellationToken = default) =>
+        leaveService.RequestLeaveAsync(cancellationToken);
 
     /// <summary>
     /// Upper bound on how long a teardown drain waits for each partition's <c>DrainBarrier</c>.
@@ -2402,12 +1427,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// </summary>
     private RaftException BuildUnknownPartitionException(int partitionId)
     {
-        List<RaftPartitionRange> ranges = committedRanges;
-        foreach (RaftPartitionRange range in ranges)
-        {
-            if (range.PartitionId == partitionId && range.State != RaftPartitionState.Removed)
-                return new PartitionNotHostedException(partitionId);
-        }
+        if (routingTable.IsLiveMappedRange(partitionId))
+            return new PartitionNotHostedException(partitionId);
 
         return new RaftException("Invalid partition: " + partitionId);
     }
@@ -2437,6 +1458,33 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         return partitions.TryGetValue(partitionId, out partition);
     }
 
+    // Partition-registry seam consumed by the extracted collaborators. Implemented explicitly so
+    // the underlying helpers stay private and no new surface is added to the public facade: the
+    // registry remains owned and written here, and collaborators only read through it.
+
+    /// <inheritdoc/>
+    RaftPartition? IPartitionProvider.SystemPartition => systemPartition;
+
+    /// <inheritdoc/>
+    IEnumerable<RaftPartition> IPartitionProvider.DataPartitions => partitions.Values;
+
+    /// <inheritdoc/>
+    int IPartitionProvider.DataPartitionCount => partitions.Count;
+
+    /// <inheritdoc/>
+    bool IPartitionProvider.TryGetDataPartition(int partitionId, out RaftPartition? partition) =>
+        partitions.TryGetValue(partitionId, out partition);
+
+    /// <inheritdoc/>
+    bool IPartitionProvider.TryGetPartition(int partitionId, out RaftPartition? partition) =>
+        TryGetPartition(partitionId, out partition);
+
+    /// <inheritdoc/>
+    RaftPartition IPartitionProvider.GetPartition(int partitionId) => GetPartition(partitionId);
+
+    /// <inheritdoc/>
+    bool IPartitionProvider.HostsPartition(int partitionId) => HostsPartition(partitionId);
+
     /// <summary>
     /// Sets the minimum WAL log index that compaction must not truncate below on the given
     /// partition. No-ops silently when the partition is not hosted on this node.
@@ -2455,8 +1503,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// </summary>
     public long GetCommitIndex(int partitionId)
     {
-        if (partitions.TryGetValue(partitionId, out RaftPartition? partition))
-            return partition.GetCommitIndex();
+        if (TryGetPartition(partitionId, out RaftPartition? partition))
+            return partition!.GetCommitIndex();
 
         return -1;
     }
@@ -2530,151 +1578,46 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     internal NodeLoadReport BuildLocalLoadReport() => loadReportService.BuildLocalLoadReport();
 
     /// <summary>
-    /// Passes the Handshake to the appropriate partition.
-    /// <para>
-    /// Tolerate a not-yet-created data partition during cluster assembly: drop the handshake
-    /// rather than blocking until this node initializes. This handler runs inline on the transport
-    /// path (<c>BatchRequests</c> awaits each item in order), so blocking here head-of-line-stalls
-    /// the whole batch. A previous version spun on <c>while (!IsInitialized) await Task.Delay(100)</c>,
-    /// which deadlocked join: a user-partition handshake to a joining node blocked the
-    /// <c>AppendLogs</c>/<c>CompleteAppendLogs</c> that followed it in the same batch — the very P0
-    /// entries the node needs to reach <see cref="IsInitialized"/>. Handshake ⇒ waits for init;
-    /// init ⇒ needs those AppendLogs; AppendLogs ⇒ trapped behind the handshake. The remote re-sends
-    /// the handshake on its next round, so dropping is safe. Mirrors the resilience in
-    /// <see cref="RequestVote"/>; see <see cref="TryGetPartition"/> for the full rationale.
-    /// </para>
+    /// Passes the handshake to the addressed partition. Delegates to <see cref="RaftRpcRouter"/>,
+    /// which drops the message when that partition is not materialized here yet.
     /// </summary>
     /// <param name="request"></param>
-    public Task Handshake(HandshakeRequest request)
-    {
-        if (TryGetPartition(request.Partition, out RaftPartition? partition))
-            partition!.Handshake(request);
+    public Task Handshake(HandshakeRequest request) => rpcRouter.Handshake(request);
 
-        return Task.CompletedTask;
-    }
-
-    internal HandshakeResponse GetHandshakeResponse(int partitionId)
-    {
-        long maxLogId = walAdapter.GetMaxLog(partitionId);
-        return new(LocalNodeId, maxLogId, LocalEndpoint);
-    }
+    /// <summary>Builds this node's handshake reply for a partition.</summary>
+    internal HandshakeResponse GetHandshakeResponse(int partitionId) => rpcRouter.GetHandshakeResponse(partitionId);
 
     /// <summary>
     /// Passes the RequestVote to the appropriate partition
     /// </summary>
     /// <param name="request"></param>
-    public void RequestVote(RequestVotesRequest request)
-    {
-        // Tolerate a not-yet-created data partition during cluster assembly: drop the vote
-        // rather than throwing and poisoning the rest of the endpoint batch. The candidate
-        // retries on its next election timeout. See TryGetPartition for the full rationale.
-        if (TryGetPartition(request.Partition, out RaftPartition? partition))
-            partition!.RequestVote(request);
-    }
+    public void RequestVote(RequestVotesRequest request) => rpcRouter.RequestVote(request);
 
     /// <summary>
     /// Passes the request to the appropriate partition
     /// </summary>
     /// <param name="request"></param>
-    public void Vote(VoteRequest request)
-    {
-        // See RequestVote: an inbound vote for a partition this node has not created yet is
-        // dropped, not thrown, so it cannot abort sibling messages in the same endpoint batch.
-        if (TryGetPartition(request.Partition, out RaftPartition? partition))
-            partition!.Vote(request);
-    }
+    public void Vote(VoteRequest request) => rpcRouter.Vote(request);
 
-    internal void StepDownNotice(StepDownNoticeRequest request)
-    {
-        if (TryGetPartition(request.Partition, out RaftPartition? partition))
-            partition!.StepDownNotice(request);
-    }
+    /// <summary>Passes a step-down notice to the appropriate partition.</summary>
+    internal void StepDownNotice(StepDownNoticeRequest request) => rpcRouter.StepDownNotice(request);
 
-    internal void TransferLeadership(TransferLeadershipRequest request)
-    {
-        if (TryGetPartition(request.Partition, out RaftPartition? partition))
-            partition!.TransferLeadership(request);
-    }
+    /// <summary>Passes a leadership-transfer command to the appropriate partition.</summary>
+    internal void TransferLeadership(TransferLeadershipRequest request) => rpcRouter.TransferLeadership(request);
 
     /// <summary>
-    /// Receives an advisory leadership-transfer suggestion from the P0 balancer.
-    /// Validates that this node currently leads the partition, that the partition is
-    /// <see cref="System.RaftPartitionState.Active"/>, and that <paramref name="request"/>
-    /// <see cref="Data.TransferLeadershipSuggestionRequest.TargetEndpoint"/> is a live voter —
-    /// then fires the local transfer fire-and-forget.  Drops silently on any validation failure
-    /// so a stale or misdirected suggestion is always safe.
+    /// Receives an advisory leadership-transfer suggestion from the balancer running on the
+    /// system-partition leader.
     /// </summary>
-    internal void ReceiveTransferLeadershipSuggestion(Data.TransferLeadershipSuggestionRequest request)
-    {
-        if (!partitions.TryGetValue(request.Partition, out RaftPartition? partition))
-            return;
-
-        // Only act if we currently lead this partition.
-        if (!string.Equals(partition.Leader, LocalEndpoint, global::System.StringComparison.Ordinal))
-        {
-            Logger.LogDebugTransferSuggestionDroppedNotLeader(
-                request.Partition, request.Term, partition.Leader ?? "(none)", request.SuggestedBy);
-            return;
-        }
-
-        // Only move Active partitions.
-        if (partition.State != System.RaftPartitionState.Active)
-        {
-            Logger.LogDebugTransferSuggestionDroppedNotActive(
-                request.Partition, request.Term, partition.State, request.SuggestedBy);
-            return;
-        }
-
-        // Target must be a live voter.
-        System.ClusterMembership membership = systemCoordinator.GetMembership();
-        bool targetIsVoter = membership.Members.Exists(m =>
-            string.Equals(m.Endpoint, request.TargetEndpoint, global::System.StringComparison.Ordinal) &&
-            m.Role == System.ClusterMemberRole.Voter);
-
-        if (!targetIsVoter)
-        {
-            Logger.LogDebugTransferSuggestionDroppedNotVoter(
-                request.Partition, request.Term, request.TargetEndpoint, request.SuggestedBy);
-            return;
-        }
-
-        if (Liveness.GetState(request.TargetEndpoint) >= Gossip.MemberLivenessState.Suspect)
-        {
-            Logger.LogDebugTransferSuggestionDroppedSuspect(
-                request.Partition, request.Term, request.TargetEndpoint, request.SuggestedBy);
-            return;
-        }
-
-        // Fire-and-forget: the executor serialises the transfer; we don't await here.
-        _ = partition.TransferLeadershipAsync(request.TargetEndpoint, global::System.Threading.CancellationToken.None);
-    }
+    internal void ReceiveTransferLeadershipSuggestion(Data.TransferLeadershipSuggestionRequest request) =>
+        rpcRouter.ReceiveTransferLeadershipSuggestion(request);
 
     /// <summary>
-    /// Sends an advisory leadership-transfer suggestion to the node at
-    /// <paramref name="ownerEndpoint"/> via the existing responder transport.
-    /// Fire-and-forget; a failed delivery is silently ignored and the suggestion
-    /// will time out in the balancer's outstanding-move tracking table.
-    /// <para>
-    /// When the owner is this node itself — the common case where the P0 balancer leader
-    /// also leads the overloaded partition — the suggestion is delivered in-process.  The
-    /// peer transport cannot be used for self-delivery: a node is not its own peer
-    /// (<see cref="ClusterHandler.IsNode"/> excludes the local endpoint), so a self-addressed
-    /// responder message is dropped on the wire.  Without this short-circuit the balancer
-    /// could never rebalance partitions led by the P0 node.
-    /// </para>
+    /// Sends an advisory leadership-transfer suggestion to the node owning the partition,
+    /// short-circuiting to in-process delivery when that owner is this node.
     /// </summary>
-    internal void SendTransferLeadershipSuggestion(string ownerEndpoint, Data.TransferLeadershipSuggestionRequest request)
-    {
-        if (string.Equals(ownerEndpoint, LocalEndpoint, global::System.StringComparison.Ordinal))
-        {
-            ReceiveTransferLeadershipSuggestion(request);
-            return;
-        }
-
-        RaftNode node = new(ownerEndpoint);
-        EnqueueResponse(ownerEndpoint, new Data.RaftResponderRequest(
-            Data.RaftResponderRequestType.TransferLeadershipSuggestion, node, request));
-    }
+    internal void SendTransferLeadershipSuggestion(string ownerEndpoint, Data.TransferLeadershipSuggestionRequest request) =>
+        rpcRouter.SendTransferLeadershipSuggestion(ownerEndpoint, request);
 
     /// <summary>
     /// Append logs in the appropriate partition
@@ -2682,60 +1625,25 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// </summary>
     /// <param name="request"></param>
     /// <returns></returns>
-    public void AppendLogs(AppendLogsRequest request)
-    {
-        // Tolerate a not-yet-created data partition: dropping the append is safe because the
-        // leader retries on its next heartbeat. Throwing here would abort the rest of the
-        // coalesced endpoint batch. See TryGetPartition for the full rationale.
-        if (TryGetPartition(request.Partition, out RaftPartition? partition))
-            partition!.AppendLogs(request);
-    }
+    public void AppendLogs(AppendLogsRequest request) => rpcRouter.AppendLogs(request);
 
     /// <summary>
     /// Completes an append logs operation in the appropriate partition
     /// </summary>
     /// <param name="request"></param>
     /// <returns></returns>
-    public void CompleteAppendLogs(CompleteAppendLogsRequest request)
-    {
-        // See AppendLogs: an inbound completion for a partition not created here yet is dropped,
-        // not thrown, so it cannot abort sibling messages in the same endpoint batch.
-        if (TryGetPartition(request.Partition, out RaftPartition? partition))
-            partition!.CompleteAppendLogs(request);
-    }
+    public void CompleteAppendLogs(CompleteAppendLogsRequest request) => rpcRouter.CompleteAppendLogs(request);
 
     /// <summary>
     /// Replicate a single log to the follower nodes in the system partition
     /// </summary>
-    /// <param name="partitionId"></param>
     /// <param name="type"></param>
     /// <param name="data"></param>
     /// <param name="autoCommit"></param>
     /// <param name="cancellationToken"></param>
     /// <returns></returns>
-    internal async Task<RaftReplicationResult> ReplicateSystemLogs(string type, byte[] data, bool autoCommit = true, CancellationToken cancellationToken = default)
-    {
-        if (systemPartition is null)
-            throw new RaftException("System partition not initialized.");
-
-        bool success;
-        HLCTimestamp ticketId;
-        RaftOperationStatus status;
-
-        do
-        {
-            (success, status, ticketId) = await systemPartition.ReplicateLogs(type, data, autoCommit).ConfigureAwait(false);
-
-            if (status == RaftOperationStatus.ActiveProposal)
-                await Task.Delay(ProposalRetryDelay, cancellationToken).ConfigureAwait(false);
-
-        } while (status == RaftOperationStatus.ActiveProposal);
-
-        if (!success)
-            return new(success, status, ticketId, -1);
-
-        return await WaitForQuorum(systemPartition, ticketId, autoCommit, cancellationToken).ConfigureAwait(false);
-    }
+    internal Task<RaftReplicationResult> ReplicateSystemLogs(string type, byte[] data, bool autoCommit = true, CancellationToken cancellationToken = default) =>
+        replicationGateway.ReplicateSystemLogs(type, data, autoCommit, cancellationToken);
 
     /// <summary>
     /// Replicates a single log entry to the follower nodes in the specified partition.
@@ -2745,391 +1653,63 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// with <see cref="RaftException"/> to prevent userland from forging coordinator entries.
     /// P0 is never a valid target for create, split, merge, or remove.
     /// </summary>
-    public async Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default)
-    {
-        if (partitionId == RaftSystemConfig.SystemPartition && type == RaftSystemConfig.RaftLogType)
-            throw new RaftException("System log type is reserved on the system partition");
-
-        // Single TryGetValue instead of ContainsKey + GetPartition re-lookup on the per-write path.
-        RaftPartition? partition = null;
-
-        if (partitionId != RaftSystemConfig.SystemPartition && !partitions.TryGetValue(partitionId, out partition))
-        {
-            RaftReplicationResult? forwarded = await ForwardToReplicaAsync(
-                partitionId, type, [data], autoCommit, expectedGeneration, cancellationToken).ConfigureAwait(false);
-            if (forwarded is not null)
-                return forwarded;
-        }
-
-        partition ??= GetPartition(partitionId);
-
-        bool success;
-        HLCTimestamp ticketId;
-        RaftOperationStatus status;
-
-        do
-        {
-            (success, status, ticketId) = await partition.ReplicateLogs(type, data, autoCommit, expectedGeneration).ConfigureAwait(false);
-
-            if (status == RaftOperationStatus.ActiveProposal)
-                await Task.Delay(ProposalRetryDelay, cancellationToken).ConfigureAwait(false);
-
-        } while (status == RaftOperationStatus.ActiveProposal);
-
-        if (!success)
-            return new(success, status, ticketId, -1);
-
-        return await WaitForQuorum(partition, ticketId, autoCommit, cancellationToken).ConfigureAwait(false);
-    }
+    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default) =>
+        replicationGateway.ReplicateLogs(partitionId, type, data, autoCommit, expectedGeneration, cancellationToken);
 
     /// <summary>
     /// Replicates a batch of log entries to the follower nodes in the specified partition.
-    /// P0 routes committed entries by log type: <c>_RaftSystem</c> entries go to the system
-    /// coordinator; all other types go to consumer callbacks (<c>OnReplicationReceived</c> /
-    /// <c>OnLogRestored</c>).  Passing <c>type == "_RaftSystem"</c> on partition 0 is rejected
-    /// with <see cref="RaftException"/> to prevent userland from forging coordinator entries.
-    /// P0 is never a valid target for create, split, merge, or remove.
+    /// See the <see cref="IReadOnlyList{T}"/> overload for the full contract.
     /// </summary>
-    public async Task<RaftReplicationResult> ReplicateLogs(
+    public Task<RaftReplicationResult> ReplicateLogs(
         int partitionId,
         string type,
         IEnumerable<byte[]> logs,
         bool autoCommit = true,
         long expectedGeneration = 0,
         CancellationToken cancellationToken = default
-    )
-    {
-        // Materialize once before the retry loop so generator inputs are not re-enumerated on each
-        // retry, and list/array inputs skip the copy.
-        IReadOnlyList<byte[]> materializedLogs = logs as IReadOnlyList<byte[]> ?? logs.ToList();
-        return await ReplicateLogs(partitionId, type, materializedLogs, autoCommit, expectedGeneration, cancellationToken).ConfigureAwait(false);
-    }
+    ) => replicationGateway.ReplicateLogs(partitionId, type, logs, autoCommit, expectedGeneration, cancellationToken);
 
     /// <summary>
     /// Replicates a batch of log entries to the follower nodes in the specified partition.
     /// Accepts an already-materialized list or array and avoids the intermediate copy
     /// incurred by the <see cref="IEnumerable{T}"/> overload for array and list callers.
-    /// P0 routes committed entries by log type: <c>_RaftSystem</c> entries go to the system
-    /// coordinator; all other types go to consumer callbacks (<c>OnReplicationReceived</c> /
-    /// <c>OnLogRestored</c>).  Passing <c>type == "_RaftSystem"</c> on partition 0 is rejected
-    /// with <see cref="RaftException"/> to prevent userland from forging coordinator entries.
-    /// P0 is never a valid target for create, split, merge, or remove.
     /// </summary>
-    public async Task<RaftReplicationResult> ReplicateLogs(
+    public Task<RaftReplicationResult> ReplicateLogs(
         int partitionId,
         string type,
         IReadOnlyList<byte[]> logs,
         bool autoCommit = true,
         long expectedGeneration = 0,
         CancellationToken cancellationToken = default
-    )
-    {
-        if (partitionId == RaftSystemConfig.SystemPartition && type == RaftSystemConfig.RaftLogType)
-            throw new RaftException("System log type is reserved on the system partition");
-
-        // Single TryGetValue instead of ContainsKey + GetPartition re-lookup on the per-write path.
-        RaftPartition? partition = null;
-
-        if (partitionId != RaftSystemConfig.SystemPartition && !partitions.TryGetValue(partitionId, out partition))
-        {
-            RaftReplicationResult? forwarded = await ForwardToReplicaAsync(
-                partitionId, type, logs, autoCommit, expectedGeneration, cancellationToken).ConfigureAwait(false);
-            if (forwarded is not null)
-                return forwarded;
-        }
-
-        partition ??= GetPartition(partitionId);
-
-        bool success;
-        HLCTimestamp ticketId;
-        RaftOperationStatus status;
-
-        do
-        {
-            // Test seam (null in production): lets a test drive the ActiveProposal retry loop
-            // deterministically without a live leader, to prove the payload list is materialized
-            // once before the loop and reused across retries rather than re-enumerated.
-            (success, status, ticketId) = _replicateAttemptHookForTesting is { } hook
-                ? hook()
-                : await partition.ReplicateLogs(type, logs, autoCommit, expectedGeneration).ConfigureAwait(false);
-
-            if (status == RaftOperationStatus.ActiveProposal)
-                await Task.Delay(ProposalRetryDelay, cancellationToken).ConfigureAwait(false);
-
-        } while (status == RaftOperationStatus.ActiveProposal);
-
-        if (!success)
-            return new(success, status, ticketId, -1);
-
-        return await WaitForQuorum(partition, ticketId, autoCommit, cancellationToken).ConfigureAwait(false);
-    }
+    ) => replicationGateway.ReplicateLogs(partitionId, type, logs, autoCommit, expectedGeneration, cancellationToken);
 
     /// <summary>
-    /// Forwards a proposal for a range this node does not host to one of the range's replicas
-    /// (voters first — the leader is always a voter). Each attempt runs through the remote
-    /// node's own <c>ReplicateLogs</c> path, so leader checks and the generation fence apply
-    /// there; <c>NodeIsNotLeader</c> moves on to the next replica, any other outcome is final.
-    /// Returns <see langword="null"/> when the range has no committed replica set (legacy
-    /// full replication — the local "invalid partition" throw is the right diagnosis) or the
-    /// transport does not support forwarding, in which case consumers must route directly via
-    /// <see cref="GetPartitionReplicas"/>.
+    /// Replicates a heterogeneous, per-entry-typed batch to one partition
+    /// (<see cref="IRaft.ReplicateEntries"/>): a leading auto-commit group plus an optional single
+    /// trailing manual group, with a per-entry generation fence.
     /// </summary>
-    private async Task<RaftReplicationResult?> ForwardToReplicaAsync(
-        int partitionId,
-        string type,
-        IReadOnlyList<byte[]> logs,
-        bool autoCommit,
-        long expectedGeneration,
-        CancellationToken cancellationToken)
-    {
-        if (!partitionPlacements.TryGetValue(partitionId, out PartitionPlacement? placement))
-            return null;
-
-        RaftReplicationResult? lastRejection = null;
-
-        foreach (System.RaftReplica replica in placement.Replicas
-                     .OrderBy(r => r.Role == System.RaftReplicaRole.Voter ? 0 : 1))
-        {
-            if (replica.Endpoint == LocalEndpoint)
-                continue;
-
-            RaftReplicationResult? result = await communication.ForwardReplicateLogs(
-                this, new RaftNode(replica.Endpoint), partitionId, type, logs,
-                autoCommit, expectedGeneration, cancellationToken).ConfigureAwait(false);
-
-            if (result is null)
-                continue; // unreachable or transport lacks forwarding — try the next replica
-
-            if (result.Status == RaftOperationStatus.NodeIsNotLeader)
-            {
-                lastRejection = result;
-                continue;
-            }
-
-            return result;
-        }
-
-        return lastRejection;
-    }
-
-    /// <summary>
-    /// Replicates a heterogeneous, per-entry-typed batch to one partition (<see cref="IRaft.ReplicateEntries"/>).
-    /// A leading auto-commit group plus an optional single <b>trailing</b> manual group (slice 2), with a
-    /// <b>per-entry</b> generation fence (slice 3). See <see cref="RaftProposalEntry"/> /
-    /// <see cref="RaftBatchReplicationResult"/>.
-    /// <para>
-    /// <b>Per-entry fence.</b> Each entry's <see cref="RaftProposalEntry.ExpectedGeneration"/> is evaluated
-    /// independently against the partition's current committed generation: a non-zero value that no longer
-    /// matches fences <i>that</i> entry out (reported <see cref="RaftOperationStatus.PartitionMoved"/>, not
-    /// appended) while its siblings proceed; zero opts the entry out of the fence entirely. A batch may thus
-    /// mix hash-routed (generation-0) entries with fenced key-range entries. The classification reads the
-    /// generation once here (it is <see cref="Interlocked"/>-published, so the read is safe off the executor
-    /// thread). To also close the classify→append window for an unambiguous key-range batch — every admitted
-    /// entry non-zero, none hash-routed — the admitted proposal carries that shared generation as an
-    /// executor-side backstop, so a split/merge landing mid-flight fences the whole admitted group rather than
-    /// admitting stale writes. A <i>mixed</i> admitted set (hash-routed + key-range) cannot use that backstop
-    /// without also fencing the hash-routed entries, so its fence is best-effort at classification time.
-    /// </para>
-    /// <para>
-    /// <b>Sequential commit.</b> The auto group commits <i>before</i> the manual group is proposed. Were they
-    /// posted concurrently to coalesce the fsync, a failure to commit the auto group after the manual propose
-    /// was already durable would let a later manual <c>CommitLogs</c> advance the commit index past the
-    /// uncommitted auto entries. Committing auto first makes the manual group a clean uncommitted suffix on a
-    /// committed prefix, so its ticket rolls back or commits without touching the auto entries. Flush
-    /// coalescing is therefore opportunistic (scheduler linger), not guaranteed.
-    /// </para>
-    /// <para>
-    /// Per-entry <see cref="RaftEntryResult.LogIndex"/> values come from the <see cref="RaftLog.Id"/> assigned
-    /// in place during propose (not from a ticket <c>commitIndex</c>): each <see cref="RaftLog"/> list built
-    /// here is the same instance set the state machine mutates, and the propose reply only resolves once those
-    /// indices are durable, so reading them back is race-free. Results are index-aligned to the input list;
-    /// fenced entries keep their input slot with <c>LogIndex = -1</c>.
-    /// </para>
-    /// </summary>
-    public async Task<RaftBatchReplicationResult> ReplicateEntries(int partitionId, IReadOnlyList<RaftProposalEntry> entries, CancellationToken cancellationToken = default)
-    {
-        if (entries is null || entries.Count == 0)
-            return new(true, RaftOperationStatus.Success, HLCTimestamp.Zero, []);
-
-        // ── Batch-level validation (shape) — reject before any append, no partial state. ──
-        // An optional auto-commit prefix followed by an optional single trailing manual group: once a manual
-        // (autoCommit:false) entry is seen, no later entry may be auto-commit, else the manual entries would
-        // not form one contiguous truncatable suffix (§3). Reserved system-log-type guard mirrors the
-        // single-type ReplicateLogs path. Generations are NOT validated here — they are fenced per entry below.
-        bool seenManual = false;
-
-        for (int i = 0; i < entries.Count; i++)
-        {
-            RaftProposalEntry entry = entries[i];
-
-            if (partitionId == RaftSystemConfig.SystemPartition && entry.Type == RaftSystemConfig.RaftLogType)
-                throw new RaftException("System log type is reserved on the system partition");
-
-            if (!entry.AutoCommit)
-                seenManual = true;
-            else if (seenManual)
-                return RejectBatch(entries.Count, RaftOperationStatus.Errored); // auto-commit after manual
-        }
-
-        RaftPartition partition = GetPartition(partitionId);
-        long currentGeneration = partition.Generation;
-
-        // ── Per-entry fence classification. Fenced entries take their result slot now (PartitionMoved) and are
-        //    excluded from the append; admitted entries are split into the auto prefix and trailing manual
-        //    group, each RaftLog carrying its input index so ids read back after propose stay index-aligned. ──
-        RaftEntryResult[] results = new RaftEntryResult[entries.Count];
-
-        List<RaftLog> autoLogs = [];
-        List<int> autoInputIndex = [];
-        List<RaftLog> manualLogs = [];
-        List<int> manualInputIndex = [];
-        bool admittedHasKeyRange = false; // any admitted entry with a non-zero (fenced) generation
-        bool admittedHasHashRouted = false; // any admitted entry with generation 0
-
-        for (int i = 0; i < entries.Count; i++)
-        {
-            RaftProposalEntry entry = entries[i];
-
-            if (entry.ExpectedGeneration != 0 && entry.ExpectedGeneration != currentGeneration)
-            {
-                results[i] = new(RaftOperationStatus.PartitionMoved, -1, HLCTimestamp.Zero);
-                continue;
-            }
-
-            RaftLog log = new() { Type = RaftLogType.Proposed, LogType = entry.Type, LogData = entry.Data };
-
-            if (entry.AutoCommit)
-            {
-                autoLogs.Add(log);
-                autoInputIndex.Add(i);
-            }
-            else
-            {
-                manualLogs.Add(log);
-                manualInputIndex.Add(i);
-            }
-
-            if (entry.ExpectedGeneration == 0)
-                admittedHasHashRouted = true;
-            else
-                admittedHasKeyRange = true;
-        }
-
-        // Admission backstop: only for an unambiguous key-range batch (all admitted entries fenced, none
-        // hash-routed) can we re-assert the generation at executor admission without wrongly fencing a
-        // hash-routed sibling. currentGeneration is safe here because every admitted key-range entry expects
-        // exactly it (any other non-zero expectation was fenced out above).
-        long admissionBackstop = admittedHasKeyRange && !admittedHasHashRouted ? currentGeneration : 0;
-
-        // Nothing admitted (every entry fenced): report PartitionMoved overall so the caller refreshes the map.
-        if (autoLogs.Count == 0 && manualLogs.Count == 0)
-            return new(false, RaftOperationStatus.PartitionMoved, HLCTimestamp.Zero, results);
-
-        HLCTimestamp batchTicket = HLCTimestamp.Zero;
-
-        // ── Auto group: propose and commit with the batch. ──
-        if (autoLogs.Count > 0)
-        {
-            (bool autoOk, RaftOperationStatus autoStatus, HLCTimestamp autoTicket) =
-                await partition.ReplicateEntries(autoLogs, admissionBackstop, autoCommit: true).ConfigureAwait(false);
-
-            if (!autoOk)
-                return FailBatch(results, autoInputIndex, manualInputIndex, autoStatus);
-
-            RaftReplicationResult autoQuorum = await WaitForQuorum(partition, autoTicket, true, cancellationToken).ConfigureAwait(false);
-
-            if (!autoQuorum.Success)
-                return FailBatch(results, autoInputIndex, manualInputIndex, autoQuorum.Status);
-
-            for (int j = 0; j < autoLogs.Count; j++)
-                results[autoInputIndex[j]] = new(RaftOperationStatus.Success, autoLogs[j].Id, HLCTimestamp.Zero);
-
-            batchTicket = autoTicket;
-        }
-
-        // ── Manual group (optional): proposed only after the auto group committed, so it is a clean suffix.
-        //    Its ticket is returned to the caller (Pending), who commits or rolls it back later. ──
-        if (manualLogs.Count > 0)
-        {
-            (bool manualOk, RaftOperationStatus manualStatus, HLCTimestamp manualTicket) =
-                await partition.ReplicateEntries(manualLogs, admissionBackstop, autoCommit: false).ConfigureAwait(false);
-
-            if (!manualOk)
-                return FailBatch(results, [], manualInputIndex, manualStatus);
-
-            // For a manual proposal, WaitForQuorum resolves at propose-quorum durability (the ticket stays
-            // live in activeProposals for the caller's later CommitLogs/RollbackLogs).
-            RaftReplicationResult manualQuorum = await WaitForQuorum(partition, manualTicket, false, cancellationToken).ConfigureAwait(false);
-
-            if (!manualQuorum.Success)
-                return FailBatch(results, [], manualInputIndex, manualQuorum.Status);
-
-            for (int j = 0; j < manualLogs.Count; j++)
-                results[manualInputIndex[j]] = new(RaftOperationStatus.Pending, manualLogs[j].Id, manualTicket);
-
-            // The manual ticket is the actionable one for the caller; surface it as the batch ticket.
-            batchTicket = manualTicket;
-        }
-
-        // Some entries may still be PartitionMoved (per-entry fence); overall success reflects that at least
-        // one entry was admitted and committed/queued.
-        return new(true, RaftOperationStatus.Success, batchTicket, results);
-    }
-
-    /// <summary>
-    /// Builds a batch-level rejection result: overall failure with <paramref name="status"/> propagated to
-    /// every entry slot and <c>LogIndex = -1</c>, signalling that nothing was appended.
-    /// </summary>
-    private static RaftBatchReplicationResult RejectBatch(int count, RaftOperationStatus status)
-    {
-        RaftEntryResult[] results = new RaftEntryResult[count];
-        for (int i = 0; i < count; i++)
-            results[i] = new(status, -1, HLCTimestamp.Zero);
-
-        return new(false, status, HLCTimestamp.Zero, results);
-    }
-
-    /// <summary>
-    /// Marks the still-in-flight admitted entries (identified by their input indices) with a proposal
-    /// <paramref name="status"/> failure while leaving already-resolved slots — per-entry
-    /// <see cref="RaftOperationStatus.PartitionMoved"/> fences and any committed auto entries — untouched.
-    /// Used when an admitted proposal fails after some entries were already accounted for.
-    /// </summary>
-    private static RaftBatchReplicationResult FailBatch(RaftEntryResult[] results, IReadOnlyList<int> autoInputIndex, IReadOnlyList<int> manualInputIndex, RaftOperationStatus status)
-    {
-        foreach (int i in autoInputIndex)
-            results[i] = new(status, -1, HLCTimestamp.Zero);
-        foreach (int i in manualInputIndex)
-            results[i] = new(status, -1, HLCTimestamp.Zero);
-
-        return new(false, status, HLCTimestamp.Zero, results);
-    }
+    public Task<RaftBatchReplicationResult> ReplicateEntries(int partitionId, IReadOnlyList<RaftProposalEntry> entries, CancellationToken cancellationToken = default) =>
+        replicationGateway.ReplicateEntries(partitionId, entries, cancellationToken);
 
     /// <summary>
     /// Commit logs and notify followers in the partition
     /// </summary>
     /// <param name="partitionId"></param>
-    /// <param name="proposalIndex"></param>
+    /// <param name="ticketId"></param>
+    /// <param name="cancellationToken"></param>
     /// <returns></returns>
-    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> CommitLogs(int partitionId, HLCTimestamp ticketId, CancellationToken cancellationToken = default)
-    {
-        RaftPartition partition = GetPartition(partitionId);
-
-        return await partition.CommitLogs(ticketId, cancellationToken).ConfigureAwait(false);
-    }
+    public Task<(bool success, RaftOperationStatus status, long commitLogId)> CommitLogs(int partitionId, HLCTimestamp ticketId, CancellationToken cancellationToken = default) =>
+        replicationGateway.CommitLogs(partitionId, ticketId, cancellationToken);
 
     /// <summary>
     /// Rollback logs and notify followers in the partition
     /// </summary>
     /// <param name="partitionId"></param>
-    /// <param name="proposalIndex"></param>
+    /// <param name="ticketId"></param>
+    /// <param name="cancellationToken"></param>
     /// <returns></returns>
-    public async Task<(bool success, RaftOperationStatus status, long commitLogId)> RollbackLogs(int partitionId, HLCTimestamp ticketId, CancellationToken cancellationToken = default)
-    {
-        RaftPartition partition = GetPartition(partitionId);
-
-        return await partition.RollbackLogs(ticketId, cancellationToken).ConfigureAwait(false);
-    }
+    public Task<(bool success, RaftOperationStatus status, long commitLogId)> RollbackLogs(int partitionId, HLCTimestamp ticketId, CancellationToken cancellationToken = default) =>
+        replicationGateway.RollbackLogs(partitionId, ticketId, cancellationToken);
 
     /// <summary>
     /// Replicates a checkpoint to the follower nodes
@@ -3137,101 +1717,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <param name="partitionId"></param>
     /// <param name="cancellationToken"></param>
     /// <returns></returns>
-    public async Task<RaftReplicationResult> ReplicateCheckpoint(int partitionId, CancellationToken cancellationToken = default)
-    {
-        RaftPartition partition = GetPartition(partitionId);
-
-        bool success;
-        HLCTimestamp ticketId;
-        RaftOperationStatus status;
-
-        do
-        {
-            (success, status, ticketId) = await partition.ReplicateCheckpoint().ConfigureAwait(false);
-
-            if (status == RaftOperationStatus.ActiveProposal)
-                await Task.Delay(ProposalRetryDelay, cancellationToken).ConfigureAwait(false);
-
-        } while (status == RaftOperationStatus.ActiveProposal);
-
-        if (!success)
-            return new(success, status, ticketId, -1);
-
-        return await WaitForQuorum(partition, ticketId, true, cancellationToken).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Waits for the replication proposal to be completed in the given partition using
-    /// event-driven notification rather than periodic polling.
-    /// <para>
-    /// One executor round-trip is made to obtain the proposal's completion task; subsequent
-    /// progress is delivered without executor involvement as the state machine fires
-    /// <see cref="RaftProposalQuorum.CompleteWaiter"/> on commit, rollback, or leader loss.
-    /// A 10-second timeout is enforced via <see cref="CancellationTokenSource.CancelAfter"/>
-    /// so that the caller's wait is bounded identically to the previous polling loop.
-    /// </para>
-    /// <para>
-    /// Falls back to a single <see cref="RaftPartition.GetTicketState"/> poll when the
-    /// completion task cannot be retrieved (proposal not found in <c>activeProposals</c>),
-    /// which can happen if the proposal completed and was cleaned up between the
-    /// <c>ReplicateLogs</c> response and the <c>GetTicketWaiterTask</c> request.
-    /// </para>
-    /// </summary>
-    private async Task<RaftReplicationResult> WaitForQuorum(RaftPartition partition, HLCTimestamp ticketId, bool autoCommit, CancellationToken cancellationToken)
-    {
-        if (!string.IsNullOrEmpty(partition.Leader) && partition.Leader != LocalEndpoint)
-            return new(false, RaftOperationStatus.NodeIsNotLeader, ticketId, -1);
-
-        cancellationToken.ThrowIfCancellationRequested();
-
-        Task<(RaftProposalTicketState, long)>? waiterTask = null;
-
-        try
-        {
-            waiterTask = await partition.GetTicketWaiterTaskAsync(ticketId).ConfigureAwait(false);
-        }
-        catch (Exception e) when (e is not OperationCanceledException)
-        {
-            Logger.LogError("WaitForQuorum: GetTicketWaiterTask failed: {Message}", e.Message);
-        }
-
-        if (waiterTask is null)
-        {
-            // Proposal is not in activeProposals — either it completed before we could retrieve
-            // the waiter, or it was never registered. Fall back to a single poll.
-            try
-            {
-                (RaftProposalTicketState state, long commitId) = await partition.GetTicketState(ticketId, autoCommit).ConfigureAwait(false);
-                return state == RaftProposalTicketState.Committed
-                    ? new(true, RaftOperationStatus.Success, ticketId, commitId)
-                    : new(false, RaftOperationStatus.ReplicationFailed, ticketId, -1);
-            }
-            catch (Exception e) when (e is not OperationCanceledException)
-            {
-                Logger.LogError("WaitForQuorum: GetTicketState fallback failed: {Message}", e.Message);
-                return new(false, RaftOperationStatus.ReplicationFailed, ticketId, -1);
-            }
-        }
-
-        try
-        {
-            // WaitAsync(TimeSpan, token) rides the shared timer queue — the previous linked
-            // CancellationTokenSource allocated a CTS + registration + timer per successful
-            // proposal. Caller cancellation still surfaces as OperationCanceledException;
-            // the elapsed timeout surfaces as TimeoutException instead of a filtered OCE.
-            (RaftProposalTicketState ticketState, long commitIndex) = await waiterTask
-                .WaitAsync(TimeSpan.FromMilliseconds(10_000), cancellationToken).ConfigureAwait(false);
-
-            return ticketState == RaftProposalTicketState.Committed
-                ? new(true, RaftOperationStatus.Success, ticketId, commitIndex)
-                : new(false, RaftOperationStatus.ReplicationFailed, ticketId, -1);
-        }
-        catch (TimeoutException)
-        {
-            // 10-second timeout elapsed without a terminal state transition.
-            return new(false, RaftOperationStatus.ProposalTimeout, ticketId, -1);
-        }
-    }
+    public Task<RaftReplicationResult> ReplicateCheckpoint(int partitionId, CancellationToken cancellationToken = default) =>
+        replicationGateway.ReplicateCheckpoint(partitionId, cancellationToken);
 
     // ── Event dispatch — bodies live in RaftEventNotifier ─────────────────
 
@@ -3307,32 +1794,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// </summary>
     /// <param name="partitionId"></param>
     /// <returns></returns>
-    public async ValueTask<bool> AmILeaderQuick(int partitionId)
-    {
-        if (_amILeaderQuickHookForTesting is { } hook)
-            return await hook(partitionId).ConfigureAwait(false);
-
-        if (!IsInitialized)
-            return false;
-
-        RaftPartition partition = GetPartition(partitionId);
-
-        if (!string.IsNullOrEmpty(partition.Leader) && partition.Leader == LocalEndpoint)
-            return true;
-
-        try
-        {
-            RaftNodeState response = await partition.GetState().ConfigureAwait(false);
-
-            return response == RaftNodeState.Leader;
-        }
-        catch (Exception e) when (e is not OperationCanceledException)
-        {
-            Logger.LogError("AmILeaderQuick: {Message}", e.Message);
-        }
-
-        return false;
-    }
+    public ValueTask<bool> AmILeaderQuick(int partitionId) => leadershipService.AmILeaderQuick(partitionId);
 
     /// <summary>
     /// Checks if the local node is the leader in the given partition
@@ -3342,539 +1804,97 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <returns></returns>
     /// <exception cref="OperationCanceledException"></exception>
     /// <exception cref="RaftException"></exception>
-    public async ValueTask<bool> AmILeader(int partitionId, CancellationToken cancellationToken)
-    {
-        if (!IsInitialized)
-            return false;
-
-        RaftPartition partition = GetPartition(partitionId);
-
-        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
-
-        while (stopwatch.GetElapsedMilliseconds() < 10000)
-        {
-            if (!string.IsNullOrEmpty(partition.Leader) && partition.Leader == LocalEndpoint)
-                return true;
-
-            cancellationToken.ThrowIfCancellationRequested();
-
-            try
-            {
-                RaftNodeState response = await partition.GetState(cancellationToken).ConfigureAwait(false);
-
-                return response == RaftNodeState.Leader;
-            }
-            catch (Exception e) when (e is not OperationCanceledException)
-            {
-                Logger.LogError("AmILeader: {Message}", e.Message);
-            }
-
-            await Task.Delay(ProposalStatusPollDelay, cancellationToken).ConfigureAwait(false);
-        }
-
-        throw new RaftException("Leader couldn't be found or is not decided");
-    }
+    public ValueTask<bool> AmILeader(int partitionId, CancellationToken cancellationToken) =>
+        leadershipService.AmILeader(partitionId, cancellationToken);
 
     /// <summary>
     /// Read-index leadership confirmation for the given partition — see
-    /// <see cref="IRaft.ConfirmLeadershipAsync"/> for the contract. Unlike
-    /// <see cref="AmILeader"/> this never reports success from local belief alone: the state
-    /// machine must collect a same-term quorum ack round and catch the applied frontier up to the
-    /// confirmed commit index. Transport or executor errors map to <see langword="false"/> (the
-    /// caller's retry path), matching how a failed quorum round is reported; caller-requested
-    /// cancellation propagates as <see cref="OperationCanceledException"/>.
+    /// <see cref="IRaft.ConfirmLeadershipAsync"/> for the contract.
     /// </summary>
-    public async ValueTask<bool> ConfirmLeadershipAsync(int partitionId, CancellationToken cancellationToken = default)
-    {
-        if (!IsInitialized)
-            return false;
-
-        RaftPartition partition = GetPartition(partitionId);
-
-        try
-        {
-            return await partition.ConfirmLeadershipAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception e) when (e is not OperationCanceledException)
-        {
-            Logger.LogError("ConfirmLeadershipAsync: {Message}", e.Message);
-            return false;
-        }
-    }
+    public ValueTask<bool> ConfirmLeadershipAsync(int partitionId, CancellationToken cancellationToken = default) =>
+        leadershipService.ConfirmLeadershipAsync(partitionId, cancellationToken);
 
     /// <summary>
     /// Follower catch-up confirmation — see <see cref="IRaft.ConfirmLocalApplicationAsync"/> for
-    /// the contract. On the (believed) leader the call degenerates to
-    /// <see cref="ConfirmLeadershipAsync"/>: the leader's own applied-frontier wait is the same
-    /// proof. Otherwise the classic §6.4 follower read runs: fetch a quorum-confirmed commit
-    /// index from the leader (<see cref="ICommunication.GetReadIndex"/> — trustworthy because a
-    /// deposed leader's ack round cannot complete), then wait until the local applied frontier
-    /// covers it. No leader known, failed fetch, transport error, wait timeout, or restore in
-    /// progress all map to <see langword="false"/>; no retries happen inside the primitive — the
-    /// caller owns retry cadence, mirroring <see cref="ConfirmLeadershipAsync"/>.
-    /// <para>The leader-belief routing is a fast path, not a correctness gate: a stale belief
-    /// either fails the local confirmation (this node is not really the leader) or fails the
-    /// remote fetch (the target is not really the leader) — both land on
-    /// <see langword="false"/>, never on a false confirmation.</para>
+    /// the contract.
     /// </summary>
-    public async ValueTask<bool> ConfirmLocalApplicationAsync(int partitionId, CancellationToken cancellationToken = default)
-    {
-        if (!IsInitialized)
-            return false;
-
-        try
-        {
-            RaftPartition partition = GetPartition(partitionId);
-
-            string leader = partition.Leader;
-            if (leader == LocalEndpoint)
-                return await partition.ConfirmLeadershipAsync(cancellationToken).ConfigureAwait(false);
-
-            if (string.IsNullOrEmpty(leader))
-                return false;
-
-            GetReadIndexResponse response = await communication.GetReadIndex(
-                this, new RaftNode(leader), new GetReadIndexRequest(partitionId), cancellationToken).ConfigureAwait(false);
-
-            if (!response.Success || response.ReadIndex < 0)
-                return false;
-
-            return await partition.WaitLocalApplicationAsync(response.ReadIndex, cancellationToken).ConfigureAwait(false);
-        }
-        catch (PartitionNotHostedException e)
-        {
-            // Expected under replica placement — this node simply isn't a replica of the range.
-            // Fail closed without error-level noise: routers probe this per request.
-            if (Logger.IsEnabled(LogLevel.Debug))
-                Logger.LogDebug("ConfirmLocalApplicationAsync: {Message}", e.Message);
-            return false;
-        }
-        catch (Exception e) when (e is not OperationCanceledException)
-        {
-            Logger.LogError("ConfirmLocalApplicationAsync: {Message}", e.Message);
-            return false;
-        }
-    }
+    public ValueTask<bool> ConfirmLocalApplicationAsync(int partitionId, CancellationToken cancellationToken = default) =>
+        leadershipService.ConfirmLocalApplicationAsync(partitionId, cancellationToken);
 
     /// <summary>
     /// Serves a non-leader's read-index fetch (<see cref="ICommunication.GetReadIndex"/>): runs
     /// this node's read-index confirmation round for the partition and returns the captured
-    /// commit index on success. Failure — including this node not being the partition leader —
-    /// returns an unsuccessful response so the remote caller fails closed.
+    /// commit index on success.
     /// </summary>
-    public async ValueTask<GetReadIndexResponse> ReceiveGetReadIndex(GetReadIndexRequest request, CancellationToken cancellationToken = default)
-    {
-        if (!IsInitialized)
-            return new GetReadIndexResponse(false);
-
-        try
-        {
-            RaftPartition partition = GetPartition(request.PartitionId);
-
-            (RaftOperationStatus status, long readIndex) = await partition
-                .GetConfirmedReadIndexAsync(cancellationToken).ConfigureAwait(false);
-
-            return status == RaftOperationStatus.Success && readIndex >= 0
-                ? new GetReadIndexResponse(true, readIndex)
-                : new GetReadIndexResponse(false);
-        }
-        catch (Exception e) when (e is not OperationCanceledException)
-        {
-            Logger.LogError("ReceiveGetReadIndex: {Message}", e.Message);
-            return new GetReadIndexResponse(false);
-        }
-    }
+    public ValueTask<GetReadIndexResponse> ReceiveGetReadIndex(GetReadIndexRequest request, CancellationToken cancellationToken = default) =>
+        leadershipService.ReceiveGetReadIndex(request, cancellationToken);
 
     /// <summary>
     /// Waits for the leader to be elected in the given partition.
     /// If the leader is already elected, it returns the leader.
-    ///
-    /// The method first waits for the partition's WAL restore to complete. That wait is bounded
-    /// only by <paramref name="cancellationToken"/> — never by a fixed budget — because during a
-    /// large or slow replay the partition cannot settle on a leader and <see cref="RaftNodeState"/>
-    /// stays undecided. Only after restore has finished does the fixed 10 s election budget apply,
-    /// which is its original intent (bounding genuine election latency, not restore work).
-    ///
-    /// A faulted restore surfaces to the caller as a <see cref="RaftException"/> wrapping the real
-    /// cause rather than the generic "leader couldn't be found" timeout.
     /// </summary>
     /// <param name="partitionId"></param>
     /// <param name="cancellationToken"></param>
     /// <returns></returns>
     /// <exception cref="RaftException"></exception>
-    public async ValueTask<string> WaitForLeader(int partitionId, CancellationToken cancellationToken)
-    {
-        // Before initialization the partition map hasn't been applied and user partitions don't
-        // exist yet, so GetPartition would throw "Invalid partition" for ids that are perfectly
-        // valid once assembly completes. Mirror the AmILeader/AmILeaderQuick guard, but surface
-        // the condition as a typed retryable exception instead of a silent default: this method
-        // must return a leader endpoint and has none to give. Without this guard a restarting
-        // node that already reports Joined (set at the start of both join paths) leaks the
-        // misleading "Invalid partition" error to routing callers.
-        if (!IsInitialized)
-            throw new RaftNodeNotReadyException(
-                $"Cannot resolve leader for partition {partitionId}: node has not completed cluster initialization");
-
-        RaftPartition partition = GetPartition(partitionId);
-
-        // Wait for WAL restore before starting the election budget. This wait is bounded only by the
-        // caller's cancellation token; it is deliberately outside the poll loop's swallowing catch so
-        // a faulted restore is reported as its real cause instead of a generic election timeout.
-        try
-        {
-            await partition.RestoreTask.WaitAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception e)
-        {
-            throw new RaftException($"Partition {partitionId} restore failed", e);
-        }
-
-        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
-
-        while (stopwatch.GetElapsedMilliseconds() < 10000)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            try
-            {
-                RaftNodeState response = await partition.GetState(cancellationToken).ConfigureAwait(false);
-
-                if (response == RaftNodeState.Leader)
-                    return LocalEndpoint;
-
-                if (string.IsNullOrEmpty(partition.Leader))
-                {
-                    await Task.Delay(100 + Random.Shared.Next(-50, 50), cancellationToken).ConfigureAwait(false);
-                    continue;
-                }
-
-                return partition.Leader;
-            }
-            catch (Exception e) when (e is not OperationCanceledException)
-            {
-                Logger.LogError("WaitForLeader: {Message}", e.Message);
-            }
-        }
-
-        throw new RaftException("Leader couldn't be found or is not decided");
-    }
+    public ValueTask<string> WaitForLeader(int partitionId, CancellationToken cancellationToken) =>
+        leadershipService.WaitForLeader(partitionId, cancellationToken);
 
     [EditorBrowsable(EditorBrowsableState.Never)]
     public ValueTask<string> WaitForLeaderStableAsync(
         int partitionId,
         TimeSpan minStableFor,
-        CancellationToken cancellationToken = default)
-    {
-        if (!IsInitialized)
-            throw new RaftNodeNotReadyException("Raft manager is not initialized");
-
-        return GetPartition(partitionId).WaitForLeaderStableAsync(minStableFor, timeout: null, cancellationToken);
-    }
+        CancellationToken cancellationToken = default) =>
+        leadershipService.WaitForLeaderStableAsync(partitionId, minStableFor, cancellationToken);
 
     [EditorBrowsable(EditorBrowsableState.Never)]
     public ValueTask<string> WaitForLeaderStableAsync(
         int partitionId,
         TimeSpan minStableFor,
         TimeSpan timeout,
-        CancellationToken cancellationToken = default)
-    {
-        if (!IsInitialized)
-            throw new RaftNodeNotReadyException("Raft manager is not initialized");
-
-        return GetPartition(partitionId).WaitForLeaderStableAsync(minStableFor, timeout, cancellationToken);
-    }
+        CancellationToken cancellationToken = default) =>
+        leadershipService.WaitForLeaderStableAsync(partitionId, minStableFor, timeout, cancellationToken);
 
     [EditorBrowsable(EditorBrowsableState.Never)]
-    public async Task<RaftOperationStatus> ForceLeaderForTestingAsync(
+    public Task<RaftOperationStatus> ForceLeaderForTestingAsync(
         int partitionId,
-        CancellationToken cancellationToken = default)
-    {
-        if (!Joined || !IsInitialized)
-            return RaftOperationStatus.Errored;
-
-        RaftPartition partition;
-
-        try
-        {
-            partition = GetPartition(partitionId);
-        }
-        catch (RaftException)
-        {
-            return RaftOperationStatus.Errored;
-        }
-
-        RaftOperationStatus status = await partition.ForceLeaderForTestingAsync(cancellationToken).ConfigureAwait(false);
-        if (status != RaftOperationStatus.Pending)
-            return status;
-
-        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
-
-        while (stopwatch.GetElapsedMilliseconds() < 10000)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (!string.IsNullOrEmpty(partition.Leader))
-            {
-                if (partition.Leader == LocalEndpoint)
-                    return RaftOperationStatus.Success;
-
-                return RaftOperationStatus.LeaderAlreadyElected;
-            }
-
-            try
-            {
-                RaftNodeState nodeState = await partition.GetState(cancellationToken).ConfigureAwait(false);
-                if (nodeState == RaftNodeState.Leader)
-                    return RaftOperationStatus.Success;
-            }
-            catch (Exception e) when (e is not OperationCanceledException)
-            {
-                Logger.LogWarning("ForceLeaderForTestingAsync: {Message}", e.Message);
-            }
-
-            await Task.Delay(ProposalStatusPollDelay, cancellationToken).ConfigureAwait(false);
-        }
-
-        return RaftOperationStatus.Pending;
-    }
+        CancellationToken cancellationToken = default) =>
+        leadershipService.ForceLeaderForTestingAsync(partitionId, cancellationToken);
 
     [EditorBrowsable(EditorBrowsableState.Never)]
-    public async Task<RaftOperationStatus> StepDownAsync(
+    public Task<RaftOperationStatus> StepDownAsync(
         int partitionId,
-        CancellationToken cancellationToken = default)
-    {
-        if (!Joined || !IsInitialized)
-            return RaftOperationStatus.Errored;
-
-        RaftPartition partition;
-
-        try
-        {
-            partition = GetPartition(partitionId);
-        }
-        catch (RaftException)
-        {
-            return RaftOperationStatus.Errored;
-        }
-
-        RaftOperationStatus status = await partition.StepDownAsync(cancellationToken).ConfigureAwait(false);
-        if (status != RaftOperationStatus.Pending)
-            return status;
-
-        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
-
-        while (stopwatch.GetElapsedMilliseconds() < 10000)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (!string.IsNullOrEmpty(partition.Leader))
-            {
-                if (partition.Leader == LocalEndpoint)
-                {
-                    await Task.Delay(ProposalStatusPollDelay, cancellationToken).ConfigureAwait(false);
-                    continue;
-                }
-
-                return RaftOperationStatus.Success;
-            }
-
-            try
-            {
-                RaftNodeState nodeState = await partition.GetState(cancellationToken).ConfigureAwait(false);
-                if (nodeState != RaftNodeState.Leader && !string.IsNullOrEmpty(partition.Leader) && partition.Leader != LocalEndpoint)
-                    return RaftOperationStatus.Success;
-            }
-            catch (Exception e) when (e is not OperationCanceledException)
-            {
-                Logger.LogWarning("StepDownAsync: {Message}", e.Message);
-            }
-
-            await Task.Delay(ProposalStatusPollDelay, cancellationToken).ConfigureAwait(false);
-        }
-
-        return RaftOperationStatus.Pending;
-    }
+        CancellationToken cancellationToken = default) =>
+        leadershipService.StepDownAsync(partitionId, cancellationToken);
 
     /// <summary>
     /// Relinquishes leadership of <paramref name="partitionId"/> WITHOUT waiting for a successor to be
-    /// elected. Used only by the self-removal teardown path (<c>StepDownSelfRemovedAsync</c>): a node that
-    /// the committed roster has already dropped from the voter set is shutting down and does not need — and
-    /// must not block on — a handoff. The remaining voters elect a new leader on their own election timeout.
-    ///
-    /// <para>This exists because the public <see cref="StepDownAsync(int,CancellationToken)"/> polls up to
-    /// 10 s for a successor to announce itself, which is correct for an in-service leadership transfer but
-    /// pathological during a coordinated shutdown: no peer campaigns for the handoff, so every partition's
-    /// step-down burns the full 10 s (spamming the executor as it stops), and across many partitions/nodes
-    /// this serialises into multi-minute teardowns. The local step-down (state → Follower, leadership
-    /// relinquished, StepDownNotice sent) is already complete when <see cref="RaftPartition.StepDownAsync"/>
-    /// returns <see cref="RaftOperationStatus.Pending"/>; we simply do not wait past that point.</para>
+    /// elected. Used only by the self-removal teardown path: a node the committed roster has already
+    /// dropped from the voter set is shutting down and must not block on a handoff.
     /// </summary>
-    internal async Task<RaftOperationStatus> StepDownWithoutSuccessorWaitAsync(
+    internal Task<RaftOperationStatus> StepDownWithoutSuccessorWaitAsync(
         int partitionId,
-        CancellationToken cancellationToken = default)
-    {
-        if (!Joined || !IsInitialized)
-            return RaftOperationStatus.Errored;
-
-        RaftPartition partition;
-
-        try
-        {
-            partition = GetPartition(partitionId);
-        }
-        catch (RaftException)
-        {
-            return RaftOperationStatus.Errored;
-        }
-
-        RaftOperationStatus status = await partition.StepDownAsync(cancellationToken).ConfigureAwait(false);
-
-        // Pending == the local step-down succeeded but a successor has not yet been confirmed. For the
-        // removed-and-tearing-down node that is exactly the state we want to return on; treat it as success.
-        return status == RaftOperationStatus.Pending ? RaftOperationStatus.Success : status;
-    }
+        CancellationToken cancellationToken = default) =>
+        leadershipService.StepDownWithoutSuccessorWaitAsync(partitionId, cancellationToken);
 
     [EditorBrowsable(EditorBrowsableState.Never)]
-    public async Task<RaftOperationStatus> TransferLeadershipAsync(
+    public Task<RaftOperationStatus> TransferLeadershipAsync(
         int partitionId,
         string targetEndpoint,
-        CancellationToken cancellationToken = default)
-    {
-        if (!Joined || !IsInitialized)
-            return RaftOperationStatus.Errored;
-
-        RaftPartition partition;
-
-        try
-        {
-            partition = GetPartition(partitionId);
-        }
-        catch (RaftException)
-        {
-            return RaftOperationStatus.Errored;
-        }
-
-        RaftOperationStatus status = await partition.TransferLeadershipAsync(targetEndpoint, cancellationToken).ConfigureAwait(false);
-        if (status == RaftOperationStatus.ReplicationFailed)
-            status = await RetryTransferLeadershipAfterProbeAsync(partition, partitionId, targetEndpoint, cancellationToken).ConfigureAwait(false);
-
-        if (status != RaftOperationStatus.Pending)
-            return status;
-
-        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
-
-        while (stopwatch.GetElapsedMilliseconds() < 10000)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (!string.IsNullOrEmpty(partition.Leader))
-            {
-                if (partition.Leader == targetEndpoint)
-                    return RaftOperationStatus.Success;
-
-                if (partition.Leader != LocalEndpoint)
-                    return RaftOperationStatus.LeaderAlreadyElected;
-            }
-
-            try
-            {
-                RaftNodeState nodeState = await partition.GetState(cancellationToken).ConfigureAwait(false);
-                if (nodeState != RaftNodeState.Leader && partition.Leader == targetEndpoint)
-                    return RaftOperationStatus.Success;
-            }
-            catch (Exception e) when (e is not OperationCanceledException)
-            {
-                Logger.LogWarning("TransferLeadershipAsync: {Message}", e.Message);
-            }
-
-            await Task.Delay(ProposalStatusPollDelay, cancellationToken).ConfigureAwait(false);
-        }
-
-        return RaftOperationStatus.Pending;
-    }
+        CancellationToken cancellationToken = default) =>
+        leadershipService.TransferLeadershipAsync(partitionId, targetEndpoint, cancellationToken);
 
     [EditorBrowsable(EditorBrowsableState.Never)]
-    public async Task<RaftOperationStatus> SuspendHeartbeatsAsync(
+    public Task<RaftOperationStatus> SuspendHeartbeatsAsync(
         int partitionId,
-        CancellationToken cancellationToken = default)
-    {
-        if (!Joined || !IsInitialized)
-            return RaftOperationStatus.Errored;
-
-        try
-        {
-            return await GetPartition(partitionId).SuspendHeartbeatsAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (RaftException)
-        {
-            return RaftOperationStatus.Errored;
-        }
-    }
+        CancellationToken cancellationToken = default) =>
+        leadershipService.SuspendHeartbeatsAsync(partitionId, cancellationToken);
 
     [EditorBrowsable(EditorBrowsableState.Never)]
-    public async Task<RaftOperationStatus> ResumeHeartbeatsAsync(
+    public Task<RaftOperationStatus> ResumeHeartbeatsAsync(
         int partitionId,
-        CancellationToken cancellationToken = default)
-    {
-        if (!Joined || !IsInitialized)
-            return RaftOperationStatus.Errored;
-
-        try
-        {
-            return await GetPartition(partitionId).ResumeHeartbeatsAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (RaftException)
-        {
-            return RaftOperationStatus.Errored;
-        }
-    }
-
-    private async Task<RaftOperationStatus> RetryTransferLeadershipAfterProbeAsync(
-        RaftPartition partition,
-        int partitionId,
-        string targetEndpoint,
-        CancellationToken cancellationToken)
-    {
-        if (string.IsNullOrWhiteSpace(targetEndpoint) || targetEndpoint == LocalEndpoint)
-            return RaftOperationStatus.ReplicationFailed;
-
-        RaftNode? targetNode = Nodes.FirstOrDefault(node => node.Endpoint == targetEndpoint);
-        if (targetNode is null)
-            return RaftOperationStatus.ReplicationFailed;
-
-        HandshakeResponse response;
-
-        try
-        {
-            response = await communication.Handshake(this, targetNode, new HandshakeRequest(
-                LocalNodeId,
-                partitionId,
-                walAdapter.GetMaxLog(partitionId),
-                LocalEndpoint)).ConfigureAwait(false);
-        }
-        catch (Exception e) when (e is not OperationCanceledException)
-        {
-            Logger.LogWarning("TransferLeadershipAsync probe: {Message}", e.Message);
-            return RaftOperationStatus.ReplicationFailed;
-        }
-
-        if (string.IsNullOrEmpty(response.Endpoint))
-            response = new HandshakeResponse(response.NodeId, response.MaxLogId, targetEndpoint);
-
-        partition.Handshake(new HandshakeRequest(
-            response.NodeId,
-            partitionId,
-            response.MaxLogId,
-            response.Endpoint));
-
-        await partition.DrainAsync(cancellationToken).ConfigureAwait(false);
-
-        return await partition.TransferLeadershipAsync(targetEndpoint, cancellationToken).ConfigureAwait(false);
-    }
+        CancellationToken cancellationToken = default) =>
+        leadershipService.ResumeHeartbeatsAsync(partitionId, cancellationToken);
 
     /// <summary>
     /// Queues a request to split a partition. Splitting is an asynchronous
@@ -3969,10 +1989,10 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// <see cref="InvalidOperationException"/> immediately rather than spinning to the timeout.
     /// </summary>
     internal void SetJoinTerminalReason(string endpoint, string reason) =>
-        _joinTerminalReasons[endpoint] = reason;
+        joinService.SetJoinTerminalReason(endpoint, reason);
 
     internal string? GetJoinTerminalReason(string endpoint) =>
-        _joinTerminalReasons.TryGetValue(endpoint, out string? reason) ? reason : null;
+        joinService.GetJoinTerminalReason(endpoint);
 
     /// <inheritdoc/>
     public long GetPartitionGeneration(int partitionId)
@@ -3981,17 +2001,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
             return partition.Generation;
 
         // Non-hosted ranges (per-partition placement) still expose the committed generation so
-        // callers on non-replica nodes can build a correctly-fenced forwarded proposal. Removed
-        // entries are tombstones: no proposal can target them, so they report 0 like any other
-        // non-existent partition instead of leaking the tombstone's generation.
-        List<RaftPartitionRange> ranges = committedRanges;
-        foreach (RaftPartitionRange range in ranges)
-        {
-            if (range.PartitionId == partitionId)
-                return range.State == RaftPartitionState.Removed ? 0 : range.Generation;
-        }
-
-        return 0;
+        // callers on non-replica nodes can build a correctly-fenced forwarded proposal.
+        return routingTable.GetCommittedGeneration(partitionId);
     }
 
     /// <inheritdoc/>
@@ -4019,73 +2030,8 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     /// Called by <see cref="RaftSystemCoordinator"/> each time <c>_cachedMembership</c>
     /// advances to a strictly higher version.
     /// </summary>
-    internal void RaiseMembershipChanged(System.ClusterMembership membership)
-    {
-        eventNotifier.RaiseMembershipChanged(membership);
-
-        ResetProgressForReadmittedMembers(membership);
-
-        // Record self-inclusion BEFORE the rejoin check: during startup restore the
-        // self-including roster and the eviction record arrive back-to-back on the coordinator
-        // loop, and the flag must be visible when the eviction record's event fires.
-        if (membership.Members.Any(m => m.Endpoint == LocalEndpoint))
-            _wasRosterMember = true;
-        else
-            MaybeStartAutoRejoin(membership);
-    }
-
-    /// <summary>
-    /// The <see cref="System.ClusterMember.JoinedVersion"/> last observed per endpoint, used to
-    /// detect (re)admissions. Keying on JoinedVersion rather than a previous-roster diff makes
-    /// detection robust to version jumps: the membership cache is monotonic and a node may apply
-    /// v1 → v3 directly (per-key config replication carries only the latest roster), which would
-    /// hide the intermediate eviction from a set diff — but a readmitted member always carries a
-    /// strictly higher JoinedVersion. Read and mutated only on the coordinator's event path
-    /// (single-threaded per roster version), so no synchronization is required.
-    /// </summary>
-    private readonly Dictionary<string, long> _lastSeenJoinedVersions = new(StringComparer.Ordinal);
-
-    /// <summary>
-    /// Detects members the advancing roster (re)admits — a new endpoint, or a known endpoint whose
-    /// <see cref="System.ClusterMember.JoinedVersion"/> advanced — and posts a replication-progress
-    /// reset to every local partition (user partitions and the system partition alike). A leader's
-    /// retained progress for a member predates its (re)admission and may describe a log the member
-    /// no longer holds — an evicted node typically rejoins with reset state, and a leader that
-    /// still "remembers" it as caught-up neither un-quiesces nor backfills it, starving the member
-    /// indefinitely. The first observed roster only records the baseline: a node with no baseline
-    /// has no retained progress worth resetting (leaders clear per-follower state on election).
-    /// </summary>
-    private void ResetProgressForReadmittedMembers(System.ClusterMembership membership)
-    {
-        bool hasBaseline = _lastSeenJoinedVersions.Count > 0;
-
-        foreach (System.ClusterMember member in membership.Members)
-        {
-            string endpoint = member.Endpoint;
-            if (string.IsNullOrEmpty(endpoint))
-                continue;
-
-            bool known = _lastSeenJoinedVersions.TryGetValue(endpoint, out long seenVersion);
-            _lastSeenJoinedVersions[endpoint] = member.JoinedVersion;
-
-            if (endpoint == LocalEndpoint || !hasBaseline)
-                continue;
-
-            bool readmitted = known ? member.JoinedVersion > seenVersion : true;
-            if (!readmitted)
-                continue;
-
-            if (Logger.IsEnabled(LogLevel.Information))
-                Logger.LogInformation(
-                    "[{LocalEndpoint}] Roster v{Version} (re)admits {Endpoint} (joinedVersion={JoinedVersion}); resetting per-follower replication progress on all local partitions",
-                    LocalEndpoint, membership.MembershipVersion, endpoint, member.JoinedVersion);
-
-            systemPartition?.ResetFollowerProgress(endpoint);
-
-            foreach (RaftPartition partition in partitions.Values)
-                partition.ResetFollowerProgress(endpoint);
-        }
-    }
+    internal void RaiseMembershipChanged(System.ClusterMembership membership) =>
+        membershipChangeHandler.RaiseMembershipChanged(membership);
 
     /// <summary>
     /// Last-chance liveness check used by the eviction path: one direct ping bounded by
@@ -4095,309 +2041,28 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     internal Task<bool> ProbeEndpointAliveAsync(string endpoint, CancellationToken cancellationToken = default) =>
         gossipService.ProbeAndResurrectAsync(this, endpoint, cancellationToken);
 
-    /// <summary>
-    /// Guard flag: non-zero while <see cref="AutoRejoinLoopAsync"/> is running so roster updates
-    /// arriving mid-rejoin don't spawn a second loop.
-    /// </summary>
-    private int _autoRejoinRunning;
-
-    /// <summary>
-    /// True once any committed roster observed by this node — including one replayed from the
-    /// WAL during startup restore — contained the local endpoint. This, not
-    /// <c>IsInitialized</c>, is what distinguishes "an evicted member" from "a node that was
-    /// never admitted": a node that <b>boots into</b> an evicted roster applies the
-    /// self-excluding record during restore, before initialization completes, and no further
-    /// roster change ever arrives to re-fire the edge-triggered check — an
-    /// <c>IsInitialized</c> gate therefore deadlocked it as NotMember forever. The restore
-    /// replays the earlier self-including roster first (it precedes the eviction record in log
-    /// order), so this flag is always set by the time the eviction record is applied.
-    /// </summary>
-    private volatile bool _wasRosterMember;
-
-    /// <summary>
-    /// Starts the auto-rejoin driver when a committed roster no longer contains this node.
-    /// Eviction is otherwise a one-way door: the startup join already completed, so nothing
-    /// would ever invoke the Join RPC again and the node parks as <c>NotMember</c> forever
-    /// (pre-votes suppressed on every partition, terminal errors to clients).
-    /// <para>
-    /// Deliberately NOT triggered when: auto-rejoin is disabled; the node initiated a graceful
-    /// leave (<c>_leaving</c> — the removal is intentional — or <c>_leaveRequested</c>, which stays
-    /// set even for an attempt that reported failure, because the removal may still land later and
-    /// re-admitting would undo an operator-ordered decommission); this node has never been in a
-    /// committed roster (<see cref="_wasRosterMember"/> — first-time joins own their admission
-    /// retry loop in <c>JoinCluster(seeds)</c>, and a booting learner or a bare test manager
-    /// routinely observes rosters that don't include it); or the roster is the pre-seed
-    /// version 0.
-    /// </para>
-    /// <para>
-    /// Known residual: a node whose replayed history contains <em>only</em> self-excluding
-    /// rosters (possible after a snapshot install that post-dates its own eviction) never sets
-    /// <see cref="_wasRosterMember"/> and still parks; it needs an explicit
-    /// <c>JoinCluster(seeds)</c>.
-    /// </para>
-    /// </summary>
-    private void MaybeStartAutoRejoin(System.ClusterMembership membership)
-    {
-        if (!configuration.EnableAutoRejoin)
-            return;
-        if (_leaving || _leaveRequested || Volatile.Read(ref _disposed) != 0)
-            return;
-        if (membership.MembershipVersion == 0 || !_wasRosterMember)
-            return;
-        if (membership.Members.Any(m => m.Endpoint == LocalEndpoint))
-            return;
-        if (Interlocked.CompareExchange(ref _autoRejoinRunning, 1, 0) != 0)
-            return;
-
-        _ = Task.Run(AutoRejoinLoopAsync);
-    }
-
-    /// <summary>
-    /// Background rejoin loop for an evicted member: sends the (idempotent) Join RPC to the
-    /// remaining roster members and discovery peers with exponential backoff until this node is
-    /// back in the committed roster (role leaves <c>NotMember</c> when the re-admission commit
-    /// reaches us via replication or gossip), or the node starts leaving / disposing. Re-uses
-    /// the same admission path as a first-time seed join, so the node re-enters as a Learner
-    /// and is promoted back to Voter by the normal learner-promotion machinery once caught up
-    /// — an evicted-but-live node is typically already caught up, so promotion is quick.
-    /// </summary>
-    private async Task AutoRejoinLoopAsync()
-    {
-        try
-        {
-            Logger.LogWarning(
-                "[{LocalEndpoint}] Removed from committed roster while running (likely dead-member eviction across a restart); starting auto-rejoin",
-                LocalEndpoint);
-
-            TimeSpan backoff = TimeSpan.FromSeconds(1);
-            TimeSpan maxBackoff = TimeSpan.FromSeconds(30);
-
-            while (!_leaving && Volatile.Read(ref _disposed) == 0)
-            {
-                System.ClusterMemberRole role = LocalRole;
-                if (role != System.ClusterMemberRole.NotMember)
-                {
-                    if (Logger.IsEnabled(LogLevel.Information))
-                        Logger.LogInformation("[{LocalEndpoint}] Auto-rejoin complete: local role is {Role}", LocalEndpoint, role);
-                    return;
-                }
-
-                // Candidate targets: the members of the roster that excluded us (they are the
-                // live cluster) plus discovery peers as a fallback.
-                List<string> targets = systemCoordinator.GetMembership().Members
-                    .Select(m => m.Endpoint)
-                    .Concat(discovery.GetNodes().Select(n => n.Endpoint))
-                    .Where(e => e != LocalEndpoint)
-                    .Distinct()
-                    .ToList();
-
-                foreach (string target in targets)
-                {
-                    if (_leaving || Volatile.Read(ref _disposed) != 0)
-                        return;
-
-                    if (await TrySendJoinAsync(target).ConfigureAwait(false))
-                        break;
-                }
-
-                await Task.Delay(backoff).ConfigureAwait(false);
-                backoff = backoff * 2 > maxBackoff ? maxBackoff : backoff * 2;
-            }
-        }
-        catch (Exception ex)
-        {
-            Logger.LogWarning("[{LocalEndpoint}] Auto-rejoin loop failed: {Message}", LocalEndpoint, ex.Message);
-        }
-        finally
-        {
-            Interlocked.Exchange(ref _autoRejoinRunning, 0);
-            // A roster update that raced our exit re-triggers via MaybeStartAutoRejoin; no
-            // re-check is needed here because every roster change goes through
-            // RaiseMembershipChanged.
-        }
-    }
-
-    /// <summary>
-    /// One Join attempt against <paramref name="target"/>, following a single leader hint,
-    /// mirroring the seed-join contact loop. Returns true when a leader accepted the join
-    /// (the committed roster entry then reaches this node asynchronously).
-    /// </summary>
-    private async Task<bool> TrySendJoinAsync(string target)
-    {
-        try
-        {
-            JoinResponse resp = await communication.SendJoin(
-                this, new RaftNode(target), new JoinRequest(LocalEndpoint, LocalNodeId)).ConfigureAwait(false);
-
-            if (resp.Success)
-                return true;
-
-            if (!string.IsNullOrEmpty(resp.LeaderHint))
-            {
-                resp = await communication.SendJoin(
-                    this, new RaftNode(resp.LeaderHint), new JoinRequest(LocalEndpoint, LocalNodeId)).ConfigureAwait(false);
-                return resp.Success;
-            }
-        }
-        catch (Exception ex)
-        {
-            if (Logger.IsEnabled(LogLevel.Debug))
-                Logger.LogDebug("[{LocalEndpoint}] Auto-rejoin: join attempt against {Target} failed: {Message}", LocalEndpoint, target, ex.Message);
-        }
-
-        return false;
-    }
+    /// <inheritdoc/>
+    public IReadOnlyList<RaftPartitionRange> GetPartitionMap() => routingTable.GetPartitionMap();
 
     /// <inheritdoc/>
-    public IReadOnlyList<RaftPartitionRange> GetPartitionMap()
-    {
-        // Prefer the committed map: under per-partition placement the local `partitions`
-        // dictionary only holds hosted ranges, but routing must see every range.
-        List<RaftPartitionRange> ranges = committedRanges;
-        if (ranges.Count > 0)
-        {
-            List<RaftPartitionRange> mapSnapshot = new(ranges.Count);
-            foreach (RaftPartitionRange range in ranges)
-            {
-                if (range.State == RaftPartitionState.Removed)
-                    continue;
-
-                mapSnapshot.Add(new RaftPartitionRange
-                {
-                    PartitionId = range.PartitionId,
-                    StartRange = range.StartRange,
-                    EndRange = range.EndRange,
-                    RoutingMode = range.RoutingMode,
-                    Generation = range.Generation,
-                    State = range.State,
-                    ReplicationFactor = range.ReplicationFactor,
-                    Replicas = range.Replicas.Select(r => new System.RaftReplica
-                    {
-                        Endpoint = r.Endpoint,
-                        NodeId = r.NodeId,
-                        Role = r.Role,
-                        SinceGeneration = r.SinceGeneration
-                    }).ToList()
-                });
-            }
-
-            return mapSnapshot;
-        }
-
-        // Fallback for hosts that never applied a committed map (unit-test harnesses that
-        // populate `partitions` directly).
-        List<RaftPartitionRange> snapshot = new(partitions.Count);
-
-        foreach (KeyValuePair<int, RaftPartition> kv in partitions)
-        {
-            RaftPartition p = kv.Value;
-            snapshot.Add(new RaftPartitionRange
-            {
-                PartitionId  = p.PartitionId,
-                StartRange   = p.StartRange,
-                EndRange     = p.EndRange,
-                RoutingMode  = p.RoutingMode,
-                Generation   = p.Generation,
-                State        = p.State,
-            });
-        }
-
-        return snapshot;
-    }
-
-    /// <inheritdoc/>
-    public int GetNextAvailablePartitionId()
-    {
-        // Unlike GetPartitionMap this keeps Removed entries: a tombstoned id can never be recreated,
-        // so it is spent and the allocator has to step past it.
-        List<RaftPartitionRange> ranges = committedRanges;
-        if (ranges.Count > 0)
-            return RaftPartitionMap.NextAvailablePartitionId(ranges);
-
-        // Fallback for hosts that never applied a committed map (unit-test harnesses that
-        // populate `partitions` directly). No tombstones exist there — a removal takes the
-        // partition out of the dictionary — so this is the best the local view can do.
-        int maxPartitionId = RaftSystemConfig.SystemPartition;
-
-        foreach (int partitionId in partitions.Keys)
-        {
-            if (partitionId > maxPartitionId)
-                maxPartitionId = partitionId;
-        }
-
-        return maxPartitionId + 1;
-    }
+    public int GetNextAvailablePartitionId() => routingTable.GetNextAvailablePartitionId();
 
     /// <summary>
     /// Returns the number of the partition for the given partition key
     /// </summary>
     /// <param name="partitionKey"></param>
     /// <returns></returns>
-    public int GetPartitionKey(string partitionKey)
-    {
-        int rangeId = (int)HashUtils.InversePrefixedStaticHash(partitionKey, '/');
-        if (rangeId < 0)
-            rangeId = -rangeId;
-
-        int? partitionId = ResolveRangeId(rangeId);
-        if (partitionId is not null)
-            return partitionId.Value;
-
-        throw new RaftException("Couldn't find partition range for: " + partitionKey + " " + rangeId);
-    }
+    public int GetPartitionKey(string partitionKey) => routingTable.GetPartitionKey(partitionKey);
 
     /// <summary>
-    /// Resolves a hash range id to its partition id using the committed map when available —
-    /// required under per-partition placement, where a non-replica node must still route any
-    /// key even though it hosts no <see cref="RaftPartition"/> for the range — falling back to
-    /// the hosted set for hosts that never applied a committed map.
+    /// Returns the number of the partition for the given prefix partition key
     /// </summary>
-    private int? ResolveRangeId(int rangeId)
-    {
-        List<RaftPartitionRange> ranges = committedRanges;
-        if (ranges.Count > 0)
-        {
-            foreach (RaftPartitionRange range in ranges)
-            {
-                if (range.State != RaftPartitionState.Removed &&
-                    range.RoutingMode == RaftRoutingMode.HashRange &&
-                    range.StartRange <= rangeId && range.EndRange >= rangeId)
-                    return range.PartitionId;
-            }
-
-            return null;
-        }
-
-        foreach (KeyValuePair<int, RaftPartition> partition in partitions)
-        {
-            if (partition.Value.RoutingMode == RaftRoutingMode.HashRange &&
-                partition.Value.StartRange <= rangeId && partition.Value.EndRange >= rangeId)
-                return partition.Key;
-        }
-
-        return null;
-    }
-    
-    /// <summary>
-    /// Returns the number of the partition for the given partition key
-    /// </summary>
-    /// <param name="partitionKey"></param>
+    /// <param name="prefixPartitionKey"></param>
     /// <returns></returns>
-    public int GetPrefixPartitionKey(string prefixPartitionKey)
-    {
-        int rangeId = (int)HashUtils.SimpleHash(prefixPartitionKey);
-        if (rangeId < 0)
-            rangeId = -rangeId;
-
-        int? partitionId = ResolveRangeId(rangeId);
-        if (partitionId is not null)
-            return partitionId.Value;
-
-        throw new RaftException("Couldn't find partition range for: " + prefixPartitionKey + " " + rangeId);
-    }
+    public int GetPrefixPartitionKey(string prefixPartitionKey) => routingTable.GetPrefixPartitionKey(prefixPartitionKey);
     
     internal void EnqueueResponse(string endpoint, RaftResponderRequest request) =>
-        transportDispatcher.Enqueue(endpoint, request);
+        rpcRouter.EnqueueResponse(endpoint, request);
 
     public void Dispose()
     {
@@ -4443,7 +2108,7 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
         // 4. Dispose remaining shared resources.
         hybridLogicalClock.Dispose();
         walAdapter.Dispose();
-        leaveRequestLock.Dispose();
+        leaveService.Dispose();
 
         if (discovery is IDisposable disposableDiscovery)
             disposableDiscovery.Dispose();
