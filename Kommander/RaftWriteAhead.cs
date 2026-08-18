@@ -159,6 +159,16 @@ public sealed class RaftWriteAhead
 
     private int compactionPassCount;
 
+    private int effectiveCompactionPassCount;
+
+    /// <summary>
+    /// 1 once the "compaction has no checkpoint to compact to" line has been logged for this
+    /// partition. Rearmed (back to 0) as soon as a pass observes a checkpoint, so the message is
+    /// one-shot per stall rather than one-shot per process — a partition that checkpoints and then
+    /// stops checkpointing reports again instead of staying silent for the process lifetime.
+    /// </summary>
+    private int awaitingFirstCheckpointReported;
+
     /// <summary>
     /// Constructor
     /// </summary>
@@ -1600,11 +1610,19 @@ public sealed class RaftWriteAhead
     /// <summary>
     /// Starts log compaction for this partition if no pass is already running.
     /// Returns immediately without waiting for the pass to finish.
+    /// <para>
+    /// The overlap skip is logged at Trace: it is a silent return that fires often under load, and
+    /// "the trigger fired but no pass ran" is otherwise indistinguishable from "the trigger never
+    /// fired" when diagnosing a WAL that is not shrinking.
+    /// </para>
     /// </summary>
     public void Compact()
     {
         if (Interlocked.CompareExchange(ref compactionInFlight, 1, 0) != 0)
+        {
+            logger.LogTraceCompactionAlreadyInFlight(manager.LocalEndpoint, partition.PartitionId);
             return;
+        }
 
         compactionPassTask = RunCompactionPassAsync();
     }
@@ -1618,6 +1636,14 @@ public sealed class RaftWriteAhead
     /// Number of compaction passes that actually started. For tests only.
     /// </summary>
     internal int CompactionPassCount => Volatile.Read(ref compactionPassCount);
+
+    /// <summary>
+    /// Number of invoked passes that got past both retention gates and reached
+    /// <c>CompactLogsOlderThan</c>. The difference against <see cref="CompactionPassCount"/> is the
+    /// invoked-vs-effective gap that makes a stalled checkpoint visible. For tests only; the same
+    /// split is published as the <c>raft.wal.compaction_passes_total</c> metric.
+    /// </summary>
+    internal int EffectiveCompactionPassCount => Volatile.Read(ref effectiveCompactionPassCount);
 
     /// <summary>
     /// Sets the minimum WAL index that compaction must not truncate below, regardless of the
@@ -1741,6 +1767,19 @@ public sealed class RaftWriteAhead
         }
     }
 
+    /// <summary>
+    /// Runs one compaction pass: resolves the truncation floor, then drains removable entries below
+    /// it. Never throws — a failed pass is logged and the in-flight flag released.
+    /// <para>
+    /// The floor is <c>min(lastCheckpoint, minRetainIndex, holdFloor, durabilityFloor)</c>, so a
+    /// pass can legitimately do nothing. Every such outcome is reported: the two gates log at Debug
+    /// and count into <c>raft.wal.compaction_passes_total</c> under their own <c>outcome</c> tag,
+    /// and the no-checkpoint gate additionally emits one Information line per stall. This is
+    /// deliberate — both gates used to return above the first log statement, which made a WAL that
+    /// never shrinks produce no evidence at any level, so "the trigger never fired", "nothing has
+    /// checkpointed", and "a retention floor is holding" were indistinguishable in a post-mortem.
+    /// </para>
+    /// </summary>
     private async Task RunCompactionPassAsync()
     {
         Interlocked.Increment(ref compactionPassCount);
@@ -1752,7 +1791,22 @@ public sealed class RaftWriteAhead
             ).ConfigureAwait(false);
 
             if (lastCheckpoint <= 0)
+            {
+                KommanderMetrics.RecordCompactionPass(partition.PartitionId, KommanderMetrics.CompactionOutcome.NoCheckpoint);
+                logger.LogDebugCompactionSkippedNoCheckpoint(manager.LocalEndpoint, partition.PartitionId, lastCheckpoint);
+
+                // One line per stall at Information: the Debug line above can fire on every commit,
+                // but a deployment whose application never checkpoints needs exactly one visible
+                // statement that compaction is gated on something other than CompactEveryOperations.
+                if (Interlocked.Exchange(ref awaitingFirstCheckpointReported, 1) == 0)
+                    logger.LogInfoCompactionAwaitingFirstCheckpoint(manager.LocalEndpoint, partition.PartitionId);
+
                 return;
+            }
+
+            // A checkpoint exists again: rearm the one-shot so a later stall is reported rather
+            // than swallowed by the flag set during an earlier one.
+            Volatile.Write(ref awaitingFirstCheckpointReported, 0);
 
             // Application-durability floor: entries the application has not durably applied must
             // never be truncated, even below the checkpoint — restart replay needs them (see
@@ -1781,11 +1835,32 @@ public sealed class RaftWriteAhead
             // Compose the legacy single floor with the min-of-holds floor and the
             // application-durability floor: compaction must retain below whichever protected index
             // is lowest across all consumers.
-            long retainFloor = Math.Min(Math.Min(Volatile.Read(ref minRetainIndex), Volatile.Read(ref holdFloor)), durabilityFloor);
+            long retainIndexFloor = Volatile.Read(ref minRetainIndex);
+            long activeHoldFloor = Volatile.Read(ref holdFloor);
+            long retainFloor = Math.Min(Math.Min(retainIndexFloor, activeHoldFloor), durabilityFloor);
             long effectiveFloor = Math.Min(lastCheckpoint, retainFloor);
 
             if (effectiveFloor <= 0)
+            {
+                KommanderMetrics.RecordCompactionPass(partition.PartitionId, KommanderMetrics.CompactionOutcome.FloorNotPositive);
+
+                // Guarded so the floor-source attribution is not computed when Debug is off.
+                if (logger.IsEnabled(LogLevel.Debug))
+                    logger.LogDebugCompactionSkippedFloorNotPositive(
+                        manager.LocalEndpoint,
+                        partition.PartitionId,
+                        effectiveFloor,
+                        DescribeFloorSource(effectiveFloor, lastCheckpoint, retainIndexFloor, activeHoldFloor, durabilityFloor),
+                        lastCheckpoint,
+                        retainIndexFloor,
+                        activeHoldFloor,
+                        durabilityFloor);
+
                 return;
+            }
+
+            Interlocked.Increment(ref effectiveCompactionPassCount);
+            KommanderMetrics.RecordCompactionPass(partition.PartitionId, KommanderMetrics.CompactionOutcome.Effective);
 
             logger.LogInfoCompactionStarted(manager.LocalEndpoint, partition.PartitionId, effectiveFloor);
 
@@ -1821,6 +1896,8 @@ public sealed class RaftWriteAhead
         }
         catch (Exception ex)
         {
+            KommanderMetrics.RecordCompactionPass(partition.PartitionId, KommanderMetrics.CompactionOutcome.Failed);
+
             logger.LogError(
                 ex,
                 "[{Endpoint}/{Partition}] Compaction failed",
@@ -1831,5 +1908,30 @@ public sealed class RaftWriteAhead
         {
             Interlocked.Exchange(ref compactionInFlight, 0);
         }
+    }
+
+    /// <summary>
+    /// Names which consumer's floor the composed <paramref name="effectiveFloor"/> came from, for the
+    /// skip log. Ties are resolved in the order checkpoint → durability floor → retention holds →
+    /// <see cref="SetMinRetainIndex"/>: the earlier a source appears, the more likely it is the one an
+    /// operator can act on, and reporting a single name keeps the message actionable where printing
+    /// four numbers alone would not.
+    /// </summary>
+    private static string DescribeFloorSource(
+        long effectiveFloor,
+        long lastCheckpoint,
+        long retainIndexFloor,
+        long activeHoldFloor,
+        long durabilityFloor)
+    {
+        if (effectiveFloor == lastCheckpoint)
+            return "checkpoint";
+        if (effectiveFloor == durabilityFloor)
+            return "durability_floor";
+        if (effectiveFloor == activeHoldFloor)
+            return "retention_hold";
+        if (effectiveFloor == retainIndexFloor)
+            return "min_retain_index";
+        return "unknown";
     }
 }

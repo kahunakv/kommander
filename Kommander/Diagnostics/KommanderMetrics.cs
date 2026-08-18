@@ -91,6 +91,37 @@ public static class KommanderMetrics
             "raft.wal.compaction_blocked_by_durability_floor_total",
             description: "Compaction passes fully blocked by the application-durability floor.");
 
+    /// <summary>
+    /// Every compaction pass that was invoked, tagged by <c>partition_id</c> and <c>outcome</c>:
+    /// <c>no_checkpoint</c> (nothing has checkpointed, so there is no floor to compact to),
+    /// <c>floor_not_positive</c> (a composed retention floor left nothing removable),
+    /// <c>effective</c> (the pass reached <c>CompactLogsOlderThan</c>), or <c>failed</c>.
+    ///
+    /// <para>The sum across outcomes is "passes invoked", so invoked-vs-effective is readable from
+    /// telemetry alone. This exists because a WAL that never shrinks used to produce no signal at
+    /// all: the passes fired and returned before the first log statement, making "the threshold was
+    /// never reached" indistinguishable from "every pass found no checkpoint" on a dashboard.</para>
+    /// </summary>
+    internal static readonly Counter<long> WalCompactionPassesTotal =
+        Meter.CreateCounter<long>(
+            "raft.wal.compaction_passes_total",
+            description: "Compaction passes invoked, by outcome (no_checkpoint/floor_not_positive/effective/failed).");
+
+    /// <summary>Outcome tag values for <see cref="WalCompactionPassesTotal"/>.</summary>
+    internal static class CompactionOutcome
+    {
+        internal const string NoCheckpoint = "no_checkpoint";
+        internal const string FloorNotPositive = "floor_not_positive";
+        internal const string Effective = "effective";
+        internal const string Failed = "failed";
+    }
+
+    /// <summary>Counts one invoked compaction pass, tagged by partition and outcome.</summary>
+    internal static void RecordCompactionPass(int partitionId, string outcome) =>
+        WalCompactionPassesTotal.Add(1,
+            new KeyValuePair<string, object?>("partition_id", partitionId),
+            new KeyValuePair<string, object?>("outcome", outcome));
+
     /// <summary>Records the durability-floor lag for one compaction pass, tagged by partition.</summary>
     internal static void RecordDurabilityFloorLag(int partitionId, long lag) =>
         WalDurabilityFloorLag.Record(lag, new KeyValuePair<string, object?>("partition_id", partitionId));

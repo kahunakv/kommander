@@ -684,10 +684,39 @@ public class RaftConfiguration
     // ── Bounded log backfill ──────────────────────────────────────────────────
 
     /// <summary>
+    /// Master switch for leader-driven log backfill on this node's partitions. When
+    /// <see langword="false"/> the leader never ships catch-up batches and never falls back to a
+    /// snapshot transfer for a lagging follower: peers converge only through the live
+    /// propose/commit broadcast. Default <see langword="true"/>.
+    /// <para>
+    /// This exists because <see cref="BackfillThreshold"/> is <b>not</b> a disable switch — it gates
+    /// one of three triggers, so a large threshold suppresses backfill only while writes are
+    /// flowing, and leaks the moment the node goes idle. Consumers that legitimately want no
+    /// catch-up traffic for a class of peers (witness/observer topologies whose peers never need
+    /// real data, and whose commit progress does not depend on their catch-up) must set this rather
+    /// than raising the threshold.
+    /// </para>
+    /// <para>
+    /// Turning this off makes lagging followers permanently stale by design: nothing else re-ships
+    /// entries they missed. Leave it on unless a consumer owns the peers' catch-up story.
+    /// </para>
+    /// </summary>
+    public bool BackfillEnabled { get; set; } = true;
+
+    /// <summary>
     /// Number of committed entries a follower may trail the leader before the leader
     /// switches from empty heartbeats to active backfill on that follower.
     /// Lower values trigger backfill sooner; higher values tolerate more lag before
     /// kicking in. Default 10.
+    /// <para>
+    /// <b>This paces an enabled backfill; it does not disable one.</b> It gates the actively-behind
+    /// trigger (a follower trailing by more than this many entries) and the two per-ack fast-path
+    /// re-supplies. It does <b>not</b> gate the other two heartbeat triggers: the idle-tail trigger
+    /// (any gap ≥ 1 once live replication goes quiet, which exists precisely because empty
+    /// heartbeats cannot heal a residual tail entry) and the crash-restart regression re-supply.
+    /// Raising it to <see cref="int.MaxValue"/> therefore suppresses backfill only while writes are
+    /// flowing — use <see cref="BackfillEnabled"/> to turn backfill off.
+    /// </para>
     /// </summary>
     public int BackfillThreshold { get; set; } = 10;
 
@@ -1132,6 +1161,15 @@ public class RaftConfiguration
     /// <summary>
     /// Committed operations between automatic WAL compaction triggers per partition.
     /// Set to 0 or a negative value to disable automatic compaction.
+    /// <para>
+    /// <b>This schedules passes; it does not by itself truncate anything.</b> A pass can only remove
+    /// entries below the partition's last checkpoint, and the checkpoint advances only when the
+    /// application calls <see cref="IRaft.ReplicateCheckpoint"/> (or when a snapshot is installed).
+    /// Kommander does not checkpoint on a cadence of its own. A deployment that never checkpoints
+    /// therefore never compacts, however low this value is set — the passes fire, find no floor, and
+    /// return. Watch for the per-partition "compaction is running but has never had a checkpoint"
+    /// line, or the <c>raft.wal.compaction_passes_total</c> metric with <c>outcome=no_checkpoint</c>.
+    /// </para>
     /// </summary>
     public int CompactEveryOperations { get; set; } = 10000;
 

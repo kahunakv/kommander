@@ -459,6 +459,22 @@ public interface IRaft
     public IReadOnlyList<Data.RaftSnapshotStatus> GetSnapshotStatuses(int partitionId);
 
     /// <summary>
+    /// Returns this node's leader-side backfill-refusal status per follower on the given partition:
+    /// which followers cannot be served an anchored catch-up batch because no committed entry exists
+    /// at their anchor, how many times the refusal has fired, and the anchor / first-available /
+    /// last-checkpoint triple that separates the two possible causes — an uncommitted run at the
+    /// anchor (repaired by the inherited-tail re-commit) or a compaction floor above it (only a
+    /// snapshot install can seed the follower). Pairs with
+    /// <see cref="GetSnapshotStatuses"/>, which reports what happened to the snapshot fallback the
+    /// refusal routes into.
+    /// <para>The refusal is logged once per episode rather than once per heartbeat, so this is the
+    /// live view of a condition the log states only when it starts and when it clears. Empty when
+    /// the partition is not hosted on this node, this node is not its leader, or every follower's
+    /// anchor is serviceable. Diagnostic only — never gate correctness on it.</para>
+    /// </summary>
+    public IReadOnlyList<Data.RaftBackfillStatus> GetBackfillStatuses(int partitionId);
+
+    /// <summary>
     /// Acquires a composable retention hold on <paramref name="partitionId"/>'s WAL: committed
     /// entries are retained down to <paramref name="index"/> until the returned handle is disposed.
     /// <para>

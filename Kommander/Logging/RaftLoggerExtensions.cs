@@ -161,6 +161,15 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot installed on {Endpoint} at index {Index} ({Chunks} chunk(s))")]
     public static partial void LogInfoSnapshotInstalled(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index, int chunks);
 
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Refusing non-contiguous backfill batch for {Endpoint}: anchored at {From} but the first committed entry available is {FirstId} — no committed entry exists at the anchor (the run below it is uncommitted, or it was compacted away; LastCheckpoint={LastCheckpoint} tells which). Repeats log at Debug; query IRaft.GetBackfillStatuses while this persists")]
+    public static partial void LogWarnBackfillNonContiguous(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long from, long firstId, long lastCheckpoint);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Still refusing non-contiguous backfill batch for {Endpoint} anchored at {From} (first available {FirstId}, occurrence {Occurrences})")]
+    public static partial void LogDebugBackfillNonContiguousRepeat(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long from, long firstId, int occurrences);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Non-contiguous backfill for {Endpoint} cleared after {Occurrences} refusal(s) anchored at {From} (first available {FirstId}): {Reason}")]
+    public static partial void LogInfoBackfillNonContiguousCleared(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long from, long firstId, int occurrences, string reason);
+
     // ── RaftWriteAhead ────────────────────────────────────────────────────
 
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}/{Partition}] Recovered {LogsCount} logs")]
@@ -180,6 +189,18 @@ public static partial class RaftLoggerExtensions
 
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}/{Partition}] Compaction process started LastCheckpoint={LastCheckpoint}")]
     public static partial void LogInfoCompactionStarted(this ILogger<IRaft> logger, string endpoint, int partition, long lastCheckpoint);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{Endpoint}/{Partition}] Compaction pass skipped: no checkpoint yet (LastCheckpoint={LastCheckpoint}) — the truncation floor is the last checkpoint, so nothing can be removed until the application calls ReplicateCheckpoint")]
+    public static partial void LogDebugCompactionSkippedNoCheckpoint(this ILogger<IRaft> logger, string endpoint, int partition, long lastCheckpoint);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}/{Partition}] Compaction is running but has never had a checkpoint to compact to: CompactEveryOperations only schedules passes, the floor advances only when the application calls ReplicateCheckpoint (or a snapshot is installed). The WAL will grow until then. This is logged once per partition")]
+    public static partial void LogInfoCompactionAwaitingFirstCheckpoint(this ILogger<IRaft> logger, string endpoint, int partition);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{Endpoint}/{Partition}] Compaction pass skipped: effective floor {EffectiveFloor} is not positive, contributed by {FloorSource} (LastCheckpoint={LastCheckpoint} MinRetainIndex={MinRetainIndex} HoldFloor={HoldFloor} DurabilityFloor={DurabilityFloor})")]
+    public static partial void LogDebugCompactionSkippedFloorNotPositive(this ILogger<IRaft> logger, string endpoint, int partition, long effectiveFloor, string floorSource, long lastCheckpoint, long minRetainIndex, long holdFloor, long durabilityFloor);
+
+    [LoggerMessage(Level = LogLevel.Trace, Message = "[{Endpoint}/{Partition}] Compaction trigger skipped: a pass is already in flight")]
+    public static partial void LogTraceCompactionAlreadyInFlight(this ILogger<IRaft> logger, string endpoint, int partition);
 
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}/{Partition}] Compaction finished Removed={RemovedTotal} LastCheckpoint={LastCheckpoint}")]
     public static partial void LogInfoCompactionFinished(this ILogger<IRaft> logger, string endpoint, int partition, int removedTotal, long lastCheckpoint);

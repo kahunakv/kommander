@@ -753,6 +753,8 @@ public sealed class TestReplicaPlacement
         public void RegisterSystemStateTransfer(IRaftSystemStateTransfer? transfer) => throw new NotImplementedException();
         public void RegisterPartitionStateTransfer(IRaftPartitionStateTransfer? transfer) => throw new NotImplementedException();
         public IReadOnlyList<RaftSnapshotStatus> GetSnapshotStatuses(int partitionId) => throw new NotImplementedException();
+
+        public IReadOnlyList<RaftBackfillStatus> GetBackfillStatuses(int partitionId) => throw new NotImplementedException();
     }
 
     /// <summary>

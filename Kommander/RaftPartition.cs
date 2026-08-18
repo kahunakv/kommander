@@ -285,6 +285,13 @@ public sealed class RaftPartition : IDisposable
     public IReadOnlyList<Data.RaftSnapshotStatus> GetSnapshotStatuses() => stateMachine.GetSnapshotStatuses();
 
     /// <summary>
+    /// Leader-side non-contiguous-backfill status per follower for this partition — see
+    /// <see cref="IRaft.GetBackfillStatuses"/>. Empty on a healthy partition; a plain thread-safe
+    /// read, no executor round-trip.
+    /// </summary>
+    public IReadOnlyList<Data.RaftBackfillStatus> GetBackfillStatuses() => stateMachine.GetBackfillStatuses();
+
+    /// <summary>
     /// Advisory composite load score for this partition, forwarded from the executor's
     /// <see cref="Scheduling.RaftPartitionExecutor.CurrentLoad"/> accumulator.
     /// </summary>

@@ -2490,6 +2490,19 @@ public sealed class RaftManager : IRaft, Scheduling.IRaftTimerHost, IDisposable
     }
 
     /// <summary>
+    /// Returns the leader-side non-contiguous-backfill status per follower for the given partition —
+    /// see <see cref="IRaft.GetBackfillStatuses"/>. Empty when the partition is not hosted here, this
+    /// node is not its leader, or no follower's anchor is unserviceable.
+    /// </summary>
+    public IReadOnlyList<Data.RaftBackfillStatus> GetBackfillStatuses(int partitionId)
+    {
+        if (partitions.TryGetValue(partitionId, out RaftPartition? partition))
+            return partition.GetBackfillStatuses();
+
+        return [];
+    }
+
+    /// <summary>
     /// Acquires a composable retention hold on the given partition's WAL. When the partition is not
     /// hosted on this node the call is a no-op that returns a disposable which does nothing, mirroring
     /// the silent no-op of <see cref="SetMinRetainIndex"/>. See <see cref="IRaft.AcquireRetentionHold"/>

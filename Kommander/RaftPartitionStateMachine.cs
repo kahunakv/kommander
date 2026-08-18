@@ -279,6 +279,34 @@ public sealed class RaftPartitionStateMachine
     private readonly Dictionary<string, long> regressedFrontiers = [];
 
     /// <summary>
+    /// Open non-contiguous-backfill episodes, keyed by follower endpoint. An entry exists while the
+    /// leader is refusing to ship that peer an anchored batch because no committed entry sits at its
+    /// anchor.
+    ///
+    /// <para>Concurrent because <see cref="GetBackfillStatuses"/> serves the operator query off the
+    /// executor thread while the refusal path mutates it on the executor thread — the same split
+    /// <see cref="SnapshotSender"/>'s failure states live under. Every field is diagnostic; a benign
+    /// race yields a slightly stale reading, never a wrong decision (nothing here gates behavior).</para>
+    /// </summary>
+    private readonly ConcurrentDictionary<string, NonContiguousBackfillEpisode> nonContiguousEpisodes = new();
+
+    /// <summary>
+    /// One follower's open refusal episode. Identity is the <c>(From, FirstId)</c> pair: while it
+    /// holds, repeats are the same episode and log at Debug; a changed pair is a genuinely different
+    /// condition and opens a new episode with its own Warning.
+    /// </summary>
+    private sealed class NonContiguousBackfillEpisode
+    {
+        public long From;
+        public long FirstId;
+        public long LastCheckpoint;
+        public int Occurrences;
+        public long LastSeenTicks;
+        public DateTimeOffset FirstSeenAt;
+        public DateTimeOffset LastSeenAt;
+    }
+
+    /// <summary>
     /// Highest log index that has been delivered to the consumer via
     /// <see cref="IRaftPartitionHost.InvokeReplicationReceived"/> or
     /// <see cref="IRaftPartitionHost.InvokeSystemReplicationReceived"/>.
@@ -2332,7 +2360,13 @@ public sealed class RaftPartitionStateMachine
             if (regressed)
                 regressedFrontiers.Remove(node.Endpoint);
 
+            // BackfillEnabled short-circuits ALL three triggers. BackfillThreshold gates only the
+            // first, so a consumer that raised it to int.MaxValue meaning "off" still got backfill
+            // from idleTailGap the moment writes paused — the inverse of what an idle node needs.
+            // The snapshot fallback below is inside this branch by design: "no backfill" also means
+            // no repeated, always-discarded partition-state exports for a peer nobody is catching up.
             bool willBackfill = nodeState == RaftNodeState.Leader
+                && host.Configuration.BackfillEnabled
                 && localCommittedIndex >= 0
                 && (followerGap > host.Configuration.BackfillThreshold || idleTailGap || regressed);
 
@@ -3393,8 +3427,9 @@ public sealed class RaftPartitionStateMachine
         if (logger.IsEnabled(LogLevel.Information))
         {
             logger.LogInformation(
-                "[{LocalEndpoint}/{PartitionId}/{State}] DIAG backfill-decision peer={Endpoint} send={Send} followerMaxLog={FollowerMaxLog} localCommitted={LocalCommitted} gap={Gap} threshold={Threshold} idleTailGap={IdleTailGap} regressed={Regressed} liveQuiet={LiveQuiet} liveCommitFloor={LiveCommitFloor} suppressedSinceLastLine={Suppressed}",
+                "[{LocalEndpoint}/{PartitionId}/{State}] DIAG backfill-decision peer={Endpoint} send={Send} enabled={Enabled} followerMaxLog={FollowerMaxLog} localCommitted={LocalCommitted} gap={Gap} threshold={Threshold} idleTailGap={IdleTailGap} regressed={Regressed} liveQuiet={LiveQuiet} liveCommitFloor={LiveCommitFloor} suppressedSinceLastLine={Suppressed}",
                 host.LocalEndpoint, host.PartitionId, nodeState, endpoint, willBackfill,
+                host.Configuration.BackfillEnabled,
                 followerMaxLog, localCommittedIndex, followerGap, host.Configuration.BackfillThreshold,
                 idleTailGap, regressed, liveQuiet, liveCommitFloor, suppressedBackfillTraces);
         }
@@ -4048,6 +4083,7 @@ public sealed class RaftPartitionStateMachine
 
             logger.LogDebugBackfilling(host.LocalEndpoint, host.PartitionId, nodeState, cached.Logs.Count, node.Endpoint, from, prevIdx, localCommittedIndex);
 
+            ClearNonContiguousEpisode(node.Endpoint, "a contiguous batch was shipped");
             AppendLogToNode(node, timestamp, cached.Logs, prevIdx, cached.PrevTerm, grpcLogCache: cached.GrpcLogCache);
             return BackfillSendResult.Sent;
         }
@@ -4063,19 +4099,26 @@ public sealed class RaftPartitionStateMachine
         }
 
         // Anchor-contiguity guard: an anchored batch asserts, via (prevIdx, prevTerm), that its
-        // entries IMMEDIATELY follow the anchor. GetRangeAsync filters uncommitted entries, so a
-        // Proposed run starting exactly at `from` (e.g. an inherited range whose commit markers
-        // were lost and not yet re-committed) yields a batch whose first id is ABOVE `from` —
-        // shipping it anchored at from-1 would land it over the follower's gap, advance nothing,
-        // and repeat forever with no error anywhere (the observed Jepsen wedge). Refuse to ship:
-        // NonContiguous deliberately routes the heartbeat path to its snapshot fallback, and the
-        // log line makes the state visible instead of silent. The inherited-tail re-commit in
-        // DrainInheritedAppliesAsync repairs the underlying range, so this firing at all means
-        // that repair has not landed (or a new gap source exists) — never suppress the log.
+        // entries IMMEDIATELY follow the anchor. The read came back with a first id ABOVE `from`,
+        // so no committed entry exists at the anchor — shipping it anchored at from-1 would land it
+        // over the follower's gap, advance nothing, and repeat forever with no error anywhere (the
+        // observed Jepsen wedge). Two causes produce this identical batch shape and the guard cannot
+        // tell them apart: a Proposed run starting exactly at `from` (an inherited range whose
+        // commit markers were lost and not yet re-committed — repaired by the inherited-tail
+        // re-commit in DrainInheritedAppliesAsync), or a compaction floor above the anchor (the peer
+        // is below the floor and only a snapshot can seed it). The reported message must not claim
+        // one over the other; it carries the anchor, the first id, and the last checkpoint so a
+        // reader can tell. Refuse to ship: NonContiguous deliberately routes the heartbeat path to
+        // its snapshot fallback.
+        //
+        // The condition must stay visible, but "never suppress" was previously implemented as "warn
+        // on every heartbeat forever", which buries the signal where the repair never lands.
+        // ReportNonContiguousBackfillAsync scopes it to one Warning per episode and keeps the live
+        // condition queryable through GetBackfillStatuses — the SnapshotSender discipline, applied
+        // to the refusal that routes into it.
         if (backfill[0].Id != from)
         {
-            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Backfill read for {Endpoint} anchored at {From} returned committed entries starting at {FirstId} — uncommitted entries below block re-supply; refusing non-contiguous batch.",
-                host.LocalEndpoint, host.PartitionId, nodeState, node.Endpoint, from, backfill[0].Id);
+            await ReportNonContiguousBackfillAsync(node.Endpoint, from, backfill[0].Id).ConfigureAwait(false);
             round?.Add(from, [], 0, BackfillSendResult.NonContiguous);
             return BackfillSendResult.NonContiguous;
         }
@@ -4086,6 +4129,7 @@ public sealed class RaftPartitionStateMachine
 
         logger.LogDebugBackfilling(host.LocalEndpoint, host.PartitionId, nodeState, backfill.Count, node.Endpoint, from, prevIdx, localCommittedIndex);
 
+        ClearNonContiguousEpisode(node.Endpoint, "a contiguous batch was shipped");
         AppendLogToNode(node, timestamp, backfill, prevIdx, prevTerm, grpcLogCache: shared?.GrpcLogCache);
         return BackfillSendResult.Sent;
     }
@@ -4326,6 +4370,7 @@ public sealed class RaftPartitionStateMachine
         // replication), and eagerly catching it up here would, e.g., make a barely-behind node look
         // fresh enough to receive a leadership transfer it should not.
         if (nodeState == RaftNodeState.Leader
+            && host.Configuration.BackfillEnabled
             && localCommittedIndex - newMatchIndex > host.Configuration.BackfillThreshold)
         {
             RaftNode? behindNode = FindNodeByEndpoint(host.Nodes, endpoint);
@@ -4340,6 +4385,7 @@ public sealed class RaftPartitionStateMachine
         // matchIndex; confined to the fast path (flag off ⇒ a heartbeat reports -1 ⇒ never fires).
         if (host.Configuration.WalSingleFsyncCommit
             && nodeState == RaftNodeState.Leader
+            && host.Configuration.BackfillEnabled
             && committedIndex >= 0
             && localCommittedIndex - committedIndex > host.Configuration.BackfillThreshold)
         {
@@ -5706,8 +5752,14 @@ public sealed class RaftPartitionStateMachine
     /// snapshot task confirmed successful installation. Called on the executor thread via the
     /// <c>postToExecutor</c> callback; delegates ownership update to <see cref="snapshotSender"/>.
     /// </summary>
-    public void CompleteSnapshotInstalled(string endpoint, long snapshotIndex) =>
+    public void CompleteSnapshotInstalled(string endpoint, long snapshotIndex)
+    {
+        // A seeded follower is above the anchor that could not be served, so any open refusal
+        // episode for it is over — this is the resolution the fallback exists to produce, and it
+        // must be as observable as the refusal was.
+        ClearNonContiguousEpisode(endpoint, "the follower was seeded by snapshot install");
         snapshotSender.CompleteSnapshotInstalled(endpoint, snapshotIndex);
+    }
 
     /// <summary>
     /// Leader-side snapshot-transfer status per follower — see <see cref="IRaft.GetSnapshotStatuses"/>.
@@ -5715,4 +5767,117 @@ public sealed class RaftPartitionStateMachine
     /// </summary>
     public IReadOnlyList<RaftSnapshotStatus> GetSnapshotStatuses() => snapshotSender.GetStatuses();
 
+    /// <summary>
+    /// Records one refusal to ship a non-contiguous anchored batch to <paramref name="endpoint"/>
+    /// and logs it at <b>episode</b> scope rather than per attempt.
+    ///
+    /// <para>The first refusal of an episode — and any refusal whose <c>(from, firstId)</c> pair
+    /// differs from the open one, i.e. a genuinely changed condition — logs at Warning. Identical
+    /// repeats log at Debug carrying the occurrence count. This replaces a Warning per heartbeat,
+    /// which produced hundreds of thousands of identical lines wherever the underlying range is
+    /// never repaired (a peer permanently below the compaction floor) and buried the signal it was
+    /// meant to raise. The condition itself is never suppressed: the episode stays open and
+    /// queryable through <see cref="GetBackfillStatuses"/> for as long as it keeps firing.</para>
+    ///
+    /// <para>The last-checkpoint read happens only on the Warning path, so the diagnostic that
+    /// separates the two causes (an uncommitted run at the anchor versus a compaction floor above
+    /// it) never becomes a per-heartbeat WAL read.</para>
+    /// </summary>
+    private async Task ReportNonContiguousBackfillAsync(string endpoint, long from, long firstId)
+    {
+        long nowTicks = host.GetMonotonicTimestamp();
+
+        if (nonContiguousEpisodes.TryGetValue(endpoint, out NonContiguousBackfillEpisode? open)
+            && open.From == from && open.FirstId == firstId)
+        {
+            int occurrences = Interlocked.Increment(ref open.Occurrences);
+            Volatile.Write(ref open.LastSeenTicks, nowTicks);
+            open.LastSeenAt = DateTimeOffset.UtcNow;
+
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebugBackfillNonContiguousRepeat(
+                    host.LocalEndpoint, host.PartitionId, nodeState, endpoint, from, firstId, occurrences);
+
+            return;
+        }
+
+        long lastCheckpoint = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
+
+        nonContiguousEpisodes[endpoint] = new NonContiguousBackfillEpisode
+        {
+            From = from,
+            FirstId = firstId,
+            LastCheckpoint = lastCheckpoint,
+            Occurrences = 1,
+            LastSeenTicks = nowTicks,
+            FirstSeenAt = DateTimeOffset.UtcNow,
+            LastSeenAt = DateTimeOffset.UtcNow,
+        };
+
+        logger.LogWarnBackfillNonContiguous(
+            host.LocalEndpoint, host.PartitionId, nodeState, endpoint, from, firstId, lastCheckpoint);
+    }
+
+    /// <summary>
+    /// Closes any open refusal episode for <paramref name="endpoint"/>, logging why it ended.
+    /// Recovery is stated rather than left to be inferred from the absence of further warnings —
+    /// silence is what the old per-heartbeat logging made unreadable in the first place.
+    /// </summary>
+    private void ClearNonContiguousEpisode(string endpoint, string reason)
+    {
+        if (!nonContiguousEpisodes.TryRemove(endpoint, out NonContiguousBackfillEpisode? episode))
+            return;
+
+        logger.LogInfoBackfillNonContiguousCleared(
+            host.LocalEndpoint, host.PartitionId, nodeState, endpoint,
+            episode.From, episode.FirstId, episode.Occurrences, reason);
+    }
+
+    /// <summary>
+    /// Leader-side non-contiguous-backfill status per follower — see
+    /// <see cref="IRaft.GetBackfillStatuses"/>. Safe to call off the executor thread.
+    ///
+    /// <para>Episodes not seen for <see cref="StaleBackfillEpisodeMs"/> are dropped here rather than
+    /// reported: a peer that stopped triggering backfill entirely (seeded another way, removed from
+    /// the cluster, or this node stepped down) never reaches the clear path, and a condition that is
+    /// no longer being observed must not be reported as live.</para>
+    /// </summary>
+    public IReadOnlyList<RaftBackfillStatus> GetBackfillStatuses()
+    {
+        if (nonContiguousEpisodes.IsEmpty)
+            return [];
+
+        long now = host.GetMonotonicTimestamp();
+        long staleTicks = StaleBackfillEpisodeMs * Stopwatch.Frequency / 1000;
+        List<RaftBackfillStatus> statuses = [];
+
+        foreach ((string endpoint, NonContiguousBackfillEpisode episode) in nonContiguousEpisodes)
+        {
+            if (now - Volatile.Read(ref episode.LastSeenTicks) > staleTicks)
+            {
+                nonContiguousEpisodes.TryRemove(endpoint, out _);
+                continue;
+            }
+
+            statuses.Add(new RaftBackfillStatus
+            {
+                FollowerEndpoint = endpoint,
+                AnchorIndex = episode.From,
+                FirstAvailableIndex = episode.FirstId,
+                LastCheckpoint = episode.LastCheckpoint,
+                Occurrences = Volatile.Read(ref episode.Occurrences),
+                FirstRefusedAt = episode.FirstSeenAt,
+                LastRefusedAt = episode.LastSeenAt,
+            });
+        }
+
+        return statuses;
+    }
+
+    /// <summary>
+    /// How long an unobserved refusal episode is still reported before it is treated as gone.
+    /// Generous relative to a heartbeat interval: a live condition re-fires every round, so anything
+    /// this quiet has stopped happening.
+    /// </summary>
+    private const long StaleBackfillEpisodeMs = 60_000;
 }

@@ -123,26 +123,44 @@ Why the live path is deliberately *not* anchored is covered in [its own section]
 ## Flow 1 — Detecting a lagging follower
 
 The leader tracks, per follower, how far behind it is (via `matchIndex` vs. its own committed index).
-Backfill only kicks in once the gap crosses `BackfillThreshold` — small, transient lag is left to the
-live path to settle.
+There are **three** independent triggers, and only the first is gated by `BackfillThreshold`:
 
 ```
    LEADER, for each follower:
         gap = leaderCommittedIndex - matchIndex[follower]
         │
         ▼
-   gap > BackfillThreshold ?
-        │              │
-        no             yes
-        ▼              ▼
-   leave it to     start a backfill round (Flow 2)
-   the live path
+   BackfillEnabled ? ──── no ──▶ never backfill this follower
+        │ yes
+        ▼
+   gap > BackfillThreshold ?          ─── yes ──▶ actively behind: stream it forward
+        │ no
+        ▼
+   gap >= 1 and writes have paused ?  ─── yes ──▶ idle tail: re-ship the missed entries
+        │ no
+        ▼
+   follower reported a frontier below ─── yes ──▶ crash-restart: re-supply from its
+   its recorded matchIndex ?                       reported frontier
+        │ no
+        ▼
+   leave it to the live path
 ```
 
-Why a threshold and not "any lag"? Because a follower that is one or two entries behind is almost
-certainly mid-broadcast and about to catch up on its own. Backfilling it would be wasted work and could
-race with the live path. The threshold draws the line between "transiently behind" and "genuinely
-lagging."
+Why a threshold and not "any lag" on the first trigger? Because a follower that is one or two entries
+behind is almost certainly mid-broadcast and about to catch up on its own. Backfilling it would be
+wasted work and could race with the live path. The threshold draws the line between "transiently
+behind" and "genuinely lagging."
+
+The other two triggers deliberately ignore the threshold, because in their situations the live path
+cannot heal the gap at all: once writes stop, empty heartbeats carry no entries, so even a single
+missed tail entry would strand the follower forever; and a follower that restarted and lost its lazy
+commit markers has to be re-supplied from where it says it is, however small the gap looks.
+
+**This is why `BackfillThreshold` is not a disable switch.** Raising it suppresses backfill only while
+writes are flowing — the moment the partition goes idle, the idle-tail trigger fires anyway. To turn
+backfill off for a node's partitions, set `BackfillEnabled = false`; it short-circuits all three
+triggers *and* the snapshot fallback. Do that only when something else owns those peers' catch-up
+story, because nothing else re-ships entries they missed.
 
 > Note (`GetFollowerLagAsync`): the public `IRaft` API exposes a follower's lag so applications and
 > operators can observe catch-up progress.
@@ -281,6 +299,14 @@ Two operational notes on the handoff:
 - A follower that needs a snapshot when **no snapshot transfer is registered** cannot catch up; the
   condition is recorded once per episode and reported — together with in-flight transfers, attempt
   counts and last errors — through `IRaft.GetSnapshotStatuses(partitionId)`.
+- A read that comes back **starting above the anchor** — no committed entry exists at the follower's
+  next index, because the run there is uncommitted or was compacted away — is refused rather than
+  shipped: an anchored batch that skips the gap would advance nothing and repeat forever. The refusal
+  is logged **once per episode** (repeats drop to Debug, and there is a line when it clears) and the
+  live condition is reported through `IRaft.GetBackfillStatuses(partitionId)`, which carries the
+  anchor, the first index the leader could actually read, and the last checkpoint — the checkpoint is
+  what tells the two causes apart: at or above the first readable index means the anchor was
+  compacted away and only a snapshot can seed that follower.
 
 ---
 
@@ -320,13 +346,15 @@ In `RaftConfiguration.cs`:
 
 | Setting | Default | What it does |
 |---|---|---|
-| `BackfillThreshold` | `10` | A follower must lag by more than this many entries before backfill engages. Below it, the live path handles catch-up. |
+| `BackfillEnabled` | `true` | Master switch. `false` means this node never backfills and never falls back to a snapshot transfer for a lagging follower — peers converge only through the live path, and a follower that misses entries stays behind. |
+| `BackfillThreshold` | `10` | A follower must lag by more than this many entries before the *actively-behind* trigger engages. Below it, the live path handles catch-up. Does not gate the idle-tail or crash-restart triggers — see Flow 1. |
 | `MaxBackfillEntriesPerRound` | `128` | Maximum entries shipped in a single backfill round. Caps message size and keeps backfill sharing the partition fairly. |
 
 Tuning notes:
 
 - **Lower `BackfillThreshold`** → backfill engages sooner (faster recovery, slightly more eager work on
-  small lags). **Higher** → more lag tolerated before the dedicated path kicks in.
+  small lags). **Higher** → more lag tolerated before the dedicated path kicks in. Raising it to
+  `int.MaxValue` does **not** disable backfill; use `BackfillEnabled` for that.
 - **Lower `MaxBackfillEntriesPerRound`** → smaller, more frequent rounds (smoother, more rounds to
   converge). **Higher** → fewer, larger rounds (faster bulk catch-up, bigger messages).
 
@@ -352,7 +380,8 @@ Kommander/
 │     ├─ AppendLogsRequest.cs            carries PrevLogIndex / PrevLogTerm
 │     └─ RaftOperationStatus.cs          LogMismatch (SnapshotRequired is reserved, never produced)
 ├─ WAL/IO/FairWalScheduler.cs           applies divergent-tail truncation
-└─ RaftConfiguration.cs                 BackfillThreshold, MaxBackfillEntriesPerRound
+└─ RaftConfiguration.cs                 BackfillEnabled, BackfillThreshold,
+                                        MaxBackfillEntriesPerRound
 
 Kommander.Tests/
 ├─ TestLogMatchingCheck.cs              direct-injection LMP tests (reject/accept/backtrack)
