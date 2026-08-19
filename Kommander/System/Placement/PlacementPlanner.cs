@@ -11,7 +11,15 @@ namespace Kommander.System.Placement;
 ///   <item><b>Repair under-replication</b> — a range with fewer healthy replicas than its RF is
 ///   a durability risk; repairs bypass the deadband.</item>
 ///   <item><b>Trim over-replication</b> — a range with more voters than RF (e.g. after a merge
-///   union or an RF decrease) sheds the replica on the most-loaded node.</item>
+///   union, an RF decrease, or a completed zone-spread repair) sheds a replica, preferring a
+///   victim whose zone is duplicated inside the range, then the most-loaded node.</item>
+///   <item><b>Repair zone-spread violations</b> — a range that doubles up voters in one known
+///   zone while an alive node in an uncovered known zone exists loses quorum when that one zone
+///   fails, even though RF is satisfied. Bootstrap produces exactly this: remote zones travel on
+///   load-report gossip, which only starts after the initial map is committed, so the initial
+///   assignment is zone-blind for remote nodes. The repair adds a replica in the uncovered zone;
+///   the zone-aware trim above then sheds a doubled-zone voter on a later pass, converging to
+///   one replica per zone without ever dropping below RF.</item>
 ///   <item><b>Balance replica-count skew</b> — nodes above the even-spread ceiling plus
 ///   <see cref="PlacementView.ReplicaCountDeadband"/> donate a range to the least-loaded node,
 ///   expressed as an add; the trim emerges on a later pass as over-replication once the learner
@@ -22,7 +30,7 @@ namespace Kommander.System.Placement;
 /// costs more than perfection), and cap the plan at <see cref="PlacementView.MaxMoves"/> total.
 /// Moves are budgeted by class: repairs (priority 1, and priority-2 sheds of replicas on nodes
 /// that left the roster) draw on <see cref="PlacementView.RepairBudget"/>; balance moves
-/// (priority-2 cosmetic trims and priority-3 skew adds) draw on
+/// (priority-2 cosmetic trims, priority-3 zone-spread adds, and priority-4 skew adds) draw on
 /// <see cref="PlacementView.TransferBudget"/>, against which repairs emitted in the same plan
 /// also count — so durability work is never throttled by the balance budget, while balance work
 /// yields to an in-flight repair wave. The planner holds no state — determinism comes from
@@ -138,10 +146,28 @@ public static class PlacementPlanner
             if (!BalanceAllowed())
                 continue;
 
-            // Most-loaded healthy voter, preferring non-leader victims.
+            // Victim preference: a voter whose known zone another healthy voter of this range
+            // also occupies goes first — removing it keeps every covered zone covered, which is
+            // what lets a zone-spread repair (add in the uncovered zone, then this trim)
+            // converge instead of shedding the replica that was just added. Then the historical
+            // order: non-leader victims, most-loaded node, endpoint.
+            HashSet<string> duplicatedZones = range.VoterEndpoints
+                .Where(aliveEndpoints.Contains)
+                .Select(e => zoneOf.GetValueOrDefault(e))
+                .Where(z => !string.IsNullOrEmpty(z))
+                .GroupBy(z => z!, StringComparer.Ordinal)
+                .Where(g => g.Count() > 1)
+                .Select(g => g.Key)
+                .ToHashSet(StringComparer.Ordinal);
+
             string? victim = range.VoterEndpoints
                 .Where(aliveEndpoints.Contains)
-                .OrderBy(e => e == range.LeaderEndpoint ? 1 : 0)
+                .OrderBy(e =>
+                {
+                    string? zone = zoneOf.GetValueOrDefault(e);
+                    return !string.IsNullOrEmpty(zone) && duplicatedZones.Contains(zone) ? 0 : 1;
+                })
+                .ThenBy(e => e == range.LeaderEndpoint ? 1 : 0)
                 .ThenByDescending(e => replicaCount.GetValueOrDefault(e))
                 .ThenBy(e => e, StringComparer.Ordinal)
                 .FirstOrDefault();
@@ -154,7 +180,64 @@ public static class PlacementPlanner
             touched.Add(range.PartitionId);
         }
 
-        // ── Priority 3: balance replica-count skew (deadband-gated, balance budget) ──
+        // ── Priority 3: repair zone-spread violations (balance budget) ───────
+        // Only a settled range qualifies: exactly effective-RF voters, all healthy, nothing
+        // transitional (the actionable filter). Anything else belongs to the repair/trim
+        // paths first — single mover per range. The violation predicate is strict on purpose:
+        // it needs a *known* doubled zone and a *known* uncovered zone with a free alive node,
+        // so partial zone knowledge (a node that never gossiped a report) plans nothing rather
+        // than thrashing on guesses. Zone-less deployments (the common case) skip the
+        // per-range zone work entirely.
+        if (alive.Any(n => !string.IsNullOrEmpty(n.Zone)))
+        {
+            foreach (RangePlacement range in actionable)
+            {
+                if (!BalanceAllowed())
+                    break;
+
+                if (touched.Contains(range.PartitionId))
+                    continue;
+
+                int effectiveRf = Math.Min(range.ReplicationFactor, alive.Count);
+
+                if (range.VoterEndpoints.Count != effectiveRf ||
+                    !range.VoterEndpoints.All(aliveEndpoints.Contains))
+                    continue;
+
+                List<string> voterZones = range.VoterEndpoints
+                    .Select(e => zoneOf.GetValueOrDefault(e))
+                    .Where(z => !string.IsNullOrEmpty(z))
+                    .Select(z => z!)
+                    .ToList();
+
+                // No two voters share a known zone: nothing to repair.
+                if (voterZones.Count == voterZones.Distinct(StringComparer.Ordinal).Count())
+                    continue;
+
+                HashSet<string> coveredZones = voterZones.ToHashSet(StringComparer.Ordinal);
+                HashSet<string> occupied = range.VoterEndpoints
+                    .Concat(range.LearnerEndpoints)
+                    .ToHashSet(StringComparer.Ordinal);
+
+                // Least-loaded free alive node whose known zone the range does not cover yet.
+                string? target = alive
+                    .Where(n => !occupied.Contains(n.Endpoint))
+                    .Where(n => !string.IsNullOrEmpty(n.Zone) && !coveredZones.Contains(n.Zone!))
+                    .OrderBy(n => replicaCount.GetValueOrDefault(n.Endpoint))
+                    .ThenBy(n => n.Endpoint, StringComparer.Ordinal)
+                    .Select(n => n.Endpoint)
+                    .FirstOrDefault();
+
+                if (target is null)
+                    continue; // every known zone is covered or full — pigeonhole says this is optimal
+
+                moves.Add(new PlacementMove(range.PartitionId, PlacementMoveKind.AddReplica, target));
+                replicaCount[target]++;
+                touched.Add(range.PartitionId);
+            }
+        }
+
+        // ── Priority 4: balance replica-count skew (deadband-gated, balance budget) ──
         int totalReplicas = replicaCount.Values.Sum();
         int ceiling = (totalReplicas + alive.Count - 1) / alive.Count; // even-spread ceiling
 

@@ -441,4 +441,210 @@ public sealed class TestPlacementPlanner
         PlacementMove repair = Assert.Single(moves);
         Assert.Equal("d:1", repair.Endpoint); // z2 not yet covered beats equally-loaded z1 node
     }
+
+    [Fact]
+    public void Plan_ZoneDoubledRange_AddsReplicaInUncoveredZone()
+    {
+        // RF satisfied and counts even, but two of three voters share z-a while z-c has free
+        // nodes: losing z-a would drop the range below quorum. The planner must emit an add
+        // into the uncovered zone even though no count-based rule fires.
+        PlacementView view = new()
+        {
+            Ranges = [Range(1, 3, ["n1:1", "n2:1", "n3:1"])],
+            Nodes =
+            [
+                Node("n1:1", zone: "z-a"), Node("n2:1", zone: "z-a"),
+                Node("n3:1", zone: "z-b"), Node("n4:1", zone: "z-b"),
+                Node("n5:1", zone: "z-c"), Node("n6:1", zone: "z-c"),
+            ],
+            MaxMoves = 4,
+            TransferBudget = 4
+        };
+
+        PlacementMove move = Assert.Single(PlacementPlanner.Plan(view));
+        Assert.Equal(PlacementMoveKind.AddReplica, move.Kind);
+        Assert.Equal("n5:1", move.Endpoint); // least-loaded free node in the uncovered zone z-c
+    }
+
+    [Fact]
+    public void Plan_OverReplicatedRange_PrefersZoneDuplicatedVictim()
+    {
+        // A zone-spread repair has promoted: 4 voters over RF 3, zones z-a,z-a,z-b,z-c. The trim
+        // must shed a doubled-zone voter — never the replica that made the range span 3 zones.
+        PlacementView view = new()
+        {
+            Ranges = [Range(1, 3, ["n1:1", "n2:1", "n3:1", "n5:1"], leader: "n1:1")],
+            Nodes =
+            [
+                Node("n1:1", zone: "z-a"), Node("n2:1", zone: "z-a"),
+                Node("n3:1", zone: "z-b"), Node("n5:1", zone: "z-c"),
+            ],
+            MaxMoves = 4,
+            TransferBudget = 4
+        };
+
+        PlacementMove trim = Assert.Single(PlacementPlanner.Plan(view));
+        Assert.Equal(PlacementMoveKind.RemoveReplica, trim.Kind);
+        Assert.Equal("n2:1", trim.Endpoint); // the non-leader half of the doubled z-a pair
+    }
+
+    [Fact]
+    public void Plan_ZoneDoubledButNoUncoveredZone_YieldsNoMoves()
+    {
+        // Pigeonhole: RF 3 across only two known zones — a doubled zone is unavoidable, so the
+        // planner must hold still instead of churning.
+        PlacementView view = new()
+        {
+            Ranges = [Range(1, 3, ["n1:1", "n2:1", "n3:1"])],
+            Nodes =
+            [
+                Node("n1:1", zone: "z-a"), Node("n2:1", zone: "z-a"),
+                Node("n3:1", zone: "z-b"), Node("n4:1", zone: "z-b"),
+            ],
+            MaxMoves = 4,
+            TransferBudget = 4
+        };
+
+        Assert.Empty(PlacementPlanner.Plan(view));
+    }
+
+    [Fact]
+    public void Plan_UnknownVoterZones_YieldNoZoneMoves()
+    {
+        // Partial zone knowledge (a node whose load report never arrived) must not trigger a
+        // move: the violation predicate needs a *known* doubled zone.
+        PlacementView view = new()
+        {
+            Ranges = [Range(1, 3, ["n1:1", "n2:1", "n3:1"])],
+            Nodes =
+            [
+                Node("n1:1", zone: "z-a"), Node("n2:1"), Node("n3:1"),
+                Node("n4:1", zone: "z-b"), Node("n5:1", zone: "z-c"),
+            ],
+            MaxMoves = 4,
+            TransferBudget = 4
+        };
+
+        Assert.Empty(PlacementPlanner.Plan(view));
+    }
+
+    [Fact]
+    public void Plan_ZoneSpreadRepair_DrawsOnTransferBudgetOnly()
+    {
+        // Zone-spread repair is balance-class work: it must not run on the repair budget.
+        PlacementView Zoned(int transferBudget, int repairBudget) => new()
+        {
+            Ranges = [Range(1, 3, ["n1:1", "n2:1", "n3:1"])],
+            Nodes =
+            [
+                Node("n1:1", zone: "z-a"), Node("n2:1", zone: "z-a"),
+                Node("n3:1", zone: "z-b"), Node("n5:1", zone: "z-c"),
+            ],
+            MaxMoves = 4,
+            TransferBudget = transferBudget,
+            RepairBudget = repairBudget
+        };
+
+        Assert.Empty(PlacementPlanner.Plan(Zoned(transferBudget: 0, repairBudget: 3)));
+
+        PlacementMove move = Assert.Single(PlacementPlanner.Plan(Zoned(transferBudget: 1, repairBudget: 0)));
+        Assert.Equal(PlacementMoveKind.AddReplica, move.Kind);
+        Assert.Equal("n5:1", move.Endpoint);
+    }
+
+    [Fact]
+    public void Plan_ZoneSpreadSatisfied_IsFixedPoint()
+    {
+        // One replica per zone on every range: the planner must plan nothing.
+        PlacementView view = new()
+        {
+            Ranges =
+            [
+                Range(1, 3, ["n1:1", "n3:1", "n5:1"]),
+                Range(2, 3, ["n2:1", "n4:1", "n6:1"])
+            ],
+            Nodes =
+            [
+                Node("n1:1", zone: "z-a"), Node("n2:1", zone: "z-a"),
+                Node("n3:1", zone: "z-b"), Node("n4:1", zone: "z-b"),
+                Node("n5:1", zone: "z-c"), Node("n6:1", zone: "z-c"),
+            ],
+            MaxMoves = 4,
+            TransferBudget = 4
+        };
+
+        Assert.Empty(PlacementPlanner.Plan(view));
+    }
+
+    [Fact]
+    public void Plan_BootstrapZoneBlindPlacement_ConvergesToZoneSpread()
+    {
+        // The bring-up scenario that motivated zone-spread repair: remote zones are not
+        // gossiped yet when the initial map is assigned, so bootstrap places consecutive-node
+        // round-robin (two zones doubled per range). Once zones are known, iterating the
+        // planner and applying its moves must (1) never drop a range below RF, (2) reach one
+        // replica per zone on every range, (3) keep the per-node replica count even, and
+        // (4) reach a fixed point — the plan after convergence is empty.
+        string[] endpoints = ["n1:1", "n2:1", "n3:1", "n4:1", "n5:1", "n6:1"];
+        Dictionary<string, string> zones = new(StringComparer.Ordinal)
+        {
+            ["n1:1"] = "z-a", ["n2:1"] = "z-a",
+            ["n3:1"] = "z-b", ["n4:1"] = "z-b",
+            ["n5:1"] = "z-c", ["n6:1"] = "z-c",
+        };
+
+        // Zone-blind bootstrap output for 6 partitions at RF 3: p1/p3/p5 on n1-n2-n3,
+        // p2/p4/p6 on n4-n5-n6 — exactly the observed incident placement.
+        Dictionary<int, List<string>> voters = new()
+        {
+            [1] = ["n1:1", "n2:1", "n3:1"],
+            [2] = ["n4:1", "n5:1", "n6:1"],
+            [3] = ["n1:1", "n2:1", "n3:1"],
+            [4] = ["n4:1", "n5:1", "n6:1"],
+            [5] = ["n1:1", "n2:1", "n3:1"],
+            [6] = ["n4:1", "n5:1", "n6:1"],
+        };
+
+        List<CandidateNode> nodes = [.. endpoints.Select(e => Node(e, zone: zones[e]))];
+
+        int passes = 0;
+        while (true)
+        {
+            Assert.True(++passes <= 30, "planner failed to converge within 30 passes");
+
+            PlacementView view = new()
+            {
+                Ranges = [.. voters.Select(kv => Range(kv.Key, 3, [.. kv.Value]))],
+                Nodes = nodes,
+                MaxMoves = 4,
+                TransferBudget = 4,
+                RepairBudget = 3
+            };
+
+            List<PlacementMove> moves = PlacementPlanner.Plan(view);
+            if (moves.Count == 0)
+                break;
+
+            foreach (PlacementMove move in moves)
+            {
+                // Model the learner add as promoted by the next pass; the removal as done.
+                if (move.Kind == PlacementMoveKind.AddReplica)
+                    voters[move.PartitionId].Add(move.Endpoint);
+                else
+                    voters[move.PartitionId].Remove(move.Endpoint);
+
+                Assert.True(voters[move.PartitionId].Count >= 3,
+                    $"range {move.PartitionId} dropped below RF during rebalancing");
+            }
+        }
+
+        foreach ((int partitionId, List<string> replicas) in voters)
+        {
+            Assert.Equal(3, replicas.Count);
+            Assert.Equal(3, replicas.Select(e => zones[e]).Distinct().Count());
+        }
+
+        foreach (string endpoint in endpoints)
+            Assert.Equal(3, voters.Values.Count(v => v.Contains(endpoint)));
+    }
 }

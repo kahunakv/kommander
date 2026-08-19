@@ -42,6 +42,9 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
 
     public long GetPresentTerm() => wal.GetPresentTerm();
 
+    public ValueTask RegressFrontiersAfterFailedWriteAsync(long minLogIndex, long maxLogIndex, bool regressPresence, bool regressCommit) =>
+        wal.RegressFrontiersAfterFailedWriteAsync(minLogIndex, maxLogIndex, regressPresence, regressCommit);
+
     public void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0) =>
         wal.SeedCommitFrontierFromSnapshot(snapshotIndex, snapshotTerm);
 

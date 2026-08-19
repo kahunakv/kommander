@@ -1044,6 +1044,89 @@ public sealed class RaftWriteAhead
     }
 
     /// <summary>
+    /// Undoes the optimistic frontier advance for a WAL write that COMPLETED with a failure
+    /// (e.g. a full disk). The enqueue paths advance the presence/commit frontiers as soon as the
+    /// scheduler accepts an operation — correct in the steady state — but a write that later
+    /// fails leaves the frontiers certifying entries that are not on disk. That is a Raft §5.4.1
+    /// safety hazard: the node advertises election freshness for entries it does not hold, can
+    /// win an election with a short log, and acks heartbeats with a commit frontier the leader
+    /// then trusts to skip backfill.
+    ///
+    /// <para>The regression is deliberately conservative: both clamps go to the failed range's
+    /// LOWEST id, so a durable entry above the range stops being advertised too. Under-advertising
+    /// durable entries is always safe — it can only lose elections and invite re-shipment
+    /// (idempotent puts) — while over-advertising undoes quorum. A follower heals through
+    /// backfill: the leader sees the low ack and re-ships, and the re-enqueue re-advances the
+    /// frontier. A leader heals on restart, when <see cref="CompleteRestoreAsync"/> recomputes
+    /// the frontiers from on-disk contiguity.</para>
+    ///
+    /// <para>The propose ALLOCATOR (<c>proposeIndex</c>) is deliberately NOT regressed: it must
+    /// stay monotonic (see <see cref="SeedProposeAllocator"/>) or a later propose reissues ids a
+    /// pipelined sibling already occupies. The failed ids become a hole this node's frontiers now
+    /// truthfully report.</para>
+    ///
+    /// <para>Runs on the partition's serialized executor path — the single writer of the frontier
+    /// fields — like every other frontier mutation. The WAL term read for the regressed freshness
+    /// pair degrades to 0 (the "empty log" term) on any read failure, which only makes this node
+    /// less electable, never more.</para>
+    /// </summary>
+    public async ValueTask RegressFrontiersAfterFailedWriteAsync(long minLogIndex, long maxLogIndex, bool regressPresence, bool regressCommit)
+    {
+        if (minLogIndex < 0)
+            return;
+
+        if (maxLogIndex < minLogIndex)
+            maxLogIndex = minLogIndex;
+
+        // Drop the failed range from the over-gap buffers first, so a buffered id can never
+        // re-certify an entry the disk refused when the frontier later drains over it.
+        for (long id = minLogIndex; id <= maxLogIndex; id++)
+        {
+            if (regressPresence)
+                pendingPresent.Remove(id);
+            if (regressCommit)
+                pendingResolved.Remove(id);
+        }
+
+        bool commitRegressed = regressCommit && commitIndex > minLogIndex;
+        if (commitRegressed)
+            commitIndex = minLogIndex;
+
+        bool presenceRegressed = regressPresence && presentIndex > minLogIndex;
+        if (presenceRegressed)
+        {
+            presentIndex = minLogIndex;
+
+            // The entry now at the frontier is the durable one below the failed range; re-read
+            // its term so the advertised (term, index) freshness pair describes a real on-disk
+            // entry instead of the entry that failed to persist.
+            long termAtFrontier = 0;
+            if (minLogIndex - 1 > 0)
+            {
+                try
+                {
+                    long storedTerm = await GetAnyTermAtAsync(minLogIndex - 1).ConfigureAwait(false);
+                    if (storedTerm > 0)
+                        termAtFrontier = storedTerm;
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(
+                        "[{Endpoint}/{Partition}] Could not re-read the term at {Index} after a failed WAL write; advertising term 0 at the regressed frontier: {Message}",
+                        manager.LocalEndpoint, partition.PartitionId, minLogIndex - 1, ex.Message);
+                }
+            }
+
+            presentTerm = termAtFrontier;
+        }
+
+        if (commitRegressed || presenceRegressed)
+            logger.LogError(
+                "[{Endpoint}/{Partition}] WAL write of range [{Min},{Max}] failed after the frontiers advanced optimistically; regressed commit frontier to {CommitIndex} and presence frontier to {PresentIndex} so this node stops advertising entries that are not on disk",
+                manager.LocalEndpoint, partition.PartitionId, minLogIndex, maxLogIndex, commitIndex - 1, presentIndex - 1);
+    }
+
+    /// <summary>
     /// Seeds the in-memory commit/propose frontier to a freshly installed snapshot boundary at
     /// <paramref name="snapshotIndex"/>. A snapshot means every id through the boundary is durably committed
     /// (the prefix is compacted away), so the frontier — which a fresh or lagging follower otherwise leaves at

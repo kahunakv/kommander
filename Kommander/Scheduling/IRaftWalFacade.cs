@@ -110,6 +110,17 @@ public interface IRaftWalFacade
     long GetPresentTerm() => -1;
 
     /// <summary>
+    /// Undoes the optimistic frontier advance for a WAL write that completed with a failure
+    /// (e.g. a full disk): the enqueue paths advance the presence/commit frontiers when an
+    /// operation is accepted, so a failed completion leaves them certifying entries that are not
+    /// on disk — an election-freshness and backfill-suppression hazard. Called by the completion
+    /// router before any fence can discard the failed completion. Default no-op for facades that
+    /// do not track frontiers (test stubs).
+    /// </summary>
+    ValueTask RegressFrontiersAfterFailedWriteAsync(long minLogIndex, long maxLogIndex, bool regressPresence, bool regressCommit)
+        => ValueTask.CompletedTask;
+
+    /// <summary>
     /// Seeds the in-memory commit/propose frontier to a freshly installed snapshot boundary so
     /// <see cref="GetCommitIndex"/> reflects the compacted prefix as committed rather than an unfilled gap.
     /// <paramref name="snapshotTerm"/> carries the boundary's last-included term so the presence

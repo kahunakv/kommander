@@ -1147,9 +1147,13 @@ public class RaftConfiguration
 
     /// <summary>
     /// Optional locality hint (zone/rack) for the local node. When set, it is gossiped on this
-    /// node's load reports and the placement planner prefers spreading a range's replicas across
-    /// distinct zones. Zone-aware spread therefore needs load-report gossip
-    /// (<see cref="LoadReportsEnabled"/> — implied by placement) to see remote nodes' zones.
+    /// node's load reports and the placement planner spreads a range's replicas across distinct
+    /// zones: adds prefer uncovered zones, and the rebalancer actively repairs a range that
+    /// doubles up voters in one zone while an uncovered zone has a free node. Zone-aware spread
+    /// needs load-report gossip (<see cref="LoadReportsEnabled"/> — implied by placement) to see
+    /// remote nodes' zones; gossip only starts once membership is seeded, which happens after
+    /// the initial partition map is committed, so the <b>initial</b> placement cannot see remote
+    /// zones — the rebalancer converges the spread shortly after bring-up instead.
     /// Normalized by <see cref="Validate"/>: whitespace-only values become null (the planner
     /// treats empty as "no zone" anyway, so a stray <c>""</c> would otherwise silently disable
     /// the hint while looking configured).

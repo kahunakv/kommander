@@ -27,8 +27,9 @@ public sealed class PlacementView
 
     /// <summary>
     /// Remaining <b>balance</b>-class slots (<see cref="RaftConfiguration.MaxConcurrentReplicaTransfers"/>
-    /// minus ranges already mid-move). Consumed by priority-3 skew moves and priority-2 trims of
-    /// cosmetically-excess voters. Repair-class moves emitted in the same plan also count against
+    /// minus ranges already mid-move). Consumed by priority-2 trims of cosmetically-excess
+    /// voters, priority-3 zone-spread repair adds, and priority-4 skew moves.
+    /// Repair-class moves emitted in the same plan also count against
     /// it — any transfer consumes bandwidth — so at the default of 1, balance work pauses
     /// entirely while a repair wave is in flight.
     /// </summary>

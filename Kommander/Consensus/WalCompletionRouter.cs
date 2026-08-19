@@ -98,6 +98,31 @@ internal sealed class WalCompletionRouter
             return;
         }
 
+        // ── Failed-write frontier repair ───────────────────────────────────────
+        // Runs BEFORE the term and pending fences: a failed WAL write is a fact about this
+        // node's disk regardless of which term submitted it or whether the operation is still
+        // tracked. The enqueue path advanced the presence/commit frontiers optimistically when
+        // this operation was queued; on failure they must stop certifying the failed range
+        // (election freshness and heartbeat acks read them), so the repair cannot live in a
+        // handler a fence might discard on the way there.
+        if (completion.Status != RaftOperationStatus.Success && completion.MinLogIndex >= 0)
+        {
+            // Only the frontiers this op's enqueue path actually advanced: proposes advance
+            // presence (new rows), commits advance the commit frontier (resolutions), follower
+            // appends advance both; rollbacks re-write already-present ids and advance neither.
+            (bool regressPresence, bool regressCommit) = completion.OperationType switch
+            {
+                WALWriteOperationType.LeaderPropose => (true, false),
+                WALWriteOperationType.LeaderCommit => (false, true),
+                WALWriteOperationType.FollowerAppend => (true, true),
+                _ => (false, false)
+            };
+
+            if (regressPresence || regressCommit)
+                await wal.RegressFrontiersAfterFailedWriteAsync(
+                    completion.MinLogIndex, completion.MaxLogIndex, regressPresence, regressCommit).ConfigureAwait(false);
+        }
+
         // ── Term fence ─────────────────────────────────────────────────────────
         // A completion submitted when the node was in an earlier term must not
         // advance state after a leadership or followership change.  Term -1 means
