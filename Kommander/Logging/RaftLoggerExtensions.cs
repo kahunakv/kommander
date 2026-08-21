@@ -170,6 +170,9 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Non-contiguous backfill for {Endpoint} cleared after {Occurrences} refusal(s) anchored at {From} (first available {FirstId}): {Reason}")]
     public static partial void LogInfoBackfillNonContiguousCleared(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long from, long firstId, int occurrences, string reason);
 
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Refusing non-contiguous backfill batch for {Endpoint} again: anchored at {From}, first committed entry available {FirstId} (LastCheckpoint={LastCheckpoint}) — this condition was already reported at Warning inside the re-warn window, so this re-open logs at Debug")]
+    public static partial void LogDebugBackfillNonContiguousReopened(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long from, long firstId, long lastCheckpoint);
+
     // ── RaftWriteAhead ────────────────────────────────────────────────────
 
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}/{Partition}] Recovered {LogsCount} logs")]

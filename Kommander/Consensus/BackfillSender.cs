@@ -2,6 +2,7 @@ using Kommander.Communication.Grpc;
 using Kommander.Data;
 using Kommander.Logging;
 using Kommander.Scheduling;
+using Kommander.System;
 using Kommander.Time;
 using Microsoft.Extensions.Logging;
 
@@ -34,6 +35,7 @@ internal sealed class BackfillSender
     private readonly RaftPartitionCoreState coreState;
     private readonly ReplicationTracker tracker;
     private readonly NonContiguousBackfillTracker backfillTracker;
+    private readonly SnapshotSender snapshotSender;
     private readonly ILogger<IRaft> logger;
 
     public BackfillSender(
@@ -42,6 +44,7 @@ internal sealed class BackfillSender
         RaftPartitionCoreState coreState,
         ReplicationTracker tracker,
         NonContiguousBackfillTracker backfillTracker,
+        SnapshotSender snapshotSender,
         ILogger<IRaft> logger)
     {
         this.host = host;
@@ -49,6 +52,7 @@ internal sealed class BackfillSender
         this.coreState = coreState;
         this.tracker = tracker;
         this.backfillTracker = backfillTracker;
+        this.snapshotSender = snapshotSender;
         this.logger = logger;
     }
 
@@ -107,11 +111,13 @@ internal sealed class BackfillSender
     /// Reads a bounded committed range for <paramref name="node"/> from the WAL and ships it via
     /// <see cref="AppendLogToNode"/> with the correct Log Matching anchors.
     /// Returns <see cref="BackfillSendResult.Sent"/> when at least one entry was shipped; otherwise
-    /// the specific reason nothing was sent, because the causes demand different reactions at the
-    /// heartbeat call site: only <see cref="BackfillSendResult.CompactionFloor"/> and the deliberate
-    /// <see cref="BackfillSendResult.NonContiguous"/> refusal may fall back to a snapshot transfer,
-    /// while <see cref="BackfillSendResult.SaturationPaused"/> must simply wait — a saturated
-    /// follower is not below the floor, and shipping it a full snapshot only adds load.
+    /// the specific reason nothing was sent. The reaction by cause happens HERE, not at a call
+    /// site: <see cref="BackfillSendResult.CompactionFloor"/> and the deliberate
+    /// <see cref="BackfillSendResult.NonContiguous"/> refusal escalate to a snapshot transfer via
+    /// <see cref="EscalateRefusalToSnapshotAsync"/> before they return, while
+    /// <see cref="BackfillSendResult.SaturationPaused"/> simply waits — a saturated follower is not
+    /// below the floor, and shipping it a full snapshot only adds load. Callers may still branch on
+    /// the result for their own flow, but no caller is responsible for the rescue.
     /// </summary>
     /// <param name="node">The peer to send the batch to.</param>
     /// <param name="followerMaxLog">The highest committed index the leader believes the follower holds;
@@ -155,11 +161,17 @@ internal sealed class BackfillSender
         if (round is not null && round.TryGet(from, out BackfillRoundBatches.Batch? cached))
         {
             if (cached!.Logs.Count == 0)
+            {
+                // A memoized refusal is still a refusal for THIS follower: it must escalate to the
+                // snapshot fallback exactly like the follower that triggered the original read.
+                if (cached.EmptyResult != BackfillSendResult.SaturationPaused)
+                    await EscalateRefusalToSnapshotAsync(node).ConfigureAwait(false);
                 return cached.EmptyResult;
+            }
 
             logger.LogDebugBackfilling(host.LocalEndpoint, host.PartitionId, coreState.NodeState, cached.Logs.Count, node.Endpoint, from, prevIdx, coreState.LocalCommittedIndex);
 
-            backfillTracker.Clear(node.Endpoint, "a contiguous batch was shipped");
+            backfillTracker.ClearIfCovered(node.Endpoint, from, "a contiguous batch was shipped at or below the episode anchor");
             AppendLogToNode(node, timestamp, cached.Logs, prevIdx, cached.PrevTerm, grpcLogCache: cached.GrpcLogCache);
             return BackfillSendResult.Sent;
         }
@@ -171,6 +183,7 @@ internal sealed class BackfillSender
             // Memoize the empty result as well: every follower anchored here would otherwise repeat the
             // same read before falling through to the snapshot path.
             round?.Add(from, backfill, 0);
+            await EscalateRefusalToSnapshotAsync(node).ConfigureAwait(false);
             return BackfillSendResult.CompactionFloor;
         }
 
@@ -196,6 +209,7 @@ internal sealed class BackfillSender
         {
             await backfillTracker.ReportAsync(node.Endpoint, from, backfill[0].Id).ConfigureAwait(false);
             round?.Add(from, [], 0, BackfillSendResult.NonContiguous);
+            await EscalateRefusalToSnapshotAsync(node).ConfigureAwait(false);
             return BackfillSendResult.NonContiguous;
         }
 
@@ -205,9 +219,58 @@ internal sealed class BackfillSender
 
         logger.LogDebugBackfilling(host.LocalEndpoint, host.PartitionId, coreState.NodeState, backfill.Count, node.Endpoint, from, prevIdx, coreState.LocalCommittedIndex);
 
-        backfillTracker.Clear(node.Endpoint, "a contiguous batch was shipped");
+        backfillTracker.ClearIfCovered(node.Endpoint, from, "a contiguous batch was shipped at or below the episode anchor");
         AppendLogToNode(node, timestamp, backfill, prevIdx, prevTerm, grpcLogCache: shared?.GrpcLogCache);
         return BackfillSendResult.Sent;
+    }
+
+    /// <summary>
+    /// Escalates one refused backfill attempt to a snapshot transfer (or records that no snapshot
+    /// can be produced).
+    ///
+    /// <para><b>Why this lives at the choke point and not at a call site.</b> The escalation used to
+    /// run only inside <c>HeartbeatDriver.SendHeartbeat</c>. The ack fast-path re-supply calls this
+    /// sender too and discarded its result, so a peer whose refusals all arrived through acks was
+    /// never offered a snapshot: the Caraxes soak (vorpal feature d11fd5f9) wedged a healthy 3-voter
+    /// cluster permanently that way — 24,253 refusals, zero snapshot attempts. Escalating here makes
+    /// a refusal without an escalation impossible, from every present and future caller.</para>
+    ///
+    /// <para><b>Cost and pacing.</b> <see cref="SnapshotSender.CanAttempt"/> is checked first, so a
+    /// refusal during an in-flight transfer or inside a failure backoff window costs two dictionary
+    /// lookups and no WAL read. Only a compaction floor above zero escalates: a refusal caused by an
+    /// uncommitted run on an uncompacted WAL has nothing to snapshot from and is repaired by the
+    /// inherited-tail re-commit instead.</para>
+    /// </summary>
+    private async Task EscalateRefusalToSnapshotAsync(RaftNode node)
+    {
+        if (coreState.NodeState != RaftNodeState.Leader)
+            return;
+
+        if (!snapshotSender.CanAttempt(node.Endpoint))
+            return;
+
+        long lastCheckpoint = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
+        if (lastCheckpoint <= 0)
+            return;
+
+        bool p0System = host.PartitionId == RaftSystemConfig.SystemPartition && host.SystemStateTransfer is not null;
+        if (host.PartitionStateTransfer is not null || host.StateMachineTransfer is not null || p0System)
+        {
+            // The in-flight guard inside TrySend prevents duplicate transfers; the postToExecutor
+            // callback advances the follower's recorded frontier once it confirms installation.
+            // LastIncludedTerm is the term at the checkpoint index (may be -1 when compacted away,
+            // in which case the receiver falls back to its own matching rules).
+            long lastIncludedTerm = await wal.GetAnyTermAtAsync(lastCheckpoint).ConfigureAwait(false);
+            snapshotSender.TrySend(node, lastCheckpoint, coreState.CurrentTerm, lastIncludedTerm);
+        }
+        else
+        {
+            // The follower needs a snapshot and none can be produced. Record the condition (one
+            // Warning per episode, queryable via GetSnapshotStatuses) so an operator can see it
+            // and register a transfer — a silent skip here is how a peer gets stranded with no
+            // evidence anywhere.
+            snapshotSender.ReportUnproducible(node);
+        }
     }
 
     /// <summary>

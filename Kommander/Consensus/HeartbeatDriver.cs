@@ -37,7 +37,6 @@ internal sealed class HeartbeatDriver
     private readonly ProposalRegistry proposals;
     private readonly BackfillSender sender;
     private readonly RaftPartitionLogThrottle logThrottle;
-    private readonly SnapshotSender snapshotSender;
     private readonly ILogger<IRaft> logger;
 
     public HeartbeatDriver(
@@ -48,7 +47,6 @@ internal sealed class HeartbeatDriver
         ProposalRegistry proposals,
         BackfillSender sender,
         RaftPartitionLogThrottle logThrottle,
-        SnapshotSender snapshotSender,
         ILogger<IRaft> logger)
     {
         this.host = host;
@@ -58,7 +56,6 @@ internal sealed class HeartbeatDriver
         this.proposals = proposals;
         this.sender = sender;
         this.logThrottle = logThrottle;
-        this.snapshotSender = snapshotSender;
         this.logger = logger;
     }
 
@@ -186,10 +183,13 @@ internal sealed class HeartbeatDriver
                 && coreState.LocalCommittedIndex >= 0
                 && (followerGap > host.Configuration.BackfillThreshold || idleTailGap || regressed);
 
-            // DIAGNOSTIC (see FINDINGS.md #3/#5): records every input to the decision above, so a
-            // run in which replicas stop advancing can be read for *why* the leader sent nothing
-            // rather than inferred from its silence. `followerMaxLog` is the interesting one — it
-            // is the leader's belief about the peer, and every trigger here is derived from it.
+            // DIAGNOSTIC (vorpal feature 767f3314; the numbered findings live in the Jepsen harness
+            // repository at ~/kommander-jepsen/FINDINGS.md, not in this one): records every input to
+            // the decision above, so a run in which replicas stop advancing can be read for *why*
+            // the leader sent nothing rather than inferred from its silence. `followerMaxLog` is the
+            // interesting one — it is the leader's belief about the peer, and every trigger here is
+            // derived from it. The probe logs at Debug, and drops idle no-op rounds before its own
+            // per-second throttle — see RaftPartitionLogThrottle.LogBackfillDecision.
             logThrottle.LogBackfillDecision(node.Endpoint, willBackfill, followerMaxLog, followerGap,
                                 idleTailGap, regressed, liveReplicationQuiet);
 
@@ -202,41 +202,12 @@ internal sealed class HeartbeatDriver
                 if (backfillResult == BackfillSendResult.Sent)
                     continue;
 
-                // Nothing was shipped — react by cause. Only the compaction floor (and the
-                // deliberate non-contiguous refusal, which routes here by design while the
-                // inherited-tail re-commit repairs the range) may escalate to a snapshot
-                // transfer. A saturation pause must NOT: the follower is draining its WAL
-                // queue, not missing compacted entries, and a full snapshot would only add
-                // to the load that caused the pause.
-                if (backfillResult != BackfillSendResult.SaturationPaused)
-                {
-                    long lastCheckpoint = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
-                    bool p0System = host.PartitionId == RaftSystemConfig.SystemPartition && host.SystemStateTransfer is not null;
-                    if (lastCheckpoint > 0)
-                    {
-                        if (host.PartitionStateTransfer is not null || host.StateMachineTransfer is not null || p0System)
-                        {
-                            // The in-flight guard prevents duplicate transfers; the postToExecutor
-                            // callback advances lastCommitIndexes[endpoint] once the follower
-                            // confirms installation.
-                            // LastIncludedTerm = the term of the entry at the checkpoint index (may
-                            // be -1 if compacted away, in which case the receiver falls back to its
-                            // own matching rules). LeaderTerm = this leader's coreState.CurrentTerm so the
-                            // follower can apply leader-RPC term rules.
-                            long lastIncludedTerm = await wal.GetAnyTermAtAsync(lastCheckpoint).ConfigureAwait(false);
-                            snapshotSender.TrySend(node, lastCheckpoint, coreState.CurrentTerm, lastIncludedTerm);
-                        }
-                        else
-                        {
-                            // The follower needs a snapshot and none can be produced: previously
-                            // this skipped SILENTLY and the follower was stranded with no evidence
-                            // anywhere. Record the condition (one Warning per episode, queryable
-                            // via GetSnapshotStatuses) so an operator can see it and register a
-                            // transfer.
-                            snapshotSender.ReportUnproducible(node);
-                        }
-                    }
-                }
+                // Nothing was shipped. The reaction by cause happens inside
+                // TrySendBackfillBatchAsync itself: a compaction-floor or non-contiguous refusal
+                // escalates to a snapshot transfer there, and a saturation pause waits. The
+                // escalation used to live here, which left every other caller of the sender — the
+                // ack fast-path re-supply in particular — refusing without ever escalating: the
+                // Caraxes soak wedged a 3-voter cluster permanently that way (vorpal d11fd5f9).
             }
 
             sender.AppendLogToNode(node, coreState.LastHeartbeat, null);

@@ -56,6 +56,16 @@ internal sealed class SnapshotSender
 
     private readonly ConcurrentDictionary<string, FollowerSnapshotState> failureStates = new();
 
+    /// <summary>
+    /// Per-follower pause armed after a SUCCESSFUL transfer. The refusal-path escalation fires per
+    /// refused batch — on the ack fast-path that is per ack — and a follower keeps reporting a
+    /// below-floor frontier until it finishes installing and its next ack reflects the seeded
+    /// state. Without this pause, every ack in that window fired another full multi-chunk transfer
+    /// back to back. One base pause restores the old heartbeat-interval pacing without touching
+    /// <see cref="failureStates"/>, so a success still clears the failure-status surface.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, long> successPauseUntilTicks = new();
+
     private readonly IRaftPartitionHost host;
     private readonly ILogger<IRaft> logger;
     private readonly Func<RaftNodeState> getNodeState;
@@ -86,7 +96,7 @@ internal sealed class SnapshotSender
     /// </summary>
     internal void TrySend(RaftNode node, long snapshotIndex, long leaderTerm, long lastIncludedTerm)
     {
-        if (IsBackedOff(node.Endpoint))
+        if (IsBackedOff(node.Endpoint) || IsInSuccessPause(node.Endpoint))
             return;
 
         if (pendingSnapshotEndpoints.TryAdd(node.Endpoint, 0))
@@ -123,6 +133,33 @@ internal sealed class SnapshotSender
             error: "follower requires a snapshot (below the WAL compaction floor) but no snapshot transfer is registered; " +
                    "register IRaftPartitionStateTransfer (or IRaftStateMachineTransfer) on this node",
             unproducible: true);
+    }
+
+    /// <summary>
+    /// Cheap pre-check for the refusal-path escalation in <c>BackfillSender</c>: whether a snapshot
+    /// attempt for <paramref name="endpoint"/> could proceed right now. False while a transfer is
+    /// already in flight or the follower sits inside a failure/unproducible backoff window. The
+    /// caller uses it to skip the WAL checkpoint read on the per-ack hot path — <see cref="TrySend"/>
+    /// re-checks both guards itself, so this is an optimization, never the correctness gate.
+    /// </summary>
+    internal bool CanAttempt(string endpoint) =>
+        !pendingSnapshotEndpoints.ContainsKey(endpoint) && !IsBackedOff(endpoint) && !IsInSuccessPause(endpoint);
+
+    /// <summary>
+    /// Whether <paramref name="endpoint"/> sits inside the post-success pause — see
+    /// <see cref="successPauseUntilTicks"/>. Expired entries are removed on read so the map does
+    /// not accumulate healed followers.
+    /// </summary>
+    private bool IsInSuccessPause(string endpoint)
+    {
+        if (!successPauseUntilTicks.TryGetValue(endpoint, out long until))
+            return false;
+
+        if (host.GetMonotonicTimestamp() < until)
+            return true;
+
+        successPauseUntilTicks.TryRemove(endpoint, out _);
+        return false;
     }
 
     /// <summary>
@@ -393,6 +430,12 @@ internal sealed class SnapshotSender
             if (success)
             {
                 failureStates.TryRemove(node.Endpoint, out _);
+
+                // Arm the post-success pause before the pending guard is released (finally below):
+                // the refusal-path escalation can fire again on the very next ack, and the follower
+                // legitimately keeps reporting a below-floor frontier until the install lands.
+                successPauseUntilTicks[node.Endpoint] =
+                    host.GetMonotonicTimestamp() + MsToTicks(BasePauseMs());
 
                 // Guard the Information log so the getNodeState() delegate is not invoked when
                 // the level is disabled (CA1873).

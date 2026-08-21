@@ -204,9 +204,10 @@ public sealed class RaftPartitionStateMachine
         tracker = new ReplicationTracker(host);
         logThrottle = new RaftPartitionLogThrottle(host, coreState, logger);
         backfillTracker = new NonContiguousBackfillTracker(host, wal, coreState, logger);
-        sender = new BackfillSender(host, wal, coreState, tracker, backfillTracker, logger);
-        proposals = new ProposalRegistry(host, coreState, logger, (node, ticket, logs) => sender.AppendLogToNode(node, ticket, logs));
 
+        // Constructed before the BackfillSender, which owns the refusal-to-snapshot escalation:
+        // every refused backfill batch — from the heartbeat round AND the ack fast-path — funnels
+        // through the sender, so the escalation lives there rather than in the heartbeat driver.
         snapshotSender = new SnapshotSender(
             host,
             logger,
@@ -217,7 +218,10 @@ public sealed class RaftPartitionStateMachine
                 tracker.AdvanceCommitFrontier(endpoint, idx);
             });
 
-        heartbeats = new HeartbeatDriver(host, wal, coreState, tracker, proposals, sender, logThrottle, snapshotSender, logger);
+        sender = new BackfillSender(host, wal, coreState, tracker, backfillTracker, snapshotSender, logger);
+        proposals = new ProposalRegistry(host, coreState, logger, (node, ticket, logs) => sender.AppendLogToNode(node, ticket, logs));
+
+        heartbeats = new HeartbeatDriver(host, wal, coreState, tracker, proposals, sender, logThrottle, logger);
         readIndex = new ReadIndexCoordinator(host, coreState, replySink, logger, heartbeats.SendHeartbeat);
         applier = new LogApplicator(host, wal, coreState, proposals, readIndex, logger);
         snapshotInstaller = new SnapshotInstaller(host, wal, coreState, logger, AdoptLeaderAsync);

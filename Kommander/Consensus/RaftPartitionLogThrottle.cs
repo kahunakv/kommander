@@ -141,14 +141,28 @@ internal sealed class RaftPartitionLogThrottle
     /// DIAGNOSTIC. Records the inputs to one peer's backfill decision in a heartbeat round.
     /// </summary>
     /// <remarks>
-    /// Temporary. A leader that sends nothing looks identical in the logs to a leader with nothing
-    /// to send, and telling those apart is the whole question when replicas stop advancing. Every
-    /// trigger here derives from <paramref name="followerMaxLog"/> — the leader's belief about the
-    /// peer — so that value is what the trace exists to expose. Remove once answered.
+    /// A permanent Debug-level probe, not a temporary one. A leader that sends nothing looks
+    /// identical in the logs to a leader with nothing to send, and telling those apart is the whole
+    /// question when replicas stop advancing. Every trigger here derives from
+    /// <paramref name="followerMaxLog"/> — the leader's belief about the peer — so that value is
+    /// what the trace exists to expose.
+    ///
+    /// <para><b>Two suppression stages, and why one is not enough.</b> The probe fires once per peer
+    /// per heartbeat round, and the throttle state is per partition. The per-second cap alone
+    /// therefore still emitted one line per partition per second, without end, on a healthy cluster.
+    /// The interest gate below drops the rounds that carry no information: no batch to send, no gap,
+    /// and backfill switched off by configuration. Such a round reports a decision that no input
+    /// could have changed. A dropped round does not raise <c>suppressedBackfillTraces</c>, so that
+    /// count stays a count of suppressed <i>interesting</i> traces.</para>
     /// </remarks>
     public void LogBackfillDecision(string endpoint, bool willBackfill, long followerMaxLog,
                                     long followerGap, bool idleTailGap, bool regressed, bool liveQuiet)
     {
+        // Interest gate, ahead of the per-second throttle. See the remarks above: an idle partition
+        // with backfill disabled reports the same all-zero decision every round forever.
+        if (!willBackfill && followerGap == 0 && !host.Configuration.BackfillEnabled)
+            return;
+
         long now = Stopwatch.GetTimestamp();
 
         if (lastBackfillTraceTicks != 0 && (now - lastBackfillTraceTicks) < Stopwatch.Frequency)
@@ -157,9 +171,9 @@ internal sealed class RaftPartitionLogThrottle
             return;
         }
 
-        if (logger.IsEnabled(LogLevel.Information))
+        if (logger.IsEnabled(LogLevel.Debug))
         {
-            logger.LogInformation(
+            logger.LogDebug(
                 "[{LocalEndpoint}/{PartitionId}/{State}] DIAG backfill-decision peer={Endpoint} send={Send} enabled={Enabled} followerMaxLog={FollowerMaxLog} localCommitted={LocalCommitted} gap={Gap} threshold={Threshold} idleTailGap={IdleTailGap} regressed={Regressed} liveQuiet={LiveQuiet} liveCommitFloor={LiveCommitFloor} suppressedSinceLastLine={Suppressed}",
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, willBackfill,
                 host.Configuration.BackfillEnabled,

@@ -36,6 +36,17 @@ internal sealed class NonContiguousBackfillTracker
     /// </summary>
     private const long StaleBackfillEpisodeMs = 60_000;
 
+    /// <summary>
+    /// Window inside which a re-open of an already-warned (endpoint, from, firstId) condition logs
+    /// at Debug rather than Warning. Episode identity alone did not bound the log volume in the
+    /// Caraxes soak (feature d11fd5f9): a wedged peer produced 24,253 Warnings from 4 distinct
+    /// conditions, because episode churn (clears, replacements, overlapped reports) re-opened the
+    /// same condition thousands of times. The cooldown slides on every open, so a condition that
+    /// keeps re-opening warns exactly once, and a condition that stays quiet for the window warns
+    /// again on its next occurrence.
+    /// </summary>
+    private const long RewarnCooldownMs = 10_000;
+
     private readonly IRaftPartitionHost host;
     private readonly IRaftWalFacade wal;
     private readonly RaftPartitionCoreState coreState;
@@ -47,6 +58,14 @@ internal sealed class NonContiguousBackfillTracker
     /// anchor.
     /// </summary>
     private readonly ConcurrentDictionary<string, NonContiguousBackfillEpisode> nonContiguousEpisodes = new();
+
+    /// <summary>
+    /// Monotonic tick of the last time each (endpoint, from, firstId) condition was opened as an
+    /// episode. Backs the <see cref="RewarnCooldownMs"/> demotion. Entries older than the cooldown
+    /// are pruned opportunistically on new opens, so the map stays bounded by the set of conditions
+    /// live inside one window.
+    /// </summary>
+    private readonly ConcurrentDictionary<(string Endpoint, long From, long FirstId), long> recentOpenTicks = new();
 
     /// <summary>
     /// One follower's open refusal episode. Identity is the <c>(From, FirstId)</c> pair: while it
@@ -82,9 +101,11 @@ internal sealed class NonContiguousBackfillTracker
     ///
     /// <para>The first refusal of an episode — and any refusal whose <c>(from, firstId)</c> pair
     /// differs from the open one, i.e. a genuinely changed condition — logs at Warning. Identical
-    /// repeats log at Debug carrying the occurrence count.</para>
+    /// repeats log at Debug carrying the occurrence count. A re-open of a condition that already
+    /// warned inside <see cref="RewarnCooldownMs"/> also logs at Debug: episode identity alone did
+    /// not bound the volume under episode churn (see the constant's remarks).</para>
     ///
-    /// <para>The last-checkpoint read happens only on the Warning path, so the diagnostic that
+    /// <para>The last-checkpoint read happens only on the new-episode path, so the diagnostic that
     /// separates the two causes (an uncommitted run at the anchor versus a compaction floor above
     /// it) never becomes a per-heartbeat WAL read.</para>
     /// </summary>
@@ -92,21 +113,17 @@ internal sealed class NonContiguousBackfillTracker
     {
         long nowTicks = host.GetMonotonicTimestamp();
 
-        if (nonContiguousEpisodes.TryGetValue(endpoint, out NonContiguousBackfillEpisode? open)
-            && open.From == from && open.FirstId == firstId)
-        {
-            int occurrences = Interlocked.Increment(ref open.Occurrences);
-            Volatile.Write(ref open.LastSeenTicks, nowTicks);
-            open.LastSeenAt = DateTimeOffset.UtcNow;
-
-            if (logger.IsEnabled(LogLevel.Debug))
-                logger.LogDebugBackfillNonContiguousRepeat(
-                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, from, firstId, occurrences);
-
+        if (TryRecordRepeat(endpoint, from, firstId, nowTicks))
             return;
-        }
 
         long lastCheckpoint = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
+
+        // Re-check after the await. The checkpoint read runs off the executor thread, so a second
+        // report for the same condition can complete its insert while this one is suspended. Without
+        // the re-check every overlapped caller misses the lookup, re-inserts, and re-warns — the
+        // suppression fails exactly where it matters, under a slow read on a loaded node.
+        if (TryRecordRepeat(endpoint, from, firstId, nowTicks))
+            return;
 
         nonContiguousEpisodes[endpoint] = new NonContiguousBackfillEpisode
         {
@@ -119,8 +136,67 @@ internal sealed class NonContiguousBackfillTracker
             LastSeenAt = DateTimeOffset.UtcNow,
         };
 
+        if (WasOpenedInsideCooldown(endpoint, from, firstId, nowTicks))
+        {
+            logger.LogDebugBackfillNonContiguousReopened(
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, from, firstId, lastCheckpoint);
+            return;
+        }
+
         logger.LogWarnBackfillNonContiguous(
             host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, from, firstId, lastCheckpoint);
+    }
+
+    /// <summary>
+    /// Records the refusal against an already-open matching episode. Returns <see langword="true"/>
+    /// when the open episode for <paramref name="endpoint"/> carries the same
+    /// (<paramref name="from"/>, <paramref name="firstId"/>) pair — the repeat path, which logs at
+    /// Debug and never re-warns. Called twice by <see cref="ReportAsync"/>: once before and once
+    /// after its awaited checkpoint read, because a concurrent report can insert the episode during
+    /// the await.
+    /// </summary>
+    private bool TryRecordRepeat(string endpoint, long from, long firstId, long nowTicks)
+    {
+        if (!nonContiguousEpisodes.TryGetValue(endpoint, out NonContiguousBackfillEpisode? open)
+            || open.From != from || open.FirstId != firstId)
+            return false;
+
+        int occurrences = Interlocked.Increment(ref open.Occurrences);
+        Volatile.Write(ref open.LastSeenTicks, nowTicks);
+        open.LastSeenAt = DateTimeOffset.UtcNow;
+
+        if (logger.IsEnabled(LogLevel.Debug))
+            logger.LogDebugBackfillNonContiguousRepeat(
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, from, firstId, occurrences);
+
+        return true;
+    }
+
+    /// <summary>
+    /// Applies the <see cref="RewarnCooldownMs"/> demotion for one episode open, and slides the
+    /// condition's window. Returns <see langword="true"/> when the same condition already opened an
+    /// episode inside the window, so the caller logs the open at Debug instead of Warning. The
+    /// window slides on every open: a condition that keeps re-opening (episode churn on a wedged
+    /// peer) therefore warns exactly once, however long the churn lasts.
+    /// </summary>
+    private bool WasOpenedInsideCooldown(string endpoint, long from, long firstId, long nowTicks)
+    {
+        long cooldownTicks = RewarnCooldownMs * Stopwatch.Frequency / 1000;
+
+        // Opportunistic prune keeps the map bounded by the conditions live inside one window.
+        if (recentOpenTicks.Count > 16)
+        {
+            foreach (((string, long, long) key, long ticks) in recentOpenTicks)
+            {
+                if (nowTicks - ticks > cooldownTicks)
+                    recentOpenTicks.TryRemove(key, out _);
+            }
+        }
+
+        bool insideCooldown = recentOpenTicks.TryGetValue((endpoint, from, firstId), out long lastOpen)
+                              && nowTicks - lastOpen <= cooldownTicks;
+        recentOpenTicks[(endpoint, from, firstId)] = nowTicks;
+        return insideCooldown;
     }
 
     /// <summary>
@@ -136,6 +212,25 @@ internal sealed class NonContiguousBackfillTracker
         logger.LogInfoBackfillNonContiguousCleared(
             host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint,
             episode.From, episode.FirstId, episode.Occurrences, reason);
+    }
+
+    /// <summary>
+    /// Closes an open refusal episode for <paramref name="endpoint"/> only when the shipped batch
+    /// actually served the episode's anchor, i.e. <paramref name="shippedFrom"/> is at or below it.
+    ///
+    /// <para>The two backfill anchors diverge on a wedged peer: <c>nextIndex</c> tracks the
+    /// monotonic <c>matchIndex</c>, while the refusal anchors at the reported commit frontier. A
+    /// contiguous batch shipped from the high <c>nextIndex</c> anchor proves nothing about the
+    /// frontier anchor below the compaction floor — the refusal condition still holds, the peer is
+    /// still pinned, and closing the episode on that ship makes the status flap and re-opens the
+    /// episode (with a fresh Warning) on the very next frontier-anchored attempt. The Caraxes soak
+    /// (feature d11fd5f9) showed this shape sustained for hours.</para>
+    /// </summary>
+    public void ClearIfCovered(string endpoint, long shippedFrom, string reason)
+    {
+        if (nonContiguousEpisodes.TryGetValue(endpoint, out NonContiguousBackfillEpisode? episode)
+            && shippedFrom <= episode.From)
+            Clear(endpoint, reason);
     }
 
     /// <summary>

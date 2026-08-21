@@ -99,8 +99,13 @@ public class TestSnapshotFailureBackoff
         Harness h = await Harness.BuildLeaderAsync(transfer, heartbeatInterval: TimeSpan.Zero);
         h.Host.Configuration.FollowerSaturationBackoff = TimeSpan.FromSeconds(30);
 
-        await h.AckSuccess();
+        // Saturation is armed FIRST: the refusal-path escalation now fires on any refused batch —
+        // including the one the Success ack's fast-path re-supply triggers — so a Success ack
+        // before the pause would legitimately start a snapshot (that is the Caraxes fix). This
+        // test pins the saturation contract, so the pause must be in place before the
+        // below-floor ack arrives.
         await h.Ack(RaftOperationStatus.FollowerWalSaturated);
+        await h.AckSuccess();
 
         // Below the floor AND saturated: the old collapsed-false code fell through to the
         // snapshot path here. The saturation pause must win — no export, no chunks.
