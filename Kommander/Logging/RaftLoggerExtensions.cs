@@ -71,8 +71,11 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Starting pre-vote round for Term={PreVoteTerm}")]
     public static partial void LogInfoStartingPreVoteRound(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, long preVoteTerm);
 
-    [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Starting snapshot transfer to {Endpoint} at index {Index}")]
-    public static partial void LogInfoStartingSnapshotTransfer(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index);
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Escalating refused backfill to a snapshot transfer for {Endpoint} at index {Index} — the follower sits below the WAL compaction floor and only a snapshot can seed it. Repeats within the cooldown log at Debug; query IRaft.GetSnapshotStatuses while this persists")]
+    public static partial void LogWarnStartingSnapshotTransfer(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Starting another snapshot transfer to {Endpoint} at index {Index} (within the re-warn cooldown)")]
+    public static partial void LogDebugStartingSnapshotTransfer(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index);
 
     [LoggerMessage(Level = LogLevel.Critical, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Same node id was found in the cluster {NodeId} {RemoteNodeId}")]
     public static partial void LogCritSameNodeId(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, int nodeId, int remoteNodeId);
@@ -158,8 +161,11 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Proposal {Timestamp} doesn't have auto-commit")]
     public static partial void LogInfoProposalNoAutoCommit(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, HLCTimestamp timestamp);
 
-    [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot installed on {Endpoint} at index {Index} ({Chunks} chunk(s))")]
-    public static partial void LogInfoSnapshotInstalled(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index, int chunks);
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot installed on {Endpoint} at index {Index} ({Chunks} chunk(s)) — the follower is seeded and its next ack reports the new frontier")]
+    public static partial void LogWarnSnapshotInstalled(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index, int chunks);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot installed on {Endpoint} at index {Index} ({Chunks} chunk(s)) (within the re-warn cooldown)")]
+    public static partial void LogDebugSnapshotInstalled(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index, int chunks);
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Refusing non-contiguous backfill batch for {Endpoint}: anchored at {From} but the first committed entry available is {FirstId} — no committed entry exists at the anchor (the run below it is uncommitted, or it was compacted away; LastCheckpoint={LastCheckpoint} tells which). Repeats log at Debug; query IRaft.GetBackfillStatuses while this persists")]
     public static partial void LogWarnBackfillNonContiguous(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long from, long firstId, long lastCheckpoint);
@@ -210,6 +216,9 @@ public static partial class RaftLoggerExtensions
 
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}/{Partition}] Restore replay widened by application-durability floor: ReplayFloor={ReplayFloor} LastCheckpoint={LastCheckpoint}")]
     public static partial void LogInfoRestoreWidenedByDurabilityFloor(this ILogger<IRaft> logger, string endpoint, int partition, long replayFloor, long lastCheckpoint);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{Endpoint}/{Partition}] Restore reconstructed a commit frontier of {ReconstructedFrontier} below the durable checkpoint {LastCheckpoint} (checkpoint log entry absent from the restore read); seeding the frontier from the checkpoint so this node does not advertise a near-zero frontier")]
+    public static partial void LogWarnRestoreFrontierBelowCheckpoint(this ILogger<IRaft> logger, string endpoint, int partition, long reconstructedFrontier, long lastCheckpoint);
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "[{Endpoint}/{Partition}] Compaction blocked by application-durability floor: DurablyApplied={DurablyApplied} LastCheckpoint={LastCheckpoint} — application flusher may be stalled; WAL will grow until the floor advances")]
     public static partial void LogWarnCompactionBlockedByDurabilityFloor(this ILogger<IRaft> logger, string endpoint, int partition, long durablyApplied, long lastCheckpoint);

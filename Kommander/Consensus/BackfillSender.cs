@@ -231,8 +231,8 @@ internal sealed class BackfillSender
     /// <para><b>Why this lives at the choke point and not at a call site.</b> The escalation used to
     /// run only inside <c>HeartbeatDriver.SendHeartbeat</c>. The ack fast-path re-supply calls this
     /// sender too and discarded its result, so a peer whose refusals all arrived through acks was
-    /// never offered a snapshot: the Caraxes soak (vorpal feature d11fd5f9) wedged a healthy 3-voter
-    /// cluster permanently that way — 24,253 refusals, zero snapshot attempts. Escalating here makes
+    /// never offered a snapshot: the Caraxes soak wedged a healthy 3-voter cluster permanently that
+    /// way — 24,253 refusals, zero snapshot attempts. Escalating here makes
     /// a refusal without an escalation impossible, from every present and future caller.</para>
     ///
     /// <para><b>Cost and pacing.</b> <see cref="SnapshotSender.CanAttempt"/> is checked first, so a

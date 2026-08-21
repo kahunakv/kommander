@@ -380,6 +380,26 @@ public sealed class RaftWriteAhead
         presentIndex = any ? contiguousPresent + 1 : commitIndex;
         presentTerm = any ? contiguousPresentTerm : 0;
 
+        // ── Floor the frontier at the durable checkpoint ─────────────────────────────────
+        // A durable checkpoint certifies its whole prefix as committed, so no reconstruction may
+        // publish a frontier below it. The scans above depend on the checkpoint LOG ENTRY being in
+        // the restore read; when it is absent — a fully compacted partition whose boundary survives
+        // only in backend metadata, or a truncated tail — an empty or short list reconstructs a
+        // near-zero frontier. The node then reports commit frontier 0 in every ack, the leader
+        // anchors backfill at 1 below its own compaction floor, and only a snapshot install can
+        // repair it (the "anchored at 1" producer in the Caraxes soak wedge). Seeding from the
+        // recorded boundary — exactly what a snapshot install would do — makes the restored node
+        // report the truth instead. Runs before replay: entries below the boundary are certified
+        // committed, so replaying them under the raised frontier is correct.
+        long restoredCheckpoint = await GetLastCheckpointAsync().ConfigureAwait(false);
+        if (restoredCheckpoint > 0 && commitIndex <= restoredCheckpoint)
+        {
+            long checkpointTerm = await GetAnyTermAtAsync(restoredCheckpoint).ConfigureAwait(false);
+            manager.Logger.LogWarnRestoreFrontierBelowCheckpoint(
+                manager.LocalEndpoint, partition.PartitionId, commitIndex - 1, restoredCheckpoint);
+            SeedCommitFrontierFromSnapshot(restoredCheckpoint, Math.Max(checkpointTerm, 0));
+        }
+
         // ── Replay the committed prefix to the application ─────────────────────────────────
         // Apply only committed data entries strictly below the reconstructed frontier. Checkpoints carry
         // no application payload (their state is restored via the snapshot transfer); entries at or above

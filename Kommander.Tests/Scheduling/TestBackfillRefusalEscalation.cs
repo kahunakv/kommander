@@ -12,7 +12,7 @@ namespace Kommander.Tests.Scheduling;
 /// <summary>
 /// A voter pinned below the leader's compaction floor must be rescued from EVERY refusal path.
 ///
-/// <para>The Caraxes two-hour soak (vorpal feature d11fd5f9) wedged a healthy 3-voter cluster
+/// <para>The Caraxes two-hour soak wedged a healthy 3-voter cluster
 /// permanently: a follower's progress reset to zero, the leader's backfill anchored at 1 below a
 /// compaction floor near 2,000,000, and every batch was refused. The snapshot escalation lived only
 /// on the heartbeat call site, so 24,253 refusals that arrived through the ack fast-path produced

@@ -35,7 +35,27 @@ internal sealed class SnapshotSender
     /// <summary>Hard cap on the retry pause, and the fixed pause for permanent causes.</summary>
     private const long MaxPauseMs = 30_000;
 
-    private readonly ConcurrentDictionary<string, byte> pendingSnapshotEndpoints = new();
+    /// <summary>
+    /// Sliding window inside which a repeated transfer-start or install-complete line for the same
+    /// follower drops from Warning to Debug. The rescue must be visible at the default consumer log
+    /// level (Warning — consumers commonly filter the Kommander category there, which is how two
+    /// soak runs produced "zero snapshot mentions" while transfers were in fact attempted), but a
+    /// fast install loop against a follower whose frontier keeps resetting must not warn per cycle.
+    /// </summary>
+    private const long RescueWarnCooldownMs = 10_000;
+
+    /// <summary>
+    /// In-flight guard, keyed by follower endpoint. The value is the transfer's start timestamp
+    /// (monotonic ticks), surfaced as <see cref="RaftSnapshotStatus.InFlightFor"/> so a live query
+    /// can tell a progressing transfer from a stuck one.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, long> pendingSnapshotEndpoints = new();
+
+    /// <summary>Last Warning-level transfer-start line per endpoint — see <see cref="RescueWarnCooldownMs"/>.</summary>
+    private readonly ConcurrentDictionary<string, long> lastStartWarnTicks = new();
+
+    /// <summary>Last Warning-level install-complete line per endpoint — see <see cref="RescueWarnCooldownMs"/>.</summary>
+    private readonly ConcurrentDictionary<string, long> lastInstallWarnTicks = new();
 
     /// <summary>
     /// Per-follower failure episode. Mutated by background transfer tasks and read by
@@ -87,27 +107,48 @@ internal sealed class SnapshotSender
     }
 
     /// <summary>
-    /// Called on the executor thread each heartbeat cycle. Fires a background snapshot
-    /// transfer to <paramref name="node"/> if the follower is not inside a failure backoff
-    /// window and no transfer is already in progress for that endpoint (guarded by
-    /// <c>pendingSnapshotEndpoints.TryAdd</c>). The entry is removed in the <c>finally</c>
-    /// block of <see cref="TrySendSnapshotAsync"/> so a later heartbeat can retry on failure —
-    /// paced by the recorded backoff rather than every heartbeat.
+    /// Called on the executor thread by the refused-backfill escalation in <c>BackfillSender</c>.
+    /// Fires a background snapshot transfer to <paramref name="node"/> if the follower is not
+    /// inside a failure backoff window or the post-success pause and no transfer is already in
+    /// progress for that endpoint (guarded by <c>pendingSnapshotEndpoints.TryAdd</c>). The entry
+    /// is removed in the <c>finally</c> block of <see cref="TrySendSnapshotAsync"/> so a later
+    /// refusal can retry on failure — paced by the recorded backoff rather than per refusal.
     /// </summary>
     internal void TrySend(RaftNode node, long snapshotIndex, long leaderTerm, long lastIncludedTerm)
     {
         if (IsBackedOff(node.Endpoint) || IsInSuccessPause(node.Endpoint))
             return;
 
-        if (pendingSnapshotEndpoints.TryAdd(node.Endpoint, 0))
+        if (pendingSnapshotEndpoints.TryAdd(node.Endpoint, host.GetMonotonicTimestamp()))
         {
-            // Guard the Information log so the getNodeState() delegate is not invoked when
-            // the level is disabled (CA1873).
-            if (logger.IsEnabled(LogLevel.Information))
-                logger.LogInfoStartingSnapshotTransfer(
+            // A transfer start is always logged, and at Warning outside the cooldown: the only
+            // caller is the refused-backfill escalation, so a start here means a peer sits below
+            // the compaction floor — an abnormal condition whose rescue attempt must be visible at
+            // the default consumer log level (see RescueWarnCooldownMs).
+            if (TryOpenWarnWindow(lastStartWarnTicks, node.Endpoint))
+                logger.LogWarnStartingSnapshotTransfer(
                     host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex);
+            else if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebugStartingSnapshotTransfer(
+                    host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex);
+
             _ = TrySendSnapshotAsync(node, snapshotIndex, leaderTerm, lastIncludedTerm);
         }
+    }
+
+    /// <summary>
+    /// Opens the Warning window for <paramref name="endpoint"/> in <paramref name="lastWarnTicks"/>
+    /// if no Warning was logged inside the last <see cref="RescueWarnCooldownMs"/>. Returns true
+    /// when the caller should log at Warning; false demotes the repeat to Debug.
+    /// </summary>
+    private bool TryOpenWarnWindow(ConcurrentDictionary<string, long> lastWarnTicks, string endpoint)
+    {
+        long now = host.GetMonotonicTimestamp();
+        if (lastWarnTicks.TryGetValue(endpoint, out long last) && now - last < MsToTicks(RescueWarnCooldownMs))
+            return false;
+
+        lastWarnTicks[endpoint] = now;
+        return true;
     }
 
     /// <summary>
@@ -177,13 +218,17 @@ internal sealed class SnapshotSender
         foreach ((string endpoint, FollowerSnapshotState state) in failureStates)
         {
             long remainingTicks = Volatile.Read(ref state.PausedUntilTicks) - now;
+            bool inFlight = pendingSnapshotEndpoints.TryGetValue(endpoint, out long startedTicks);
             statuses.Add(new RaftSnapshotStatus
             {
                 FollowerEndpoint = endpoint,
                 FailedAttempts = state.FailedAttempts,
                 LastError = state.LastError,
                 Unproducible = state.Unproducible,
-                InFlight = pendingSnapshotEndpoints.ContainsKey(endpoint),
+                InFlight = inFlight,
+                InFlightFor = inFlight
+                    ? TimeSpan.FromSeconds((double)(now - startedTicks) / Stopwatch.Frequency)
+                    : null,
                 FirstFailureAt = state.FirstFailureAt,
                 LastFailureAt = state.LastFailureAt,
                 RetryBackoffRemaining = remainingTicks > 0
@@ -192,10 +237,15 @@ internal sealed class SnapshotSender
             });
         }
 
-        foreach (string endpoint in pendingSnapshotEndpoints.Keys)
+        foreach ((string endpoint, long startedTicks) in pendingSnapshotEndpoints)
         {
             if (!failureStates.ContainsKey(endpoint))
-                statuses.Add(new RaftSnapshotStatus { FollowerEndpoint = endpoint, InFlight = true });
+                statuses.Add(new RaftSnapshotStatus
+                {
+                    FollowerEndpoint = endpoint,
+                    InFlight = true,
+                    InFlightFor = TimeSpan.FromSeconds((double)(now - startedTicks) / Stopwatch.Frequency),
+                });
         }
 
         return statuses;
@@ -278,6 +328,15 @@ internal sealed class SnapshotSender
     {
         const int chunkSize = 3 * 1024 * 1024;
 
+        // Per-step watchdog: every awaited external step — the application export, one stream
+        // read, one chunk send — must finish inside SnapshotTransferStepTimeout. A step that
+        // completes resets the clock, so a large snapshot on a slow link is never cut off; only a
+        // step that stops moving trips it. Without this bound, one hung export or one
+        // deadline-less install RPC parked this task forever, the pendingSnapshotEndpoints entry
+        // never released, and CanAttempt silently vetoed every later rescue for this follower.
+        TimeSpan stepTimeout = host.Configuration.SnapshotTransferStepTimeout;
+        using CancellationTokenSource transferCts = new();
+
         try
         {
             bool useSystemState = host.PartitionId == RaftSystemConfig.SystemPartition
@@ -290,9 +349,13 @@ internal sealed class SnapshotSender
                 kind = SnapshotKind.SystemState;
                 try
                 {
-                    snapshot = await host.SystemStateTransfer!
-                        .ExportPartitionState(host.PartitionId, snapshotIndex, CancellationToken.None)
-                        .ConfigureAwait(false);
+                    snapshot = await AwaitStepAsync(
+                        host.SystemStateTransfer!.ExportPartitionState(host.PartitionId, snapshotIndex, transferCts.Token),
+                        stepTimeout, transferCts, "ExportPartitionState (system)").ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -310,9 +373,13 @@ internal sealed class SnapshotSender
                 kind = SnapshotKind.PartitionState;
                 try
                 {
-                    snapshot = await partitionTransfer
-                        .ExportPartitionState(host.PartitionId, snapshotIndex, CancellationToken.None)
-                        .ConfigureAwait(false);
+                    snapshot = await AwaitStepAsync(
+                        partitionTransfer.ExportPartitionState(host.PartitionId, snapshotIndex, transferCts.Token),
+                        stepTimeout, transferCts, "ExportPartitionState").ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -341,7 +408,13 @@ internal sealed class SnapshotSender
                 RaftSplitPlan plan = new() { TargetPartitionId = host.PartitionId };
                 try
                 {
-                    snapshot = await transfer.ExportRange(plan, snapshotIndex, CancellationToken.None).ConfigureAwait(false);
+                    snapshot = await AwaitStepAsync(
+                        transfer.ExportRange(plan, snapshotIndex, transferCts.Token),
+                        stepTimeout, transferCts, "ExportRange").ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -359,6 +432,7 @@ internal sealed class SnapshotSender
             byte[] buffer = ArrayPool<byte>.Shared.Rent(chunkSize);
             int chunkIndex = 0;
             bool success = false;
+            bool bufferDetached = false;
 
             // Hashed incrementally as the snapshot streams, so the digest costs one pass over bytes
             // already in hand rather than a second read of the whole snapshot. The receiver hashes
@@ -371,7 +445,11 @@ internal sealed class SnapshotSender
                 {
                     while (true)
                     {
-                        int bytesRead = await StreamUtils.ReadExactAsync(snapshot, buffer, chunkSize, CancellationToken.None).ConfigureAwait(false);
+                        bufferDetached = true;
+                        int bytesRead = await AwaitStepAsync(
+                            StreamUtils.ReadExactAsync(snapshot, buffer, chunkSize, transferCts.Token).AsTask(),
+                            stepTimeout, transferCts, "snapshot stream read").ConfigureAwait(false);
+                        bufferDetached = false;
                         bool isLast = bytesRead < chunkSize;
 
                         if (bytesRead > 0)
@@ -403,7 +481,11 @@ internal sealed class SnapshotSender
                                 : "",
                         };
 
-                        SnapshotResponse response = await host.SendInstallSnapshotAsync(node, chunk, CancellationToken.None).ConfigureAwait(false);
+                        bufferDetached = true;
+                        SnapshotResponse response = await AwaitStepAsync(
+                            host.SendInstallSnapshotAsync(node, chunk, transferCts.Token),
+                            stepTimeout, transferCts, $"install chunk {chunkIndex}").ConfigureAwait(false);
+                        bufferDetached = false;
                         if (!response.Success)
                         {
                             RecordFailure(node.Endpoint, cause: "chunk_rejected",
@@ -424,7 +506,11 @@ internal sealed class SnapshotSender
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(buffer);
+                // An abandoned read/send step may still touch the rented buffer from its zombie
+                // task; returning it to the pool would hand live memory to an unrelated renter.
+                // Leak it deliberately in that case — the GC reclaims it when the zombie ends.
+                if (!bufferDetached)
+                    ArrayPool<byte>.Shared.Return(buffer);
             }
 
             if (success)
@@ -437,16 +523,25 @@ internal sealed class SnapshotSender
                 successPauseUntilTicks[node.Endpoint] =
                     host.GetMonotonicTimestamp() + MsToTicks(BasePauseMs());
 
-                // Guard the Information log so the getNodeState() delegate is not invoked when
-                // the level is disabled (CA1873).
-                if (logger.IsEnabled(LogLevel.Information))
-                    logger.LogInfoSnapshotInstalled(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex, chunkIndex + 1);
+                // Warning outside the cooldown: this line ends a below-the-floor rescue incident
+                // and must be visible at the default consumer log level (see RescueWarnCooldownMs).
+                if (TryOpenWarnWindow(lastInstallWarnTicks, node.Endpoint))
+                    logger.LogWarnSnapshotInstalled(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex, chunkIndex + 1);
+                else if (logger.IsEnabled(LogLevel.Debug))
+                    logger.LogDebugSnapshotInstalled(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex, chunkIndex + 1);
 
                 getPostToExecutor()?.Invoke(new RaftRequest(
                     RaftRequestType.SnapshotInstalled,
                     commitIndex: snapshotIndex,
                     endpoint: node.Endpoint));
             }
+        }
+        catch (TimeoutException ex)
+        {
+            // A hung step. The attempt is abandoned (the zombie step task is never awaited again)
+            // and recorded as a normal failure, so the backoff paces a retry instead of the old
+            // behaviour: an eternal in-flight guard that silently vetoed every later rescue.
+            RecordFailure(node.Endpoint, cause: "step_timeout", error: ex.Message, unproducible: false);
         }
         catch (Exception ex)
         {
@@ -458,5 +553,25 @@ internal sealed class SnapshotSender
         {
             pendingSnapshotEndpoints.TryRemove(node.Endpoint, out _);
         }
+    }
+
+    /// <summary>
+    /// Awaits <paramref name="step"/> for at most <paramref name="timeout"/>. On timeout the
+    /// transfer's cancellation source is cancelled — so a token-honouring callee stops too — and a
+    /// <see cref="TimeoutException"/> naming <paramref name="stepName"/> is thrown; the abandoned
+    /// step task keeps running as a detached zombie and must not share resources with the caller
+    /// afterwards (see the rented-buffer handling in <see cref="TrySendSnapshotAsync"/>).
+    /// </summary>
+    private static async Task<T> AwaitStepAsync<T>(Task<T> step, TimeSpan timeout, CancellationTokenSource transferCts, string stepName)
+    {
+        Task completed = await Task.WhenAny(step, Task.Delay(timeout, transferCts.Token)).ConfigureAwait(false);
+        if (completed != step)
+        {
+            await transferCts.CancelAsync().ConfigureAwait(false);
+            throw new TimeoutException(
+                $"snapshot transfer step '{stepName}' made no progress within {timeout.TotalSeconds:0}s (SnapshotTransferStepTimeout)");
+        }
+
+        return await step.ConfigureAwait(false);
     }
 }

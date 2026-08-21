@@ -36,6 +36,13 @@ public sealed class RaftSnapshotStatus
     /// <summary>True while a transfer to this follower is currently in flight.</summary>
     public bool InFlight { get; init; }
 
+    /// <summary>
+    /// How long the in-flight transfer has been running, or null when none is in flight. A value
+    /// far above the configured <c>SnapshotTransferStepTimeout</c> should be impossible; a value
+    /// near it points at a slow or hung step about to be abandoned and retried.
+    /// </summary>
+    public TimeSpan? InFlightFor { get; init; }
+
     /// <summary>When the current failure episode started (UTC), or null if nothing has failed.</summary>
     public DateTimeOffset? FirstFailureAt { get; init; }
 

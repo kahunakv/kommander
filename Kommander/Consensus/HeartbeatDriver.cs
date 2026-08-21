@@ -183,7 +183,7 @@ internal sealed class HeartbeatDriver
                 && coreState.LocalCommittedIndex >= 0
                 && (followerGap > host.Configuration.BackfillThreshold || idleTailGap || regressed);
 
-            // DIAGNOSTIC (vorpal feature 767f3314; the numbered findings live in the Jepsen harness
+            // DIAGNOSTIC (the numbered findings live in the Jepsen harness
             // repository at ~/kommander-jepsen/FINDINGS.md, not in this one): records every input to
             // the decision above, so a run in which replicas stop advancing can be read for *why*
             // the leader sent nothing rather than inferred from its silence. `followerMaxLog` is the
@@ -207,7 +207,7 @@ internal sealed class HeartbeatDriver
                 // escalates to a snapshot transfer there, and a saturation pause waits. The
                 // escalation used to live here, which left every other caller of the sender — the
                 // ack fast-path re-supply in particular — refusing without ever escalating: the
-                // Caraxes soak wedged a 3-voter cluster permanently that way (vorpal d11fd5f9).
+                // Caraxes soak wedged a 3-voter cluster permanently that way.
             }
 
             sender.AppendLogToNode(node, coreState.LastHeartbeat, null);

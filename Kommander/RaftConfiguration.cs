@@ -786,6 +786,19 @@ public class RaftConfiguration
     public bool AllowLegacySnapshotSenders { get; set; }
 
     /// <summary>
+    /// Upper bound on ONE awaited step of an outbound snapshot transfer: the application export
+    /// call, one stream read, or one chunk send. A step that makes progress resets the clock, so a
+    /// large snapshot on a slow link is never cut off — only a step that stops moving is. Without
+    /// this bound a hung export or a deadline-less install RPC parked the transfer task forever,
+    /// and its in-flight guard then silently blocked every later rescue attempt for that follower
+    /// (the Caraxes wedge, second occurrence: refusals escalated, but each new leader's single
+    /// transfer hung with zero visible evidence). On timeout the attempt is recorded as a failure
+    /// (visible at Warning, queryable via <see cref="IRaft.GetSnapshotStatuses"/>) and retried
+    /// under the normal backoff. Must be positive. Default 2 minutes.
+    /// </summary>
+    public TimeSpan SnapshotTransferStepTimeout { get; set; } = TimeSpan.FromMinutes(2);
+
+    /// <summary>
     /// Maximum REST request body, in bytes, that will be read and digested before its signature has
     /// been verified. Larger bodies are refused with 413 and
     /// <see cref="RaftTransportAuthenticationStatus.RequestBodyTooLarge"/>. Default 32 MiB.
@@ -1304,6 +1317,12 @@ public class RaftConfiguration
             throw new RaftException(
                 $"[Kommander] SnapshotReceiveSessionTtl ({SnapshotReceiveSessionTtl}) must be positive. " +
                 "It bounds how long an idle snapshot-receive session is retained before its buffer is released.");
+
+        if (SnapshotTransferStepTimeout <= TimeSpan.Zero)
+            throw new RaftException(
+                $"[Kommander] SnapshotTransferStepTimeout ({SnapshotTransferStepTimeout}) must be positive. " +
+                "It bounds each awaited step of an outbound snapshot transfer; without it a hung export or " +
+                "install RPC parks the transfer forever and its in-flight guard blocks every later rescue.");
 
         if (SnapshotMaxPendingSessions <= 0)
             throw new RaftException(
