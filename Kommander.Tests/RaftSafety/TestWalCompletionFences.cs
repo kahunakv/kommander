@@ -356,6 +356,87 @@ public sealed class TestWalCompletionFences : IDisposable
     }
 
     /// <summary>
+    /// The no-orphan rule behind the Caraxes run-H stall: a term-fenced propose completion must
+    /// FAIL the client reply, never drop it. The pending entry it discards carries the reply
+    /// correlation of the <c>Ask(ReplicateLogs)</c> that submitted the propose, and this completion
+    /// is that operation's only resolution channel — before the fix, discarding it silently left
+    /// the caller awaiting forever (no response, no timeout), which starved a closed-loop workload
+    /// cluster-wide after a paused leader resumed into a higher term.
+    /// </summary>
+    [Fact]
+    public async Task TermFencedPropose_FailsTheClientReplyInsteadOfOrphaningIt()
+    {
+        using RaftPartitionExecutor executor = BuildExecutor(partitionId: 0);
+        await executor.RestoreTask;
+
+        // Become a single-node leader so ReplicateLogs accepts the propose.
+        await executor.Ask(new RaftRequest(RaftRequestType.ForceLeaderForTesting), TestContext.Current.CancellationToken);
+
+        // Submit a propose. The StubWal registers it under OperationId 0 and its reply resolves
+        // only through the WAL completion router, so the Ask must still be pending here.
+        Task<RaftResponse> proposeAsk = executor.Ask(
+            new RaftRequest(RaftRequestType.ReplicateLogs, [new RaftLog { Type = RaftLogType.Proposed, LogType = "t", LogData = [1] }], true),
+            TestContext.Current.CancellationToken);
+
+        await executor.Ask(new RaftRequest(RaftRequestType.GetNodeState), TestContext.Current.CancellationToken);
+        Assert.False(proposeAsk.IsCompleted, "the propose reply must still be pending before its WAL completion arrives");
+
+        // Deliver the propose's completion stamped with a superseded term: the fence discards the
+        // state transition, and must answer the caller with a retryable failure.
+        RaftWalCompletion staleCompletion = new(
+            PartitionId:   0,
+            OperationId:   0,
+            Term:          999,   // != the node's current term → term fence
+            MinLogIndex:   -1,
+            MaxLogIndex:   -1,
+            OperationType: WALWriteOperationType.LeaderPropose,
+            Status:        RaftOperationStatus.Success
+        );
+
+        await executor.Ask(CompletionRequest(staleCompletion), TestContext.Current.CancellationToken);
+
+        RaftResponse reply = await proposeAsk.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Assert.Equal(RaftOperationStatus.NodeIsNotLeader, reply.Status);
+    }
+
+    /// <summary>
+    /// Same no-orphan rule for the min-log-index cross-check: a mismatched envelope is discarded,
+    /// but the pending entry it consumed must still answer the caller.
+    /// </summary>
+    [Fact]
+    public async Task MinLogMismatchPropose_FailsTheClientReplyInsteadOfOrphaningIt()
+    {
+        using RaftPartitionExecutor executor = BuildExecutor(partitionId: 0);
+        await executor.RestoreTask;
+
+        await executor.Ask(new RaftRequest(RaftRequestType.ForceLeaderForTesting), TestContext.Current.CancellationToken);
+
+        Task<RaftResponse> proposeAsk = executor.Ask(
+            new RaftRequest(RaftRequestType.ReplicateLogs, [new RaftLog { Type = RaftLogType.Proposed, LogType = "t", LogData = [1] }], true),
+            TestContext.Current.CancellationToken);
+
+        await executor.Ask(new RaftRequest(RaftRequestType.GetNodeState), TestContext.Current.CancellationToken);
+        Assert.False(proposeAsk.IsCompleted, "the propose reply must still be pending before its WAL completion arrives");
+
+        // Term -1 bypasses the term fence; the envelope min (5) mismatches the pending batch's
+        // actual min id, so the min-log cross-check discards it — and must answer the caller.
+        RaftWalCompletion mismatched = new(
+            PartitionId:   0,
+            OperationId:   0,
+            Term:          -1,
+            MinLogIndex:   5,
+            MaxLogIndex:   5,
+            OperationType: WALWriteOperationType.LeaderPropose,
+            Status:        RaftOperationStatus.Success
+        );
+
+        await executor.Ask(CompletionRequest(mismatched), TestContext.Current.CancellationToken);
+
+        RaftResponse reply = await proposeAsk.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Assert.Equal(RaftOperationStatus.Errored, reply.Status);
+    }
+
+    /// <summary>
     /// A Compaction completion with no pending entry is handled gracefully
     /// (Compaction is fire-and-forget — no pending entry is required).
     /// </summary>

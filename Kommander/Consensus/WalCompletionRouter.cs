@@ -127,6 +127,17 @@ internal sealed class WalCompletionRouter
         // A completion submitted when the node was in an earlier term must not
         // advance state after a leadership or followership change.  Term -1 means
         // "not set" (legacy / test paths) and bypasses the fence.
+        //
+        // The fence discards the STATE transition, never the CLIENT. The pending entry
+        // carries the reply correlation of the Ask that submitted the operation, and this
+        // completion is that operation's only completion — dropping the entry without
+        // answering orphans the caller forever, because the propose path has no other
+        // resolution channel and callers above have no timeout of their own. That orphan
+        // was the Caraxes run-H stall: a leader deposed by post-SIGSTOP term confusion
+        // fenced its in-flight proposes here, every caller behind them hung with no
+        // response and no timeout, and the closed-loop workload starved the whole cluster
+        // while health stayed green. Fail the reply with NodeIsNotLeader so the caller
+        // can retry against the current leader.
         if (completion.Term >= 0 && completion.Term != coreState.CurrentTerm)
         {
             logger.LogWarning(
@@ -134,19 +145,30 @@ internal sealed class WalCompletionRouter
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState,
                 completion.Term, coreState.CurrentTerm, completion.OperationId);
             if (proposals.TryTakePending(completion.OperationId, out Scheduling.RaftPendingWalOperation? stalePending))
+            {
+                CompleteReply(stalePending.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, 0L));
                 proposals.ReturnPending(stalePending);
+            }
             KommanderMetrics.StaleCompletionsTotal.Add(1,
                 new KeyValuePair<string, object?>("reason", "term_mismatch"));
             return;
         }
 
         // ── Log-range validation ───────────────────────────────────────────────
+        // Same no-orphan rule as the term fence: the malformed envelope is discarded,
+        // but its pending entry must still answer the caller — this is the operation's
+        // only completion.
         if (completion.MinLogIndex >= 0 && completion.MaxLogIndex >= 0 && completion.MinLogIndex > completion.MaxLogIndex)
         {
             logger.LogWarning(
                 "[{LocalEndpoint}/{PartitionId}/{State}] WAL completion op {OperationId} has inverted log range [{Min},{Max}]; discarding.",
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState,
                 completion.OperationId, completion.MinLogIndex, completion.MaxLogIndex);
+            if (proposals.TryTakePending(completion.OperationId, out Scheduling.RaftPendingWalOperation? invalidPending))
+            {
+                CompleteReply(invalidPending.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Errored, 0L));
+                proposals.ReturnPending(invalidPending);
+            }
             return;
         }
 
@@ -190,6 +212,11 @@ internal sealed class WalCompletionRouter
                     "[{LocalEndpoint}/{PartitionId}/{State}] WAL completion op {OperationId} min-log-index mismatch: envelope {EnvelopeMin} vs actual {ActualMin}; discarding.",
                     host.LocalEndpoint, host.PartitionId, coreState.NodeState,
                     completion.OperationId, completion.MinLogIndex, actualMin);
+                // The pending entry was already taken above; this is its only completion, so
+                // the caller must be answered before the entry is dropped (no-orphan rule).
+                CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Errored, 0L));
+                if (pending is not null)
+                    proposals.ReturnPending(pending);
                 return;
             }
         }
@@ -253,6 +280,24 @@ internal sealed class WalCompletionRouter
                 await revertUnpublishedPromotionAsync($"barrier propose failed ({completion.Status})").ConfigureAwait(false);
 
             CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, completion.Status, ticketId));
+            return;
+        }
+
+        // Leader-state fence. The term fence upstream only catches step-downs that bumped the
+        // term; a voluntary same-term step-down (leadership transfer, step-down notice) leaves
+        // the term unchanged, so a propose completion racing it lands here with this node already
+        // a Follower. Running the fan-out anyway would broadcast AppendLogs from a non-leader —
+        // peers adopt the sender as the term's leader again, its acks are then dropped by the
+        // ack processor's leader fence ("Ignoring stale CompleteAppendLogs", on repeat in the
+        // Caraxes run-H logs), and the proposal can never resolve because the transfer already
+        // cleared the quorum ledger. Answer the caller and stop; same no-orphan rule as the
+        // fences in CompleteWalOperationAsync.
+        if (coreState.NodeState != RaftNodeState.Leader)
+        {
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Propose completion for ticket {Ticket} landed after a same-term step-down; failing the caller instead of fanning out.",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, ticketId);
+            CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, 0L));
             return;
         }
 

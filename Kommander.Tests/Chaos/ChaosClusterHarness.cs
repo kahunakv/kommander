@@ -18,6 +18,13 @@ public sealed record ChaosClusterOptions
     public int BasePort { get; init; } = 8600;
     public TimeSpan InvariantPollInterval { get; init; } = TimeSpan.FromMilliseconds(100);
     public string Scenario { get; init; } = "unnamed";
+
+    /// <summary>
+    /// Optional per-node configuration hook, applied after the harness defaults. A scenario uses
+    /// this to opt into production-shaped settings the fixed defaults turn off (for example
+    /// quiescence), without forking the harness.
+    /// </summary>
+    public Action<RaftConfiguration>? ConfigureNode { get; init; }
 }
 
 /// <summary>
@@ -129,6 +136,7 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
             BackfillThreshold = 0,
             MaxBackfillEntriesPerRound = 128,
         };
+        _options.ConfigureNode?.Invoke(cfg);
         return new RaftManager(cfg, new StaticDiscovery(peers.Select(e => new RaftNode(e)).ToList()),
             new InMemoryWAL(NullLogger<IRaft>.Instance), Nemesis, new HybridLogicalClock(), NullLogger<IRaft>.Instance);
     }

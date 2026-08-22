@@ -392,6 +392,35 @@ public sealed class RaftPartition : IDisposable
     }
 
     /// <summary>
+    /// Upper bound on how long a deferred-reply operation (propose, commit, rollback, checkpoint)
+    /// may wait for its executor reply. These replies resolve through the WAL completion router,
+    /// not inline in the executor, so a dropped completion would otherwise hang the caller with no
+    /// response and no timeout — the Caraxes run-H shape, where callers orphaned by a term-fenced
+    /// propose completion starved a closed-loop workload cluster-wide while health stayed green.
+    /// The router no longer orphans replies (every fence answers before discarding); this bound is
+    /// defense in depth so no future drop path can ever wedge callers permanently. Mirrors the
+    /// 10 s ticket bound in <c>ReplicationGateway.WaitForQuorum</c>.
+    /// </summary>
+    private static readonly TimeSpan DeferredReplyTimeout = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Awaits a deferred-reply Ask under <see cref="DeferredReplyTimeout"/>, converting an elapsed
+    /// bound into a <see cref="RaftOperationStatus.ProposalTimeout"/> response instead of throwing.
+    /// Caller cancellation still surfaces as <see cref="OperationCanceledException"/>.
+    /// </summary>
+    private static async Task<RaftResponse> AskBounded(Task<RaftResponse> ask)
+    {
+        try
+        {
+            return await ask.WaitAsync(DeferredReplyTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            return new(RaftResponseType.None, RaftOperationStatus.ProposalTimeout, 0L);
+        }
+    }
+
+    /// <summary>
     /// Replicates logs to the cluster, ensuring log consistency according to the Raft consensus algorithm.
     /// (Replicates a single log to the partition)
     /// </summary>
@@ -410,7 +439,7 @@ public sealed class RaftPartition : IDisposable
 
         List<RaftLog> logsToReplicate = [new() { Type = RaftLogType.Proposed, LogType = type, LogData = data }];
 
-        RaftResponse response = await executor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit, expectedGeneration)).ConfigureAwait(false);
+        RaftResponse response = await AskBounded(executor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit, expectedGeneration))).ConfigureAwait(false);
 
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
@@ -449,7 +478,7 @@ public sealed class RaftPartition : IDisposable
         for (int i = 0; i < logs.Count; i++)
             logsToReplicate.Add(new() { Type = RaftLogType.Proposed, LogType = type, LogData = logs[i] });
 
-        RaftResponse response = await executor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit, expectedGeneration)).ConfigureAwait(false);
+        RaftResponse response = await AskBounded(executor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit, expectedGeneration))).ConfigureAwait(false);
 
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
@@ -483,7 +512,7 @@ public sealed class RaftPartition : IDisposable
         // Reuses the existing ReplicateLogs request path: a heterogeneous List<RaftLog> with one autoCommit
         // flag and one generation fence is exactly what that path already accepts. RaftManager.ReplicateEntries
         // enforces the batch shape (single trailing manual group) before splitting into auto/manual proposals.
-        RaftResponse response = await executor.Ask(new(RaftRequestType.ReplicateLogs, logs, autoCommit, expectedGeneration)).ConfigureAwait(false);
+        RaftResponse response = await AskBounded(executor.Ask(new(RaftRequestType.ReplicateLogs, logs, autoCommit, expectedGeneration))).ConfigureAwait(false);
 
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
@@ -501,7 +530,7 @@ public sealed class RaftPartition : IDisposable
     /// </para>
     /// </summary>
     /// <param name="ticketId">The logical timestamp associated with the logs to be committed.</param>
-    /// <param name="cancellationToken">Optional deadline; default leaves the executor await unbounded.</param>
+    /// <param name="cancellationToken">Optional deadline; the wait is additionally bounded by <see cref="DeferredReplyTimeout"/>.</param>
     /// <returns>A tuple containing a boolean indicating success, the status of the operation as <see cref="RaftOperationStatus"/>, and the commit index of the logs.</returns>
     public async Task<(bool success, RaftOperationStatus status, long commitIndex)> CommitLogs(HLCTimestamp ticketId, CancellationToken cancellationToken = default)
     {
@@ -513,7 +542,7 @@ public sealed class RaftPartition : IDisposable
 
         try
         {
-            RaftResponse response = await executor.Ask(new(RaftRequestType.CommitLogs, ticketId, false), cancellationToken).ConfigureAwait(false);
+            RaftResponse response = await AskBounded(executor.Ask(new(RaftRequestType.CommitLogs, ticketId, false), cancellationToken)).ConfigureAwait(false);
 
             if (response.Status == RaftOperationStatus.Success)
                 return (true, response.Status, response.LogIndex);
@@ -537,7 +566,7 @@ public sealed class RaftPartition : IDisposable
     /// </para>
     /// </summary>
     /// <param name="ticketId">The timestamp indicating the point to roll back the logs to.</param>
-    /// <param name="cancellationToken">Optional deadline; default leaves the executor await unbounded.</param>
+    /// <param name="cancellationToken">Optional deadline; the wait is additionally bounded by <see cref="DeferredReplyTimeout"/>.</param>
     /// <returns>A tuple indicating the success of the operation, the operation status, and the commit index.</returns>
     public async Task<(bool success, RaftOperationStatus status, long commitIndex)> RollbackLogs(HLCTimestamp ticketId, CancellationToken cancellationToken = default)
     {
@@ -549,7 +578,7 @@ public sealed class RaftPartition : IDisposable
 
         try
         {
-            RaftResponse response = await executor.Ask(new(RaftRequestType.RollbackLogs, ticketId, false), cancellationToken).ConfigureAwait(false);
+            RaftResponse response = await AskBounded(executor.Ask(new(RaftRequestType.RollbackLogs, ticketId, false), cancellationToken)).ConfigureAwait(false);
 
             if (response.Status == RaftOperationStatus.Success)
                 return (true, response.Status, response.LogIndex);
@@ -577,7 +606,7 @@ public sealed class RaftPartition : IDisposable
         if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
         
-        RaftResponse response = await executor.Ask(ReplicateCheckpointRequest).ConfigureAwait(false);
+        RaftResponse response = await AskBounded(executor.Ask(ReplicateCheckpointRequest)).ConfigureAwait(false);
         
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
