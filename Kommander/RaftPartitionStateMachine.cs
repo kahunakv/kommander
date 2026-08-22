@@ -215,7 +215,7 @@ public sealed class RaftPartitionStateMachine
             () => postToExecutor,
             (endpoint, idx) =>
             {
-                tracker.AdvanceCommitFrontier(endpoint, idx);
+                tracker.AdvanceProgressFromSnapshotInstall(endpoint, idx);
             });
 
         sender = new BackfillSender(host, wal, coreState, tracker, backfillTracker, snapshotSender, logger);
@@ -1440,9 +1440,14 @@ public sealed class RaftPartitionStateMachine
     }
 
     /// <summary>
-    /// Advances <c>lastCommitIndexes</c> for <paramref name="endpoint"/> after the background
-    /// snapshot task confirmed successful installation. Called on the executor thread via the
-    /// <c>postToExecutor</c> callback; delegates ownership update to <see cref="snapshotSender"/>.
+    /// Advances the full replication progress for <paramref name="endpoint"/> (commit frontier,
+    /// <c>matchIndex</c>, <c>nextIndex</c>, log-start) after the background snapshot task confirmed
+    /// successful installation — see
+    /// <see cref="Consensus.ReplicationTracker.AdvanceProgressFromSnapshotInstall"/> for why the
+    /// send cursors must advance here and not wait for an ack (on the legacy two-fsync path no ack
+    /// ever carries a frontier, and a stale <c>nextIndex</c> below the compaction floor loops the
+    /// rescue forever). Called on the executor thread via the <c>postToExecutor</c> callback;
+    /// delegates ownership update to <see cref="snapshotSender"/>.
     /// </summary>
     public void CompleteSnapshotInstalled(string endpoint, long snapshotIndex)
     {

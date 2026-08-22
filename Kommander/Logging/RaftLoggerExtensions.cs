@@ -161,7 +161,7 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Proposal {Timestamp} doesn't have auto-commit")]
     public static partial void LogInfoProposalNoAutoCommit(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, HLCTimestamp timestamp);
 
-    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot installed on {Endpoint} at index {Index} ({Chunks} chunk(s)) — the follower is seeded and its next ack reports the new frontier")]
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot installed on {Endpoint} at index {Index} ({Chunks} chunk(s)) — the follower is seeded and the leader's replication cursors advance to the boundary")]
     public static partial void LogWarnSnapshotInstalled(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index, int chunks);
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot installed on {Endpoint} at index {Index} ({Chunks} chunk(s)) (within the re-warn cooldown)")]

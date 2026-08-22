@@ -252,9 +252,10 @@ internal sealed class SnapshotSender
     }
 
     /// <summary>
-    /// Advances the <c>lastCommitIndexes</c> entry for the follower after the background
-    /// snapshot task confirmed successful installation. Always called on the executor thread
-    /// via the <c>postToExecutor</c> callback, preserving the single-owner invariant.
+    /// Advances the follower's tracked replication progress (commit frontier, matchIndex,
+    /// nextIndex, log-start) after the background snapshot task confirmed successful installation.
+    /// Always called on the executor thread via the <c>postToExecutor</c> callback, preserving the
+    /// single-owner invariant.
     /// </summary>
     internal void CompleteSnapshotInstalled(string endpoint, long snapshotIndex) =>
         onSnapshotInstalled(endpoint, snapshotIndex);

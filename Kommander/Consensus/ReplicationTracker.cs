@@ -163,6 +163,42 @@ internal sealed class ReplicationTracker
             lastCommitIndexes[endpoint] = value;
     }
 
+    /// <summary>
+    /// Records a CONFIRMED snapshot install at <paramref name="snapshotIndex"/> as replication
+    /// progress for one peer: the commit frontier, <c>matchIndex</c>, <c>nextIndex</c>, and the
+    /// log-start position all advance to the installed boundary.
+    ///
+    /// <para><b>Why every cursor must advance, not only the frontier.</b> On the legacy two-fsync
+    /// path a follower's acks carry <c>committedIndex = -1</c> ("no report"), so no ack ever
+    /// advances <c>matchIndex</c> or <c>nextIndex</c>. The install confirmation is therefore the
+    /// leader's ONLY progress channel for such a peer. An earlier version advanced only the
+    /// frontier; the stale <c>nextIndex</c> stayed pinned below the WAL compaction floor, and the
+    /// backfill path prefers <c>nextIndex</c> as its anchor — so every batch re-anchored at an
+    /// index the WAL could no longer serve, was refused, re-escalated to another snapshot, and the
+    /// rescue looped every cooldown while the follower fell monotonically further behind (the
+    /// Caraxes <c>bank-optimistic-2h-f</c> frozen-anchor finding).</para>
+    ///
+    /// <para>Every advance is monotonic — a completion that raced a newer ack must not drag
+    /// progress backwards. The boundary covers only committed state, so claiming it in
+    /// <c>matchIndex</c> can never over-count a commit quorum. A pending regression note below the
+    /// boundary is dropped: the installed state supersedes the regressed range it pointed at, and
+    /// acting on it would re-anchor below the floor again.</para>
+    /// </summary>
+    public void AdvanceProgressFromSnapshotInstall(string endpoint, long snapshotIndex)
+    {
+        AdvanceCommitFrontier(endpoint, snapshotIndex);
+        AdvanceStartCommitIndex(endpoint, snapshotIndex);
+
+        if (!matchIndex.TryGetValue(endpoint, out long match) || snapshotIndex > match)
+            matchIndex[endpoint] = snapshotIndex;
+
+        if (!nextIndex.TryGetValue(endpoint, out long next) || snapshotIndex + 1 > next)
+            nextIndex[endpoint] = snapshotIndex + 1;
+
+        if (regressedFrontiers.TryGetValue(endpoint, out long regressed) && regressed < snapshotIndex)
+            regressedFrontiers.Remove(endpoint);
+    }
+
     // ── log-start positions ───────────────────────────────────────────────────────────────────
 
     public long GetStartCommitIndexOrDefault(string endpoint, long fallback) => startCommitIndexes.GetValueOrDefault(endpoint, fallback);
