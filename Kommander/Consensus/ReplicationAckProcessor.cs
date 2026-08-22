@@ -218,82 +218,100 @@ internal sealed class ReplicationAckProcessor
             await readIndex.RegisterAckAsync(endpoint).ConfigureAwait(false);
         }
 
-        // Success: advance matchIndex and nextIndex for this peer so the backfill loop
-        // knows the follower has caught up to at least committedIndex. matchIndex stays monotonic
-        // (a stale in-flight ack must not drag a peer's recorded progress backwards), so the prior
-        // value is captured first — it is the only evidence of a genuine frontier regression, which
-        // the fast-path re-supply below keys on.
-        // newMatchIndex mirrors matchIndex[endpoint] locally — this method previously re-read the
-        // dictionary up to four more times below (a string hash + compare each) for a value fully
-        // determined right here on the highest-frequency inbound message a leader handles.
-        bool hadMatchIndex = tracker.TryGetMatchIndex(endpoint, out long priorMatchIndex);
-        long newMatchIndex = priorMatchIndex;
-        if (!hadMatchIndex || committedIndex > priorMatchIndex)
+        // Everything below this guard derives replication progress from committedIndex, so it
+        // requires an actual report. A Success ack with committedIndex < 0 carries NO frontier
+        // information — the legacy (two-fsync) heartbeat ack always reports -1, and the embedded
+        // Kahuna consumer runs that path by default. Feeding the -1 through the progress math
+        // fabricated a catch-up target out of nothing: right after an election win the optimistic
+        // seed holds matchIndex = 0, a -1 report left newMatchIndex at 0, nextIndex became
+        // 0 + 1 = 1, and the eager fast path below shipped a backfill anchored at 1 for a peer
+        // whose real frontier was millions of entries higher. On a compacted WAL that anchor can
+        // never be served, so every leadership change on a busy partition produced a refused
+        // batch and then a full snapshot transfer to an in-sync voter (the Caraxes "anchored at
+        // 1" soak finding) — and before the refusals escalated at the choke point, a permanently
+        // wedged cluster. A no-report ack must leave matchIndex, nextIndex, the fast-path
+        // triggers and the regression detection untouched; the -1 frontier seed above is still
+        // recorded so quiescence counts the peer as contacted, and the proposal quorum
+        // accounting below still runs.
+        if (committedIndex >= 0)
         {
-            newMatchIndex = committedIndex;
-            tracker.SetMatchIndex(endpoint, committedIndex);
-        }
-        tracker.SetNextIndex(endpoint, newMatchIndex + 1);
+            // Success: advance matchIndex and nextIndex for this peer so the backfill loop
+            // knows the follower has caught up to at least committedIndex. matchIndex stays monotonic
+            // (a stale in-flight ack must not drag a peer's recorded progress backwards), so the prior
+            // value is captured first — it is the only evidence of a genuine frontier regression, which
+            // the fast-path re-supply below keys on.
+            // newMatchIndex mirrors matchIndex[endpoint] locally — this method previously re-read the
+            // dictionary up to four more times below (a string hash + compare each) for a value fully
+            // determined right here on the highest-frequency inbound message a leader handles.
+            bool hadMatchIndex = tracker.TryGetMatchIndex(endpoint, out long priorMatchIndex);
+            long newMatchIndex = priorMatchIndex;
+            if (!hadMatchIndex || committedIndex > priorMatchIndex)
+            {
+                newMatchIndex = committedIndex;
+                tracker.SetMatchIndex(endpoint, committedIndex);
+            }
+            tracker.SetNextIndex(endpoint, newMatchIndex + 1);
 
-        // Immediately ship the next bounded batch only while an active catch-up is in progress,
-        // so a multi-batch backfill converges without stalling a full heartbeat per batch. This
-        // must honour the same BackfillThreshold gate as the heartbeat path: a follower lagging by
-        // ≤ threshold is intentionally not actively backfilled (small lag rides on normal
-        // replication), and eagerly catching it up here would, e.g., make a barely-behind node look
-        // fresh enough to receive a leadership transfer it should not.
-        if (coreState.NodeState == RaftNodeState.Leader
-            && host.Configuration.BackfillEnabled
-            && coreState.LocalCommittedIndex - newMatchIndex > host.Configuration.BackfillThreshold)
-        {
-            RaftNode? behindNode = RaftPeers.FindByEndpoint(host.Nodes, endpoint);
-            if (behindNode is not null)
-                await sender.TrySendBackfillBatchAsync(behindNode, committedIndex, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId)).ConfigureAwait(false);
-        }
+            // Immediately ship the next bounded batch only while an active catch-up is in progress,
+            // so a multi-batch backfill converges without stalling a full heartbeat per batch. This
+            // must honour the same BackfillThreshold gate as the heartbeat path: a follower lagging by
+            // ≤ threshold is intentionally not actively backfilled (small lag rides on normal
+            // replication), and eagerly catching it up here would, e.g., make a barely-behind node look
+            // fresh enough to receive a leadership transfer it should not.
+            if (coreState.NodeState == RaftNodeState.Leader
+                && host.Configuration.BackfillEnabled
+                && coreState.LocalCommittedIndex - newMatchIndex > host.Configuration.BackfillThreshold)
+            {
+                RaftNode? behindNode = RaftPeers.FindByEndpoint(host.Nodes, endpoint);
+                if (behindNode is not null)
+                    await sender.TrySendBackfillBatchAsync(behindNode, committedIndex, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId)).ConfigureAwait(false);
+            }
 
-        // Fast-path far-behind re-supply: a follower whose reported frontier trails the leader by more
-        // than BackfillThreshold is streamed forward here on its own ack (anchored normally via
-        // nextIndex), so a multi-batch catch-up converges without stalling a heartbeat per batch. This
-        // mirrors the eager catch-up above but keys on the reported committed frontier rather than
-        // matchIndex; confined to the fast path (flag off ⇒ a heartbeat reports -1 ⇒ never fires).
-        if (host.Configuration.WalSingleFsyncCommit
-            && coreState.NodeState == RaftNodeState.Leader
-            && host.Configuration.BackfillEnabled
-            && committedIndex >= 0
-            && coreState.LocalCommittedIndex - committedIndex > host.Configuration.BackfillThreshold)
-        {
-            RaftNode? behindNode2 = RaftPeers.FindByEndpoint(host.Nodes, endpoint);
-            if (behindNode2 is not null)
-                await sender.TrySendBackfillBatchAsync(behindNode2, committedIndex, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId)).ConfigureAwait(false);
-        }
+            // Fast-path far-behind re-supply: a follower whose reported frontier trails the leader by more
+            // than BackfillThreshold is streamed forward here on its own ack (anchored normally via
+            // nextIndex), so a multi-batch catch-up converges without stalling a heartbeat per batch. This
+            // mirrors the eager catch-up above but keys on the reported committed frontier rather than
+            // matchIndex; confined to the fast path (flag off ⇒ a heartbeat reports -1 ⇒ never fires).
+            if (host.Configuration.WalSingleFsyncCommit
+                && coreState.NodeState == RaftNodeState.Leader
+                && host.Configuration.BackfillEnabled
+                && committedIndex >= 0
+                && coreState.LocalCommittedIndex - committedIndex > host.Configuration.BackfillThreshold)
+            {
+                RaftNode? behindNode2 = RaftPeers.FindByEndpoint(host.Nodes, endpoint);
+                if (behindNode2 is not null)
+                    await sender.TrySendBackfillBatchAsync(behindNode2, committedIndex, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId)).ConfigureAwait(false);
+            }
 
-        // Commit-frontier REGRESSION detection (crash-restart signature) — detection only; the repair
-        // is done by SendHeartbeat, not here. A follower that restarted after losing its lazy commit
-        // markers reports a frontier BELOW what the leader's monotonic matchIndex already recorded.
-        //
-        // This must NOT re-ship inline. An earlier version did, and it livelocked the cluster under load:
-        // the anchored re-supply issues a WAL read plus an AppendLogs on the hot per-ack path, and when
-        // it fires on a peer that is NOT genuinely crash-restarted — a reordered ack during ordinary
-        // catch-up can transiently satisfy the "below matchIndex" test — the anchored batch fights the
-        // in-flight forward catch-up (log-hole truncate → re-replicate) and starves the executor enough
-        // to stall elections. So detection is split from action:
-        //   * Here (cheap, per ack): if the ack looks like a genuine regression, RECORD the reported
-        //     frontier. If instead the ack shows the peer at/above its recorded match (normal progress),
-        //     CLEAR any pending note — a transient reordering self-heals before the next heartbeat and
-        //     never triggers a re-supply.
-        //   * In SendHeartbeat (paced, once per interval): act on any note still standing.
-        // The "was caught up" clause (priorMatchIndex within BackfillThreshold of coreState.LocalCommittedIndex)
-        // excludes a still-climbing joining/far-behind follower, whose low acks are catch-up, not
-        // regression — those are handled by the threshold paths above.
-        if (host.Configuration.WalSingleFsyncCommit && coreState.NodeState == RaftNodeState.Leader && committedIndex >= 0)
-        {
-            bool frontierRegressed = hadMatchIndex
-                && committedIndex < priorMatchIndex
-                && priorMatchIndex >= coreState.LocalCommittedIndex - host.Configuration.BackfillThreshold;
+            // Commit-frontier REGRESSION detection (crash-restart signature) — detection only; the repair
+            // is done by SendHeartbeat, not here. A follower that restarted after losing its lazy commit
+            // markers reports a frontier BELOW what the leader's monotonic matchIndex already recorded.
+            //
+            // This must NOT re-ship inline. An earlier version did, and it livelocked the cluster under load:
+            // the anchored re-supply issues a WAL read plus an AppendLogs on the hot per-ack path, and when
+            // it fires on a peer that is NOT genuinely crash-restarted — a reordered ack during ordinary
+            // catch-up can transiently satisfy the "below matchIndex" test — the anchored batch fights the
+            // in-flight forward catch-up (log-hole truncate → re-replicate) and starves the executor enough
+            // to stall elections. So detection is split from action:
+            //   * Here (cheap, per ack): if the ack looks like a genuine regression, RECORD the reported
+            //     frontier. If instead the ack shows the peer at/above its recorded match (normal progress),
+            //     CLEAR any pending note — a transient reordering self-heals before the next heartbeat and
+            //     never triggers a re-supply.
+            //   * In SendHeartbeat (paced, once per interval): act on any note still standing.
+            // The "was caught up" clause (priorMatchIndex within BackfillThreshold of coreState.LocalCommittedIndex)
+            // excludes a still-climbing joining/far-behind follower, whose low acks are catch-up, not
+            // regression — those are handled by the threshold paths above.
+            if (host.Configuration.WalSingleFsyncCommit && coreState.NodeState == RaftNodeState.Leader && committedIndex >= 0)
+            {
+                bool frontierRegressed = hadMatchIndex
+                    && committedIndex < priorMatchIndex
+                    && priorMatchIndex >= coreState.LocalCommittedIndex - host.Configuration.BackfillThreshold;
 
-            if (frontierRegressed)
-                tracker.RecordRegressedFrontier(endpoint, committedIndex);
-            else if (committedIndex >= newMatchIndex)
-                tracker.ClearRegressedFrontier(endpoint);
+                if (frontierRegressed)
+                    tracker.RecordRegressedFrontier(endpoint, committedIndex);
+                else if (committedIndex >= newMatchIndex)
+                    tracker.ClearRegressedFrontier(endpoint);
+            }
         }
 
         if (!proposals.TryGet(timestamp, out RaftProposalQuorum? proposal))

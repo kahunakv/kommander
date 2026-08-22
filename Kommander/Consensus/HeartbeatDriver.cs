@@ -157,9 +157,23 @@ internal sealed class HeartbeatDriver
             // without the exemption, a learner added to an idle range whose leader was elected after
             // the last write (frontier == floor) with a gap at or under BackfillThreshold was never
             // shipped anything, and the placement promotion driver waited on its lag forever.
-            long followerGap = tracker.TryGetCommitFrontier(node.Endpoint, out long followerMaxLog)
-                ? coreState.LocalCommittedIndex - followerMaxLog
-                : 0;
+            // followerMaxLog can be -1: the seed recorded for a contacted peer whose Success acks
+            // carry no frontier report (the legacy two-fsync heartbeat ack always reports -1).
+            // That value means "position unknown", not "position 0" — deriving the gap and the
+            // backfill anchor from it shipped a batch anchored at 0, which a compacted WAL can
+            // never serve contiguously, and the refusal then escalated to a full snapshot for a
+            // peer that may be perfectly in sync (the Caraxes "anchored at 1" storm was this
+            // shape, produced on the ack fast path). Substitute the best positional evidence the
+            // leader holds — where the peer's log started per its handshake/vote, advanced by
+            // every ack that carried a max — so an in-sync peer measures no gap and a genuinely
+            // behind one is backfilled from a position it actually holds. A peer with no evidence
+            // at all falls back to 0, whose anchored read either ships from entry 1 or refuses
+            // into the snapshot rescue — the correct outcome for a blank follower.
+            bool frontierKnown = tracker.TryGetCommitFrontier(node.Endpoint, out long followerMaxLog);
+            long effectiveFloor = followerMaxLog >= 0
+                ? followerMaxLog
+                : Math.Max(tracker.GetStartCommitIndexOrDefault(node.Endpoint, 0), 0);
+            long followerGap = frontierKnown ? coreState.LocalCommittedIndex - effectiveFloor : 0;
             bool idleTailGap = followerGap > 0 && liveReplicationQuiet
                 && (coreState.LocalCommittedIndex > coreState.LiveCommitFloor || !host.IsVoter(node.Endpoint));
 
@@ -195,7 +209,7 @@ internal sealed class HeartbeatDriver
 
             if (willBackfill)
             {
-                long anchorFrom = regressed ? regressedFrontier : followerMaxLog;
+                long anchorFrom = regressed ? regressedFrontier : effectiveFloor;
                 backfillRound ??= new();
                 BackfillSendResult backfillResult = await sender.TrySendBackfillBatchAsync(
                     node, anchorFrom, coreState.LastHeartbeat, anchorToFollowerFrontier: regressed, round: backfillRound).ConfigureAwait(false);

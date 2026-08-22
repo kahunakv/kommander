@@ -681,6 +681,20 @@ public sealed class RaftPartitionStateMachine
     }
 
     /// <summary>
+    /// Seeds one peer's optimistic replication progress for unit testing, exactly as the
+    /// election-win path does (<c>nextIndex = leaderMaxLog + 1</c>, <c>matchIndex = 0</c>).
+    /// Lets a test reproduce the just-elected leader's state without driving a full election.
+    /// </summary>
+    public void SeedOptimisticProgressForTesting(string endpoint, long leaderMaxLog) =>
+        tracker.SeedOptimisticProgress(endpoint, leaderMaxLog);
+
+    /// <summary>
+    /// Records where a peer's log starts for unit testing, as a handshake or vote reply would.
+    /// </summary>
+    public void SetStartCommitIndexForTesting(string endpoint, long value) =>
+        tracker.SetStartCommitIndex(endpoint, value);
+
+    /// <summary>
     /// Seeds the state shared by all become-leader paths: advances the HLC, marks the node as
     /// Leader, records the durable committed index for backfill, and starts both the heartbeat
     /// timer and the idle-quiesce clock at the same election timestamp.  Per-follower cursors

@@ -159,6 +159,78 @@ public class TestBackfillRefusalEscalation
         Assert.Contains(sm.GetSnapshotStatuses(), s => s.FollowerEndpoint == VoterB);
     }
 
+    // ── A no-report ack must not fabricate progress ──────────────────────────
+
+    /// <summary>
+    /// The "anchored at 1" producer, minimized (Caraxes run E, task 1). The legacy two-fsync
+    /// heartbeat ack reports committedIndex = -1: "no frontier report", not a position. Right
+    /// after an election win the optimistic seed holds matchIndex = 0; feeding the -1 through the
+    /// progress math left newMatchIndex at 0, set nextIndex to 1, and the eager fast path shipped
+    /// a backfill anchored at 1 — refused below the compaction floor and escalated to a full
+    /// snapshot transfer for a peer that was in sync. A no-report ack must leave progress and the
+    /// backfill triggers untouched.
+    /// </summary>
+    [Fact]
+    public async Task NoReportAck_AfterElectionSeed_DoesNotAnchorBackfillAtOne()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, LevelCountingLogger logger) = await BuildCompactedLeader();
+        sm.SeedOptimisticProgressForTesting(VoterA, 117);
+
+        await sm.CompleteAppendLogsAsync(VoterA, host.HybridLogicalClock.TrySendOrLocalEvent(1),
+                                         RaftOperationStatus.Success, committedIndex: -1);
+
+        Assert.Equal(0, EntryBatchesTo(host, VoterA));
+        Assert.Equal(0, logger.Count(LogLevel.Warning, "Refusing non-contiguous backfill batch"));
+        Assert.Empty(sm.GetSnapshotStatuses());
+    }
+
+    /// <summary>
+    /// The heartbeat half of the same defect: the -1 seed recorded for a contacted, never-reported
+    /// peer is "position unknown", not "position 0". The round must anchor at the best positional
+    /// evidence the leader holds — where the peer's log started per its handshake/vote — and ship
+    /// a contiguous batch from there, not refuse an anchor-0 read on every beat.
+    /// </summary>
+    [Fact]
+    public async Task NoReportAck_ThenHeartbeat_BackfillsFromKnownLogStart()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, LevelCountingLogger logger) = await BuildCompactedLeader();
+        sm.SetStartCommitIndexForTesting(VoterA, 100);
+
+        await sm.CompleteAppendLogsAsync(VoterA, host.HybridLogicalClock.TrySendOrLocalEvent(1),
+                                         RaftOperationStatus.Success, committedIndex: -1);
+        Assert.Equal(0, EntryBatchesTo(host, VoterA));
+
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.True(EntryBatchesTo(host, VoterA) > 0);
+        Assert.Equal(0, logger.Count(LogLevel.Warning, "Refusing non-contiguous backfill batch"));
+
+        RaftResponderRequest batch = host.Requests.First(r =>
+            r.Node?.Endpoint == VoterA && r.AppendLogsRequest?.Logs is { Count: > 0 });
+        Assert.Equal(100, batch.AppendLogsRequest!.PrevLogIndex);
+    }
+
+    /// <summary>
+    /// A contacted peer with no frontier report AND no positional evidence at all is a blank
+    /// follower: the round anchors at 1, the compacted WAL refuses, and the refusal escalates into
+    /// the snapshot rescue — the correct outcome for a peer that provably holds nothing.
+    /// </summary>
+    [Fact]
+    public async Task NoReportAck_UnknownPeer_IsRescuedBySnapshotFromAnchorOne()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, _) = await BuildCompactedLeader();
+
+        await sm.CompleteAppendLogsAsync(VoterA, host.HybridLogicalClock.TrySendOrLocalEvent(1),
+                                         RaftOperationStatus.Success, committedIndex: -1);
+        Assert.Equal(0, EntryBatchesTo(host, VoterA));
+
+        await sm.CheckPartitionLeadershipAsync();
+
+        RaftBackfillStatus status = Assert.Single(sm.GetBackfillStatuses(), s => s.FollowerEndpoint == VoterA);
+        Assert.Equal(1, status.AnchorIndex);
+        Assert.Contains(sm.GetSnapshotStatuses(), s => s.FollowerEndpoint == VoterA);
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     /// <summary>
