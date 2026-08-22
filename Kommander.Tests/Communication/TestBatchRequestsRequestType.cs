@@ -15,5 +15,6 @@ public sealed class TestBatchRequestsRequestType
         Assert.Equal(5, (int)BatchRequestsRequestType.CompleteAppendLogs);
         Assert.Equal(6, (int)BatchRequestsRequestType.StepDownNotice);
         Assert.Equal(7, (int)BatchRequestsRequestType.TransferLeadership);
+        Assert.Equal(8, (int)BatchRequestsRequestType.TransferLeadershipSuggestion);
     }
 }

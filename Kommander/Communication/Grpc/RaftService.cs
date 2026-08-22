@@ -363,20 +363,27 @@ public sealed class RaftService : Rafter.RafterBase
 
             await foreach (GrpcBatchRequestsRequest message in requestStream.ReadAllAsync())
             {
-                //GrpcBatchClientRequestsRequest message = requestStream.Current;                
-
                 foreach (GrpcBatchRequestsRequestItem request in message.Requests)
                 {
-                    //if (request.Type != GrpcBatchRequestsRequestType.AppendLogs && request.Type != GrpcBatchRequestsRequestType.CompleteAppendLogs)
-                    //    Console.WriteLine($"Client sent: {request.Type}");
-                    
+                    // Every payload is null-checked BEFORE it is dereferenced. A typed item with no
+                    // payload is a real wire shape, not a hypothetical: a sender-side mapping gap
+                    // shipped every TransferLeadershipSuggestion that way for years, and the old
+                    // null-forgiving dereference turned each one into a bare NullReferenceException
+                    // with a single stack frame — undiagnosable from logs (the Caraxes 30-second
+                    // "BatchRequests: NullReferenceException" finding). Dropping the item is always
+                    // safe: batch items are fire-and-forget, and real acknowledgement travels at the
+                    // protocol level (CompleteAppendLogs) or not at all.
                     try
                     {
                         switch (request.Type)
                         {
                             case GrpcBatchRequestsRequestType.Handshake:
                             {
-                                GrpcHandshakeRequest handshake = request.Handshake!;
+                                if (request.Handshake is not { } handshake)
+                                {
+                                    LogMissingBatchItemPayload(request.Type, context);
+                                    break;
+                                }
 
                                 await raft.Handshake(new(
                                     handshake.NodeId,
@@ -389,10 +396,11 @@ public sealed class RaftService : Rafter.RafterBase
 
                             case GrpcBatchRequestsRequestType.RequestVotes:
                             {
-                                GrpcRequestVotesRequest requestVotes = request.RequestVotes!;
-
-                                if (requestVotes is null)
-                                    throw new InvalidOperationException("requestVotes is null");
+                                if (request.RequestVotes is not { } requestVotes)
+                                {
+                                    LogMissingBatchItemPayload(request.Type, context);
+                                    break;
+                                }
 
                                 raft.RequestVote(new(
                                     requestVotes.Partition,
@@ -408,7 +416,11 @@ public sealed class RaftService : Rafter.RafterBase
 
                             case GrpcBatchRequestsRequestType.Vote:
                             {
-                                GrpcVoteRequest voteRequest = request.Vote!;
+                                if (request.Vote is not { } voteRequest)
+                                {
+                                    LogMissingBatchItemPayload(request.Type, context);
+                                    break;
+                                }
 
                                 raft.Vote(new(
                                     voteRequest.Partition,
@@ -427,7 +439,11 @@ public sealed class RaftService : Rafter.RafterBase
                                 if (raft is not RaftManager manager)
                                     throw new InvalidOperationException("raft is not a RaftManager");
 
-                                GrpcStepDownNoticeRequest stepDownNotice = request.StepDownNotice!;
+                                if (request.StepDownNotice is not { } stepDownNotice)
+                                {
+                                    LogMissingBatchItemPayload(request.Type, context);
+                                    break;
+                                }
 
                                 manager.StepDownNotice(new(
                                     stepDownNotice.Partition,
@@ -443,7 +459,11 @@ public sealed class RaftService : Rafter.RafterBase
                                 if (raft is not RaftManager transferManager)
                                     throw new InvalidOperationException("raft is not a RaftManager");
 
-                                GrpcTransferLeadershipRequest transferLeadership = request.TransferLeadership!;
+                                if (request.TransferLeadership is not { } transferLeadership)
+                                {
+                                    LogMissingBatchItemPayload(request.Type, context);
+                                    break;
+                                }
 
                                 transferManager.TransferLeadership(new(
                                     transferLeadership.Partition,
@@ -460,7 +480,11 @@ public sealed class RaftService : Rafter.RafterBase
                                 if (raft is not RaftManager suggestionManager)
                                     throw new InvalidOperationException("raft is not a RaftManager");
 
-                                GrpcTransferLeadershipSuggestionRequest s = request.TransferLeadershipSuggestion!;
+                                if (request.TransferLeadershipSuggestion is not { } s)
+                                {
+                                    LogMissingBatchItemPayload(request.Type, context);
+                                    break;
+                                }
 
                                 suggestionManager.ReceiveTransferLeadershipSuggestion(new(
                                     s.Partition,
@@ -474,7 +498,11 @@ public sealed class RaftService : Rafter.RafterBase
 
                             case GrpcBatchRequestsRequestType.AppendLogs:
                             {
-                                GrpcAppendLogsRequest appendLogsRequest = request.AppendLogs!;
+                                if (request.AppendLogs is not { } appendLogsRequest)
+                                {
+                                    LogMissingBatchItemPayload(request.Type, context);
+                                    break;
+                                }
 
                                 raft.AppendLogs(new(
                                     appendLogsRequest.Partition,
@@ -490,7 +518,11 @@ public sealed class RaftService : Rafter.RafterBase
 
                             case GrpcBatchRequestsRequestType.CompleteAppendLogs:
                             {
-                                GrpcCompleteAppendLogsRequest completeAppendLogsRequest = request.CompleteAppendLogs!;
+                                if (request.CompleteAppendLogs is not { } completeAppendLogsRequest)
+                                {
+                                    LogMissingBatchItemPayload(request.Type, context);
+                                    break;
+                                }
 
                                 raft.CompleteAppendLogs(new(
                                     completeAppendLogsRequest.Partition,
@@ -511,7 +543,13 @@ public sealed class RaftService : Rafter.RafterBase
                     }
                     catch (Exception ex)
                     {
-                        logger.LogError("BatchRequests: {Type} {Message}\n{StackTrace}", ex.GetType().Name, ex.Message, ex.StackTrace);
+                        // ex (not ex.StackTrace): a diagnosable record needs the inner exceptions
+                        // and their frames, and the item type plus peer identify what was being
+                        // processed — the old {Message}\n{StackTrace} form logged a single frame
+                        // with no peer, which made these occurrences unattributable for years.
+                        logger.LogError(
+                            "BatchRequests: failed to process {ItemType} item from {Peer}: {Exception}",
+                            request.Type, context.Peer, ex.ToString());
                     }
                 }
 
@@ -525,11 +563,33 @@ public sealed class RaftService : Rafter.RafterBase
                 await responseStream.WriteAsync(response);
             }
         }
+        catch (Exception ex) when (ex is OperationCanceledException
+                                   || (ex is RpcException rpc && rpc.StatusCode == StatusCode.Cancelled)
+                                   || ex is IOException)
+        {
+            // Routine stream teardown: the client cancelled, the connection dropped, or the host is
+            // shutting down. The client re-opens the stream on its next send, so this is not an
+            // error — logging it as one buried the real failures among restart noise.
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug("BatchRequests: stream from {Peer} closed: {Message}", context.Peer, ex.Message);
+        }
         catch (Exception ex)
         {
-            logger.LogError("BatchRequests: {Type} {Message}\n{StackTrace}", ex.GetType().Name, ex.Message, ex.StackTrace);
+            logger.LogError("BatchRequests: stream from {Peer} failed: {Exception}", context.Peer, ex.ToString());
         }
     }
+
+    /// <summary>
+    /// Records a batch item that declared a type but carried no payload for it, then lets the
+    /// caller drop it. Kept at Error because the only known producer of this shape is a
+    /// sender-side mapping bug (a missing branch in <c>GrpcCommunication.TryMapBatchItem</c>), and
+    /// the message must name the type and the peer so the next occurrence is attributable — the
+    /// bare NullReferenceException this replaces was not.
+    /// </summary>
+    private void LogMissingBatchItemPayload(GrpcBatchRequestsRequestType type, ServerCallContext context) =>
+        logger.LogError(
+            "BatchRequests: item of type {ItemType} from {Peer} carried no payload — item dropped",
+            type, context.Peer);
 
     /// <summary>
     /// Handles a <c>Leave</c> RPC from a departing node requesting removal from the committed roster.

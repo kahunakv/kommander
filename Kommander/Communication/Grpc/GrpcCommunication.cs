@@ -509,30 +509,80 @@ public class GrpcCommunication : ICommunication
 
         foreach (BatchRequestsRequestItem requestItem in request.Requests)
         {
-            GrpcBatchRequestsRequestItem item = new()
+            GrpcBatchRequestsRequestItem? item = TryMapBatchItem(requestItem);
+
+            if (item is null)
             {
-                Type = (GrpcBatchRequestsRequestType) requestItem.Type
-            };
+                // A typed item with no payload must be dropped HERE, on the sender, where the type
+                // and the gap are both known. Shipping it anyway hands the receiver an item it can
+                // only fail on — the shape behind the two-year "BatchRequests: NullReferenceException"
+                // noise (see TryMapBatchItem).
+                manager.Logger.LogError(
+                    "BatchRequests: dropped unmappable batch item of type {Type} for {Endpoint} (missing payload or unmapped type)",
+                    requestItem.Type, node.Endpoint);
+                continue;
+            }
 
             batchRequests.Requests.Add(item);
+        }
+        
+        try
+        {
+            await streaming.Semaphore.WaitAsync();
 
-            if (requestItem.Handshake is not null)
-            {
-                GrpcHandshakeRequest handshake = new()
+            await streaming.Streaming.RequestStream.WriteAsync(batchRequests);
+        }
+        finally
+        {
+            streaming.Semaphore.Release();
+        }
+        
+        return batchRequestsResponse;
+    }
+
+    /// <summary>
+    /// Maps one transport-neutral batch item onto its gRPC wire shape, or returns null when the
+    /// item cannot be mapped — an unknown type, or a declared type whose payload is missing. The
+    /// caller drops a null loudly instead of sending it.
+    ///
+    /// <para><b>Keyed on the item's Type, mirroring the receiving switch in
+    /// <c>RaftService.BatchRequests</c>, so the two ends cannot drift.</b> The previous mapping
+    /// keyed on payload-field presence, and its if-chain silently lacked a
+    /// <see cref="BatchRequestsRequestItem.TransferLeadershipSuggestion"/> branch: every leadership
+    /// balance suggestion went out with <c>Type = TRANSFER_LEADERSHIP_SUGGESTION</c> and a null
+    /// payload, the receiver dereferenced the payload and threw a bare
+    /// <c>NullReferenceException</c> on the 30-second balancer cadence, and the suggestion itself
+    /// was silently lost — the leader balancer never worked across gRPC (Caraxes
+    /// "BatchRequests: NullReferenceException" finding, present since at least 1.2.3). A
+    /// type-keyed switch turns that class of gap into a compile-visible case list with a loud
+    /// default, on the sender, where the bug lives.</para>
+    /// </summary>
+    internal static GrpcBatchRequestsRequestItem? TryMapBatchItem(BatchRequestsRequestItem requestItem)
+    {
+        GrpcBatchRequestsRequestItem item = new()
+        {
+            Type = (GrpcBatchRequestsRequestType)requestItem.Type
+        };
+
+        switch (requestItem.Type)
+        {
+            // A ping is deliberately payload-free: it exists only to keep the stream observably
+            // alive, and the receiver ignores it.
+            case BatchRequestsRequestType.Ping:
+                return item;
+
+            case BatchRequestsRequestType.Handshake when requestItem.Handshake is not null:
+                item.Handshake = new()
                 {
                     NodeId = requestItem.Handshake.NodeId,
                     Partition = requestItem.Handshake.Partition,
                     MaxLogId = requestItem.Handshake.MaxLogId,
                     Endpoint = requestItem.Handshake.Endpoint
                 };
-                
-                item.Handshake = handshake;
-                continue;
-            }
-            
-            if (requestItem.Vote is not null)
-            {
-                GrpcVoteRequest voteRequest = new()
+                return item;
+
+            case BatchRequestsRequestType.Vote when requestItem.Vote is not null:
+                item.Vote = new()
                 {
                     Partition = requestItem.Vote.Partition,
                     Term = requestItem.Vote.Term,
@@ -544,14 +594,10 @@ public class GrpcCommunication : ICommunication
                     Endpoint = requestItem.Vote.Endpoint,
                     PreVote = requestItem.Vote.PreVote
                 };
-                
-                item.Vote = voteRequest;
-                continue;
-            }
-            
-            if (requestItem.RequestVotes is not null)
-            {
-                GrpcRequestVotesRequest requestVotes = new()
+                return item;
+
+            case BatchRequestsRequestType.RequestVote when requestItem.RequestVotes is not null:
+                item.RequestVotes = new()
                 {
                     Partition = requestItem.RequestVotes.Partition,
                     Term = requestItem.RequestVotes.Term,
@@ -563,14 +609,10 @@ public class GrpcCommunication : ICommunication
                     Endpoint = requestItem.RequestVotes.Endpoint,
                     PreVote = requestItem.RequestVotes.PreVote
                 };
-                
-                item.RequestVotes = requestVotes;
-                continue;
-            }
+                return item;
 
-            if (requestItem.StepDownNotice is not null)
-            {
-                GrpcStepDownNoticeRequest stepDownNotice = new()
+            case BatchRequestsRequestType.StepDownNotice when requestItem.StepDownNotice is not null:
+                item.StepDownNotice = new()
                 {
                     Partition = requestItem.StepDownNotice.Partition,
                     Term = requestItem.StepDownNotice.Term,
@@ -579,14 +621,10 @@ public class GrpcCommunication : ICommunication
                     TimeCounter = requestItem.StepDownNotice.Time.C,
                     Endpoint = requestItem.StepDownNotice.Endpoint
                 };
+                return item;
 
-                item.StepDownNotice = stepDownNotice;
-                continue;
-            }
-
-            if (requestItem.TransferLeadership is not null)
-            {
-                GrpcTransferLeadershipRequest transferLeadership = new()
+            case BatchRequestsRequestType.TransferLeadership when requestItem.TransferLeadership is not null:
+                item.TransferLeadership = new()
                 {
                     Partition = requestItem.TransferLeadership.Partition,
                     Term = requestItem.TransferLeadership.Term,
@@ -596,12 +634,22 @@ public class GrpcCommunication : ICommunication
                     Endpoint = requestItem.TransferLeadership.Endpoint,
                     TargetEndpoint = requestItem.TransferLeadership.TargetEndpoint
                 };
+                return item;
 
-                item.TransferLeadership = transferLeadership;
-                continue;
-            }
+            case BatchRequestsRequestType.TransferLeadershipSuggestion when requestItem.TransferLeadershipSuggestion is not null:
+                item.TransferLeadershipSuggestion = new()
+                {
+                    Partition = requestItem.TransferLeadershipSuggestion.Partition,
+                    Term = requestItem.TransferLeadershipSuggestion.Term,
+                    TimeNode = requestItem.TransferLeadershipSuggestion.Time.N,
+                    TimePhysical = requestItem.TransferLeadershipSuggestion.Time.L,
+                    TimeCounter = requestItem.TransferLeadershipSuggestion.Time.C,
+                    SuggestedBy = requestItem.TransferLeadershipSuggestion.SuggestedBy,
+                    TargetEndpoint = requestItem.TransferLeadershipSuggestion.TargetEndpoint
+                };
+                return item;
 
-            if (requestItem.AppendLogs is not null)
+            case BatchRequestsRequestType.AppendLogs when requestItem.AppendLogs is not null:
             {
                 GrpcAppendLogsRequest appendRequest = new()
                 {
@@ -618,14 +666,13 @@ public class GrpcCommunication : ICommunication
 
                 if (requestItem.AppendLogs.Logs is { Count: > 0 })
                     AddGrpcLogs(appendRequest.Logs, requestItem.AppendLogs);
-                
+
                 item.AppendLogs = appendRequest;
-                continue;
+                return item;
             }
-            
-            if (requestItem.CompleteAppendLogs is not null)
-            {
-                GrpcCompleteAppendLogsRequest completeRequest = new()
+
+            case BatchRequestsRequestType.CompleteAppendLogs when requestItem.CompleteAppendLogs is not null:
+                item.CompleteAppendLogs = new()
                 {
                     Partition = requestItem.CompleteAppendLogs.Partition,
                     Term = requestItem.CompleteAppendLogs.Term,
@@ -633,28 +680,16 @@ public class GrpcCommunication : ICommunication
                     TimePhysical = requestItem.CompleteAppendLogs.Time.L,
                     TimeCounter = requestItem.CompleteAppendLogs.Time.C,
                     Endpoint = requestItem.CompleteAppendLogs.Endpoint,
-                    Status = (GrpcRaftOperationStatus) requestItem.CompleteAppendLogs.Status,
+                    Status = (GrpcRaftOperationStatus)requestItem.CompleteAppendLogs.Status,
                     CommitIndex = requestItem.CompleteAppendLogs.CommitIndex
                 };
-                
-                item.CompleteAppendLogs = completeRequest;
-            }
-        }
-        
-        try
-        {
-            await streaming.Semaphore.WaitAsync();
+                return item;
 
-            await streaming.Streaming.RequestStream.WriteAsync(batchRequests);
+            default:
+                return null;
         }
-        finally
-        {
-            streaming.Semaphore.Release();
-        }
-        
-        return batchRequestsResponse;
     }
-    
+
     /// <summary>
     /// Sends a <see cref="LeaveRequest"/> to <paramref name="node"/> via the <c>Leave</c> gRPC RPC.
     /// If the target is not the P0 leader it returns <see cref="LeaveResponse.LeaderHint"/> so the
