@@ -61,10 +61,10 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
     private sealed class PartitionState
     {
         /// <summary>
-        /// Pending read operations in submission order. Each item is either a plain
-        /// <see cref="Action"/> (from <see cref="EnqueueTask{T}"/>) or a <see cref="BatchableOp"/>
-        /// (from <see cref="EnqueueBatchableTask{TArg,T}"/>); the drain loop type-tests rather
-        /// than wrapping plain actions, so the existing path pays no extra allocation.
+        /// Pending read operations in submission order. Each item is either an
+        /// <see cref="IReadWorkItem"/> (from both <see cref="EnqueueTask{T}"/> overloads) or a
+        /// <see cref="BatchableOp"/> (from <see cref="EnqueueBatchableTask{TArg,T}"/>); the drain
+        /// loop type-tests, so no per-item wrapper allocation exists.
         /// </summary>
         public readonly Queue<object> Ops = new();
 
@@ -110,6 +110,51 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
         /// the group instead, matching the N-individual-failed-reads semantics.
         /// </summary>
         internal abstract void RunGroup(List<object> batch, int start, int count);
+    }
+
+    /// <summary>
+    /// Marker for the state-carried queue item so the drain loop can dispatch it without knowing
+    /// its generic closed type. An interface (not a base class) because the item itself IS its
+    /// <see cref="TaskCompletionSource{T}"/> — merging the two halves into one allocation is the
+    /// point of the type.
+    /// </summary>
+    private interface IReadWorkItem
+    {
+        /// <summary>Runs the operation and completes or faults the task; never throws.</summary>
+        void Run();
+    }
+
+    /// <summary>
+    /// One queued read for the state-carried <see cref="EnqueueTask{TState,T}"/> path. Subclasses
+    /// <see cref="TaskCompletionSource{T}"/> so the queue item, the completion source, and the
+    /// (state, delegate) pair are ONE object — with a static caller delegate this makes a read
+    /// cost two allocations (item + its <see cref="Task{T}"/>) instead of the closure/Action/TCS
+    /// trio of the legacy path. Completion semantics are identical: result or exception via
+    /// <c>TrySet*</c>, continuations always asynchronous.
+    /// </summary>
+    private sealed class ReadWorkItem<TState, T> : TaskCompletionSource<T>, IReadWorkItem
+    {
+        private readonly TState state;
+        private readonly Func<TState, T> operation;
+
+        internal ReadWorkItem(TState state, Func<TState, T> operation)
+            : base(TaskCreationOptions.RunContinuationsAsynchronously)
+        {
+            this.state = state;
+            this.operation = operation;
+        }
+
+        public void Run()
+        {
+            try
+            {
+                TrySetResult(operation(state));
+            }
+            catch (Exception ex)
+            {
+                TrySetException(ex);
+            }
+        }
     }
 
     private sealed class BatchableOp<TArg, T> : BatchableOp
@@ -268,26 +313,19 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
     // ── IRaftReadScheduler ─────────────────────────────────────────────────
 
     /// <inheritdoc/>
-    public Task<T> EnqueueTask<T>(int partitionId, Func<T> operation)
+    /// <remarks>Routed through the state-carried path with the delegate itself as the state, so
+    /// even the legacy overload queues a single combined item instead of a TCS + closure + Action.</remarks>
+    public Task<T> EnqueueTask<T>(int partitionId, Func<T> operation) =>
+        EnqueueTask(partitionId, operation, static op => op());
+
+    /// <inheritdoc/>
+    public Task<T> EnqueueTask<TState, T>(int partitionId, TState state, Func<TState, T> operation)
     {
-        TaskCompletionSource<T> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        ReadWorkItem<TState, T> item = new(state, operation);
 
-        // Capture TCS and delegate in an Action; the drain loop type-tests queue items.
-        Action work = () =>
-        {
-            try
-            {
-                tcs.TrySetResult(operation());
-            }
-            catch (Exception ex)
-            {
-                tcs.TrySetException(ex);
-            }
-        };
+        EnqueueCore(partitionId, item);
 
-        EnqueueCore(partitionId, work);
-
-        return tcs.Task;
+        return item.Task;
     }
 
     /// <inheritdoc/>
@@ -312,7 +350,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
     /// <summary>
     /// Shared admission path for <see cref="EnqueueTask{T}"/> and
     /// <see cref="EnqueueBatchableTask{TArg,T}"/>. Publishes <paramref name="work"/> (an
-    /// <see cref="Action"/> or a <see cref="BatchableOp"/>) into the partition queue, or throws
+    /// <see cref="IReadWorkItem"/> or a <see cref="BatchableOp"/>) into the partition queue, or throws
     /// without publishing (stopping / backpressure) — in which case the caller's task object is
     /// never exposed, so nothing is stranded.
     /// </summary>
@@ -552,7 +590,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
         {
             // Coalesce each maximal run of ADJACENT ops sharing one executor instance into a
             // single ExecuteBatch call. Adjacency preserves the queue's total execution order
-            // relative to interleaved plain Actions — see EnqueueBatchableTask remarks.
+            // relative to interleaved plain work items — see EnqueueBatchableTask remarks.
             int runLength = 1;
 
             if (batch[i] is BatchableOp first)
@@ -565,8 +603,8 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
 
             try
             {
-                if (batch[i] is Action work)
-                    work(); // Sets TCS result or exception internally.
+                if (batch[i] is IReadWorkItem item)
+                    item.Run(); // Sets its own result or exception internally.
                 else
                     ((BatchableOp)batch[i]).RunGroup(batch, i, runLength); // Completes/faults each op's TCS internally.
 

@@ -902,7 +902,11 @@ public sealed class RaftWriteAhead
     /// </returns>
     public async Task<long> GetMaxLog()
     {
-        return await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () => walAdapter.GetMaxLog(partition.PartitionId));
+        return await manager.ReadScheduler.EnqueueTask(
+            partition.PartitionId,
+            (walAdapter, partition.PartitionId),
+            static s => s.walAdapter.GetMaxLog(s.PartitionId)
+        ).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1156,6 +1160,14 @@ public sealed class RaftWriteAhead
     /// Any over-gap ids buffered in <c>pendingResolved</c> that the boundary now covers are drained. Runs on the
     /// partition executor, the single writer of these fields.
     /// </summary>
+    /// <summary>
+    /// Advances the in-memory commit frontier over a §5.4.2-proven inherited entry at delivery
+    /// time, ahead of its lazy durable re-commit marker (see
+    /// <see cref="Scheduling.IRaftWalFacade.MarkInheritedCommitted"/>). Monotonic and gap-buffered
+    /// like every resolution: the later re-commit enqueue's own advance is then a no-op.
+    /// </summary>
+    public void MarkInheritedCommitted(long id) => AdvanceCommitFrontier(id);
+
     public void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0)
     {
         long target = snapshotIndex + 1;
@@ -1233,11 +1245,14 @@ public sealed class RaftWriteAhead
     /// </summary>
     public async ValueTask<long> TruncateLogsAfterAsync(long afterLogId)
     {
-        long maxLogId = await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () =>
-        {
-            (RaftOperationStatus _, long m) = walAdapter.TruncateLogsAfterAndGetMax(partition.PartitionId, afterLogId);
-            return m;
-        }).ConfigureAwait(false);
+        long maxLogId = await manager.ReadScheduler.EnqueueTask(
+            partition.PartitionId,
+            (walAdapter, partition.PartitionId, afterLogId),
+            static s =>
+            {
+                (RaftOperationStatus _, long m) = s.walAdapter.TruncateLogsAfterAndGetMax(s.PartitionId, s.afterLogId);
+                return m;
+            }).ConfigureAwait(false);
 
         // The truncation removed every WAL entry above afterLogId, so any buffered out-of-order
         // resolution above it now points at an absent entry. Drop them; the leader's contiguous
@@ -1285,9 +1300,11 @@ public sealed class RaftWriteAhead
     public async ValueTask<(RaftOperationStatus Status, bool SuffixTruncated)> InstallSnapshotBoundaryAsync(
         long snapshotIndex, long lastIncludedTerm)
     {
-        return await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () =>
-            walAdapter.InstallSnapshotBoundary(
-                partition.PartitionId, snapshotIndex, lastIncludedTerm, sync: true)
+        return await manager.ReadScheduler.EnqueueTask(
+            partition.PartitionId,
+            (walAdapter, partition.PartitionId, snapshotIndex, lastIncludedTerm),
+            static s => s.walAdapter.InstallSnapshotBoundary(
+                s.PartitionId, s.snapshotIndex, s.lastIncludedTerm, sync: true)
         ).ConfigureAwait(false);
     }
 
@@ -1299,7 +1316,8 @@ public sealed class RaftWriteAhead
     {
         return await manager.ReadScheduler.EnqueueTask(
             partition.PartitionId,
-            () => walAdapter.GetLastCheckpoint(partition.PartitionId)
+            (walAdapter, partition.PartitionId),
+            static s => s.walAdapter.GetLastCheckpoint(s.PartitionId)
         ).ConfigureAwait(false);
     }
 
@@ -1312,7 +1330,11 @@ public sealed class RaftWriteAhead
     /// </returns>
     public async Task<long> GetCurrentTerm()
     {
-        return await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () => walAdapter.GetCurrentTerm(partition.PartitionId));
+        return await manager.ReadScheduler.EnqueueTask(
+            partition.PartitionId,
+            (walAdapter, partition.PartitionId),
+            static s => s.walAdapter.GetCurrentTerm(s.PartitionId)
+        ).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1635,7 +1657,11 @@ public sealed class RaftWriteAhead
     /// </exception>
     public async Task<List<RaftLog>> GetRange(long startLogIndex)
     {
-        return await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () => walAdapter.ReadLogsRange(partition.PartitionId, startLogIndex)).ConfigureAwait(false);
+        return await manager.ReadScheduler.EnqueueTask(
+            partition.PartitionId,
+            (walAdapter, partition.PartitionId, startLogIndex),
+            static s => s.walAdapter.ReadLogsRange(s.PartitionId, s.startLogIndex)
+        ).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1649,7 +1675,8 @@ public sealed class RaftWriteAhead
         // materializing a full RaftLog and its payload just to discard everything but Term.
         return await manager.ReadScheduler.EnqueueTask(
             partition.PartitionId,
-            () => walAdapter.GetTermAt(partition.PartitionId, logIndex)
+            (walAdapter, partition.PartitionId, logIndex),
+            static s => s.walAdapter.GetTermAt(s.PartitionId, s.logIndex)
         ).ConfigureAwait(false);
     }
 
@@ -1673,7 +1700,8 @@ public sealed class RaftWriteAhead
     {
         List<RaftLog> all = await manager.ReadScheduler.EnqueueTask(
             partition.PartitionId,
-            () => walAdapter.ReadLogsRange(partition.PartitionId, startLogIndex, maxEntries)
+            (walAdapter, partition.PartitionId, startLogIndex, maxEntries),
+            static s => s.walAdapter.ReadLogsRange(s.PartitionId, s.startLogIndex, s.maxEntries)
         ).ConfigureAwait(false);
 
         // Filter out any uncommitted entries (proposed/rolled-back) within the bounded batch.
@@ -1706,7 +1734,8 @@ public sealed class RaftWriteAhead
     {
         return await manager.ReadScheduler.EnqueueTask(
             partition.PartitionId,
-            () => walAdapter.ReadLogsRange(partition.PartitionId, startLogIndex, maxEntries)
+            (walAdapter, partition.PartitionId, startLogIndex, maxEntries),
+            static s => s.walAdapter.ReadLogsRange(s.PartitionId, s.startLogIndex, s.maxEntries)
         ).ConfigureAwait(false);
     }
 

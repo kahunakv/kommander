@@ -303,19 +303,22 @@ public class GrpcCommunication : ICommunication
             AppendLogs = appendLogsRequest
         };
 
+        // Static write delegate with the stream holder as explicit state: the previous
+        // `async b => ...` lambda captured `streaming` and allocated a closure per append.
         await FlushCoalesced(
             streaming.Pending,
             streaming.Semaphore,
-            async b =>
+            streaming,
+            static async (s, b) =>
             {
                 try
                 {
-                    await streaming.Streaming.RequestStream.WriteAsync(b);
+                    await s.Streaming.RequestStream.WriteAsync(b);
                 }
                 catch
                 {
                     // Broken stream: flag for recreation on the next GetStreaming.
-                    streaming.MarkFaulted();
+                    s.MarkFaulted();
                     throw;
                 }
             },
@@ -364,10 +367,25 @@ public class GrpcCommunication : ICommunication
     /// path; no caller relies on the <c>AppendLogs</c> return value for delivery confirmation.
     /// </para>
     /// </summary>
-    internal static async Task FlushCoalesced(
+    internal static Task FlushCoalesced(
         ConcurrentQueue<PendingAppendLogs> pending,
         SemaphoreSlim semaphore,
         Func<GrpcBatchRequestsRequest, Task> write,
+        int maxBatch,
+        PendingAppendLogs item) =>
+        FlushCoalesced(pending, semaphore, write, static (w, b) => w(b), maxBatch, item);
+
+    /// <summary>
+    /// State-carried core of <see cref="FlushCoalesced"/>: the write delegate receives
+    /// <paramref name="writeState"/> explicitly so the production caller can pass a static
+    /// (non-capturing) delegate — the closure-per-append the plain overload forces on it was a
+    /// measured per-send allocation. Semantics are identical to the plain overload.
+    /// </summary>
+    internal static async Task FlushCoalesced<TState>(
+        ConcurrentQueue<PendingAppendLogs> pending,
+        SemaphoreSlim semaphore,
+        TState writeState,
+        Func<TState, GrpcBatchRequestsRequest, Task> write,
         int maxBatch,
         PendingAppendLogs item)
     {
@@ -398,7 +416,7 @@ public class GrpcCommunication : ICommunication
                 }
 
                 if (batch.Requests.Count > 0)
-                    await write(batch);
+                    await write(writeState, batch);
             }
             while (!pending.IsEmpty);
         }
@@ -536,7 +554,18 @@ public class GrpcCommunication : ICommunication
         {
             streaming.Semaphore.Release();
         }
-        
+
+        // Return the rented wire children only after WriteAsync completed — the serializer may
+        // read them until then. On a failed write the objects are simply collected (a pool drop
+        // is always safe; a premature return is not).
+        foreach (GrpcBatchRequestsRequestItem sentItem in batchRequests.Requests)
+        {
+            if (sentItem.AppendLogs is not null)
+                GrpcCommunicationPool.Return(sentItem.AppendLogs);
+            else if (sentItem.CompleteAppendLogs is not null)
+                GrpcCommunicationPool.Return(sentItem.CompleteAppendLogs);
+        }
+
         return batchRequestsResponse;
     }
 
@@ -649,20 +678,23 @@ public class GrpcCommunication : ICommunication
                 };
                 return item;
 
+            // The two hot payloads rent their wire children from GrpcCommunicationPool instead of
+            // allocating: BatchRequests (the only production caller) returns them after the frame
+            // write completes, the same after-send rule the dispatcher applies to the managed
+            // DTOs. A direct test caller that never returns the child only forgoes reuse — the
+            // pool tolerates drops.
             case BatchRequestsRequestType.AppendLogs when requestItem.AppendLogs is not null:
             {
-                GrpcAppendLogsRequest appendRequest = new()
-                {
-                    Partition = requestItem.AppendLogs.Partition,
-                    Term = requestItem.AppendLogs.Term,
-                    TimeNode = requestItem.AppendLogs.Time.N,
-                    TimePhysical = requestItem.AppendLogs.Time.L,
-                    TimeCounter = requestItem.AppendLogs.Time.C,
-                    Endpoint = requestItem.AppendLogs.Endpoint,
-                    PrevLogIndex = requestItem.AppendLogs.PrevLogIndex,
-                    PrevLogTerm = requestItem.AppendLogs.PrevLogTerm,
-                    Quiesce = requestItem.AppendLogs.Quiesce
-                };
+                GrpcAppendLogsRequest appendRequest = GrpcCommunicationPool.RentAppendLogsRequest();
+                appendRequest.Partition = requestItem.AppendLogs.Partition;
+                appendRequest.Term = requestItem.AppendLogs.Term;
+                appendRequest.TimeNode = requestItem.AppendLogs.Time.N;
+                appendRequest.TimePhysical = requestItem.AppendLogs.Time.L;
+                appendRequest.TimeCounter = requestItem.AppendLogs.Time.C;
+                appendRequest.Endpoint = requestItem.AppendLogs.Endpoint;
+                appendRequest.PrevLogIndex = requestItem.AppendLogs.PrevLogIndex;
+                appendRequest.PrevLogTerm = requestItem.AppendLogs.PrevLogTerm;
+                appendRequest.Quiesce = requestItem.AppendLogs.Quiesce;
 
                 if (requestItem.AppendLogs.Logs is { Count: > 0 })
                     AddGrpcLogs(appendRequest.Logs, requestItem.AppendLogs);
@@ -672,18 +704,20 @@ public class GrpcCommunication : ICommunication
             }
 
             case BatchRequestsRequestType.CompleteAppendLogs when requestItem.CompleteAppendLogs is not null:
-                item.CompleteAppendLogs = new()
-                {
-                    Partition = requestItem.CompleteAppendLogs.Partition,
-                    Term = requestItem.CompleteAppendLogs.Term,
-                    TimeNode = requestItem.CompleteAppendLogs.Time.N,
-                    TimePhysical = requestItem.CompleteAppendLogs.Time.L,
-                    TimeCounter = requestItem.CompleteAppendLogs.Time.C,
-                    Endpoint = requestItem.CompleteAppendLogs.Endpoint,
-                    Status = (GrpcRaftOperationStatus)requestItem.CompleteAppendLogs.Status,
-                    CommitIndex = requestItem.CompleteAppendLogs.CommitIndex
-                };
+            {
+                GrpcCompleteAppendLogsRequest completeRequest = GrpcCommunicationPool.RentCompleteAppendLogsRequest();
+                completeRequest.Partition = requestItem.CompleteAppendLogs.Partition;
+                completeRequest.Term = requestItem.CompleteAppendLogs.Term;
+                completeRequest.TimeNode = requestItem.CompleteAppendLogs.Time.N;
+                completeRequest.TimePhysical = requestItem.CompleteAppendLogs.Time.L;
+                completeRequest.TimeCounter = requestItem.CompleteAppendLogs.Time.C;
+                completeRequest.Endpoint = requestItem.CompleteAppendLogs.Endpoint;
+                completeRequest.Status = (GrpcRaftOperationStatus)requestItem.CompleteAppendLogs.Status;
+                completeRequest.CommitIndex = requestItem.CompleteAppendLogs.CommitIndex;
+
+                item.CompleteAppendLogs = completeRequest;
                 return item;
+            }
 
             default:
                 return null;
@@ -1117,16 +1151,18 @@ public class GrpcCommunication : ICommunication
     private static void AddGrpcLogs(RepeatedField<GrpcRaftLog> target, AppendLogsRequest request)
     {
         if (request.GrpcLogCache is not null)
-            target.AddRange(request.GrpcLogCache.GetOrCreate(request.Logs!));
-        else
-            target.AddRange(GetLogs(request.Logs!));
-    }
-
-    private static IEnumerable<GrpcRaftLog> GetLogs(List<RaftLog> requestLogs)
-    {
-        foreach (RaftLog requestLog in requestLogs)
         {
-            yield return new()
+            target.AddRange(request.GrpcLogCache.GetOrCreate(request.Logs!));
+            return;
+        }
+
+        // Indexed loop, not an iterator: the previous `yield return` fallback allocated a
+        // compiler state machine per call on top of the per-entry messages.
+        List<RaftLog> requestLogs = request.Logs!;
+        for (int i = 0; i < requestLogs.Count; i++)
+        {
+            RaftLog requestLog = requestLogs[i];
+            target.Add(new GrpcRaftLog
             {
                 Id = requestLog.Id,
                 Term = requestLog.Term,
@@ -1136,7 +1172,7 @@ public class GrpcCommunication : ICommunication
                 TimePhysical = requestLog.Time.L,
                 TimeCounter = requestLog.Time.C,
                 Data = UnsafeByteOperations.UnsafeWrap(requestLog.LogData)
-            };
+            });
         }
-    } 
+    }
 }

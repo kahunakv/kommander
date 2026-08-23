@@ -148,6 +148,16 @@ internal sealed class ReplicationAckProcessor
             long backtracked  = Math.Max(1, Math.Min(currentNext - 1, committedIndex + 1));
             tracker.SetNextIndex(endpoint, backtracked);
 
+            // Anchored-repair note: the reported anchor is the peer's contiguous position, so the
+            // next heartbeat ships an anchored batch from exactly there (SendHeartbeat's mismatch
+            // trigger). This is the only repair driver when the missing range is part of the
+            // leader's UNCOMMITTED inherited tail — the committed-gap backfill triggers all
+            // measure zero in that state (both committed frontiers match), and without a driver a
+            // new leader's promotion barrier that landed above the peer's gap can never gather
+            // quorum under the over-gap ack gate. Paced through the heartbeat, never inline.
+            if (coreState.NodeState == RaftNodeState.Leader && committedIndex >= 0)
+                tracker.RecordMismatchAnchor(endpoint, committedIndex);
+
             logger.LogDebugBacktrackingNextIndex(
                 host.LocalEndpoint,
                 host.PartitionId,

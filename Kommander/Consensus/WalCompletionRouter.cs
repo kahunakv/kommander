@@ -727,12 +727,46 @@ internal sealed class WalCompletionRouter
             wal.NotifyCommitted();
         }
 
+        // ── Quorum-integrity gate (the §5.4.1 dual) ──────────────────────────────────────
+        // The leader counts a Success ack toward propose quorum (ReplicationAckProcessor →
+        // proposal.MarkNodeCompleted) with no further proof, while election freshness advertises
+        // only the CONTIGUOUS presence frontier. An entry this node persisted ABOVE a gap (the
+        // unanchored live-propose broadcast writes over gaps by design) is therefore one this
+        // node can never defend in an election: a candidate without the entry out-advertises this
+        // node, wins the term, and overwrites the entry that this ack helped commit — while the
+        // old leader has already applied it (the Scenario09 applied-prefix hole). A batch that is
+        // not contiguously grounded must NOT ack Success: report LogMismatch with the presence
+        // frontier instead, which keeps the ack out of quorum accounting AND anchors the leader's
+        // backfill at exactly the gap. The buffered entries stay in the WAL; once backfill fills
+        // the gap, the proposal retry's duplicate re-ack (gated the same way in
+        // FollowerAppendHandler) supplies the quorum ack that this one withheld.
+        RaftOperationStatus ackStatus = completion.Status;
+        long ackIndex = committedIndex;
+        if (completion.Status == RaftOperationStatus.Success && pending.Logs is { Count: > 0 })
+        {
+            long maxBatchId = -1;
+            foreach (RaftLog log in pending.Logs)
+            {
+                if (log.Id > maxBatchId)
+                    maxBatchId = log.Id;
+            }
+
+            long presentIndex = wal.GetPresentIndex();
+            if (presentIndex >= 0 && maxBatchId > presentIndex)
+            {
+                logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Withholding Success ack for batch through {MaxBatchId}: presence frontier {PresentIndex} does not cover it (batch landed over a gap) — reporting LogMismatch so the leader backfills.",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, maxBatchId, presentIndex);
+                ackStatus = RaftOperationStatus.LogMismatch;
+                ackIndex = presentIndex;
+            }
+        }
+
         if (!string.IsNullOrEmpty(endpoint))
         {
             host.EnqueueResponse(endpoint, new(
                 RaftResponderRequestType.CompleteAppendLogs,
                 new(endpoint),
-                new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, completion.Status, committedIndex)
+                new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, ackStatus, ackIndex)
             ));
         }
 

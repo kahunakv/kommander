@@ -41,6 +41,19 @@ public interface IRaftReadScheduler
     Task<T> EnqueueTask<T>(int partitionId, Func<T> operation);
 
     /// <summary>
+    /// State-carried variant of <see cref="EnqueueTask{T}"/> for hot paths: the caller passes its
+    /// inputs through <paramref name="state"/> and a <b>static</b> (non-capturing) delegate, so
+    /// the call site allocates no closure. Semantics (fairness, FIFO order, backpressure, faults)
+    /// are identical to <see cref="EnqueueTask{T}"/>.
+    /// <para>The default implementation forwards through a capturing closure — correct for stub
+    /// schedulers; <see cref="FairReadScheduler"/> overrides it with an allocation-lean queue item.</para>
+    /// </summary>
+    /// <typeparam name="TState">Caller-supplied state passed to the delegate unchanged.</typeparam>
+    /// <typeparam name="T">The return type of the read operation.</typeparam>
+    Task<T> EnqueueTask<TState, T>(int partitionId, TState state, Func<TState, T> operation) =>
+        EnqueueTask(partitionId, () => operation(state));
+
+    /// <summary>
     /// Submits a point-read operation that the scheduler MAY coalesce with other pending
     /// operations sharing the same <paramref name="executor"/> instance into a single
     /// <see cref="IReadBatchExecutor{TArg,T}.ExecuteBatch"/> call (e.g. one RocksDB

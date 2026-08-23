@@ -91,6 +91,21 @@ internal sealed class ReplicationTracker
     /// </summary>
     private readonly Dictionary<string, long> regressedFrontiers = [];
 
+    /// <summary>
+    /// Per-peer anchored-repair notes recorded when a peer answers an append with
+    /// <see cref="Kommander.Data.RaftOperationStatus.LogMismatch"/>. The note carries the anchor the
+    /// peer reported (its contiguous position — the presence frontier under the over-gap ack gate,
+    /// or its raw max on a genuine divergence), and the next heartbeat acts on it with an anchored
+    /// backfill batch from exactly that position. This is the only repair driver for a peer whose
+    /// COMMITTED frontier matches the leader's while its log is missing part of the leader's
+    /// uncommitted (inherited prior-term) tail — the committed-gap triggers all measure zero there,
+    /// so without this note a new leader whose promotion barrier lands above such a gap can never
+    /// commit the barrier (the post-heal wedge behind the over-gap ack gate). Same paced,
+    /// take-once discipline as <see cref="regressedFrontiers"/>: acting inline on every ack is the
+    /// shape that livelocked before.
+    /// </summary>
+    private readonly Dictionary<string, long> mismatchAnchors = [];
+
     public ReplicationTracker(IRaftPartitionHost host) => this.host = host;
 
     // ── bulk resets ───────────────────────────────────────────────────────────────────────────
@@ -108,6 +123,7 @@ internal sealed class ReplicationTracker
         nextIndex.Clear();
         matchIndex.Clear();
         regressedFrontiers.Clear();
+        mismatchAnchors.Clear();
     }
 
     /// <summary>
@@ -121,6 +137,7 @@ internal sealed class ReplicationTracker
         nextIndex.Clear();
         matchIndex.Clear();
         regressedFrontiers.Clear();
+        mismatchAnchors.Clear();
     }
 
     /// <summary>
@@ -268,6 +285,25 @@ internal sealed class ReplicationTracker
     public void RecordRegressedFrontier(string endpoint, long value) => regressedFrontiers[endpoint] = value;
 
     public void ClearRegressedFrontier(string endpoint) => regressedFrontiers.Remove(endpoint);
+
+    // ── anchored-repair notes (LogMismatch) ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Takes and clears any anchored-repair note for <paramref name="endpoint"/> (see
+    /// <see cref="mismatchAnchors"/>). Take-once: a peer that is still mismatched re-records the
+    /// note on its next rejection, so the heartbeat never spins on a stale note.
+    /// </summary>
+    public bool TryTakeMismatchAnchor(string endpoint, out long value)
+    {
+        if (!mismatchAnchors.TryGetValue(endpoint, out value))
+            return false;
+
+        mismatchAnchors.Remove(endpoint);
+        return true;
+    }
+
+    /// <summary>Records the anchor a peer reported with a LogMismatch rejection (see <see cref="mismatchAnchors"/>).</summary>
+    public void RecordMismatchAnchor(string endpoint, long value) => mismatchAnchors[endpoint] = value;
 
     // ── saturation back-off ───────────────────────────────────────────────────────────────────
 

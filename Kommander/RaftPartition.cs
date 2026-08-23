@@ -656,9 +656,16 @@ public sealed class RaftPartition : IDisposable
     /// afterwards is linearizable; every non-success outcome (not leader, quorum timeout,
     /// admission-control rejection, restore in progress) maps to <see langword="false"/> so the
     /// caller retries or redirects, mirroring the write path.
+    /// <para>Fast path: a leadership lease published within the last heartbeat interval (with the
+    /// applied frontier caught up) confirms synchronously without touching the executor queue —
+    /// the async machinery then completes with the runtime's cached <c>true</c> task, so a hit
+    /// allocates nothing. A miss falls through to the full executor round; it never fails early.</para>
     /// </summary>
     public async Task<bool> ConfirmLeadershipAsync(CancellationToken cancellationToken = default)
     {
+        if (stateMachine.TryConfirmLeadershipFast())
+            return true;
+
         RaftResponse response = await executor.Ask(ConfirmLeadershipRequest, cancellationToken).ConfigureAwait(false);
         return response.Status == RaftOperationStatus.Success;
     }

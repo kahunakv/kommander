@@ -354,13 +354,28 @@ internal sealed class FollowerAppendHandler
             }
 
             long durableMax = await wal.GetMaxLogAsync().ConfigureAwait(false);
-            if (durableMax >= alreadyHeldMax)
+            long presentIndexAtReack = wal.GetPresentIndex();
+            if (durableMax >= alreadyHeldMax && (presentIndexAtReack < 0 || presentIndexAtReack >= alreadyHeldMax))
             {
                 host.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs,
                     new(endpoint),
                     new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.Success,
                         host.Configuration.WalSingleFsyncCommit ? wal.GetCommitIndex() : -1)
+                ));
+            }
+            else if (durableMax >= alreadyHeldMax)
+            {
+                // Held above a gap: durable but not contiguously grounded. Same quorum-integrity
+                // gate as the completion ack in CompleteFollowerAppend — a Success re-ack here
+                // would count toward quorum for entries this node cannot defend in an election
+                // (freshness advertises only the contiguous presence frontier). Report LogMismatch
+                // anchored at the presence frontier so the leader backfills the gap; the retry
+                // after that repair re-acks Success through the branch above.
+                host.EnqueueResponse(endpoint, new(
+                    RaftResponderRequestType.CompleteAppendLogs,
+                    new(endpoint),
+                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, presentIndexAtReack)
                 ));
             }
 

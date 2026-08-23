@@ -187,6 +187,14 @@ internal sealed class HeartbeatDriver
             // frontier), the snapshot fallback below takes over.
             bool regressed = tracker.TryTakeRegressedFrontier(node.Endpoint, out long regressedFrontier);
 
+            // Anchored-repair note (paced, take-once): this peer rejected an append with
+            // LogMismatch, reporting its contiguous anchor. Repair it here with an anchored batch
+            // from exactly that anchor. Committed-gap triggers cannot see this state when the
+            // missing range is the leader's uncommitted inherited tail (both committed frontiers
+            // match), so this note is the only driver that un-wedges a promotion whose barrier
+            // landed above the peer's gap (the over-gap ack gate wedge).
+            bool mismatchNote = tracker.TryTakeMismatchAnchor(node.Endpoint, out long mismatchAnchor);
+
             // BackfillEnabled short-circuits ALL three triggers. BackfillThreshold gates only the
             // first, so a consumer that raised it to int.MaxValue meaning "off" still got backfill
             // from idleTailGap the moment writes paused — the inverse of what an idle node needs.
@@ -194,8 +202,8 @@ internal sealed class HeartbeatDriver
             // no repeated, always-discarded partition-state exports for a peer nobody is catching up.
             bool willBackfill = coreState.NodeState == RaftNodeState.Leader
                 && host.Configuration.BackfillEnabled
-                && coreState.LocalCommittedIndex >= 0
-                && (followerGap > host.Configuration.BackfillThreshold || idleTailGap || regressed);
+                && (coreState.LocalCommittedIndex >= 0 || mismatchNote)
+                && (followerGap > host.Configuration.BackfillThreshold || idleTailGap || regressed || mismatchNote);
 
             // DIAGNOSTIC (the numbered findings live in the Jepsen harness
             // repository at ~/kommander-jepsen/FINDINGS.md, not in this one): records every input to
@@ -209,10 +217,20 @@ internal sealed class HeartbeatDriver
 
             if (willBackfill)
             {
-                long anchorFrom = regressed ? regressedFrontier : effectiveFloor;
+                // The mismatch note's anchor is only trustworthy as an UPPER bound: the over-gap
+                // ack gate and the hole-repair rejection report the peer's contiguous position,
+                // but a legacy LogMismatch (follower-behind, term divergence) reports its RAW max
+                // log, which sits above any stalled frontier — anchoring there ships nothing and
+                // strands the peer (the TestAckFrontierSemantics shape). Clamp to the peer's
+                // recorded commit-frontier self-report when one exists; anchoring low only costs
+                // redundant idempotent entries, anchoring high costs the repair.
+                long mismatchRepairAnchor = frontierKnown && followerMaxLog >= 0
+                    ? Math.Min(mismatchAnchor, followerMaxLog)
+                    : mismatchAnchor;
+                long anchorFrom = regressed ? regressedFrontier : mismatchNote ? mismatchRepairAnchor : effectiveFloor;
                 backfillRound ??= new();
                 BackfillSendResult backfillResult = await sender.TrySendBackfillBatchAsync(
-                    node, anchorFrom, coreState.LastHeartbeat, anchorToFollowerFrontier: regressed, round: backfillRound).ConfigureAwait(false);
+                    node, anchorFrom, coreState.LastHeartbeat, anchorToFollowerFrontier: regressed || mismatchNote, round: backfillRound).ConfigureAwait(false);
                 if (backfillResult == BackfillSendResult.Sent)
                     continue;
 

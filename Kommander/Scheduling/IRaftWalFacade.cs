@@ -121,6 +121,19 @@ public interface IRaftWalFacade
         => ValueTask.CompletedTask;
 
     /// <summary>
+    /// Advances the in-memory contiguous commit frontier over an entry the consensus layer has
+    /// PROVEN committed but whose durable marker has not landed yet — the Raft §5.4.2 inherited
+    /// prior-term entry that the promotion/commit drain delivers before its lazy re-commit marker
+    /// is enqueued. Without this, the applied cursor leads the advertised commit frontier for the
+    /// whole delivery window (and indefinitely if the batched re-commit enqueue fails), which
+    /// reads as a commit-below-applied inversion to external observers. The durable marker still
+    /// rides the batched re-commit; a failed enqueue leaves the row Proposed, which the restore
+    /// reconstruction and the as-stored backfill both tolerate. Default no-op for facades that do
+    /// not track frontiers (test stubs).
+    /// </summary>
+    void MarkInheritedCommitted(long id) { }
+
+    /// <summary>
     /// Seeds the in-memory commit/propose frontier to a freshly installed snapshot boundary so
     /// <see cref="GetCommitIndex"/> reflects the compacted prefix as committed rather than an unfilled gap.
     /// <paramref name="snapshotTerm"/> carries the boundary's last-included term so the presence

@@ -40,16 +40,65 @@ internal sealed class RaftPartitionCoreState
     /// The raw role of this node. Kept as a property over a volatile field so that all the
     /// existing transition sites publish the new role to off-thread readers automatically — do not
     /// reintroduce a plain field here.
+    /// <para>Any assignment to a non-Leader role also kills the published leadership lease
+    /// (<see cref="LeadershipLease"/>) before the role is published, so every demotion path
+    /// invalidates the off-thread confirmation fast path structurally — no per-site call needed.</para>
     /// </summary>
     public RaftNodeState NodeState
     {
         get => (RaftNodeState)nodeStateValue;
-        set => nodeStateValue = (int)value;
+        set
+        {
+            if (value != RaftNodeState.Leader)
+                leadershipLease = null;
+            nodeStateValue = (int)value;
+        }
     }
 
+    /// <summary>Backing store for <see cref="CurrentTerm"/>. Plain (non-volatile) because only the
+    /// executor's single-writer thread reads or writes the term; off-thread readers must never
+    /// consume it directly (they read the lease, whose lifecycle the setter controls).</summary>
+    private long currentTermValue;
+
     /// <summary>Current Raft term. Persisted through the WAL hard state; see
-    /// <c>CompleteRestoreAsync</c> for why the log tail alone is not authoritative.</summary>
-    public long CurrentTerm;
+    /// <c>CompleteRestoreAsync</c> for why the log tail alone is not authoritative.
+    /// <para>A property so every term change also kills the published leadership lease
+    /// (<see cref="LeadershipLease"/>): a term change is exactly the event that makes a cached
+    /// confirmation stale, and routing it through the setter covers every adoption path —
+    /// including follower-side adoptions that never call <c>FailAllActiveProposalWaiters</c>.</para>
+    /// </summary>
+    public long CurrentTerm
+    {
+        get => currentTermValue;
+        set
+        {
+            if (currentTermValue == value)
+                return;
+            leadershipLease = null;
+            currentTermValue = value;
+        }
+    }
+
+    /// <summary>
+    /// The published leadership-confirmation lease, or <see langword="null"/> when none is live.
+    /// Written only by the executor thread; read from arbitrary threads. Immutable snapshot behind
+    /// a volatile reference so an off-thread reader never observes a torn (term, ticks) pair.
+    /// Invalidated structurally by the <see cref="NodeState"/> and <see cref="CurrentTerm"/>
+    /// setters, and explicitly by <c>ReadIndexCoordinator.FailAllWaiters</c> /
+    /// <c>ResetForNewLeadership</c>. Freshness (heartbeat-interval window) is the reader's check.
+    /// </summary>
+    private volatile LeadershipLease? leadershipLease;
+
+    /// <summary>Reads the current leadership lease snapshot (may be <see langword="null"/>).</summary>
+    public LeadershipLease? LeadershipLease => leadershipLease;
+
+    /// <summary>Publishes a fresh leadership lease. Executor thread only; called from the
+    /// read-index quorum confirmation, which is the only event that proves leadership.</summary>
+    public void PublishLeadershipLease(long term, long confirmedTicks) =>
+        leadershipLease = new(term, confirmedTicks);
+
+    /// <summary>Kills the published lease. Idempotent; safe to call from any demotion/reset path.</summary>
+    public void InvalidateLeadershipLease() => leadershipLease = null;
 
     /// <summary>
     /// Set once the WAL restore has completed. Guards <c>CompleteRestoreAsync</c> against a second
@@ -111,8 +160,16 @@ internal sealed class RaftPartitionCoreState
     /// a follower gap warrants backfill. Intentionally excludes in-flight proposed-but-uncommitted
     /// entries so healthy followers don't trigger spurious WAL reads under write load.
     /// Reset to -1 on every leader→follower transition.
+    /// <para>Volatile-backed (like <see cref="NodeState"/>) because the leadership-lease fast path
+    /// reads it off-thread; the executor thread stays the only writer.</para>
     /// </summary>
-    public long LocalCommittedIndex = -1;
+    public long LocalCommittedIndex
+    {
+        get => Volatile.Read(ref localCommittedIndexValue);
+        set => Volatile.Write(ref localCommittedIndexValue, value);
+    }
+
+    private long localCommittedIndexValue = -1;
 
     /// <summary>
     /// The committed frontier captured at the moment this node became leader — the boundary between
@@ -143,8 +200,19 @@ internal sealed class RaftPartitionCoreState
     /// of a WAL range-read so that every committed entry between the current cursor
     /// and the commit frontier is delivered to the consumer before the partition is
     /// advertised as the serving leader — a no-op for entries already applied during restore.</para>
+    ///
+    /// <para>Volatile-backed (like <see cref="NodeState"/>) because the leadership-lease fast path
+    /// reads it off-thread; the executor thread stays the only writer. The lease fast path must
+    /// read <see cref="LocalCommittedIndex"/> BEFORE this — commit-index monotonicity is what makes
+    /// that order the safe one.</para>
     /// </summary>
-    public long LastAppliedIndex = -1;
+    public long LastAppliedIndex
+    {
+        get => Volatile.Read(ref lastAppliedIndexValue);
+        set => Volatile.Write(ref lastAppliedIndexValue, value);
+    }
+
+    private long lastAppliedIndexValue = -1;
 
     /// <summary>
     /// Ticket of the in-flight promotion-barrier no-op, or <see cref="HLCTimestamp.Zero"/> when no

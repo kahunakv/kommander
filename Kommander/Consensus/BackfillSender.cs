@@ -176,7 +176,19 @@ internal sealed class BackfillSender
             return BackfillSendResult.Sent;
         }
 
-        List<RaftLog> backfill = await wal.GetRangeAsync(from, host.Configuration.MaxBackfillEntriesPerRound).ConfigureAwait(false);
+        // Read the log AS STORED (all row types), not just committed rows. Classic AppendEntries
+        // ships any entry from the leader's log and signals commitment separately; here the row
+        // types themselves are the commit signal, and shipping a Proposed or RolledBack row simply
+        // reproduces the leader's bookkeeping on the follower (the planner has an arm for every
+        // type). Filtering to committed rows made the leader's uncommitted inherited tail
+        // unshippable, which deadlocked promotions under the over-gap ack gate: the barrier could
+        // not commit until the followers' gaps were filled, and the gap rows could not ship until
+        // the barrier's commit re-committed them. It also mis-routed the "Proposed run at the
+        // anchor" case into the snapshot fallback. Quorum integrity is unaffected: backfill acks
+        // carry the backfill timestamp, never a proposal ticket, so a shipped Proposed row still
+        // gains quorum credit only through the proposal-retry re-ack (gated on contiguous
+        // presence).
+        List<RaftLog> backfill = await wal.GetRangeAllTypesAsync(from, host.Configuration.MaxBackfillEntriesPerRound).ConfigureAwait(false);
 
         if (backfill.Count == 0)
         {
@@ -191,14 +203,12 @@ internal sealed class BackfillSender
         // entries IMMEDIATELY follow the anchor. The read came back with a first id ABOVE `from`,
         // so no committed entry exists at the anchor — shipping it anchored at from-1 would land it
         // over the follower's gap, advance nothing, and repeat forever with no error anywhere (the
-        // observed Jepsen wedge). Two causes produce this identical batch shape and the guard cannot
-        // tell them apart: a Proposed run starting exactly at `from` (an inherited range whose
-        // commit markers were lost and not yet re-committed — repaired by the inherited-tail
-        // re-commit in DrainInheritedAppliesAsync), or a compaction floor above the anchor (the peer
-        // is below the floor and only a snapshot can seed it). The reported message must not claim
-        // one over the other; it carries the anchor, the first id, and the last checkpoint so a
-        // reader can tell. Refuse to ship: NonContiguous deliberately routes the heartbeat path to
-        // its snapshot fallback.
+        // observed Jepsen wedge). With the all-types read above, a Proposed run at the anchor now
+        // ships instead of tripping this guard; the remaining cause is a row genuinely absent at
+        // `from` — a compaction floor above the anchor (the peer is below the floor and only a
+        // snapshot can seed it), or a truncated hole. The reported message carries the anchor, the
+        // first id, and the last checkpoint so a reader can tell. Refuse to ship: NonContiguous
+        // deliberately routes the heartbeat path to its snapshot fallback.
         //
         // The condition must stay visible, but "never suppress" was previously implemented as "warn
         // on every heartbeat forever", which buries the signal where the repair never lands.

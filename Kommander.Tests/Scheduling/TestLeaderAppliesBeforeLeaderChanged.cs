@@ -55,6 +55,9 @@ public class TestLeaderAppliesBeforeLeaderChanged
         /// <summary>Ordered log of event labels produced by the callbacks.</summary>
         public List<string> EventLog { get; } = [];
 
+        /// <summary>The exact <see cref="RaftLog"/> instances handed to the consumer callback, in order.</summary>
+        public List<RaftLog> DeliveredLogs { get; } = [];
+
         public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;
         public HLCTimestamp GetLastNodeActivity(string ep, int p) => HLCTimestamp.Zero;
         public HLCTimestamp GetLastNodeHearthbeat(string ep, int p) => HLCTimestamp.Zero;
@@ -73,6 +76,7 @@ public class TestLeaderAppliesBeforeLeaderChanged
         public Task<bool> InvokeReplicationReceived(int p, RaftLog log)
         {
             EventLog.Add($"Applied:{log.Id}");
+            DeliveredLogs.Add(log);
             return Task.FromResult(true);
         }
 
@@ -592,6 +596,49 @@ public class TestLeaderAppliesBeforeLeaderChanged
         Assert.Equal(1, host.EventLog.Count(e => e == "Applied:1"));
         Assert.Equal(1, host.EventLog.Count(e => e == "Applied:2"));
         Assert.Equal(1, host.EventLog.Count(e => e == "Applied:3"));
+    }
+
+    /// <summary>
+    /// Regression for the Scenario09 applied-prefix divergence: the inherited drain used to hand the consumer the
+    /// raw WAL instance, whose <see cref="RaftLog.Type"/> still read <c>Proposed</c>, while peers
+    /// that received the same entry through the commit broadcast observed <c>Committed</c>. The
+    /// consumer must only ever see <c>Committed</c>, and the WAL instance must stay untouched so
+    /// the durable re-commit still finds it <c>Proposed</c>.
+    /// </summary>
+    [Fact]
+    public async Task PromotedLeader_InheritedEntries_DeliveredAsCommitted_WithoutMutatingWalInstance()
+    {
+        CallbackWalFacade wal = new();
+        wal.InheritedProposed.AddRange([
+            new() { Id = 1, Term = 0, Type = RaftLogType.Proposed, LogType = "t" },
+            new() { Id = 2, Term = 0, Type = RaftLogType.Proposed, LogType = "t" },
+        ]);
+
+        OrderRecordingHost host = new() { NodesOverride = [] };
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+
+        List<RaftLog> logs = [new() { Id = 3, Term = 1, LogType = "t" }];
+        sm.ReplicateLogs(logs, autoCommit: false, replyCorrelationId: 1);
+        await sm.CompleteWalOperationAsync(MakeProposeCompletion(host.PartitionId, logIndex: 3));
+
+        (_, RaftResponse proposeReply) = Assert.Single(sink.Completed, r => r.Id == 1);
+        await sm.CommitLogsAsync(proposeReply.TicketId, replyCorrelationId: 2);
+        await sm.CompleteWalOperationAsync(MakeCommitCompletion(host.PartitionId, minLogIndex: 3, maxLogIndex: 3));
+
+        // Every delivered entry, inherited ones included, must carry Type=Committed. The drain
+        // delivers BEFORE the durable re-commit enqueue stamps the WAL instances, so without the
+        // normalized copy the consumer would observe Proposed here (the Scenario09 divergence).
+        Assert.All(host.DeliveredLogs, l => Assert.Equal(RaftLogType.Committed, l.Type));
+        Assert.Contains(host.DeliveredLogs, l => l.Id == 1);
+        Assert.Contains(host.DeliveredLogs, l => l.Id == 2);
+
+        // The delivered objects must be copies: the drain itself must not stamp the WAL
+        // instances — EnqueueCommit (the durable re-commit) is the single authority that does.
+        Assert.All(host.DeliveredLogs.Where(l => l.Id is 1 or 2),
+            l => Assert.DoesNotContain(wal.InheritedProposed, w => ReferenceEquals(w, l)));
     }
 
     /// <summary>

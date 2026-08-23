@@ -54,7 +54,16 @@ public static class GrpcCommunicationPool
 
     public static void Return(GrpcAppendLogsRequest obj)
     {
+        // Reset EVERY field, not only the conditionally-set ones: pool safety must not depend on
+        // every renter overwriting every scalar before send. (Protobuf string fields reject null —
+        // empty string is the wire default.)
         obj.Logs.Clear();
+        obj.Partition = 0;
+        obj.Term = 0;
+        obj.TimeNode = 0;
+        obj.TimePhysical = 0;
+        obj.TimeCounter = 0;
+        obj.Endpoint = "";
         obj.PrevLogIndex = 0;
         obj.PrevLogTerm = 0;
         obj.Quiesce = false;
@@ -82,6 +91,17 @@ public static class GrpcCommunicationPool
 
     public static void Return(GrpcCompleteAppendLogsRequest obj)
     {
+        // Full scalar reset for the same reason as the AppendLogs overload: previously this
+        // relied on every caller assigning every field before send.
+        obj.Partition = 0;
+        obj.Term = 0;
+        obj.TimeNode = 0;
+        obj.TimePhysical = 0;
+        obj.TimeCounter = 0;
+        obj.Endpoint = "";
+        obj.Status = default;
+        obj.CommitIndex = 0;
+
         if (Interlocked.Increment(ref _completeAppendLogsCount) <= MaxRetained)
         {
             _completeAppendLogsPool.Enqueue(obj);

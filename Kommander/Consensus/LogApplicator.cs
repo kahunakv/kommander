@@ -211,6 +211,15 @@ internal sealed class LogApplicator
     /// Proposed entries (whose lazy-commit markers may be absent after a crash on the
     /// single-fsync fast path) are visible.</para>
     ///
+    /// <para><b>Delivery contract:</b> consumers only ever observe entries with
+    /// <see cref="RaftLogType.Committed"/>. An inherited prior-term entry whose WAL record still
+    /// reads Proposed is delivered as a normalized <b>copy</b> with the type rewritten to
+    /// Committed: delivering the raw WAL instance leaks internal commit bookkeeping and makes the
+    /// applied metadata differ from nodes that received the same entry through the commit
+    /// broadcast. The drain never stamps the WAL instance itself — the durable re-commit enqueue
+    /// (<see cref="EnqueueInheritedRecommitMarkers"/> → <c>EnqueueCommit</c>) is the single
+    /// authority that stamps final types.</para>
+    ///
     /// <para><b>Gap contract:</b> returns <see cref="InheritedDrainStatus.Hole"/> when an id in the
     /// range is absent above the snapshot floor — a WAL hole. Advancing over it (the old behavior)
     /// would silently skip entries that may be committed elsewhere and mark them applied forever,
@@ -284,9 +293,16 @@ internal sealed class LogApplicator
                 // Advancing over a prior-term Proposed entry commits it (Raft §5.4.2: the
                 // current-term commit above it proves the prefix); record it for the durable
                 // re-commit. Includes prior-term barrier no-ops — never delivered, but the durable
-                // frontier must still pass them.
+                // frontier must still pass them. The in-memory frontier advances HERE, at the
+                // proof point: waiting for the batched re-commit enqueue at drain exit leaves the
+                // applied cursor ahead of the advertised commit frontier for the whole delivery
+                // window (a confirmed commit-below-applied inversion to the chaos oracle under
+                // load), and permanently if that enqueue hits backpressure.
                 if (log.Type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
+                {
                     (recommit ??= []).Add(log);
+                    wal.MarkInheritedCommitted(log.Id);
+                }
 
                 // Apply committed entries and inherited Proposed entries (prior term only).
                 // Skip current-term Proposed entries — they are in-flight proposals.
@@ -299,22 +315,33 @@ internal sealed class LogApplicator
                 // Exactly-once: only deliver entries past the applied frontier (the cursor advances below).
                 if (deliver && log.Id > coreState.LastAppliedIndex)
                 {
+                    // Consumers must only ever observe Committed entries. An inherited prior-term
+                    // entry is committed by this drain (§5.4.2), but its WAL record still reads
+                    // Proposed until the durable re-commit lands; delivering the WAL instance as-is
+                    // leaks that internal state — nodes that receive the same entry through the
+                    // commit broadcast observe Committed, so per-node applied metadata diverges
+                    // (the Scenario09 applied-prefix divergence). Deliver a normalized copy; the
+                    // WAL instance is stamped only by the durable re-commit enqueue, not here.
+                    RaftLog delivery = log.Type == RaftLogType.Proposed
+                        ? new RaftLog { Id = log.Id, Type = RaftLogType.Committed, Term = log.Term, Time = log.Time, LogType = log.LogType, LogData = log.LogData }
+                        : log;
+
                     try
                     {
                         bool ok;
                         if (host.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType)
-                            ok = await host.InvokeSystemReplicationReceived(host.PartitionId, log).ConfigureAwait(false);
+                            ok = await host.InvokeSystemReplicationReceived(host.PartitionId, delivery).ConfigureAwait(false);
                         else
-                            ok = await host.InvokeReplicationReceived(host.PartitionId, log).ConfigureAwait(false);
+                            ok = await host.InvokeReplicationReceived(host.PartitionId, delivery).ConfigureAwait(false);
 
                         if (!ok)
-                            host.InvokeReplicationError(host.PartitionId, log);
+                            host.InvokeReplicationError(host.PartitionId, delivery);
                     }
                     catch (Exception ex)
                     {
                         logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Consumer threw during inherited-entry apply of log {LogId}: {Message}\n{Stacktrace}",
                             host.LocalEndpoint, host.PartitionId, coreState.NodeState, log.Id, ex.Message, ex.StackTrace);
-                        host.InvokeReplicationError(host.PartitionId, log);
+                        host.InvokeReplicationError(host.PartitionId, delivery);
                     }
                 }
 

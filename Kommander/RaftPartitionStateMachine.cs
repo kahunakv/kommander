@@ -158,6 +158,43 @@ public sealed class RaftPartitionStateMachine
     public long CurrentTerm => coreState.CurrentTerm;
 
     /// <summary>
+    /// Off-thread leadership-confirmation fast path. Returns <see langword="true"/> when a
+    /// published lease proves this node confirmed leadership within the last heartbeat interval
+    /// AND the applied frontier covers the commit frontier — the same two halves the executor-side
+    /// confirmation enforces, so a caller may treat a hit exactly like a completed
+    /// <c>ConfirmLeadership</c> round. A miss means nothing: the caller must fall through to the
+    /// executor path, never fail.
+    /// <para><b>Thread safety.</b> Reads only volatile-published state: the lease reference,
+    /// <see cref="RaftPartitionCoreState.NodeState"/>, <see cref="IRaftPartitionHost.Leader"/>, and
+    /// the volatile commit/apply frontiers. Every demotion or term change kills the lease on the
+    /// executor thread before or with the transition (see <see cref="RaftPartitionCoreState"/>),
+    /// and the heartbeat-interval window bounds the residual race exactly as it bounds the
+    /// executor-side fast path (pre-vote leader stickiness; see <c>ReadIndexCoordinator</c>).</para>
+    /// <para><b>Read order matters:</b> the commit frontier is read BEFORE the applied frontier.
+    /// The commit index is monotonic, so <c>applied &gt;= committed</c> under that order proves
+    /// every entry acknowledged before this call is applied; the reverse order could miss one.</para>
+    /// </summary>
+    internal bool TryConfirmLeadershipFast()
+    {
+        Consensus.LeadershipLease? lease = coreState.LeadershipLease;
+        if (lease is null)
+            return false;
+
+        // Published-leader gate: while the promotion barrier is armed NodeState is Leader but the
+        // leader is unpublished, and a confirmation must not leak through (same guard as the
+        // executor path).
+        if (coreState.NodeState != RaftNodeState.Leader || host.Leader != host.LocalEndpoint)
+            return false;
+
+        if (RaftMonotonic.Elapsed(lease.ConfirmedTicks, host.GetMonotonicTimestamp()) >= host.Configuration.HeartbeatInterval)
+            return false;
+
+        long committed = coreState.LocalCommittedIndex;
+        long applied = coreState.LastAppliedIndex;
+        return applied >= committed;
+    }
+
+    /// <summary>
     /// Test-only: snapshots this partition's consensus state into an immutable <see cref="RaftPartitionView"/>.
     /// Runs on the executor's single-writer thread (dispatched via <see cref="RaftRequestType.GetPartitionView"/>),
     /// so all mutable fields are read consistently and never observed torn by a polling thread. The WAL max
@@ -1082,6 +1119,15 @@ public sealed class RaftPartitionStateMachine
         tracker.ClearAll();
         coreState.LocalCommittedIndex = -1;
         proposals.ClearWithoutFailingWaiters();
+
+        // A step-down notice is a leadership-loss transition like any other: read-index waiters
+        // and the confirmation fast path must die with it. The other demotion paths get this via
+        // FailAllActiveProposalWaiters; this path deliberately keeps proposals alive
+        // (ClearWithoutFailingWaiters), so the read-index half is invoked directly. Without it,
+        // an equal-term notice (Math.Max no-op below the term fence) would leave parked waiters
+        // to die by timeout instead of failing fast.
+        readIndex.FailAllWaiters();
+
         coreState.LastHeartbeat = HLCTimestamp.Zero;
         coreState.LastHeartbeatTicks = 0;
 

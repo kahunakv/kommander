@@ -17,17 +17,6 @@ namespace Kommander.Tests.Chaos.Scenarios;
 [Trait("Category", "ChaosSoak")]
 public class Scenario09_PauseSlowSoak
 {
-    // SKIPPED: the continuous StateMachineSafety oracle trips a PRE-EXISTING applied-prefix
-    // divergence within seconds of the first pause/slow cycles (seeds 11001/11002 reproduce on an
-    // unmodified Kommander tree; the run-H orphaned-reply fix neither causes nor cures it). Same
-    // deferred commit-model family as the Scenario04/06 skips and TestChaosRandomized.BlockedReason.
-    // Tracked as Vorpal feature 84c75177-4f4d-4db5-8b72-f19b90cf5c21 — un-skip when it lands.
-    // The run-H stall itself stays covered by Scenario08_PausedLeaderResume and the no-orphan
-    // regressions in TestWalCompletionFences.
-    private const string BlockedReason =
-        "Surfaces a pre-existing applied-prefix divergence under pause/slow cycles (Vorpal feature " +
-        "84c75177-4f4d-4db5-8b72-f19b90cf5c21). Un-skip when the divergence is fixed.";
-
     public static IEnumerable<object[]> Seeds()
     {
         // (seed, basePort, quiescence): quiescence=true mirrors the production default.
@@ -37,7 +26,7 @@ public class Scenario09_PauseSlowSoak
         yield return [11004, 8830, true];
     }
 
-    [Theory(Skip = BlockedReason)]
+    [Theory]
     [MemberData(nameof(Seeds))]
     public async Task PauseSlowCycles_EveryPartitionServesAfterEveryHeal(int seed, int basePort, bool quiescence)
     {

@@ -18,21 +18,23 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
 
     public ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs) => wal.CompleteRestoreAsync(logs);
 
-    public async ValueTask<long> GetMaxLogAsync() => await wal.GetMaxLog().ConfigureAwait(false);
+    // Pass-throughs, not `async ... => await ...` re-wraps: the facade adds no logic, and an async
+    // wrapper would box a second state machine per read on the hottest read paths.
+    public ValueTask<long> GetMaxLogAsync() => new(wal.GetMaxLog());
 
-    public async ValueTask<long> GetCurrentTermAsync() => await wal.GetCurrentTerm().ConfigureAwait(false);
+    public ValueTask<long> GetCurrentTermAsync() => new(wal.GetCurrentTerm());
 
-    public async ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) =>
-        await wal.GetRangeAsync(startLogIndex, maxEntries).ConfigureAwait(false);
+    public ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) =>
+        wal.GetRangeAsync(startLogIndex, maxEntries);
 
-    public async ValueTask<List<RaftLog>> GetRangeAllTypesAsync(long startLogIndex, int maxEntries) =>
-        await wal.GetRangeAllTypesAsync(startLogIndex, maxEntries).ConfigureAwait(false);
+    public ValueTask<List<RaftLog>> GetRangeAllTypesAsync(long startLogIndex, int maxEntries) =>
+        wal.GetRangeAllTypesAsync(startLogIndex, maxEntries);
 
-    public async ValueTask<long> GetAnyTermAtAsync(long logIndex) =>
-        await wal.GetAnyTermAtAsync(logIndex).ConfigureAwait(false);
+    public ValueTask<long> GetAnyTermAtAsync(long logIndex) =>
+        wal.GetAnyTermAtAsync(logIndex);
 
-    public async ValueTask<long> GetLastCheckpointAsync() =>
-        await wal.GetLastCheckpointAsync().ConfigureAwait(false);
+    public ValueTask<long> GetLastCheckpointAsync() =>
+        wal.GetLastCheckpointAsync();
 
     public long GetCommitIndex() => wal.GetCommitIndex();
 
@@ -48,8 +50,8 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
     public void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0) =>
         wal.SeedCommitFrontierFromSnapshot(snapshotIndex, snapshotTerm);
 
-    public async ValueTask<long> TruncateLogsAfterAsync(long afterLogId) =>
-        await wal.TruncateLogsAfterAsync(afterLogId).ConfigureAwait(false);
+    public ValueTask<long> TruncateLogsAfterAsync(long afterLogId) =>
+        wal.TruncateLogsAfterAsync(afterLogId);
 
     public ValueTask<(RaftOperationStatus Status, bool SuffixTruncated)> InstallSnapshotBoundaryAsync(
         long snapshotIndex, long lastIncludedTerm) =>

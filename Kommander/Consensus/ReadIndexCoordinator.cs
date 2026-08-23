@@ -239,6 +239,11 @@ internal sealed class ReadIndexCoordinator
         lastLeadershipConfirmedTicks = host.GetMonotonicTimestamp();
         lastLeadershipConfirmedTerm = round.Term;
 
+        // Publish the confirmation for off-thread readers: the lease fast path
+        // (RaftPartitionStateMachine.TryConfirmLeadershipFast) reuses this window without an
+        // executor round trip. Same freshness argument as the executor-side fast path above.
+        coreState.PublishLeadershipLease(round.Term, lastLeadershipConfirmedTicks);
+
         foreach (ulong waiter in round.Waiters)
             CompleteOrParkReadIndexWaiter(waiter, round.ReadIndex, round.StartedTicks);
 
@@ -454,6 +459,7 @@ internal sealed class ReadIndexCoordinator
     {
         lastLeadershipConfirmedTicks = 0;
         lastLeadershipConfirmedTerm = -1;
+        coreState.InvalidateLeadershipLease();
         lastVoterAckTicks.Clear();
         lastQuorumContactTicks = 0;
 
@@ -489,6 +495,7 @@ internal sealed class ReadIndexCoordinator
     {
         lastLeadershipConfirmedTicks = 0;
         lastLeadershipConfirmedTerm = -1;
+        coreState.InvalidateLeadershipLease();
         lastVoterAckTicks.Clear();
         lastQuorumContactTicks = nowTicks;
     }

@@ -40,9 +40,18 @@ public sealed class TestAppendLogsCoalescing
 
         public void Dispose() => _writeStarted.Dispose();
 
+        /// <summary>Per-batch partition ids captured AT WRITE TIME. The flusher returns each
+        /// drained child to the pool after the write, and the pool reset scrubs its scalars, so
+        /// field assertions must snapshot here — never on <see cref="Batches"/> after the flush.</summary>
+        public List<int[]> BatchPartitions { get; } = [];
+
         public Func<GrpcBatchRequestsRequest, Task> Write => async batch =>
         {
-            lock (Batches) Batches.Add(batch);
+            lock (Batches)
+            {
+                Batches.Add(batch);
+                BatchPartitions.Add(batch.Requests.Select(r => r.AppendLogs.Partition).ToArray());
+            }
             var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             _pending.Enqueue(tcs);
             _writeStarted.Release();
@@ -82,16 +91,24 @@ public sealed class TestAppendLogsCoalescing
         var pending = new ConcurrentQueue<PendingAppendLogs>();
         var sem = new SemaphoreSlim(1, 1);
         var batches = new List<GrpcBatchRequestsRequest>();
+        var seenPartitions = new List<int>();
 
+        // Field values must be captured at write time: the flusher returns the pooled child
+        // after the write and the pool reset scrubs its scalars.
         await GrpcCommunication.FlushCoalesced(
             pending, sem,
-            b => { batches.Add(b); return Task.CompletedTask; },
+            b =>
+            {
+                batches.Add(b);
+                seenPartitions.AddRange(b.Requests.Select(r => r.AppendLogs.Partition));
+                return Task.CompletedTask;
+            },
             maxBatch: 256,
             MakePending(partition: 7));
 
         Assert.Single(batches);
         Assert.Single(batches[0].Requests);
-        Assert.Equal(7, batches[0].Requests[0].AppendLogs.Partition);
+        Assert.Equal([7], seenPartitions);
         Assert.True(pending.IsEmpty);
         Assert.Equal(1, sem.CurrentCount); // semaphore was released
     }
@@ -197,11 +214,8 @@ public sealed class TestAppendLogsCoalescing
         await flushTask;
 
         Assert.Equal(2, writer.Batches.Count);
-        Assert.Single(writer.Batches[0].Requests);        // first write: only A
-        Assert.Equal(1, writer.Batches[0].Requests[0].AppendLogs.Partition);
-        Assert.Equal(2, writer.Batches[1].Requests.Count); // second write: B and C
-        Assert.Equal(2, writer.Batches[1].Requests[0].AppendLogs.Partition);
-        Assert.Equal(3, writer.Batches[1].Requests[1].AppendLogs.Partition);
+        Assert.Equal([1], writer.BatchPartitions[0]);    // first write: only A
+        Assert.Equal([2, 3], writer.BatchPartitions[1]); // second write: B and C
         Assert.True(pending.IsEmpty);
         Assert.Equal(1, sem.CurrentCount);
     }
@@ -314,26 +328,28 @@ public sealed class TestAppendLogsCoalescing
         var pending = new ConcurrentQueue<PendingAppendLogs>();
         var sem = new SemaphoreSlim(1, 1);
         var batches = new List<GrpcBatchRequestsRequest>();
+        var seenPartitions = new List<int>();
+
+        // Capture at write time — the pool reset scrubs returned children after the flush.
+        Func<GrpcBatchRequestsRequest, Task> write = b =>
+        {
+            batches.Add(b);
+            seenPartitions.AddRange(b.Requests.Select(r => r.AppendLogs.Partition));
+            return Task.CompletedTask;
+        };
 
         sem.Wait(CancellationToken.None);
         for (int i = 1; i <= 4; i++)
         {
             await GrpcCommunication.FlushCoalesced(
-                pending, sem,
-                b => { batches.Add(b); return Task.CompletedTask; },
-                maxBatch: 256,
-                MakePending(partition: i));
+                pending, sem, write, maxBatch: 256, MakePending(partition: i));
         }
         sem.Release();
 
         await GrpcCommunication.FlushCoalesced(
-            pending, sem,
-            b => { batches.Add(b); return Task.CompletedTask; },
-            maxBatch: 256,
-            MakePending(partition: 5));
+            pending, sem, write, maxBatch: 256, MakePending(partition: 5));
 
         Assert.Single(batches);
-        int[] partitions = batches[0].Requests.Select(r => r.AppendLogs.Partition).ToArray();
-        Assert.Equal([1, 2, 3, 4, 5], partitions);
+        Assert.Equal([1, 2, 3, 4, 5], seenPartitions);
     }
 }

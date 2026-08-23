@@ -283,6 +283,12 @@ public sealed class TestSystemPartitionRetainFloor
 
             Assert.True(transfer.ImportCount > 0,
                 "ImportPartitionState must have been called at least once on the learner");
+
+            // The durable boundary is written AFTER the import returns (InstallSnapshotAsync
+            // ordering step 3), and ImportCount increments inside step 2 — so at this point the
+            // boundary write can still be in flight on n4's executor. Wait for it instead of
+            // asserting instantaneously; the install completes independently of the cancelled join.
+            await WaitForAsync(() => innerWal4.GetLastCheckpoint(0) > 0, ct, timeoutMs: 15_000);
             Assert.True(innerWal4.GetLastCheckpoint(0) > 0,
                 "n4's P0 WAL must have a CommittedCheckpoint after snapshot install");
         }
