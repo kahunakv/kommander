@@ -122,6 +122,34 @@ internal sealed class FollowerAppendHandler
             return;
         }
 
+        // One-leader-per-term fence (Raft §5.2). While this node holds Leader state for leaderTerm,
+        // its election quorum proves no other node can legitimately lead the same term, so an
+        // equal-term AppendLogs from another endpoint is a protocol violation — not a leadership
+        // announcement — and adopting the sender would abdicate real leadership and orphan the
+        // term's in-flight replication. The observed source is a zombie broadcast: a deposed peer
+        // whose queued WAL commit completion fanned out AppendLogs stamped with a term it adopted
+        // but never won (the Caraxes run-J split-brain: the resumed node adopted the new term from
+        // the elected leader's own traffic, then re-broadcast under it, and the elected leader
+        // stepped down inside its own term). The fence deliberately covers ONLY the Leader state:
+        // a follower's host.Leader legitimately lags one term behind (the vote path adopts a higher
+        // term while keeping old leader knowledge until the winner's first AppendLogs), so for a
+        // follower a same-term sender that conflicts with host.Leader is usually the real new
+        // leader announcing itself and must still be adopted below.
+        if (coreState.NodeState == RaftNodeState.Leader && coreState.CurrentTerm == leaderTerm)
+        {
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Rejecting AppendLogs from {Endpoint} claiming leadership of our own term {Term} — one leader per term; not adopting.",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, leaderTerm);
+
+            host.EnqueueResponse(endpoint, new(
+                RaftResponderRequestType.CompleteAppendLogs,
+                new(endpoint),
+                new CompleteAppendLogsRequest(host.PartitionId, coreState.CurrentTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogsFromAnotherLeader, -1)
+            ));
+
+            return;
+        }
+
         // leaderTerm >= coreState.CurrentTerm is guaranteed here (the coreState.CurrentTerm > leaderTerm case returned
         // above). A valid AppendEntries authoritatively identifies the single leader of leaderTerm,
         // so adopt it regardless of whom we voted for this term. Granting a vote to a candidate does

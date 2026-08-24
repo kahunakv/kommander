@@ -390,6 +390,12 @@ internal sealed class WalCompletionRouter
     /// and permanently suppress its later delivery. The blocker's own completion flushes deferred
     /// batches in order via <see cref="FlushDeferredLeaderAppliesAsync"/>.
     /// </para>
+    /// <para>
+    /// Leader-state fenced like <see cref="CompleteLeaderPropose"/>: a completion that lands after
+    /// a step-down answers its caller with <c>NodeIsNotLeader</c> and fans out nothing, because a
+    /// non-leader's broadcast carries the term this node holds at fan-out time and can depose the
+    /// term's real leader (the zombie same-term broadcast).
+    /// </para>
     /// </summary>
     private async Task CompleteLeaderCommit(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
@@ -420,6 +426,28 @@ internal sealed class WalCompletionRouter
                 await revertUnpublishedPromotionAsync($"barrier commit failed ({completion.Status})").ConfigureAwait(false);
 
             CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, completion.Status, 0));
+            return;
+        }
+
+        // Leader-state fence — the commit-side twin of the fence in CompleteLeaderPropose. The
+        // upstream term fence cannot catch this: commit operations are enqueued without a term
+        // (EnqueueCommit takes none, so completion.Term is -1), and a same-term step-down leaves
+        // the term unchanged anyway. Running the fan-out as a non-leader broadcasts AppendLogs
+        // stamped with whatever term this node holds NOW — peers treat AppendLogs as
+        // authoritatively identifying that term's leader and depose the real one (the Caraxes
+        // run-J split-brain: a SIGSTOPed leader resumed, adopted the new term from the elected
+        // leader's traffic, then its queued commit completions fanned out under the adopted term
+        // and the elected leader abdicated inside its own term). Skipping the local applies here
+        // is safe: the batch is durably committed in this WAL, so the follower path's
+        // DrainCommittedAppliesAsync delivers it on the next received append, and a later
+        // promotion's inherited drain covers the leader path. Same no-orphan rule as every fence:
+        // answer the caller before returning.
+        if (coreState.NodeState != RaftNodeState.Leader)
+        {
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Commit completion for ticket {Ticket} landed after a step-down; failing the caller instead of fanning out.",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, ticketId);
+            CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, 0L));
             return;
         }
 
@@ -584,6 +612,8 @@ internal sealed class WalCompletionRouter
     /// Like <see cref="CompleteLeaderCommit"/>, this delivery carries no Log Matching anchors:
     /// it targets ids the follower already saw during the anchored propose, and adding a WAL term
     /// read on this completion path would stall propagation. LMP remains enforced on propose/backfill.
+    /// Leader-state fenced like <see cref="CompleteLeaderCommit"/>: after a step-down the caller is
+    /// answered with <c>NodeIsNotLeader</c> and nothing is fanned out.
     /// </summary>
     private async Task CompleteLeaderRollback(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
@@ -599,6 +629,20 @@ internal sealed class WalCompletionRouter
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Couldn't rollback proposal {Timestamp}", host.LocalEndpoint, host.PartitionId, coreState.NodeState, ticketId);
             CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, completion.Status, 0));
+            return;
+        }
+
+        // Leader-state fence — mirrors CompleteLeaderCommit (and CompleteLeaderPropose): rollback
+        // operations are enqueued without a term, so only this state check stops a stepped-down
+        // node from fanning out AppendLogs stamped with a term it since adopted but never won.
+        // The rolled-back range needs no local repair here: rollback markers are durably in this
+        // WAL, and the applied-cursor advance over them is re-derived by any later drain.
+        if (coreState.NodeState != RaftNodeState.Leader)
+        {
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Rollback completion for ticket {Ticket} landed after a step-down; failing the caller instead of fanning out.",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, ticketId);
+            CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, 0L));
             return;
         }
 
