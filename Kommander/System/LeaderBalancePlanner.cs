@@ -10,8 +10,12 @@ namespace Kommander.System;
 /// own <c>TransferLeadershipAsync</c> validation, an incorrect or stale plan is always
 /// safe: the worst outcome is a wasted or skipped move.
 ///
-/// <para><b>Two-tier strategy (run in order, stop when caps are hit):</b></para>
+/// <para><b>Three-tier strategy (run in order, stop when caps are hit):</b></para>
 /// <list type="number">
+///   <item><b>Drain tier</b> — evacuates every node in <c>slowNodes</c>, moving its leaderships to
+///   the coolest healthy voter. Runs first, and when it emits anything the other two tiers are
+///   skipped for that pass: a drain deliberately unbalances the counts, so letting the count tier
+///   fight it in the same pass would only produce churn.</item>
 ///   <item><b>Count tier</b> — redistributes leaders from over-loaded nodes to
 ///   under-loaded nodes until the per-node count is within
 ///   <see cref="RaftConfiguration.CountDeadband"/> of the ideal value.
@@ -27,6 +31,8 @@ namespace Kommander.System;
 ///   <item>Partition <see cref="RaftPartitionState.Active"/> in <paramref name="partitionMap"/>.</item>
 ///   <item><c>LeaderSinceMs ≥ MinLeaderStabilityMs</c> — the leader must be stable.</item>
 ///   <item>Target endpoint is a live voter in <see cref="GlobalLeadershipView.LiveVoters"/>.</item>
+///   <item>Target endpoint is not in <c>slowNodes</c> — a degraded node never receives leadership,
+///   in any tier, including the drain tier's own destination choice.</item>
 ///   <item>Partition not in <paramref name="cooldownState"/> with an unexpired entry.</item>
 /// </list>
 /// </summary>
@@ -45,13 +51,21 @@ public static class LeaderBalancePlanner
     /// Partitions with a future expiry time are excluded from this pass.
     /// </param>
     /// <param name="now">Wall-clock time used for cooldown expiry evaluation.</param>
+    /// <param name="slowNodes">
+    /// Endpoints classified degraded by <see cref="SlowNodeDetector"/>. They are excluded as
+    /// transfer targets everywhere, and the drain tier evacuates the leaderships they still hold.
+    /// Pass an empty set to get exactly the previous two-tier behaviour.
+    /// </param>
     public static IReadOnlyList<LeaderMove> Plan(
         GlobalLeadershipView view,
         RaftPartitionMap partitionMap,
         RaftConfiguration config,
         IReadOnlyDictionary<int, global::System.DateTimeOffset> cooldownState,
-        global::System.DateTimeOffset now)
+        global::System.DateTimeOffset now,
+        IReadOnlySet<string>? slowNodes = null)
     {
+        slowNodes ??= EmptySlowNodes;
+
         int liveNodeCount = view.LiveVoters.Count;
         if (liveNodeCount < 2)
             return [];
@@ -67,14 +81,143 @@ public static class LeaderBalancePlanner
 
         List<LeaderMove> moves = new(config.MaxMovesPerPass);
 
+        // ── Drain tier (degraded nodes first) ─────────────────────────────────
+        RunDrainTier(view, config, stateById, cooldownState, now, slowNodes, moves);
+
+        // A drain in progress owns the pass. The count tier would immediately try to push
+        // leaderships back toward the node being emptied's share of the ideal count.
+        if (moves.Count > 0)
+            return moves;
+
         // ── Count tier ────────────────────────────────────────────────────────
-        RunCountTier(view, config, stateById, cooldownState, now, moves);
+        RunCountTier(view, config, stateById, cooldownState, now, slowNodes, moves);
 
         // ── Load tier (only when counts are balanced) ─────────────────────────
         if (moves.Count == 0)
-            RunLoadTier(view, config, stateById, cooldownState, now, moves);
+            RunLoadTier(view, config, stateById, cooldownState, now, slowNodes, moves);
 
         return moves;
+    }
+
+    private static readonly IReadOnlySet<string> EmptySlowNodes =
+        new HashSet<string>(StringComparer.Ordinal);
+
+    // ── Drain tier ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Evacuates leadership from every node in <paramref name="slowNodes"/>, hottest partition
+    /// first, onto the coolest healthy live voter.
+    ///
+    /// <para><b>Why this is not the load tier.</b> <see cref="RunLoadTier"/> emits a count-neutral
+    /// hot↔cold swap — one partition leaves the hot node and one arrives. A degraded node would keep
+    /// exactly as many fsync streams as before, which is the opposite of the intent. A drain is
+    /// one-directional by construction.</para>
+    ///
+    /// <para>The per-pass move cap still applies, so a node holding many leaderships empties over
+    /// several passes instead of in one burst; <see cref="LeaderBalancer"/> additionally caps the
+    /// outstanding transfers. Every ordinary per-move filter still applies too, so a partition in
+    /// cooldown or below <see cref="RaftConfiguration.MinLeaderStabilityMs"/> stays where it is —
+    /// a degraded disk is a reason to move leadership, not a reason to move it unsafely.</para>
+    /// </summary>
+    private static void RunDrainTier(
+        GlobalLeadershipView view,
+        RaftConfiguration config,
+        Dictionary<int, RaftPartitionState> stateById,
+        IReadOnlyDictionary<int, global::System.DateTimeOffset> cooldownState,
+        global::System.DateTimeOffset now,
+        IReadOnlySet<string> slowNodes,
+        List<LeaderMove> moves)
+    {
+        if (slowNodes.Count == 0)
+            return;
+
+        // Simulated destination state, so successive picks in one pass spread across healthy nodes
+        // instead of piling every drained leadership onto whichever node started coolest.
+        Dictionary<string, double> loadByNode = new(StringComparer.Ordinal);
+        Dictionary<string, int> countByNode = new(StringComparer.Ordinal);
+
+        foreach (string voter in view.LiveVoters)
+        {
+            if (slowNodes.Contains(voter))
+                continue;
+
+            loadByNode[voter] = view.LoadByNode.TryGetValue(voter, out double l) ? l : 0.0;
+            countByNode[voter] = view.LeadersByNode.TryGetValue(voter, out List<int>? led) ? led.Count : 0;
+        }
+
+        if (loadByNode.Count == 0)
+            return; // Nowhere healthy to put anything; leave the cluster as it is.
+
+        // Endpoint order makes the plan deterministic when several nodes are classified at once.
+        List<string> drainOrder = [];
+        foreach (string endpoint in slowNodes)
+        {
+            if (view.LeadersByNode.ContainsKey(endpoint))
+                drainOrder.Add(endpoint);
+        }
+        drainOrder.Sort(StringComparer.Ordinal);
+
+        foreach (string slowNode in drainOrder)
+        {
+            List<int> remaining = new(view.LeadersByNode[slowNode]);
+
+            while (moves.Count < config.MaxMovesPerPass && remaining.Count > 0)
+            {
+                string? target = PickCoolestDestination(loadByNode, countByNode);
+                if (target is null)
+                    break;
+
+                int? chosen = PickHottestEligible(
+                    slowNode, target, view, stateById, cooldownState, now, config.MinLeaderStabilityMs,
+                    slowNodes, remaining);
+
+                if (chosen is null)
+                    break; // Nothing on this node is movable right now; try the next slow node.
+
+                moves.Add(new LeaderMove(chosen.Value, slowNode, target, IsDrain: true));
+
+                remaining.Remove(chosen.Value);
+                loadByNode[target] += view.PartitionLoad.TryGetValue(chosen.Value, out double pl) ? pl : 0.0;
+                countByNode[target]++;
+            }
+
+            if (moves.Count >= config.MaxMovesPerPass)
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Coolest healthy destination by simulated load, then by leader count, then by endpoint
+    /// string. The two tie-breaks matter: an idle cluster has every load at 0.0, where count is the
+    /// only meaningful spread, and the endpoint comparison keeps a plan reproducible.
+    /// </summary>
+    private static string? PickCoolestDestination(
+        Dictionary<string, double> loadByNode,
+        Dictionary<string, int> countByNode)
+    {
+        string? best = null;
+        double bestLoad = double.MaxValue;
+        int bestCount = int.MaxValue;
+
+        foreach (KeyValuePair<string, double> kv in loadByNode)
+        {
+            int count = countByNode.TryGetValue(kv.Key, out int c) ? c : 0;
+
+            bool better =
+                kv.Value < bestLoad ||
+                (kv.Value == bestLoad && count < bestCount) ||
+                (kv.Value == bestLoad && count == bestCount &&
+                 global::System.StringComparer.Ordinal.Compare(kv.Key, best) < 0);
+
+            if (better)
+            {
+                best = kv.Key;
+                bestLoad = kv.Value;
+                bestCount = count;
+            }
+        }
+
+        return best;
     }
 
     // ── Count tier ────────────────────────────────────────────────────────────
@@ -85,6 +228,7 @@ public static class LeaderBalancePlanner
         Dictionary<int, RaftPartitionState> stateById,
         IReadOnlyDictionary<int, global::System.DateTimeOffset> cooldownState,
         global::System.DateTimeOffset now,
+        IReadOnlySet<string> slowNodes,
         List<LeaderMove> moves)
     {
         int liveNodeCount = view.LiveVoters.Count;
@@ -135,6 +279,12 @@ public static class LeaderBalancePlanner
             int underCount = int.MaxValue;
             foreach (KeyValuePair<string, int> kv in countByNode)
             {
+                // A slow node is skipped as a destination here, not only in IsEligible: without
+                // this the search would settle on it, find every candidate partition ineligible,
+                // and abandon the pass instead of trying the next-emptiest healthy node.
+                if (slowNodes.Contains(kv.Key))
+                    continue;
+
                 if (kv.Key != overNode && kv.Value < underThreshold &&
                     (kv.Value < underCount ||
                      (kv.Value == underCount && global::System.StringComparer.Ordinal.Compare(kv.Key, underNode) < 0)))
@@ -149,6 +299,7 @@ public static class LeaderBalancePlanner
             // Pick the hottest eligible partition from overNode.
             int? chosenPartition = PickHottestEligible(
                 overNode, underNode, view, stateById, cooldownState, now, config.MinLeaderStabilityMs,
+                slowNodes,
                 leadersByNode.TryGetValue(overNode, out List<int>? overPartitions) ? overPartitions : []);
 
             if (chosenPartition is null) break; // nothing movable
@@ -175,6 +326,7 @@ public static class LeaderBalancePlanner
         Dictionary<int, RaftPartitionState> stateById,
         IReadOnlyDictionary<int, global::System.DateTimeOffset> cooldownState,
         global::System.DateTimeOffset now,
+        IReadOnlySet<string> slowNodes,
         List<LeaderMove> moves)
     {
         if (view.LiveVoters.Count < 2) return;
@@ -187,6 +339,12 @@ public static class LeaderBalancePlanner
 
         foreach (string voter in view.LiveVoters)
         {
+            // Slow nodes are excluded from both ends of the swap, not just the cold end. A slow hot
+            // node would pick a cold partner it is then forbidden to receive, and the tier would
+            // abandon the pass rather than swapping the two healthy nodes it could have helped.
+            if (slowNodes.Contains(voter))
+                continue;
+
             double load = view.LoadByNode.TryGetValue(voter, out double l) ? l : 0.0;
             if (load > maxLoad || (load == maxLoad && global::System.StringComparer.Ordinal.Compare(voter, hotNode) < 0))
                 { maxLoad = load; hotNode = voter; }
@@ -207,7 +365,7 @@ public static class LeaderBalancePlanner
         List<int> hotPartitions = view.LeadersByNode.TryGetValue(hotNode, out List<int>? hp) ? hp : [];
         int? hotPartition = PickHottestEligible(
             hotNode, coldNode, view, stateById, cooldownState, now, config.MinLeaderStabilityMs,
-            hotPartitions);
+            slowNodes, hotPartitions);
 
         if (hotPartition is null) return;
 
@@ -215,7 +373,7 @@ public static class LeaderBalancePlanner
         List<int> coldPartitions = view.LeadersByNode.TryGetValue(coldNode, out List<int>? cp) ? cp : [];
         int? coldPartition = PickColdestEligible(
             coldNode, hotNode, view, stateById, cooldownState, now, config.MinLeaderStabilityMs,
-            coldPartitions, excludePartition: hotPartition.Value);
+            slowNodes, coldPartitions, excludePartition: hotPartition.Value);
 
         if (coldPartition is null) return; // no swap partner — skip this pass
 
@@ -243,6 +401,7 @@ public static class LeaderBalancePlanner
         IReadOnlyDictionary<int, global::System.DateTimeOffset> cooldownState,
         global::System.DateTimeOffset now,
         long minStabilityMs,
+        IReadOnlySet<string> slowNodes,
         List<int> candidatePartitions)
     {
         int? best = null;
@@ -250,7 +409,7 @@ public static class LeaderBalancePlanner
 
         foreach (int pid in candidatePartitions)
         {
-            if (!IsEligible(pid, fromNode, toNode, view, stateById, cooldownState, now, minStabilityMs))
+            if (!IsEligible(pid, fromNode, toNode, view, stateById, cooldownState, now, minStabilityMs, slowNodes))
                 continue;
 
             double load = view.PartitionLoad.TryGetValue(pid, out double l) ? l : 0.0;
@@ -268,6 +427,7 @@ public static class LeaderBalancePlanner
         IReadOnlyDictionary<int, global::System.DateTimeOffset> cooldownState,
         global::System.DateTimeOffset now,
         long minStabilityMs,
+        IReadOnlySet<string> slowNodes,
         List<int> candidatePartitions,
         int excludePartition)
     {
@@ -277,7 +437,7 @@ public static class LeaderBalancePlanner
         foreach (int pid in candidatePartitions)
         {
             if (pid == excludePartition) continue;
-            if (!IsEligible(pid, fromNode, toNode, view, stateById, cooldownState, now, minStabilityMs))
+            if (!IsEligible(pid, fromNode, toNode, view, stateById, cooldownState, now, minStabilityMs, slowNodes))
                 continue;
 
             double load = view.PartitionLoad.TryGetValue(pid, out double l) ? l : 0.0;
@@ -298,7 +458,8 @@ public static class LeaderBalancePlanner
         Dictionary<int, RaftPartitionState> stateById,
         IReadOnlyDictionary<int, global::System.DateTimeOffset> cooldownState,
         global::System.DateTimeOffset now,
-        long minStabilityMs)
+        long minStabilityMs,
+        IReadOnlySet<string> slowNodes)
     {
         // Partition must exist and be Active.
         if (!stateById.TryGetValue(partitionId, out RaftPartitionState state) ||
@@ -317,6 +478,11 @@ public static class LeaderBalancePlanner
 
         // Target must be a live voter.
         if (!view.LiveVoters.Contains(toNode))
+            return false;
+
+        // Target must not be classified degraded. This is the gate that keeps leadership off a
+        // slow disk; the per-tier destination searches only avoid wasting the pass on one.
+        if (slowNodes.Contains(toNode))
             return false;
 
         // Partition must not be in cooldown.

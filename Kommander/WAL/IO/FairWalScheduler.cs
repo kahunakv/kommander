@@ -134,6 +134,23 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
     private readonly ConcurrentDictionary<int, PartitionState> _partitions = new();
 
+    /// <summary>
+    /// Node-wide EWMA of enqueue-to-durable latency, fed once per group batch with the mean wait
+    /// across every operation in that batch — regardless of which partitions contributed to it.
+    ///
+    /// <para><b>Why this is not the mean of the per-partition accumulators.</b> The fsync is shared:
+    /// one <c>walAdapter.Write</c> covers every partition in the group, so the batch is the unit at
+    /// which the device is actually observed. Averaging the per-partition EWMAs would instead weight
+    /// an idle partition's frozen last value equally with a hot partition's live one, and those
+    /// frozen values never age (see <see cref="PartitionWaitAccumulator"/>).</para>
+    ///
+    /// <para><b>Why it exists at all.</b> Follower appends enqueue here too, so this is the one
+    /// commit-wait figure a node can report when it leads no partition. Per-partition figures ride
+    /// the load report only for led partitions, which makes them useless for judging a node that is
+    /// a candidate to *receive* leadership.</para>
+    /// </summary>
+    private readonly PartitionWaitAccumulator _nodeCommitWait = new();
+
     // ── Global ready-queue ─────────────────────────────────────────────────
 
     // Partition IDs that have at least one pending operation waiting to be drained.
@@ -355,6 +372,27 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// </summary>
     public double GetPartitionCommitWaitMs(int partitionId) =>
         _partitions.TryGetValue(partitionId, out PartitionState? state) ? state.CommitWait.CurrentWaitMs() : 0.0;
+
+    /// <summary>
+    /// Returns the node-wide EWMA enqueue-to-durable commit-wait latency in milliseconds, across
+    /// every partition this node writes for — led or followed. <c>0</c> when no group batch has
+    /// completed yet, which a caller must read as <b>unknown</b> and not as <b>fast</b>: pair it
+    /// with <see cref="GetNodeCommitWaitSamples"/> and <see cref="GetNodeCommitWaitAgeMs"/>.
+    /// </summary>
+    public double GetNodeCommitWaitMs() => _nodeCommitWait.CurrentWaitMs();
+
+    /// <summary>
+    /// Number of group batches that fed <see cref="GetNodeCommitWaitMs"/>. <c>0</c> means the node
+    /// has written nothing yet, so its commit-wait figure carries no information at all.
+    /// </summary>
+    public long GetNodeCommitWaitSamples() => _nodeCommitWait.SampleCount;
+
+    /// <summary>
+    /// Milliseconds since the last group batch fed <see cref="GetNodeCommitWaitMs"/>, or <c>0</c>
+    /// when there has been none. The EWMA decays per sample, so a node that goes quiet holds its
+    /// last figure indefinitely; this is how a consumer detects that.
+    /// </summary>
+    public double GetNodeCommitWaitAgeMs() => _nodeCommitWait.AgeMs();
 
     /// <summary>
     /// Stops the scheduler.
@@ -627,6 +665,11 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         KommanderMetrics.WalBatchesTotal.Add(1);
 
         // ── Phase 3: per-partition post-write cleanup ──────────────────────
+        // Node-wide wait is accumulated across every partition in this group batch and recorded
+        // once below, so one shared fsync yields exactly one node-level observation.
+        double groupTotalWaitMs = 0;
+        int groupOpCount = 0;
+
         foreach ((int pid, List<WALWriteOperation> pidBatch) in groupBatches)
         {
             KommanderMetrics.WalBatchSize.Record(pidBatch.Count);
@@ -648,6 +691,9 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                         WalPhaseInstrumentation.RecordDurable(op.Type, opWaitMs);
                 }
                 waitState.CommitWait.RecordWaitMs(totalWaitMs / pidBatch.Count);
+
+                groupTotalWaitMs += totalWaitMs;
+                groupOpCount += pidBatch.Count;
             }
 
             foreach (WALWriteOperation op in pidBatch)
@@ -688,6 +734,10 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                 }
             }
         }
+
+        // One observation per group batch, after every partition in it is accounted for.
+        if (groupOpCount > 0)
+            _nodeCommitWait.RecordWaitMs(groupTotalWaitMs / groupOpCount);
     }
 
     /// <summary>

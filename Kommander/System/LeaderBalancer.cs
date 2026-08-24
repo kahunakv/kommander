@@ -4,20 +4,27 @@ using Kommander.Data;
 using Kommander.Discovery;
 using Kommander.Gossip;
 using Kommander.Time;
+using Microsoft.Extensions.Logging;
 
 namespace Kommander.System;
 
 /// <summary>
-/// Owns the per-partition cooldown and outstanding-transfer tables and executes one
-/// leader-balancer planning pass per coordinator tick. Invoked exclusively on the
+/// Owns the per-partition cooldown and outstanding-transfer tables, the degraded-node classifier,
+/// and executes one leader-balancer planning pass per coordinator tick. Invoked exclusively on the
 /// <see cref="RaftSystemCoordinator"/> single-consumer channel loop — no locking is
 /// required for the owned dictionaries. Resets its tables on P0 leadership loss so
 /// the next P0 leader always starts with a clean slate.
+///
+/// <para>The pass is also the clock for <see cref="SlowNodeDetector"/>, whose hysteresis is counted
+/// in passes rather than in seconds. <see cref="SlowNodeDetector.Classify"/> must therefore be
+/// called exactly once per pass that actually planned, and never for one abandoned on an incomplete
+/// view — otherwise the enter and exit delays no longer mean what the configuration says.</para>
 /// </summary>
 internal sealed class LeaderBalancer
 {
     private readonly Dictionary<int, DateTimeOffset> _balancerCooldowns = new();
     private readonly Dictionary<int, (string Target, DateTimeOffset Deadline)> _outstandingMoves = new();
+    private readonly SlowNodeDetector _slowNodeDetector;
 
     private readonly LoadReportStore loadReportStore;
     private readonly Func<string?> getLeaderNode;
@@ -40,8 +47,10 @@ internal sealed class LeaderBalancer
         Action<string, TransferLeadershipSuggestionRequest> sendSuggestion,
         LivenessTable liveness,
         RaftConfiguration configuration,
-        string localEndpoint)
+        string localEndpoint,
+        ILogger<IRaft> logger)
     {
+        _slowNodeDetector = new SlowNodeDetector(configuration, logger);
         this.loadReportStore = loadReportStore;
         this.getLeaderNode = getLeaderNode;
         this.getMembership = getMembership;
@@ -56,6 +65,9 @@ internal sealed class LeaderBalancer
 
     /// <summary>Returns current count of outstanding suggestions. For test assertions only.</summary>
     internal int OutstandingMoveCountForTest => _outstandingMoves.Count;
+
+    /// <summary>Nodes currently classified degraded. For test assertions only.</summary>
+    internal IReadOnlySet<string> SlowNodesForTest => _slowNodeDetector.SlowNodes;
 
     /// <summary>
     /// Executes one leader-balancer planning pass. Only acts when this node is the P0 leader
@@ -74,6 +86,7 @@ internal sealed class LeaderBalancer
             Diagnostics.KommanderMetrics.BalancerLoadImbalance = 0.0;
             _balancerCooldowns.Clear();
             _outstandingMoves.Clear();
+            _slowNodeDetector.Reset();
             return Task.CompletedTask;
         }
 
@@ -127,6 +140,11 @@ internal sealed class LeaderBalancer
             return Task.CompletedTask;
         }
 
+        // Classified after the completeness guard on purpose: the detector's hysteresis counts
+        // passes, so crediting a pass that never planned anything would shorten the enter delay by
+        // exactly the number of passes the cluster spent with an incomplete view.
+        IReadOnlySet<string> slowNodes = _slowNodeDetector.Classify(view);
+
         IReadOnlyDictionary<int, DateTimeOffset> cooldowns;
         if (_outstandingMoves.Count > 0)
         {
@@ -170,7 +188,7 @@ internal sealed class LeaderBalancer
             };
 
         IReadOnlyList<LeaderMove> moves =
-            LeaderBalancePlanner.Plan(view, partitionMap, planConfig, cooldowns, now);
+            LeaderBalancePlanner.Plan(view, partitionMap, planConfig, cooldowns, now, slowNodes);
 
         long systemTerm = getSystemTerm();
 
@@ -191,7 +209,7 @@ internal sealed class LeaderBalancer
             _outstandingMoves[move.PartitionId] = (move.ToEndpoint, now + configuration.SuggestionTimeout);
 
             Diagnostics.KommanderMetrics.BalancerMovesTotal.Add(1,
-                new KeyValuePair<string, object?>("outcome", "planned"));
+                new KeyValuePair<string, object?>("outcome", move.IsDrain ? "drain" : "planned"));
         }
 
         return Task.CompletedTask;

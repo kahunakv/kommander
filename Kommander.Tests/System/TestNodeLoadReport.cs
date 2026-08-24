@@ -433,4 +433,125 @@ public sealed class TestNodeLoadReport
         Assert.Single(deserialized.Leaderships);
         Assert.Equal(8.3, deserialized.Leaderships[0].CommitWaitMs);
     }
+
+    // ── Node-level health fields: rolling-upgrade / additive compatibility ────
+    // NodeCommitWaitMs/Samples/AgeMs were added to NodeLoadReport for degraded-node leader
+    // avoidance. An older peer omits all three. The zero they default to must read as "unknown",
+    // which is why the sample count travels beside the figure.
+
+    /// <summary>
+    /// gRPC path (plain <c>JsonSerializer</c>): a payload omitting the three node-health fields
+    /// must deserialize without error and yield zeros — a zero sample count, which the detector
+    /// treats as unknown rather than healthy.
+    /// </summary>
+    [Fact]
+    public void GrpcPath_MissingNodeHealthFields_DefaultToZero()
+    {
+        NodeLoadReport source = new()
+        {
+            Endpoint = "node1:7000",
+            ReportVersion = 1,
+            NodeCommitWaitMs = 42.5,
+            NodeCommitWaitSamples = 128,
+            NodeCommitWaitAgeMs = 900,
+            Leaderships = [new PartitionLoad { PartitionId = 1, Load = 5.0, LeaderSinceMs = 10_000 }],
+        };
+
+        string fullJson = JsonSerializer.Serialize(source);
+        JsonObject root = JsonNode.Parse(fullJson)!.AsObject();
+        root.Remove("NodeCommitWaitMs");
+        root.Remove("NodeCommitWaitSamples");
+        root.Remove("NodeCommitWaitAgeMs");
+
+        NodeLoadReport? report = JsonSerializer.Deserialize<NodeLoadReport>(root.ToJsonString());
+
+        Assert.NotNull(report);
+        Assert.Equal(0.0, report.NodeCommitWaitMs);
+        Assert.Equal(0L, report.NodeCommitWaitSamples);
+        Assert.Equal(0L, report.NodeCommitWaitAgeMs);
+        Assert.Single(report.Leaderships);
+    }
+
+    /// <summary>
+    /// gRPC path: the three node-health fields must round-trip exactly.
+    /// </summary>
+    [Fact]
+    public void GrpcPath_NodeHealthFields_RoundTrip()
+    {
+        NodeLoadReport original = new()
+        {
+            Endpoint = "node1:7000",
+            ReportVersion = 1,
+            Time = new HLCTimestamp(1, 100_000L, 0),
+            NodeCommitWaitMs = 15.75,
+            NodeCommitWaitSamples = 64,
+            NodeCommitWaitAgeMs = 1_250,
+        };
+
+        NodeLoadReport? deserialized =
+            JsonSerializer.Deserialize<NodeLoadReport>(JsonSerializer.Serialize(original));
+
+        Assert.NotNull(deserialized);
+        Assert.Equal(15.75, deserialized.NodeCommitWaitMs);
+        Assert.Equal(64L, deserialized.NodeCommitWaitSamples);
+        Assert.Equal(1_250L, deserialized.NodeCommitWaitAgeMs);
+    }
+
+    /// <summary>
+    /// Source-gen context (<c>RestJsonContext</c>): a payload omitting the three node-health fields
+    /// must deserialize without error and yield zeros.
+    /// </summary>
+    [Fact]
+    public void SourceGenContext_MissingNodeHealthFields_DefaultToZero()
+    {
+        NodeLoadReport source = new()
+        {
+            Endpoint = "node1:7000",
+            ReportVersion = 1,
+            NodeCommitWaitMs = 42.5,
+            NodeCommitWaitSamples = 128,
+            NodeCommitWaitAgeMs = 900,
+        };
+
+        // The source-gen context is configured for camelCase, so the wire names differ from the
+        // property names — strip what an older peer would actually have omitted.
+        string fullJson = JsonSerializer.Serialize(source, RestJsonContext.Default.NodeLoadReport);
+        JsonObject root = JsonNode.Parse(fullJson)!.AsObject();
+        root.Remove("nodeCommitWaitMs");
+        root.Remove("nodeCommitWaitSamples");
+        root.Remove("nodeCommitWaitAgeMs");
+
+        NodeLoadReport? report = JsonSerializer.Deserialize(
+            root.ToJsonString(), RestJsonContext.Default.NodeLoadReport);
+
+        Assert.NotNull(report);
+        Assert.Equal(0.0, report.NodeCommitWaitMs);
+        Assert.Equal(0L, report.NodeCommitWaitSamples);
+        Assert.Equal(0L, report.NodeCommitWaitAgeMs);
+    }
+
+    /// <summary>
+    /// Source-gen context: the three node-health fields must round-trip exactly. The REST context
+    /// is source-generated, so a new public property is only carried if the generator picked it up.
+    /// </summary>
+    [Fact]
+    public void SourceGenContext_NodeHealthFields_RoundTrip()
+    {
+        NodeLoadReport original = new()
+        {
+            Endpoint = "node1:7000",
+            ReportVersion = 1,
+            NodeCommitWaitMs = 8.5,
+            NodeCommitWaitSamples = 33,
+            NodeCommitWaitAgeMs = 700,
+        };
+
+        string json = JsonSerializer.Serialize(original, RestJsonContext.Default.NodeLoadReport);
+        NodeLoadReport? deserialized = JsonSerializer.Deserialize(json, RestJsonContext.Default.NodeLoadReport);
+
+        Assert.NotNull(deserialized);
+        Assert.Equal(8.5, deserialized.NodeCommitWaitMs);
+        Assert.Equal(33L, deserialized.NodeCommitWaitSamples);
+        Assert.Equal(700L, deserialized.NodeCommitWaitAgeMs);
+    }
 }

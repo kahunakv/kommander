@@ -61,4 +61,68 @@ public sealed class TestPartitionWaitAccumulator
         acc.RecordWaitMs(0.0); // ewma = 0.5*0 + 0.5*100 = 50
         Assert.Equal(50.0, acc.CurrentWaitMs(), precision: 6);
     }
+
+    // ── Sample count and age (degraded-node avoidance) ────────────────────────
+    // These exist so a caller can tell "unknown" from "healthy". A zero CurrentWaitMs is
+    // produced both by a fast device and by one that has never been written to.
+
+    [Fact]
+    public void SampleCount_StartsAtZero()
+    {
+        PartitionWaitAccumulator acc = new();
+        Assert.Equal(0L, acc.SampleCount);
+    }
+
+    [Fact]
+    public void SampleCount_CountsEveryObservation()
+    {
+        PartitionWaitAccumulator acc = new();
+        acc.RecordWaitMs(1.0);
+        acc.RecordWaitMs(2.0);
+        acc.RecordWaitMs(3.0);
+        Assert.Equal(3L, acc.SampleCount);
+    }
+
+    [Fact]
+    public void SampleCount_IgnoresRejectedNegativeObservation()
+    {
+        PartitionWaitAccumulator acc = new();
+        acc.RecordWaitMs(-1.0);
+        Assert.Equal(0L, acc.SampleCount);
+        Assert.Equal(0.0, acc.CurrentWaitMs());
+    }
+
+    [Fact]
+    public void AgeMs_IsZeroWithNoObservation()
+    {
+        PartitionWaitAccumulator acc = new();
+        Assert.Equal(0.0, acc.AgeMs());
+    }
+
+    [Fact]
+    public async Task AgeMs_GrowsWhileNoNewObservationArrives()
+    {
+        PartitionWaitAccumulator acc = new();
+        acc.RecordWaitMs(50.0);
+
+        await Task.Delay(60, TestContext.Current.CancellationToken);
+
+        double aged = acc.AgeMs();
+        Assert.True(aged >= 40.0, $"expected the age to grow past ~40 ms, got {aged}");
+
+        // The estimate itself does not decay — that is precisely why the age is needed.
+        Assert.Equal(50.0, acc.CurrentWaitMs());
+    }
+
+    [Fact]
+    public async Task AgeMs_ResetsOnNewObservation()
+    {
+        PartitionWaitAccumulator acc = new();
+        acc.RecordWaitMs(50.0);
+
+        await Task.Delay(60, TestContext.Current.CancellationToken);
+        acc.RecordWaitMs(50.0);
+
+        Assert.True(acc.AgeMs() < 40.0, "a fresh observation must restart the age");
+    }
 }

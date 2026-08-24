@@ -1054,6 +1054,75 @@ public class RaftConfiguration
     /// </summary>
     public TimeSpan SuggestionTimeout { get; set; } = TimeSpan.FromSeconds(15);
 
+    // ── Degraded-node leader avoidance ────────────────────────────────────────
+
+    /// <summary>
+    /// Master switch for degraded-node leader avoidance. When on, the balancer classifies nodes
+    /// whose WAL commit wait stands far above the cluster median as <c>Slow</c>, refuses them as
+    /// transfer targets, and drains the leaderships they already hold.
+    ///
+    /// <para>Deliberately separate from the composite <c>Load</c> score, which stays a throughput
+    /// and backlog measure. A node-wide latency figure summed once per leadership would scale with
+    /// the leader count, and the balancer's load tier emits count-neutral swaps — so a degraded
+    /// node would keep exactly as many fsync streams as before. Avoidance needs a gate and a drain,
+    /// not a weight.</para>
+    ///
+    /// <para>Acts only inside the leader-balancer pass, so it does nothing unless
+    /// <see cref="EnableLeaderBalancer"/> is also on. The node-health fields still ride the load
+    /// report either way. <b>Default is off.</b></para>
+    /// </summary>
+    public bool EnableSlowNodeAvoidance { get; set; }
+
+    /// <summary>
+    /// How far above the cluster median commit wait a node must sit before it is a slow candidate.
+    /// The test is relative on purpose: under uniformly heavy write load every node's wait rises
+    /// together and the ratio stays flat, so a legitimately busy cluster classifies nobody, while a
+    /// single bad device stands out.
+    /// <para>Default is <b>3.0</b>. Must be greater than 1.0.</para>
+    /// </summary>
+    public double SlowNodeMultiplier { get; set; } = 3.0;
+
+    /// <summary>
+    /// Absolute floor in milliseconds below which a node is never a slow candidate, whatever its
+    /// ratio to the median. Stops a healthy cluster whose median is 0.1 ms from classifying a node
+    /// at 0.3 ms, where the ratio is large but the absolute wait is irrelevant.
+    /// <para>Default is <b>10 ms</b>.</para>
+    /// </summary>
+    public double SlowNodeFloorMs { get; set; } = 10.0;
+
+    /// <summary>
+    /// Number of WAL group batches a node must have observed before its commit wait is judged at
+    /// all. Below this the node counts as <i>unknown</i>, and an unknown node is never drained and
+    /// never excluded — a quiet node must not be punished for being quiet.
+    /// <para>Default is <b>20</b>.</para>
+    /// </summary>
+    public long SlowNodeMinSamples { get; set; } = 20;
+
+    /// <summary>
+    /// Maximum age of a node's last commit-wait observation before the node counts as
+    /// <i>unknown</i>. The EWMA decays per sample rather than per second, so a node that goes quiet
+    /// keeps reporting its last figure; without this bound a since-recovered node would stay
+    /// classified on evidence that stopped being true.
+    /// <para>Default is <b>30 s</b>.</para>
+    /// </summary>
+    public TimeSpan SlowNodeObservationTtl { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Consecutive balancer passes a node must look slow before it is classified <c>Slow</c>.
+    /// <para>Counted in <b>passes, not seconds</b>: at the default
+    /// <see cref="LeaderBalancerInterval"/> of 30 s this is 90 s, and shortening that interval
+    /// shortens the delay with it. Default is <b>3</b>.</para>
+    /// </summary>
+    public int SlowNodeEnterPasses { get; set; } = 3;
+
+    /// <summary>
+    /// Consecutive clean passes before a classified node is released. Deliberately longer than
+    /// <see cref="SlowNodeEnterPasses"/>: leadership that flaps between a healthy and a marginal
+    /// node is worse than leaving it parked on the healthy one a while longer.
+    /// <para>Default is <b>6</b> (180 s at the default interval).</para>
+    /// </summary>
+    public int SlowNodeExitPasses { get; set; } = 6;
+
     // ── Replica placement (replication factor) ────────────────────────────────
 
     /// <summary>
@@ -1253,6 +1322,37 @@ public class RaftConfiguration
         // zone would silently behave as "no zone" while looking configured. Trim it to the
         // canonical form here (null = no zone) so every consumer sees the same value.
         Zone = string.IsNullOrWhiteSpace(Zone) ? null : Zone.Trim();
+
+        // Degraded-node avoidance drains leadership off a node, so a misconfigured threshold is a
+        // liveness hazard rather than a tuning nuisance. A multiplier at or below 1.0 marks every
+        // node at or above the median, which is at least half the cluster. Fail fast at startup.
+        if (SlowNodeMultiplier <= 1.0)
+            throw new RaftException(
+                $"[Kommander] SlowNodeMultiplier ({SlowNodeMultiplier}) must be greater than 1.0. " +
+                "At or below 1.0 every node at the median is classified slow, which drains most of " +
+                "the cluster's leadership.");
+
+        if (SlowNodeFloorMs < 0)
+            throw new RaftException(
+                $"[Kommander] SlowNodeFloorMs ({SlowNodeFloorMs}) must not be negative.");
+
+        if (SlowNodeMinSamples < 1)
+            throw new RaftException(
+                $"[Kommander] SlowNodeMinSamples ({SlowNodeMinSamples}) must be at least 1; " +
+                "a node with no observations would otherwise be judged on a zero commit wait.");
+
+        if (SlowNodeObservationTtl <= TimeSpan.Zero)
+            throw new RaftException(
+                $"[Kommander] SlowNodeObservationTtl ({SlowNodeObservationTtl}) must be positive; " +
+                "every node would otherwise be permanently unknown and the feature inert.");
+
+        if (SlowNodeEnterPasses < 1)
+            throw new RaftException(
+                $"[Kommander] SlowNodeEnterPasses ({SlowNodeEnterPasses}) must be at least 1.");
+
+        if (SlowNodeExitPasses < 1)
+            throw new RaftException(
+                $"[Kommander] SlowNodeExitPasses ({SlowNodeExitPasses}) must be at least 1.");
 
         // A leader only sends heartbeats from the CheckLeader timer pass, so the effective
         // heartbeat cadence is max(HeartbeatInterval, CheckLeaderInterval). If either is at or

@@ -1,4 +1,6 @@
 
+using System.Diagnostics;
+
 namespace Kommander.Diagnostics;
 
 /// <summary>
@@ -14,6 +16,13 @@ namespace Kommander.Diagnostics;
 ///
 /// <para><b>Advisory, never authoritative.</b> A stale or imprecise value only delays
 /// a consumer decision — it never violates Raft safety.</para>
+///
+/// <para><b>The estimate does not age on its own.</b> Because the decay is per sample, an
+/// accumulator that stops receiving observations holds its last value forever, and one that
+/// never received any returns <c>0</c> — which reads as "perfectly fast" rather than "unknown".
+/// Both are acceptable for a diagnostic read, and both are wrong for a placement decision, so
+/// <see cref="SampleCount"/> and <see cref="AgeMs"/> exist to let a caller tell *unknown* and
+/// *stale* apart from *healthy*. A caller that acts on the value must consult them.</para>
 /// </summary>
 public sealed class PartitionWaitAccumulator
 {
@@ -29,6 +38,8 @@ public sealed class PartitionWaitAccumulator
 
     private double _ewmaMs;
     private bool _hasObservation;
+    private long _sampleCount;
+    private long _lastObservationTicks;
 
     /// <param name="alpha">
     /// Per-sample smoothing weight ∈ (0, 1].  Defaults to <see cref="DefaultAlpha"/>.
@@ -56,7 +67,39 @@ public sealed class PartitionWaitAccumulator
             {
                 _ewmaMs = _alpha * avgWaitMs + (1.0 - _alpha) * _ewmaMs;
             }
+
+            _sampleCount++;
+            _lastObservationTicks = Stopwatch.GetTimestamp();
         }
+    }
+
+    /// <summary>
+    /// Number of observations recorded so far. <c>0</c> means <b>unknown</b>, not <b>fast</b>:
+    /// a caller must not read a zero <see cref="CurrentWaitMs"/> from an unobserved accumulator
+    /// as evidence of a healthy device. Saturates in practice only after ~2.9 × 10^11 batches.
+    /// </summary>
+    public long SampleCount
+    {
+        get { lock (_lock) return _sampleCount; }
+    }
+
+    /// <summary>
+    /// Milliseconds elapsed since the last observation, or <c>0</c> when there is none
+    /// (pair with <see cref="SampleCount"/> to tell those apart). Because the EWMA decays per
+    /// sample rather than per second, this is the only way to detect that
+    /// <see cref="CurrentWaitMs"/> describes the past rather than the present.
+    /// </summary>
+    public double AgeMs()
+    {
+        long lastTicks;
+        lock (_lock)
+        {
+            if (_sampleCount == 0)
+                return 0.0;
+            lastTicks = _lastObservationTicks;
+        }
+
+        return (Stopwatch.GetTimestamp() - lastTicks) * (1000.0 / Stopwatch.Frequency);
     }
 
     /// <summary>

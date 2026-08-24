@@ -116,7 +116,8 @@ internal sealed class RaftSystemCoordinator : IDisposable
             manager.SendTransferLeadershipSuggestion,
             manager.Liveness,
             manager.Configuration,
-            manager.LocalEndpoint);
+            manager.LocalEndpoint,
+            logger);
 
         _splitMerge = new SplitMergeController(
             systemConfiguration,

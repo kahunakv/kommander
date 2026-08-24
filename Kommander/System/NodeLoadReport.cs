@@ -48,6 +48,33 @@ public sealed class NodeLoadReport
     public string? Zone { get; set; }
 
     /// <summary>
+    /// Node-wide EWMA of the WAL enqueue-to-durable commit wait in milliseconds at the time this
+    /// report was built. Unlike <see cref="PartitionLoad.CommitWaitMs"/>, which exists only for
+    /// partitions this node leads, this figure covers every partition the node writes for —
+    /// follower appends included — so a node that leads nothing still advertises its disk health.
+    /// That is what makes it usable for judging a node that is a candidate to *receive* leadership.
+    /// <para>Meaningless on its own: <c>0</c> is the wire default an older peer produces, and also
+    /// what a node that has written nothing reports. Always read it together with
+    /// <see cref="NodeCommitWaitSamples"/> and <see cref="NodeCommitWaitAgeMs"/>.</para>
+    /// </summary>
+    public double NodeCommitWaitMs { get; set; }
+
+    /// <summary>
+    /// Number of WAL group batches that fed <see cref="NodeCommitWaitMs"/>. <c>0</c> means
+    /// <b>unknown</b> — either the node has written nothing, or the report came from a peer too old
+    /// to carry the field. A consumer must never read an unknown node as a healthy one.
+    /// </summary>
+    public long NodeCommitWaitSamples { get; set; }
+
+    /// <summary>
+    /// Milliseconds elapsed between the last WAL batch observation and the moment this report was
+    /// built. The commit-wait EWMA decays per sample rather than per second, so a node that goes
+    /// quiet keeps reporting its last figure; this field is the only way a consumer can tell that
+    /// <see cref="NodeCommitWaitMs"/> describes the past.
+    /// </summary>
+    public long NodeCommitWaitAgeMs { get; set; }
+
+    /// <summary>
     /// Load snapshots for every partition this node currently leads.
     /// Partitions for which another node is leader are absent — the receiver
     /// must not infer "no leadership" from a missing entry; it must consult the

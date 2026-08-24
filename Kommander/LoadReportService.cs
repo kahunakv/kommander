@@ -70,12 +70,18 @@ internal sealed class LoadReportService
             });
         }
 
+        // Node-wide disk health is read outside the leadership loop on purpose: a node that leads
+        // nothing must still advertise it, because that is exactly the node the balancer has to
+        // judge before it hands over a leadership.
         return new NodeLoadReport
         {
             Endpoint = localEndpoint,
             ReportVersion = Interlocked.Increment(ref _reportVersion),
             Time = getHlcNow(),
             Zone = configuration.Zone,
+            NodeCommitWaitMs = walScheduler.GetNodeCommitWaitMs(),
+            NodeCommitWaitSamples = walScheduler.GetNodeCommitWaitSamples(),
+            NodeCommitWaitAgeMs = (long)walScheduler.GetNodeCommitWaitAgeMs(),
             Leaderships = leaderships,
         };
     }

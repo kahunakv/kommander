@@ -32,6 +32,8 @@ Swap `-f net8.0` for `-f net10.0` to measure the .NET 10 build.
 |-------|---------------|
 | `LogOrderingBenchmarks` | `OrderById` allocates 0 bytes for already-sorted batches (the common case) vs the old `OrderBy(...).ToArray()`; parity on the unsorted fallback. |
 | `AuthMetadataBenchmarks` | Old path signs HMAC + allocates `Metadata` per send; the new warm-send path does neither (signing moves to once-per-stream-open). |
+| `LeadershipLeaseBenchmarks` | A published-lease confirmation hit (`TryConfirmLeadershipFast`, and the async hit chain) allocates 0 bytes vs the executor-side fast path's 80 B `RaftResponse` per call (which itself excludes the full `Ask` round trip). |
+| `ReadSchedulerBenchmarks` | Bytes/read through the real `FairReadScheduler`: state-carried `EnqueueTask<TState,T>` (item + `Task` only) vs the legacy `Func<T>` overload vs the pre-change TCS + closure + `Action` shape. |
 
 ## Adding a suite
 

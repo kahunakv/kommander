@@ -197,8 +197,9 @@ public static class KommanderMetrics
     // ── Leader balancer ───────────────────────────────────────────────────────
 
     /// <summary>
-    /// Total leadership-transfer moves by outcome: <c>planned</c>, <c>succeeded</c>,
-    /// <c>timed_out</c>.  A sustained high <c>timed_out</c> rate indicates suggestions
+    /// Total leadership-transfer moves by outcome: <c>planned</c>, <c>drain</c>,
+    /// <c>succeeded</c>, <c>timed_out</c>. A <c>drain</c> move is one the degraded-node detector
+    /// forced off a slow node, as opposed to an ordinary <c>planned</c> rebalance.  A sustained high <c>timed_out</c> rate indicates suggestions
     /// are not reaching their recipient or the recipient is dropping them.
     /// </summary>
     internal static readonly Counter<long> BalancerMovesTotal =
@@ -237,6 +238,20 @@ public static class KommanderMetrics
                    global::System.BitConverter.DoubleToInt64Bits(value));
     }
 
+    private static long _balancerSlowNodes;
+
+    /// <summary>
+    /// Number of nodes currently classified as slow by the degraded-node detector (P0 leader only;
+    /// 0 when the balancer is off, avoidance is off, or this node is not the P0 leader). A value
+    /// that oscillates between passes means the hysteresis thresholds are too tight for the
+    /// deployment's latency variance.
+    /// </summary>
+    internal static long BalancerSlowNodes
+    {
+        get => Interlocked.Read(ref _balancerSlowNodes);
+        set => Interlocked.Exchange(ref _balancerSlowNodes, value);
+    }
+
     // ── Observable gauges (dynamic per-partition) ─────────────────────────────
 
     // Weak references allow GC to collect stopped instances without leaking.
@@ -267,6 +282,11 @@ public static class KommanderMetrics
             "raft.balancer.load_imbalance",
             static () => BalancerLoadImbalance,
             description: "Fractional load imbalance: (maxLoad / meanLoad) - 1 (P0 leader only; 0 when not applicable).");
+
+        Meter.CreateObservableGauge(
+            "raft.balancer.slow_nodes",
+            static () => BalancerSlowNodes,
+            description: "Nodes currently classified slow by commit-wait (P0 leader only; 0 when not applicable).");
     }
 
     /// <summary>

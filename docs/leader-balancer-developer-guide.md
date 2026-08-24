@@ -151,6 +151,39 @@ planner moves leaderships from the most over-loaded node to the most under-loade
 has a choice, it moves the **hottest** partition onto the **coolest** node — improving count *and*
 load in one move.
 
+### Tier 0 — degraded-node drain (optional, runs first)
+Off by default. Switch it on with `EnableSlowNodeAvoidance`.
+
+Every node measures how long its own WAL writes take to become durable, and reports that figure with
+its load report. Followers report it too, which matters: the balancer must judge the disk of a node it
+is about to *give* leadership to, and that node is a follower for the partition in question.
+
+When one node's write latency stands far above its peers', the balancer stops sending it leadership
+and moves away the leaderships it already holds. If this tier emits any move, the other two tiers sit
+out that pass — a drain deliberately unbalances the counts, and Tier 1 would only fight it.
+
+Four rules keep it from firing on a healthy cluster:
+
+1. **A node is judged against its peers, not against a fixed number.** Under heavy write load every
+   disk slows down together, so the ratio to the cluster median stays flat and nobody is classified.
+   A single failing device is what stands out.
+2. **A quiet node is "unknown", not "healthy".** The latency estimate only updates when writes
+   happen, so a node that stopped writing keeps reporting its last figure. Both the number of
+   observations and their age travel with the report, and a node without enough recent evidence is
+   left alone — including a freshly restarted one, which would otherwise look like the fastest node
+   in the cluster.
+3. **Nothing happens on the first bad pass.** A node must look slow for `SlowNodeEnterPasses`
+   consecutive passes to be classified, and clean for `SlowNodeExitPasses` consecutive passes to be
+   released. Recovery is deliberately slower than detection.
+4. **Never a majority.** If half or more of the voters look slow, none are classified. That is a
+   cluster-wide condition, and draining a majority would be a self-inflicted outage.
+
+Fewer than three nodes with usable measurements also classifies nobody: with two, the median is their
+mean, so a slow node lifts the very number it is compared against.
+
+> **This is a leadership decision only.** A node classified slow keeps its replicas, keeps its vote,
+> and stays a full cluster member. Nothing is evicted.
+
 ### Tier 2 — load balance (secondary)
 If counts are already even but one node is still much hotter than another (load skew above
 `LoadImbalanceThreshold`), the planner emits a **count-neutral swap**: move a hot partition off the
@@ -164,6 +197,8 @@ Before a move is allowed, it must pass all of these:
 - Its leader has been stable for at least `MinLeaderStabilityMs` (don't move a leadership that just
   formed — it's probably still settling).
 - The target is a live, voting member that actually belongs to that partition's group.
+- The target is not currently classified as a degraded node (only when `EnableSlowNodeAvoidance` is
+  on; see Tier 0).
 - The partition isn't in **cooldown** from a recent move (prevents ping-ponging).
 - The partition doesn't already have an **outstanding** suggestion in flight (prevents duplicates).
 
@@ -248,6 +283,13 @@ The balancer is **off by default**. Turn it on by setting `EnableLeaderBalancer 
 | `SuggestionTimeout` | `15s` | How long to wait for a suggested move to show up before giving up on it. |
 | `LeaderBalancerOpsWeight` | `1.0` | Weight of throughput in the load score. |
 | `LeaderBalancerQueueWeight` | `0.5` | Weight of queue depth in the load score. |
+| `EnableSlowNodeAvoidance` | `false` | Master on/off switch for Tier 0. Off: no node is ever classified. |
+| `SlowNodeMultiplier` | `3.0` | How many times the cluster median write latency makes a node a candidate. |
+| `SlowNodeFloorMs` | `10.0` | Below this absolute latency a node is never a candidate, whatever the ratio. |
+| `SlowNodeMinSamples` | `20` | Write batches a node must have observed before it is judged at all. |
+| `SlowNodeObservationTtl` | `30s` | Older measurements are treated as unknown, not as healthy. |
+| `SlowNodeEnterPasses` | `3` | Consecutive bad passes before a node is classified. |
+| `SlowNodeExitPasses` | `6` | Consecutive clean passes before a node is released. |
 
 **Tuning tips for beginners:**
 
@@ -258,6 +300,9 @@ The balancer is **off by default**. Turn it on by setting `EnableLeaderBalancer 
   takes gossip to spread across your cluster. If it's too small, successful moves get mis-counted as
   failures (because their "I'm the new leader" report hasn't reached the controller yet) and get
   needlessly retried. On bigger clusters, raise it.
+- `SlowNodeEnterPasses` and `SlowNodeExitPasses` count **passes, not seconds**. If you shorten
+  `LeaderBalancerInterval`, you shorten the detection and recovery delays with it. At the defaults
+  (30s interval) a node is classified after 90s and released after 180s.
 - `CountDeadband` and `LoadImbalanceThreshold` are your anti-oscillation knobs. Raise them if you see
   the balancer fidgeting; lower them for tighter balance at the cost of more moves.
 
@@ -270,16 +315,21 @@ The balancer publishes metrics under the `Kommander` meter (consumable via OpenT
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `raft.balancer.moves_total` | counter | Moves tagged by outcome: `planned`, `succeeded`, `timed_out`. |
+| `raft.balancer.moves_total` | counter | Moves tagged by outcome: `planned`, `drain`, `succeeded`, `timed_out`. |
 | `raft.balancer.skipped_passes_total` | counter | Passes skipped because the view was incomplete. |
 | `raft.balancer.count_imbalance` | gauge | How far the most-loaded node is above the ideal count. Trends to ~0 as it converges. |
 | `raft.balancer.load_imbalance` | gauge | Fractional load skew across nodes. Also trends down. |
+| `raft.balancer.slow_nodes` | gauge | Nodes currently classified degraded by Tier 0. Normally `0`. |
 
 **Reading them:**
 
 - Healthy: a burst of `planned` then `succeeded`, and both imbalance gauges drifting toward zero.
 - A high `timed_out` rate means suggestions aren't landing — recipients are dropping them, or
   `SuggestionTimeout` is too tight for your gossip latency.
+- A `drain` outcome means Tier 0 evacuated a node it judged degraded — check that node's disk before
+  assuming the balancer got it wrong.
+- `raft.balancer.slow_nodes` flipping between `0` and `1` across passes means the thresholds are too
+  tight for your latency variance. Raise `SlowNodeMultiplier` or `SlowNodeExitPasses`.
 - A high `skipped_passes_total` means the view is often incomplete — a node may be silent, or report
   TTL/interval are mismatched.
 

@@ -317,4 +317,39 @@ public class TestLeadershipLease
         await ConfirmOnce(sm, host, correlationId: 7, term: 3);
         Assert.True(sm.TryConfirmLeadershipFast());
     }
+
+    // ── allocation contract ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The lease exists to make a confirmed read a zero-allocation field read; this pins that
+    /// contract so a future edit cannot quietly reintroduce a per-call allocation. Measured with
+    /// the per-thread allocation counter over a synchronous loop (no awaits inside the measured
+    /// region, so the thread cannot migrate). The companion benchmark
+    /// (`Kommander.MicroBenchmarks/LeadershipLeaseBenchmarks.cs`) reports the same number.
+    /// </summary>
+    [Fact]
+    public async Task FastPathHit_AllocatesNothing()
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+
+        await ConfirmOnce(sm, host);
+        Assert.True(sm.TryConfirmLeadershipFast());
+
+        // Warm-up: let any lazy statics (cached delegates, tier-0 helpers) allocate outside the
+        // measured region.
+        for (int i = 0; i < 1_000; i++)
+            sm.TryConfirmLeadershipFast();
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+
+        bool all = true;
+        for (int i = 0; i < 10_000; i++)
+            all &= sm.TryConfirmLeadershipFast();
+
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.True(all);
+        Assert.Equal(0, allocated);
+    }
 }

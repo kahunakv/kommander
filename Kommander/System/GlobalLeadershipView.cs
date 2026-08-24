@@ -37,6 +37,15 @@ public sealed class GlobalLeadershipView
     public IReadOnlyDictionary<int, long> PartitionLeaderSinceMs { get; }
 
     /// <summary>
+    /// Maps each endpoint with a fresh report to its WAL disk-health figures. Keyed by every fresh
+    /// reporter, not only by nodes that lead something — a node that leads nothing still reports,
+    /// and it is exactly the node a transfer would target.
+    /// <para>An endpoint absent here has no fresh report at all, which a consumer must treat as
+    /// unknown rather than healthy.</para>
+    /// </summary>
+    public IReadOnlyDictionary<string, NodeHealthSample> NodeHealth { get; }
+
+    /// <summary>
     /// The set of cluster members with <see cref="ClusterMemberRole.Voter"/> role that
     /// appeared alive (in <c>aliveEndpoints</c>) at <see cref="Build"/> time.
     /// Only voters in this set are eligible as transfer targets.
@@ -59,6 +68,7 @@ public sealed class GlobalLeadershipView
         Dictionary<int, string> partitionOwner,
         Dictionary<int, double> partitionLoad,
         Dictionary<int, long> partitionLeaderSinceMs,
+        Dictionary<string, NodeHealthSample> nodeHealth,
         HashSet<string> liveVoters,
         HashSet<string> freshReportEndpoints)
     {
@@ -67,6 +77,7 @@ public sealed class GlobalLeadershipView
         PartitionOwner  = partitionOwner;
         PartitionLoad   = partitionLoad;
         PartitionLeaderSinceMs = partitionLeaderSinceMs;
+        NodeHealth      = nodeHealth;
         LiveVoters      = liveVoters;
         FreshReportEndpoints = freshReportEndpoints;
     }
@@ -130,6 +141,23 @@ public sealed class GlobalLeadershipView
             }
         }
 
+        // Step 2b: node-level disk health, one entry per fresh reporter. Unlike the partition maps
+        // below there is nothing to conflict-resolve: each node is the only authority on its own
+        // device. The reported age is measured at the sender, so add the report's own age to it —
+        // gossip transit is otherwise invisible and would understate staleness.
+        Dictionary<string, NodeHealthSample> nodeHealth = new(fresh.Count, StringComparer.Ordinal);
+        foreach (NodeLoadReport report in fresh)
+        {
+            long transitMs = (long)(now - report.Time).TotalMilliseconds;
+            if (transitMs < 0)
+                transitMs = 0;
+
+            nodeHealth[report.Endpoint] = new NodeHealthSample(
+                report.NodeCommitWaitMs,
+                report.NodeCommitWaitSamples,
+                report.NodeCommitWaitAgeMs + transitMs);
+        }
+
         // Step 3: conflict-resolve partition ownership by newest report Time.
         // claimTime tracks which report's Time was used to win each partition.
         Dictionary<int, (string Endpoint, HLCTimestamp ClaimTime, double Load, long LeaderSinceMs)> claims = new();
@@ -185,6 +213,7 @@ public sealed class GlobalLeadershipView
             partitionOwner,
             partitionLoad,
             partitionLeaderSinceMs,
+            nodeHealth,
             liveVoters,
             freshReportEndpoints);
     }
