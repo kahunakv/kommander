@@ -131,6 +131,21 @@ public static class KommanderMetrics
         WalCompactionBlockedByDurabilityFloorTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
 
     /// <summary>
+    /// Restores whose WAL read was narrowed by the soft checkpoint: the application-durability
+    /// floor sat above the last hard checkpoint, so replay started at the floor instead. This is
+    /// the signal that cold-restart replay is bounded by the application's flush lag rather than
+    /// by the retained log length.
+    /// </summary>
+    internal static readonly Counter<long> WalRestoreNarrowedBySoftFloorTotal =
+        Meter.CreateCounter<long>(
+            "raft.wal.restore_narrowed_by_soft_floor_total",
+            description: "Partition restores whose replay was narrowed to the application-durability floor (soft checkpoint).");
+
+    /// <summary>Counts one restore narrowed by the soft checkpoint, tagged by partition.</summary>
+    internal static void RecordRestoreNarrowedBySoftFloor(int partitionId) =>
+        WalRestoreNarrowedBySoftFloorTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
+
+    /// <summary>
     /// Entries a compaction pass retained below the checkpoint for a live, acking follower (the
     /// live-replica lag budget). A persistently large value for one partition means a follower is
     /// chronically behind but still being served by backfill instead of snapshots.
