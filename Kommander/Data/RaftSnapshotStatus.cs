@@ -51,4 +51,20 @@ public sealed class RaftSnapshotStatus
 
     /// <summary>Time remaining before the next transfer attempt is allowed; zero when not backing off.</summary>
     public TimeSpan RetryBackoffRemaining { get; init; }
+
+    /// <summary>
+    /// True when the rescue convergence breaker is tripped for this follower: every recent
+    /// snapshot install reported success, yet the follower returned below the WAL compaction floor
+    /// each time, so the leader has stopped escalating (probes excepted — see
+    /// <see cref="RaftConfiguration.SnapshotRescueProbeInterval"/>). A follower in this state
+    /// cannot be repaired by re-sending snapshots and needs operator attention; note that
+    /// <see cref="FailedAttempts"/> stays 0 here because nothing in the loop ever fails.
+    /// </summary>
+    public bool RescueNotConverging { get; init; }
+
+    /// <summary>
+    /// Consecutive non-converging rescue cycles observed for this follower (a successful install
+    /// followed by another below-floor escalation). Resets when the follower's refusals stop.
+    /// </summary>
+    public int ConsecutiveRescueCycles { get; init; }
 }

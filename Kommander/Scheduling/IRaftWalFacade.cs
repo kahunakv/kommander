@@ -182,6 +182,19 @@ public interface IRaftWalFacade
     void NotifyCommitted();
 
     /// <summary>
+    /// Publishes the leader's live-replica retention floor: the lowest log index a live, acking
+    /// follower still needs (its replicated position + 1), or <see cref="long.MaxValue"/> when no
+    /// follower constrains retention. The heartbeat round republishes it every interval;
+    /// compaction holds its floor there — bounded by
+    /// <see cref="RaftConfiguration.CompactionLiveReplicaLagBudget"/> and a staleness window, so a
+    /// stepped-down or stalled leader's value expires on its own. Without this, a leader
+    /// compacting on its ordinary cadence repeatedly pushed a live follower back below the floor
+    /// and the snapshot rescue could never converge. Default no-op for facades that do not
+    /// compact (test stubs).
+    /// </summary>
+    void SetLiveReplicaRetentionFloor(long floor) { }
+
+    /// <summary>
     /// Persists this partition's Raft hard state — the current term and the endpoint we last granted our
     /// vote to in that term. Durability rides the backend's existing WAL fsync cadence (no dedicated
     /// fsync), so the last vote/term can be lost on power failure. The default is a no-op so non-durable

@@ -130,6 +130,20 @@ public static class KommanderMetrics
     internal static void RecordCompactionBlockedByDurabilityFloor(int partitionId) =>
         WalCompactionBlockedByDurabilityFloorTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
 
+    /// <summary>
+    /// Entries a compaction pass retained below the checkpoint for a live, acking follower (the
+    /// live-replica lag budget). A persistently large value for one partition means a follower is
+    /// chronically behind but still being served by backfill instead of snapshots.
+    /// </summary>
+    internal static readonly Histogram<long> WalCompactionLiveReplicaHold =
+        Meter.CreateHistogram<long>(
+            "raft.wal.compaction_live_replica_hold_entries",
+            description: "Entries retained below the checkpoint for a live lagging follower, per pass.");
+
+    /// <summary>Records the entries held below the checkpoint for a live replica in one pass.</summary>
+    internal static void RecordCompactionHeldByLiveReplica(int partitionId, long heldEntries) =>
+        WalCompactionLiveReplicaHold.Record(heldEntries, new KeyValuePair<string, object?>("partition_id", partitionId));
+
     // ── Snapshot transfer ─────────────────────────────────────────────────────
 
     /// <summary>
@@ -148,6 +162,21 @@ public static class KommanderMetrics
         SnapshotTransferFailuresTotal.Add(1,
             new KeyValuePair<string, object?>("partition_id", partitionId),
             new KeyValuePair<string, object?>("cause", cause));
+
+    /// <summary>
+    /// Snapshot-rescue convergence breaker trips: N consecutive installs each reported success and
+    /// the follower still returned below the compaction floor, so the leader stopped escalating.
+    /// This never shows in <see cref="SnapshotTransferFailuresTotal"/> — nothing in such a loop
+    /// fails — which is exactly why it needs its own signal.
+    /// </summary>
+    internal static readonly Counter<long> SnapshotRescueBreakerTrippedTotal =
+        Meter.CreateCounter<long>(
+            "raft.snapshot.rescue_breaker_tripped_total",
+            description: "Snapshot rescue loops stopped by the convergence breaker, by partition.");
+
+    /// <summary>Counts one convergence-breaker trip, tagged by partition.</summary>
+    internal static void RecordSnapshotRescueBreakerTripped(int partitionId) =>
+        SnapshotRescueBreakerTrippedTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
 
     // ── State machine ─────────────────────────────────────────────────────────
 

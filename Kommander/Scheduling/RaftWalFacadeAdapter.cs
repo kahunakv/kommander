@@ -69,6 +69,8 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
 
     public void NotifyCommitted() => wal.NotifyCommitted();
 
+    public void SetLiveReplicaRetentionFloor(long floor) => wal.SetLiveReplicaRetentionFloor(floor);
+
     public ValueTask PersistHardStateAsync(long currentTerm, string? votedFor)
     {
         wal.PersistHardState(currentTerm, votedFor);

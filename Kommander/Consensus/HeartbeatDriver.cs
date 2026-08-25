@@ -2,6 +2,7 @@ using System.Diagnostics;
 using Kommander.Communication.Grpc;
 using Kommander.Data;
 using Kommander.Diagnostics;
+using Kommander.Gossip;
 using Kommander.Logging;
 using Kommander.Scheduling;
 using Kommander.System;
@@ -103,7 +104,10 @@ internal sealed class HeartbeatDriver
         // proposals can never quiesce (the quiesce gate requires activeProposals empty), so this
         // site is always reached while anything needs retrying.
         if (coreState.NodeState == RaftNodeState.Leader)
+        {
             proposals.RetryUnresolved(coreState.LastHeartbeat);
+            PublishLiveReplicaRetentionFloor(nodes);
+        }
 
         TagList heartbeatTags = new() { { "partition_id", host.PartitionId } };
         KommanderMetrics.HeartbeatsSentTotal.Add(1, heartbeatTags);
@@ -244,6 +248,57 @@ internal sealed class HeartbeatDriver
 
             sender.AppendLogToNode(node, coreState.LastHeartbeat, null);
         }
+    }
+
+    /// <summary>
+    /// Publishes the live-replica retention floor to the WAL for this heartbeat round: the lowest
+    /// log index a live peer with positional evidence still needs (its best-known replicated
+    /// position + 1), or <see cref="long.MaxValue"/> when no peer constrains retention. Compaction
+    /// holds its truncation floor there — bounded by
+    /// <see cref="RaftConfiguration.CompactionLiveReplicaLagBudget"/> — so a responsive follower is
+    /// not compacted into permanent snapshot dependence (the non-converging rescue loop's deeper
+    /// cause). Peer selection is deliberately conservative:
+    /// <list type="bullet">
+    ///   <item>Only SWIM-Alive peers hold the floor — a paused or dead node must not grow the WAL
+    ///   (beyond what the budget already bounds while its staleness lasts).</item>
+    ///   <item>A peer with no positional evidence contributes nothing: there is no index to hold
+    ///   at, and a blank joiner on a compacted WAL is seeded by snapshot anyway. Position 0 counts
+    ///   as no evidence — election seeding sets <c>matchIndex</c> to 0 optimistically for every
+    ///   peer, including in-sync ones whose legacy acks never advance it.</item>
+    ///   <item>Learners count too — a placement learner mid-catch-up is exactly the replica whose
+    ///   backfill the floor must keep servable.</item>
+    /// </list>
+    /// Runs on the executor thread; the WAL side applies the budget clamp and a staleness window,
+    /// so this publisher needs no step-down hook — a leader that stops beating stops holding.
+    /// </summary>
+    private void PublishLiveReplicaRetentionFloor(IReadOnlyList<RaftNode> nodes)
+    {
+        if (host.Configuration.CompactionLiveReplicaLagBudget <= 0)
+            return;
+
+        long floor = long.MaxValue;
+
+        foreach (RaftNode node in nodes)
+        {
+            if (node.Endpoint == host.LocalEndpoint)
+                continue;
+
+            if (host.GetNodeLiveness(node.Endpoint) != MemberLivenessState.Alive)
+                continue;
+
+            long position = tracker.GetKnownRemoteMaxLogId(node.Endpoint);
+            if (tracker.TryGetMatchIndex(node.Endpoint, out long match) && match > position)
+                position = match;
+
+            if (position <= 0)
+                continue;
+
+            long needed = position + 1;
+            if (needed < floor)
+                floor = needed;
+        }
+
+        wal.SetLiveReplicaRetentionFloor(floor);
     }
 
     /// <summary>

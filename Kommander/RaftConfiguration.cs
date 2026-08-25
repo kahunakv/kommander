@@ -799,6 +799,43 @@ public class RaftConfiguration
     public TimeSpan SnapshotTransferStepTimeout { get; set; } = TimeSpan.FromMinutes(2);
 
     /// <summary>
+    /// Convergence breaker for the refused-backfill → snapshot rescue: the number of consecutive
+    /// rescue cycles (a successful install followed by another below-floor escalation for the same
+    /// follower) after which the leader stops escalating for that follower. Every cycle in such a
+    /// loop reports success, so the failure backoff never fires — without this bound a follower
+    /// that returns below the compaction floor after every install drove an unbounded
+    /// whole-partition export every cooldown until the leader died of memory exhaustion (the
+    /// Caraxes <c>bank-optimistic-45m-p</c> OOM/SIGSEGV). A tripped breaker is surfaced as
+    /// <see cref="Data.RaftSnapshotStatus.RescueNotConverging"/> on
+    /// <see cref="IRaft.GetSnapshotStatuses"/> and logged once at Warning; recovery probes are
+    /// paced by <see cref="SnapshotRescueProbeInterval"/>. Values &lt;= 0 disable the breaker
+    /// (pre-existing unbounded behavior). Default 3.
+    /// </summary>
+    public int SnapshotRescueMaxConsecutiveCycles { get; set; } = 3;
+
+    /// <summary>
+    /// While the rescue convergence breaker is tripped for a follower, one snapshot rescue attempt
+    /// is still allowed per this interval, so a follower whose environment recovers (compaction
+    /// paced, disk freed, application healed) is eventually re-seeded without operator action.
+    /// The probe rate bounds the leader's export cost to a few megabytes per interval instead of
+    /// one full export per cooldown. Values &lt;= 0 disable probing: a tripped breaker then stays
+    /// tripped until the follower converges by other means or the episode goes quiet. Default 5
+    /// minutes.
+    /// </summary>
+    public TimeSpan SnapshotRescueProbeInterval { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Upper bound, in bytes, on the leader-side retry cache for one produced snapshot export.
+    /// An export at or under this size is drained into memory once and re-sent from that cache on
+    /// every retry at the same index; without it each retry re-ran
+    /// <c>ExportPartitionState</c> from scratch — under memory pressure the sender's response to a
+    /// failed send was to immediately repeat the most allocation-hungry operation in the process
+    /// (the Caraxes OOM loop). An export above this bound streams chunk-by-chunk exactly as before
+    /// and is not cached. Values &lt;= 0 disable the cache entirely. Default 64 MiB.
+    /// </summary>
+    public long SnapshotExportRetryCacheMaxBytes { get; set; } = 64L * 1024 * 1024;
+
+    /// <summary>
     /// Maximum REST request body, in bytes, that will be read and digested before its signature has
     /// been verified. Larger bodies are refused with 413 and
     /// <see cref="RaftTransportAuthenticationStatus.RequestBodyTooLarge"/>. Default 32 MiB.
@@ -1270,6 +1307,20 @@ public class RaftConfiguration
     /// Must be greater than or equal to <see cref="CompactNumberEntries"/>.
     /// </summary>
     public int MaxEntriesPerCompaction { get; set; } = 5000;
+
+    /// <summary>
+    /// Maximum number of log entries the leader retains below the compaction checkpoint for a
+    /// live, acking follower that has not yet replicated them. While a reachable follower's
+    /// replicated position sits inside this budget, compaction holds its floor at that position so
+    /// the follower can be served by ordinary backfill; beyond the budget (or once the follower is
+    /// no longer Alive) the floor advances normally and the follower must be seeded by a snapshot.
+    /// Without this hold, a leader compacting on its ordinary cadence repeatedly re-created the
+    /// below-floor condition the snapshot rescue had just repaired, so the rescue could never
+    /// converge (the Caraxes <c>bank-optimistic-45m-p</c> loop). Followers only — the budget is
+    /// applied on the leader from its replication tracker; it has no effect on a node's own
+    /// restart replay. Values &lt;= 0 disable the hold. Default 100000.
+    /// </summary>
+    public long CompactionLiveReplicaLagBudget { get; set; } = 100_000;
 
     /// <summary>
     /// Returns <see cref="CompactNumberEntries"/> clamped to at least 1 when misconfigured.

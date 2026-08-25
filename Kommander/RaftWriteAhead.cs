@@ -154,6 +154,35 @@ public sealed class RaftWriteAhead
     /// </summary>
     private long holdFloor = long.MaxValue;
 
+    /// <summary>
+    /// Live-replica retention floor as last published by the leader's heartbeat round: the lowest
+    /// log index a live, acking follower still needs, or <see cref="long.MaxValue"/> when no
+    /// follower constrains retention. See <see cref="SetLiveReplicaRetentionFloor"/>. Volatile
+    /// pattern as <see cref="minRetainIndex"/>.
+    /// </summary>
+    private long liveReplicaRetentionFloor = long.MaxValue;
+
+    /// <summary>
+    /// When <see cref="liveReplicaRetentionFloor"/> was last published (monotonic ticks; 0 = never).
+    /// A value older than <see cref="liveReplicaFloorStalenessTicks"/> is ignored by compaction:
+    /// the publisher runs only on an active leader's heartbeat round, so expiry — rather than a
+    /// clear-on-step-down hook at every leader→follower transition site — is what keeps a
+    /// stepped-down, quiesced, or crashed-mid-publish leader from pinning retention forever.
+    /// </summary>
+    private long liveReplicaFloorPublishedTicks;
+
+    /// <summary>
+    /// Staleness bound for the published live-replica floor: ten heartbeat intervals, floored at
+    /// 30 s. An active leader republishes every round, so a fresh value is always present where the
+    /// hold matters; anything older means the publisher stopped. Not readonly only for
+    /// <see cref="SetLiveReplicaFloorStalenessForTesting"/>.
+    /// </summary>
+    private long liveReplicaFloorStalenessTicks;
+
+    /// <summary>Test-only: overrides the staleness bound so expiry is testable without waiting 30 s.</summary>
+    internal void SetLiveReplicaFloorStalenessForTesting(TimeSpan window) =>
+        liveReplicaFloorStalenessTicks = (long)(window.TotalSeconds * Stopwatch.Frequency);
+
     // Test-only handle for WaitForCompactionIdleAsync; not a production synchronization point.
     private Task? compactionPassTask;
 
@@ -192,6 +221,22 @@ public sealed class RaftWriteAhead
         this.compactNumberEntries = manager.Configuration.GetEffectiveCompactNumberEntries();
         this.maxEntriesPerCompaction = manager.Configuration.GetEffectiveMaxEntriesPerCompaction();
         this.operations = compactEveryOperations > 0 ? compactEveryOperations : 0;
+        this.liveReplicaFloorStalenessTicks = (long)(Math.Max(
+            30_000, 10 * manager.Configuration.HeartbeatInterval.TotalMilliseconds) * Stopwatch.Frequency / 1000);
+    }
+
+    /// <summary>
+    /// Publishes the live-replica retention floor (see <see cref="Scheduling.IRaftWalFacade.SetLiveReplicaRetentionFloor"/>).
+    /// Called from the leader's heartbeat round on the partition executor; read lock-free by
+    /// <see cref="RunCompactionPassAsync"/>. Values &lt;= 0 are normalized to
+    /// <see cref="long.MaxValue"/> (no protection), mirroring <see cref="SetMinRetainIndex"/>.
+    /// The publish timestamp is written after the floor, so a torn observation errs toward
+    /// treating the value as stale — never toward applying a stale one as fresh.
+    /// </summary>
+    public void SetLiveReplicaRetentionFloor(long floor)
+    {
+        Volatile.Write(ref liveReplicaRetentionFloor, floor <= 0 ? long.MaxValue : floor);
+        Volatile.Write(ref liveReplicaFloorPublishedTicks, Stopwatch.GetTimestamp());
     }
 
     /// <summary>
@@ -1869,6 +1914,13 @@ public sealed class RaftWriteAhead
     internal long MinRetainIndex => Volatile.Read(ref minRetainIndex);
 
     /// <summary>
+    /// Live-replica retention floor as last published (before the budget clamp and the staleness
+    /// check applied at compaction time). Diagnostics/tests only; <see cref="long.MaxValue"/> means
+    /// no follower constrains retention.
+    /// </summary>
+    internal long LiveReplicaRetentionFloor => Volatile.Read(ref liveReplicaRetentionFloor);
+
+    /// <summary>
     /// Effective retention floor actually applied by compaction (before composing with the
     /// checkpoint): the minimum of the legacy <see cref="SetMinRetainIndex"/> floor and the
     /// min-of-holds floor. <see cref="long.MaxValue"/> means no extra retention. Diagnostics/tests only.
@@ -1964,12 +2016,40 @@ public sealed class RaftWriteAhead
                 }
             }
 
-            // Compose the legacy single floor with the min-of-holds floor and the
-            // application-durability floor: compaction must retain below whichever protected index
-            // is lowest across all consumers.
+            // Live-replica lag budget: while a live, acking follower's replicated position sits
+            // below the checkpoint AND within the configured budget, hold the floor at that
+            // position so ordinary backfill can still serve the follower. Compacting past a
+            // responsive replica forces it into snapshot dependence, and a leader that does so on
+            // its ordinary cadence re-creates the below-floor condition faster than any snapshot
+            // rescue can repair it — the rescue then loops forever (the Caraxes
+            // bank-optimistic-45m-p finding). The budget bounds the retention: a follower more
+            // than lagBudget entries behind is beyond what backfill catch-up can plausibly close
+            // before the next pass and is left to the snapshot path, so a slow-forever replica
+            // cannot grow the WAL without bound. The staleness window bounds trust in the
+            // publisher: only an active leader keeps the value fresh.
+            long liveReplicaFloor = long.MaxValue;
+            long lagBudget = manager.Configuration.CompactionLiveReplicaLagBudget;
+            if (lagBudget > 0)
+            {
+                long publishedTicks = Volatile.Read(ref liveReplicaFloorPublishedTicks);
+                long publishedFloor = Volatile.Read(ref liveReplicaRetentionFloor);
+                if (publishedTicks != 0
+                    && Stopwatch.GetTimestamp() - publishedTicks <= liveReplicaFloorStalenessTicks
+                    && publishedFloor < lastCheckpoint)
+                {
+                    liveReplicaFloor = Math.Max(publishedFloor, lastCheckpoint - lagBudget);
+                    KommanderMetrics.RecordCompactionHeldByLiveReplica(
+                        partition.PartitionId, lastCheckpoint - liveReplicaFloor);
+                }
+            }
+
+            // Compose the legacy single floor with the min-of-holds floor, the
+            // application-durability floor, and the live-replica floor: compaction must retain
+            // below whichever protected index is lowest across all consumers.
             long retainIndexFloor = Volatile.Read(ref minRetainIndex);
             long activeHoldFloor = Volatile.Read(ref holdFloor);
-            long retainFloor = Math.Min(Math.Min(retainIndexFloor, activeHoldFloor), durabilityFloor);
+            long retainFloor = Math.Min(
+                Math.Min(Math.Min(retainIndexFloor, activeHoldFloor), durabilityFloor), liveReplicaFloor);
             long effectiveFloor = Math.Min(lastCheckpoint, retainFloor);
 
             if (effectiveFloor <= 0)
@@ -1982,7 +2062,7 @@ public sealed class RaftWriteAhead
                         manager.LocalEndpoint,
                         partition.PartitionId,
                         effectiveFloor,
-                        DescribeFloorSource(effectiveFloor, lastCheckpoint, retainIndexFloor, activeHoldFloor, durabilityFloor),
+                        DescribeFloorSource(effectiveFloor, lastCheckpoint, retainIndexFloor, activeHoldFloor, durabilityFloor, liveReplicaFloor),
                         lastCheckpoint,
                         retainIndexFloor,
                         activeHoldFloor,
@@ -2054,7 +2134,8 @@ public sealed class RaftWriteAhead
         long lastCheckpoint,
         long retainIndexFloor,
         long activeHoldFloor,
-        long durabilityFloor)
+        long durabilityFloor,
+        long liveReplicaFloor)
     {
         if (effectiveFloor == lastCheckpoint)
             return "checkpoint";
@@ -2064,6 +2145,8 @@ public sealed class RaftWriteAhead
             return "retention_hold";
         if (effectiveFloor == retainIndexFloor)
             return "min_retain_index";
+        if (effectiveFloor == liveReplicaFloor)
+            return "live_replica_lag_budget";
         return "unknown";
     }
 }
