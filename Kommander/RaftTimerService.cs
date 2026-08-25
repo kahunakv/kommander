@@ -1,4 +1,5 @@
 using Kommander.Scheduling;
+using Kommander.Support.Parallelization;
 using Microsoft.Extensions.Logging;
 
 namespace Kommander;
@@ -253,7 +254,7 @@ public sealed class RaftTimerService : IDisposable
         // _host.UpdateNodes() and catches all exceptions — including those thrown after
         // the first await — so the discarded Task is always in a completed (not faulted)
         // state when it is collected.
-        _ = UpdateNodesAsync();
+        FireAndForget.Observe(UpdateNodesAsync(), _logger, "RaftTimerService.UpdateNodes");
     }
 
     private async Task UpdateNodesAsync()
@@ -289,7 +290,7 @@ public sealed class RaftTimerService : IDisposable
         if (Interlocked.CompareExchange(ref _gossipRunning, 1, 0) != 0)
             return;
 
-        _ = GossipTickAsync();
+        FireAndForget.Observe(GossipTickAsync(), _logger, "RaftTimerService.Gossip");
     }
 
     private async Task GossipTickAsync()
@@ -324,7 +325,7 @@ public sealed class RaftTimerService : IDisposable
         if (Interlocked.CompareExchange(ref _pingRunning, 1, 0) != 0)
             return;
 
-        _ = PingTickAsync();
+        FireAndForget.Observe(PingTickAsync(), _logger, "RaftTimerService.Ping");
     }
 
     private async Task PingTickAsync()

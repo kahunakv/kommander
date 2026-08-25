@@ -374,6 +374,92 @@ public sealed class TestRaftTransportDispatcher
         }
     }
 
+    // ── Outbound queue byte budget ────────────────────────────────────────────
+    // The per-peer payload budget is what keeps a non-draining follower from making its queue
+    // retain the leader's whole write load (the Caraxes run Q memory-exhaustion abort). Entries
+    // are accounted as LogData bytes plus a 128-byte per-entry overhead constant.
+
+    private static RaftResponderRequest MakePayloadAppendLogs(string ep, long term, int payloadSize) =>
+        new(RaftResponderRequestType.AppendLogs,
+            Node(ep),
+            new AppendLogsRequest(0, term, HLCTimestamp.Zero, ep,
+                [new RaftLog { Id = term, Term = term, LogType = "test", LogData = new byte[payloadSize] }]));
+
+    [Fact]
+    public async Task EntryCarryingMessages_OverByteBudget_AreDroppedWhileControlMessagesPass()
+    {
+        CapturingCommunication comm = new();
+        RaftConfiguration config = new() { Host = "localhost", Port = 9000, InitialPartitions = 0 };
+
+        RaftManager manager = new(
+            config,
+            new StaticDiscovery([]),
+            new InMemoryWAL(NullLogger<IRaft>.Instance),
+            new CapturingCommunication(),
+            new HybridLogicalClock(),
+            NullLogger<IRaft>.Instance
+        );
+
+        // Budget of exactly two 1000-byte-payload messages (1000 + 128 overhead each).
+        RaftTransportDispatcher dispatcher = new(manager, comm, NullLogger<IRaft>.Instance,
+            maxQueuedPayloadBytesPerPeer: 2 * (1000 + 128));
+
+        using (manager)
+        {
+            const string Ep = "node-a:8001";
+
+            // Gate the first send so everything after message 1 stays queued (and counted).
+            TaskCompletionSource<bool> gate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            TaskCompletionSource<bool> entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            comm.SetGate(gate, entered);
+
+            dispatcher.Enqueue(Ep, MakePayloadAppendLogs(Ep, term: 1, payloadSize: 1000)); // in-flight, still counted
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+            dispatcher.Enqueue(Ep, MakePayloadAppendLogs(Ep, term: 2, payloadSize: 1000)); // fills the budget
+            Assert.True(dispatcher.IsOutboundQueueSaturated(Ep), "two accepted messages reach the budget exactly");
+
+            dispatcher.Enqueue(Ep, MakePayloadAppendLogs(Ep, term: 3, payloadSize: 1000)); // over budget: dropped
+            dispatcher.Enqueue(Ep, MakeVote(Ep));                                          // control: always passes
+            dispatcher.Enqueue(Ep, MakeAppendLogs(Ep, term: 4));                           // empty heartbeat: always passes
+
+            gate.TrySetResult(true);
+            dispatcher.Dispose();
+
+            List<long> deliveredTerms = [];
+            foreach (CapturingCommunication.Call call in comm.Calls)
+            {
+                if (call.Kind == "AppendLogs")
+                    deliveredTerms.Add(((AppendLogsRequest)call.Payload).Term);
+                else if (call.Kind == "BatchRequests")
+                    foreach (BatchRequestsRequestItem item in ((BatchRequestsRequest)call.Payload).Requests!)
+                        if (item.AppendLogs is { } r) deliveredTerms.Add(r.Term);
+            }
+
+            Assert.Contains(1L, deliveredTerms);
+            Assert.Contains(2L, deliveredTerms);
+            Assert.DoesNotContain(3L, deliveredTerms); // the over-budget batch was dropped
+            Assert.Contains(4L, deliveredTerms);       // the empty heartbeat passed
+            Assert.Contains(comm.Calls, c =>
+                c.Kind == "Vote" || (c.Kind == "BatchRequests" &&
+                    ((BatchRequestsRequest)c.Payload).Requests!.Any(i => i.Vote is not null)));
+
+            Assert.False(dispatcher.IsOutboundQueueSaturated(Ep), "a drained queue is no longer saturated");
+        }
+    }
+
+    [Fact]
+    public void UnknownEndpoint_IsNeverSaturated()
+    {
+        CapturingCommunication comm = new();
+        var (manager, dispatcher) = Build(comm);
+        using (manager)
+        {
+            Assert.False(dispatcher.IsOutboundQueueSaturated("nobody:9999"));
+            dispatcher.Dispose();
+        }
+    }
+
     [Theory]
     [InlineData("Handshake")]
     [InlineData("Vote")]

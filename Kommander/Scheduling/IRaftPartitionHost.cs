@@ -108,6 +108,16 @@ public interface IRaftPartitionHost
 
     void EnqueueResponse(string endpoint, RaftResponderRequest request);
 
+    /// <summary>
+    /// True when the outbound transport queue for <paramref name="endpoint"/> holds more queued
+    /// log-payload bytes than <see cref="RaftConfiguration.MaxOutboundQueueBytesPerPeer"/> allows.
+    /// The backfill sender checks this before reading a batch from the WAL: a peer that is not
+    /// draining its queue gains nothing from another batch, and reading one per heartbeat is how a
+    /// paused follower exhausted the leader's heap in the Caraxes run Q soak. Defaults to
+    /// <see langword="false"/> so unit-test hosts without a real transport are unaffected.
+    /// </summary>
+    bool IsOutboundQueueSaturated(string endpoint) => false;
+
     Task InvokeLeaderChanged(int partitionId, string leader);
 
     Task<bool> InvokeReplicationReceived(int partitionId, RaftLog log);

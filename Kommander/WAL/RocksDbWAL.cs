@@ -333,6 +333,14 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <paramref name="maxEntries"/> rows have been read so large tails are not scanned in full.
     /// </summary>
     public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue)
+        => ReadLogsRange(partitionId, startLogIndex, maxEntries, long.MaxValue);
+
+    /// <summary>
+    /// Byte-budgeted range read. The budget is checked against <c>view.Log.Length</c> BEFORE
+    /// <see cref="ToRaftLog"/> materializes the payload, so an over-budget entry costs a wire-view
+    /// decode but never a managed copy — the point of the budget is to bound that allocation.
+    /// </summary>
+    public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries, long maxBytes)
     {
         // Presize when the caller supplied a sane bound (the common case: a bounded backfill batch),
         // so a full batch does not walk the doubling sequence. An unbounded/absurd limit falls back
@@ -350,6 +358,8 @@ public class RocksDbWAL : IWAL, IDisposable
         Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
         BuildPartitionPrefix(partitionPrefix, partitionId);
 
+        long payloadBytes = 0;
+
         while (iterator.Valid())
         {
             if (!iterator.GetKeySpan().StartsWith(partitionPrefix))
@@ -363,6 +373,12 @@ public class RocksDbWAL : IWAL, IDisposable
                 continue;
             }
 
+            // At-least-one-entry rule: the budget stops a batch, never the first entry —
+            // an entry larger than the whole budget must still ship or the follower stalls.
+            if (result.Count > 0 && payloadBytes + view.Log.Length > maxBytes)
+                break;
+
+            payloadBytes += view.Log.Length;
             result.Add(ToRaftLog(view));
 
             iterator.Next();

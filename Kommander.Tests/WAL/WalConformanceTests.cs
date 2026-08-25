@@ -649,6 +649,85 @@ public abstract class WalConformanceTests
         finally { cleanup(); }
     }
 
+    // ─────────────────────── ReadLogsRange byte budget ──────────────────────────
+    // The byte-budgeted overload bounds the leader-backfill allocation: the batch stops once
+    // adding the next entry would exceed the payload budget, whichever of the entry and byte
+    // bounds is hit first, but never returns fewer than one available entry.
+
+    [Fact]
+    public void ReadLogsRange_ByteBudget_StopsBeforeExceedingBudget()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            // Five entries of 100 payload bytes each; a 250-byte budget fits exactly two.
+            wal.Write([(41, [
+                PayloadLog(id: 1, payloadSize: 100),
+                PayloadLog(id: 2, payloadSize: 100),
+                PayloadLog(id: 3, payloadSize: 100),
+                PayloadLog(id: 4, payloadSize: 100),
+                PayloadLog(id: 5, payloadSize: 100)])]);
+
+            List<RaftLog> result = wal.ReadLogsRange(41, 1, maxEntries: 128, maxBytes: 250);
+            Assert.Equal([1L, 2L], result.Select(l => l.Id));
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void ReadLogsRange_ByteBudget_AlwaysReturnsAtLeastOneEntry()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            // The first entry alone is larger than the whole budget: it must still ship,
+            // or a follower behind an oversized entry could never converge.
+            wal.Write([(42, [
+                PayloadLog(id: 1, payloadSize: 1000),
+                PayloadLog(id: 2, payloadSize: 10)])]);
+
+            List<RaftLog> result = wal.ReadLogsRange(42, 1, maxEntries: 128, maxBytes: 100);
+            Assert.Equal([1L], result.Select(l => l.Id));
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void ReadLogsRange_ByteBudget_EntryBoundStillApplies()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(43, [
+                PayloadLog(id: 1, payloadSize: 10),
+                PayloadLog(id: 2, payloadSize: 10),
+                PayloadLog(id: 3, payloadSize: 10)])]);
+
+            // A generous byte budget must not defeat the entry cap.
+            List<RaftLog> result = wal.ReadLogsRange(43, 1, maxEntries: 2, maxBytes: long.MaxValue);
+            Assert.Equal([1L, 2L], result.Select(l => l.Id));
+        }
+        finally { cleanup(); }
+    }
+
+    [Fact]
+    public void ReadLogsRange_ByteBudget_UnlimitedBudgetMatchesPlainOverload()
+    {
+        using IWAL wal = CreateWal(out Action cleanup);
+        try
+        {
+            wal.Write([(44, [
+                PayloadLog(id: 1, payloadSize: 50),
+                PayloadLog(id: 2, payloadSize: 50),
+                PayloadLog(id: 3, payloadSize: 50)])]);
+
+            Assert.Equal(
+                wal.ReadLogsRange(44, 1, 128).Select(l => l.Id),
+                wal.ReadLogsRange(44, 1, 128, long.MaxValue).Select(l => l.Id));
+        }
+        finally { cleanup(); }
+    }
+
     /// <summary>
     /// Every field of an entry must survive a write/read round-trip — not just the ids and terms most
     /// tests assert on. Backends that decode the stored record field by field (RocksDB parses the
@@ -1896,6 +1975,10 @@ public abstract class WalConformanceTests
 
     protected static RaftLog Log(long id, long term = 1, RaftLogType type = RaftLogType.Committed) =>
         new() { Id = id, Term = term, Type = type, LogType = "conformance" };
+
+    /// <summary>An entry with a payload of exactly <paramref name="payloadSize"/> bytes, for the byte-budget tests.</summary>
+    protected static RaftLog PayloadLog(long id, int payloadSize) =>
+        new() { Id = id, Term = 1, Type = RaftLogType.Committed, LogType = "conformance", LogData = new byte[payloadSize] };
 }
 
 // ─────────────────────── SqliteWAL-specific tests ───────────────────────────

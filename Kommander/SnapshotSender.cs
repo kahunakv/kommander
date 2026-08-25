@@ -7,6 +7,7 @@ using Kommander.Data;
 using Kommander.Diagnostics;
 using Kommander.Logging;
 using Kommander.Scheduling;
+using Kommander.Support.Parallelization;
 using Kommander.System;
 using Microsoft.Extensions.Logging;
 
@@ -206,7 +207,7 @@ internal sealed class SnapshotSender
                 logger.LogDebugStartingSnapshotTransfer(
                     host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex);
 
-            _ = TrySendSnapshotAsync(node, snapshotIndex, leaderTerm, lastIncludedTerm);
+            FireAndForget.Observe(TrySendSnapshotAsync(node, snapshotIndex, leaderTerm, lastIncludedTerm), logger, "SnapshotSender.TrySend");
         }
     }
 

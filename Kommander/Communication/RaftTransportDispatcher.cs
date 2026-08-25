@@ -30,22 +30,131 @@ internal sealed class RaftTransportDispatcher : IDisposable
         private readonly Channel<RaftResponderRequest> _channel;
         private readonly CancellationTokenSource _cts = new();
         private readonly Task _loop;
+        private readonly long _maxQueuedPayloadBytes;
+        private readonly ILogger<IRaft> _logger;
+        private readonly string _endpoint;
+
+        /// <summary>
+        /// Approximate log-payload bytes currently queued (or in the in-flight batch) for this
+        /// peer. Incremented at enqueue, decremented after the batch containing the message has
+        /// been handed to the transport — the queue AND the in-flight batch both retain the
+        /// payload lists, so both count against the budget.
+        /// </summary>
+        private long _queuedPayloadBytes;
+
+        /// <summary>Total entry-carrying messages dropped since the worker started; monotonic, for the episode log.</summary>
+        private long _droppedMessages;
+
+        /// <summary>1 while a drop episode is open, so the Warning fires once per episode, not per message.</summary>
+        private int _dropEpisodeOpen;
 
         internal EndpointWorker(
             RaftManager manager,
             RaftNode node,
             ICommunication communication,
-            ILogger<IRaft> logger)
+            ILogger<IRaft> logger,
+            long maxQueuedPayloadBytes)
         {
+            _maxQueuedPayloadBytes = maxQueuedPayloadBytes;
+            _logger = logger;
+            _endpoint = node.Endpoint;
+
             _channel = Channel.CreateUnbounded<RaftResponderRequest>(
                 new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
 
             _loop = Task.Run(() =>
                 RunAsync(manager, node, communication, logger, _cts.Token));
+
+            // The loop only surfaces to a Wait in Dispose, which not every shutdown reaches; an
+            // unobserved fault here would otherwise re-throw on the finalizer thread.
+            Support.Parallelization.FireAndForget.Observe(_loop, logger, "RaftTransportDispatcher.Worker");
         }
 
-        internal void Enqueue(RaftResponderRequest request) =>
-            _channel.Writer.TryWrite(request);
+        /// <summary>
+        /// True when this peer's queued payload bytes are at or over the budget. Consulted by the
+        /// backfill sender (via <c>RaftManager.IsOutboundQueueSaturated</c>) to skip reading a
+        /// batch that would only be dropped here.
+        /// </summary>
+        internal bool IsSaturated =>
+            _maxQueuedPayloadBytes > 0 && Interlocked.Read(ref _queuedPayloadBytes) >= _maxQueuedPayloadBytes;
+
+        /// <summary>
+        /// Sum of <see cref="RaftLog.LogData"/> lengths carried by <paramref name="request"/>, or 0
+        /// for control messages and empty heartbeats. The per-entry constant approximates the
+        /// <see cref="RaftLog"/> object and list-slot overhead so a flood of small entries is not
+        /// accounted as free.
+        /// </summary>
+        private static long PayloadBytes(in RaftResponderRequest request)
+        {
+            List<RaftLog>? logs = request.AppendLogsRequest?.Logs;
+            if (logs is null || logs.Count == 0)
+                return 0;
+
+            const int perEntryOverhead = 128;
+
+            long total = 0;
+            for (int i = 0; i < logs.Count; i++)
+                total += perEntryOverhead + (logs[i].LogData?.Length ?? 0);
+
+            return total;
+        }
+
+        internal void Enqueue(RaftResponderRequest request)
+        {
+            long payloadBytes = PayloadBytes(request);
+
+            if (payloadBytes > 0 && _maxQueuedPayloadBytes > 0)
+            {
+                // Budget check for entry-carrying messages only: votes, handshakes, step-down
+                // notices, acks, and EMPTY heartbeats always pass — they are what hold leadership
+                // and elections together, and they retain no payload. Dropping an entry-carrying
+                // AppendLogs is safe: the send is fire-and-forget and the heartbeat/backfill retry
+                // path re-ships every unacknowledged entry once the queue drains. Buffering it
+                // instead is how a paused follower made the leader retain the entire write load
+                // (the Caraxes run Q memory-exhaustion abort).
+                if (Interlocked.Read(ref _queuedPayloadBytes) + payloadBytes > _maxQueuedPayloadBytes)
+                {
+                    long dropped = Interlocked.Increment(ref _droppedMessages);
+
+                    // One Warning per episode; the counter carries the magnitude when the episode
+                    // closes and a later one re-opens. Per-message logging at saturation rates
+                    // would itself be an allocation storm.
+                    if (Interlocked.CompareExchange(ref _dropEpisodeOpen, 1, 0) == 0)
+                        _logger.LogWarning(
+                            "[RaftTransportDispatcher/{Endpoint}] Outbound queue over budget ({MaxBytes} bytes); dropping entry-carrying messages until it drains (total dropped so far: {Dropped})",
+                            _endpoint, _maxQueuedPayloadBytes, dropped);
+
+                    return;
+                }
+
+                Interlocked.Add(ref _queuedPayloadBytes, payloadBytes);
+            }
+
+            if (!_channel.Writer.TryWrite(request) && payloadBytes > 0)
+                Interlocked.Add(ref _queuedPayloadBytes, -payloadBytes); // channel completed during shutdown
+        }
+
+        /// <summary>
+        /// Releases the byte reservation of a dispatched (or drained) batch and closes the drop
+        /// episode once the backlog has fallen to half the budget — hysteresis so a queue hovering
+        /// at the boundary does not emit a Warning per message.
+        /// </summary>
+        private void ReleaseBatchBytes(List<RaftResponderRequest> batch)
+        {
+            long total = 0;
+            for (int i = 0; i < batch.Count; i++)
+                total += PayloadBytes(batch[i]);
+
+            if (total == 0)
+                return;
+
+            long remaining = Interlocked.Add(ref _queuedPayloadBytes, -total);
+
+            if (remaining <= _maxQueuedPayloadBytes / 2 && Interlocked.CompareExchange(ref _dropEpisodeOpen, 0, 1) == 1)
+                _logger.LogWarning(
+                    "[RaftTransportDispatcher/{Endpoint}] Outbound queue drained below half budget; resuming entry-carrying messages ({Dropped} dropped during the episode)",
+                    _endpoint, Interlocked.Read(ref _droppedMessages));
+        }
 
         internal void Stop()
         {
@@ -108,6 +217,12 @@ internal sealed class RaftTransportDispatcher : IDisposable
                         "[RaftTransportDispatcher/{Endpoint}] {Type}: {Message}\n{StackTrace}",
                         node.Endpoint, ex.GetType().Name, ex.Message, ex.StackTrace);
                 }
+                finally
+                {
+                    // Failed sends release too: the messages are gone either way, and a stuck
+                    // reservation would otherwise saturate the peer forever.
+                    ReleaseBatchBytes(batch);
+                }
             }
 
             // Post-loop drain: flush any items that were buffered before the channel was
@@ -129,6 +244,7 @@ internal sealed class RaftTransportDispatcher : IDisposable
                             "[RaftTransportDispatcher/{Endpoint}] drain {Type}: {Message}",
                             node.Endpoint, ex.GetType().Name, ex.Message);
                     }
+                    finally { ReleaseBatchBytes(batch); }
                     batch.Clear();
                 }
             }
@@ -142,6 +258,7 @@ internal sealed class RaftTransportDispatcher : IDisposable
                         "[RaftTransportDispatcher/{Endpoint}] drain {Type}: {Message}",
                         node.Endpoint, ex.GetType().Name, ex.Message);
                 }
+                finally { ReleaseBatchBytes(batch); }
             }
         }
 
@@ -342,6 +459,7 @@ internal sealed class RaftTransportDispatcher : IDisposable
     private readonly RaftManager _manager;
     private readonly ICommunication _communication;
     private readonly ILogger<IRaft> _logger;
+    private readonly long _maxQueuedPayloadBytesPerPeer;
     private readonly ConcurrentDictionary<string, EndpointWorker> _workers = new();
     private volatile bool _stopped;
     private int _disposed;
@@ -349,12 +467,22 @@ internal sealed class RaftTransportDispatcher : IDisposable
     internal RaftTransportDispatcher(
         RaftManager manager,
         ICommunication communication,
-        ILogger<IRaft> logger)
+        ILogger<IRaft> logger,
+        long maxQueuedPayloadBytesPerPeer = 64L * 1024 * 1024)
     {
         _manager = manager;
         _communication = communication;
         _logger = logger;
+        _maxQueuedPayloadBytesPerPeer = maxQueuedPayloadBytesPerPeer;
     }
+
+    /// <summary>
+    /// True when the outbound queue for <paramref name="endpoint"/> is over its payload-byte
+    /// budget, meaning an entry-carrying message enqueued now would be dropped. A peer with no
+    /// worker yet has an empty queue and is never saturated.
+    /// </summary>
+    internal bool IsOutboundQueueSaturated(string endpoint) =>
+        _workers.TryGetValue(endpoint, out EndpointWorker? worker) && worker.IsSaturated;
 
     /// <summary>
     /// Enqueues an outbound message for delivery to the given remote endpoint.
@@ -371,7 +499,7 @@ internal sealed class RaftTransportDispatcher : IDisposable
         if (!_workers.TryGetValue(endpoint, out EndpointWorker? worker))
             worker = _workers.GetOrAdd(
                 endpoint,
-                ep => new EndpointWorker(_manager, new RaftNode(ep), _communication, _logger));
+                ep => new EndpointWorker(_manager, new RaftNode(ep), _communication, _logger, _maxQueuedPayloadBytesPerPeer));
 
         worker.Enqueue(request);
     }

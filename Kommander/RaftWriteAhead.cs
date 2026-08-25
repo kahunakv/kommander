@@ -1899,6 +1899,21 @@ public sealed class RaftWriteAhead
     }
 
     /// <summary>
+    /// Byte-budgeted variant of <see cref="GetRangeAllTypesAsync(long, int)"/>: the storage engine
+    /// also stops once adding the next entry would exceed <paramref name="maxBytes"/> of payload,
+    /// while always returning at least one entry when one exists. Bounds the materialized
+    /// allocation of the leader-backfill read, which an entry count alone does not.
+    /// </summary>
+    public async ValueTask<List<RaftLog>> GetRangeAllTypesAsync(long startLogIndex, int maxEntries, long maxBytes)
+    {
+        return await manager.ReadScheduler.EnqueueTask(
+            partition.PartitionId,
+            (walAdapter, partition.PartitionId, startLogIndex, maxEntries, maxBytes),
+            static s => s.walAdapter.ReadLogsRange(s.PartitionId, s.startLogIndex, s.maxEntries, s.maxBytes)
+        ).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Starts log compaction for this partition if no pass is already running.
     /// Returns immediately without waiting for the pass to finish.
     /// <para>

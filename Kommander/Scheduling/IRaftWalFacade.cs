@@ -61,6 +61,17 @@ public interface IRaftWalFacade
         => GetRangeAsync(startLogIndex, maxEntries);
 
     /// <summary>
+    /// Byte-budgeted variant of <see cref="GetRangeAllTypesAsync(long, int)"/>: the batch also
+    /// stops once adding the next entry would exceed <paramref name="maxBytes"/> of payload, while
+    /// always returning at least one entry when one exists. This is the leader-backfill read; the
+    /// budget bounds the materialized allocation, which an entry count alone does not.
+    /// <para>The default implementation ignores the budget so in-memory fakes need no override;
+    /// the production adapter forwards it to the storage engine.</para>
+    /// </summary>
+    ValueTask<List<RaftLog>> GetRangeAllTypesAsync(long startLogIndex, int maxEntries, long maxBytes)
+        => GetRangeAllTypesAsync(startLogIndex, maxEntries);
+
+    /// <summary>
     /// Returns the term of the entry at exactly <paramref name="logIndex"/>, or <c>-1</c> if
     /// no entry with that id exists.  Unlike <see cref="GetRangeAsync"/>, this reads <em>any</em>
     /// entry regardless of commit status (Proposed, Committed, etc.) so it can be used for the

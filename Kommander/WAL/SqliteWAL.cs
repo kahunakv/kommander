@@ -359,6 +359,15 @@ public class SqliteWAL : IWAL, IDisposable
     /// into SQL so the engine can stop at the boundary instead of scanning the full tail.
     /// </summary>
     public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue)
+        => ReadLogsRange(partitionId, startLogIndex, maxEntries, long.MaxValue);
+
+    /// <summary>
+    /// Byte-budgeted range read. The reader streams rows, so the budget check runs after a row is
+    /// materialized: the single over-budget row is discarded (one row of overshoot cost) rather
+    /// than added, keeping the returned batch within <paramref name="maxBytes"/> plus never less
+    /// than one entry.
+    /// </summary>
+    public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries, long maxBytes)
     {
         ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
 
@@ -376,9 +385,21 @@ public class SqliteWAL : IWAL, IDisposable
             if (applyLimit)
                 command.Parameters[2].Value = maxEntries;
 
+            long payloadBytes = 0;
+
             using SqliteDataReader reader = command.ExecuteReader();
             while (reader.Read())
-                result.Add(ReadLogRow(reader));
+            {
+                RaftLog row = ReadLogRow(reader);
+                long entryBytes = row.LogData?.Length ?? 0;
+
+                // At-least-one-entry rule: the budget stops a batch, never the first entry.
+                if (result.Count > 0 && payloadBytes + entryBytes > maxBytes)
+                    break;
+
+                payloadBytes += entryBytes;
+                result.Add(row);
+            }
 
             return result;
         }

@@ -117,7 +117,20 @@ public sealed class GrpcInterSharedStreaming
         }
         catch (Exception ex)
         {
-            Console.WriteLine("ListenForEvents: {0}: {1}", ex.GetType().Name, ex.Message);
+            // This task is fire-and-forget: an exception that escapes here is never observed and
+            // is re-raised on the finalizer thread by TaskExceptionHolder, where a secondary
+            // failure aborts the whole process. Under memory exhaustion the log write below is
+            // itself an allocation and DID throw OutOfMemoryException out of this catch in the
+            // Caraxes run Q crash (SIGABRT from the finalizer thread). Nothing thrown from
+            // logging may escape; the finally still flags the stream for recreation.
+            try
+            {
+                Console.WriteLine("ListenForEvents: {0}: {1}", ex.GetType().Name, ex.Message);
+            }
+            catch
+            {
+                // Logging failed (most likely OOM); the fault flag below is the required outcome.
+            }
         }
         finally
         {

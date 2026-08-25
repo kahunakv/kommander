@@ -152,6 +152,17 @@ internal sealed class BackfillSender
         if (tracker.IsBackfillPaused(node.Endpoint))
             return BackfillSendResult.SaturationPaused;
 
+        // Outbound-queue saturation. Unlike the ack-driven pause above, this gate needs no reply
+        // from the peer: a follower that stopped draining entirely (SIGSTOP pause, dead network)
+        // never acks, so the ack-driven pause never engages, and every heartbeat used to read a
+        // fresh full batch from the WAL and stack it onto the peer's outbound queue behind all the
+        // previous ones. The queue byte-cap would drop the batch anyway; checking here skips the
+        // WAL read and the batch materialization altogether. SaturationPaused deliberately does
+        // not escalate to a snapshot: the peer is not below the compaction floor, it is just not
+        // consuming, and a snapshot transfer would only add to the unsent backlog.
+        if (host.IsOutboundQueueSaturated(node.Endpoint))
+            return BackfillSendResult.SaturationPaused;
+
         long from = !anchorToFollowerFrontier && tracker.TryGetNextIndex(node.Endpoint, out long ni) && ni <= coreState.LocalCommittedIndex
             ? ni
             : followerMaxLog + 1;
@@ -188,7 +199,10 @@ internal sealed class BackfillSender
         // carry the backfill timestamp, never a proposal ticket, so a shipped Proposed row still
         // gains quorum credit only through the proposal-retry re-ack (gated on contiguous
         // presence).
-        List<RaftLog> backfill = await wal.GetRangeAllTypesAsync(from, host.Configuration.MaxBackfillEntriesPerRound).ConfigureAwait(false);
+        List<RaftLog> backfill = await wal.GetRangeAllTypesAsync(
+            from,
+            host.Configuration.MaxBackfillEntriesPerRound,
+            host.Configuration.MaxBackfillBytesPerRound).ConfigureAwait(false);
 
         if (backfill.Count == 0)
         {

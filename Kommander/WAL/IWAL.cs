@@ -50,6 +50,24 @@ public interface IWAL : IDisposable
     public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue);
 
     /// <summary>
+    /// Like <see cref="ReadLogsRange(int, long, int)"/> but additionally stops once adding the next
+    /// entry would push the accumulated payload bytes (sum of <see cref="RaftLog.LogData"/> lengths)
+    /// past <paramref name="maxBytes"/>. The result always contains at least one entry when one
+    /// exists at or above <paramref name="startLogIndex"/>, so a single entry larger than the budget
+    /// still ships and convergence never stalls on it.
+    /// <para>
+    /// This is the allocation bound for the leader-backfill read: an entry-count cap alone lets a
+    /// large-payload workload materialize tens of megabytes per batch on the heartbeat path.
+    /// </para>
+    /// <para>The default implementation ignores <paramref name="maxBytes"/> and applies only the
+    /// entry bound, which keeps external backends source-compatible; the built-in backends override
+    /// it and enforce the budget during the scan, before payloads are materialized where the storage
+    /// layout allows it.</para>
+    /// </summary>
+    public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries, long maxBytes)
+        => ReadLogsRange(partitionId, startLogIndex, maxEntries);
+
+    /// <summary>
     /// Returns the <see cref="RaftLog.Term"/> of the single entry whose id equals
     /// <paramref name="logIndex"/>, or <c>-1</c> if no entry with that exact id exists.
     /// <para>

@@ -555,6 +555,23 @@ public class RaftConfiguration
     /// </summary>
     public int GrpcAppendLogsMaxCoalesceBatch { get; set; } = 256;
 
+    /// <summary>
+    /// Maximum total log-payload bytes that may sit queued in the outbound transport for one
+    /// peer. When the budget is exceeded, further <b>entry-carrying</b> <c>AppendLogs</c>
+    /// messages to that peer are dropped at enqueue instead of buffered; control messages
+    /// (votes, handshakes, step-down notices) and empty heartbeats always pass.
+    /// <para>
+    /// The per-peer outbound queue is the only unbounded structure between the Raft state
+    /// machine and the wire. A follower that stops draining (SIGSTOP pause, network stall)
+    /// previously made its queue absorb the leader's entire write load plus a fresh backfill
+    /// batch per heartbeat, indefinitely: the Caraxes run Q leader retained ~830 MiB of live
+    /// gen2 batches this way and aborted on memory exhaustion. Dropping is safe — an
+    /// <c>AppendLogs</c> is fire-and-forget and every dropped entry is re-shipped by the
+    /// heartbeat/backfill retry path once the queue drains. Default 64 MiB.
+    /// </para>
+    /// </summary>
+    public long MaxOutboundQueueBytesPerPeer { get; set; } = 64L * 1024 * 1024;
+
     private const int GrpcChannelsPerNodeMax = 64;
 
     // Warn at most once per process so repeated calls don't spam.
@@ -747,6 +764,21 @@ public class RaftConfiguration
     /// backfill cannot starve concurrent client writes. Default 128.
     /// </summary>
     public int MaxBackfillEntriesPerRound { get; set; } = 128;
+
+    /// <summary>
+    /// Maximum total payload bytes (sum of <see cref="Data.RaftLog.LogData"/> lengths) one
+    /// backfill batch may materialize from the WAL. The batch stops at whichever bound —
+    /// this or <see cref="MaxBackfillEntriesPerRound"/> — is reached first, but always
+    /// contains at least one entry so a single oversized entry cannot stall convergence.
+    /// <para>
+    /// An entry count alone does not bound the allocation: under a large-payload workload,
+    /// 128 entries is tens of megabytes materialized on the heartbeat path per follower per
+    /// round. The Caraxes run Q leader died of memory exhaustion with this read as the
+    /// tipping allocation. The default (4 MiB) also keeps a batch under the gRPC receiver's
+    /// default 4 MB message cap. Default 4 MiB.
+    /// </para>
+    /// </summary>
+    public int MaxBackfillBytesPerRound { get; set; } = 4 * 1024 * 1024;
 
     // ── Snapshot receive session ──────────────────────────────────────────────
 

@@ -8,6 +8,7 @@ using Kommander.Data;
 using Kommander.Logging;
 using Microsoft.Extensions.Logging;
 using Kommander.Discovery;
+using Kommander.Support.Parallelization;
 
 namespace Kommander.System;
 
@@ -1093,7 +1094,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
             // executing ReplicateMembership (the P0 leader) takes this path; a draining follower
             // applies the roster via ApplyMembershipFromCache and keeps all its leaderships.
             if (!newMembership.Members.Any(m => m.Endpoint == manager.LocalEndpoint && m.Role == ClusterMemberRole.Voter))
-                _ = StepDownSelfRemovedAsync();
+                FireAndForget.Observe(StepDownSelfRemovedAsync(), logger, "StepDownSelfRemoved");
 
             completion?.TrySetResult((RaftOperationStatus.Success, newMembership.MembershipVersion));
         }

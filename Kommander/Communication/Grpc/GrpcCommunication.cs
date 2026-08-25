@@ -294,6 +294,18 @@ public class GrpcCommunication : ICommunication
         AppendLogsRequest request,
         int maxBatch)
     {
+        // Bound the pending queue. A non-flusher enqueues and returns immediately, so the
+        // dispatcher's await gives NO backpressure on this path: while one flusher sits in a
+        // stalled WriteAsync (frozen peer, zero TCP window), every producer keeps adding fully
+        // serialized payloads here without limit — the same unbounded-outbound-queue shape that
+        // exhausted the Caraxes run Q leader, one config flag away. Dropping is safe by this
+        // path's documented contract: the send is fire-and-forget and the heartbeat/backfill
+        // retry re-ships unacknowledged entries. Four full flush cycles of headroom keeps the
+        // drop rare under healthy bursts.
+        const int pendingCapMultiplier = 4;
+        if (streaming.Pending.Count >= maxBatch * pendingCapMultiplier)
+            return appendLogsResponse;
+
         GrpcAppendLogsRequest appendLogsRequest = GrpcCommunicationPool.RentAppendLogsRequest();
         FillAppendLogsRequest(appendLogsRequest, request);
 
