@@ -106,6 +106,37 @@ internal sealed class ReplicationTracker
     /// </summary>
     private readonly Dictionary<string, long> mismatchAnchors = [];
 
+    /// <summary>
+    /// Per-peer convergence probe for entry-carrying backfill: the follower's reported commit
+    /// frontier at the moment the last batch shipped, when it shipped, and how many consecutive
+    /// batches have shipped without that frontier advancing.
+    ///
+    /// <para>This exists because the ack fast-path re-supply is self-exciting: a follower whose
+    /// frontier is stuck (a lost lazy commit marker below the leader's monotonic
+    /// <see cref="matchIndex"/>) acknowledges every duplicate batch with Success and the same
+    /// frontier, and each such ack triggers another WAL range read and another ship — a
+    /// network-speed ping-pong that reads the WAL tail forever, saturates the shared read
+    /// scheduler, and starves application reads, with zero writes and zero log lines. The probe
+    /// makes "shipping is not helping" observable so the sender can pace itself and re-anchor.</para>
+    ///
+    /// <para>Only peers that report a commit frontier (&gt;= 0) are tracked: a legacy-path peer
+    /// reports -1 forever, its catch-up is driven by snapshot installs rather than frontier
+    /// advances, and pacing it on a frontier that can never move would throttle a healthy
+    /// catch-up.</para>
+    /// </summary>
+    private sealed class BackfillProgressProbe
+    {
+        public long FrontierAtLastShip;
+        public long LastShipTicks;
+        public int FruitlessShips;
+        public bool Warned;
+    }
+
+    private readonly Dictionary<string, BackfillProgressProbe> backfillProgress = [];
+
+    /// <summary>Snapshot of one peer's backfill-convergence probe, consumed by the sender.</summary>
+    public readonly record struct BackfillProgress(int FruitlessShips, long LastShipTicks);
+
     public ReplicationTracker(IRaftPartitionHost host) => this.host = host;
 
     // ── bulk resets ───────────────────────────────────────────────────────────────────────────
@@ -124,6 +155,7 @@ internal sealed class ReplicationTracker
         matchIndex.Clear();
         regressedFrontiers.Clear();
         mismatchAnchors.Clear();
+        backfillProgress.Clear();
     }
 
     /// <summary>
@@ -138,6 +170,7 @@ internal sealed class ReplicationTracker
         matchIndex.Clear();
         regressedFrontiers.Clear();
         mismatchAnchors.Clear();
+        backfillProgress.Clear();
     }
 
     /// <summary>
@@ -152,6 +185,7 @@ internal sealed class ReplicationTracker
         matchIndex.Remove(endpoint);
         regressedFrontiers.Remove(endpoint);
         startCommitIndexes.Remove(endpoint);
+        backfillProgress.Remove(endpoint);
         return hadProgress;
     }
 
@@ -205,6 +239,10 @@ internal sealed class ReplicationTracker
     {
         AdvanceCommitFrontier(endpoint, snapshotIndex);
         AdvanceStartCommitIndex(endpoint, snapshotIndex);
+
+        // The installed boundary supersedes whatever range log shipping was failing to converge;
+        // the peer earns a fresh, undamped backfill start from the new position.
+        backfillProgress.Remove(endpoint);
 
         if (!matchIndex.TryGetValue(endpoint, out long match) || snapshotIndex > match)
             matchIndex[endpoint] = snapshotIndex;
@@ -304,6 +342,83 @@ internal sealed class ReplicationTracker
 
     /// <summary>Records the anchor a peer reported with a LogMismatch rejection (see <see cref="mismatchAnchors"/>).</summary>
     public void RecordMismatchAnchor(string endpoint, long value) => mismatchAnchors[endpoint] = value;
+
+    // ── backfill convergence probe ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Consults (and self-heals) the peer's backfill-convergence probe before a ship attempt.
+    /// A reported frontier above the one recorded at the last ship proves progress: the probe is
+    /// dropped and the default (undamped) state returned. A frontier of -1 means the peer does
+    /// not report one; such peers are never tracked (see <see cref="BackfillProgressProbe"/>).
+    /// </summary>
+    public BackfillProgress ObserveBackfillProgress(string endpoint, long reportedFrontier)
+    {
+        if (!backfillProgress.TryGetValue(endpoint, out BackfillProgressProbe? probe))
+            return default;
+
+        if (reportedFrontier > probe.FrontierAtLastShip)
+        {
+            backfillProgress.Remove(endpoint);
+            return default;
+        }
+
+        return new(probe.FruitlessShips, probe.LastShipTicks);
+    }
+
+    /// <summary>
+    /// Records that an entry-carrying batch shipped to <paramref name="endpoint"/> while its
+    /// reported commit frontier stood at <paramref name="reportedFrontier"/>, and returns the
+    /// consecutive count of ships that produced no frontier advance. A negative frontier (no
+    /// report) clears any probe and returns 0 — pacing on a frontier that can never move would
+    /// throttle a healthy legacy-path catch-up.
+    /// </summary>
+    public int RecordBackfillShip(string endpoint, long reportedFrontier)
+    {
+        if (reportedFrontier < 0)
+        {
+            backfillProgress.Remove(endpoint);
+            return 0;
+        }
+
+        long nowTicks = host.GetMonotonicTimestamp();
+
+        if (backfillProgress.TryGetValue(endpoint, out BackfillProgressProbe? probe))
+        {
+            if (reportedFrontier > probe.FrontierAtLastShip)
+            {
+                probe.FruitlessShips = 0;
+                probe.Warned = false;
+            }
+            else
+                probe.FruitlessShips++;
+
+            probe.FrontierAtLastShip = reportedFrontier;
+            probe.LastShipTicks = nowTicks;
+            return probe.FruitlessShips;
+        }
+
+        backfillProgress[endpoint] = new()
+        {
+            FrontierAtLastShip = reportedFrontier,
+            LastShipTicks = nowTicks,
+            FruitlessShips = 0,
+        };
+        return 0;
+    }
+
+    /// <summary>
+    /// Marks the peer's current no-progress episode as warned, returning true exactly once per
+    /// episode so the log carries one Warning instead of one per ship. The flag resets when a
+    /// ship observes frontier progress.
+    /// </summary>
+    public bool TryMarkBackfillNoProgressWarned(string endpoint)
+    {
+        if (!backfillProgress.TryGetValue(endpoint, out BackfillProgressProbe? probe) || probe.Warned)
+            return false;
+
+        probe.Warned = true;
+        return true;
+    }
 
     // ── saturation back-off ───────────────────────────────────────────────────────────────────
 

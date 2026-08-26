@@ -114,6 +114,32 @@ public sealed class RaftPartitionStateMachine
     /// see <see cref="WalCompletionRouter"/>.</summary>
     private readonly WalCompletionRouter walCompletions;
 
+    /// <summary>
+    /// With voter peers present, the promotion completeness gate refuses this many consecutive
+    /// same-hole promotions before it self-repairs (truncates the orphaned tail above the
+    /// contiguous frontier) and serves. Each refused promotion hands the term back to the
+    /// electorate; a voter with a fresher contiguous log denies this node's vote requests and wins
+    /// the term itself, so winning this many consecutive elections over the SAME hole is quorum
+    /// evidence that no reachable voter holds the missing range — refusing further would leave the
+    /// partition permanently leaderless (a hole is only ever repaired by a serving leader's
+    /// backfill, which requires a leader to exist).
+    /// </summary>
+    private const int MaxPresenceGateRefusals = 3;
+
+    /// <summary>
+    /// Consecutive promotions refused by the completeness gate over the same
+    /// (<see cref="lastPresenceRefusalPresent"/>, <see cref="lastPresenceRefusalMax"/>) hole.
+    /// Reset when the gate passes, when the hole changes shape (some repair or write landed), or
+    /// after the self-repair escape.
+    /// </summary>
+    private int presenceGateRefusals;
+
+    /// <summary>Contiguous frontier recorded at the last completeness-gate refusal (-1 = none).</summary>
+    private long lastPresenceRefusalPresent = -1;
+
+    /// <summary>Max log id recorded at the last completeness-gate refusal (-1 = none).</summary>
+    private long lastPresenceRefusalMax = -1;
+
 
 
 
@@ -825,6 +851,14 @@ public sealed class RaftPartitionStateMachine
     /// term. Barrier failures after this method returns (propose/commit failure, rollback,
     /// timeout) revert through <see cref="RevertUnpublishedPromotionAsync"/>.</para>
     ///
+    /// <para><b>Completeness gate:</b> when the WAL has a hole below its max id (the facade tracks
+    /// presence and the contiguous frontier trails the max), the promotion is refused so a voter
+    /// with a contiguous log can win instead — but only a bounded number of times
+    /// (<see cref="MaxPresenceGateRefusals"/>) over the same hole, and never for a sole voter.
+    /// Past the bound the node truncates the orphaned tail above the contiguous frontier and
+    /// serves: an unbounded refusal is itself a wedge, because a hole is only ever repaired by a
+    /// serving leader's backfill and the refusal prevents any leader from existing.</para>
+    ///
     /// <para><b>Latency note:</b> the drain holds the partition executor for the full
     /// duration of the backlog (one <c>ReadScheduler</c> round-trip per 512-entry batch
     /// plus one consumer callback per committed entry).  <c>SendHeartbeat</c> runs only
@@ -852,6 +886,7 @@ public sealed class RaftPartitionStateMachine
         coreState.SetQuiesced(false);
 
         long maxLog;
+        bool hasVoterPeers = sender.HasVoterPeer();
 
         try
         {
@@ -875,7 +910,6 @@ public sealed class RaftPartitionStateMachine
             // queue to drain — nothing external can arrive — so its bound is short; with voter
             // peers the full barrier timeout is worth spending, because refusing hands leadership
             // to a peer that may hold the missing entries.
-            bool hasVoterPeers = sender.HasVoterPeer();
             TimeSpan drainBound = hasVoterPeers ? host.Configuration.LeadershipBarrierTimeout : TimeSpan.FromMilliseconds(250);
             long drainDeadlineTicks = Stopwatch.GetTimestamp();
 
@@ -923,17 +957,86 @@ public sealed class RaftPartitionStateMachine
         // committed elsewhere (the lone-high-entry-over-a-gap shape the unanchored live-propose
         // broadcast can leave). Serving as leader would fix an incomplete consumer projection for
         // the whole tenure — a leader is never backfilled, and neither drain can deliver entries it
-        // does not have. Revert so a node with a contiguous log wins the next term; the gap-aware
-        // election freshness normally prevents this node from winning at all, so this gate is the
-        // defense-in-depth backstop (e.g. a hole opened by an append that raced the election).
+        // does not have. With a voter peer to defer to, revert so a node with a contiguous log wins
+        // the next term; the gap-aware election freshness normally prevents this node from winning
+        // at all, so the refusal is the defense-in-depth backstop (e.g. a hole opened by an append
+        // that raced the election).
+        //
+        // The refusal must be bounded, or it becomes its own wedge: a refused node reverts,
+        // re-elects (it wins again whenever no peer advertises a fresher contiguous position), and
+        // refuses again — forever, because a hole is only ever repaired by a serving leader's
+        // backfill, and the refusal is exactly what prevents a leader from existing. A sole voter
+        // can never be handed the missing range at all. With voter peers, each election win is
+        // quorum evidence that no reachable voter holds a fresher contiguous log: a fresher voter
+        // denies this node's vote requests (its freshness position is higher) and wins the term
+        // itself. In both cases the entries above the hole are unreachable for every replica, so
+        // after the bounded refusals the node truncates the orphaned tail above the contiguous
+        // frontier and serves. This is the same repair the follower append path applies when an
+        // anchored batch exposes a gap, and the same availability trade as the sole-voter drain
+        // escapes above: only rows that no replica could ever apply are dropped.
         long presentId = wal.GetPresentIndex();
         if (presentId >= 0 && presentId < maxLog)
         {
-            logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Promotion refused: WAL has a hole below the max id (contiguous through {PresentId}, max {MaxLog}) — reverting to Follower.",
-                host.LocalEndpoint, host.PartitionId, coreState.NodeState, presentId, maxLog);
-            coreState.NodeState = RaftNodeState.Follower;
-            coreState.LocalCommittedIndex = -1;
-            throw new RaftException($"Promotion refused: WAL hole below max id (contiguous through {presentId}, max {maxLog})");
+            bool sameHole = presentId == lastPresenceRefusalPresent && maxLog == lastPresenceRefusalMax;
+            presenceGateRefusals = sameHole ? presenceGateRefusals + 1 : 1;
+            lastPresenceRefusalPresent = presentId;
+            lastPresenceRefusalMax = maxLog;
+
+            if (hasVoterPeers && presenceGateRefusals <= MaxPresenceGateRefusals)
+            {
+                logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Promotion refused ({Attempt}/{MaxAttempts}): WAL has a hole below the max id (contiguous through {PresentId}, max {MaxLog}) — reverting to Follower so a node with a contiguous log can win the next term.",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, presenceGateRefusals, MaxPresenceGateRefusals, presentId, maxLog);
+                coreState.NodeState = RaftNodeState.Follower;
+                coreState.LocalCommittedIndex = -1;
+                throw new RaftException($"Promotion refused: WAL hole below max id (contiguous through {presentId}, max {maxLog})");
+            }
+
+            logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] WAL hole below the max id (contiguous through {PresentId}, max {MaxLog}) and {Reason} — truncating the orphaned tail and serving; the truncated rows are unreachable for every replica.",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, presentId, maxLog,
+                hasVoterPeers
+                    ? $"{presenceGateRefusals - 1} consecutive promotions already refused with no fresher voter winning"
+                    : "no voter peers to defer to");
+
+            try
+            {
+                // The floor never truncates a row the node has applied or resolved: applied and
+                // commit frontiers both sit at or below the contiguous frontier here (the drain
+                // above ran to the commit frontier, and resolution requires presence), so the Max
+                // is belt-and-braces against a frontier inversion introduced elsewhere.
+                long truncateFloor = Math.Max(presentId, Math.Max(coreState.LastAppliedIndex, commitFrontier));
+                maxLog = await wal.TruncateLogsAfterAsync(truncateFloor).ConfigureAwait(false);
+                presentId = wal.GetPresentIndex();
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Orphaned-tail truncation failed — reverting to Follower. {Message}\n{Stacktrace}",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, ex.Message, ex.StackTrace);
+                coreState.NodeState = RaftNodeState.Follower;
+                coreState.LocalCommittedIndex = -1;
+                throw;
+            }
+
+            presenceGateRefusals = 0;
+            lastPresenceRefusalPresent = -1;
+            lastPresenceRefusalMax = -1;
+
+            if (presentId >= 0 && presentId < maxLog)
+            {
+                // A queued append landed above the hole between the max-log read and the
+                // truncation, so the log is holey again. Refuse this round; the next promotion
+                // re-evaluates from a quiescent write queue.
+                logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Promotion refused: WAL hole re-opened after truncation (contiguous through {PresentId}, max {MaxLog}) — reverting to Follower.",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, presentId, maxLog);
+                coreState.NodeState = RaftNodeState.Follower;
+                coreState.LocalCommittedIndex = -1;
+                throw new RaftException($"Promotion refused: WAL hole re-opened after truncation (contiguous through {presentId}, max {maxLog})");
+            }
+        }
+        else
+        {
+            presenceGateRefusals = 0;
+            lastPresenceRefusalPresent = -1;
+            lastPresenceRefusalMax = -1;
         }
 
         // The inherited-tail decision must come from the enqueue-advanced presence frontier, not

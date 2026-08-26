@@ -22,7 +22,11 @@ namespace Kommander.Tests.Scheduling;
 ///         max id.</item>
 ///   <item>Voters compare a candidate against their own contiguous-presence position.</item>
 ///   <item>Promotion refuses to publish when the WAL has a hole below the max id (defense in
-///         depth when the facade tracks presence).</item>
+///         depth when the facade tracks presence) — but only while a voter peer could win the
+///         term instead, and only a bounded number of times over the same hole. A sole voter,
+///         or a node that keeps winning elections over the same hole, truncates the orphaned
+///         tail (rows no replica could ever apply) and serves: an unbounded refusal would leave
+///         the partition permanently leaderless.</item>
 ///   <item>The inherited-entry drain detects a hole instead of advancing over it, and the barrier
 ///         completion reverts the promotion instead of publishing over an incomplete drain.</item>
 /// </list>
@@ -175,7 +179,22 @@ public class TestHoleyLogElection
         public ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync()
             => ValueTask.FromResult<IReadOnlyList<RaftLog>>([]);
         public ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs) => ValueTask.CompletedTask;
-        public ValueTask<long> TruncateLogsAfterAsync(long afterLogId) => ValueTask.FromResult(afterLogId);
+
+        /// <summary>Every truncation boundary requested, in call order.</summary>
+        public List<long> TruncateCalls { get; } = [];
+
+        public ValueTask<long> TruncateLogsAfterAsync(long afterLogId)
+        {
+            // Mirror RaftWriteAhead.TruncateLogsAfterAsync: delete above the boundary, clamp the
+            // presence frontier, report the post-truncation max.
+            TruncateCalls.Add(afterLogId);
+            Entries.RemoveAll(l => l.Id > afterLogId);
+            if (RawMaxLog > afterLogId)
+                RawMaxLog = afterLogId;
+            if (PresentId > afterLogId)
+                PresentId = afterLogId;
+            return ValueTask.FromResult(RawMaxLog);
+        }
 
         public WALWriteOperation EnqueueRollback(List<RaftLog> logs)
             => new(_ => { }, 3L, WALWriteOperationType.LeaderRollback, (1, logs));
@@ -266,9 +285,10 @@ public class TestHoleyLogElection
     // ── promotion refuses to publish over a hole ──────────────────────────────
 
     /// <summary>
-    /// Defense in depth: even if a holey node somehow wins (e.g. every peer has the same hole, or
-    /// an append raced the election), promotion must refuse to publish — serving would fix an
-    /// incomplete consumer projection for the whole tenure, because a leader is never backfilled.
+    /// Defense in depth: even if a holey node somehow wins (e.g. an append raced the election),
+    /// promotion must refuse to publish while a voter peer exists that could hold the missing
+    /// range — serving would fix an incomplete consumer projection for the whole tenure, because
+    /// a leader is never backfilled. The refusal hands the term to the peer.
     /// </summary>
     [Fact]
     public async Task Promotion_WithWalHole_IsRefusedAndRevertsToFollower()
@@ -281,14 +301,104 @@ public class TestHoleyLogElection
             new RaftLog { Id = 3, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
             new RaftLog { Id = 10, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
         ]);
-        CapturingHost host = new();
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
 
-        await Assert.ThrowsAsync<RaftException>(() => sm.ForceLeaderForTestingAsync(replyCorrelationId: null));
+        // Win a real election with the peer's vote so the promotion runs with a voter peer visible.
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        await Assert.ThrowsAsync<RaftException>(() =>
+            sm.ReceivedVoteAsync("node-b", sm.CurrentTerm, remoteMaxLogId: 3));
 
         Assert.NotEqual("node-a", host.Leader);
         Assert.DoesNotContain("LeaderChanged:node-a", host.EventLog);
         Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        Assert.Empty(wal.TruncateCalls);
+    }
+
+    /// <summary>
+    /// The refusal must be bounded, or it is its own wedge: a hole is only ever repaired by a
+    /// serving leader's backfill, and the refusal is what prevents a leader from existing. Each
+    /// election win over the SAME hole is quorum evidence that no reachable voter holds a fresher
+    /// contiguous log (a fresher voter denies the vote and wins the term itself). After the bound,
+    /// the node truncates the orphaned tail above the contiguous frontier — rows no replica could
+    /// ever apply — and serves.
+    /// </summary>
+    [Fact]
+    public async Task Promotion_WithWalHole_RepeatedRefusals_TruncateOrphanedTailAndServe()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 10, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3 };
+        wal.Entries.AddRange(
+        [
+            new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 2, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 3, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 10, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+        ]);
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        // Three consecutive wins over the same hole are refused: a fresher peer still has every
+        // chance to win one of these terms.
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+            await Assert.ThrowsAsync<RaftException>(() =>
+                sm.ReceivedVoteAsync("node-b", sm.CurrentTerm, remoteMaxLogId: 3));
+            Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+            Assert.Empty(wal.TruncateCalls);
+        }
+
+        // The fourth win escapes: truncate above the contiguous frontier (3) and publish.
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        await sm.ReceivedVoteAsync("node-b", sm.CurrentTerm, remoteMaxLogId: 3);
+
+        long truncateBoundary = Assert.Single(wal.TruncateCalls);
+        Assert.Equal(3, truncateBoundary);
+        Assert.DoesNotContain(wal.Entries, l => l.Id == 10);
+        Assert.DoesNotContain("Applied:10", host.EventLog);
+
+        Assert.Equal("node-a", host.Leader);
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        Assert.Contains("LeaderChanged:node-a", host.EventLog);
+    }
+
+    /// <summary>
+    /// A sole voter (e.g. the last survivor of graceful leaves) is never refused on a hole: no
+    /// reachable node can ever supply the missing range, so an unbounded refusal would leave the
+    /// partition permanently leaderless — the node re-elects itself into the same refusal every
+    /// election timeout, forever. It truncates the orphaned tail immediately and serves, keeping
+    /// every entry at or below the contiguous frontier.
+    /// </summary>
+    [Fact]
+    public async Task Promotion_WithWalHole_SoleVoter_TruncatesOrphanedTailAndServes()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 10, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3 };
+        wal.Entries.AddRange(
+        [
+            new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 2, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 3, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 10, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+        ]);
+        CapturingHost host = new();   // Nodes stays empty: sole voter
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+
+        // The contiguous prefix was applied; the unreachable lone high entry was truncated, never
+        // delivered.
+        Assert.Contains("Applied:1", host.EventLog);
+        Assert.Contains("Applied:2", host.EventLog);
+        Assert.Contains("Applied:3", host.EventLog);
+        Assert.DoesNotContain("Applied:10", host.EventLog);
+
+        long truncateBoundary = Assert.Single(wal.TruncateCalls);
+        Assert.Equal(3, truncateBoundary);
+        Assert.DoesNotContain(wal.Entries, l => l.Id == 10);
+
+        Assert.Equal("node-a", host.Leader);
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        Assert.Contains("LeaderChanged:node-a", host.EventLog);
     }
 
     // ── the inherited drain detects the hole and the barrier reverts ──────────

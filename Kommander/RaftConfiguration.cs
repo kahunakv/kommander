@@ -780,6 +780,38 @@ public class RaftConfiguration
     /// </summary>
     public int MaxBackfillBytesPerRound { get; set; } = 4 * 1024 * 1024;
 
+    /// <summary>
+    /// Cap on the exponential pause between backfill batches to a follower whose reported commit
+    /// frontier is not advancing. Default 30 s.
+    /// <para>
+    /// The ack fast-path re-supply is self-exciting: a follower whose frontier is stuck (a lost
+    /// lazy commit marker below the leader's monotonic matchIndex) acknowledges every duplicate
+    /// batch with Success and the same frontier, and each such ack triggers another WAL range read
+    /// and another ship. Unpaced, the pair ping-pongs at network speed forever — a measured soak
+    /// held ~800 MiB/s of pure WAL reads with zero writes for over half an hour after the workload
+    /// stopped, starving application reads on the shared read scheduler. The pause starts at
+    /// <see cref="HeartbeatInterval"/> after the first fruitless ship and doubles per further
+    /// fruitless ship up to this cap; any frontier advance resets it. A zero
+    /// <see cref="HeartbeatInterval"/> disables the pacing entirely.
+    /// </para>
+    /// </summary>
+    public TimeSpan BackfillNoProgressPauseCap { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Consecutive fruitless backfill ships after which the leader stops anchoring at
+    /// <c>nextIndex</c> and anchors the next batch at the follower's reported commit frontier
+    /// instead. Values &lt;= 0 disable the fallback. Default 2.
+    /// <para>
+    /// <c>nextIndex</c> derives from the monotonic matchIndex, which a transiently overshooting
+    /// frontier report can pin <b>above</b> the entry the follower actually needs; every batch
+    /// anchored there is a duplicate the follower acknowledges without progress. Re-anchoring at
+    /// the reported frontier re-ships the first entry the follower has not committed — including
+    /// its commit marker, the piece a marker-loss wedge is missing. Anchoring low only costs
+    /// redundant idempotent entries; anchoring high costs convergence.
+    /// </para>
+    /// </summary>
+    public int BackfillNoProgressAnchorFallbackShips { get; set; } = 2;
+
     // ── Snapshot receive session ──────────────────────────────────────────────
 
     /// <summary>

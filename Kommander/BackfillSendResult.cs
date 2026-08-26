@@ -34,4 +34,14 @@ internal enum BackfillSendResult
     /// anchor-contiguity guard's comment — while the inherited-tail re-commit repairs the range.
     /// </summary>
     NonContiguous,
+
+    /// <summary>
+    /// Recent batches to this peer shipped without its reported commit frontier advancing, and the
+    /// no-progress pause for the current fruitless streak has not elapsed. The batch (and its WAL
+    /// range read) is skipped: re-sending what the follower already acknowledged cannot advance it,
+    /// and unpaced it becomes a network-speed read loop on the shared scheduler. Nothing is wrong
+    /// with the log — do NOT fall back to a snapshot; retry after the pause expires or when the
+    /// frontier moves.
+    /// </summary>
+    NoProgressPaused,
 }

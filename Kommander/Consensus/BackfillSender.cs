@@ -1,5 +1,6 @@
 using Kommander.Communication.Grpc;
 using Kommander.Data;
+using Kommander.Diagnostics;
 using Kommander.Logging;
 using Kommander.Scheduling;
 using Kommander.System;
@@ -163,9 +164,49 @@ internal sealed class BackfillSender
         if (host.IsOutboundQueueSaturated(node.Endpoint))
             return BackfillSendResult.SaturationPaused;
 
-        long from = !anchorToFollowerFrontier && tracker.TryGetNextIndex(node.Endpoint, out long ni) && ni <= coreState.LocalCommittedIndex
-            ? ni
-            : followerMaxLog + 1;
+        // No-progress pacing. A follower whose reported commit frontier is stuck — a lost lazy
+        // commit marker below the leader's monotonic matchIndex — acknowledges every duplicate
+        // batch with Success and the same frontier, and on the single-fsync path each such ack
+        // funnels right back into this method: unpaced, the pair ping-pongs at network speed
+        // forever, reading a WAL range per iteration on the shared read scheduler with zero
+        // progress, zero writes, and zero log lines. The probe self-heals on any frontier
+        // advance; while a fruitless streak stands, further batches wait out an exponential
+        // pause (heartbeat-interval base, capped) BEFORE the WAL read is issued.
+        long reportedFrontier = tracker.GetCommitFrontierOrDefault(node.Endpoint, -1);
+        ReplicationTracker.BackfillProgress progress = tracker.ObserveBackfillProgress(node.Endpoint, reportedFrontier);
+
+        if (progress.FruitlessShips > 0)
+        {
+            TimeSpan pause = NoProgressPause(progress.FruitlessShips);
+            if (pause > TimeSpan.Zero
+                && RaftMonotonic.Elapsed(progress.LastShipTicks, host.GetMonotonicTimestamp()) < pause)
+            {
+                KommanderMetrics.RecordBackfillNoProgressPause(host.PartitionId);
+                return BackfillSendResult.NoProgressPaused;
+            }
+        }
+
+        // Anchor fallback. nextIndex derives from the monotonic matchIndex, which a transiently
+        // overshooting frontier report can pin ABOVE the entry the follower actually needs; every
+        // batch anchored there is a duplicate the follower acknowledges without progress. After
+        // the configured number of fruitless ships, anchor at the reported frontier instead: that
+        // re-ships the first entry the follower has not committed — including its commit marker,
+        // the piece a marker-loss wedge is missing. Anchoring low only costs redundant idempotent
+        // entries; anchoring high costs convergence.
+        bool reanchorAtReportedFrontier = !anchorToFollowerFrontier
+            && host.Configuration.BackfillNoProgressAnchorFallbackShips > 0
+            && reportedFrontier >= 0
+            && progress.FruitlessShips >= host.Configuration.BackfillNoProgressAnchorFallbackShips;
+
+        long from;
+        if (anchorToFollowerFrontier)
+            from = followerMaxLog + 1;
+        else if (reanchorAtReportedFrontier)
+            from = reportedFrontier + 1;
+        else if (tracker.TryGetNextIndex(node.Endpoint, out long ni) && ni <= coreState.LocalCommittedIndex)
+            from = ni;
+        else
+            from = followerMaxLog + 1;
 
         long prevIdx = from - 1;
 
@@ -184,6 +225,7 @@ internal sealed class BackfillSender
 
             backfillTracker.ClearIfCovered(node.Endpoint, from, "a contiguous batch was shipped at or below the episode anchor");
             AppendLogToNode(node, timestamp, cached.Logs, prevIdx, cached.PrevTerm, grpcLogCache: cached.GrpcLogCache);
+            RecordShipped(node, reportedFrontier, from);
             return BackfillSendResult.Sent;
         }
 
@@ -245,7 +287,54 @@ internal sealed class BackfillSender
 
         backfillTracker.ClearIfCovered(node.Endpoint, from, "a contiguous batch was shipped at or below the episode anchor");
         AppendLogToNode(node, timestamp, backfill, prevIdx, prevTerm, grpcLogCache: shared?.GrpcLogCache);
+        RecordShipped(node, reportedFrontier, from);
         return BackfillSendResult.Sent;
+    }
+
+    /// <summary>
+    /// Fruitless-ship count at which a no-progress episode logs its one Warning (and counts one
+    /// episode metric). By this point the anchor fallback has already re-anchored at the reported
+    /// frontier and the batch still produced no advance, so the follower cannot be converged by
+    /// log shipping alone — an operator-relevant condition, not a transient.
+    /// </summary>
+    private const int NoProgressWarnShips = 4;
+
+    /// <summary>
+    /// The pause owed after <paramref name="fruitlessShips"/> consecutive ships without frontier
+    /// progress: heartbeat-interval base, doubling per fruitless ship, capped by configuration.
+    /// A zero heartbeat interval disables the pacing (test configurations).
+    /// </summary>
+    private TimeSpan NoProgressPause(int fruitlessShips)
+    {
+        TimeSpan basePause = host.Configuration.HeartbeatInterval;
+        if (basePause <= TimeSpan.Zero)
+            return TimeSpan.Zero;
+
+        double pauseMs = basePause.TotalMilliseconds * Math.Pow(2, Math.Min(fruitlessShips - 1, 20));
+
+        TimeSpan cap = host.Configuration.BackfillNoProgressPauseCap;
+        if (cap > TimeSpan.Zero && pauseMs > cap.TotalMilliseconds)
+            pauseMs = cap.TotalMilliseconds;
+
+        return TimeSpan.FromMilliseconds(pauseMs);
+    }
+
+    /// <summary>
+    /// Records a shipped batch against the peer's convergence probe and, when a fruitless streak
+    /// crosses <see cref="NoProgressWarnShips"/>, logs the episode's single Warning and counts it.
+    /// </summary>
+    private void RecordShipped(RaftNode node, long reportedFrontier, long anchor)
+    {
+        int fruitlessShips = tracker.RecordBackfillShip(node.Endpoint, reportedFrontier);
+
+        if (fruitlessShips < NoProgressWarnShips || !tracker.TryMarkBackfillNoProgressWarned(node.Endpoint))
+            return;
+
+        KommanderMetrics.RecordBackfillNoProgressEpisode(host.PartitionId);
+        logger.LogWarning(
+            "[{LocalEndpoint}/{PartitionId}/{State}] Backfill to {Endpoint} shipped {Ships} consecutive batches without its reported commit frontier advancing past {Frontier}; batches are now paced and anchored at the frontier (last anchor {Anchor})",
+            host.LocalEndpoint, host.PartitionId, coreState.NodeState,
+            node.Endpoint, fruitlessShips, reportedFrontier, anchor);
     }
 
     /// <summary>
