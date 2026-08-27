@@ -1,8 +1,10 @@
+using System.Collections.Concurrent;
 using Kommander.Communication.Memory;
 using Kommander.Data;
 using Kommander.Discovery;
 using Kommander.Time;
 using Kommander.WAL;
+using Kommander.WAL.Data;
 using Kommander.WAL.IO;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -33,12 +35,12 @@ public sealed class TestFailedWriteFrontierRegression
 
         try
         {
-            Append(writeAhead, Committed(1), Committed(2));
+            await Append(writeAhead, Committed(1), Committed(2));
             Assert.Equal(2, writeAhead.GetCommitIndex());
             Assert.Equal(2, writeAhead.GetPresentIndex());
 
             // The enqueue for id 3 advances both frontiers optimistically...
-            Append(writeAhead, Committed(3));
+            await Append(writeAhead, Committed(3));
             Assert.Equal(3, writeAhead.GetCommitIndex());
             Assert.Equal(3, writeAhead.GetPresentIndex());
 
@@ -49,7 +51,7 @@ public sealed class TestFailedWriteFrontierRegression
             Assert.Equal(2, writeAhead.GetPresentIndex());
 
             // Re-delivery (the leader re-ships after seeing the low ack) re-advances normally.
-            Append(writeAhead, Committed(3));
+            await Append(writeAhead, Committed(3));
             Assert.Equal(3, writeAhead.GetCommitIndex());
             Assert.Equal(3, writeAhead.GetPresentIndex());
         }
@@ -72,11 +74,11 @@ public sealed class TestFailedWriteFrontierRegression
 
         try
         {
-            Append(writeAhead, Committed(1, term: 1), Committed(2, term: 2));
+            await Append(writeAhead, Committed(1, term: 1), Committed(2, term: 2));
             Assert.Equal(2, writeAhead.GetPresentTerm());
 
             // A term-3 entry advances the advertised term optimistically...
-            Append(writeAhead, Committed(3, term: 3));
+            await Append(writeAhead, Committed(3, term: 3));
             Assert.Equal(3, writeAhead.GetPresentTerm());
 
             // ...but its write failed: the pair must return to the durable entry at id 2.
@@ -104,21 +106,21 @@ public sealed class TestFailedWriteFrontierRegression
 
         try
         {
-            Append(writeAhead, Committed(1));
+            await Append(writeAhead, Committed(1));
 
             // Ids 3 and 4 arrive above the hole at 2 and are buffered — then their write fails.
-            Append(writeAhead, Committed(3), Committed(4));
+            await Append(writeAhead, Committed(3), Committed(4));
             Assert.Equal(1, writeAhead.GetCommitIndex());
 
             await writeAhead.RegressFrontiersAfterFailedWriteAsync(3, 4, regressPresence: true, regressCommit: true);
 
             // Filling the hole must advance ONLY to 2 — proof the failed 3,4 did not drain.
-            Append(writeAhead, Committed(2));
+            await Append(writeAhead, Committed(2));
             Assert.Equal(2, writeAhead.GetCommitIndex());
             Assert.Equal(2, writeAhead.GetPresentIndex());
 
             // Re-delivered, they advance normally.
-            Append(writeAhead, Committed(3), Committed(4));
+            await Append(writeAhead, Committed(3), Committed(4));
             Assert.Equal(4, writeAhead.GetCommitIndex());
             Assert.Equal(4, writeAhead.GetPresentIndex());
         }
@@ -140,7 +142,7 @@ public sealed class TestFailedWriteFrontierRegression
 
         try
         {
-            Append(writeAhead, Committed(1), Committed(2), Committed(3));
+            await Append(writeAhead, Committed(1), Committed(2), Committed(3));
             Assert.Equal(3, writeAhead.GetCommitIndex());
             Assert.Equal(3, writeAhead.GetPresentIndex());
 
@@ -167,7 +169,7 @@ public sealed class TestFailedWriteFrontierRegression
 
         try
         {
-            Append(writeAhead, Committed(1), Committed(2));
+            await Append(writeAhead, Committed(1), Committed(2));
 
             await writeAhead.RegressFrontiersAfterFailedWriteAsync(10, 12, regressPresence: true, regressCommit: true);
             await writeAhead.RegressFrontiersAfterFailedWriteAsync(-1, -1, regressPresence: true, regressCommit: true);
@@ -182,8 +184,39 @@ public sealed class TestFailedWriteFrontierRegression
         }
     }
 
-    private static void Append(RaftWriteAhead writeAhead, params RaftLog[] logs) =>
-        writeAhead.EnqueueProposeOrCommit(logs.ToList());
+    /// <summary>
+    /// Completions the WAL scheduler delivered so far, keyed by operation id. Both the
+    /// completion callback and the waiter use GetOrAdd, so the wait is race-free even when
+    /// the write completes before the waiter registers.
+    /// </summary>
+    private readonly ConcurrentDictionary<long, TaskCompletionSource<RaftWalCompletion>> completions = new();
+
+    private void OnWalComplete(RaftWalCompletion completion) =>
+        completions.GetOrAdd(
+                completion.OperationId,
+                static _ => new TaskCompletionSource<RaftWalCompletion>(TaskCreationOptions.RunContinuationsAsynchronously))
+            .TrySetResult(completion);
+
+    /// <summary>
+    /// Enqueues the batch and waits for its durable WAL completion. The production caller of
+    /// <see cref="RaftWriteAhead.RegressFrontiersAfterFailedWriteAsync"/> is the completion
+    /// router, which runs only after the scheduler wrote every earlier batch of the partition
+    /// (per-partition FIFO). A test that regresses right after the enqueue must wait the same
+    /// way, or the regression's term re-read races the still-queued write and reads term 0.
+    /// </summary>
+    private async Task Append(RaftWriteAhead writeAhead, params RaftLog[] logs)
+    {
+        WALWriteOperation? operation = writeAhead.EnqueueProposeOrCommit(logs.ToList());
+
+        Assert.NotNull(operation);
+
+        RaftWalCompletion completion = await completions.GetOrAdd(
+                operation.OperationId,
+                static _ => new TaskCompletionSource<RaftWalCompletion>(TaskCreationOptions.RunContinuationsAsynchronously))
+            .Task.WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(RaftOperationStatus.Success, completion.Status);
+    }
 
     private static RaftLog Committed(long id, long term = 1) => new()
     {
@@ -194,7 +227,7 @@ public sealed class TestFailedWriteFrontierRegression
         LogData = [1, 2, 3],
     };
 
-    private static RaftWriteAhead CreateWriteAhead(out RaftManager manager, out RaftPartition partition)
+    private RaftWriteAhead CreateWriteAhead(out RaftManager manager, out RaftPartition partition)
     {
         const int partitionId = 1;
 
@@ -226,6 +259,6 @@ public sealed class TestFailedWriteFrontierRegression
             endRange: 0,
             NullLogger<IRaft>.Instance);
 
-        return new RaftWriteAhead(manager, _ => { }, partition, wal);
+        return new RaftWriteAhead(manager, OnWalComplete, partition, wal);
     }
 }
