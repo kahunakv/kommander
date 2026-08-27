@@ -555,6 +555,23 @@ public class RaftConfiguration
     /// </summary>
     public int GrpcAppendLogsMaxCoalesceBatch { get; set; } = 256;
 
+    /// <summary>
+    /// Maximum total log-payload bytes that may sit queued in the outbound transport for one
+    /// peer. When the budget is exceeded, further <b>entry-carrying</b> <c>AppendLogs</c>
+    /// messages to that peer are dropped at enqueue instead of buffered; control messages
+    /// (votes, handshakes, step-down notices) and empty heartbeats always pass.
+    /// <para>
+    /// The per-peer outbound queue is the only unbounded structure between the Raft state
+    /// machine and the wire. A follower that stops draining (SIGSTOP pause, network stall)
+    /// previously made its queue absorb the leader's entire write load plus a fresh backfill
+    /// batch per heartbeat, indefinitely: the Caraxes run Q leader retained ~830 MiB of live
+    /// gen2 batches this way and aborted on memory exhaustion. Dropping is safe — an
+    /// <c>AppendLogs</c> is fire-and-forget and every dropped entry is re-shipped by the
+    /// heartbeat/backfill retry path once the queue drains. Default 64 MiB.
+    /// </para>
+    /// </summary>
+    public long MaxOutboundQueueBytesPerPeer { get; set; } = 64L * 1024 * 1024;
+
     private const int GrpcChannelsPerNodeMax = 64;
 
     // Warn at most once per process so repeated calls don't spam.
@@ -748,6 +765,53 @@ public class RaftConfiguration
     /// </summary>
     public int MaxBackfillEntriesPerRound { get; set; } = 128;
 
+    /// <summary>
+    /// Maximum total payload bytes (sum of <see cref="Data.RaftLog.LogData"/> lengths) one
+    /// backfill batch may materialize from the WAL. The batch stops at whichever bound —
+    /// this or <see cref="MaxBackfillEntriesPerRound"/> — is reached first, but always
+    /// contains at least one entry so a single oversized entry cannot stall convergence.
+    /// <para>
+    /// An entry count alone does not bound the allocation: under a large-payload workload,
+    /// 128 entries is tens of megabytes materialized on the heartbeat path per follower per
+    /// round. The Caraxes run Q leader died of memory exhaustion with this read as the
+    /// tipping allocation. The default (4 MiB) also keeps a batch under the gRPC receiver's
+    /// default 4 MB message cap. Default 4 MiB.
+    /// </para>
+    /// </summary>
+    public int MaxBackfillBytesPerRound { get; set; } = 4 * 1024 * 1024;
+
+    /// <summary>
+    /// Cap on the exponential pause between backfill batches to a follower whose reported commit
+    /// frontier is not advancing. Default 30 s.
+    /// <para>
+    /// The ack fast-path re-supply is self-exciting: a follower whose frontier is stuck (a lost
+    /// lazy commit marker below the leader's monotonic matchIndex) acknowledges every duplicate
+    /// batch with Success and the same frontier, and each such ack triggers another WAL range read
+    /// and another ship. Unpaced, the pair ping-pongs at network speed forever — a measured soak
+    /// held ~800 MiB/s of pure WAL reads with zero writes for over half an hour after the workload
+    /// stopped, starving application reads on the shared read scheduler. The pause starts at
+    /// <see cref="HeartbeatInterval"/> after the first fruitless ship and doubles per further
+    /// fruitless ship up to this cap; any frontier advance resets it. A zero
+    /// <see cref="HeartbeatInterval"/> disables the pacing entirely.
+    /// </para>
+    /// </summary>
+    public TimeSpan BackfillNoProgressPauseCap { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Consecutive fruitless backfill ships after which the leader stops anchoring at
+    /// <c>nextIndex</c> and anchors the next batch at the follower's reported commit frontier
+    /// instead. Values &lt;= 0 disable the fallback. Default 2.
+    /// <para>
+    /// <c>nextIndex</c> derives from the monotonic matchIndex, which a transiently overshooting
+    /// frontier report can pin <b>above</b> the entry the follower actually needs; every batch
+    /// anchored there is a duplicate the follower acknowledges without progress. Re-anchoring at
+    /// the reported frontier re-ships the first entry the follower has not committed — including
+    /// its commit marker, the piece a marker-loss wedge is missing. Anchoring low only costs
+    /// redundant idempotent entries; anchoring high costs convergence.
+    /// </para>
+    /// </summary>
+    public int BackfillNoProgressAnchorFallbackShips { get; set; } = 2;
+
     // ── Snapshot receive session ──────────────────────────────────────────────
 
     /// <summary>
@@ -797,6 +861,43 @@ public class RaftConfiguration
     /// under the normal backoff. Must be positive. Default 2 minutes.
     /// </summary>
     public TimeSpan SnapshotTransferStepTimeout { get; set; } = TimeSpan.FromMinutes(2);
+
+    /// <summary>
+    /// Convergence breaker for the refused-backfill → snapshot rescue: the number of consecutive
+    /// rescue cycles (a successful install followed by another below-floor escalation for the same
+    /// follower) after which the leader stops escalating for that follower. Every cycle in such a
+    /// loop reports success, so the failure backoff never fires — without this bound a follower
+    /// that returns below the compaction floor after every install drove an unbounded
+    /// whole-partition export every cooldown until the leader died of memory exhaustion (the
+    /// Caraxes <c>bank-optimistic-45m-p</c> OOM/SIGSEGV). A tripped breaker is surfaced as
+    /// <see cref="Data.RaftSnapshotStatus.RescueNotConverging"/> on
+    /// <see cref="IRaft.GetSnapshotStatuses"/> and logged once at Warning; recovery probes are
+    /// paced by <see cref="SnapshotRescueProbeInterval"/>. Values &lt;= 0 disable the breaker
+    /// (pre-existing unbounded behavior). Default 3.
+    /// </summary>
+    public int SnapshotRescueMaxConsecutiveCycles { get; set; } = 3;
+
+    /// <summary>
+    /// While the rescue convergence breaker is tripped for a follower, one snapshot rescue attempt
+    /// is still allowed per this interval, so a follower whose environment recovers (compaction
+    /// paced, disk freed, application healed) is eventually re-seeded without operator action.
+    /// The probe rate bounds the leader's export cost to a few megabytes per interval instead of
+    /// one full export per cooldown. Values &lt;= 0 disable probing: a tripped breaker then stays
+    /// tripped until the follower converges by other means or the episode goes quiet. Default 5
+    /// minutes.
+    /// </summary>
+    public TimeSpan SnapshotRescueProbeInterval { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Upper bound, in bytes, on the leader-side retry cache for one produced snapshot export.
+    /// An export at or under this size is drained into memory once and re-sent from that cache on
+    /// every retry at the same index; without it each retry re-ran
+    /// <c>ExportPartitionState</c> from scratch — under memory pressure the sender's response to a
+    /// failed send was to immediately repeat the most allocation-hungry operation in the process
+    /// (the Caraxes OOM loop). An export above this bound streams chunk-by-chunk exactly as before
+    /// and is not cached. Values &lt;= 0 disable the cache entirely. Default 64 MiB.
+    /// </summary>
+    public long SnapshotExportRetryCacheMaxBytes { get; set; } = 64L * 1024 * 1024;
 
     /// <summary>
     /// Maximum REST request body, in bytes, that will be read and digested before its signature has
@@ -1270,6 +1371,20 @@ public class RaftConfiguration
     /// Must be greater than or equal to <see cref="CompactNumberEntries"/>.
     /// </summary>
     public int MaxEntriesPerCompaction { get; set; } = 5000;
+
+    /// <summary>
+    /// Maximum number of log entries the leader retains below the compaction checkpoint for a
+    /// live, acking follower that has not yet replicated them. While a reachable follower's
+    /// replicated position sits inside this budget, compaction holds its floor at that position so
+    /// the follower can be served by ordinary backfill; beyond the budget (or once the follower is
+    /// no longer Alive) the floor advances normally and the follower must be seeded by a snapshot.
+    /// Without this hold, a leader compacting on its ordinary cadence repeatedly re-created the
+    /// below-floor condition the snapshot rescue had just repaired, so the rescue could never
+    /// converge (the Caraxes <c>bank-optimistic-45m-p</c> loop). Followers only — the budget is
+    /// applied on the leader from its replication tracker; it has no effect on a node's own
+    /// restart replay. Values &lt;= 0 disable the hold. Default 100000.
+    /// </summary>
+    public long CompactionLiveReplicaLagBudget { get; set; } = 100_000;
 
     /// <summary>
     /// Returns <see cref="CompactNumberEntries"/> clamped to at least 1 when misconfigured.

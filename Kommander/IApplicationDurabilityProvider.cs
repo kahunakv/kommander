@@ -15,6 +15,14 @@ namespace Kommander;
 /// compaction" spec.
 /// </para>
 /// <para>
+/// The floor also acts as a <b>soft checkpoint</b> in the opposite direction: when it sits above
+/// the last hard checkpoint, restart replay starts at the floor instead of the checkpoint and
+/// committed entries at or below the floor are not redelivered (they are already durably applied).
+/// Nothing is removed from the WAL — compaction keeps its own conservative fences — so a stalled
+/// or lagging compaction no longer makes cold-restart time proportional to the retained log
+/// length. See the "Rethink WAL replay" spec.
+/// </para>
+/// <para>
 /// Wire an implementation via <see cref="RaftConfiguration.ApplicationDurabilityProvider"/>. A
 /// <see langword="null"/> provider keeps the checkpoint-anchored behavior byte-for-byte.
 /// </para>
@@ -37,7 +45,11 @@ public interface IApplicationDurabilityProvider
     ///         record): entries in <c>(floor, actuallyFlushed]</c> are then redelivered via
     ///         <c>OnLogRestored</c>, so consumers must make restore application idempotent.
     ///         It must <b>never</b> be high — a too-high floor recreates the data-loss window this
-    ///         provider exists to close.</item>
+    ///         provider exists to close, both through compaction (entries removed before they were
+    ///         applied) and through restore (entries at or below the floor are not redelivered).</item>
+    ///   <item>When one logical partition feeds several application stores, the floor must be the
+    ///         <b>minimum</b> across those stores — no store may sit behind the reported value,
+    ///         because restore will not redeliver anything at or below it.</item>
     /// </list>
     /// </para>
     /// </summary>

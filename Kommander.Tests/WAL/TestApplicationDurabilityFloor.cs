@@ -88,18 +88,176 @@ public sealed class TestApplicationDurabilityFloor
     }
 
     /// <summary>
-    /// A floor at or above the checkpoint adds nothing to replay: the checkpoint-anchored read is
-    /// already wide enough.
+    /// A floor exactly at the checkpoint keeps the checkpoint-anchored read; the delivery filter
+    /// has nothing to remove because everything above the checkpoint is above the floor too.
     /// </summary>
     [Theory]
     [InlineData("sqlite")]
     [InlineData("rocksdb")]
-    public async Task Restore_FloorAtOrAboveCheckpoint_KeepsCheckpointAnchoredReplay(string backend)
+    public async Task Restore_FloorAtCheckpoint_KeepsCheckpointAnchoredReplay(string backend)
     {
         await RunRestoreCaseAsync(
             backend,
-            durablyAppliedIndex: 12,
+            durablyAppliedIndex: 11,
             expectedRestoredIds: [12, 13, 14, 15]);
+    }
+
+    // ── Restore: the soft checkpoint narrows replay above the hard checkpoint ─
+
+    /// <summary>
+    /// A floor above the checkpoint is a soft checkpoint: only committed entries above the floor
+    /// are redelivered, and the commit frontier still reconstructs to the full tail (the floor
+    /// certifies its prefix like a checkpoint entry would).
+    /// </summary>
+    [Theory]
+    [InlineData("sqlite", 12, new long[] { 13, 14, 15 })]
+    [InlineData("rocksdb", 12, new long[] { 13, 14, 15 })]
+    [InlineData("sqlite", 14, new long[] { 15 })]
+    [InlineData("rocksdb", 14, new long[] { 15 })]
+    [InlineData("sqlite", 15, new long[] { })]
+    [InlineData("rocksdb", 15, new long[] { })]
+    public async Task Restore_FloorAboveCheckpoint_NarrowsReplayToTailAboveFloor(string backend, long floor, long[] expectedRestoredIds)
+    {
+        await RunRestoreCaseAsync(
+            backend,
+            durablyAppliedIndex: floor,
+            expectedRestoredIds: expectedRestoredIds);
+    }
+
+    /// <summary>
+    /// The compaction-blocked shape from the bank-soak incident: no checkpoint exists at all (the
+    /// hard-checkpoint floor never advanced) while the application durably applied a long prefix.
+    /// Replay must start at the floor instead of index 1 — this is exactly the case that made
+    /// cold-restart time proportional to workload runtime.
+    /// </summary>
+    [Theory]
+    [InlineData("sqlite")]
+    [InlineData("rocksdb")]
+    public async Task Restore_NoCheckpointWithFloor_NarrowsReplayToTailAboveFloor(string backend)
+    {
+        string path = CreateTempWalPath(backend);
+
+        try
+        {
+            IWAL wal = CreateWal(backend, path);
+
+            TestDurabilityProvider provider = new() { DurablyAppliedIndex = 10 };
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal,
+                provider,
+                out RaftManager manager,
+                out RaftPartition partition);
+
+            try
+            {
+                await partition.RestoreTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+                // Committed 1..15, never checkpointed.
+                List<RaftLog> batch = [];
+                for (long id = 1; id <= 15; id++)
+                    batch.Add(CreateCommittedLog(id));
+                Assert.Equal(RaftOperationStatus.Success, wal.Write([(PartitionId, batch)]));
+
+                List<long> restoredIds = [];
+                manager.OnLogRestored += (_, log) =>
+                {
+                    restoredIds.Add(log.Id);
+                    return Task.FromResult(true);
+                };
+
+                IReadOnlyList<RaftLog> logs = await writeAhead.LoadRestoreLogsAsync().ConfigureAwait(true);
+
+                // The read itself was narrowed — the durably-applied prefix is not even loaded.
+                Assert.Equal([11L, 12L, 13L, 14L, 15L], logs.Select(log => log.Id).ToArray());
+
+                await writeAhead.CompleteRestoreAsync(logs).ConfigureAwait(true);
+
+                Assert.Equal([11L, 12L, 13L, 14L, 15L], restoredIds);
+
+                // The soft floor seeds the frontier scan, so the frontier is intact.
+                Assert.Equal(15, writeAhead.GetCommitIndex());
+                Assert.Equal(15, writeAhead.GetPresentIndex());
+                Assert.Equal(1, writeAhead.GetPresentTerm());
+            }
+            finally
+            {
+                partition.Dispose();
+                manager.Dispose();
+            }
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    /// <summary>
+    /// When the WAL holds no entry at the floor (here: the floor points into a hole), narrowing is
+    /// abandoned — the read stays conservative and the frontier reconstructs from what the WAL
+    /// actually holds — but already-applied committed entries are still not redelivered.
+    /// </summary>
+    [Theory]
+    [InlineData("sqlite")]
+    [InlineData("rocksdb")]
+    public async Task Restore_FloorEntryMissingFromWal_FallsBackToFullReadWithDeliverySkip(string backend)
+    {
+        string path = CreateTempWalPath(backend);
+
+        try
+        {
+            IWAL wal = CreateWal(backend, path);
+
+            TestDurabilityProvider provider = new() { DurablyAppliedIndex = 6 };
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal,
+                provider,
+                out RaftManager manager,
+                out RaftPartition partition);
+
+            try
+            {
+                await partition.RestoreTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+                // Committed 1..5 and 7..8: id 6 — exactly the floor — is a hole.
+                List<RaftLog> batch = [];
+                for (long id = 1; id <= 5; id++)
+                    batch.Add(CreateCommittedLog(id));
+                batch.Add(CreateCommittedLog(7));
+                batch.Add(CreateCommittedLog(8));
+                Assert.Equal(RaftOperationStatus.Success, wal.Write([(PartitionId, batch)]));
+
+                List<long> restoredIds = [];
+                manager.OnLogRestored += (_, log) =>
+                {
+                    restoredIds.Add(log.Id);
+                    return Task.FromResult(true);
+                };
+
+                IReadOnlyList<RaftLog> logs = await writeAhead.LoadRestoreLogsAsync().ConfigureAwait(true);
+
+                // Fallback: the full (unnarrowed) read.
+                Assert.Equal([1L, 2L, 3L, 4L, 5L, 7L, 8L], logs.Select(log => log.Id).ToArray());
+
+                await writeAhead.CompleteRestoreAsync(logs).ConfigureAwait(true);
+
+                // Entries at or below the floor are still not redelivered; 7 and 8 sit above the
+                // floor but also above the reconstructed frontier (the hole at 6 stops the
+                // contiguous prefix), so they are deferred to leader re-supply as before.
+                Assert.Empty(restoredIds);
+                Assert.Equal(5, writeAhead.GetCommitIndex());
+            }
+            finally
+            {
+                partition.Dispose();
+                manager.Dispose();
+            }
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
     }
 
     /// <summary>
@@ -308,6 +466,85 @@ public sealed class TestApplicationDurabilityFloor
                     .WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
                 // Commit-order overwrite: v2 (pre-checkpoint delta) → v3 (snapshot) → v4 (tail delta).
+                Assert.Equal(4, manager.GetMembership().MembershipVersion);
+            }
+            finally
+            {
+                partition.Dispose();
+                manager.Dispose();
+            }
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    /// <summary>
+    /// The system partition is never narrowed by the soft checkpoint: the coordinator's roster and
+    /// partition map exist only in memory and are rebuilt from replay, and the application floor
+    /// certifies nothing about them. With a floor above every entry, the checkpoint-anchored read
+    /// and the full system replay must both survive unchanged.
+    /// </summary>
+    [Fact]
+    public async Task Restore_P0FloorAboveCheckpoint_StillReplaysSystemEntries()
+    {
+        const int partitionId = RaftSystemConfig.SystemPartition;
+
+        string path = CreateTempWalPath("sqlite");
+
+        try
+        {
+            IWAL wal = new SqliteWAL(path, "wal", NullLogger<IRaft>.Instance);
+
+            ConcurrentDictionary<string, string> snapshotConfig = new();
+            snapshotConfig[RaftSystemConfigKeys.Members] = JsonSerializer.Serialize(CreateRoster(3));
+            byte[]? snapshotPayload = RaftSystemCoordinatorHelpers.SerializeCheckpointSnapshot(snapshotConfig);
+            Assert.NotNull(snapshotPayload);
+
+            // The application durably applied everything — irrelevant to coordinator replay.
+            TestDurabilityProvider provider = new() { DurablyAppliedIndex = 43 };
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal,
+                provider,
+                out RaftManager manager,
+                out RaftPartition partition,
+                partitionId: partitionId);
+
+            try
+            {
+                await partition.RestoreTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+                List<RaftLog> logs =
+                [
+                    new()
+                    {
+                        Id = 42, Term = 5, Type = RaftLogType.CommittedCheckpoint,
+                        LogType = RaftSystemConfig.CheckpointLogType,
+                        LogData = snapshotPayload,
+                    },
+                    new()
+                    {
+                        Id = 43, Term = 5, Type = RaftLogType.Committed,
+                        LogType = RaftSystemConfig.RaftLogType,
+                        LogData = SerializeMembersDelta(CreateRoster(4)),
+                    },
+                ];
+                Assert.Equal(RaftOperationStatus.Success, wal.Write([(partitionId, logs)]));
+
+                IReadOnlyList<RaftLog> restoreLogs = await writeAhead.LoadRestoreLogsAsync().ConfigureAwait(true);
+
+                // Not narrowed: the checkpoint-anchored read still returns the checkpoint and the
+                // system delta at 43 even though both sit at or below the floor.
+                Assert.Equal([42L, 43L], restoreLogs.Select(log => log.Id).ToArray());
+
+                await writeAhead.CompleteRestoreAsync(restoreLogs).ConfigureAwait(true);
+
+                await manager.SystemCoordinator.DrainAsync()
+                    .WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+                // Snapshot v3 then delta v4 both replayed: the coordinator sees the newest roster.
                 Assert.Equal(4, manager.GetMembership().MembershipVersion);
             }
             finally

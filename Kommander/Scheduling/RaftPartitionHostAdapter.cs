@@ -78,6 +78,8 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
 
     public void EnqueueResponse(string endpoint, RaftResponderRequest request) => manager.EnqueueResponse(endpoint, request);
 
+    public bool IsOutboundQueueSaturated(string endpoint) => manager.IsOutboundQueueSaturated(endpoint);
+
     public Task InvokeLeaderChanged(int partitionId, string leader) => manager.InvokeLeaderChanged(partitionId, leader);
 
     public Task<bool> InvokeReplicationReceived(int partitionId, RaftLog log) => manager.InvokeReplicationReceived(partitionId, log);

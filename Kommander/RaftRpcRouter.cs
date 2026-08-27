@@ -1,6 +1,7 @@
 
 using Kommander.Data;
 using Kommander.Gossip;
+using Kommander.Support.Parallelization;
 using Kommander.Logging;
 using Kommander.System;
 using Kommander.WAL;
@@ -188,7 +189,7 @@ internal sealed class RaftRpcRouter
         }
 
         // Fire-and-forget: the executor serialises the transfer; we don't await here.
-        _ = partition.TransferLeadershipAsync(request.TargetEndpoint, CancellationToken.None);
+        FireAndForget.Observe(partition.TransferLeadershipAsync(request.TargetEndpoint, CancellationToken.None), logger, "TransferLeadershipSuggestion");
     }
 
     /// <summary>

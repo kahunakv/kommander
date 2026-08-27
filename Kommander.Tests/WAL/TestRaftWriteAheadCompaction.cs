@@ -969,6 +969,207 @@ public sealed class TestRaftWriteAheadCompaction
         finally { DeleteTempWalPath(path); }
     }
 
+    // ── Live-replica retention floor (compaction lag budget) tests ───────────
+
+    /// <summary>
+    /// A live follower's published retention floor below the checkpoint holds compaction at that
+    /// floor, so the entries the follower still needs stay servable by ordinary backfill instead
+    /// of forcing the follower into snapshot dependence (the non-converging rescue loop's deeper
+    /// cause).
+    /// </summary>
+    [Fact]
+    public async Task LiveReplicaFloor_WithinBudget_HoldsCompaction()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance);
+            const int partitionId = 1;
+            // logs 1-9 committed, checkpoint at 10
+            SeedRemovableLogs(wal, partitionId, removableCount: 9, checkpointId: 10);
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal, compactNumberEntries: 100, maxEntriesPerCompaction: 1000, compactEveryOperations: 0,
+                partitionId, out RaftManager manager, out RaftPartition partition);
+
+            try
+            {
+                // A live follower still needs entry 5 — the default budget easily covers a 5-entry lag.
+                writeAhead.SetLiveReplicaRetentionFloor(5);
+
+                writeAhead.Compact();
+                await writeAhead.WaitForCompactionIdleAsync().ConfigureAwait(true);
+
+                long[] survivingIds = wal.ReadLogsRange(partitionId, 0).Select(l => l.Id).ToArray();
+                Assert.DoesNotContain(4L, survivingIds);
+                Assert.Contains(5L, survivingIds);
+                Assert.Contains(9L, survivingIds);
+                Assert.Contains(10L, survivingIds);
+            }
+            finally { partition.Dispose(); manager.Dispose(); }
+        }
+        finally { DeleteTempWalPath(path); }
+    }
+
+    /// <summary>
+    /// The hold is bounded: a follower further behind than
+    /// <see cref="RaftConfiguration.CompactionLiveReplicaLagBudget"/> cannot grow the WAL without
+    /// limit — the floor clamps to (checkpoint − budget) and the follower beyond it is left to the
+    /// snapshot path.
+    /// </summary>
+    [Fact]
+    public async Task LiveReplicaFloor_BeyondBudget_ClampsToTheBudget()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance);
+            const int partitionId = 1;
+            // logs 1-9 committed, checkpoint at 10
+            SeedRemovableLogs(wal, partitionId, removableCount: 9, checkpointId: 10);
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal, compactNumberEntries: 100, maxEntriesPerCompaction: 1000, compactEveryOperations: 0,
+                partitionId, out RaftManager manager, out RaftPartition partition);
+
+            try
+            {
+                // Budget 3 with checkpoint 10 → the floor can be held no lower than 7, however far
+                // behind the published follower position sits.
+                manager.Configuration.CompactionLiveReplicaLagBudget = 3;
+                writeAhead.SetLiveReplicaRetentionFloor(2);
+
+                writeAhead.Compact();
+                await writeAhead.WaitForCompactionIdleAsync().ConfigureAwait(true);
+
+                long[] survivingIds = wal.ReadLogsRange(partitionId, 0).Select(l => l.Id).ToArray();
+                Assert.DoesNotContain(2L, survivingIds);
+                Assert.DoesNotContain(6L, survivingIds);
+                Assert.Contains(7L, survivingIds);
+                Assert.Contains(9L, survivingIds);
+                Assert.Contains(10L, survivingIds);
+            }
+            finally { partition.Dispose(); manager.Dispose(); }
+        }
+        finally { DeleteTempWalPath(path); }
+    }
+
+    /// <summary>
+    /// A budget of 0 disables the hold entirely: the published floor is ignored and compaction
+    /// truncates to the checkpoint — the pre-fix behaviour.
+    /// </summary>
+    [Fact]
+    public async Task LiveReplicaFloor_BudgetDisabled_TruncatesToCheckpoint()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance);
+            const int partitionId = 1;
+            const int removableCount = 9;
+
+            SeedRemovableLogs(wal, partitionId, removableCount, checkpointId: removableCount + 1);
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal, compactNumberEntries: 100, maxEntriesPerCompaction: 1000, compactEveryOperations: 0,
+                partitionId, out RaftManager manager, out RaftPartition partition);
+
+            try
+            {
+                manager.Configuration.CompactionLiveReplicaLagBudget = 0;
+                writeAhead.SetLiveReplicaRetentionFloor(5);
+
+                writeAhead.Compact();
+                await writeAhead.WaitForCompactionIdleAsync().ConfigureAwait(true);
+
+                (_, int remaining) = wal.CompactLogsOlderThan(
+                    partitionId, lastCheckpoint: removableCount + 1, compactNumberEntries: 100);
+                Assert.Equal(0, remaining);
+            }
+            finally { partition.Dispose(); manager.Dispose(); }
+        }
+        finally { DeleteTempWalPath(path); }
+    }
+
+    /// <summary>
+    /// A stale published floor is ignored: the publisher runs only on an active leader's heartbeat
+    /// round, so expiry — not a step-down hook — is what keeps a stepped-down or stalled leader
+    /// from pinning retention forever.
+    /// </summary>
+    [Fact]
+    public async Task LiveReplicaFloor_Stale_IsIgnored()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance);
+            const int partitionId = 1;
+            const int removableCount = 9;
+
+            SeedRemovableLogs(wal, partitionId, removableCount, checkpointId: removableCount + 1);
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal, compactNumberEntries: 100, maxEntriesPerCompaction: 1000, compactEveryOperations: 0,
+                partitionId, out RaftManager manager, out RaftPartition partition);
+
+            try
+            {
+                writeAhead.SetLiveReplicaRetentionFloor(5);
+                writeAhead.SetLiveReplicaFloorStalenessForTesting(TimeSpan.FromMilliseconds(1));
+                await Task.Delay(50, TestContext.Current.CancellationToken);
+
+                writeAhead.Compact();
+                await writeAhead.WaitForCompactionIdleAsync().ConfigureAwait(true);
+
+                (_, int remaining) = wal.CompactLogsOlderThan(
+                    partitionId, lastCheckpoint: removableCount + 1, compactNumberEntries: 100);
+                Assert.Equal(0, remaining);
+            }
+            finally { partition.Dispose(); manager.Dispose(); }
+        }
+        finally { DeleteTempWalPath(path); }
+    }
+
+    /// <summary>
+    /// A published floor at or above the checkpoint constrains nothing — a caught-up follower
+    /// leaves compaction identical to the pre-fix behaviour, and non-positive floors normalize to
+    /// no protection.
+    /// </summary>
+    [Fact]
+    public async Task LiveReplicaFloor_AtOrAboveCheckpoint_NoEffect()
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance);
+            const int partitionId = 1;
+            const int removableCount = 9;
+
+            SeedRemovableLogs(wal, partitionId, removableCount, checkpointId: removableCount + 1);
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal, compactNumberEntries: 100, maxEntriesPerCompaction: 1000, compactEveryOperations: 0,
+                partitionId, out RaftManager manager, out RaftPartition partition);
+
+            try
+            {
+                writeAhead.SetLiveReplicaRetentionFloor(0);
+                Assert.Equal(long.MaxValue, writeAhead.LiveReplicaRetentionFloor);
+
+                writeAhead.SetLiveReplicaRetentionFloor(removableCount + 5);
+
+                writeAhead.Compact();
+                await writeAhead.WaitForCompactionIdleAsync().ConfigureAwait(true);
+
+                (_, int remaining) = wal.CompactLogsOlderThan(
+                    partitionId, lastCheckpoint: removableCount + 1, compactNumberEntries: 100);
+                Assert.Equal(0, remaining);
+            }
+            finally { partition.Dispose(); manager.Dispose(); }
+        }
+        finally { DeleteTempWalPath(path); }
+    }
+
     private static RaftWriteAhead CreateWriteAhead(
         SqliteWAL wal,
         int compactNumberEntries,

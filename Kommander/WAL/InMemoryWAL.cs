@@ -76,6 +76,9 @@ public class InMemoryWAL : IWAL, IDisposable
     }
 
     public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue)
+        => ReadLogsRange(partitionId, startLogIndex, maxEntries, long.MaxValue);
+
+    public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries, long maxBytes)
     {
         rwLock.EnterReadLock();
         try
@@ -90,8 +93,17 @@ public class InMemoryWAL : IWAL, IDisposable
                 IList<long> keys = partitionLogs.Keys;
                 IList<RaftLog> values = partitionLogs.Values;
 
+                long payloadBytes = 0;
+
                 for (int i = LowerBound(keys, startLogIndex); i < keys.Count; i++)
                 {
+                    long entryBytes = values[i].LogData?.Length ?? 0;
+
+                    // At-least-one-entry rule: the budget stops a batch, never the first entry.
+                    if (result.Count > 0 && payloadBytes + entryBytes > maxBytes)
+                        break;
+
+                    payloadBytes += entryBytes;
                     result.Add(values[i]);
                     if (result.Count >= maxEntries)
                         break;

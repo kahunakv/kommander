@@ -30,6 +30,9 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
     public ValueTask<List<RaftLog>> GetRangeAllTypesAsync(long startLogIndex, int maxEntries) =>
         wal.GetRangeAllTypesAsync(startLogIndex, maxEntries);
 
+    public ValueTask<List<RaftLog>> GetRangeAllTypesAsync(long startLogIndex, int maxEntries, long maxBytes) =>
+        wal.GetRangeAllTypesAsync(startLogIndex, maxEntries, maxBytes);
+
     public ValueTask<long> GetAnyTermAtAsync(long logIndex) =>
         wal.GetAnyTermAtAsync(logIndex);
 
@@ -68,6 +71,8 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
         wal.EnqueueProposeOrCommit(logs, timestamp, endpoint, term);
 
     public void NotifyCommitted() => wal.NotifyCommitted();
+
+    public void SetLiveReplicaRetentionFloor(long floor) => wal.SetLiveReplicaRetentionFloor(floor);
 
     public ValueTask PersistHardStateAsync(long currentTerm, string? votedFor)
     {

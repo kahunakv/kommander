@@ -223,6 +223,15 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Warning, Message = "[{Endpoint}/{Partition}] Compaction blocked by application-durability floor: DurablyApplied={DurablyApplied} LastCheckpoint={LastCheckpoint} — application flusher may be stalled; WAL will grow until the floor advances")]
     public static partial void LogWarnCompactionBlockedByDurabilityFloor(this ILogger<IRaft> logger, string endpoint, int partition, long durablyApplied, long lastCheckpoint);
 
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}/{Partition}] Restore replay narrowed by soft checkpoint (application-durability floor above the last checkpoint): SoftFloor={SoftFloor} LastCheckpoint={LastCheckpoint} — replaying only the {TailCount} entries above the floor")]
+    public static partial void LogInfoRestoreNarrowedBySoftFloor(this ILogger<IRaft> logger, string endpoint, int partition, long softFloor, long lastCheckpoint, int tailCount);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{Endpoint}/{Partition}] Application-durability floor {SoftFloor} is above the last checkpoint {LastCheckpoint} but the WAL holds no entry at the floor; falling back to the full checkpoint-anchored restore read (already-applied committed entries are still not redelivered)")]
+    public static partial void LogWarnRestoreSoftFloorEntryMissing(this ILogger<IRaft> logger, string endpoint, int partition, long softFloor, long lastCheckpoint);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}/{Partition}] Restore skipped redelivery of {SkippedCount} committed entries at or below the application-durability floor {DeliveryFloor} (durably applied by the application)")]
+    public static partial void LogInfoRestoreSkippedBelowSoftFloor(this ILogger<IRaft> logger, string endpoint, int partition, long skippedCount, long deliveryFloor);
+
     // ── RaftManager ───────────────────────────────────────────────────────
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "SystemLogRestored: skipping entry on system partition (LogType={LogType}, DataNull={DataNull}) — non-system types are routed to consumer callbacks upstream")]

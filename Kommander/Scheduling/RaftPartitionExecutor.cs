@@ -4,6 +4,7 @@ using System.Diagnostics.Metrics;
 using Kommander.Data;
 using Kommander.Diagnostics;
 using Kommander.Scheduling;
+using Kommander.Support.Parallelization;
 using Kommander.WAL;
 using Kommander.WAL.Data;
 using Microsoft.Extensions.Logging;
@@ -448,7 +449,7 @@ public sealed class RaftPartitionExecutor : IDisposable
         // On completion it posts RestoreLogsLoaded to the maintenance queue and calls
         // MarkRunnable(), which either releases the per-partition semaphore (dedicated)
         // or schedules to the shared pool (pool mode).
-        _ = Task.Run(() => RunRestorePhase1Async(_cts.Token));
+        FireAndForget.Observe(Task.Run(() => RunRestorePhase1Async(_cts.Token)), _logger, "RestorePhase1");
 
         // In dedicated-thread mode the worker loop parks on _workAvailable and drains.
         // In pool mode there is no per-partition thread; the pool drives DrainOnPool.

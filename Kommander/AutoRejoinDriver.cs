@@ -1,6 +1,7 @@
 
 using Kommander.Data;
 using Kommander.Discovery;
+using Kommander.Support.Parallelization;
 using Kommander.System;
 using Microsoft.Extensions.Logging;
 
@@ -113,7 +114,7 @@ internal sealed class AutoRejoinDriver
         if (Interlocked.CompareExchange(ref _autoRejoinRunning, 1, 0) != 0)
             return;
 
-        _ = Task.Run(AutoRejoinLoopAsync);
+        FireAndForget.Observe(Task.Run(AutoRejoinLoopAsync), logger, "AutoRejoinLoop");
     }
 
     /// <summary>

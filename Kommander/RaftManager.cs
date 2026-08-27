@@ -540,7 +540,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             () => IsInitialized,
             AmILeader);
 
-        transportDispatcher = new Communication.RaftTransportDispatcher(this, communication, Logger);
+        transportDispatcher = new Communication.RaftTransportDispatcher(
+            this, communication, Logger, configuration.MaxOutboundQueueBytesPerPeer);
 
         rpcRouter = new RaftRpcRouter(
             this,
@@ -1035,7 +1036,7 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
 
         RemovePartition(partitionId);
 
-        _ = Task.Run(async () =>
+        Support.Parallelization.FireAndForget.Observe(Task.Run(async () =>
         {
             try
             {
@@ -1054,7 +1055,7 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
                     "StopUnhostedPartition: partition {PartitionId}: {Message}",
                     partitionId, ex.Message);
             }
-        });
+        }), Logger, "StopUnhostedPartition");
     }
 
     /// <summary>
@@ -2063,6 +2064,15 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     
     internal void EnqueueResponse(string endpoint, RaftResponderRequest request) =>
         rpcRouter.EnqueueResponse(endpoint, request);
+
+    /// <summary>
+    /// True when the outbound transport queue for <paramref name="endpoint"/> is over its
+    /// payload-byte budget (<see cref="RaftConfiguration.MaxOutboundQueueBytesPerPeer"/>).
+    /// The backfill sender consults this before reading a batch from the WAL, so a peer that
+    /// stopped draining does not cause a fresh batch to be materialized per heartbeat.
+    /// </summary>
+    internal bool IsOutboundQueueSaturated(string endpoint) =>
+        transportDispatcher.IsOutboundQueueSaturated(endpoint);
 
     public void Dispose()
     {

@@ -57,7 +57,36 @@ public sealed class RaftWriteAhead
     private readonly int maxEntriesPerCompaction;
 
     private bool recovered;
-    
+
+    // ── Soft restore floor (the "soft checkpoint") ───────────────────────────────────────────────
+    // A durable CommittedCheckpoint (the HARD checkpoint) is the compaction anchor: entries below
+    // it are removed, so it must stay conservative (it is fenced by the application-durability
+    // floor and by follower retention). The application-durability floor itself, however, can sit
+    // far ABOVE the last hard checkpoint — exactly the state a blocked compaction leaves behind —
+    // and every entry at or below that floor is already durably applied by the application.
+    // Redelivering those entries on restore is pure replay cost: it made cold-restart time
+    // proportional to workload runtime instead of to the application's flush lag.
+    //
+    // The three fields below carry the floor from LoadRestoreLogsAsync (phase 1) to
+    // CompleteRestoreAsync (phase 2). They are written once in phase 1 and read once in phase 2;
+    // the executor handoff between the phases orders the accesses.
+    //
+    // restoreDeliveryFloor: committed CONSUMER entries with id <= this are not redelivered via
+    // OnLogRestored. System-partition coordinator entries are exempt — the coordinator rebuilds
+    // its in-memory state (roster, partition map) from replay, and the application floor says
+    // nothing about that state. -1 = no floor (no provider, or "no opinion").
+    private long restoreDeliveryFloor = -1;
+
+    // restoreSoftFloorIndex/Term: when > 0, the restore read was NARROWED to start at
+    // restoreSoftFloorIndex + 1 and the frontier scan must be seeded as if a CommittedCheckpoint
+    // sat at this position — the floor certifies its whole prefix committed (the application can
+    // only durably apply entries that were delivered as committed, and delivery is contiguous).
+    // Only set when the WAL was proven to still hold the entry at the floor, so the (term, index)
+    // freshness pair advertised after restore describes a real on-disk entry.
+    private long restoreSoftFloorIndex = -1;
+
+    private long restoreSoftFloorTerm;
+
     private long proposeIndex = 1;
 
     private long commitIndex = 1;
@@ -154,6 +183,35 @@ public sealed class RaftWriteAhead
     /// </summary>
     private long holdFloor = long.MaxValue;
 
+    /// <summary>
+    /// Live-replica retention floor as last published by the leader's heartbeat round: the lowest
+    /// log index a live, acking follower still needs, or <see cref="long.MaxValue"/> when no
+    /// follower constrains retention. See <see cref="SetLiveReplicaRetentionFloor"/>. Volatile
+    /// pattern as <see cref="minRetainIndex"/>.
+    /// </summary>
+    private long liveReplicaRetentionFloor = long.MaxValue;
+
+    /// <summary>
+    /// When <see cref="liveReplicaRetentionFloor"/> was last published (monotonic ticks; 0 = never).
+    /// A value older than <see cref="liveReplicaFloorStalenessTicks"/> is ignored by compaction:
+    /// the publisher runs only on an active leader's heartbeat round, so expiry — rather than a
+    /// clear-on-step-down hook at every leader→follower transition site — is what keeps a
+    /// stepped-down, quiesced, or crashed-mid-publish leader from pinning retention forever.
+    /// </summary>
+    private long liveReplicaFloorPublishedTicks;
+
+    /// <summary>
+    /// Staleness bound for the published live-replica floor: ten heartbeat intervals, floored at
+    /// 30 s. An active leader republishes every round, so a fresh value is always present where the
+    /// hold matters; anything older means the publisher stopped. Not readonly only for
+    /// <see cref="SetLiveReplicaFloorStalenessForTesting"/>.
+    /// </summary>
+    private long liveReplicaFloorStalenessTicks;
+
+    /// <summary>Test-only: overrides the staleness bound so expiry is testable without waiting 30 s.</summary>
+    internal void SetLiveReplicaFloorStalenessForTesting(TimeSpan window) =>
+        liveReplicaFloorStalenessTicks = (long)(window.TotalSeconds * Stopwatch.Frequency);
+
     // Test-only handle for WaitForCompactionIdleAsync; not a production synchronization point.
     private Task? compactionPassTask;
 
@@ -192,6 +250,22 @@ public sealed class RaftWriteAhead
         this.compactNumberEntries = manager.Configuration.GetEffectiveCompactNumberEntries();
         this.maxEntriesPerCompaction = manager.Configuration.GetEffectiveMaxEntriesPerCompaction();
         this.operations = compactEveryOperations > 0 ? compactEveryOperations : 0;
+        this.liveReplicaFloorStalenessTicks = (long)(Math.Max(
+            30_000, 10 * manager.Configuration.HeartbeatInterval.TotalMilliseconds) * Stopwatch.Frequency / 1000);
+    }
+
+    /// <summary>
+    /// Publishes the live-replica retention floor (see <see cref="Scheduling.IRaftWalFacade.SetLiveReplicaRetentionFloor"/>).
+    /// Called from the leader's heartbeat round on the partition executor; read lock-free by
+    /// <see cref="RunCompactionPassAsync"/>. Values &lt;= 0 are normalized to
+    /// <see cref="long.MaxValue"/> (no protection), mirroring <see cref="SetMinRetainIndex"/>.
+    /// The publish timestamp is written after the floor, so a torn observation errs toward
+    /// treating the value as stale — never toward applying a stale one as fresh.
+    /// </summary>
+    public void SetLiveReplicaRetentionFloor(long floor)
+    {
+        Volatile.Write(ref liveReplicaRetentionFloor, floor <= 0 ? long.MaxValue : floor);
+        Volatile.Write(ref liveReplicaFloorPublishedTicks, Stopwatch.GetTimestamp());
     }
 
     /// <summary>
@@ -219,12 +293,22 @@ public sealed class RaftWriteAhead
     /// deliver it back to the partition executor for replay under the single-owner
     /// guarantee (correctness rule 1).
     /// <para>
-    /// When an <see cref="IApplicationDurabilityProvider"/> is configured and reports a floor
-    /// below the last checkpoint, the read starts at <c>floor + 1</c> instead of the checkpoint,
-    /// so committed entries the application has not durably applied are redelivered on replay.
-    /// The checkpoint remains the recovery anchor for consensus state; the returned list is a
-    /// superset of the checkpoint-anchored read, never a subset, so the frontier math in
-    /// <see cref="CompleteRestoreAsync"/> is unaffected.
+    /// When an <see cref="IApplicationDurabilityProvider"/> is configured, the floor it reports
+    /// re-anchors the read in both directions. A floor <b>below</b> the last checkpoint widens the
+    /// read down to <c>floor + 1</c>, so committed entries the application has not durably applied
+    /// are redelivered on replay. A floor <b>above</b> the checkpoint is a <b>soft checkpoint</b>:
+    /// entries at or below it are already durably applied by the application, so (on non-system
+    /// partitions, and only when the WAL still holds the entry at the floor) the read is
+    /// <b>narrowed</b> to start at <c>floor + 1</c> and <see cref="CompleteRestoreAsync"/> seeds
+    /// the frontier scan from the floor. Unlike the hard checkpoint, the soft floor removes
+    /// nothing: the skipped prefix stays in the WAL for follower backfill and compaction keeps its
+    /// own conservative fences. This bounds cold-restart replay by the application's flush lag
+    /// instead of by workload runtime.
+    /// </para>
+    /// <para>
+    /// The system partition is never narrowed: the system coordinator rebuilds its in-memory
+    /// roster/partition-map from replayed <c>_RaftSystem</c> entries, and the application floor
+    /// certifies nothing about coordinator state.
     /// </para>
     /// </summary>
     public async ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync()
@@ -240,6 +324,7 @@ public sealed class RaftWriteAhead
 
         long lastCheckpoint = -1;
         long replayFloor = -1;
+        long softFloorTerm = -1;
 
         List<RaftLog> logs = await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () =>
         {
@@ -249,16 +334,55 @@ public sealed class RaftWriteAhead
             lastCheckpoint = walAdapter.GetLastCheckpoint(partition.PartitionId);
             replayFloor = durablyApplied + 1;
 
-            // No checkpoint ⇒ ReadLogs already reads from the beginning; floor at/above the
-            // checkpoint ⇒ the checkpoint-anchored read is already wide enough. Either way the
-            // plain path is byte-for-byte the historical behavior.
-            if (lastCheckpoint <= 0 || replayFloor >= lastCheckpoint)
-                return walAdapter.ReadLogs(partition.PartitionId);
+            // Floor below the checkpoint: widen. Unbounded range read from the floor — the same
+            // seek-from-id path the backends already implement, returning every entry (any type)
+            // with id >= replayFloor.
+            if (lastCheckpoint > 0 && replayFloor < lastCheckpoint)
+                return walAdapter.ReadLogsRange(partition.PartitionId, replayFloor);
 
-            // Unbounded range read from the floor: same seek-from-id path the backends already
-            // implement, returning every entry (any type) with id >= replayFloor.
-            return walAdapter.ReadLogsRange(partition.PartitionId, replayFloor);
+            // Floor above the checkpoint (including "no checkpoint at all", the state a
+            // durability-fenced compaction leaves behind): narrow the read to the tail above the
+            // soft floor. Requires proof that the entry AT the floor is still durably present —
+            // its term seeds the post-restore freshness pair — otherwise fall through to the
+            // conservative full read (the WAL and the application have diverged; frontier
+            // reconstruction then proceeds from what the WAL actually holds). Any entry type
+            // counts: under WalSingleFsyncCommit a durably applied entry can persist as Proposed
+            // with its lazy commit marker lost, yet the application floor proves it committed.
+            if (durablyApplied > 0
+                && durablyApplied > lastCheckpoint
+                && partition.PartitionId != RaftSystemConfig.SystemPartition)
+            {
+                softFloorTerm = walAdapter.GetTermAt(partition.PartitionId, durablyApplied);
+                if (softFloorTerm > 0)
+                    return walAdapter.ReadLogsRange(partition.PartitionId, replayFloor);
+
+                softFloorTerm = -1;
+            }
+
+            // Historical checkpoint-anchored read (also the no-provider path above): with no
+            // checkpoint, ReadLogs reads from the beginning.
+            return walAdapter.ReadLogs(partition.PartitionId);
         }).ConfigureAwait(false);
+
+        // Committed consumer entries at or below the floor are durably applied and are not
+        // redelivered, on every read path (the widened and narrowed reads exclude them by
+        // construction; the full reads skip them at delivery).
+        restoreDeliveryFloor = durablyApplied;
+
+        if (softFloorTerm > 0)
+        {
+            restoreSoftFloorIndex = durablyApplied;
+            restoreSoftFloorTerm = softFloorTerm;
+            manager.Logger.LogInfoRestoreNarrowedBySoftFloor(
+                manager.LocalEndpoint, partition.PartitionId, durablyApplied, lastCheckpoint, logs.Count);
+            KommanderMetrics.RecordRestoreNarrowedBySoftFloor(partition.PartitionId);
+        }
+        else if (durablyApplied > 0 && durablyApplied > lastCheckpoint
+                 && partition.PartitionId != RaftSystemConfig.SystemPartition)
+        {
+            manager.Logger.LogWarnRestoreSoftFloorEntryMissing(
+                manager.LocalEndpoint, partition.PartitionId, durablyApplied, lastCheckpoint);
+        }
 
         if (replayFloor > 0 && lastCheckpoint > 0 && replayFloor < lastCheckpoint)
             manager.Logger.LogInfoRestoreWidenedByDurabilityFloor(manager.LocalEndpoint, partition.PartitionId, replayFloor, lastCheckpoint);
@@ -291,16 +415,33 @@ public sealed class RaftWriteAhead
         // ── Reconstruct the commit frontier ───────────────────────────────────────────────
         // logs is sorted ascending by id and begins at the last durable CommittedCheckpoint — or
         // below it, at the application-durability floor + 1, when a configured
-        // IApplicationDurabilityProvider reported a floor under the checkpoint (see
-        // LoadRestoreLogsAsync). The extra pre-checkpoint entries never move the frontier: they sit
-        // below the checkpoint, which certifies its whole prefix and jumps the contiguous frontier
-        // over them regardless. We scan once to derive three quantities used below.
+        // IApplicationDurabilityProvider reported a floor under the checkpoint — or ABOVE it, at
+        // the soft-checkpoint floor + 1, when the floor sits over the checkpoint and the read was
+        // narrowed (see LoadRestoreLogsAsync; the seed below re-anchors the scan for that case).
+        // Extra pre-checkpoint entries never move the frontier: they sit below the checkpoint,
+        // which certifies its whole prefix and jumps the contiguous frontier over them regardless.
+        // We scan once to derive three quantities used below.
         long maxLogId = 0;              // highest durable id (any type) — the propose cursor floor
         long lastResolvedCommitted = 0; // id of the last Committed/CommittedCheckpoint seen (legacy path)
         long contiguousCommitted = 0;   // highest id of an unbroken committed prefix (fast path)
         long contiguousPresent = 0;     // highest id of an unbroken present prefix (any type)
         long contiguousPresentTerm = 0; // term of the entry at contiguousPresent
         bool any = false;
+
+        // A narrowed read (soft checkpoint, see LoadRestoreLogsAsync) starts ABOVE the floor, so
+        // the scan would never chain from id 1 (or from a checkpoint entry — none is in the read).
+        // Seed every cursor as if a CommittedCheckpoint sat at the floor: the application's durable
+        // floor certifies its whole prefix committed, exactly the certificate a checkpoint entry
+        // carries, and the floor entry's term was proven on-disk before narrowing was chosen.
+        if (restoreSoftFloorIndex > 0)
+        {
+            maxLogId = restoreSoftFloorIndex;
+            lastResolvedCommitted = restoreSoftFloorIndex;
+            contiguousCommitted = restoreSoftFloorIndex;
+            contiguousPresent = restoreSoftFloorIndex;
+            contiguousPresentTerm = restoreSoftFloorTerm;
+            any = true;
+        }
 
         foreach (RaftLog log in logs)
         {
@@ -404,6 +545,8 @@ public sealed class RaftWriteAhead
         // Apply only committed data entries strictly below the reconstructed frontier. Checkpoints carry
         // no application payload (their state is restored via the snapshot transfer); entries at or above
         // the frontier are deferred to leader re-supply / re-commit.
+        long softFloorSkipped = 0;
+
         foreach (RaftLog log in logs)
         {
             // P0 checkpoint entries may carry a serialized system-configuration snapshot
@@ -438,6 +581,18 @@ public sealed class RaftWriteAhead
             if (log.LogType == RaftSystemConfig.LeadershipBarrierLogType)
                 continue;
 
+            // Soft restore floor: the application durably applied every committed entry at or
+            // below the floor, so consumer redelivery is skipped. The narrowed read excludes these
+            // entries by construction; this filter covers the full-read paths (the system
+            // partition, and the WAL-diverged fallback). System coordinator entries are exempt:
+            // the coordinator's in-memory state is rebuilt only from replay.
+            if (log.Id <= restoreDeliveryFloor
+                && !(partition.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType))
+            {
+                softFloorSkipped++;
+                continue;
+            }
+
             try
             {
                 if (partition.PartitionId == RaftSystemConfig.SystemPartition && log.LogType == RaftSystemConfig.RaftLogType)
@@ -458,6 +613,10 @@ public sealed class RaftWriteAhead
                 manager.InvokeReplicationError(partition.PartitionId, log);
             }
         }
+
+        if (softFloorSkipped > 0)
+            manager.Logger.LogInfoRestoreSkippedBelowSoftFloor(
+                manager.LocalEndpoint, partition.PartitionId, softFloorSkipped, restoreDeliveryFloor);
 
         if (partition.PartitionId == RaftSystemConfig.SystemPartition)
         {
@@ -1740,6 +1899,21 @@ public sealed class RaftWriteAhead
     }
 
     /// <summary>
+    /// Byte-budgeted variant of <see cref="GetRangeAllTypesAsync(long, int)"/>: the storage engine
+    /// also stops once adding the next entry would exceed <paramref name="maxBytes"/> of payload,
+    /// while always returning at least one entry when one exists. Bounds the materialized
+    /// allocation of the leader-backfill read, which an entry count alone does not.
+    /// </summary>
+    public async ValueTask<List<RaftLog>> GetRangeAllTypesAsync(long startLogIndex, int maxEntries, long maxBytes)
+    {
+        return await manager.ReadScheduler.EnqueueTask(
+            partition.PartitionId,
+            (walAdapter, partition.PartitionId, startLogIndex, maxEntries, maxBytes),
+            static s => s.walAdapter.ReadLogsRange(s.PartitionId, s.startLogIndex, s.maxEntries, s.maxBytes)
+        ).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Starts log compaction for this partition if no pass is already running.
     /// Returns immediately without waiting for the pass to finish.
     /// <para>
@@ -1869,6 +2043,13 @@ public sealed class RaftWriteAhead
     internal long MinRetainIndex => Volatile.Read(ref minRetainIndex);
 
     /// <summary>
+    /// Live-replica retention floor as last published (before the budget clamp and the staleness
+    /// check applied at compaction time). Diagnostics/tests only; <see cref="long.MaxValue"/> means
+    /// no follower constrains retention.
+    /// </summary>
+    internal long LiveReplicaRetentionFloor => Volatile.Read(ref liveReplicaRetentionFloor);
+
+    /// <summary>
     /// Effective retention floor actually applied by compaction (before composing with the
     /// checkpoint): the minimum of the legacy <see cref="SetMinRetainIndex"/> floor and the
     /// min-of-holds floor. <see cref="long.MaxValue"/> means no extra retention. Diagnostics/tests only.
@@ -1964,12 +2145,40 @@ public sealed class RaftWriteAhead
                 }
             }
 
-            // Compose the legacy single floor with the min-of-holds floor and the
-            // application-durability floor: compaction must retain below whichever protected index
-            // is lowest across all consumers.
+            // Live-replica lag budget: while a live, acking follower's replicated position sits
+            // below the checkpoint AND within the configured budget, hold the floor at that
+            // position so ordinary backfill can still serve the follower. Compacting past a
+            // responsive replica forces it into snapshot dependence, and a leader that does so on
+            // its ordinary cadence re-creates the below-floor condition faster than any snapshot
+            // rescue can repair it — the rescue then loops forever (the Caraxes
+            // bank-optimistic-45m-p finding). The budget bounds the retention: a follower more
+            // than lagBudget entries behind is beyond what backfill catch-up can plausibly close
+            // before the next pass and is left to the snapshot path, so a slow-forever replica
+            // cannot grow the WAL without bound. The staleness window bounds trust in the
+            // publisher: only an active leader keeps the value fresh.
+            long liveReplicaFloor = long.MaxValue;
+            long lagBudget = manager.Configuration.CompactionLiveReplicaLagBudget;
+            if (lagBudget > 0)
+            {
+                long publishedTicks = Volatile.Read(ref liveReplicaFloorPublishedTicks);
+                long publishedFloor = Volatile.Read(ref liveReplicaRetentionFloor);
+                if (publishedTicks != 0
+                    && Stopwatch.GetTimestamp() - publishedTicks <= liveReplicaFloorStalenessTicks
+                    && publishedFloor < lastCheckpoint)
+                {
+                    liveReplicaFloor = Math.Max(publishedFloor, lastCheckpoint - lagBudget);
+                    KommanderMetrics.RecordCompactionHeldByLiveReplica(
+                        partition.PartitionId, lastCheckpoint - liveReplicaFloor);
+                }
+            }
+
+            // Compose the legacy single floor with the min-of-holds floor, the
+            // application-durability floor, and the live-replica floor: compaction must retain
+            // below whichever protected index is lowest across all consumers.
             long retainIndexFloor = Volatile.Read(ref minRetainIndex);
             long activeHoldFloor = Volatile.Read(ref holdFloor);
-            long retainFloor = Math.Min(Math.Min(retainIndexFloor, activeHoldFloor), durabilityFloor);
+            long retainFloor = Math.Min(
+                Math.Min(Math.Min(retainIndexFloor, activeHoldFloor), durabilityFloor), liveReplicaFloor);
             long effectiveFloor = Math.Min(lastCheckpoint, retainFloor);
 
             if (effectiveFloor <= 0)
@@ -1982,7 +2191,7 @@ public sealed class RaftWriteAhead
                         manager.LocalEndpoint,
                         partition.PartitionId,
                         effectiveFloor,
-                        DescribeFloorSource(effectiveFloor, lastCheckpoint, retainIndexFloor, activeHoldFloor, durabilityFloor),
+                        DescribeFloorSource(effectiveFloor, lastCheckpoint, retainIndexFloor, activeHoldFloor, durabilityFloor, liveReplicaFloor),
                         lastCheckpoint,
                         retainIndexFloor,
                         activeHoldFloor,
@@ -2054,7 +2263,8 @@ public sealed class RaftWriteAhead
         long lastCheckpoint,
         long retainIndexFloor,
         long activeHoldFloor,
-        long durabilityFloor)
+        long durabilityFloor,
+        long liveReplicaFloor)
     {
         if (effectiveFloor == lastCheckpoint)
             return "checkpoint";
@@ -2064,6 +2274,8 @@ public sealed class RaftWriteAhead
             return "retention_hold";
         if (effectiveFloor == retainIndexFloor)
             return "min_retain_index";
+        if (effectiveFloor == liveReplicaFloor)
+            return "live_replica_lag_budget";
         return "unknown";
     }
 }
