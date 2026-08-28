@@ -136,8 +136,9 @@ internal sealed class WalCompletionRouter
         // was the Caraxes run-H stall: a leader deposed by post-SIGSTOP term confusion
         // fenced its in-flight proposes here, every caller behind them hung with no
         // response and no timeout, and the closed-loop workload starved the whole cluster
-        // while health stayed green. Fail the reply with NodeIsNotLeader so the caller
-        // can retry against the current leader.
+        // while health stayed green. Fail the reply with ProposalOutcomeUnknown so the caller
+        // learns the outcome is indeterminate (the entry is appended and may still commit via
+        // the next leader's §5.4.2 inherited commit) and can retry against the current leader.
         if (completion.Term >= 0 && completion.Term != coreState.CurrentTerm)
         {
             logger.LogWarning(
@@ -146,7 +147,7 @@ internal sealed class WalCompletionRouter
                 completion.Term, coreState.CurrentTerm, completion.OperationId);
             if (proposals.TryTakePending(completion.OperationId, out Scheduling.RaftPendingWalOperation? stalePending))
             {
-                CompleteReply(stalePending.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, 0L));
+                CompleteReply(stalePending.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.ProposalOutcomeUnknown, 0L));
                 proposals.ReturnPending(stalePending);
             }
             KommanderMetrics.StaleCompletionsTotal.Add(1,
@@ -297,7 +298,7 @@ internal sealed class WalCompletionRouter
             logger.LogWarning(
                 "[{LocalEndpoint}/{PartitionId}/{State}] Propose completion for ticket {Ticket} landed after a same-term step-down; failing the caller instead of fanning out.",
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState, ticketId);
-            CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, 0L));
+            CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.ProposalOutcomeUnknown, 0L));
             return;
         }
 
@@ -447,7 +448,7 @@ internal sealed class WalCompletionRouter
             logger.LogWarning(
                 "[{LocalEndpoint}/{PartitionId}/{State}] Commit completion for ticket {Ticket} landed after a step-down; failing the caller instead of fanning out.",
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState, ticketId);
-            CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, 0L));
+            CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.ProposalOutcomeUnknown, 0L));
             return;
         }
 
@@ -642,7 +643,7 @@ internal sealed class WalCompletionRouter
             logger.LogWarning(
                 "[{LocalEndpoint}/{PartitionId}/{State}] Rollback completion for ticket {Ticket} landed after a step-down; failing the caller instead of fanning out.",
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState, ticketId);
-            CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, 0L));
+            CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.ProposalOutcomeUnknown, 0L));
             return;
         }
 

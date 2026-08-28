@@ -365,8 +365,12 @@ internal sealed class LogReplicator
         ulong? replyCorrelationId = null
     )
     {
+        // Post-propose refusal: the ticket's entries are already appended (phase 1 of the manual
+        // two-phase), so a step-down here leaves their outcome genuinely open — the next leader's
+        // §5.4.2 inherited commit can still commit them. Indeterminate, never NodeIsNotLeader
+        // (clients read that as "definitely did not take effect").
         if (coreState.NodeState != RaftNodeState.Leader)
-            return (RaftOperationStatus.NodeIsNotLeader, 0);
+            return (RaftOperationStatus.ProposalOutcomeUnknown, 0);
 
         if (!proposals.TryGet(ticketId, out RaftProposalQuorum? proposal))
             return (RaftOperationStatus.ProposalNotFound, 0);
@@ -429,8 +433,10 @@ internal sealed class LogReplicator
         ulong? replyCorrelationId = null
     )
     {
+        // Same post-propose contract as CommitLogs: a refused ABORT leaves appended entries whose
+        // fate the next leader decides — indeterminate for the caller.
         if (coreState.NodeState != RaftNodeState.Leader)
-            return (RaftOperationStatus.NodeIsNotLeader, 0);
+            return (RaftOperationStatus.ProposalOutcomeUnknown, 0);
 
         if (!proposals.TryGet(ticketId, out RaftProposalQuorum? proposal))
             return (RaftOperationStatus.ProposalNotFound, 0);

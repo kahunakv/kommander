@@ -116,4 +116,23 @@ public enum RaftOperationStatus
     /// operator and retry only after the in-flight drain completes or rolls back.
     /// </summary>
     DrainInProgress = 22,
+
+    /// <summary>
+    /// The proposal was ACCEPTED (an entry exists in at least this node's log) but this node can
+    /// no longer determine its outcome — leadership moved, or the completion landed after a
+    /// step-down. The entry may still commit: a durable Proposed row inherited by the next leader
+    /// is committed by its promotion barrier (Raft §5.4.2), so the write can materialize AFTER
+    /// this reply. Callers MUST treat this as indeterminate (like <see cref="ProposalTimeout"/>),
+    /// never as a definite failure.
+    /// <para>
+    /// This status exists because these paths previously answered
+    /// <see cref="NodeIsNotLeader"/> — a status clients are entitled to read as
+    /// "rejected before anything was appended, definitely did not take effect". A Jepsen
+    /// <c>register</c> run caught the contradiction as a linearizability violation: a write
+    /// failed with <c>node-is-not-leader</c> at a SIGSTOP-resume and its value was served by
+    /// reads three seconds later (run 33198349291, key 20). <see cref="NodeIsNotLeader"/> is now
+    /// reserved for pre-accept rejections only.
+    /// </para>
+    /// </summary>
+    ProposalOutcomeUnknown = 23,
 }

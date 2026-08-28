@@ -1054,7 +1054,12 @@ internal sealed class RaftSystemCoordinator : IDisposable
                         "ReplicateMembership: replication failed {Status} {LogIndex} Retry={Retry}",
                         result.Status, result.LogIndex, i);
 
-                    if (result.Status == RaftOperationStatus.NodeIsNotLeader)
+                    // NodeIsNotLeader: someone else leads — hand the result back and stop.
+                    // ProposalOutcomeUnknown: leadership moved with the proposal in flight — the
+                    // membership entry may still commit via the new leader's §5.4.2 inherited
+                    // commit, so retrying here risks a duplicate delta; stop and report the
+                    // indeterminate status to the caller.
+                    if (result.Status is RaftOperationStatus.NodeIsNotLeader or RaftOperationStatus.ProposalOutcomeUnknown)
                     {
                         completion?.TrySetResult((result.Status, 0));
                         return;

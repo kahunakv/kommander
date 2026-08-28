@@ -324,4 +324,13 @@ enum GrpcRaftOperationStatus {
   // 17–18: log catch-up / backfill statuses
   LOG_MISMATCH = 17;
   SNAPSHOT_REQUIRED = 18;
+  // 19–22: statuses that predate this proto being kept in sync (values already
+  // crossed the wire as raw ints; proto3 passes unknown enum values through)
+  OPERATION_CANCELLED = 19;
+  FOLLOWER_WAL_SATURATED = 20;
+  MEMBER_NOT_FOUND = 21;
+  DRAIN_IN_PROGRESS = 22;
+  // 23: accepted proposal whose outcome this node can no longer determine —
+  // indeterminate for clients, never a definite failure
+  PROPOSAL_OUTCOME_UNKNOWN = 23;
 }

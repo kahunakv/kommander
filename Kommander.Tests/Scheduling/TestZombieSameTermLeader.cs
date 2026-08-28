@@ -24,7 +24,9 @@ namespace Kommander.Tests.Scheduling;
 /// <list type="bullet">
 ///   <item>Send side — <c>CompleteLeaderCommit</c> / <c>CompleteLeaderRollback</c> are
 ///         leader-state fenced like <c>CompleteLeaderPropose</c>: after a step-down they answer
-///         the caller with <see cref="RaftOperationStatus.NodeIsNotLeader"/> and fan out
+///         the caller with <see cref="RaftOperationStatus.ProposalOutcomeUnknown"/> (the entries
+///         are appended and may still commit via the next leader's §5.4.2 inherited commit, so
+///         the outcome is indeterminate — never the definite NodeIsNotLeader) and fan out
 ///         nothing.</item>
 ///   <item>Receive side — a node in Leader state rejects an equal-term AppendLogs from another
 ///         endpoint (one leader per term, Raft §5.2) instead of adopting the sender.</item>
@@ -107,8 +109,9 @@ public class TestZombieSameTermLeader
     /// <summary>
     /// The run-J trigger in miniature: a commit's WAL completion lands after the node stepped
     /// down. The fan-out must not run (it would broadcast AppendLogs stamped with whatever term
-    /// this node holds now), and the caller must be answered — not orphaned — with
-    /// <see cref="RaftOperationStatus.NodeIsNotLeader"/>.
+    /// this node holds now), and the caller must be answered — not orphaned — with the
+    /// indeterminate <see cref="RaftOperationStatus.ProposalOutcomeUnknown"/>: the entries are
+    /// appended, so their fate is the next leader's to decide.
     /// </summary>
     [Fact]
     public async Task CommitCompletion_AfterStepDown_DoesNotFanOutAndAnswersCaller()
@@ -135,7 +138,37 @@ public class TestZombieSameTermLeader
 
         Assert.DoesNotContain(host.Requests, r => r.Type == RaftResponderRequestType.AppendLogs);
         (ulong _, RaftResponse commitReply) = Assert.Single(sink.Completed, r => r.Id == 20);
-        Assert.Equal(RaftOperationStatus.NodeIsNotLeader, commitReply.Status);
+        Assert.Equal(RaftOperationStatus.ProposalOutcomeUnknown, commitReply.Status);
+    }
+
+    /// <summary>
+    /// The commit REQUEST itself arriving after a step-down (not just its completion): the
+    /// ticket's entries are already appended, so the refusal must be the indeterminate
+    /// <see cref="RaftOperationStatus.ProposalOutcomeUnknown"/> — a definite NodeIsNotLeader here
+    /// told clients "the write did not take effect" for entries the next leader's §5.4.2
+    /// inherited commit can still commit (the Jepsen register non-linearizable read of run
+    /// 33198349291: a write failed node-is-not-leader at a SIGSTOP-resume and its value was
+    /// served by reads three seconds later).
+    /// </summary>
+    [Fact]
+    public async Task CommitRequest_AfterStepDown_AnswersProposalOutcomeUnknown()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, CapturingReplySink sink) = await BuildLeaderWithSink();
+
+        List<RaftLog> logs = [new() { Id = 1, Term = 1, LogType = "t" }];
+        sm.ReplicateLogs(logs, autoCommit: false, replyCorrelationId: 12);
+        await sm.CompleteWalOperationAsync(MakeCompletion(host.PartitionId, operationId: 1, WALWriteOperationType.LeaderPropose));
+
+        (ulong _, RaftResponse proposeReply) = Assert.Single(sink.Completed, r => r.Id == 12);
+        HLCTimestamp ticketId = proposeReply.TicketId;
+
+        await sm.StepDownAsync(replyCorrelationId: null);
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+
+        await sm.CommitLogsAsync(ticketId, replyCorrelationId: 30);
+
+        (ulong _, RaftResponse commitGateReply) = Assert.Single(sink.Completed, r => r.Id == 30);
+        Assert.Equal(RaftOperationStatus.ProposalOutcomeUnknown, commitGateReply.Status);
     }
 
     /// <summary>Same fence on the rollback completion path.</summary>
@@ -163,7 +196,7 @@ public class TestZombieSameTermLeader
 
         Assert.DoesNotContain(host.Requests, r => r.Type == RaftResponderRequestType.AppendLogs);
         (ulong _, RaftResponse rollbackReply) = Assert.Single(sink.Completed, r => r.Id == 21);
-        Assert.Equal(RaftOperationStatus.NodeIsNotLeader, rollbackReply.Status);
+        Assert.Equal(RaftOperationStatus.ProposalOutcomeUnknown, rollbackReply.Status);
     }
 
     /// <summary>

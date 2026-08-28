@@ -922,10 +922,12 @@ public sealed class RaftPartitionStateMachine
         long resolvedThroughApplied = presenceCap >= 0
             ? Math.Min(coreState.LastAppliedIndex, presenceCap)
             : coreState.LastAppliedIndex;
-        if (resolvedThroughApplied > wal.GetCommitIndex())
+        long commitIndexBeforeAbsorb = wal.GetCommitIndex();
+        if (resolvedThroughApplied > commitIndexBeforeAbsorb)
         {
-            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Promotion frontier reconciliation: commit frontier {Frontier} trails the applied-and-present prefix {Resolved} — absorbing the delivered range.",
-                host.LocalEndpoint, host.PartitionId, coreState.NodeState, wal.GetCommitIndex(), resolvedThroughApplied);
+            if (logger.IsEnabled(LogLevel.Information))
+                logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Promotion frontier reconciliation: commit frontier {Frontier} trails the applied-and-present prefix {Resolved} — absorbing the delivered range.",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, commitIndexBeforeAbsorb, resolvedThroughApplied);
             wal.AbsorbResolvedPrefix(resolvedThroughApplied);
         }
 
