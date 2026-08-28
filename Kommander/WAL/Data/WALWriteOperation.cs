@@ -36,6 +36,17 @@ public sealed class WALWriteOperation
     public long LogIndex { get; }
 
     /// <summary>
+    /// Highest log id the enqueuing partition had accepted (contiguous presence frontier plus any
+    /// ids buffered over a gap, plus this batch) at enqueue time. The scheduler's proposed-tail
+    /// truncation must never delete a row at or below this floor: every such id was durably
+    /// accepted by this process and may back a quorum ack, so deleting it silently loses
+    /// acknowledged data while the in-memory frontiers keep certifying it (the "hole below the
+    /// advertised frontier" class). <c>-1</c> means "no floor known" (non-append operations and
+    /// legacy callers), which leaves the truncation cutoff unclamped.
+    /// </summary>
+    public long TruncateFloor { get; }
+
+    /// <summary>
     /// Monotonic tick count stamped by <see cref="Kommander.WAL.IO.FairWalScheduler"/>
     /// at the moment the operation enters the per-partition queue. Used to compute
     /// the enqueue-to-durable latency once the write batch completes.
@@ -51,7 +62,8 @@ public sealed class WALWriteOperation
         string? endpoint = null,
         long term = -1,
         bool autoCommit = false,
-        long logIndex = -1
+        long logIndex = -1,
+        long truncateFloor = -1
     )
     {
         OnComplete = onComplete;
@@ -63,5 +75,6 @@ public sealed class WALWriteOperation
         Term = term;
         AutoCommit = autoCommit;
         LogIndex = logIndex;
+        TruncateFloor = truncateFloor;
     }
 }

@@ -607,18 +607,50 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         // first keeps the pre-existing-orphan cleanup (those rows predate every op in the batch,
         // so the batch minimum is exactly their sequential fate) while every row written by this
         // batch survives it; a genuine orphan among them is cleaned by a later batch's pass.
+        // Two guards keep the sweep from deleting live data (it deletes with no log line and no
+        // frontier bookkeeping, so anything it takes is silently unrecoverable):
+        //
+        //   1. Only an op that writes a first-durability row (Proposed/ProposedCheckpoint) may
+        //      define a cutoff. Such an op is a live tail append, and "the tail ends at X ⇒
+        //      Proposed rows above X are a dead term's orphans" is the sweep's founding claim. A
+        //      pure resolution op — a commit-marker re-ship of an OLD id — says nothing about the
+        //      tail: with pipelined proposals the commit of id k always races proposals k+1.., so
+        //      letting its low max id drive the cutoff deleted freshly-acked quorum rows above it.
+        //      That is precisely what manufactured the shared hole at index 6 on four of five
+        //      voters in Jepsen run 32690955741 (a duplicate commit-marker batch for the committed
+        //      prefix, LogIndex 5, arriving after proposes 6..8 had landed) and left the partition
+        //      permanently leaderless.
+        //
+        //   2. The cutoff never goes below the enqueue-time accepted-id floor stamped on the ops
+        //      (see WALWriteOperation.TruncateFloor): a row this process accepted may back a
+        //      quorum ack and is certified by the in-memory frontiers, which are never re-read
+        //      from disk. This also covers a late proposal RETRY (a Proposed-carrying op whose max
+        //      id sits below already-accepted higher rows). Floors are monotone per partition, so
+        //      the batch maximum is the latest knowledge.
+        //
+        // Pre-restart orphans (the sweep's legacy target: the two-fsync recovery path discards the
+        // proposed tail and reuses its ids) sit above the floor whenever recovery could not chain
+        // presence over them, and are still swept; orphans the floor now covers are inert rows
+        // that id reuse overwrites in place.
         foreach ((int pid, List<WALWriteOperation> pidBatch) in groupBatches)
         {
             long minTruncateIndex = long.MaxValue;
+            long acceptedFloor = -1;
 
             foreach (WALWriteOperation op in pidBatch)
             {
-                if (op.Type == WALWriteOperationType.FollowerAppend && op.LogIndex > 0 && op.LogIndex < minTruncateIndex)
+                if (op.Type != WALWriteOperationType.FollowerAppend)
+                    continue;
+
+                if (op.TruncateFloor > acceptedFloor)
+                    acceptedFloor = op.TruncateFloor;
+
+                if (op.LogIndex > 0 && op.LogIndex < minTruncateIndex && ContainsFirstDurabilityRow(op.Logs.Logs))
                     minTruncateIndex = op.LogIndex;
             }
 
             if (minTruncateIndex != long.MaxValue)
-                walAdapter.TruncateProposedLogsAfter(pid, minTruncateIndex);
+                walAdapter.TruncateProposedLogsAfter(pid, Math.Max(minTruncateIndex, acceptedFloor));
         }
 
         // ── Phase 2: single cross-partition WAL write ──────────────────────
@@ -792,6 +824,22 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// and every first-durability type (Proposed/ProposedCheckpoint) and rollback marker. An empty list is
     /// not eligible (returns false), so it can never spuriously suppress a fsync.
     /// </summary>
+    /// <summary>
+    /// True when <paramref name="logs"/> contains at least one first-durability row
+    /// (<see cref="RaftLogType.Proposed"/> or <see cref="RaftLogType.ProposedCheckpoint"/>) — the
+    /// mark of a live tail append. Only such an operation may drive the proposed-tail truncation
+    /// cutoff; see the guard notes at the call site.
+    /// </summary>
+    private static bool ContainsFirstDurabilityRow(List<RaftLog> logs)
+    {
+        foreach (RaftLog log in logs)
+        {
+            if (log.Type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
+                return true;
+        }
+        return false;
+    }
+
     private static bool AllCommittedMarkers(List<RaftLog> logs)
     {
         if (logs.Count == 0)

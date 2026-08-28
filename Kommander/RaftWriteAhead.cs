@@ -139,6 +139,11 @@ public sealed class RaftWriteAhead
     // presence analog of pendingResolved.
     private readonly SortedDictionary<long, long> pendingPresent = new();
 
+    // High-water mark of ids ever buffered in pendingPresent, maintained on insert and never
+    // lowered. Feeds the accepted-id floor stamped on follower-append operations: a stale-high
+    // value only raises the floor, which suppresses deletions — always the safe direction.
+    private long pendingPresentHighWater = -1;
+
     private int operations;
 
     private long walOperationSequence;
@@ -792,7 +797,6 @@ public sealed class RaftWriteAhead
             return Task.FromResult((RaftOperationStatus.Success, -1L));
 
         long lastCommitIndex = -1;
-        long savedCommitIndex = commitIndex;
         IReadOnlyList<RaftLog> ordered = OrderById(logs);
         int count = ordered.Count;
         RaftLogType[] savedTypes = ArrayPool<RaftLogType>.Shared.Rent(count);
@@ -807,26 +811,14 @@ public sealed class RaftWriteAhead
                 switch (log.Type)
                 {
                     case RaftLogType.Proposed:
-                    {
                         log.Type = RaftLogType.Committed;
-
-                        //RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Commit(partition.PartitionId, log));
-
-                        commitIndex = log.Id + 1;
                         lastCommitIndex = log.Id;
-                    }
-                    break;
+                        break;
 
                     case RaftLogType.ProposedCheckpoint:
-                    {
                         log.Type = RaftLogType.CommittedCheckpoint;
-
-                        //RaftOperationStatus status = await manager.WriteThreadPool.EnqueueTask(() => walAdapter.Commit(partition.PartitionId, log));
-
-                        commitIndex = log.Id + 1;
                         lastCommitIndex = log.Id;
-                    }
-                    break;
+                        break;
 
                     case RaftLogType.Committed:
                     case RaftLogType.CommittedCheckpoint:
@@ -840,11 +832,19 @@ public sealed class RaftWriteAhead
             try
             {
                 WALWriteOperation operation = EnqueueCommitPrepared(logs, lastCommitIndex);
+
+                // Gap-buffered, post-enqueue frontier advance — same rationale as EnqueueCommit:
+                // the frontier must never certify past an unresolved id.
+                for (int i = 0; i < count; i++)
+                {
+                    if (savedTypes[i] is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
+                        AdvanceCommitFrontier(ordered[i].Id);
+                }
+
                 return Task.FromResult((RaftOperationStatus.Pending, operation.LogIndex));
             }
             catch
             {
-                commitIndex = savedCommitIndex;
                 for (int i = 0; i < count; i++)
                     ordered[i].Type = savedTypes[i];
                 throw;
@@ -859,7 +859,6 @@ public sealed class RaftWriteAhead
     public WALWriteOperation EnqueueCommit(List<RaftLog> logs)
     {
         long lastCommitIndex = -1;
-        long savedCommitIndex = commitIndex;
         IReadOnlyList<RaftLog> ordered = OrderById(logs);
         int count = ordered.Count;
         RaftLogType[] savedTypes = ArrayPool<RaftLogType>.Shared.Rent(count);
@@ -873,21 +872,13 @@ public sealed class RaftWriteAhead
 
                 switch (log.Type)
                 {
-                    // Monotonic, not a plain assignment: the inherited-tail re-commit (see
-                    // DrainInheritedAppliesAsync) durably commits PRIOR-term entries after the
-                    // promotion barrier's own commit has already advanced the frontier past them,
-                    // so a lower id here must never drag the frontier backwards.
                     case RaftLogType.Proposed:
                         log.Type = RaftLogType.Committed;
-                        if (log.Id + 1 > commitIndex)
-                            commitIndex = log.Id + 1;
                         lastCommitIndex = log.Id;
                         break;
 
                     case RaftLogType.ProposedCheckpoint:
                         log.Type = RaftLogType.CommittedCheckpoint;
-                        if (log.Id + 1 > commitIndex)
-                            commitIndex = log.Id + 1;
                         lastCommitIndex = log.Id;
                         break;
                 }
@@ -895,11 +886,30 @@ public sealed class RaftWriteAhead
 
             try
             {
-                return EnqueueCommitPrepared(logs, lastCommitIndex);
+                WALWriteOperation operation = EnqueueCommitPrepared(logs, lastCommitIndex);
+
+                // Advance the frontier only AFTER a successful enqueue, and only through the
+                // gap-buffered path. The old arms jumped the frontier monotonically to the highest
+                // committed id, which certified a "committed through N" that skipped every
+                // unresolved id below N — on a node whose log has a hole (the poisoned-quorum
+                // shape), a promotion-barrier no-op commit then poisoned the commit frontier past
+                // the hole, and every later promotion refused forever on a committed drain that
+                // could never reach it (the Jepsen majority-hole leaderless wedge, observation 1
+                // of run 32690955741). AdvanceCommitFrontier keeps the two properties the old
+                // comment wanted — a lower id never drags the frontier backwards (below-frontier
+                // ids are ignored, so the inherited-tail re-commit stays a no-op) — while an
+                // over-gap id is buffered until the gap resolves instead of certifying it away.
+                // Ascending order (OrderById) keeps the buffered drain cheap.
+                for (int i = 0; i < count; i++)
+                {
+                    if (savedTypes[i] is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
+                        AdvanceCommitFrontier(ordered[i].Id);
+                }
+
+                return operation;
             }
             catch
             {
-                commitIndex = savedCommitIndex;
                 for (int i = 0; i < count; i++)
                     ordered[i].Type = savedTypes[i];
                 throw;
@@ -1190,6 +1200,15 @@ public sealed class RaftWriteAhead
     public long GetPresentIndex() => presentIndex - 1;
 
     /// <summary>
+    /// True when this node holds durable entries buffered ABOVE an unfilled gap — the lone-high
+    /// shape the unanchored live-propose broadcast leaves on a behind follower. A node in this
+    /// state knows its own log is missing a range some peer may hold; the election path uses it
+    /// to defer candidacy to a known fresher voter instead of churning elections it would refuse
+    /// at the promotion gates. Synchronous: reads an in-memory collection count.
+    /// </summary>
+    public bool HasPresenceGap() => pendingPresent.Count > 0;
+
+    /// <summary>
     /// Returns the term of the log entry at <see cref="GetPresentIndex"/> — the pair a candidate
     /// or voter uses for the Raft §5.4.1 comparison. 0 when the log is empty at the frontier.
     /// </summary>
@@ -1217,6 +1236,8 @@ public sealed class RaftWriteAhead
         if (id > presentIndex)
         {
             pendingPresent[id] = term;
+            if (id > pendingPresentHighWater)
+                pendingPresentHighWater = id;
             return;
         }
 
@@ -1753,6 +1774,14 @@ public sealed class RaftWriteAhead
         if (logsToWrite.Count == 0)
             return null;
 
+        // Accepted-id floor for the scheduler's proposed-tail truncation: everything at or below
+        // the contiguous presence frontier, everything ever buffered over a gap, and this batch
+        // itself has been accepted by this process — a commit-marker re-ship or a late proposal
+        // retry whose own max id sits BELOW these rows must not delete them (they may already back
+        // quorum acks; the frontiers certifying them are never re-read from disk). Computed on the
+        // partition's serialized executor path, the single writer of the presence fields.
+        long acceptedFloor = Math.Max(presentIndex - 1, Math.Max(pendingPresentHighWater, maxLogId));
+
         WALWriteOperation operation = new(
             onComplete,
             Interlocked.Increment(ref walOperationSequence),
@@ -1761,7 +1790,8 @@ public sealed class RaftWriteAhead
             timestamp,
             endpoint,
             term,
-            logIndex: maxLogId
+            logIndex: maxLogId,
+            truncateFloor: acceptedFloor
         );
 
         try

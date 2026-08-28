@@ -106,6 +106,14 @@ public interface IRaftWalFacade
     long GetPresentIndex() => -1;
 
     /// <summary>
+    /// True when this node holds durable entries buffered above an unfilled gap — it knows its own
+    /// log is missing a range some peer may hold. The election path uses this to defer candidacy
+    /// to a known fresher live voter instead of churning elections that the promotion gates would
+    /// refuse. Default false for facades that do not track presence (test stubs).
+    /// </summary>
+    bool HasPresenceGap() => false;
+
+    /// <summary>
     /// Seeds the propose-id allocator at promotion to exactly <paramref name="nextId"/> —
     /// one above the promotion-time log tail — so a new leader stamps client writes at
     /// <c>lastLogIndex + 1</c> (Raft §5.3) and can neither reissue a durably occupied index

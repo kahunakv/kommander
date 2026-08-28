@@ -271,8 +271,12 @@ internal sealed class LogApplicator
                     long floor = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
                     if (expected > 0 && expected > floor)
                     {
-                        logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Inherited-entry drain found a WAL hole: expected {Expected}, next present {Present} (floor {Floor}).",
-                            host.LocalEndpoint, host.PartitionId, coreState.NodeState, expected, log.Id, floor);
+                        // Throttled: the promotion paths retry this drain every 2ms for up to the
+                        // barrier timeout, and an unthrottled line per attempt wrote ~4.4k
+                        // identical lines per episode in the Jepsen stores.
+                        if (ShouldLogDrainHole())
+                            logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Inherited-entry drain found a WAL hole: expected {Expected}, next present {Present} (floor {Floor}) (suppressedSinceLastLine={Suppressed}).",
+                                host.LocalEndpoint, host.PartitionId, coreState.NodeState, expected, log.Id, floor, TakeSuppressedDrainHoleLogs());
                         EnqueueInheritedRecommitMarkers(recommit);
                         return InheritedDrainStatus.Hole;
                     }
@@ -364,8 +368,10 @@ internal sealed class LogApplicator
             long floor = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
             if (expected > 0 && expected > floor)
             {
-                logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Inherited-entry drain missing the range tail: expected through {UpToIndex}, present through {Expected} (floor {Floor}).",
-                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, upToIndex, expected - 1, floor);
+                // Same 1s throttle as the interior-gap line above (the 2ms retry loops).
+                if (ShouldLogDrainHole())
+                    logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Inherited-entry drain missing the range tail: expected through {UpToIndex}, present through {Expected} (floor {Floor}) (suppressedSinceLastLine={Suppressed}).",
+                        host.LocalEndpoint, host.PartitionId, coreState.NodeState, upToIndex, expected - 1, floor, TakeSuppressedDrainHoleLogs());
                 return InheritedDrainStatus.Hole;
             }
         }
@@ -394,6 +400,40 @@ internal sealed class LogApplicator
     /// refusals). Every drain exit returns immediately after calling this, so no double-enqueue
     /// is possible without the clear.
     /// </summary>
+    /// <summary>Monotonic tick of the last drain-hole error line, for the 1s log throttle.</summary>
+    private long lastDrainHoleLogTicks;
+
+    /// <summary>Drain-hole error lines suppressed since the last one written.</summary>
+    private long suppressedDrainHoleLogs;
+
+    /// <summary>
+    /// 1-per-second throttle for the drain-hole error lines: the promotion paths retry the
+    /// inherited drain every 2ms for up to the barrier timeout, and logging every attempt wrote
+    /// thousands of identical lines per episode. Runs on the partition's serialized executor path,
+    /// so plain fields suffice.
+    /// </summary>
+    private bool ShouldLogDrainHole()
+    {
+        long now = global::System.Diagnostics.Stopwatch.GetTimestamp();
+
+        if (lastDrainHoleLogTicks != 0 && (now - lastDrainHoleLogTicks) < global::System.Diagnostics.Stopwatch.Frequency)
+        {
+            suppressedDrainHoleLogs++;
+            return false;
+        }
+
+        lastDrainHoleLogTicks = now;
+        return true;
+    }
+
+    /// <summary>Returns and resets the suppressed-line count for inclusion in the next line.</summary>
+    private long TakeSuppressedDrainHoleLogs()
+    {
+        long suppressed = suppressedDrainHoleLogs;
+        suppressedDrainHoleLogs = 0;
+        return suppressed;
+    }
+
     private void EnqueueInheritedRecommitMarkers(List<RaftLog>? inherited)
     {
         if (inherited is null || inherited.Count == 0)
