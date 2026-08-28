@@ -143,7 +143,9 @@ public sealed class TestRocksDbWAL
             Assert.Equal(RaftOperationStatus.Success, status);
             Assert.Equal(3, wal.GetMaxLog(0));
             Assert.Equal(13, wal.GetCurrentTerm(0));
-            Assert.Equal(3, wal.GetLastCheckpoint(0));
+            // Partition 0's log has a hole at id 2, so the checkpoint row at 3 lands without
+            // advancing the recorded checkpoint (an over-gap checkpoint certifies nothing).
+            Assert.Equal(-1, wal.GetLastCheckpoint(0));
             Assert.Equal(3, wal.GetMaxLog(8));
             Assert.Equal(83, wal.GetCurrentTerm(8));
             Assert.Equal(-1, wal.GetLastCheckpoint(8));

@@ -442,11 +442,29 @@ public class RocksDbWAL : IWAL, IDisposable
                     // Promote the single-put fast path to a 2-op batch so the log entry and the persisted
                     // last-checkpoint id land atomically (RocksDB applies a batch all-or-nothing). max() so a
                     // late/duplicate lower checkpoint never regresses the recorded id.
-                    long newCheckpoint = Math.Max(GetLastCheckpointFromMeta(partitionId), log.Id);
+                    long currentFloor = GetLastCheckpointFromMeta(partitionId);
+                    long newCheckpoint = Math.Max(currentFloor, log.Id);
 
                     using WriteBatch checkpointBatch = new();
                     PutLogToBatch(checkpointBatch, partitionId, log, columnFamilyHandle);
-                    PutLastCheckpointToBatch(checkpointBatch, partitionId, newCheckpoint);
+
+                    // The persisted floor is an APPLIED/COMPACTED certificate for its whole prefix (restore
+                    // frontier seeding, the drain's compacted-below-floor skip, and compaction all trust it),
+                    // so it may only advance when every id up to the checkpoint is durably present here. A
+                    // checkpoint row broadcast over a replication gap must land as a plain row: raising the
+                    // floor across the gap certified entries this node never held, the applier then skipped
+                    // them as "compacted", and compaction erased them before they were ever delivered.
+                    if (newCheckpoint > currentFloor)
+                    {
+                        if (VerifyCheckpointPrefixPresent(partitionId, columnFamilyHandle, currentFloor, log.Id,
+                                                          stagedIds: null, stagedSingleId: log.Id, out long firstMissing))
+                            PutLastCheckpointToBatch(checkpointBatch, partitionId, newCheckpoint);
+                        else
+                            logger.LogWarning(
+                                "Withholding last-checkpoint advance for partition {Partition}: checkpoint {CheckpointId} landed over a gap (floor {Floor}, first missing id {MissingId}); the floor advances when a later checkpoint finds the gap backfilled",
+                                partitionId, log.Id, currentFloor, firstMissing);
+                    }
+
                     db.Write(checkpointBatch, effectiveOptions);
 
                     return RaftOperationStatus.Success;
@@ -482,6 +500,12 @@ public class RocksDbWAL : IWAL, IDisposable
             // last-checkpoint update into the SAME WriteBatch as the log puts (atomic).
             Dictionary<int, long> checkpointMaxByPartition = new();
 
+            // Ids staged in THIS batch per checkpoint-bearing partition. The floor-advance contiguity
+            // check below reads the CF with an iterator, which cannot see rows still staged in the
+            // write batch, so staged ids count as present. Collected only on the (rare, exclusive)
+            // checkpoint path to keep the plain-append path allocation-free.
+            Dictionary<int, HashSet<long>>? stagedIdsByPartition = exclusive ? new() : null;
+
             // Copy-on-second-sight: a partition that appears exactly once (the overwhelmingly common
             // shape of a scheduler group batch) stores the CALLER'S list in the plan directly — the
             // plan is only read below, and the caller owns the batch until Write returns. Only when
@@ -498,6 +522,13 @@ public class RocksDbWAL : IWAL, IDisposable
                     if (entry.Type == RaftLogType.CommittedCheckpoint &&
                         entry.Id > checkpointMaxByPartition.GetValueOrDefault(log.partitionId, -1))
                         checkpointMaxByPartition[log.partitionId] = entry.Id;
+
+                    if (stagedIdsByPartition is not null)
+                    {
+                        if (!stagedIdsByPartition.TryGetValue(log.partitionId, out HashSet<long>? staged))
+                            stagedIdsByPartition[log.partitionId] = staged = [];
+                        staged.Add(entry.Id);
+                    }
                 }
 
                 if (plan.TryGetValue(columnFamilyHandle, out Dictionary<int, List<RaftLog>>? raftLogsPerPartition))
@@ -543,11 +574,25 @@ public class RocksDbWAL : IWAL, IDisposable
 
             // Stage the persisted last-checkpoint update for any partition that committed a checkpoint in
             // this batch, so it is durable atomically with the log entries. max() with the existing value so
-            // an out-of-order lower checkpoint cannot regress the recorded id.
+            // an out-of-order lower checkpoint cannot regress the recorded id. The advance is withheld when
+            // the checkpoint's prefix is not contiguously present here (see the fast-path comment): the row
+            // itself still lands, and a later checkpoint re-attempts the advance once backfill closes the gap.
             foreach ((int partitionId, long batchMaxCheckpoint) in checkpointMaxByPartition)
             {
-                long newCheckpoint = Math.Max(GetLastCheckpointFromMeta(partitionId), batchMaxCheckpoint);
-                PutLastCheckpointToBatch(writeBatch, partitionId, newCheckpoint);
+                long currentFloor = GetLastCheckpointFromMeta(partitionId);
+                if (batchMaxCheckpoint <= currentFloor)
+                    continue;
+
+                HashSet<long>? staged = null;
+                stagedIdsByPartition?.TryGetValue(partitionId, out staged);
+
+                if (VerifyCheckpointPrefixPresent(partitionId, GetColumnFamily(partitionId), currentFloor,
+                                                  batchMaxCheckpoint, staged, stagedSingleId: -1, out long firstMissing))
+                    PutLastCheckpointToBatch(writeBatch, partitionId, batchMaxCheckpoint);
+                else
+                    logger.LogWarning(
+                        "Withholding last-checkpoint advance for partition {Partition}: checkpoint {CheckpointId} landed over a gap (floor {Floor}, first missing id {MissingId}); the floor advances when a later checkpoint finds the gap backfilled",
+                        partitionId, batchMaxCheckpoint, currentFloor, firstMissing);
             }
 
             db.Write(writeBatch, effectiveOptions);
@@ -1302,6 +1347,74 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </summary>
     private void PutLastCheckpointToBatch(WriteBatch writeBatch, int partitionId, long value) =>
         writeBatch.Put(LastCheckpointKey(partitionId), Encoding.UTF8.GetBytes(value.ToString()), cf: metadataColumnFamily);
+
+    /// <summary>
+    /// Verifies that every log id in <c>(floorExclusive, checkpointId]</c> is durably present for the
+    /// partition — in the column family, staged in the current write batch (<paramref name="stagedIds"/> /
+    /// <paramref name="stagedSingleId"/>), or already certified by the existing floor. Any entry type
+    /// counts: presence is the property being certified, resolution is the drain's concern.
+    ///
+    /// <para>The persisted last-checkpoint id is trusted as an applied/compacted certificate for its whole
+    /// prefix by restore frontier seeding, by the apply drains' compacted-below-floor skip, and by
+    /// compaction. A <see cref="RaftLogType.CommittedCheckpoint"/> row that lands OVER a replication gap
+    /// (the unanchored commit broadcast on a catching-up follower) must therefore not raise the floor:
+    /// doing so certified entries this node never held, the drains skipped them as compacted, compaction
+    /// deleted them once backfill stored them, and the consumer permanently lost committed writes.</para>
+    ///
+    /// <para>A floor of <c>-1</c> (never recorded) anchors the scan at id 1. That is deliberately strict:
+    /// nothing else attests where the log's compacted prefix ended, so a partition whose checkpoint
+    /// metadata was truncated away withholds advances (and logs) rather than certifying an unknown prefix.
+    /// Runs under the exclusive write guard (checkpoint batches only), so the scan cannot race appends.</para>
+    /// </summary>
+    private bool VerifyCheckpointPrefixPresent(
+        int partitionId,
+        ColumnFamilyHandle columnFamilyHandle,
+        long floorExclusive,
+        long checkpointId,
+        HashSet<long>? stagedIds,
+        long stagedSingleId,
+        out long firstMissing)
+    {
+        firstMissing = -1;
+
+        long expected = Math.Max(floorExclusive, 0) + 1;
+        if (expected > checkpointId)
+            return true;
+
+        using Iterator iterator = db.NewIterator(cf: columnFamilyHandle);
+        Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+        BuildLogKey(seekKey, partitionId, expected);
+        iterator.Seek(seekKey);
+
+        Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
+        BuildPartitionPrefix(partitionPrefix, partitionId);
+
+        while (expected <= checkpointId)
+        {
+            long present = long.MaxValue;
+            if (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix))
+                present = ParseLogIdFromKey(iterator.GetKeySpan());
+
+            if (present <= expected)
+            {
+                if (present == expected)
+                    expected++;
+                iterator.Next();
+                continue;
+            }
+
+            if (expected == stagedSingleId || (stagedIds is not null && stagedIds.Contains(expected)))
+            {
+                expected++;
+                continue;
+            }
+
+            firstMissing = expected;
+            return false;
+        }
+
+        return true;
+    }
 
     /// <summary>
     /// Stages deletion of the persisted last-checkpoint id (equivalent to "no checkpoint", i.e. a future

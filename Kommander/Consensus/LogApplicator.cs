@@ -113,11 +113,15 @@ internal sealed class LogApplicator
                     //     id and the tail in order. Delivering past it would skip it permanently.
                     //   * expected AT/BELOW the floor, or the -1/0 pre-restore sentinel (below the first log id):
                     //     the id was compacted by a snapshot or never existed. Not a gap — ACCEPT this entry as
-                    //     the next contiguous delivery (the cursor advances to it below).
+                    //     the next contiguous delivery (the cursor advances to it below). The certificate ends
+                    //     AT the floor: accepting an entry above floor+1 would advance the cursor across the
+                    //     uncertified absent range (floor, entry) and permanently skip committed entries that
+                    //     backfill delivers later — so that shape withholds too.
                     // With skipGaps (a sole voter proceeding past an unrecoverable gap), every present
                     // entry is delivered regardless of holes.
                     long floor = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
-                    if (coreState.LastAppliedIndex + 1 > 0 && coreState.LastAppliedIndex + 1 > floor)
+                    if (coreState.LastAppliedIndex + 1 > 0
+                        && (coreState.LastAppliedIndex + 1 > floor || log.Id > floor + 1))
                         return false;
                 }
 
@@ -146,12 +150,14 @@ internal sealed class LogApplicator
         }
 
         // The loop can exit with the range uncovered (an empty batch: the tail of the range is
-        // absent). A missing tail above the floor is a gap exactly like an interior hole.
+        // absent). A missing tail above the floor is a gap exactly like an interior hole — and a
+        // "covered" verdict may only rest on the floor's certificate up to the floor itself, so a
+        // target past the floor with an absent tail is a gap too.
         if (coreState.LastAppliedIndex < upToIndex && !skipGaps)
         {
             long expected = coreState.LastAppliedIndex + 1;
             long floor = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
-            if (expected > 0 && expected > floor)
+            if (expected > 0 && (expected > floor || upToIndex > floor))
                 return false;
         }
 
@@ -287,8 +293,11 @@ internal sealed class LogApplicator
 
                 if (log.Id > expected && !skipGaps)
                 {
+                    // Same certificate bound as the committed drain: the floor certifies only ids at
+                    // or below itself, so an entry above floor+1 sits past an uncertified absent
+                    // range and is a hole even when 'expected' is under the floor.
                     long floor = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
-                    if (expected > 0 && expected > floor)
+                    if (expected > 0 && (expected > floor || log.Id > floor + 1))
                     {
                         // Throttled: the promotion paths retry this drain every 2ms for up to the
                         // barrier timeout, and an unthrottled line per attempt wrote ~4.4k
@@ -393,11 +402,12 @@ internal sealed class LogApplicator
         EnqueueInheritedRecommitMarkers(recommit);
 
         // The loop can also exit without reaching upToIndex (an empty batch: the whole tail of the
-        // range is absent). A missing tail above the floor is a hole exactly like an interior gap.
+        // range is absent). A missing tail above the floor is a hole exactly like an interior gap,
+        // and so is a target past the floor's certificate with the tail absent.
         if (expected <= upToIndex && !skipGaps)
         {
             long floor = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
-            if (expected > 0 && expected > floor)
+            if (expected > 0 && (expected > floor || upToIndex > floor))
             {
                 // Same 1s throttle as the interior-gap line above (the 2ms retry loops).
                 if (ShouldLogDrainHole())

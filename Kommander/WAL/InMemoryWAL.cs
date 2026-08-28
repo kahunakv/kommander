@@ -162,10 +162,19 @@ public class InMemoryWAL : IWAL, IDisposable
                 if (batchMaxId > maxLogIds.GetValueOrDefault(item.partitionId, 0))
                     maxLogIds[item.partitionId] = batchMaxId;
 
-                // max() so an out-of-order lower checkpoint never regresses the recorded id.
+                // max() so an out-of-order lower checkpoint never regresses the recorded id. Like the
+                // durable backends, the recorded id advances only when its whole prefix above the
+                // current floor is present — a checkpoint row landing over a replication gap must not
+                // certify entries this node never held (the floor drives restore seeding, the apply
+                // drains' compacted-below-floor skip, and compaction).
                 if (batchMaxCheckpoint >= 0)
-                    lastCheckpoints[item.partitionId] =
-                        Math.Max(lastCheckpoints.GetValueOrDefault(item.partitionId, -1), batchMaxCheckpoint);
+                {
+                    long currentFloor = lastCheckpoints.GetValueOrDefault(item.partitionId, -1);
+                    if (batchMaxCheckpoint > currentFloor
+                        && allLogs.TryGetValue(item.partitionId, out SortedList<long, RaftLog>? checkLogs)
+                        && CheckpointPrefixPresent(checkLogs, currentFloor, batchMaxCheckpoint))
+                        lastCheckpoints[item.partitionId] = batchMaxCheckpoint;
+                }
             }
 
             return RaftOperationStatus.Success;
@@ -222,6 +231,22 @@ public class InMemoryWAL : IWAL, IDisposable
         {
             rwLock.ExitReadLock();
         }
+    }
+
+    /// <summary>
+    /// True when every log id in <c>(floorExclusive, checkpointId]</c> exists for the partition — the
+    /// contiguity certificate a last-checkpoint advance requires. A floor of <c>-1</c> anchors at id 1.
+    /// Must be called under the write lock, after the batch's rows were inserted (so they count).
+    /// </summary>
+    private static bool CheckpointPrefixPresent(SortedList<long, RaftLog> partitionLogs, long floorExclusive, long checkpointId)
+    {
+        for (long id = Math.Max(floorExclusive, 0) + 1; id <= checkpointId; id++)
+        {
+            if (!partitionLogs.ContainsKey(id))
+                return false;
+        }
+
+        return true;
     }
 
     /// <summary>

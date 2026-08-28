@@ -448,6 +448,15 @@ public sealed class RaftWriteAhead
             any = true;
         }
 
+        // The persisted last-checkpoint id only advances when the checkpoint's whole prefix was
+        // contiguously present at land time (see RocksDbWAL.VerifyCheckpointPrefixPresent). A
+        // CommittedCheckpoint ROW above this floor therefore landed over a replication gap this
+        // node never backfilled before the crash: it certifies nothing here, and letting it jump
+        // the frontiers would advertise election freshness for — and mark as applied — entries
+        // this node does not hold. Such a row extends the chains only contiguously, like any
+        // other entry.
+        long certifiedCheckpointFloor = await GetLastCheckpointAsync().ConfigureAwait(false);
+
         foreach (RaftLog log in logs)
         {
             any = true;
@@ -455,10 +464,10 @@ public sealed class RaftWriteAhead
                 maxLogId = log.Id;
 
             // A checkpoint certifies its whole prefix (it is the durable recovery anchor), so it
-            // may jump the presence frontier; every other type only extends an unbroken run — a
-            // missing id (e.g. a hole left by an out-of-order append) stops it, exactly like the
-            // committed frontier below.
-            if (log.Type == RaftLogType.CommittedCheckpoint
+            // may jump the presence frontier — but only when the persisted floor covers it (see
+            // above); every other type only extends an unbroken run — a missing id (e.g. a hole
+            // left by an out-of-order append) stops it, exactly like the committed frontier below.
+            if (log.Type == RaftLogType.CommittedCheckpoint && log.Id <= certifiedCheckpointFloor
                 ? log.Id > contiguousPresent
                 : log.Id == contiguousPresent + 1)
             {
@@ -471,8 +480,12 @@ public sealed class RaftWriteAhead
                 case RaftLogType.CommittedCheckpoint:
                     lastResolvedCommitted = log.Id;
                     // A checkpoint certifies the whole prefix ≤ its id is committed (it is the durable
-                    // recovery anchor), so it may jump the contiguous frontier.
-                    if (log.Id > contiguousCommitted)
+                    // recovery anchor), so it may jump the contiguous frontier — again only when the
+                    // persisted floor attests its prefix was present; an over-gap row extends the
+                    // chain contiguously like a plain Committed entry.
+                    if (log.Id <= certifiedCheckpointFloor
+                        ? log.Id > contiguousCommitted
+                        : log.Id == contiguousCommitted + 1)
                         contiguousCommitted = log.Id;
                     break;
 
@@ -537,7 +550,7 @@ public sealed class RaftWriteAhead
         // recorded boundary — exactly what a snapshot install would do — makes the restored node
         // report the truth instead. Runs before replay: entries below the boundary are certified
         // committed, so replaying them under the raised frontier is correct.
-        long restoredCheckpoint = await GetLastCheckpointAsync().ConfigureAwait(false);
+        long restoredCheckpoint = certifiedCheckpointFloor;
         if (restoredCheckpoint > 0 && commitIndex <= restoredCheckpoint)
         {
             long checkpointTerm = await GetAnyTermAtAsync(restoredCheckpoint).ConfigureAwait(false);

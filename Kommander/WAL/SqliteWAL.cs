@@ -611,13 +611,25 @@ public class SqliteWAL : IWAL, IDisposable
 
                                 // Persist the last-checkpoint id in the SAME transaction as the log rows so
                                 // it is durable atomically. max() with the existing value so an out-of-order
-                                // lower checkpoint cannot regress the recorded id.
+                                // lower checkpoint cannot regress the recorded id. The recorded id is trusted
+                                // as an applied/compacted certificate for its whole prefix (restore seeding,
+                                // the apply drains' compacted-below-floor skip, compaction), so it may only
+                                // advance when every id up to the checkpoint is present here — a checkpoint
+                                // row broadcast over a replication gap lands as a plain row and the floor
+                                // advances once a later checkpoint finds the gap backfilled. The count query
+                                // runs inside the transaction, so rows upserted just above are visible.
                                 if (batchMaxCheckpoint >= 0)
                                 {
-                                    long newCheckpoint = Math.Max(
-                                        ReadCheckpointInTransaction(shard, transaction, partitionId),
-                                        batchMaxCheckpoint);
-                                    UpsertCheckpointInTransaction(shard, transaction, partitionId, newCheckpoint);
+                                    long currentFloor = ReadCheckpointInTransaction(shard, transaction, partitionId);
+                                    if (batchMaxCheckpoint > currentFloor)
+                                    {
+                                        if (CheckpointPrefixPresentInTransaction(shard, transaction, partitionId, currentFloor, batchMaxCheckpoint))
+                                            UpsertCheckpointInTransaction(shard, transaction, partitionId, batchMaxCheckpoint);
+                                        else
+                                            logger.LogWarning(
+                                                "Withholding last-checkpoint advance for partition {Partition}: checkpoint {CheckpointId} landed over a gap (floor {Floor}); the floor advances when a later checkpoint finds the gap backfilled",
+                                                partitionId, batchMaxCheckpoint, currentFloor);
+                                    }
                                 }
                             }
 
@@ -1150,6 +1162,32 @@ public class SqliteWAL : IWAL, IDisposable
         {
             command.Transaction = null;
         }
+    }
+
+    /// <summary>
+    /// True when every log id in <c>(floorExclusive, checkpointId]</c> exists for the partition —
+    /// the contiguity certificate a last-checkpoint advance requires (see the call site in
+    /// <c>Write</c>). A floor of <c>-1</c> anchors the count at id 1. Runs inside
+    /// <paramref name="transaction"/>, so rows upserted by the same batch count as present.
+    /// Not a prepared/cached command: checkpoints are rare (once per checkpoint interval).
+    /// </summary>
+    private static bool CheckpointPrefixPresentInTransaction(
+        ShardDatabase shard, SqliteTransaction transaction, int partitionId, long floorExclusive, long checkpointId)
+    {
+        long fromExclusive = Math.Max(floorExclusive, 0);
+        if (checkpointId <= fromExclusive)
+            return true;
+
+        using SqliteCommand command = new(
+            "SELECT COUNT(*) FROM logs WHERE partitionId = @partitionId AND id > @fromExclusive AND id <= @checkpointId",
+            shard.Connection,
+            transaction);
+        command.Parameters.AddWithValue("@partitionId", partitionId);
+        command.Parameters.AddWithValue("@fromExclusive", fromExclusive);
+        command.Parameters.AddWithValue("@checkpointId", checkpointId);
+
+        long present = Convert.ToInt64(command.ExecuteScalar());
+        return present >= checkpointId - fromExclusive;
     }
 
     /// <summary>Upserts the persisted last-checkpoint id for a partition inside <paramref name="transaction"/>.</summary>

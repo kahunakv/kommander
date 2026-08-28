@@ -54,26 +54,27 @@ public sealed class TestInMemoryWalCheckpoint
     [Fact]
     public void MultipleCheckpoints_ReturnsHighest()
     {
+        // A contiguous prefix: a checkpoint written over a gap no longer advances the recorded id.
         InMemoryWAL wal = NewWal();
         wal.Write([(1, [
-            Log(10, RaftLogType.CommittedCheckpoint),
-            Log(20, RaftLogType.Committed),
-            Log(30, RaftLogType.CommittedCheckpoint),
-            Log(40, RaftLogType.Committed),
+            Log(1, RaftLogType.CommittedCheckpoint),
+            Log(2, RaftLogType.Committed),
+            Log(3, RaftLogType.CommittedCheckpoint),
+            Log(4, RaftLogType.Committed),
         ])]);
 
-        Assert.Equal(30, wal.GetLastCheckpoint(1));
+        Assert.Equal(3, wal.GetLastCheckpoint(1));
     }
 
     [Fact]
     public void CheckpointIsPerPartition()
     {
         InMemoryWAL wal = NewWal();
-        wal.Write([(1, [Log(5, RaftLogType.CommittedCheckpoint)])]);
-        wal.Write([(2, [Log(9, RaftLogType.CommittedCheckpoint)])]);
+        wal.Write([(1, [Log(1, RaftLogType.Committed), Log(2, RaftLogType.CommittedCheckpoint)])]);
+        wal.Write([(2, [Log(1, RaftLogType.Committed), Log(2, RaftLogType.Committed), Log(3, RaftLogType.CommittedCheckpoint)])]);
 
-        Assert.Equal(5, wal.GetLastCheckpoint(1));
-        Assert.Equal(9, wal.GetLastCheckpoint(2));
+        Assert.Equal(2, wal.GetLastCheckpoint(1));
+        Assert.Equal(3, wal.GetLastCheckpoint(2));
         Assert.Equal(-1, wal.GetLastCheckpoint(3));
     }
 
