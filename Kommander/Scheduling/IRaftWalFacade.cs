@@ -114,6 +114,14 @@ public interface IRaftWalFacade
     bool HasPresenceGap() => false;
 
     /// <summary>
+    /// Absorbs a prefix proven resolved by other bookkeeping (the applied cursor, capped by
+    /// contiguous presence) into the commit frontier. Used at promotion so a follower-era frontier
+    /// bookkeeping miss cannot be frozen for a whole leader tenure — see the implementation notes
+    /// in <c>RaftWriteAhead</c>. Default no-op for facades that do not track the frontier.
+    /// </summary>
+    void AbsorbResolvedPrefix(long throughId) { }
+
+    /// <summary>
     /// Seeds the propose-id allocator at promotion to exactly <paramref name="nextId"/> —
     /// one above the promotion-time log tail — so a new leader stamps client writes at
     /// <c>lastLogIndex + 1</c> (Raft §5.3) and can neither reissue a durably occupied index

@@ -991,6 +991,14 @@ public sealed class RaftWriteAhead
             try
             {
                 WALWriteOperation operation = EnqueueRollbackPrepared(logs);
+
+                // Same rollback-resolves-the-frontier rule as EnqueueRollback.
+                for (int i = 0; i < count; i++)
+                {
+                    if (savedTypes[i] is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
+                        AdvanceCommitFrontier(ordered[i].Id);
+                }
+
                 return Task.FromResult((RaftOperationStatus.Pending, operation.LogIndex));
             }
             catch
@@ -1033,7 +1041,24 @@ public sealed class RaftWriteAhead
 
             try
             {
-                return EnqueueRollbackPrepared(logs);
+                WALWriteOperation operation = EnqueueRollbackPrepared(logs);
+
+                // A rollback RESOLVES its ids, exactly like a commit — the frontier tracks the
+                // resolved prefix, not the committed one (the follower append path already counts
+                // RolledBack rows in resolvedThisBatch). Under the old monotonic EnqueueCommit
+                // jump this advance was implicit: the next commit above a rolled-back band jumped
+                // the frontier over it. With the gap-buffered commit advance, skipping rollbacks
+                // here left the leader's frontier stuck below every rolled-back id forever while
+                // the apply path advanced over the resolved band — the CommitMonotonicity
+                // commit-below-applied violations of CI run 33195170707 (Scenario08/09 pause
+                // chaos, where proposal-timeout rollbacks are constant).
+                for (int i = 0; i < count; i++)
+                {
+                    if (savedTypes[i] is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
+                        AdvanceCommitFrontier(ordered[i].Id);
+                }
+
+                return operation;
             }
             catch
             {
@@ -1347,6 +1372,37 @@ public sealed class RaftWriteAhead
     /// like every resolution: the later re-commit enqueue's own advance is then a no-op.
     /// </summary>
     public void MarkInheritedCommitted(long id) => AdvanceCommitFrontier(id);
+
+    /// <summary>
+    /// Absorbs a prefix that is proven resolved by OTHER bookkeeping (the applied cursor, capped by
+    /// contiguous presence) into the commit frontier, then drains any buffered resolutions that
+    /// became contiguous. Called at promotion: a follower stint can leave the in-memory frontier
+    /// below ids the node has already delivered — the applied cursor only ever advances over
+    /// delivered or resolution-visited rows, so applied∧present ⇒ resolved — and a LEADER never
+    /// receives the re-ship/backfill that heals a follower's frontier, so without this the
+    /// promotion freezes the dip for the whole tenure: every new commit buffers above the
+    /// phantom gap, the advertised frontier pins, and the CommitMonotonicity oracle fires (CI run
+    /// 33195170707). The old monotonic <see cref="EnqueueCommit"/> jump absorbed such prefixes
+    /// implicitly; the gap-buffered frontier needs the explicit, bounded reconciliation. Never
+    /// moves the frontier backwards, and callers must never pass an id beyond the contiguous
+    /// presence frontier.
+    /// </summary>
+    public void AbsorbResolvedPrefix(long throughId)
+    {
+        if (throughId + 1 <= commitIndex)
+            return;
+
+        commitIndex = throughId + 1;
+
+        while (pendingResolved.Count > 0 && pendingResolved.Min < commitIndex)
+            pendingResolved.Remove(pendingResolved.Min);
+        while (pendingResolved.Count > 0 && pendingResolved.Min == commitIndex)
+        {
+            long next = pendingResolved.Min;
+            pendingResolved.Remove(next);
+            commitIndex = next + 1;
+        }
+    }
 
     public void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0)
     {

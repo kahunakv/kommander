@@ -43,6 +43,14 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
 
     public bool HasPresenceGap() => wal.HasPresenceGap();
 
+    public void AbsorbResolvedPrefix(long throughId) => wal.AbsorbResolvedPrefix(throughId);
+
+    // Explicit forward — the interface declares a default no-op body, which silently swallowed
+    // this call for as long as the adapter did not override it: the inherited drain's frontier
+    // advance never reached RaftWriteAhead, masked by the old monotonic EnqueueCommit jump until
+    // the gap-buffered frontier exposed it (CI run 33195170707).
+    public void MarkInheritedCommitted(long id) => wal.MarkInheritedCommitted(id);
+
     public long GetPresentIndex() => wal.GetPresentIndex();
 
     public void SeedProposeAllocator(long nextId) => wal.SeedProposeAllocator(nextId);

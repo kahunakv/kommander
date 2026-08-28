@@ -138,7 +138,8 @@ public sealed class ChaosClusterHarness : IAsyncDisposable
         };
         _options.ConfigureNode?.Invoke(cfg);
         return new RaftManager(cfg, new StaticDiscovery(peers.Select(e => new RaftNode(e)).ToList()),
-            new InMemoryWAL(NullLogger<IRaft>.Instance), Nemesis, new HybridLogicalClock(), NullLogger<IRaft>.Instance);
+            new InMemoryWAL(NullLogger<IRaft>.Instance), Nemesis, new HybridLogicalClock(),
+            Environment.GetEnvironmentVariable("CHAOS_DIAG_LOG") is not null ? new TempFileLogger<IRaft>() : NullLogger<IRaft>.Instance);
     }
 
     // ── driving ─────────────────────────────────────────────────────────────────────

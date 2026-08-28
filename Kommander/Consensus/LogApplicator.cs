@@ -88,8 +88,17 @@ internal sealed class LogApplicator
 
             foreach (RaftLog log in batch)
             {
+                // A row past the target does NOT prove the range below it is covered: with the
+                // expected next id still queued in the WAL write scheduler (invisible to this
+                // backend read), the first visible row can sit above the target — returning
+                // "covered" here skipped the classification below and reported success over an
+                // undelivered range. Stop and let the exit checks classify the remainder (gap →
+                // withhold and retry; covered → true).
                 if (log.Id > upToIndex)
-                    return true;
+                {
+                    from = upToIndex + 1;           // terminate the outer loop; exit checks decide
+                    break;
+                }
                 if (log.Id <= coreState.LastAppliedIndex)
                     continue;                       // already applied (defensive; the read starts at 'from')
                 if (log.Id != coreState.LastAppliedIndex + 1 && !skipGaps)
@@ -260,10 +269,20 @@ internal sealed class LogApplicator
 
             foreach (RaftLog log in batch)
             {
+                // A row past the range does NOT prove the range was covered: with the expected
+                // next id still queued in the WAL write scheduler (invisible to this backend
+                // read), the first visible row can sit above upToIndex — returning Covered here
+                // let the barrier completion apply its batch and jump the cursor over an entry
+                // that was never delivered and never re-committed. Nothing ever revisits it: the
+                // consumer projection silently misses a committed entry for the whole tenure, and
+                // the (gap-aware) commit frontier pins below it while applied marches on — the
+                // CommitMonotonicity violations of CI run 33195170707. Fall through to the exit
+                // checks, which classify the unvisited remainder (hole → the caller's retry loop
+                // re-reads after the queued write lands; covered → Covered).
                 if (log.Id > upToIndex)
                 {
-                    EnqueueInheritedRecommitMarkers(recommit);
-                    return InheritedDrainStatus.Covered;
+                    from = upToIndex + 1;           // terminate the outer loop; exit checks decide
+                    break;
                 }
 
                 if (log.Id > expected && !skipGaps)
@@ -305,6 +324,18 @@ internal sealed class LogApplicator
                 if (log.Type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
                 {
                     (recommit ??= []).Add(log);
+                    wal.MarkInheritedCommitted(log.Id);
+                }
+                else
+                {
+                    // Already durably resolved on disk (Committed / RolledBack / checkpoint) — but
+                    // possibly NOT yet absorbed by the in-memory frontier: a follower stint can
+                    // miss a resolution's bookkeeping (its re-ship heals a follower, but a leader
+                    // is never backfilled). This drain advances the applied cursor over the row,
+                    // so the frontier must absorb the same resolution or it pins below the cursor
+                    // for the whole tenure while every new commit buffers above the phantom gap
+                    // (the mid-tenure CommitMonotonicity shape of CI run 33195170707). Gap-buffered
+                    // and idempotent: ids at/below the frontier are ignored.
                     wal.MarkInheritedCommitted(log.Id);
                 }
 

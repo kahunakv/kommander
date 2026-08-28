@@ -906,6 +906,29 @@ public sealed class RaftPartitionStateMachine
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         long nowTicks = host.GetMonotonicTimestamp();
         coreState.NodeState = RaftNodeState.Leader;
+
+        // Reconcile the commit frontier with what this node has provably resolved before anything
+        // reads it. A follower stint can leave the in-memory frontier below ids the node already
+        // DELIVERED (the applied cursor advances only over delivered or resolution-visited rows,
+        // so applied ∧ contiguously-present ⇒ resolved); on a follower the leader's re-ship heals
+        // that transient, but a LEADER is never backfilled — without this reconciliation the
+        // promotion freezes the dip for the whole tenure: the inherited drain sees the range as
+        // already applied and skips it, every new commit buffers above the phantom gap, and the
+        // advertised frontier pins below the applied prefix (the CommitMonotonicity failures of
+        // CI run 33195170707). Capped by contiguous presence so the frontier never certifies an
+        // id this node does not contiguously hold; the sole-voter skip-gaps escapes advance the
+        // applied cursor over genuinely absent ids, and presence stops below those.
+        long presenceCap = wal.GetPresentIndex();
+        long resolvedThroughApplied = presenceCap >= 0
+            ? Math.Min(coreState.LastAppliedIndex, presenceCap)
+            : coreState.LastAppliedIndex;
+        if (resolvedThroughApplied > wal.GetCommitIndex())
+        {
+            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Promotion frontier reconciliation: commit frontier {Frontier} trails the applied-and-present prefix {Resolved} — absorbing the delivered range.",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, wal.GetCommitIndex(), resolvedThroughApplied);
+            wal.AbsorbResolvedPrefix(resolvedThroughApplied);
+        }
+
         long commitFrontier = wal.GetCommitIndex();
         coreState.LocalCommittedIndex = commitFrontier;
         coreState.LiveCommitFloor = commitFrontier;

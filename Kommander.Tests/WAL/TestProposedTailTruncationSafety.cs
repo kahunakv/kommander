@@ -155,6 +155,107 @@ public sealed class TestProposedTailTruncationSafety
         }
     }
 
+    /// <summary>
+    /// A rollback resolves its ids, exactly like a commit: with the gap-buffered commit advance, a
+    /// leader-side rollback must advance the resolution frontier, or every later commit above the
+    /// rolled-back band buffers forever and the reported commit index sticks below the applied
+    /// prefix (the CommitMonotonicity violations of CI run 33195170707 — Scenario08/09 pause
+    /// chaos, where proposal-timeout rollbacks are constant). The old monotonic commit jump
+    /// absorbed rolled-back bands implicitly; the gap-aware frontier needs the explicit advance,
+    /// mirroring the follower append path where RolledBack rows already count as resolutions.
+    /// </summary>
+    [Fact]
+    public void LeaderRollback_ResolvesTheFrontier_SoLaterCommitsDoNotStick()
+    {
+        RaftWriteAhead writeAhead = CreateWriteAhead(out RaftManager manager, out RaftPartition partition);
+
+        try
+        {
+            RaftLog l1 = new() { LogType = "test", LogData = [1] };
+            RaftLog l2 = new() { LogType = "test", LogData = [1] };
+            RaftLog l3 = new() { LogType = "test", LogData = [1] };
+            writeAhead.EnqueuePropose(1, [l1], HLCTimestamp.Zero, autoCommit: true);
+            writeAhead.EnqueuePropose(1, [l2], HLCTimestamp.Zero, autoCommit: true);
+            writeAhead.EnqueuePropose(1, [l3], HLCTimestamp.Zero, autoCommit: true);
+            Assert.Equal(3, l3.Id);
+
+            writeAhead.EnqueueCommit([l1]);
+            Assert.Equal(1, writeAhead.GetCommitIndex());
+
+            // Proposal 2 times out and rolls back; proposal 3 commits. The frontier must reach 3
+            // — the rolled-back id is resolved, not a gap.
+            writeAhead.EnqueueRollback([l2]);
+            writeAhead.EnqueueCommit([l3]);
+            Assert.Equal(3, writeAhead.GetCommitIndex());
+        }
+        finally
+        {
+            partition.Dispose();
+            manager.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The facade adapter must actually forward <c>MarkInheritedCommitted</c> to the WAL: the
+    /// interface declares a default no-op body, and for as long as the adapter did not override
+    /// it, every inherited-drain frontier advance was silently swallowed — masked by the old
+    /// monotonic commit jump until the gap-buffered frontier exposed it as a permanently pinned
+    /// commit index on every new leader with an inherited tail (CI run 33195170707).
+    /// </summary>
+    [Fact]
+    public void FacadeAdapter_ForwardsMarkInheritedCommitted_ToTheFrontier()
+    {
+        RaftWriteAhead writeAhead = CreateWriteAhead(out RaftManager manager, out RaftPartition partition);
+
+        try
+        {
+            Append(writeAhead, Committed(1), Committed(2));
+            Assert.Equal(2, writeAhead.GetCommitIndex());
+            Append(writeAhead, Proposed(3));
+
+            Kommander.Scheduling.IRaftWalFacade facade = new RaftWalFacadeAdapter(writeAhead);
+            facade.MarkInheritedCommitted(3);
+
+            Assert.Equal(3, writeAhead.GetCommitIndex());
+        }
+        finally
+        {
+            partition.Dispose();
+            manager.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Promotion-time frontier reconciliation: a follower stint can leave the in-memory frontier
+    /// below ids the node already delivered (its applied cursor advanced over them), and a leader
+    /// is never backfilled — <c>AbsorbResolvedPrefix</c> absorbs the proven-resolved prefix and
+    /// drains any buffered resolutions that became contiguous, so a new leader's commits stop
+    /// buffering above a phantom gap.
+    /// </summary>
+    [Fact]
+    public void AbsorbResolvedPrefix_AdvancesTheFrontier_AndDrainsBufferedResolutions()
+    {
+        RaftWriteAhead writeAhead = CreateWriteAhead(out RaftManager manager, out RaftPartition partition);
+
+        try
+        {
+            Append(writeAhead, Committed(1), Committed(2));
+            Append(writeAhead, Committed(4));            // buffered over the gap at 3
+            Assert.Equal(2, writeAhead.GetCommitIndex());
+
+            writeAhead.AbsorbResolvedPrefix(3);          // 3 proven resolved by other bookkeeping
+            Assert.Equal(4, writeAhead.GetCommitIndex());
+
+            writeAhead.AbsorbResolvedPrefix(2);          // never moves backwards
+            Assert.Equal(4, writeAhead.GetCommitIndex());
+        }
+        finally
+        {
+            partition.Dispose();
+            manager.Dispose();
+        }
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     private static void Append(RaftWriteAhead writeAhead, params RaftLog[] logs) =>
