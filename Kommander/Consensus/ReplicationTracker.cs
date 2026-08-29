@@ -108,8 +108,8 @@ internal sealed class ReplicationTracker
 
     /// <summary>
     /// Per-peer convergence probe for entry-carrying backfill: the follower's reported commit
-    /// frontier at the moment the last batch shipped, when it shipped, and how many consecutive
-    /// batches have shipped without that frontier advancing.
+    /// frontier at the moment the last batch shipped, when it shipped, and how many ships a later
+    /// acknowledgement has proven fruitless.
     ///
     /// <para>This exists because the ack fast-path re-supply is self-exciting: a follower whose
     /// frontier is stuck (a lost lazy commit marker below the leader's monotonic
@@ -118,6 +118,19 @@ internal sealed class ReplicationTracker
     /// network-speed ping-pong that reads the WAL tail forever, saturates the shared read
     /// scheduler, and starves application reads, with zero writes and zero log lines. The probe
     /// makes "shipping is not helping" observable so the sender can pace itself and re-anchor.</para>
+    ///
+    /// <para><b>A ship counts as fruitless only when an acknowledgement proves it.</b> The proof is
+    /// a later Success ack whose frontier report sits at or below the frontier recorded at ship
+    /// time (<see cref="RecordBackfillAckFrontier"/>). A ship the peer never answered proves
+    /// nothing: the peer may be dead, partitioned away, or mid-restart. An earlier version counted
+    /// every ship whose recorded frontier had not moved, and the frontier only moves on a Success
+    /// ack — so a killed follower accrued a capped pause from silent ships and then served that
+    /// pause the moment it restarted, exactly when catch-up mattered most. That starved
+    /// meta-partition repair under a restart-heavy fault profile (12&#215; fewer backfill batches, the
+    /// Jepsen <c>snapshot / partition,kill</c> regression at Kommander 1.3.4). The wedge this probe
+    /// exists for is characterized by acks that DO arrive, so gating the count on an ack keeps the
+    /// wedge fully detected. A dead peer that never acks is bounded by the outbound-queue
+    /// saturation gate instead.</para>
     ///
     /// <para>Only peers that report a commit frontier (&gt;= 0) are tracked: a legacy-path peer
     /// reports -1 forever, its catch-up is driven by snapshot installs rather than frontier
@@ -130,6 +143,14 @@ internal sealed class ReplicationTracker
         public long LastShipTicks;
         public int FruitlessShips;
         public bool Warned;
+
+        /// <summary>
+        /// True while at least one ship since the last fruitless-count update awaits its verdict.
+        /// Set on every ship, cleared when an ack proves the outstanding ship(s) fruitless — so a
+        /// burst of ships answered by one stuck ack counts once, and a flood of heartbeat acks
+        /// between two ships cannot inflate the count either.
+        /// </summary>
+        public bool ShipOutstanding;
     }
 
     private readonly Dictionary<string, BackfillProgressProbe> backfillProgress = [];
@@ -368,9 +389,11 @@ internal sealed class ReplicationTracker
     /// <summary>
     /// Records that an entry-carrying batch shipped to <paramref name="endpoint"/> while its
     /// reported commit frontier stood at <paramref name="reportedFrontier"/>, and returns the
-    /// consecutive count of ships that produced no frontier advance. A negative frontier (no
-    /// report) clears any probe and returns 0 — pacing on a frontier that can never move would
-    /// throttle a healthy legacy-path catch-up.
+    /// current fruitless streak. The ship itself never grows the streak — only a later ack proves
+    /// a ship fruitless (<see cref="RecordBackfillAckFrontier"/>); see
+    /// <see cref="BackfillProgressProbe"/> for why silent ships must not count. A negative
+    /// frontier (no report) clears any probe and returns 0 — pacing on a frontier that can never
+    /// move would throttle a healthy legacy-path catch-up.
     /// </summary>
     public int RecordBackfillShip(string endpoint, long reportedFrontier)
     {
@@ -389,11 +412,10 @@ internal sealed class ReplicationTracker
                 probe.FruitlessShips = 0;
                 probe.Warned = false;
             }
-            else
-                probe.FruitlessShips++;
 
             probe.FrontierAtLastShip = reportedFrontier;
             probe.LastShipTicks = nowTicks;
+            probe.ShipOutstanding = true;
             return probe.FruitlessShips;
         }
 
@@ -402,8 +424,38 @@ internal sealed class ReplicationTracker
             FrontierAtLastShip = reportedFrontier,
             LastShipTicks = nowTicks,
             FruitlessShips = 0,
+            ShipOutstanding = true,
         };
         return 0;
+    }
+
+    /// <summary>
+    /// Feeds one Success ack's frontier self-report into the peer's backfill-convergence probe.
+    /// This is the ONLY place the fruitless streak grows: a report above the frontier at the last
+    /// ship is progress and drops the probe; a report at or below it, while a ship awaits its
+    /// verdict, proves that ship fruitless and counts it (once — the outstanding flag clears, so
+    /// neither a ship burst nor a heartbeat-ack flood inflates the streak). An ack with no
+    /// outstanding ship changes nothing: the peer is merely repeating what the sender already
+    /// paced on. Callers pass Success-ack frontier reports only, mirroring
+    /// <see cref="SetCommitFrontier"/> — a rejection's committedIndex is a raw max log id and
+    /// proves nothing about commit progress.
+    /// </summary>
+    public void RecordBackfillAckFrontier(string endpoint, long reportedFrontier)
+    {
+        if (!backfillProgress.TryGetValue(endpoint, out BackfillProgressProbe? probe))
+            return;
+
+        if (reportedFrontier > probe.FrontierAtLastShip)
+        {
+            backfillProgress.Remove(endpoint);
+            return;
+        }
+
+        if (probe.ShipOutstanding)
+        {
+            probe.ShipOutstanding = false;
+            probe.FruitlessShips++;
+        }
     }
 
     /// <summary>

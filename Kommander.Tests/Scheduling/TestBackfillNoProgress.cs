@@ -26,6 +26,14 @@ namespace Kommander.Tests.Scheduling;
 /// anchor falls back to the follower's reported frontier (which re-ships the entry whose marker
 /// is missing), any frontier advance resets both, and a persistent episode logs exactly one
 /// Warning.</para>
+///
+/// <para>The counting is evidence-gated, and that boundary is under test too: a ship counts as
+/// fruitless only when a later Success ack reports a frontier at or below the one at ship time.
+/// A ship the peer never answered proves nothing — a dead or restarting peer must not accrue a
+/// pause it then serves on return, and the take-once anchored repairs must never be paced at all.
+/// Counting silent ships starved meta-partition repair after restarts (the Jepsen
+/// <c>snapshot / partition,kill</c> regression at Kommander 1.3.4: 12&#215; fewer backfill batches,
+/// 8&#215; more log mismatches).</para>
 /// </summary>
 public class TestBackfillNoProgress
 {
@@ -96,6 +104,63 @@ public class TestBackfillNoProgress
 
         Assert.True(EntryBatchesTo(host, VoterB) > 0,
             "a healthy peer's first batch must not inherit another peer's pause");
+    }
+
+    /// <summary>
+    /// Ships the peer never answered must not build a streak. The peer here acks once and then
+    /// goes silent — the kill window of a restart-heavy fault profile. Every heartbeat still
+    /// ships a batch: silence is not evidence that shipping failed to help, and a streak accrued
+    /// against a dead peer was served as a capped pause the moment it restarted, which starved
+    /// its repair across whole fault cycles.
+    /// </summary>
+    [Fact]
+    public async Task ShipsWithoutAcks_DoNotBuildAStreak()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, _) =
+            await BuildFullLogLeader(heartbeatInterval: TimeSpan.FromMinutes(5));
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(1);
+
+        await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 50);
+        int shippedAfterFirstAck = EntryBatchesTo(host, VoterA);
+        Assert.True(shippedAfterFirstAck > 0);
+
+        // Three heartbeat rounds with no ack in between: each must ship one unpaced batch.
+        for (int i = 0; i < 3; i++)
+            await sm.ResumeHeartbeatsAsync(null);
+
+        Assert.Equal(shippedAfterFirstAck + 3, EntryBatchesTo(host, VoterA));
+    }
+
+    /// <summary>
+    /// The take-once anchored repairs must never be paced. A streak stands (one ship, one
+    /// equal-frontier ack proving it fruitless), and then the peer rejects an append with
+    /// LogMismatch — a restarted follower with a log hole answers every batch this way, because
+    /// the over-gap ack gate withholds its Success acks. The next heartbeat's mismatch-anchored
+    /// batch must ship through the standing pause: a paced-out attempt consumed the take-once
+    /// note and shipped nothing, so the repair waited for the peer's next rejection AND the pause
+    /// expiry, and the pause doubles.
+    /// </summary>
+    [Fact]
+    public async Task MismatchAnchoredRepair_IsNotPacedByTheStreak()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, _) =
+            await BuildFullLogLeader(heartbeatInterval: TimeSpan.FromMinutes(5));
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(1);
+
+        await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 50);
+        await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 50);
+        int shippedWhileStuck = EntryBatchesTo(host, VoterA);
+
+        await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.LogMismatch, committedIndex: 200);
+        await sm.ResumeHeartbeatsAsync(null);
+
+        Assert.True(EntryBatchesTo(host, VoterA) > shippedWhileStuck,
+            "the mismatch-anchored repair must ship through a standing no-progress pause");
+
+        // The anchor is the mismatch note clamped to the reported frontier (50), not nextIndex.
+        Assert.Contains(host.Requests, r => r.Node?.Endpoint == VoterA
+            && r.AppendLogsRequest?.Logs is { Count: > 0 }
+            && r.AppendLogsRequest.PrevLogIndex == 50);
     }
 
     // ── The anchor falls back to the reported frontier ───────────────────────

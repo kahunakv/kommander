@@ -54,6 +54,12 @@ internal sealed class RaftPartitionLogThrottle
     private long lastBackfillTraceTicks;
     private int suppressedBackfillTraces;
 
+    // Diagnostic throttle for the served no-progress pause. The sender probes the pause on every
+    // entry-carrying trigger, and the ack fast-path funnels every inbound ack into it — during
+    // the wedge the pause exists for, that is once per network round-trip. Executor thread only.
+    private long lastNoProgressPauseTraceTicks;
+    private int suppressedNoProgressPauseTraces;
+
     public RaftPartitionLogThrottle(IRaftPartitionHost host, RaftPartitionCoreState coreState, ILogger<IRaft> logger)
     {
         this.host = host;
@@ -183,5 +189,37 @@ internal sealed class RaftPartitionLogThrottle
 
         lastBackfillTraceTicks   = now;
         suppressedBackfillTraces = 0;
+    }
+
+    /// <summary>
+    /// DIAGNOSTIC. Records that the no-progress pause skipped one backfill batch to a peer.
+    /// </summary>
+    /// <remarks>
+    /// Before this line existed, a partition could pace for an entire run with nothing in the log
+    /// below the 4-ship episode Warning — the Jepsen analysis of the 1.3.4 meta-partition repair
+    /// starvation could not tell whether partition 0 paced at all. One Debug line per second per
+    /// partition, carrying the suppressed count, keeps the pacing visible without letting the
+    /// wedge's per-ack probe rate flood the log.
+    /// </remarks>
+    public void LogBackfillNoProgressPaused(string endpoint, int fruitlessShips, TimeSpan pause, long reportedFrontier)
+    {
+        long now = Stopwatch.GetTimestamp();
+
+        if (lastNoProgressPauseTraceTicks != 0 && (now - lastNoProgressPauseTraceTicks) < Stopwatch.Frequency)
+        {
+            suppressedNoProgressPauseTraces++;
+            return;
+        }
+
+        if (logger.IsEnabled(LogLevel.Debug))
+        {
+            logger.LogDebug(
+                "[{LocalEndpoint}/{PartitionId}/{State}] DIAG backfill no-progress pause peer={Endpoint} fruitlessShips={FruitlessShips} pauseMs={PauseMs} reportedFrontier={ReportedFrontier} suppressedSinceLastLine={Suppressed}",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint,
+                fruitlessShips, pause.TotalMilliseconds, reportedFrontier, suppressedNoProgressPauseTraces);
+        }
+
+        lastNoProgressPauseTraceTicks   = now;
+        suppressedNoProgressPauseTraces = 0;
     }
 }

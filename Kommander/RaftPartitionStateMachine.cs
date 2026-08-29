@@ -123,6 +123,11 @@ public sealed class RaftPartitionStateMachine
     /// evidence that no reachable voter holds the missing range — refusing further would leave the
     /// partition permanently leaderless (a hole is only ever repaired by a serving leader's
     /// backfill, which requires a leader to exist).
+    /// <para>A count is not a clock: at a 2 s election timeout this budget is spent long before a
+    /// restarting voter is back, and that voter is the likeliest holder of the range. While a voter
+    /// peer is not Alive the escape therefore also waits out
+    /// <see cref="RaftConfiguration.SelfRepairPeerDownGrace"/> — see
+    /// <see cref="SelfRepairGraceHolds"/>.</para>
     /// </summary>
     private const int MaxPresenceGateRefusals = 3;
 
@@ -165,6 +170,20 @@ public sealed class RaftPartitionStateMachine
 
     /// <summary>Commit frontier recorded at the last committed-drain refusal (-1 = none).</summary>
     private long lastDrainRefusalFrontier = -1;
+
+    /// <summary>
+    /// Monotonic tick of the FIRST refusal in the current same-shape committed-drain streak
+    /// (0 = no streak). The peer-down grace is measured from here, not from the latest refusal, so
+    /// the wait covers a peer restart rather than restarting with every election round. Reset with
+    /// the counter, which is what makes a real repair (a shape change) restart the grace too.
+    /// </summary>
+    private long drainRefusalStreakTicks;
+
+    /// <summary>
+    /// Monotonic tick of the FIRST refusal in the current same-hole completeness-gate streak
+    /// (0 = no streak). See <see cref="drainRefusalStreakTicks"/>.
+    /// </summary>
+    private long presenceRefusalStreakTicks;
 
 
 
@@ -307,7 +326,7 @@ public sealed class RaftPartitionStateMachine
                 tracker.AdvanceProgressFromSnapshotInstall(endpoint, idx);
             });
 
-        sender = new BackfillSender(host, wal, coreState, tracker, backfillTracker, snapshotSender, logger);
+        sender = new BackfillSender(host, wal, coreState, tracker, backfillTracker, snapshotSender, logThrottle, logger);
         proposals = new ProposalRegistry(host, coreState, logger, (node, ticket, logs) => sender.AppendLogToNode(node, ticket, logs));
 
         heartbeats = new HeartbeatDriver(host, wal, coreState, tracker, proposals, sender, logThrottle, logger);
@@ -833,6 +852,62 @@ public sealed class RaftPartitionStateMachine
     }
 
     /// <summary>
+    /// True when at least one voter peer is not <see cref="MemberLivenessState.Alive"/> per the SWIM
+    /// failure detector. Unknown endpoints read as Alive, so this is a positive signal — SWIM
+    /// actually flagged the peer — rather than an absence of information.
+    /// </summary>
+    private bool AnyVoterPeerDown()
+    {
+        IReadOnlyList<RaftNode> nodes = host.Nodes;
+
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            string endpoint = nodes[i].Endpoint;
+            if (!host.IsVoter(endpoint))
+                continue;
+
+            if (host.GetNodeLiveness(endpoint) != MemberLivenessState.Alive)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// The peer-down grace shared by both promotion gates: <see langword="true"/> while their
+    /// destructive self-repair must keep waiting even though the refusal count is spent.
+    ///
+    /// <para>Both gates escape on the argument that N same-shape election wins are quorum evidence
+    /// that no reachable voter holds the missing range. "Reachable" is the load-bearing word: while
+    /// a voter peer is down, the node that holds the range is very likely that peer, and the
+    /// survivors burn the whole refusal budget inside a few election timeouts — far sooner than a
+    /// process restart completes. Both then delete the range and it is gone cluster-wide. So while
+    /// a voter peer is not Alive, the escape additionally waits out
+    /// <see cref="RaftConfiguration.SelfRepairPeerDownGrace"/> measured from the first refusal of
+    /// the current shape.</para>
+    ///
+    /// <para>Bounded on purpose. A peer that never returns must not hold the partition leaderless
+    /// forever — that is the wedge the refusal caps exist to break — so the grace expires and the
+    /// gate self-repairs with the peer still down. Nothing waits while every voter peer is Alive.</para>
+    /// </summary>
+    /// <param name="streakStartedTicks">Monotonic tick of the first refusal in the current streak.</param>
+    /// <param name="waited">How long the current streak has lasted.</param>
+    /// <param name="grace">The configured grace, for the log line.</param>
+    private bool SelfRepairGraceHolds(long streakStartedTicks, out TimeSpan waited, out TimeSpan grace)
+    {
+        grace = host.Configuration.SelfRepairPeerDownGrace;
+        waited = RaftMonotonic.Elapsed(streakStartedTicks, host.GetMonotonicTimestamp());
+
+        if (grace <= TimeSpan.Zero)
+            return false;
+
+        if (!AnyVoterPeerDown())
+            return false;
+
+        return waited < grace;
+    }
+
+    /// <summary>
     /// Promotion helper used by all real election paths. Performs the same internal
     /// bookkeeping as <see cref="BecomeLeader"/> but defers publishing
     /// <see cref="IRaftPartitionHost.Leader"/> until the consumer projection provably
@@ -888,7 +963,9 @@ public sealed class RaftPartitionStateMachine
     /// unbounded variant left the partition leaderless for a whole Jepsen run when a voter
     /// majority shared the hole. Both gates stretch their cap (never to infinity) while a fresher
     /// live voter is known from the vote paths, because that voter can win the term and repair
-    /// this node by backfill with nothing lost.</para>
+    /// this node by backfill with nothing lost. Both also hold their self-repair for
+    /// <see cref="RaftConfiguration.SelfRepairPeerDownGrace"/> while a voter peer is down, so a
+    /// peer restart cannot be mistaken for a peer that does not hold the range.</para>
     ///
     /// <para><b>Latency note:</b> the drain holds the partition executor for the full
     /// duration of the backlog (one <c>ReadScheduler</c> round-trip per 512-entry batch
@@ -987,6 +1064,7 @@ public sealed class RaftPartitionStateMachine
                 drainGateRefusals = 0;
                 lastDrainRefusalApplied = -1;
                 lastDrainRefusalFrontier = -1;
+                drainRefusalStreakTicks = 0;
             }
             else if (hasVoterPeers)
             {
@@ -1003,19 +1081,31 @@ public sealed class RaftPartitionStateMachine
                 bool sameShape = coreState.LastAppliedIndex == lastDrainRefusalApplied
                                  && commitFrontier == lastDrainRefusalFrontier;
                 drainGateRefusals = sameShape ? drainGateRefusals + 1 : 1;
+                // Anchor the grace at the first refusal of this shape. The `== 0` arm covers the
+                // one shape that reads as "same" on its very first refusal (applied and frontier
+                // both at their -1 init), which would otherwise leave the anchor unset.
+                if (!sameShape || drainRefusalStreakTicks == 0)
+                    drainRefusalStreakTicks = host.GetMonotonicTimestamp();
                 lastDrainRefusalApplied = coreState.LastAppliedIndex;
                 lastDrainRefusalFrontier = commitFrontier;
 
                 bool fresherVoterKnown = election.KnowsFresherAliveVoter(wal.GetPresentIndex());
                 int refusalCap = fresherVoterKnown ? MaxDeferredGateRefusals : MaxPresenceGateRefusals;
 
-                if (drainGateRefusals <= refusalCap)
+                // The count alone reads an unreachable voter as an absent one. While a voter peer
+                // is down, hold the gap-skipping drain for the peer-down grace as well: that peer
+                // is the likeliest holder of the missing range, and it cannot deny a vote or
+                // backfill this node while it is restarting.
+                bool drainGraceHolds = SelfRepairGraceHolds(drainRefusalStreakTicks, out TimeSpan drainWaited, out TimeSpan drainGrace);
+
+                if (drainGateRefusals <= refusalCap || drainGraceHolds)
                     throw new RaftException(
                         $"Promotion refused ({drainGateRefusals}/{refusalCap}): committed drain stopped at {coreState.LastAppliedIndex} below the frontier {commitFrontier}"
-                        + (fresherVoterKnown ? " — a fresher live voter is known; deferring self-repair so it can win the term" : ""));
+                        + (fresherVoterKnown ? " — a fresher live voter is known; deferring self-repair so it can win the term" : "")
+                        + (drainGraceHolds ? $" — a voter peer is down; deferring self-repair for the peer-down grace ({drainWaited.TotalSeconds:F1}s of {drainGrace.TotalSeconds:F1}s)" : ""));
 
-                logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Committed drain stopped at {LastApplied} below the frontier {Frontier} after {Refusals} consecutive refused promotions with no fresher voter winning — proceeding; entries in the gap are unreachable for every replica.",
-                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, coreState.LastAppliedIndex, commitFrontier, drainGateRefusals - 1);
+                logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Committed drain stopped at {LastApplied} below the frontier {Frontier} after {Refusals} consecutive refused promotions over {Waited} with no fresher voter winning — proceeding; entries in the gap are unreachable for every replica.",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, coreState.LastAppliedIndex, commitFrontier, drainGateRefusals - 1, drainWaited);
 
                 // Deliver everything this node DOES hold past the gap, so only the genuinely
                 // absent entries are lost rather than the whole suffix — the same trade the
@@ -1025,6 +1115,7 @@ public sealed class RaftPartitionStateMachine
                 drainGateRefusals = 0;
                 lastDrainRefusalApplied = -1;
                 lastDrainRefusalFrontier = -1;
+                drainRefusalStreakTicks = 0;
             }
             else
             {
@@ -1080,6 +1171,8 @@ public sealed class RaftPartitionStateMachine
         {
             bool sameHole = presentId == lastPresenceRefusalPresent && maxLog == lastPresenceRefusalMax;
             presenceGateRefusals = sameHole ? presenceGateRefusals + 1 : 1;
+            if (!sameHole || presenceRefusalStreakTicks == 0)
+                presenceRefusalStreakTicks = host.GetMonotonicTimestamp();
             lastPresenceRefusalPresent = presentId;
             lastPresenceRefusalMax = maxLog;
 
@@ -1089,10 +1182,19 @@ public sealed class RaftPartitionStateMachine
             bool fresherAliveVoterKnown = election.KnowsFresherAliveVoter(presentId);
             int presenceRefusalCap = fresherAliveVoterKnown ? MaxDeferredGateRefusals : MaxPresenceGateRefusals;
 
-            if (hasVoterPeers && presenceGateRefusals <= presenceRefusalCap)
+            // A count of wins measures elections, not outages. A voter restart outlasts the whole
+            // budget at a 2 s election timeout, and the voter that holds the missing range is
+            // exactly the one that is down — so while any voter peer is down the truncation also
+            // waits out the peer-down grace. Bounded: the grace expires even if the peer never
+            // returns.
+            bool presenceGraceHolds = SelfRepairGraceHolds(presenceRefusalStreakTicks, out TimeSpan presenceWaited, out TimeSpan presenceGrace);
+
+            if (hasVoterPeers && (presenceGateRefusals <= presenceRefusalCap || presenceGraceHolds))
             {
-                logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Promotion refused ({Attempt}/{MaxAttempts}): WAL has a hole below the max id (contiguous through {PresentId}, max {MaxLog}) — reverting to Follower so a node with a contiguous log can win the next term.",
-                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, presenceGateRefusals, presenceRefusalCap, presentId, maxLog);
+                logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Promotion refused ({Attempt}/{MaxAttempts}, {Waited} of the peer-down grace {Grace} elapsed): WAL has a hole below the max id (contiguous through {PresentId}, max {MaxLog}) — reverting to Follower so a node with a contiguous log can win the next term.",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, presenceGateRefusals, presenceRefusalCap,
+                    presenceGraceHolds ? presenceWaited : TimeSpan.Zero, presenceGraceHolds ? presenceGrace : TimeSpan.Zero,
+                    presentId, maxLog);
                 coreState.NodeState = RaftNodeState.Follower;
                 coreState.LocalCommittedIndex = -1;
                 throw new RaftException($"Promotion refused: WAL hole below max id (contiguous through {presentId}, max {maxLog})");
@@ -1101,7 +1203,7 @@ public sealed class RaftPartitionStateMachine
             logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] WAL hole below the max id (contiguous through {PresentId}, max {MaxLog}) and {Reason} — truncating the orphaned tail and serving; the truncated rows are unreachable for every replica.",
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState, presentId, maxLog,
                 hasVoterPeers
-                    ? $"{presenceGateRefusals - 1} consecutive promotions already refused with no fresher voter winning"
+                    ? $"{presenceGateRefusals - 1} consecutive promotions already refused over {presenceWaited} with no fresher voter winning"
                     : "no voter peers to defer to");
 
             try
@@ -1132,6 +1234,7 @@ public sealed class RaftPartitionStateMachine
             presenceGateRefusals = 0;
             lastPresenceRefusalPresent = -1;
             lastPresenceRefusalMax = -1;
+            presenceRefusalStreakTicks = 0;
 
             if (presentId >= 0 && presentId < maxLog)
             {
@@ -1150,6 +1253,7 @@ public sealed class RaftPartitionStateMachine
             presenceGateRefusals = 0;
             lastPresenceRefusalPresent = -1;
             lastPresenceRefusalMax = -1;
+            presenceRefusalStreakTicks = 0;
         }
 
         // The inherited-tail decision must come from the enqueue-advanced presence frontier, not

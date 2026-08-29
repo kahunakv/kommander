@@ -218,6 +218,17 @@ internal sealed class ReplicationAckProcessor
         if (committedIndex >= 0 || !tracker.HasCommitFrontier(endpoint))
             tracker.SetCommitFrontier(endpoint, committedIndex);
 
+        // Feed the backfill-convergence probe. This ack is the only EVIDENCE about whether the
+        // batches already shipped to this peer helped: a frontier above the one at the last ship
+        // drops the probe, a frontier at or below it proves the outstanding ship(s) fruitless and
+        // grows the streak — once, however many ships or acks pile up. Ships themselves no longer
+        // grow it (a peer that is dead or restarting answers nothing, and pacing it on silence
+        // starved its repair the moment it returned). Must run BEFORE the fast-path re-supplies
+        // below, so the streak this ack proves paces this ack's own follow-on batch — that
+        // ordering is what breaks the network-speed ping-pong after a single fruitless ship.
+        if (committedIndex >= 0)
+            tracker.RecordBackfillAckFrontier(endpoint, committedIndex);
+
         // Same-term success acks double as leadership proof: they feed the read-index confirmation
         // round and the check-quorum recency window. Only term-stamped acks count — an unstamped
         // (-1) ack passed the term fence above by default and could belong to an earlier stint of

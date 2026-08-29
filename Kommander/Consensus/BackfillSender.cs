@@ -37,6 +37,7 @@ internal sealed class BackfillSender
     private readonly ReplicationTracker tracker;
     private readonly NonContiguousBackfillTracker backfillTracker;
     private readonly SnapshotSender snapshotSender;
+    private readonly RaftPartitionLogThrottle logThrottle;
     private readonly ILogger<IRaft> logger;
 
     public BackfillSender(
@@ -46,6 +47,7 @@ internal sealed class BackfillSender
         ReplicationTracker tracker,
         NonContiguousBackfillTracker backfillTracker,
         SnapshotSender snapshotSender,
+        RaftPartitionLogThrottle logThrottle,
         ILogger<IRaft> logger)
     {
         this.host = host;
@@ -54,6 +56,7 @@ internal sealed class BackfillSender
         this.tracker = tracker;
         this.backfillTracker = backfillTracker;
         this.snapshotSender = snapshotSender;
+        this.logThrottle = logThrottle;
         this.logger = logger;
     }
 
@@ -172,16 +175,27 @@ internal sealed class BackfillSender
         // progress, zero writes, and zero log lines. The probe self-heals on any frontier
         // advance; while a fruitless streak stands, further batches wait out an exponential
         // pause (heartbeat-interval base, capped) BEFORE the WAL read is issued.
+        //
+        // The anchored repair paths are EXEMPT. anchorToFollowerFrontier marks the heartbeat's
+        // regressed-frontier and mismatch-anchored repairs: both are take-once notes acted on at
+        // most once per heartbeat interval, so they cannot self-excite — and both exist precisely
+        // to converge a peer whose frontier is not advancing. Pausing them consumed the note and
+        // shipped nothing, deferring the repair to whenever the peer's NEXT rejection re-recorded
+        // it AND the pause window had expired; under a restart-heavy fault profile that starved
+        // meta-partition repair for whole fault cycles (the Jepsen 1.3.4 regression). The streak
+        // still records these ships, so a peer that stays stuck even against anchored repair still
+        // warns and still paces the unanchored paths.
         long reportedFrontier = tracker.GetCommitFrontierOrDefault(node.Endpoint, -1);
         ReplicationTracker.BackfillProgress progress = tracker.ObserveBackfillProgress(node.Endpoint, reportedFrontier);
 
-        if (progress.FruitlessShips > 0)
+        if (!anchorToFollowerFrontier && progress.FruitlessShips > 0)
         {
             TimeSpan pause = NoProgressPause(progress.FruitlessShips);
             if (pause > TimeSpan.Zero
                 && RaftMonotonic.Elapsed(progress.LastShipTicks, host.GetMonotonicTimestamp()) < pause)
             {
                 KommanderMetrics.RecordBackfillNoProgressPause(host.PartitionId);
+                logThrottle.LogBackfillNoProgressPaused(node.Endpoint, progress.FruitlessShips, pause, reportedFrontier);
                 return BackfillSendResult.NoProgressPaused;
             }
         }
@@ -202,7 +216,19 @@ internal sealed class BackfillSender
         if (anchorToFollowerFrontier)
             from = followerMaxLog + 1;
         else if (reanchorAtReportedFrontier)
+        {
             from = reportedFrontier + 1;
+
+            // Observability: without this line a partition can re-anchor for a whole run with no
+            // evidence anywhere below the 4-ship Warning — the gap that kept the Jepsen 1.3.4
+            // analysis at "hypothesis". Bounded: a re-anchored attempt on this path is itself
+            // paced by the no-progress pause, so the volume cannot exceed the ship rate.
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] Backfill anchor fallback for {Endpoint}: fruitlessShips={FruitlessShips}, anchoring at reported frontier {Frontier} instead of nextIndex",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState,
+                    node.Endpoint, progress.FruitlessShips, reportedFrontier);
+        }
         else if (tracker.TryGetNextIndex(node.Endpoint, out long ni) && ni <= coreState.LocalCommittedIndex)
             from = ni;
         else

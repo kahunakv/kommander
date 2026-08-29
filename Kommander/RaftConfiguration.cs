@@ -385,10 +385,15 @@ public class RaftConfiguration
     /// once like a leader's local proposes — coalescing them into one fsync removes
     /// real time from the propose quorum's critical path.</para>
     ///
-    /// <para>The window is <b>adaptive</b>: the worker bails out the moment a probe
-    /// finds no further partition arriving, so sequential / low-overlap load does not
-    /// pay the full window. It is also bounded by <see cref="MaxWalGroupBatchPartitions"/>
-    /// (a full batch fsyncs immediately).</para>
+    /// <para>The window is <b>evidence-gated</b>: a worker enters a timed wait only
+    /// while some other partition has enqueued work that has not yet reached any write
+    /// batch — work guaranteed to become ready shortly — and an arrival ends the wait
+    /// immediately. When nothing can arrive (sequential or closed-loop load, where the
+    /// next operation is caused by the completion of the very flush that would wait),
+    /// the worker flushes immediately and the linger costs nothing. The wait is bounded
+    /// by this window and by <see cref="MaxWalGroupBatchPartitions"/> (a full batch
+    /// fsyncs immediately); timed-wait granularity is ~1 ms, so sub-millisecond
+    /// remainders round up to ~1 ms.</para>
     ///
     /// <para>Defaults to <c>0</c> (disabled — behaviour is byte-for-byte the prior
     /// opportunistic batching). Enable and measure before relying on it.</para>
@@ -661,6 +666,33 @@ public class RaftConfiguration
     /// </summary>
     public TimeSpan LeadershipBarrierTimeout { get; set; } = TimeSpan.FromSeconds(10);
 
+    // ── Promotion-gate self-repair ───────────────────────────────────────────
+
+    /// <summary>
+    /// How long both promotion gates defer their destructive self-repair — the gap-skipping
+    /// committed drain and the orphaned-tail truncation — while a voter peer is not
+    /// <see cref="Kommander.Gossip.MemberLivenessState.Alive"/>.
+    ///
+    /// <para>Each gate escapes after a bounded number of same-shape refusals, on the argument that
+    /// N consecutive election wins over one hole are quorum evidence that no reachable voter holds
+    /// the missing range. The argument has a blind spot: during a short outage the voter that holds
+    /// the range is exactly the one that is unreachable, and the survivors can refuse and win
+    /// repeatedly inside that window (the refusal budget is spent in a few election timeouts, and a
+    /// process restart takes far longer). Both survivors then truncate, and the range is gone
+    /// cluster-wide — the split-nemesis loss. This grace makes the escape wait out a peer restart:
+    /// the refusal count still governs, but while a voter peer is down the escape additionally
+    /// requires the same-shape refusal streak to have lasted this long.</para>
+    ///
+    /// <para>Set it above the longest expected process restart of a voter. It is a bound, never a
+    /// hold: an unbounded wait is the leaderless wedge the refusal caps exist to break, so once the
+    /// grace elapses the gate self-repairs even with the peer still down. It is measured from the
+    /// FIRST refusal of the current shape, so any real repair (a backfill that changes the hole)
+    /// restarts it. Nothing is deferred while every voter peer is Alive — there the quorum evidence
+    /// is sound and the counts alone govern, exactly as before. Set to
+    /// <see cref="TimeSpan.Zero"/> to disable the grace. Default 30 s.</para>
+    /// </summary>
+    public TimeSpan SelfRepairPeerDownGrace { get; set; } = TimeSpan.FromSeconds(30);
+
     // ── Read-index leadership confirmation ───────────────────────────────────
 
     /// <summary>
@@ -794,13 +826,24 @@ public class RaftConfiguration
     /// fruitless ship up to this cap; any frontier advance resets it. A zero
     /// <see cref="HeartbeatInterval"/> disables the pacing entirely.
     /// </para>
+    /// <para>
+    /// A ship counts as fruitless only when a later Success ack proves it: the ack must report a
+    /// frontier at or below the one recorded at ship time. A ship the peer never answered proves
+    /// nothing and never grows the pause — a dead or restarting peer must not serve a stale pause
+    /// the moment it returns (that starved meta-partition repair after restarts, the Jepsen 1.3.4
+    /// regression; a peer that never acks is bounded by the outbound-queue saturation gate
+    /// instead). The take-once anchored repairs (regressed frontier, mismatch anchor) are exempt
+    /// from the pause: they run at most once per heartbeat and exist to converge exactly the peer
+    /// the pause would otherwise hold off.
+    /// </para>
     /// </summary>
     public TimeSpan BackfillNoProgressPauseCap { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
-    /// Consecutive fruitless backfill ships after which the leader stops anchoring at
-    /// <c>nextIndex</c> and anchors the next batch at the follower's reported commit frontier
-    /// instead. Values &lt;= 0 disable the fallback. Default 2.
+    /// Consecutive ack-proven fruitless backfill ships (see
+    /// <see cref="BackfillNoProgressPauseCap"/> for what counts) after which the leader stops
+    /// anchoring at <c>nextIndex</c> and anchors the next batch at the follower's reported commit
+    /// frontier instead. Values &lt;= 0 disable the fallback. Default 2.
     /// <para>
     /// <c>nextIndex</c> derives from the monotonic matchIndex, which a transiently overshooting
     /// frontier report can pin <b>above</b> the entry the follower actually needs; every batch
@@ -1527,6 +1570,12 @@ public class RaftConfiguration
                 "inherited uncommitted prior-term entries holds leadership unpublished until its barrier " +
                 "no-op commits; a non-positive timeout would make it revert to Follower immediately on " +
                 "every such promotion, so the partition could never elect a serving leader.");
+
+        if (SelfRepairPeerDownGrace < TimeSpan.Zero)
+            throw new RaftException(
+                $"[Kommander] SelfRepairPeerDownGrace ({SelfRepairPeerDownGrace}) must not be negative. " +
+                "It is how long a promotion gate defers its destructive self-repair while a voter peer " +
+                "is down; use TimeSpan.Zero to disable the grace and let the refusal counts alone govern.");
 
         if (SnapshotReceiveSessionTtl <= TimeSpan.Zero)
             throw new RaftException(

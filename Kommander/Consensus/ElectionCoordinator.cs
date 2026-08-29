@@ -143,10 +143,33 @@ internal sealed class ElectionCoordinator
         electionPhase = RaftElectionPhase.None;
     }
 
+    /// <summary>
+    /// Raft §5.4.1 freshness: <see langword="true"/> when the candidate's <c>(lastLogTerm,
+    /// lastLogIndex)</c> is strictly less up to date than the local pair, which is the condition to
+    /// deny a vote.
+    ///
+    /// <para><b>The missing-term fallback is symmetric on purpose.</b> A term of <c>0</c> or
+    /// <c>-1</c> means "no usable last-log term here", not "an ancient term", so a lexicographic
+    /// comparison against it is meaningless in EITHER direction. Testing only the remote side left
+    /// a hole: a voter whose own term degraded read <c>remoteTerm != localTerm</c>, returned
+    /// <c>remoteTerm &lt; localTerm</c> — false for any real term against 0 — and granted the vote
+    /// with the index never examined at all. That voter is not necessarily an empty node whose vote
+    /// costs nothing: the degraded pair is <b>a high index with no term</b>, reachable whenever the
+    /// presence frontier lands on a compacted checkpoint boundary (its stored term reads -1, and
+    /// both restore and the post-truncation re-read clamp that to 0). Such a voter holds a long
+    /// committed log and still granted to a candidate missing an arbitrary range of it; the
+    /// candidate wins and overwrites the range.</para>
+    ///
+    /// <para>With either side missing a term the comparison falls back to index-only, which is the
+    /// legacy ordering and is strictly stricter than the old behaviour — it can only deny where the
+    /// old code granted. A genuinely empty voter still grants, because its own index is 0 and no
+    /// candidate is behind that.</para>
+    /// </summary>
     private static bool CandidateLogIsBehind(long remoteLastLogTerm, long remoteMaxLogId, long localLastLogTerm, long localMaxId)
     {
-        if (remoteLastLogTerm <= 0)
-            return remoteMaxLogId < localMaxId; // legacy peer / empty candidate log → index-only
+        // Legacy peer / empty candidate log / boundary term the local side cannot read → index-only.
+        if (remoteLastLogTerm <= 0 || localLastLogTerm <= 0)
+            return remoteMaxLogId < localMaxId;
 
         if (remoteLastLogTerm != localLastLogTerm)
             return remoteLastLogTerm < localLastLogTerm;
@@ -500,7 +523,8 @@ internal sealed class ElectionCoordinator
     /// <param name="remoteLastLogTerm">
     /// The candidate's last log term, compared lexicographically before <paramref name="remoteMaxLogId"/>
     /// (Raft §5.4.1). <c>0</c> from a peer predating this field or an empty candidate log; the freshness
-    /// check falls back to index-only comparison in that case (see <see cref="CandidateLogIsBehind"/>).
+    /// check falls back to index-only comparison when EITHER side lacks a usable term — the local side
+    /// included (see <see cref="CandidateLogIsBehind"/>).
     /// </param>
     /// <param name="timestamp"></param>
     /// <param name="preVote">When true, evaluate as a pure pre-vote probe and never persist state.</param>
