@@ -162,7 +162,7 @@ internal sealed class HeartbeatDriver
             // the last write (frontier == floor) with a gap at or under BackfillThreshold was never
             // shipped anything, and the placement promotion driver waited on its lag forever.
             // followerMaxLog can be -1: the seed recorded for a contacted peer whose Success acks
-            // carry no frontier report (the legacy two-fsync heartbeat ack always reports -1).
+            // carry no frontier report (a pre-frontier-report release during a rolling upgrade).
             // That value means "position unknown", not "position 0" — deriving the gap and the
             // backfill anchor from it shipped a batch anchored at 0, which a compacted WAL can
             // never serve contiguously, and the refusal then escalated to a full snapshot for a

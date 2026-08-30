@@ -423,7 +423,7 @@ internal sealed class FollowerAppendHandler
                     RaftResponderRequestType.CompleteAppendLogs,
                     new(endpoint),
                     new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.Success,
-                        host.Configuration.WalSingleFsyncCommit ? wal.GetCommitIndex() : -1)
+                        wal.GetCommitIndex())
                 ));
             }
             else if (durableMax >= alreadyHeldMax)
@@ -445,11 +445,16 @@ internal sealed class FollowerAppendHandler
             return;
         }
         
-        // On the single-fsync fast path a heartbeat ack carries the follower's TRUE committed frontier
-        // (not the legacy -1). This is the "leader's leaderCommit on reconnect" feedback channel: a
-        // follower whose commit frontier regressed on restart (lazy markers lost, then reconstructed
-        // conservatively) advertises the lower value so the leader can re-supply the still-committed tail.
-        long reportedCommittedIndex = host.Configuration.WalSingleFsyncCommit ? wal.GetCommitIndex() : -1;
+        // A heartbeat ack carries the follower's TRUE committed frontier, in both commit modes.
+        // This is the "leader's leaderCommit on reconnect" feedback channel: a follower whose
+        // commit frontier regressed on restart (commit markers lost in a crash — lazy markers on
+        // the single-fsync path, the asynchronous commit broadcast on the two-fsync path — then
+        // reconstructed conservatively) advertises the lower value so the leader can re-supply
+        // the still-committed tail. An earlier version reported -1 here with WalSingleFsyncCommit
+        // off, which left the regression permanently invisible on an idle partition: the damaged
+        // follower kept acking, stayed in quorum and stayed election-eligible while silently
+        // missing acknowledged entries.
+        long reportedCommittedIndex = wal.GetCommitIndex();
 
         host.EnqueueResponse(endpoint, new(
             RaftResponderRequestType.CompleteAppendLogs,

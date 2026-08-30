@@ -351,8 +351,9 @@ public sealed class RaftWriteAhead
             // its term seeds the post-restore freshness pair — otherwise fall through to the
             // conservative full read (the WAL and the application have diverged; frontier
             // reconstruction then proceeds from what the WAL actually holds). Any entry type
-            // counts: under WalSingleFsyncCommit a durably applied entry can persist as Proposed
-            // with its lazy commit marker lost, yet the application floor proves it committed.
+            // counts: a durably applied entry can persist as Proposed when a crash dropped its
+            // commit marker (lazy markers on the single-fsync path; the asynchronous commit
+            // broadcast on a follower), yet the application floor proves it committed.
             if (durablyApplied > 0
                 && durablyApplied > lastCheckpoint
                 && partition.PartitionId != RaftSystemConfig.SystemPartition)
@@ -425,10 +426,9 @@ public sealed class RaftWriteAhead
         // narrowed (see LoadRestoreLogsAsync; the seed below re-anchors the scan for that case).
         // Extra pre-checkpoint entries never move the frontier: they sit below the checkpoint,
         // which certifies its whole prefix and jumps the contiguous frontier over them regardless.
-        // We scan once to derive three quantities used below.
+        // We scan once to derive the quantities used below.
         long maxLogId = 0;              // highest durable id (any type) — the propose cursor floor
-        long lastResolvedCommitted = 0; // id of the last Committed/CommittedCheckpoint seen (legacy path)
-        long contiguousCommitted = 0;   // highest id of an unbroken committed prefix (fast path)
+        long contiguousCommitted = 0;   // highest id of an unbroken committed prefix
         long contiguousPresent = 0;     // highest id of an unbroken present prefix (any type)
         long contiguousPresentTerm = 0; // term of the entry at contiguousPresent
         bool any = false;
@@ -441,7 +441,6 @@ public sealed class RaftWriteAhead
         if (restoreSoftFloorIndex > 0)
         {
             maxLogId = restoreSoftFloorIndex;
-            lastResolvedCommitted = restoreSoftFloorIndex;
             contiguousCommitted = restoreSoftFloorIndex;
             contiguousPresent = restoreSoftFloorIndex;
             contiguousPresentTerm = restoreSoftFloorTerm;
@@ -478,7 +477,6 @@ public sealed class RaftWriteAhead
             switch (log.Type)
             {
                 case RaftLogType.CommittedCheckpoint:
-                    lastResolvedCommitted = log.Id;
                     // A checkpoint certifies the whole prefix ≤ its id is committed (it is the durable
                     // recovery anchor), so it may jump the contiguous frontier — again only when the
                     // persisted floor attests its prefix was present; an over-gap row extends the
@@ -490,9 +488,8 @@ public sealed class RaftWriteAhead
                     break;
 
                 case RaftLogType.Committed:
-                    lastResolvedCommitted = log.Id;
                     // Extend the contiguous prefix only across an unbroken run; a gap — a Proposed entry
-                    // whose lazy commit marker was lost on the fast path, or any missing id — stops it.
+                    // whose commit marker was lost in a crash, or any missing id — stops it.
                     if (log.Id == contiguousCommitted + 1)
                         contiguousCommitted = log.Id;
                     break;
@@ -508,30 +505,30 @@ public sealed class RaftWriteAhead
             }
         }
 
-        if (manager.Configuration.WalSingleFsyncCommit)
-        {
-            // Single-fsync fast path: the per-entry Committed marker is written lazily, so a crash can
-            // leave a durable Proposed prefix whose markers were lost. The on-disk types are no longer a
-            // reliable committed/uncommitted boundary, so reconstruct conservatively:
-            //   commitIndex  = highest CONTIGUOUS committed prefix + 1 (the safe lower bound). Entries
-            //                  above the first gap are NOT treated as committed here; the true frontier
-            //                  above this is re-supplied by the leader on reconnect (follower) or by
-            //                  re-commit once a current-term entry commits on election (leader).
-            //   proposeIndex = maxLogId + 1, so the durable Proposed tail is PRESERVED — a later propose
-            //                  never reuses its ids, which would overwrite an acked-but-lazily-committed
-            //                  entry (data loss). Recovery never treats that tail as committed, so an
-            //                  unacknowledged-but-not-durable write is never promoted.
-            commitIndex = contiguousCommitted + 1;
-            proposeIndex = maxLogId + 1;
-        }
-        else
-        {
-            // Legacy path (commit markers always durable ⇒ the committed prefix is contiguous and
-            // complete). Byte-for-byte the prior behaviour: the frontier is the last committed id, and a
-            // proposed-but-uncommitted tail is discarded (a later propose reuses its ids).
-            commitIndex = any ? lastResolvedCommitted + 1 : await GetMaxLog().ConfigureAwait(false) + 1;
-            proposeIndex = any ? lastResolvedCommitted + 1 : commitIndex;
-        }
+        // The on-disk entry types are not a reliable committed/uncommitted boundary after a crash,
+        // in EITHER commit mode — so the reconstruction below is deliberately identical for
+        // WalSingleFsyncCommit on and off. On the single-fsync fast path the per-entry Committed
+        // marker is written lazily, so a crash can leave a durable Proposed prefix whose markers
+        // were lost. On the two-fsync path the LEADER's marker is durable before the client ack,
+        // but a FOLLOWER learns commits through the asynchronous commit broadcast: a kill between
+        // the entry write and the marker write leaves acknowledged entries Proposed on its disk,
+        // and out-of-order broadcast delivery can persist markers with unresolved holes below
+        // them. An earlier two-fsync branch here anchored the frontier at the LAST durable marker
+        // and discarded the Proposed tail; on a follower with a marker hole that certified
+        // entries as committed which restore never applied and nothing ever re-supplied — a
+        // silent, permanent applied-state hole that surfaced as lost acknowledged writes when
+        // the node was later elected (the fsync-gate kill soak's broken bank invariant).
+        // Reconstruct conservatively:
+        //   commitIndex  = highest CONTIGUOUS committed prefix + 1 (the safe lower bound). Entries
+        //                  above the first gap are NOT treated as committed here; the true frontier
+        //                  above this is re-supplied by the leader on reconnect (follower) or by
+        //                  re-commit once a current-term entry commits on election (leader).
+        //   proposeIndex = maxLogId + 1, so the durable Proposed tail is PRESERVED — a later propose
+        //                  never reuses its ids, which would overwrite an acked-but-unmarked
+        //                  entry (data loss). Recovery never treats that tail as committed, so an
+        //                  unacknowledged-but-not-durable write is never promoted.
+        commitIndex = contiguousCommitted + 1;
+        proposeIndex = maxLogId + 1;
 
         // Presence frontier: the last id of the unbroken durable prefix (any type), independent of
         // the commit-marker reconstruction above. With no entries, mirror the commit frontier (a
@@ -1263,9 +1260,10 @@ public sealed class RaftWriteAhead
     {
         if (id < presentIndex)
         {
-            // The legacy (two-fsync) recovery path discards the proposed tail and lets a later
-            // propose reuse its ids. An overwrite of the frontier entry itself must refresh the
-            // advertised term so the (term, index) freshness pair keeps describing the real entry.
+            // An already-present id can be re-written — a divergent tail entry replaced after a
+            // term change, or an anchored repair re-shipping the frontier entry. An overwrite of
+            // the frontier entry itself must refresh the advertised term so the (term, index)
+            // freshness pair keeps describing the real entry.
             if (id == presentIndex - 1)
                 presentTerm = term;
             return;
