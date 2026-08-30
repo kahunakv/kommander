@@ -374,4 +374,12 @@ public static partial class RaftLoggerExtensions
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "Removed {Count} from WAL for partition {PartitionId}")]
     public static partial void LogDebugRemovedFromWal(this ILogger<IRaft> logger, int count, int partitionId);
+
+    // ── Safety option audit ───────────────────────────────────────────────
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[Kommander] {Kind} fence not enabled: {Option}={Current} (protected value: {Safe}). {Hazard}")]
+    public static partial void LogInfoSafetyFenceNotEnabled(this ILogger<IRaft> logger, string kind, string option, string current, string safe, string hazard);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[Kommander] {Kind} fence disabled by configuration: {Option}={Current} (protected value: {Safe}). {Hazard}")]
+    public static partial void LogWarnSafetyFenceDisabled(this ILogger<IRaft> logger, string kind, string option, string current, string safe, string hazard);
 }

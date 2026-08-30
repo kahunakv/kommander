@@ -376,14 +376,14 @@ public sealed class TestFairWalScheduler
     }
 
     /// <summary>
-    /// The linger is <b>adaptive</b>: causally-sequential writes — each enqueued only
-    /// after the previous one is durable — must NOT be merged and must not stall. Each
-    /// isolated write gets its own fsync because the worker bails out of the linger the
-    /// instant a probe finds nothing newly ready, so a low-overlap workload pays at most
-    /// one short probe, never the full window. A naive fixed-window implementation that
-    /// always waited would still produce one batch per write here (nothing else is in
-    /// flight), but it would inflate each write's latency by the window; this test pins
-    /// the batch-per-write structure that proves no unwanted merging.
+    /// The linger is <b>evidence-gated</b>: causally-sequential writes — each enqueued only
+    /// after the previous one is durable — must NOT be merged and must not stall. When the
+    /// worker takes such a write, no partition outside its group has queued work (the next
+    /// op arrives only after this flush completes), so the gate must refuse a timed wait and
+    /// the worker must fsync immediately. This pins both the batch-per-write structure (no
+    /// unwanted merging) and, via <see cref="FairWalScheduler.TotalLingerWaits"/>, that a
+    /// low-overlap workload pays zero wait — not even the single fixed 1 ms probe the
+    /// pre-gate implementation charged every flush.
     /// </summary>
     [Fact]
     public async Task Linger_DoesNotMergeCausallySequentialWrites()
@@ -409,6 +409,89 @@ public sealed class TestFairWalScheduler
 
         Assert.Equal(writes, scheduler.TotalBatchesWritten);
         Assert.Equal(writes, scheduler.TotalPartitionsBatched);
+        Assert.Equal(0, scheduler.TotalLingerWaits);
+    }
+
+    /// <summary>
+    /// Regression pin for the 3-partition closed-loop throughput collapse (−44% measured in
+    /// CamusDB): with a small partition count the group batch can never fill, and under
+    /// closed-loop load the next operation arrives only after the current flush completes —
+    /// so the pre-gate implementation's fixed 1 ms empty probe blocked every single flush
+    /// for ~1–2 ms (kernel timed-wait granularity) and returned nothing. Rotating one durable
+    /// op at a time through 3 partitions, nothing is ever queued outside the flushing
+    /// partition, so the evidence gate must never admit a timed wait. The window is set large
+    /// so any regression to unconditional waiting also fails loudly (the run would stall
+    /// 200 ms per write), but the load-bearing assertion is the wait counter at zero — this
+    /// behaviour is invisible at the default 64-partition batch cap and only bites small
+    /// partition counts, which is exactly where the field regression was found.
+    /// </summary>
+    [Fact]
+    public async Task Linger_ClosedLoopSmallPartitionCount_NeverWaits()
+    {
+        const int writes = 60;
+        const int partitions = 3;
+        RecordingWal wal = new();
+
+        using FairWalScheduler scheduler = new(
+            wal,
+            NullLogger<IRaft>.Instance,
+            workerCount: 2,
+            groupCommitLingerMs: 200);
+        scheduler.Start();
+
+        for (long i = 1; i <= writes; i++)
+        {
+            TaskCompletionSource tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            scheduler.Enqueue(MakeOp((int)(i % partitions) + 1, i, Logs(i), _ => tcs.SetResult()));
+            await tcs.Task; // closed loop: the next op exists only once this one is durable.
+        }
+
+        Assert.Equal(writes, scheduler.TotalBatchesWritten);
+        Assert.Equal(0, scheduler.TotalLingerWaits);
+    }
+
+    /// <summary>
+    /// Positive path of the evidence gate: partition 2 has an op queued BEHIND an in-flight
+    /// write (held open by the WAL fake), so the worker flushing partition 1 sees concrete
+    /// evidence of an imminent arrival and must enter a timed wait rather than fsync alone.
+    /// The wait entry is deterministic (partition 2's second op is enqueued before partition
+    /// 1's op, so the gate cannot miss it); which free worker then grabs the re-scheduled
+    /// partition 2 is racy, so coalescing itself is not asserted — full completion and at
+    /// least one gated wait are.
+    /// </summary>
+    [Fact]
+    public async Task Linger_WaitsWhenAnotherPartitionHasQueuedWork()
+    {
+        CoordinatedWal wal = new();
+        CountdownEvent done = new(3);
+
+        using FairWalScheduler scheduler = new(
+            wal,
+            NullLogger<IRaft>.Instance,
+            workerCount: 2,
+            groupCommitLingerMs: 300);
+        scheduler.Start();
+
+        // Partition 2, op 1 → a worker takes it and blocks inside the first Write.
+        scheduler.Enqueue(MakeOp(2, 21, Logs(1), _ => done.Signal()));
+        wal.WaitForFirstWrite();
+
+        // Partition 2, op 2 queues behind the in-flight write (InFlight → not re-scheduled).
+        scheduler.Enqueue(MakeOp(2, 22, Logs(2), _ => done.Signal()));
+
+        // Partition 1 → the free worker takes it; its sweep finds nothing ready, but the
+        // gate sees partition 2's queued op and must wait instead of flushing alone.
+        scheduler.Enqueue(MakeOp(1, 11, Logs(1), _ => done.Signal()));
+
+        // Let the free worker reach its timed wait, then allow partition 2's write to finish,
+        // which re-schedules partition 2 and produces the arrival the wait was gated on.
+        await Task.Delay(50, TestContext.Current.CancellationToken);
+        wal.Release();
+
+        bool finished = await Task.Run(() => done.Wait(TimeSpan.FromSeconds(10)));
+        Assert.True(finished, "Linger gather test timed out.");
+        Assert.True(scheduler.TotalLingerWaits >= 1,
+            $"Expected the evidence gate to admit at least one timed wait; got {scheduler.TotalLingerWaits}.");
     }
 
     /// <summary>

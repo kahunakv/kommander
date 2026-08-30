@@ -454,6 +454,11 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
 
         configuration.Validate();
 
+        // Say out loud which fences this node is running without. A fence that an option can
+        // disable will eventually run disabled somewhere; the only thing that makes that
+        // recoverable is that the node said so at startup rather than at the incident.
+        LogSafetyOptionDeviations(configuration, logger);
+
         LocalEndpoint = string.Concat(configuration.Host, ":", configuration.Port);
         LocalNodeName = string.IsNullOrEmpty(this.configuration.NodeName) ? Environment.MachineName : this.configuration.NodeName;
         LocalNodeId = this.configuration.NodeId > 0 ? this.configuration.NodeId : HashUtils.SmallSimpleHash(LocalNodeName);
@@ -2130,5 +2135,41 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
 
         if (discovery is IDisposable disposableDiscovery)
             disposableDiscovery.Dispose();
+    }
+
+    /// <summary>
+    /// Logs each safety or liveness fence the configuration leaves off (see
+    /// <see cref="RaftSafetyOptionAudit"/>). A deviation someone chose is a warning; one that comes
+    /// with the shipped defaults is informational, because warning on every default startup trains
+    /// operators to ignore the message.
+    /// </summary>
+    private static void LogSafetyOptionDeviations(RaftConfiguration configuration, ILogger<IRaft> logger)
+    {
+        bool warnEnabled = logger.IsEnabled(LogLevel.Warning);
+        bool infoEnabled = logger.IsEnabled(LogLevel.Information);
+
+        if (!warnEnabled && !infoEnabled)
+            return;
+
+        foreach (RaftSafetyOptionDeviation deviation in configuration.GetSafetyOptionDeviations())
+        {
+            // Hoisted so the log call takes plain locals: the shipped-default branch runs on every
+            // startup, and it must cost nothing when the level is off.
+            string kind = deviation.Kind.ToString();
+            string option = deviation.Option;
+            string current = deviation.CurrentValue;
+            string safe = deviation.SafeValue;
+            string hazard = deviation.Hazard;
+
+            if (deviation.IsShippedDefault)
+            {
+                if (infoEnabled)
+                    logger.LogInfoSafetyFenceNotEnabled(kind, option, current, safe, hazard);
+            }
+            else if (warnEnabled)
+            {
+                logger.LogWarnSafetyFenceDisabled(kind, option, current, safe, hazard);
+            }
+        }
     }
 }

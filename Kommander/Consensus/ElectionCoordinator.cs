@@ -144,9 +144,9 @@ internal sealed class ElectionCoordinator
     }
 
     /// <summary>
-    /// Raft §5.4.1 log freshness; see <see cref="ElectionFreshness"/> for the rule and for why it
-    /// lives in its own type. Kept as a local forwarder so the two call sites below read the same
-    /// as before.
+    /// Raft §5.4.1 log freshness; see <see cref="ElectionFreshness"/> for the rule, for the
+    /// symmetric missing-term fallback, and for why it lives in its own type. Kept as a local
+    /// forwarder so the two call sites below read the same as before.
     /// </summary>
     private static bool CandidateLogIsBehind(long remoteLastLogTerm, long remoteMaxLogId, long localLastLogTerm, long localMaxId) =>
         ElectionFreshness.CandidateLogIsBehind(remoteLastLogTerm, remoteMaxLogId, localLastLogTerm, localMaxId);
@@ -171,6 +171,87 @@ internal sealed class ElectionCoordinator
             await wal.GetMaxLogAsync().ConfigureAwait(false),
             await wal.GetCurrentTermAsync().ConfigureAwait(false)
         );
+    }
+
+    /// <summary>
+    /// Records the §5.4.1 log position a peer advertised on a vote-path message. Called for every
+    /// RequestVotes probe and every grant received, so the map stays current even while this node
+    /// denies the peer (a denial teaches the denier nothing otherwise).
+    /// </summary>
+    private void RecordPeerFreshness(string endpoint, long position)
+    {
+        if (position < 0)
+            return;
+
+        peerFreshness[endpoint] = (position, host.GetMonotonicTimestamp());
+    }
+
+    /// <summary>
+    /// True when some committed voter is (a) known — from a recent vote-path advertisement — to
+    /// hold a log position strictly above <paramref name="localPosition"/>, and (b) currently
+    /// Alive per the failure detector. Used by the candidacy deference and by the promotion-gate
+    /// escalations: while such a voter exists, refusing/yielding lets it win the term and repair
+    /// this node by backfill, so destructive self-repair (tail truncation, gap-skipping drains)
+    /// must wait. Both the TTL and the liveness gate exist so a departed or dead peer's stale
+    /// advertisement can never hold liveness hostage.
+    /// </summary>
+    public bool KnowsFresherAliveVoter(long localPosition)
+    {
+        if (localPosition < 0 || peerFreshness.Count == 0)
+            return false;
+
+        long nowTicks = host.GetMonotonicTimestamp();
+
+        foreach (RaftNode node in host.Nodes)
+        {
+            if (!host.IsVoter(node.Endpoint))
+                continue;
+
+            if (!peerFreshness.TryGetValue(node.Endpoint, out (long Position, long ObservedTicks) seen))
+                continue;
+
+            if (seen.Position <= localPosition)
+                continue;
+
+            if (RaftMonotonic.Elapsed(seen.ObservedTicks, nowTicks) > PeerFreshnessTtl)
+                continue;
+
+            if (host.GetNodeLiveness(node.Endpoint) == MemberLivenessState.Alive)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// The candidacy-deference gate: a node holding entries above an unfilled WAL gap knows it is
+    /// missing a range some peer may hold; if a fresher live voter is known, campaigning is worse
+    /// than waiting — this node would either lose, or win and refuse at the promotion gates, and
+    /// each such refused term appends a new-term barrier no-op that RAISES this node's advertised
+    /// last-log term above the complete peer's, locking it out of §5.4.1 forever (the Jepsen
+    /// majority-hole wedge: four gapped voters out-elected the one complete node for the rest of
+    /// the run). Yielding a bounded number of rounds quiets the election churn — and the
+    /// vote-grant cooldowns it keeps refreshing — so the complete peer's own pre-vote can reach
+    /// quorum. Bounded so a fresher peer that never campaigns cannot suppress this node forever.
+    /// </summary>
+    private bool ShouldDeferCandidacy()
+    {
+        if (!wal.HasPresenceGap() || !KnowsFresherAliveVoter(wal.GetPresentIndex()))
+        {
+            candidacyDeferrals = 0;
+            return false;
+        }
+
+        if (candidacyDeferrals >= MaxCandidacyDeferrals)
+            return false;
+
+        candidacyDeferrals++;
+
+        if (logger.IsEnabled(LogLevel.Information))
+            logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Deferring candidacy ({Attempt}/{MaxAttempts}): this log has a hole (contiguous through {PresentId}) and a fresher live voter is known — yielding the term so it can win and backfill.",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, candidacyDeferrals, MaxCandidacyDeferrals, wal.GetPresentIndex());
+
+        return true;
     }
 
     public async Task StartElectionAsync(HLCTimestamp currentTime, bool ignoreRecentVoteCooldown)
@@ -227,6 +308,12 @@ internal sealed class ElectionCoordinator
                     return;
                 }
             }
+
+            // A gapped log with a fresher live voter known: yield the round (bounded) instead of
+            // winning a term this node would refuse at the promotion gates. Skipped when a
+            // pre-vote quorum promoted us here (peers already judged us electable).
+            if (ShouldDeferCandidacy())
+                return;
         }
 
         // No global "am I outdated?" pre-election veto here (removed): candidate eligibility is decided
@@ -327,6 +414,12 @@ internal sealed class ElectionCoordinator
             }
         }
 
+        // A gapped log with a fresher live voter known: yield the round (bounded) instead of
+        // probing for a term this node would refuse at the promotion gates. Unlike the removed
+        // global veto this is TTL- and liveness-gated and bounded, so it cannot suppress forever.
+        if (ShouldDeferCandidacy())
+            return;
+
         // No global "am I outdated?" pre-election veto here (removed): a pre-vote is side-effect-free by
         // design, so a genuinely-behind node can safely probe — its peers deny the pre-vote via the
         // per-voter log check in VoteAsync and it never reaches quorum. The old veto instead consulted
@@ -404,7 +497,8 @@ internal sealed class ElectionCoordinator
     /// <param name="remoteLastLogTerm">
     /// The candidate's last log term, compared lexicographically before <paramref name="remoteMaxLogId"/>
     /// (Raft §5.4.1). <c>0</c> from a peer predating this field or an empty candidate log; the freshness
-    /// check falls back to index-only comparison in that case (see <see cref="CandidateLogIsBehind"/>).
+    /// check falls back to index-only comparison when EITHER side lacks a usable term — the local side
+    /// included (see <see cref="CandidateLogIsBehind"/>).
     /// </param>
     /// <param name="timestamp"></param>
     /// <param name="preVote">When true, evaluate as a pure pre-vote probe and never persist state.</param>
@@ -413,6 +507,12 @@ internal sealed class ElectionCoordinator
     /// index-only comparison; the transport dispatch path always supplies the real value.</remarks>
     public async Task VoteAsync(RaftNode node, long voteTerm, long remoteMaxLogId, HLCTimestamp timestamp, bool preVote = false, long remoteLastLogTerm = 0)
     {
+        // Every vote-path message advertises the sender's §5.4.1 position — record it even when
+        // the request is denied below, so the deference/escalation evidence stays current. (A
+        // denial otherwise teaches this node nothing, and the majority-hole wedge is exactly the
+        // state where the fresher peer's probes keep being denied.)
+        RecordPeerFreshness(node.Endpoint, remoteMaxLogId);
+
         if (preVote)
         {
             // Side-effect-free pre-vote (Raft §9.6). NOTHING below this branch's `return`
@@ -664,6 +764,11 @@ internal sealed class ElectionCoordinator
             return;
         }
 
+        // A grant advertises the granter's §5.4.1 position — record it BEFORE any of the guards
+        // below can discard the message (in particular the fresher-granter guard: a voter whose
+        // position exceeds ours is exactly the evidence the deference/escalation logic needs).
+        RecordPeerFreshness(endpoint, remoteMaxLogId);
+
         if (preVote)
         {
             // Tally a pre-grant. Placed before the Follower early-return because a node running a
@@ -767,7 +872,27 @@ internal sealed class ElectionCoordinator
 
         if (numberVotes < quorum)
             return;
-        
+
+        // A quorum built from stale dispatches must not promote: under executor backlog the vote
+        // that completes quorum can be processed many seconds after the election started (a
+        // 10,001 ms ReceiveVote dispatch was observed in the Jepsen nightlies), and by then the
+        // cluster has moved — the promotion drain targets a frontier the stale round never saw,
+        // spins for its whole bound inside the dispatch, and is recorded as a drain failure when
+        // the log is actually fine. Abandon the round instead: hand the term back cheaply and let
+        // the election timer start a fresh one. This is a staleness check, not a log-integrity
+        // check, so it deliberately does not touch the promotion-gate refusal counters.
+        if (coreState.VotingStartedTicks != 0
+            && RaftMonotonic.Elapsed(coreState.VotingStartedTicks, host.GetMonotonicTimestamp()) > coreState.ElectionTimeout * 2)
+        {
+            logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Quorum for Term={Term} completed {ElapsedMs}ms after the election started — abandoning the stale promotion; the election timer will start a fresh round.",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, voteTerm,
+                RaftMonotonic.Elapsed(coreState.VotingStartedTicks, host.GetMonotonicTimestamp()).TotalMilliseconds);
+
+            coreState.NodeState = RaftNodeState.Follower;
+            coreState.LocalCommittedIndex = -1;
+            return;
+        }
+
         // Here quorum was achieved and we can mark ourselves as leader in the partition.
         // Seed per-follower replication progress. nextIndex is optimistic (leaderMaxLog + 1);
         // it will be corrected by LogMismatch replies if any peer is behind.
@@ -829,6 +954,32 @@ internal sealed class ElectionCoordinator
     private long preVoteTerm = -1;
 
     private readonly Dictionary<long, string> expectedLeaders = [];
+
+    /// <summary>
+    /// Last §5.4.1 log position each peer advertised on the vote paths (its RequestVotes probes
+    /// and its grants), with the monotonic tick it was observed at. This is the evidence base for
+    /// <see cref="KnowsFresherAliveVoter"/>: a node whose own log has a hole must not campaign —
+    /// or escalate a promotion refusal into a tail truncation — while a live voter is known to
+    /// hold a fresher contiguous log, because that voter can win the term (and then backfill the
+    /// hole) with nothing lost. Kept separate from the replication tracker's
+    /// <c>startCommitIndexes</c>, whose entries carry different semantics and drive backfill
+    /// decisions. Entries are never trusted beyond <see cref="PeerFreshnessTtl"/> and never
+    /// without a live SWIM state, so a departed peer's stale advertisement cannot suppress
+    /// elections forever (the failure mode of the removed pre-election veto).
+    /// </summary>
+    private readonly Dictionary<string, (long Position, long ObservedTicks)> peerFreshness = [];
+
+    private static readonly TimeSpan PeerFreshnessTtl = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Consecutive election-timer rounds this node has yielded because its own log has a hole and
+    /// a fresher live voter is known (see <see cref="StartPreVoteAsync"/>). Bounded by
+    /// <see cref="MaxCandidacyDeferrals"/> so a fresher peer that never campaigns cannot suppress
+    /// this node's candidacy forever; reset whenever the deference condition stops holding.
+    /// </summary>
+    private int candidacyDeferrals;
+
+    private const int MaxCandidacyDeferrals = 10;
 
     private readonly Random random;
 }

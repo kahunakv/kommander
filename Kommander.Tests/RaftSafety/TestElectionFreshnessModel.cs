@@ -28,7 +28,8 @@ namespace Kommander.Tests.RaftSafety;
 ///   <item>Transitive over real terms, so a three-way election has a stable ranking.</item>
 ///   <item>Safe: a strictly fresher candidate is never judged behind.</item>
 ///   <item>Faithful to the §5.4.1 ranking: term dominates index.</item>
-///   <item>The legacy zero-term path compares indices only, on that side alone.</item>
+///   <item>The missing-term path compares indices only, and does so symmetrically: a term at or
+///         below zero on EITHER side takes it.</item>
 /// </list>
 /// </summary>
 public sealed class TestElectionFreshnessModel
@@ -127,8 +128,8 @@ public sealed class TestElectionFreshnessModel
         {
             foreach ((long Term, long Index) local in Positions())
             {
-                if (remote.Term <= 0)
-                    continue; // the legacy path has its own test below
+                if (remote.Term <= 0 || local.Term <= 0)
+                    continue; // either side missing a term takes the legacy path, tested below
 
                 if (remote.Term == local.Term)
                     continue;
@@ -168,6 +169,24 @@ public sealed class TestElectionFreshnessModel
     }
 
     [Fact]
+    public void AZeroLocalTermAlsoFallsBackToIndexOnly()
+    {
+        // The fallback is symmetric. A voter whose own last-log term is unreadable — the presence
+        // frontier landing on a compacted checkpoint boundary reads -1, which restore clamps to 0 —
+        // holds a high index with no term. Comparing terms there once made it grant its vote to a
+        // candidate missing an arbitrary committed range, with the index never examined.
+        for (long localIndex = MinIndex; localIndex <= MaxIndex; localIndex++)
+        {
+            foreach ((long Term, long Index) remote in Positions())
+            {
+                Assert.Equal(
+                    remote.Index < localIndex,
+                    IsBehind(remote, (0, localIndex)));
+            }
+        }
+    }
+
+    [Fact]
     public void ANegativeRemoteTermTakesTheSameLegacyPath()
     {
         // GetFreshnessLogPositionAsync can return a negative term from a stub facade; the rule must
@@ -181,8 +200,8 @@ public sealed class TestElectionFreshnessModel
     }
 
     /// <summary>
-    /// The subset of the space with a real term. The zero and negative terms take the legacy
-    /// index-only path, which is deliberately not a strict order against a real-term peer — two
+    /// The subset of the space with a real term on both sides. A term at or below zero takes the
+    /// index-only fallback, which is deliberately not a strict order against a real-term peer — two
     /// such nodes may each grant the other a vote, and Raft's term restriction, not this
     /// comparison, is what keeps that safe.
     /// </summary>

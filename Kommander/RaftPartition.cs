@@ -534,11 +534,14 @@ public sealed class RaftPartition : IDisposable
     /// <returns>A tuple containing a boolean indicating success, the status of the operation as <see cref="RaftOperationStatus"/>, and the commit index of the logs.</returns>
     public async Task<(bool success, RaftOperationStatus status, long commitIndex)> CommitLogs(HLCTimestamp ticketId, CancellationToken cancellationToken = default)
     {
+        // Post-propose refusal (the ticket's entries are appended already): a leadership change
+        // here leaves their outcome open — the next leader's §5.4.2 inherited commit can still
+        // commit them — so the answer is indeterminate, never the definite NodeIsNotLeader.
         if (string.IsNullOrEmpty(Leader))
-            return (false, RaftOperationStatus.NodeIsNotLeader, 0);
+            return (false, RaftOperationStatus.ProposalOutcomeUnknown, 0);
 
         if (Leader != manager.LocalEndpoint)
-            return (false, RaftOperationStatus.NodeIsNotLeader, 0);
+            return (false, RaftOperationStatus.ProposalOutcomeUnknown, 0);
 
         try
         {
@@ -570,11 +573,12 @@ public sealed class RaftPartition : IDisposable
     /// <returns>A tuple indicating the success of the operation, the operation status, and the commit index.</returns>
     public async Task<(bool success, RaftOperationStatus status, long commitIndex)> RollbackLogs(HLCTimestamp ticketId, CancellationToken cancellationToken = default)
     {
+        // Same post-propose contract as CommitLogs: a refused abort is indeterminate.
         if (string.IsNullOrEmpty(Leader))
-            return (false, RaftOperationStatus.NodeIsNotLeader, 0);
+            return (false, RaftOperationStatus.ProposalOutcomeUnknown, 0);
 
         if (Leader != manager.LocalEndpoint)
-            return (false, RaftOperationStatus.NodeIsNotLeader, 0);
+            return (false, RaftOperationStatus.ProposalOutcomeUnknown, 0);
 
         try
         {

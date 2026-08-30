@@ -151,7 +151,7 @@ propose and the replicated commit). `RaftWriteAhead` enqueues the propose and co
 ```
 
 The worker blocks for the first ready partition, then sweeps up the rest (opportunistically, or — with
-`WalGroupCommitLingerMs > 0` — after a brief adaptive linger to gather more), and issues a single write
+`WalGroupCommitLingerMs > 0` — after a brief evidence-gated linger to gather more), and issues a single write
 spanning all of them. `MaxWalGroupBatchPartitions` caps the partitions per batch; `MaxWalBatchSize` caps
 the operations drained per partition. More concurrency ⇒ denser batches ⇒ fewer syncs per write.
 
@@ -265,7 +265,7 @@ In `RaftConfiguration.cs`:
 | Setting | Default | What it does |
 |---|---|---|
 | `WalSingleFsyncCommit` | `true` | The latency lever. Acks `autoCommit` writes on propose-quorum-durable and writes the commit marker lazily, removing one `fsync` from the critical path. Off ⇒ byte-for-byte the prior two-sync behaviour. |
-| `WalGroupCommitLingerMs` | `0` | The throughput/tail lever. `> 0` lets a WAL worker linger up to this many ms to gather more ready partitions into one `fsync`. Adaptive: low-overlap load pays at most one short probe. `0` keeps purely opportunistic batching. |
+| `WalGroupCommitLingerMs` | `0` | The throughput/tail lever. `> 0` lets a WAL worker linger up to this many ms to gather more ready partitions into one `fsync`. Evidence-gated: a worker waits only while another partition has queued work that must become ready soon, so low-overlap and closed-loop load pay **zero** wait. `0` keeps purely opportunistic batching. |
 | `MaxWalGroupBatchPartitions` | `64` | Max partitions coalesced into a single `walAdapter.Write` (one `fsync` on RocksDB). |
 | `MaxWalBatchSize` | `256` | Max operations drained from one partition per write. |
 | `WriteIOThreads` | `4` | WAL scheduler worker threads — how many writes can sync concurrently across partitions. |
@@ -284,8 +284,10 @@ Tuning notes:
     until re-supply lands (Flow 5).
 - **`WalGroupCommitLingerMs`** helps most when writes spread across **many partitions** and arrive
   staggered (the follower append path). Start around `2` ms and measure; the win is denser batches and a
-  tighter tail, not a lower median. A larger value bounds the linger; the adaptive bail keeps idle load
-  from paying it.
+  tighter tail, not a lower median. A larger value bounds the linger; the evidence gate keeps idle,
+  sequential and closed-loop load from paying any of it (a worker waits only while another partition has
+  queued work that must become ready soon — check `TotalLingerWaits` and
+  `TotalLingerPartitionsGathered` to see the gate and its hit rate in action).
 - The two levers are **complementary**: group commit reduces total syncs under load; the fast path
   removes a sync from each write's path. They can be enabled together.
 
@@ -300,9 +302,13 @@ Tuning notes:
 | `TotalBatchesWritten` | Number of `walAdapter.Write` calls — the batching/Write-call count. **Unchanged** by the fast path. |
 | `TotalSyncBatchesWritten` | Number of those calls that actually `fsync`ed — the **true sync count**. Equals `TotalBatchesWritten` with the fast path off; drops toward ~1× per committed write with it on. |
 | `TotalPartitionsBatched` | Sum of partitions across all batches; divided by `TotalBatchesWritten` gives **mean partitions per `fsync`** — the batch density the linger raises. |
+| `TotalLingerWaits` | Timed linger waits entered (the evidence gate admitted a wait). Must stay `0` under closed-loop / sequential load. |
+| `TotalLingerPartitionsGathered` | Partitions added to a batch by a linger wait; divided by `TotalLingerWaits` gives the linger's **hit rate**. |
 
 To verify the fast path is doing its job, compare `TotalSyncBatchesWritten ÷ committed-writes` with the
-flag off (~2) and on (~1). To verify the linger, compare `TotalPartitionsBatched ÷ TotalBatchesWritten`.
+flag off (~2) and on (~1). To verify the linger, compare `TotalPartitionsBatched ÷ TotalBatchesWritten`,
+and check `TotalLingerPartitionsGathered ÷ TotalLingerWaits` — a low hit rate means the gate is admitting
+waits that rarely pay, and the linger is probably not worth its window on that workload.
 
 ---
 

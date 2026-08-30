@@ -25,6 +25,13 @@ namespace Kommander.Consensus;
 /// truncate exists for the same reason: the truncate is irreversible, so a queued-but-unread append
 /// must never look like a hole.</para>
 ///
+/// <para><b>The hole repair never deletes below the advertised commit frontier.</b> The blanket
+/// truncation is licensed by one premise: a row above an unfilled gap cannot have earned quorum
+/// credit here, so this node's advertised frontier stays below the gap. The committed-frontier
+/// fence tests that premise instead of assuming it — a frontier that reaches the anchor means the
+/// node advertises a prefix it does not hold, and the repair falls back to a backfill anchored at
+/// the contiguous presence frontier.</para>
+///
 /// <para><b>Concurrency.</b> Invoked only on the partition executor thread; holds no locks by
 /// design.</para>
 /// </summary>
@@ -186,7 +193,8 @@ internal sealed class FollowerAppendHandler
         //     tail above the gap so the leader heals it in one forward backfill pass instead of
         //     walking nextIndex down one slot at a time. This is safe by construction: a hole at
         //     prevLogIndex proves the committed prefix ends below it, so the truncated tail is
-        //     necessarily uncommitted.
+        //     necessarily uncommitted. The committed-frontier fence checks that construction holds
+        //     before the delete and falls back to a backfill repair when it does not.
         //   * localTermAtPrev >= 0 && localTermAtPrev != prevLogTerm — genuine term divergence: an
         //     entry exists but belongs to a different term. The existing backtrack path is used
         //     unchanged; the leader decrements nextIndex and retries with an earlier anchor.
@@ -249,14 +257,40 @@ internal sealed class FollowerAppendHandler
                         return;
                     }
 
+                    // Committed-frontier fence (defense in depth; the truncate below is irreversible).
+                    // The safety argument for the blanket truncation rests on ONE premise: the rows above
+                    // the gap never earned quorum credit here, so this node's own advertised commit
+                    // frontier stays below prevLogIndex. Two mechanisms hold that premise up — the commit
+                    // frontier only ever advances contiguously (AdvanceCommitFrontier buffers an over-gap
+                    // id instead of jumping it), and the over-gap ack gate withholds the Success ack that
+                    // would let a row above a gap count toward propose quorum. A frontier that reaches
+                    // prevLogIndex means one of them failed: the node advertises a resolved prefix
+                    // covering an id it does not hold, a leader may have counted a row that is about to be
+                    // deleted, and the premise no longer licenses the delete. Refuse, alarm, and report
+                    // the contiguous presence frontier so the leader's anchored backfill repairs the hole
+                    // from BELOW instead — non-destructive, and it converges: once the backfill closes the
+                    // gap the anchor matches and this branch is not reached again.
+                    long advertisedCommitFrontier = wal.GetCommitIndex();
+                    if (advertisedCommitFrontier >= prevLogIndex)
+                    {
+                        long repairAnchor = presentIndexAtAnchor >= 0 ? presentIndexAtAnchor : localMaxLog;
+                        logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Refusing log-hole repair from {Endpoint} at prevLogIndex={PrevLogIndex}: the advertised commit frontier {Frontier} covers the hole, so the truncation could delete a Committed row this node already acked. Reporting LogMismatch anchored at {Anchor} for a backfill repair instead.",
+                            host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, prevLogIndex, advertisedCommitFrontier, repairAnchor);
+                        host.EnqueueResponse(endpoint, new(
+                            RaftResponderRequestType.CompleteAppendLogs,
+                            new(endpoint),
+                            new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, repairAnchor)
+                        ));
+                        return;
+                    }
+
                     // Hole: no entry exists at prevLogIndex even though prevLogIndex <= localMaxLog, so the
                     // follower's log has an internal gap. This proves the follower's truly committed prefix ends
                     // below prevLogIndex: the leader commits contiguously, so no entry above an unfilled gap can
                     // have been quorum-committed — any entry sitting above the gap is an orphan delivered out of
                     // order by the unanchored live-propose broadcast. Truncating that orphaned tail (everything
-                    // after prevLogIndex-1) can therefore never discard committed data, regardless of what the
-                    // in-memory commitIndex reports (it can transiently overshoot the gap when a misordered
-                    // Committed delivery lands above it). Reporting the post-truncation max lets the leader heal
+                    // after prevLogIndex-1) can therefore never discard committed data — the fence above proves
+                    // the advertised frontier agrees. Reporting the post-truncation max lets the leader heal
                     // the gap in one forward backfill pass instead of walking nextIndex down one slot at a time.
                     long newMax = await wal.TruncateLogsAfterAsync(prevLogIndex - 1).ConfigureAwait(false);
                     logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Log-hole repair from {Endpoint}: prevLogIndex={PrevLogIndex} truncated to newMax={NewMax}", host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, prevLogIndex, newMax);

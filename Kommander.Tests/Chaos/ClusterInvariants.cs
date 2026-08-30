@@ -210,7 +210,7 @@ public sealed class CommitMonotonicityInvariant : IClusterInvariant
             string key = InvariantPredicates.NodeKey(v.Endpoint, v.Partition);
             if (current.MaxAppliedByNode.TryGetValue(key, out long maxApplied) && v.CommitIndex < maxApplied)
                 return new ClusterViolation(Name,
-                    $"node {v.Endpoint} p{v.Partition} commit index {v.CommitIndex} dropped below the durable applied prefix {maxApplied}",
+                    $"node {v.Endpoint} p{v.Partition} commit index {v.CommitIndex} dropped below the durable applied prefix {maxApplied} (view: {v})",
                     RequiresConfirmation: true);
         }
         return null;

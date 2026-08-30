@@ -123,6 +123,11 @@ public sealed class RaftPartitionStateMachine
     /// evidence that no reachable voter holds the missing range — refusing further would leave the
     /// partition permanently leaderless (a hole is only ever repaired by a serving leader's
     /// backfill, which requires a leader to exist).
+    /// <para>A count is not a clock: at a 2 s election timeout this budget is spent long before a
+    /// restarting voter is back, and that voter is the likeliest holder of the range. While a voter
+    /// peer is not Alive the escape therefore also waits out
+    /// <see cref="RaftConfiguration.SelfRepairPeerDownGrace"/> — see
+    /// <see cref="SelfRepairGraceHolds"/>.</para>
     /// </summary>
     private const int MaxPresenceGateRefusals = 3;
 
@@ -139,6 +144,46 @@ public sealed class RaftPartitionStateMachine
 
     /// <summary>Max log id recorded at the last completeness-gate refusal (-1 = none).</summary>
     private long lastPresenceRefusalMax = -1;
+
+    /// <summary>
+    /// Extended refusal cap used by both promotion gates while a fresher live voter is known
+    /// (see <see cref="ElectionCoordinator.KnowsFresherAliveVoter"/>): that voter can win the term
+    /// and repair this node by backfill, so destructive self-repair is deferred longer — but not
+    /// forever, because "known and Alive" does not guarantee "will campaign" (its own elections
+    /// can be suppressed), and an unbounded deferral is the same wedge the caps exist to break.
+    /// </summary>
+    private const int MaxDeferredGateRefusals = 12;
+
+    /// <summary>
+    /// Consecutive promotions refused because the committed drain could not reach the commit
+    /// frontier (over the same (<see cref="lastDrainRefusalApplied"/>,
+    /// <see cref="lastDrainRefusalFrontier"/>) shape). The committed-drain guard previously
+    /// refused UNBOUNDED with voter peers present; when a voter majority shared the same WAL hole
+    /// that refusal loop left the partition leaderless for the rest of a Jepsen run (~18k
+    /// refusals, observation 1 of run 32690955741). Mirrors the presence-gate counter: same-shape
+    /// wins are quorum evidence that no reachable voter holds the missing range.
+    /// </summary>
+    private int drainGateRefusals;
+
+    /// <summary>Applied index recorded at the last committed-drain refusal (-1 = none).</summary>
+    private long lastDrainRefusalApplied = -1;
+
+    /// <summary>Commit frontier recorded at the last committed-drain refusal (-1 = none).</summary>
+    private long lastDrainRefusalFrontier = -1;
+
+    /// <summary>
+    /// Monotonic tick of the FIRST refusal in the current same-shape committed-drain streak
+    /// (0 = no streak). The peer-down grace is measured from here, not from the latest refusal, so
+    /// the wait covers a peer restart rather than restarting with every election round. Reset with
+    /// the counter, which is what makes a real repair (a shape change) restart the grace too.
+    /// </summary>
+    private long drainRefusalStreakTicks;
+
+    /// <summary>
+    /// Monotonic tick of the FIRST refusal in the current same-hole completeness-gate streak
+    /// (0 = no streak). See <see cref="drainRefusalStreakTicks"/>.
+    /// </summary>
+    private long presenceRefusalStreakTicks;
 
 
 
@@ -284,7 +329,7 @@ public sealed class RaftPartitionStateMachine
                 tracker.AdvanceProgressFromSnapshotInstall(endpoint, idx);
             });
 
-        sender = new BackfillSender(host, wal, coreState, tracker, backfillTracker, snapshotSender, logger);
+        sender = new BackfillSender(host, wal, coreState, tracker, backfillTracker, snapshotSender, logThrottle, logger);
         proposals = new ProposalRegistry(host, coreState, logger, (node, ticket, logs) => sender.AppendLogToNode(node, ticket, logs));
 
         heartbeats = new HeartbeatDriver(host, wal, coreState, tracker, proposals, sender, logThrottle, logger);
@@ -812,6 +857,62 @@ public sealed class RaftPartitionStateMachine
     }
 
     /// <summary>
+    /// True when at least one voter peer is not <see cref="MemberLivenessState.Alive"/> per the SWIM
+    /// failure detector. Unknown endpoints read as Alive, so this is a positive signal — SWIM
+    /// actually flagged the peer — rather than an absence of information.
+    /// </summary>
+    private bool AnyVoterPeerDown()
+    {
+        IReadOnlyList<RaftNode> nodes = host.Nodes;
+
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            string endpoint = nodes[i].Endpoint;
+            if (!host.IsVoter(endpoint))
+                continue;
+
+            if (host.GetNodeLiveness(endpoint) != MemberLivenessState.Alive)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// The peer-down grace shared by both promotion gates: <see langword="true"/> while their
+    /// destructive self-repair must keep waiting even though the refusal count is spent.
+    ///
+    /// <para>Both gates escape on the argument that N same-shape election wins are quorum evidence
+    /// that no reachable voter holds the missing range. "Reachable" is the load-bearing word: while
+    /// a voter peer is down, the node that holds the range is very likely that peer, and the
+    /// survivors burn the whole refusal budget inside a few election timeouts — far sooner than a
+    /// process restart completes. Both then delete the range and it is gone cluster-wide. So while
+    /// a voter peer is not Alive, the escape additionally waits out
+    /// <see cref="RaftConfiguration.SelfRepairPeerDownGrace"/> measured from the first refusal of
+    /// the current shape.</para>
+    ///
+    /// <para>Bounded on purpose. A peer that never returns must not hold the partition leaderless
+    /// forever — that is the wedge the refusal caps exist to break — so the grace expires and the
+    /// gate self-repairs with the peer still down. Nothing waits while every voter peer is Alive.</para>
+    /// </summary>
+    /// <param name="streakStartedTicks">Monotonic tick of the first refusal in the current streak.</param>
+    /// <param name="waited">How long the current streak has lasted.</param>
+    /// <param name="grace">The configured grace, for the log line.</param>
+    private bool SelfRepairGraceHolds(long streakStartedTicks, out TimeSpan waited, out TimeSpan grace)
+    {
+        grace = host.Configuration.SelfRepairPeerDownGrace;
+        waited = RaftMonotonic.Elapsed(streakStartedTicks, host.GetMonotonicTimestamp());
+
+        if (grace <= TimeSpan.Zero)
+            return false;
+
+        if (!AnyVoterPeerDown())
+            return false;
+
+        return waited < grace;
+    }
+
+    /// <summary>
     /// Promotion helper used by all real election paths. Performs the same internal
     /// bookkeeping as <see cref="BecomeLeader"/> but defers publishing
     /// <see cref="IRaftPartitionHost.Leader"/> until the consumer projection provably
@@ -862,7 +963,14 @@ public sealed class RaftPartitionStateMachine
     /// (<see cref="MaxPresenceGateRefusals"/>) over the same hole, and never for a sole voter.
     /// Past the bound the node truncates the orphaned tail above the contiguous frontier and
     /// serves: an unbounded refusal is itself a wedge, because a hole is only ever repaired by a
-    /// serving leader's backfill and the refusal prevents any leader from existing.</para>
+    /// serving leader's backfill and the refusal prevents any leader from existing. The
+    /// committed-drain refusal ("drain stopped below the frontier") is bounded the same way — an
+    /// unbounded variant left the partition leaderless for a whole Jepsen run when a voter
+    /// majority shared the hole. Both gates stretch their cap (never to infinity) while a fresher
+    /// live voter is known from the vote paths, because that voter can win the term and repair
+    /// this node by backfill with nothing lost. Both also hold their self-repair for
+    /// <see cref="RaftConfiguration.SelfRepairPeerDownGrace"/> while a voter peer is down, so a
+    /// peer restart cannot be mistaken for a peer that does not hold the range.</para>
     ///
     /// <para><b>Latency note:</b> the drain holds the partition executor for the full
     /// duration of the backlog (one <c>ReadScheduler</c> round-trip per 512-entry batch
@@ -880,6 +988,31 @@ public sealed class RaftPartitionStateMachine
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         long nowTicks = host.GetMonotonicTimestamp();
         coreState.NodeState = RaftNodeState.Leader;
+
+        // Reconcile the commit frontier with what this node has provably resolved before anything
+        // reads it. A follower stint can leave the in-memory frontier below ids the node already
+        // DELIVERED (the applied cursor advances only over delivered or resolution-visited rows,
+        // so applied ∧ contiguously-present ⇒ resolved); on a follower the leader's re-ship heals
+        // that transient, but a LEADER is never backfilled — without this reconciliation the
+        // promotion freezes the dip for the whole tenure: the inherited drain sees the range as
+        // already applied and skips it, every new commit buffers above the phantom gap, and the
+        // advertised frontier pins below the applied prefix (the CommitMonotonicity failures of
+        // CI run 33195170707). Capped by contiguous presence so the frontier never certifies an
+        // id this node does not contiguously hold; the sole-voter skip-gaps escapes advance the
+        // applied cursor over genuinely absent ids, and presence stops below those.
+        long presenceCap = wal.GetPresentIndex();
+        long resolvedThroughApplied = presenceCap >= 0
+            ? Math.Min(coreState.LastAppliedIndex, presenceCap)
+            : coreState.LastAppliedIndex;
+        long commitIndexBeforeAbsorb = wal.GetCommitIndex();
+        if (resolvedThroughApplied > commitIndexBeforeAbsorb)
+        {
+            if (logger.IsEnabled(LogLevel.Information))
+                logger.LogInformation("[{LocalEndpoint}/{PartitionId}/{State}] Promotion frontier reconciliation: commit frontier {Frontier} trails the applied-and-present prefix {Resolved} — absorbing the delivered range.",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, commitIndexBeforeAbsorb, resolvedThroughApplied);
+            wal.AbsorbResolvedPrefix(resolvedThroughApplied);
+        }
+
         long commitFrontier = wal.GetCommitIndex();
         coreState.SeedLocalCommittedIndexOnPromotion(commitFrontier);
         coreState.LiveCommitFloor = commitFrontier;
@@ -918,29 +1051,88 @@ public sealed class RaftPartitionStateMachine
             TimeSpan drainBound = hasVoterPeers ? host.Configuration.LeadershipBarrierTimeout : TimeSpan.FromMilliseconds(250);
             long drainDeadlineTicks = Stopwatch.GetTimestamp();
 
+            bool drainCovered = true;
+
             while (!await applier.DrainCommittedAppliesAsync(commitFrontier).ConfigureAwait(false))
             {
                 if (Stopwatch.GetElapsedTime(drainDeadlineTicks) > drainBound)
                 {
-                    // Refuse only when another voter exists that could hold the missing entries —
-                    // reverting lets it win the next term with a complete log. A sole voter has no
-                    // such peer: the departed quorum took the entries with it, refusing forever
-                    // would leave the partition permanently leaderless, and the gap is
-                    // unrecoverable either way. Serve, and say so loudly.
-                    if (hasVoterPeers)
-                        throw new RaftException(
-                            $"Promotion refused: committed drain stopped at {coreState.LastAppliedIndex} below the frontier {commitFrontier}");
-
-                    logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Committed drain stopped at {LastApplied} below the frontier {Frontier} with no voter peers to defer to — proceeding as sole voter; entries in the gap are unrecoverable.",
-                        host.LocalEndpoint, host.PartitionId, coreState.NodeState, coreState.LastAppliedIndex, commitFrontier);
-
-                    // Deliver everything this survivor DOES hold past the gap, so only the
-                    // genuinely absent entries are lost rather than the whole suffix.
-                    await applier.DrainCommittedAppliesAsync(commitFrontier, skipGaps: true).ConfigureAwait(false);
+                    drainCovered = false;
                     break;
                 }
 
                 await Task.Delay(2).ConfigureAwait(false);
+            }
+
+            if (drainCovered)
+            {
+                drainGateRefusals = 0;
+                lastDrainRefusalApplied = -1;
+                lastDrainRefusalFrontier = -1;
+                drainRefusalStreakTicks = 0;
+            }
+            else if (hasVoterPeers)
+            {
+                // Refusing hands the term to a voter that may hold the missing entries — but only
+                // a BOUNDED number of times over the same shape, mirroring the presence gate
+                // below. Unbounded refusal was itself the wedge: when a voter majority shares the
+                // hole (or shares a commit frontier poisoned past it), every winner refuses here
+                // and the partition stays leaderless for the rest of the run, because a hole is
+                // only ever repaired by a serving leader's backfill and the refusal is what
+                // prevents a leader from existing. Each same-shape win is quorum evidence that no
+                // reachable voter holds the missing range; while a fresher live voter IS known,
+                // the cap stretches (it can win the term and repair us losslessly), but never to
+                // infinity — its own candidacy can be suppressed.
+                bool sameShape = coreState.LastAppliedIndex == lastDrainRefusalApplied
+                                 && commitFrontier == lastDrainRefusalFrontier;
+                drainGateRefusals = sameShape ? drainGateRefusals + 1 : 1;
+                // Anchor the grace at the first refusal of this shape. The `== 0` arm covers the
+                // one shape that reads as "same" on its very first refusal (applied and frontier
+                // both at their -1 init), which would otherwise leave the anchor unset.
+                if (!sameShape || drainRefusalStreakTicks == 0)
+                    drainRefusalStreakTicks = host.GetMonotonicTimestamp();
+                lastDrainRefusalApplied = coreState.LastAppliedIndex;
+                lastDrainRefusalFrontier = commitFrontier;
+
+                bool fresherVoterKnown = election.KnowsFresherAliveVoter(wal.GetPresentIndex());
+                int refusalCap = fresherVoterKnown ? MaxDeferredGateRefusals : MaxPresenceGateRefusals;
+
+                // The count alone reads an unreachable voter as an absent one. While a voter peer
+                // is down, hold the gap-skipping drain for the peer-down grace as well: that peer
+                // is the likeliest holder of the missing range, and it cannot deny a vote or
+                // backfill this node while it is restarting.
+                bool drainGraceHolds = SelfRepairGraceHolds(drainRefusalStreakTicks, out TimeSpan drainWaited, out TimeSpan drainGrace);
+
+                if (drainGateRefusals <= refusalCap || drainGraceHolds)
+                    throw new RaftException(
+                        $"Promotion refused ({drainGateRefusals}/{refusalCap}): committed drain stopped at {coreState.LastAppliedIndex} below the frontier {commitFrontier}"
+                        + (fresherVoterKnown ? " — a fresher live voter is known; deferring self-repair so it can win the term" : "")
+                        + (drainGraceHolds ? $" — a voter peer is down; deferring self-repair for the peer-down grace ({drainWaited.TotalSeconds:F1}s of {drainGrace.TotalSeconds:F1}s)" : ""));
+
+                logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Committed drain stopped at {LastApplied} below the frontier {Frontier} after {Refusals} consecutive refused promotions over {Waited} with no fresher voter winning — proceeding; entries in the gap are unreachable for every replica.",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, coreState.LastAppliedIndex, commitFrontier, drainGateRefusals - 1, drainWaited);
+
+                // Deliver everything this node DOES hold past the gap, so only the genuinely
+                // absent entries are lost rather than the whole suffix — the same trade the
+                // sole-voter escape below makes.
+                await applier.DrainCommittedAppliesAsync(commitFrontier, skipGaps: true).ConfigureAwait(false);
+
+                drainGateRefusals = 0;
+                lastDrainRefusalApplied = -1;
+                lastDrainRefusalFrontier = -1;
+                drainRefusalStreakTicks = 0;
+            }
+            else
+            {
+                // A sole voter has no peer to defer to: the departed quorum took the entries with
+                // it, refusing forever would leave the partition permanently leaderless, and the
+                // gap is unrecoverable either way. Serve, and say so loudly.
+                logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Committed drain stopped at {LastApplied} below the frontier {Frontier} with no voter peers to defer to — proceeding as sole voter; entries in the gap are unrecoverable.",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, coreState.LastAppliedIndex, commitFrontier);
+
+                // Deliver everything this survivor DOES hold past the gap, so only the
+                // genuinely absent entries are lost rather than the whole suffix.
+                await applier.DrainCommittedAppliesAsync(commitFrontier, skipGaps: true).ConfigureAwait(false);
             }
 
             maxLog = await wal.GetMaxLogAsync().ConfigureAwait(false);
@@ -984,13 +1176,30 @@ public sealed class RaftPartitionStateMachine
         {
             bool sameHole = presentId == lastPresenceRefusalPresent && maxLog == lastPresenceRefusalMax;
             presenceGateRefusals = sameHole ? presenceGateRefusals + 1 : 1;
+            if (!sameHole || presenceRefusalStreakTicks == 0)
+                presenceRefusalStreakTicks = host.GetMonotonicTimestamp();
             lastPresenceRefusalPresent = presentId;
             lastPresenceRefusalMax = maxLog;
 
-            if (hasVoterPeers && presenceGateRefusals <= MaxPresenceGateRefusals)
+            // While a fresher live voter is known, stretch the refusal cap: that voter can win the
+            // term and repair this node's hole by backfill with nothing lost, so the destructive
+            // tail truncation below is deferred longer. Never unbounded — see MaxDeferredGateRefusals.
+            bool fresherAliveVoterKnown = election.KnowsFresherAliveVoter(presentId);
+            int presenceRefusalCap = fresherAliveVoterKnown ? MaxDeferredGateRefusals : MaxPresenceGateRefusals;
+
+            // A count of wins measures elections, not outages. A voter restart outlasts the whole
+            // budget at a 2 s election timeout, and the voter that holds the missing range is
+            // exactly the one that is down — so while any voter peer is down the truncation also
+            // waits out the peer-down grace. Bounded: the grace expires even if the peer never
+            // returns.
+            bool presenceGraceHolds = SelfRepairGraceHolds(presenceRefusalStreakTicks, out TimeSpan presenceWaited, out TimeSpan presenceGrace);
+
+            if (hasVoterPeers && (presenceGateRefusals <= presenceRefusalCap || presenceGraceHolds))
             {
-                logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Promotion refused ({Attempt}/{MaxAttempts}): WAL has a hole below the max id (contiguous through {PresentId}, max {MaxLog}) — reverting to Follower so a node with a contiguous log can win the next term.",
-                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, presenceGateRefusals, MaxPresenceGateRefusals, presentId, maxLog);
+                logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Promotion refused ({Attempt}/{MaxAttempts}, {Waited} of the peer-down grace {Grace} elapsed): WAL has a hole below the max id (contiguous through {PresentId}, max {MaxLog}) — reverting to Follower so a node with a contiguous log can win the next term.",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, presenceGateRefusals, presenceRefusalCap,
+                    presenceGraceHolds ? presenceWaited : TimeSpan.Zero, presenceGraceHolds ? presenceGrace : TimeSpan.Zero,
+                    presentId, maxLog);
                 coreState.NodeState = RaftNodeState.Follower;
                 coreState.ResetLocalCommittedIndexOnDemotion();
                 throw new RaftException($"Promotion refused: WAL hole below max id (contiguous through {presentId}, max {maxLog})");
@@ -999,16 +1208,22 @@ public sealed class RaftPartitionStateMachine
             logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] WAL hole below the max id (contiguous through {PresentId}, max {MaxLog}) and {Reason} — truncating the orphaned tail and serving; the truncated rows are unreachable for every replica.",
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState, presentId, maxLog,
                 hasVoterPeers
-                    ? $"{presenceGateRefusals - 1} consecutive promotions already refused with no fresher voter winning"
+                    ? $"{presenceGateRefusals - 1} consecutive promotions already refused over {presenceWaited} with no fresher voter winning"
                     : "no voter peers to defer to");
 
             try
             {
-                // The floor never truncates a row the node has applied or resolved: applied and
-                // commit frontiers both sit at or below the contiguous frontier here (the drain
-                // above ran to the commit frontier, and resolution requires presence), so the Max
-                // is belt-and-braces against a frontier inversion introduced elsewhere.
-                long truncateFloor = Math.Max(presentId, Math.Max(coreState.LastAppliedIndex, commitFrontier));
+                // The floor never truncates a row the node has applied: the applied cursor sits at
+                // or below the contiguous frontier except after a skip-gaps drain, so the Max
+                // protects delivered rows. The commit frontier is deliberately NOT in the floor:
+                // when it sits ABOVE the contiguous frontier it is poisoned (a real commit
+                // requires presence — the shape the old monotonic EnqueueCommit jump produced on a
+                // holey barrier leader), and flooring on it made this truncation a no-op that
+                // re-refused forever instead of self-repairing.
+                long truncateFloor = Math.Max(presentId, coreState.LastAppliedIndex);
+                if (commitFrontier > truncateFloor)
+                    logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Commit frontier {Frontier} sits above the contiguous frontier {PresentId} — a poisoned frontier; ignoring it for the orphaned-tail truncation floor.",
+                        host.LocalEndpoint, host.PartitionId, coreState.NodeState, commitFrontier, presentId);
                 maxLog = await wal.TruncateLogsAfterAsync(truncateFloor).ConfigureAwait(false);
                 presentId = wal.GetPresentIndex();
             }
@@ -1024,6 +1239,7 @@ public sealed class RaftPartitionStateMachine
             presenceGateRefusals = 0;
             lastPresenceRefusalPresent = -1;
             lastPresenceRefusalMax = -1;
+            presenceRefusalStreakTicks = 0;
 
             if (presentId >= 0 && presentId < maxLog)
             {
@@ -1042,6 +1258,7 @@ public sealed class RaftPartitionStateMachine
             presenceGateRefusals = 0;
             lastPresenceRefusalPresent = -1;
             lastPresenceRefusalMax = -1;
+            presenceRefusalStreakTicks = 0;
         }
 
         // The inherited-tail decision must come from the enqueue-advanced presence frontier, not
@@ -1064,7 +1281,17 @@ public sealed class RaftPartitionStateMachine
         // already proven the log contiguous through the tail, which is what makes the exact set
         // safe at this point and nowhere else. Seeded BEFORE the barrier propose so the barrier
         // no-op itself is stamped correctly.
-        wal.SeedProposeAllocator(Math.Max(inheritedTail, commitFrontier) + 1);
+        //
+        // The Max with the commit frontier exists for facades that do not track presence: their
+        // inheritedTail is a backend max-read that can under-report queued writes, and seeding
+        // below the frontier would reissue occupied ids. With presence tracked, an honest frontier
+        // can never exceed the contiguous tail (a commit requires presence), so a frontier ABOVE
+        // it is poisoned — seeding from it would stamp the next write past ids this node does not
+        // hold and open a permanent hole below the first new entry. Trust presence there.
+        long allocatorTail = presentId >= 0 && commitFrontier > inheritedTail
+            ? inheritedTail
+            : Math.Max(inheritedTail, commitFrontier);
+        wal.SeedProposeAllocator(allocatorTail + 1);
 
         if (inheritedTail <= commitFrontier)
         {

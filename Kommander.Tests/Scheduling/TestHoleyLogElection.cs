@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Kommander;
 using Kommander.Data;
 using Kommander.Gossip;
@@ -69,7 +70,26 @@ public class TestHoleyLogElection
         /// <summary>Every outbound transport message, in send order.</summary>
         public List<RaftResponderRequest> Outbound { get; } = [];
 
-        public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;
+        /// <summary>
+        /// SWIM verdict per endpoint; anything absent reads Alive, matching the production default.
+        /// </summary>
+        public Dictionary<string, MemberLivenessState> Liveness { get; } = [];
+
+        public MemberLivenessState GetNodeLiveness(string endpoint) =>
+            Liveness.TryGetValue(endpoint, out MemberLivenessState state) ? state : MemberLivenessState.Alive;
+
+        /// <summary>
+        /// Frozen monotonic tick source, so a test can age a refusal streak past the peer-down grace
+        /// without sleeping. Left null the host uses the real stopwatch and behaves as before.
+        /// </summary>
+        public long? MonotonicTicks { get; set; }
+
+        public long GetMonotonicTimestamp() => MonotonicTicks ?? Stopwatch.GetTimestamp();
+
+        /// <summary>Freezes the clock (if it is not frozen yet) and moves it forward.</summary>
+        public void AdvanceMonotonic(TimeSpan delta) =>
+            MonotonicTicks = (MonotonicTicks ?? Stopwatch.GetTimestamp()) + (long)(delta.TotalSeconds * Stopwatch.Frequency);
+
         public HLCTimestamp GetLastNodeActivity(string ep, int p) => HLCTimestamp.Zero;
         public HLCTimestamp GetLastNodeHearthbeat(string ep, int p) => HLCTimestamp.Zero;
         public void UpdateLastHeartbeat(string ep, int p, HLCTimestamp t) { }
@@ -123,6 +143,11 @@ public class TestHoleyLogElection
         public long PresentId { get; set; } = -1;
 
         public long PresentTermValue { get; set; } = -1;
+
+        /// <summary>Models entries buffered above an unfilled gap (see IRaftWalFacade.HasPresenceGap).</summary>
+        public bool HasPresenceGapValue { get; set; }
+
+        public bool HasPresenceGap() => HasPresenceGapValue;
 
         public long LastEntryTerm { get; set; }
 
@@ -282,6 +307,81 @@ public class TestHoleyLogElection
         Assert.DoesNotContain(host.Outbound, m => m.Type == RaftResponderRequestType.Vote);
     }
 
+    // ── the §5.4.1 missing-term fallback is symmetric ─────────────────────────
+
+    /// <summary>
+    /// A voter whose OWN last-log term is unreadable must not grant index-blind. The dangerous
+    /// shape is a high index with no term — reachable when the presence frontier lands on a
+    /// compacted checkpoint boundary, whose stored term reads -1 and is clamped to 0. The old
+    /// comparison short-circuited on the remote term only, so it evaluated <c>5 != 0</c> then
+    /// <c>5 &lt; 0</c> (false) and granted, with the index never examined. This voter holds a log
+    /// through 10; the candidate holds 2 and must be denied.
+    /// </summary>
+    [Fact]
+    public async Task Voter_WithUnreadableLocalTerm_DeniesCandidateBehindOnIndex()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 10, LastEntryTerm = 1, PresentId = 10, PresentTermValue = 0 };
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 5, remoteMaxLogId: 2, ts, preVote: false, remoteLastLogTerm: 5);
+
+        Assert.DoesNotContain(host.Outbound, m => m.Type == RaftResponderRequestType.Vote);
+    }
+
+    /// <summary>
+    /// The same voter still grants when the candidate is at or ahead of it on index. The fallback
+    /// only removes the term from the comparison; it must not deny a candidate that is genuinely
+    /// as up to date, or a node with a compacted boundary term could never help elect anyone.
+    /// </summary>
+    [Fact]
+    public async Task Voter_WithUnreadableLocalTerm_StillGrantsCandidateAtOrAheadOnIndex()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 10, LastEntryTerm = 1, PresentId = 10, PresentTermValue = 0 };
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 5, remoteMaxLogId: 10, ts, preVote: false, remoteLastLogTerm: 5);
+
+        Assert.Contains(host.Outbound, m => m.Type == RaftResponderRequestType.Vote);
+    }
+
+    /// <summary>
+    /// A genuinely empty voter is unaffected: its index is 0, so no candidate is behind it and the
+    /// grant still goes out. The fallback must not turn an empty node into a vote sink.
+    /// </summary>
+    [Fact]
+    public async Task Voter_WithEmptyLog_StillGrants()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 0, LastEntryTerm = 0, PresentId = 0, PresentTermValue = 0 };
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 5, remoteMaxLogId: 5, ts, preVote: false, remoteLastLogTerm: 5);
+
+        Assert.Contains(host.Outbound, m => m.Type == RaftResponderRequestType.Vote);
+    }
+
+    /// <summary>
+    /// The pre-vote probe shares the comparison, so it must deny the same candidate. A pre-vote
+    /// grant that the real vote would refuse only churns elections.
+    /// </summary>
+    [Fact]
+    public async Task PreVoter_WithUnreadableLocalTerm_DeniesCandidateBehindOnIndex()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 10, LastEntryTerm = 1, PresentId = 10, PresentTermValue = 0 };
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 5, remoteMaxLogId: 2, ts, preVote: true, remoteLastLogTerm: 5);
+
+        Assert.DoesNotContain(host.Outbound, m => m.Type == RaftResponderRequestType.Vote);
+    }
+
     // ── promotion refuses to publish over a hole ──────────────────────────────
 
     /// <summary>
@@ -360,6 +460,142 @@ public class TestHoleyLogElection
         Assert.Equal("node-a", host.Leader);
         Assert.Equal(RaftNodeState.Leader, sm.NodeState);
         Assert.Contains("LeaderChanged:node-a", host.EventLog);
+    }
+
+    // ── the peer-down grace on the destructive self-repair ────────────────────
+
+    /// <summary>
+    /// The refusal count measures elections, not outages. At a 2 s election timeout the budget is
+    /// spent in seconds while a restarting voter is tens of seconds away — and that voter is
+    /// exactly the one that may hold the missing range, because a reachable holder would have
+    /// denied this node's vote and won the term itself. Truncating inside that window is how the
+    /// split-nemesis run lost committed writes cluster-wide: every survivor self-repaired before
+    /// the holder came back. While a voter peer is not Alive the truncation must therefore wait out
+    /// the peer-down grace, no matter how many terms this node wins meanwhile.
+    /// </summary>
+    [Fact]
+    public async Task Promotion_WithWalHole_DownVoterPeer_DefersTruncationDuringTheGrace()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 10, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3 };
+        wal.Entries.AddRange(
+        [
+            new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 2, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 3, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 10, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+        ]);
+
+        // node-b is up and votes; node-c is the restarting holder of the missing range.
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b"), new RaftNode("node-c")] };
+        host.Liveness["node-c"] = MemberLivenessState.Dead;
+        host.MonotonicTicks = Stopwatch.GetTimestamp();   // freeze: the grace cannot elapse in this loop
+
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        // Far past both caps (3, and 12 with a fresher live voter known): the count alone would
+        // have truncated many terms ago.
+        for (int attempt = 1; attempt <= 15; attempt++)
+        {
+            await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+            await Assert.ThrowsAsync<RaftException>(() =>
+                sm.ReceivedVoteAsync("node-b", sm.CurrentTerm, remoteMaxLogId: 3));
+            Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+            Assert.Empty(wal.TruncateCalls);
+        }
+
+        Assert.NotEqual("node-a", host.Leader);
+        Assert.Contains(wal.Entries, l => l.Id == 10);
+    }
+
+    /// <summary>
+    /// The grace is a bound, never a hold: a peer that never returns must not keep the partition
+    /// leaderless forever — that is the wedge the refusal caps exist to break. Once the grace
+    /// elapses the gate self-repairs with the peer still down, exactly as it does when every voter
+    /// peer is Alive.
+    /// </summary>
+    [Fact]
+    public async Task Promotion_WithWalHole_DownVoterPeer_TruncatesOnceTheGraceExpires()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 10, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3 };
+        wal.Entries.AddRange(
+        [
+            new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 2, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 3, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 10, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+        ]);
+
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b"), new RaftNode("node-c")] };
+        host.Liveness["node-c"] = MemberLivenessState.Dead;
+        host.MonotonicTicks = Stopwatch.GetTimestamp();
+
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        // The count budget is spent here; only the grace still holds the truncation back.
+        for (int attempt = 1; attempt <= 5; attempt++)
+        {
+            await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+            await Assert.ThrowsAsync<RaftException>(() =>
+                sm.ReceivedVoteAsync("node-b", sm.CurrentTerm, remoteMaxLogId: 3));
+            Assert.Empty(wal.TruncateCalls);
+        }
+
+        host.AdvanceMonotonic(host.Config.SelfRepairPeerDownGrace + TimeSpan.FromSeconds(1));
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        await sm.ReceivedVoteAsync("node-b", sm.CurrentTerm, remoteMaxLogId: 3);
+
+        long truncateBoundary = Assert.Single(wal.TruncateCalls);
+        Assert.Equal(3, truncateBoundary);
+        Assert.DoesNotContain(wal.Entries, l => l.Id == 10);
+
+        Assert.Equal("node-a", host.Leader);
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+    }
+
+    /// <summary>
+    /// The committed-drain gate takes the same grace: its escape delivers past the gap with
+    /// <c>skipGaps</c>, which marks the missing ids applied forever, so it is destructive in the
+    /// same way the tail truncation is. Here the frontier (5) sits above the last entry the drain
+    /// can reach (3), and a voter peer is down.
+    /// </summary>
+    [Fact]
+    public async Task Promotion_DrainBelowFrontier_DownVoterPeer_DefersSkipGapsDrainDuringTheGrace()
+    {
+        // RawMaxLog == PresentId keeps the completeness gate out of the way: the drain gate is the
+        // one under test, and it runs first.
+        HoleyWalFacade wal = new() { RawMaxLog = 3, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 5 };
+        wal.Entries.AddRange(
+        [
+            new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 2, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 3, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+        ]);
+
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b"), new RaftNode("node-c")] };
+        host.Liveness["node-c"] = MemberLivenessState.Dead;
+        host.MonotonicTicks = Stopwatch.GetTimestamp();
+
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        // Past the cap of 3: the count alone would already have taken the skip-gaps escape.
+        for (int attempt = 1; attempt <= 5; attempt++)
+        {
+            await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+            await Assert.ThrowsAsync<RaftException>(() =>
+                sm.ReceivedVoteAsync("node-b", sm.CurrentTerm, remoteMaxLogId: 3));
+            Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+            Assert.NotEqual("node-a", host.Leader);
+        }
+
+        // Grace expired: the gate stops waiting and serves, as it must to avoid a permanent wedge.
+        host.AdvanceMonotonic(host.Config.SelfRepairPeerDownGrace + TimeSpan.FromSeconds(1));
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        await sm.ReceivedVoteAsync("node-b", sm.CurrentTerm, remoteMaxLogId: 3);
+
+        Assert.Equal("node-a", host.Leader);
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
     }
 
     /// <summary>
@@ -528,5 +764,194 @@ public class TestHoleyLogElection
         // The leader stepped down instead of continuing to serve from an incomplete projection.
         Assert.NotEqual("node-a", host.Leader);
         Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+    }
+
+    // ── the committed-drain guard is bounded and escalates ────────────────────
+
+    /// <summary>
+    /// The committed-drain refusal ("drain stopped below the frontier") must be bounded like the
+    /// presence gate: when a voter majority shares the same hole — or shares a commit frontier
+    /// poisoned past it — every winner refuses, and an unbounded refusal leaves the partition
+    /// leaderless for the rest of the run (~18k refusals in Jepsen run 32690955741). Three
+    /// consecutive same-shape refusals hand the term back; the fourth win escalates: the node
+    /// delivers everything it does hold past the gap and serves.
+    /// </summary>
+    [Fact]
+    public async Task Promotion_CommittedDrainBelowFrontier_BoundedRefusalsThenServe()
+    {
+        // Commit frontier (5) sits above the drainable prefix (1..3): the committed drain can
+        // never reach it — the poisoned-frontier shape of observation 1.
+        HoleyWalFacade wal = new() { RawMaxLog = 3, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 5 };
+        wal.Entries.AddRange(
+        [
+            new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 2, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 3, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+        ]);
+        wal.SeedNextId(4);
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        // Three consecutive wins over the same shape are refused (the granter advertises no
+        // fresher position, so the default cap applies).
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+            RaftException ex = await Assert.ThrowsAsync<RaftException>(() =>
+                sm.ReceivedVoteAsync("node-b", sm.CurrentTerm, remoteMaxLogId: 3));
+            Assert.Contains($"({attempt}/3)", ex.Message);
+            Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        }
+
+        // The fourth win escapes: the drainable prefix is delivered and leadership publishes.
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        await sm.ReceivedVoteAsync("node-b", sm.CurrentTerm, remoteMaxLogId: 3);
+
+        Assert.Contains("Applied:1", host.EventLog);
+        Assert.Contains("Applied:3", host.EventLog);
+        Assert.Equal("node-a", host.Leader);
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+    }
+
+    /// <summary>
+    /// While a fresher live voter is known (its vote-path messages advertised a contiguous
+    /// position above ours), the escalation is deferred with a stretched cap: that voter can win
+    /// the term and repair this node by backfill with nothing lost, so destructive self-repair
+    /// must wait for it. The stretched cap is still finite — "known and alive" does not guarantee
+    /// "will campaign".
+    /// </summary>
+    [Fact]
+    public async Task Promotion_CommittedDrainBelowFrontier_FresherVoterKnown_DefersEscalation()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 3, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 5 };
+        wal.Entries.AddRange(
+        [
+            new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 2, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 3, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+        ]);
+        wal.SeedNextId(4);
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b"), new RaftNode("node-c")] };
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        // Five consecutive wins: node-b's grant advertises position 9 (above our contiguous 3) and
+        // is ignored for quorum — but recorded as freshness evidence; node-c's grant completes the
+        // quorum. With the fresher voter known, the 4th and 5th wins still refuse (the default cap
+        // of 3 would have escalated at the 4th).
+        for (int attempt = 1; attempt <= 5; attempt++)
+        {
+            await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+            await sm.ReceivedVoteAsync("node-b", sm.CurrentTerm, remoteMaxLogId: 9);
+            RaftException ex = await Assert.ThrowsAsync<RaftException>(() =>
+                sm.ReceivedVoteAsync("node-c", sm.CurrentTerm, remoteMaxLogId: 3));
+            Assert.Contains($"({attempt}/12)", ex.Message);
+            Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        }
+    }
+
+    // ── stale-vote promotions are abandoned, not recorded as drain failures ───
+
+    /// <summary>
+    /// A quorum completed by a vote dispatched long after the election started (executor backlog:
+    /// a 10,001ms ReceiveVote was observed in the nightlies) must not promote: the drain would
+    /// target a frontier the stale round never saw, spin for its whole bound, and be recorded as a
+    /// drain failure on a perfectly good log. The round is abandoned cheaply — no exception, no
+    /// refusal counted, term handed back for a fresh election.
+    /// </summary>
+    [Fact]
+    public async Task StaleQuorumVote_AbandonsPromotionInsteadOfDraining()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 3, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3 };
+        wal.Entries.AddRange(
+        [
+            new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 2, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 3, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+        ]);
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        Assert.Equal(RaftNodeState.Candidate, sm.NodeState);
+
+        // Age the round past 2× the election timeout (the stub randomizes within 50..100ms).
+        await Task.Delay(350, TestContext.Current.CancellationToken);
+
+        // The quorum-completing vote arrives stale: no promotion, no exception, no leadership.
+        await sm.ReceivedVoteAsync("node-b", sm.CurrentTerm, remoteMaxLogId: 3);
+
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        Assert.NotEqual("node-a", host.Leader);
+        Assert.DoesNotContain("LeaderChanged:node-a", host.EventLog);
+    }
+
+    // ── gapped nodes defer candidacy to a known fresher voter ─────────────────
+
+    /// <summary>
+    /// A node holding entries above an unfilled gap, with a fresher live voter known from the
+    /// vote paths, must yield the election-timer round instead of campaigning: winning would only
+    /// reach the promotion gates and refuse, and each refused term appends a new-term barrier
+    /// no-op that raises this node's advertised last-log term above the complete peer's — locking
+    /// the complete peer out of §5.4.1 for the rest of the run (the majority-hole wedge). Yielding
+    /// quiets the churn so the complete peer's own pre-vote can reach quorum.
+    /// </summary>
+    [Fact]
+    public async Task GappedFollower_WithFresherVoterKnown_DefersCandidacy()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 8, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3, HasPresenceGapValue = true };
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        // node-b's pre-vote probe advertises contiguous position 9 — recorded as freshness
+        // evidence even though the probe itself may be granted or denied.
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 2, remoteMaxLogId: 9, ts, preVote: true, remoteLastLogTerm: 1);
+        host.Outbound.Clear();
+
+        // The election-timer tick on a follower with no heartbeat would normally open a pre-vote
+        // round; with the gap and the fresher voter known, the round is deferred.
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.DoesNotContain(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
+    }
+
+    /// <summary>
+    /// The deference is bounded: a fresher peer that never campaigns must not suppress this node
+    /// forever. After the bounded rounds the node campaigns normally.
+    /// </summary>
+    [Fact]
+    public async Task GappedFollower_CandidacyDeference_IsBounded()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 8, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3, HasPresenceGapValue = true };
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 2, remoteMaxLogId: 9, ts, preVote: true, remoteLastLogTerm: 1);
+        host.Outbound.Clear();
+
+        // Ten rounds defer; the eleventh campaigns (opens a pre-vote round).
+        for (int round = 1; round <= 10; round++)
+        {
+            await sm.CheckPartitionLeadershipAsync();
+            Assert.DoesNotContain(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
+        }
+
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.Contains(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
+    }
+
+    /// <summary>
+    /// Control: without a known fresher voter, a gapped follower still campaigns — the deference
+    /// must never suppress the only nodes left.
+    /// </summary>
+    [Fact]
+    public async Task GappedFollower_WithoutFresherVoterKnown_StillCampaigns()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 8, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3, HasPresenceGapValue = true };
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.Contains(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
     }
 }

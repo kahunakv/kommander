@@ -251,7 +251,11 @@ internal sealed class PartitionMapService
                     "Failed to replicate initial partitions {Status} {LogIndex} Retry={Retry}",
                     result.Status, result.LogIndex, i);
 
-                if (result.Status == RaftOperationStatus.NodeIsNotLeader)
+                // NodeIsNotLeader: someone else leads — stop, they own this. ProposalOutcomeUnknown:
+                // this node lost authority with the proposal in flight — the entry may still commit
+                // via the new leader's §5.4.2 inherited commit, so a blind re-propose risks a
+                // duplicate; stop for the same reason.
+                if (result.Status is RaftOperationStatus.NodeIsNotLeader or RaftOperationStatus.ProposalOutcomeUnknown)
                     return;
 
                 try { await Task.Delay(getRetryDelay(), cancellationToken).ConfigureAwait(false); }

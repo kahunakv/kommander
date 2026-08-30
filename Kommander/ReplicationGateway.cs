@@ -533,8 +533,14 @@ internal sealed class ReplicationGateway
     /// </summary>
     private async Task<RaftReplicationResult> WaitForQuorum(RaftPartition partition, HLCTimestamp ticketId, bool autoCommit, CancellationToken cancellationToken)
     {
+        // The proposal was already ACCEPTED (it has a ticket): if leadership moved between the
+        // accept and this check, the entry is in the log and may still commit — a durable
+        // Proposed row inherited by the next leader is committed by its promotion barrier
+        // (Raft §5.4.2). Answering NodeIsNotLeader here told the client "definitely did not take
+        // effect" for a write that could (and did) materialize; post-accept, the only honest
+        // answer is indeterminate.
         if (!string.IsNullOrEmpty(partition.Leader) && partition.Leader != localEndpoint)
-            return new(false, RaftOperationStatus.NodeIsNotLeader, ticketId, -1);
+            return new(false, RaftOperationStatus.ProposalOutcomeUnknown, ticketId, -1);
 
         cancellationToken.ThrowIfCancellationRequested();
 

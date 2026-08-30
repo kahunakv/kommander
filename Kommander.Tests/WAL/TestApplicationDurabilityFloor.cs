@@ -432,6 +432,14 @@ public sealed class TestApplicationDurabilityFloor
                 // the restore under test delivers entries to the coordinator.
                 await partition.RestoreTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
+                // The sparse prefix below 40 models a compacted partition. In production the floor
+                // was recorded before compaction removed the rows; a plain checkpoint write over
+                // the absent prefix no longer records it, so install the boundary the way a real
+                // compacted partition earned it (the row's snapshot payload is upserted below).
+                Assert.Equal(
+                    RaftOperationStatus.Success,
+                    wal.InstallSnapshotBoundary(partitionId, snapshotIndex: 42, lastIncludedTerm: 5, sync: true).Status);
+
                 List<RaftLog> logs =
                 [
                     new()
@@ -515,6 +523,12 @@ public sealed class TestApplicationDurabilityFloor
             try
             {
                 await partition.RestoreTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+                // As above: the compacted prefix's floor is earned through the boundary install; a
+                // plain checkpoint write over the absent prefix no longer records it.
+                Assert.Equal(
+                    RaftOperationStatus.Success,
+                    wal.InstallSnapshotBoundary(partitionId, snapshotIndex: 42, lastIncludedTerm: 5, sync: true).Status);
 
                 List<RaftLog> logs =
                 [

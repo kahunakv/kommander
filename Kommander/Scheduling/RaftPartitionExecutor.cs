@@ -233,7 +233,13 @@ public sealed class RaftPartitionExecutor : IDisposable
 
     // Set to true once the RestoreLogsLoaded event has been fully processed by
     // the worker thread.  Client proposals are rejected with RestoreInProgress
-    // until this flag is true.  Volatile so producers see the update promptly.
+    // until this flag is true, and RequestVote is dropped — see the vote fence in
+    // Enqueue for why a vote answered from pre-restore state can double-vote a
+    // term across a crash.  Volatile so producers see the update promptly.
+    //
+    // False from construction, and no operation can be enqueued before Start()
+    // (ThrowIfNotReady), so the fences cover the whole pre-restore window — including
+    // the gap between Start() and Phase 1 actually running on the thread pool.
     private volatile bool _restoreCompleted;
 
     // Completes when Phase 2 of the restore (log replay) finishes on the worker
@@ -660,6 +666,31 @@ public sealed class RaftPartitionExecutor : IDisposable
             Interlocked.Increment(ref _totalClientRejected);
             KommanderMetrics.ExecutorRejectionsTotal.Add(1, _rejectionTag);
             reply?.TrySetResult(RaftResponseStatic.RestoreInProgressResponse);
+            return;
+        }
+
+        // Vote fence: RequestVote is the one Control op that must NOT be served before Phase 2.
+        // Everything a vote decision reads is still at its pre-restore init here — CurrentTerm is
+        // 0, the vote record is empty, and the freshness position is 0 — because the durable hard
+        // state (term, votedFor) is loaded by CompleteRestoreAsync and nowhere else. A node paused
+        // in Phase 1 therefore grants unconditionally, and the grant path persists the new
+        // (term, votedFor) OVER the record it has not read yet: if it already voted in that term
+        // before the crash, the term now holds two durable votes from one voter, and two leaders
+        // in one term follow. Dropping the request is protocol-safe — a denial is silence on this
+        // path anyway — and it costs at most one election round on a restarting node.
+        //
+        // Deliberately narrower than "all Control ops". Heartbeats and appends still flow (an
+        // unrestored follower that stops acking stalls its leader for no safety gain), and the
+        // RestoreLogsLoaded event that clears this gate is Maintenance. Appends carry their own
+        // pre-restore hazard, which is a separate change.
+        if (request.Type == RaftRequestType.RequestVote && !_restoreCompleted)
+        {
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug(
+                    "[RaftPartitionExecutor/{PartitionId}] Dropping RequestVote from {Endpoint} for term {Term}: the WAL restore has not completed, so the durable (term, votedFor) record is not loaded yet.",
+                    _partitionId, request.Endpoint ?? "", request.Term);
+
+            reply?.TrySetResult(RaftResponseStatic.NoneResponse);
             return;
         }
 

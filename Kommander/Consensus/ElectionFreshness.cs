@@ -19,17 +19,29 @@ namespace Kommander.Consensus;
 internal static class ElectionFreshness
 {
     /// <summary>
-    /// <see langword="true"/> when the remote candidate's log is strictly less up to date than the
-    /// local log, so the local node must deny its vote.
+    /// <see langword="true"/> when the remote candidate's <c>(lastLogTerm, lastLogIndex)</c> is
+    /// strictly less up to date than the local pair, which is the condition to deny a vote.
     ///
-    /// <para>A <paramref name="remoteLastLogTerm"/> at or below zero means the peer sent no term:
-    /// either a legacy peer that predates the field, or a candidate whose log is empty. The
-    /// comparison then falls back to index only, which preserves the ordering those peers were
-    /// built against.</para>
+    /// <para><b>The missing-term fallback is symmetric on purpose.</b> A term of <c>0</c> or
+    /// <c>-1</c> means "no usable last-log term here", not "an ancient term", so a lexicographic
+    /// comparison against it is meaningless in EITHER direction. Testing only the remote side left
+    /// a hole: a voter whose own term degraded read <c>remoteTerm != localTerm</c>, returned
+    /// <c>remoteTerm &lt; localTerm</c> — false for any real term against 0 — and granted the vote
+    /// with the index never examined at all. That voter is not necessarily an empty node whose vote
+    /// costs nothing: the degraded pair is <b>a high index with no term</b>, reachable whenever the
+    /// presence frontier lands on a compacted checkpoint boundary (its stored term reads -1, and
+    /// both restore and the post-truncation re-read clamp that to 0). Such a voter holds a long
+    /// committed log and still granted to a candidate missing an arbitrary range of it; the
+    /// candidate wins and overwrites the range.</para>
+    ///
+    /// <para>With either side missing a term the comparison falls back to index-only, which is the
+    /// legacy ordering and is strictly stricter than the old behaviour — it can only deny where the
+    /// old code granted. A genuinely empty voter still grants, because its own index is 0 and no
+    /// candidate is behind that.</para>
     /// </summary>
     /// <param name="remoteLastLogTerm">Term of the candidate's last log entry, or 0 when unknown.</param>
     /// <param name="remoteMaxLogId">Index the candidate advertises.</param>
-    /// <param name="localLastLogTerm">Term of this node's last log entry.</param>
+    /// <param name="localLastLogTerm">Term of this node's last log entry, or 0 when unknown.</param>
     /// <param name="localMaxId">Index this node advertises.</param>
     public static bool CandidateLogIsBehind(
         long remoteLastLogTerm,
@@ -37,8 +49,9 @@ internal static class ElectionFreshness
         long localLastLogTerm,
         long localMaxId)
     {
-        if (remoteLastLogTerm <= 0)
-            return remoteMaxLogId < localMaxId; // legacy peer / empty candidate log → index-only
+        // Legacy peer / empty candidate log / boundary term the local side cannot read → index-only.
+        if (remoteLastLogTerm <= 0 || localLastLogTerm <= 0)
+            return remoteMaxLogId < localMaxId;
 
         if (remoteLastLogTerm != localLastLogTerm)
             return remoteLastLogTerm < localLastLogTerm;

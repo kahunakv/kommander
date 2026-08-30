@@ -382,7 +382,10 @@ public sealed class TestWalCompletionFences : IDisposable
         Assert.False(proposeAsk.IsCompleted, "the propose reply must still be pending before its WAL completion arrives");
 
         // Deliver the propose's completion stamped with a superseded term: the fence discards the
-        // state transition, and must answer the caller with a retryable failure.
+        // state transition, and must answer the caller with the INDETERMINATE
+        // ProposalOutcomeUnknown — the entry is durably appended and may still commit via the
+        // next leader's §5.4.2 inherited commit, so the definite NodeIsNotLeader would lie to
+        // the client (the Jepsen register non-linearizable read of run 33198349291).
         RaftWalCompletion staleCompletion = new(
             PartitionId:   0,
             OperationId:   0,
@@ -396,7 +399,7 @@ public sealed class TestWalCompletionFences : IDisposable
         await executor.Ask(CompletionRequest(staleCompletion), TestContext.Current.CancellationToken);
 
         RaftResponse reply = await proposeAsk.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
-        Assert.Equal(RaftOperationStatus.NodeIsNotLeader, reply.Status);
+        Assert.Equal(RaftOperationStatus.ProposalOutcomeUnknown, reply.Status);
     }
 
     /// <summary>

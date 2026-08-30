@@ -29,8 +29,10 @@ namespace Kommander.WAL.IO;
 ///       <em>opportunistic</em> — a worker fsyncs whatever happens to be ready the
 ///       instant it wakes. When a linger window is configured
 ///       (<c>RaftConfiguration.WalGroupCommitLingerMs</c>) the worker instead waits a
-///       bounded, adaptive interval to let more partitions become ready and share the
-///       fsync. This matters where ready partitions trickle in rather than arriving
+///       bounded, evidence-gated interval to let more partitions become ready and share
+///       the fsync — but only while some other partition has queued work that must
+///       become ready soon; with nothing to wait for it flushes immediately.
+///       This matters where ready partitions trickle in rather than arriving
 ///       together — notably the follower append path, whose appends are paced by
 ///       replication RPCs — so they would otherwise each force a near-solo fsync. See
 ///       <c>LingerForMoreReadyPartitions</c>.</item>
@@ -79,10 +81,18 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// Deferred group-commit linger window in <see cref="Stopwatch"/> ticks, or 0 when
     /// disabled. When &gt; 0 a worker that took its first ready partition keeps gathering
     /// more ready partitions (up to <see cref="maxGroupBatchPartitions"/>) until this much
-    /// time elapses or a probe finds nothing newly ready — see the drain loop. 0 preserves
-    /// the original purely-opportunistic batching.
+    /// time elapses or no partition outside its group has queued work left to wait for —
+    /// see <see cref="LingerForMoreReadyPartitions"/>. 0 preserves the original
+    /// purely-opportunistic batching.
     /// </summary>
     private readonly long lingerTicks;
+
+    /// <summary>
+    /// True when the linger is enabled, so <see cref="_queuedOperations"/> is maintained.
+    /// Kept conditional so a linger-off scheduler stays byte-for-byte the prior behaviour,
+    /// with no extra interlocked traffic on the hot enqueue path.
+    /// </summary>
+    private readonly bool trackQueuedOps;
 
     /// <summary>
     /// When true, the single-fsync commit fast path is active: a group batch whose logs are <b>all</b>
@@ -97,6 +107,18 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     // Checked against maxGlobalQueueDepth (when > 0) in Enqueue;
     // decremented in ProcessGroupBatch after each batch write completes.
     private int _globalQueueDepth;
+
+    /// <summary>
+    /// Operations enqueued but not yet drained into any worker's write batch. Maintained only
+    /// when <see cref="trackQueuedOps"/> — the linger's evidence gate reads it (minus the
+    /// gathering group's own depths) to decide whether any partition outside the group still
+    /// has work that is guaranteed to become ready soon. Unlike <see cref="_globalQueueDepth"/>
+    /// (pending-or-in-flight, for back-pressure), this counter is decremented at drain time:
+    /// an op inside another worker's in-flight write is <b>not</b> evidence of a future arrival
+    /// (its partition only re-schedules if more ops remain queued behind it), so it must not
+    /// hold the gate open.
+    /// </summary>
+    private int _queuedOperations;
 
     // ── Per-partition state ────────────────────────────────────────────────
 
@@ -171,6 +193,8 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     private long _totalSyncBatchesWritten;
     private long _totalOperationsCompleted;
     private long _totalPartitionsBatched;
+    private long _totalLingerWaits;
+    private long _totalLingerPartitionsGathered;
 
     /// <summary>
     /// Total number of <c>walAdapter.Write</c> calls dispatched to the storage adapter.
@@ -201,6 +225,23 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// </summary>
     public long TotalPartitionsBatched => Interlocked.Read(ref _totalPartitionsBatched);
 
+    /// <summary>
+    /// Number of timed linger waits entered: the linger was enabled, window remained, and at
+    /// least one partition outside the gathering group had queued-but-undrained work. This is
+    /// the contract of the evidence gate — under closed-loop or sequential load (where the next
+    /// op arrives only after the current flush completes) this counter must stay at zero,
+    /// because a wait there stalls the very flush the next op depends on. The 3-partition
+    /// throughput investigation that motivated the gate lacked exactly this figure.
+    /// </summary>
+    public long TotalLingerWaits => Interlocked.Read(ref _totalLingerWaits);
+
+    /// <summary>
+    /// Partitions added to a group batch by the linger — arrivals during or immediately after a
+    /// timed wait, i.e. the coalescing the opportunistic sweep alone would have missed. Divided
+    /// by <see cref="TotalLingerWaits"/> this gives the linger's hit rate.
+    /// </summary>
+    public long TotalLingerPartitionsGathered => Interlocked.Read(ref _totalLingerPartitionsGathered);
+
     // ── Construction ──────────────────────────────────────────────────────
 
     /// <param name="walAdapter">Synchronous storage adapter invoked on worker threads.</param>
@@ -229,8 +270,10 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// <param name="groupCommitLingerMs">
     /// Deferred group-commit linger window in milliseconds (see
     /// <c>RaftConfiguration.WalGroupCommitLingerMs</c>). 0 (default) keeps the original
-    /// opportunistic batching; &gt; 0 lets a worker briefly wait to gather more ready
-    /// partitions into one fsync, bailing early under low load.
+    /// opportunistic batching; &gt; 0 lets a worker wait — only while another partition
+    /// has queued work that is guaranteed to become ready soon — to gather more ready
+    /// partitions into one fsync. When nothing can arrive, the worker flushes
+    /// immediately and the window costs nothing.
     /// </param>
     /// <param name="lazyCommitMarkers">
     /// Single-fsync commit fast path (see <c>RaftConfiguration.WalSingleFsyncCommit</c>). When true, a
@@ -257,6 +300,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         this.lingerTicks = groupCommitLingerMs > 0
             ? (long)(groupCommitLingerMs / 1000.0 * global::System.Diagnostics.Stopwatch.Frequency)
             : 0;
+        this.trackQueuedOps = this.lingerTicks > 0;
         this.lazyCommitMarkers = lazyCommitMarkers;
 
         if (workerCount <= 0)
@@ -305,6 +349,13 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             operation.EnqueueTicks = global::System.Diagnostics.Stopwatch.GetTimestamp();
             state.Ops.Enqueue(operation);
             state.Depth++;
+
+            // Increment AFTER Depth++: the interlocked full fence orders the two stores, so a
+            // linger gate that observes the new queued count also observes the new depth and
+            // can never spuriously report work outside a group that only this partition holds.
+            // (The reverse skew — new depth, stale count — merely makes a linger flush early.)
+            if (trackQueuedOps)
+                Interlocked.Increment(ref _queuedOperations);
 
             // Schedule the partition in the global ready-queue only if it is not
             // already scheduled AND no worker is currently executing I/O for it.
@@ -469,13 +520,16 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                 partitionGroup.Add(extraId);
 
             // (2) Deferred linger (opt-in): if the batch is not yet full and a window is
-            //     configured, briefly wait for more partitions to become ready so they
-            //     share this fsync instead of forcing their own. Adaptive and bounded:
-            //     we bail the instant a probe finds nothing newly ready (so sequential /
-            //     low-overlap load pays at most one probe, not the whole window), and the
-            //     total wait never exceeds lingerTicks. This is the lever for paths whose
-            //     ready partitions trickle in (e.g. follower appends paced by replication
-            //     RPCs) rather than arriving all at once like a leader's local proposes.
+            //     configured, wait briefly for more partitions to become ready so they
+            //     share this fsync instead of forcing their own. The wait is evidence-
+            //     gated: it runs only while some partition OUTSIDE this group has queued
+            //     work — work guaranteed to become ready once its current write finishes —
+            //     and the total wait never exceeds lingerTicks. When nothing can arrive
+            //     (e.g. closed-loop load, where the next op is caused by this very flush's
+            //     completion) the worker flushes immediately and the linger costs nothing.
+            //     This is the lever for paths whose ready partitions trickle in (e.g.
+            //     follower appends paced by replication RPCs) rather than arriving all at
+            //     once like a leader's local proposes.
             if (lingerTicks > 0 && partitionGroup.Count < maxGroupBatchPartitions)
                 LingerForMoreReadyPartitions(partitionGroup, token);
 
@@ -483,23 +537,30 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         }
     }
 
-    /// <summary>Per-probe wait while lingering. BlockingCollection timeouts have ~1 ms
-    /// granularity, so this is the smallest useful slice; the cumulative wait is bounded by
-    /// <see cref="lingerTicks"/>, not by this value.</summary>
-    private const int LingerProbeMs = 1;
-
     /// <summary>
-    /// Deferred group-commit: after the opportunistic sweep, keep pulling newly-ready
-    /// partitions into <paramref name="partitionGroup"/> so they share this worker's single
-    /// fsync, until the batch is full, the linger window (<see cref="lingerTicks"/>) elapses,
-    /// or a probe finds nothing newly ready.
+    /// Deferred group-commit: after the opportunistic sweep, wait for more partitions to
+    /// become ready so they share this worker's single fsync, until the batch is full, the
+    /// linger window (<see cref="lingerTicks"/>) elapses, or no partition outside the group
+    /// has queued work left to wait for.
     ///
-    /// <para>The early bail on an empty probe is what makes this <b>adaptive</b>:
-    /// <see cref="System.Collections.Concurrent.BlockingCollection{T}.TryTake(out T,int,CancellationToken)"/>
-    /// returns immediately while partitions are already queued (a dense burst is gathered at
-    /// full speed) but blocks up to one short probe when the queue drains — and a probe that
-    /// comes back empty means the arrival burst has paused, so we stop rather than wait out
-    /// the whole window. Sequential / low-overlap load therefore pays at most one probe.</para>
+    /// <para><b>The wait is evidence-gated, not speculative.</b> Partitions already in the
+    /// group cannot re-enter the ready-queue while gathered (their <c>Scheduled</c> flag is
+    /// still set until the drain phase clears it), so the only possible arrivals are OTHER
+    /// partitions. A timed wait therefore runs only while at least one of those has
+    /// queued-but-undrained work (<see cref="OtherPartitionsHaveQueuedWork"/>): such a
+    /// partition is either already in the ready-queue (taken instantly) or queued behind
+    /// another worker's in-flight write, which re-schedules it on completion — a concrete
+    /// arrival to wait for. With no such partition the worker flushes immediately and pays
+    /// nothing. The previous implementation instead probed blindly with a fixed 1 ms timeout
+    /// and bailed on an empty probe; on a small partition count under closed-loop load the
+    /// batch could never fill AND the next op could only arrive after this flush completed,
+    /// so every flush blocked ~1–2 ms (kernel timed-wait granularity) for nothing — measured
+    /// as a 44% throughput loss on a 3-partition cluster, with 1 ms and 2 ms windows
+    /// indistinguishable because the wait was probe-bounded, not window-bounded.</para>
+    ///
+    /// <para>Each timed wait is bounded by the <em>remaining</em> window, so the configured
+    /// linger is honoured exactly; an arrival ends the wait immediately. Kernel timed-wait
+    /// granularity still rounds a sub-millisecond remainder up to ~1 ms.</para>
     ///
     /// <para>Only <em>when</em> the group fsync fires changes; never <em>whether</em> a write
     /// is durable before its completion callback runs. Per-partition ordering and the
@@ -509,14 +570,23 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     {
         long deadline = global::System.Diagnostics.Stopwatch.GetTimestamp() + lingerTicks;
 
-        while (partitionGroup.Count < maxGroupBatchPartitions
-               && global::System.Diagnostics.Stopwatch.GetTimestamp() < deadline)
+        while (partitionGroup.Count < maxGroupBatchPartitions)
         {
+            long remainingTicks = deadline - global::System.Diagnostics.Stopwatch.GetTimestamp();
+            if (remainingTicks <= 0)
+                break;
+
+            if (!OtherPartitionsHaveQueuedWork(partitionGroup))
+                break; // nothing outside the group can become ready → flushing now is strictly better.
+
+            int waitMs = (int)Math.Ceiling(remainingTicks * 1000.0 / global::System.Diagnostics.Stopwatch.Frequency);
+
             int extraId;
             try
             {
-                if (!_readyPartitions.TryTake(out extraId, LingerProbeMs, token))
-                    break; // queue paused within the probe → burst over, stop lingering.
+                Interlocked.Increment(ref _totalLingerWaits);
+                if (!_readyPartitions.TryTake(out extraId, waitMs, token))
+                    break; // window exhausted: the expected arrival was slower than the budget.
             }
             catch (OperationCanceledException)
             {
@@ -528,7 +598,41 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             }
 
             partitionGroup.Add(extraId);
+            Interlocked.Increment(ref _totalLingerPartitionsGathered);
+
+            // Grab whatever arrived alongside without waiting again; the loop then re-checks
+            // the remaining window and whether anything else is worth waiting for.
+            while (partitionGroup.Count < maxGroupBatchPartitions && _readyPartitions.TryTake(out int moreId))
+            {
+                partitionGroup.Add(moreId);
+                Interlocked.Increment(ref _totalLingerPartitionsGathered);
+            }
         }
+    }
+
+    /// <summary>
+    /// True when at least one partition outside <paramref name="partitionGroup"/> has operations
+    /// enqueued but not yet drained into any worker's write batch — i.e. a concrete future
+    /// ready-queue arrival the linger can gather. Computed as <see cref="_queuedOperations"/>
+    /// minus the group's own depths; for group partitions depth equals their queued count,
+    /// because their ready-queue slot is held by this worker so none of their ops can be in
+    /// flight. Lock-free and approximate: the reads race with concurrent enqueues and drains,
+    /// so a stale answer occasionally makes the linger wait once more or flush a little early.
+    /// Both are timing effects only — durability and ordering never depend on this answer.
+    /// </summary>
+    private bool OtherPartitionsHaveQueuedWork(List<int> partitionGroup)
+    {
+        int queuedElsewhere = Volatile.Read(ref _queuedOperations);
+        if (queuedElsewhere <= 0)
+            return false;
+
+        foreach (int pid in partitionGroup)
+        {
+            if (_partitions.TryGetValue(pid, out PartitionState? state))
+                queuedElsewhere -= state.Depth;
+        }
+
+        return queuedElsewhere > 0;
     }
 
     /// <summary>
@@ -583,6 +687,10 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
             if (pidBatch.Count > 0)
             {
+                // Drained ops leave the linger gate's evidence pool here, not at completion:
+                // once inside this batch they can no longer cause a future ready-queue arrival.
+                if (trackQueuedOps)
+                    Interlocked.Add(ref _queuedOperations, -pidBatch.Count);
                 groupBatches.Add((pid, pidBatch));
             }
             else
@@ -607,18 +715,50 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         // first keeps the pre-existing-orphan cleanup (those rows predate every op in the batch,
         // so the batch minimum is exactly their sequential fate) while every row written by this
         // batch survives it; a genuine orphan among them is cleaned by a later batch's pass.
+        // Two guards keep the sweep from deleting live data (it deletes with no log line and no
+        // frontier bookkeeping, so anything it takes is silently unrecoverable):
+        //
+        //   1. Only an op that writes a first-durability row (Proposed/ProposedCheckpoint) may
+        //      define a cutoff. Such an op is a live tail append, and "the tail ends at X ⇒
+        //      Proposed rows above X are a dead term's orphans" is the sweep's founding claim. A
+        //      pure resolution op — a commit-marker re-ship of an OLD id — says nothing about the
+        //      tail: with pipelined proposals the commit of id k always races proposals k+1.., so
+        //      letting its low max id drive the cutoff deleted freshly-acked quorum rows above it.
+        //      That is precisely what manufactured the shared hole at index 6 on four of five
+        //      voters in Jepsen run 32690955741 (a duplicate commit-marker batch for the committed
+        //      prefix, LogIndex 5, arriving after proposes 6..8 had landed) and left the partition
+        //      permanently leaderless.
+        //
+        //   2. The cutoff never goes below the enqueue-time accepted-id floor stamped on the ops
+        //      (see WALWriteOperation.TruncateFloor): a row this process accepted may back a
+        //      quorum ack and is certified by the in-memory frontiers, which are never re-read
+        //      from disk. This also covers a late proposal RETRY (a Proposed-carrying op whose max
+        //      id sits below already-accepted higher rows). Floors are monotone per partition, so
+        //      the batch maximum is the latest knowledge.
+        //
+        // Pre-restart orphans (the sweep's legacy target: the two-fsync recovery path discards the
+        // proposed tail and reuses its ids) sit above the floor whenever recovery could not chain
+        // presence over them, and are still swept; orphans the floor now covers are inert rows
+        // that id reuse overwrites in place.
         foreach ((int pid, List<WALWriteOperation> pidBatch) in groupBatches)
         {
             long minTruncateIndex = long.MaxValue;
+            long acceptedFloor = -1;
 
             foreach (WALWriteOperation op in pidBatch)
             {
-                if (op.Type == WALWriteOperationType.FollowerAppend && op.LogIndex > 0 && op.LogIndex < minTruncateIndex)
+                if (op.Type != WALWriteOperationType.FollowerAppend)
+                    continue;
+
+                if (op.TruncateFloor > acceptedFloor)
+                    acceptedFloor = op.TruncateFloor;
+
+                if (op.LogIndex > 0 && op.LogIndex < minTruncateIndex && ContainsFirstDurabilityRow(op.Logs.Logs))
                     minTruncateIndex = op.LogIndex;
             }
 
             if (minTruncateIndex != long.MaxValue)
-                walAdapter.TruncateProposedLogsAfter(pid, minTruncateIndex);
+                walAdapter.TruncateProposedLogsAfter(pid, Math.Max(minTruncateIndex, acceptedFloor));
         }
 
         // ── Phase 2: single cross-partition WAL write ──────────────────────
@@ -792,6 +932,22 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// and every first-durability type (Proposed/ProposedCheckpoint) and rollback marker. An empty list is
     /// not eligible (returns false), so it can never spuriously suppress a fsync.
     /// </summary>
+    /// <summary>
+    /// True when <paramref name="logs"/> contains at least one first-durability row
+    /// (<see cref="RaftLogType.Proposed"/> or <see cref="RaftLogType.ProposedCheckpoint"/>) — the
+    /// mark of a live tail append. Only such an operation may drive the proposed-tail truncation
+    /// cutoff; see the guard notes at the call site.
+    /// </summary>
+    private static bool ContainsFirstDurabilityRow(List<RaftLog> logs)
+    {
+        foreach (RaftLog log in logs)
+        {
+            if (log.Type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
+                return true;
+        }
+        return false;
+    }
+
     private static bool AllCommittedMarkers(List<RaftLog> logs)
     {
         if (logs.Count == 0)

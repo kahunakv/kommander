@@ -88,8 +88,17 @@ internal sealed class LogApplicator
 
             foreach (RaftLog log in batch)
             {
+                // A row past the target does NOT prove the range below it is covered: with the
+                // expected next id still queued in the WAL write scheduler (invisible to this
+                // backend read), the first visible row can sit above the target — returning
+                // "covered" here skipped the classification below and reported success over an
+                // undelivered range. Stop and let the exit checks classify the remainder (gap →
+                // withhold and retry; covered → true).
                 if (log.Id > upToIndex)
-                    return true;
+                {
+                    from = upToIndex + 1;           // terminate the outer loop; exit checks decide
+                    break;
+                }
                 if (log.Id <= coreState.LastAppliedIndex)
                     continue;                       // already applied (defensive; the read starts at 'from')
                 if (log.Id != coreState.LastAppliedIndex + 1 && !skipGaps)
@@ -104,11 +113,15 @@ internal sealed class LogApplicator
                     //     id and the tail in order. Delivering past it would skip it permanently.
                     //   * expected AT/BELOW the floor, or the -1/0 pre-restore sentinel (below the first log id):
                     //     the id was compacted by a snapshot or never existed. Not a gap — ACCEPT this entry as
-                    //     the next contiguous delivery (the cursor advances to it below).
+                    //     the next contiguous delivery (the cursor advances to it below). The certificate ends
+                    //     AT the floor: accepting an entry above floor+1 would advance the cursor across the
+                    //     uncertified absent range (floor, entry) and permanently skip committed entries that
+                    //     backfill delivers later — so that shape withholds too.
                     // With skipGaps (a sole voter proceeding past an unrecoverable gap), every present
                     // entry is delivered regardless of holes.
                     long floor = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
-                    if (coreState.LastAppliedIndex + 1 > 0 && coreState.LastAppliedIndex + 1 > floor)
+                    if (coreState.LastAppliedIndex + 1 > 0
+                        && (coreState.LastAppliedIndex + 1 > floor || log.Id > floor + 1))
                         return false;
                 }
 
@@ -137,12 +150,14 @@ internal sealed class LogApplicator
         }
 
         // The loop can exit with the range uncovered (an empty batch: the tail of the range is
-        // absent). A missing tail above the floor is a gap exactly like an interior hole.
+        // absent). A missing tail above the floor is a gap exactly like an interior hole — and a
+        // "covered" verdict may only rest on the floor's certificate up to the floor itself, so a
+        // target past the floor with an absent tail is a gap too.
         if (coreState.LastAppliedIndex < upToIndex && !skipGaps)
         {
             long expected = coreState.LastAppliedIndex + 1;
             long floor = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
-            if (expected > 0 && expected > floor)
+            if (expected > 0 && (expected > floor || upToIndex > floor))
                 return false;
         }
 
@@ -260,19 +275,36 @@ internal sealed class LogApplicator
 
             foreach (RaftLog log in batch)
             {
+                // A row past the range does NOT prove the range was covered: with the expected
+                // next id still queued in the WAL write scheduler (invisible to this backend
+                // read), the first visible row can sit above upToIndex — returning Covered here
+                // let the barrier completion apply its batch and jump the cursor over an entry
+                // that was never delivered and never re-committed. Nothing ever revisits it: the
+                // consumer projection silently misses a committed entry for the whole tenure, and
+                // the (gap-aware) commit frontier pins below it while applied marches on — the
+                // CommitMonotonicity violations of CI run 33195170707. Fall through to the exit
+                // checks, which classify the unvisited remainder (hole → the caller's retry loop
+                // re-reads after the queued write lands; covered → Covered).
                 if (log.Id > upToIndex)
                 {
-                    EnqueueInheritedRecommitMarkers(recommit);
-                    return InheritedDrainStatus.Covered;
+                    from = upToIndex + 1;           // terminate the outer loop; exit checks decide
+                    break;
                 }
 
                 if (log.Id > expected && !skipGaps)
                 {
+                    // Same certificate bound as the committed drain: the floor certifies only ids at
+                    // or below itself, so an entry above floor+1 sits past an uncertified absent
+                    // range and is a hole even when 'expected' is under the floor.
                     long floor = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
-                    if (expected > 0 && expected > floor)
+                    if (expected > 0 && (expected > floor || log.Id > floor + 1))
                     {
-                        logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Inherited-entry drain found a WAL hole: expected {Expected}, next present {Present} (floor {Floor}).",
-                            host.LocalEndpoint, host.PartitionId, coreState.NodeState, expected, log.Id, floor);
+                        // Throttled: the promotion paths retry this drain every 2ms for up to the
+                        // barrier timeout, and an unthrottled line per attempt wrote ~4.4k
+                        // identical lines per episode in the Jepsen stores.
+                        if (ShouldLogDrainHole())
+                            logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Inherited-entry drain found a WAL hole: expected {Expected}, next present {Present} (floor {Floor}) (suppressedSinceLastLine={Suppressed}).",
+                                host.LocalEndpoint, host.PartitionId, coreState.NodeState, expected, log.Id, floor, TakeSuppressedDrainHoleLogs());
                         EnqueueInheritedRecommitMarkers(recommit);
                         return InheritedDrainStatus.Hole;
                     }
@@ -301,6 +333,18 @@ internal sealed class LogApplicator
                 if (log.Type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
                 {
                     (recommit ??= []).Add(log);
+                    wal.MarkInheritedCommitted(log.Id);
+                }
+                else
+                {
+                    // Already durably resolved on disk (Committed / RolledBack / checkpoint) — but
+                    // possibly NOT yet absorbed by the in-memory frontier: a follower stint can
+                    // miss a resolution's bookkeeping (its re-ship heals a follower, but a leader
+                    // is never backfilled). This drain advances the applied cursor over the row,
+                    // so the frontier must absorb the same resolution or it pins below the cursor
+                    // for the whole tenure while every new commit buffers above the phantom gap
+                    // (the mid-tenure CommitMonotonicity shape of CI run 33195170707). Gap-buffered
+                    // and idempotent: ids at/below the frontier are ignored.
                     wal.MarkInheritedCommitted(log.Id);
                 }
 
@@ -358,14 +402,17 @@ internal sealed class LogApplicator
         EnqueueInheritedRecommitMarkers(recommit);
 
         // The loop can also exit without reaching upToIndex (an empty batch: the whole tail of the
-        // range is absent). A missing tail above the floor is a hole exactly like an interior gap.
+        // range is absent). A missing tail above the floor is a hole exactly like an interior gap,
+        // and so is a target past the floor's certificate with the tail absent.
         if (expected <= upToIndex && !skipGaps)
         {
             long floor = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
-            if (expected > 0 && expected > floor)
+            if (expected > 0 && (expected > floor || upToIndex > floor))
             {
-                logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Inherited-entry drain missing the range tail: expected through {UpToIndex}, present through {Expected} (floor {Floor}).",
-                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, upToIndex, expected - 1, floor);
+                // Same 1s throttle as the interior-gap line above (the 2ms retry loops).
+                if (ShouldLogDrainHole())
+                    logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Inherited-entry drain missing the range tail: expected through {UpToIndex}, present through {Expected} (floor {Floor}) (suppressedSinceLastLine={Suppressed}).",
+                        host.LocalEndpoint, host.PartitionId, coreState.NodeState, upToIndex, expected - 1, floor, TakeSuppressedDrainHoleLogs());
                 return InheritedDrainStatus.Hole;
             }
         }
@@ -394,6 +441,40 @@ internal sealed class LogApplicator
     /// refusals). Every drain exit returns immediately after calling this, so no double-enqueue
     /// is possible without the clear.
     /// </summary>
+    /// <summary>Monotonic tick of the last drain-hole error line, for the 1s log throttle.</summary>
+    private long lastDrainHoleLogTicks;
+
+    /// <summary>Drain-hole error lines suppressed since the last one written.</summary>
+    private long suppressedDrainHoleLogs;
+
+    /// <summary>
+    /// 1-per-second throttle for the drain-hole error lines: the promotion paths retry the
+    /// inherited drain every 2ms for up to the barrier timeout, and logging every attempt wrote
+    /// thousands of identical lines per episode. Runs on the partition's serialized executor path,
+    /// so plain fields suffice.
+    /// </summary>
+    private bool ShouldLogDrainHole()
+    {
+        long now = global::System.Diagnostics.Stopwatch.GetTimestamp();
+
+        if (lastDrainHoleLogTicks != 0 && (now - lastDrainHoleLogTicks) < global::System.Diagnostics.Stopwatch.Frequency)
+        {
+            suppressedDrainHoleLogs++;
+            return false;
+        }
+
+        lastDrainHoleLogTicks = now;
+        return true;
+    }
+
+    /// <summary>Returns and resets the suppressed-line count for inclusion in the next line.</summary>
+    private long TakeSuppressedDrainHoleLogs()
+    {
+        long suppressed = suppressedDrainHoleLogs;
+        suppressedDrainHoleLogs = 0;
+        return suppressed;
+    }
+
     private void EnqueueInheritedRecommitMarkers(List<RaftLog>? inherited)
     {
         if (inherited is null || inherited.Count == 0)

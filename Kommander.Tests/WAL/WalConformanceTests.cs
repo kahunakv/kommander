@@ -520,11 +520,13 @@ public abstract class WalConformanceTests
             const int p = 42;
 
             // A higher checkpoint at id 5 exists; installing a boundary at a LOWER matching index must not
-            // regress the recorded checkpoint when the suffix (including id 5) is retained.
+            // regress the recorded checkpoint when the suffix (including id 5) is retained. The prefix is
+            // contiguous: a checkpoint written over a gap no longer advances the recorded id.
             wal.Write([(p, [
                 Log(1),
                 Log(2, term: 4, type: RaftLogType.CommittedCheckpoint),
                 Log(3, term: 4),
+                Log(4, term: 4),
                 Log(5, term: 4, type: RaftLogType.CommittedCheckpoint)
             ])]);
             AssertCheckpointMatchesScan(wal, p, 5);
