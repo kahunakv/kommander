@@ -84,8 +84,12 @@ collect() {
     regex="${entry#*|}"
     for path in "${CONSENSUS_PATHS[@]}"; do
       [[ -e "$path" ]] || continue
-      # -r walks a directory; a single file argument works the same way.
-      grep -rEIn --include='*.cs' "$regex" "$path" 2>/dev/null | while IFS= read -r hit; do
+      # -r walks a directory; a single file argument works the same way. -H is required:
+      # GNU grep omits the filename prefix when it searches exactly one file, which turns the
+      # per-file key into a line number and makes every single-file entry miss its baseline.
+      # BSD grep prints the prefix either way, so without -H the check passes on macOS and
+      # fails in CI.
+      grep -rHEIn --include='*.cs' "$regex" "$path" 2>/dev/null | while IFS= read -r hit; do
         local file="${hit%%:*}"
         is_allowed_file "$file" && continue
         printf '%s\t%s\n' "$label" "$hit"
@@ -103,7 +107,7 @@ fi
 
 # Reduce to per-file, per-label counts and compare against the baseline.
 CURRENT="$(printf '%s\n' "$MATCHES" \
-  | awk -F'\t' 'NF==2 { split($2, parts, ":"); print parts[1] "|" $1 }' \
+  | awk -F'\t' 'NF>=2 { split($2, parts, ":"); print parts[1] "|" $1 }' \
   | sort | uniq -c | awk '{ print $2 " " $1 }' | sort)"
 
 if [[ ! -f "$BASELINE_FILE" ]]; then
