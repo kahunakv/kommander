@@ -71,21 +71,29 @@ public sealed class RecoveryReconstructionCrashMatrixTests
     }
 
     /// <summary>
-    /// The crash-after-lazy-commit shape: the tail's lazy commit markers were lost, so entries
+    /// The crash-after-commit-marker-loss shape: the tail's commit markers were lost, so entries
     /// K+1..N are durable only as Proposed. Recovery must restore exactly the contiguous committed
     /// prefix 1..K, retain the durable tail (no acked write lost, no overwrite of its ids), and must
     /// NOT deliver the Proposed tail as committed. Asserted for kills at three windows (the tail length
     /// = how many markers the crash dropped): just the last (between writes), a few (after a burst), and
-    /// the whole tail (before any marker flushed).
+    /// the whole tail (before any marker flushed). Runs with the single-fsync fast path on AND off:
+    /// the shape arises in both modes (lazy markers on the fast path; a follower's asynchronous
+    /// commit broadcast on the two-fsync path), so recovery must be identical.
     /// </summary>
     [Theory]
-    [InlineData(WalBackend.RocksDb, 11)] // one marker lost (kill between the last two writes)
-    [InlineData(WalBackend.RocksDb, 8)]  // a few markers lost
-    [InlineData(WalBackend.RocksDb, 0)]  // every marker lost (kill before any flush)
-    [InlineData(WalBackend.Sqlite, 11)]
-    [InlineData(WalBackend.Sqlite, 8)]
-    [InlineData(WalBackend.Sqlite, 0)]
-    public async Task CrashShape_LostTailMarkers_RecoversContiguousPrefix_RetainsDurableTail(WalBackend backend, int committedThrough)
+    [InlineData(WalBackend.RocksDb, 11, true)]  // one marker lost (kill between the last two writes)
+    [InlineData(WalBackend.RocksDb, 8, true)]   // a few markers lost
+    [InlineData(WalBackend.RocksDb, 0, true)]   // every marker lost (kill before any flush)
+    [InlineData(WalBackend.RocksDb, 11, false)]
+    [InlineData(WalBackend.RocksDb, 8, false)]
+    [InlineData(WalBackend.RocksDb, 0, false)]
+    [InlineData(WalBackend.Sqlite, 11, true)]
+    [InlineData(WalBackend.Sqlite, 8, true)]
+    [InlineData(WalBackend.Sqlite, 0, true)]
+    [InlineData(WalBackend.Sqlite, 11, false)]
+    [InlineData(WalBackend.Sqlite, 8, false)]
+    [InlineData(WalBackend.Sqlite, 0, false)]
+    public async Task CrashShape_LostTailMarkers_RecoversContiguousPrefix_RetainsDurableTail(WalBackend backend, int committedThrough, bool fastPath)
     {
         const int total = 12;
         string path = CreateTempWalPath();
@@ -94,7 +102,7 @@ public sealed class RecoveryReconstructionCrashMatrixTests
             // Seed: ids 1..committedThrough Committed, committedThrough+1..12 Proposed (markers lost).
             SeedPartition(backend, path, committedThrough: committedThrough, proposedTailThrough: total);
 
-            (List<long> restored, long maxLog, long nextId) = await RecoverAndProbeAsync(backend, path, fastPath: true);
+            (List<long> restored, long maxLog, long nextId) = await RecoverAndProbeAsync(backend, path, fastPath);
 
             // Only the contiguous committed prefix is delivered as committed.
             Assert.Equal(Enumerable.Range(1, committedThrough).Select(i => (long)i), restored);
@@ -116,9 +124,63 @@ public sealed class RecoveryReconstructionCrashMatrixTests
     }
 
     /// <summary>
-    /// Equivalence: for the clean shape the fast-path-on reconstruction and the fast-path-off legacy
-    /// recovery deliver the <b>identical</b> committed prefix. (The shapes diverge only when markers are
-    /// actually lost, which the legacy path cannot produce.)
+    /// The out-of-order marker-loss shape: markers landed for ids above a hole, then the crash took
+    /// the hole's marker. On disk: 1..8 Committed, 9 Proposed, 10..12 Committed. The commit broadcast
+    /// delivers marker batches out of order, and the WAL write path persists whatever a batch carries,
+    /// so this shape is reachable in BOTH commit modes.
+    ///
+    /// <para>Recovery must anchor at the CONTIGUOUS prefix (1..8) — never at the last durable marker
+    /// (12). Anchoring at the last marker certified 9 as committed without ever applying it, and
+    /// advertised a healthy frontier, so no re-supply ever repaired the hole: a silent, permanent
+    /// applied-state hole that surfaced as lost acknowledged writes once the node led (the fsync-gate
+    /// kill soak's broken bank invariant). The full assertion: restore delivers exactly 1..8, and the
+    /// promotion drain then re-commits and delivers 9..12 — every acked entry is applied, exactly
+    /// once, in order.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(WalBackend.RocksDb, true)]
+    [InlineData(WalBackend.RocksDb, false)]
+    [InlineData(WalBackend.Sqlite, true)]
+    [InlineData(WalBackend.Sqlite, false)]
+    public async Task CrashShape_MarkerHoleBelowDurableMarkers_AnchorsAtContiguousPrefix_NoAckedWriteLost(WalBackend backend, bool fastPath)
+    {
+        const int total = 12;
+        const int holeId = 9;
+        string path = CreateTempWalPath();
+        try
+        {
+            // Seed: all 12 rows present; every marker durable EXCEPT id 9's (still Proposed).
+            SeedPartitionWithMarkerHole(backend, path, total: total, holeId: holeId);
+
+            ConcurrentBag<long> received = [];
+            (List<long> restored, long maxLog, long nextId) = await RecoverAndProbeAsync(backend, path, fastPath, received);
+
+            // Restore delivers ONLY the contiguous committed prefix below the hole — 10..12 are
+            // durable markers but sit above an unresolved id and must not be applied over it.
+            Assert.Equal(Enumerable.Range(1, holeId - 1).Select(i => (long)i), restored);
+
+            // The hole and everything above it arrive via the promotion drain (re-commit of the
+            // inherited prior-term entry plus delivery of the buffered committed tail): no acked
+            // write is lost and none is double-applied.
+            List<long> drained = received.Where(id => id >= holeId && id <= total).OrderBy(id => id).ToList();
+            Assert.Equal(Enumerable.Range(holeId, total - holeId + 1).Select(i => (long)i), drained);
+            Assert.DoesNotContain(received, id => id < holeId);
+
+            // The durable tail was retained (no id reuse): the promotion barrier no-op sits at
+            // total+1 and the probe write lands strictly past it.
+            Assert.Equal(total + 1, maxLog);
+            Assert.Equal(total + 2, nextId);
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    /// <summary>
+    /// Equivalence: for the clean shape the fast-path-on and fast-path-off recoveries deliver the
+    /// <b>identical</b> committed prefix. (The crash shapes above assert the same equivalence for
+    /// marker-loss shapes, which arise in both modes.)
     /// </summary>
     [Theory]
     [InlineData(WalBackend.RocksDb)]
@@ -177,11 +239,41 @@ public sealed class RecoveryReconstructionCrashMatrixTests
     }
 
     /// <summary>
+    /// Writes the out-of-order marker-loss shape: ids 1..<paramref name="total"/> all present, every
+    /// one <see cref="RaftLogType.Committed"/> except <paramref name="holeId"/>, which stays
+    /// <see cref="RaftLogType.Proposed"/> — the row a crash leaves when marker batches landed out of
+    /// order and the hole's marker was the one lost. Disposes the WAL so the node can reopen it.
+    /// </summary>
+    private void SeedPartitionWithMarkerHole(WalBackend backend, string path, int total, long holeId)
+    {
+        using IWAL wal = CreateWal(backend, path);
+
+        List<RaftLog> logs = [];
+        for (int id = 1; id <= total; id++)
+        {
+            logs.Add(new RaftLog
+            {
+                Id = id,
+                Term = 1,
+                Type = id == holeId ? RaftLogType.Proposed : RaftLogType.Committed,
+                LogType = "Greeting",
+                LogData = "Hello World"u8.ToArray(),
+            });
+        }
+
+        RaftOperationStatus status = wal.Write([(UserPartition, logs)]);
+        Assert.Equal(RaftOperationStatus.Success, status);
+    }
+
+    /// <summary>
     /// Starts a single node on the seeded WAL, captures the committed entries delivered on restore for
     /// <see cref="UserPartition"/>, then probes the reconstructed propose cursor by issuing one write and
     /// reading back its assigned index. Returns (restoredIds, maxLog, nextProposedId).
+    /// <paramref name="received"/>, when supplied, collects post-restore consumer deliveries
+    /// (<c>OnReplicationReceived</c>) — the promotion drain's re-supply of entries above the
+    /// reconstructed frontier.
     /// </summary>
-    private async Task<(List<long> restored, long maxLog, long nextId)> RecoverAndProbeAsync(WalBackend backend, string path, bool fastPath)
+    private async Task<(List<long> restored, long maxLog, long nextId)> RecoverAndProbeAsync(WalBackend backend, string path, bool fastPath, ConcurrentBag<long>? received = null)
     {
         ConcurrentBag<long> restored = [];
 
@@ -192,6 +284,15 @@ public sealed class RecoveryReconstructionCrashMatrixTests
                 restored.Add(log.Id);
             return Task.FromResult(true);
         };
+        if (received is not null)
+        {
+            node.OnReplicationReceived += (partitionId, log) =>
+            {
+                if (partitionId == UserPartition)
+                    received.Add(log.Id);
+                return Task.FromResult(true);
+            };
+        }
 
         using CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         cts.CancelAfter(TimeSpan.FromSeconds(15));

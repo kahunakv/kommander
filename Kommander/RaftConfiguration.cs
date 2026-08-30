@@ -434,20 +434,22 @@ public class RaftConfiguration
     /// <para>Scope is strictly the <c>autoCommit</c> single-round path. The explicit
     /// two-phase (<c>!AutoCommit</c>) path keeps its separate durable commit, untouched.</para>
     ///
-    /// <para><b>Defaults to <c>true</c>.</b> The cost of the fast path is that the on-disk
-    /// entry type is no longer a reliable committed/uncommitted boundary after a crash: restore
-    /// reconstructs a conservative lower bound (the contiguous committed prefix) and the true
-    /// tail is re-supplied by the leader on reconnect, or re-committed once this node wins an
-    /// election and commits a current-term entry. A node therefore serves a briefly truncated
-    /// view of its own committed state between restore and re-supply. Set to <c>false</c> to get
-    /// byte-for-byte the prior always-sync two-fsync behaviour, where the disk alone answers
-    /// "what was committed".</para>
+    /// <para><b>Defaults to <c>true</c>.</b> The flag controls exactly two things: the moment
+    /// the client ticket releases (quorum-durable vs. after the leader's own commit fsync), and
+    /// whether all-marker WAL batches may skip their own fsync and ride the next durable write
+    /// (see <c>FairWalScheduler</c>'s <c>lazyCommitMarkers</c>). Set to <c>false</c> to keep the
+    /// commit fsync on the client's critical path.</para>
     ///
-    /// <para>The flag must be set <b>uniformly across the cluster</b>: the regressed-frontier
-    /// re-supply channel is a follower-reports / leader-reacts pair (see
-    /// <c>RaftPartitionStateMachine.CompleteAppendLogsAsync</c>), and with the flag off a
-    /// follower's heartbeat ack reports <c>-1</c> instead of its real frontier, leaving the
-    /// channel half-wired.</para>
+    /// <para>Crash recovery and repair are deliberately <b>identical in both modes</b>: restore
+    /// reconstructs a conservative lower bound (the contiguous committed prefix, never anchored
+    /// at the last marker, which can sit above a marker hole), the durable Proposed tail is
+    /// preserved, every Success ack reports the follower's true committed frontier, and the
+    /// leader's regressed-frontier re-supply reacts to it. The on-disk entry type is not a
+    /// reliable committed/uncommitted boundary after a crash in either mode — a follower learns
+    /// commits through the asynchronous commit broadcast, so a kill can leave acknowledged
+    /// entries Proposed on its disk (or persist markers out of order) regardless of this flag.
+    /// A restarted node therefore serves a briefly truncated view of its own committed state
+    /// between restore and re-supply, in both modes.</para>
     /// </summary>
     public bool WalSingleFsyncCommit { get; set; } = true;
 

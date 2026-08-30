@@ -132,10 +132,10 @@ internal sealed class ReplicationTracker
     /// wedge fully detected. A dead peer that never acks is bounded by the outbound-queue
     /// saturation gate instead.</para>
     ///
-    /// <para>Only peers that report a commit frontier (&gt;= 0) are tracked: a legacy-path peer
-    /// reports -1 forever, its catch-up is driven by snapshot installs rather than frontier
-    /// advances, and pacing it on a frontier that can never move would throttle a healthy
-    /// catch-up.</para>
+    /// <para>Only peers that report a commit frontier (&gt;= 0) are tracked: a peer that never
+    /// reports one (a pre-frontier-report release during a rolling upgrade) has its catch-up
+    /// driven by snapshot installs rather than frontier advances, and pacing it on a frontier
+    /// that can never move would throttle a healthy catch-up.</para>
     /// </summary>
     private sealed class BackfillProgressProbe
     {
@@ -240,9 +240,10 @@ internal sealed class ReplicationTracker
     /// progress for one peer: the commit frontier, <c>matchIndex</c>, <c>nextIndex</c>, and the
     /// log-start position all advance to the installed boundary.
     ///
-    /// <para><b>Why every cursor must advance, not only the frontier.</b> On the legacy two-fsync
-    /// path a follower's acks carry <c>committedIndex = -1</c> ("no report"), so no ack ever
-    /// advances <c>matchIndex</c> or <c>nextIndex</c>. The install confirmation is therefore the
+    /// <para><b>Why every cursor must advance, not only the frontier.</b> A follower whose acks
+    /// carry <c>committedIndex = -1</c> ("no report" — a pre-frontier-report release during a
+    /// rolling upgrade) never advances <c>matchIndex</c> or <c>nextIndex</c> through acks. The
+    /// install confirmation is therefore the
     /// leader's ONLY progress channel for such a peer. An earlier version advanced only the
     /// frontier; the stale <c>nextIndex</c> stayed pinned below the WAL compaction floor, and the
     /// backfill path prefers <c>nextIndex</c> as its anchor — so every batch re-anchored at an

@@ -1825,8 +1825,8 @@ public sealed class RaftPartitionStateMachine
     /// <c>matchIndex</c>, <c>nextIndex</c>, log-start) after the background snapshot task confirmed
     /// successful installation — see
     /// <see cref="Consensus.ReplicationTracker.AdvanceProgressFromSnapshotInstall"/> for why the
-    /// send cursors must advance here and not wait for an ack (on the legacy two-fsync path no ack
-    /// ever carries a frontier, and a stale <c>nextIndex</c> below the compaction floor loops the
+    /// send cursors must advance here and not wait for an ack (a peer that reports no frontier in
+    /// its acks, and a stale <c>nextIndex</c> below the compaction floor, loop the
     /// rescue forever). Called on the executor thread via the <c>postToExecutor</c> callback;
     /// delegates ownership update to <see cref="snapshotSender"/>.
     /// </summary>

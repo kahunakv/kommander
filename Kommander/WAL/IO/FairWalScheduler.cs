@@ -736,10 +736,10 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         //      id sits below already-accepted higher rows). Floors are monotone per partition, so
         //      the batch maximum is the latest knowledge.
         //
-        // Pre-restart orphans (the sweep's legacy target: the two-fsync recovery path discards the
-        // proposed tail and reuses its ids) sit above the floor whenever recovery could not chain
-        // presence over them, and are still swept; orphans the floor now covers are inert rows
-        // that id reuse overwrites in place.
+        // Pre-restart orphans (Proposed rows of a dead term left above the durable tail by a
+        // crash) sit above the floor whenever recovery could not chain presence over them, and
+        // are still swept; rows the floor covers are certified by the in-memory frontiers and
+        // never touched.
         foreach ((int pid, List<WALWriteOperation> pidBatch) in groupBatches)
         {
             long minTruncateIndex = long.MaxValue;

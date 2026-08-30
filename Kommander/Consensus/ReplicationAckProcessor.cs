@@ -241,8 +241,9 @@ internal sealed class ReplicationAckProcessor
 
         // Everything below this guard derives replication progress from committedIndex, so it
         // requires an actual report. A Success ack with committedIndex < 0 carries NO frontier
-        // information — the legacy (two-fsync) heartbeat ack always reports -1, and the embedded
-        // Kahuna consumer runs that path by default. Feeding the -1 through the progress math
+        // information — current followers report their true frontier on every Success ack in both
+        // commit modes, but a peer from a release whose two-fsync heartbeat ack still reports -1
+        // can share the cluster during a rolling upgrade. Feeding the -1 through the progress math
         // fabricated a catch-up target out of nothing: right after an election win the optimistic
         // seed holds matchIndex = 0, a -1 report left newMatchIndex at 0, nextIndex became
         // 0 + 1 = 1, and the eager fast path below shipped a backfill anchored at 1 for a peer
@@ -288,13 +289,13 @@ internal sealed class ReplicationAckProcessor
                     await sender.TrySendBackfillBatchAsync(behindNode, committedIndex, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId)).ConfigureAwait(false);
             }
 
-            // Fast-path far-behind re-supply: a follower whose reported frontier trails the leader by more
+            // Far-behind re-supply: a follower whose reported frontier trails the leader by more
             // than BackfillThreshold is streamed forward here on its own ack (anchored normally via
             // nextIndex), so a multi-batch catch-up converges without stalling a heartbeat per batch. This
             // mirrors the eager catch-up above but keys on the reported committed frontier rather than
-            // matchIndex; confined to the fast path (flag off ⇒ a heartbeat reports -1 ⇒ never fires).
-            if (host.Configuration.WalSingleFsyncCommit
-                && coreState.NodeState == RaftNodeState.Leader
+            // matchIndex. Runs in both commit modes: a follower can lose commit markers in a crash
+            // on either path, and this ack is its report of that state.
+            if (coreState.NodeState == RaftNodeState.Leader
                 && host.Configuration.BackfillEnabled
                 && committedIndex >= 0
                 && coreState.LocalCommittedIndex - committedIndex > host.Configuration.BackfillThreshold)
@@ -322,7 +323,7 @@ internal sealed class ReplicationAckProcessor
             // The "was caught up" clause (priorMatchIndex within BackfillThreshold of coreState.LocalCommittedIndex)
             // excludes a still-climbing joining/far-behind follower, whose low acks are catch-up, not
             // regression — those are handled by the threshold paths above.
-            if (host.Configuration.WalSingleFsyncCommit && coreState.NodeState == RaftNodeState.Leader && committedIndex >= 0)
+            if (coreState.NodeState == RaftNodeState.Leader && committedIndex >= 0)
             {
                 bool frontierRegressed = hadMatchIndex
                     && committedIndex < priorMatchIndex

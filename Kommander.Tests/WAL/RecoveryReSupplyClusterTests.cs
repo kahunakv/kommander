@@ -10,10 +10,12 @@ namespace Kommander.Tests.WAL;
 
 /// <summary>
 /// The cluster half of the crash matrix: a follower that lost
-/// its lazy commit markers on a crash must re-converge to the full committed log via the leader's
-/// re-supply on reconnect, losing no acknowledged write.
+/// its commit markers on a crash must re-converge to the full committed log via the leader's
+/// re-supply on reconnect, losing no acknowledged write. Each case runs with the single-fsync
+/// fast path on AND off — a follower loses markers the same way in both modes (they arrive via
+/// the asynchronous commit broadcast), so the repair channel must work in both.
 ///
-/// <para>The crash is staged faithfully. A live 3-node cluster (fast path on) replicates and durably
+/// <para>The crash is staged faithfully. A live 3-node cluster replicates and durably
 /// commits N entries, then one follower is <b>crashed</b> via <see cref="RaftManager.Dispose"/> — an
 /// abrupt local stop that, unlike a graceful <c>LeaveCluster</c>, does <b>not</b> announce a membership
 /// removal, so the leader keeps treating the endpoint as a peer (exactly as in a real crash). The
@@ -41,8 +43,10 @@ public sealed class RecoveryReSupplyClusterTests
 
     private const int UserPartition = 1;
 
-    [Fact]
-    public async Task Follower_LostLazyMarkers_ReConvergesViaLeaderReSupply_NoAckedWriteLost()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Follower_LostLazyMarkers_ReConvergesViaLeaderReSupply_NoAckedWriteLost(bool singleFsyncCommit)
     {
         const int total = 20;
         const int keepCommitted = 5; // demote ids 6..20 back to Proposed on the crashed follower
@@ -62,7 +66,7 @@ public sealed class RecoveryReSupplyClusterTests
         try
         {
             for (int i = 0; i < 3; i++)
-                live[i] = MakeNode(i + 1, comm, new RocksDbWAL(tmpDir, $"node{i + 1}", logger, syncWrites: true), peersById[i]);
+                live[i] = MakeNode(i + 1, comm, new RocksDbWAL(tmpDir, $"node{i + 1}", logger, syncWrites: true), peersById[i], singleFsyncCommit: singleFsyncCommit);
 
             SetNetwork(comm, live);
 
@@ -106,7 +110,7 @@ public sealed class RecoveryReSupplyClusterTests
             DemoteCommitMarkers(tmpDir, $"node{victimNodeId}", from: keepCommitted + 1, to: total);
 
             // Restart on the same WAL.
-            RaftManager restarted = MakeNode(victimNodeId, comm, new RocksDbWAL(tmpDir, $"node{victimNodeId}", logger, syncWrites: true), peersById[victimIdx]);
+            RaftManager restarted = MakeNode(victimNodeId, comm, new RocksDbWAL(tmpDir, $"node{victimNodeId}", logger, syncWrites: true), peersById[victimIdx], singleFsyncCommit: singleFsyncCommit);
 
             ConcurrentBag<long> restoredIds = [];
             ConcurrentBag<long> receivedIds = [];
@@ -172,8 +176,10 @@ public sealed class RecoveryReSupplyClusterTests
     /// <para>Deliberately uses the <b>default</b> <c>BackfillThreshold</c> and writes nothing after the
     /// restart, so convergence can only come from the regressed-frontier path.</para>
     /// </summary>
-    [Fact]
-    public async Task Follower_LostSubThresholdTail_ReConvergesWithoutFurtherWrites()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Follower_LostSubThresholdTail_ReConvergesWithoutFurtherWrites(bool singleFsyncCommit)
     {
         const int total = 12;
         const int keepCommitted = 10; // demote ids 11..12 — a gap of 2, well under the default threshold of 10
@@ -193,7 +199,7 @@ public sealed class RecoveryReSupplyClusterTests
         try
         {
             for (int i = 0; i < 3; i++)
-                live[i] = MakeNode(i + 1, comm, new RocksDbWAL(tmpDir, $"node{i + 1}", logger, syncWrites: true), peersById[i], backfillThreshold: null);
+                live[i] = MakeNode(i + 1, comm, new RocksDbWAL(tmpDir, $"node{i + 1}", logger, syncWrites: true), peersById[i], backfillThreshold: null, singleFsyncCommit: singleFsyncCommit);
 
             SetNetwork(comm, live);
 
@@ -232,7 +238,7 @@ public sealed class RecoveryReSupplyClusterTests
 
             DemoteCommitMarkers(tmpDir, $"node{victimNodeId}", from: keepCommitted + 1, to: total);
 
-            RaftManager restarted = MakeNode(victimNodeId, comm, new RocksDbWAL(tmpDir, $"node{victimNodeId}", logger, syncWrites: true), peersById[victimIdx], backfillThreshold: null);
+            RaftManager restarted = MakeNode(victimNodeId, comm, new RocksDbWAL(tmpDir, $"node{victimNodeId}", logger, syncWrites: true), peersById[victimIdx], backfillThreshold: null, singleFsyncCommit: singleFsyncCommit);
 
             ConcurrentBag<long> restoredIds = [];
             ConcurrentBag<long> receivedIds = [];
@@ -317,7 +323,7 @@ public sealed class RecoveryReSupplyClusterTests
     /// <see cref="Follower_LostSubThresholdTail_ReConvergesWithoutFurtherWrites"/> needs in order to prove
     /// the regressed-frontier path repairs a gap the threshold would otherwise ignore.
     /// </param>
-    private RaftManager MakeNode(int id, InMemoryCommunication communication, IWAL wal, string[] peers, int? backfillThreshold = 1)
+    private RaftManager MakeNode(int id, InMemoryCommunication communication, IWAL wal, string[] peers, int? backfillThreshold = 1, bool singleFsyncCommit = true)
     {
         RaftConfiguration config = new()
         {
@@ -335,7 +341,7 @@ public sealed class RecoveryReSupplyClusterTests
             StartElectionTimeout = 100,
             EnableQuiescence = false,
             EndElectionTimeout = 250,
-            WalSingleFsyncCommit = true,
+            WalSingleFsyncCommit = singleFsyncCommit,
         };
 
         if (backfillThreshold is not null)
