@@ -156,23 +156,23 @@ public sealed class TestExternallyDrivenScheduling
 
     /// <summary>An idle manual pool has nothing to drain, and starting it creates no threads.</summary>
     [Fact]
-    public void ManualExecutorPool_StartsNoThreadsAndPumpsNothingWhenIdle()
+    public async Task ManualExecutorPool_StartsNoThreadsAndPumpsNothingWhenIdle()
     {
         using RaftExecutorPool pool = new(poolSize: 4, manualExecution: true);
         pool.Start();
 
         Assert.Equal(0, pool.PoolSize);
-        Assert.False(pool.PumpOnce());
-        Assert.Equal(0, pool.PumpUntilIdle());
+        Assert.False(await pool.PumpOnceAsync());
+        Assert.Equal(0, await pool.PumpUntilIdleAsync());
     }
 
     /// <summary>Pumping a pool that owns worker threads is refused, for the same reason.</summary>
     [Fact]
-    public void ThreadedExecutorPool_RefusesToBePumped()
+    public async Task ThreadedExecutorPool_RefusesToBePumped()
     {
         using RaftExecutorPool pool = new(poolSize: 2);
 
-        Assert.Throws<InvalidOperationException>(() => pool.PumpOnce());
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await pool.PumpOnceAsync());
     }
 
     // ── Configuration ─────────────────────────────────────────────────────

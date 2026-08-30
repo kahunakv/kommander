@@ -38,6 +38,17 @@ public sealed record SimulationClusterOptions
     public long UpdateNodesIntervalMs { get; init; } = 100;
 
     /// <summary>
+    /// When true the nodes own no scheduling threads and the harness drives their executors,
+    /// write-ahead logs, and outbound transports itself.
+    ///
+    /// <para>Default false while the mode is being brought up. With it on, the driver must
+    /// interleave the nodes rather than finish one at a time: an executor operation can be waiting
+    /// for another node, and a driver that ran one node to idle before starting the next would be
+    /// parked inside the one node it must leave.</para>
+    /// </summary>
+    public bool DrivenScheduling { get; init; }
+
+    /// <summary>
     /// Applied to every node's configuration after the defaults above. Use it to sample the
     /// safety-relevant configuration surface per run.
     /// </summary>

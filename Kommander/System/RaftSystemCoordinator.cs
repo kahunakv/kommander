@@ -182,7 +182,11 @@ internal sealed class RaftSystemCoordinator : IDisposable
             MaxRetries,
             logger);
 
-        _loop = Task.Run(RunAsync);
+        // Started inline rather than on the thread pool when the node's scheduling threads are off.
+        // RunAsync parks on its channel almost immediately, so starting it here costs nothing, and
+        // it removes one more decision the thread pool would otherwise make about when this loop
+        // gets to run relative to everything a deterministic driver is stepping.
+        _loop = manager.Configuration.EnableInternalSchedulingThreads ? Task.Run(RunAsync) : RunAsync();
     }
 
     /// <summary>

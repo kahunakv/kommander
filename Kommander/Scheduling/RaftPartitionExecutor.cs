@@ -563,8 +563,10 @@ public sealed class RaftPartitionExecutor : IDisposable
             {
                 // No pool thread exists to run that cleanup drain, so this thread runs it.
                 // Waiting on _stopTcs instead would deadlock: the task is completed by the very
-                // drain that nobody is left to perform.
-                while (!_stopTcs.Task.IsCompleted && _pool.PumpOnce())
+                // drain that nobody is left to perform. Blocking on the pump is acceptable here
+                // and only here: teardown is past the point where an operation can await new work.
+                while (!_stopTcs.Task.IsCompleted
+                       && _pool.PumpOnceAsync().AsTask().GetAwaiter().GetResult())
                 {
                 }
 
@@ -610,7 +612,24 @@ public sealed class RaftPartitionExecutor : IDisposable
     /// The <c>_inQueue</c> clear + re-check pattern closes the race between the drain-
     /// complete check and a concurrent producer enqueue.</para>
     /// </summary>
-    internal void DrainOnPool()
+    /// <summary>
+    /// Synchronous entry point for a pool worker thread. Blocks that thread until the drain
+    /// finishes, which is what it did before and what a pool thread is for.
+    ///
+    /// <para>An externally driven pool calls <see cref="DrainOnPoolAsync"/> instead, so its single
+    /// thread stays free while an operation is in flight.</para>
+    /// </summary>
+    internal void DrainOnPool() => DrainOnPoolAsync().AsTask().GetAwaiter().GetResult();
+
+    /// <summary>
+    /// Drains this partition under the per-partition run-lock, then re-schedules itself when work
+    /// remains.
+    ///
+    /// <para>The run-lock is an interlocked flag, not a monitor, so it survives a continuation
+    /// resuming on another thread. That is what makes the awaiting form safe: the state machine
+    /// still sees exactly one caller at a time, whichever thread carries it.</para>
+    /// </summary>
+    internal async ValueTask DrainOnPoolAsync()
     {
         // Acquire the per-partition run-lock.  This cannot normally fail because _inQueue
         // prevents the same executor being in the ready-queue twice, but guard it anyway.
@@ -621,12 +640,12 @@ public sealed class RaftPartitionExecutor : IDisposable
         {
             if (_stopping)
             {
-                DrainAll();
+                await DrainAllAsync().ConfigureAwait(false);
                 CancelPendingReplies();
             }
             else
             {
-                DrainQueues();
+                await DrainQueuesAsync().ConfigureAwait(false);
             }
         }
         finally
@@ -800,7 +819,9 @@ public sealed class RaftPartitionExecutor : IDisposable
             }
             catch (OperationCanceledException)
             {
-                DrainAll();
+                // Blocking is correct here: this thread belongs to this executor and has nothing
+                // else to do. Only an externally driven pool needs the awaiting form.
+                DrainAllAsync().AsTask().GetAwaiter().GetResult();
                 CancelPendingReplies();
                 break;
             }
@@ -820,7 +841,7 @@ public sealed class RaftPartitionExecutor : IDisposable
             while (true)
             {
                 // Drain all queues in weighted-fair order.
-                DrainQueues();
+                DrainQueuesAsync().AsTask().GetAwaiter().GetResult();
 
                 while (_workAvailable.Wait(0))
                 {
@@ -877,7 +898,7 @@ public sealed class RaftPartitionExecutor : IDisposable
             {
                 // Dedicated-thread mode: the worker will notice cancellation and drain,
                 // but also drain here defensively in case the worker hasn't started yet.
-                DrainAll();
+                await DrainAllAsync().ConfigureAwait(false);
                 CancelPendingReplies();
             }
         }
@@ -887,16 +908,33 @@ public sealed class RaftPartitionExecutor : IDisposable
     /// Weighted-fair drain using configurable per-class quanta.
     /// Defaults: Control×8, Replication×4, Client×2, Maintenance×1.
     /// </summary>
-    private void DrainQueues()
+    private async ValueTask DrainQueuesAsync()
     {
-        DrainQueue(_controlQueue,     _drainQuantumControl);
-        DrainQueue(_replicationQueue, _drainQuantumReplication);
+        await DrainQueueAsync(_controlQueue,     _drainQuantumControl).ConfigureAwait(false);
+        await DrainQueueAsync(_replicationQueue, _drainQuantumReplication).ConfigureAwait(false);
         // Only decrement the depth counter when the bounded path was used in Enqueue.
-        DrainQueue(_clientQueue,      _drainQuantumClient, decrementClientDepth: _maxClientQueueDepth > 0);
-        DrainQueue(_maintenanceQueue, _drainQuantumMaintenance);
+        await DrainQueueAsync(_clientQueue,      _drainQuantumClient, decrementClientDepth: _maxClientQueueDepth > 0).ConfigureAwait(false);
+        await DrainQueueAsync(_maintenanceQueue, _drainQuantumMaintenance).ConfigureAwait(false);
     }
 
-    private void DrainQueue(ConcurrentQueue<PendingOperation> queue, int maxPerCycle, bool decrementClientDepth = false)
+    /// <summary>
+    /// Drains up to <paramref name="maxPerCycle"/> operations from one queue.
+    ///
+    /// <para><b>Why this awaits rather than blocks.</b> It used to call
+    /// <c>GetAwaiter().GetResult()</c> on every operation. That is fine on a thread the executor
+    /// owns, but it makes the executor impossible to drive from a single thread: the driver would
+    /// sit inside this method for the whole operation, and any operation awaiting something
+    /// outside the executor could never complete, because the driver is the only thread that could
+    /// complete it. Awaiting lets a driver service the other schedulers while an operation is in
+    /// flight.</para>
+    ///
+    /// <para>Serialization is unaffected. The per-partition run-lock in
+    /// <see cref="DrainOnPoolAsync"/> is an interlocked flag rather than a thread-affine monitor,
+    /// so a continuation resuming on a different thread still holds it, and the state machine
+    /// still sees one caller at a time. The scratch lists are likewise safe: only the run-lock
+    /// holder touches them.</para>
+    /// </summary>
+    private async ValueTask DrainQueueAsync(ConcurrentQueue<PendingOperation> queue, int maxPerCycle, bool decrementClientDepth = false)
     {
         // Collect up to maxPerCycle items from this queue into the scratch list.
         _drainBatch.Clear();
@@ -927,20 +965,20 @@ public sealed class RaftPartitionExecutor : IDisposable
             // Pass the leading [0, batchEnd) window by index/count — no GetRange copy. An async
             // method cannot take a ReadOnlySpan<T>, so the (source, count) contract is the allocation-
             // free equivalent. _drainBatch is not mutated while the batch call runs.
-            ExecuteBatchAsync(_drainBatch, batchEnd).GetAwaiter().GetResult();
+            await ExecuteBatchAsync(_drainBatch, batchEnd).ConfigureAwait(false);
             dispatchStart = batchEnd;
         }
 
         for (int i = dispatchStart; i < _drainBatch.Count; i++)
-            ExecuteOneAsync(_drainBatch[i]).GetAwaiter().GetResult();
+            await ExecuteOneAsync(_drainBatch[i]).ConfigureAwait(false);
     }
 
-    private void DrainAll()
+    private async ValueTask DrainAllAsync()
     {
-        DrainQueue(_controlQueue,     int.MaxValue);
-        DrainQueue(_replicationQueue, int.MaxValue);
-        DrainQueue(_clientQueue,      int.MaxValue, decrementClientDepth: _maxClientQueueDepth > 0);
-        DrainQueue(_maintenanceQueue, int.MaxValue);
+        await DrainQueueAsync(_controlQueue,     int.MaxValue).ConfigureAwait(false);
+        await DrainQueueAsync(_replicationQueue, int.MaxValue).ConfigureAwait(false);
+        await DrainQueueAsync(_clientQueue,      int.MaxValue, decrementClientDepth: _maxClientQueueDepth > 0).ConfigureAwait(false);
+        await DrainQueueAsync(_maintenanceQueue, int.MaxValue).ConfigureAwait(false);
     }
 
     private bool AreQueuesEmpty() =>

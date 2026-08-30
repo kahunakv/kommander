@@ -18,11 +18,16 @@ namespace Kommander.Tests.Simulation.Cluster;
 /// collaborators. The harness owns the clock, the timer ticks, and the wire.</para>
 ///
 /// <para><b>Known residual.</b> Executor and write-ahead-log work still runs on real threads
-/// inside a step. Step boundaries are therefore deterministic while the interleaving within one
-/// step is not. The externally driven schedulers that would close this gap exist in the library
-/// and are tested, but a node cannot yet run on a single thread: a partition executor blocks on
-/// each operation it dispatches, so an operation that awaits anything outside the executor
-/// deadlocks a single-threaded driver. See the determinism-boundary notes in the specification.</para>
+/// inside a step, so step boundaries are deterministic while the interleaving within one step is
+/// not.
+/// <br/>
+/// The externally driven schedulers exist in the library and are tested, and the executor's drain
+/// path now awaits rather than blocks, but that is still not enough for one thread to run a whole
+/// node. A driver that awaits a node's drain to completion stalls whenever an operation is waiting
+/// on another node, because the driver is the only thing that would ever service that node. The
+/// fix is not another pump: the driver must interleave the nodes rather than finish one at a time,
+/// or the operations must stop awaiting cross-node work from inside the executor. See the
+/// determinism-boundary notes in the specification.</para>
 /// </summary>
 public sealed class SimulationCluster : IAsyncDisposable
 {
@@ -53,6 +58,13 @@ public sealed class SimulationCluster : IAsyncDisposable
 
     /// <summary>Simulated time at which the next membership refresh is due.</summary>
     private long nextUpdateNodesAtMilliseconds;
+
+    /// <summary>
+    /// Membership refreshes started but not finished, in driven mode. They are started rather than
+    /// awaited because each awaits partition operations that only the driver can complete, so the
+    /// settle loop is what waits for them.
+    /// </summary>
+    private readonly List<Task> pendingUpdateNodes = [];
 
     /// <summary>
     /// Builds and joins a cluster.
@@ -137,7 +149,12 @@ public sealed class SimulationCluster : IAsyncDisposable
             nextUpdateNodesAtMilliseconds = Clock.LogicalMilliseconds + Options.UpdateNodesIntervalMs;
 
             foreach (SimulationNode node in nodes)
-                await node.TickUpdateNodesAsync().ConfigureAwait(false);
+            {
+                if (Options.DrivenScheduling)
+                    pendingUpdateNodes.Add(node.BeginTickUpdateNodes());
+                else
+                    await node.TickUpdateNodesAsync().ConfigureAwait(false);
+            }
         }
 
         foreach (SimulationNode node in nodes)
@@ -172,8 +189,23 @@ public sealed class SimulationCluster : IAsyncDisposable
     /// cluster is measured against it — those all read the simulated clock, which this method
     /// never advances.</para>
     /// </summary>
+    /// <summary>
+    /// Executor drains started but not yet finished, one slot per node.
+    ///
+    /// <para>They are started rather than awaited because a drain can be waiting for another node.
+    /// A driver that awaited one would be parked inside the very node it must leave in order to
+    /// service the other, which is how the first attempt at this mode deadlocked.</para>
+    /// </summary>
+    private Task<int>?[]? inFlightDrains;
+
     private async Task SettleAsync(bool deliverMessages, CancellationToken cancellationToken)
     {
+        if (Options.DrivenScheduling)
+        {
+            await SettleDrivenAsync(deliverMessages, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
         long previousDelivered = -1;
 
         for (int round = 0; round < MaxSettleRounds; round++)
@@ -192,6 +224,121 @@ public sealed class SimulationCluster : IAsyncDisposable
             previousDelivered = delivered;
             await Task.Delay(1, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// Settles a cluster whose nodes own no scheduling threads.
+    ///
+    /// <para><b>The shape that works.</b> Each node's executor drain is <em>started</em> and kept
+    /// in flight. The driver then keeps doing the two things a parked drain is waiting for:
+    /// flushing every node's outbound transport, and delivering the wire. A drain that finishes
+    /// frees its slot and a fresh one starts. The round ends when nothing moved and no drain is
+    /// still running.</para>
+    ///
+    /// <para>Flushing the transport of a node whose drain is in flight is not optional. The
+    /// request that drain is waiting on may still be sitting in that node's own outbound queue,
+    /// and a driver that flushed only idle nodes would never send it.</para>
+    /// </summary>
+    private async Task SettleDrivenAsync(bool deliverMessages, CancellationToken cancellationToken)
+    {
+        for (int round = 0; round < MaxSettleRounds; round++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (await PumpRoundAsync(deliverMessages, cancellationToken).ConfigureAwait(false))
+                return;
+        }
+    }
+
+    /// <summary>
+    /// Runs one round of driven work and reports whether the cluster is now idle.
+    ///
+    /// <para>Each node's executor drain is <em>started</em> and kept in flight rather than awaited.
+    /// A drain can be waiting for another node, and a driver that awaited one would be parked
+    /// inside the very node it must leave in order to service the other. While the drains run,
+    /// this keeps doing the things a parked drain is waiting for: writing the write-ahead log,
+    /// flushing every node's outbound transport, and delivering the wire.</para>
+    ///
+    /// <para>Flushing a node whose drain is in flight is not optional. The request that drain is
+    /// waiting on may still be sitting in that node's own outbound queue.</para>
+    /// </summary>
+    private async Task<bool> PumpRoundAsync(bool deliverMessages, CancellationToken cancellationToken)
+    {
+        inFlightDrains ??= new Task<int>?[nodes.Count];
+
+        int work = 0;
+
+        for (int index = 0; index < nodes.Count; index++)
+        {
+            Task<int>? drain = inFlightDrains[index];
+
+            if (drain is not null && !drain.IsCompleted)
+                continue;
+
+            if (drain is not null)
+                work += await drain.ConfigureAwait(false);
+
+            inFlightDrains[index] = nodes[index].Manager.PumpExecutorsAsync().AsTask();
+        }
+
+        // Storage first: a completion posted here becomes executor work on the next round.
+        foreach (SimulationNode node in nodes)
+            work += node.Manager.PumpWriteAheadLog();
+
+        foreach (SimulationNode node in nodes)
+            work += await node.Manager.FlushTransportAsync().ConfigureAwait(false);
+
+        if (deliverMessages)
+            work += await Transport.DeliverAll().ConfigureAwait(false);
+
+        pendingUpdateNodes.RemoveAll(task => task.IsCompleted);
+
+        bool anyRunning = inFlightDrains.Any(drain => drain is not null && !drain.IsCompleted);
+        bool coordinatorBusy = nodes.Any(node => node.HasPendingCoordinatorWork);
+
+        if (work == 0 && !anyRunning && !coordinatorBusy && pendingUpdateNodes.Count == 0)
+            return true;
+
+        // Lets the started drains and the system coordinator's own loop advance. It waits on
+        // nothing the cluster measures: every timeout reads the simulated clock, which this method
+        // never advances.
+        await Task.Delay(1, cancellationToken).ConfigureAwait(false);
+        return false;
+    }
+
+    /// <summary>
+    /// Rounds a driven call may spend before it is declared stuck. Generous, because a client
+    /// proposal legitimately needs a full replication round trip.
+    /// </summary>
+    private const int MaxDriveRounds = 5_000;
+
+    /// <summary>
+    /// Runs <paramref name="operation"/> while driving the cluster, and returns its result.
+    ///
+    /// <para><b>Why every call needs this in driven mode.</b> With the nodes' threads gone, no work
+    /// happens unless the driver makes it happen — and that includes work the caller itself
+    /// started. Reading a partition view posts a request to an executor. Proposing an entry waits
+    /// for a replication round trip. Awaiting either without driving would wait forever, because
+    /// the awaiting thread is the only one that could serve it.</para>
+    /// </summary>
+    public async Task<T> DriveAsync<T>(Func<Task<T>> operation, CancellationToken cancellationToken)
+    {
+        Task<T> task = operation();
+
+        if (!Options.DrivenScheduling)
+            return await task.ConfigureAwait(false);
+
+        for (int round = 0; round < MaxDriveRounds && !task.IsCompleted; round++)
+            await PumpRoundAsync(deliverMessages: true, cancellationToken).ConfigureAwait(false);
+
+        if (!task.IsCompleted)
+        {
+            throw new InvalidOperationException(
+                $"A driven operation did not finish within {MaxDriveRounds} rounds. The cluster is " +
+                "stuck, or the operation is waiting on something the driver does not pump.");
+        }
+
+        return await task.ConfigureAwait(false);
     }
 
     /// <summary>Waits for every node's partition executors to drain, in node order.</summary>
@@ -248,8 +395,11 @@ public sealed class SimulationCluster : IAsyncDisposable
             if (node.LifecycleStatus == SimulationNodeLifecycleStatus.Stopped)
                 continue;
 
-            RaftPartitionView? view = await node.GetPartitionViewAsync(partitionId, cancellationToken)
-                .ConfigureAwait(false);
+            // Driven through DriveAsync: a view read posts a request to the node's executor, and
+            // in driven mode nothing runs that executor unless this driver does.
+            RaftPartitionView? view = await DriveAsync(
+                () => node.GetPartitionViewAsync(partitionId, cancellationToken),
+                cancellationToken).ConfigureAwait(false);
 
             if (view is not null)
                 views.Add(view);
@@ -271,7 +421,9 @@ public sealed class SimulationCluster : IAsyncDisposable
         {
             RaftPartitionView? view = node.LifecycleStatus == SimulationNodeLifecycleStatus.Stopped
                 ? null
-                : await node.GetPartitionViewAsync(partitionId, cancellationToken).ConfigureAwait(false);
+                : await DriveAsync(
+                    () => node.GetPartitionViewAsync(partitionId, cancellationToken),
+                    cancellationToken).ConfigureAwait(false);
 
             // The committed prefix is summarized by its frontier, not entry by entry. The
             // invariants compare frontiers and agreement at an index, and materializing every

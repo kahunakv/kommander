@@ -38,6 +38,13 @@ public sealed class SimulationNode : IAsyncDisposable
         Wal = wal;
     }
 
+    /// <summary>
+    /// Unix-millisecond epoch the simulated hybrid logical clock counts from. 2026-01-01, chosen
+    /// only because it is far from zero: a hybrid logical clock rejects a non-positive physical
+    /// component, and a value near zero would leave no room for the counter arithmetic.
+    /// </summary>
+    private const long SimulatedEpochMilliseconds = 1_767_225_600_000;
+
     /// <summary>Zero-based index of this node within the cluster.</summary>
     public int NodeIndex { get; }
 
@@ -97,6 +104,8 @@ public sealed class SimulationNode : IAsyncDisposable
             // determinism-boundary notes in the specification.
             TickSource = clock,
             EnableInternalTimers = false,
+            EnableInternalSchedulingThreads = !options.DrivenScheduling,
+            EnableSharedExecutorPool = true,
 
             // Election randomness is drawn from the seed, not from the process clock, so two
             // runs of one seed draw the same timeout on the same node.
@@ -126,7 +135,14 @@ public sealed class SimulationNode : IAsyncDisposable
             new StaticDiscovery(peers),
             wal,
             transport,
-            new HybridLogicalClock(),
+            // In driven mode the hybrid logical clock reads simulated time too. It is the last
+            // thing in a node that would otherwise read the wall clock on its own, and its value
+            // reaches log entries and freshness gates, so leaving it real would keep a run
+            // irreproducible however carefully the rest was driven. The epoch is arbitrary and
+            // fixed: only the difference between readings matters.
+            options.DrivenScheduling
+                ? new HybridLogicalClock(() => SimulatedEpochMilliseconds + clock.LogicalMilliseconds)
+                : new HybridLogicalClock(),
             logger);
 
         return new SimulationNode(nodeIndex, endpoint, manager, wal);
@@ -177,6 +193,20 @@ public sealed class SimulationNode : IAsyncDisposable
 
         await Manager.UpdateNodes().ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Starts the membership refresh and returns its task without awaiting it.
+    ///
+    /// <para>Used when the harness drives the node's schedulers. <c>UpdateNodes</c> awaits
+    /// partition operations of its own — learner promotion and dead-member eviction both ask the
+    /// system partition — and those complete only when the driver runs. Awaiting it on the driving
+    /// thread would park the driver inside the very call it has not yet driven. Production has the
+    /// same shape: the timer fires this and does not wait for it.</para>
+    /// </summary>
+    public Task BeginTickUpdateNodes() =>
+        LifecycleStatus == SimulationNodeLifecycleStatus.Running
+            ? Manager.UpdateNodes()
+            : Task.CompletedTask;
 
     /// <summary>
     /// Stops consuming ticks without tearing the node down. Queued messages and timers stay

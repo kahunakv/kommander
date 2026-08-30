@@ -303,6 +303,35 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     /// executor queues. Then the transport, so the replies leave. A caller loops until this
     /// returns 0, which is the node's settled state.</para>
     /// </summary>
+    /// <summary>
+    /// Runs one round of this node's partition executors and returns how many drains ran.
+    ///
+    /// <para>Separate from <see cref="PumpSchedulingAsync"/> so a driver can start this without
+    /// awaiting it. That distinction is the whole point: an executor operation can be waiting for
+    /// another node, and a driver that awaited this call would be parked inside the one node it
+    /// must leave in order to service the other. The driver starts this, then keeps flushing
+    /// transports and delivering messages so the parked operation can finish.</para>
+    /// </summary>
+    internal ValueTask<int> PumpExecutorsAsync() =>
+        configuration.EnableInternalSchedulingThreads || executorPool is null
+            ? new ValueTask<int>(0)
+            : executorPool.PumpUntilIdleAsync();
+
+    /// <summary>
+    /// Sends this node's queued outbound messages and returns how many left.
+    ///
+    /// <para>Safe to call while an executor drain is in flight, and a driver must: the request
+    /// that drain is waiting on may still be sitting in this queue.</para>
+    /// </summary>
+    internal Task<int> FlushTransportAsync() =>
+        configuration.EnableInternalSchedulingThreads
+            ? Task.FromResult(0)
+            : transportDispatcher.FlushAsync();
+
+    /// <summary>Writes this node's pending write-ahead-log batches and returns how many ran.</summary>
+    internal int PumpWriteAheadLog() =>
+        configuration.EnableInternalSchedulingThreads ? 0 : walScheduler.PumpUntilIdle();
+
     internal async Task<int> PumpSchedulingAsync()
     {
         if (configuration.EnableInternalSchedulingThreads)
@@ -311,7 +340,7 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         int work = 0;
 
         if (executorPool is not null)
-            work += executorPool.PumpUntilIdle();
+            work += await executorPool.PumpUntilIdleAsync().ConfigureAwait(false);
 
         work += walScheduler.PumpUntilIdle();
         work += await transportDispatcher.FlushAsync().ConfigureAwait(false);

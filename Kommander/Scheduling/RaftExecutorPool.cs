@@ -81,16 +81,16 @@ public sealed class RaftExecutorPool : IDisposable
     /// Drains one ready executor on the calling thread. Returns true when one was drained.
     /// Manual mode only.
     /// </summary>
-    public bool PumpOnce()
+    public async ValueTask<bool> PumpOnceAsync()
     {
         if (!_manualExecution)
             throw new InvalidOperationException(
-                "RaftExecutorPool.PumpOnce requires manual mode; this pool owns worker threads.");
+                "RaftExecutorPool.PumpOnceAsync requires manual mode; this pool owns worker threads.");
 
         if (!_ready.TryDequeue(out RaftPartitionExecutor? executor))
             return false;
 
-        executor.DrainOnPool();
+        await executor.DrainOnPoolAsync().ConfigureAwait(false);
         return true;
     }
 
@@ -102,11 +102,11 @@ public sealed class RaftExecutorPool : IDisposable
     /// partitions that keep waking each other would otherwise never return, and a simulation
     /// wants that reported as a stuck step rather than as a hang.</para>
     /// </summary>
-    public int PumpUntilIdle(int maxDrains = 10_000)
+    public async ValueTask<int> PumpUntilIdleAsync(int maxDrains = 10_000)
     {
         int drains = 0;
 
-        while (drains < maxDrains && PumpOnce())
+        while (drains < maxDrains && await PumpOnceAsync().ConfigureAwait(false))
             drains++;
 
         return drains;

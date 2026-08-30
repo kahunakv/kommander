@@ -65,8 +65,23 @@ public sealed class HybridLogicalClock : IDisposable
 
     private long _state;
 
-    public HybridLogicalClock()
+    /// <summary>
+    /// Supplies the physical component in Unix milliseconds. Defaults to the wall clock.
+    ///
+    /// <para>Injectable for one reason: a deterministic simulation must be able to make the whole
+    /// node a function of simulated time. The hybrid logical clock is the last thing in a node
+    /// that reads real time on its own, and its value reaches log entries and freshness gates, so
+    /// leaving it on the wall clock would keep a run irreproducible however carefully everything
+    /// else was driven.</para>
+    ///
+    /// <para>Production must leave it null. The physical component is what keeps a hybrid logical
+    /// clock close to real time, which is the whole reason it is hybrid.</para>
+    /// </summary>
+    private readonly Func<long>? _physicalTimeMilliseconds;
+
+    public HybridLogicalClock(Func<long>? physicalTimeMilliseconds = null)
     {
+        _physicalTimeMilliseconds = physicalTimeMilliseconds;
         _state = Pack(GetPhysicalTime(), 0);
     }
 
@@ -187,9 +202,11 @@ public sealed class HybridLogicalClock : IDisposable
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static long GetPhysicalTime()
+    private long GetPhysicalTime()
     {
-        return DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        return _physicalTimeMilliseconds is null
+            ? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            : _physicalTimeMilliseconds();
     }
 
     public void Dispose()
