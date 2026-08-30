@@ -461,11 +461,18 @@ public sealed class RaftPartitionExecutor : IDisposable
 
         _started = true;
 
-        // Kick off WAL restore Phase 1 on the CLR thread pool regardless of mode.
-        // On completion it posts RestoreLogsLoaded to the maintenance queue and calls
-        // MarkRunnable(), which either releases the per-partition semaphore (dedicated)
-        // or schedules to the shared pool (pool mode).
-        FireAndForget.Observe(Task.Run(() => RunRestorePhase1Async(_cts.Token)), _logger, "RestorePhase1");
+        // Kick off WAL restore Phase 1. On completion it posts RestoreLogsLoaded to the
+        // maintenance queue and calls MarkRunnable(), which either releases the per-partition
+        // semaphore (dedicated) or schedules to the shared pool (pool mode).
+        //
+        // Normally this runs on the CLR thread pool. Under an externally driven pool it runs on
+        // the calling thread instead: the read scheduler that backs the restore is inline in that
+        // mode, so the call completes synchronously, and a thread-pool hop would only put the
+        // restore outside the driver's control.
+        if (_pool is not null && _pool.IsManualExecution)
+            FireAndForget.Observe(RunRestorePhase1Async(_cts.Token), _logger, "RestorePhase1");
+        else
+            FireAndForget.Observe(Task.Run(() => RunRestorePhase1Async(_cts.Token)), _logger, "RestorePhase1");
 
         // In dedicated-thread mode the worker loop parks on _workAvailable and drains.
         // In pool mode there is no per-partition thread; the pool drives DrainOnPool.
@@ -551,6 +558,27 @@ public sealed class RaftPartitionExecutor : IDisposable
             // runs DrainAll + CancelPendingReplies under the single-owner run-lock, then
             // signals _stopTcs so this call can return.
             MarkRunnable();
+
+            if (_pool.IsManualExecution)
+            {
+                // No pool thread exists to run that cleanup drain, so this thread runs it.
+                // Waiting on _stopTcs instead would deadlock: the task is completed by the very
+                // drain that nobody is left to perform.
+                while (!_stopTcs.Task.IsCompleted && _pool.PumpOnce())
+                {
+                }
+
+                if (!_stopTcs.Task.IsCompleted)
+                {
+                    _logger.LogWarning(
+                        "[RaftPartitionExecutor/{PartitionId}] Stop drained the pool without completing " +
+                        "the cleanup barrier; pending replies may not have been cancelled.",
+                        _partitionId);
+                }
+
+                return;
+            }
+
             _stopTcs.Task.GetAwaiter().GetResult();
         }
         else

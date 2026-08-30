@@ -40,12 +40,23 @@ public sealed class RaftExecutorPool : IDisposable
     /// Number of worker threads.  0 auto-sizes to <see cref="Environment.ProcessorCount"/>.
     /// Values below 1 are clamped to 1.
     /// </param>
-    public RaftExecutorPool(int poolSize)
+    /// <param name="manualExecution">
+    /// When true the pool owns no threads: <see cref="Start"/> creates none and a caller drives
+    /// every drain through <see cref="PumpOnce"/> or <see cref="PumpUntilIdle"/>.
+    /// <para>Only a deterministic simulation sets this. It is what turns "the executors made
+    /// progress" from something the thread pool decides into a step the harness takes, which is
+    /// the difference between a run that replays and one that only usually behaves the same. The
+    /// single-owner invariant is unaffected: the per-partition run-lock inside
+    /// <see cref="RaftPartitionExecutor.DrainOnPool"/> still admits one drainer at a time.</para>
+    /// </param>
+    public RaftExecutorPool(int poolSize, bool manualExecution = false)
     {
-        int p = poolSize > 0 ? poolSize : poolSize == 0 ? Environment.ProcessorCount : 1;
-        _workers = new Thread[p];
+        _manualExecution = manualExecution;
 
-        for (int i = 0; i < p; i++)
+        int p = poolSize > 0 ? poolSize : poolSize == 0 ? Environment.ProcessorCount : 1;
+        _workers = new Thread[manualExecution ? 0 : p];
+
+        for (int i = 0; i < _workers.Length; i++)
         {
             _workers[i] = new Thread(WorkerLoop)
             {
@@ -55,10 +66,59 @@ public sealed class RaftExecutorPool : IDisposable
         }
     }
 
+    /// <summary>True when this pool owns no threads and a caller drives every drain.</summary>
+    private readonly bool _manualExecution;
+
+    /// <summary>
+    /// Whether this pool is externally driven. Read by <see cref="RaftPartitionExecutor.Start"/>,
+    /// which must run the write-ahead-log restore on the calling thread rather than on the thread
+    /// pool: a thread-pool hop there would put the restore outside the harness's control and
+    /// re-introduce exactly the nondeterminism manual mode exists to remove.
+    /// </summary>
+    internal bool IsManualExecution => _manualExecution;
+
+    /// <summary>
+    /// Drains one ready executor on the calling thread. Returns true when one was drained.
+    /// Manual mode only.
+    /// </summary>
+    public bool PumpOnce()
+    {
+        if (!_manualExecution)
+            throw new InvalidOperationException(
+                "RaftExecutorPool.PumpOnce requires manual mode; this pool owns worker threads.");
+
+        if (!_ready.TryDequeue(out RaftPartitionExecutor? executor))
+            return false;
+
+        executor.DrainOnPool();
+        return true;
+    }
+
+    /// <summary>
+    /// Drains ready executors until none is ready, and returns how many drains ran.
+    ///
+    /// <para>One drain can make another executor ready — that is how a message crosses from one
+    /// partition to another — so this is a loop. <paramref name="maxDrains"/> bounds it: two
+    /// partitions that keep waking each other would otherwise never return, and a simulation
+    /// wants that reported as a stuck step rather than as a hang.</para>
+    /// </summary>
+    public int PumpUntilIdle(int maxDrains = 10_000)
+    {
+        int drains = 0;
+
+        while (drains < maxDrains && PumpOnce())
+            drains++;
+
+        return drains;
+    }
+
     /// <summary>Number of pool threads.</summary>
     public int PoolSize => _workers.Length;
 
-    /// <summary>Starts all pool worker threads.  Safe to call only once.</summary>
+    /// <summary>
+    /// Starts all pool worker threads.  Safe to call only once.
+    /// <para>In manual mode there are no threads to start; the caller pumps instead.</para>
+    /// </summary>
     public void Start()
     {
         if (_started)
@@ -125,7 +185,9 @@ public sealed class RaftExecutorPool : IDisposable
         _stopped = true;
         _cts.Cancel();
 
-        if (_started)
+        // _workers is empty in manual mode. Release(0) throws, so the wake-and-join is skipped:
+        // there is no parked worker to wake and no thread to join.
+        if (_started && _workers.Length > 0)
         {
             // Wake all parked workers so they observe cancellation and exit.
             _workAvailable.Release(_workers.Length);

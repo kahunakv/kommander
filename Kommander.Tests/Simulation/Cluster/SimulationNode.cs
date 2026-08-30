@@ -86,8 +86,15 @@ public sealed class SimulationNode : IAsyncDisposable
             Port = port,
             InitialPartitions = options.PartitionCount,
 
-            // The determinism seams. TickSource makes every elapsed-time gate a function of
-            // simulated time; EnableInternalTimers hands the tick itself to the harness.
+            // The determinism seams in use today. TickSource makes every elapsed-time gate a
+            // function of simulated time; EnableInternalTimers hands the tick itself to the
+            // harness.
+            //
+            // EnableInternalSchedulingThreads is deliberately left on. The externally driven
+            // schedulers exist and are tested, but a node cannot yet run on one thread: a
+            // partition executor blocks on each operation it dispatches, so an operation that
+            // awaits anything outside the executor deadlocks a single-threaded driver. See the
+            // determinism-boundary notes in the specification.
             TickSource = clock,
             EnableInternalTimers = false,
 
@@ -196,9 +203,9 @@ public sealed class SimulationNode : IAsyncDisposable
     /// <summary>
     /// Waits until every partition executor on this node has drained its queues.
     ///
-    /// <para>This is the step barrier. The executors still run on real threads, so a snapshot
-    /// taken while they are busy would capture a half-applied step. Draining first makes each
-    /// step boundary a settled state, which is what the invariant checks are written against.</para>
+    /// <para>This is the step barrier. The executors run on real threads, so a snapshot taken
+    /// while they are busy would capture a half-applied step. Draining first makes each step
+    /// boundary a settled state, which is what the invariant checks are written against.</para>
     /// </summary>
     public async Task DrainAsync(CancellationToken cancellationToken)
     {
@@ -214,6 +221,12 @@ public sealed class SimulationNode : IAsyncDisposable
         if (barriers.Count > 0)
             await Task.WhenAll(barriers).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// True while this node's system coordinator has a queued or in-flight request. A step that
+    /// ended while this is true would leave the partition proposals its messages produce unstarted.
+    /// </summary>
+    public bool HasPendingCoordinatorWork => Manager.SystemCoordinator.HasPendingWork;
 
     /// <inheritdoc />
     public async ValueTask DisposeAsync()

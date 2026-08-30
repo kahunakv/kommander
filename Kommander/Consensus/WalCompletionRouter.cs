@@ -491,12 +491,17 @@ internal sealed class WalCompletionRouter
             // spending before stepping down.
             bool drainHasVoterPeers = sender.HasVoterPeer();
             TimeSpan inheritedDrainBound = drainHasVoterPeers ? host.Configuration.LeadershipBarrierTimeout : TimeSpan.FromMilliseconds(250);
-            long drainStartTicks = host.GetMonotonicTimestamp();
+            // Deliberately the PROCESS clock, not host.GetMonotonicTimestamp(). This bound is a
+            // watchdog on a spin loop, and the loop's own wait below is Task.Delay — real time. A
+            // watchdog measured on an injectable clock can be frozen by whoever injects it, and a
+            // frozen watchdog is not a watchdog: the loop would burn real time forever while its
+            // deadline never arrives. Deadline and wait must read the same clock.
+            long drainStartTicks = Stopwatch.GetTimestamp();
 
             while ((drainStatus =
                        await applier.DrainInheritedAppliesAsync(coreState.LastAppliedIndex + 1, inheritedEnd).ConfigureAwait(false)) == InheritedDrainStatus.Hole)
             {
-                if (Stopwatch.GetElapsedTime(drainStartTicks, host.GetMonotonicTimestamp()) > inheritedDrainBound)
+                if (Stopwatch.GetElapsedTime(drainStartTicks) > inheritedDrainBound)
                 {
                     // Same sole-voter escape as the promotion drain: with no voter peer to defer
                     // to, stepping down just re-elects this node into the same gap forever. The

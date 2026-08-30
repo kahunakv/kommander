@@ -10,8 +10,8 @@ namespace Kommander.Tests.Simulation.Cluster;
 ///
 /// <para><b>The step model.</b> A run is a sequence of steps. One step advances simulated time,
 /// posts the ticks that time makes due, releases the network messages the scenario chose, and
-/// then waits on the executor drain barrier. Only after the barrier is the state settled enough
-/// to snapshot and to check invariants against. Nothing in a step waits on the process clock.</para>
+/// then settles. Only after settling is the state stable enough to snapshot and to check
+/// invariants against. Nothing in a step waits on the process clock for its timing.</para>
 ///
 /// <para><b>What is still shared with production.</b> Everything that decides anything: the
 /// partition state machine, the write-ahead log, the executor, the replication and election
@@ -19,8 +19,10 @@ namespace Kommander.Tests.Simulation.Cluster;
 ///
 /// <para><b>Known residual.</b> Executor and write-ahead-log work still runs on real threads
 /// inside a step. Step boundaries are therefore deterministic while the interleaving within one
-/// step is not. Closing that gap needs a single-threaded pump for the executor and the
-/// write-ahead-log scheduler, which is separate work.</para>
+/// step is not. The externally driven schedulers that would close this gap exist in the library
+/// and are tested, but a node cannot yet run on a single thread: a partition executor blocks on
+/// each operation it dispatches, so an operation that awaits anything outside the executor
+/// deadlocks a single-threaded driver. See the determinism-boundary notes in the specification.</para>
 /// </summary>
 public sealed class SimulationCluster : IAsyncDisposable
 {
@@ -81,10 +83,10 @@ public sealed class SimulationCluster : IAsyncDisposable
         foreach (SimulationNode node in cluster.nodes)
             joins.Add(await node.BeginStartAsync(cancellationToken).ConfigureAwait(false));
 
-        // Joining is a simulated process, not a prelude to one. It completes only after the
-        // system partition elects a leader and commits the partition map, and with the internal
-        // timers off that election happens only while the harness is stepping. So step the
-        // cluster until every join has returned.
+        // Joining is a simulated process, not a prelude to one. It completes only after the system
+        // partition elects a leader and commits the partition map, and with the internal timers
+        // off that election happens only while the harness is stepping. So step the cluster until
+        // every join has returned.
         Task allJoined = Task.WhenAll(joins);
 
         for (int step = 0; step < JoinStepBudget && !allJoined.IsCompleted; step++)
@@ -113,8 +115,8 @@ public sealed class SimulationCluster : IAsyncDisposable
     private const long JoinStepMilliseconds = 25;
 
     /// <summary>
-    /// Runs one simulation step: advance time, tick every running node, deliver held messages,
-    /// then wait on the drain barrier.
+    /// Runs one simulation step: advance time, refresh membership when due, tick every running
+    /// node, deliver held messages, then settle.
     ///
     /// <para><paramref name="deliverMessages"/> is false when a scenario wants time to pass while
     /// the network stays silent — the shape that expires an election timeout.</para>
@@ -153,7 +155,7 @@ public sealed class SimulationCluster : IAsyncDisposable
     /// state settled. A round that changes nothing ends the settle early, so the bound only
     /// matters for a step that genuinely keeps producing work.
     /// </summary>
-    private const int MaxSettleRounds = 40;
+    private const int MaxSettleRounds = 60;
 
     /// <summary>
     /// Waits until one step's work has stopped producing more work.
@@ -161,15 +163,14 @@ public sealed class SimulationCluster : IAsyncDisposable
     /// <para><b>Why a settle loop and not a single drain.</b> One tick starts a chain: the local
     /// executor sends a vote request, the peer's executor answers it, the answer travels back
     /// through the outbound dispatcher, and the original node counts it. Each hop lands on a
-    /// different thread. A single drain barrier covers only the first hop, so a step that
-    /// ended there would cut every round trip in half and no election could ever conclude.</para>
+    /// different thread. A single drain barrier covers only the first hop, so a step that ended
+    /// there would cut every round trip in half and no election could conclude.</para>
     ///
-    /// <para>The loop ends as soon as a round delivers no message and moves no executor, which is
-    /// the definition of a settled state. The one-millisecond wait is a scheduling yield that
-    /// lets the other threads run; it is not scenario timing. No timeout, election, or backoff in
-    /// the cluster is measured against it — those all read the simulated clock, which this method
-    /// never advances. It disappears once the executor and the write-ahead-log scheduler are
-    /// driven by a single-threaded pump.</para>
+    /// <para>The loop ends once a round delivers no message, moves no executor, and leaves no
+    /// system-coordinator work outstanding. The one-millisecond wait is a scheduling yield that
+    /// lets those threads run; it is not scenario timing. No timeout, election, or backoff in the
+    /// cluster is measured against it — those all read the simulated clock, which this method
+    /// never advances.</para>
     /// </summary>
     private async Task SettleAsync(bool deliverMessages, CancellationToken cancellationToken)
     {
@@ -177,18 +178,27 @@ public sealed class SimulationCluster : IAsyncDisposable
 
         for (int round = 0; round < MaxSettleRounds; round++)
         {
-            await DrainAsync(cancellationToken).ConfigureAwait(false);
+            await DrainNodesAsync(cancellationToken).ConfigureAwait(false);
 
             if (deliverMessages)
                 await Transport.DeliverAll().ConfigureAwait(false);
 
             long delivered = Transport.DeliveredCount;
-            if (delivered == previousDelivered)
+            bool coordinatorBusy = nodes.Any(node => node.HasPendingCoordinatorWork);
+
+            if (delivered == previousDelivered && !coordinatorBusy)
                 return;
 
             previousDelivered = delivered;
             await Task.Delay(1, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>Waits for every node's partition executors to drain, in node order.</summary>
+    private async Task DrainNodesAsync(CancellationToken cancellationToken)
+    {
+        foreach (SimulationNode node in nodes)
+            await node.DrainAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -216,12 +226,11 @@ public sealed class SimulationCluster : IAsyncDisposable
         return false;
     }
 
-    /// <summary>Waits for every node's partition executors to drain.</summary>
-    public async Task DrainAsync(CancellationToken cancellationToken)
-    {
-        foreach (SimulationNode node in nodes)
-            await node.DrainAsync(cancellationToken).ConfigureAwait(false);
-    }
+    /// <summary>
+    /// Settles the cluster without advancing simulated time and without delivering held messages.
+    /// </summary>
+    public Task DrainAsync(CancellationToken cancellationToken) =>
+        SettleAsync(deliverMessages: false, cancellationToken);
 
     /// <summary>
     /// Reads one partition's view from every running node. A node that has not materialized the

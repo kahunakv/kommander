@@ -1049,13 +1049,18 @@ public sealed class RaftPartitionStateMachine
             // peers the full barrier timeout is worth spending, because refusing hands leadership
             // to a peer that may hold the missing entries.
             TimeSpan drainBound = hasVoterPeers ? host.Configuration.LeadershipBarrierTimeout : TimeSpan.FromMilliseconds(250);
-            long drainDeadlineTicks = host.GetMonotonicTimestamp();
+            // Deliberately the PROCESS clock, not host.GetMonotonicTimestamp(). This bound is a
+            // watchdog on a spin loop, and the loop's own wait below is Task.Delay — real time. A
+            // watchdog measured on an injectable clock can be frozen by whoever injects it, and a
+            // frozen watchdog is not a watchdog: the loop would burn real time forever while its
+            // deadline never arrives. Deadline and wait must read the same clock.
+            long drainDeadlineTicks = Stopwatch.GetTimestamp();
 
             bool drainCovered = true;
 
             while (!await applier.DrainCommittedAppliesAsync(commitFrontier).ConfigureAwait(false))
             {
-                if (Stopwatch.GetElapsedTime(drainDeadlineTicks, host.GetMonotonicTimestamp()) > drainBound)
+                if (Stopwatch.GetElapsedTime(drainDeadlineTicks) > drainBound)
                 {
                     drainCovered = false;
                     break;

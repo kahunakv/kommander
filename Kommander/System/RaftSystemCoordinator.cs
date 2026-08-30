@@ -191,6 +191,21 @@ internal sealed class RaftSystemCoordinator : IDisposable
     internal void Send(RaftSystemRequest request) =>
         _channel.Writer.TryWrite(request);
 
+    /// <summary>1 while the loop is inside <see cref="Receive"/>; 0 when it is idle.</summary>
+    private int _processing;
+
+    /// <summary>
+    /// True while this coordinator has a queued request or is processing one.
+    ///
+    /// <para>Read by a deterministic driver, which must not call a step settled while the
+    /// coordinator still owes work: its messages turn into partition proposals, and a driver that
+    /// stopped pumping at that moment would starve them. The coordinator's loop is the one part of
+    /// a node that still runs on the thread pool, so this flag is how a driver waits for it
+    /// without blocking on a barrier the driver itself would have to satisfy.</para>
+    /// </summary>
+    internal bool HasPendingWork =>
+        (_channel.Reader.CanCount && _channel.Reader.Count > 0) || Volatile.Read(ref _processing) != 0;
+
     /// <summary>
     /// Returns a <see cref="Task"/> that completes only after all requests
     /// currently in the channel have been processed by the background loop.
@@ -216,6 +231,8 @@ internal sealed class RaftSystemCoordinator : IDisposable
             {
                 while (reader.TryRead(out RaftSystemRequest? request))
                 {
+                    Interlocked.Exchange(ref _processing, 1);
+
                     try
                     {
                         await Receive(request, _cts.Token).ConfigureAwait(false);
@@ -229,6 +246,10 @@ internal sealed class RaftSystemCoordinator : IDisposable
                         logger.LogError(
                             "[RaftSystemCoordinator] Unhandled exception processing {Type}: {Message}\n{StackTrace}",
                             request.Type, ex.Message, ex.StackTrace);
+                    }
+                    finally
+                    {
+                        Volatile.Write(ref _processing, 0);
                     }
                 }
             }

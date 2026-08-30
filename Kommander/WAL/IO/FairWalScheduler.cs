@@ -110,6 +110,18 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// </summary>
     private readonly bool lazyCommitMarkers;
 
+    /// <summary>
+    /// True when this scheduler owns no worker threads and a caller drives every flush through
+    /// <see cref="PumpOnce"/> or <see cref="PumpUntilIdle"/>.
+    /// <para>Only a deterministic simulation sets this. Writes stay deferred rather than running
+    /// inline, which is the point: "the write completed" becomes an explicit, schedulable event
+    /// instead of something that happens whenever a worker thread is next scheduled. The
+    /// completion path is unchanged — it still reports through
+    /// <c>WALWriteOperation.OnComplete</c> — so nothing in the consensus path can tell the
+    /// difference except when the callback arrives.</para>
+    /// </summary>
+    private readonly bool manualExecution;
+
     // Total pending-or-in-flight operations across all partitions.
     // Checked against maxGlobalQueueDepth (when > 0) in Enqueue;
     // decremented in ProcessGroupBatch after each batch write completes.
@@ -302,8 +314,10 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         int maxGroupBatchPartitions = DefaultMaxGroupBatchPartitions,
         int groupCommitLingerMs = 0,
         bool lazyCommitMarkers = false,
-        Kommander.Time.IMonotonicTickSource? tickSource = null)
+        Kommander.Time.IMonotonicTickSource? tickSource = null,
+        bool manualExecution = false)
     {
+        this.manualExecution = manualExecution;
         this.tickSource = tickSource ?? Kommander.Time.SystemMonotonicTickSource.Instance;
         this._nodeCommitWait = new PartitionWaitAccumulator(tickSource: this.tickSource);
         this.walAdapter = walAdapter;
@@ -322,7 +336,10 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             workerCount = Math.Max(1, Environment.ProcessorCount);
 
         _readyPartitions = new BlockingCollection<int>(boundedCapacity: workerCount * 64);
-        _workers = new Thread[workerCount];
+
+        // The ready-queue capacity is still sized from the resolved worker count, so manual mode
+        // and threaded mode admit the same number of ready partitions. Only the threads differ.
+        _workers = new Thread[manualExecution ? 0 : workerCount];
     }
 
     // ── IRaftWalScheduler ──────────────────────────────────────────────────
@@ -386,11 +403,21 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                     _readyPartitions.Add(partitionId, _cts.Token);
             }
         }
+
+        // Manual mode writes here, outside the partition lock, so the operation is durable and its
+        // completion callback delivered before this call returns.
+        if (manualExecution)
+            DrainInline();
     }
 
     // ── Lifecycle ──────────────────────────────────────────────────────────
 
-    /// <summary>Starts the worker threads.  Must be called exactly once before <see cref="Enqueue"/>.</summary>
+    /// <summary>
+    /// Starts the worker threads.  Must be called exactly once before <see cref="Enqueue"/>.
+    /// <para>In manual mode there are no worker threads to start; the caller drives every flush
+    /// through <see cref="PumpOnce"/> or <see cref="PumpUntilIdle"/>. The scheduler is still
+    /// registered for metrics and still accepts work.</para>
+    /// </summary>
     public void Start()
     {
         if (_started)
@@ -475,6 +502,16 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
         _stopping = true;
 
+        // Manual mode has no worker to drain the tail, so this thread drains it. Without this a
+        // shutdown would strand every queued write with its completion callback unfired, and the
+        // partition waiting on that callback would never learn the write failed.
+        if (manualExecution)
+        {
+            PumpUntilIdle();
+            _cts.Cancel();
+            return;
+        }
+
         // Give workers a signal to drain remaining items and then exit.
         // We do this by cancelling after a best-effort drain pass.
         // Workers complete in-flight batches and then re-check the queue.
@@ -486,6 +523,77 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     }
 
     // ── Worker ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Runs every ready group batch on the calling thread. Called by <see cref="Enqueue"/> in
+    /// manual mode so a write is durable, and its completion callback delivered, before the
+    /// enqueuing call returns.
+    ///
+    /// <para><b>Why inline and not deferred.</b> A deferred write deadlocks a single-threaded
+    /// driver whenever a partition operation awaits its own write: the driver is inside the
+    /// executor drain, and the write pump it would need runs after that drain returns. Making the
+    /// write inline removes the whole class of deadlock. The cost is that "the write is slow" can
+    /// no longer be expressed by holding the completion here — a simulation models that in the
+    /// storage device instead, which is where the latency belongs.</para>
+    ///
+    /// <para>Re-entrancy is not a concern: a completion callback posts into a partition executor
+    /// queue, never back into this scheduler.</para>
+    /// </summary>
+    private void DrainInline() => PumpUntilIdle();
+
+    /// <summary>
+    /// Runs at most one group batch on the calling thread. Returns true when a batch ran.
+    /// Manual mode only; throws otherwise, because pumping a scheduler that also has worker
+    /// threads would break the single-executor-per-partition discipline those threads rely on.
+    /// </summary>
+    /// <remarks>
+    /// The batch is assembled exactly as a worker thread assembles it, including the
+    /// opportunistic sweep for more ready partitions, so group-commit behaviour is the real one.
+    /// The linger step is deliberately skipped: it waits on wall-clock time, which a
+    /// deterministic run must never do, and its only effect is which partitions share an fsync.
+    /// </remarks>
+    public bool PumpOnce()
+    {
+        if (!manualExecution)
+            throw new InvalidOperationException(
+                "FairWalScheduler.PumpOnce requires manual mode; this scheduler owns worker threads.");
+
+        if (!_readyPartitions.TryTake(out int partitionId))
+            return false;
+
+        List<int> partitionGroup = new(maxGroupBatchPartitions) { partitionId };
+        List<(int PartitionId, List<WALWriteOperation> Ops)> groupBatches = new(maxGroupBatchPartitions);
+
+        List<List<WALWriteOperation>> opListPool = new(maxGroupBatchPartitions);
+        for (int i = 0; i < maxGroupBatchPartitions; i++)
+            opListPool.Add(new List<WALWriteOperation>(maxBatchSize));
+
+        List<(int, List<RaftLog>)> logGroups = new(maxGroupBatchPartitions);
+
+        while (partitionGroup.Count < maxGroupBatchPartitions && _readyPartitions.TryTake(out int extraId))
+            partitionGroup.Add(extraId);
+
+        ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups);
+        return true;
+    }
+
+    /// <summary>
+    /// Runs group batches until nothing is ready, and returns how many ran.
+    ///
+    /// <para>A completing write can enqueue the next one, so this is a loop rather than a single
+    /// pass. <paramref name="maxBatches"/> bounds it: a workload that feeds itself forever would
+    /// otherwise never return, and a simulation wants that reported as a stuck step rather than
+    /// as a hang.</para>
+    /// </summary>
+    public int PumpUntilIdle(int maxBatches = 10_000)
+    {
+        int batches = 0;
+
+        while (batches < maxBatches && PumpOnce())
+            batches++;
+
+        return batches;
+    }
 
     private void WorkerLoop(int workerId)
     {

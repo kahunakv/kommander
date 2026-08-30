@@ -7,8 +7,12 @@
 # decision: it stamps a diagnostic, retries a control-plane pass, or measures latency for a
 # log line. None of them gates an election, a commit, or an apply.
 #
-# The tick-read count (wall-clock-ticks) is deliberately absent: after the tick-source seam no
-# consensus-path file reads Stopwatch.GetTimestamp() directly. Do not add one back.
+# Two tick reads remain, and only two. Both are watchdogs on a spin loop whose own wait is
+# Task.Delay — real time. A watchdog measured on an injectable clock can be frozen by whoever
+# injects it, and a frozen watchdog is not a watchdog: the loop would burn real time forever while
+# its deadline never arrives. Deadline and wait must read the same clock. Every other
+# consensus-path tick read goes through RaftConfiguration.TickSource; do not add a third here
+# without the same argument.
 #
 # Raising a number here is a deliberate act. Say in the commit message why the new read
 # cannot affect a decision, or route it through RaftConfiguration.TickSource instead.
@@ -30,3 +34,5 @@ Kommander/System/RaftSystemCoordinator.cs|wall-clock-sleep 1
 Kommander/System/ReplicaPlacementService.cs|wall-clock-date 1
 Kommander/System/ReplicaPlacementService.cs|wall-clock-sleep 1
 Kommander/System/SplitMergeController.cs|wall-clock-sleep 4
+Kommander/Consensus/WalCompletionRouter.cs|wall-clock-ticks 1
+Kommander/RaftPartitionStateMachine.cs|wall-clock-ticks 1

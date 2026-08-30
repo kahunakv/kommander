@@ -210,6 +210,25 @@ public class RaftConfiguration
     public bool EnableInternalTimers { get; set; } = true;
 
     /// <summary>
+    /// When false, this node owns no scheduling threads of its own. The partition executors, the
+    /// write-ahead-log write scheduler, and the outbound transport dispatcher all stop creating
+    /// threads, and a driver advances each of them explicitly. Write-ahead-log reads run on the
+    /// calling thread.
+    ///
+    /// <para>Default is true, so production is unchanged. Only a deterministic simulation sets it
+    /// to false, and it is the switch that makes a run replayable: with it on, "the executor made
+    /// progress" and "the reply was sent" happen whenever the thread pool decides, which is enough
+    /// to make two runs of one seed diverge even though every timeout reads
+    /// <see cref="TickSource"/>.</para>
+    ///
+    /// <para>It requires <see cref="EnableSharedExecutorPool"/>, because a partition executor on
+    /// its own dedicated thread has nothing to pump. <see cref="Validate"/> enforces that.</para>
+    ///
+    /// <para>Never set this in production. Nothing would run.</para>
+    /// </summary>
+    public bool EnableInternalSchedulingThreads { get; set; } = true;
+
+    /// <summary>
     /// Interval at which the timer service refreshes the in-memory membership view
     /// and triggers gossip exchange rounds.  This is also the cadence at which
     /// SWIM-triggered membership changes (additions, evictions) are reflected in the
@@ -1536,6 +1555,14 @@ public class RaftConfiguration
                 "[Kommander] TickSource must not be null. Leave it at its default " +
                 "(SystemMonotonicTickSource.Instance) unless a deterministic simulation is " +
                 "supplying its own clock.");
+
+        // A dedicated-thread executor has no pump, so externally driven scheduling would leave
+        // every partition frozen. Refuse the combination rather than ship a node that starts and
+        // then does nothing.
+        if (!EnableInternalSchedulingThreads && !EnableSharedExecutorPool)
+            throw new RaftException(
+                "[Kommander] EnableInternalSchedulingThreads=false requires EnableSharedExecutorPool=true. " +
+                "A partition executor on a dedicated thread cannot be driven externally.");
 
         // Degraded-node avoidance drains leadership off a node, so a misconfigured threshold is a
         // liveness hazard rather than a tuning nuisance. A multiplier at or below 1.0 marks every

@@ -289,6 +289,62 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     public IRaftWalScheduler WalScheduler => walScheduler;
 
     /// <summary>
+    /// Runs one round of this node's scheduling work on the calling thread and returns how many
+    /// units of work ran. Zero means the node is idle: no executor had queued work, no
+    /// write-ahead-log batch was pending, and no outbound message was waiting.
+    ///
+    /// <para>Only meaningful when <see cref="RaftConfiguration.EnableInternalSchedulingThreads"/>
+    /// is false; with the threads running it returns 0 and does nothing, because the threads are
+    /// already doing this work.</para>
+    ///
+    /// <para><b>The order matters and is not arbitrary.</b> Executors first, so a tick that was
+    /// just posted produces its write-ahead-log writes and its outbound messages. Then the
+    /// write-ahead log, so those writes reach durability and post their completions back into the
+    /// executor queues. Then the transport, so the replies leave. A caller loops until this
+    /// returns 0, which is the node's settled state.</para>
+    /// </summary>
+    internal async Task<int> PumpSchedulingAsync()
+    {
+        if (configuration.EnableInternalSchedulingThreads)
+            return 0;
+
+        int work = 0;
+
+        if (executorPool is not null)
+            work += executorPool.PumpUntilIdle();
+
+        work += walScheduler.PumpUntilIdle();
+        work += await transportDispatcher.FlushAsync().ConfigureAwait(false);
+
+        return work;
+    }
+
+    /// <summary>
+    /// Loops <see cref="PumpSchedulingAsync"/> until the node reports no work, and returns the
+    /// total units run.
+    ///
+    /// <para>One round is not enough. A write-ahead-log completion posted in round one is
+    /// executor work in round two, and the message it produces is transport work in round three.
+    /// <paramref name="maxRounds"/> bounds the loop so a pair of components that keep waking each
+    /// other is reported as a stuck node rather than as a hang.</para>
+    /// </summary>
+    internal async Task<int> PumpSchedulingUntilIdleAsync(int maxRounds = 1000)
+    {
+        int total = 0;
+
+        for (int round = 0; round < maxRounds; round++)
+        {
+            int work = await PumpSchedulingAsync().ConfigureAwait(false);
+            if (work == 0)
+                return total;
+
+            total += work;
+        }
+
+        return total;
+    }
+
+    /// <summary>
     /// Whether the node has joined the Raft cluster
     /// </summary>
     public bool Joined => clusterHandler.Joined;
@@ -554,7 +610,11 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             AmILeader);
 
         transportDispatcher = new Communication.RaftTransportDispatcher(
-            this, communication, Logger, configuration.MaxOutboundQueueBytesPerPeer);
+            this,
+            communication,
+            Logger,
+            configuration.MaxOutboundQueueBytesPerPeer,
+            manualExecution: !configuration.EnableInternalSchedulingThreads);
 
         rpcRouter = new RaftRpcRouter(
             this,
@@ -593,7 +653,10 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             Logger,
             LocalEndpoint);
 
-        readScheduler = new(logger, configuration.ReadIOThreads);
+        readScheduler = new(
+            logger,
+            configuration.ReadIOThreads,
+            inlineExecution: !configuration.EnableInternalSchedulingThreads);
         walScheduler = new(
             walAdapter,
             logger,
@@ -604,7 +667,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             configuration.MaxWalGroupBatchPartitions,
             configuration.WalGroupCommitLingerMs,
             configuration.WalSingleFsyncCommit,
-            configuration.TickSource);
+            configuration.TickSource,
+            manualExecution: !configuration.EnableInternalSchedulingThreads);
 
         loadReportService = new LoadReportService(
             this,
@@ -617,7 +681,9 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
 
         if (configuration.EnableSharedExecutorPool)
         {
-            executorPool = new Scheduling.RaftExecutorPool(configuration.PartitionExecutorPoolSize);
+            executorPool = new Scheduling.RaftExecutorPool(
+                configuration.PartitionExecutorPoolSize,
+                manualExecution: !configuration.EnableInternalSchedulingThreads);
 
             // Start the pool here, where it is created, rather than in JoinCluster.
             // A partition executor in pool mode depends on a *running* pool: Start()
@@ -1212,6 +1278,12 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
 
         if (drainTasks.Count == 0)
             return;
+
+        // With no scheduling threads the barriers would never be processed and every wait would
+        // burn its full timeout. The barrier requests are already queued at this point, so one
+        // pump runs them and Task.WhenAll below returns at once.
+        if (!configuration.EnableInternalSchedulingThreads)
+            await PumpSchedulingUntilIdleAsync().ConfigureAwait(false);
 
         try
         {

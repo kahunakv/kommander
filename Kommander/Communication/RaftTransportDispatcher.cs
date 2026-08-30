@@ -48,19 +48,38 @@ internal sealed class RaftTransportDispatcher : IDisposable
         /// <summary>1 while a drop episode is open, so the Warning fires once per episode, not per message.</summary>
         private int _dropEpisodeOpen;
 
+        // Send context, kept so manual mode can perform a flush without a running loop.
+        private readonly RaftManager _manager;
+        private readonly RaftNode _node;
+        private readonly ICommunication _communication;
+        private readonly bool _manualExecution;
+
         internal EndpointWorker(
             RaftManager manager,
             RaftNode node,
             ICommunication communication,
             ILogger<IRaft> logger,
-            long maxQueuedPayloadBytes)
+            long maxQueuedPayloadBytes,
+            bool manualExecution = false)
         {
             _maxQueuedPayloadBytes = maxQueuedPayloadBytes;
             _logger = logger;
             _endpoint = node.Endpoint;
+            _manager = manager;
+            _node = node;
+            _communication = communication;
+            _manualExecution = manualExecution;
 
             _channel = Channel.CreateUnbounded<RaftResponderRequest>(
                 new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+
+            if (manualExecution)
+            {
+                // No loop: a caller drains this queue through FlushAsync. _loop is a completed
+                // task so Dispose's Wait returns at once instead of blocking for its timeout.
+                _loop = Task.CompletedTask;
+                return;
+            }
 
             _loop = Task.Run(() =>
                 RunAsync(manager, node, communication, logger, _cts.Token));
@@ -68,6 +87,59 @@ internal sealed class RaftTransportDispatcher : IDisposable
             // The loop only surfaces to a Wait in Dispose, which not every shutdown reaches; an
             // unobserved fault here would otherwise re-throw on the finalizer thread.
             Support.Parallelization.FireAndForget.Observe(_loop, logger, "RaftTransportDispatcher.Worker");
+        }
+
+        /// <summary>
+        /// Sends every queued message on the calling thread, batched the same way the loop
+        /// batches, and returns how many were sent. Manual mode only.
+        /// </summary>
+        internal async Task<int> FlushAsync()
+        {
+            if (!_manualExecution)
+                return 0;
+
+            List<RaftResponderRequest> batch = new(MaxBatchSize);
+            int sent = 0;
+
+            while (_channel.Reader.TryRead(out RaftResponderRequest item))
+            {
+                batch.Add(item);
+
+                if (batch.Count < MaxBatchSize)
+                    continue;
+
+                sent += await SendBatchAsync(batch).ConfigureAwait(false);
+                batch.Clear();
+            }
+
+            if (batch.Count > 0)
+                sent += await SendBatchAsync(batch).ConfigureAwait(false);
+
+            return sent;
+        }
+
+        /// <summary>
+        /// Sends one batch and releases its byte reservation, mirroring the loop's own
+        /// try/catch/finally so a failed send never strands the reservation.
+        /// </summary>
+        private async Task<int> SendBatchAsync(List<RaftResponderRequest> batch)
+        {
+            try
+            {
+                await Send(batch, _manager, _node, _communication, _logger).ConfigureAwait(false);
+                return batch.Count;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    "[RaftTransportDispatcher/{Endpoint}] flush {Type}: {Message}",
+                    _endpoint, ex.GetType().Name, ex.Message);
+                return 0;
+            }
+            finally
+            {
+                ReleaseBatchBytes(batch);
+            }
         }
 
         /// <summary>
@@ -464,16 +536,48 @@ internal sealed class RaftTransportDispatcher : IDisposable
     private volatile bool _stopped;
     private int _disposed;
 
+    /// <summary>True when no endpoint worker owns a loop and a caller drives every send.</summary>
+    private readonly bool _manualExecution;
+
     internal RaftTransportDispatcher(
         RaftManager manager,
         ICommunication communication,
         ILogger<IRaft> logger,
-        long maxQueuedPayloadBytesPerPeer = 64L * 1024 * 1024)
+        long maxQueuedPayloadBytesPerPeer = 64L * 1024 * 1024,
+        bool manualExecution = false)
     {
         _manager = manager;
         _communication = communication;
         _logger = logger;
         _maxQueuedPayloadBytesPerPeer = maxQueuedPayloadBytesPerPeer;
+        _manualExecution = manualExecution;
+    }
+
+    /// <summary>
+    /// Sends every queued outbound message on the calling thread and returns how many were sent.
+    /// A no-op unless the dispatcher is in manual mode.
+    ///
+    /// <para>This is on the critical path of a deterministic run and not an optimisation: every
+    /// vote reply and every append acknowledgement leaves through here. Left to its own loop, each
+    /// one crosses to a thread-pool thread at a moment nothing in the run controls, which is
+    /// enough to make two runs of one seed diverge.</para>
+    /// </summary>
+    internal async Task<int> FlushAsync()
+    {
+        if (!_manualExecution || _stopped)
+            return 0;
+
+        int sent = 0;
+
+        // Ordered by endpoint so the flush order is a property of the cluster, not of the
+        // dictionary's internal layout.
+        foreach (string endpoint in _workers.Keys.OrderBy(key => key, StringComparer.Ordinal))
+        {
+            if (_workers.TryGetValue(endpoint, out EndpointWorker? worker))
+                sent += await worker.FlushAsync().ConfigureAwait(false);
+        }
+
+        return sent;
     }
 
     /// <summary>
@@ -499,7 +603,8 @@ internal sealed class RaftTransportDispatcher : IDisposable
         if (!_workers.TryGetValue(endpoint, out EndpointWorker? worker))
             worker = _workers.GetOrAdd(
                 endpoint,
-                ep => new EndpointWorker(_manager, new RaftNode(ep), _communication, _logger, _maxQueuedPayloadBytesPerPeer));
+                ep => new EndpointWorker(
+                    _manager, new RaftNode(ep), _communication, _logger, _maxQueuedPayloadBytesPerPeer, _manualExecution));
 
         worker.Enqueue(request);
     }
@@ -507,6 +612,11 @@ internal sealed class RaftTransportDispatcher : IDisposable
     /// <summary>
     /// Signals all worker channels to complete.  Workers finish in-flight sends
     /// before exiting.  Safe to call multiple times.
+    ///
+    /// <para>In manual mode there is no worker to finish the tail, so a message still queued here
+    /// is dropped. That is the caller's responsibility: a driver that wants the tail delivered
+    /// calls <see cref="FlushAsync"/> before stopping. Stop is deliberately not made async or
+    /// blocking for this — teardown must not wait on a send.</para>
     /// </summary>
     internal void Stop()
     {

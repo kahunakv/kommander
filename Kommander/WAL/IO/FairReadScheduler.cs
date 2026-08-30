@@ -43,6 +43,12 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
     // dirty in-memory entries are never served from disk, so disk is only read when authoritative).
     private readonly bool concurrentPerPartition;
 
+    /// <summary>
+    /// True when this scheduler owns no threads and runs each operation on the calling thread.
+    /// See the constructor's <c>inlineExecution</c> parameter for why a deterministic run needs it.
+    /// </summary>
+    private readonly bool inlineExecution;
+
     // ── Constants ──────────────────────────────────────────────────────────
 
     /// <summary>Maximum number of operations drained from a partition per scheduling cycle.</summary>
@@ -286,17 +292,39 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
     /// source under cold caches. Leave false (the default) for any scheduler whose operations require
     /// mutual ordering (WAL reads interleaved with truncations/compaction deletes).
     /// </param>
+    /// <param name="inlineExecution">
+    /// When true the scheduler owns no threads: <see cref="Start"/> creates none, and every
+    /// enqueued operation runs on the calling thread before <c>EnqueueTask</c> returns, so the
+    /// returned task is always already completed.
+    /// <para>
+    /// This exists for deterministic simulation. A read is the one write-ahead-log operation the
+    /// consensus path <b>awaits</b> (writes report through a completion callback instead), and the
+    /// partition executor blocks on that await. A simulation pumped by one thread would therefore
+    /// deadlock: the pump would wait for a read that only a read worker could run, and no read
+    /// worker exists. Returning an already-completed task keeps every such await synchronous.
+    /// </para>
+    /// <para>
+    /// Submission order still decides execution order, and the same drain path runs, so batching
+    /// and per-partition ordering behave as in threaded mode. What is given up is cross-partition
+    /// fairness and read parallelism, neither of which a deterministic run wants. Never set this
+    /// in production: one slow backend read would then stall the partition executor that issued it.
+    /// </para>
+    /// </param>
     public FairReadScheduler(
         ILogger<IRaft> logger,
         int workerCount = 0,
         int maxQueueDepthPerPartition = DefaultMaxQueueDepth,
-        bool concurrentPerPartition = false)
+        bool concurrentPerPartition = false,
+        bool inlineExecution = false)
     {
         this.logger = logger;
         this.maxQueueDepthPerPartition = maxQueueDepthPerPartition;
         this.concurrentPerPartition = concurrentPerPartition;
+        this.inlineExecution = inlineExecution;
 
-        if (workerCount <= 0)
+        if (inlineExecution)
+            workerCount = 0;
+        else if (workerCount <= 0)
             workerCount = Math.Max(1, Environment.ProcessorCount);
 
         // The ready queue is intentionally UNBOUNDED. Each partition is represented at
@@ -393,6 +421,13 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
         {
             _lifecycle.ExitReadLock();
         }
+
+        // Inline mode runs the work here, outside the admission lock, so the caller's task is
+        // already completed when EnqueueTask returns and the caller's await never yields.
+        // Outside the lock on purpose: read I/O must not run under the lifecycle read lock, which
+        // Stop() takes for writing.
+        if (inlineExecution)
+            DrainInline();
     }
 
     /// <summary>
@@ -437,6 +472,10 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
             return;
 
         _started = true;
+
+        // Inline mode owns no threads; the work already ran on the enqueuing thread.
+        if (inlineExecution)
+            return;
 
         for (int i = 0; i < _workers.Length; i++)
         {
@@ -492,7 +531,9 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
 
         try
         {
-            if (!_started)
+            // Inline mode joins the same path: it owns no threads, so there is nothing to cancel
+            // or join, and anything parked must still be drained so no awaiter is stranded.
+            if (!_started || inlineExecution)
             {
                 // Start() was never called, but callers may have parked reads via EnqueueTask
                 // (which no longer requires Start()). Drain them synchronously on this thread
@@ -543,6 +584,22 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
 
             ProcessPartition(partitionId, batch);
         }
+    }
+
+    /// <summary>
+    /// Runs every ready partition on the calling thread until nothing is ready.
+    ///
+    /// <para>Re-entrant by design. Completing an operation's task can resume a caller that
+    /// enqueues another read, which calls back into this method. The per-partition
+    /// <c>Scheduled</c>/<c>InFlightCount</c> guards make that safe: an inner call drains what it
+    /// can and the outer loop then finds the ready queue empty.</para>
+    /// </summary>
+    private void DrainInline()
+    {
+        List<object> batch = new(MaxBatchSize);
+
+        while (_readyPartitions.TryTake(out int partitionId))
+            ProcessPartition(partitionId, batch);
     }
 
     private void ProcessPartition(int partitionId, List<object> batch)

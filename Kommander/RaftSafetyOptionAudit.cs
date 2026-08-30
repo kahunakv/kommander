@@ -111,6 +111,7 @@ public static class RaftSafetyOptionAudit
         // leave both at their defaults; only a deterministic simulation changes them.
         [nameof(RaftConfiguration.TickSource)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.EnableInternalTimers)] = RaftOptionKind.Liveness,
+        [nameof(RaftConfiguration.EnableInternalSchedulingThreads)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.InvariantChecks)] = RaftOptionKind.Diagnostics,
         [nameof(RaftConfiguration.SlowRaftStateMachineLog)] = RaftOptionKind.Diagnostics,
         [nameof(RaftConfiguration.SlowRaftWALMachineLog)] = RaftOptionKind.Diagnostics,
