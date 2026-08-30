@@ -181,6 +181,35 @@ public class RaftConfiguration
     public TimeSpan TimerInitialDelay { get; set; } = TimeSpan.FromMilliseconds(2500);
 
     /// <summary>
+    /// The single source of monotonic ticks for every elapsed-time gate in this node.
+    ///
+    /// <para>Default is <see cref="Time.SystemMonotonicTickSource.Instance"/>, the process
+    /// clock. Production must not change it. A Deterministic Simulation Testing (DST) run
+    /// replaces it with a tick source that the harness advances explicitly, which is what makes
+    /// an election, a heartbeat round, or a backfill pause replayable from a seed.</para>
+    ///
+    /// <para>Consensus-path code reads ticks from here, never from
+    /// <c>Stopwatch.GetTimestamp()</c>. See <see cref="Time.IMonotonicTickSource"/> for the
+    /// rule and for the repository check that enforces it.</para>
+    /// </summary>
+    public Time.IMonotonicTickSource TickSource { get; set; } = Time.SystemMonotonicTickSource.Instance;
+
+    /// <summary>
+    /// When false, <see cref="RaftTimerService.Start"/> registers no wall-clock timers.
+    /// The recurring operations still run, but only when a caller invokes the trigger methods
+    /// (<see cref="RaftTimerService.TriggerCheckLeader"/> and its siblings) itself.
+    ///
+    /// <para>Default is true, so production is unchanged. A DST run sets it to false and posts
+    /// each tick from the simulation scheduler, which turns "time passed" into an explicit,
+    /// recordable event instead of a race against the thread pool.</para>
+    ///
+    /// <para>This flag does not affect <see cref="RaftPartition"/> timeout arithmetic. Election
+    /// and heartbeat timeouts are still measured against <see cref="TickSource"/>; the flag only
+    /// controls who calls the trigger.</para>
+    /// </summary>
+    public bool EnableInternalTimers { get; set; } = true;
+
+    /// <summary>
     /// Interval at which the timer service refreshes the in-memory membership view
     /// and triggers gossip exchange rounds.  This is also the cadence at which
     /// SWIM-triggered membership changes (additions, evictions) are reflected in the
@@ -1498,6 +1527,15 @@ public class RaftConfiguration
         // zone would silently behave as "no zone" while looking configured. Trim it to the
         // canonical form here (null = no zone) so every consumer sees the same value.
         Zone = string.IsNullOrWhiteSpace(Zone) ? null : Zone.Trim();
+
+        // A null tick source is a liveness hazard, not a null-reference nuisance: every election,
+        // heartbeat, and quiesce gate reads it, so the first read would fail the partition rather
+        // than the node. Fail at startup with a message that names the option.
+        if (TickSource is null)
+            throw new RaftException(
+                "[Kommander] TickSource must not be null. Leave it at its default " +
+                "(SystemMonotonicTickSource.Instance) unless a deterministic simulation is " +
+                "supplying its own clock.");
 
         // Degraded-node avoidance drains leadership off a node, so a misconfigured threshold is a
         // liveness hazard rather than a tuning nuisance. A multiplier at or below 1.0 marks every

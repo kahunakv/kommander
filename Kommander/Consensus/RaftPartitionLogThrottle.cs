@@ -82,7 +82,7 @@ internal sealed class RaftPartitionLogThrottle
     /// </remarks>
     public void LogWalSaturated(string endpoint, int depth, long localMaxLog)
     {
-        long now = Stopwatch.GetTimestamp();
+        long now = host.GetMonotonicTimestamp();
 
         if (lastWalSaturatedLogTicks != 0 && (now - lastWalSaturatedLogTicks) < Stopwatch.Frequency)
         {
@@ -118,7 +118,7 @@ internal sealed class RaftPartitionLogThrottle
     /// </remarks>
     public void LogFailedAppendAck(RaftOperationStatus status, string endpoint, HLCTimestamp timestamp, long committedIndex)
     {
-        long now = Stopwatch.GetTimestamp();
+        long now = host.GetMonotonicTimestamp();
 
         if (lastLoggedAckStatus == status && (now - lastFailedAckLogTicks) < Stopwatch.Frequency)
         {
@@ -169,7 +169,7 @@ internal sealed class RaftPartitionLogThrottle
         if (!willBackfill && followerGap == 0 && !host.Configuration.BackfillEnabled)
             return;
 
-        long now = Stopwatch.GetTimestamp();
+        long now = host.GetMonotonicTimestamp();
 
         if (lastBackfillTraceTicks != 0 && (now - lastBackfillTraceTicks) < Stopwatch.Frequency)
         {
@@ -203,7 +203,7 @@ internal sealed class RaftPartitionLogThrottle
     /// </remarks>
     public void LogBackfillNoProgressPaused(string endpoint, int fruitlessShips, TimeSpan pause, long reportedFrontier)
     {
-        long now = Stopwatch.GetTimestamp();
+        long now = host.GetMonotonicTimestamp();
 
         if (lastNoProgressPauseTraceTicks != 0 && (now - lastNoProgressPauseTraceTicks) < Stopwatch.Frequency)
         {

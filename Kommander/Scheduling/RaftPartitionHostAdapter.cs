@@ -62,6 +62,15 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
 
     public RaftConfiguration Configuration => manager.Configuration;
 
+    /// <summary>
+    /// Reads local monotonic ticks from the node's single tick source
+    /// (<see cref="RaftConfiguration.TickSource"/>) instead of the process clock.
+    /// This is the seam that lets a Deterministic Simulation Testing run advance every
+    /// election, heartbeat, voting, and quiesce gate explicitly. Production wires
+    /// <see cref="Time.SystemMonotonicTickSource"/>, so behavior is unchanged.
+    /// </summary>
+    public long GetMonotonicTimestamp() => manager.Configuration.TickSource.GetTimestamp();
+
     public HybridLogicalClock HybridLogicalClock => manager.HybridLogicalClock;
 
     public IReadOnlyList<RaftNode> Nodes => manager.GetPartitionPeers(partition.PartitionId);

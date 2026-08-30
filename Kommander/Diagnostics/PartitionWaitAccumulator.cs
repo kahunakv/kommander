@@ -44,10 +44,20 @@ public sealed class PartitionWaitAccumulator
     /// <param name="alpha">
     /// Per-sample smoothing weight ∈ (0, 1].  Defaults to <see cref="DefaultAlpha"/>.
     /// </param>
-    public PartitionWaitAccumulator(double alpha = DefaultAlpha)
+    /// <summary>
+    /// Creates an accumulator.
+    /// <paramref name="tickSource"/> supplies the observation stamps used to age a frozen value;
+    /// it defaults to the process clock so existing callers are unchanged. The WAL scheduler
+    /// passes the node's <see cref="RaftConfiguration.TickSource"/>, which keeps age computation
+    /// deterministic in a simulation run.
+    /// </summary>
+    public PartitionWaitAccumulator(double alpha = DefaultAlpha, Kommander.Time.IMonotonicTickSource? tickSource = null)
     {
         _alpha = alpha;
+        _tickSource = tickSource ?? Kommander.Time.SystemMonotonicTickSource.Instance;
     }
+
+    private readonly Kommander.Time.IMonotonicTickSource _tickSource;
 
     /// <summary>
     /// Records a single batch's average enqueue-to-durable wait in milliseconds.
@@ -69,7 +79,7 @@ public sealed class PartitionWaitAccumulator
             }
 
             _sampleCount++;
-            _lastObservationTicks = Stopwatch.GetTimestamp();
+            _lastObservationTicks = _tickSource.GetTimestamp();
         }
     }
 
@@ -99,7 +109,7 @@ public sealed class PartitionWaitAccumulator
             lastTicks = _lastObservationTicks;
         }
 
-        return (Stopwatch.GetTimestamp() - lastTicks) * (1000.0 / Stopwatch.Frequency);
+        return (_tickSource.GetTimestamp() - lastTicks) * (1000.0 / _tickSource.Frequency);
     }
 
     /// <summary>

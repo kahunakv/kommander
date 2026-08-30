@@ -76,6 +76,18 @@ public sealed class RaftTimerService : IDisposable
     private readonly bool _placementEnabled;
     private readonly TimeSpan _initialDelay;
 
+    /// <summary>
+    /// False when <see cref="RaftConfiguration.EnableInternalTimers"/> is off. In that mode
+    /// <see cref="Start"/> registers no <see cref="Timer"/> at all and every recurring operation
+    /// runs only when a caller invokes the matching Trigger method. A Deterministic Simulation
+    /// Testing run uses this so that "a heartbeat interval elapsed" is an explicit, recorded
+    /// event rather than a thread-pool callback that a replay cannot reproduce.
+    /// </summary>
+    private readonly bool _internalTimersEnabled;
+
+    /// <summary>True when this service owns wall-clock timers. False in externally driven mode.</summary>
+    public bool InternalTimersEnabled => _internalTimersEnabled;
+
     public RaftTimerService(
         IRaftTimerHost host,
         ILogger<IRaft> logger,
@@ -94,18 +106,28 @@ public sealed class RaftTimerService : IDisposable
         _placementInterval = configuration.PlacementPassInterval;
         _placementEnabled = configuration.PlacementPassEnabled;
         _initialDelay = initialDelay ?? configuration.TimerInitialDelay;
+        _internalTimersEnabled = configuration.EnableInternalTimers;
         _enableHotSet = configuration.EnableSharedExecutorPool;
         // Safety sweep every ~UpdateNodesInterval (e.g. 5 s / 250 ms = 20 ticks), minimum 1.
         _safetyTickPeriod = (int)Math.Max(1, Math.Round(_updateNodesInterval / _checkLeaderInterval));
     }
 
-    /// <summary>Starts the periodic timers.  Safe to call only once.</summary>
+    /// <summary>
+    /// Starts the periodic timers.  Safe to call only once.
+    ///
+    /// <para>When <see cref="RaftConfiguration.EnableInternalTimers"/> is false the service is
+    /// marked started but registers no timer. The Trigger methods stay live, so an external
+    /// driver (a deterministic simulation, or a test) supplies every tick itself.</para>
+    /// </summary>
     public void Start()
     {
         if (_started)
             return;
 
         _started = true;
+
+        if (!_internalTimersEnabled)
+            return;
 
         _checkLeaderTimer = new Timer(
             _ => TriggerCheckLeader(),

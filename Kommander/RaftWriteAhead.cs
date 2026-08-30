@@ -270,7 +270,7 @@ public sealed class RaftWriteAhead
     public void SetLiveReplicaRetentionFloor(long floor)
     {
         Volatile.Write(ref liveReplicaRetentionFloor, floor <= 0 ? long.MaxValue : floor);
-        Volatile.Write(ref liveReplicaFloorPublishedTicks, Stopwatch.GetTimestamp());
+        Volatile.Write(ref liveReplicaFloorPublishedTicks, manager.Configuration.TickSource.GetTimestamp());
     }
 
     /// <summary>
@@ -1134,7 +1134,7 @@ public sealed class RaftWriteAhead
         // Counted before the throttle: the log line is sampled, the counter is not.
         staleProposedSkipped++;
 
-        long now = global::System.Diagnostics.Stopwatch.GetTimestamp();
+        long now = manager.Configuration.TickSource.GetTimestamp();
 
         if (lastStaleProposedLogTicks != 0 && (now - lastStaleProposedLogTicks) < global::System.Diagnostics.Stopwatch.Frequency)
         {
@@ -2258,7 +2258,7 @@ public sealed class RaftWriteAhead
                 long publishedTicks = Volatile.Read(ref liveReplicaFloorPublishedTicks);
                 long publishedFloor = Volatile.Read(ref liveReplicaRetentionFloor);
                 if (publishedTicks != 0
-                    && Stopwatch.GetTimestamp() - publishedTicks <= liveReplicaFloorStalenessTicks
+                    && manager.Configuration.TickSource.GetTimestamp() - publishedTicks <= liveReplicaFloorStalenessTicks
                     && publishedFloor < lastCheckpoint)
                 {
                     liveReplicaFloor = Math.Max(publishedFloor, lastCheckpoint - lagBudget);

@@ -22,5 +22,10 @@ jobs:
           dotnet-version: |
             8.0.x
             10.0.x
+      - name: Check determinism boundary
+        # A new direct wall-clock or thread-pool read in the consensus path makes a simulation
+        # run unreplayable, and the failure is silent: the run still passes. Fail the build here
+        # instead, before the run stops being reproducible.
+        run: bash scripts/check-determinism-boundary.sh
       - name: Run Tests
         run: (cd Kommander.Tests && dotnet test -l "console;verbosity=detailed" --filter "Category!=Stress" --blame-hang --blame-hang-timeout 120s)

@@ -1,0 +1,32 @@
+# Determinism boundary baseline.
+#
+# Format: <repo-relative-file>|<pattern-label> <accepted-count>
+#
+# Every line here is a consensus-path read of wall-clock time or a thread-pool hop that
+# predates the tick-source seam. Each one is accepted because it cannot change a Raft
+# decision: it stamps a diagnostic, retries a control-plane pass, or measures latency for a
+# log line. None of them gates an election, a commit, or an apply.
+#
+# The tick-read count (wall-clock-ticks) is deliberately absent: after the tick-source seam no
+# consensus-path file reads Stopwatch.GetTimestamp() directly. Do not add one back.
+#
+# Raising a number here is a deliberate act. Say in the commit message why the new read
+# cannot affect a decision, or route it through RaftConfiguration.TickSource instead.
+
+Kommander/Consensus/NonContiguousBackfillTracker.cs|wall-clock-date 3
+Kommander/Consensus/WalCompletionRouter.cs|wall-clock-sleep 1
+Kommander/RaftManager.cs|thread-pool-hop 1
+Kommander/RaftPartition.cs|wall-clock-sleep 1
+Kommander/RaftPartitionStateMachine.cs|wall-clock-sleep 1
+Kommander/ReplicationGateway.cs|wall-clock-sleep 4
+Kommander/Scheduling/RaftPartitionExecutor.cs|thread-pool-hop 1
+Kommander/SnapshotSender.cs|wall-clock-date 2
+Kommander/SnapshotSender.cs|wall-clock-sleep 1
+Kommander/System/LeaderBalancer.cs|wall-clock-date 1
+Kommander/System/PartitionMapService.cs|wall-clock-sleep 3
+Kommander/System/RaftSystemCoordinator.cs|thread-pool-hop 1
+Kommander/System/RaftSystemCoordinator.cs|wall-clock-date 2
+Kommander/System/RaftSystemCoordinator.cs|wall-clock-sleep 1
+Kommander/System/ReplicaPlacementService.cs|wall-clock-date 1
+Kommander/System/ReplicaPlacementService.cs|wall-clock-sleep 1
+Kommander/System/SplitMergeController.cs|wall-clock-sleep 4

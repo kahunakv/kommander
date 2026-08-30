@@ -47,8 +47,8 @@ internal sealed class LoadReportService
     {
         double wOps = configuration.LeaderBalancerOpsWeight;
         double wQueue = configuration.LeaderBalancerQueueWeight;
-        double ticksToMs = 1000.0 / global::System.Diagnostics.Stopwatch.Frequency;
-        long now = global::System.Diagnostics.Stopwatch.GetTimestamp();
+        double ticksToMs = 1000.0 / configuration.TickSource.Frequency;
+        long now = configuration.TickSource.GetTimestamp();
 
         List<PartitionLoad> leaderships = [];
 

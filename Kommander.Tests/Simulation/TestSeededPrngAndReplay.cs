@@ -5,7 +5,7 @@ using Kommander.Tests.Simulation.Replay;
 namespace Kommander.Tests.Simulation;
 
 /// <summary>
-/// Acceptance tests for DST-2 seeded PRNG and replay logging.
+/// Acceptance tests for the seeded PRNG and the replay log.
 /// </summary>
 public class TestSeededPrngAndReplay
 {

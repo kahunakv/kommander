@@ -190,6 +190,13 @@ internal sealed class RaftPartitionCoreState
     /// Reset to -1 on every leader→follower transition.
     /// <para>Volatile-backed (like <see cref="NodeState"/>) because the leadership-lease fast path
     /// reads it off-thread; the executor thread stays the only writer.</para>
+    /// <para><b>Not a commit frontier, and not an upper bound on <see cref="LastAppliedIndex"/>.</b>
+    /// It counts only what THIS leader committed in THIS term, so a snapshot install or a restore
+    /// legitimately leaves the applied frontier above it — both import a committed prefix this
+    /// leader never committed itself. An invariant check of the form "applied never exceeds
+    /// committed" was tried against this field and removed: it fires on the snapshot-install and
+    /// rollback paths, which are correct. The WAL's commit frontier, not this field, is what bounds
+    /// the applied frontier.</para>
     /// </summary>
     public long LocalCommittedIndex
     {
@@ -290,19 +297,6 @@ internal sealed class RaftPartitionCoreState
                 value,
                 partitionId,
                 localEndpoint);
-
-            // A leader publishes both frontiers, and every consumer of the pair — the leadership
-            // lease fast path above all — reads the committed frontier first and assumes the
-            // applied one cannot overtake it. Checked only on a leader with a live frontier: a
-            // follower parks LocalCommittedIndex at -1 by design, so the comparison would be
-            // meaningless there rather than merely uninteresting.
-            if (NodeState == RaftNodeState.Leader)
-            {
-                long committed = Volatile.Read(ref localCommittedIndexValue);
-                if (committed >= 0)
-                    RaftInvariants.RequireAppliedNotAboveCommitted(
-                        value, committed, partitionId, localEndpoint);
-            }
 
             Volatile.Write(ref lastAppliedIndexValue, value);
         }

@@ -69,7 +69,14 @@ public sealed class RaftPartition : IDisposable
     /// poller observes the publication instead of a cached core-local value.
     /// </summary>
     private volatile string _leader = "";
-    private long _leaderChangedTicks = Stopwatch.GetTimestamp();
+
+    /// <summary>
+    /// Monotonic tick stamp of the last leader change, read from
+    /// <see cref="RaftConfiguration.TickSource"/> rather than the process clock so that a
+    /// deterministic simulation controls leader-stability windows. Seeded in the constructor,
+    /// because a field initializer would run before <see cref="manager"/> is assigned.
+    /// </summary>
+    private long _leaderChangedTicks;
 
     internal string Leader
     {
@@ -80,7 +87,7 @@ public sealed class RaftPartition : IDisposable
                 return;
 
             _leader = value;
-            Interlocked.Exchange(ref _leaderChangedTicks, Stopwatch.GetTimestamp());
+            Interlocked.Exchange(ref _leaderChangedTicks, manager.Configuration.TickSource.GetTimestamp());
         }
     }
 
@@ -165,6 +172,7 @@ public sealed class RaftPartition : IDisposable
     )
     {
         this.manager = manager;
+        _leaderChangedTicks = manager.Configuration.TickSource.GetTimestamp();
 
         PartitionId = partitionId;
         StartRange = startRange;
@@ -201,7 +209,8 @@ public sealed class RaftPartition : IDisposable
             drainQuantumMaintenance: manager.Configuration.MaxDrainQuantumMaintenance,
             getGeneration:           () => Generation,
             walQueueDepthProvider:   () => manager.WalScheduler.GetPartitionDepth(partitionId),
-            pool:                    pool);
+            pool:                    pool,
+            tickSource:              manager.Configuration.TickSource);
         executorRef = executor;
         replySink.Executor = executor;
         stateMachine.SetPostToExecutor(req => executorRef.Post(req));
@@ -739,13 +748,13 @@ public sealed class RaftPartition : IDisposable
         CancellationToken cancellationToken = default)
     {
         TimeSpan requiredStableFor = minStableFor <= TimeSpan.Zero ? TimeSpan.Zero : minStableFor;
-        long startTicks = Stopwatch.GetTimestamp();
+        long startTicks = manager.Configuration.TickSource.GetTimestamp();
 
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            if (timeout.HasValue && ValueStopwatch.GetElapsedTime(startTicks, Stopwatch.GetTimestamp()) >= timeout.Value)
+            if (timeout.HasValue && ValueStopwatch.GetElapsedTime(startTicks, manager.Configuration.TickSource.GetTimestamp()) >= timeout.Value)
                 throw new TimeoutException(
                     $"Leader for partition {PartitionId} did not remain stable for {requiredStableFor.TotalMilliseconds}ms within {timeout.Value.TotalMilliseconds}ms");
 
@@ -769,7 +778,7 @@ public sealed class RaftPartition : IDisposable
                 if (requiredStableFor == TimeSpan.Zero)
                     return leader;
 
-                TimeSpan stableFor = ValueStopwatch.GetElapsedTime(LeaderChangedTicks, Stopwatch.GetTimestamp());
+                TimeSpan stableFor = ValueStopwatch.GetElapsedTime(LeaderChangedTicks, manager.Configuration.TickSource.GetTimestamp());
                 if (stableFor >= requiredStableFor)
                     return leader;
             }

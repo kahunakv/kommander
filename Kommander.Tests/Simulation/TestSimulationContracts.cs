@@ -1,7 +1,7 @@
 namespace Kommander.Tests.Simulation;
 
 /// <summary>
-/// Acceptance tests for DST-1 simulation contracts.
+/// Acceptance tests for the simulation contracts.
 /// </summary>
 public class TestSimulationContracts
 {

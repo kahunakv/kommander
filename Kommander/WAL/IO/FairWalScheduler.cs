@@ -71,6 +71,13 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     // ── Configuration ──────────────────────────────────────────────────────
 
     private readonly IWAL walAdapter;
+
+    /// <summary>
+    /// Tick source for enqueue stamps, the group-commit linger window, and completion latency.
+    /// Comes from <see cref="RaftConfiguration.TickSource"/>, so a deterministic run measures WAL
+    /// latency on simulated ticks instead of the process clock.
+    /// </summary>
+    private readonly Kommander.Time.IMonotonicTickSource tickSource;
     private readonly ILogger<IRaft> logger;
     private readonly int maxQueueDepthPerPartition;
     private readonly int maxGlobalQueueDepth;
@@ -151,7 +158,12 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         /// Per-partition EWMA of enqueue-to-durable latency in milliseconds.
         /// Updated by the worker thread after each successful Write batch.
         /// </summary>
-        public readonly PartitionWaitAccumulator CommitWait = new();
+        public readonly PartitionWaitAccumulator CommitWait;
+
+        public PartitionState(Kommander.Time.IMonotonicTickSource tickSource)
+        {
+            CommitWait = new PartitionWaitAccumulator(tickSource: tickSource);
+        }
     }
 
     private readonly ConcurrentDictionary<int, PartitionState> _partitions = new();
@@ -171,7 +183,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// the load report only for led partitions, which makes them useless for judging a node that is
     /// a candidate to *receive* leadership.</para>
     /// </summary>
-    private readonly PartitionWaitAccumulator _nodeCommitWait = new();
+    private readonly PartitionWaitAccumulator _nodeCommitWait;
 
     // ── Global ready-queue ─────────────────────────────────────────────────
 
@@ -289,8 +301,11 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         int maxGlobalQueueDepth = 0,
         int maxGroupBatchPartitions = DefaultMaxGroupBatchPartitions,
         int groupCommitLingerMs = 0,
-        bool lazyCommitMarkers = false)
+        bool lazyCommitMarkers = false,
+        Kommander.Time.IMonotonicTickSource? tickSource = null)
     {
+        this.tickSource = tickSource ?? Kommander.Time.SystemMonotonicTickSource.Instance;
+        this._nodeCommitWait = new PartitionWaitAccumulator(tickSource: this.tickSource);
         this.walAdapter = walAdapter;
         this.logger = logger;
         this.maxQueueDepthPerPartition = maxQueueDepthPerPartition;
@@ -329,7 +344,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             throw new InvalidOperationException("FairWalScheduler: call Start() before Enqueue().");
 
         int partitionId = operation.Logs.PartitionId;
-        PartitionState state = _partitions.GetOrAdd(partitionId, _ => new PartitionState());
+        PartitionState state = _partitions.GetOrAdd(partitionId, _ => new PartitionState(tickSource));
 
         lock (state.Lock)
         {
@@ -346,7 +361,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                 }
             }
 
-            operation.EnqueueTicks = global::System.Diagnostics.Stopwatch.GetTimestamp();
+            operation.EnqueueTicks = tickSource.GetTimestamp();
             state.Ops.Enqueue(operation);
             state.Depth++;
 
@@ -568,18 +583,18 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// </summary>
     private void LingerForMoreReadyPartitions(List<int> partitionGroup, CancellationToken token)
     {
-        long deadline = global::System.Diagnostics.Stopwatch.GetTimestamp() + lingerTicks;
+        long deadline = tickSource.GetTimestamp() + lingerTicks;
 
         while (partitionGroup.Count < maxGroupBatchPartitions)
         {
-            long remainingTicks = deadline - global::System.Diagnostics.Stopwatch.GetTimestamp();
+            long remainingTicks = deadline - tickSource.GetTimestamp();
             if (remainingTicks <= 0)
                 break;
 
             if (!OtherPartitionsHaveQueuedWork(partitionGroup))
                 break; // nothing outside the group can become ready → flushing now is strictly better.
 
-            int waitMs = (int)Math.Ceiling(remainingTicks * 1000.0 / global::System.Diagnostics.Stopwatch.Frequency);
+            int waitMs = (int)Math.Ceiling(remainingTicks * 1000.0 / tickSource.Frequency);
 
             int extraId;
             try
@@ -799,8 +814,8 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         }
 
         // Stamp completion time once for all ops in this group batch.
-        long doneAtTicks = global::System.Diagnostics.Stopwatch.GetTimestamp();
-        double ticksToMs = 1000.0 / global::System.Diagnostics.Stopwatch.Frequency;
+        long doneAtTicks = tickSource.GetTimestamp();
+        double ticksToMs = 1000.0 / tickSource.Frequency;
 
         KommanderMetrics.WalBatchesTotal.Add(1);
 

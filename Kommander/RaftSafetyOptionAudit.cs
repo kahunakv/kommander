@@ -105,6 +105,12 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.StartElectionTimeoutIncrement)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.EndElectionTimeoutIncrement)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.ElectionTimeoutSeed)] = RaftOptionKind.Deployment,
+        // Both are liveness, not diagnostics: a tick source that does not advance, or timers that
+        // nobody drives, stop every election and heartbeat. Committed data stays correct and the
+        // cluster stops making progress, which is exactly the liveness class. Production must
+        // leave both at their defaults; only a deterministic simulation changes them.
+        [nameof(RaftConfiguration.TickSource)] = RaftOptionKind.Liveness,
+        [nameof(RaftConfiguration.EnableInternalTimers)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.InvariantChecks)] = RaftOptionKind.Diagnostics,
         [nameof(RaftConfiguration.SlowRaftStateMachineLog)] = RaftOptionKind.Diagnostics,
         [nameof(RaftConfiguration.SlowRaftWALMachineLog)] = RaftOptionKind.Diagnostics,

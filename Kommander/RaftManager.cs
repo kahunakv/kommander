@@ -475,7 +475,7 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             SnapshotReceiver.TicksForDuration(this.configuration.SnapshotReceiveSessionTtl),
             this.configuration.SnapshotMaxPendingSessions,
             this.configuration.SnapshotMaxPendingBytes,
-            static () => global::System.Diagnostics.Stopwatch.GetTimestamp(),
+            () => this.configuration.TickSource.GetTimestamp(),
             () => this.configuration.AllowLegacySnapshotSenders);
 
         clusterHandler = new(this, discovery);
@@ -603,7 +603,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             configuration.MaxGlobalWalQueueDepth,
             configuration.MaxWalGroupBatchPartitions,
             configuration.WalGroupCommitLingerMs,
-            configuration.WalSingleFsyncCommit);
+            configuration.WalSingleFsyncCommit,
+            configuration.TickSource);
 
         loadReportService = new LoadReportService(
             this,

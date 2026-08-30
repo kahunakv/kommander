@@ -491,12 +491,12 @@ internal sealed class WalCompletionRouter
             // spending before stepping down.
             bool drainHasVoterPeers = sender.HasVoterPeer();
             TimeSpan inheritedDrainBound = drainHasVoterPeers ? host.Configuration.LeadershipBarrierTimeout : TimeSpan.FromMilliseconds(250);
-            long drainStartTicks = Stopwatch.GetTimestamp();
+            long drainStartTicks = host.GetMonotonicTimestamp();
 
             while ((drainStatus =
                        await applier.DrainInheritedAppliesAsync(coreState.LastAppliedIndex + 1, inheritedEnd).ConfigureAwait(false)) == InheritedDrainStatus.Hole)
             {
-                if (Stopwatch.GetElapsedTime(drainStartTicks) > inheritedDrainBound)
+                if (Stopwatch.GetElapsedTime(drainStartTicks, host.GetMonotonicTimestamp()) > inheritedDrainBound)
                 {
                     // Same sole-voter escape as the promotion drain: with no voter peer to defer
                     // to, stepping down just re-elects this node into the same gap forever. The

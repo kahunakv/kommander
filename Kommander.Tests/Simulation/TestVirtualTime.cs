@@ -3,7 +3,7 @@ using Kommander.Tests.Simulation.Time;
 namespace Kommander.Tests.Simulation;
 
 /// <summary>
-/// Acceptance tests for DST-3 virtual time and timer scheduling.
+/// Acceptance tests for virtual time and timer scheduling.
 /// </summary>
 public class TestVirtualTime
 {

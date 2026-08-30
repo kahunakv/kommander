@@ -1049,13 +1049,13 @@ public sealed class RaftPartitionStateMachine
             // peers the full barrier timeout is worth spending, because refusing hands leadership
             // to a peer that may hold the missing entries.
             TimeSpan drainBound = hasVoterPeers ? host.Configuration.LeadershipBarrierTimeout : TimeSpan.FromMilliseconds(250);
-            long drainDeadlineTicks = Stopwatch.GetTimestamp();
+            long drainDeadlineTicks = host.GetMonotonicTimestamp();
 
             bool drainCovered = true;
 
             while (!await applier.DrainCommittedAppliesAsync(commitFrontier).ConfigureAwait(false))
             {
-                if (Stopwatch.GetElapsedTime(drainDeadlineTicks) > drainBound)
+                if (Stopwatch.GetElapsedTime(drainDeadlineTicks, host.GetMonotonicTimestamp()) > drainBound)
                 {
                     drainCovered = false;
                     break;

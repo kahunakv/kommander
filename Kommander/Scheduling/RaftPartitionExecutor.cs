@@ -197,6 +197,14 @@ public sealed class RaftPartitionExecutor : IDisposable
     // ── Per-execution context ──────────────────────────────────────────────
 
     private readonly RaftPartitionStateMachine _stateMachine;
+
+    /// <summary>
+    /// Tick source for the exception-log throttle below. Comes from
+    /// <see cref="RaftConfiguration.TickSource"/> so a deterministic run never reads the
+    /// process clock on the executor path.
+    /// </summary>
+    private readonly Kommander.Time.IMonotonicTickSource _tickSource;
+
     private readonly ILogger<IRaft> _logger;
     private readonly int _partitionId;
     private readonly Func<long>? _getGeneration;
@@ -395,8 +403,10 @@ public sealed class RaftPartitionExecutor : IDisposable
         int drainQuantumMaintenance = 0,
         Func<long>? getGeneration = null,
         Func<int>? walQueueDepthProvider = null,
-        RaftExecutorPool? pool = null)
+        RaftExecutorPool? pool = null,
+        Kommander.Time.IMonotonicTickSource? tickSource = null)
     {
+        _tickSource = tickSource ?? Kommander.Time.SystemMonotonicTickSource.Instance;
         _stateMachine = stateMachine;
         _partitionId = partitionId;
         _slowThresholdMs = slowThresholdMs;
@@ -1188,10 +1198,10 @@ public sealed class RaftPartitionExecutor : IDisposable
     private void LogOperationFailure(Exception ex)
     {
         string exceptionType = ex.GetType().Name;
-        long now = Stopwatch.GetTimestamp();
+        long now = _tickSource.GetTimestamp();
 
         if (exceptionType == _lastLoggedExceptionType &&
-            (now - _lastExceptionLogTicks) < Stopwatch.Frequency)
+            (now - _lastExceptionLogTicks) < _tickSource.Frequency)
         {
             _suppressedExceptionLogs++;
             return;

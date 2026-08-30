@@ -115,33 +115,21 @@ public sealed class TestRaftInvariants : IDisposable
     }
 
     [Fact]
-    public void LeaderAppliedMayNotOvertakeCommitted()
+    public void AppliedIsAllowedAboveTheLeaderCommittedFrontier()
     {
+        // Pins a finding rather than a rule. An "applied never exceeds committed" check was tried
+        // here and removed: LocalCommittedIndex counts only what THIS leader committed in THIS
+        // term, so a snapshot install (SnapshotInstaller) and a rollback both leave the applied
+        // frontier above it while being correct. The WAL commit frontier, not this field, bounds
+        // the applied frontier. This test exists so the check is not reintroduced.
         RaftInvariants.Policy = RaftInvariantPolicy.Throw;
         RaftPartitionCoreState state = NewState();
         state.NodeState = RaftNodeState.Leader;
-        state.LocalCommittedIndex = 5;
+        state.LocalCommittedIndex = 0;
 
-        state.LastAppliedIndex = 5;
+        state.LastAppliedIndex = 100;
 
-        RaftInvariantViolationException ex =
-            Assert.Throws<RaftInvariantViolationException>(() => state.LastAppliedIndex = 6);
-
-        Assert.Equal(RaftInvariants.AppliedNotAboveCommitted, ex.Invariant);
-    }
-
-    [Fact]
-    public void FollowerAppliedIsNotComparedAgainstTheLeaderFrontier()
-    {
-        // A follower parks LocalCommittedIndex at -1 by design, so the comparison must not run.
-        RaftInvariants.Policy = RaftInvariantPolicy.Throw;
-        RaftPartitionCoreState state = NewState();
-        state.NodeState = RaftNodeState.Follower;
-
-        state.LastAppliedIndex = 40;
-
-        Assert.Equal(40, state.LastAppliedIndex);
-        Assert.Equal(-1, state.LocalCommittedIndex);
+        Assert.Equal(100, state.LastAppliedIndex);
     }
 
     // ── Policy ────────────────────────────────────────────────────────────────

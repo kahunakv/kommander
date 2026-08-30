@@ -455,7 +455,7 @@ internal sealed class LogApplicator
     /// </summary>
     private bool ShouldLogDrainHole()
     {
-        long now = global::System.Diagnostics.Stopwatch.GetTimestamp();
+        long now = host.GetMonotonicTimestamp();
 
         if (lastDrainHoleLogTicks != 0 && (now - lastDrainHoleLogTicks) < global::System.Diagnostics.Stopwatch.Frequency)
         {
