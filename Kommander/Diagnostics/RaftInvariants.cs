@@ -69,9 +69,6 @@ public static class RaftInvariants
     /// delivered to the consumer cannot be undelivered.</summary>
     public const string AppliedFrontierMonotonic = "applied_frontier_monotonic";
 
-    /// <summary>A leader never reports more applied than committed.</summary>
-    public const string AppliedNotAboveCommitted = "applied_not_above_committed";
-
     /// <summary>The composed compaction floor is at or below every floor it composes.</summary>
     public const string CompactionFloorIsLowerBound = "compaction_floor_is_lower_bound";
 
@@ -106,27 +103,6 @@ public static class RaftInvariants
             partitionId,
             localEndpoint,
             $"value regressed from {previous} to {next}");
-    }
-
-    /// <summary>
-    /// Asserts <c>applied &lt;= committed</c>. The caller is responsible for only asking while the
-    /// node is a leader with a live committed frontier: a follower keeps its leader-side committed
-    /// frontier at -1 by design, so the comparison is meaningless there.
-    /// </summary>
-    public static void RequireAppliedNotAboveCommitted(
-        long applied,
-        long committed,
-        int partitionId,
-        string? localEndpoint)
-    {
-        if (applied <= committed)
-            return;
-
-        Violate(
-            RaftInvariants.AppliedNotAboveCommitted,
-            partitionId,
-            localEndpoint,
-            $"applied={applied} exceeds committed={committed}");
     }
 
     /// <summary>

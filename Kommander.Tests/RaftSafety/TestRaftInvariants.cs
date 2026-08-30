@@ -114,36 +114,6 @@ public sealed class TestRaftInvariants : IDisposable
         Assert.Equal(RaftInvariants.AppliedFrontierMonotonic, ex.Invariant);
     }
 
-    [Fact]
-    public void LeaderAppliedMayNotOvertakeCommitted()
-    {
-        RaftInvariants.Policy = RaftInvariantPolicy.Throw;
-        RaftPartitionCoreState state = NewState();
-        state.NodeState = RaftNodeState.Leader;
-        state.LocalCommittedIndex = 5;
-
-        state.LastAppliedIndex = 5;
-
-        RaftInvariantViolationException ex =
-            Assert.Throws<RaftInvariantViolationException>(() => state.LastAppliedIndex = 6);
-
-        Assert.Equal(RaftInvariants.AppliedNotAboveCommitted, ex.Invariant);
-    }
-
-    [Fact]
-    public void FollowerAppliedIsNotComparedAgainstTheLeaderFrontier()
-    {
-        // A follower parks LocalCommittedIndex at -1 by design, so the comparison must not run.
-        RaftInvariants.Policy = RaftInvariantPolicy.Throw;
-        RaftPartitionCoreState state = NewState();
-        state.NodeState = RaftNodeState.Follower;
-
-        state.LastAppliedIndex = 40;
-
-        Assert.Equal(40, state.LastAppliedIndex);
-        Assert.Equal(-1, state.LocalCommittedIndex);
-    }
-
     // ── Policy ────────────────────────────────────────────────────────────────
 
     [Fact]

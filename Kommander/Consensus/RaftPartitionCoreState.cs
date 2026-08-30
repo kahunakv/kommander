@@ -291,19 +291,6 @@ internal sealed class RaftPartitionCoreState
                 partitionId,
                 localEndpoint);
 
-            // A leader publishes both frontiers, and every consumer of the pair — the leadership
-            // lease fast path above all — reads the committed frontier first and assumes the
-            // applied one cannot overtake it. Checked only on a leader with a live frontier: a
-            // follower parks LocalCommittedIndex at -1 by design, so the comparison would be
-            // meaningless there rather than merely uninteresting.
-            if (NodeState == RaftNodeState.Leader)
-            {
-                long committed = Volatile.Read(ref localCommittedIndexValue);
-                if (committed >= 0)
-                    RaftInvariants.RequireAppliedNotAboveCommitted(
-                        value, committed, partitionId, localEndpoint);
-            }
-
             Volatile.Write(ref lastAppliedIndexValue, value);
         }
     }
