@@ -179,7 +179,26 @@ public class RocksDbWAL : IWAL, IDisposable
             .SetCreateIfMissing(true)
             .SetCreateMissingColumnFamilies(true)
             .SetAllowConcurrentMemtableWrite(true)
-            .SetWalRecoveryMode(Recovery.AbsoluteConsistency);
+            // A torn record at the tail of the RocksDB log is the normal residue of an unclean
+            // shutdown: the process died between the write syscall and its completion, so the last
+            // record is short. Recovery.AbsoluteConsistency refuses to open on it, which turns a
+            // single SIGKILL into a permanently unopenable data directory — the node crash-loops,
+            // stays a voter that never returns, and the next fault takes the cluster below quorum.
+            //
+            // TolerateCorruptedTailRecords (RocksDB's own default) drops that record and opens.
+            // Dropping it loses nothing that was promised: with syncWrites the fsync completes
+            // before the caller is acknowledged, so a record that is short was never acknowledged.
+            // Restore then rebuilds commitIndex from the contiguous committed prefix and the leader
+            // re-supplies the rest — the input this mode hands it is exactly what that path expects.
+            // With syncWrites off there is no such guarantee, but that configuration already accepts
+            // the loss of writes the operating system had not flushed, and a WAL that cannot open at
+            // all is the worse outcome there too.
+            //
+            // This is not a blanket "ignore corruption". A short body can only occur at the end of
+            // the file. A checksum mismatch with whole records after it is real damage, and RocksDB
+            // still refuses to open on it in this mode. Recovery.SkipAnyCorruptedRecords is the mode
+            // that would swallow that, and it is not used here.
+            .SetWalRecoveryMode(Recovery.TolerateCorruptedTailRecords);
 
         // When sharing resources, apply the WBM to the DbOptions before opening. The block cache is
         // applied per-CF below. Both must be set before RocksDb.Open — they cannot be changed afterward.
