@@ -30,13 +30,17 @@ public sealed class SimulationNode : IAsyncDisposable
 {
     private int disposed;
 
-    private SimulationNode(int nodeIndex, string endpoint, RaftManager manager, IWAL wal)
+    private SimulationNode(int nodeIndex, string endpoint, RaftManager manager, IWAL wal, bool drivenScheduling)
     {
         NodeIndex = nodeIndex;
         Endpoint = endpoint;
         Manager = manager;
         Wal = wal;
+        this.drivenScheduling = drivenScheduling;
     }
+
+    /// <summary>True when this node owns no scheduling threads. Changes how it is torn down.</summary>
+    private readonly bool drivenScheduling;
 
     /// <summary>
     /// Unix-millisecond epoch the simulated hybrid logical clock counts from. 2026-01-01, chosen
@@ -93,15 +97,12 @@ public sealed class SimulationNode : IAsyncDisposable
             Port = port,
             InitialPartitions = options.PartitionCount,
 
-            // The determinism seams in use today. TickSource makes every elapsed-time gate a
-            // function of simulated time; EnableInternalTimers hands the tick itself to the
-            // harness.
-            //
-            // EnableInternalSchedulingThreads is deliberately left on. The externally driven
-            // schedulers exist and are tested, but a node cannot yet run on one thread: a
-            // partition executor blocks on each operation it dispatches, so an operation that
-            // awaits anything outside the executor deadlocks a single-threaded driver. See the
-            // determinism-boundary notes in the specification.
+            // The three determinism seams. TickSource makes every elapsed-time gate a function of
+            // simulated time. EnableInternalTimers hands the tick itself to the harness.
+            // EnableInternalSchedulingThreads, when the scenario asks for driven scheduling,
+            // removes the node's own threads so its executors, write-ahead log and outbound
+            // transport advance only when the harness advances them — which is what makes two runs
+            // of one seed reach the same state at every step.
             TickSource = clock,
             EnableInternalTimers = false,
             EnableInternalSchedulingThreads = !options.DrivenScheduling,
@@ -145,7 +146,7 @@ public sealed class SimulationNode : IAsyncDisposable
                 : new HybridLogicalClock(),
             logger);
 
-        return new SimulationNode(nodeIndex, endpoint, manager, wal);
+        return new SimulationNode(nodeIndex, endpoint, manager, wal, options.DrivenScheduling);
     }
 
     /// <summary>
@@ -265,6 +266,18 @@ public sealed class SimulationNode : IAsyncDisposable
             return;
 
         LifecycleStatus = SimulationNodeLifecycleStatus.Stopped;
+
+        // A driven node is disposed outright rather than asked to leave gracefully. A graceful
+        // leave waits for roster changes to commit, and in driven mode nobody is left to drive
+        // them: every one of its waits runs to its full timeout. Measured at roughly twelve
+        // seconds per node, against a hundred milliseconds for the run it was tearing down.
+        // Nothing is lost by skipping it — the whole cluster is being discarded, and graceful
+        // leave has its own tests.
+        if (drivenScheduling)
+        {
+            Manager.Dispose();
+            return;
+        }
 
         try
         {

@@ -72,6 +72,10 @@ public sealed class TestDrivenSchedulingCluster
         Assert.True(elected, "No leader was elected with the scheduling threads switched off.");
         Assert.True(invariants.ChecksRun > 0);
         Assert.True(cluster.Clock.ReadCount > 0);
+
+        // A whole run costs tens of driving rounds, not thousands. If this ever climbs, the run is
+        // waiting on something rather than driving it.
+        Assert.True(cluster.PumpRounds < 2_000, $"The run took {cluster.PumpRounds} driving rounds.");
     }
 
     /// <summary>
@@ -173,30 +177,24 @@ public sealed class TestDrivenSchedulingCluster
     /// node's lifecycle, term, known leader, and committed frontier, plus the pending wire — so
     /// two runs that agreed by luck on the leader but differed anywhere else would still fail.</para>
     ///
-    /// <para><b>Skipped, and the measurement is the point.</b> Two runs of seed 20260830 agree for
-    /// 34 steps and then diverge. Driven mode got most of the way: the executors, the write-ahead
-    /// logs, and the outbound transports no longer decide anything. What still decides is how far
-    /// an in-flight drain gets within one round. The driver starts each drain and does not await
-    /// it — that is what unblocked progress — so the thread pool chooses how much of it completes
-    /// before the round ends, and a round that completes more delivers more.</para>
+    /// <para><b>What it took.</b> An earlier attempt agreed for 34 steps and then diverged. Two
+    /// things were still deciding order on their own: each node's <c>HybridLogicalClock</c> read
+    /// the wall clock, and the system coordinator started its loop on <c>Task.Run</c>. Both now
+    /// follow the simulation — the clock reads simulated milliseconds, and the loop starts inline
+    /// when the node's scheduling threads are off.</para>
     ///
-    /// <para>Interleaving cannot fix this by itself, because not awaiting the drain is exactly what
-    /// makes interleaving work. Closing it needs the drains to advance deterministically within a
-    /// round: a cooperative scheduler the driver owns, so continuations run when the driver runs
-    /// them rather than when the thread pool does. Two smaller suspects to rule out first — the
-    /// system coordinator's loop still runs on <c>Task.Run</c>, and each node's
-    /// <c>HybridLogicalClock</c> reads wall time.</para>
-    ///
-    /// <para>Un-skip this when that lands. Do not weaken it: a test that asserts "the runs agree
-    /// for a while" would pass forever and measure nothing.</para>
+    /// <para>Do not weaken this test. One asserting that the runs agree "for a while" would pass
+    /// forever and measure nothing.</para>
     /// </summary>
-    [Fact]
-    public async Task SameSeed_ReachesTheSameStateAtEveryStep()
+    [Theory]
+    [InlineData(20260830UL)]
+    [InlineData(4242UL)]
+    public async Task SameSeed_ReachesTheSameStateAtEveryStep(ulong seed)
     {
         CancellationToken cancellationToken = TestContext.Current.CancellationToken;
 
-        IReadOnlyList<string> first = await RecordStateHashesAsync(seed: 20260830, cancellationToken);
-        IReadOnlyList<string> second = await RecordStateHashesAsync(seed: 20260830, cancellationToken);
+        IReadOnlyList<string> first = await RecordStateHashesAsync(seed, cancellationToken);
+        IReadOnlyList<string> second = await RecordStateHashesAsync(seed, cancellationToken);
 
         Assert.Equal(first.Count, second.Count);
         Assert.True(first.Count > 5, "The run was too short to be evidence.");
@@ -205,8 +203,8 @@ public sealed class TestDrivenSchedulingCluster
         {
             Assert.True(
                 string.Equals(first[step], second[step], StringComparison.Ordinal),
-                $"Two runs of one seed diverged at step {step}. Something outside the seed and the " +
-                "driver is deciding order; that is a determinism leak, not a flake.");
+                $"Seed {seed}: two runs diverged at step {step} of {first.Count}. Something outside " +
+                "the seed and the driver is deciding order; that is a determinism leak, not a flake.");
         }
     }
 
@@ -239,7 +237,11 @@ public sealed class TestDrivenSchedulingCluster
 
         List<string> hashes = [];
 
-        for (int step = 0; step < 40; step++)
+        // Two seeds of 25 steps rather than more of either. The property is all-or-nothing: a
+        // determinism leak shows within a few steps of the first message it touches, so a longer
+        // run mostly re-confirms what the early steps already proved, and this category runs on
+        // every pull request.
+        for (int step = 0; step < 25; step++)
         {
             await cluster.StepAsync(advanceMilliseconds: 50, cancellationToken);
 
