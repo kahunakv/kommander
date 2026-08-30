@@ -143,16 +143,13 @@ internal sealed class ElectionCoordinator
         electionPhase = RaftElectionPhase.None;
     }
 
-    private static bool CandidateLogIsBehind(long remoteLastLogTerm, long remoteMaxLogId, long localLastLogTerm, long localMaxId)
-    {
-        if (remoteLastLogTerm <= 0)
-            return remoteMaxLogId < localMaxId; // legacy peer / empty candidate log → index-only
-
-        if (remoteLastLogTerm != localLastLogTerm)
-            return remoteLastLogTerm < localLastLogTerm;
-
-        return remoteMaxLogId < localMaxId;
-    }
+    /// <summary>
+    /// Raft §5.4.1 log freshness; see <see cref="ElectionFreshness"/> for the rule and for why it
+    /// lives in its own type. Kept as a local forwarder so the two call sites below read the same
+    /// as before.
+    /// </summary>
+    private static bool CandidateLogIsBehind(long remoteLastLogTerm, long remoteMaxLogId, long localLastLogTerm, long localMaxId) =>
+        ElectionFreshness.CandidateLogIsBehind(remoteLastLogTerm, remoteMaxLogId, localLastLogTerm, localMaxId);
 
     /// <summary>
     /// The (index, term) log position this node advertises — and compares against — for Raft §5.4.1
@@ -573,7 +570,7 @@ internal sealed class ElectionCoordinator
                 coreState.NodeState = RaftNodeState.Follower;
                 host.Leader = "";
                 tracker.ClearAll();
-                coreState.LocalCommittedIndex = -1;
+                coreState.ResetLocalCommittedIndexOnDemotion();
                 failAllActiveProposalWaiters();
             }
 

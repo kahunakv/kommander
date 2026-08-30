@@ -1,3 +1,4 @@
+using Kommander.Diagnostics;
 using Kommander.Scheduling;
 using Kommander.Time;
 
@@ -27,6 +28,26 @@ namespace Kommander.Consensus;
 /// </summary>
 internal sealed class RaftPartitionCoreState
 {
+    /// <summary>
+    /// Partition this state belongs to, and the node that owns it. Written once by
+    /// <see cref="RaftPartitionStateMachine"/> at construction; used only to identify the
+    /// partition in an invariant violation report, never in a protocol decision.
+    /// <para>Assigned after construction rather than through a constructor because the field
+    /// initializer that creates this object runs before the state machine's own fields are set.
+    /// A report from a test stub that never calls <see cref="SetIdentity"/> reads
+    /// <c>[?/0]</c>, which is a worse message but never a wrong decision.</para>
+    /// </summary>
+    private int partitionId;
+
+    private string? localEndpoint;
+
+    /// <summary>Records the partition and node identity used in invariant violation reports.</summary>
+    public void SetIdentity(int partition, string? endpoint)
+    {
+        partitionId = partition;
+        localEndpoint = endpoint;
+    }
+
     /// <summary>
     /// Volatile backing store for <see cref="NodeState"/>. The state machine itself only ever
     /// mutates this from the executor's single-writer thread, but the role is read off-thread by
@@ -74,6 +95,13 @@ internal sealed class RaftPartitionCoreState
         {
             if (currentTermValue == value)
                 return;
+
+            // Raft §5.1: a node's term never decreases. Every adoption path already takes the
+            // higher of the two terms, so a decrease here means one of them stopped doing so —
+            // and a node that regresses its term can vote twice in the same term.
+            RaftInvariants.RequireNoRegression(
+                RaftInvariants.TermMonotonic, currentTermValue, value, partitionId, localEndpoint);
+
             leadershipLease = null;
             currentTermValue = value;
         }
@@ -166,8 +194,49 @@ internal sealed class RaftPartitionCoreState
     public long LocalCommittedIndex
     {
         get => Volatile.Read(ref localCommittedIndexValue);
-        set => Volatile.Write(ref localCommittedIndexValue, value);
+        set
+        {
+            // The committed frontier only advances. The two declared regressions have their own
+            // named methods (ResetLocalCommittedIndexOnDemotion, SeedLocalCommittedIndexOnPromotion)
+            // so a regression is always a stated intent at the call site rather than a bare
+            // assignment that a reader has to reason about.
+            RaftInvariants.RequireNoRegression(
+                RaftInvariants.CommittedFrontierMonotonic,
+                Volatile.Read(ref localCommittedIndexValue),
+                value,
+                partitionId,
+                localEndpoint);
+
+            Volatile.Write(ref localCommittedIndexValue, value);
+        }
     }
+
+    /// <summary>
+    /// Clears the leader-side committed frontier on a leader→follower transition. This is the one
+    /// declared regression of <see cref="LocalCommittedIndex"/>: the value means "what THIS node
+    /// committed as leader", so it carries no meaning once the node is not the leader, and
+    /// carrying it forward would let a stale frontier feed the backfill and quiesce gates in the
+    /// next term.
+    /// </summary>
+    public void ResetLocalCommittedIndexOnDemotion() =>
+        Volatile.Write(ref localCommittedIndexValue, -1);
+
+    /// <summary>
+    /// Anchors the committed frontier to the WAL's commit frontier at promotion. A second declared
+    /// regression: the incoming value is what this node's own log proves is committed, which can
+    /// sit below a frontier left over from an earlier leadership that the demotion reset did not
+    /// run for (a promotion that follows a promotion). The WAL is authoritative at this point, so
+    /// the anchor wins over the remembered value.
+    /// </summary>
+    public void SeedLocalCommittedIndexOnPromotion(long commitFrontier) =>
+        Volatile.Write(ref localCommittedIndexValue, commitFrontier);
+
+    /// <summary>
+    /// Test-only escape from the monotonic check, for a unit test that stages a leader's frontier
+    /// directly instead of driving a propose/commit cycle. Never call from product code.
+    /// </summary>
+    internal void SetLocalCommittedIndexUnchecked(long value) =>
+        Volatile.Write(ref localCommittedIndexValue, value);
 
     private long localCommittedIndexValue = -1;
 
@@ -209,7 +278,34 @@ internal sealed class RaftPartitionCoreState
     public long LastAppliedIndex
     {
         get => Volatile.Read(ref lastAppliedIndexValue);
-        set => Volatile.Write(ref lastAppliedIndexValue, value);
+        set
+        {
+            // The applied frontier has no declared regression at all, on any path. An entry
+            // delivered to the consumer cannot be undelivered, so lowering this value would make
+            // the node re-deliver a prefix it already applied — the exact shape of the leader
+            // re-delivery hole the restore seed exists to prevent.
+            RaftInvariants.RequireNoRegression(
+                RaftInvariants.AppliedFrontierMonotonic,
+                Volatile.Read(ref lastAppliedIndexValue),
+                value,
+                partitionId,
+                localEndpoint);
+
+            // A leader publishes both frontiers, and every consumer of the pair — the leadership
+            // lease fast path above all — reads the committed frontier first and assumes the
+            // applied one cannot overtake it. Checked only on a leader with a live frontier: a
+            // follower parks LocalCommittedIndex at -1 by design, so the comparison would be
+            // meaningless there rather than merely uninteresting.
+            if (NodeState == RaftNodeState.Leader)
+            {
+                long committed = Volatile.Read(ref localCommittedIndexValue);
+                if (committed >= 0)
+                    RaftInvariants.RequireAppliedNotAboveCommitted(
+                        value, committed, partitionId, localEndpoint);
+            }
+
+            Volatile.Write(ref lastAppliedIndexValue, value);
+        }
     }
 
     private long lastAppliedIndexValue = -1;

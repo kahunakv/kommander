@@ -130,6 +130,28 @@ public static class KommanderMetrics
     internal static void RecordCompactionBlockedByDurabilityFloor(int partitionId) =>
         WalCompactionBlockedByDurabilityFloorTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
 
+    // ── Consensus invariants ──────────────────────────────────────────────────
+
+    /// <summary>
+    /// Consensus invariant violations, tagged by <c>partition_id</c> and <c>invariant</c>.
+    ///
+    /// <para>Any non-zero value is a defect, not a tuning signal: every invariant behind this
+    /// counter is a rule the protocol says cannot be broken. It exists so a release build — which
+    /// is what a Jepsen run and a Caraxes soak execute — reports the first divergence at the
+    /// transition that caused it, instead of leaving a checker to infer it later from the
+    /// symptom. Alert on any increment.</para>
+    /// </summary>
+    internal static readonly Counter<long> InvariantViolationsTotal =
+        Meter.CreateCounter<long>(
+            "raft.invariant.violations_total",
+            description: "Consensus invariant violations detected in the product code, by invariant name.");
+
+    internal static void RecordInvariantViolation(int partitionId, string invariant) =>
+        InvariantViolationsTotal.Add(
+            1,
+            new KeyValuePair<string, object?>("partition_id", partitionId),
+            new KeyValuePair<string, object?>("invariant", invariant));
+
     /// <summary>
     /// Backfill batches skipped (WAL range read and all) because recent batches to the peer
     /// shipped without its reported commit frontier advancing and the no-progress pause had not

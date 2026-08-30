@@ -2129,7 +2129,6 @@ public sealed class RaftWriteAhead
             // followers alike, including the startup window before the consumer's first flush tick
             // (the provider reads its persisted floor, so nothing needs re-asserting).
             long durabilityFloor = long.MaxValue;
-            bool clampedByDurabilityFloor = false;
 
             IApplicationDurabilityProvider? durabilityProvider = manager.Configuration.ApplicationDurabilityProvider;
             if (durabilityProvider is not null)
@@ -2138,7 +2137,6 @@ public sealed class RaftWriteAhead
                 if (durablyApplied >= 0)
                 {
                     durabilityFloor = durablyApplied + 1;
-                    clampedByDurabilityFloor = durabilityFloor < lastCheckpoint;
                     KommanderMetrics.RecordDurabilityFloorLag(
                         partition.PartitionId,
                         Math.Max(0, lastCheckpoint - durabilityFloor));
@@ -2174,24 +2172,33 @@ public sealed class RaftWriteAhead
 
             // Compose the legacy single floor with the min-of-holds floor, the
             // application-durability floor, and the live-replica floor: compaction must retain
-            // below whichever protected index is lowest across all consumers.
+            // below whichever protected index is lowest across all consumers. The lattice computes
+            // the effective floor and the name of the floor it came from from one comparison
+            // chain, and asserts that the result is a lower bound on all five.
             long retainIndexFloor = Volatile.Read(ref minRetainIndex);
             long activeHoldFloor = Volatile.Read(ref holdFloor);
-            long retainFloor = Math.Min(
-                Math.Min(Math.Min(retainIndexFloor, activeHoldFloor), durabilityFloor), liveReplicaFloor);
-            long effectiveFloor = Math.Min(lastCheckpoint, retainFloor);
+
+            CompactionFloorLattice floors = CompactionFloorLattice.Compose(
+                lastCheckpoint,
+                durabilityFloor,
+                activeHoldFloor,
+                retainIndexFloor,
+                liveReplicaFloor,
+                partition.PartitionId,
+                manager.LocalEndpoint);
+
+            long effectiveFloor = floors.Effective;
 
             if (effectiveFloor <= 0)
             {
                 KommanderMetrics.RecordCompactionPass(partition.PartitionId, KommanderMetrics.CompactionOutcome.FloorNotPositive);
 
-                // Guarded so the floor-source attribution is not computed when Debug is off.
                 if (logger.IsEnabled(LogLevel.Debug))
                     logger.LogDebugCompactionSkippedFloorNotPositive(
                         manager.LocalEndpoint,
                         partition.PartitionId,
                         effectiveFloor,
-                        DescribeFloorSource(effectiveFloor, lastCheckpoint, retainIndexFloor, activeHoldFloor, durabilityFloor, liveReplicaFloor),
+                        floors.Source,
                         lastCheckpoint,
                         retainIndexFloor,
                         activeHoldFloor,
@@ -2225,7 +2232,7 @@ public sealed class RaftWriteAhead
             // A clamped pass that removed nothing has fully drained the durably-applied prefix and
             // is now blocked waiting on the application's flusher. Surface it loudly: a stalled
             // flusher otherwise grows the WAL without bound and silently.
-            if (clampedByDurabilityFloor && removedTotal == 0)
+            if (floors.IsClampedByDurabilityFloor && removedTotal == 0)
             {
                 KommanderMetrics.RecordCompactionBlockedByDurabilityFloor(partition.PartitionId);
                 logger.LogWarnCompactionBlockedByDurabilityFloor(
@@ -2249,33 +2256,5 @@ public sealed class RaftWriteAhead
         {
             Interlocked.Exchange(ref compactionInFlight, 0);
         }
-    }
-
-    /// <summary>
-    /// Names which consumer's floor the composed <paramref name="effectiveFloor"/> came from, for the
-    /// skip log. Ties are resolved in the order checkpoint → durability floor → retention holds →
-    /// <see cref="SetMinRetainIndex"/>: the earlier a source appears, the more likely it is the one an
-    /// operator can act on, and reporting a single name keeps the message actionable where printing
-    /// four numbers alone would not.
-    /// </summary>
-    private static string DescribeFloorSource(
-        long effectiveFloor,
-        long lastCheckpoint,
-        long retainIndexFloor,
-        long activeHoldFloor,
-        long durabilityFloor,
-        long liveReplicaFloor)
-    {
-        if (effectiveFloor == lastCheckpoint)
-            return "checkpoint";
-        if (effectiveFloor == durabilityFloor)
-            return "durability_floor";
-        if (effectiveFloor == activeHoldFloor)
-            return "retention_hold";
-        if (effectiveFloor == retainIndexFloor)
-            return "min_retain_index";
-        if (effectiveFloor == liveReplicaFloor)
-            return "live_replica_lag_budget";
-        return "unknown";
     }
 }

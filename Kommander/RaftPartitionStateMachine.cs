@@ -260,6 +260,9 @@ public sealed class RaftPartitionStateMachine
         this.replySink = replySink;
         this.logger = logger;
 
+        // Identity for invariant violation reports only; see RaftPartitionCoreState.SetIdentity.
+        coreState.SetIdentity(host.PartitionId, host.LocalEndpoint);
+
         // Collaborators are constructed in dependency order: state-owning leaves first, then the
         // ones that compose them. Everything here is called ON the executor thread and shares
         // `coreState`; nothing takes a reference back to this machine, so where a collaborator needs
@@ -538,7 +541,7 @@ public sealed class RaftPartitionStateMachine
                 election.RandomizeElectionTimeout();
                 election.ClearExpectedLeaders();
                 tracker.ClearAll();
-                coreState.LocalCommittedIndex = -1;
+                coreState.ResetLocalCommittedIndexOnDemotion();
                 FailAllActiveProposalWaiters();
                 coreState.LastProposalAt = HLCTimestamp.Zero;
                 coreState.LastProposalAtTicks = 0;
@@ -603,7 +606,7 @@ public sealed class RaftPartitionStateMachine
         coreState.VotingStartedTicks = 0;
         election.ClearExpectedLeaders();
         tracker.ClearAll();
-        coreState.LocalCommittedIndex = -1;
+        coreState.ResetLocalCommittedIndexOnDemotion();
         FailAllActiveProposalWaiters();
         coreState.LastProposalAt = HLCTimestamp.Zero;
         coreState.LastProposalAtTicks = 0;
@@ -679,7 +682,7 @@ public sealed class RaftPartitionStateMachine
         election.ClearExpectedLeaders();
         election.RecordExpectedLeader(targetTerm, targetEndpoint);
         tracker.ClearAll();
-        coreState.LocalCommittedIndex = -1;
+        coreState.ResetLocalCommittedIndexOnDemotion();
         FailAllActiveProposalWaiters();
 
         await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
@@ -740,7 +743,9 @@ public sealed class RaftPartitionStateMachine
     /// </summary>
     public void SetLocalCommittedIndexForTesting(long committedIndex)
     {
-        coreState.LocalCommittedIndex = committedIndex;
+        // Unchecked on purpose: several tests stage a frontier and then lower it back to -1 to
+        // recreate a demoted node, which the monotonic check would reject.
+        coreState.SetLocalCommittedIndexUnchecked(committedIndex);
     }
 
     /// <summary>
@@ -774,7 +779,7 @@ public sealed class RaftPartitionStateMachine
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         long nowTicks = host.GetMonotonicTimestamp();
         coreState.NodeState = RaftNodeState.Leader;
-        coreState.LocalCommittedIndex = wal.GetCommitIndex();
+        coreState.SeedLocalCommittedIndexOnPromotion(wal.GetCommitIndex());
         coreState.LiveCommitFloor = coreState.LocalCommittedIndex;
         host.Leader = host.LocalEndpoint;
         coreState.LastHeartbeat = ts;
@@ -876,7 +881,7 @@ public sealed class RaftPartitionStateMachine
         long nowTicks = host.GetMonotonicTimestamp();
         coreState.NodeState = RaftNodeState.Leader;
         long commitFrontier = wal.GetCommitIndex();
-        coreState.LocalCommittedIndex = commitFrontier;
+        coreState.SeedLocalCommittedIndexOnPromotion(commitFrontier);
         coreState.LiveCommitFloor = commitFrontier;
         coreState.LastHeartbeat = ts;
         coreState.LastProposalAt = ts;
@@ -949,7 +954,7 @@ public sealed class RaftPartitionStateMachine
             logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Promotion drain failed — reverting to Follower. {Message}\n{Stacktrace}",
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState, ex.Message, ex.StackTrace);
             coreState.NodeState = RaftNodeState.Follower;
-            coreState.LocalCommittedIndex = -1;
+            coreState.ResetLocalCommittedIndexOnDemotion();
             throw;
         }
 
@@ -987,7 +992,7 @@ public sealed class RaftPartitionStateMachine
                 logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Promotion refused ({Attempt}/{MaxAttempts}): WAL has a hole below the max id (contiguous through {PresentId}, max {MaxLog}) — reverting to Follower so a node with a contiguous log can win the next term.",
                     host.LocalEndpoint, host.PartitionId, coreState.NodeState, presenceGateRefusals, MaxPresenceGateRefusals, presentId, maxLog);
                 coreState.NodeState = RaftNodeState.Follower;
-                coreState.LocalCommittedIndex = -1;
+                coreState.ResetLocalCommittedIndexOnDemotion();
                 throw new RaftException($"Promotion refused: WAL hole below max id (contiguous through {presentId}, max {maxLog})");
             }
 
@@ -1012,7 +1017,7 @@ public sealed class RaftPartitionStateMachine
                 logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Orphaned-tail truncation failed — reverting to Follower. {Message}\n{Stacktrace}",
                     host.LocalEndpoint, host.PartitionId, coreState.NodeState, ex.Message, ex.StackTrace);
                 coreState.NodeState = RaftNodeState.Follower;
-                coreState.LocalCommittedIndex = -1;
+                coreState.ResetLocalCommittedIndexOnDemotion();
                 throw;
             }
 
@@ -1028,7 +1033,7 @@ public sealed class RaftPartitionStateMachine
                 logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Promotion refused: WAL hole re-opened after truncation (contiguous through {PresentId}, max {MaxLog}) — reverting to Follower.",
                     host.LocalEndpoint, host.PartitionId, coreState.NodeState, presentId, maxLog);
                 coreState.NodeState = RaftNodeState.Follower;
-                coreState.LocalCommittedIndex = -1;
+                coreState.ResetLocalCommittedIndexOnDemotion();
                 throw new RaftException($"Promotion refused: WAL hole re-opened after truncation (contiguous through {presentId}, max {maxLog})");
             }
         }
@@ -1095,7 +1100,7 @@ public sealed class RaftPartitionStateMachine
             logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Promotion barrier propose failed — reverting to Follower. {Message}\n{Stacktrace}",
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState, ex.Message, ex.StackTrace);
             coreState.NodeState = RaftNodeState.Follower;
-            coreState.LocalCommittedIndex = -1;
+            coreState.ResetLocalCommittedIndexOnDemotion();
             throw;
         }
 
@@ -1104,7 +1109,7 @@ public sealed class RaftPartitionStateMachine
             logger.LogError("[{LocalEndpoint}/{PartitionId}/{State}] Promotion barrier propose rejected ({Status}) — reverting to Follower.",
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState, status);
             coreState.NodeState = RaftNodeState.Follower;
-            coreState.LocalCommittedIndex = -1;
+            coreState.ResetLocalCommittedIndexOnDemotion();
             throw new RaftException($"Promotion barrier propose rejected: {status}");
         }
 
@@ -1142,7 +1147,7 @@ public sealed class RaftPartitionStateMachine
         coreState.LastHeartbeatTicks = nowTicks;
         election.ClearExpectedLeaders();
         tracker.ClearAll();
-        coreState.LocalCommittedIndex = -1;
+        coreState.ResetLocalCommittedIndexOnDemotion();
         FailAllActiveProposalWaiters();     // also clears the barrier fields
         coreState.LastProposalAt = HLCTimestamp.Zero;
         coreState.LastProposalAtTicks = 0;
@@ -1220,7 +1225,7 @@ public sealed class RaftPartitionStateMachine
         coreState.VotingStartedTicks = 0;
         election.ClearExpectedLeaders();
         tracker.ClearAll();
-        coreState.LocalCommittedIndex = -1;
+        coreState.ResetLocalCommittedIndexOnDemotion();
         proposals.ClearWithoutFailingWaiters();
 
         // A step-down notice is a leadership-loss transition like any other: read-index waiters
@@ -1266,7 +1271,7 @@ public sealed class RaftPartitionStateMachine
         coreState.VotingStartedTicks = 0;
         election.ClearExpectedLeaders();
         tracker.ClearAll();
-        coreState.LocalCommittedIndex = -1;
+        coreState.ResetLocalCommittedIndexOnDemotion();
         FailAllActiveProposalWaiters();
         coreState.LastHeartbeat = HLCTimestamp.Zero;
         coreState.LastHeartbeatTicks = 0;
@@ -1286,7 +1291,7 @@ public sealed class RaftPartitionStateMachine
 
         election.ClearExpectedLeaders();
         tracker.ClearAll();
-        coreState.LocalCommittedIndex = -1;
+        coreState.ResetLocalCommittedIndexOnDemotion();
         election.ClearVotes();
         proposals.ClearWithoutFailingWaiters();
 
@@ -1545,7 +1550,7 @@ public sealed class RaftPartitionStateMachine
         coreState.LastVotationTicks = nowTicks;
         election.ClearExpectedLeaders();
         tracker.ClearAll();
-        coreState.LocalCommittedIndex = -1;
+        coreState.ResetLocalCommittedIndexOnDemotion();
         FailAllActiveProposalWaiters();
         coreState.LastProposalAt = HLCTimestamp.Zero;
         coreState.LastProposalAtTicks = 0;
@@ -1579,7 +1584,7 @@ public sealed class RaftPartitionStateMachine
         host.Leader = leaderEndpoint;
         coreState.CurrentTerm = leaderTerm;
         tracker.ClearAll();
-        coreState.LocalCommittedIndex = -1;
+        coreState.ResetLocalCommittedIndexOnDemotion();
         FailAllActiveProposalWaiters();
         election.RecordExpectedLeader(leaderTerm, leaderEndpoint);
         election.ResetPreVoteRound();

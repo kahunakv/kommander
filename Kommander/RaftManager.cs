@@ -444,6 +444,14 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
 
         Logger = logger;
 
+        // Publish the invariant-check policy and the report sink before anything can transition:
+        // both are process-wide statics on the checker, because the types that assert (the
+        // partition core state above all) hold neither a configuration nor a logger. In a process
+        // that hosts several managers the last one to start wins; the setting is diagnostic only,
+        // so a shared value cannot change what any of them does.
+        Diagnostics.RaftInvariants.Policy = configuration.InvariantChecks;
+        Diagnostics.RaftInvariants.Logger = logger;
+
         configuration.Validate();
 
         LocalEndpoint = string.Concat(configuration.Host, ":", configuration.Port);

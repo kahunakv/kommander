@@ -101,7 +101,7 @@ internal sealed class ReplicationAckProcessor
                 coreState.NodeState = RaftNodeState.Follower;
                 host.Leader = "";
                 tracker.ClearAll();
-                coreState.LocalCommittedIndex = -1;
+                coreState.ResetLocalCommittedIndexOnDemotion();
                 failAllActiveProposalWaiters();
             }
 

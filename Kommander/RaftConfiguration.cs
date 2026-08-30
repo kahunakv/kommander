@@ -240,6 +240,22 @@ public class RaftConfiguration
     // ── Observability ─────────────────────────────────────────────────────────
 
     /// <summary>
+    /// What the consensus invariant checks do when a rule is violated (see
+    /// <see cref="Diagnostics.RaftInvariants"/>). Defaults to
+    /// <see cref="Diagnostics.RaftInvariants.DefaultPolicy"/>: throw in a debug build, log and
+    /// count in a release build.
+    ///
+    /// <para>This is a diagnostic setting only. No value changes what the protocol does, so
+    /// lowering it can hide a defect but can never cause one. Raise it to
+    /// <see cref="Diagnostics.RaftInvariantPolicy.Throw"/> in a release chaos run to convert the
+    /// first divergence into a crash with a stack trace at the offending transition.</para>
+    ///
+    /// <para><b>Process-wide.</b> The checker holds one static policy, so in a process that hosts
+    /// several <see cref="RaftManager"/> instances the last one to start wins.</para>
+    /// </summary>
+    public Diagnostics.RaftInvariantPolicy InvariantChecks { get; set; } = Diagnostics.RaftInvariants.DefaultPolicy;
+
+    /// <summary>
     /// Warning threshold (milliseconds) for the per-partition state-machine executor.
     /// If processing a single operation takes longer than this value, a warning is
     /// emitted to the logger to help identify scheduling hot spots.
