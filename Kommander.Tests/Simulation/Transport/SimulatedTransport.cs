@@ -32,7 +32,14 @@ namespace Kommander.Tests.Simulation.Transport;
 /// through: deferring them would stall a scenario without adding coverage.</para>
 ///
 /// <para><b>Ordering.</b> Ids are allocated under one lock, so the queue preserves the order in
-/// which the calls arrived. Delivery order is the harness's choice, not the arrival order.</para>
+/// which the calls arrived. Delivery order is the harness's choice, not the arrival order, so
+/// reordering needs no separate feature: hold the wire, then deliver by id in any order.</para>
+///
+/// <para><b>Link faults.</b> A one-way block and a duplication factor are set per ordered pair of
+/// endpoints. One-way matters on its own: a link that fails in one direction only is what
+/// separates a genuinely partitioned leader from one that can still hear its followers, and the
+/// two produce very different elections. Duplication matters because Raft claims idempotence for
+/// its RPCs, and a claim of idempotence is worth testing.</para>
 /// </summary>
 public sealed class SimulatedTransport : ICommunication
 {
@@ -40,9 +47,17 @@ public sealed class SimulatedTransport : ICommunication
     private readonly object gate = new();
     private readonly List<PendingMessage> pending = [];
 
+    private readonly Dictionary<(string From, string To), LinkFault> linkFaults = [];
+
     private long nextMessageId = 1;
     private long deliveredCount;
     private long droppedCount;
+    private long duplicatedCount;
+
+    /// <summary>Fault settings for one ordered pair of endpoints.</summary>
+    /// <param name="Blocked">Drop every message on this link, in this direction only.</param>
+    /// <param name="Copies">How many times a delivered message arrives. 1 is normal.</param>
+    private readonly record struct LinkFault(bool Blocked, int Copies);
 
     /// <summary>
     /// When true, consensus RPCs are queued instead of delivered. The harness releases them
@@ -57,6 +72,36 @@ public sealed class SimulatedTransport : ICommunication
 
     /// <summary>Total messages the harness dropped without delivering.</summary>
     public long DroppedCount => Interlocked.Read(ref droppedCount);
+
+    /// <summary>Total extra copies delivered because a link duplicates.</summary>
+    public long DuplicatedCount => Interlocked.Read(ref duplicatedCount);
+
+    /// <summary>
+    /// Drops every message from <paramref name="from"/> to <paramref name="to"/>, and only in that
+    /// direction. Call it twice, once each way, for a symmetric partition; or use
+    /// <see cref="PartitionNode"/>, which cuts a node off in both directions.
+    /// </summary>
+    public void BlockLink(string from, string to) => UpdateLink(from, to, fault => fault with { Blocked = true });
+
+    /// <summary>Restores a link blocked by <see cref="BlockLink"/>.</summary>
+    public void UnblockLink(string from, string to) => UpdateLink(from, to, fault => fault with { Blocked = false });
+
+    /// <summary>
+    /// Makes every message on this link arrive <paramref name="copies"/> times.
+    ///
+    /// <para>Raft's RPCs are meant to be idempotent, so a duplicate must change nothing. A value
+    /// of 1 restores normal delivery; 0 and negatives are treated as 1, because "deliver zero
+    /// copies" is a block and belongs in <see cref="BlockLink"/> where it reads as one.</para>
+    /// </summary>
+    public void SetLinkDuplication(string from, string to, int copies) =>
+        UpdateLink(from, to, fault => fault with { Copies = copies < 1 ? 1 : copies });
+
+    /// <summary>Clears every link fault. The wire returns to perfect.</summary>
+    public void ClearLinkFaults()
+    {
+        lock (gate)
+            linkFaults.Clear();
+    }
 
     /// <summary>Registers the cluster routing table. Delegates to the wrapped transport.</summary>
     public void SetNodes(Dictionary<string, IRaft> nodes) => inner.SetNodes(nodes);
@@ -276,24 +321,71 @@ public sealed class SimulatedTransport : ICommunication
         Func<Task<TResponse>> send,
         Task<TResponse> heldResponse)
     {
+        string from = manager.LocalEndpoint;
+        string to = node.Endpoint;
+        LinkFault fault = GetLinkFault(from, to);
+
+        // A blocked link drops before anything else. The caller still gets the transport's empty
+        // response, which is what it would get from a real send into a black hole.
+        if (fault.Blocked)
+        {
+            Interlocked.Increment(ref droppedCount);
+            return heldResponse;
+        }
+
+        int copies = fault.Copies < 1 ? 1 : fault.Copies;
+
         if (!HoldMessages)
         {
             Interlocked.Increment(ref deliveredCount);
+
+            // The extra copies are fire-and-forget, exactly as a duplicating network would deliver
+            // them: the caller waits for one send and never learns the others happened.
+            for (int copy = 1; copy < copies; copy++)
+            {
+                Interlocked.Increment(ref duplicatedCount);
+                _ = send();
+            }
+
             return send();
         }
 
         lock (gate)
         {
-            pending.Add(new PendingMessage(
-                nextMessageId++,
-                manager.LocalEndpoint,
-                node.Endpoint,
-                messageType,
-                Environment.TickCount64,
-                async () => await send().ConfigureAwait(false)));
+            for (int copy = 0; copy < copies; copy++)
+            {
+                if (copy > 0)
+                    Interlocked.Increment(ref duplicatedCount);
+
+                pending.Add(new PendingMessage(
+                    nextMessageId++,
+                    from,
+                    to,
+                    messageType,
+                    Environment.TickCount64,
+                    async () => await send().ConfigureAwait(false)));
+            }
         }
 
         return heldResponse;
+    }
+
+    private LinkFault GetLinkFault(string from, string to)
+    {
+        lock (gate)
+            return linkFaults.TryGetValue((from, to), out LinkFault fault) ? fault : new LinkFault(false, 1);
+    }
+
+    private void UpdateLink(string from, string to, Func<LinkFault, LinkFault> update)
+    {
+        lock (gate)
+        {
+            LinkFault current = linkFaults.TryGetValue((from, to), out LinkFault existing)
+                ? existing
+                : new LinkFault(false, 1);
+
+            linkFaults[(from, to)] = update(current);
+        }
     }
 
     private PendingMessage? Take(long messageId)

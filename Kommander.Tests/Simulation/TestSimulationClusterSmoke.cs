@@ -160,6 +160,10 @@ public sealed class TestSimulationClusterSmoke
             cancellationToken);
 
         Assert.True(converged, "Followers did not converge on the committed entry.");
+
+        // The run-level check. Every fault is over and the frontiers have had time to meet, so the
+        // three nodes must now hold the same committed prefix, entry for entry.
+        await invariants.CheckConvergedAsync(cluster, PartitionId, cancellationToken);
     }
 
     /// <summary>
@@ -213,6 +217,141 @@ public sealed class TestSimulationClusterSmoke
             cancellationToken);
 
         Assert.True(recovered, "The cluster did not recover a leader after the wire reopened.");
+
+        // The wire is open again and the cluster has settled, so convergence is now owed.
+        await invariants.CheckConvergedAsync(cluster, PartitionId, cancellationToken);
+    }
+
+    /// <summary>
+    /// A one-way partition must not produce two leaders.
+    ///
+    /// <para>The leader keeps hearing its followers but cannot reach them. That asymmetry is what
+    /// makes the case worth its own test: the leader believes it still leads, while the followers
+    /// see silence and campaign. Election safety must hold through it, and the cluster must settle
+    /// on exactly one leader once the link is restored.</para>
+    /// </summary>
+    [Fact]
+    public async Task OneWayPartition_DoesNotProduceTwoLeaders()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+
+        await using SimulationCluster cluster = await SimulationCluster.StartAsync(
+            new SimulationClusterOptions { NodeCount = 3, PartitionCount = 1, Seed = 314 },
+            logger,
+            cancellationToken);
+
+        ClusterInvariantRunner invariants = new();
+
+        Assert.True(
+            await cluster.RunUntilAsync(
+                () => HasSingleLeaderAsync(cluster, cancellationToken),
+                stepCount: 200,
+                advanceMilliseconds: 50,
+                cancellationToken),
+            "No leader was elected within the step budget.");
+
+        SimulationNode leader = await GetLeaderAsync(cluster, cancellationToken);
+
+        // Cut the leader's outbound links only. It still receives.
+        foreach (SimulationNode node in cluster.Nodes)
+        {
+            if (node.NodeIndex != leader.NodeIndex)
+                cluster.Transport.BlockLink(leader.Endpoint, node.Endpoint);
+        }
+
+        for (int step = 0; step < 60; step++)
+        {
+            await cluster.StepAsync(advanceMilliseconds: 50, cancellationToken);
+            await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
+        }
+
+        Assert.True(cluster.Transport.DroppedCount > 0, "The blocked link dropped nothing.");
+
+        cluster.Transport.ClearLinkFaults();
+
+        Assert.True(
+            await cluster.RunUntilAsync(
+                async () =>
+                {
+                    await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
+                    return await HasSingleLeaderAsync(cluster, cancellationToken);
+                },
+                stepCount: 200,
+                advanceMilliseconds: 50,
+                cancellationToken),
+            "The cluster did not settle on one leader after the link was restored.");
+
+        await invariants.CheckConvergedAsync(cluster, PartitionId, cancellationToken);
+    }
+
+    /// <summary>
+    /// A duplicating link changes nothing.
+    ///
+    /// <para>Raft claims its RPCs are idempotent. This makes every message arrive three times and
+    /// checks that claim against the invariants: a duplicate that were counted twice would show up
+    /// as a second vote in one term, or as an entry committed at an index that already held one.</para>
+    /// </summary>
+    [Fact]
+    public async Task DuplicatedMessages_ChangeNothing()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+
+        await using SimulationCluster cluster = await SimulationCluster.StartAsync(
+            new SimulationClusterOptions { NodeCount = 3, PartitionCount = 1, Seed = 2718 },
+            logger,
+            cancellationToken);
+
+        ClusterInvariantRunner invariants = new();
+
+        foreach (SimulationNode from in cluster.Nodes)
+        {
+            foreach (SimulationNode to in cluster.Nodes)
+            {
+                if (from.NodeIndex != to.NodeIndex)
+                    cluster.Transport.SetLinkDuplication(from.Endpoint, to.Endpoint, copies: 3);
+            }
+        }
+
+        Assert.True(
+            await cluster.RunUntilAsync(
+                async () =>
+                {
+                    await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
+                    return await HasSingleLeaderAsync(cluster, cancellationToken);
+                },
+                stepCount: 200,
+                advanceMilliseconds: 50,
+                cancellationToken),
+            "No leader was elected while every message was duplicated.");
+
+        Assert.True(cluster.Transport.DuplicatedCount > 0, "No message was duplicated.");
+
+        SimulationNode leader = await GetLeaderAsync(cluster, cancellationToken);
+
+        RaftReplicationResult result = await leader.Manager.ReplicateLogs(
+            PartitionId,
+            "Greeting",
+            "Hello World"u8.ToArray(),
+            cancellationToken: cancellationToken);
+
+        Assert.Equal(RaftOperationStatus.Success, result.Status);
+
+        // One proposal, one index, however many copies of each message crossed the wire.
+        Assert.Equal(1, result.LogIndex);
+
+        Assert.True(
+            await cluster.RunUntilAsync(
+                async () =>
+                {
+                    await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
+                    return cluster.Nodes.All(node => node.Wal.GetMaxLog(PartitionId) >= 1);
+                },
+                stepCount: 200,
+                advanceMilliseconds: 50,
+                cancellationToken),
+            "Followers did not converge while every message was duplicated.");
+
+        await invariants.CheckConvergedAsync(cluster, PartitionId, cancellationToken);
     }
 
     private static async Task<bool> HasSingleLeaderAsync(SimulationCluster cluster, CancellationToken cancellationToken)

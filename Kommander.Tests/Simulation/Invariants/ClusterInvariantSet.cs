@@ -142,6 +142,197 @@ public static class ClusterInvariantSet
     }
 
     /// <summary>
+    /// Committed terms never decrease as the log index rises.
+    ///
+    /// <para>Raft assigns each entry the term of the leader that created it, and terms only ever
+    /// rise. A committed log whose terms dip has an entry from an older term sitting above one
+    /// from a newer term, which means a stale leader's entry survived into the committed prefix.
+    /// </para>
+    /// </summary>
+    public const string CommittedTermsNonDecreasing = "committed-terms-non-decreasing";
+
+    /// <summary>
+    /// A leader holds every entry the cluster has already committed.
+    ///
+    /// <para>This is Raft's leader-completeness property, and it is the one the election
+    /// restriction exists to protect. A leader missing a committed entry cannot replicate it, so
+    /// the entry is lost for the rest of that term however the leader later behaves. It is also
+    /// the shape of the hole-in-the-log defect: a candidate whose log has a gap below its
+    /// high-water mark wins the term and then serves an incomplete projection.</para>
+    /// </summary>
+    public const string LeaderCompleteness = "leader-completeness";
+
+    /// <summary>
+    /// Once faults stop and time advances past every timeout, live nodes hold identical committed
+    /// prefixes.
+    ///
+    /// <para>A run-level check, not a per-step one: convergence is a promise about where the
+    /// cluster ends up, not about any single moment. Its absence is the signature of a wedge —
+    /// every replica alive, no fault left, and the frontiers still disagree.</para>
+    /// </summary>
+    public const string QuiescentConvergence = "quiescent-convergence";
+
+    /// <summary>
+    /// One node's readable committed window: the entries it returned, plus the index range that
+    /// read actually covered. The range matters. An index missing from the map is a hole only if
+    /// the read covered it; below the range the node may simply have compacted the entry away.
+    /// </summary>
+    /// <param name="Endpoint">The node.</param>
+    /// <param name="RangeStart">Lowest index the read covered.</param>
+    /// <param name="RangeEnd">Highest index the read covered.</param>
+    /// <param name="ByIndex">Committed entries the node actually holds, keyed by index.</param>
+    public sealed record NodeCommittedWindow(
+        string Endpoint,
+        long RangeStart,
+        long RangeEnd,
+        IReadOnlyDictionary<long, CommittedEntryFingerprint> ByIndex);
+
+    /// <summary>
+    /// Checks <see cref="CommittedTermsNonDecreasing"/> over everything the run has recorded.
+    /// </summary>
+    public static void CheckCommittedTermsNonDecreasing(
+        int stepNumber,
+        IReadOnlyDictionary<long, CommittedEntryFingerprint> recordedByIndex)
+    {
+        CommittedEntryFingerprint? previous = null;
+
+        foreach (long index in recordedByIndex.Keys.OrderBy(key => key))
+        {
+            CommittedEntryFingerprint current = recordedByIndex[index];
+
+            if (previous is not null && current.Term < previous.Term)
+            {
+                throw Violation(
+                    CommittedTermsNonDecreasing,
+                    stepNumber,
+                    $"Committed index {current.LogId} carries term {current.Term}, below index " +
+                    $"{previous.LogId} at term {previous.Term}. An older term sits above a newer one.");
+            }
+
+            previous = current;
+        }
+    }
+
+    /// <summary>
+    /// Checks <see cref="LeaderCompleteness"/> for every node currently claiming leadership.
+    ///
+    /// <para>Only indices inside the leader's own read range are judged. Below that range the
+    /// leader may have compacted the entry, and calling that a violation would report a defect
+    /// where the protocol did exactly what it should.</para>
+    /// </summary>
+    public static void CheckLeaderCompleteness(
+        int stepNumber,
+        IReadOnlyList<RaftPartitionView> views,
+        IReadOnlyList<NodeCommittedWindow> windows,
+        IReadOnlyDictionary<long, CommittedEntryFingerprint> recordedByIndex)
+    {
+        foreach (RaftPartitionView view in views)
+        {
+            if (view.Role != RaftNodeState.Leader)
+                continue;
+
+            NodeCommittedWindow? window = windows.FirstOrDefault(
+                candidate => string.Equals(candidate.Endpoint, view.Endpoint, StringComparison.Ordinal));
+
+            if (window is null || window.ByIndex.Count == 0)
+                continue;
+
+            foreach (KeyValuePair<long, CommittedEntryFingerprint> recorded in recordedByIndex)
+            {
+                if (recorded.Key < window.RangeStart || recorded.Key > window.RangeEnd)
+                    continue;
+
+                if (!window.ByIndex.TryGetValue(recorded.Key, out CommittedEntryFingerprint? held))
+                {
+                    throw Violation(
+                        LeaderCompleteness,
+                        stepNumber,
+                        $"Leader '{view.Endpoint}' (term {view.Term}) has no entry at committed index " +
+                        $"{recorded.Key}, which '{recorded.Value.Endpoint}' committed at term " +
+                        $"{recorded.Value.Term}. The read covered [{window.RangeStart}, " +
+                        $"{window.RangeEnd}], so this is a hole rather than a compacted prefix.");
+                }
+
+                if (!held.DescribesSameEntryAs(recorded.Value))
+                {
+                    throw Violation(
+                        LeaderCompleteness,
+                        stepNumber,
+                        $"Leader '{view.Endpoint}' holds a different entry at committed index " +
+                        $"{recorded.Key}: term {held.Term} payload {held.PayloadHash}, against " +
+                        $"term {recorded.Value.Term} payload {recorded.Value.PayloadHash} from " +
+                        $"'{recorded.Value.Endpoint}'.");
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Checks <see cref="QuiescentConvergence"/> across the nodes that are still running.
+    ///
+    /// <para>Call this at the end of a run, after faults have stopped and enough simulated time
+    /// has passed for every timeout to expire. Calling it mid-run reports a disagreement that the
+    /// protocol is entitled to have.</para>
+    /// </summary>
+    public static void CheckQuiescentConvergence(
+        int stepNumber,
+        IReadOnlyList<RaftPartitionView> views,
+        IReadOnlyList<NodeCommittedWindow> windows)
+    {
+        if (views.Count < 2)
+            return;
+
+        RaftPartitionView reference = views[0];
+
+        foreach (RaftPartitionView view in views.Skip(1))
+        {
+            if (view.CommitIndex != reference.CommitIndex)
+            {
+                throw Violation(
+                    QuiescentConvergence,
+                    stepNumber,
+                    $"After quiescence '{reference.Endpoint}' is committed to {reference.CommitIndex} " +
+                    $"and '{view.Endpoint}' to {view.CommitIndex}. The cluster did not converge.");
+            }
+        }
+
+        // Frontiers can agree while the entries behind them do not. Compare the entries too,
+        // over the index range every node's read actually covered.
+        if (windows.Count < 2)
+            return;
+
+        long start = windows.Max(window => window.RangeStart);
+        long end = windows.Min(window => window.RangeEnd);
+
+        for (long index = start; index <= end; index++)
+        {
+            CommittedEntryFingerprint? first = null;
+
+            foreach (NodeCommittedWindow window in windows)
+            {
+                if (!window.ByIndex.TryGetValue(index, out CommittedEntryFingerprint? held))
+                    continue;
+
+                if (first is null)
+                {
+                    first = held;
+                    continue;
+                }
+
+                if (!first.DescribesSameEntryAs(held))
+                {
+                    throw Violation(
+                        QuiescentConvergence,
+                        stepNumber,
+                        $"After quiescence index {index} differs: '{first.Endpoint}' holds term " +
+                        $"{first.Term} payload {first.PayloadHash}, '{held.Endpoint}' holds term " +
+                        $"{held.Term} payload {held.PayloadHash}.");
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// Checks <see cref="CommittedEntriesAgree"/> over the committed entries themselves.
     ///
     /// <para>Each reading is compared against the first reading recorded at that index, so the

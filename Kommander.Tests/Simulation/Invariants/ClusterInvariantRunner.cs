@@ -4,13 +4,13 @@ using Kommander.Tests.Simulation.Cluster;
 namespace Kommander.Tests.Simulation.Invariants;
 
 /// <summary>
-/// Runs the per-step invariant set against a live simulated cluster and carries the history that
-/// the history-dependent checks need.
+/// Runs the invariant set against a live simulated cluster and carries the history that the
+/// history-dependent checks need.
 ///
-/// <para>Two of the three checks are not functions of a single state. "Committed ids never
-/// decrease" and "committed entries agree" both compare the current reading against what the run
-/// has already seen, so the runner owns that memory for the whole run rather than rebuilding it
-/// per step.</para>
+/// <para>Most of these checks are not functions of a single state. "Committed ids never decrease",
+/// "committed entries agree", "committed terms never decrease", and leader completeness all
+/// compare the current reading against what the run has already seen, so the runner owns that
+/// memory for the whole run rather than rebuilding it per step.</para>
 ///
 /// <para>One runner belongs to one run. Reusing it across runs would carry one run's history into
 /// another and report a violation that neither run committed.</para>
@@ -36,38 +36,90 @@ public sealed class ClusterInvariantRunner
     public int CommittedIndicesSeen => recordedByCommittedIndex.Count;
 
     /// <summary>
-    /// Checks every invariant against the current settled state of <paramref name="partitionId"/>.
-    /// Throws <see cref="InvariantViolationException"/> on the first rule that breaks.
+    /// Checks every per-step invariant against the current settled state of
+    /// <paramref name="partitionId"/>. Throws <see cref="InvariantViolationException"/> on the
+    /// first rule that breaks.
     /// </summary>
     public async Task CheckAsync(SimulationCluster cluster, int partitionId, CancellationToken cancellationToken)
     {
         IReadOnlyList<RaftPartitionView> views =
             await cluster.GetPartitionViewsAsync(partitionId, cancellationToken).ConfigureAwait(false);
 
+        IReadOnlyList<ClusterInvariantSet.NodeCommittedWindow> windows =
+            CollectCommittedWindows(cluster, views, partitionId);
+
         ClusterInvariantSet.CheckOneLeaderPerTerm(cluster.StepNumber, views);
         ClusterInvariantSet.CheckCommittedIdsMonotonic(cluster.StepNumber, views, highestCommitByNode);
+
         ClusterInvariantSet.CheckCommittedEntriesAgree(
             cluster.StepNumber,
-            CollectCommittedFingerprints(cluster, views, partitionId),
+            Flatten(windows),
+            recordedByCommittedIndex);
+
+        ClusterInvariantSet.CheckCommittedTermsNonDecreasing(cluster.StepNumber, recordedByCommittedIndex);
+
+        // Runs after the agreement check on purpose: that check is what populates the recorded
+        // history this one measures a leader against.
+        ClusterInvariantSet.CheckLeaderCompleteness(
+            cluster.StepNumber,
+            views,
+            windows,
             recordedByCommittedIndex);
 
         ChecksRun++;
     }
 
     /// <summary>
-    /// Reads the tail of each node's committed prefix and turns it into fingerprints.
+    /// Checks that the cluster converged. Call this at the end of a run, after faults have stopped
+    /// and enough simulated time has passed for every timeout to expire.
+    ///
+    /// <para>Kept separate from <see cref="CheckAsync"/> because convergence is a promise about
+    /// where a run ends, not about any single moment. Asserting it mid-run would report a
+    /// disagreement the protocol is entitled to have.</para>
+    /// </summary>
+    public async Task CheckConvergedAsync(
+        SimulationCluster cluster,
+        int partitionId,
+        CancellationToken cancellationToken)
+    {
+        IReadOnlyList<RaftPartitionView> views =
+            await cluster.GetPartitionViewsAsync(partitionId, cancellationToken).ConfigureAwait(false);
+
+        ClusterInvariantSet.CheckQuiescentConvergence(
+            cluster.StepNumber,
+            views,
+            CollectCommittedWindows(cluster, views, partitionId));
+    }
+
+    private static List<CommittedEntryFingerprint> Flatten(
+        IReadOnlyList<ClusterInvariantSet.NodeCommittedWindow> windows)
+    {
+        List<CommittedEntryFingerprint> fingerprints = [];
+
+        foreach (ClusterInvariantSet.NodeCommittedWindow window in windows)
+            fingerprints.AddRange(window.ByIndex.Values);
+
+        return fingerprints;
+    }
+
+    /// <summary>
+    /// Reads the tail of each node's committed prefix and turns it into a window.
     ///
     /// <para>Only entries at or below the node's own commit index are read. An entry above it is
     /// proposed, not committed, and two nodes are entitled to disagree about a proposed tail —
     /// treating one as evidence would report a violation where the protocol is behaving
     /// correctly.</para>
+    ///
+    /// <para>The range each read covered is carried alongside the entries, because a missing index
+    /// means two different things. Inside the range it is a hole. Below it, the node may simply
+    /// have compacted the entry away, which is correct behavior.</para>
     /// </summary>
-    private static List<CommittedEntryFingerprint> CollectCommittedFingerprints(
+    private static List<ClusterInvariantSet.NodeCommittedWindow> CollectCommittedWindows(
         SimulationCluster cluster,
         IReadOnlyList<RaftPartitionView> views,
         int partitionId)
     {
-        List<CommittedEntryFingerprint> fingerprints = [];
+        List<ClusterInvariantSet.NodeCommittedWindow> windows = [];
 
         foreach (RaftPartitionView view in views)
         {
@@ -81,17 +133,27 @@ public sealed class ClusterInvariantRunner
                 continue;
 
             long from = Math.Max(1, view.CommitIndex - CommittedWindow + 1);
+            Dictionary<long, CommittedEntryFingerprint> byIndex = [];
 
             foreach (RaftLog log in node.Wal.ReadLogsRange(partitionId, from, CommittedWindow))
             {
                 if (log.Id > view.CommitIndex || !IsCommitted(log.Type))
                     continue;
 
-                fingerprints.Add(CommittedEntryFingerprint.From(view.Endpoint, log));
+                byIndex[log.Id] = CommittedEntryFingerprint.From(view.Endpoint, log);
             }
+
+            if (byIndex.Count == 0)
+                continue;
+
+            windows.Add(new ClusterInvariantSet.NodeCommittedWindow(
+                view.Endpoint,
+                from,
+                view.CommitIndex,
+                byIndex));
         }
 
-        return fingerprints;
+        return windows;
     }
 
     /// <summary>
