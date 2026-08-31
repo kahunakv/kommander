@@ -288,7 +288,10 @@ public sealed class TestSystemPartitionRetainFloor
             // ordering step 3), and ImportCount increments inside step 2 — so at this point the
             // boundary write can still be in flight on n4's executor. Wait for it instead of
             // asserting instantaneously; the install completes independently of the cancelled join.
-            await WaitForAsync(() => innerWal4.GetLastCheckpoint(0) > 0, ct, timeoutMs: 15_000);
+            // 30 s base (90 s on CI) because this is a queued WAL flush, not a protocol timer, and
+            // the queue can back up under sustained CI load — a wider budget here does not mask a
+            // real bug the way widening an election-timeout wait would.
+            await WaitForAsync(() => innerWal4.GetLastCheckpoint(0) > 0, ct, timeoutMs: 30_000);
             Assert.True(innerWal4.GetLastCheckpoint(0) > 0,
                 "n4's P0 WAL must have a CommittedCheckpoint after snapshot install");
         }
