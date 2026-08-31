@@ -85,6 +85,23 @@ public sealed class SimulatedWAL : IWAL
     private readonly Dictionary<int, long> retentionHolds = new();
 
     /// <summary>
+    /// Compaction requests that named a floor above the checkpoint certified at that moment, per
+    /// partition, with the worst example. Recorded here because only the store sees the request; by
+    /// the time a snapshot is read, a log missing its head is indistinguishable from one that never
+    /// received it.
+    /// </summary>
+    private readonly Dictionary<int, (int Count, long Request, long Certified)> compactionsAboveFloor = new();
+
+    /// <summary>
+    /// Highest id compaction has actually removed, per partition, or 0 where none was.
+    ///
+    /// <para>This is what makes a missing head readable. A log whose lowest id is 5 has either
+    /// compacted 1 through 4 or never received them, and only the store knows which. Without this
+    /// the two are indistinguishable and no rule can call either one a hole.</para>
+    /// </summary>
+    private readonly Dictionary<int, long> compactedThrough = new();
+
+    /// <summary>
     /// Partitions the out-of-space fault applies to, or null for every partition. A scenario
     /// almost always wants a scope: a fault that also hits partition 0 takes down the control plane,
     /// and the run then measures how a cluster dies rather than how Raft handles a bad disk.
@@ -323,6 +340,11 @@ public sealed class SimulatedWAL : IWAL
                         missing.Add(id);
                 }
 
+                (int aboveFloor, long worstRequest, long worstCertified) =
+                    compactionsAboveFloor.GetValueOrDefault(partitionId, (0, -1, -1));
+
+                long compacted = compactedThrough.GetValueOrDefault(partitionId);
+
                 partitions[partitionId] = new SimulatedWalPartitionSnapshot(
                     partitionId,
                     entries.Count,
@@ -331,7 +353,11 @@ public sealed class SimulatedWAL : IWAL
                     inner.GetLastCheckpoint(partitionId),
                     countByType,
                     missing,
-                    nonDurableIds);
+                    nonDurableIds,
+                    aboveFloor,
+                    worstRequest,
+                    worstCertified,
+                    compacted);
             }
 
             return new SimulatedWalSnapshot(
@@ -454,6 +480,21 @@ public sealed class SimulatedWAL : IWAL
         {
             AdvanceDurability(nowMilliseconds());
 
+            // Record an over-reaching request before clamping it. The clamp below would hide the
+            // very thing worth catching: a caller asking to remove entries the certified checkpoint
+            // still promises are readable.
+            long certified = inner.GetLastCheckpoint(partitionId);
+
+            if (lastCheckpoint > certified)
+            {
+                (int count, long worstRequest, long worstCertified) =
+                    compactionsAboveFloor.GetValueOrDefault(partitionId, (0, -1, -1));
+
+                compactionsAboveFloor[partitionId] = lastCheckpoint > worstRequest
+                    ? (count + 1, lastCheckpoint, certified)
+                    : (count + 1, worstRequest, worstCertified);
+            }
+
             // A retention hold pins entries at or above its index, so the effective floor is the
             // lower of the two. Clamping here rather than refusing the call models the production
             // behaviour: compaction still runs, it just stops earlier.
@@ -470,7 +511,19 @@ public sealed class SimulatedWAL : IWAL
                 entriesCompacted += removed;
 
                 if (removed > 0)
+                {
+                    // What was removed, not what was asked for: the retention hold may have stopped
+                    // it earlier, and a rule reading the request would then treat retained entries
+                    // as gone.
+                    List<RaftLog> remaining = inner.ReadLogsRange(partitionId, 0, 1);
+
+                    long highestRemoved = remaining.Count > 0 ? remaining[0].Id - 1 : floor - 1;
+
+                    compactedThrough[partitionId] =
+                        Math.Max(compactedThrough.GetValueOrDefault(partitionId), highestRemoved);
+
                     DropVanishedTracking(partitionId);
+                }
             }
 
             return (status, removed);
@@ -488,6 +541,7 @@ public sealed class SimulatedWAL : IWAL
             {
                 priorEntries.Remove(partitionId);
                 ridingEntries.Remove(partitionId);
+                compactedThrough.Remove(partitionId);
 
                 foreach (PendingFsync pending in inFlight)
                 {
@@ -664,8 +718,23 @@ public sealed class SimulatedWAL : IWAL
             return inner.CountRemovableLogs(partitionId);
     }
 
-    /// <inheritdoc />
+    /// <summary>
+    /// Deliberately does nothing.
+    ///
+    /// <para>A disk outlives the process that used it, and this store models a disk. Disposing a
+    /// <see cref="RaftManager"/> disposes the write-ahead log it was handed, which is correct for a
+    /// node shutting down and wrong for a node crashing: the crash scenario would come back to a
+    /// store it could no longer read, and the whole point of a restart is reading what the crash
+    /// left behind. The harness ends the store's life explicitly through
+    /// <see cref="DisposeStore"/>.</para>
+    /// </summary>
     public void Dispose()
+    {
+        // Intentionally empty. See the summary.
+    }
+
+    /// <summary>Really releases the store. Called by the harness at teardown, by nothing else.</summary>
+    public void DisposeStore()
     {
         lock (gate)
         {

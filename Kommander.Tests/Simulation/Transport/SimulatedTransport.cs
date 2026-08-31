@@ -35,6 +35,19 @@ namespace Kommander.Tests.Simulation.Transport;
 /// which the calls arrived. Delivery order is the harness's choice, not the arrival order, so
 /// reordering needs no separate feature: hold the wire, then deliver by id in any order.</para>
 ///
+/// <para><b>Frozen endpoints.</b> <see cref="FreezeEndpoint"/> models a stopped process rather than
+/// a broken link. Every consensus RPC addressed to a frozen endpoint queues, whatever
+/// <see cref="HoldMessages"/> says, and no delivery method will release one while it stays frozen.
+/// <see cref="ThawEndpoint"/> lets the whole backlog through on the next delivery round, in arrival
+/// order — the burst a real <c>SIGSTOP</c> and <c>SIGCONT</c> pair produces, and a different failure
+/// from a blocked link, which loses the traffic instead of storing it.</para>
+///
+/// <para><b>What a freeze does not cover.</b> <c>Handshake</c> and the control-plane RPCs still
+/// answer, for the reason given above: their replies are synchronous and carry real state, so
+/// holding one fabricates an answer rather than delaying it. A frozen node is therefore silent on
+/// the consensus path and still responsive on the control plane. That is a modelled limitation, not
+/// a property of a stopped process.</para>
+///
 /// <para><b>Link faults.</b> A one-way block and a duplication factor are set per ordered pair of
 /// endpoints. One-way matters on its own: a link that fails in one direction only is what
 /// separates a genuinely partitioned leader from one that can still hear its followers, and the
@@ -48,6 +61,9 @@ public sealed class SimulatedTransport : ICommunication
     private readonly List<PendingMessage> pending = [];
 
     private readonly Dictionary<(string From, string To), LinkFault> linkFaults = [];
+
+    /// <summary>Endpoints whose process is modelled as stopped. Messages to them queue and stay queued.</summary>
+    private readonly HashSet<string> frozenEndpoints = [];
 
     private long nextMessageId = 1;
     private long deliveredCount;
@@ -112,6 +128,43 @@ public sealed class SimulatedTransport : ICommunication
     /// <summary>Restores traffic to and from <paramref name="endpoint"/>.</summary>
     public void HealPartition(string endpoint) => inner.HealPartition(endpoint);
 
+    /// <summary>
+    /// Stops <paramref name="endpoint"/> receiving consensus traffic and starts storing it.
+    ///
+    /// <para>This is a stopped process, not a cut cable. The difference is what happens on
+    /// recovery: a blocked link has already lost its traffic, while a frozen endpoint still holds
+    /// every message and takes them all at once. Several defects only appear in that burst.</para>
+    /// </summary>
+    public void FreezeEndpoint(string endpoint)
+    {
+        lock (gate)
+            frozenEndpoints.Add(endpoint);
+    }
+
+    /// <summary>
+    /// Lets <paramref name="endpoint"/> receive again. The stored backlog goes out on the next
+    /// delivery round, oldest first.
+    /// </summary>
+    public void ThawEndpoint(string endpoint)
+    {
+        lock (gate)
+            frozenEndpoints.Remove(endpoint);
+    }
+
+    /// <summary>True while <paramref name="endpoint"/> is modelled as a stopped process.</summary>
+    public bool IsFrozen(string endpoint)
+    {
+        lock (gate)
+            return frozenEndpoints.Contains(endpoint);
+    }
+
+    /// <summary>Messages stored for <paramref name="endpoint"/> while it is frozen.</summary>
+    public int FrozenBacklog(string endpoint)
+    {
+        lock (gate)
+            return pending.Count(message => message.To == endpoint);
+    }
+
     /// <summary>Number of messages currently waiting in the hold queue.</summary>
     public int PendingCount
     {
@@ -143,7 +196,7 @@ public sealed class SimulatedTransport : ICommunication
     /// </summary>
     public async Task<bool> Deliver(long messageId)
     {
-        PendingMessage? message = Take(messageId);
+        PendingMessage? message = Take(messageId, respectFreeze: true);
         if (message is null)
             return false;
 
@@ -158,11 +211,12 @@ public sealed class SimulatedTransport : ICommunication
         PendingMessage? message;
         lock (gate)
         {
-            if (pending.Count == 0)
+            int index = pending.FindIndex(candidate => !frozenEndpoints.Contains(candidate.To));
+            if (index < 0)
                 return false;
 
-            message = pending[0];
-            pending.RemoveAt(0);
+            message = pending[index];
+            pending.RemoveAt(index);
         }
 
         await message.Send().ConfigureAwait(false);
@@ -180,8 +234,10 @@ public sealed class SimulatedTransport : ICommunication
         List<PendingMessage> batch;
         lock (gate)
         {
-            batch = [.. pending];
-            pending.Clear();
+            // A frozen endpoint keeps its messages. They are not lost and not delivered: they wait,
+            // which is the whole difference between a stopped process and a cut link.
+            batch = pending.Where(message => !frozenEndpoints.Contains(message.To)).ToList();
+            pending.RemoveAll(message => !frozenEndpoints.Contains(message.To));
         }
 
         foreach (PendingMessage message in batch)
@@ -199,7 +255,7 @@ public sealed class SimulatedTransport : ICommunication
     /// </summary>
     public bool Drop(long messageId)
     {
-        if (Take(messageId) is null)
+        if (Take(messageId, respectFreeze: false) is null)
             return false;
 
         Interlocked.Increment(ref droppedCount);
@@ -335,7 +391,10 @@ public sealed class SimulatedTransport : ICommunication
 
         int copies = fault.Copies < 1 ? 1 : fault.Copies;
 
-        if (!HoldMessages)
+        // A frozen endpoint queues regardless of the hold switch. Its process is stopped, so the
+        // message reaches its socket and sits there; the scenario did not have to hold the wire to
+        // ask for that.
+        if (!HoldMessages && !IsFrozen(to))
         {
             Interlocked.Increment(ref deliveredCount);
 
@@ -388,12 +447,19 @@ public sealed class SimulatedTransport : ICommunication
         }
     }
 
-    private PendingMessage? Take(long messageId)
+    /// <param name="respectFreeze">
+    /// True for delivery, which must not reach a frozen endpoint. False for a drop, which models a
+    /// lost packet and may discard a message a stopped process was never going to read anyway.
+    /// </param>
+    private PendingMessage? Take(long messageId, bool respectFreeze)
     {
         lock (gate)
         {
             int index = pending.FindIndex(candidate => candidate.Id == messageId);
             if (index < 0)
+                return null;
+
+            if (respectFreeze && frozenEndpoints.Contains(pending[index].To))
                 return null;
 
             PendingMessage message = pending[index];

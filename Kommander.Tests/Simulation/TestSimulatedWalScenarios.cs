@@ -63,7 +63,14 @@ public sealed class TestSimulatedWalScenarios
                 async () =>
                 {
                     await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
-                    return cluster.Nodes.All(node => node.Wal.GetMaxLog(PartitionId) >= 3);
+
+                    // The committed frontier, not the stored log. A node holding an entry over a
+                    // hole below it passes a max-log test and has converged on nothing.
+                    IReadOnlyList<RaftPartitionView> views =
+                        await cluster.GetPartitionViewsAsync(PartitionId, cancellationToken);
+
+                    return views.Count == cluster.Nodes.Count
+                        && views.All(view => view.CommitIndex >= 3);
                 },
                 stepCount: 200,
                 advanceMilliseconds: 50,
@@ -175,6 +182,12 @@ public sealed class TestSimulatedWalScenarios
 
         Assert.True(follower.SimulatedWal.Counters.FailedWrites > 0, "The fault never bit.");
 
+        // Cancel whatever budget is left. FailNextWrites counts write calls, not client entries, and
+        // heartbeat traffic consumes them at a rate no scenario can predict — so a leftover budget
+        // sometimes swallowed the recovery write below, leaving the follower with nothing and no
+        // live write to repair it. The fault has to end where the scenario says it ends.
+        follower.SimulatedWal.FailNextWrites(0);
+
         // The disk works again from here. One more write is needed, and that is the contract
         // rather than a weakness of the scenario: idle backfill is confined to entries the current
         // leader committed live (HeartbeatDriver, LocalCommittedIndex > LiveCommitFloor), because a
@@ -188,7 +201,16 @@ public sealed class TestSimulatedWalScenarios
                 async () =>
                 {
                     await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
-                    return cluster.Nodes.All(node => node.Wal.GetMaxLog(PartitionId) >= 2);
+
+                    // Waiting on the stored log alone is not enough, and the difference is not
+                    // pedantic: a node can hold entry 2 over a hole at entry 1, which satisfies a
+                    // max-log test while its committed frontier honestly stays at 0. That is the
+                    // exact state DST FINDING 1 described. The frontier is what converging means.
+                    IReadOnlyList<RaftPartitionView> views =
+                        await cluster.GetPartitionViewsAsync(PartitionId, cancellationToken);
+
+                    return views.Count == cluster.Nodes.Count
+                        && views.All(view => view.CommitIndex >= 2);
                 },
                 stepCount: 300,
                 advanceMilliseconds: 50,

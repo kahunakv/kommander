@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using Kommander.Data;
+using Kommander.Tests.Simulation.WAL;
 
 namespace Kommander.Tests.Simulation.Invariants;
 
@@ -171,6 +172,124 @@ public static class ClusterInvariantSet
     /// every replica alive, no fault left, and the frontiers still disagree.</para>
     /// </summary>
     public const string QuiescentConvergence = "quiescent-convergence";
+
+    /// <summary>
+    /// A node's durable log holds every id at or below its own committed frontier, except those it
+    /// compacted.
+    ///
+    /// <para>A node that says it committed up to N is asserting that N and everything under it is
+    /// on its disk. Losing one of those entries while still advertising N is how a replica serves a
+    /// prefix it does not have, and it is the durable half of the applied-hole shape that
+    /// <c>9ba52729</c> produced.</para>
+    ///
+    /// <para><b>What it is not.</b> This is not the per-step form of DST FINDING 1, and it is worth
+    /// being exact about why. The stranded node in that defect held entry 2 with entry 1 absent and
+    /// its frontier honestly at 0 — it never claimed the missing entry, so no per-node rule was
+    /// broken. Only comparing nodes at rest exposed it. A rule that appears to cover a known defect
+    /// but does not is worse than no rule, because it stops anyone looking for the one that would.</para>
+    ///
+    /// <para><b>Physically absent, not merely uncommitted.</b> The rule reads ids with no row at
+    /// all. An id present but still marked proposed is legal: the single-fsync fast path can lose a
+    /// commit marker without losing the entry, and calling that a hole would fail every crash
+    /// scenario for modelling exactly what it is meant to model.</para>
+    ///
+    /// <para><b>Two ways to be absent.</b> An id can be missing inside the retained range, or the
+    /// whole head can be gone. The second needs the store's compaction record to judge: a log whose
+    /// lowest id is 5 either compacted 1 through 4 or never received them, and nothing observable
+    /// afterwards separates those. Compaction is legal, never receiving them and claiming to have
+    /// committed them is not.</para>
+    /// </summary>
+    public const string CommittedPrefixPresent = "committed-prefix-present";
+
+    /// <summary>
+    /// Compaction is never asked to remove an entry above the certified checkpoint floor.
+    ///
+    /// <para>The floor is the promise that everything above it is still readable. A compaction that
+    /// passed it would leave a leader unable to serve a follower from a position that follower is
+    /// entitled to ask for, and the failure surfaces far away — as a backfill that refuses, or a
+    /// snapshot rescue for a peer that was nearly in sync.</para>
+    ///
+    /// <para><b>The request, not the result.</b> An earlier version of this rule compared the lowest
+    /// retained id against the floor, and it was unsound: a log that starts above its first id may
+    /// have been compacted, or may simply never have received its head. A follower whose write was
+    /// refused produces the second, and the rule fired on it every time. Only the request separates
+    /// the two, so the store records each request against the checkpoint certified at that instant
+    /// and this rule reads the count.</para>
+    /// </summary>
+    public const string CompactionFloorRespected = "compaction-floor-respected";
+
+    /// <summary>
+    /// Checks <see cref="CommittedPrefixPresent"/> for every node whose store the harness can read.
+    /// </summary>
+    /// <param name="storeByEndpoint">
+    /// One partition's store state per endpoint. Nodes absent from the map are skipped rather than
+    /// treated as empty: a scenario may have asked for a plain in-memory log, and a missing reading
+    /// is not evidence of anything.
+    /// </param>
+    public static void CheckCommittedPrefixPresent(
+        int stepNumber,
+        IReadOnlyList<RaftPartitionView> views,
+        IReadOnlyDictionary<string, SimulatedWalPartitionSnapshot> storeByEndpoint)
+    {
+        foreach (RaftPartitionView view in views)
+        {
+            if (!storeByEndpoint.TryGetValue(view.Endpoint, out SimulatedWalPartitionSnapshot? store))
+                continue;
+
+            foreach (long missing in store.MissingIds)
+            {
+                if (missing > view.CommitIndex)
+                    continue;
+
+                throw Violation(
+                    CommittedPrefixPresent,
+                    stepNumber,
+                    $"Node '{view.Endpoint}' partition {view.Partition} is committed to " +
+                    $"{view.CommitIndex} but holds no entry at {missing}. Retained range is " +
+                    $"[{store.FirstLogId}, {store.MaxLogId}].");
+            }
+
+            // The head. The lowest id the node should still hold is one above whatever it compacted;
+            // anything between that and its first retained id was never received, and the node may
+            // not claim to have committed it.
+            long expectedFirst = store.CompactedThrough + 1;
+
+            if (store.EntryCount > 0
+                && store.FirstLogId > expectedFirst
+                && view.CommitIndex >= expectedFirst)
+            {
+                throw Violation(
+                    CommittedPrefixPresent,
+                    stepNumber,
+                    $"Node '{view.Endpoint}' partition {view.Partition} is committed to " +
+                    $"{view.CommitIndex} but its log starts at {store.FirstLogId} and it compacted " +
+                    $"only through {store.CompactedThrough}, so ids {expectedFirst} to " +
+                    $"{store.FirstLogId - 1} were never received.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Checks <see cref="CompactionFloorRespected"/> for every node whose store the harness can read.
+    /// </summary>
+    public static void CheckCompactionFloorRespected(
+        int stepNumber,
+        IReadOnlyDictionary<string, SimulatedWalPartitionSnapshot> storeByEndpoint)
+    {
+        foreach ((string endpoint, SimulatedWalPartitionSnapshot store) in storeByEndpoint)
+        {
+            if (store.CompactionsAboveFloor == 0)
+                continue;
+
+            throw Violation(
+                CompactionFloorRespected,
+                stepNumber,
+                $"Node '{endpoint}' partition {store.PartitionId} was asked " +
+                $"{store.CompactionsAboveFloor} time(s) to compact below " +
+                $"{store.WorstCompactionRequest} while its certified checkpoint was " +
+                $"{store.WorstCompactionCertifiedFloor}.");
+        }
+    }
 
     /// <summary>
     /// One node's readable committed window: the entries it returned, plus the index range that

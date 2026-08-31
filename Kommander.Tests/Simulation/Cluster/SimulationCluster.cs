@@ -101,11 +101,7 @@ public sealed class SimulationCluster : IAsyncDisposable
         for (int nodeIndex = 0; nodeIndex < options.NodeCount; nodeIndex++)
             cluster.nodes.Add(SimulationNode.Create(nodeIndex, options, clock, transport, logger));
 
-        Dictionary<string, IRaft> routingTable = cluster.nodes.ToDictionary(
-            node => node.Endpoint,
-            node => (IRaft)node.Manager);
-
-        transport.SetNodes(routingTable);
+        cluster.PublishRoutingTable();
 
         List<Task> joins = [];
         foreach (SimulationNode node in cluster.nodes)
@@ -130,6 +126,54 @@ public sealed class SimulationCluster : IAsyncDisposable
         await allJoined.ConfigureAwait(false);
         cluster.StepNumber = 0;
         return cluster;
+    }
+
+    /// <summary>
+    /// Publishes the endpoint-to-node routing table. Called again after a restart, because the
+    /// restarted node is a different <see cref="RaftManager"/> behind the same endpoint and the
+    /// table holds the object, not the address.
+    /// </summary>
+    private void PublishRoutingTable() =>
+        Transport.SetNodes(nodes.ToDictionary(node => node.Endpoint, node => (IRaft)node.Manager));
+
+    /// <summary>
+    /// Kills a node without warning and settles the cluster around the loss.
+    ///
+    /// <para>The node's store survives and loses only what was inside its fsync window. Its
+    /// endpoint is both frozen, so consensus traffic waits rather than vanishing, and partitioned,
+    /// so a control-plane call fails instead of reaching a disposed manager.</para>
+    /// </summary>
+    public async Task CrashNodeAsync(SimulationNode node, CancellationToken cancellationToken)
+    {
+        node.Crash();
+        Transport.PartitionNode(node.Endpoint);
+
+        await SettleAsync(deliverMessages: true, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Starts a crashed node again over the same store and steps until it has rejoined.
+    ///
+    /// <para>Order matters, as it does at cluster start. The rebuilt manager goes into the routing
+    /// table before it refreshes its membership, or it refreshes against a table that still names
+    /// the dead one.</para>
+    /// </summary>
+    public async Task RestartNodeAsync(SimulationNode node, CancellationToken cancellationToken)
+    {
+        node.Rebuild();
+        PublishRoutingTable();
+        Transport.HealPartition(node.Endpoint);
+
+        Task join = await node.BeginStartAsync(cancellationToken).ConfigureAwait(false);
+
+        for (int step = 0; step < JoinStepBudget && !join.IsCompleted; step++)
+            await StepAsync(JoinStepMilliseconds, cancellationToken).ConfigureAwait(false);
+
+        if (!join.IsCompleted)
+            throw new TimeoutException(
+                $"{node.Endpoint} did not rejoin within {JoinStepBudget} simulated steps.");
+
+        await join.ConfigureAwait(false);
     }
 
     /// <summary>
@@ -440,9 +484,9 @@ public sealed class SimulationCluster : IAsyncDisposable
         int partitionId,
         CancellationToken cancellationToken)
     {
-        List<SimulationNode> live = nodes
-            .Where(node => node.LifecycleStatus != SimulationNodeLifecycleStatus.Stopped)
-            .ToList();
+        // A crashed node's manager is disposed and a stopped one never started. Asking either
+        // throws rather than answering, and a run must survive its own faults.
+        List<SimulationNode> live = nodes.Where(node => node.HasLiveManager).ToList();
 
         // Every read is started before any is driven. A view read posts a request to that node's
         // executor, and in driven mode nothing runs those executors unless this driver does — so
@@ -503,7 +547,7 @@ public sealed class SimulationCluster : IAsyncDisposable
 
         foreach (SimulationNode node in nodes)
         {
-            RaftPartitionView? view = node.LifecycleStatus == SimulationNodeLifecycleStatus.Stopped
+            RaftPartitionView? view = !node.HasLiveManager
                 ? null
                 : await DriveAsync(
                     () => node.GetPartitionViewAsync(partitionId, cancellationToken),
@@ -572,7 +616,19 @@ public sealed class SimulationCluster : IAsyncDisposable
         Transport.HoldMessages = false;
         await Transport.DeliverAll().ConfigureAwait(false);
 
+        // A graceful leave commits a roster change, and a roster change needs a majority. If any
+        // node ended the run crashed or paused, the survivors lose that majority as soon as the
+        // first of them leaves, and every later leave burns its full timeout — ten seconds each,
+        // on a cluster nobody is going to use again. So the whole cluster is torn down outright
+        // when it did not end healthy. Graceful leave has its own tests.
+        bool endedHealthy = nodes.All(node =>
+            node.LifecycleStatus is SimulationNodeLifecycleStatus.Running
+                or SimulationNodeLifecycleStatus.Stopped);
+
         foreach (SimulationNode node in nodes)
+        {
+            node.SkipGracefulLeave = !endedHealthy;
             await node.DisposeAsync().ConfigureAwait(false);
+        }
     }
 }

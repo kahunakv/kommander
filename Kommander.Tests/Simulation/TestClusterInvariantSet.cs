@@ -1,6 +1,7 @@
 using Kommander.Data;
 using Kommander.System;
 using Kommander.Tests.Simulation.Invariants;
+using Kommander.Tests.Simulation.WAL;
 
 namespace Kommander.Tests.Simulation;
 
@@ -328,6 +329,175 @@ public sealed class TestClusterInvariantSet
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
+
+    // ── Committed prefix present ──────────────────────────────────────────
+
+    /// <summary>
+    /// A node committed past an id it does not hold. This is the per-step form of the state DST
+    /// FINDING 1 reached, which until now only the run-level convergence check could see.
+    /// </summary>
+    [Fact]
+    public void CommittedPrefixPresent_FiresOnAHoleBelowTheFrontier()
+    {
+        List<RaftPartitionView> views = [View("node1", RaftNodeState.Follower, term: 3, commitIndex: 4)];
+
+        InvariantViolationException error = Assert.Throws<InvariantViolationException>(() =>
+            ClusterInvariantSet.CheckCommittedPrefixPresent(
+                stepNumber: 9,
+                views,
+                Stores(Store("node1", firstLogId: 1, maxLogId: 5, lastCheckpoint: -1, missing: [3]))));
+
+        Assert.Equal(ClusterInvariantSet.CommittedPrefixPresent, error.InvariantName);
+        Assert.Contains("no entry at 3", error.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A gap above the frontier is legal. Entries above the commit index are proposed, and two nodes
+    /// are entitled to differ there; calling it a hole would fail every run with an in-flight tail.
+    /// </summary>
+    [Fact]
+    public void CommittedPrefixPresent_IsSilentOnAGapAboveTheFrontier()
+    {
+        List<RaftPartitionView> views = [View("node1", RaftNodeState.Follower, term: 3, commitIndex: 2)];
+
+        ClusterInvariantSet.CheckCommittedPrefixPresent(
+            stepNumber: 9,
+            views,
+            Stores(Store("node1", firstLogId: 1, maxLogId: 6, lastCheckpoint: -1, missing: [5])));
+    }
+
+    /// <summary>A compacted prefix is not a hole: the node removed those ids deliberately.</summary>
+    [Fact]
+    public void CommittedPrefixPresent_IsSilentOnACompactedPrefix()
+    {
+        List<RaftPartitionView> views = [View("node1", RaftNodeState.Follower, term: 3, commitIndex: 9)];
+
+        ClusterInvariantSet.CheckCommittedPrefixPresent(
+            stepNumber: 9,
+            views,
+            Stores(Store("node1", firstLogId: 7, maxLogId: 9, lastCheckpoint: 7, missing: [],
+                compactedThrough: 6)));
+    }
+
+    /// <summary>
+    /// A node claiming a frontier over a head it never received. This is the case that needs the
+    /// compaction record: the log looks identical to a compacted one, and only what the store
+    /// actually removed tells the two apart.
+    /// </summary>
+    [Fact]
+    public void CommittedPrefixPresent_FiresOnAHeadThatWasNeverReceived()
+    {
+        List<RaftPartitionView> views = [View("node1", RaftNodeState.Follower, term: 3, commitIndex: 9)];
+
+        InvariantViolationException error = Assert.Throws<InvariantViolationException>(() =>
+            ClusterInvariantSet.CheckCommittedPrefixPresent(
+                stepNumber: 9,
+                views,
+                Stores(Store("node1", firstLogId: 7, maxLogId: 9, lastCheckpoint: -1, missing: [],
+                    compactedThrough: 0))));
+
+        Assert.Equal(ClusterInvariantSet.CommittedPrefixPresent, error.InvariantName);
+        Assert.Contains("never received", error.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A node whose head is absent but whose frontier stays below it is legal, and this is the state
+    /// DST FINDING 1 reached. It is a stranded replica, not a lying one — which is exactly why no
+    /// per-node rule caught that defect and the run-level convergence check did.
+    /// </summary>
+    [Fact]
+    public void CommittedPrefixPresent_IsSilentWhenTheFrontierStaysBelowTheMissingHead()
+    {
+        List<RaftPartitionView> views = [View("node1", RaftNodeState.Follower, term: 3, commitIndex: 0)];
+
+        ClusterInvariantSet.CheckCommittedPrefixPresent(
+            stepNumber: 9,
+            views,
+            Stores(Store("node1", firstLogId: 2, maxLogId: 2, lastCheckpoint: -1, missing: [],
+                compactedThrough: 0)));
+    }
+
+    /// <summary>
+    /// A node whose store the harness cannot read is skipped, not assumed empty. Assuming would
+    /// report a hole on every node running a plain in-memory log.
+    /// </summary>
+    [Fact]
+    public void CommittedPrefixPresent_SkipsANodeWithNoReadableStore()
+    {
+        List<RaftPartitionView> views = [View("node1", RaftNodeState.Follower, term: 3, commitIndex: 4)];
+
+        ClusterInvariantSet.CheckCommittedPrefixPresent(
+            stepNumber: 9,
+            views,
+            new Dictionary<string, SimulatedWalPartitionSnapshot>());
+    }
+
+    // ── Compaction floor ──────────────────────────────────────────────────
+
+    /// <summary>A caller asked to compact past the checkpoint that was certified at the time.</summary>
+    [Fact]
+    public void CompactionFloorRespected_FiresOnARequestAboveTheCertifiedFloor()
+    {
+        InvariantViolationException error = Assert.Throws<InvariantViolationException>(() =>
+            ClusterInvariantSet.CheckCompactionFloorRespected(
+                stepNumber: 4,
+                Stores(Store("node1", firstLogId: 1, maxLogId: 20, lastCheckpoint: 6, missing: [],
+                    compactionsAboveFloor: 1, worstRequest: 12, worstCertified: 6))));
+
+        Assert.Equal(ClusterInvariantSet.CompactionFloorRespected, error.InvariantName);
+        Assert.Contains("compact below 12", error.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>Compaction that stayed at or under the floor is legal, and is the normal case.</summary>
+    [Fact]
+    public void CompactionFloorRespected_IsSilentWhenEveryRequestStayedUnderTheFloor()
+    {
+        ClusterInvariantSet.CheckCompactionFloorRespected(
+            stepNumber: 4,
+            Stores(Store("node1", firstLogId: 6, maxLogId: 20, lastCheckpoint: 6, missing: [])));
+    }
+
+    /// <summary>
+    /// A log that starts above its first id is not evidence of anything on its own. The head may
+    /// have been compacted, or may never have been written — a follower whose write was refused
+    /// produces exactly this. The earlier version of the rule compared these indices and fired on
+    /// every storage-fault scenario, which is why the rule reads the request instead.
+    /// </summary>
+    [Fact]
+    public void CompactionFloorRespected_IsSilentOnALogThatNeverReceivedItsHead()
+    {
+        ClusterInvariantSet.CheckCompactionFloorRespected(
+            stepNumber: 4,
+            Stores(Store("node1", firstLogId: 2, maxLogId: 2, lastCheckpoint: -1, missing: [])));
+    }
+
+    private static Dictionary<string, SimulatedWalPartitionSnapshot> Stores(
+        params (string Endpoint, SimulatedWalPartitionSnapshot Snapshot)[] entries) =>
+        entries.ToDictionary(entry => entry.Endpoint, entry => entry.Snapshot);
+
+    private static (string, SimulatedWalPartitionSnapshot) Store(
+        string endpoint,
+        long firstLogId,
+        long maxLogId,
+        long lastCheckpoint,
+        long[] missing,
+        int compactionsAboveFloor = 0,
+        long worstRequest = -1,
+        long worstCertified = -1,
+        long compactedThrough = 0) =>
+        (endpoint, new SimulatedWalPartitionSnapshot(
+            PartitionId,
+            EntryCount: (int)(maxLogId - firstLogId + 1 - missing.Length),
+            FirstLogId: firstLogId,
+            MaxLogId: maxLogId,
+            LastCheckpoint: lastCheckpoint,
+            CountByType: new Dictionary<RaftLogType, int>(),
+            MissingIds: missing,
+            NonDurableIds: [],
+            CompactionsAboveFloor: compactionsAboveFloor,
+            WorstCompactionRequest: worstRequest,
+            WorstCompactionCertifiedFloor: worstCertified,
+            CompactedThrough: compactedThrough));
 
     private static RaftPartitionView View(string endpoint, RaftNodeState role, long term, long commitIndex) =>
         new(

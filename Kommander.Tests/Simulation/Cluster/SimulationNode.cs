@@ -31,18 +31,37 @@ public sealed class SimulationNode : IAsyncDisposable
 {
     private int disposed;
 
-    private SimulationNode(int nodeIndex, string endpoint, RaftManager manager, IWAL wal, bool drivenScheduling)
+    private SimulationNode(
+        int nodeIndex,
+        string endpoint,
+        RaftManager manager,
+        IWAL wal,
+        SimulationClusterOptions options,
+        VirtualTickSource clock,
+        SimulatedTransport transport,
+        ILogger<IRaft> logger)
     {
         NodeIndex = nodeIndex;
         Endpoint = endpoint;
         Manager = manager;
         Wal = wal;
         SimulatedWal = wal as SimulatedWAL;
-        this.drivenScheduling = drivenScheduling;
+        this.options = options;
+        this.clock = clock;
+        this.transport = transport;
+        this.logger = logger;
+        drivenScheduling = options.DrivenScheduling;
     }
 
     /// <summary>True when this node owns no scheduling threads. Changes how it is torn down.</summary>
     private readonly bool drivenScheduling;
+
+    // The inputs a restart rebuilds from. A restarted node is a new process on the same machine:
+    // new manager, same configuration, same disk.
+    private readonly SimulationClusterOptions options;
+    private readonly VirtualTickSource clock;
+    private readonly SimulatedTransport transport;
+    private readonly ILogger<IRaft> logger;
 
     /// <summary>
     /// Unix-millisecond epoch the simulated hybrid logical clock counts from. 2026-01-01, chosen
@@ -57,8 +76,12 @@ public sealed class SimulationNode : IAsyncDisposable
     /// <summary>Host and port that peers address this node by.</summary>
     public string Endpoint { get; }
 
-    /// <summary>The real Raft node under test.</summary>
-    public RaftManager Manager { get; }
+    /// <summary>
+    /// The real Raft node under test. Replaced by <see cref="BeginRestartAsync"/>, because a
+    /// restarted node is a new process: the old manager's in-memory state is exactly what a restart
+    /// is supposed to lose.
+    /// </summary>
+    public RaftManager Manager { get; private set; }
 
     /// <summary>This node's write-ahead log.</summary>
     public IWAL Wal { get; }
@@ -74,6 +97,22 @@ public sealed class SimulationNode : IAsyncDisposable
         SimulationNodeLifecycleStatus.Stopped;
 
     /// <summary>
+    /// A paused node counts as live: its process is frozen at the wire, but the object is intact
+    /// and reading it tells the harness what a stopped node still believes, which is often the
+    /// point of the scenario. A crashed or stopped node does not: its executors are shut down and
+    /// any call into one throws rather than answering.
+    /// </summary>
+    /// <summary>
+    /// How many times this node has crashed. A monotonic counter rather than a flag, so an observer
+    /// can tell that a crash happened even if it never saw the node in the crashed state.
+    /// </summary>
+    public int CrashCount { get; private set; }
+
+    /// <summary>True while this node has a <see cref="RaftManager"/> that can be asked anything.</summary>
+    public bool HasLiveManager =>
+        LifecycleStatus is SimulationNodeLifecycleStatus.Running or SimulationNodeLifecycleStatus.Paused;
+
+    /// <summary>
     /// Builds a node. The node is constructed but not yet joined; the cluster joins every node
     /// after the routing table is published, because a node that campaigns before its peers are
     /// addressable elects itself with an empty log.
@@ -85,9 +124,33 @@ public sealed class SimulationNode : IAsyncDisposable
         SimulatedTransport transport,
         ILogger<IRaft> logger)
     {
-        int port = options.BasePort + nodeIndex;
-        string endpoint = $"localhost:{port}";
+        string endpoint = $"localhost:{options.BasePort + nodeIndex}";
 
+        // The simulated store reads the cluster clock, not the process clock: a durability window
+        // measured in real time would make a crash land somewhere different on every run, which is
+        // the one thing the whole harness exists to prevent.
+        IWAL wal = options.UseSimulatedWal
+            ? new SimulatedWAL(logger, () => clock.LogicalMilliseconds)
+              { WriteLatencyMilliseconds = options.WalWriteLatencyMilliseconds }
+            : new InMemoryWAL(logger);
+
+        RaftManager manager = BuildManager(nodeIndex, options, clock, transport, logger, wal);
+
+        return new SimulationNode(nodeIndex, endpoint, manager, wal, options, clock, transport, logger);
+    }
+
+    /// <summary>
+    /// Builds a manager over an existing store. Separated from <see cref="Create"/> so a restart
+    /// rebuilds the node without rebuilding its disk: the store is precisely what must survive.
+    /// </summary>
+    private static RaftManager BuildManager(
+        int nodeIndex,
+        SimulationClusterOptions options,
+        VirtualTickSource clock,
+        SimulatedTransport transport,
+        ILogger<IRaft> logger,
+        IWAL wal)
+    {
         List<RaftNode> peers = [];
         for (int peerIndex = 0; peerIndex < options.NodeCount; peerIndex++)
         {
@@ -102,7 +165,7 @@ public sealed class SimulationNode : IAsyncDisposable
             NodeName = $"node{nodeIndex + 1}",
             NodeId = nodeIndex + 1,
             Host = "localhost",
-            Port = port,
+            Port = options.BasePort + nodeIndex,
             InitialPartitions = options.PartitionCount,
 
             // The three determinism seams. TickSource makes every elapsed-time gate a function of
@@ -137,15 +200,7 @@ public sealed class SimulationNode : IAsyncDisposable
 
         options.ConfigureNode?.Invoke(configuration);
 
-        // The simulated store reads the cluster clock, not the process clock: a durability window
-        // measured in real time would make a crash land somewhere different on every run, which is
-        // the one thing the whole harness exists to prevent.
-        IWAL wal = options.UseSimulatedWal
-            ? new SimulatedWAL(logger, () => clock.LogicalMilliseconds)
-              { WriteLatencyMilliseconds = options.WalWriteLatencyMilliseconds }
-            : new InMemoryWAL(logger);
-
-        RaftManager manager = new(
+        return new RaftManager(
             configuration,
             new StaticDiscovery(peers),
             wal,
@@ -159,8 +214,6 @@ public sealed class SimulationNode : IAsyncDisposable
                 ? new HybridLogicalClock(() => SimulatedEpochMilliseconds + clock.LogicalMilliseconds)
                 : new HybridLogicalClock(),
             logger);
-
-        return new SimulationNode(nodeIndex, endpoint, manager, wal, options.DrivenScheduling);
     }
 
     /// <summary>
@@ -224,17 +277,90 @@ public sealed class SimulationNode : IAsyncDisposable
             : Task.CompletedTask;
 
     /// <summary>
-    /// Stops consuming ticks without tearing the node down. Queued messages and timers stay
-    /// where they are, so a later <see cref="Resume"/> processes the backlog in one burst —
-    /// the shape a real <c>SIGSTOP</c> produces, and the shape that found several defects.
+    /// Stops the node the way <c>SIGSTOP</c> stops a process: it consumes no ticks, and the
+    /// consensus traffic addressed to it is stored rather than delivered or lost.
+    ///
+    /// <para><b>Why the wire has to freeze too.</b> An earlier version of this method only stopped
+    /// the ticks. Its peers kept getting answered, so nothing about the run looked stopped, and the
+    /// backlog that makes a resume interesting never formed. A paused process does not decline
+    /// messages, it fails to read them; they wait in its socket and arrive together when it wakes.
+    /// Several shipped defects live in exactly that burst.</para>
+    ///
+    /// <para><b>What still answers.</b> The handshake and the control-plane calls, because their
+    /// replies are synchronous and carry real state — holding one fabricates an answer rather than
+    /// delaying it. A paused node is therefore silent on the consensus path and still responsive on
+    /// the control plane. It is a modelled limitation, not a property of a stopped process.</para>
     /// </summary>
-    public void Pause() => LifecycleStatus = SimulationNodeLifecycleStatus.Paused;
+    public void Pause()
+    {
+        if (LifecycleStatus != SimulationNodeLifecycleStatus.Running)
+            return;
 
-    /// <summary>Resumes tick consumption after <see cref="Pause"/>.</summary>
+        LifecycleStatus = SimulationNodeLifecycleStatus.Paused;
+        transport.FreezeEndpoint(Endpoint);
+    }
+
+    /// <summary>
+    /// Wakes the node after <see cref="Pause"/>. Everything stored while it slept is delivered on
+    /// the next step, oldest first.
+    /// </summary>
     public void Resume()
     {
-        if (LifecycleStatus == SimulationNodeLifecycleStatus.Paused)
-            LifecycleStatus = SimulationNodeLifecycleStatus.Running;
+        if (LifecycleStatus != SimulationNodeLifecycleStatus.Paused)
+            return;
+
+        LifecycleStatus = SimulationNodeLifecycleStatus.Running;
+        transport.ThawEndpoint(Endpoint);
+    }
+
+    /// <summary>Messages waiting for this node while it is paused or crashed.</summary>
+    public int FrozenBacklog => transport.FrozenBacklog(Endpoint);
+
+    /// <summary>
+    /// Kills the node the way a power cut kills one: the process is gone, and the disk keeps only
+    /// what it had fsynced.
+    ///
+    /// <para>The manager is disposed outright rather than asked to leave. A graceful leave is the
+    /// opposite of a crash — it commits a roster change on the way out, which is exactly the
+    /// courtesy a crashed node does not extend.</para>
+    ///
+    /// <para>The store survives, and that is the point of the whole exercise. Everything inside its
+    /// fsync window is lost, so a run that wrote commit markers on the single-fsync fast path comes
+    /// back missing them. The endpoint is frozen so peers store their traffic instead of throwing
+    /// into a disposed manager.</para>
+    /// </summary>
+    public void Crash()
+    {
+        if (LifecycleStatus == SimulationNodeLifecycleStatus.Crashed)
+            return;
+
+        LifecycleStatus = SimulationNodeLifecycleStatus.Crashed;
+        CrashCount++;
+        transport.FreezeEndpoint(Endpoint);
+
+        Manager.Dispose();
+        SimulatedWal?.Crash();
+    }
+
+    /// <summary>
+    /// Rebuilds the node's process over the same disk, ready to be started again.
+    ///
+    /// <para>A restart builds a new <see cref="RaftManager"/>. Reusing the old one would keep the
+    /// in-memory frontiers, terms and leader beliefs a restart is supposed to lose, and the
+    /// scenario would then prove only that a node which never forgot anything still agrees with
+    /// itself. What survives is the store, which is what survives a real restart.</para>
+    ///
+    /// <para>Rebuilding and starting are separate steps because the new manager has to be in the
+    /// routing table before it refreshes its membership, and only the cluster owns that table. The
+    /// caller rebuilds, republishes, then calls <see cref="BeginStartAsync"/>.</para>
+    /// </summary>
+    public void Rebuild()
+    {
+        if (LifecycleStatus == SimulationNodeLifecycleStatus.Running)
+            throw new InvalidOperationException($"{Endpoint} is already running.");
+
+        Manager = BuildManager(NodeIndex, options, clock, transport, logger, Wal);
+        transport.ThawEndpoint(Endpoint);
     }
 
     /// <summary>
@@ -243,7 +369,9 @@ public sealed class SimulationNode : IAsyncDisposable
     /// Returns null when the partition is not materialized on this node yet.
     /// </summary>
     public Task<RaftPartitionView?> GetPartitionViewAsync(int partitionId, CancellationToken cancellationToken) =>
-        Manager.GetPartitionViewAsync(partitionId, cancellationToken);
+        HasLiveManager
+            ? Manager.GetPartitionViewAsync(partitionId, cancellationToken)
+            : Task.FromResult<RaftPartitionView?>(null);
 
     /// <summary>
     /// Waits until every partition executor on this node has drained its queues.
@@ -254,6 +382,9 @@ public sealed class SimulationNode : IAsyncDisposable
     /// </summary>
     public async Task DrainAsync(CancellationToken cancellationToken)
     {
+        if (!HasLiveManager)
+            return;
+
         IPartitionProvider provider = Manager;
 
         List<Task> barriers = [];
@@ -271,7 +402,13 @@ public sealed class SimulationNode : IAsyncDisposable
     /// True while this node's system coordinator has a queued or in-flight request. A step that
     /// ended while this is true would leave the partition proposals its messages produce unstarted.
     /// </summary>
-    public bool HasPendingCoordinatorWork => Manager.SystemCoordinator.HasPendingWork;
+    public bool HasPendingCoordinatorWork => HasLiveManager && Manager.SystemCoordinator.HasPendingWork;
+
+    /// <summary>
+    /// Set by the cluster before teardown when a graceful leave cannot work. See
+    /// <see cref="SimulationCluster.DisposeAsync"/> for the condition.
+    /// </summary>
+    internal bool SkipGracefulLeave { get; set; }
 
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
@@ -279,7 +416,15 @@ public sealed class SimulationNode : IAsyncDisposable
         if (Interlocked.Exchange(ref disposed, 1) != 0)
             return;
 
+        bool alreadyCrashed = LifecycleStatus == SimulationNodeLifecycleStatus.Crashed;
         LifecycleStatus = SimulationNodeLifecycleStatus.Stopped;
+
+        // A crashed node has no manager left to leave gracefully; its store is all that remains.
+        if (alreadyCrashed)
+        {
+            ReleaseStore();
+            return;
+        }
 
         // Faults are cleared before anything else. A graceful leave waits for a roster change to
         // commit, and a node still refusing writes can never commit one, so a fault left set by a
@@ -292,9 +437,10 @@ public sealed class SimulationNode : IAsyncDisposable
         // seconds per node, against a hundred milliseconds for the run it was tearing down.
         // Nothing is lost by skipping it — the whole cluster is being discarded, and graceful
         // leave has its own tests.
-        if (drivenScheduling)
+        if (drivenScheduling || SkipGracefulLeave)
         {
             Manager.Dispose();
+            ReleaseStore();
             return;
         }
 
@@ -307,5 +453,20 @@ public sealed class SimulationNode : IAsyncDisposable
             // Teardown is best-effort: a run that already failed must still release its nodes.
             Manager.Dispose();
         }
+
+        ReleaseStore();
+    }
+
+    /// <summary>
+    /// Ends the store's life. The simulated store ignores an ordinary <c>Dispose</c> so that a crash
+    /// does not destroy the disk it is supposed to leave behind, so teardown has to say so
+    /// explicitly.
+    /// </summary>
+    private void ReleaseStore()
+    {
+        if (SimulatedWal is not null)
+            SimulatedWal.DisposeStore();
+        else
+            Wal.Dispose();
     }
 }

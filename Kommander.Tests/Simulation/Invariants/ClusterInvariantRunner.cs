@@ -1,5 +1,6 @@
 using Kommander.Data;
 using Kommander.Tests.Simulation.Cluster;
+using Kommander.Tests.Simulation.WAL;
 
 namespace Kommander.Tests.Simulation.Invariants;
 
@@ -29,8 +30,18 @@ public sealed class ClusterInvariantRunner
     private readonly Dictionary<string, long> highestCommitByNode = [];
     private readonly Dictionary<long, CommittedEntryFingerprint> recordedByCommittedIndex = [];
 
+    /// <summary>Crash count last seen per node, so no crash is missed between two checks.</summary>
+    private readonly Dictionary<string, int> crashCountByNode = [];
+
     /// <summary>Number of settled states checked so far.</summary>
     public int ChecksRun { get; private set; }
+
+    /// <summary>
+    /// Commit high-water marks actually dropped because their node crashed. Counting the marks
+    /// rather than the crashes is deliberate: a reset that matched no mark would otherwise report
+    /// success while changing nothing.
+    /// </summary>
+    public int CrashResets { get; private set; }
 
     /// <summary>Number of distinct committed indices the run has fingerprinted.</summary>
     public int CommittedIndicesSeen => recordedByCommittedIndex.Count;
@@ -48,6 +59,8 @@ public sealed class ClusterInvariantRunner
         IReadOnlyList<ClusterInvariantSet.NodeCommittedWindow> windows =
             CollectCommittedWindows(cluster, views, partitionId);
 
+        ForgetCrashedNodes(cluster);
+
         ClusterInvariantSet.CheckOneLeaderPerTerm(cluster.StepNumber, views);
         ClusterInvariantSet.CheckCommittedIdsMonotonic(cluster.StepNumber, views, highestCommitByNode);
 
@@ -57,6 +70,12 @@ public sealed class ClusterInvariantRunner
             recordedByCommittedIndex);
 
         ClusterInvariantSet.CheckCommittedTermsNonDecreasing(cluster.StepNumber, recordedByCommittedIndex);
+
+        IReadOnlyDictionary<string, SimulatedWalPartitionSnapshot> stores =
+            CollectStores(cluster, partitionId);
+
+        ClusterInvariantSet.CheckCommittedPrefixPresent(cluster.StepNumber, views, stores);
+        ClusterInvariantSet.CheckCompactionFloorRespected(cluster.StepNumber, stores);
 
         // Runs after the agreement check on purpose: that check is what populates the recorded
         // history this one measures a leader against.
@@ -89,6 +108,77 @@ public sealed class ClusterInvariantRunner
             cluster.StepNumber,
             views,
             CollectCommittedWindows(cluster, views, partitionId));
+    }
+
+    /// <summary>
+    /// Drops the commit high-water mark of any node that has crashed since the last check.
+    ///
+    /// <para><b>Why the invariant needs this.</b> "A node's committed index never decreases" is
+    /// true of a running node and false of one that crashed: a crash takes back everything inside
+    /// the fsync window, so the node comes up having genuinely committed less than it once
+    /// reported. Raft is not violated — the entry survives on the majority that fsynced it — but
+    /// the per-node rule is, and without this the first crash scenario would report a defect that
+    /// is really the durability model working.</para>
+    ///
+    /// <para><b>Why only a crash.</b> A paused node keeps its memory and must stay monotonic; a
+    /// stopped one is being torn down. Resetting on either would blunt the rule for no reason. The
+    /// mark is dropped once per crash, not once per step, so a node that keeps running after its
+    /// restart is held to the rule again from its new baseline. <see cref="CrashResets"/> counts
+    /// the drops, so a scenario can prove the reset engaged rather than assume it.</para>
+    /// </summary>
+    private void ForgetCrashedNodes(SimulationCluster cluster)
+    {
+        foreach (SimulationNode node in cluster.Nodes)
+        {
+            int seen = crashCountByNode.GetValueOrDefault(node.Endpoint);
+            if (node.CrashCount <= seen)
+                continue;
+
+            // The count, not the current status. A node can crash and restart between two checks,
+            // and a status test would then see it running and hold it to a mark it no longer has.
+            crashCountByNode[node.Endpoint] = node.CrashCount;
+
+            // Every partition, because the crash took the whole process. The marks are keyed by
+            // endpoint and partition together, so removing the bare endpoint removes nothing —
+            // which is how the first version of this reset counted itself as done while leaving
+            // every mark in place. CrashResets therefore counts marks actually dropped.
+            string prefix = node.Endpoint + "/p";
+
+            List<string> keys = highestCommitByNode.Keys
+                .Where(key => key.StartsWith(prefix, StringComparison.Ordinal))
+                .ToList();
+
+            foreach (string key in keys)
+            {
+                highestCommitByNode.Remove(key);
+                CrashResets++;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reads one partition's store state from every node that has a simulated one.
+    ///
+    /// <para>A node running a plain in-memory log contributes nothing and is simply absent from the
+    /// map. That is deliberate: the store rules skip what they cannot read rather than treat a
+    /// missing reading as an empty log, which would report a hole on every node the harness cannot
+    /// see into.</para>
+    /// </summary>
+    private static IReadOnlyDictionary<string, SimulatedWalPartitionSnapshot> CollectStores(
+        SimulationCluster cluster,
+        int partitionId)
+    {
+        Dictionary<string, SimulatedWalPartitionSnapshot> stores = new();
+
+        foreach ((string endpoint, SimulatedWalSnapshot snapshot) in cluster.GetWalSnapshots())
+        {
+            SimulatedWalPartitionSnapshot? partition = snapshot.Partition(partitionId);
+
+            if (partition is not null)
+                stores[endpoint] = partition;
+        }
+
+        return stores;
     }
 
     private static List<CommittedEntryFingerprint> Flatten(

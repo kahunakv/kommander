@@ -23,6 +23,20 @@ namespace Kommander.Tests.Simulation.WAL;
 /// <param name="NonDurableIds">
 /// Ids written but not yet fsynced. A crash at this instant would revert or remove exactly these.
 /// </param>
+/// <param name="CompactionsAboveFloor">
+/// Times the caller asked to compact past the checkpoint that was certified at that moment.
+///
+/// <para>Recorded at the moment of the request rather than derived afterwards, because afterwards
+/// the two cases are indistinguishable: a log that starts above its first id may have been
+/// compacted, or may simply never have received its head. Only the request separates them.</para>
+/// </param>
+/// <param name="WorstCompactionRequest">The highest floor ever asked for, or -1 if none was too high.</param>
+/// <param name="WorstCompactionCertifiedFloor">The checkpoint certified when that request arrived.</param>
+/// <param name="CompactedThrough">
+/// Highest id compaction actually removed, or 0 where none was. This is what makes a missing head
+/// readable: a log whose lowest id is 5 has either compacted 1 through 4 or never received them, and
+/// nothing observable afterwards separates those two.
+/// </param>
 public sealed record SimulatedWalPartitionSnapshot(
     int PartitionId,
     int EntryCount,
@@ -31,7 +45,11 @@ public sealed record SimulatedWalPartitionSnapshot(
     long LastCheckpoint,
     IReadOnlyDictionary<RaftLogType, int> CountByType,
     IReadOnlyList<long> MissingIds,
-    IReadOnlyList<long> NonDurableIds)
+    IReadOnlyList<long> NonDurableIds,
+    int CompactionsAboveFloor = 0,
+    long WorstCompactionRequest = -1,
+    long WorstCompactionCertifiedFloor = -1,
+    long CompactedThrough = 0)
 {
     /// <summary>True when an id is absent inside the retained range.</summary>
     public bool HasHole => MissingIds.Count > 0;
