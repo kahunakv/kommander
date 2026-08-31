@@ -60,6 +60,12 @@ internal sealed class RaftPartitionLogThrottle
     private long lastNoProgressPauseTraceTicks;
     private int suppressedNoProgressPauseTraces;
 
+    // Throttle for the follower's heartbeat-time hole report. The report re-fires on every
+    // heartbeat while the hole stands (that level-triggered repetition is its whole point), so
+    // an unrepaired hole would otherwise emit one Warning per beat forever. Executor thread only.
+    private long lastHoleReportLogTicks;
+    private int suppressedHoleReportLogs;
+
     public RaftPartitionLogThrottle(IRaftPartitionHost host, RaftPartitionCoreState coreState, ILogger<IRaft> logger)
     {
         this.host = host;
@@ -189,6 +195,41 @@ internal sealed class RaftPartitionLogThrottle
 
         lastBackfillTraceTicks   = now;
         suppressedBackfillTraces = 0;
+    }
+
+    /// <summary>
+    /// Reports that this follower told the leader about a log hole on a heartbeat ack, at most
+    /// once per second per partition with the count suppressed since the last line.
+    /// </summary>
+    /// <remarks>
+    /// Warning rather than Debug on purpose: a hole that persists across many heartbeats means
+    /// the repair this report exists to trigger is not landing (backfill disabled, or the leader
+    /// cannot serve the anchor), which is exactly the stranded-replica condition an operator
+    /// must see. Consumers commonly filter Kommander to Warning, so anything quieter vanishes.
+    /// </remarks>
+    public void LogHeartbeatHoleReport(string endpoint, long anchor)
+    {
+        long now = host.GetMonotonicTimestamp();
+
+        if (lastHoleReportLogTicks != 0 && (now - lastHoleReportLogTicks) < Stopwatch.Frequency)
+        {
+            suppressedHoleReportLogs++;
+            return;
+        }
+
+        lastHoleReportLogTicks = now;
+
+        logger.LogWarning(
+            "[{LocalEndpoint}/{PartitionId}/{State}] Log hole above contiguous frontier {Anchor} — reporting LogMismatch to {Endpoint} on heartbeat so the leader backfills the gap. suppressedSinceLastLine={Suppressed}",
+            host.LocalEndpoint,
+            host.PartitionId,
+            coreState.NodeState,
+            anchor,
+            endpoint,
+            suppressedHoleReportLogs
+        );
+
+        suppressedHoleReportLogs = 0;
     }
 
     /// <summary>

@@ -25,6 +25,13 @@ namespace Kommander.Consensus;
 /// truncate exists for the same reason: the truncate is irreversible, so a queued-but-unread append
 /// must never look like a hole.</para>
 ///
+/// <para><b>A heartbeat ack re-raises the hole report until the hole is repaired.</b> The
+/// entry-carrying paths report a hole only at the moment a batch lands over it, and that edge
+/// signal dies with the leadership that heard it. The heartbeat branch therefore sends a second,
+/// LogMismatch-status response — alongside the normal Success ack, never instead of it — whenever
+/// durable entries sit buffered above the contiguous presence frontier, so every current leader
+/// learns the repair anchor within one beat regardless of elections in between (DST FINDING 1).</para>
+///
 /// <para><b>The hole repair never deletes below the advertised commit frontier.</b> The blanket
 /// truncation is licensed by one premise: a row above an unfilled gap cannot have earned quorum
 /// credit here, so this node's advertised frontier stays below the gap. The committed-frontier
@@ -461,6 +468,34 @@ internal sealed class FollowerAppendHandler
             new(endpoint),
             new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.Success, reportedCommittedIndex)
         ));
+
+        // Level-triggered hole report (DST FINDING 1: a hole smaller than BackfillThreshold was
+        // never repaired). The over-gap ack gate and the duplicate re-ack both report LogMismatch
+        // only at the moment an entry-carrying batch lands over the gap — an EDGE signal, and it
+        // dies with the leadership that heard it: the reproduction lost three leaders right after
+        // the fault, so each report was either term-fenced away at a deposed leader or wiped by
+        // its step-down ClearAll, and no later trigger could see the hole (the committed gap sat
+        // under BackfillThreshold, and to every later leader the entries were merely-restored
+        // state, which LiveCommitFloor deliberately confines). The hole itself is a LEVEL
+        // condition this node reads for free — durable entries buffered above the contiguous
+        // presence frontier — so re-raise the anchored-repair note on every heartbeat until the
+        // gap closes: whichever node leads now learns the anchor within one beat, and the
+        // mismatch-note trigger it feeds is gated on neither BackfillThreshold nor
+        // LiveCommitFloor. Sent IN ADDITION to the Success ack above, never instead of it: the
+        // Success ack must keep feeding the frontier report, read-index confirmation and
+        // check-quorum recency, so a holed follower stays a live quorum member while it heals.
+        if (wal.HasPresenceGap())
+        {
+            long holeAnchor = Math.Max(0, wal.GetPresentIndex());
+
+            logThrottle.LogHeartbeatHoleReport(endpoint, holeAnchor);
+
+            host.EnqueueResponse(endpoint, new(
+                RaftResponderRequestType.CompleteAppendLogs,
+                new(endpoint),
+                new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, holeAnchor)
+            ));
+        }
 
         CompleteReply(replyCorrelationId, RaftResponseStatic.NoneResponse);
     }

@@ -247,42 +247,33 @@ public sealed class TestSimulatedWalScenarios
     }
 
     /// <summary>
-    /// A follower that misses one entry to a write failure is never repaired, because the hole is
-    /// smaller than <see cref="RaftConfiguration.BackfillThreshold"/>.
+    /// A follower that misses one entry to a write failure is repaired once its disk is freed,
+    /// even though the hole is smaller than <see cref="RaftConfiguration.BackfillThreshold"/>.
     ///
-    /// <para><b>This test is skipped because it fails, and it fails on a real defect.</b> It is kept
-    /// so the defect has an exact reproduction rather than a description.</para>
+    /// <para><b>History (DST FINDING 1).</b> This was the first real defect the harness found, and
+    /// this test was its skipped reproduction. The starved node ended holding entry 2 and not
+    /// entry 1 — a physical hole — with its committed frontier honestly stopped at 0 while the
+    /// other two stood at 2, and no repair ever came: the committed gap (2) sat under
+    /// <c>BackfillThreshold</c> (10), the entries were merely-restored state to every
+    /// post-election leader (the <c>LiveCommitFloor</c> confinement), and the over-gap
+    /// <c>LogMismatch</c> reports the follower did raise all landed on leaders the election churn
+    /// deposed, so the recorded repair anchors died with them.</para>
     ///
-    /// <para><b>The state it reaches.</b> The starved node ends holding entry 2 and not entry 1 — a
-    /// physical hole — with its committed frontier correctly stopped at 0 while the other two are at
-    /// 2. Twenty seconds of simulated time and a further live write do not repair it. Reproduced on
-    /// seeds 20260903, 7 and 999; on seed 999 the victim is a different node, so it follows the
-    /// fault rather than the node.</para>
+    /// <para><b>The fix this test now locks in.</b> The hole is a level condition, so the follower
+    /// re-raises the repair anchor on every heartbeat ack (a <c>LogMismatch</c> response alongside
+    /// the normal Success ack) while durable entries sit buffered above its contiguous presence
+    /// frontier. Whichever node leads after the churn learns the anchor within one beat, and the
+    /// mismatch-note backfill it feeds is gated on neither <c>BackfillThreshold</c> nor
+    /// <c>LiveCommitFloor</c>. See <c>FollowerAppendHandler</c>.</para>
     ///
-    /// <para><b>The mechanism, confirmed by experiment.</b> With
-    /// <c>BackfillThreshold = 0</c> the same run repairs completely, all three nodes reaching
-    /// <c>[1,2]</c> at commit index 2. With the default of 10 it never repairs. Three triggers could
-    /// have caught it and none can:</para>
-    ///
-    /// <list type="number">
-    ///   <item>The committed-gap trigger needs <c>followerGap > BackfillThreshold</c>. The gap is 2.</item>
-    ///   <item>The idle-tail-gap trigger is confined to entries the current leader committed live,
-    ///     and the write failures cost this cluster an election, so those entries are merely restored
-    ///     state to whoever leads afterwards.</item>
-    ///   <item>No log-mismatch rejection is ever raised, because the propose and commit broadcast
-    ///     ships entries unanchored. The follower accepts entry 2 over the hole with no check
-    ///     against entry 1.</item>
-    /// </list>
-    ///
-    /// <para><b>What it costs.</b> No acknowledged data is lost and no safety invariant breaks: the
-    /// node's frontier honestly stops below the hole. The replica is stranded — permanently outside
-    /// the durability quorum while appearing healthy. The threshold is therefore a lower bound on
-    /// damage that can never be repaired, which is not what a tuning knob should be.</para>
+    /// <para>The three seeds are the ones the finding reproduced on; on seed 999 the victim is a
+    /// different node, so the scenario follows the fault rather than the node.</para>
     /// </summary>
-    [Fact(Skip = "Open defect: a log hole smaller than BackfillThreshold is never repaired. "
-                 + "Reproduced on seeds 20260903, 7 and 999. Setting BackfillThreshold to 0 repairs it, "
-                 + "which pins the mechanism to the committed-gap trigger. See the summary above.")]
-    public async Task AStarvedFollower_IsRepairedOnceItsDiskIsFreed()
+    [Theory]
+    [InlineData(20260903ul)]
+    [InlineData(7ul)]
+    [InlineData(999ul)]
+    public async Task AStarvedFollower_IsRepairedOnceItsDiskIsFreed(ulong seed)
     {
         CancellationToken cancellationToken = TestContext.Current.CancellationToken;
 
@@ -290,7 +281,7 @@ public sealed class TestSimulatedWalScenarios
         {
             NodeCount = 3,
             PartitionCount = 1,
-            Seed = 20260903,
+            Seed = seed,
         }, cancellationToken);
 
         ClusterInvariantRunner invariants = new();
