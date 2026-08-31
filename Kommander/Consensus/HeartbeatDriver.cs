@@ -17,9 +17,11 @@ namespace Kommander.Consensus;
 /// <para><b>A heartbeat is not just liveness.</b> It is also the only catch-up path once writes go
 /// quiet: the live-propose broadcast is one-shot, so a follower that missed a committed tail entry
 /// is repaired here or not at all. That is why the round carries two backfill triggers — a
-/// threshold-gated one for an actively-behind peer, and a single-entry one that fires only once
-/// live replication is quiet AND a commit exists above this term's floor, which keeps a leader from
-/// pushing merely-restored state while still healing a genuine tail gap.</para>
+/// threshold-gated one for an actively-behind peer, and a single-entry one that fires once live
+/// replication is quiet AND either a commit exists above this term's floor or the peer has no
+/// stake in the floor's contract (a learner, or a voter that reported a committed prefix of this
+/// log). The floor keeps a leader from pushing merely-restored state at a blank voter while still
+/// healing a genuine tail gap.</para>
 ///
 /// <para>Proposal retry rides the beat for the same reason: Raft leaders retry replication until it
 /// succeeds, and a partition with unresolved proposals can never quiesce, so this site is always
@@ -161,6 +163,22 @@ internal sealed class HeartbeatDriver
             // without the exemption, a learner added to an idle range whose leader was elected after
             // the last write (frontier == floor) with a gap at or under BackfillThreshold was never
             // shipped anything, and the placement promotion driver waited on its lag forever.
+            //
+            // A VOTER that itself reported a committed prefix of this range's log (frontier >= 1,
+            // via Success acks only — see ReplicationTracker.SetCommitFrontier) is exempt as well.
+            // A strictly shorter contiguous prefix is a fact the follower reported, not divergence
+            // for the highest-WAL election preference to arbitrate: committed prefixes cannot
+            // diverge, so topping the voter up only re-ships entries it already participated in.
+            // Without this, a voter that missed one committed entry (crash-restart, a refused
+            // write) on a range that then went idle behind an election was never repaired: the gap
+            // sat under BackfillThreshold, and the missing entry was merely-restored state to the
+            // post-outage leader (DST finding, vorpal 32348e83). The floor still confines a voter
+            // with NO reported committed prefix (frontier absent, -1, or 0): shipping a restored
+            // log at a blank voter before the next live write is exactly what the floor exists to
+            // prevent (the TestJoinClusterSimultAndDecideLeaderWithHighestWal/HighestTerm
+            // contract). A divergent or holed tail ABOVE the reported frontier is out of scope
+            // here by construction — the trigger keys only on the contiguous frontier, and the
+            // Log Matching anchors plus the LogMismatch/anchored-repair paths arbitrate the tail.
             // followerMaxLog can be -1: the seed recorded for a contacted peer whose Success acks
             // carry no frontier report (a pre-frontier-report release during a rolling upgrade).
             // That value means "position unknown", not "position 0" — deriving the gap and the
@@ -178,8 +196,11 @@ internal sealed class HeartbeatDriver
                 ? followerMaxLog
                 : Math.Max(tracker.GetStartCommitIndexOrDefault(node.Endpoint, 0), 0);
             long followerGap = frontierKnown ? coreState.LocalCommittedIndex - effectiveFloor : 0;
+            bool voterShortPrefix = frontierKnown && followerMaxLog >= 1;
             bool idleTailGap = followerGap > 0 && liveReplicationQuiet
-                && (coreState.LocalCommittedIndex > coreState.LiveCommitFloor || !host.IsVoter(node.Endpoint));
+                && (coreState.LocalCommittedIndex > coreState.LiveCommitFloor
+                    || !host.IsVoter(node.Endpoint)
+                    || voterShortPrefix);
 
             // Crash-restart re-supply (paced): CompleteAppendLogsAsync recorded that this peer reported a
             // committed frontier below its recorded matchIndex (lost lazy markers on restart). The repair
@@ -217,7 +238,7 @@ internal sealed class HeartbeatDriver
             // derived from it. The probe logs at Debug, and drops idle no-op rounds before its own
             // per-second throttle — see RaftPartitionLogThrottle.LogBackfillDecision.
             logThrottle.LogBackfillDecision(node.Endpoint, willBackfill, followerMaxLog, followerGap,
-                                idleTailGap, regressed, liveReplicationQuiet);
+                                idleTailGap, voterShortPrefix, regressed, liveReplicationQuiet);
 
             if (willBackfill)
             {

@@ -123,6 +123,152 @@ public sealed class TestNodeLifecycleScenarios
     }
 
     /// <summary>
+    /// A crashed follower that comes back one committed entry short is repaired on an idle range,
+    /// with no client write after the recovery.
+    ///
+    /// <para>This is the voter half of the LiveCommitFloor confinement (vorpal 32348e83). The gap
+    /// is far under BackfillThreshold, and the outage costs the cluster an election: the old
+    /// leader is paused while the victim is down, so the third node wins the term and the missing
+    /// entry is merely-restored state to it. Its LiveCommitFloor equals its committed frontier, no
+    /// live commit exists above the floor, and before the fix no backfill trigger fired — the node
+    /// sat one entry behind for the full step budget while every health signal reported it fine.
+    /// The repair must key on the follower's own frontier report: it holds a committed prefix of
+    /// this log, so topping it up is not the restored-state push the floor exists to prevent.</para>
+    ///
+    /// <para>The election is load-bearing, not decoration. Without it the old leader keeps its
+    /// pre-outage floor, the ordinary idle-tail-gap arm fires, and the scenario passes with or
+    /// without the voter exemption. The absence of a <c>ProposeAsync</c> after the recovery is the
+    /// other half of the point: <see cref="ACrashedFollower_RejoinsAndCatchesUp"/> covers the
+    /// with-a-live-write contract, and adding a write here would pin nothing.</para>
+    /// </summary>
+    [Fact]
+    public async Task ACrashedFollower_CatchesUpOnAnIdleRange_WithoutALiveWrite()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+
+        await using SimulationCluster cluster = await StartAsync(20260904, cancellationToken);
+
+        ClusterInvariantRunner invariants = new();
+        SimulationNode leader = await ElectAsync(cluster, cancellationToken);
+        SimulationNode victim = cluster.Nodes.First(node => node != leader);
+
+        // Two entries before the crash, and the second one is durability choreography rather than
+        // padding. A commit marker rides the next sync write on its partition (the single-fsync
+        // contract), so entry 1's marker becomes durable only when entry 2's propose carries it.
+        // The scenario needs the victim to come back with a committed prefix and an honest
+        // frontier of at least 1, because that reported frontier is what the repair keys on — one
+        // entry alone leaves its marker inside the fsync window, the crash takes it, and the
+        // victim restores as a blank-frontier voter, which the confinement covers by design.
+        await ProposeAsync(cluster, cancellationToken);
+        await ProposeAsync(cluster, cancellationToken);
+        await ConvergeAsync(cluster, invariants, index: 2, cancellationToken);
+
+        await cluster.CrashNodeAsync(victim, cancellationToken);
+
+        // The entry the victim will miss. The surviving two are a majority and commit it alone.
+        await ProposeAsync(cluster, cancellationToken);
+
+        Assert.True(
+            await cluster.RunUntilAsync(
+                async () =>
+                {
+                    await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
+
+                    return cluster.Nodes
+                        .Where(node => node != victim)
+                        .All(node => node.Wal.GetMaxLog(PartitionId) >= 3);
+                },
+                stepCount: 300,
+                advanceMilliseconds: 50,
+                cancellationToken),
+            "The surviving majority did not commit while one node was down.");
+
+        Assert.True(
+            victim.Wal.GetMaxLog(PartitionId) < 3,
+            $"The crashed node already holds log {victim.Wal.GetMaxLog(PartitionId)}, so it missed nothing.");
+
+        // Pause the old leader BEFORE the victim comes back, so the victim can never be repaired
+        // under the old term's floor. The third node holds the full log and must win the term.
+        leader.Pause();
+
+        await cluster.RestartNodeAsync(victim, cancellationToken);
+
+        Assert.True(
+            await cluster.RunUntilAsync(
+                async () =>
+                {
+                    await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
+
+                    IReadOnlyList<RaftPartitionView> views =
+                        await cluster.GetPartitionViewsAsync(PartitionId, cancellationToken);
+
+                    return views.Any(view =>
+                        view.Role == RaftNodeState.Leader && view.Endpoint != leader.Endpoint);
+                },
+                stepCount: 400,
+                advanceMilliseconds: 50,
+                cancellationToken),
+            "No replacement leader was elected while the original slept.");
+
+        leader.Resume();
+
+        Assert.True(
+            await cluster.RunUntilAsync(
+                async () =>
+                {
+                    await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
+
+                    IReadOnlyList<RaftPartitionView> views =
+                        await cluster.GetPartitionViewsAsync(PartitionId, cancellationToken);
+
+                    return views.Count(view => view.Role == RaftNodeState.Leader) == 1;
+                },
+                stepCount: 400,
+                advanceMilliseconds: 50,
+                cancellationToken),
+            "The cluster did not settle on exactly one leader after the old one woke.");
+
+        // Precondition, not the property under test: the crash kept the first committed entry
+        // (its marker was carried by entry 2's propose), so the victim restores a committed
+        // prefix with an honest frontier of at least 1. That reported frontier is what the
+        // repair keys on — a blank-frontier voter would be confined by design, and this scenario
+        // would then need a durability re-check rather than a looser assertion.
+        Assert.True(
+            await cluster.RunUntilAsync(
+                async () =>
+                {
+                    RaftPartitionView? view =
+                        await victim.GetPartitionViewAsync(PartitionId, cancellationToken);
+
+                    return view is not null && view.CommitIndex >= 1;
+                },
+                stepCount: 300,
+                advanceMilliseconds: 50,
+                cancellationToken),
+            "The restarted node did not restore its committed prefix, so it cannot report a frontier.");
+
+        // No write from here on. The idle heartbeat path alone must repair the gap.
+        Assert.True(
+            await cluster.RunUntilAsync(
+                async () =>
+                {
+                    await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
+
+                    RaftPartitionView? view =
+                        await victim.GetPartitionViewAsync(PartitionId, cancellationToken);
+
+                    return view is not null && view.CommitIndex >= 3;
+                },
+                stepCount: 400,
+                advanceMilliseconds: 50,
+                cancellationToken),
+            "The restarted node was never caught up on the idle range without a live write.");
+
+        await invariants.CheckConvergedAsync(cluster, PartitionId, cancellationToken);
+        Assert.Equal(1, invariants.CrashResets);
+    }
+
+    /// <summary>
     /// A crash keeps what reached the disk and loses only what was still inside the fsync window.
     ///
     /// <para>The window is opened deliberately with a write latency. Without one the store is

@@ -168,7 +168,8 @@ internal sealed class RaftPartitionLogThrottle
     /// count stays a count of suppressed <i>interesting</i> traces.</para>
     /// </remarks>
     public void LogBackfillDecision(string endpoint, bool willBackfill, long followerMaxLog,
-                                    long followerGap, bool idleTailGap, bool regressed, bool liveQuiet)
+                                    long followerGap, bool idleTailGap, bool voterShortPrefix,
+                                    bool regressed, bool liveQuiet)
     {
         // Interest gate, ahead of the per-second throttle. See the remarks above: an idle partition
         // with backfill disabled reports the same all-zero decision every round forever.
@@ -186,11 +187,11 @@ internal sealed class RaftPartitionLogThrottle
         if (logger.IsEnabled(LogLevel.Debug))
         {
             logger.LogDebug(
-                "[{LocalEndpoint}/{PartitionId}/{State}] DIAG backfill-decision peer={Endpoint} send={Send} enabled={Enabled} followerMaxLog={FollowerMaxLog} localCommitted={LocalCommitted} gap={Gap} threshold={Threshold} idleTailGap={IdleTailGap} regressed={Regressed} liveQuiet={LiveQuiet} liveCommitFloor={LiveCommitFloor} suppressedSinceLastLine={Suppressed}",
+                "[{LocalEndpoint}/{PartitionId}/{State}] DIAG backfill-decision peer={Endpoint} send={Send} enabled={Enabled} followerMaxLog={FollowerMaxLog} localCommitted={LocalCommitted} gap={Gap} threshold={Threshold} idleTailGap={IdleTailGap} voterShortPrefix={VoterShortPrefix} regressed={Regressed} liveQuiet={LiveQuiet} liveCommitFloor={LiveCommitFloor} suppressedSinceLastLine={Suppressed}",
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, willBackfill,
                 host.Configuration.BackfillEnabled,
                 followerMaxLog, coreState.LocalCommittedIndex, followerGap, host.Configuration.BackfillThreshold,
-                idleTailGap, regressed, liveQuiet, coreState.LiveCommitFloor, suppressedBackfillTraces);
+                idleTailGap, voterShortPrefix, regressed, liveQuiet, coreState.LiveCommitFloor, suppressedBackfillTraces);
         }
 
         lastBackfillTraceTicks   = now;
