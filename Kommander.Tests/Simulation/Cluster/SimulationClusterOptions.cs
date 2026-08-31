@@ -49,6 +49,22 @@ public sealed record SimulationClusterOptions
     public bool DrivenScheduling { get; init; }
 
     /// <summary>
+    /// When true, every node stores its log in a <see cref="WAL.SimulatedWAL"/> rather than a plain
+    /// in-memory one.
+    ///
+    /// <para>On by default. With no fault set the simulated store behaves exactly like the one it
+    /// wraps, so nothing changes for a scenario that does not ask for a fault, and every scenario
+    /// gains a log snapshot and a crash it can reach for.</para>
+    /// </summary>
+    public bool UseSimulatedWal { get; init; } = true;
+
+    /// <summary>
+    /// Simulated milliseconds between a durable write and its fsync, applied to every node's store.
+    /// Zero, the default, leaves no window for a crash to catch. Raise it to model a slow disk.
+    /// </summary>
+    public long WalWriteLatencyMilliseconds { get; init; }
+
+    /// <summary>
     /// Applied to every node's configuration after the defaults above. Use it to sample the
     /// safety-relevant configuration surface per run.
     /// </summary>

@@ -2,6 +2,7 @@ using Kommander.Data;
 using Kommander.Discovery;
 using Kommander.Tests.Simulation.Time;
 using Kommander.Tests.Simulation.Transport;
+using Kommander.Tests.Simulation.WAL;
 using Kommander.Time;
 using Kommander.WAL;
 using Microsoft.Extensions.Logging;
@@ -36,6 +37,7 @@ public sealed class SimulationNode : IAsyncDisposable
         Endpoint = endpoint;
         Manager = manager;
         Wal = wal;
+        SimulatedWal = wal as SimulatedWAL;
         this.drivenScheduling = drivenScheduling;
     }
 
@@ -60,6 +62,12 @@ public sealed class SimulationNode : IAsyncDisposable
 
     /// <summary>This node's write-ahead log.</summary>
     public IWAL Wal { get; }
+
+    /// <summary>
+    /// The same store typed as the simulated one, or null when the scenario asked for a plain
+    /// in-memory log. This is the handle a scenario injects a storage fault through.
+    /// </summary>
+    public SimulatedWAL? SimulatedWal { get; }
 
     /// <summary>Lifecycle state as the harness last set it.</summary>
     public SimulationNodeLifecycleStatus LifecycleStatus { get; private set; } =
@@ -129,7 +137,13 @@ public sealed class SimulationNode : IAsyncDisposable
 
         options.ConfigureNode?.Invoke(configuration);
 
-        IWAL wal = new InMemoryWAL(logger);
+        // The simulated store reads the cluster clock, not the process clock: a durability window
+        // measured in real time would make a crash land somewhere different on every run, which is
+        // the one thing the whole harness exists to prevent.
+        IWAL wal = options.UseSimulatedWal
+            ? new SimulatedWAL(logger, () => clock.LogicalMilliseconds)
+              { WriteLatencyMilliseconds = options.WalWriteLatencyMilliseconds }
+            : new InMemoryWAL(logger);
 
         RaftManager manager = new(
             configuration,
@@ -266,6 +280,11 @@ public sealed class SimulationNode : IAsyncDisposable
             return;
 
         LifecycleStatus = SimulationNodeLifecycleStatus.Stopped;
+
+        // Faults are cleared before anything else. A graceful leave waits for a roster change to
+        // commit, and a node still refusing writes can never commit one, so a fault left set by a
+        // scenario turns every shutdown after it into a full timeout.
+        SimulatedWal?.ClearFaults();
 
         // A driven node is disposed outright rather than asked to leave gracefully. A graceful
         // leave waits for roster changes to commit, and in driven mode nobody is left to drive

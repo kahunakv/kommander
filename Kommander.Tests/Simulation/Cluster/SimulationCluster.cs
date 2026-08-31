@@ -1,6 +1,7 @@
 using Kommander.Data;
 using Kommander.Tests.Simulation.Time;
 using Kommander.Tests.Simulation.Transport;
+using Kommander.Tests.Simulation.WAL;
 using Microsoft.Extensions.Logging;
 
 namespace Kommander.Tests.Simulation.Cluster;
@@ -465,6 +466,30 @@ public sealed class SimulationCluster : IAsyncDisposable
         }
 
         return views;
+    }
+
+    /// <summary>
+    /// Reads every node's write-ahead log, keyed by endpoint.
+    ///
+    /// <para>A partition view says how far a node believes it committed. Only the store says what
+    /// is behind that belief, and the gap between the two is where several shipped defects lived.
+    /// Nodes whose scenario asked for a plain in-memory log contribute nothing.</para>
+    ///
+    /// <para>This reads the store directly rather than through an executor. It is safe because the
+    /// store is thread-safe by contract, but a caller that wants a settled reading should still
+    /// take it at a step boundary.</para>
+    /// </summary>
+    public IReadOnlyDictionary<string, SimulatedWalSnapshot> GetWalSnapshots()
+    {
+        Dictionary<string, SimulatedWalSnapshot> snapshots = new();
+
+        foreach (SimulationNode node in nodes)
+        {
+            if (node.SimulatedWal is not null)
+                snapshots[node.Endpoint] = node.SimulatedWal.Snapshot();
+        }
+
+        return snapshots;
     }
 
     /// <summary>
