@@ -28,4 +28,8 @@ jobs:
         # instead, before the run stops being reproducible.
         run: bash scripts/check-determinism-boundary.sh
       - name: Run Tests
-        run: (cd Kommander.Tests && dotnet test -l "console;verbosity=detailed" --filter "Category!=Stress" --blame-hang --blame-hang-timeout 120s)
+        # DSTRandom is the seeded random search. It belongs to a nightly budget, not to a pull
+        # request: its cost grows with the seed count, and a seed that fails is a lead to
+        # investigate rather than a verdict on the change under review. The DSTSmoke scenarios,
+        # which include one short generated run, stay in this job.
+        run: (cd Kommander.Tests && dotnet test -l "console;verbosity=detailed" --filter "Category!=Stress&Category!=DSTRandom" --blame-hang --blame-hang-timeout 120s)

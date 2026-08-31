@@ -1,0 +1,89 @@
+namespace Kommander.Tests.Simulation.Scenarios.Random;
+
+/// <summary>
+/// Bounds and weights for a random run. Everything a run does is a function of these values plus
+/// the seed, so both are recorded in the plan artifact.
+/// </summary>
+public sealed record RandomScenarioOptions
+{
+    /// <summary>Partition the run exercises. Never zero: partition 0 is the control plane.</summary>
+    public int PartitionId { get; init; } = 1;
+
+    /// <summary>How many actions the run draws before it starts healing.</summary>
+    public int ActionCount { get; init; } = 24;
+
+    /// <summary>Simulation steps run after each action, so the cluster can react to it.</summary>
+    public int StepsPerAction { get; init; } = 6;
+
+    /// <summary>Simulated milliseconds each step advances.</summary>
+    public long AdvanceMillisecondsPerStep { get; init; } = 50;
+
+    /// <summary>
+    /// How many faults that cost the cluster a node may be active at once.
+    ///
+    /// <para><b>One, and the default is not timid.</b> A three-node cluster commits with two nodes,
+    /// so one fault leaves every proposal fast and every commit reachable. Two faults remove the
+    /// quorum, and a proposal with no quorum does not fail quickly: it waits ten <b>real</b>
+    /// seconds inside <c>WaitForQuorum</c> before it reports a timeout. A run that loses quorum
+    /// therefore stops exploring and starts paying, which is the opposite of what a random search
+    /// is for. Raise this only for a scenario written to study a cluster with no quorum, and
+    /// expect it to run in real seconds rather than simulated ones.</para>
+    /// </summary>
+    public int MaxImpairedNodes { get; init; } = 1;
+
+    /// <summary>
+    /// Actions a fault may stay active before the generator heals it whether or not the draw asks.
+    ///
+    /// <para>Without a bound the search converges on a permanently broken cluster: faults arrive
+    /// faster than heals are drawn, and every later action is spent on a cluster that can no longer
+    /// do anything. The bound is what keeps a run moving through states rather than sitting in
+    /// one.</para>
+    /// </summary>
+    public int MaxFaultAgeInActions { get; init; } = 4;
+
+    /// <summary>Steps allowed for the healed cluster to converge before the run reports a failure.</summary>
+    public int RecoveryStepBudget { get; init; } = 900;
+
+    /// <summary>Weight of a client operation in the draw.</summary>
+    public int ClientWeight { get; init; } = 30;
+
+    /// <summary>Weight of letting time pass.</summary>
+    public int IdleWeight { get; init; } = 20;
+
+    /// <summary>Weight of a network fault.</summary>
+    public int NetworkFaultWeight { get; init; } = 12;
+
+    /// <summary>Weight of a storage fault.</summary>
+    public int StorageFaultWeight { get; init; } = 12;
+
+    /// <summary>Weight of a crash or a pause.</summary>
+    public int LifecycleFaultWeight { get; init; } = 12;
+
+    /// <summary>Weight of healing something that is currently broken.</summary>
+    public int HealWeight { get; init; } = 14;
+
+    /// <summary>
+    /// Where a failing run writes its plan. Null puts it beside the test binary, which is what a
+    /// continuous-integration job can collect.
+    /// </summary>
+    public string? ArtifactDirectory { get; init; }
+
+    /// <summary>Parameters recorded in the plan artifact and the replay-log header.</summary>
+    public IReadOnlyDictionary<string, string> ToParameters() =>
+        new Dictionary<string, string>
+        {
+            ["partitionId"] = PartitionId.ToString(),
+            ["actionCount"] = ActionCount.ToString(),
+            ["stepsPerAction"] = StepsPerAction.ToString(),
+            ["advanceMillisecondsPerStep"] = AdvanceMillisecondsPerStep.ToString(),
+            ["maxImpairedNodes"] = MaxImpairedNodes.ToString(),
+            ["maxFaultAgeInActions"] = MaxFaultAgeInActions.ToString(),
+            ["recoveryStepBudget"] = RecoveryStepBudget.ToString(),
+            ["clientWeight"] = ClientWeight.ToString(),
+            ["idleWeight"] = IdleWeight.ToString(),
+            ["networkFaultWeight"] = NetworkFaultWeight.ToString(),
+            ["storageFaultWeight"] = StorageFaultWeight.ToString(),
+            ["lifecycleFaultWeight"] = LifecycleFaultWeight.ToString(),
+            ["healWeight"] = HealWeight.ToString(),
+        };
+}

@@ -41,4 +41,11 @@
       <FrameworkReference Include="Microsoft.AspNetCore.App" />
     </ItemGroup>
 
+    <ItemGroup>
+      <!-- The random-search seed corpus is read at run time, so it must sit beside the binary. It
+           is data rather than code: a seed earns its line by finding something, and the reason is
+           written next to it. -->
+      <Content Include="Simulation\Scenarios\Random\seed-corpus.txt" Link="seed-corpus.txt" CopyToOutputDirectory="PreserveNewest" />
+    </ItemGroup>
+
 </Project>

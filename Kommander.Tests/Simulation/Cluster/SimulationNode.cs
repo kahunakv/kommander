@@ -326,8 +326,8 @@ public sealed class SimulationNode : IAsyncDisposable
     ///
     /// <para>The store survives, and that is the point of the whole exercise. Everything inside its
     /// fsync window is lost, so a run that wrote commit markers on the single-fsync fast path comes
-    /// back missing them. The endpoint is frozen so peers store their traffic instead of throwing
-    /// into a disposed manager.</para>
+    /// back missing them. Traffic addressed to the node is refused rather than stored, because a
+    /// dead process keeps nothing — see <see cref="Transport.SimulatedTransport.MarkDown"/>.</para>
     /// </summary>
     public void Crash()
     {
@@ -336,7 +336,12 @@ public sealed class SimulationNode : IAsyncDisposable
 
         LifecycleStatus = SimulationNodeLifecycleStatus.Crashed;
         CrashCount++;
+
+        // Frozen so nothing in flight can reach a disposed manager, and marked down so the traffic
+        // already stored for it dies with the process. A crash is not a deep pause: the socket goes
+        // with the process, and a restart must not read messages written to the life before it.
         transport.FreezeEndpoint(Endpoint);
+        transport.MarkDown(Endpoint);
 
         Manager.Dispose();
         SimulatedWal?.Crash();
@@ -361,6 +366,7 @@ public sealed class SimulationNode : IAsyncDisposable
 
         Manager = BuildManager(NodeIndex, options, clock, transport, logger, Wal);
         transport.ThawEndpoint(Endpoint);
+        transport.MarkUp(Endpoint);
     }
 
     /// <summary>

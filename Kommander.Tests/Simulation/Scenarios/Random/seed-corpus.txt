@@ -1,0 +1,15 @@
+# Seeds worth keeping.
+#
+# A seed earns a line here when it produced something the scripted scenarios did not: a failure, a
+# state nobody had written down, or a schedule that reached a part of the fault space the other
+# seeds miss. Add the reason beside it. A corpus of unexplained numbers is a corpus nobody dares
+# remove anything from.
+#
+# One seed per line. Blank lines and lines starting with '#' are ignored.
+
+20260901   # Crash and restart under a starved disk, with the outage costing the cluster an election.
+20260902   # A paused leader while a follower's writes are refused.
+20260903   # The schedule FINDING 1 first reproduced on, kept because that state was productive once.
+20260904   # A blocked link during a client workload, healed while the cluster is mid-election.
+7          # Small seeds explore a different corner of SplitMix64's output than large ones.
+999        # The seed on which FINDING 1 moved to a different victim node.

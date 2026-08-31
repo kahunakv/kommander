@@ -65,6 +65,9 @@ public sealed class SimulatedTransport : ICommunication
     /// <summary>Endpoints whose process is modelled as stopped. Messages to them queue and stay queued.</summary>
     private readonly HashSet<string> frozenEndpoints = [];
 
+    /// <summary>Endpoints whose process is modelled as dead. Messages to them are refused at once.</summary>
+    private readonly HashSet<string> downEndpoints = [];
+
     private long nextMessageId = 1;
     private long deliveredCount;
     private long droppedCount;
@@ -156,6 +159,50 @@ public sealed class SimulatedTransport : ICommunication
     {
         lock (gate)
             return frozenEndpoints.Contains(endpoint);
+    }
+
+    /// <summary>
+    /// Models the death of the process behind <paramref name="endpoint"/>: whatever was waiting for
+    /// it is lost, and nothing new is stored until it comes back. Returns how many stored messages
+    /// the death took.
+    ///
+    /// <para><b>Why a crash is not a deep pause.</b> A stopped process still owns its socket, so
+    /// its peers' traffic waits and arrives in one burst when it wakes. A dead process owns
+    /// nothing: the connection is reset, the sender learns at once, and the messages are gone. The
+    /// difference is not cosmetic. Storing traffic across a crash delivers pre-crash messages to a
+    /// manager built after it, carrying terms and indices from a life the new process never had —
+    /// something no real network does, and a failure the harness would then report as the
+    /// library's.</para>
+    ///
+    /// <para>Found by the random search on its first outing, which is the argument for the random
+    /// search in one sentence: the scripted scenarios all crash a node whose peers happen to have
+    /// nothing stored for it.</para>
+    /// </summary>
+    public int MarkDown(string endpoint)
+    {
+        lock (gate)
+        {
+            downEndpoints.Add(endpoint);
+
+            int lost = pending.RemoveAll(message => message.To == endpoint);
+            droppedCount += lost;
+
+            return lost;
+        }
+    }
+
+    /// <summary>Lets a restarted process receive again.</summary>
+    public void MarkUp(string endpoint)
+    {
+        lock (gate)
+            downEndpoints.Remove(endpoint);
+    }
+
+    /// <summary>True while the process behind <paramref name="endpoint"/> is modelled as dead.</summary>
+    public bool IsDown(string endpoint)
+    {
+        lock (gate)
+            return downEndpoints.Contains(endpoint);
     }
 
     /// <summary>Messages stored for <paramref name="endpoint"/> while it is frozen.</summary>
@@ -313,8 +360,57 @@ public sealed class SimulatedTransport : ICommunication
             () => inner.CompleteAppendLogs(manager, node, request),
             EmptyCompleteAppendLogs);
 
-    public Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request) =>
-        Intercept(manager, node, "BatchRequests", () => inner.BatchRequests(manager, node, request), EmptyBatchRequests);
+    /// <summary>
+    /// Batched consensus traffic, copied before it is intercepted.
+    ///
+    /// <para><b>The copy is required, not defensive.</b> <c>RaftTransportDispatcher</c> rents the
+    /// batch wrapper, its item list, and each item from a pool and returns them to it as soon as
+    /// the send completes — its own summary says the transport may reference them only until the
+    /// call finishes. This transport breaks that contract on purpose: a held message answers at
+    /// once and is actually sent later, and a duplicated one is sent again without anybody waiting.
+    /// By then the pooled objects belong to a different batch, and the receiver enumerating the
+    /// list sees it change underneath it.</para>
+    ///
+    /// <para>Only the containers are pooled, so the copy stops at the item: the requests an item
+    /// points at are ordinary objects with no second owner.</para>
+    ///
+    /// <para>Found by the random search on its first outing. It needed a message stored while a
+    /// node was paused and released in the burst after it woke — a delay long enough for the pool
+    /// to hand the same list to somebody else. No scripted scenario had held one that long.</para>
+    /// </summary>
+    public Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)
+    {
+        BatchRequestsRequest copy = Copy(request);
+
+        return Intercept(manager, node, "BatchRequests", () => inner.BatchRequests(manager, node, copy), EmptyBatchRequests);
+    }
+
+    /// <summary>Copies a batch far enough that the pool cannot take it back.</summary>
+    private static BatchRequestsRequest Copy(BatchRequestsRequest request)
+    {
+        if (request.Requests is null)
+            return new BatchRequestsRequest();
+
+        List<BatchRequestsRequestItem> items = new(request.Requests.Count);
+
+        foreach (BatchRequestsRequestItem item in request.Requests)
+        {
+            items.Add(new BatchRequestsRequestItem
+            {
+                Type = item.Type,
+                Handshake = item.Handshake,
+                Vote = item.Vote,
+                RequestVotes = item.RequestVotes,
+                StepDownNotice = item.StepDownNotice,
+                TransferLeadership = item.TransferLeadership,
+                AppendLogs = item.AppendLogs,
+                CompleteAppendLogs = item.CompleteAppendLogs,
+                TransferLeadershipSuggestion = item.TransferLeadershipSuggestion,
+            });
+        }
+
+        return new BatchRequestsRequest { Requests = items };
+    }
 
     // ── ICommunication: control-plane RPCs (always inline) ─────────────────
 
@@ -384,6 +480,14 @@ public sealed class SimulatedTransport : ICommunication
         // A blocked link drops before anything else. The caller still gets the transport's empty
         // response, which is what it would get from a real send into a black hole.
         if (fault.Blocked)
+        {
+            Interlocked.Increment(ref droppedCount);
+            return heldResponse;
+        }
+
+        // A dead process refuses before anything is stored for it. See MarkDown: storing traffic
+        // across a crash would hand a message written for one process to the one that replaced it.
+        if (IsDown(to))
         {
             Interlocked.Increment(ref droppedCount);
             return heldResponse;
