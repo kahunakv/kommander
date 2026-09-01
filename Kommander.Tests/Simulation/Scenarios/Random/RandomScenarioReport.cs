@@ -32,6 +32,14 @@ public sealed record RandomScenarioReport
     /// <summary>Per-step invariant checks the run performed.</summary>
     public required int InvariantChecks { get; init; }
 
+    /// <summary>
+    /// Entries compaction removed across every node.
+    ///
+    /// <para>Reported so a run can prove it exercised compaction rather than assume it. Zero here
+    /// means the two rules about compaction described nothing that happened.</para>
+    /// </summary>
+    public long EntriesCompacted { get; init; }
+
     /// <summary>Actions of one kind. Used by the tests that prove the vocabulary is reachable.</summary>
     public int CountOf(RandomScenarioActionKind kind) => Actions.Count(action => action.Kind == kind);
 
@@ -54,6 +62,7 @@ public sealed record RandomScenarioReport
         text.AppendLine($"stepsRun={StepsRun}");
         text.AppendLine($"finalCommitIndex={FinalCommitIndex}");
         text.AppendLine($"invariantChecks={InvariantChecks}");
+        text.AppendLine($"entriesCompacted={EntriesCompacted}");
         text.AppendLine($"appendsAcknowledged={History.AcknowledgedCount}");
         text.AppendLine($"appendsUnknown={History.UnknownCount}");
         text.AppendLine();

@@ -66,7 +66,24 @@ public static class ClientHistoryChecker
     /// ignored: a proposed entry is not yet a promise to anybody.
     /// </param>
     /// <param name="stepNumber">Step to name in a violation, for the failure report.</param>
-    public static void Check(ClientHistory history, IReadOnlyList<RaftLog> committed, int stepNumber)
+    /// <param name="compactedThrough">
+    /// Highest index compaction has removed from the reader's log, or -1 when nothing was compacted.
+    ///
+    /// <para><b>Why the checker has to be told.</b> Compaction deletes committed entries on purpose.
+    /// Without this, the presence rule reports every compacted acknowledgement as a lost write, and
+    /// it does so the first time a run ever compacts — which is exactly what happened when
+    /// checkpoints entered the fault vocabulary. The rule was not wrong before; it was only sound
+    /// because compaction never happened.</para>
+    ///
+    /// <para>The refusal rule is left alone. Compaction can hide a wrongly-refused write by removing
+    /// it, which costs the rule some power and never makes it raise a false alarm — the safe
+    /// direction of the two.</para>
+    /// </param>
+    public static void Check(
+        ClientHistory history,
+        IReadOnlyList<RaftLog> committed,
+        int stepNumber,
+        long compactedThrough = -1)
     {
         List<RaftLog> entries = committed
             .Where(entry => entry.Type is RaftLogType.Committed or RaftLogType.CommittedCheckpoint)
@@ -78,17 +95,22 @@ public static class ClientHistoryChecker
         // acknowledged entry is missing" names the symptom, and only the first tells the reader
         // where to look.
         CheckAcknowledgedUnique(history, entries, stepNumber);
-        CheckAcknowledgedPresent(history, entries, stepNumber);
+        CheckAcknowledgedPresent(history, entries, stepNumber, compactedThrough);
         CheckOrderRespectsRealTime(history, stepNumber);
         CheckRefusedAbsent(history, entries, stepNumber);
     }
 
     private static void CheckAcknowledgedPresent(
-        ClientHistory history, List<RaftLog> entries, int stepNumber)
+        ClientHistory history, List<RaftLog> entries, int stepNumber, long compactedThrough)
     {
         foreach (ClientOperation operation in history.Operations)
         {
             if (operation.Outcome != ClientOperationOutcome.Ok)
+                continue;
+
+            // Compaction removed it deliberately. Its absence says nothing about whether the write
+            // took effect, so the rule has nothing to check here.
+            if (operation.LogIndex <= compactedThrough)
                 continue;
 
             RaftLog? entry = entries.FirstOrDefault(candidate => candidate.Id == operation.LogIndex);

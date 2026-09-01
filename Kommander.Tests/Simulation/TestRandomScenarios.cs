@@ -74,6 +74,50 @@ public sealed class TestRandomScenarios
     }
 
     /// <summary>
+    /// A run that checkpoints really compacts.
+    ///
+    /// <para>Two invariants describe compaction: one says compaction is never asked to remove an
+    /// entry above the certified checkpoint, the other tolerates a compacted head when it looks for
+    /// a hole. Until a generated run actually compacted, both described something that never
+    /// happened, and a rule nothing exercises is decoration. This run weights the draw towards
+    /// client writes and checkpoints and then insists that entries really left the log.</para>
+    /// </summary>
+    [Fact]
+    [Trait("Category", "DSTSmoke")]
+    public async Task ARunThatCheckpoints_ReallyCompacts()
+    {
+        RandomScenarioOptions options = new()
+        {
+            ActionCount = 16,
+            StepsPerAction = 5,
+            ClientWeight = 30,
+            MaintenanceWeight = 30,
+            IdleWeight = 0,
+            OutageWeight = 0,
+            NetworkFaultWeight = 0,
+            StorageFaultWeight = 0,
+            LifecycleFaultWeight = 0,
+            HealWeight = 0,
+
+            // Low enough that a run of this length really compacts. The sweeping runs leave it at
+            // the production default; see RandomScenarioOptions.CompactEveryOperations for why.
+            CompactEveryOperations = 8,
+        };
+
+        RandomScenarioReport report = await RunSeedAsync(
+            20260907, options, TestContext.Current.CancellationToken);
+
+        Assert.True(
+            report.CountOf(RandomScenarioActionKind.Checkpoint) > 0,
+            "No checkpoint was drawn, so nothing could compact.");
+
+        Assert.True(
+            report.EntriesCompacted > 0,
+            $"The run wrote checkpoints and compacted nothing ({report.EntriesCompacted} entries). " +
+            "The compaction rules are describing something that does not happen.");
+    }
+
+    /// <summary>
     /// The nightly search. The corpus seeds always run; the sweep beside them moves with
     /// <see cref="RandomSeedCorpus.SeedBaseVariable"/>, and its length with
     /// <see cref="RandomSeedCorpus.SeedCountVariable"/>.
@@ -175,7 +219,17 @@ public sealed class TestRandomScenarios
         CancellationToken cancellationToken)
     {
         await using SimulationCluster cluster = await SimulationCluster.StartAsync(
-            new SimulationClusterOptions { NodeCount = 3, PartitionCount = 1, Seed = seed },
+            new SimulationClusterOptions
+            {
+                NodeCount = 3,
+                PartitionCount = 1,
+                Seed = seed,
+
+                // A generated run is a few dozen entries long. At the production compaction cadence
+                // no run would ever compact, and every rule about compaction would go unexercised.
+                ConfigureNode = configuration =>
+                    configuration.CompactEveryOperations = options.CompactEveryOperations,
+            },
             logger,
             cancellationToken);
 

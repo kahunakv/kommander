@@ -143,7 +143,16 @@ public static class ClusterInvariantSet
     }
 
     /// <summary>
-    /// Committed terms never decrease as the log index rises.
+    /// Committed terms never decrease as the log index rises, <b>within one node's own log</b>.
+    ///
+    /// <para><b>Why per node, and not over a record accumulated across the run.</b> Raft's guarantee
+    /// is about a single log at a single moment: read one node's committed entries in index order
+    /// and the terms never go backwards. A record merged from every node over a whole run is a
+    /// different object, and it goes stale — a row one node marked committed and the cluster later
+    /// replaced stays in that record forever, and the rule then compares a ghost against a live
+    /// entry. That produced an intermittent report which survived two runs of one seed and vanished
+    /// on the third, the signature of a check reading history rather than state. Checking per node
+    /// is also stronger: every node is held to the rule rather than one merged view.</para>
     ///
     /// <para>Raft assigns each entry the term of the leader that created it, and terms only ever
     /// rise. A committed log whose terms dip has an entry from an older term sitting above one
@@ -311,24 +320,29 @@ public static class ClusterInvariantSet
     /// </summary>
     public static void CheckCommittedTermsNonDecreasing(
         int stepNumber,
-        IReadOnlyDictionary<long, CommittedEntryFingerprint> recordedByIndex)
+        IReadOnlyList<NodeCommittedWindow> windows)
     {
-        CommittedEntryFingerprint? previous = null;
-
-        foreach (long index in recordedByIndex.Keys.OrderBy(key => key))
+        foreach (NodeCommittedWindow window in windows)
         {
-            CommittedEntryFingerprint current = recordedByIndex[index];
+            CommittedEntryFingerprint? previous = null;
 
-            if (previous is not null && current.Term < previous.Term)
+            foreach (long index in window.ByIndex.Keys.OrderBy(key => key))
             {
-                throw Violation(
-                    CommittedTermsNonDecreasing,
-                    stepNumber,
-                    $"Committed index {current.LogId} carries term {current.Term}, below index " +
-                    $"{previous.LogId} at term {previous.Term}. An older term sits above a newer one.");
-            }
+                CommittedEntryFingerprint current = window.ByIndex[index];
 
-            previous = current;
+                if (previous is not null && current.Term < previous.Term)
+                {
+                    throw Violation(
+                        CommittedTermsNonDecreasing,
+                        stepNumber,
+                        $"On '{window.Endpoint}', committed index {current.LogId} carries term " +
+                        $"{current.Term} (type '{current.LogType}') below index {previous.LogId} at " +
+                        $"term {previous.Term} (type '{previous.LogType}'). An older term sits above " +
+                        "a newer one in one node's own log.");
+                }
+
+                previous = current;
+            }
         }
     }
 

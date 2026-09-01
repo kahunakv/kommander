@@ -165,6 +165,7 @@ public sealed class RandomScenarioGenerator
         if (canStorage) Offer(options.StorageFaultWeight, 3);
         if (canLifecycle) Offer(options.LifecycleFaultWeight, 4);
         if (canHeal) Offer(options.HealWeight, 5);
+        if (observation.Running.Count > 0) Offer(options.MaintenanceWeight, 7);
 
         // An outage costs the cluster its leader for as long as it lasts, so it takes the same
         // budget a fault does. It needs a leader to cut off, and it heals inside its own action, so
@@ -197,8 +198,20 @@ public sealed class RandomScenarioGenerator
             3 => DrawStorage(index, observation),
             4 => DrawLifecycle(index, observation),
             5 => DrawHeal(index),
+            7 => DrawMaintenance(index, observation),
+            // Two thirds of the outages carry a client write into the disruption. That overlap is
+            // the only place a client can be told the wrong thing about its own operation, and the
+            // two write variants disrupt different halves of it: one takes the leader away for
+            // good, the other takes its quorum away and gives it back.
             6 => new RandomScenarioAction(
-                index, RandomScenarioActionKind.LeaderOutage, observation.Leader),
+                index,
+                random.NextInt("outage-kind", 0, 3) switch
+                {
+                    0 => RandomScenarioActionKind.AppendAcrossOutage,
+                    1 => RandomScenarioActionKind.AppendAcrossQuorumLoss,
+                    _ => RandomScenarioActionKind.LeaderOutage,
+                },
+                observation.Leader),
             _ => DrawIdle(index),
         };
     }
@@ -336,6 +349,35 @@ public sealed class RandomScenarioGenerator
             key: $"life/pause/{target}",
             heal: new RandomScenarioAction(index, RandomScenarioActionKind.ResumeNode, target),
             costsQuorum: true,
+            index);
+    }
+
+    /// <summary>
+    /// Draws a checkpoint or a retention hold.
+    ///
+    /// <para>The checkpoint carries no target: it is resolved to whoever leads when it runs, because
+    /// only a leader can write one. The hold is a fault with a repair, but it takes no quorum budget
+    /// — a node that keeps too much of its log still answers every request.</para>
+    /// </summary>
+    private RandomScenarioAction DrawMaintenance(int index, RandomScenarioObservation observation)
+    {
+        // A checkpoint is a full quorum write, so it is gated exactly like a client write: a leader
+        // whose own disk refuses writes cannot commit one, and the call then waits out the ten real
+        // seconds of the quorum timeout. Leaving this ungated made some runs take minutes.
+        bool leaderUsable = observation.Leader is not null
+                            && observation.Running.Contains(observation.Leader)
+                            && !HasStorageFaultOn(observation.Leader);
+
+        if (leaderUsable && random.NextInt("maintenance-kind", 0, 3) > 0)
+            return new RandomScenarioAction(index, RandomScenarioActionKind.Checkpoint, observation.Leader);
+
+        string target = PickRunning(observation, "retention-target");
+
+        return Start(
+            new RandomScenarioAction(index, RandomScenarioActionKind.HoldRetention, target),
+            key: $"retention/{target}",
+            heal: new RandomScenarioAction(index, RandomScenarioActionKind.ReleaseRetention, target),
+            costsQuorum: false,
             index);
     }
 

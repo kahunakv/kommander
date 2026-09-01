@@ -56,8 +56,11 @@ public sealed class ClusterInvariantRunner
         IReadOnlyList<RaftPartitionView> views =
             await cluster.GetPartitionViewsAsync(partitionId, cancellationToken).ConfigureAwait(false);
 
+        IReadOnlyDictionary<string, SimulatedWalPartitionSnapshot> stores =
+            CollectStores(cluster, partitionId);
+
         IReadOnlyList<ClusterInvariantSet.NodeCommittedWindow> windows =
-            CollectCommittedWindows(cluster, views, partitionId);
+            CollectCommittedWindows(cluster, views, partitionId, stores);
 
         ForgetCrashedNodes(cluster);
 
@@ -69,10 +72,7 @@ public sealed class ClusterInvariantRunner
             Flatten(windows),
             recordedByCommittedIndex);
 
-        ClusterInvariantSet.CheckCommittedTermsNonDecreasing(cluster.StepNumber, recordedByCommittedIndex);
-
-        IReadOnlyDictionary<string, SimulatedWalPartitionSnapshot> stores =
-            CollectStores(cluster, partitionId);
+        ClusterInvariantSet.CheckCommittedTermsNonDecreasing(cluster.StepNumber, windows);
 
         ClusterInvariantSet.CheckCommittedPrefixPresent(cluster.StepNumber, views, stores);
         ClusterInvariantSet.CheckCompactionFloorRespected(cluster.StepNumber, stores);
@@ -107,7 +107,7 @@ public sealed class ClusterInvariantRunner
         ClusterInvariantSet.CheckQuiescentConvergence(
             cluster.StepNumber,
             views,
-            CollectCommittedWindows(cluster, views, partitionId));
+            CollectCommittedWindows(cluster, views, partitionId, CollectStores(cluster, partitionId)));
     }
 
     /// <summary>
@@ -207,7 +207,8 @@ public sealed class ClusterInvariantRunner
     private static List<ClusterInvariantSet.NodeCommittedWindow> CollectCommittedWindows(
         SimulationCluster cluster,
         IReadOnlyList<RaftPartitionView> views,
-        int partitionId)
+        int partitionId,
+        IReadOnlyDictionary<string, SimulatedWalPartitionSnapshot> stores)
     {
         List<ClusterInvariantSet.NodeCommittedWindow> windows = [];
 
@@ -222,7 +223,20 @@ public sealed class ClusterInvariantRunner
             if (node is null)
                 continue;
 
-            long from = Math.Max(1, view.CommitIndex - CommittedWindow + 1);
+            // The window must start above whatever this node compacted away, not at whatever the
+            // read asked for. Compaction removes committed entries on purpose, and a window that
+            // claims to cover an index the node deliberately discarded turns every compacted prefix
+            // into a reported hole — which is exactly what the leader-completeness rule did the
+            // first time a generated run ever compacted. The rule was never wrong before; it was
+            // only sound because nothing compacted.
+            long compactedThrough = stores.TryGetValue(view.Endpoint, out SimulatedWalPartitionSnapshot? store)
+                ? store.CompactedThrough
+                : -1;
+
+            long from = Math.Max(Math.Max(1, view.CommitIndex - CommittedWindow + 1), compactedThrough + 1);
+
+            if (from > view.CommitIndex)
+                continue;
             Dictionary<long, CommittedEntryFingerprint> byIndex = [];
 
             foreach (RaftLog log in node.Wal.ReadLogsRange(partitionId, from, CommittedWindow))

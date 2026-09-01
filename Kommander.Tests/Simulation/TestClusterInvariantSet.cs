@@ -147,14 +147,18 @@ public sealed class TestClusterInvariantSet
     [Fact]
     public void CommittedTermsNonDecreasing_FiresWhenAnOlderTermSitsAbove()
     {
-        Dictionary<long, CommittedEntryFingerprint> recorded = new()
-        {
-            [1] = Fingerprint("node1", index: 1, term: 3, payload: "a"),
-            [2] = Fingerprint("node1", index: 2, term: 2, payload: "b"),
-        };
+        ClusterInvariantSet.NodeCommittedWindow window = new(
+            "node1",
+            1,
+            2,
+            new Dictionary<long, CommittedEntryFingerprint>
+            {
+                [1] = Fingerprint("node1", index: 1, term: 3, payload: "a"),
+                [2] = Fingerprint("node1", index: 2, term: 2, payload: "b"),
+            });
 
         InvariantViolationException error = Assert.Throws<InvariantViolationException>(
-            () => ClusterInvariantSet.CheckCommittedTermsNonDecreasing(stepNumber: 4, recorded));
+            () => ClusterInvariantSet.CheckCommittedTermsNonDecreasing(stepNumber: 4, [window]));
 
         Assert.Equal(ClusterInvariantSet.CommittedTermsNonDecreasing, error.InvariantName);
     }
@@ -162,14 +166,18 @@ public sealed class TestClusterInvariantSet
     [Fact]
     public void CommittedTermsNonDecreasing_AllowsARepeatedOrRisingTerm()
     {
-        Dictionary<long, CommittedEntryFingerprint> recorded = new()
-        {
-            [1] = Fingerprint("node1", index: 1, term: 2, payload: "a"),
-            [2] = Fingerprint("node1", index: 2, term: 2, payload: "b"),
-            [3] = Fingerprint("node1", index: 3, term: 5, payload: "c"),
-        };
+        ClusterInvariantSet.NodeCommittedWindow window = new(
+            "node1",
+            1,
+            3,
+            new Dictionary<long, CommittedEntryFingerprint>
+            {
+                [1] = Fingerprint("node1", index: 1, term: 2, payload: "a"),
+                [2] = Fingerprint("node1", index: 2, term: 2, payload: "b"),
+                [3] = Fingerprint("node1", index: 3, term: 5, payload: "c"),
+            });
 
-        ClusterInvariantSet.CheckCommittedTermsNonDecreasing(stepNumber: 4, recorded);
+        ClusterInvariantSet.CheckCommittedTermsNonDecreasing(stepNumber: 4, [window]);
     }
 
     // ── Leader completeness ───────────────────────────────────────────────

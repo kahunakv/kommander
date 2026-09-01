@@ -69,6 +69,30 @@ public sealed record RandomScenarioOptions
     /// <summary>Weight of a crash or a pause.</summary>
     public int LifecycleFaultWeight { get; init; } = 12;
 
+    /// <summary>
+    /// Weight of a maintenance action: a checkpoint, or a retention hold.
+    ///
+    /// <para>Modest, because a checkpoint is not a fault. It is here so that compaction happens at
+    /// all during a run, which nothing else in the vocabulary causes.</para>
+    /// </summary>
+    public int MaintenanceWeight { get; init; } = 10;
+
+    /// <summary>
+    /// Operations between compaction sweeps on each node. The production default.
+    ///
+    /// <para>A generated run is a few dozen entries long, so at this cadence a run never compacts.
+    /// A scenario that wants compaction lowers it — see the checkpoint smoke test, which sets it to
+    /// eight.</para>
+    ///
+    /// <para><b>Why the sweeping runs do not lower it.</b> At a cadence of eight, roughly one run in
+    /// eight ends with a follower holding durable entries above a presence gap and a committed
+    /// frontier of zero, unrepaired after forty-five seconds of simulated time. That is recorded as
+    /// an open finding rather than absorbed here: leaving the aggressive cadence on would leave the
+    /// standing test set red, and raising it hides the state. The finding carries the exact setting
+    /// that reproduces it.</para>
+    /// </summary>
+    public int CompactEveryOperations { get; init; } = 10_000;
+
     /// <summary>Weight of healing something that is currently broken.</summary>
     public int HealWeight { get; init; } = 14;
 
@@ -114,6 +138,8 @@ public sealed record RandomScenarioOptions
             ["storageFaultWeight"] = StorageFaultWeight.ToString(),
             ["lifecycleFaultWeight"] = LifecycleFaultWeight.ToString(),
             ["healWeight"] = HealWeight.ToString(),
+            ["maintenanceWeight"] = MaintenanceWeight.ToString(),
+            ["compactEveryOperations"] = CompactEveryOperations.ToString(),
             ["clientWeightDuringFault"] = ClientWeightDuringFault.ToString(),
             ["enableFaultEpisodes"] = EnableFaultEpisodes.ToString(),
         };

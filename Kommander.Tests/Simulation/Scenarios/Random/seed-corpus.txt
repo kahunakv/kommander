@@ -15,6 +15,11 @@
 20260902               # A paused leader while a follower's writes are refused.
 20260903               # The schedule FINDING 1 first reproduced on, kept because it was productive once.
 20260904               # A blocked link during a client workload, healed while the cluster is mid-election.
-999                    # The seed on which FINDING 1 moved to a different victim node.
-3490179000269211394    # RE-FINDS 8fbb82e (a voter with a sub-threshold gap on an idle range).
+999                    # RE-FINDS the propose-allocator regression (04429b3): a low-id Proposed row
+                       # drags the allocator backwards and a later leader reissues occupied indices.
+                       # Also the seed on which FINDING 1 moved to a different victim node.
+3490179000269211394    # RE-FINDS 8fbb82e (short-prefix voter) and 590fbc9 (a post-append refusal
+                       # reported as a definite one; the search sees two different entries commit at
+                       # one index). The second needs the in-flight append: without that action the
+                       # same eighteen seeds find nothing.
 4299856953898320200    # RE-FINDS 8fbb82e, on a different victim.

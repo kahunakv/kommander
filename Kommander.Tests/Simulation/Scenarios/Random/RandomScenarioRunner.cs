@@ -4,6 +4,7 @@ using Kommander.Tests.Simulation.History;
 using Kommander.Tests.Simulation.Invariants;
 using Kommander.Tests.Simulation.Random;
 using Kommander.Tests.Simulation.Replay;
+using Kommander.Tests.Simulation.WAL;
 
 namespace Kommander.Tests.Simulation.Scenarios.Random;
 
@@ -81,6 +82,7 @@ public sealed class RandomScenarioRunner
             History = history,
             FinalCommitIndex = -1,
             InvariantChecks = invariants.ChecksRun,
+            EntriesCompacted = EntriesCompacted(),
         };
 
     /// <summary>
@@ -163,8 +165,13 @@ public sealed class RandomScenarioRunner
             History = history,
             FinalCommitIndex = finalCommitIndex,
             InvariantChecks = invariants.ChecksRun,
+            EntriesCompacted = EntriesCompacted(),
         };
     }
+
+    /// <summary>Entries compaction removed across every node's store.</summary>
+    private long EntriesCompacted() =>
+        cluster.GetWalSnapshots().Values.Sum(snapshot => snapshot.Counters.EntriesCompacted);
 
     /// <summary>
     /// Writes the entropy the plan consumed as a replay log, in the same format the model-layer
@@ -257,19 +264,50 @@ public sealed class RandomScenarioRunner
             options.AdvanceMillisecondsPerStep,
             cancellationToken).ConfigureAwait(false);
 
-        Assert.True(
-            converged,
-            $"The healed cluster did not converge within {options.RecoveryStepBudget} steps.");
+        if (!converged)
+        {
+            // The state, not just the step count. A convergence failure has several very different
+            // causes — a node short of the leader, a node holding entries nobody else has, a node
+            // stranded below a compaction floor with no snapshot — and the frontiers plus the
+            // retained ranges separate them at a glance.
+            IReadOnlyList<RaftPartitionView> finalViews = await cluster
+                .GetPartitionViewsAsync(options.PartitionId, cancellationToken)
+                .ConfigureAwait(false);
+
+            List<string> lines = [];
+
+            foreach (RaftPartitionView view in finalViews)
+            {
+                SimulatedWalPartitionSnapshot? store = cluster.Nodes
+                    .FirstOrDefault(node => node.Endpoint == view.Endpoint)?
+                    .SimulatedWal?.Snapshot().Partition(options.PartitionId);
+
+                lines.Add(
+                    $"{view.Endpoint} role={view.Role} term={view.Term} commit={view.CommitIndex} " +
+                    $"maxLog={store?.MaxLogId} first={store?.FirstLogId} " +
+                    $"compactedThrough={store?.CompactedThrough} missing=[{string.Join(",", store?.MissingIds ?? [])}]");
+            }
+
+            Assert.Fail(
+                $"The healed cluster did not converge within {options.RecoveryStepBudget} steps. " +
+                $"Final state: {string.Join(" | ", lines)}");
+        }
 
         await invariants.CheckConvergedAsync(cluster, options.PartitionId, cancellationToken)
             .ConfigureAwait(false);
 
         SimulationNode reader = cluster.Nodes.First(node => node.HasLiveManager);
 
+        // The reader's own compaction floor, not the cluster's. What this node threw away is what
+        // its log cannot answer for, and the history is read against this node.
+        long compactedThrough = reader.SimulatedWal?.Snapshot()
+            .Partition(options.PartitionId)?.CompactedThrough ?? -1;
+
         ClientHistoryChecker.Check(
             history,
             reader.Wal.ReadLogsRange(options.PartitionId, 0),
-            cluster.StepNumber);
+            cluster.StepNumber,
+            compactedThrough);
     }
 
     /// <summary>Steps a healed cluster is given to converge before anybody writes to it.</summary>
@@ -378,6 +416,18 @@ public sealed class RandomScenarioRunner
             return resolved;
         }
 
+        if (resolved.Kind == RandomScenarioActionKind.AppendAcrossOutage && resolved.Target is not null)
+        {
+            await RunAppendAcrossOutageAsync(resolved.Target, cancellationToken).ConfigureAwait(false);
+            return resolved;
+        }
+
+        if (resolved.Kind == RandomScenarioActionKind.AppendAcrossQuorumLoss && resolved.Target is not null)
+        {
+            await RunAppendAcrossQuorumLossAsync(resolved.Target, cancellationToken).ConfigureAwait(false);
+            return resolved;
+        }
+
         bool deliver = await ApplyAsync(resolved, cancellationToken).ConfigureAwait(false);
 
         await RunStepsAsync(options.StepsPerAction, deliver, cancellationToken).ConfigureAwait(false);
@@ -403,7 +453,10 @@ public sealed class RandomScenarioRunner
 
         if (action.Kind is not (RandomScenarioActionKind.AppendAtLeader
             or RandomScenarioActionKind.AppendAtFollower
-            or RandomScenarioActionKind.LeaderOutage))
+            or RandomScenarioActionKind.LeaderOutage
+            or RandomScenarioActionKind.AppendAcrossOutage
+            or RandomScenarioActionKind.AppendAcrossQuorumLoss
+            or RandomScenarioActionKind.Checkpoint))
         {
             return action;
         }
@@ -415,7 +468,10 @@ public sealed class RandomScenarioRunner
 
         // An outage with nobody to cut off is not an outage. It becomes an idle action rather than
         // a silent skip, so the plan still accounts for the step.
-        if (action.Kind == RandomScenarioActionKind.LeaderOutage)
+        if (action.Kind is RandomScenarioActionKind.LeaderOutage
+            or RandomScenarioActionKind.AppendAcrossOutage
+            or RandomScenarioActionKind.AppendAcrossQuorumLoss
+            or RandomScenarioActionKind.Checkpoint)
             return new RandomScenarioAction(action.Index, RandomScenarioActionKind.Idle);
 
         return observation.Running.Count > 0
@@ -565,9 +621,173 @@ public sealed class RandomScenarioRunner
                 Store(action.Target!).WriteLatencyMilliseconds = 0;
                 return true;
 
+            case RandomScenarioActionKind.Checkpoint:
+            {
+                // Only a leader can write one, and leadership may have moved since the draw. A
+                // checkpoint nobody can write is not an error: the run simply had no leader at that
+                // moment, which is a state the plan is entitled to reach.
+                SimulationNode node = Node(action.Target!);
+
+                if (node.LifecycleStatus == SimulationNodeLifecycleStatus.Running)
+                {
+                    // Started, then driven, rather than simply awaited. A checkpoint needs a quorum
+                    // like any other write, and a quorum needs the cluster to keep running — a
+                    // plain await would stop the harness stepping and leave the call to time out on
+                    // the wall clock instead of committing.
+                    Task<RaftReplicationResult> checkpoint =
+                        node.Manager.ReplicateCheckpoint(options.PartitionId, cancellationToken);
+
+                    await cluster.RunUntilAsync(
+                        () => Task.FromResult(checkpoint.IsCompleted),
+                        options.StepsPerAction * OutageElectionBudgetFactor,
+                        options.AdvanceMillisecondsPerStep,
+                        cancellationToken).ConfigureAwait(false);
+
+                    await checkpoint.ConfigureAwait(false);
+                }
+
+                return true;
+            }
+
+            case RandomScenarioActionKind.HoldRetention:
+                // Index 1 pins the whole log. A hold further up would be a weaker version of the
+                // same idea and would need the run to know where the frontier is.
+                Store(action.Target!).SetRetentionHold(options.PartitionId, 1);
+                return true;
+
+            case RandomScenarioActionKind.ReleaseRetention:
+                Store(action.Target!).ClearRetentionHold(options.PartitionId);
+                return true;
+
             default:
                 return true;
         }
+    }
+
+    /// <summary>
+    /// Starts a client append, cuts the leader off underneath it, and waits for whatever answer the
+    /// client is finally given.
+    ///
+    /// <para><b>Why this is worth its complexity.</b> Every other action in the vocabulary happens
+    /// between client operations, so the client is never mid-call when the cluster changes shape. A
+    /// client that is never mid-call cannot be misinformed about its own write, and the answers
+    /// that go wrong are decided exactly when a proposal outlives the leader that accepted it: the
+    /// entry is already appended, the leader can no longer speak for it, and the next leader may
+    /// still commit it. Whether the client is told "refused" or "unknown" there is the difference
+    /// between a correct history and a phantom write.</para>
+    ///
+    /// <para>The append is started and not awaited while the cluster is driven, because the
+    /// proposal runs on the library's own threads and the harness must keep stepping for the
+    /// election to happen at all. It is awaited before the action ends, so only one client
+    /// operation is ever in flight and the history's ordering stays single-threaded.</para>
+    ///
+    /// <para>The answer is recorded whatever it is. A refusal, an acknowledgement, and a timeout
+    /// are all legal here; the history checker decides which of them the log then contradicts.</para>
+    /// </summary>
+    private async Task RunAppendAcrossOutageAsync(string endpoint, CancellationToken cancellationToken)
+    {
+        Task<ClientOperation> append = history.AppendUniqueAsync(
+            cluster, Node(endpoint), options.PartitionId, "Greeting", cancellationToken);
+
+        cluster.Transport.PartitionNode(endpoint);
+
+        try
+        {
+            await cluster.RunUntilAsync(
+                async () =>
+                {
+                    await invariants.CheckAsync(cluster, options.PartitionId, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    IReadOnlyList<RaftPartitionView> views = await cluster
+                        .GetPartitionViewsAsync(options.PartitionId, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    return views.Any(view =>
+                        view.Role == RaftNodeState.Leader
+                        && !string.Equals(view.Endpoint, endpoint, StringComparison.Ordinal));
+                },
+                options.StepsPerAction * OutageElectionBudgetFactor,
+                options.AdvanceMillisecondsPerStep,
+                cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            cluster.Transport.HealPartition(endpoint);
+        }
+
+        // The cut leader learns of the new term once it is reachable again, and that is what
+        // resolves a proposal it can no longer finish. Stepping is what delivers that news.
+        await cluster.RunUntilAsync(
+            () => Task.FromResult(append.IsCompleted),
+            options.StepsPerAction * OutageElectionBudgetFactor,
+            options.AdvanceMillisecondsPerStep,
+            cancellationToken).ConfigureAwait(false);
+
+        await append.ConfigureAwait(false);
+
+        await RunStepsAsync(OutageRecoverySteps, deliver: true, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Steps a leader spends without a quorum. Short enough that it usually keeps its term.</summary>
+    private const int QuorumLossSteps = 2;
+
+    /// <summary>
+    /// Starts a client append, takes the leader's quorum away underneath it, and gives it back
+    /// before an election can replace the leader.
+    ///
+    /// <para><b>What this reaches that nothing else does.</b> The followers receive the entries and
+    /// the leader hears nothing back, so it still owes the client an answer for entries that are, in
+    /// fact, already replicated. Whether those entries resolve
+    /// depends on the leader retrying replication of its own accord — Raft's own requirement, and
+    /// the thing a partition wedges without. Every other action either leaves the quorum intact, so
+    /// the proposal resolves at once, or removes the leader, so the next one inherits the
+    /// problem.</para>
+    ///
+    /// <para><b>Why the window is measured in a couple of steps.</b> A leader with no quorum waits
+    /// ten <b>real</b> seconds inside its quorum wait. The window has to be shorter than the
+    /// election timeout to keep the leader, and far shorter than that wait to keep the run cheap;
+    /// two steps of simulated time is both.</para>
+    ///
+    /// <para>The links are restored in a <c>finally</c>, so a failure inside the window cannot leave
+    /// a partitioned cluster for the teardown to time out on.</para>
+    /// </summary>
+    private async Task RunAppendAcrossQuorumLossAsync(string endpoint, CancellationToken cancellationToken)
+    {
+        Task<ClientOperation> append = history.AppendUniqueAsync(
+            cluster, Node(endpoint), options.PartitionId, "Greeting", cancellationToken);
+
+        // The acknowledgement direction only. Cutting both directions would drop the entries too,
+        // and ordinary replication then simply sends them again — the leader never has to remember
+        // anything. Dropping only the replies leaves every follower holding the data and the leader
+        // believing nobody took it, which is the state an unresolved proposal wedges in.
+        List<string> peers = cluster.Nodes
+            .Select(node => node.Endpoint)
+            .Where(peer => !string.Equals(peer, endpoint, StringComparison.Ordinal))
+            .ToList();
+
+        foreach (string peer in peers)
+            cluster.Transport.BlockLink(peer, endpoint);
+
+        try
+        {
+            await RunStepsAsync(QuorumLossSteps, deliver: true, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            foreach (string peer in peers)
+                cluster.Transport.UnblockLink(peer, endpoint);
+        }
+
+        await cluster.RunUntilAsync(
+            () => Task.FromResult(append.IsCompleted),
+            options.StepsPerAction * OutageElectionBudgetFactor,
+            options.AdvanceMillisecondsPerStep,
+            cancellationToken).ConfigureAwait(false);
+
+        await append.ConfigureAwait(false);
+
+        await RunStepsAsync(OutageRecoverySteps, deliver: true, cancellationToken).ConfigureAwait(false);
     }
 
     // ── Observing and stepping ────────────────────────────────────────────
