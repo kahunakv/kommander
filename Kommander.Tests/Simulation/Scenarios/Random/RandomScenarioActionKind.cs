@@ -19,8 +19,22 @@ public enum RandomScenarioActionKind
     /// <summary>Let simulated time pass with the network working.</summary>
     Idle,
 
-    /// <summary>Let simulated time pass with nothing delivered. This is the shape that expires an election timeout.</summary>
-    Quiet,
+    /// <summary>
+    /// Cut the leader off in both directions until the rest of the cluster elects another one, then
+    /// let it back.
+    ///
+    /// <para>This is how a run reaches an election deliberately, and it is the action that matters
+    /// most. Several of this project's defects need a leader elected <b>after</b> the damage was
+    /// done: a leader that committed the entries itself repairs a follower through a path a
+    /// post-outage leader does not have, so a search that never changes leadership under fault
+    /// cannot reach them.</para>
+    ///
+    /// <para>The leader alone, rather than the whole wire. Holding every link produces the same
+    /// election and an unbounded backlog with it: nothing can complete, the senders keep sending,
+    /// and releasing the pile costs minutes of real time per run. Measured at six minutes for one
+    /// twelve-action plan before this became a targeted cut.</para>
+    /// </summary>
+    LeaderOutage,
 
     /// <summary>Append through the node that believes it leads.</summary>
     AppendAtLeader,

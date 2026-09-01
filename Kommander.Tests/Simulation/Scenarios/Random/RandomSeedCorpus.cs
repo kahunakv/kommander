@@ -33,7 +33,7 @@ public static class RandomSeedCorpus
 
     /// <summary>The corpus as compiled in, used when the file cannot be read.</summary>
     public static IReadOnlyList<ulong> Builtin { get; } =
-        [20260901, 20260902, 20260903, 20260904, 7, 999];
+        [7, 20260901, 20260902, 20260903, 20260904, 999, 3490179000269211394, 4299856953898320200];
 
     /// <summary>
     /// Reads the corpus file beside the test binary, falling back to <see cref="Builtin"/>.

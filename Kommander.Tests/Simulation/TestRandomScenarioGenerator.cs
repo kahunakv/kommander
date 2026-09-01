@@ -89,12 +89,16 @@ public sealed class TestRandomScenarioGenerator
         {
             ClientWeight = 0,
             IdleWeight = 0,
+            OutageWeight = 0,
             NetworkFaultWeight = 0,
             StorageFaultWeight = 0,
             HealWeight = 0,
             LifecycleFaultWeight = 1,
             MaxImpairedNodes = 1,
             MaxFaultAgeInActions = 4,
+
+            // Episodes would fill the gap the bound is being measured across.
+            EnableFaultEpisodes = false,
         };
 
         RandomScenarioGenerator generator = new(new SimulationRandom(seed: 11), options);
@@ -182,6 +186,7 @@ public sealed class TestRandomScenarioGenerator
         {
             ClientWeight = 2,
             IdleWeight = 0,
+            OutageWeight = 0,
             NetworkFaultWeight = 0,
             StorageFaultWeight = 2,
             LifecycleFaultWeight = 0,
@@ -231,6 +236,7 @@ public sealed class TestRandomScenarioGenerator
         {
             ClientWeight = 1,
             IdleWeight = 0,
+            OutageWeight = 0,
             NetworkFaultWeight = 0,
             StorageFaultWeight = 0,
             LifecycleFaultWeight = 0,
@@ -259,6 +265,7 @@ public sealed class TestRandomScenarioGenerator
         {
             ClientWeight = 0,
             IdleWeight = 0,
+            OutageWeight = 0,
             NetworkFaultWeight = 1,
             StorageFaultWeight = 0,
             LifecycleFaultWeight = 0,
@@ -305,6 +312,94 @@ public sealed class TestRandomScenarioGenerator
             // in the vocabulary must appear in a plan this long.
             Assert.Contains(kind, seen);
         }
+    }
+
+    /// <summary>
+    /// A fault pulls its own life in behind it: use it, repair it, change leadership, use it again.
+    ///
+    /// <para>The order is the whole value. Several known defects need a leader elected after the
+    /// damage and a write after that leader takes over, and a uniform draw reaches that five-step
+    /// order almost never — measured, not assumed: thirty seeds of independent draws failed to
+    /// re-find a defect that a scripted scenario finds every time.</para>
+    ///
+    /// <para>The targets are left open on purpose. An episode is decided before its steps run, so
+    /// the leader it means is the one in place by then; the runner fills them in and records what
+    /// it used.</para>
+    /// </summary>
+    [Fact]
+    public void AFault_PullsItsOwnEpisodeInBehindIt()
+    {
+        RandomScenarioOptions options = new()
+        {
+            ClientWeight = 0,
+            IdleWeight = 0,
+            OutageWeight = 0,
+            NetworkFaultWeight = 0,
+            LifecycleFaultWeight = 0,
+            HealWeight = 0,
+            StorageFaultWeight = 1,
+            MaxFaultAgeInActions = 10,
+            EnableFaultEpisodes = true,
+        };
+
+        RandomScenarioGenerator generator = new(new SimulationRandom(seed: 20260905), options);
+
+        List<RandomScenarioAction> plan = [];
+
+        for (int index = 0; index < 40; index++)
+            plan.Add(generator.Next(Observation()));
+
+        int start = plan.FindIndex(action => action.Kind == RandomScenarioActionKind.StarveDisk);
+
+        Assert.True(start >= 0, "No starved disk was drawn, so no episode could follow one.");
+
+        // The transient write-failure fault has no repair of its own, so it starts no episode. Find
+        // the first fault whose next action is a client write: that is one that did.
+        while (start >= 0 && plan[start + 1].Kind != RandomScenarioActionKind.AppendAtLeader)
+            start = plan.FindIndex(start + 1, action => action.Kind == RandomScenarioActionKind.StarveDisk);
+
+        Assert.True(start >= 0, "No storage fault started an episode.");
+
+        Assert.Equal(RandomScenarioActionKind.AppendAtLeader, plan[start + 1].Kind);
+        Assert.Equal(RandomScenarioActionKind.FreeDisk, plan[start + 2].Kind);
+        Assert.Equal(plan[start].Target, plan[start + 2].Target);
+        Assert.Equal(RandomScenarioActionKind.LeaderOutage, plan[start + 3].Kind);
+        Assert.Equal(RandomScenarioActionKind.AppendAtLeader, plan[start + 4].Kind);
+    }
+
+    /// <summary>
+    /// An episode's repair clears the fault, so the age bound never repairs it a second time. A
+    /// second repair would arrive after the run had already moved on, and the plan would record a
+    /// heal for something that was no longer broken.
+    /// </summary>
+    [Fact]
+    public void AnEpisodeRepair_ClearsTheFault()
+    {
+        RandomScenarioOptions options = new()
+        {
+            ClientWeight = 0,
+            IdleWeight = 0,
+            OutageWeight = 0,
+            NetworkFaultWeight = 0,
+            LifecycleFaultWeight = 0,
+            HealWeight = 0,
+            StorageFaultWeight = 1,
+            MaxFaultAgeInActions = 3,
+            EnableFaultEpisodes = true,
+        };
+
+        RandomScenarioGenerator generator = new(new SimulationRandom(seed: 20260906), options);
+
+        List<RandomScenarioAction> plan = [];
+
+        for (int index = 0; index < 60; index++)
+            plan.Add(generator.Next(Observation()));
+
+        int starves = plan.Count(action => action.Kind == RandomScenarioActionKind.StarveDisk);
+        int frees = plan.Count(action => action.Kind == RandomScenarioActionKind.FreeDisk);
+
+        Assert.True(starves > 0, "No storage fault was drawn.");
+        Assert.True(frees <= starves, $"{frees} repairs for {starves} faults: one was repaired twice.");
     }
 
     // ── The plan as an artifact ───────────────────────────────────────────

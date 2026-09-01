@@ -129,12 +129,10 @@ public sealed class RandomScenarioRunner
                 random.SetContext(cluster.StepNumber, cluster.Clock.LogicalMilliseconds);
 
                 RandomScenarioAction action = generator.Next(observation);
-                actions.Add(action);
 
-                bool deliver = await ApplyAsync(action, cancellationToken).ConfigureAwait(false);
-
-                await RunStepsAsync(options.StepsPerAction, deliver, cancellationToken)
-                    .ConfigureAwait(false);
+                // The plan records what ran, not what was asked for. An episode's actions carry no
+                // target until they run, and a plan that kept the blank would replay somewhere else.
+                actions.Add(await PerformAsync(action, cancellationToken).ConfigureAwait(false));
             }
 
             // A drawn plan may still hold faults the age bound never reached. A recorded plan
@@ -148,14 +146,7 @@ public sealed class RandomScenarioRunner
         else
         {
             foreach (RandomScenarioAction action in plan)
-            {
-                actions.Add(action);
-
-                bool deliver = await ApplyAsync(action, cancellationToken).ConfigureAwait(false);
-
-                await RunStepsAsync(options.StepsPerAction, deliver, cancellationToken)
-                    .ConfigureAwait(false);
-            }
+                actions.Add(await PerformAsync(action, cancellationToken).ConfigureAwait(false));
         }
 
         await HealEverythingAsync(cancellationToken).ConfigureAwait(false);
@@ -235,6 +226,8 @@ public sealed class RandomScenarioRunner
     /// </summary>
     private async Task RecoverAsync(CancellationToken cancellationToken)
     {
+        await CheckIdleConvergenceAsync(cancellationToken).ConfigureAwait(false);
+
         SimulationNode? leader = await ElectAsync(cancellationToken).ConfigureAwait(false);
 
         if (leader is not null)
@@ -279,7 +272,206 @@ public sealed class RandomScenarioRunner
             cluster.StepNumber);
     }
 
+    /// <summary>Steps a healed cluster is given to converge before anybody writes to it.</summary>
+    private const int IdleConvergenceStepBudget = 300;
+
+    /// <summary>
+    /// A healed cluster converges on its own, without a client writing to it first.
+    ///
+    /// <para><b>Why this runs before the recovery write, and why it exists at all.</b> The recovery
+    /// write repairs a follower that is short of the leader, so a check placed only after it can
+    /// never see a follower that would have stayed short forever. That is not a hypothetical: a
+    /// validation run over a reintroduced defect (`32348e83`, a voter with a sub-threshold gap on an
+    /// idle range) passed every seed, because this runner healed the very state it was looking
+    /// for.</para>
+    ///
+    /// <para><b>Why nodes at frontier zero are exempt, and why that is not a loophole.</b> A leader
+    /// deliberately does not push merely-restored state at a voter that has never reported holding
+    /// any of this log — the confinement that protects the highest-write-ahead-log election
+    /// preference. Such a voter waits for the next live write by design, so failing it here would
+    /// report documented behaviour as a defect. A voter that <i>has</i> reported a committed prefix
+    /// makes no such claim on the floor, and it must converge without help.</para>
+    /// </summary>
+    private async Task CheckIdleConvergenceAsync(CancellationToken cancellationToken)
+    {
+        bool converged = await cluster.RunUntilAsync(
+            async () =>
+            {
+                await invariants.CheckAsync(cluster, options.PartitionId, cancellationToken)
+                    .ConfigureAwait(false);
+
+                return await IdleFrontiersAgreeAsync(cancellationToken).ConfigureAwait(false);
+            },
+            IdleConvergenceStepBudget,
+            options.AdvanceMillisecondsPerStep,
+            cancellationToken).ConfigureAwait(false);
+
+        if (converged)
+            return;
+
+        IReadOnlyList<RaftPartitionView> views = await cluster
+            .GetPartitionViewsAsync(options.PartitionId, cancellationToken)
+            .ConfigureAwait(false);
+
+        string state = string.Join(
+            ", ", views.Select(view => $"{view.Endpoint}={view.CommitIndex}"));
+
+        Assert.Fail(
+            $"idle-convergence: the healed cluster did not converge in {IdleConvergenceStepBudget} " +
+            $"steps without a client write. Frontiers: {state}. A node that reported a committed " +
+            "prefix must be caught up by the heartbeat path alone.");
+    }
+
+    /// <summary>
+    /// True when every live node that reported holding part of this log agrees on how much of it is
+    /// committed.
+    /// </summary>
+    private async Task<bool> IdleFrontiersAgreeAsync(CancellationToken cancellationToken)
+    {
+        IReadOnlyList<RaftPartitionView> views = await cluster
+            .GetPartitionViewsAsync(options.PartitionId, cancellationToken)
+            .ConfigureAwait(false);
+
+        int live = cluster.Nodes.Count(node => node.HasLiveManager);
+
+        if (views.Count != live || views.Count == 0)
+            return false;
+
+        List<long> frontiers = views
+            .Select(view => view.CommitIndex)
+            .Where(index => index >= 1)
+            .ToList();
+
+        // Nothing committed anywhere: a run whose every append was refused has nothing to converge
+        // on, and waiting out the budget for it would only slow the run down.
+        if (frontiers.Count == 0)
+            return true;
+
+        return frontiers.Distinct().Count() == 1;
+    }
+
     // ── Applying one action ───────────────────────────────────────────────
+
+    /// <summary>Steps spent letting the returned node settle before the next action is chosen.</summary>
+    private const int OutageRecoverySteps = 4;
+
+    /// <summary>
+    /// How many action-lengths an outage waits for the replacement leader. The election timeout is a
+    /// few steps of simulated time, so this is generous; an outage that never produced an election
+    /// is left to end anyway rather than fail, because a run's verdict belongs to its checks.
+    /// </summary>
+    private const int OutageElectionBudgetFactor = 4;
+
+    /// <summary>
+    /// Performs one action and gives the cluster its steps to react. Returns the action as it
+    /// actually ran, which is what the plan records.
+    /// </summary>
+    private async Task<RandomScenarioAction> PerformAsync(
+        RandomScenarioAction action,
+        CancellationToken cancellationToken)
+    {
+        RandomScenarioAction resolved = await ResolveAsync(action, cancellationToken).ConfigureAwait(false);
+
+        if (resolved.Kind == RandomScenarioActionKind.LeaderOutage && resolved.Target is not null)
+        {
+            await RunLeaderOutageAsync(resolved.Target, cancellationToken).ConfigureAwait(false);
+            return resolved;
+        }
+
+        bool deliver = await ApplyAsync(resolved, cancellationToken).ConfigureAwait(false);
+
+        await RunStepsAsync(options.StepsPerAction, deliver, cancellationToken).ConfigureAwait(false);
+
+        return resolved;
+    }
+
+    /// <summary>
+    /// Fills in a target the generator left open.
+    ///
+    /// <para>An episode decides its steps before they happen, so "write at the leader" cannot name
+    /// a node yet — the leader it means is the one in place when the step runs, which is usually not
+    /// the one in place when the episode began. A leaderless cluster still takes the write: the
+    /// answer is a refusal, and a refused append that must not reach the log is a check of its
+    /// own.</para>
+    /// </summary>
+    private async Task<RandomScenarioAction> ResolveAsync(
+        RandomScenarioAction action,
+        CancellationToken cancellationToken)
+    {
+        if (action.Target is not null)
+            return action;
+
+        if (action.Kind is not (RandomScenarioActionKind.AppendAtLeader
+            or RandomScenarioActionKind.AppendAtFollower
+            or RandomScenarioActionKind.LeaderOutage))
+        {
+            return action;
+        }
+
+        RandomScenarioObservation observation = await ObserveAsync(cancellationToken).ConfigureAwait(false);
+
+        if (observation.Leader is not null)
+            return action with { Target = observation.Leader };
+
+        // An outage with nobody to cut off is not an outage. It becomes an idle action rather than
+        // a silent skip, so the plan still accounts for the step.
+        if (action.Kind == RandomScenarioActionKind.LeaderOutage)
+            return new RandomScenarioAction(action.Index, RandomScenarioActionKind.Idle);
+
+        return observation.Running.Count > 0
+            ? action with { Target = observation.Running[0] }
+            : new RandomScenarioAction(action.Index, RandomScenarioActionKind.Idle);
+    }
+
+    /// <summary>
+    /// Cuts one endpoint off in both directions until the rest of the cluster elects somebody else,
+    /// then lets it back and gives the reunion a few steps to settle.
+    ///
+    /// <para><b>Why the leader alone and not the whole wire.</b> The first version held every link.
+    /// It produced the election and an unbounded backlog with it: no call can complete while the
+    /// wire is held, the senders keep sending, and releasing the pile turned a twenty-second run
+    /// into a six-minute one. A partition drops instead of storing, so the cost is flat.</para>
+    ///
+    /// <para><b>Why skipping delivery was never enough.</b> The transport sends inline unless it is
+    /// told otherwise, so a step that merely declines to flush the queue leaves the cluster talking
+    /// normally: the leader keeps its heartbeats and no timeout expires. The action a plan recorded
+    /// as an outage cost the run nothing, and a validation run over a reintroduced defect found the
+    /// election it was supposed to cause missing.</para>
+    ///
+    /// <para>The endpoint is healed in a <c>finally</c>. A run that failed mid-outage must not also
+    /// leave a partitioned node behind for the teardown to time out on.</para>
+    /// </summary>
+    private async Task RunLeaderOutageAsync(string endpoint, CancellationToken cancellationToken)
+    {
+        cluster.Transport.PartitionNode(endpoint);
+
+        try
+        {
+            await cluster.RunUntilAsync(
+                async () =>
+                {
+                    await invariants.CheckAsync(cluster, options.PartitionId, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    IReadOnlyList<RaftPartitionView> views = await cluster
+                        .GetPartitionViewsAsync(options.PartitionId, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    return views.Any(view =>
+                        view.Role == RaftNodeState.Leader
+                        && !string.Equals(view.Endpoint, endpoint, StringComparison.Ordinal));
+                },
+                options.StepsPerAction * OutageElectionBudgetFactor,
+                options.AdvanceMillisecondsPerStep,
+                cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            cluster.Transport.HealPartition(endpoint);
+        }
+
+        await RunStepsAsync(OutageRecoverySteps, deliver: true, cancellationToken).ConfigureAwait(false);
+    }
 
     /// <summary>
     /// Performs one action. Returns whether the steps that follow it should deliver messages.
@@ -293,9 +485,6 @@ public sealed class RandomScenarioRunner
     {
         switch (action.Kind)
         {
-            case RandomScenarioActionKind.Quiet:
-                return false;
-
             case RandomScenarioActionKind.AppendAtLeader:
             case RandomScenarioActionKind.AppendAtFollower:
                 await history

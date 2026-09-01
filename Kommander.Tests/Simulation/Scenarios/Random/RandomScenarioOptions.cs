@@ -47,8 +47,18 @@ public sealed record RandomScenarioOptions
     /// <summary>Weight of a client operation in the draw.</summary>
     public int ClientWeight { get; init; } = 30;
 
-    /// <summary>Weight of letting time pass.</summary>
-    public int IdleWeight { get; init; } = 20;
+    /// <summary>Weight of letting time pass with the network working.</summary>
+    public int IdleWeight { get; init; } = 14;
+
+    /// <summary>
+    /// Weight of cutting the leader off until another is elected.
+    ///
+    /// <para>Its own category rather than a sub-draw of an idle action, because it is the only way
+    /// a run elects a leader on purpose, and a leader elected after the damage is what several
+    /// known defects need. A validation run over a reintroduced defect measured the cost of not
+    /// having it: thirty seeds found nothing.</para>
+    /// </summary>
+    public int OutageWeight { get; init; } = 12;
 
     /// <summary>Weight of a network fault.</summary>
     public int NetworkFaultWeight { get; init; } = 12;
@@ -61,6 +71,24 @@ public sealed record RandomScenarioOptions
 
     /// <summary>Weight of healing something that is currently broken.</summary>
     public int HealWeight { get; init; } = 14;
+
+    /// <summary>
+    /// How much the client weight rises while a fault is active.
+    ///
+    /// <para>A fault nobody writes through teaches nothing. The interesting states are the ones
+    /// where a client operation and a broken node overlap, and uniform weights reach that overlap
+    /// far less often than the fault rate alone suggests.</para>
+    /// </summary>
+    public int ClientWeightDuringFault { get; init; } = 2;
+
+    /// <summary>
+    /// Whether a fault may pull the rest of its life in behind it: use it, repair it, change
+    /// leadership, use it again. One drawn fault in two does, on average.
+    ///
+    /// <para>On by default, and worth the loss of independence. See
+    /// <c>RandomScenarioGenerator.StartEpisode</c> for the measurement that justifies it.</para>
+    /// </summary>
+    public bool EnableFaultEpisodes { get; init; } = true;
 
     /// <summary>
     /// Where a failing run writes its plan. Null puts it beside the test binary, which is what a
@@ -81,9 +109,12 @@ public sealed record RandomScenarioOptions
             ["recoveryStepBudget"] = RecoveryStepBudget.ToString(),
             ["clientWeight"] = ClientWeight.ToString(),
             ["idleWeight"] = IdleWeight.ToString(),
+            ["outageWeight"] = OutageWeight.ToString(),
             ["networkFaultWeight"] = NetworkFaultWeight.ToString(),
             ["storageFaultWeight"] = StorageFaultWeight.ToString(),
             ["lifecycleFaultWeight"] = LifecycleFaultWeight.ToString(),
             ["healWeight"] = HealWeight.ToString(),
+            ["clientWeightDuringFault"] = ClientWeightDuringFault.ToString(),
+            ["enableFaultEpisodes"] = EnableFaultEpisodes.ToString(),
         };
 }

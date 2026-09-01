@@ -39,6 +39,11 @@ public sealed class RandomScenarioGenerator
     private readonly RandomScenarioOptions options;
     private readonly List<ActiveFault> active = [];
 
+    /// <summary>
+    /// Actions already decided, waiting their turn. See <see cref="StartEpisode"/>.
+    /// </summary>
+    private readonly Queue<(RandomScenarioAction Action, string? ClearsKey)> pending = new();
+
     private int actionIndex;
 
     public RandomScenarioGenerator(SimulationRandom random, RandomScenarioOptions options)
@@ -67,6 +72,19 @@ public sealed class RandomScenarioGenerator
         ArgumentNullException.ThrowIfNull(observation);
 
         int index = actionIndex++;
+
+        // An episode already decided what happens next. It runs before anything else, including the
+        // age bound: the bound exists to stop a fault outliving its usefulness, and an episode is
+        // the fault being used.
+        if (pending.Count > 0)
+        {
+            (RandomScenarioAction queued, string? clearsKey) = pending.Dequeue();
+
+            if (clearsKey is not null)
+                active.RemoveAll(fault => fault.Key == clearsKey);
+
+            return queued with { Index = index };
+        }
 
         // A fault that ends on its own needs no action. It is dropped silently, because emitting a
         // heal for it would put a line in the plan that the run never performed.
@@ -134,12 +152,24 @@ public sealed class RandomScenarioGenerator
         bool canLifecycle = HasBudget && observation.Running.Count > 0;
         bool canHeal = active.Count > 0;
 
-        if (canClient) Offer(options.ClientWeight, 0);
+        // A fault nobody writes through teaches nothing, so client operations weigh more while one
+        // is active. Measured, not guessed: a validation run over a reintroduced defect showed the
+        // search reaching a fault often and a write-during-that-fault rarely.
+        int clientWeight = active.Count > 0
+            ? options.ClientWeight * Math.Max(1, options.ClientWeightDuringFault)
+            : options.ClientWeight;
+
+        if (canClient) Offer(clientWeight, 0);
         Offer(options.IdleWeight, 1);
         if (canNetwork) Offer(options.NetworkFaultWeight, 2);
         if (canStorage) Offer(options.StorageFaultWeight, 3);
         if (canLifecycle) Offer(options.LifecycleFaultWeight, 4);
         if (canHeal) Offer(options.HealWeight, 5);
+
+        // An outage costs the cluster its leader for as long as it lasts, so it takes the same
+        // budget a fault does. It needs a leader to cut off, and it heals inside its own action, so
+        // it never joins the fault table.
+        if (HasBudget && observation.Leader is not null) Offer(options.OutageWeight, 6);
 
         int total = categories.Sum(entry => entry.Weight);
 
@@ -167,20 +197,14 @@ public sealed class RandomScenarioGenerator
             3 => DrawStorage(index, observation),
             4 => DrawLifecycle(index, observation),
             5 => DrawHeal(index),
+            6 => new RandomScenarioAction(
+                index, RandomScenarioActionKind.LeaderOutage, observation.Leader),
             _ => DrawIdle(index),
         };
     }
 
-    private RandomScenarioAction DrawIdle(int index)
-    {
-        // Quiet steps deliver nothing, which is the only way an election timeout expires while the
-        // cluster is otherwise healthy. One draw in three, so a run spends most of its idle time
-        // letting the cluster work rather than starving it.
-        bool quiet = random.NextInt("idle-quiet", 0, 3) == 0;
-
-        return new RandomScenarioAction(
-            index, quiet ? RandomScenarioActionKind.Quiet : RandomScenarioActionKind.Idle);
-    }
+    private static RandomScenarioAction DrawIdle(int index) =>
+        new(index, RandomScenarioActionKind.Idle);
 
     private RandomScenarioAction DrawClient(int index, RandomScenarioObservation observation)
     {
@@ -342,7 +366,40 @@ public sealed class RandomScenarioGenerator
             return new RandomScenarioAction(index, RandomScenarioActionKind.Idle);
 
         active.Add(new ActiveFault(key, index, heal, costsQuorum));
+
+        if (options.EnableFaultEpisodes && heal is not null && random.NextInt("episode", 0, 2) == 0)
+            StartEpisode(key, heal);
+
         return action;
+    }
+
+    /// <summary>
+    /// Queues the rest of a fault's life: use it, repair it, change leadership, use it again.
+    ///
+    /// <para><b>Why a template at all, in a random search.</b> The defects worth finding live in
+    /// conjunctions, not in single faults. A uniform draw reaches "a disk refused a write" often and
+    /// "a disk refused a write, a client wrote through it, the disk recovered, leadership moved, and
+    /// a client wrote again" almost never — the five-step order is a small fraction of a
+    /// twenty-four action plan, and a validation run over a reintroduced defect measured the
+    /// consequence: thirty seeds found nothing a scripted scenario finds every time.</para>
+    ///
+    /// <para><b>Why this is not teaching to the test.</b> The shape is the life of any fault, not
+    /// the recipe for one defect: what breaks, which node, whether an episode happens at all, and
+    /// everything between the steps stay random. The template supplies the order; the seed supplies
+    /// the content.</para>
+    ///
+    /// <para>The repair is the fault's own heal, and dequeuing it clears the fault from the table,
+    /// so the age bound never repairs the same fault a second time.</para>
+    /// </summary>
+    private void StartEpisode(string key, RandomScenarioAction heal)
+    {
+        // Null targets are resolved when the action runs, and the plan records what was actually
+        // used. An episode is decided before its steps happen, and the leader it wants is the one
+        // in place by then rather than the one in place now.
+        pending.Enqueue((new RandomScenarioAction(0, RandomScenarioActionKind.AppendAtLeader), null));
+        pending.Enqueue((heal, key));
+        pending.Enqueue((new RandomScenarioAction(0, RandomScenarioActionKind.LeaderOutage), null));
+        pending.Enqueue((new RandomScenarioAction(0, RandomScenarioActionKind.AppendAtLeader), null));
     }
 
     private string PickRunning(RandomScenarioObservation observation, string choiceName)
