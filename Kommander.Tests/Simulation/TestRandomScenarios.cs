@@ -1,6 +1,7 @@
 using Kommander.Tests.Simulation.Cluster;
 using Kommander.Tests.Simulation.Random;
 using Kommander.Tests.Simulation.Scenarios.Random;
+using Kommander.Tests.Simulation.Shrinking;
 using Microsoft.Extensions.Logging;
 
 namespace Kommander.Tests.Simulation;
@@ -236,26 +237,95 @@ public sealed class TestRandomScenarios
         SimulationRandom random = new(seed);
         RandomScenarioRunner runner = new(cluster, options, random);
 
+        string directory = options.ArtifactDirectory
+                           ?? Path.Combine(AppContext.BaseDirectory, "dst-artifacts");
+
+        RandomScenarioReport partial;
+        Exception failure;
+        string planPath;
+        string replayPath;
+
         try
         {
             return await runner.RunAsync(cancellationToken);
         }
         catch (Exception error)
         {
-            string directory = options.ArtifactDirectory
-                               ?? Path.Combine(AppContext.BaseDirectory, "dst-artifacts");
+            partial = runner.Partial();
 
-            RandomScenarioReport partial = runner.Partial();
+            planPath = partial.WriteArtifact(directory, "random");
+            replayPath = runner.WriteReplayLog(directory, "random");
+            failure = error;
+        }
 
-            string planPath = partial.WriteArtifact(directory, "random");
-            string replayPath = runner.WriteReplayLog(directory, "random");
+        // The failing cluster is disposed before a shrink begins. A shrink starts a fresh cluster
+        // for every candidate, and this one is still holding its endpoints, its threads and
+        // whatever fault the failure left behind.
+        await cluster.DisposeAsync();
 
-            throw new InvalidOperationException(
-                $"Random run failed on seed {seed}. Re-run this seed to reproduce it exactly." +
-                $"{Environment.NewLine}Plan: {planPath}" +
-                $"{Environment.NewLine}Replay: {replayPath}" +
-                $"{Environment.NewLine}{partial.Describe()}",
-                error);
+        string shrink = await ShrinkIfAskedAsync(
+            seed, options, partial, failure, directory, cancellationToken);
+
+        throw new InvalidOperationException(
+            $"Random run failed on seed {seed}. Re-run this seed to reproduce it exactly." +
+            $"{Environment.NewLine}Plan: {planPath}" +
+            $"{Environment.NewLine}Replay: {replayPath}" +
+            shrink +
+            $"{Environment.NewLine}{partial.Describe()}",
+            failure);
+    }
+
+    /// <summary>
+    /// Reduces the failing plan to the actions the failure needs, when the environment asks for it.
+    ///
+    /// <para><b>Why this is opt-in.</b> A shrink costs one cluster run per candidate, tens of them
+    /// for one failure. The nightly search is where a failure is the point and where a reader will
+    /// read the answer in the morning; a pull request wants the failure reported and nothing more.
+    /// See <see cref="ShrinkPolicy"/>.</para>
+    ///
+    /// <para><b>Why it cannot throw.</b> The original failure is the result. A shrink that broke —
+    /// on its own budget, on a cluster that would not start — must not replace the finding with a
+    /// report about the tool that was looking at it, so its own failure is written into the message
+    /// as text and the original is rethrown regardless.</para>
+    /// </summary>
+    private async Task<string> ShrinkIfAskedAsync(
+        ulong seed,
+        RandomScenarioOptions options,
+        RandomScenarioReport partial,
+        Exception failure,
+        string directory,
+        CancellationToken cancellationToken)
+    {
+        if (!ShrinkPolicy.Enabled())
+            return string.Empty;
+
+        string signature = FailureSignature.Of(failure);
+
+        if (signature == FailureSignature.None)
+            return $"{Environment.NewLine}Shrink: skipped, the failure carried no signature.";
+
+        try
+        {
+            PlanShrinker shrinker = new(
+                new ClusterPlanOracle(seed, options, logger).AsOracle(),
+                ShrinkPolicy.Options());
+
+            ShrinkResult result = await shrinker.ShrinkAsync(
+                partial.Actions, signature, cancellationToken);
+
+            string path = result.WriteArtifact(directory, $"random-seed-{seed}");
+
+            return $"{Environment.NewLine}Shrunk: {path} " +
+                   $"({result.Original.Count} actions to {result.Shrunk.Count} " +
+                   $"in {result.CandidatesRun} runs)";
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception error)
+        {
+            return $"{Environment.NewLine}Shrink failed: {error.Message}";
         }
     }
 }
