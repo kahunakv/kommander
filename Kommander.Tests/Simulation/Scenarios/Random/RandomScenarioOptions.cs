@@ -1,3 +1,5 @@
+using System.Globalization;
+
 namespace Kommander.Tests.Simulation.Scenarios.Random;
 
 /// <summary>
@@ -143,4 +145,73 @@ public sealed record RandomScenarioOptions
             ["clientWeightDuringFault"] = ClientWeightDuringFault.ToString(),
             ["enableFaultEpisodes"] = EnableFaultEpisodes.ToString(),
         };
+
+    /// <summary>
+    /// Rebuilds the bounds a recorded run was drawn under.
+    ///
+    /// <para><b>Why a plan cannot be replayed without this.</b> The actions say what happened; the
+    /// bounds say what the run was allowed to do. Steps per action and the recovery budget are not
+    /// decoration — a plan replayed at six steps per action and a plan replayed at three are two
+    /// different experiments, and only one of them is the one that failed. A promoted regression
+    /// that lost its bounds would be a test of something nobody recorded.</para>
+    ///
+    /// <para><b>Why a missing key is a default and not an error.</b> The artifact format grows: a
+    /// plan written before <c>maintenanceWeight</c> existed has no line for it. Refusing such a file
+    /// would make every older regression unloadable the day a knob is added, which is the opposite
+    /// of what a regression corpus is for. An unreadable <em>value</em> is still an error, because
+    /// that is corruption rather than age.</para>
+    /// </summary>
+    public static RandomScenarioOptions FromParameters(IReadOnlyDictionary<string, string> parameters)
+    {
+        ArgumentNullException.ThrowIfNull(parameters);
+
+        RandomScenarioOptions defaults = new();
+
+        return new RandomScenarioOptions
+        {
+            PartitionId = Int(parameters, "partitionId", defaults.PartitionId),
+            ActionCount = Int(parameters, "actionCount", defaults.ActionCount),
+            StepsPerAction = Int(parameters, "stepsPerAction", defaults.StepsPerAction),
+            AdvanceMillisecondsPerStep =
+                Int(parameters, "advanceMillisecondsPerStep", (int)defaults.AdvanceMillisecondsPerStep),
+            MaxImpairedNodes = Int(parameters, "maxImpairedNodes", defaults.MaxImpairedNodes),
+            MaxFaultAgeInActions = Int(parameters, "maxFaultAgeInActions", defaults.MaxFaultAgeInActions),
+            RecoveryStepBudget = Int(parameters, "recoveryStepBudget", defaults.RecoveryStepBudget),
+            ClientWeight = Int(parameters, "clientWeight", defaults.ClientWeight),
+            IdleWeight = Int(parameters, "idleWeight", defaults.IdleWeight),
+            OutageWeight = Int(parameters, "outageWeight", defaults.OutageWeight),
+            NetworkFaultWeight = Int(parameters, "networkFaultWeight", defaults.NetworkFaultWeight),
+            StorageFaultWeight = Int(parameters, "storageFaultWeight", defaults.StorageFaultWeight),
+            LifecycleFaultWeight = Int(parameters, "lifecycleFaultWeight", defaults.LifecycleFaultWeight),
+            HealWeight = Int(parameters, "healWeight", defaults.HealWeight),
+            MaintenanceWeight = Int(parameters, "maintenanceWeight", defaults.MaintenanceWeight),
+            CompactEveryOperations =
+                Int(parameters, "compactEveryOperations", defaults.CompactEveryOperations),
+            ClientWeightDuringFault =
+                Int(parameters, "clientWeightDuringFault", defaults.ClientWeightDuringFault),
+            EnableFaultEpisodes = Bool(parameters, "enableFaultEpisodes", defaults.EnableFaultEpisodes),
+        };
+    }
+
+    private static int Int(IReadOnlyDictionary<string, string> parameters, string key, int fallback)
+    {
+        if (!parameters.TryGetValue(key, out string? text))
+            return fallback;
+
+        if (!int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int value))
+            throw new FormatException($"Parameter '{key}' is not a number: '{text}'.");
+
+        return value;
+    }
+
+    private static bool Bool(IReadOnlyDictionary<string, string> parameters, string key, bool fallback)
+    {
+        if (!parameters.TryGetValue(key, out string? text))
+            return fallback;
+
+        if (!bool.TryParse(text, out bool value))
+            throw new FormatException($"Parameter '{key}' is not a true or false value: '{text}'.");
+
+        return value;
+    }
 }

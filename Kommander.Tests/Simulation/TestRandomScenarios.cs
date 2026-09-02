@@ -206,6 +206,17 @@ public sealed class TestRandomScenarios
 
     // ── Helpers ───────────────────────────────────────────────────────────
 
+    /// <summary>The seed and the bounds, in the order a plan artifact writes them.</summary>
+    private static Dictionary<string, string> Header(ulong seed, RandomScenarioOptions options)
+    {
+        Dictionary<string, string> header = new() { ["seed"] = seed.ToString() };
+
+        foreach ((string key, string value) in options.ToParameters())
+            header[key] = value;
+
+        return header;
+    }
+
     /// <summary>
     /// Runs one seed and turns any failure into a report a reader can act on.
     ///
@@ -312,6 +323,10 @@ public sealed class TestRandomScenarios
 
             ShrinkResult result = await shrinker.ShrinkAsync(
                 partial.Actions, signature, cancellationToken);
+
+            // The shrunk file carries the same header the plan artifact does, so it can be dropped
+            // straight into the regression corpus without a reader reconstructing the bounds.
+            result = result with { Header = Header(seed, options) };
 
             string path = result.WriteArtifact(directory, $"random-seed-{seed}");
 

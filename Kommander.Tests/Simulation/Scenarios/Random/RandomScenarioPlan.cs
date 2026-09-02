@@ -47,6 +47,47 @@ public static class RandomScenarioPlan
         Parse(File.ReadAllLines(path));
 
     /// <summary>
+    /// Reads the <c>key=value</c> lines above the actions.
+    ///
+    /// <para>The header holds the seed and the bounds the run was drawn under, which is what makes a
+    /// plan replayable rather than merely readable. Reading stops at the first action line, so a
+    /// value that happens to contain an equals sign later in the file cannot be mistaken for a
+    /// header entry.</para>
+    ///
+    /// <para>Every key is kept, including ones no option knows about. A plan file also records what
+    /// the run <em>did</em> — the steps it took, the entries it compacted — and a reader looking at
+    /// a promoted regression wants those beside the bounds.</para>
+    /// </summary>
+    public static IReadOnlyDictionary<string, string> ParseHeader(IEnumerable<string> lines)
+    {
+        ArgumentNullException.ThrowIfNull(lines);
+
+        Dictionary<string, string> header = [];
+
+        foreach (string line in lines)
+        {
+            string text = line.Trim();
+
+            if (text.Length == 0)
+                continue;
+
+            if (char.IsDigit(text[0]))
+                break;
+
+            int split = text.IndexOf('=', StringComparison.Ordinal);
+
+            if (split > 0)
+                header[text[..split]] = text[(split + 1)..];
+        }
+
+        return header;
+    }
+
+    /// <summary>Reads the header of a plan artifact on disk.</summary>
+    public static IReadOnlyDictionary<string, string> ParseHeaderFile(string path) =>
+        ParseHeader(File.ReadAllLines(path));
+
+    /// <summary>
     /// Parses one action line.
     ///
     /// <para>Strict on purpose. A line it cannot read is a plan it would replay incorrectly, and a

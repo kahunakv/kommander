@@ -38,6 +38,18 @@ public sealed record ShrinkResult
     /// </summary>
     public required bool BudgetExhausted { get; init; }
 
+    /// <summary>
+    /// The run's own header — its seed and the bounds it was drawn under — written above the shrink
+    /// counters.
+    ///
+    /// <para>Carried through so a shrunk plan is promotable as it stands. A regression corpus
+    /// replays a plan under the bounds the failing run used, and a file that lost them would be a
+    /// test of something nobody recorded. Empty is allowed: a shrink driven from a hand-built plan
+    /// has no run behind it.</para>
+    /// </summary>
+    public IReadOnlyDictionary<string, string> Header { get; init; } =
+        new Dictionary<string, string>();
+
     /// <summary>Actions removed, counted from the original.</summary>
     public int ActionsRemoved => Original.Count - Shrunk.Count;
 
@@ -48,6 +60,9 @@ public sealed record ShrinkResult
     public string Describe()
     {
         StringBuilder text = new();
+
+        foreach ((string key, string value) in Header)
+            text.AppendLine($"{key}={value}");
 
         text.AppendLine($"signature={Signature}");
         text.AppendLine($"originalActions={Original.Count}");

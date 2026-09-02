@@ -46,6 +46,12 @@
            is data rather than code: a seed earns its line by finding something, and the reason is
            written next to it. -->
       <Content Include="Simulation\Scenarios\Random\seed-corpus.txt" Link="seed-corpus.txt" CopyToOutputDirectory="PreserveNewest" />
+
+      <!-- Promoted failures. A generated run that failed leaves its plan under dst-artifacts/;
+           copying that file in here turns it into a test that runs for ever. The plan is the
+           replay unit rather than the seed, because a seed re-draws against whatever the cluster
+           happens to do and a plan does not. -->
+      <Content Include="Simulation\Scenarios\Random\regressions\*.plan.txt" LinkBase="regressions" CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 
 </Project>
