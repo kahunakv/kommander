@@ -11,6 +11,11 @@ jobs:
     env:
       GIT_BRANCH: ${{ github.head_ref || github.ref_name }}
       GIT_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+
+      # Fail a simulation run that stopped working. The limits are stall detectors rather than
+      # speed limits — a busy runner is expected — so this catches a run that hangs, not one that
+      # is merely sharing a machine.
+      KOMMANDER_DST_BUDGET: 'ci'
     steps:
       - name: Check out repository code
         uses: actions/checkout@v5
@@ -41,4 +46,8 @@ jobs:
         # request: its cost grows with the seed count, and a seed that fails is a lead to
         # investigate rather than a verdict on the change under review. The DSTSmoke scenarios,
         # which include one short generated run, stay in this job.
-        run: (cd Kommander.Tests && dotnet test -l "console;verbosity=detailed" --filter "Category!=Stress&Category!=DSTRandom" --blame-hang --blame-hang-timeout 120s)
+        #
+        # DSTProbe is excluded too. Those tests take a plan or a folder from the environment and
+        # skip without one, so they would run here as a row of skips that says nothing — and would
+        # spend half an hour if anybody ever set the variable in this job.
+        run: (cd Kommander.Tests && dotnet test -l "console;verbosity=detailed" --filter "Category!=Stress&Category!=DSTRandom&Category!=DSTProbe" --blame-hang --blame-hang-timeout 120s)

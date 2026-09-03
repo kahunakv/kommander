@@ -1,6 +1,7 @@
 using Kommander.Data;
 using Kommander.Tests.Simulation.Cluster;
 using Kommander.Tests.Simulation.History;
+using Kommander.Tests.Simulation.Diagnostics;
 using Kommander.Tests.Simulation.Invariants;
 using Kommander.Tests.Simulation.Random;
 using Kommander.Tests.Simulation.Replay;
@@ -35,6 +36,7 @@ public sealed class RandomScenarioRunner
     private readonly RandomScenarioOptions options;
     private readonly SimulationRandom random;
     private readonly RandomScenarioGenerator generator;
+    private readonly SimulationMetricsCollector metrics = new();
     private readonly ClusterInvariantRunner invariants = new();
     private readonly ClientHistory history = new();
     private readonly List<RandomScenarioAction> actions = [];
@@ -53,6 +55,10 @@ public sealed class RandomScenarioRunner
         this.random = random;
 
         generator = new RandomScenarioGenerator(random, options);
+
+        // The checker records its own time here. A run that spends nearly all of itself checking is
+        // exploring almost nothing, and no single total would show that.
+        invariants.Metrics = metrics;
     }
 
     /// <summary>The plan, as far as it has been drawn. Populated even when the run fails.</summary>
@@ -63,6 +69,10 @@ public sealed class RandomScenarioRunner
 
     /// <summary>Per-step invariant checks performed so far.</summary>
     public int InvariantChecks => invariants.ChecksRun;
+
+    /// <summary>What the run has cost so far. Populated whether or not the run finished.</summary>
+    public SimulationMetrics Metrics =>
+        metrics.Snapshot(cluster.StepNumber, actions.Count, invariants.ChecksRun);
 
     /// <summary>
     /// The report as far as the run got.
@@ -83,6 +93,7 @@ public sealed class RandomScenarioRunner
             FinalCommitIndex = -1,
             InvariantChecks = invariants.ChecksRun,
             EntriesCompacted = EntriesCompacted(),
+            Metrics = Metrics,
         };
 
     /// <summary>
@@ -166,6 +177,7 @@ public sealed class RandomScenarioRunner
             FinalCommitIndex = finalCommitIndex,
             InvariantChecks = invariants.ChecksRun,
             EntriesCompacted = EntriesCompacted(),
+            Metrics = Metrics,
         };
     }
 
@@ -310,8 +322,12 @@ public sealed class RandomScenarioRunner
             compactedThrough);
     }
 
-    /// <summary>Steps a healed cluster is given to converge before anybody writes to it.</summary>
-    private const int IdleConvergenceStepBudget = 300;
+    /// <summary>
+    /// Steps a healed cluster is given to converge before anybody writes to it. Configurable,
+    /// because it is the bound this check's verdict rests on — see
+    /// <see cref="RandomScenarioOptions.IdleConvergenceStepBudget"/>.
+    /// </summary>
+    private int IdleConvergenceStepBudget => options.IdleConvergenceStepBudget;
 
     /// <summary>
     /// A healed cluster converges on its own, without a client writing to it first.
@@ -354,10 +370,85 @@ public sealed class RandomScenarioRunner
         string state = string.Join(
             ", ", views.Select(view => $"{view.Endpoint}={view.CommitIndex}"));
 
+        // What the leader believes about each peer, beside what each peer actually holds. The
+        // leader's repair decision is computed from these values and nothing else, so a follower
+        // that is never caught up is explained by one of them — most often a frontier the leader
+        // never recorded, which it treats as a gap of zero and therefore never repairs.
+        string leaderBelief = string.Join(
+            " | ",
+            views
+                .Where(view => view.Peers.Count > 0)
+                .Select(view => $"{view.Endpoint} sees [{string.Join("; ", view.Peers)}]"));
+
+        if (leaderBelief.Length == 0)
+            leaderBelief = "no node reported peer state, so no node was leading at the end.";
+
+        // Backfill refusals, from the library's own queryable diagnostic. A leader that decided to
+        // ship a repair and then could not says so here; an empty list means the send was never
+        // refused, which points the reader at the decision rather than at the log read.
+        List<string> refusals = [];
+
+        foreach (SimulationNode node in cluster.Nodes.Where(candidate => candidate.HasLiveManager))
+        {
+            foreach (RaftBackfillStatus status in node.Manager.GetBackfillStatuses(options.PartitionId))
+            {
+                refusals.Add(
+                    $"{node.Endpoint}->{status.FollowerEndpoint} anchor={status.AnchorIndex} " +
+                    $"firstAvailable={status.FirstAvailableIndex} " +
+                    $"lastCheckpoint={status.LastCheckpoint} occurrences={status.Occurrences}");
+            }
+        }
+
+        string refusalText = refusals.Count > 0
+            ? string.Join(" | ", refusals)
+            : "none, so no leader was refused a repair it decided to send.";
+
+        // Each node's store beside its committed frontier, which separates the two remaining
+        // causes. A follower whose log holds the entry but whose frontier is short received the
+        // repair and did not commit it. A follower whose log stops at its frontier was never sent
+        // anything. The failure message alone cannot tell those apart, and they are different
+        // defects.
+        string stores = string.Join(
+            " | ",
+            views.Select(view =>
+            {
+                SimulatedWalPartitionSnapshot? store = cluster.Nodes
+                    .FirstOrDefault(node => node.Endpoint == view.Endpoint)?
+                    .SimulatedWal?.Snapshot().Partition(options.PartitionId);
+
+                return $"{view.Endpoint} commit={view.CommitIndex} maxLog={store?.MaxLogId} " +
+                       $"first={store?.FirstLogId} missing=[{string.Join(",", store?.MissingIds ?? [])}]";
+            }));
+
+        // Two different failures wear this one signature, and conflating them cost two rounds of
+        // investigating the wrong mechanism.
+        //
+        // A cluster with no leader cannot converge by the heartbeat path, because there is no
+        // heartbeat path: nobody ships anything to anybody. Reporting that as "a node that reported
+        // a committed prefix must be caught up" points the reader at the repair decision, which is
+        // not running at all. It is a liveness failure, and it is named as one.
+        //
+        // A cluster that does have a leader, and still leaves a follower short, is the repair
+        // failure the rule was written for. Only then is the leader's belief worth reading.
+        bool leaderless = views.All(view => view.Role != RaftNodeState.Leader);
+
+        if (leaderless)
+        {
+            Assert.Fail(
+                $"idle-convergence-leaderless: the healed cluster had no leader after " +
+                $"{IdleConvergenceStepBudget} steps. Frontiers: {state}. With no leader there is no " +
+                "heartbeat path, so nothing could have repaired anybody — this is a liveness " +
+                $"failure, not a repair failure.{Environment.NewLine}" +
+                $"Roles: {string.Join(", ", views.Select(view => $"{view.Endpoint}={view.Role}"))}");
+        }
+
         Assert.Fail(
             $"idle-convergence: the healed cluster did not converge in {IdleConvergenceStepBudget} " +
             $"steps without a client write. Frontiers: {state}. A node that reported a committed " +
-            "prefix must be caught up by the heartbeat path alone.");
+            $"prefix must be caught up by the heartbeat path alone.{Environment.NewLine}" +
+            $"Leader belief: {leaderBelief}{Environment.NewLine}" +
+            $"Backfill refusals: {refusalText}{Environment.NewLine}" +
+            $"Stores: {stores}");
     }
 
     /// <summary>

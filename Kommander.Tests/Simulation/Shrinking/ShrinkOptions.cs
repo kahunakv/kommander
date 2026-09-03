@@ -1,3 +1,5 @@
+using Kommander.Tests.Simulation.Scenarios.Random;
+
 namespace Kommander.Tests.Simulation.Shrinking;
 
 /// <summary>
@@ -36,6 +38,20 @@ public sealed record ShrinkOptions
     /// short of it saves the last few pointless runs.
     /// </summary>
     public int MinimumPlanLength { get; init; } = 1;
+
+    /// <summary>
+    /// Called with the plan each time a reduction is confirmed.
+    ///
+    /// <para><b>Why a shrink needs this at all.</b> A shrink of an intermittent failure runs for
+    /// tens of minutes, and everything it learned is in the return value. A run that is interrupted
+    /// — a cancelled job, a killed process, a laptop lid — loses all of it, and the next attempt
+    /// starts from the original plan. Reporting each accepted reduction lets a caller keep the best
+    /// plan so far on disk, so an interrupted shrink still leaves something to resume from.</para>
+    ///
+    /// <para>Progress only, never a decision. The search does not read anything back from the
+    /// callback, and an exception from it is the caller's problem, not the shrinker's.</para>
+    /// </summary>
+    public Action<IReadOnlyList<RandomScenarioAction>>? OnProgress { get; init; }
 
     /// <summary>
     /// Whether to try smaller numeric parameters after the removals are done.

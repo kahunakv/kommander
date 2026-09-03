@@ -134,6 +134,7 @@ public sealed class PlanShrinker
                     best = candidate;
                     removalsAccepted++;
                     progressed = true;
+                    options.OnProgress?.Invoke(best);
                     continue;
                 }
 
@@ -189,6 +190,7 @@ public sealed class PlanShrinker
 
                 best = candidate;
                 parametersReduced++;
+                options.OnProgress?.Invoke(best);
                 break;
             }
         }

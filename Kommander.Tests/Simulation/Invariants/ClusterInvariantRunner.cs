@@ -1,5 +1,6 @@
 using Kommander.Data;
 using Kommander.Tests.Simulation.Cluster;
+using Kommander.Tests.Simulation.Diagnostics;
 using Kommander.Tests.Simulation.WAL;
 
 namespace Kommander.Tests.Simulation.Invariants;
@@ -37,6 +38,15 @@ public sealed class ClusterInvariantRunner
     public int ChecksRun { get; private set; }
 
     /// <summary>
+    /// Where the time these checks take is recorded, when somebody is measuring.
+    ///
+    /// <para>Optional on purpose. The checker is correct without a collector, and a run that only
+    /// wants the rules should not have to build one. When it is set, the share of a run spent here
+    /// is what says whether the search is paying for oracles rather than for exploration.</para>
+    /// </summary>
+    public SimulationMetricsCollector? Metrics { get; set; }
+
+    /// <summary>
     /// Commit high-water marks actually dropped because their node crashed. Counting the marks
     /// rather than the crashes is deliberate: a reset that matched no mark would otherwise report
     /// success while changing nothing.
@@ -53,6 +63,12 @@ public sealed class ClusterInvariantRunner
     /// </summary>
     public async Task CheckAsync(SimulationCluster cluster, int partitionId, CancellationToken cancellationToken)
     {
+        // The timer opens here, not at the first rule. Reading every node's view and every node's
+        // store is most of what a check costs, and a measurement that started after the reads
+        // reported four milliseconds for four hundred checks — a number that would have sent a
+        // reader looking for the run's cost anywhere but here.
+        using IDisposable? timer = Metrics?.TimeInvariantCheck();
+
         IReadOnlyList<RaftPartitionView> views =
             await cluster.GetPartitionViewsAsync(partitionId, cancellationToken).ConfigureAwait(false);
 

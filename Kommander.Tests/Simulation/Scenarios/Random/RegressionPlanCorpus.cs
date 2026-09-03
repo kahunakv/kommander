@@ -25,9 +25,29 @@ public static class RegressionPlanCorpus
     /// <summary>The folder beside the test binary that holds promoted plans.</summary>
     public const string FolderName = "regressions";
 
-    /// <summary>Loads every promoted plan beside the test binary.</summary>
-    public static IReadOnlyList<RegressionPlan> Load() =>
-        Load(Path.Combine(AppContext.BaseDirectory, FolderName));
+    /// <summary>
+    /// Points the replay at another folder, for a plan that is not promoted yet.
+    ///
+    /// <para>The facility a lead needs. A run fails once, its plan lands in
+    /// <c>dst-artifacts/</c>, and the only question worth asking next is whether it fails again —
+    /// which is a question about that one file, not about the standing corpus. Promoting an
+    /// unconfirmed plan to answer it would put a coin toss in the test set, so the folder is
+    /// overridable instead.</para>
+    /// </summary>
+    public const string DirectoryVariable = "KOMMANDER_DST_REPLAY_DIR";
+
+    /// <summary>The folder the replay reads: the override, or the one beside the binary.</summary>
+    public static string ConfiguredDirectory()
+    {
+        string? directory = Environment.GetEnvironmentVariable(DirectoryVariable);
+
+        return string.IsNullOrWhiteSpace(directory)
+            ? Path.Combine(AppContext.BaseDirectory, FolderName)
+            : directory;
+    }
+
+    /// <summary>Loads every promoted plan from the configured folder.</summary>
+    public static IReadOnlyList<RegressionPlan> Load() => Load(ConfiguredDirectory());
 
     /// <summary>
     /// Loads every promoted plan in one folder.

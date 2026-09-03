@@ -53,6 +53,11 @@ jobs:
 
       # One replay of a promoted plan is weak evidence: these plans are not deterministic.
       KOMMANDER_DST_REPLAY_REPEATS: ${{ inputs.replay_repeats || '3' }}
+
+      # Fail a run that stopped working. A run that stalls still passes every check — it simply
+      # takes an order of magnitude longer, and nothing reports that. The limits are stall
+      # detectors, not speed limits: a loaded runner is expected and is not a failure.
+      KOMMANDER_DST_BUDGET: 'ci'
     steps:
       - name: Check out repository code
         uses: actions/checkout@v5

@@ -284,7 +284,40 @@ public sealed class RaftPartitionStateMachine
             LastAppliedIndex: coreState.LastAppliedIndex,
             MaxWalIndex: maxWal,
             Quiesced: coreState.Quiesced,
-            MemberRole: host.LocalRole);
+            MemberRole: host.LocalRole,
+            Peers: CollectPeerReplicationViews());
+    }
+
+    /// <summary>
+    /// What this node believes about each peer's position, for the view.
+    ///
+    /// <para>Empty unless this node is leading. Only a leader tracks peers, so an empty list is a
+    /// fact about the role rather than a value that could not be read.</para>
+    ///
+    /// <para>Runs on the executor's single-writer thread, like the rest of the view, so the tracker
+    /// is never read while a replication acknowledgement is updating it.</para>
+    /// </summary>
+    private IReadOnlyList<RaftPeerReplicationView> CollectPeerReplicationViews()
+    {
+        if (coreState.NodeState != RaftNodeState.Leader)
+            return [];
+
+        IReadOnlyList<RaftNode> nodes = host.Nodes;
+        List<RaftPeerReplicationView> peers = new(nodes.Count);
+
+        foreach (RaftNode node in nodes)
+        {
+            bool known = tracker.TryGetCommitFrontier(node.Endpoint, out long frontier);
+
+            peers.Add(new RaftPeerReplicationView(
+                Endpoint: node.Endpoint,
+                IsVoter: host.IsVoter(node.Endpoint),
+                FrontierKnown: known,
+                CommitFrontier: known ? frontier : -1,
+                StartCommitIndex: tracker.GetStartCommitIndexOrDefault(node.Endpoint, -1)));
+        }
+
+        return peers;
     }
 
     /// <summary>

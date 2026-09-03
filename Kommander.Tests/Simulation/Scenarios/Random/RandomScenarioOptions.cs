@@ -46,6 +46,22 @@ public sealed record RandomScenarioOptions
     /// <summary>Steps allowed for the healed cluster to converge before the run reports a failure.</summary>
     public int RecoveryStepBudget { get; init; } = 900;
 
+    /// <summary>
+    /// Steps a healed cluster is given to converge <em>before</em> anybody writes to it.
+    ///
+    /// <para><b>Why this is separate from <see cref="RecoveryStepBudget"/>, and smaller.</b> That
+    /// budget covers a recovery that includes a client write, and a write repairs a follower that is
+    /// merely behind. This one deliberately withholds the write, so it measures only what the
+    /// heartbeat path does on its own — a much narrower claim, and one a cluster should satisfy
+    /// quickly or not at all.</para>
+    ///
+    /// <para><b>Why it is a knob rather than a constant.</b> It is the bound the check's verdict
+    /// depends on, so it is the first thing to vary when the check fires. A failure that goes away at
+    /// a larger budget is a bound set too low, not a defect — and a bound nobody can vary cannot be
+    /// tested for that.</para>
+    /// </summary>
+    public int IdleConvergenceStepBudget { get; init; } = 300;
+
     /// <summary>Weight of a client operation in the draw.</summary>
     public int ClientWeight { get; init; } = 30;
 
@@ -133,6 +149,7 @@ public sealed record RandomScenarioOptions
             ["maxImpairedNodes"] = MaxImpairedNodes.ToString(),
             ["maxFaultAgeInActions"] = MaxFaultAgeInActions.ToString(),
             ["recoveryStepBudget"] = RecoveryStepBudget.ToString(),
+            ["idleConvergenceStepBudget"] = IdleConvergenceStepBudget.ToString(),
             ["clientWeight"] = ClientWeight.ToString(),
             ["idleWeight"] = IdleWeight.ToString(),
             ["outageWeight"] = OutageWeight.ToString(),
@@ -177,6 +194,8 @@ public sealed record RandomScenarioOptions
             MaxImpairedNodes = Int(parameters, "maxImpairedNodes", defaults.MaxImpairedNodes),
             MaxFaultAgeInActions = Int(parameters, "maxFaultAgeInActions", defaults.MaxFaultAgeInActions),
             RecoveryStepBudget = Int(parameters, "recoveryStepBudget", defaults.RecoveryStepBudget),
+            IdleConvergenceStepBudget =
+                Int(parameters, "idleConvergenceStepBudget", defaults.IdleConvergenceStepBudget),
             ClientWeight = Int(parameters, "clientWeight", defaults.ClientWeight),
             IdleWeight = Int(parameters, "idleWeight", defaults.IdleWeight),
             OutageWeight = Int(parameters, "outageWeight", defaults.OutageWeight),

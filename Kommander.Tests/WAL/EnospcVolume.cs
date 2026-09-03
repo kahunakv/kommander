@@ -90,6 +90,11 @@ internal sealed class EnospcVolume : IDisposable
     /// or a cap. The small-file phase is what pushes the volume from "no blocks" to "no new files"
     /// (catalog growth on HFS+, inode exhaustion on an inode-limited tmpfs), which is the condition that
     /// makes RocksDB's next WAL file creation fail.
+    ///
+    /// <para>Every stream here is opened unbuffered. A buffered <see cref="FileStream"/> keeps the bytes a
+    /// refused flush could not write, and then throws the same ENOSPC again from <c>Dispose</c>, outside
+    /// any <c>try</c>: that is exactly how the first CI run of these tests failed on tmpfs, where the 512
+    /// bytes of the very first small file are refused because the block-full phase already ran.</para>
     /// </summary>
     public void Fill()
     {
@@ -97,20 +102,23 @@ internal sealed class EnospcVolume : IDisposable
 
         byte[] chunk = new byte[1 << 20];
 
-        using (FileStream big = new(Path.Combine(fillerDirectory, "big"), FileMode.Create, FileAccess.Write))
+        FileStream big = OpenUnbuffered(Path.Combine(fillerDirectory, "big"), FileMode.Create);
+
+        try
         {
-            try
+            while (true)
             {
-                while (true)
-                {
-                    big.Write(chunk);
-                    big.Flush(flushToDisk: true);
-                }
+                big.Write(chunk);
+                big.Flush(flushToDisk: true);
             }
-            catch (IOException)
-            {
-                // The volume is out of blocks.
-            }
+        }
+        catch (IOException)
+        {
+            // The volume is out of blocks.
+        }
+        finally
+        {
+            CloseQuietly(big);
         }
 
         const int cap = 20_000;
@@ -121,7 +129,7 @@ internal sealed class EnospcVolume : IDisposable
 
             try
             {
-                small = new FileStream(Path.Combine(fillerDirectory, $"s{i}"), FileMode.CreateNew, FileAccess.Write);
+                small = OpenUnbuffered(Path.Combine(fillerDirectory, $"s{i}"), FileMode.CreateNew);
             }
             catch (IOException)
             {
@@ -129,18 +137,39 @@ internal sealed class EnospcVolume : IDisposable
                 return;
             }
 
-            using (small)
+            try
             {
-                try
-                {
-                    small.Write(chunk, 0, 512);
-                    small.Flush(flushToDisk: true);
-                }
-                catch (IOException)
-                {
-                    // Out of blocks but the file exists; keep it so it consumes an inode / catalog slot.
-                }
+                small.Write(chunk, 0, 512);
+                small.Flush(flushToDisk: true);
             }
+            catch (IOException)
+            {
+                // Out of blocks but the file exists; keep it so it consumes an inode / catalog slot.
+            }
+            finally
+            {
+                CloseQuietly(small);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A write-only stream with no managed buffer (<c>bufferSize: 0</c>), so that every
+    /// <see cref="FileStream.Write(byte[], int, int)"/> reaches the OS at once and a refusal surfaces
+    /// where the caller expects it.
+    /// </summary>
+    private static FileStream OpenUnbuffered(string path, FileMode mode) =>
+        new(path, mode, FileAccess.Write, FileShare.None, bufferSize: 0);
+
+    /// <summary>Closes a filler stream and swallows a late ENOSPC; the file has done its job either way.</summary>
+    private static void CloseQuietly(FileStream stream)
+    {
+        try
+        {
+            stream.Dispose();
+        }
+        catch (IOException)
+        {
         }
     }
 

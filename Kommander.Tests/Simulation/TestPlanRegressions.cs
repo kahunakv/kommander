@@ -1,8 +1,10 @@
 using System.Globalization;
 using System.Text;
 using Kommander.Tests.Simulation.Cluster;
+using Kommander.Tests.Simulation.Diagnostics;
 using Kommander.Tests.Simulation.Random;
 using Kommander.Tests.Simulation.Scenarios.Random;
+using Kommander.Tests.Simulation.Shrinking;
 using Microsoft.Extensions.Logging;
 
 namespace Kommander.Tests.Simulation;
@@ -35,7 +37,35 @@ public sealed class TestPlanRegressions
     /// </summary>
     public const string RepeatsVariable = "KOMMANDER_DST_REPLAY_REPEATS";
 
+    /// <summary>Plan file the shrink probe reads. The probe is skipped when it is unset.</summary>
+    public const string ShrinkPlanVariable = "KOMMANDER_DST_SHRINK_PLAN";
+
+    /// <summary>Runs of one candidate before the probe calls it a pass.</summary>
+    public const string ShrinkAttemptsVariable = "KOMMANDER_DST_SHRINK_ATTEMPTS";
+
+    /// <summary>Cluster runs the probe may spend in total.</summary>
+    public const string ShrinkBudgetVariable = "KOMMANDER_DST_SHRINK_BUDGET";
+
+    /// <summary>
+    /// Runs of the whole plan before the shrink starts, used to measure how often it reproduces.
+    ///
+    /// <para>Twenty by default, and ten was measurably too few. The plan this feature was built for
+    /// reproduces about fifteen per cent of the time, and ten runs miss such a plan entirely one
+    /// time in five — which is exactly what happened on the first attempt. Twenty misses it about
+    /// one time in twenty-five.</para>
+    ///
+    /// <para>No default is right for every rate, so the failure message says to raise this. The
+    /// measurement is what sets the attempt count, and it is worth its own runs: a plan that
+    /// reproduces three times in twenty needs about fifteen attempts per candidate, and nobody
+    /// guesses that.</para>
+    /// </summary>
+    public const string ShrinkProbeRunsVariable = "KOMMANDER_DST_SHRINK_PROBE_RUNS";
+
+    /// <summary>Substring of the library trace the diagnostic probe keeps.</summary>
+    public const string TraceVariable = "KOMMANDER_DST_TRACE";
+
     private readonly ILogger<IRaft> logger;
+    private readonly ITestOutputHelper output;
 
     public TestPlanRegressions(ITestOutputHelper outputHelper)
     {
@@ -43,6 +73,7 @@ public sealed class TestPlanRegressions
             builder.AddXUnit(outputHelper).SetMinimumLevel(LogLevel.Warning));
 
         logger = loggerFactory.CreateLogger<IRaft>();
+        output = outputHelper;
     }
 
     /// <summary>
@@ -62,11 +93,17 @@ public sealed class TestPlanRegressions
         if (plans.Count == 0)
             return;
 
+        output.WriteLine(
+            $"Replaying {plans.Count} plan(s) from {RegressionPlanCorpus.ConfiguredDirectory()}.");
+
         int repeats = ConfiguredRepeats();
         StringBuilder failures = new();
 
         foreach (RegressionPlan plan in plans)
         {
+            int failed = 0;
+            string? first = null;
+
             for (int attempt = 1; attempt <= repeats; attempt++)
             {
                 string? failure = await ReplayAsync(plan, cancellationToken);
@@ -74,13 +111,19 @@ public sealed class TestPlanRegressions
                 if (failure is null)
                     continue;
 
-                failures.AppendLine(
-                    $"{plan.Name} failed on replay {attempt} of {repeats}: {failure}");
-
-                // One report per plan. A plan that fails on every replay would otherwise bury the
-                // other plans under one message.
-                break;
+                failed++;
+                first ??= failure;
             }
+
+            if (failed == 0)
+                continue;
+
+            // The rate, not the fact. Every failure this search finds is intermittent, and one in
+            // twenty and twenty in twenty are different findings that need different next steps:
+            // the first is a rare state to hunt, the second is a defect to fix. A message that
+            // said only "it failed" would hide which one this is.
+            failures.AppendLine(
+                $"{plan.Name} failed {failed} of {repeats} replays. First failure: {first}");
         }
 
         Assert.True(failures.Length == 0, failures.ToString());
@@ -253,6 +296,201 @@ public sealed class TestPlanRegressions
         Assert.True(failure is null, $"The promoted plan did not replay: {failure}");
     }
 
+    /// <summary>
+    /// Reduces one named plan to the actions its failure needs.
+    ///
+    /// <para><b>What this is for.</b> A lead arrives as a plan of twenty-five actions of which two
+    /// or three matter. Answering "which ones" by hand costs an afternoon of re-runs; this runs the
+    /// same re-runs. It is the step between "the state is reachable" and "here is the defect".</para>
+    ///
+    /// <para><b>Why it is driven by the environment and skipped otherwise.</b> A shrink costs one
+    /// cluster run per attempt, and the useful settings depend entirely on the lead: a plan that
+    /// reproduces three times in ten needs several attempts per candidate, and one that reproduces
+    /// every time needs one. Those are decisions for the person holding the lead, not constants for
+    /// a test set to carry.</para>
+    ///
+    /// <para><b>The reproduction rate is the setting that matters, so the probe measures it rather
+    /// than asking.</b> It runs the whole plan ten times first, counts the failures, and derives an
+    /// attempt count that catches such a plan nine times in ten. At one attempt a plan that fails
+    /// three times in ten reads as passing on most candidates, and the shrinker then keeps almost
+    /// every action and reports a reduction of nothing — which is indistinguishable from a plan
+    /// whose every action matters. <see cref="ShrinkAttemptsVariable"/> overrides the derived
+    /// count.</para>
+    /// </summary>
+    [Fact]
+    [Trait("Category", "DSTProbe")]
+    public async Task AConfiguredPlan_ShrinksToItsCause()
+    {
+        string? path = Environment.GetEnvironmentVariable(ShrinkPlanVariable);
+
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            Assert.Skip(
+                $"Set {ShrinkPlanVariable} to a plan file to shrink it. " +
+                $"Optional: {ShrinkAttemptsVariable} (default 3), {ShrinkBudgetVariable} (default 180).");
+        }
+
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+
+        RegressionPlan plan = RegressionPlanCorpus.Read(path);
+
+        output.WriteLine($"Shrinking {plan.Name}: {plan.Actions.Count} actions, seed {plan.Seed}.");
+
+        int budget = Setting(ShrinkBudgetVariable, 180);
+        int probeRuns = Setting(ShrinkProbeRunsVariable, 20);
+
+        PlanOracle oracle = new ClusterPlanOracle(plan.Seed, plan.Options, logger).AsOracle();
+
+        // The whole plan is run several times before anything is removed, and both things that
+        // come out of it matter.
+        //
+        // The signature must come from a real run rather than a guess: a wrongly guessed signature
+        // makes every candidate a rejection, and the shrink then reports that nothing could be
+        // removed — which reads exactly like a plan whose every action matters.
+        //
+        // The reproduction rate decides the attempt count, and it is the setting a person is worst
+        // placed to guess. Measuring it here costs ten runs and removes the guess.
+        ShrinkAttempt? original = null;
+        int reproduced = 0;
+
+        for (int run = 0; run < probeRuns; run++)
+        {
+            ShrinkAttempt candidate = await oracle(plan.Actions, cancellationToken);
+
+            if (candidate.Passed)
+                continue;
+
+            reproduced++;
+            original ??= candidate;
+        }
+
+        if (original is null)
+        {
+            Assert.Fail(
+                $"{plan.Name} held every check over {probeRuns} run(s), so there was no failure to " +
+                $"shrink. Raise {ShrinkProbeRunsVariable} if the plan reproduces more rarely than that.");
+        }
+
+        double rate = (double)reproduced / probeRuns;
+        int attempts = Setting(ShrinkAttemptsVariable, ReproductionRate.RequiredAttempts(rate));
+
+        output.WriteLine($"Signature: {original.Signature}");
+
+        output.WriteLine(
+            $"Reproduced {reproduced} of {probeRuns} runs (rate {rate:P0}). Using {attempts} " +
+            $"attempts per candidate, which catches such a plan " +
+            $"{ReproductionRate.CatchProbability(rate, attempts):P0} of the time.");
+
+        string directory = Path.GetDirectoryName(path) ?? AppContext.BaseDirectory;
+        string name = Path.GetFileNameWithoutExtension(plan.Name);
+
+        PlanShrinker shrinker = new(
+            new ClusterPlanOracle(plan.Seed, plan.Options, logger).AsOracle(),
+            new ShrinkOptions
+            {
+                MaxCandidates = budget,
+                AttemptsPerCandidate = attempts,
+
+                // Each confirmed reduction is written straight away. A shrink of an intermittent
+                // plan runs for tens of minutes, and an interrupted run would otherwise lose
+                // everything it learned — which has already happened once here.
+                OnProgress = reduced => WriteProgress(directory, name, plan, reduced),
+            });
+
+        ShrinkResult result = await shrinker.ShrinkAsync(
+            plan.Actions, original.Signature, cancellationToken);
+
+        // The seed and the bounds only. The original run's step count and measurements would read
+        // as this reduced plan's numbers, and a plan of three actions has nothing to do with the
+        // four hundred steps the plan it came from took.
+        result = result with { Header = PlanHeader.For(plan.Seed, plan.Options) };
+
+        string written = result.WriteArtifact(directory, name);
+
+        output.WriteLine($"Wrote {written}");
+        output.WriteLine(result.Describe());
+
+        Assert.True(
+            result.Shrunk.Count < result.Original.Count,
+            $"The shrink removed nothing over {result.CandidatesRun} runs. At a measured rate of " +
+            $"{rate:P0} and {attempts} attempts a candidate is caught " +
+            $"{ReproductionRate.CatchProbability(rate, attempts):P0} of the time, so this is only " +
+            "evidence that every action is needed if that figure is high.");
+    }
+
+    /// <summary>
+    /// Replays a named plan until it fails, and reports the library trace that explains it.
+    ///
+    /// <para><b>What this is for.</b> A reduced plan says which actions reach a state; it does not
+    /// say why the state is wrong. The answer is usually already written down — the library logs its
+    /// own decisions — but at <c>Debug</c>, under one category, alongside every other trace. This
+    /// captures one trace by substring and prints what it said on the run that failed.</para>
+    ///
+    /// <para><b>Why the trace is printed rather than asserted on.</b> A log message is not a
+    /// contract. This reports; it never decides. A rule worth keeping is read from a view or a
+    /// snapshot and asserted there.</para>
+    ///
+    /// <para>Set <see cref="TraceVariable"/> to the substring to keep — for a repair that never
+    /// happens, <c>backfill-decision</c> is the one that says what the leader decided and on what
+    /// evidence.</para>
+    /// </summary>
+    [Fact]
+    [Trait("Category", "DSTProbe")]
+    public async Task AConfiguredPlan_ReportsTheTraceThatExplainsIt()
+    {
+        string? path = Environment.GetEnvironmentVariable(ShrinkPlanVariable);
+        string? substring = Environment.GetEnvironmentVariable(TraceVariable);
+
+        if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(substring))
+        {
+            Assert.Skip(
+                $"Set {ShrinkPlanVariable} to a plan file and {TraceVariable} to the trace substring " +
+                $"to capture. Optional: {ShrinkProbeRunsVariable} (default 20).");
+        }
+
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+
+        RegressionPlan plan = RegressionPlanCorpus.Read(path);
+        int runs = Setting(ShrinkProbeRunsVariable, 20);
+
+        SubstringFileLogger capture = new(substring);
+
+        using ILoggerFactory factory = LoggerFactory.Create(builder =>
+        {
+            builder.AddProvider(capture);
+            builder.SetMinimumLevel(LogLevel.Trace);
+        });
+
+        ILogger<IRaft> tracing = factory.CreateLogger<IRaft>();
+
+        for (int run = 1; run <= runs; run++)
+        {
+            capture.Clear();
+
+            string? failure = await ReplayAsync(plan, cancellationToken, tracing);
+
+            if (failure is null)
+                continue;
+
+            output.WriteLine($"Failed on run {run} of {runs}: {failure}");
+            output.WriteLine($"Captured {capture.Lines.Count} line(s) matching '{substring}':");
+
+            // The tail, not the whole capture. These traces are per-heartbeat and the run makes
+            // hundreds; what matters is what the leader was deciding once the writes stopped, which
+            // is the end of the list.
+            foreach (string line in capture.Lines.TakeLast(40))
+                output.WriteLine(line);
+
+            Assert.Fail(
+                $"Reported the trace for a failure on run {run} of {runs}. This probe always fails " +
+                "when it reproduces — the output above is the result.");
+        }
+
+        Assert.Fail(
+            $"{plan.Name} held every check over {runs} run(s), so there was no failure to explain. " +
+            $"Raise {ShrinkProbeRunsVariable}.");
+    }
+
     /// <summary>A folder nobody has promoted into is empty, not broken.</summary>
     [Fact]
     [Trait("Category", "DSTSmoke")]
@@ -276,7 +514,10 @@ public sealed class TestPlanRegressions
     /// regression run that stopped at the first failure would hide the rest, and the reader's next
     /// question is always how many.</para>
     /// </summary>
-    private async Task<string?> ReplayAsync(RegressionPlan plan, CancellationToken cancellationToken)
+    private async Task<string?> ReplayAsync(
+        RegressionPlan plan,
+        CancellationToken cancellationToken,
+        ILogger<IRaft>? replayLogger = null)
     {
         try
         {
@@ -289,7 +530,7 @@ public sealed class TestPlanRegressions
                     ConfigureNode = configuration =>
                         configuration.CompactEveryOperations = plan.Options.CompactEveryOperations,
                 },
-                logger,
+                replayLogger ?? logger,
                 cancellationToken);
 
             RandomScenarioRunner runner = new(cluster, plan.Options, new SimulationRandom(plan.Seed));
@@ -306,6 +547,44 @@ public sealed class TestPlanRegressions
         {
             return error.Message;
         }
+    }
+
+    /// <summary>
+    /// Writes the best plan found so far, so an interrupted shrink leaves something behind.
+    ///
+    /// <para>A separate file from the finished one. A reader must be able to tell a shrink that
+    /// completed from a shrink that was killed halfway: the first is a claim about what the failure
+    /// needs, the second is only the furthest the search happened to get.</para>
+    /// </summary>
+    private static void WriteProgress(
+        string directory,
+        string name,
+        RegressionPlan plan,
+        IReadOnlyList<RandomScenarioAction> reduced)
+    {
+        ShrinkResult partial = new()
+        {
+            Original = plan.Actions,
+            Shrunk = reduced,
+            Signature = "in-progress",
+            CandidatesRun = 0,
+            RemovalsAccepted = 0,
+            ParametersReduced = 0,
+            BudgetExhausted = false,
+            Header = PlanHeader.For(plan.Seed, plan.Options),
+        };
+
+        partial.WriteArtifact(directory, $"{name}.partial");
+    }
+
+    private static int Setting(string variable, int fallback)
+    {
+        string? text = Environment.GetEnvironmentVariable(variable);
+
+        return int.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out int value)
+               && value > 0
+            ? value
+            : fallback;
     }
 
     private static int ConfiguredRepeats()

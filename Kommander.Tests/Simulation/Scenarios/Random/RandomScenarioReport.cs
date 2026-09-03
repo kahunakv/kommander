@@ -1,4 +1,5 @@
 using System.Text;
+using Kommander.Tests.Simulation.Diagnostics;
 using Kommander.Tests.Simulation.History;
 
 namespace Kommander.Tests.Simulation.Scenarios.Random;
@@ -40,6 +41,15 @@ public sealed record RandomScenarioReport
     /// </summary>
     public long EntriesCompacted { get; init; }
 
+    /// <summary>
+    /// What the run cost.
+    ///
+    /// <para>Reported beside the plan because a run that is slow and a run that is wedged look
+    /// identical from a pass or a failure, and the difference is the whole question when a
+    /// continuous-integration job reports something unusual.</para>
+    /// </summary>
+    public SimulationMetrics? Metrics { get; init; }
+
     /// <summary>Actions of one kind. Used by the tests that prove the vocabulary is reachable.</summary>
     public int CountOf(RandomScenarioActionKind kind) => Actions.Count(action => action.Kind == kind);
 
@@ -65,6 +75,12 @@ public sealed record RandomScenarioReport
         text.AppendLine($"entriesCompacted={EntriesCompacted}");
         text.AppendLine($"appendsAcknowledged={History.AcknowledgedCount}");
         text.AppendLine($"appendsUnknown={History.UnknownCount}");
+
+        if (Metrics is not null)
+        {
+            foreach ((string key, string value) in Metrics.Pairs())
+                text.AppendLine($"{key}={value}");
+        }
         text.AppendLine();
 
         foreach (RandomScenarioAction action in Actions)

@@ -1,4 +1,5 @@
 using Kommander.Tests.Simulation.Cluster;
+using Kommander.Tests.Simulation.Diagnostics;
 using Kommander.Tests.Simulation.Random;
 using Kommander.Tests.Simulation.Scenarios.Random;
 using Kommander.Tests.Simulation.Shrinking;
@@ -36,6 +37,7 @@ namespace Kommander.Tests.Simulation;
 public sealed class TestRandomScenarios
 {
     private readonly ILogger<IRaft> logger;
+    private readonly ITestOutputHelper output;
 
     public TestRandomScenarios(ITestOutputHelper outputHelper)
     {
@@ -43,6 +45,7 @@ public sealed class TestRandomScenarios
             builder.AddXUnit(outputHelper).SetMinimumLevel(LogLevel.Warning));
 
         logger = loggerFactory.CreateLogger<IRaft>();
+        output = outputHelper;
     }
 
     /// <summary>
@@ -72,6 +75,22 @@ public sealed class TestRandomScenarios
         // log. A run that acknowledged nothing would have checked a history of nothing.
         Assert.True(report.History.Count > 0, "No client operation was issued.");
         Assert.True(report.FinalCommitIndex >= 0, "The cluster committed nothing at all.");
+
+        // Printed on every run, passing or not. What a search costs is the number that settles an
+        // argument about whether an unusual run was the change or the machine, and it is worth
+        // nothing if it only appears once something has already gone wrong.
+        Assert.NotNull(report.Metrics);
+        output.WriteLine(report.Metrics.Describe());
+
+        Assert.True(report.Metrics.StepsPerSecond > 0, "The run reported no throughput.");
+
+        Assert.InRange(report.Metrics.InvariantShare, 0, 1);
+
+        // The checker reads every node's view and every node's store on every settled state, so a
+        // run that reported no time at all in it has a timer around the wrong code.
+        Assert.True(
+            report.Metrics.InvariantTime > TimeSpan.Zero,
+            "The run reported no time spent checking invariants, which cannot be true.");
     }
 
     /// <summary>
@@ -285,16 +304,32 @@ public sealed class TestRandomScenarios
 
     // ── Helpers ───────────────────────────────────────────────────────────
 
-    /// <summary>The seed and the bounds, in the order a plan artifact writes them.</summary>
-    private static Dictionary<string, string> Header(ulong seed, RandomScenarioOptions options)
+    /// <summary>
+    /// Fails a run that broke its cost budget, when a budget is in force.
+    ///
+    /// <para><b>Why a passing run is checked at all.</b> A run that stops making progress still
+    /// passes: every check holds, it simply takes an order of magnitude longer, and nothing reports
+    /// that. The loss is silent, which is the only kind worth building a detector for.</para>
+    ///
+    /// <para><b>Why it is off unless the environment asks.</b> A developer's machine is not a
+    /// controlled environment. A suite that failed because a build was running beside it would teach
+    /// people to ignore the failure, and the metrics would then be worth less than nothing. The
+    /// continuous-integration jobs set the variable.</para>
+    /// </summary>
+    private static void RequireWithinBudget(ulong seed, RandomScenarioReport report)
     {
-        Dictionary<string, string> header = new() { ["seed"] = seed.ToString() };
+        if (report.Metrics is null)
+            return;
 
-        foreach ((string key, string value) in options.ToParameters())
-            header[key] = value;
+        IReadOnlyList<string> breaches = SimulationBudgetPolicy.Current().Breaches(report.Metrics);
 
-        return header;
+        Assert.True(
+            breaches.Count == 0,
+            $"Seed {seed} ran outside its budget.{Environment.NewLine}" +
+            $"{string.Join(Environment.NewLine, breaches)}{Environment.NewLine}" +
+            $"Measured: {report.Metrics.Describe()}");
     }
+
 
     /// <summary>
     /// Runs one seed and turns any failure into a report a reader can act on.
@@ -337,7 +372,11 @@ public sealed class TestRandomScenarios
 
         try
         {
-            return await runner.RunAsync(cancellationToken);
+            RandomScenarioReport report = await runner.RunAsync(cancellationToken);
+
+            RequireWithinBudget(seed, report);
+
+            return report;
         }
         catch (Exception error)
         {
@@ -405,7 +444,7 @@ public sealed class TestRandomScenarios
 
             // The shrunk file carries the same header the plan artifact does, so it can be dropped
             // straight into the regression corpus without a reader reconstructing the bounds.
-            result = result with { Header = Header(seed, options) };
+            result = result with { Header = PlanHeader.For(seed, options) };
 
             string path = result.WriteArtifact(directory, $"random-seed-{seed}");
 

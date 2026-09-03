@@ -63,8 +63,9 @@ public sealed class TestRocksDbWalEnospcRecovery
         volume.Fill();
 
         // Full volume: writes fail as a status, never as an escaping native exception. The first
-        // failure is an append failure, which RocksDB could still recover from on its own. Entries
-        // that still succeeded (RocksDB preallocates WAL file space) are durable and must survive.
+        // failure is either an append failure, which RocksDB could still recover from on its own, or
+        // already the WAL-creation failure that the helper provokes. Entries that still succeeded
+        // (RocksDB preallocates WAL file space) are durable and must survive.
         long failedId = WriteUntilErrored(wal, Partition, entries + 1);
         Assert.False(hardState.PersistHardState(Partition, currentTerm: 4, votedFor: "node-a"));
 
@@ -257,8 +258,13 @@ public sealed class TestRocksDbWalEnospcRecovery
 
     /// <summary>
     /// Writes entries from <paramref name="firstId"/> upward until the WAL reports Errored and returns
-    /// the id that failed. RocksDB preallocates space for its WAL file, so the first writes after the
-    /// volume fills can still succeed; those entries are durable and are expected to survive.
+    /// the id that failed. RocksDB preallocates space for its WAL file (about 70 MiB with the default
+    /// 64 MiB write buffer), and a filesystem that honours <c>fallocate</c>, such as tmpfs, lets every
+    /// append land inside that reservation long after the volume is full. HFS+ does not reserve that
+    /// much, which is why a plain write loop was enough on the macOS ramdisk and not in CI. So every
+    /// <see cref="FlushInterval"/> entries the helper forces a memtable switch: that creates a fresh
+    /// WAL file, which a volume that refuses file creation rejects at once. Entries that succeeded
+    /// before the failure are durable and are expected to survive the episode.
     /// </summary>
     private static long WriteUntilErrored(RocksDbWAL wal, int partition, long firstId)
     {
@@ -268,10 +274,19 @@ public sealed class TestRocksDbWalEnospcRecovery
         {
             if (wal.Write([(partition, [Entry(id)])]) == RaftOperationStatus.Errored)
                 return id;
+
+            if ((id - firstId + 1) % FlushInterval == 0)
+            {
+                try { wal.FlushMemTablesForTesting(); }
+                catch (RocksDbException) { }
+            }
         }
 
         throw new InvalidOperationException("The WAL never reported Errored on a full volume.");
     }
+
+    /// <summary>Entries between two forced memtable switches in <see cref="WriteUntilErrored"/>.</summary>
+    private const int FlushInterval = 256;
 
     private static void SetNetwork(InMemoryCommunication comm, RaftManager?[] live)
     {

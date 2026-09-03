@@ -247,6 +247,44 @@ public sealed class TestPlanShrinker
         Assert.Equal(RandomScenarioActionKind.PauseNode, result.Shrunk[0].Kind);
     }
 
+    /// <summary>
+    /// The attempt count follows from the reproduction rate.
+    ///
+    /// <para>The arithmetic that removes the worst guess in a shrink. A plan that reproduces every
+    /// time needs one attempt; one that reproduces rarely needs many; and a plan that never
+    /// reproduces cannot be caught at all, so the ceiling is returned rather than a number that
+    /// pretends otherwise.</para>
+    /// </summary>
+    [Theory]
+    [Trait("Category", "DSTSmoke")]
+    [InlineData(1.0, 1)]
+    [InlineData(0.5, 4)]
+    [InlineData(0.15, 15)]
+    [InlineData(0.05, 40)]
+    [InlineData(0.0, 40)]
+    public void TheAttemptCount_FollowsTheReproductionRate(double rate, int expected)
+    {
+        Assert.Equal(expected, ReproductionRate.RequiredAttempts(rate));
+    }
+
+    /// <summary>
+    /// A shrink can say what its own result is worth.
+    ///
+    /// <para>The number that stops a stalled shrink being read as a minimal plan. At six attempts
+    /// against a fifteen per cent plan a candidate is caught around three times in five, so a
+    /// search that removed nothing has probably rejected valid cuts.</para>
+    /// </summary>
+    [Fact]
+    [Trait("Category", "DSTSmoke")]
+    public void TheCatchProbability_SaysWhatAShrinkIsWorth()
+    {
+        Assert.InRange(ReproductionRate.CatchProbability(0.15, 6), 0.55, 0.65);
+        Assert.InRange(ReproductionRate.CatchProbability(0.15, 15), 0.85, 0.95);
+
+        Assert.Equal(1, ReproductionRate.CatchProbability(1.0, 1));
+        Assert.Equal(0, ReproductionRate.CatchProbability(0.0, 100));
+    }
+
     /// <summary>A shrink of a passing run is a caller error, not an empty result.</summary>
     [Fact]
     [Trait("Category", "DSTSmoke")]
