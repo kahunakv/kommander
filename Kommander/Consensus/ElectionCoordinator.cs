@@ -334,13 +334,28 @@ internal sealed class ElectionCoordinator
 
         await host.InvokeLeaderChanged(host.PartitionId, "");
 
-        coreState.CurrentTerm++;
+        // B2b: durably record the new term and our self-vote BEFORE adopting either in memory and before
+        // soliciting votes (see the same call in ForceLeaderForTestingAsync for rationale). Persisted
+        // first so a rejected write leaves nothing to undo. On a full disk (field incident 2026-09-01)
+        // the write fails on every attempt; a term bumped in memory without a durable self-vote could
+        // let this node vote a second time in that term after a crash. The attempt is abandoned
+        // instead: the node drops back to Follower with its term unchanged, and the election timer
+        // fires again on its own cadence until the WAL accepts the write.
+        long candidateTerm = coreState.CurrentTerm + 1;
+
+        if (!await wal.PersistHardStateAsync(candidateTerm, host.LocalEndpoint).ConfigureAwait(false))
+        {
+            logger.LogWarnHardStateNotPersisted(
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, candidateTerm, host.LocalEndpoint,
+                "election start", "Election abandoned; it is retried on the next election timeout.");
+
+            coreState.NodeState = RaftNodeState.Follower;
+            return;
+        }
+
+        coreState.CurrentTerm = candidateTerm;
 
         IncreaseVotes(host.LocalEndpoint, coreState.CurrentTerm);
-
-        // B2b: durably record the new term and our self-vote before soliciting votes (see the same call
-        // in ForceLeaderForTestingAsync for rationale).
-        await wal.PersistHardStateAsync(coreState.CurrentTerm, host.LocalEndpoint).ConfigureAwait(false);
 
         double delayMs = coreState.LastHeartbeatTicks != 0
             ? RaftMonotonic.Elapsed(coreState.LastHeartbeatTicks, nowTicks).TotalMilliseconds
@@ -689,7 +704,14 @@ internal sealed class ElectionCoordinator
             // B2b: the higher term is adopted here even if we go on to DENY this candidate below (on
             // log-freshness), so persist it now with no vote yet — otherwise a crash after step-down but
             // before any log write would regress the term on restart. A grant below overwrites votedFor.
-            await wal.PersistHardStateAsync(coreState.CurrentTerm, null).ConfigureAwait(false);
+            // A rejected write is tolerated: the term stays adopted in memory, and a crash may regress it,
+            // which is safe because no vote was recorded in it (a grant below persists on its own).
+            if (!await wal.PersistHardStateAsync(coreState.CurrentTerm, null).ConfigureAwait(false))
+            {
+                logger.LogWarnHardStateNotPersisted(
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, coreState.CurrentTerm, null,
+                    "higher-term adoption on a vote request", "The term is adopted in memory only.");
+            }
         }
 
         string expectedLeader = expectedLeaders.GetValueOrDefault(voteTerm, "");
@@ -714,6 +736,21 @@ internal sealed class ElectionCoordinator
             return;
         }
         
+        // B2b: durably record who we voted for in this term BEFORE replying, so a crash right after the
+        // reply cannot let us grant a different candidate in the same term after restart (the double-vote
+        // that would let two leaders be elected for one term). The term persisted is voteTerm — the term we
+        // are voting in, which is >= coreState.CurrentTerm here. Persisted before any in-memory grant
+        // bookkeeping so a rejected write leaves nothing to undo: the vote is simply withheld, because a
+        // vote the node cannot remember across a crash is exactly the double-vote hazard above. The
+        // candidate asks again on its next round, and the grant succeeds once the WAL accepts writes.
+        if (!await wal.PersistHardStateAsync(voteTerm, node.Endpoint).ConfigureAwait(false))
+        {
+            logger.LogWarnHardStateNotPersisted(
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, voteTerm, node.Endpoint,
+                "vote grant", "Vote withheld; the candidate may ask again.");
+            return;
+        }
+
         coreState.LastHeartbeat = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, timestamp);
         coreState.LastVotation = coreState.LastHeartbeat;
 
@@ -724,12 +761,6 @@ internal sealed class ElectionCoordinator
         coreState.LastVotationTicks = grantTicks;
 
         expectedLeaders[voteTerm] = node.Endpoint;
-
-        // B2b: durably record who we voted for in this term BEFORE replying, so a crash right after the
-        // reply cannot let us grant a different candidate in the same term after restart (the double-vote
-        // that would let two leaders be elected for one term). The term persisted is voteTerm — the term we
-        // are voting in, which is >= coreState.CurrentTerm here.
-        await wal.PersistHardStateAsync(voteTerm, node.Endpoint).ConfigureAwait(false);
 
         logger.LogInfoSendingVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm);
 

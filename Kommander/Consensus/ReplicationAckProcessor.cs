@@ -111,7 +111,15 @@ internal sealed class ReplicationAckProcessor
             if (stepDown)
                 await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
 
-            await wal.PersistHardStateAsync(coreState.CurrentTerm, null).ConfigureAwait(false);
+            // A rejected write is tolerated here: the higher term stays adopted in memory and no vote was
+            // recorded in it, so a crash that regresses the term cannot produce a double vote.
+            if (!await wal.PersistHardStateAsync(coreState.CurrentTerm, null).ConfigureAwait(false))
+            {
+                logger.LogWarnHardStateNotPersisted(
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, coreState.CurrentTerm, null,
+                    "higher-term adoption on an append ack", "The term is adopted in memory only.");
+            }
+
             return;
         }
 

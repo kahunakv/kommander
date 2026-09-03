@@ -1,5 +1,7 @@
 
 using System.Buffers;
+using System.Diagnostics;
+using Kommander.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Text;
 using Google.Protobuf;
@@ -71,18 +73,36 @@ public class RocksDbWAL : IWAL, IDisposable
     /// for write-ahead logging (WAL). Provides efficient operations for
     /// persisting and retrieving logs with support for multiple column
     /// families and partitioning.
+    ///
+    /// <para>Not <c>readonly</c>: <see cref="ReopenEngine"/> replaces the instance when RocksDB latches
+    /// a storage error it cannot clear on its own (see the engine-recovery region). Every access runs
+    /// under the read side of <see cref="engineGuard"/>; the swap runs under its write side, which is
+    /// what makes the replacement safe against in-flight iterators and writes.</para>
     /// </summary>
-    private readonly RocksDb db;
+    private RocksDb db;
 
     /// <summary>
     /// Cached handle to the <c>metadata</c> column family. Resolved once at construction so the hot
-    /// checkpoint-lookup / checkpoint-persist paths never re-resolve it per call.
+    /// checkpoint-lookup / checkpoint-persist paths never re-resolve it per call. Re-resolved by
+    /// <see cref="ReopenEngine"/>, because a handle belongs to the engine instance that issued it.
     /// </summary>
-    private readonly ColumnFamilyHandle metadataColumnFamily;
+    private ColumnFamilyHandle metadataColumnFamily;
 
     private readonly string path;
     
     private readonly string revision;
+
+    /// <summary>
+    /// The options the engine was opened with, kept so that a recovery reopen uses exactly the
+    /// configuration the constructor chose (shared block cache and write-buffer manager included).
+    /// </summary>
+    private readonly DbOptions dbOptions;
+
+    /// <summary>Column-family descriptors the engine was opened with; see <see cref="dbOptions"/>.</summary>
+    private readonly ColumnFamilies columnFamilies;
+
+    /// <summary>The on-disk directory of this engine: <c>{path}/{revision}</c>.</summary>
+    private readonly string enginePath;
     
     private readonly ConcurrentDictionary<int, Lazy<ColumnFamilyHandle>> families = new();
 
@@ -238,6 +258,10 @@ public class RocksDbWAL : IWAL, IDisposable
         // firstTime probe above must run before this, since creating the directory would answer it.
         WalStoragePaths.EnsureDirectory(completePath);
 
+        this.dbOptions = dbOptions;
+        this.columnFamilies = columnFamilies;
+        enginePath = completePath;
+
         db = RocksDb.Open(dbOptions, completePath, columnFamilies);
 
         metadataColumnFamily = db.GetColumnFamily("metadata");
@@ -257,6 +281,356 @@ public class RocksDbWAL : IWAL, IDisposable
                 );
             }
         }
+    }
+
+
+    // ── Engine recovery after a latched storage error ────────────────────────────────────────────
+    //
+    // Field incident (2026-09-01): the data volume filled, the operator freed space while the process
+    // kept running, and the node never recovered. Every election attempt failed inside PersistHardState
+    // with the SAME RocksDB error naming the SAME WAL file, for many minutes, until a process restart.
+    //
+    // RocksDB keeps one background-error status per engine. A failed WAL *append* ("While appending
+    // to file") is a recoverable error: the engine's built-in SstFileManager polls free space and
+    // resumes the engine on its own once space is back (measured at ~5 s on this binding). A failed
+    // WAL *file creation* is different. The memtable switch that every flush performs opens a fresh
+    // log file, and "While open a file for appending" is that open. RocksDB classifies a failure there
+    // as an unrecoverable memtable error: automatic recovery never runs for it, and even a manual
+    // resume is refused. From then on every write returns the cached status without touching the
+    // disk, which is why the error kept naming a log file long after the space was freed. Under a
+    // full disk the switch is reached from ordinary load (a memtable fills, or the shared
+    // write-buffer manager asks for a flush), so the latch is the expected end state of any
+    // sustained ENOSPC episode, not a rare corner.
+    //
+    // The only way out is to close the engine and open it again. That is safe: every acknowledged
+    // sync write is already fsynced, and un-synced records were handed to the operating system on
+    // append (RocksDB flushes its writer buffer per record), so a same-process reopen replays the log
+    // files from disk or page cache and loses nothing that was acknowledged. The failed batch itself
+    // was already reported as Errored, and the Raft layer regressed its frontiers for it
+    // (RaftWriteAhead.RegressFrontiersAfterFailedWriteAsync).
+    //
+    // Detection does not parse error strings. After a write-path failure the WAL asks two questions:
+    //   1. Does the filesystem accept writes now?  A probe file: create, write, fsync, delete.
+    //   2. Does the engine accept writes now?      A canary put into the metadata column family.
+    // "Filesystem yes, engine no" is a latched engine, and only then is it reopened. A still-full
+    // disk fails question 1, so the WAL keeps reporting Errored and the Raft layer keeps retrying on
+    // its own cadence. An engine that resumed by itself passes question 2 and is left alone. The
+    // reopen runs under the exclusive side of engineGuard, so no iterator, read, or write can touch
+    // the handle being replaced. Every write-path entry point retries its operation once after a
+    // successful recovery; all of them are idempotent upserts or deletes, so the retry is safe.
+
+    /// <summary>
+    /// Fences the engine handle: every public operation holds the read side for its duration, and
+    /// <see cref="ReopenEngine"/> / <see cref="Dispose"/> take the write side. Recursion is permitted
+    /// because a small number of public operations call other public operations on the same thread
+    /// (for example <see cref="TruncateLogsAfterAndGetMax"/>); the cost of the recursive policy is
+    /// negligible next to the storage operation it brackets.
+    /// </summary>
+    private readonly ReaderWriterLockSlim engineGuard = new(LockRecursionPolicy.SupportsRecursion);
+
+    /// <summary>
+    /// True while <see cref="db"/> is not a usable handle: after <see cref="Dispose"/>, and between a
+    /// close and a successful reopen when the reopen itself failed. Public operations throw a
+    /// <see cref="RaftException"/> in that state; the next write-path failure retries the reopen.
+    /// </summary>
+    private volatile bool engineClosed;
+
+    /// <summary>The exception of the most recent write-path failure; consumed by <see cref="TryRecoverEngineAfterFailure"/>.</summary>
+    private Exception? lastStorageFailure;
+
+    private long lastProbeTicks;
+
+    /// <summary>Consecutive write-path failures since the last success; drives the sustained-failure log cadence.</summary>
+    private int failureStreak;
+
+    private long failureStreakStartTicks;
+
+    private long lastFailureLogTicks;
+
+    /// <summary>Number of successful engine reopens performed by recovery. Exposed for tests.</summary>
+    internal int EngineReopenCount { get; private set; }
+
+    /// <summary>Message of the most recent write-path failure, or <see langword="null"/>. Exposed for tests.</summary>
+    internal string? LastStorageFailureMessage => Volatile.Read(ref lastStorageFailure)?.Message;
+
+    /// <summary>Metadata key the engine canary writes. Its value (a UTC tick count) carries no meaning.</summary>
+    private static readonly byte[] EngineCanaryKey = "kommander_engine_canary"u8.ToArray();
+
+    /// <summary>
+    /// Name of the filesystem probe file, created inside the engine directory so the probe measures the
+    /// volume the log actually lives on. RocksDB ignores files whose names it does not recognise, and
+    /// the probe is deleted right after it is written in any case.
+    /// </summary>
+    private const string SpaceProbeFileName = ".kommander-space-probe";
+
+    /// <summary>
+    /// Bytes the filesystem probe writes. Large enough that a volume with a few stray free blocks does
+    /// not pass, small enough that a probe is cheap; RocksDB itself needs far more than this to flush,
+    /// so a passing probe followed by a failing reopen is still handled (the reopen retries later).
+    /// </summary>
+    private const int SpaceProbeBytes = 64 * 1024;
+
+    /// <summary>Minimum spacing between filesystem probes, so a flood of failing writers does not flood the disk with probes.</summary>
+    private static readonly TimeSpan ProbeInterval = TimeSpan.FromSeconds(1);
+
+    /// <summary>Cadence of the "still failing" warning while writes keep failing.</summary>
+    private static readonly TimeSpan SustainedFailureLogInterval = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Read-side lease on <see cref="engineGuard"/>, released by <c>using</c>. A <c>struct</c> so the hot
+    /// paths pay no allocation for the fence.
+    /// </summary>
+    private readonly struct EngineLease : IDisposable
+    {
+        private readonly ReaderWriterLockSlim guard;
+
+        public EngineLease(ReaderWriterLockSlim guard)
+        {
+            this.guard = guard;
+            guard.EnterReadLock();
+        }
+
+        public void Dispose() => guard.ExitReadLock();
+    }
+
+    /// <summary>
+    /// Takes the read-side lease and verifies the engine is open. Throws when it is closed so a caller
+    /// never touches a disposed handle; write-path entry points catch this like any other failure and
+    /// route it into recovery, read paths let it propagate to their caller.
+    /// </summary>
+    private EngineLease AcquireEngine()
+    {
+        EngineLease lease = new(engineGuard);
+
+        if (!engineClosed)
+            return lease;
+
+        lease.Dispose();
+        throw new RaftException(
+            $"RocksDB WAL at '{enginePath}' is closed after a storage failure and has not been reopened yet; "
+            + "the next write retries the reopen.");
+    }
+
+    /// <summary>
+    /// Records a write-path failure. The first failure of a streak logs a warning; later ones log again
+    /// every <see cref="SustainedFailureLogInterval"/> with the streak's duration so an operator can see a
+    /// disk that stays full, without one line per failed batch.
+    /// </summary>
+    private void NoteStorageFailure(Exception ex)
+    {
+        Volatile.Write(ref lastStorageFailure, ex);
+
+        long now = Stopwatch.GetTimestamp();
+        int streak = Interlocked.Increment(ref failureStreak);
+
+        if (streak == 1)
+        {
+            Volatile.Write(ref failureStreakStartTicks, now);
+            Volatile.Write(ref lastFailureLogTicks, now);
+
+            logger.LogWarning(
+                "RocksDB WAL at '{Path}' rejected a write: {Message}. Raft frontiers regress to the durable log; the WAL probes the filesystem on each failure and reopens the engine once space is back",
+                enginePath, ex.Message);
+            return;
+        }
+
+        long lastLog = Volatile.Read(ref lastFailureLogTicks);
+
+        if (Stopwatch.GetElapsedTime(lastLog, now) < SustainedFailureLogInterval)
+            return;
+
+        Volatile.Write(ref lastFailureLogTicks, now);
+
+        logger.LogWarning(
+            "RocksDB WAL at '{Path}' has rejected writes for {Duration} ({Count} failures); last error: {Message}",
+            enginePath, Stopwatch.GetElapsedTime(Volatile.Read(ref failureStreakStartTicks), now), streak, ex.Message);
+    }
+
+    /// <summary>Closes a failure streak. One volatile read on the hot path when there is no streak.</summary>
+    private void NoteStorageSuccess()
+    {
+        if (Volatile.Read(ref failureStreak) == 0)
+            return;
+
+        int streak = Interlocked.Exchange(ref failureStreak, 0);
+
+        if (streak == 0)
+            return;
+
+        logger.LogInformation(
+            "RocksDB WAL at '{Path}' accepts writes again after {Count} failures over {Duration}",
+            enginePath, streak, Stopwatch.GetElapsedTime(Volatile.Read(ref failureStreakStartTicks)));
+    }
+
+    /// <summary>
+    /// Called by every write-path entry point after its core returned <see cref="RaftOperationStatus.Errored"/>.
+    /// Returns <see langword="true"/> when the caller should retry its operation once: the engine was
+    /// reopened, or it turned out to accept writes again on its own. Returns <see langword="false"/> when
+    /// the failure was not a storage fault, when the filesystem still refuses writes, when the probe is
+    /// rate-limited, or when the reopen failed.
+    /// <para>Must be called WITHOUT the engine lease held: it takes the write side of
+    /// <see cref="engineGuard"/> to swap the handle.</para>
+    /// </summary>
+    private bool TryRecoverEngineAfterFailure()
+    {
+        Exception? failure = Volatile.Read(ref lastStorageFailure);
+
+        // A managed exception (a bug, an invalid argument) is not a storage fault; reopening the engine
+        // for it would hide the bug behind a recovery log line. A closed engine always qualifies.
+        if (failure is not RocksDbException && !engineClosed)
+            return false;
+
+        if (!FilesystemAcceptsWrites())
+            return false;
+
+        engineGuard.EnterWriteLock();
+        try
+        {
+            if (!engineClosed && EngineAcceptsWrites())
+            {
+                logger.LogInformation(
+                    "RocksDB WAL at '{Path}' resumed on its own after a storage failure; no reopen needed",
+                    enginePath);
+                return true;
+            }
+
+            return ReopenEngine(failure);
+        }
+        finally
+        {
+            engineGuard.ExitWriteLock();
+        }
+    }
+
+    /// <summary>
+    /// Question 1 of recovery: can the volume take a small durable write right now? Rate-limited to one
+    /// probe per <see cref="ProbeInterval"/> across all failing callers; a rate-limited call answers
+    /// <see langword="false"/> and the next failure asks again.
+    /// </summary>
+    private bool FilesystemAcceptsWrites()
+    {
+        long now = Stopwatch.GetTimestamp();
+        long last = Volatile.Read(ref lastProbeTicks);
+
+        if (last != 0 && Stopwatch.GetElapsedTime(last, now) < ProbeInterval)
+            return false;
+
+        if (Interlocked.CompareExchange(ref lastProbeTicks, now, last) != last)
+            return false;
+
+        string probePath = Path.Combine(enginePath, SpaceProbeFileName);
+
+        try
+        {
+            using (FileStream stream = new(probePath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 1))
+            {
+                stream.Write(new byte[SpaceProbeBytes]);
+                stream.Flush(flushToDisk: true);
+            }
+
+            return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+        finally
+        {
+            try { File.Delete(probePath); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    /// <summary>
+    /// Question 2 of recovery: does the engine accept a durable write right now? A latched engine returns
+    /// its cached error without touching the disk. Must hold the write side of <see cref="engineGuard"/>.
+    /// </summary>
+    private bool EngineAcceptsWrites()
+    {
+        try
+        {
+            db.Put(EngineCanaryKey, BitConverter.GetBytes(DateTime.UtcNow.Ticks), metadataColumnFamily, SynchronousWriteOptions);
+            return true;
+        }
+        catch (RocksDbException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Closes the current engine and opens a fresh one on the same directory with the same options. Must
+    /// hold the write side of <see cref="engineGuard"/>. When the open fails the WAL stays closed
+    /// (<see cref="engineClosed"/>): operations throw or return Errored, and the next write-path failure
+    /// runs this again. There is no way to keep the old handle as a fallback, because RocksDB's directory
+    /// lock permits one open engine per directory per process.
+    /// </summary>
+    private bool ReopenEngine(Exception? cause)
+    {
+        if (!engineClosed)
+        {
+            engineClosed = true;
+
+            // Column-family handles belong to the engine instance that issued them.
+            families.Clear();
+
+            try
+            {
+                db.Dispose();
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning("RocksDB WAL at '{Path}': close before reopen reported {Message}", enginePath, ex.Message);
+            }
+        }
+
+        try
+        {
+            db = RocksDb.Open(dbOptions, enginePath, columnFamilies);
+            metadataColumnFamily = db.GetColumnFamily("metadata");
+            engineClosed = false;
+            EngineReopenCount++;
+
+            KommanderMetrics.RecordWalEngineReopen(succeeded: true);
+
+            logger.LogWarning(
+                "RocksDB WAL at '{Path}' was reopened to clear a latched storage error (reopen #{Count}); the error was: {Message}",
+                enginePath, EngineReopenCount, cause?.Message ?? "<engine closed>");
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            KommanderMetrics.RecordWalEngineReopen(succeeded: false);
+
+            logger.LogCritical(
+                "RocksDB WAL at '{Path}' could not be reopened after a storage failure; every operation fails until a later write retries the reopen: {Message}",
+                enginePath, ex.Message);
+
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Test-only: forces a memtable switch on every column family that holds data, which makes RocksDB
+    /// create a fresh WAL file. On a full volume that creation fails and the engine latches the
+    /// unrecoverable error this recovery region exists for. Throws the engine's error to the caller.
+    /// </summary>
+    internal void FlushMemTablesForTesting()
+    {
+        using EngineLease lease = AcquireEngine();
+        FlushOptions flushOptions = new();
+
+        Native.Instance.rocksdb_flush_cf(db.Handle, flushOptions.Handle, metadataColumnFamily.Handle);
+        Native.Instance.rocksdb_flush_cf(db.Handle, flushOptions.Handle, db.GetColumnFamily("default").Handle);
+
+        for (int i = 0; i < MaxShards; i++)
+            Native.Instance.rocksdb_flush_cf(db.Handle, flushOptions.Handle, db.GetColumnFamily("shard" + i).Handle);
     }
 
     /// <summary>
@@ -304,6 +678,8 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </returns>
     public List<RaftLog> ReadLogs(int partitionId)
     {
+        using EngineLease lease = AcquireEngine();
+
         List<RaftLog> result = [];
 
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
@@ -361,6 +737,8 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </summary>
     public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries, long maxBytes)
     {
+        using EngineLease lease = AcquireEngine();
+
         // Presize when the caller supplied a sane bound (the common case: a bounded backfill batch),
         // so a full batch does not walk the doubling sequence. An unbounded/absurd limit falls back
         // to the default growth rather than reserving for entries that may not exist.
@@ -433,6 +811,24 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </remarks>
     public RaftOperationStatus Write(List<(int, List<RaftLog>)> logs, bool sync)
     {
+        RaftOperationStatus status = WriteCore(logs, sync);
+
+        if (status == RaftOperationStatus.Errored && TryRecoverEngineAfterFailure())
+            status = WriteCore(logs, sync);
+
+        if (status == RaftOperationStatus.Success)
+            NoteStorageSuccess();
+
+        return status;
+    }
+
+    /// <summary>
+    /// The body of <see cref="Write(List{ValueTuple{int, List{RaftLog}}}, bool)"/>, run under the engine
+    /// lease. Never reopens the engine itself: a failure is recorded and reported as Errored, and the
+    /// public wrapper decides about recovery after the lease is released.
+    /// </summary>
+    private RaftOperationStatus WriteCore(List<(int, List<RaftLog>)> logs, bool sync)
+    {
         WriteOptions effectiveOptions = sync ? writeOptions : NonSynchronousWriteOptions;
 
         // Checkpoint-bearing batches read-modify-write the persisted last-checkpoint metadata and must be
@@ -442,6 +838,8 @@ public class RocksDbWAL : IWAL, IDisposable
 
         try
         {
+            using EngineLease lease = AcquireEngine();
+
             if (exclusive)
                 writeGuard.EnterWriteLock();
             else
@@ -629,7 +1027,8 @@ public class RocksDbWAL : IWAL, IDisposable
         catch (Exception ex)
         {
             logger.LogError("Error during write: {Message}\n{StackTrace}", ex.Message, ex.StackTrace);
-                    
+
+            NoteStorageFailure(ex);
             return RaftOperationStatus.Errored;
         }
     }
@@ -873,6 +1272,8 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </returns>
     public long GetMaxLog(int partitionId)
     {
+        using EngineLease lease = AcquireEngine();
+
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
         
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
@@ -906,6 +1307,8 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </summary>
     public long GetTermAt(int partitionId, long logIndex)
     {
+        using EngineLease lease = AcquireEngine();
+
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
         Span<byte> key = stackalloc byte[LogKeyWidth];
@@ -1211,6 +1614,8 @@ public class RocksDbWAL : IWAL, IDisposable
 
     public long GetCurrentTerm(int partitionId)
     {
+        using EngineLease lease = AcquireEngine();
+
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
@@ -1236,12 +1641,16 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </returns>
     public long GetLastCheckpoint(int partitionId)
     {
+        using EngineLease lease = AcquireEngine();
+
         return GetLastCheckpointFromMeta(partitionId);
     }
 
     /// <inheritdoc/>
     public int CountPersistedLogs(int partitionId)
     {
+        using EngineLease lease = AcquireEngine();
+
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
@@ -1267,7 +1676,9 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <inheritdoc/>
     public int CountRemovableLogs(int partitionId)
     {
-        long lastCheckpoint = GetLastCheckpoint(partitionId);
+        using EngineLease lease = AcquireEngine();
+
+        long lastCheckpoint = GetLastCheckpointFromMeta(partitionId);
 
         if (lastCheckpoint <= 0)
             return 0;
@@ -1307,6 +1718,8 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </returns>
     public string? GetMetaData(string key)
     {
+        using EngineLease lease = AcquireEngine();
+
         byte[] value = db.Get(Encoding.UTF8.GetBytes(key), cf: metadataColumnFamily);
 
         return value is not null ? Encoding.UTF8.GetString(value) : null;
@@ -1326,9 +1739,40 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </returns>
     public bool SetMetaData(string key, string value)
     {
-        db.Put(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), cf: metadataColumnFamily);
+        bool ok = SetMetaDataCore(key, value);
 
-        return true;
+        if (!ok && TryRecoverEngineAfterFailure())
+            ok = SetMetaDataCore(key, value);
+
+        if (ok)
+            NoteStorageSuccess();
+
+        return ok;
+    }
+
+    /// <summary>
+    /// Body of <see cref="SetMetaData"/> under the engine lease. This backs Raft hard-state persistence on
+    /// the election path (<see cref="IWAL.PersistHardState"/>), so a storage failure must surface as
+    /// <see langword="false"/> and never as a native exception escaping into the partition executor: the
+    /// election code decides what to do with a vote it could not make durable.
+    /// </summary>
+    private bool SetMetaDataCore(string key, string value)
+    {
+        try
+        {
+            using EngineLease lease = AcquireEngine();
+
+            db.Put(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), cf: metadataColumnFamily);
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError("Error during SetMetaData({Key}): {Message}", key, ex.Message);
+
+            NoteStorageFailure(ex);
+            return false;
+        }
     }
 
     /// <summary>
@@ -1475,8 +1919,23 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <inheritdoc/>
     public RaftOperationStatus DeletePartitionWAL(int partitionId)
     {
+        RaftOperationStatus status = DeletePartitionWALCore(partitionId);
+
+        if (status == RaftOperationStatus.Errored && TryRecoverEngineAfterFailure())
+            status = DeletePartitionWALCore(partitionId);
+
+        if (status == RaftOperationStatus.Success)
+            NoteStorageSuccess();
+
+        return status;
+    }
+
+    private RaftOperationStatus DeletePartitionWALCore(int partitionId)
+    {
         try
         {
+            using EngineLease lease = AcquireEngine();
+
             ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
             // Deletes are staged straight into the WriteBatch while iterating — WriteBatch copies the
@@ -1524,6 +1983,8 @@ public class RocksDbWAL : IWAL, IDisposable
         catch (Exception ex)
         {
             logger.LogError("Error during DeletePartitionWAL({PartitionId}): {Message}", partitionId, ex.Message);
+
+            NoteStorageFailure(ex);
             return RaftOperationStatus.Errored;
         }
     }
@@ -1531,8 +1992,23 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <inheritdoc/>
     public RaftOperationStatus TruncateLogsAfter(int partitionId, long afterLogId)
     {
+        RaftOperationStatus status = TruncateLogsAfterCore(partitionId, afterLogId);
+
+        if (status == RaftOperationStatus.Errored && TryRecoverEngineAfterFailure())
+            status = TruncateLogsAfterCore(partitionId, afterLogId);
+
+        if (status == RaftOperationStatus.Success)
+            NoteStorageSuccess();
+
+        return status;
+    }
+
+    private RaftOperationStatus TruncateLogsAfterCore(int partitionId, long afterLogId)
+    {
         try
         {
+            using EngineLease lease = AcquireEngine();
+
             writeGuard.EnterWriteLock();
             try
             {
@@ -1589,6 +2065,8 @@ public class RocksDbWAL : IWAL, IDisposable
         catch (Exception ex)
         {
             logger.LogError("TruncateLogsAfter({PartitionId}, {AfterLogId}): {Message}", partitionId, afterLogId, ex.Message);
+
+            NoteStorageFailure(ex);
             return RaftOperationStatus.Errored;
         }
     }
@@ -1596,8 +2074,23 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <inheritdoc/>
     public RaftOperationStatus TruncateProposedLogsAfter(int partitionId, long afterLogId)
     {
+        RaftOperationStatus status = TruncateProposedLogsAfterCore(partitionId, afterLogId);
+
+        if (status == RaftOperationStatus.Errored && TryRecoverEngineAfterFailure())
+            status = TruncateProposedLogsAfterCore(partitionId, afterLogId);
+
+        if (status == RaftOperationStatus.Success)
+            NoteStorageSuccess();
+
+        return status;
+    }
+
+    private RaftOperationStatus TruncateProposedLogsAfterCore(int partitionId, long afterLogId)
+    {
         try
         {
+            using EngineLease lease = AcquireEngine();
+
             writeGuard.EnterWriteLock();
             try
             {
@@ -1647,6 +2140,8 @@ public class RocksDbWAL : IWAL, IDisposable
         catch (Exception ex)
         {
             logger.LogError("TruncateProposedLogsAfter({PartitionId}, {AfterLogId}): {Message}", partitionId, afterLogId, ex.Message);
+
+            NoteStorageFailure(ex);
             return RaftOperationStatus.Errored;
         }
     }
@@ -1681,10 +2176,26 @@ public class RocksDbWAL : IWAL, IDisposable
     public (RaftOperationStatus Status, bool SuffixTruncated) InstallSnapshotBoundary(
         int partitionId, long snapshotIndex, long lastIncludedTerm, bool sync)
     {
+        (RaftOperationStatus Status, bool SuffixTruncated) result = InstallSnapshotBoundaryCore(partitionId, snapshotIndex, lastIncludedTerm, sync);
+
+        if (result.Status == RaftOperationStatus.Errored && TryRecoverEngineAfterFailure())
+            result = InstallSnapshotBoundaryCore(partitionId, snapshotIndex, lastIncludedTerm, sync);
+
+        if (result.Status == RaftOperationStatus.Success)
+            NoteStorageSuccess();
+
+        return result;
+    }
+
+    private (RaftOperationStatus Status, bool SuffixTruncated) InstallSnapshotBoundaryCore(
+        int partitionId, long snapshotIndex, long lastIncludedTerm, bool sync)
+    {
         WriteOptions effectiveOptions = sync ? writeOptions : NonSynchronousWriteOptions;
 
         try
         {
+            using EngineLease lease = AcquireEngine();
+
             writeGuard.EnterWriteLock();
             try
             {
@@ -1756,6 +2267,8 @@ public class RocksDbWAL : IWAL, IDisposable
         {
             logger.LogError("InstallSnapshotBoundary({PartitionId}, {SnapshotIndex}): {Message}",
                 partitionId, snapshotIndex, ex.Message);
+
+            NoteStorageFailure(ex);
             return (RaftOperationStatus.Errored, false);
         }
     }
@@ -1785,10 +2298,29 @@ public class RocksDbWAL : IWAL, IDisposable
         int compactNumberEntries,
         int? maxTotalEntries = null)
     {
+        (RaftOperationStatus Status, int Removed) result = CompactLogsOlderThanCore(partitionId, lastCheckpoint, compactNumberEntries, maxTotalEntries);
+
+        if (result.Status == RaftOperationStatus.Errored && TryRecoverEngineAfterFailure())
+            result = CompactLogsOlderThanCore(partitionId, lastCheckpoint, compactNumberEntries, maxTotalEntries);
+
+        if (result.Status == RaftOperationStatus.Success)
+            NoteStorageSuccess();
+
+        return result;
+    }
+
+    private (RaftOperationStatus Status, int Removed) CompactLogsOlderThanCore(
+        int partitionId,
+        long lastCheckpoint,
+        int compactNumberEntries,
+        int? maxTotalEntries)
+    {
         int passCap = maxTotalEntries ?? compactNumberEntries;
 
         try
         {
+            using EngineLease lease = AcquireEngine();
+
             ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
             // No last-checkpoint update: compaction only removes entries with id < lastCheckpoint, so the
@@ -1850,6 +2382,7 @@ public class RocksDbWAL : IWAL, IDisposable
         {
             logger.LogError("Error during compact: {Message}", ex.Message);
 
+            NoteStorageFailure(ex);
             return (RaftOperationStatus.Errored, 0);
         }
     }
@@ -1989,7 +2522,21 @@ public class RocksDbWAL : IWAL, IDisposable
     {
         GC.SuppressFinalize(this);
 
-        db.Dispose();
+        engineGuard.EnterWriteLock();
+        try
+        {
+            if (!engineClosed)
+            {
+                engineClosed = true;
+                db.Dispose();
+            }
+        }
+        finally
+        {
+            engineGuard.ExitWriteLock();
+        }
+
         writeGuard.Dispose();
+        engineGuard.Dispose();
     }
 }

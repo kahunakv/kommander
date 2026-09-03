@@ -178,6 +178,85 @@ public sealed class TestRandomScenarios
     }
 
     /// <summary>
+    /// A failing run shrinks its own plan when the environment asks for it.
+    ///
+    /// <para><b>What this protects.</b> The nightly job turns the shrinker on with an environment
+    /// variable and collects the file it leaves behind. Nothing else exercises that path, so a
+    /// mistake in it — a variable read wrongly, an artifact written to the wrong folder, a shrink
+    /// that throws over the finding — would stay invisible until the night a real seed failed, which
+    /// is the worst possible moment to learn about it.</para>
+    ///
+    /// <para>The failure is forced by giving the run a recovery budget of one step, so the
+    /// convergence check cannot pass. Every candidate the shrinker tries fails the same way, which
+    /// is fine: what is under test is the wiring, not the reduction.</para>
+    /// </summary>
+    [Fact]
+    [Trait("Category", "DSTRandom")]
+    public async Task AFailingRun_ShrinksItsPlanWhenAsked()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+
+        string directory = Path.Combine(
+            AppContext.BaseDirectory, "dst-artifacts", "shrink-wiring-check");
+
+        if (Directory.Exists(directory))
+            Directory.Delete(directory, recursive: true);
+
+        string? enabled = Environment.GetEnvironmentVariable(ShrinkPolicy.EnabledVariable);
+        string? budget = Environment.GetEnvironmentVariable(ShrinkPolicy.BudgetVariable);
+
+        try
+        {
+            Environment.SetEnvironmentVariable(ShrinkPolicy.EnabledVariable, "1");
+            Environment.SetEnvironmentVariable(ShrinkPolicy.BudgetVariable, "3");
+
+            RandomScenarioOptions options = new()
+            {
+                ActionCount = 4,
+                StepsPerAction = 3,
+
+                // Zero steps to converge, so the convergence check reports a failure without ever
+                // looking. One step does not work: the check runs after each step and a healthy
+                // cluster passes on the first, so the run would succeed and this test would prove
+                // nothing. Zero is the only budget that fails whatever the cluster does, which is
+                // what a test of the reporting path needs.
+                RecoveryStepBudget = 0,
+                ArtifactDirectory = directory,
+            };
+
+            InvalidOperationException error =
+                await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => RunSeedAsync(20260912, options, cancellationToken));
+
+            Assert.Contains("Shrunk:", error.Message, StringComparison.Ordinal);
+
+            string[] shrunk = Directory.GetFiles(directory, "*.shrunk.plan.txt");
+
+            Assert.NotEmpty(shrunk);
+
+            // The file the nightly collects has to carry the bounds, or a reader who promotes it
+            // gets a plan that replays under the defaults instead of under the run that failed.
+            IReadOnlyDictionary<string, string> header =
+                RandomScenarioPlan.ParseHeaderFile(shrunk[0]);
+
+            Assert.Equal("20260912", header["seed"]);
+            Assert.Equal("0", header["recoveryStepBudget"]);
+            Assert.True(header.ContainsKey("signature"), "The shrunk plan does not name the failure.");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(ShrinkPolicy.EnabledVariable, enabled);
+            Environment.SetEnvironmentVariable(ShrinkPolicy.BudgetVariable, budget);
+
+            // The file this test writes is named exactly as a failing seed's file is, and the
+            // nightly job collects those and reports them as failures. A test that left one behind
+            // would make every green night look like a bad one.
+            if (Directory.Exists(directory))
+                Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    /// <summary>
     /// Seeds this run will explore: the corpus first, then the sweep. Duplicates are dropped so a
     /// sweep that lands on a corpus seed does not produce two tests with one name.
     /// </summary>

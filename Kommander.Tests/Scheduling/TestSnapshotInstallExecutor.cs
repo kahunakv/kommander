@@ -422,11 +422,11 @@ public class TestSnapshotInstallExecutor
             return ValueTask.FromResult((BoundaryStatus, false));
         }
 
-        public ValueTask PersistHardStateAsync(long currentTerm, string? votedFor)
+        public ValueTask<bool> PersistHardStateAsync(long currentTerm, string? votedFor)
         {
             PersistedTerm = currentTerm;
             PersistedVotedFor = votedFor;
-            return ValueTask.CompletedTask;
+            return ValueTask.FromResult(true);
         }
 
         public ValueTask<long> GetLastCheckpointAsync() => ValueTask.FromResult(LastCheckpoint);

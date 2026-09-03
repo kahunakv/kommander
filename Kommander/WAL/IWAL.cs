@@ -137,6 +137,12 @@ public interface IWAL : IDisposable
 
     public string? GetMetaData(string key);
 
+    /// <summary>
+    /// Persists one metadata key. Returns <see langword="false"/> when the backend could not persist it:
+    /// a storage failure must surface as a status here and never as a native exception, because this
+    /// primitive backs <see cref="PersistHardState"/> on the election path, where an escaping exception
+    /// abandons the election attempt half-way (term bumped, no vote recorded, nothing sent).
+    /// </summary>
     public bool SetMetaData(string key, string value);
 
     /// <summary>
@@ -148,6 +154,9 @@ public interface IWAL : IDisposable
     /// on power failure. Both fields are written as ONE metadata value so a crash can never tear the term
     /// away from the vote. Default implementation works for every backend that implements
     /// <see cref="SetMetaData"/>; no backend override is required.</para>
+    /// <para>Returns <see langword="false"/> when the write failed. The caller must then treat the term
+    /// or vote as NOT durable: an election must not solicit votes on a term it could not record, and a
+    /// vote must not be sent when the grant could not be recorded.</para>
     /// </summary>
     public bool PersistHardState(int partitionId, long currentTerm, string? votedFor)
         // Encoded as "term" (no vote) or "term\nvotedFor". The separator is omitted when there is no vote

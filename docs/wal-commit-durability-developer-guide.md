@@ -22,11 +22,12 @@ the idea up first, then walk the real flows, the configuration, and the code.
 9. [Flow 5 — Crash and recovery](#flow-5--crash-and-recovery)
 10. [Why the fast path is safe](#why-the-fast-path-is-safe)
 11. [Configuration](#configuration)
-12. [Observability](#observability)
-13. [Code map](#code-map)
-14. [Invariants you must not break](#invariants-you-must-not-break)
-15. [Testing](#testing)
-16. [Glossary](#glossary)
+12. [Full disk (ENOSPC) and how the WAL recovers](#full-disk-enospc-and-how-the-wal-recovers)
+13. [Observability](#observability)
+14. [Code map](#code-map)
+15. [Invariants you must not break](#invariants-you-must-not-break)
+16. [Testing](#testing)
+17. [Glossary](#glossary)
 
 ---
 
@@ -293,6 +294,81 @@ Tuning notes:
 
 ---
 
+## Full disk (ENOSPC) and how the WAL recovers
+
+A data volume that fills is an operational event, not a crash. Kommander keeps the node alive and
+makes it heal on its own when space returns. This section describes what happens on the RocksDB
+backend, because RocksDB keeps error state of its own.
+
+### What a full disk does to the node
+
+1. **Writes fail as a status.** `RocksDbWAL.Write` returns `Errored`. The Raft layer regresses its
+   in-memory presence and commit frontiers to the durable log for the failed range
+   (`RaftWriteAhead.RegressFrontiersAfterFailedWriteAsync`), so the node never advertises entries it
+   does not hold. Nothing acknowledged is lost: an acknowledged entry is fsynced on a quorum.
+2. **Elections pause.** The term and the vote are persisted through `IWAL.PersistHardState`, which
+   returns `false` on a full disk instead of throwing. An election attempt that cannot record its
+   term and self-vote is abandoned before any `RequestVote` is sent, and the node drops back to
+   `Follower`. A vote that cannot be recorded is withheld. Both are retried on the normal election
+   cadence. A vote the node could forget across a crash is the double-vote hazard hard state exists
+   to prevent, so "no durable vote, no vote" is the safe choice.
+3. **The WAL logs once, then every 30 seconds** while writes keep failing, with the duration of the
+   episode and the last error.
+
+### Why RocksDB does not always heal on its own
+
+RocksDB keeps one background-error status per engine. Two shapes matter:
+
+| Failure | RocksDB error text | RocksDB severity | Self-heals? |
+|---|---|---|---|
+| Append to the current WAL file fails | `While appending to file: …/NNNNNN.log` | Hard error | **Yes.** The engine's built-in `SstFileManager` polls free space and resumes the engine about 5 s after space returns. |
+| Creation of a fresh WAL file fails (the memtable switch every flush performs) | `While open a file for appending: …/NNNNNN.log` | Unrecoverable | **No.** Automatic recovery never runs; a manual resume is refused. Every later write returns the cached status without touching the disk. |
+
+The second shape is the end state of any sustained full-disk episode: a memtable fills under ordinary
+load, or the shared write-buffer manager asks for a flush, and the switch to a new log file fails.
+This is what the field incident of 2026-09-01 showed: identical failures naming the same log file for
+many minutes after 24 GiB had been freed, until a process restart.
+
+### How `RocksDbWAL` recovers
+
+After a write-path failure the WAL asks two questions, without parsing error strings:
+
+1. **Does the filesystem accept writes now?** A probe file inside the engine directory is created,
+   written (64 KiB), fsynced, and deleted. Rate-limited to one probe per second.
+2. **Does the engine accept writes now?** A canary key is written to the metadata column family
+   with a synced write.
+
+"Filesystem yes, engine no" means the engine is latched. Only then is it closed and reopened on the
+same directory with the same options. The reopen holds the exclusive side of an engine guard that
+every operation takes on its read side, so no iterator or write can touch the handle being replaced.
+The reopen replays the log files on disk: every acknowledged sync write is already fsynced, and
+un-synced records were handed to the operating system on append, so a same-process reopen loses
+nothing that was acknowledged. The failed batch itself was reported as `Errored` before, and the Raft
+layer already regressed its frontiers for it.
+
+The write-path entry point that observed the failure then retries its operation once. All of them are
+idempotent upserts or deletes keyed by `(partition, id)`, so the retry is safe.
+
+A still-full disk fails question 1, so nothing is reopened and the node keeps reporting `Errored`
+until space returns. An engine that resumed on its own passes question 2 and is left alone. If the
+reopen itself fails (the open needs space too), the WAL stays closed, logs at `Critical`, and the next
+write-path failure retries the reopen.
+
+### What an operator sees
+
+- `Warning` — `RocksDB WAL at '…' rejected a write: …` on the first failure of an episode, then every
+  30 seconds with the duration and count.
+- `Warning` — `RocksDB WAL at '…' was reopened to clear a latched storage error (reopen #N)`.
+- `Information` — `RocksDB WAL at '…' accepts writes again after N failures over D`.
+- `Critical` — `RocksDB WAL at '…' could not be reopened after a storage failure`.
+- Metric `raft.wal.engine_reopens_total`, tagged `outcome=success|failed`. Any non-zero value means
+  the node went through a full-disk episode and healed without a restart.
+
+The library never stops the host process on its own. A deployment that prefers to fail fast after a
+bounded window should watch the metric and the `Warning` cadence and act from outside.
+
+---
+
 ## Observability
 
 `FairWalScheduler` exposes counters that make the levers measurable:
@@ -329,7 +405,8 @@ Kommander/
 │                                   TotalBatchesWritten / TotalSyncBatchesWritten / TotalPartitionsBatched
 └─ WAL/
       ├─ IWAL.cs                    Write(logs)  and  Write(logs, sync)  (the sync-off primitive)
-      ├─ RocksDbWAL.cs              SetSync(true/false)
+      ├─ RocksDbWAL.cs              SetSync(true/false); engine recovery after a latched storage error
+│                                   (engineGuard, TryRecoverEngineAfterFailure, ReopenEngine)
       ├─ SqliteWAL.cs               PRAGMA synchronous FULL / OFF toggle
       └─ InMemoryWAL.cs             no fsync — the non-durable control
 
@@ -338,6 +415,8 @@ Kommander.Tests/
 ├─ WAL/SingleFsyncCommitTests.cs              fast-path = baseline end-to-end; single-voter; concurrency
 ├─ WAL/RecoveryReconstructionCrashMatrixTests.cs  recovers exactly the contiguous prefix, keeps the tail
 ├─ WAL/RecoveryReSupplyClusterTests.cs        a regressed follower re-converges via leader re-supply
+├─ WAL/TestRocksDbWalEnospcRecovery.cs        full-disk episode on a real small volume: writes recover
+│                                              in-process, a cluster elects again after space returns
 └─ Scheduler/TestFairWalScheduler.cs          group commit + linger behaviour
 ```
 

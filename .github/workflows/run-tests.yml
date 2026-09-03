@@ -27,6 +27,15 @@ jobs:
         # run unreplayable, and the failure is silent: the run still passes. Fail the build here
         # instead, before the run stops being reproducible.
         run: bash scripts/check-determinism-boundary.sh
+      - name: Mount a small filesystem for the ENOSPC tests
+        # The RocksDB storage-error latch under test is native state and needs a volume that really
+        # runs out of space. A tmpfs with a small size AND a small inode count: on a block-full tmpfs
+        # an empty file can still be created, and the latch needs file creation itself to fail.
+        run: |
+          sudo mkdir -p /mnt/kommander-enospc
+          sudo mount -t tmpfs -o size=192m,nr_inodes=4096 tmpfs /mnt/kommander-enospc
+          sudo chmod 1777 /mnt/kommander-enospc
+          echo "KOMMANDER_ENOSPC_VOLUME=/mnt/kommander-enospc" >> "$GITHUB_ENV"
       - name: Run Tests
         # DSTRandom is the seeded random search. It belongs to a nightly budget, not to a pull
         # request: its cost grows with the seed count, and a seed that fails is a lead to

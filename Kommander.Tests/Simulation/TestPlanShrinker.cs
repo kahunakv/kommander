@@ -197,7 +197,12 @@ public sealed class TestPlanShrinker
             candidate => candidate.Any(action => action.Kind == RandomScenarioActionKind.FailWrites),
             new ShrinkOptions { MaxCandidates = 200 });
 
-        string directory = Path.Combine(AppContext.BaseDirectory, "dst-artifacts");
+        // A subfolder of its own. A shrink artifact left at the top of dst-artifacts/ is collected
+        // by the nightly job and read as a seed that failed, so a test's own file must not sit
+        // where a real failure writes.
+        string directory = Path.Combine(
+            AppContext.BaseDirectory, "dst-artifacts", "shrink-round-trip");
+
         string path = result.WriteArtifact(directory, "shrink-round-trip");
 
         IReadOnlyList<RandomScenarioAction> parsed = RandomScenarioPlan.ParseFile(path);

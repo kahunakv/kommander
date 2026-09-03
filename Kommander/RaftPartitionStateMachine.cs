@@ -1541,7 +1541,13 @@ public sealed class RaftPartitionStateMachine
 
         // B2b: durably record the new term and our self-vote before we solicit votes or become leader, so
         // a crash mid-election cannot restart at a stale term or let us vote for someone else this term.
-        await wal.PersistHardStateAsync(coreState.CurrentTerm, host.LocalEndpoint).ConfigureAwait(false);
+        // Test-only path: a rejected write is logged and the forced promotion proceeds regardless.
+        if (!await wal.PersistHardStateAsync(coreState.CurrentTerm, host.LocalEndpoint).ConfigureAwait(false))
+        {
+            logger.LogWarnHardStateNotPersisted(
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, coreState.CurrentTerm, host.LocalEndpoint,
+                "forced leadership (testing)", "Proceeding without durable hard state.");
+        }
 
         await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
 
@@ -1822,7 +1828,16 @@ public sealed class RaftPartitionStateMachine
         election.ResetPreVoteRound();
 
         await host.InvokeLeaderChanged(host.PartitionId, leaderEndpoint);
-        await wal.PersistHardStateAsync(leaderTerm, leaderEndpoint).ConfigureAwait(false);
+
+        // A rejected write is tolerated: the leader's term is adopted in memory, and the recorded vote
+        // for the leader is a convenience (it stops this node voting for a rival in the same term after
+        // a restart) rather than a Raft safety requirement — this node cast no vote in the election.
+        if (!await wal.PersistHardStateAsync(leaderTerm, leaderEndpoint).ConfigureAwait(false))
+        {
+            logger.LogWarnHardStateNotPersisted(
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, leaderTerm, leaderEndpoint,
+                "leader adoption", "The term and leader are adopted in memory only.");
+        }
     }
 
     /// <summary>

@@ -1,0 +1,139 @@
+name: Nightly DST Search
+
+# The seeded random search over real three-node clusters.
+#
+# Why this is not in the pull-request job: its cost grows with the seed count, and a seed that
+# fails is a lead to investigate rather than a verdict on the change under review. The pull-request
+# job keeps the DSTSmoke scenarios, including one short generated run, so the harness itself is
+# still checked on every change.
+
+on:
+  schedule:
+    # 03:15 UTC. Off the hour on purpose — the top of the hour is when every other scheduled job
+    # on the runner fleet starts, and this search is timing-sensitive.
+    - cron: '15 3 * * *'
+  workflow_dispatch:
+    inputs:
+      seed_base:
+        description: 'First swept seed. Change it to explore a different region.'
+        required: false
+        default: '20260901'
+      seed_count:
+        description: 'Swept seeds beside the corpus. Cost is roughly linear in this.'
+        required: false
+        default: '32'
+      shrink_budget:
+        description: 'Cluster runs one failing plan may spend being reduced.'
+        required: false
+        default: '40'
+      replay_repeats:
+        description: 'Replays of each promoted regression plan.'
+        required: false
+        default: '3'
+
+# One search at a time. Two overlapping runs share the runner and slow each other down, and this
+# suite is load-sensitive: a loaded machine turns a passing seed into a lead nobody can reproduce.
+concurrency:
+  group: nightly-dst
+  cancel-in-progress: false
+
+jobs:
+  Random-Search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      KOMMANDER_DST_SEED_BASE: ${{ inputs.seed_base || '20260901' }}
+      KOMMANDER_DST_SEED_COUNT: ${{ inputs.seed_count || '32' }}
+
+      # A failing seed reduces its own plan before anybody reads it. This is what turns a
+      # forty-action plan into the three actions the failure needs, and it costs one cluster run
+      # per candidate — which is why it is on here and off everywhere else.
+      KOMMANDER_DST_SHRINK: '1'
+      KOMMANDER_DST_SHRINK_BUDGET: ${{ inputs.shrink_budget || '40' }}
+
+      # One replay of a promoted plan is weak evidence: these plans are not deterministic.
+      KOMMANDER_DST_REPLAY_REPEATS: ${{ inputs.replay_repeats || '3' }}
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v5
+
+      - name: Install .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Check determinism boundary
+        # A new direct wall-clock or thread-pool read in the consensus path makes a run
+        # unreplayable, and the failure is silent: the run still passes. A search whose failures
+        # cannot be replayed produces leads nobody can chase, so this is checked here too.
+        run: bash scripts/check-determinism-boundary.sh
+
+      - name: Run the random search
+        run: |
+          cd Kommander.Tests
+          dotnet test -l "console;verbosity=detailed" \
+            --filter "Category=DSTRandom" \
+            --blame-hang --blame-hang-timeout 300s
+
+      - name: Summarise what failed
+        # Runs whichever way the search went. A green night should say so in one line rather than
+        # leave a reader opening an empty artifact to find out.
+        if: always()
+        run: |
+          {
+            echo "## Nightly DST search"
+            echo
+            echo "- seed base: \`$KOMMANDER_DST_SEED_BASE\`"
+            echo "- swept seeds: \`$KOMMANDER_DST_SEED_COUNT\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Only the files a failing seed writes. Other tests leave shrink artifacts of their own
+          # under dst-artifacts/, and a wider pattern would report a green night as a failure.
+          #
+          # A null-separated read loop rather than mapfile: mapfile needs bash 4, and a summary step
+          # that dies on the runner would hide exactly the failure this job exists to report.
+          found=0
+
+          while IFS= read -r -d '' file; do
+            found=1
+            {
+              echo "### $(basename "$file")"
+              echo
+              echo '```'
+              cat "$file"
+              echo '```'
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          done < <(find . -name 'random-seed-*.shrunk.plan.txt' -print0)
+
+          if [ "$found" -eq 0 ]; then
+            echo "No plan was shrunk, so no seed failed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # How to read the counters above. A shrink that accepted no removals over a whole budget
+          # is the signature of a failure that did not reproduce: the shrinker re-ran the plan
+          # dozens of times and never saw it fail again. That is a lead about the machine's load,
+          # not about Raft. A shrink that cut the plan down reproduced the failure repeatedly, and
+          # the actions that remain are the ones the failure needs.
+          {
+            echo "A shrink with \`removalsAccepted=0\` over a full budget means the failure did"
+            echo "not reproduce on re-run. Treat that as load, not as a finding."
+            echo
+            echo "A plan worth keeping goes in \`Kommander.Tests/Simulation/Scenarios/Random/regressions/\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the search artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dst-artifacts
+          # The plan in the order it happened, the entropy it consumed, and — when a seed failed —
+          # the shrunk plan. The plan is the file that matters: it is the replay unit, and
+          # RandomScenarioRunner.ReplayAsync applies it action for action.
+          path: '**/dst-artifacts/**'
+          if-no-files-found: ignore
+          retention-days: 30

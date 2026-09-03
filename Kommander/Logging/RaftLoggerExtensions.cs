@@ -48,6 +48,9 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Sending vote to {Endpoint} on Term={CurrentTerm}")]
     public static partial void LogInfoSendingVote(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long currentTerm);
 
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Could not persist hard state (Term={Term} VotedFor={VotedFor}) during {Action}; the WAL rejected the write. {Consequence}")]
+    public static partial void LogWarnHardStateNotPersisted(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, long term, string? votedFor, string action, string consequence);
+
     [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Received logs from leader {Endpoint} with Term={Term} Timestamp={Timestamp} Logs={Logs}")]
     public static partial void LogDebugReceivedLogs(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long term, HLCTimestamp timestamp, string logs);
 

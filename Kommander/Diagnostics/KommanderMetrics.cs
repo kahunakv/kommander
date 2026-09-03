@@ -47,6 +47,22 @@ public static class KommanderMetrics
             unit: "ms",
             description: "Per-operation dispatch latency in the partition executor, by operation class.");
 
+    // ── WAL storage engine ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Engine reopens performed by <c>RocksDbWAL</c> to clear a storage error the engine latched and
+    /// could not clear on its own (the ENOSPC-at-WAL-creation case), tagged by <c>outcome</c>
+    /// (<c>success</c> / <c>failed</c>). Any non-zero value means the node went through a disk-full
+    /// episode and healed without a restart; a <c>failed</c> count means it is still trying.
+    /// </summary>
+    internal static readonly Counter<long> WalEngineReopensTotal =
+        Meter.CreateCounter<long>(
+            "raft.wal.engine_reopens_total",
+            description: "RocksDB WAL engine reopens performed to clear a latched storage error, by outcome.");
+
+    internal static void RecordWalEngineReopen(bool succeeded) =>
+        WalEngineReopensTotal.Add(1, new KeyValuePair<string, object?>("outcome", succeeded ? "success" : "failed"));
+
     // ── WAL scheduler ─────────────────────────────────────────────────────────
 
     /// <summary>Total WAL write batches dispatched to the storage adapter.</summary>

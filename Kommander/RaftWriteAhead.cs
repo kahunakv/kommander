@@ -1590,8 +1590,10 @@ public sealed class RaftWriteAhead
     /// dedicated fsync) per the chosen lighter guarantee, so the very last write can be lost on power
     /// failure. The metadata call is a fast, internally-synchronized in-process write, so it runs inline on
     /// the partition executor rather than through the I/O scheduler.
+    /// <para>Returns <see langword="false"/> when the backend rejected the write (see
+    /// <see cref="IWAL.PersistHardState"/>); the caller must not act on a term or vote it could not record.</para>
     /// </summary>
-    public void PersistHardState(long currentTerm, string? votedFor) =>
+    public bool PersistHardState(long currentTerm, string? votedFor) =>
         walAdapter.PersistHardState(partition.PartitionId, currentTerm, votedFor);
 
     /// <summary>

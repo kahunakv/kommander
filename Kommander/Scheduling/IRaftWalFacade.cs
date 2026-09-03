@@ -226,8 +226,12 @@ public interface IRaftWalFacade
     /// vote to in that term. Durability rides the backend's existing WAL fsync cadence (no dedicated
     /// fsync), so the last vote/term can be lost on power failure. The default is a no-op so non-durable
     /// test fakes simply ignore hard state.
+    /// <para>Returns <see langword="false"/> when the backend could not persist the state (a full disk,
+    /// a latched storage engine). The election code treats that as "not durable": it does not solicit
+    /// votes on the new term and does not send a vote it could not record, and simply tries again on
+    /// the next election tick. Never throws for a storage failure.</para>
     /// </summary>
-    ValueTask PersistHardStateAsync(long currentTerm, string? votedFor) => ValueTask.CompletedTask;
+    ValueTask<bool> PersistHardStateAsync(long currentTerm, string? votedFor) => ValueTask.FromResult(true);
 
     /// <summary>
     /// Loads the persisted hard state, or <see langword="null"/> when none exists yet (fresh node or a

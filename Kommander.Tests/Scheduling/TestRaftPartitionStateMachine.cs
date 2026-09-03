@@ -520,6 +520,73 @@ public class TestRaftPartitionStateMachine
         Assert.Contains(host.EnqueuedResponses, message => message.Type == RaftResponderRequestType.RequestVotes);
     }
 
+    /// <summary>
+    /// ENOSPC election guard (field incident 2026-09-01): when the WAL refuses to persist the new term
+    /// and self-vote, the election must be abandoned cleanly — no RequestVotes sent, the term not
+    /// bumped in memory, the node back to Follower — and the next attempt must succeed once the WAL
+    /// accepts writes again. Before the guard, the backend threw out of the election path and left
+    /// the node a Candidate at a bumped, non-durable term on every tick.
+    /// </summary>
+    [Fact]
+    public async Task StartElection_WhenHardStateCannotBePersisted_AbandonsAttemptAndRetriesLater()
+    {
+        FakePartitionHost host = new();
+        FakeWalFacade wal = new() { RejectHardStateWrites = true };
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        StepDownNoticeRequest notice = new(
+            host.PartitionId,
+            term: 0,
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            "node-z");
+
+        await sm.ReceiveStepDownNoticeAsync(notice);
+
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        Assert.Equal(0L, sm.CurrentTerm);
+        Assert.DoesNotContain(host.EnqueuedResponses, message => message.Type == RaftResponderRequestType.RequestVotes);
+
+        // Space returns: the same trigger now runs a full election round.
+        wal.RejectHardStateWrites = false;
+        host.ClearObservations();
+
+        await sm.ReceiveStepDownNoticeAsync(notice);
+
+        Assert.Equal(RaftNodeState.Candidate, sm.NodeState);
+        Assert.Equal(1L, sm.CurrentTerm);
+        Assert.Contains(host.EnqueuedResponses, message => message.Type == RaftResponderRequestType.RequestVotes);
+    }
+
+    /// <summary>
+    /// ENOSPC vote guard: a vote the node cannot record durably is withheld (a vote forgotten across a
+    /// crash is the double-vote hazard), and granted to the same candidate on a later request once the
+    /// WAL accepts writes.
+    /// </summary>
+    [Fact]
+    public async Task VoteAsync_WhenHardStateCannotBePersisted_WithholdsVoteUntilWalRecovers()
+    {
+        FakePartitionHost host = new();
+        FakeWalFacade wal = new() { RejectHardStateWrites = true };
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 3, remoteMaxLogId: 0,
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId));
+
+        Assert.DoesNotContain(host.EnqueuedRequests,
+            e => e.Endpoint == "node-b" && e.Request.Type == RaftResponderRequestType.Vote);
+
+        wal.RejectHardStateWrites = false;
+        host.ClearObservations();
+
+        await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 3, remoteMaxLogId: 0,
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId));
+
+        Assert.Contains(host.EnqueuedRequests,
+            e => e.Endpoint == "node-b" && e.Request.Type == RaftResponderRequestType.Vote);
+    }
+
     [Fact]
     public async Task TransferLeadershipAsync_Leader_WithUnknownTarget_ReturnsErrored()
     {
@@ -1734,13 +1801,16 @@ public class TestRaftPartitionStateMachine
 
         public ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs) => ValueTask.CompletedTask;
 
+        /// <summary>
+        /// When true, hard-state writes are refused (the facade answers <c>false</c> and records
+        /// nothing), which is what a WAL on a full disk reports. Models the ENOSPC election wedge.
+        /// </summary>
+        public bool RejectHardStateWrites { get; set; }
+
         // B2b: route hard state through the inner FakeWAL's metadata store so it survives across
         // state-machine instances constructed on the SAME facade (simulating a restart).
-        public ValueTask PersistHardStateAsync(long currentTerm, string? votedFor)
-        {
-            ((Kommander.WAL.IWAL)wal).PersistHardState(partitionId: 1, currentTerm, votedFor);
-            return ValueTask.CompletedTask;
-        }
+        public ValueTask<bool> PersistHardStateAsync(long currentTerm, string? votedFor) =>
+            ValueTask.FromResult(!RejectHardStateWrites && ((Kommander.WAL.IWAL)wal).PersistHardState(partitionId: 1, currentTerm, votedFor));
 
         public ValueTask<(long CurrentTerm, string? VotedFor)?> LoadHardStateAsync() =>
             ValueTask.FromResult(
