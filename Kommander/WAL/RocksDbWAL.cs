@@ -7,6 +7,7 @@ using System.Text;
 using Google.Protobuf;
 using Kommander.Data;
 using Kommander.Logging;
+using Kommander.Time;
 using Kommander.WAL.Protos;
 using RocksDbSharp;
 using System.Collections.Concurrent;
@@ -156,6 +157,8 @@ public class RocksDbWAL : IWAL, IDisposable
 
     private readonly bool syncWrites;
 
+    private readonly IMonotonicTickSource tickSource;
+
     internal bool SyncWritesEnabled => syncWrites;
 
     /// <summary>For tests: number of <c>db.Write</c> calls issued by the last compaction call.</summary>
@@ -182,7 +185,8 @@ public class RocksDbWAL : IWAL, IDisposable
         string revision,
         ILogger<IRaft> logger,
         bool syncWrites = true,
-        RocksDbSharedResources? sharedResources = null)
+        RocksDbSharedResources? sharedResources = null,
+        IMonotonicTickSource? tickSource = null)
     {
         // Validated before the path is composed below: the revision is a single directory name under
         // the WAL path, and a separator or relative segment would silently open the database
@@ -194,6 +198,7 @@ public class RocksDbWAL : IWAL, IDisposable
         this.logger = logger;
         this.syncWrites = syncWrites;
         this.writeOptions = syncWrites ? SynchronousWriteOptions : NonSynchronousWriteOptions;
+        this.tickSource = tickSource ?? SystemMonotonicTickSource.Instance;
 
         DbOptions dbOptions = new DbOptions()
             .SetCreateIfMissing(true)
@@ -353,7 +358,7 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <summary>Message of the most recent write-path failure, or <see langword="null"/>. Exposed for tests.</summary>
     internal string? LastStorageFailureMessage => Volatile.Read(ref lastStorageFailure)?.Message;
 
-    /// <summary>Metadata key the engine canary writes. Its value (a UTC tick count) carries no meaning.</summary>
+    /// <summary>Metadata key the engine canary writes. Its value carries no meaning.</summary>
     private static readonly byte[] EngineCanaryKey = "kommander_engine_canary"u8.ToArray();
 
     /// <summary>
@@ -420,7 +425,7 @@ public class RocksDbWAL : IWAL, IDisposable
     {
         Volatile.Write(ref lastStorageFailure, ex);
 
-        long now = Stopwatch.GetTimestamp();
+        long now = tickSource.GetTimestamp();
         int streak = Interlocked.Increment(ref failureStreak);
 
         if (streak == 1)
@@ -436,14 +441,14 @@ public class RocksDbWAL : IWAL, IDisposable
 
         long lastLog = Volatile.Read(ref lastFailureLogTicks);
 
-        if (Stopwatch.GetElapsedTime(lastLog, now) < SustainedFailureLogInterval)
+        if (tickSource.GetElapsedTime(lastLog, now) < SustainedFailureLogInterval)
             return;
 
         Volatile.Write(ref lastFailureLogTicks, now);
 
         logger.LogWarning(
             "RocksDB WAL at '{Path}' has rejected writes for {Duration} ({Count} failures); last error: {Message}",
-            enginePath, Stopwatch.GetElapsedTime(Volatile.Read(ref failureStreakStartTicks), now), streak, ex.Message);
+            enginePath, tickSource.GetElapsedTime(Volatile.Read(ref failureStreakStartTicks), now), streak, ex.Message);
     }
 
     /// <summary>Closes a failure streak. One volatile read on the hot path when there is no streak.</summary>
@@ -459,7 +464,7 @@ public class RocksDbWAL : IWAL, IDisposable
 
         logger.LogInformation(
             "RocksDB WAL at '{Path}' accepts writes again after {Count} failures over {Duration}",
-            enginePath, streak, Stopwatch.GetElapsedTime(Volatile.Read(ref failureStreakStartTicks)));
+            enginePath, streak, tickSource.GetElapsedTime(Volatile.Read(ref failureStreakStartTicks), tickSource.GetTimestamp()));
     }
 
     /// <summary>
@@ -509,10 +514,10 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </summary>
     private bool FilesystemAcceptsWrites()
     {
-        long now = Stopwatch.GetTimestamp();
+        long now = tickSource.GetTimestamp();
         long last = Volatile.Read(ref lastProbeTicks);
 
-        if (last != 0 && Stopwatch.GetElapsedTime(last, now) < ProbeInterval)
+        if (last != 0 && tickSource.GetElapsedTime(last, now) < ProbeInterval)
             return false;
 
         if (Interlocked.CompareExchange(ref lastProbeTicks, now, last) != last)
@@ -554,7 +559,7 @@ public class RocksDbWAL : IWAL, IDisposable
     {
         try
         {
-            db.Put(EngineCanaryKey, BitConverter.GetBytes(DateTime.UtcNow.Ticks), metadataColumnFamily, SynchronousWriteOptions);
+            db.Put(EngineCanaryKey, BitConverter.GetBytes(tickSource.GetTimestamp()), metadataColumnFamily, SynchronousWriteOptions);
             return true;
         }
         catch (RocksDbException)

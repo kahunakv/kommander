@@ -152,7 +152,7 @@ try
         IWAL wal = walSelection.Adapter switch
         {
             KommanderWalAdapter.Sqlite => new SqliteWAL(walSelection.Path, walSelection.Revision, logger),
-            _ => new RocksDbWAL(walSelection.Path, walSelection.Revision, logger),
+            _ => new RocksDbWAL(walSelection.Path, walSelection.Revision, logger, tickSource: configuration.TickSource),
         };
 
         RaftManager node = new(
