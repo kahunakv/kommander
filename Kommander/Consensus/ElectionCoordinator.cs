@@ -367,7 +367,15 @@ internal sealed class ElectionCoordinator
 
         logger.LogWarnVotedToBecomeLeader(host.LocalEndpoint, host.PartitionId, coreState.NodeState, delayMs, coreState.CurrentTerm);
 
-        if (host.Nodes.Count == 0)
+        // Self-quorum when no committed voter peer exists — not merely when no peer exists at
+        // all. Quorum is a majority of the committed voter set, so a sole voter whose only peers
+        // are transitional replicas (Learner/Removing) is its own majority; soliciting them
+        // instead deadlocks the range, because their grants are (correctly) discarded by the
+        // tally and no countable vote can ever arrive. This mirrors the commit path
+        // (CompleteLeaderPropose drives single-voter commit when no voter peer is registered).
+        // The heartbeat below fans out to ALL peers, so a transitional replica starts receiving
+        // appends and its catch-up proceeds under the new leadership.
+        if (CountVoterPeers() == 0)
         {
             tracker.ClearProgressKeepingCommitFrontiers();
             // published == false: barrier pending, self-quorum commit publishes shortly after
@@ -441,8 +449,12 @@ internal sealed class ElectionCoordinator
         // the never-pruned startCommitIndexes max, which let a departed peer's stale tail suppress every
         // pre-vote forever.
 
-        // No peers to probe: there is nothing a pre-vote can tell us, so go straight to a real election.
-        if (host.Nodes.Count == 0)
+        // No committed voter peer to probe: only voters can grant a countable pre-vote (the
+        // tally discards everything else), so with none present — a single-node range, or a
+        // sole voter whose only peers are transitional Learner/Removing replicas — the probe
+        // can never reach quorum. Go straight to a real election, where the same voter-only
+        // arithmetic makes this node its own majority.
+        if (CountVoterPeers() == 0)
         {
             await StartElectionAsync(currentTime, ignoreRecentVoteCooldown: true).ConfigureAwait(false);
             return;
@@ -489,10 +501,35 @@ internal sealed class ElectionCoordinator
             if (node.Endpoint == host.LocalEndpoint)
                 throw new RaftException("Corrupted nodes");
 
+            // Only committed voters can grant a countable (pre-)vote — the tally discards every
+            // other grant — so transitional Learner/Removing replicas are not solicited at all.
+            if (!host.IsVoter(node.Endpoint))
+                continue;
+
             logger.LogInfoAskedForVotes(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, term);
 
             host.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.RequestVotes, node, request));
         }
+    }
+
+    /// <summary>
+    /// Number of peers in <c>host.Nodes</c> that are committed voters of this range. Transitional
+    /// replicas (Learner/Removing) are replication peers but never part of the quorum
+    /// denominator. Plain loop — this runs on the election path, where a LINQ predicate would
+    /// allocate a closure per call.
+    /// </summary>
+    internal int CountVoterPeers()
+    {
+        int count = 0;
+
+        IReadOnlyList<RaftNode> nodes = host.Nodes;
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            if (host.IsVoter(nodes[i].Endpoint))
+                count++;
+        }
+
+        return count;
     }
 
     /// <summary>
@@ -811,9 +848,11 @@ internal sealed class ElectionCoordinator
             }
 
             preVotes.Add(endpoint);
-            // Quorum is computed over voters only; learners in host.Nodes must not inflate the denominator.
-            int preVoterTotal = host.Nodes.Count(n => host.IsVoter(n.Endpoint)) + 1; // +1 for self
-            int preVoteQuorum = Math.Max(2, (preVoterTotal / 2) + 1);
+            // Quorum is computed over voters only; learners in host.Nodes must not inflate the
+            // denominator. No artificial floor: a sole committed voter's majority is 1, and
+            // flooring at 2 made a 1-voter range with a transitional peer unelectable.
+            int preVoterTotal = CountVoterPeers() + 1; // +1 for self
+            int preVoteQuorum = (preVoterTotal / 2) + 1;
 
             logger.LogInfoReceivedPreVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, voteTerm, preVotes.Count, preVoteQuorum, preVoterTotal);
 
@@ -872,9 +911,11 @@ internal sealed class ElectionCoordinator
         }
 
         int numberVotes = IncreaseVotes(endpoint, voteTerm);
-        // Quorum is computed over voters only; learners in host.Nodes must not inflate the denominator.
-        int voterTotal = host.Nodes.Count(n => host.IsVoter(n.Endpoint)) + 1; // +1 for self
-        int quorum = Math.Max(2, (voterTotal / 2) + 1);
+        // Quorum is computed over voters only; learners in host.Nodes must not inflate the
+        // denominator. No artificial floor: a sole committed voter's majority is 1, and
+        // flooring at 2 made a 1-voter range with a transitional peer unelectable.
+        int voterTotal = CountVoterPeers() + 1; // +1 for self
+        int quorum = (voterTotal / 2) + 1;
 
         // lastCommitIndexes is NOT seeded from the vote. It means "the committed frontier this
         // follower last reported about itself", and a vote carries the voter's highest *log id* —

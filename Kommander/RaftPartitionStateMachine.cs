@@ -1585,11 +1585,13 @@ public sealed class RaftPartitionStateMachine
 
         await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
 
-        if (host.Nodes.Count == 0)
+        if (election.CountVoterPeers() == 0)
         {
-            // published == false means a promotion barrier is pending; with no peers the barrier
-            // commits locally via the WAL scheduler (self-quorum) and CompleteLeaderCommit fires
-            // both the publish and the LeaderChanged notification shortly after.
+            // published == false means a promotion barrier is pending; with no voter peers the
+            // barrier commits locally via the WAL scheduler (self-quorum, matching the election
+            // and propose paths — transitional replicas never gate quorum) and
+            // CompleteLeaderCommit fires both the publish and the LeaderChanged notification
+            // shortly after.
             bool published = await BecomeLeaderAsync().ConfigureAwait(false);
             if (published)
                 await host.InvokeLeaderChanged(host.PartitionId, host.LocalEndpoint).ConfigureAwait(false);
