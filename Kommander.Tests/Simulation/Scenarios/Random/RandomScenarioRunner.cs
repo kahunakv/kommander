@@ -416,7 +416,12 @@ public sealed class RandomScenarioRunner
                     .FirstOrDefault(node => node.Endpoint == view.Endpoint)?
                     .SimulatedWal?.Snapshot().Partition(options.PartitionId);
 
-                return $"{view.Endpoint} commit={view.CommitIndex} maxLog={store?.MaxLogId} " +
+                // Role and quiescence beside the log. Quiescing stops the heartbeat, and the
+                // heartbeat hosts the only catch-up path — so a partition that quiesced with a
+                // follower still short can never repair it, and the leader's last recorded
+                // decision stays frozen at whatever it believed when the rounds stopped.
+                return $"{view.Endpoint} role={view.Role} quiesced={view.Quiesced} " +
+                       $"commit={view.CommitIndex} maxLog={store?.MaxLogId} " +
                        $"first={store?.FirstLogId} missing=[{string.Join(",", store?.MissingIds ?? [])}]";
             }));
 

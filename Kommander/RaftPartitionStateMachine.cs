@@ -314,7 +314,8 @@ public sealed class RaftPartitionStateMachine
                 IsVoter: host.IsVoter(node.Endpoint),
                 FrontierKnown: known,
                 CommitFrontier: known ? frontier : -1,
-                StartCommitIndex: tracker.GetStartCommitIndexOrDefault(node.Endpoint, -1)));
+                StartCommitIndex: tracker.GetStartCommitIndexOrDefault(node.Endpoint, -1),
+                LastBackfillDecision: tracker.GetBackfillDecisionOrDefault(node.Endpoint)));
         }
 
         return peers;

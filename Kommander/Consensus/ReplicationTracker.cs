@@ -177,6 +177,12 @@ internal sealed class ReplicationTracker
         regressedFrontiers.Clear();
         mismatchAnchors.Clear();
         backfillProgress.Clear();
+
+        // The diagnostic record goes with the rest. A decision from a previous term was made from
+        // frontiers this reset has just discarded, so keeping it would show a reader inputs that no
+        // longer exist beside a count that spans leaderships — which reads as "the leader decided
+        // this recently" when it did not.
+        backfillDecisions.Clear();
     }
 
     /// <summary>
@@ -207,8 +213,37 @@ internal sealed class ReplicationTracker
         regressedFrontiers.Remove(endpoint);
         startCommitIndexes.Remove(endpoint);
         backfillProgress.Remove(endpoint);
+        backfillDecisions.Remove(endpoint);
         return hadProgress;
     }
+
+    /// <summary>
+    /// The last repair decision made about each peer, kept for diagnosis.
+    ///
+    /// <para>Last writer wins, one entry per peer, overwritten every heartbeat round. It is a copy
+    /// of a decision already taken: nothing reads it back, and losing it would change no
+    /// behaviour.</para>
+    /// </summary>
+    private readonly Dictionary<string, RaftPeerBackfillDecision> backfillDecisions = [];
+
+    /// <summary>
+    /// Records the repair decision just made about a peer, stamped with how many have been made.
+    ///
+    /// <para>The stamp is what distinguishes a leader that decided wrongly from one that stopped
+    /// deciding. Both leave the same stale-looking record; only the count says which.</para>
+    /// </summary>
+    public void RecordBackfillDecision(string endpoint, RaftPeerBackfillDecision decision)
+    {
+        long sequence = backfillDecisions.TryGetValue(endpoint, out RaftPeerBackfillDecision? previous)
+            ? previous.Sequence + 1
+            : 1;
+
+        backfillDecisions[endpoint] = decision with { Sequence = sequence };
+    }
+
+    /// <summary>The last repair decision made about a peer, or null when none has been.</summary>
+    public RaftPeerBackfillDecision? GetBackfillDecisionOrDefault(string endpoint) =>
+        backfillDecisions.GetValueOrDefault(endpoint);
 
     // ── reported commit frontier ──────────────────────────────────────────────────────────────
 

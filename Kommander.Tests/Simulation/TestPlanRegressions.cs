@@ -102,7 +102,11 @@ public sealed class TestPlanRegressions
         foreach (RegressionPlan plan in plans)
         {
             int failed = 0;
-            string? first = null;
+
+            // Grouped by the first line of the failure, which is the rule that fired. One plan can
+            // reach more than one broken state, and reporting only the first failure hides the
+            // others — including the case where the interesting one is the rarer of the two.
+            Dictionary<string, (int Count, string Text)> bySignature = [];
 
             for (int attempt = 1; attempt <= repeats; attempt++)
             {
@@ -112,7 +116,12 @@ public sealed class TestPlanRegressions
                     continue;
 
                 failed++;
-                first ??= failure;
+
+                string signature = failure.Split(':', 2)[0];
+
+                bySignature[signature] = bySignature.TryGetValue(signature, out var seen)
+                    ? (seen.Count + 1, seen.Text)
+                    : (1, failure);
             }
 
             if (failed == 0)
@@ -122,8 +131,13 @@ public sealed class TestPlanRegressions
             // twenty and twenty in twenty are different findings that need different next steps:
             // the first is a rare state to hunt, the second is a defect to fix. A message that
             // said only "it failed" would hide which one this is.
-            failures.AppendLine(
-                $"{plan.Name} failed {failed} of {repeats} replays. First failure: {first}");
+            failures.AppendLine($"{plan.Name} failed {failed} of {repeats} replays.");
+
+            foreach ((string signature, (int count, string text)) in bySignature.OrderByDescending(
+                         entry => entry.Value.Count))
+            {
+                failures.AppendLine($"  {count}x {signature} — {text}");
+            }
         }
 
         Assert.True(failures.Length == 0, failures.ToString());

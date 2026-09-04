@@ -30,14 +30,20 @@ namespace Kommander.Data;
 /// Where the leader last saw this peer's log start, from its handshake or vote. The fallback the
 /// gap is derived from when no frontier is known.
 /// </param>
+/// <param name="LastBackfillDecision">
+/// The last repair decision made about this peer, or null when none has been made yet — which is
+/// itself informative: it means no heartbeat round has reached this peer.
+/// </param>
 public sealed record RaftPeerReplicationView(
     string Endpoint,
     bool IsVoter,
     bool FrontierKnown,
     long CommitFrontier,
-    long StartCommitIndex)
+    long StartCommitIndex,
+    RaftPeerBackfillDecision? LastBackfillDecision = null)
 {
     public override string ToString() =>
         $"{Endpoint}{(IsVoter ? "" : "/learner")} frontierKnown={FrontierKnown} " +
-        $"frontier={CommitFrontier} start={StartCommitIndex}";
+        $"frontier={CommitFrontier} start={StartCommitIndex}" +
+        (LastBackfillDecision is null ? string.Empty : $" [{LastBackfillDecision}]");
 }

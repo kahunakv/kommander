@@ -240,6 +240,23 @@ internal sealed class HeartbeatDriver
             logThrottle.LogBackfillDecision(node.Endpoint, willBackfill, followerMaxLog, followerGap,
                                 idleTailGap, voterShortPrefix, regressed, liveReplicationQuiet);
 
+            // The same values, kept rather than only written. The trace above is throttled, drops
+            // uninteresting rounds, and lives at Debug behind a category shared with every other
+            // trace in the build — so reading it means turning all of them on, which is enough
+            // extra work per operation to change the timing of the states worth investigating.
+            // This is one assignment, always current, and free to leave unread.
+            tracker.RecordBackfillDecision(node.Endpoint, new RaftPeerBackfillDecision(
+                Sequence: 0,
+                WillBackfill: willBackfill,
+                FrontierKnown: frontierKnown,
+                LocalCommittedIndex: coreState.LocalCommittedIndex,
+                Gap: followerGap,
+                IdleTailGap: idleTailGap,
+                VoterShortPrefix: voterShortPrefix,
+                Regressed: regressed,
+                LiveReplicationQuiet: liveReplicationQuiet,
+                BackfillEnabled: host.Configuration.BackfillEnabled));
+
             if (willBackfill)
             {
                 // The mismatch note's anchor is only trustworthy as an UPPER bound: the over-gap
