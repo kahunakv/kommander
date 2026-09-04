@@ -385,4 +385,15 @@ public static partial class RaftLoggerExtensions
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "[Kommander] {Kind} fence disabled by configuration: {Option}={Current} (protected value: {Safe}). {Hazard}")]
     public static partial void LogWarnSafetyFenceDisabled(this ILogger<IRaft> logger, string kind, string option, string current, string safe, string hazard);
+
+    // ── RocksDbWAL ────────────────────────────────────────────────────────
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "RocksDB WAL at '{Path}' accepts writes again after {Count} failures over {Duration}")]
+    public static partial void LogInfoRocksDbWalAcceptsWritesAgain(this ILogger<IRaft> logger, string path, int count, TimeSpan duration);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "RocksDB WAL at '{Path}' resumed on its own after a storage failure; no reopen needed")]
+    public static partial void LogInfoRocksDbWalResumedOnItsOwn(this ILogger<IRaft> logger, string path);
+
+    [LoggerMessage(Level = LogLevel.Critical, Message = "RocksDB WAL at '{Path}' could not be reopened after a storage failure; every operation fails until a later write retries the reopen: {Message}")]
+    public static partial void LogCritRocksDbWalReopenFailed(this ILogger<IRaft> logger, string path, string message);
 }

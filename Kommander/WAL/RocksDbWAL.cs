@@ -462,9 +462,11 @@ public class RocksDbWAL : IWAL, IDisposable
         if (streak == 0)
             return;
 
-        logger.LogInformation(
-            "RocksDB WAL at '{Path}' accepts writes again after {Count} failures over {Duration}",
-            enginePath, streak, tickSource.GetElapsedTime(Volatile.Read(ref failureStreakStartTicks), tickSource.GetTimestamp()));
+        if (logger.IsEnabled(LogLevel.Information))
+        {
+            logger.LogInfoRocksDbWalAcceptsWritesAgain(
+                enginePath, streak, tickSource.GetElapsedTime(Volatile.Read(ref failureStreakStartTicks), tickSource.GetTimestamp()));
+        }
     }
 
     /// <summary>
@@ -493,9 +495,7 @@ public class RocksDbWAL : IWAL, IDisposable
         {
             if (!engineClosed && EngineAcceptsWrites())
             {
-                logger.LogInformation(
-                    "RocksDB WAL at '{Path}' resumed on its own after a storage failure; no reopen needed",
-                    enginePath);
+                logger.LogInfoRocksDbWalResumedOnItsOwn(enginePath);
                 return true;
             }
 
@@ -613,9 +613,7 @@ public class RocksDbWAL : IWAL, IDisposable
         {
             KommanderMetrics.RecordWalEngineReopen(succeeded: false);
 
-            logger.LogCritical(
-                "RocksDB WAL at '{Path}' could not be reopened after a storage failure; every operation fails until a later write retries the reopen: {Message}",
-                enginePath, ex.Message);
+            logger.LogCritRocksDbWalReopenFailed(enginePath, ex.Message);
 
             return false;
         }
