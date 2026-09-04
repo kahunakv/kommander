@@ -2,6 +2,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using Kommander.Data;
+using Kommander.Gossip;
 using Kommander.Logging;
 using Kommander.System.Protos;
 using Kommander.WAL;
@@ -44,6 +45,7 @@ internal sealed class PartitionMapService
     private readonly Func<CancellationToken, Task> seedInitialMembership;
     private readonly Func<ClusterMembership> getMembership;
     private readonly Func<string, string?> getNodeZone;
+    private readonly Func<string, MemberLivenessState> getNodeLiveness;
     private readonly Dictionary<int, SplitInProgress> pendingSplits;
     private readonly Dictionary<int, MergeInProgress> pendingMerges;
     private readonly Func<TimeSpan> getRetryDelay;
@@ -66,6 +68,7 @@ internal sealed class PartitionMapService
         Func<CancellationToken, Task> seedInitialMembership,
         Func<ClusterMembership> getMembership,
         Func<string, string?> getNodeZone,
+        Func<string, MemberLivenessState> getNodeLiveness,
         Dictionary<int, SplitInProgress> pendingSplits,
         Dictionary<int, MergeInProgress> pendingMerges,
         Func<TimeSpan> getRetryDelay,
@@ -87,6 +90,7 @@ internal sealed class PartitionMapService
         this.seedInitialMembership = seedInitialMembership;
         this.getMembership = getMembership;
         this.getNodeZone = getNodeZone;
+        this.getNodeLiveness = getNodeLiveness;
         this.pendingSplits = pendingSplits;
         this.pendingMerges = pendingMerges;
         this.getRetryDelay = getRetryDelay;
@@ -489,6 +493,18 @@ internal sealed class PartitionMapService
     /// roster voters (replica load counted from the current map), founding configuration all
     /// Voter. Returns an empty list — legacy full replication — when RF is 0 or the voter count
     /// does not exceed RF.
+    /// <para>
+    /// Voters whose SWIM liveness is not <see cref="MemberLivenessState.Alive"/> sort behind
+    /// every live voter (the local endpoint always counts as alive, mirroring
+    /// <see cref="ReplicaPlacementService.RunPlacementPassAsync"/>). Without this gate a down
+    /// node's frozen load count made it the least-loaded voter over time, so every fresh
+    /// partition was founded with a dead member deterministically first in its replica set.
+    /// When fewer than RF voters are alive the set is backfilled with non-alive voters rather
+    /// than short-placed or degraded: the founding group stays RF-sized, quorum arithmetic is
+    /// unchanged from the pre-gate behavior, and a transient liveness dip cannot flip creation
+    /// into full replication. Liveness is gossip-fed and can lag a failure by seconds, so the
+    /// resulting set is best-effort — the placement rebalancer repairs any stale pick later.
+    /// </para>
     /// </summary>
     private List<RaftReplica> PickReplicasForNewRange(RaftPartitionMap map)
     {
@@ -516,10 +532,25 @@ internal sealed class PartitionMapService
             }
         }
 
-        return voters
-            .OrderBy(v => load[v.Endpoint])
+        Dictionary<string, bool> alive = voters.ToDictionary(
+            v => v.Endpoint,
+            v => v.Endpoint == localEndpoint || getNodeLiveness(v.Endpoint) == MemberLivenessState.Alive,
+            StringComparer.Ordinal);
+
+        List<ClusterMember> picked = voters
+            .OrderByDescending(v => alive[v.Endpoint])
+            .ThenBy(v => load[v.Endpoint])
             .ThenBy(v => v.Endpoint, StringComparer.Ordinal)
             .Take(rf)
+            .ToList();
+
+        List<string> backfilled = picked.Where(v => !alive[v.Endpoint]).Select(v => v.Endpoint).ToList();
+        if (backfilled.Count > 0)
+            logger.LogWarning(
+                "PickReplicasForNewRange: only {Live} of {Rf} required voters are alive; backfilled replica set with non-alive voters [{Endpoints}]",
+                rf - backfilled.Count, rf, string.Join(",", backfilled));
+
+        return picked
             .Select(v => new RaftReplica
             {
                 Endpoint = v.Endpoint,

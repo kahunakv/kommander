@@ -151,6 +151,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
             TrySeedInitialMembership,
             GetMembership,
             GetNodeZone,
+            endpoint => manager.Liveness.GetState(endpoint),
             _splitMerge.PendingSplits,
             _splitMerge.PendingMerges,
             () => RetryDelay,

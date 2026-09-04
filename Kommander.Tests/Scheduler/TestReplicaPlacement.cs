@@ -544,6 +544,117 @@ public sealed class TestReplicaPlacement
         }
     }
 
+    // ── Dynamic-creation placement (PickReplicasForNewRange) ─────────────────
+
+    private static Task<(RaftOperationStatus Status, long Generation)> SendCreateAsync(
+        RaftManager manager, int partitionId)
+    {
+        TaskCompletionSource<(RaftOperationStatus Status, long Generation)> tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        manager.SystemCoordinator.Send(
+            new RaftSystemRequest(partitionId, RaftRoutingMode.Unrouted, null, null, tcs));
+        return tcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    /// <summary>
+    /// The liveness gate on dynamic creation. Before the fix, a down voter was a full
+    /// candidate, and its frozen load count made it the least-loaded voter — so it landed
+    /// deterministically first in every fresh replica set. Here "d:1" is the least-loaded
+    /// voter but Suspect: the pick must skip it and take the least-loaded live voters.
+    /// </summary>
+    [Fact]
+    public async Task CreatePartition_VoterNotAlive_ExcludedFromNewReplicaSet()
+    {
+        RaftManager manager = Build(replicationFactor: 3);
+        using (manager)
+        {
+            AcceptReplication(manager);
+            manager.SystemCoordinator.Send(MakeMembersReplicated(Local, "b:1", "c:1", "d:1", "e:1"));
+            // Existing load: Local/b/c hold one replica each; d and e hold zero.
+            manager.SystemCoordinator.Send(MakeConfigReplicated(
+                PlacedRange(1, 1, Replica(Local), Replica("b:1"), Replica("c:1"))));
+            await WaitForIdleAsync(manager);
+
+            manager.Liveness.MarkSuspect("d:1");
+
+            (RaftOperationStatus status, _) = await SendCreateAsync(manager, 5);
+            Assert.Equal(RaftOperationStatus.Success, status);
+
+            List<RaftReplica> replicas = MapEntry(manager, 5).Replicas;
+            Assert.Equal(3, replicas.Count);
+            Assert.DoesNotContain(replicas, r => r.Endpoint == "d:1");
+            // Least-loaded live voters win: e (load 0), then b and c (load 1, ordinal ties).
+            Assert.Equal(
+                ["b:1", "c:1", "e:1"],
+                replicas.Select(r => r.Endpoint).Order(StringComparer.Ordinal).ToList());
+            Assert.All(replicas, r =>
+            {
+                Assert.Equal(RaftReplicaRole.Voter, r.Role);
+                Assert.Equal(1, r.SinceGeneration);
+            });
+        }
+    }
+
+    /// <summary>
+    /// The documented degradation choice: when fewer than RF voters are alive, the set is
+    /// backfilled with non-alive voters so the founding group stays RF-sized. It is not
+    /// short-placed, and a liveness dip does not flip creation into full replication.
+    /// </summary>
+    [Fact]
+    public async Task CreatePartition_FewerLiveVotersThanRf_BackfillsToFullRfSize()
+    {
+        RaftManager manager = Build(replicationFactor: 3);
+        using (manager)
+        {
+            AcceptReplication(manager);
+            manager.SystemCoordinator.Send(MakeMembersReplicated(Local, "b:1", "c:1", "d:1"));
+            manager.SystemCoordinator.Send(MakeConfigReplicated(PlacedRange(1, 1)));
+            await WaitForIdleAsync(manager);
+
+            manager.Liveness.MarkSuspect("b:1");
+            manager.Liveness.MarkSuspect("c:1");
+
+            (RaftOperationStatus status, _) = await SendCreateAsync(manager, 5);
+            Assert.Equal(RaftOperationStatus.Success, status);
+
+            List<string> endpoints = MapEntry(manager, 5).Replicas.Select(r => r.Endpoint).ToList();
+            Assert.Equal(3, endpoints.Count);
+            // Both live voters are in; exactly one non-alive voter backfills the third slot
+            // (least-loaded, ordinal tiebreak → "b:1").
+            Assert.Contains(Local, endpoints);
+            Assert.Contains("d:1", endpoints);
+            Assert.Contains("b:1", endpoints);
+        }
+    }
+
+    /// <summary>
+    /// All voters alive: the pick is unchanged from the pre-gate behavior — RF least-loaded
+    /// voters, ordinal tiebreak, all Voter, SinceGeneration 1.
+    /// </summary>
+    [Fact]
+    public async Task CreatePartition_AllVotersAlive_PicksLeastLoadedAsBefore()
+    {
+        RaftManager manager = Build(replicationFactor: 3);
+        using (manager)
+        {
+            AcceptReplication(manager);
+            manager.SystemCoordinator.Send(MakeMembersReplicated(Local, "b:1", "c:1", "d:1", "e:1"));
+            manager.SystemCoordinator.Send(MakeConfigReplicated(
+                PlacedRange(1, 1, Replica(Local), Replica("b:1"), Replica("c:1"))));
+            await WaitForIdleAsync(manager);
+
+            (RaftOperationStatus status, _) = await SendCreateAsync(manager, 5);
+            Assert.Equal(RaftOperationStatus.Success, status);
+
+            List<string> endpoints = MapEntry(manager, 5).Replicas
+                .Select(r => r.Endpoint)
+                .Order(StringComparer.Ordinal)
+                .ToList();
+            // d and e carry zero load; b wins the load-1 tier on the ordinal tiebreak.
+            Assert.Equal(["b:1", "d:1", "e:1"], endpoints);
+        }
+    }
+
     // ── Placement-controller pass (RunPlacementPass) ─────────────────────────
 
     /// <summary>
