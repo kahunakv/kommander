@@ -50,8 +50,10 @@
       <!-- Promoted failures. A generated run that failed leaves its plan under dst-artifacts/;
            copying that file in here turns it into a test that runs for ever. The plan is the
            replay unit rather than the seed, because a seed re-draws against whatever the cluster
-           happens to do and a plan does not. -->
-      <Content Include="Simulation\Scenarios\Random\regressions\*.plan.txt" LinkBase="regressions" CopyToOutputDirectory="PreserveNewest" />
+           happens to do and a plan does not. Link, not LinkBase: with a flat glob LinkBase left
+           the item unlinked and nothing was copied, so the corpus test replayed an empty folder
+           and passed on every promoted plan it never read. -->
+      <Content Include="Simulation\Scenarios\Random\regressions\*.plan.txt" Link="regressions\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 
 </Project>

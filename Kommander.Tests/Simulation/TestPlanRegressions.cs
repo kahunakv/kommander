@@ -79,8 +79,14 @@ public sealed class TestPlanRegressions
     /// <summary>
     /// Every promoted plan holds every check, on every replay.
     ///
-    /// <para>An empty corpus passes and says so. That is the honest reading: nothing has been
-    /// promoted, which is a fact about the corpus rather than a fact about the library.</para>
+    /// <para><b>A corpus that loads nothing fails.</b> This test used to return early on an empty
+    /// corpus, on the reading that emptiness was a fact about the corpus rather than about the
+    /// library. That reading was safe only while nothing had been promoted. It stopped being safe
+    /// the day the first plan landed, and the cost was immediate: the project file's copy rule was
+    /// wrong, the output folder was never created, this test finished in twenty-one milliseconds,
+    /// and it passed — over a promoted plan it had never read. The failure mode of a regression
+    /// corpus is silence, so the loader's silence is now the failure. A test whose subject is
+    /// loaded from disk must assert that it loaded something.</para>
     /// </summary>
     [Fact]
     [Trait("Category", "DSTRandom")]
@@ -90,8 +96,13 @@ public sealed class TestPlanRegressions
 
         IReadOnlyList<RegressionPlan> plans = RegressionPlanCorpus.Load();
 
-        if (plans.Count == 0)
-            return;
+        Assert.True(plans.Count > 0,
+            $"No promoted plan loaded from '{RegressionPlanCorpus.ConfiguredDirectory()}'. " +
+            $"The corpus source folder is 'Kommander.Tests/Simulation/Scenarios/Random/regressions/' " +
+            $"and the project file copies its '*.plan.txt' to the output directory. An empty load " +
+            $"means one of three things: the copy rule is broken again, {RegressionPlanCorpus.DirectoryVariable} " +
+            $"points somewhere wrong, or every promoted plan was deleted on purpose — in which case " +
+            $"delete this assertion in the same change, so the corpus is never silently empty.");
 
         output.WriteLine(
             $"Replaying {plans.Count} plan(s) from {RegressionPlanCorpus.ConfiguredDirectory()}.");

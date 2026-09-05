@@ -27,9 +27,9 @@ on:
         required: false
         default: '40'
       replay_repeats:
-        description: 'Replays of each promoted regression plan.'
+        description: 'Replays of each promoted regression plan. Size it from the plan rate, not a round number.'
         required: false
-        default: '3'
+        default: '24'
 
 # One search at a time. Two overlapping runs share the runner and slow each other down, and this
 # suite is load-sensitive: a loaded machine turns a passing seed into a lead nobody can reproduce.
@@ -51,8 +51,14 @@ jobs:
       KOMMANDER_DST_SHRINK: '1'
       KOMMANDER_DST_SHRINK_BUDGET: ${{ inputs.shrink_budget || '40' }}
 
-      # One replay of a promoted plan is weak evidence: these plans are not deterministic.
-      KOMMANDER_DST_REPLAY_REPEATS: ${{ inputs.replay_repeats || '3' }}
+      # One replay of a promoted plan is weak evidence: these plans are not deterministic, and a
+      # corpus entry is promoted precisely because it reproduced INTERMITTENTLY. Size the repeats
+      # from the measured rate. The first entry reproduced about nine times in a hundred, so three
+      # replays would have caught its regression one night in four (1 - 0.91^3) and reported green
+      # on the other three. Twenty-four reaches about ninety per cent, and costs about a minute per
+      # plan. Raise it again if a promoted plan is rarer than that; a number nobody derived from a
+      # rate is a number that reports what it likes.
+      KOMMANDER_DST_REPLAY_REPEATS: ${{ inputs.replay_repeats || '24' }}
 
       # Fail a run that stopped working. A run that stalls still passes every check — it simply
       # takes an order of magnitude longer, and nothing reports that. The limits are stall

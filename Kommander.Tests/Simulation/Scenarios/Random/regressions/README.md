@@ -34,5 +34,22 @@ loadable the day somebody adds one.
 
 ## One replay is weak evidence
 
-These plans are not deterministic. Set `KOMMANDER_DST_REPLAY_REPEATS` to replay each plan several
-times; a nightly job should.
+These plans are not deterministic, and a plan is promoted here precisely because it reproduced
+*intermittently*. Set `KOMMANDER_DST_REPLAY_REPEATS` to replay each plan several times.
+
+Size that number from the plan's measured rate, not from a round number. A plan that reproduces
+nine times in a hundred is caught by three replays only one run in four, and by twenty-four replays
+about nine runs in ten. The nightly job uses twenty-four.
+
+## An empty corpus is a failure, not a pass
+
+`TestPlanRegressions` fails when it loads no plan at all. It did not always: it returned early on an
+empty corpus, and that hid a broken copy rule for as long as the rule stayed wrong — the test read
+nothing and passed in twenty-one milliseconds.
+
+So if the test reports that nothing loaded, check three things in this order.
+
+1. The copy rule in `Kommander.Tests.csproj`. The output folder beside the test binary must hold a
+   `regressions/` directory with the plans in it.
+2. `KOMMANDER_DST_REPLAY_DIR`, which overrides the folder when it is set.
+3. Whether somebody removed every plan on purpose. If so, remove the assertion in the same change.
