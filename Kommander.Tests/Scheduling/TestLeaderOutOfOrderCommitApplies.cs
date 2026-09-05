@@ -59,8 +59,6 @@ public class TestLeaderOutOfOrderCommitApplies
 
         public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;
         public HLCTimestamp GetLastNodeActivity(string ep, int p) => HLCTimestamp.Zero;
-        public HLCTimestamp GetLastNodeHearthbeat(string ep, int p) => HLCTimestamp.Zero;
-        public void UpdateLastHeartbeat(string ep, int p, HLCTimestamp t) { }
         public void UpdateLastNodeActivity(string ep, int p, HLCTimestamp t) { }
         public void EnqueueResponse(string ep, RaftResponderRequest req) { }
 

@@ -99,8 +99,6 @@ public class TestPartitionStateSeeding
         public HLCTimestamp GetLastNodeActivity(string e, int p) => HybridLogicalClock.TrySendOrLocalEvent(1);
         // A fresh heartbeat timestamp keeps the follower from campaigning during the drain tick,
         // so the test observes the pure seed-then-replay sequence.
-        public HLCTimestamp GetLastNodeHearthbeat(string e, int p) => HybridLogicalClock.TrySendOrLocalEvent(1);
-        public void UpdateLastHeartbeat(string e, int p, HLCTimestamp t) { }
         public void UpdateLastNodeActivity(string e, int p, HLCTimestamp t) { }
         public void EnqueueResponse(string e, RaftResponderRequest r) { }
         public Task InvokeLeaderChanged(int p, string l) => Task.CompletedTask;

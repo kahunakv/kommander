@@ -149,7 +149,12 @@ public class RaftConfiguration
     /// sent a heartbeat to a specific follower within this duration, the current
     /// <c>CheckLeader</c> tick skips it.  This prevents redundant sends when
     /// <see cref="CheckLeaderInterval"/> fires more frequently than
-    /// <see cref="HeartbeatInterval"/>.
+    /// <see cref="HeartbeatInterval"/>. Measured on the monotonic tick source, like every
+    /// other elapsed-time gate — never by HLC subtraction, which a skewed peer's timestamp
+    /// freezes (that shape silenced heartbeats and the repair path entirely; DST FINDING 4).
+    /// Must stay below <see cref="HeartbeatInterval"/>, or every timer-driven heartbeat
+    /// round is skipped and only forced rounds (promotion, read-index) ever reach peers.
+    /// <see cref="TimeSpan.Zero"/> disables the window (the skip is strictly-less-than).
     /// Default 100 ms.
     /// </summary>
     public TimeSpan RecentHeartbeat { get; set; } = TimeSpan.FromMilliseconds(100);
@@ -1618,6 +1623,19 @@ public class RaftConfiguration
                 "timer pass, so its interval bounds the real heartbeat cadence regardless of HeartbeatInterval; " +
                 "at or above StartElectionTimeout, followers time out before the next heartbeat and leadership " +
                 "churns indefinitely. Lower CheckLeaderInterval or raise StartElectionTimeout.");
+
+        // The per-node de-dup window must sit below the heartbeat cadence: a heartbeat round only
+        // reaches a peer once RecentHeartbeat has elapsed since the last send, so a window at or
+        // above HeartbeatInterval skips every timer-driven round and only forced rounds (promotion,
+        // read-index) ever reach peers — heartbeats and the repair path go silent while the leader
+        // believes it is beating.
+        if (RecentHeartbeat >= HeartbeatInterval)
+            throw new RaftException(
+                $"[Kommander] RecentHeartbeat ({RecentHeartbeat.TotalMilliseconds} ms) must be below " +
+                $"HeartbeatInterval ({HeartbeatInterval.TotalMilliseconds} ms). The de-dup window skips a peer " +
+                "contacted within RecentHeartbeat, so a window at or above the heartbeat cadence suppresses " +
+                "every timer-driven heartbeat — and with it the only follower catch-up path. " +
+                "Lower RecentHeartbeat or raise HeartbeatInterval.");
 
         if (EnableQuiescence && PingInterval <= TimeSpan.Zero)
             throw new RaftException(

@@ -97,7 +97,7 @@ public class TestAckPathSnapshotFallback
         {
             Host = "leader", Port = 9000, InitialPartitions = 1, BackfillThreshold = 10,
             // Heartbeat immediately on the first leadership tick so the repair path runs without a wait.
-            HeartbeatInterval = TimeSpan.Zero,
+            HeartbeatInterval = TimeSpan.Zero, RecentHeartbeat = TimeSpan.Zero,
         };
 
         public HybridLogicalClock HybridLogicalClock { get; } = new();
@@ -105,8 +105,6 @@ public class TestAckPathSnapshotFallback
         public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;
 
         public HLCTimestamp GetLastNodeActivity(string e, int p) => HLCTimestamp.Zero;
-        public HLCTimestamp GetLastNodeHearthbeat(string e, int p) => HLCTimestamp.Zero;
-        public void UpdateLastHeartbeat(string e, int p, HLCTimestamp t) { }
         public void UpdateLastNodeActivity(string e, int p, HLCTimestamp t) { }
         public void EnqueueResponse(string e, RaftResponderRequest r) { }
         public Task InvokeLeaderChanged(int p, string l) => Task.CompletedTask;

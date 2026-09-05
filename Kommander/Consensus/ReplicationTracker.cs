@@ -78,6 +78,29 @@ internal sealed class ReplicationTracker
     private readonly Dictionary<string, long> backfillPausedUntilTicks = [];
 
     /// <summary>
+    /// Per-peer monotonic tick of the last heartbeat this partition actually sent to that peer
+    /// (forced or timer-driven). The per-peer de-dup window
+    /// (<see cref="RaftConfiguration.RecentHeartbeat"/>) is measured against this anchor. Living
+    /// on the per-partition tracker keeps the throttle keyed by (partition, peer): one node hosts
+    /// many partitions, and a throttle keyed by endpoint alone would let one partition's heartbeat
+    /// suppress every other partition's to the same node, starving their followers into perpetual
+    /// re-elections.
+    /// </summary>
+    /// <remarks>
+    /// This used to live manager-wide as an HLC timestamp compared by HLC subtraction — the one
+    /// elapsed-time gate the B3 monotonic migration missed. HLC subtraction reads the physical
+    /// component only, and that component latches to the highest timestamp any peer has ever sent,
+    /// so after one skewed message two local mints differ by ~0 ms for the whole skew and the skip
+    /// silenced every heartbeat — and with it the only repair path — to every peer of every
+    /// non-system partition until the wall clock caught up (DST FINDING 4: one repair decision per
+    /// leadership, made before any frontier was reported, and never again). Like
+    /// <see cref="backfillPausedUntilTicks"/> this is pacing state, not Raft progress: a stale
+    /// entry can at most delay one heartbeat by the window, so it is deliberately not part of the
+    /// leadership resets.
+    /// </remarks>
+    private readonly Dictionary<string, long> heartbeatSentAtTicks = [];
+
+    /// <summary>
     /// Per-peer note of a detected commit-frontier regression (crash-restart signature): the endpoint
     /// maps to the committed frontier the peer reported below its recorded <see cref="matchIndex"/>.
     ///
@@ -214,6 +237,7 @@ internal sealed class ReplicationTracker
         startCommitIndexes.Remove(endpoint);
         backfillProgress.Remove(endpoint);
         backfillDecisions.Remove(endpoint);
+        heartbeatSentAtTicks.Remove(endpoint);
         return hadProgress;
     }
 
@@ -535,4 +559,18 @@ internal sealed class ReplicationTracker
     public void PauseBackfill(string endpoint, TimeSpan backoff) =>
         backfillPausedUntilTicks[endpoint] =
             host.GetMonotonicTimestamp() + (long)(backoff.TotalSeconds * Stopwatch.Frequency);
+
+    // ── per-peer heartbeat pacing ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The monotonic tick of the last heartbeat sent to <paramref name="endpoint"/>, or 0 when
+    /// none has been. 0 is the unset anchor <see cref="RaftMonotonic.Elapsed"/> maps to
+    /// <see cref="TimeSpan.MaxValue"/>, so a never-contacted peer is never skipped as "recent".
+    /// </summary>
+    public long GetHeartbeatSentTicksOrDefault(string endpoint) =>
+        heartbeatSentAtTicks.GetValueOrDefault(endpoint, 0);
+
+    /// <summary>Records that a heartbeat went out to <paramref name="endpoint"/> at <paramref name="nowTicks"/>.</summary>
+    public void RecordHeartbeatSent(string endpoint, long nowTicks) =>
+        heartbeatSentAtTicks[endpoint] = nowTicks;
 }

@@ -30,6 +30,7 @@ public class TestQuiescedLeader
         // Both intervals are set to zero so the quiesce check fires immediately
         // on the first CheckPartitionLeadershipAsync call after SetLeaderForTesting.
         host.Configuration.HeartbeatInterval = TimeSpan.Zero;
+        host.Configuration.RecentHeartbeat = TimeSpan.Zero;
         host.Configuration.QuiesceAfter = TimeSpan.Zero;
         host.Configuration.StartElectionTimeout = 500;
         host.Configuration.EndElectionTimeout = 1000;
@@ -310,9 +311,7 @@ public class TestQuiescedLeader
 
         public HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId) => HLCTimestamp.Zero;
 
-        public HLCTimestamp GetLastNodeHearthbeat(string endpoint, int partitionId) => HLCTimestamp.Zero;
 
-        public void UpdateLastHeartbeat(string endpoint, int partitionId, HLCTimestamp timestamp) { }
 
         public void UpdateLastNodeActivity(string endpoint, int partitionId, HLCTimestamp timestamp) { }
 

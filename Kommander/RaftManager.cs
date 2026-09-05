@@ -1467,22 +1467,6 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         nodeActivityTracker.UpdateLastNodeActivity(nodeId, partitionId, lastTimestamp);
 
     /// <summary>
-    /// Obtains the last heartbeat sent to a specific node for a specific partition.
-    /// The throttle key must include the partition id: a single node hosts many partitions,
-    /// and keying only by endpoint would let one partition's heartbeat suppress the
-    /// heartbeats of every other partition to the same node (within RecentHeartbeat),
-    /// starving their followers and triggering perpetual re-elections.
-    /// </summary>
-    internal HLCTimestamp GetLastNodeHearthbeat(string nodeId, int partitionId) =>
-        nodeActivityTracker.GetLastNodeHearthbeat(nodeId, partitionId);
-
-    /// <summary>
-    /// Updates the last heartbeat sent to a node for a specific partition.
-    /// </summary>
-    internal void UpdateLastHeartbeat(string nodeId, int partitionId, HLCTimestamp lastTimestamp) =>
-        nodeActivityTracker.UpdateLastHeartbeat(nodeId, partitionId, lastTimestamp);
-
-    /// <summary>
     /// Returns a list of nodes in the cluster.
     /// </summary>
     public IList<RaftNode> GetNodes()

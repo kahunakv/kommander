@@ -1545,6 +1545,112 @@ public class TestRaftPartitionStateMachine
             e => e.Request.Type == RaftResponderRequestType.RequestVotes);
     }
 
+    /// <summary>
+    /// B3, leader side (DST FINDING 4): the per-peer heartbeat de-dup window must be measured on the
+    /// monotonic clock, never by HLC subtraction. Once a remote message latches the local HLC ahead,
+    /// every later local mint keeps the same physical component, so the HLC delta between two rounds
+    /// reads ~0 ms for the whole skew. The old skip compared that delta against
+    /// <see cref="RaftConfiguration.RecentHeartbeat"/> and silenced every timer-driven heartbeat —
+    /// and with it the only follower catch-up path — until the wall clock caught up: the leader made
+    /// exactly one repair decision per peer (the forced post-promotion round, before any frontier
+    /// report) and never another, while a committed-entry hole persisted on a healthy follower.
+    /// </summary>
+    [Fact]
+    public async Task Leader_HeartbeatDedup_MeasuredOnMonotonicClock_NotFrozenByFutureTimestamp()
+    {
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [],
+            MonotonicOverride = 1_000_000_000
+        };
+        host.Configuration.EnableQuiescence = false;
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: 60);
+        host.NodesOverride = [new("node-b")];
+
+        // A remote message stamped ONE HOUR ahead latches the local HLC to its future physical time.
+        HLCTimestamp localNow = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, new HLCTimestamp(host.LocalNodeId, localNow.L + 3_600_000, 0));
+        host.ClearObservations();
+
+        // First timer round after the latch: sends, and records the send against node-b.
+        host.MonotonicOverride += (long)(host.Configuration.HeartbeatInterval.TotalSeconds * Stopwatch.Frequency) + 1;
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.Contains(host.EnqueuedResponses,
+            r => r.Endpoint == "node-b" && r.Type == RaftResponderRequestType.AppendLogs);
+
+        // Precondition of the old bug: with the HLC latched, two consecutive mints differ by less
+        // than RecentHeartbeat, so an HLC-subtraction window would now skip node-b on every round.
+        HLCTimestamp mintA = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        HLCTimestamp mintB = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        Assert.True((mintB - mintA) < host.Configuration.RecentHeartbeat,
+            "precondition: consecutive HLC mints read as the same instant while the latch holds");
+
+        host.ClearObservations();
+
+        // Second timer round, a full HeartbeatInterval later on the monotonic clock. The de-dup
+        // window has long expired in real local time; the heartbeat must go out even though the
+        // HLC delta since the previous send still reads ~0.
+        host.MonotonicOverride += (long)(host.Configuration.HeartbeatInterval.TotalSeconds * Stopwatch.Frequency) + 1;
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.Contains(host.EnqueuedResponses,
+            r => r.Endpoint == "node-b" && r.Type == RaftResponderRequestType.AppendLogs);
+    }
+
+    /// <summary>
+    /// B3 converse, leader side: the de-dup window still de-dups. A timer round that fires within
+    /// <see cref="RaftConfiguration.RecentHeartbeat"/> of the last send to a peer (possible when
+    /// the check-leader tick outpaces <see cref="RaftConfiguration.HeartbeatInterval"/>) skips that
+    /// peer, and the round after the window has elapsed reaches it again. Guards against a monotonic
+    /// rewrite that dropped the throttle instead of re-clocking it.
+    /// </summary>
+    [Fact]
+    public async Task Leader_HeartbeatDedup_WithinMonotonicWindow_SkipsThePeerOnce()
+    {
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [],
+            MonotonicOverride = 1_000_000_000,
+            HeartbeatIntervalOverride = TimeSpan.FromMilliseconds(1)
+        };
+        host.Configuration.EnableQuiescence = false;
+        // RecentHeartbeat stays at its 100 ms default, far above the 1 ms interval, so the window
+        // is what gates the second round. (Production validation forbids this ordering; here it
+        // is the lever that makes the skip reachable at all.)
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: 61);
+        host.NodesOverride = [new("node-b")];
+        host.ClearObservations();
+
+        // Round 1: 5 ms after promotion — past the interval, no send recorded yet → sends.
+        host.MonotonicOverride += (long)(0.005 * Stopwatch.Frequency);
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.Contains(host.EnqueuedResponses,
+            r => r.Endpoint == "node-b" && r.Type == RaftResponderRequestType.AppendLogs);
+
+        host.ClearObservations();
+
+        // Round 2: 5 ms later — past the interval again, but within the 100 ms window → skipped.
+        host.MonotonicOverride += (long)(0.005 * Stopwatch.Frequency);
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.DoesNotContain(host.EnqueuedResponses,
+            r => r.Type == RaftResponderRequestType.AppendLogs);
+
+        // Round 3: 200 ms later — the window has elapsed → the peer is reached again.
+        host.MonotonicOverride += (long)(0.2 * Stopwatch.Frequency);
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.Contains(host.EnqueuedResponses,
+            r => r.Endpoint == "node-b" && r.Type == RaftResponderRequestType.AppendLogs);
+    }
+
     [Fact]
     public async Task VoteAsync_NoRoster_TreatsAllEndpointsAsVoters()
     {
@@ -1738,9 +1844,7 @@ public class TestRaftPartitionStateMachine
 
         public HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId) => HLCTimestamp.Zero;
 
-        public HLCTimestamp GetLastNodeHearthbeat(string endpoint, int partitionId) => HLCTimestamp.Zero;
 
-        public void UpdateLastHeartbeat(string endpoint, int partitionId, HLCTimestamp timestamp) { }
 
         /// <summary>Records every UpdateLastNodeActivity call so tests can assert whether a code path
         /// reached the first post-fence mutation in CompleteAppendLogsAsync.</summary>

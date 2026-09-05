@@ -1,0 +1,21 @@
+seed=20260902
+partitionId=1
+stepsPerAction=6
+advanceMillisecondsPerStep=50
+maxImpairedNodes=1
+maxFaultAgeInActions=4
+recoveryStepBudget=900
+idleConvergenceStepBudget=300
+
+000 AppendAtLeader localhost:8002
+001 AppendAtLeader localhost:8002
+002 AppendAcrossOutage localhost:8003
+003 AppendAcrossOutage localhost:8001
+004 AppendAtFollower localhost:8003
+005 CrashNode localhost:8002
+006 AppendAtLeader localhost:8001
+007 RestartNode localhost:8002
+008 LeaderOutage localhost:8001
+009 AppendAtLeader localhost:8001
+010 AppendAcrossOutage localhost:8001
+011 AppendAtFollower localhost:8002

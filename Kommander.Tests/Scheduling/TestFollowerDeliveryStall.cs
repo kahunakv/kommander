@@ -165,8 +165,6 @@ public class TestFollowerDeliveryStall
         public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;
 
         public HLCTimestamp GetLastNodeActivity(string e, int p) => HLCTimestamp.Zero;
-        public HLCTimestamp GetLastNodeHearthbeat(string e, int p) => HLCTimestamp.Zero;
-        public void UpdateLastHeartbeat(string e, int p, HLCTimestamp t) { }
         public void UpdateLastNodeActivity(string e, int p, HLCTimestamp t) { }
         public void EnqueueResponse(string e, RaftResponderRequest r) { }
         public Task InvokeLeaderChanged(int p, string l) => Task.CompletedTask;

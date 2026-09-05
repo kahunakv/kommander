@@ -5,24 +5,28 @@ using Kommander.Time;
 namespace Kommander;
 
 /// <summary>
-/// Owns the per-node activity and heartbeat timestamp tables for <see cref="RaftManager"/>.
-/// Thread-safe by construction: both tables are <see cref="ConcurrentDictionary{TKey,TValue}"/>
-/// instances that are written and read concurrently without external locking. Updates are
+/// Owns the per-node activity timestamp table for <see cref="RaftManager"/>.
+/// Thread-safe by construction: the table is a <see cref="ConcurrentDictionary{TKey,TValue}"/>
+/// written and read concurrently without external locking. Updates are
 /// intentionally racy-but-benign: two concurrent writers may briefly interleave, but the
 /// read-compare-write only ever moves a timestamp forward from the value it observed, and
 /// readers tolerate slightly stale values.
 ///
 /// <para>Keyed endpoint → (partition → timestamp) rather than by a flat
-/// <c>(endpoint, partition)</c> tuple: the update paths run per follower per heartbeat round and
-/// per inbound ack, and the tuple key hashed the endpoint string on every probe (2–3 of them per
+/// <c>(endpoint, partition)</c> tuple: the update path runs per inbound ack,
+/// and the tuple key hashed the endpoint string on every probe (2–3 of them per
 /// update). The nested layout hashes the string once and the partition id (an int) for the rest,
 /// and lets the per-endpoint aggregations (<see cref="GetLastNodeActivity(string)"/>,
 /// <see cref="GetActiveNodes"/>) read one endpoint's bucket instead of scanning the whole table.</para>
+///
+/// <para>The last-heartbeat-sent table that used to live beside this one moved to the
+/// per-partition <c>ReplicationTracker</c> as monotonic ticks: its only reader was the
+/// heartbeat de-dup skip, and comparing HLC timestamps against a wall-clock window there
+/// silenced heartbeats for the length of any received clock skew (DST FINDING 4).</para>
 /// </summary>
 internal sealed class NodeActivityTracker
 {
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<int, HLCTimestamp>> lastActivity = new();
-    private readonly ConcurrentDictionary<string, ConcurrentDictionary<int, HLCTimestamp>> lastHearthBeat = new();
     private readonly Func<HLCTimestamp> getNow;
     private readonly string localEndpoint;
 
@@ -56,15 +60,6 @@ internal sealed class NodeActivityTracker
 
     internal void UpdateLastNodeActivity(string nodeId, int partitionId, HLCTimestamp lastTimestamp) =>
         Update(lastActivity, nodeId, partitionId, lastTimestamp);
-
-    internal HLCTimestamp GetLastNodeHearthbeat(string nodeId, int partitionId) =>
-        lastHearthBeat.TryGetValue(nodeId, out ConcurrentDictionary<int, HLCTimestamp>? partitions)
-        && partitions.TryGetValue(partitionId, out HLCTimestamp ts)
-            ? ts
-            : HLCTimestamp.Zero;
-
-    internal void UpdateLastHeartbeat(string nodeId, int partitionId, HLCTimestamp lastTimestamp) =>
-        Update(lastHearthBeat, nodeId, partitionId, lastTimestamp);
 
     private static void Update(
         ConcurrentDictionary<string, ConcurrentDictionary<int, HLCTimestamp>> table,

@@ -128,15 +128,23 @@ internal sealed class HeartbeatDriver
             if (node.Endpoint == host.LocalEndpoint)
                 throw new RaftException("Corrupted nodes");
 
-            if (host.PartitionId != RaftSystemConfig.SystemPartition && !force)
-            {
-                HLCTimestamp lastHearthBeatToNode = host.GetLastNodeHearthbeat(node.Endpoint, host.PartitionId);
+            // B3: the per-peer de-dup window is measured on the monotonic clock, like every other
+            // elapsed-time gate. It used to subtract HLC timestamps, and HLC subtraction reads
+            // only the physical component — which latches to the highest timestamp any peer has
+            // ever sent. After one skewed message, two local mints differ by ~0 ms for the whole
+            // skew, this condition held on every unforced round, and the leader silently stopped
+            // sending heartbeats (and with them the ONLY repair path — see the class summary) to
+            // every peer of every non-system partition until the wall clock caught up. Followers
+            // meanwhile starved on their (monotonic) election timers, so the same latch produced
+            // both a stranded-hole leader and gratuitous elections (DST FINDING 4).
+            // Strictly-less: a zero window disables the de-dup entirely (elapsed is never
+            // negative), which is what harnesses that drive rounds back-to-back rely on.
+            if (host.PartitionId != RaftSystemConfig.SystemPartition && !force
+                && RaftMonotonic.Elapsed(tracker.GetHeartbeatSentTicksOrDefault(node.Endpoint), nowTicks)
+                    < host.Configuration.RecentHeartbeat)
+                continue;
 
-                if (lastHearthBeatToNode != HLCTimestamp.Zero && ((coreState.LastHeartbeat - lastHearthBeatToNode) <= host.Configuration.RecentHeartbeat))
-                    continue;
-            }
-
-            host.UpdateLastHeartbeat(node.Endpoint, host.PartitionId, coreState.LastHeartbeat);
+            tracker.RecordHeartbeatSent(node.Endpoint, nowTicks);
 
             // Backfill: ship up to MaxBackfillEntriesPerRound committed entries instead of an empty
             // heartbeat so the follower converges without waiting for new writes.

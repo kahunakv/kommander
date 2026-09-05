@@ -103,8 +103,6 @@ public sealed class TestExecutorMetricsTags : IDisposable
         public IReadOnlyList<RaftNode> Nodes => NodesOverride;
         public StubHost(int partitionId) => PartitionId = partitionId;
         public HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId) => HLCTimestamp.Zero;
-        public HLCTimestamp GetLastNodeHearthbeat(string endpoint, int partitionId) => HLCTimestamp.Zero;
-        public void UpdateLastHeartbeat(string endpoint, int partitionId, HLCTimestamp timestamp) { }
         public void UpdateLastNodeActivity(string endpoint, int partitionId, HLCTimestamp timestamp) { }
         public void EnqueueResponse(string endpoint, RaftResponderRequest request) { }
         public Task InvokeLeaderChanged(int partitionId, string leader) => Task.CompletedTask;

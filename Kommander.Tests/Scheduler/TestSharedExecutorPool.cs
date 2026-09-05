@@ -49,8 +49,6 @@ public sealed class TestSharedExecutorPool
         public StubHost(int partitionId = 0) => PartitionId = partitionId;
 
         public HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId) => HLCTimestamp.Zero;
-        public HLCTimestamp GetLastNodeHearthbeat(string endpoint, int partitionId) => HLCTimestamp.Zero;
-        public void UpdateLastHeartbeat(string endpoint, int partitionId, HLCTimestamp timestamp) { }
         public void UpdateLastNodeActivity(string endpoint, int partitionId, HLCTimestamp timestamp) { }
         public void EnqueueResponse(string endpoint, RaftResponderRequest request) => EnqueuedResponses.Add((endpoint, request));
         public Task InvokeLeaderChanged(int partitionId, string leader) => Task.CompletedTask;

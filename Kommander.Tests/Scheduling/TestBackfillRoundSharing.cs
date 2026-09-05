@@ -122,7 +122,7 @@ public class TestBackfillRoundSharing
         public RaftConfiguration Configuration { get; } = new()
         {
             Host = "leader", Port = 9000, InitialPartitions = 1, BackfillThreshold = 10,
-            HeartbeatInterval = TimeSpan.Zero,
+            HeartbeatInterval = TimeSpan.Zero, RecentHeartbeat = TimeSpan.Zero,
         };
 
         public HybridLogicalClock HybridLogicalClock { get; } = new();
@@ -130,8 +130,6 @@ public class TestBackfillRoundSharing
         public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;
 
         public HLCTimestamp GetLastNodeActivity(string e, int p) => HLCTimestamp.Zero;
-        public HLCTimestamp GetLastNodeHearthbeat(string e, int p) => HLCTimestamp.Zero;
-        public void UpdateLastHeartbeat(string e, int p, HLCTimestamp t) { }
         public void UpdateLastNodeActivity(string e, int p, HLCTimestamp t) { }
         public void EnqueueResponse(string e, RaftResponderRequest r) => Requests.Add(r);
         public Task InvokeLeaderChanged(int p, string l) => Task.CompletedTask;

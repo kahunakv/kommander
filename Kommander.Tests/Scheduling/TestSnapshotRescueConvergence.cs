@@ -383,7 +383,7 @@ public class TestSnapshotRescueConvergence
             Configuration = new RaftConfiguration
             {
                 NodeId = 1, Host = "leader", Port = 9000, InitialPartitions = 1,
-                HeartbeatInterval = TimeSpan.Zero,
+                HeartbeatInterval = TimeSpan.Zero, RecentHeartbeat = TimeSpan.Zero,
                 BackfillThreshold = 0,
                 MaxBackfillEntriesPerRound = 128,
             };
@@ -404,8 +404,6 @@ public class TestSnapshotRescueConvergence
         public IReadOnlyList<RaftNode> Nodes => [new(Follower)];
 
         public HLCTimestamp GetLastNodeActivity(string e, int p) => HLCTimestamp.Zero;
-        public HLCTimestamp GetLastNodeHearthbeat(string e, int p) => HLCTimestamp.Zero;
-        public void UpdateLastHeartbeat(string e, int p, HLCTimestamp t) { }
         public void UpdateLastNodeActivity(string e, int p, HLCTimestamp t) { }
         public void EnqueueResponse(string e, RaftResponderRequest r) { }
         public Task InvokeLeaderChanged(int p, string l) => Task.CompletedTask;

@@ -82,8 +82,6 @@ public class TestReadIndexConfirmation
 
         public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;
         public HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId) => HLCTimestamp.Zero;
-        public HLCTimestamp GetLastNodeHearthbeat(string endpoint, int partitionId) => HLCTimestamp.Zero;
-        public void UpdateLastHeartbeat(string endpoint, int partitionId, HLCTimestamp timestamp) { }
         public void UpdateLastNodeActivity(string endpoint, int partitionId, HLCTimestamp timestamp) { }
 
         public void EnqueueResponse(string endpoint, RaftResponderRequest request) =>

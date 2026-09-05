@@ -334,7 +334,7 @@ public class TestSnapshotExport
         public RaftConfiguration Configuration { get; } = new()
         {
             NodeId = 1, Host = "leader", Port = 9000, InitialPartitions = 1,
-            HeartbeatInterval = TimeSpan.Zero,          // fires immediately
+            HeartbeatInterval = TimeSpan.Zero, RecentHeartbeat = TimeSpan.Zero,          // fires immediately
             BackfillThreshold = 0,                      // any lag triggers backfill
             MaxBackfillEntriesPerRound = 128,
         };
@@ -343,8 +343,6 @@ public class TestSnapshotExport
         public IReadOnlyList<RaftNode> Nodes => [new("follower:9000")];
 
         public HLCTimestamp GetLastNodeActivity(string e, int p) => HLCTimestamp.Zero;
-        public HLCTimestamp GetLastNodeHearthbeat(string e, int p) => HLCTimestamp.Zero;
-        public void UpdateLastHeartbeat(string e, int p, HLCTimestamp t) { }
         public void UpdateLastNodeActivity(string e, int p, HLCTimestamp t) { }
         public void EnqueueResponse(string e, RaftResponderRequest r) { }
         public Task InvokeLeaderChanged(int p, string l) => Task.CompletedTask;
