@@ -28,9 +28,20 @@ namespace Kommander.Consensus;
 /// <para><b>A heartbeat ack re-raises the hole report until the hole is repaired.</b> The
 /// entry-carrying paths report a hole only at the moment a batch lands over it, and that edge
 /// signal dies with the leadership that heard it. The heartbeat branch therefore sends a second,
-/// LogMismatch-status response — alongside the normal Success ack, never instead of it — whenever
-/// durable entries sit buffered above the contiguous presence frontier, so every current leader
-/// learns the repair anchor within one beat regardless of elections in between (DST FINDING 1).</para>
+/// LogMismatch-status response — alongside the normal Success ack, never instead of it — while
+/// durable entries sit buffered above the contiguous presence frontier, so a standing hole
+/// reaches whichever node leads now regardless of elections in between (DST FINDING 1).</para>
+///
+/// <para><b>The report is debounced to holes whose repair anchor is STUCK.</b> Under load a
+/// presence gap is routinely transient: appends ride multiple in-flight paths, so entries can
+/// enqueue out of arrival order and the gap closes milliseconds later on its own. Reporting such
+/// a gap makes the leader regress the peer's nextIndex and ship an anchored backfill batch that
+/// duplicates entries already in flight — pure waste, per beat. The report therefore fires only
+/// when the same anchor stood with a gap at the previous heartbeat ack too: a frontier that is
+/// advancing repairs itself, a frontier that is pinned is the genuine hole this path exists for.
+/// A pre-existing hole still reaches a NEW leader on its first beat (the stuck state carries
+/// across elections, because it is follower-local); only a freshly formed hole waits one extra
+/// beat before its first report.</para>
 ///
 /// <para><b>The hole repair never deletes below the advertised commit frontier.</b> The blanket
 /// truncation is licensed by one premise: a row above an unfilled gap cannot have earned quorum
@@ -78,6 +89,17 @@ internal sealed class FollowerAppendHandler
         this.logger = logger;
         this.adoptLeaderAsync = adoptLeaderAsync;
     }
+
+    /// <summary>
+    /// Presence-frontier anchor observed with a standing gap at the previous heartbeat ack, or -1
+    /// when the log was contiguous then. The heartbeat hole report fires only when the current
+    /// anchor equals this value — a gap whose frontier is advancing is in-flight reordering that
+    /// repairs itself, and reporting it would regress the peer's nextIndex and trigger a redundant
+    /// anchored backfill (see the class remarks). Executor thread only; deliberately NOT reset on
+    /// leader changes, so a hole that pre-dates an election is reported to the new leader on its
+    /// first beat.
+    /// </summary>
+    private long lastHeartbeatGapAnchor = -1;
 
     private void CompleteReply(ulong? correlationId, RaftResponse response)
     {
@@ -479,7 +501,8 @@ internal sealed class FollowerAppendHandler
         // state, which LiveCommitFloor deliberately confines). The hole itself is a LEVEL
         // condition this node reads for free — durable entries buffered above the contiguous
         // presence frontier — so re-raise the anchored-repair note on every heartbeat until the
-        // gap closes: whichever node leads now learns the anchor within one beat, and the
+        // gap closes: a standing hole reaches whichever node leads now on its first beat (a
+        // freshly formed one waits a single confirmation beat, per the debounce below), and the
         // mismatch-note trigger it feeds is gated on neither BackfillThreshold nor
         // LiveCommitFloor. Sent IN ADDITION to the Success ack above, never instead of it: the
         // Success ack must keep feeding the frontier report, read-index confirmation and
@@ -488,14 +511,27 @@ internal sealed class FollowerAppendHandler
         {
             long holeAnchor = Math.Max(0, wal.GetPresentIndex());
 
-            logThrottle.LogHeartbeatHoleReport(endpoint, holeAnchor);
+            // Debounce: report only an anchor that is STUCK — the same frontier stood under a gap
+            // at the previous heartbeat ack. An advancing frontier is in-flight reordering healing
+            // itself; reporting it would regress this peer's nextIndex at the leader and trigger a
+            // redundant anchored backfill per beat (see the class remarks). A genuinely pinned
+            // anchor fires from the second beat on, and keeps firing every beat until repaired.
+            bool anchorStuck = holeAnchor == lastHeartbeatGapAnchor;
+            lastHeartbeatGapAnchor = holeAnchor;
 
-            host.EnqueueResponse(endpoint, new(
-                RaftResponderRequestType.CompleteAppendLogs,
-                new(endpoint),
-                new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, holeAnchor)
-            ));
+            if (anchorStuck)
+            {
+                logThrottle.LogHeartbeatHoleReport(endpoint, holeAnchor);
+
+                host.EnqueueResponse(endpoint, new(
+                    RaftResponderRequestType.CompleteAppendLogs,
+                    new(endpoint),
+                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, holeAnchor)
+                ));
+            }
         }
+        else
+            lastHeartbeatGapAnchor = -1;
 
         CompleteReply(replyCorrelationId, RaftResponseStatic.NoneResponse);
     }

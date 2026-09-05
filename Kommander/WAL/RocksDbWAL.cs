@@ -326,12 +326,17 @@ public class RocksDbWAL : IWAL, IDisposable
 
     /// <summary>
     /// Fences the engine handle: every public operation holds the read side for its duration, and
-    /// <see cref="ReopenEngine"/> / <see cref="Dispose"/> take the write side. Recursion is permitted
-    /// because a small number of public operations call other public operations on the same thread
-    /// (for example <see cref="TruncateLogsAfterAndGetMax"/>); the cost of the recursive policy is
-    /// negligible next to the storage operation it brackets.
+    /// <see cref="ReopenEngine"/> / <see cref="Dispose"/> take the write side. The policy is
+    /// <see cref="LockRecursionPolicy.NoRecursion"/> — an audit of every <see cref="AcquireEngine"/>
+    /// caller found no nested acquisition (compositions such as
+    /// <see cref="TruncateLogsAfterAndGetMax"/> take and release the lease once per step,
+    /// sequentially), so a nested acquire can only be a future bug, and this policy fails it fast
+    /// with a <see cref="LockRecursionException"/> instead of silently re-entering — the safer
+    /// default for a fence that guards a native handle. The policies measure within half a
+    /// nanosecond of each other per enter/exit pair (see <c>WalEngineFenceBenchmarks</c>), so the
+    /// choice is about the failure mode, not cost.
     /// </summary>
-    private readonly ReaderWriterLockSlim engineGuard = new(LockRecursionPolicy.SupportsRecursion);
+    private readonly ReaderWriterLockSlim engineGuard = new(LockRecursionPolicy.NoRecursion);
 
     /// <summary>
     /// True while <see cref="db"/> is not a usable handle: after <see cref="Dispose"/>, and between a

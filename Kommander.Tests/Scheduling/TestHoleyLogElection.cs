@@ -954,4 +954,92 @@ public class TestHoleyLogElection
         await sm.CheckPartitionLeadershipAsync();
         Assert.Contains(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
     }
+
+    // ── the heartbeat hole report is debounced to stuck anchors ───────────────
+
+    /// <summary>LogMismatch second responses among the outbound CompleteAppendLogs acks.</summary>
+    private static List<CompleteAppendLogsRequest> HoleReports(CapturingHost host) =>
+        host.Outbound
+            .Where(m => m.Type == RaftResponderRequestType.CompleteAppendLogs)
+            .Select(m => m.CompleteAppendLogsRequest!)
+            .Where(r => r.Status == RaftOperationStatus.LogMismatch)
+            .ToList();
+
+    /// <summary>
+    /// A presence gap seen for the FIRST time at a heartbeat ack must not be reported: under load
+    /// a gap is routinely a batch that enqueued ahead of its predecessor and closes on its own,
+    /// and reporting it makes the leader regress this peer's nextIndex and ship a redundant
+    /// anchored backfill. Only an anchor that stands across two consecutive beats reports — and
+    /// from then on it re-reports every beat until the hole closes (the level-triggered repair
+    /// DST FINDING 1 requires).
+    /// </summary>
+    [Fact]
+    public async Task HeartbeatHoleReport_FiresOnlyOnceTheAnchorIsStuck()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 8, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3, HasPresenceGapValue = true };
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        await sm.AppendLogsAsync("node-b", 1, ts, logs: null);
+
+        // First sight of the gap: the Success ack flows, the hole report does not.
+        Assert.Contains(host.Outbound, m =>
+            m.Type == RaftResponderRequestType.CompleteAppendLogs
+            && m.CompleteAppendLogsRequest!.Status == RaftOperationStatus.Success);
+        Assert.Empty(HoleReports(host));
+
+        // Second beat with the frontier pinned at the same anchor: the report fires, anchored there.
+        await sm.AppendLogsAsync("node-b", 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);
+        CompleteAppendLogsRequest report = Assert.Single(HoleReports(host));
+        Assert.Equal(3, report.CommitIndex);
+
+        // Third beat, still pinned: level-triggered — it fires again.
+        await sm.AppendLogsAsync("node-b", 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);
+        Assert.Equal(2, HoleReports(host).Count);
+    }
+
+    /// <summary>
+    /// A gap whose frontier is ADVANCING between beats is in-flight replication healing itself,
+    /// not a stranded hole; it must never be reported.
+    /// </summary>
+    [Fact]
+    public async Task HeartbeatHoleReport_AdvancingFrontier_IsNotReported()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 8, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3, HasPresenceGapValue = true };
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        await sm.AppendLogsAsync("node-b", 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);
+        wal.PresentId = 5; // the gap moved: entries below filled in, a higher range still buffers
+        await sm.AppendLogsAsync("node-b", 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);
+        wal.PresentId = 6;
+        await sm.AppendLogsAsync("node-b", 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);
+
+        Assert.Empty(HoleReports(host));
+    }
+
+    /// <summary>
+    /// A gap that closes resets the debounce: a NEW gap that later forms at the same anchor is a
+    /// fresh observation and waits its own confirmation beat before reporting.
+    /// </summary>
+    [Fact]
+    public async Task HeartbeatHoleReport_GapThatClosed_ResetsTheDebounce()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 8, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3, HasPresenceGapValue = true };
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+
+        await sm.AppendLogsAsync("node-b", 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);
+        wal.HasPresenceGapValue = false; // the transient gap healed
+        await sm.AppendLogsAsync("node-b", 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);
+        wal.HasPresenceGapValue = true;  // a new gap forms over the same anchor
+        await sm.AppendLogsAsync("node-b", 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);
+
+        Assert.Empty(HoleReports(host));
+
+        // Only when the new gap survives to the next beat does it report.
+        await sm.AppendLogsAsync("node-b", 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);
+        Assert.Single(HoleReports(host));
+    }
 }
