@@ -102,7 +102,7 @@ public sealed class SnapshotRequest
     /// valid until the send completes — every transport consumes it synchronously (gRPC serializes via
     /// <c>UnsafeByteOperations.UnsafeWrap</c> before the awaited unary call; REST base64-encodes it
     /// during <c>JsonSerializer.Serialize</c>; the in-memory/​receiver path copies it into the receive
-    /// <c>MemoryStream</c> under the session lock) — and the sender awaits each send before overwriting
+    /// buffer under the session lock) — and the sender awaits each send before overwriting
     /// the buffer, so the view never outlives its backing bytes. A <c>byte[]</c> assigned to this
     /// property (e.g. in tests) converts implicitly and owns its own storage.
     /// </para>

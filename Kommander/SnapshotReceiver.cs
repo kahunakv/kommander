@@ -31,6 +31,12 @@ internal readonly record struct SnapshotSessionKey(string LeaderEndpoint, int Pa
 /// reclaimed on the next receipt or an explicit <see cref="SweepForTesting"/>, and is bounded in the
 /// meantime by the byte cap.</para>
 ///
+/// <para>The caps are accounted in payload bytes, and <see cref="SnapshotReceiveBuffer"/> is what makes
+/// that also a statement about physical memory: it stores a session in fixed-size segments, so its
+/// allocated capacity exceeds its payload by less than one segment and never doubles. The earlier
+/// <c>MemoryStream</c> could hold close to twice the payload, plus a transient copy of it, none of which
+/// the byte cap saw. <see cref="TotalStagedCapacityByteCount"/> reports the allocated total.</para>
+///
 /// <para><b>Buffering only.</b> This class does not import or writes the WAL. On the terminal
 /// chunk it hands the staged buffer plus session metadata to <c>installOnExecutor</c>, which routes the
 /// install through the partition's single-writer executor where term validation, application import, and
@@ -108,7 +114,7 @@ internal sealed class SnapshotReceiver
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        MemoryStream completeBuffer;
+        SnapshotReceiveBuffer completeBuffer;
         SnapshotReceiveSession completedSession;
         lock (_pendingSnapshotsLock)
         {
@@ -145,7 +151,7 @@ internal sealed class SnapshotReceiver
                     SnapshotIndex = request.SnapshotIndex,
                     Kind = request.Kind,
                     NextExpectedChunkIndex = 0,
-                    Buffer = new MemoryStream(),
+                    Buffer = new SnapshotReceiveBuffer(),
                     Hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256),
                     CreatedTimestamp = now,
                     LastActivityTimestamp = now,
@@ -253,13 +259,14 @@ internal sealed class SnapshotReceiver
         {
             // Release the in-install reservation, then dispose the buffer. The executor read the stream to
             // completion before installOnExecutor returned, so the buffer is safe to release here (see
-            // RaftPartition.InstallSnapshotAsync — it uses no-cancellation Ask).
+            // RaftPartition.InstallSnapshotAsync — it uses no-cancellation Ask). Disposal is synchronous:
+            // the buffer holds managed segments and nothing to flush.
             lock (_pendingSnapshotsLock)
             {
                 _inInstallBytes -= completedSession.AccumulatedBytes;
                 _inInstallCount--;
             }
-            await completeBuffer.DisposeAsync().ConfigureAwait(false);
+            completeBuffer.Dispose();
             // The completed session was detached from _sessions above, so RemoveSessionLocked never
             // runs for it and this is the only place its hash is released.
             completedSession.Hash.Dispose();
@@ -461,6 +468,28 @@ internal sealed class SnapshotReceiver
     }
 
     /// <summary>
+    /// Bytes actually allocated by the pending sessions' buffers, as opposed to the payload bytes the caps
+    /// count. Reports only the sessions still in the map; a completed buffer whose install is running is
+    /// no longer reachable from here, so read this together with <see cref="TotalStagedByteCount"/>.
+    /// Exists so a test can assert the segment overshoot stays bounded rather than take it on faith.
+    /// </summary>
+    internal long TotalStagedCapacityByteCount
+    {
+        get
+        {
+            lock (_pendingSnapshotsLock)
+            {
+                long capacity = 0;
+
+                foreach (KeyValuePair<SnapshotSessionKey, SnapshotReceiveSession> pair in _sessions)
+                    capacity += pair.Value.Buffer.AllocatedByteCount;
+
+                return capacity;
+            }
+        }
+    }
+
+    /// <summary>
     /// Runs the lazy idle-expiry sweep on demand. Exists so tests (which drive a controllable monotonic
     /// clock) can force expiry of abandoned sessions without another receipt; production relies on the
     /// per-receipt sweep.
@@ -507,7 +536,7 @@ internal sealed class SnapshotReceiver
         internal required long LastIncludedTerm { get; init; }
         internal required long SnapshotIndex { get; init; }
         internal required SnapshotKind Kind { get; init; }
-        internal required MemoryStream Buffer { get; init; }
+        internal required SnapshotReceiveBuffer Buffer { get; init; }
 
         /// <summary>
         /// Running SHA-256 over the staged bytes, advanced on every appended chunk and compared

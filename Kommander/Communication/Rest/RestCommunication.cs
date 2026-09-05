@@ -1,6 +1,7 @@
+using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
-using System.Text;
 using System.Text.Json;
 using Flurl.Http;
 using Flurl.Http.Configuration;
@@ -28,12 +29,12 @@ public class RestCommunication : ICommunication
 
     public async Task<HandshakeResponse> Handshake(RaftManager manager, RaftNode node, HandshakeRequest request)
     {
-        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.HandshakeRequest);
+        byte[] payload = JsonSerializer.SerializeToUtf8Bytes(request, RestJsonContext.Default.HandshakeRequest);
         
         try
         {
             return await CreateRaftRequest(manager, node, "/v1/raft/handshake", payload)
-                .PostStringAsync(payload)
+                .PostAsync(JsonContent(payload))
                 .ReceiveJson<HandshakeResponse>().ConfigureAwait(false);
         }
         catch (Exception e)
@@ -46,12 +47,12 @@ public class RestCommunication : ICommunication
     
     public async Task<RequestVotesResponse> RequestVotes(RaftManager manager, RaftNode node, RequestVotesRequest request)
     {
-        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.RequestVotesRequest);
+        byte[] payload = JsonSerializer.SerializeToUtf8Bytes(request, RestJsonContext.Default.RequestVotesRequest);
         
         try
         {
             return await CreateRaftRequest(manager, node, "/v1/raft/request-vote", payload)
-                .PostStringAsync(payload)
+                .PostAsync(JsonContent(payload))
                 .ReceiveJson<RequestVotesResponse>().ConfigureAwait(false);
         }
         catch (Exception e)
@@ -64,12 +65,12 @@ public class RestCommunication : ICommunication
 
     public async Task<VoteResponse> Vote(RaftManager manager, RaftNode node, VoteRequest request)
     {
-        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.VoteRequest);
+        byte[] payload = JsonSerializer.SerializeToUtf8Bytes(request, RestJsonContext.Default.VoteRequest);
         
         try
         {
             return await CreateRaftRequest(manager, node, "/v1/raft/vote", payload)
-                .PostStringAsync(payload)
+                .PostAsync(JsonContent(payload))
                 .ReceiveJson<VoteResponse>().ConfigureAwait(false);
         }
         catch (Exception e)
@@ -82,7 +83,7 @@ public class RestCommunication : ICommunication
 
     public async Task<CompleteAppendLogsResponse> CompleteAppendLogs(RaftManager manager, RaftNode node, CompleteAppendLogsRequest request)
     {
-        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.CompleteAppendLogsRequest);
+        byte[] payload = JsonSerializer.SerializeToUtf8Bytes(request, RestJsonContext.Default.CompleteAppendLogsRequest);
         
         try
         {
@@ -91,7 +92,7 @@ public class RestCommunication : ICommunication
                     node,
                     "/v1/raft/complete-append-logs",
                     payload)
-                .PostStringAsync(payload)
+                .PostAsync(JsonContent(payload))
                 .ReceiveJson<CompleteAppendLogsResponse>().ConfigureAwait(false);
 
             return response;
@@ -106,12 +107,12 @@ public class RestCommunication : ICommunication
 
     public async Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftNode node, AppendLogsRequest request)
     {
-        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.AppendLogsRequest);
+        byte[] payload = JsonSerializer.SerializeToUtf8Bytes(request, RestJsonContext.Default.AppendLogsRequest);
         
         try
         {
             AppendLogsResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/append-logs", payload)
-                .PostStringAsync(payload)
+                .PostAsync(JsonContent(payload))
                 .ReceiveJson<AppendLogsResponse>().ConfigureAwait(false);
             
             if (request.Logs is not null && request.Logs.Count > 0)
@@ -129,12 +130,12 @@ public class RestCommunication : ICommunication
 
     public async Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)
     {
-        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.BatchRequestsRequest);
+        byte[] payload = JsonSerializer.SerializeToUtf8Bytes(request, RestJsonContext.Default.BatchRequestsRequest);
         
         try
         {
             BatchRequestsResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/batch-requests", payload)
-                .PostStringAsync(payload)
+                .PostAsync(JsonContent(payload))
                 .ReceiveJson<BatchRequestsResponse>().ConfigureAwait(false);
 
             return response;
@@ -155,12 +156,12 @@ public class RestCommunication : ICommunication
     /// </summary>
     public async Task<LeaveResponse> SendLeave(RaftManager manager, RaftNode node, LeaveRequest request, CancellationToken cancellationToken = default)
     {
-        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.LeaveRequest);
+        byte[] payload = JsonSerializer.SerializeToUtf8Bytes(request, RestJsonContext.Default.LeaveRequest);
 
         try
         {
             LeaveResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/leave", payload)
-                .PostStringAsync(payload, cancellationToken: cancellationToken)
+                .PostAsync(JsonContent(payload), cancellationToken: cancellationToken)
                 .ReceiveJson<LeaveResponse>()
                 .ConfigureAwait(false);
 
@@ -182,12 +183,12 @@ public class RestCommunication : ICommunication
     /// </summary>
     public async Task<SetMemberRoleResponse> SendSetMemberRole(RaftManager manager, RaftNode node, SetMemberRoleRequest request, CancellationToken cancellationToken = default)
     {
-        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.SetMemberRoleRequest);
+        byte[] payload = JsonSerializer.SerializeToUtf8Bytes(request, RestJsonContext.Default.SetMemberRoleRequest);
 
         try
         {
             SetMemberRoleResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/set-member-role", payload)
-                .PostStringAsync(payload, cancellationToken: cancellationToken)
+                .PostAsync(JsonContent(payload), cancellationToken: cancellationToken)
                 .ReceiveJson<SetMemberRoleResponse>()
                 .ConfigureAwait(false);
 
@@ -221,12 +222,12 @@ public class RestCommunication : ICommunication
         {
             LoadReportJson = loadReportJson,
         };
-        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.GossipRequest);
+        byte[] payload = JsonSerializer.SerializeToUtf8Bytes(request, RestJsonContext.Default.GossipRequest);
 
         try
         {
             GossipResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/gossip", payload)
-                .PostStringAsync(payload, cancellationToken: cancellationToken)
+                .PostAsync(JsonContent(payload), cancellationToken: cancellationToken)
                 .ReceiveJson<GossipResponse>()
                 .ConfigureAwait(false);
 
@@ -255,12 +256,12 @@ public class RestCommunication : ICommunication
     public async Task<Gossip.PingResponse> SendPing(RaftManager manager, RaftNode node, Gossip.PingRequest request, CancellationToken cancellationToken = default)
     {
         WirePingRequest wireRequest = new(request.SenderEndpoint);
-        string payload = JsonSerializer.Serialize(wireRequest, RestJsonContext.Default.PingRequest);
+        byte[] payload = JsonSerializer.SerializeToUtf8Bytes(wireRequest, RestJsonContext.Default.PingRequest);
 
         try
         {
             WirePingResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/ping", payload)
-                .PostStringAsync(payload, cancellationToken: cancellationToken)
+                .PostAsync(JsonContent(payload), cancellationToken: cancellationToken)
                 .ReceiveJson<WirePingResponse>()
                 .ConfigureAwait(false);
 
@@ -284,12 +285,12 @@ public class RestCommunication : ICommunication
     public async Task<Gossip.PingReqResponse> SendPingReq(RaftManager manager, RaftNode node, Gossip.PingReqRequest request, CancellationToken cancellationToken = default)
     {
         WirePingReqRequest wireRequest = new(request.SenderEndpoint, request.TargetEndpoint);
-        string payload = JsonSerializer.Serialize(wireRequest, RestJsonContext.Default.PingReqRequest);
+        byte[] payload = JsonSerializer.SerializeToUtf8Bytes(wireRequest, RestJsonContext.Default.PingReqRequest);
 
         try
         {
             WirePingReqResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/ping-req", payload)
-                .PostStringAsync(payload, cancellationToken: cancellationToken)
+                .PostAsync(JsonContent(payload), cancellationToken: cancellationToken)
                 .ReceiveJson<WirePingReqResponse>()
                 .ConfigureAwait(false);
 
@@ -315,12 +316,12 @@ public class RestCommunication : ICommunication
     public async Task<long?> GetRemoteFollowerLag(RaftManager manager, RaftNode node, int partitionId, string followerEndpoint)
     {
         GetFollowerLagRequest request = new(partitionId, followerEndpoint);
-        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.GetFollowerLagRequest);
+        byte[] payload = JsonSerializer.SerializeToUtf8Bytes(request, RestJsonContext.Default.GetFollowerLagRequest);
 
         try
         {
             GetFollowerLagResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/get-follower-lag", payload)
-                .PostStringAsync(payload)
+                .PostAsync(JsonContent(payload))
                 .ReceiveJson<GetFollowerLagResponse>()
                 .ConfigureAwait(false);
 
@@ -339,12 +340,12 @@ public class RestCommunication : ICommunication
         RaftManager manager, RaftNode node, SnapshotRequest request,
         CancellationToken cancellationToken = default)
     {
-        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.SnapshotRequest);
+        byte[] payload = JsonSerializer.SerializeToUtf8Bytes(request, RestJsonContext.Default.SnapshotRequest);
 
         try
         {
             SnapshotResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/install-snapshot", payload)
-                .PostStringAsync(payload, cancellationToken: cancellationToken)
+                .PostAsync(JsonContent(payload), cancellationToken: cancellationToken)
                 .ReceiveJson<SnapshotResponse>().ConfigureAwait(false);
 
             return response ?? new SnapshotResponse(false);
@@ -360,12 +361,12 @@ public class RestCommunication : ICommunication
 
     public async Task<JoinResponse> SendJoin(RaftManager manager, RaftNode node, JoinRequest request)
     {
-        string payload = JsonSerializer.Serialize(request, RestJsonContext.Default.JoinRequest);
+        byte[] payload = JsonSerializer.SerializeToUtf8Bytes(request, RestJsonContext.Default.JoinRequest);
 
         try
         {
             JoinResponse? response = await CreateRaftRequest(manager, node, "/v1/raft/join", payload)
-                .PostStringAsync(payload)
+                .PostAsync(JsonContent(payload))
                 .ReceiveJson<JoinResponse>().ConfigureAwait(false);
 
             return response ?? new JoinResponse(false);
@@ -378,23 +379,39 @@ public class RestCommunication : ICommunication
         return new JoinResponse(false);
     }
 
+    /// <summary>
+    /// Signs <paramref name="payload"/> — the exact bytes that will be sent as the request body — and
+    /// returns the authentication headers, or an empty map when node authentication is not in shared-secret
+    /// mode.
+    /// </summary>
+    /// <remarks>
+    /// Takes bytes rather than a string because the signature must cover what the peer receives. The
+    /// caller serializes once, straight to UTF-8, and hands the same buffer here and to the HTTP content;
+    /// a second serialization for signing could produce a signature over bytes that were never sent, and
+    /// every request would then fail authentication.
+    /// </remarks>
     internal static IReadOnlyDictionary<string, string> BuildAuthenticationHeaders(
         RaftConfiguration configuration,
         string senderNode,
         string method,
         string path,
-        string payload)
+        ReadOnlySpan<byte> payload)
     {
         RaftTransportAuthenticator authenticator = configuration.GetTransportAuthenticator();
 
         if (authenticator.Options.NodeAuthenticationMode != RaftNodeAuthenticationMode.SharedSecret)
             return EmptyHeaders;
 
-        RaftTransportAuthenticationHeaders authHeaders = authenticator.Sign(
+        // Digest here and sign the digest: SignWithBodyHash exists so a transport that already holds its
+        // payload as bytes does not hand over a byte[] copy of it.
+        Span<byte> bodyHash = stackalloc byte[RaftTransportAuthenticator.BodyHashSizeInBytes];
+        SHA256.HashData(payload, bodyHash);
+
+        RaftTransportAuthenticationHeaders authHeaders = authenticator.SignWithBodyHash(
             method,
             path,
             senderNode,
-            Encoding.UTF8.GetBytes(payload));
+            bodyHash);
 
         return new Dictionary<string, string>
         {
@@ -498,7 +515,7 @@ public class RestCommunication : ICommunication
         RaftManager manager,
         RaftNode node,
         string path,
-        string payload)
+        ReadOnlySpan<byte> payload)
     {
         RaftConfiguration configuration = manager.Configuration;
         IFlurlRequest request = GetClient(manager, node)
@@ -530,5 +547,35 @@ public class RestCommunication : ICommunication
         }
 
         return request;
+    }
+
+    /// <summary>
+    /// Wraps an already-serialized UTF-8 JSON body as HTTP content.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Every REST method now serializes once, directly to UTF-8, and sends those exact bytes. The
+    /// previous shape encoded the same body three times: once into a UTF-16 string, once into a byte
+    /// array for signing, and once again when the string was written to the wire. Snapshot chunks and
+    /// log batches travel as base64 text inside the JSON, so that middle representation was the largest
+    /// single allocation on the REST replication path.
+    /// </para>
+    /// <para>
+    /// The content type is set on the content itself rather than left to the request-level header, so the
+    /// media type does not depend on how Flurl reconciles a content header with a request header. The
+    /// server binds these bodies as JSON and answers 415 for anything else, so the value is part of the
+    /// contract, not a formality.
+    /// </para>
+    /// <para>
+    /// The array is owned by the content and stays alive and unmodified for the send and any retry, so no
+    /// pooled buffer is used here: a returned buffer could be handed to another caller while a retry still
+    /// holds it.
+    /// </para>
+    /// </remarks>
+    private static ByteArrayContent JsonContent(byte[] payload)
+    {
+        ByteArrayContent content = new(payload);
+        content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+        return content;
     }
 }

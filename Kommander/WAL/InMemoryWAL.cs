@@ -14,11 +14,26 @@ namespace Kommander.WAL;
 /// and the max-id recompute to read the last key in O(1), where the tree previously forced an
 /// O(n) walk of the whole retained prefix under the read lock. The trade-off is O(n) element
 /// shifts for mid-list inserts and head removals — appends land at the tail (O(1) amortized) and
-/// the truncate paths remove in descending key order so suffix removal shifts nothing; only head
-/// compaction pays shifts, at the modest sizes this test backend sees.</para>
+/// the truncate paths remove in descending key order so suffix removal shifts nothing. Head
+/// compaction is the one path that would pay a shift per removed entry, so above
+/// <see cref="RebuildElementMoveThreshold"/> element moves it rebuilds the partition list from the
+/// retained entries instead, which touches each retained entry exactly once.</para>
 /// </summary>
 public class InMemoryWAL : IWAL, IDisposable
 {
+    /// <summary>
+    /// Element moves above which <see cref="CompactLogsOlderThan"/> rebuilds a partition's storage
+    /// instead of removing the prefix entry by entry.
+    /// </summary>
+    /// <remarks>
+    /// A rebuild costs one copy per retained entry plus two fresh arrays; a prefix removal costs about
+    /// <c>removed x retained</c> element moves in each of the two arrays. The crossover therefore sits
+    /// only a few entries in, and this value is set well above it so that a small compaction — where the
+    /// allocation would dominate — keeps the cheaper removal path. It is a deliberately conservative
+    /// bound, not a measured optimum; the backend it guards is documented for tests and debugging.
+    /// </remarks>
+    private const long RebuildElementMoveThreshold = 4096;
+
     private readonly ReaderWriterLockSlim rwLock = new(LockRecursionPolicy.NoRecursion);
 
     private readonly Dictionary<string, string> allConfigs = new();
@@ -292,16 +307,14 @@ public class InMemoryWAL : IWAL, IDisposable
 
     /// <summary>
     /// Refreshes <see cref="maxLogIds"/> after entries were removed from a partition. Must run under the
-    /// write lock. <paramref name="removedAscending"/> is built by ascending key iteration, so its last
-    /// element is the highest removed id — only when that equals the recorded max can the max have
-    /// changed, and the surviving max is then the SortedList's last key, read in O(1).
+    /// write lock. Only when <paramref name="highestRemovedId"/> equals the recorded max can the max have
+    /// changed, and the surviving max is then the SortedList's last key, read in O(1). Callers that
+    /// removed nothing must not call this: id 0 is also the "no entries" sentinel, so passing it for an
+    /// empty removal set would recompute a max that could not have moved.
     /// </summary>
-    private void UpdateMaxAfterRemoval(int partitionId, SortedList<long, RaftLog> partitionLogs, List<long> removedAscending)
+    private void UpdateMaxAfterRemoval(int partitionId, SortedList<long, RaftLog> partitionLogs, long highestRemovedId)
     {
-        if (removedAscending.Count == 0)
-            return;
-
-        if (removedAscending[^1] != maxLogIds.GetValueOrDefault(partitionId, 0))
+        if (highestRemovedId != maxLogIds.GetValueOrDefault(partitionId, 0))
             return;
 
         long max = partitionLogs.Count > 0 ? partitionLogs.Keys[partitionLogs.Count - 1] : 0;
@@ -398,7 +411,9 @@ public class InMemoryWAL : IWAL, IDisposable
                 partitionLogs.Remove(toRemove[i]);
 
             AdjustCheckpointAfterTruncation(partitionId, partitionLogs, afterLogId);
-            UpdateMaxAfterRemoval(partitionId, partitionLogs, toRemove);
+
+            if (toRemove.Count > 0)
+                UpdateMaxAfterRemoval(partitionId, partitionLogs, toRemove[^1]);
 
             return RaftOperationStatus.Success;
         }
@@ -449,7 +464,8 @@ public class InMemoryWAL : IWAL, IDisposable
             for (int i = toRemove.Count - 1; i >= 0; i--)
                 partitionLogs.Remove(toRemove[i]);
 
-            UpdateMaxAfterRemoval(partitionId, partitionLogs, toRemove);
+            if (toRemove.Count > 0)
+                UpdateMaxAfterRemoval(partitionId, partitionLogs, toRemove[^1]);
 
             // No checkpoint adjustment: only unresolved entries are removed, never a CommittedCheckpoint.
             return RaftOperationStatus.Success;
@@ -484,7 +500,9 @@ public class InMemoryWAL : IWAL, IDisposable
                 partitionLogs.Remove(toRemove[i]);
 
             AdjustCheckpointAfterTruncation(partitionId, partitionLogs, afterLogId);
-            UpdateMaxAfterRemoval(partitionId, partitionLogs, toRemove);
+
+            if (toRemove.Count > 0)
+                UpdateMaxAfterRemoval(partitionId, partitionLogs, toRemove[^1]);
 
             return (RaftOperationStatus.Success, maxLogIds.GetValueOrDefault(partitionId, 0));
         }
@@ -565,7 +583,10 @@ public class InMemoryWAL : IWAL, IDisposable
         int compactNumberEntries,
         int? maxTotalEntries = null)
     {
-        int passCap = maxTotalEntries ?? compactNumberEntries;
+        // Floor of 1 preserves this backend's previous behaviour for a non-positive cap: the old loop
+        // appended an id before it tested the cap, so a cap of 0 still removed one entry. The change
+        // below computes the removal count up front, which would otherwise turn that into a no-op.
+        int passCap = Math.Max(1, maxTotalEntries ?? compactNumberEntries);
 
         rwLock.EnterWriteLock();
         try
@@ -573,29 +594,52 @@ public class InMemoryWAL : IWAL, IDisposable
             if (!allLogs.TryGetValue(partitionId, out SortedList<long, RaftLog>? partitionLogs))
                 return (RaftOperationStatus.Success, 0);
 
-            List<long> toRemove = [];
+            IList<long> keys = partitionLogs.Keys;
+            int total = keys.Count;
 
-            foreach (long id in partitionLogs.Keys)
+            // The removal set is always the leading run of ids below lastCheckpoint, so only its size has
+            // to be discovered, and a binary search finds it without walking the prefix. The ids
+            // themselves stay addressable by index until the storage changes, which is why no list of
+            // removed keys is built here.
+            int removeCount = Math.Min(LowerBound(keys, lastCheckpoint), passCap);
+
+            if (removeCount == 0)
+                return (RaftOperationStatus.Success, 0);
+
+            long highestRemovedId = keys[removeCount - 1];
+            int retainedCount = total - removeCount;
+
+            if ((long)removeCount * retainedCount >= RebuildElementMoveThreshold)
             {
-                if (id >= lastCheckpoint)
-                    break;
+                // Rebuild. Every removal from the head of a SortedList shifts the whole retained tail in
+                // both the key array and the value array, so removing m entries in front of r retained
+                // ones moves about m x r elements per array — quadratic in the log size when a large
+                // prefix is compacted away. Copying the retained entries into a pre-sized list moves each
+                // of them exactly once. Keys are added in ascending order, so every Add lands at the tail
+                // and shifts nothing.
+                SortedList<long, RaftLog> rebuilt = new(retainedCount);
+                IList<RaftLog> values = partitionLogs.Values;
 
-                toRemove.Add(id);
+                for (int i = removeCount; i < total; i++)
+                    rebuilt.Add(keys[i], values[i]);
 
-                if (toRemove.Count >= passCap)
-                    break;
+                allLogs[partitionId] = rebuilt;
+                partitionLogs = rebuilt;
+            }
+            else
+            {
+                // Below the threshold the shift work is smaller than the two arrays a rebuild would
+                // allocate. Descending index order removes the last element of the prefix first, which is
+                // the order the previous implementation used.
+                for (int i = removeCount - 1; i >= 0; i--)
+                    partitionLogs.RemoveAt(i);
             }
 
-            // Descending so suffix removal always deletes the current last element — a SortedList
-            // shifts every element after the removed index, so ascending order would be O(m²).
-            for (int i = toRemove.Count - 1; i >= 0; i--)
-                partitionLogs.Remove(toRemove[i]);
-
-            UpdateMaxAfterRemoval(partitionId, partitionLogs, toRemove);
+            UpdateMaxAfterRemoval(partitionId, partitionLogs, highestRemovedId);
 
             // No checkpoint adjustment: only entries with id < lastCheckpoint are removed, so the recorded
             // checkpoint (>= lastCheckpoint) is never affected.
-            return (RaftOperationStatus.Success, toRemove.Count);
+            return (RaftOperationStatus.Success, removeCount);
         }
         finally
         {

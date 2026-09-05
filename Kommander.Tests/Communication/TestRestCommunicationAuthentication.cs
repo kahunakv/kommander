@@ -14,7 +14,7 @@ public sealed class TestRestCommunicationAuthentication
             senderNode: "node-a:5000",
             method: "POST",
             path: "/v1/raft/append-logs",
-            payload: "{\"ok\":true}");
+            payload: "{\"ok\":true}"u8);
 
         Assert.Empty(headers);
     }
@@ -36,7 +36,7 @@ public sealed class TestRestCommunicationAuthentication
             senderNode: "node-a:5000",
             method: "POST",
             path: "/v1/raft/append-logs",
-            payload: "{\"ok\":true}");
+            payload: "{\"ok\":true}"u8);
 
         Assert.Equal(4, headers.Count);
         Assert.Contains(configuration.TransportSecurity.HeaderName, headers.Keys);
@@ -65,7 +65,7 @@ public sealed class TestRestCommunicationAuthentication
             senderNode: "node-a:5000",
             method: "POST",
             path: "/v1/raft/append-logs",
-            payload: "{\"ok\":true}");
+            payload: "{\"ok\":true}"u8);
 
         RaftTransportAuthenticator authenticator = new(configuration.GetEffectiveTransportSecurity());
         RaftTransportAuthenticationHeaders expected = authenticator.Sign(

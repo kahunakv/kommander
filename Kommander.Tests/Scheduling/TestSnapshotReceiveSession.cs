@@ -130,6 +130,36 @@ public class TestSnapshotReceiveSession
         Assert.Equal(0, r.PendingByteCount);
     }
 
+    /// <summary>
+    /// The byte caps are accounted in payload bytes, which is only a statement about physical memory
+    /// because the receive buffer stores a session in fixed-size segments. This pins that relationship:
+    /// allocated capacity must cover the payload and overshoot it by less than one segment, no matter how
+    /// many chunks the payload arrived in. A doubling buffer would fail the upper bound.
+    /// </summary>
+    [Fact]
+    public async Task StagedCapacity_TracksThePayloadWithinOneSegment()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000, maxBytes: 64 * 1024 * 1024);
+
+        byte[] chunk = new byte[96 * 1024];
+        for (int i = 0; i < chunk.Length; i++)
+            chunk[i] = (byte)(i & 0xFF);
+
+        for (int index = 0; index < 30; index++)
+            Assert.True((await r.ReceiveInstallSnapshot(Chunk("cap", index, false, chunk), ct)).Success);
+
+        long payload = r.PendingByteCount;
+        long capacity = r.TotalStagedCapacityByteCount;
+
+        Assert.Equal(30L * chunk.Length, payload);
+        Assert.True(capacity >= payload, $"capacity {capacity} must cover the payload {payload}");
+        Assert.True(
+            capacity - payload < SnapshotReceiveBuffer.SegmentSize,
+            $"capacity {capacity} overshoots the payload {payload} by a whole segment");
+    }
+
     [Fact]
     public async Task InstallFailure_IsReportedAndSessionDetached()
     {
