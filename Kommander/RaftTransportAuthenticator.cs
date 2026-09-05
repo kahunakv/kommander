@@ -56,6 +56,25 @@ public sealed class RaftTransportAuthenticator
     /// </summary>
     public const int BodyHashSizeInBytes = 32;
 
+    /// <summary>Length in bytes of an HMAC-SHA256 signature.</summary>
+    private const int SignatureSizeInBytes = 32;
+
+    /// <summary>Length in bytes of the random nonce carried in the authentication headers.</summary>
+    private const int NonceSizeInBytes = 16;
+
+    /// <summary>
+    /// Largest signature the validator will decode into its stack buffer.
+    /// </summary>
+    /// <remarks>
+    /// Sized well above <see cref="SignatureSizeInBytes"/> so a well-formed field of the wrong length
+    /// still reaches the signature comparison and is rejected there as
+    /// <see cref="RaftTransportAuthenticationStatus.InvalidSignature"/>, which is what the previous
+    /// allocating decoder did. Only an absurdly long field — one that could not be a signature under any
+    /// reading — is refused earlier as malformed. The bound is a compile-time constant precisely because
+    /// the header it decodes is unauthenticated: no attacker-supplied length ever sizes a buffer.
+    /// </remarks>
+    private const int MaxDecodedSignatureSizeInBytes = 64;
+
     /// <summary>
     /// Creates signed authentication headers for an outgoing request, binding a body the caller has
     /// already digested.
@@ -131,13 +150,16 @@ public sealed class RaftTransportAuthenticator
 
         long timestamp = timestampUnixMilliseconds ?? GetUtcNowUnixMilliseconds();
         string authNonce = string.IsNullOrWhiteSpace(nonce) ? CreateNonce() : nonce;
-        byte[] signatureBytes = ComputeSignatureBytes(
+
+        Span<byte> signatureBytes = stackalloc byte[SignatureSizeInBytes];
+        ComputeSignature(
             method,
             pathOrGrpcMethod,
             senderNode,
             timestamp,
             authNonce,
-            bodyHash);
+            bodyHash,
+            signatureBytes);
 
         return new RaftTransportAuthenticationHeaders
         {
@@ -306,10 +328,15 @@ public sealed class RaftTransportAuthenticator
             };
         }
 
-        if (!TryDecodeBase64Url(signature, out byte[]? providedSignature)
-            || !TryDecodeBase64Url(nonce, out byte[]? decodedNonce)
-            || decodedNonce is null
-            || decodedNonce.Length != 16)
+        // Decoded into fixed stack buffers rather than into arrays sized from the header. The previous
+        // shape allocated a padded array and then a second exact-length array per field, so a successful
+        // validation cost four arrays before the HMAC result.
+        Span<byte> providedSignature = stackalloc byte[MaxDecodedSignatureSizeInBytes];
+        Span<byte> decodedNonce = stackalloc byte[NonceSizeInBytes];
+
+        if (!TryDecodeBase64Url(signature, providedSignature, out int providedSignatureLength)
+            || !TryDecodeBase64Url(nonce, decodedNonce, out int decodedNonceLength)
+            || decodedNonceLength != NonceSizeInBytes)
         {
             return new RaftTransportAuthenticationResult
             {
@@ -329,15 +356,21 @@ public sealed class RaftTransportAuthenticator
             };
         }
 
-        byte[] expectedSignature = ComputeSignatureBytes(
+        Span<byte> expectedSignature = stackalloc byte[SignatureSizeInBytes];
+        ComputeSignature(
             method,
             pathOrGrpcMethod,
             senderNode,
             timestamp,
             nonce,
-            bodyHash);
+            bodyHash,
+            expectedSignature);
 
-        if (!FixedTimeEquals(providedSignature, expectedSignature))
+        // FixedTimeEquals is length-sensitive, so a well-formed field of the wrong length fails here as
+        // an invalid signature — the same classification the allocating decoder produced.
+        if (!CryptographicOperations.FixedTimeEquals(
+                providedSignature[..providedSignatureLength],
+                expectedSignature))
         {
             return new RaftTransportAuthenticationResult
             {
@@ -453,13 +486,23 @@ public sealed class RaftTransportAuthenticator
             throw new ArgumentException("Value cannot be null or whitespace.", nameof(senderNode));
     }
 
-    private byte[] ComputeSignatureBytes(
+    /// <summary>
+    /// Writes the HMAC-SHA256 over the canonical signing representation into
+    /// <paramref name="destination"/>, which must be exactly <see cref="SignatureSizeInBytes"/> long.
+    /// </summary>
+    /// <remarks>
+    /// Takes a destination rather than returning a fresh array so neither signing nor validation
+    /// allocates for the result. The canonical representation itself is unchanged — altering the field
+    /// order, the separators, or the digest encoding here would invalidate every peer's signature.
+    /// </remarks>
+    private void ComputeSignature(
         string method,
         string pathOrGrpcMethod,
         string senderNode,
         long timestampUnixMilliseconds,
         string nonce,
-        ReadOnlySpan<byte> bodyHash)
+        ReadOnlySpan<byte> bodyHash,
+        Span<byte> destination)
     {
         int methodByteCount = Encoding.UTF8.GetByteCount(method);
         int pathByteCount = Encoding.UTF8.GetByteCount(pathOrGrpcMethod);
@@ -504,7 +547,7 @@ public sealed class RaftTransportAuthenticator
             buffer[offset++] = (byte)'\n';
             offset += WriteHexLower(buffer[offset..], bodyHash);
 
-            return HMACSHA256.HashData(sharedSecretBytes!, buffer[..offset]);
+            HMACSHA256.HashData(sharedSecretBytes!, buffer[..offset], destination);
         }
         finally
         {
@@ -563,7 +606,7 @@ public sealed class RaftTransportAuthenticator
 
     private static string CreateNonce()
     {
-        Span<byte> nonceBytes = stackalloc byte[16];
+        Span<byte> nonceBytes = stackalloc byte[NonceSizeInBytes];
         RandomNumberGenerator.Fill(nonceBytes);
         return Base64UrlEncode(nonceBytes);
     }
@@ -599,25 +642,48 @@ public sealed class RaftTransportAuthenticator
         return new string(buffer[..end]);
     }
 
-    private static bool TryDecodeBase64Url(string value, out byte[]? decoded)
+    /// <summary>
+    /// Decodes a base64url field directly into <paramref name="destination"/>, allocating nothing.
+    /// Returns false when the field is not valid base64url or cannot fit.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The character buffer is bounded by <paramref name="destination"/>, never by the field. That
+    /// ordering is the point: the field arrives in an unauthenticated header, so it must not be able to
+    /// size a stack allocation. A field longer than the destination could hold is rejected before any
+    /// buffer is touched.
+    /// </para>
+    /// <para>
+    /// The accepted encodings are unchanged — the URL alphabet, with or without trailing padding — and
+    /// so is the rejection of a length that leaves one leftover character, which no base64 encoding
+    /// produces.
+    /// </para>
+    /// </remarks>
+    private static bool TryDecodeBase64Url(string value, Span<byte> destination, out int bytesWritten)
     {
-        decoded = null;
+        bytesWritten = 0;
 
         if (string.IsNullOrWhiteSpace(value))
             return false;
 
-        // Translate the URL alphabet back and re-pad into a stack buffer, then decode once — instead of
-        // building normalized + padded intermediate strings via Replace/PadRight.
         int padding = value.Length % 4;
         if (padding == 1)
             return false;
 
         int paddedLength = padding == 0 ? value.Length : value.Length + (4 - padding);
-        Span<char> buffer = paddedLength <= 256 ? stackalloc char[paddedLength] : new char[paddedLength];
+
+        // Longest padded encoding that can decode into the destination. Four base64 characters carry
+        // three bytes, so a destination of n bytes admits at most ceil(n / 3) quartets.
+        int maxPaddedLength = ((destination.Length + 2) / 3) * 4;
+        if (paddedLength > maxPaddedLength)
+            return false;
+
+        Span<char> buffer = stackalloc char[maxPaddedLength];
+        Span<char> chars = buffer[..paddedLength];
 
         for (int i = 0; i < value.Length; i++)
         {
-            buffer[i] = value[i] switch
+            chars[i] = value[i] switch
             {
                 '-' => '+',
                 '_' => '/',
@@ -626,14 +692,9 @@ public sealed class RaftTransportAuthenticator
         }
 
         for (int i = value.Length; i < paddedLength; i++)
-            buffer[i] = '=';
+            chars[i] = '=';
 
-        byte[] output = new byte[(paddedLength / 4) * 3];
-        if (!Convert.TryFromBase64Chars(buffer, output, out int bytesWritten))
-            return false;
-
-        decoded = bytesWritten == output.Length ? output : output[..bytesWritten];
-        return true;
+        return Convert.TryFromBase64Chars(chars, destination, out bytesWritten);
     }
 
     private static int WriteUtf8(Span<byte> destination, string value)

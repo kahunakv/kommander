@@ -37,7 +37,7 @@ public sealed class TestRestClientScoping
             manager,
             new RaftNode("node-b:5001"),
             "/v1/raft/append-logs",
-            "{}");
+            "{}"u8);
 
         Assert.Equal("https://node-b:5001/v1/raft/append-logs", request.Url.ToString());
     }
@@ -59,7 +59,7 @@ public sealed class TestRestClientScoping
             manager,
             new RaftNode("node-b:5001"),
             path,
-            "{}");
+            "{}"u8);
 
         Assert.Equal("https://node-b:5001/v1/raft/vote", request.Url.ToString());
     }
@@ -74,10 +74,10 @@ public sealed class TestRestClientScoping
         using RaftManager manager = CreateManager("node-a", 5000);
 
         IFlurlRequest toB = RestCommunication.CreateRaftRequest(
-            manager, new RaftNode("node-b:5001"), "/v1/raft/ping", "{}");
+            manager, new RaftNode("node-b:5001"), "/v1/raft/ping", "{}"u8);
 
         IFlurlRequest toC = RestCommunication.CreateRaftRequest(
-            manager, new RaftNode("node-c:5002"), "/v1/raft/ping", "{}");
+            manager, new RaftNode("node-c:5002"), "/v1/raft/ping", "{}"u8);
 
         Assert.Equal("https://node-b:5001/v1/raft/ping", toB.Url.ToString());
         Assert.Equal("https://node-c:5002/v1/raft/ping", toC.Url.ToString());
@@ -93,8 +93,8 @@ public sealed class TestRestClientScoping
         using RaftManager manager = CreateManager("node-a", 5000);
         RaftNode peer = new("node-b:5001");
 
-        IFlurlRequest first = RestCommunication.CreateRaftRequest(manager, peer, "/v1/raft/ping", "{}");
-        IFlurlRequest second = RestCommunication.CreateRaftRequest(manager, peer, "/v1/raft/vote", "{}");
+        IFlurlRequest first = RestCommunication.CreateRaftRequest(manager, peer, "/v1/raft/ping", "{}"u8);
+        IFlurlRequest second = RestCommunication.CreateRaftRequest(manager, peer, "/v1/raft/vote", "{}"u8);
 
         Assert.Same(first.Client, second.Client);
     }
@@ -111,8 +111,8 @@ public sealed class TestRestClientScoping
         using RaftManager second = CreateManager("node-d", 5003);
         RaftNode peer = new("node-b:5001");
 
-        IFlurlRequest fromFirst = RestCommunication.CreateRaftRequest(first, peer, "/v1/raft/ping", "{}");
-        IFlurlRequest fromSecond = RestCommunication.CreateRaftRequest(second, peer, "/v1/raft/ping", "{}");
+        IFlurlRequest fromFirst = RestCommunication.CreateRaftRequest(first, peer, "/v1/raft/ping", "{}"u8);
+        IFlurlRequest fromSecond = RestCommunication.CreateRaftRequest(second, peer, "/v1/raft/ping", "{}"u8);
 
         Assert.NotSame(fromFirst.Client, fromSecond.Client);
     }

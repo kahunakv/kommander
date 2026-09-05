@@ -55,7 +55,7 @@ public sealed class TestRaftMutualTlsAuthentication
                 senderNode: "node-a:5000",
                 method: "POST",
                 path: "/v1/raft/append-logs",
-                payload: "{}");
+                payload: "{}"u8);
 
         Assert.Empty(headers);
     }

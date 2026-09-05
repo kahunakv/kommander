@@ -361,7 +361,16 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             throw new InvalidOperationException("FairWalScheduler: call Start() before Enqueue().");
 
         int partitionId = operation.Logs.PartitionId;
-        PartitionState state = _partitions.GetOrAdd(partitionId, _ => new PartitionState(tickSource));
+
+        // The factory is static and the tick source travels as the state argument. A capturing lambda
+        // here would read `tickSource` off this instance, which the compiler cannot cache in a static
+        // field, so every admission — including the steady state where the partition already exists —
+        // allocated a delegate. Dictionary admission semantics are unchanged; two callers that race to
+        // create the same missing partition can still both construct a PartitionState, and one loses.
+        PartitionState state = _partitions.GetOrAdd(
+            partitionId,
+            static (_, source) => new PartitionState(source),
+            tickSource);
 
         lock (state.Lock)
         {

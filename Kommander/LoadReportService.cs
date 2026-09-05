@@ -124,41 +124,61 @@ internal sealed class LoadReportService
         return best?.Endpoint;
     }
 
-    private NodeLoadReport? FindBestLoadReport(int partitionId)
+    /// <summary>
+    /// Finds the remote <see cref="PartitionLoad"/> entry that the three metric getters read, or null
+    /// when no gossiped report carries one for <paramref name="partitionId"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Returns the entry rather than the owning <see cref="NodeLoadReport"/> so a getter does not scan
+    /// the winning report's leadership list a second time to reach the one field it wants. Each getter
+    /// is a separate call, so the duplicated scan was paid once per metric per partition.
+    /// </para>
+    /// <para>
+    /// Selection order is unchanged: a known leader endpoint wins outright — including when its report
+    /// carries no entry for the partition, which still reads as "no value" rather than falling back to
+    /// another node's claim — and otherwise the newest report claiming the partition wins.
+    /// </para>
+    /// </remarks>
+    private PartitionLoad? FindPartitionLoad(int partitionId)
     {
         string? leaderEndpoint = getPartitionLeaderEndpoint(partitionId);
         IReadOnlyList<NodeLoadReport> reports = getLoadReports();
-
-        NodeLoadReport? best = null;
 
         if (leaderEndpoint is not null)
         {
             foreach (NodeLoadReport r in reports)
             {
-                if (string.Equals(r.Endpoint, leaderEndpoint, StringComparison.Ordinal))
-                {
-                    best = r;
-                    break;
-                }
-            }
-        }
+                if (!string.Equals(r.Endpoint, leaderEndpoint, StringComparison.Ordinal))
+                    continue;
 
-        if (best is null)
-        {
-            foreach (NodeLoadReport r in reports)
-            {
                 foreach (PartitionLoad l in r.Leaderships)
                 {
-                    if (l.PartitionId == partitionId && (best is null || r.Time > best.Time))
-                    {
-                        best = r;
-                        break;
-                    }
+                    if (l.PartitionId == partitionId)
+                        return l;
                 }
+
+                return null;
             }
         }
 
-        return best;
+        NodeLoadReport? best = null;
+        PartitionLoad? bestLoad = null;
+
+        foreach (NodeLoadReport r in reports)
+        {
+            foreach (PartitionLoad l in r.Leaderships)
+            {
+                if (l.PartitionId != partitionId || (best is not null && r.Time <= best.Time))
+                    continue;
+
+                best = r;
+                bestLoad = l;
+                break;
+            }
+        }
+
+        return bestLoad;
     }
 
     internal double GetPartitionLogOpsPerSecond(int partitionId)
@@ -167,16 +187,7 @@ internal sealed class LoadReportService
             string.Equals(p.Leader, localEndpoint, StringComparison.Ordinal))
             return p.GetLogOpsPerSecond();
 
-        NodeLoadReport? best = FindBestLoadReport(partitionId);
-        if (best is null) return 0.0;
-
-        foreach (PartitionLoad l in best.Leaderships)
-        {
-            if (l.PartitionId == partitionId)
-                return l.LogOpsPerSecond;
-        }
-
-        return 0.0;
+        return FindPartitionLoad(partitionId)?.LogOpsPerSecond ?? 0.0;
     }
 
     internal int GetPartitionWalQueueDepth(int partitionId)
@@ -185,16 +196,7 @@ internal sealed class LoadReportService
             string.Equals(p.Leader, localEndpoint, StringComparison.Ordinal))
             return walScheduler.GetPartitionDepth(partitionId);
 
-        NodeLoadReport? best = FindBestLoadReport(partitionId);
-        if (best is null) return 0;
-
-        foreach (PartitionLoad l in best.Leaderships)
-        {
-            if (l.PartitionId == partitionId)
-                return l.WalQueueDepth;
-        }
-
-        return 0;
+        return FindPartitionLoad(partitionId)?.WalQueueDepth ?? 0;
     }
 
     internal double GetPartitionCommitWaitMs(int partitionId)
@@ -203,15 +205,6 @@ internal sealed class LoadReportService
             string.Equals(p.Leader, localEndpoint, StringComparison.Ordinal))
             return walScheduler.GetPartitionCommitWaitMs(partitionId);
 
-        NodeLoadReport? best = FindBestLoadReport(partitionId);
-        if (best is null) return 0.0;
-
-        foreach (PartitionLoad l in best.Leaderships)
-        {
-            if (l.PartitionId == partitionId)
-                return l.CommitWaitMs;
-        }
-
-        return 0.0;
+        return FindPartitionLoad(partitionId)?.CommitWaitMs ?? 0.0;
     }
 }

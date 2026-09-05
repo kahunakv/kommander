@@ -23,7 +23,7 @@ public sealed class TestRestRouteAuthentication
                      "node-a:5000",
                      "POST",
                      "/v1/raft/append-logs",
-                     "{\"ok\":true}"))
+                     "{\"ok\":true}"u8))
         {
             context.Request.Headers[key] = value;
         }
@@ -64,7 +64,7 @@ public sealed class TestRestRouteAuthentication
                      "node-a:5000",
                      "POST",
                      "/v1/raft/append-logs",
-                     "{\"ok\":true}"))
+                     "{\"ok\":true}"u8))
         {
             context.Request.Headers[key] = value;
         }
@@ -92,7 +92,7 @@ public sealed class TestRestRouteAuthentication
             "node-a:5000",
             "POST",
             "/v1/raft/append-logs",
-            "{\"ok\":true}");
+            "{\"ok\":true}"u8);
 
         foreach ((string key, string value) in headers)
             firstContext.Request.Headers[key] = value;
@@ -205,7 +205,7 @@ public sealed class TestRestRouteAuthentication
                      "node-a:5000",
                      "POST",
                      "/v1/raft/append-logs",
-                     "{\"ok\":true}"))
+                     "{\"ok\":true}"u8))
         {
             authenticatedContext.Request.Headers[key] = value;
         }
@@ -289,7 +289,7 @@ public sealed class TestRestRouteAuthentication
             isHttps: true);
 
         foreach ((string key, string value) in RestCommunication.BuildAuthenticationHeaders(
-                     configuration, "node-a:5000", "POST", "/v1/raft/append-logs", body))
+                     configuration, "node-a:5000", "POST", "/v1/raft/append-logs", Encoding.UTF8.GetBytes(body)))
         {
             context.Request.Headers[key] = value;
         }
@@ -318,7 +318,7 @@ public sealed class TestRestRouteAuthentication
             isHttps: true);
 
         foreach ((string key, string value) in RestCommunication.BuildAuthenticationHeaders(
-                     configuration, "node-a:5000", "POST", "/v1/raft/append-logs", body))
+                     configuration, "node-a:5000", "POST", "/v1/raft/append-logs", Encoding.UTF8.GetBytes(body)))
         {
             context.Request.Headers[key] = value;
         }
