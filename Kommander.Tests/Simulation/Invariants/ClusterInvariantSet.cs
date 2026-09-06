@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using Kommander.Data;
+using Kommander.Diagnostics;
 using Kommander.Tests.Simulation.WAL;
 
 namespace Kommander.Tests.Simulation.Invariants;
@@ -68,6 +69,20 @@ public static class ClusterInvariantSet
     /// election-safety property that every later guarantee rests on.</para>
     /// </summary>
     public const string OneLeaderPerTerm = "one-leader-per-term";
+
+    /// <summary>
+    /// No node reported a violation of one of the library's own node-local invariants
+    /// (<see cref="RaftInvariants"/>): term monotonic, frontiers monotonic, compaction floor a lower
+    /// bound.
+    ///
+    /// <para>The library checks these itself at the point each value is written, but its reaction is
+    /// a log line and, in a debug build, an exception the partition executor catches and logs. A run
+    /// that only reads views and stores therefore sees the consequence — a node that stops
+    /// answering, a leader nobody can see — hundreds of steps after the rule broke, and reports the
+    /// consequence as the finding. This check fails the run at the step the report arrived, on the
+    /// rule that actually broke.</para>
+    /// </summary>
+    public const string LibraryInvariant = "library-invariant";
 
     /// <summary>
     /// Committed log ids never decrease on a node.
@@ -499,6 +514,28 @@ public static class ClusterInvariantSet
 
             recordedByIndex[fingerprint.LogId] = fingerprint;
         }
+    }
+
+    /// <summary>
+    /// Checks <see cref="LibraryInvariant"/>: the cluster recorded no node-local violation from the
+    /// library. Reports the first one; the rest are almost always its consequences.
+    /// </summary>
+    public static void CheckNoLibraryInvariantViolation(
+        int stepNumber,
+        IReadOnlyList<RaftInvariantViolation> violations)
+    {
+        if (violations.Count == 0)
+            return;
+
+        RaftInvariantViolation first = violations[0];
+
+        throw Violation(
+            LibraryInvariant,
+            stepNumber,
+            $"Step {stepNumber}: the library reported {violations.Count} node-local invariant " +
+            $"violation(s); the first is '{first.Invariant}' on {first.LocalEndpoint ?? "?"}/" +
+            $"{first.PartitionId}: {first.Detail}. The run's later state is a consequence of this, " +
+            "not a finding of its own.");
     }
 
     private static InvariantViolationException Violation(string name, int stepNumber, string message) =>

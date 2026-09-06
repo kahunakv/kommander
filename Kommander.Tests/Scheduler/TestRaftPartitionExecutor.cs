@@ -326,6 +326,10 @@ public sealed class TestRaftPartitionExecutor
 
         var (executor, _, _) = BuildExecutor(partitionId: 6);
 
+        // The ticks must be queued, not dropped: a CheckLeader that arrives before the restore
+        // completes is discarded at the door by the campaign fence and never counts as processed.
+        await executor.RestoreTask;
+
         for (int i = 0; i < opCount; i++)
             executor.Post(new RaftRequest(RaftRequestType.CheckLeader));
 

@@ -114,12 +114,38 @@ worth knowing about:
 - `CompactEveryOperations` is the production default, so a generated run never compacts. A run that
   wants compaction lowers it. At eight, roughly one run in eight ends wedged — recorded as a finding
   rather than absorbed.
+
+  Compaction is worth reaching, because it opens a state nothing else does: a follower below the
+  leader's first available index cannot be repaired by backfill at all, and only a snapshot install
+  can bring it back. So the cadence has its own sweep,
+  `AGeneratedRunUnderFrequentCompaction_HoldsEveryCheck`, over the same seeds. Run it with
+  `KOMMANDER_DST_COMPACTION_SWEEP=1`. It skips rather than passes when the variable is unset, and it
+  is not in the standing set while the one-in-eight wedge is an open question about the cadence.
 - `MaxImpairedNodes` is one. Two impaired nodes in a three-node cluster lose quorum, and a leader
   without quorum waits ten **real** seconds inside its quorum wait. A search that reaches that state
   stops exploring and starts paying.
 
 A plan artifact's header records every bound, and a replay rebuilds them from the file. A plan
 replayed at three steps per action is not the plan that failed at six.
+
+## Reading a convergence failure
+
+Two lines in a failure message decide where to look first, and both exist because a finding was
+misread without them.
+
+- **`Unobservable:`** names every live node that answered no partition view, with the executor's own
+  account of why (`restore incomplete`, `restore failed: …`, `partition not materialized`). A view
+  read is a client-kind operation, and the executor refuses those until the partition's WAL restore
+  completes — so a node that is running, acking appends and even leading can be absent from the
+  views. FINDING 5 was reported as "two followers and no leader"; the leader was the node with no
+  view. The idle check now fails with `idle-convergence-unobservable` before it says anything about
+  roles, and a run whose `Unobservable:` line is non-empty is about that node, whatever the rest says.
+- **`library-invariant`** is the run failing on a rule the library checks itself — a node's term or a
+  frontier moved backwards. The library logs these and, in a debug build, throws an exception the
+  partition executor catches; neither reached the verdict before. The cluster now records every
+  report on its own endpoints and the invariant runner fails the run at the step the report arrived,
+  ahead of every other rule. Read the named rule and values; the state three hundred steps later is
+  a consequence, not the finding.
 
 ## Metrics and the budget
 

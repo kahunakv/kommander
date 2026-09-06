@@ -1,0 +1,45 @@
+seed=20260901
+partitionId=1
+actionCount=24
+stepsPerAction=6
+advanceMillisecondsPerStep=50
+maxImpairedNodes=1
+maxFaultAgeInActions=4
+recoveryStepBudget=900
+idleConvergenceStepBudget=300
+clientWeight=30
+idleWeight=14
+outageWeight=12
+networkFaultWeight=12
+storageFaultWeight=12
+lifecycleFaultWeight=12
+healWeight=14
+maintenanceWeight=10
+compactEveryOperations=8
+clientWeightDuringFault=2
+enableFaultEpisodes=True
+
+000 HoldRetention localhost:8003
+001 AppendAtLeader localhost:8003
+002 ReleaseRetention localhost:8003
+003 LeaderOutage localhost:8003
+004 AppendAtLeader localhost:8001
+005 AppendAcrossQuorumLoss localhost:8001
+006 CrashNode localhost:8001
+007 AppendAtFollower localhost:8002
+008 RestartNode localhost:8001
+009 Idle
+010 Idle
+011 AppendAtLeader localhost:8002
+012 PauseNode localhost:8003
+013 Checkpoint localhost:8002
+014 Checkpoint localhost:8002
+015 ResumeNode localhost:8003
+016 AppendAtLeader localhost:8002
+017 LeaderOutage localhost:8002
+018 AppendAtFollower localhost:8002
+019 Idle
+020 AppendAtFollower localhost:8003
+021 AppendAtFollower localhost:8002
+022 AppendAtFollower localhost:8002
+023 AppendAtFollower localhost:8003

@@ -56,6 +56,23 @@ public static class RaftInvariants
     /// </summary>
     public static ILogger? Logger { get; set; }
 
+    /// <summary>
+    /// Raised on every violation, whatever <see cref="Policy"/> then does with it.
+    ///
+    /// <para><b>Why a log line is not enough.</b> The one consumer that must not miss a violation
+    /// is a test harness running a real cluster, and a harness cannot fail a run on a log line
+    /// without parsing its own logger. The simulation harness learned this the hard way: a
+    /// <see cref="TermMonotonic"/> violation on a restarting node was logged at Error, swallowed by
+    /// the executor, and the run went on to fail hundreds of steps later with a message about a
+    /// missing leader (DST FINDING 5). Subscribers see the report before the policy throws, so a
+    /// run fails on the rule that broke rather than on its distant consequence.</para>
+    ///
+    /// <para>Process-wide, like <see cref="Policy"/>. A subscriber that hosts several clusters
+    /// filters on <see cref="RaftInvariantViolation.LocalEndpoint"/>. Costs one null check, and
+    /// only on the violation path.</para>
+    /// </summary>
+    public static event Action<RaftInvariantViolation>? Violated;
+
     // ── Invariant names (also the metric tag values) ──────────────────────────
 
     /// <summary>A node's term never decreases (Raft §5.1).</summary>
@@ -145,6 +162,8 @@ public static class RaftInvariants
         // LogError rather than a source-generated message: a violation is rare by construction, so
         // the allocation does not matter, and the message must carry the free-form detail.
         Logger?.LogError("{InvariantViolation}", message);
+
+        Violated?.Invoke(new RaftInvariantViolation(invariant, partitionId, localEndpoint, detail));
 
         if (policy == RaftInvariantPolicy.Throw)
             throw new RaftInvariantViolationException(invariant, message);

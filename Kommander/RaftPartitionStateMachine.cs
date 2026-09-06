@@ -415,8 +415,21 @@ public sealed class RaftPartitionStateMachine
     /// <summary>
     /// Phase 2 of the nonblocking restore.  Called on the executor thread after
     /// <see cref="StartRestoreAsync"/> has loaded logs from storage.  Replays the
-    /// committed entries via the application replication callbacks, updates the
-    /// current term, and sends the initial handshake.
+    /// committed entries via the application replication callbacks, raises the
+    /// current term to what storage recorded, and sends the initial handshake.
+    ///
+    /// <para><b>Every restored term is a floor, never an assignment.</b> The executor lets
+    /// AppendEntries through while the restore is still running (an unrestored follower that
+    /// stopped acking would stall its leader), so by the time this runs the live leader may
+    /// already have taught this node a term above anything the log tail or the hard state recorded
+    /// before the crash. Writing the stored value over it would regress the term (Raft §5.1).
+    /// Under <see cref="Diagnostics.RaftInvariantPolicy.Throw"/> that faulted this method
+    /// half-way: the partition then ran forever with <see cref="RaftPartitionCoreState.Restored"/>
+    /// false — votes dropped, views refused, yet still acking appends and even winning elections
+    /// (DST FINDING 5: a restarted node that was the live leader and invisible to the harness).
+    /// Under <see cref="Diagnostics.RaftInvariantPolicy.Log"/> the node simply ran at a stale term.
+    /// Taking the maximum at every step makes the in-memory term the one value that only ever
+    /// climbs, whichever source spoke last.</para>
     /// </summary>
     public async ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs)
     {
@@ -425,7 +438,9 @@ public sealed class RaftPartitionStateMachine
 
         await wal.CompleteRestoreAsync(logs).ConfigureAwait(false);
 
-        coreState.CurrentTerm = await wal.GetCurrentTermAsync().ConfigureAwait(false);
+        long tailTerm = await wal.GetCurrentTermAsync().ConfigureAwait(false);
+        if (tailTerm > coreState.CurrentTerm)
+            coreState.CurrentTerm = tailTerm;
 
         // B2b: seed durable Raft hard state. The term inferred from the log tail (above) can LAG the true
         // term — a crash after a term bump or a granted vote but before the next log write leaves the tail

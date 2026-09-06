@@ -738,8 +738,9 @@ public sealed class RaftPartitionExecutor : IDisposable
         //
         // Deliberately narrower than "all Control ops". Heartbeats and appends still flow (an
         // unrestored follower that stops acking stalls its leader for no safety gain), and the
-        // RestoreLogsLoaded event that clears this gate is Maintenance. Appends carry their own
-        // pre-restore hazard, which is a separate change.
+        // RestoreLogsLoaded event that clears this gate is Maintenance. An append that arrives
+        // here adopts the leader's term in memory before the hard state is read; Phase 2 treats
+        // every stored term as a floor for exactly that reason (see CompleteRestoreAsync).
         if (request.Type == RaftRequestType.RequestVote && !_restoreCompleted)
         {
             if (_logger.IsEnabled(LogLevel.Debug))
@@ -747,6 +748,24 @@ public sealed class RaftPartitionExecutor : IDisposable
                     "[RaftPartitionExecutor/{PartitionId}] Dropping RequestVote from {Endpoint} for term {Term}: the WAL restore has not completed, so the durable (term, votedFor) record is not loaded yet.",
                     _partitionId, request.Endpoint ?? "", request.Term);
 
+            reply?.TrySetResult(RaftResponseStatic.NoneResponse);
+            return;
+        }
+
+        // Campaign fence: the other half of the vote fence. The leader-check tick is what starts a
+        // pre-vote and, on quorum, an election, and an election persists (CurrentTerm + 1, self)
+        // as the new hard state. Before Phase 2 CurrentTerm is whatever has been adopted in memory
+        // so far — 0 on a quiet cluster — so a node whose Phase 1 outlasts its election timeout
+        // (a large WAL, a slow disk) would campaign at a term far below the one it already voted
+        // in, and its self-vote would overwrite the durable vote record it has not read. That is
+        // the same double-vote the fence above exists to prevent, reached from the inside.
+        //
+        // Dropping the tick costs nothing the restore does not do itself: the tick's follower
+        // duties are a committed-drain retry (Phase 2 replays the committed prefix) and read-index
+        // expiry (client work is rejected until Phase 2), and no partition is a leader before it
+        // has restored. Not logged: this fires on every tick of every restoring partition.
+        if (request.Type == RaftRequestType.CheckLeader && !_restoreCompleted)
+        {
             reply?.TrySetResult(RaftResponseStatic.NoneResponse);
             return;
         }
@@ -1223,9 +1242,28 @@ public sealed class RaftPartitionExecutor : IDisposable
         {
             LogOperationFailure(ex);
 
-            // If restore Phase 2 itself throws, fault the restore task so waiters don't block.
+            // Restore Phase 2 failed: fail-stop, the same way Phase 1 does. The RestoreLogsLoaded
+            // event is consumed here whatever happened, so nothing will ever run Phase 2 again, and
+            // a partition left running in that state is a zombie: _restoreCompleted stays false, so
+            // votes are dropped and client reads are refused, while appends are still acked and the
+            // election path still runs on a term and a vote record that were never loaded. That is
+            // worse than a stopped partition in every way that matters — it looks alive to its
+            // peers and is invisible to whoever asks it for its state (DST FINDING 5). Stopping
+            // makes every later post fail loudly instead.
             if (request.Type == RaftRequestType.RestoreLogsLoaded)
+            {
+                _logger.LogError(
+                    "[RaftPartitionExecutor/{PartitionId}] WAL restore (Phase 2) failed; partition will not process operations: {Message}",
+                    _partitionId, ex.Message);
+
                 _restoreTcs.TrySetException(ex);
+                _stopping = true;
+                _cts.Cancel();
+
+                // Wake the worker (or schedule the pool drain) so the cancellation is noticed and
+                // the cleanup drain runs. Never drain from here: this runs inside a drain already.
+                MarkRunnable();
+            }
 
             op.Reply?.TrySetException(ex);
         }

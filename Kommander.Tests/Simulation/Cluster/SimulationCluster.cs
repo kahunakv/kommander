@@ -1,4 +1,5 @@
 using Kommander.Data;
+using Kommander.Diagnostics;
 using Kommander.Tests.Simulation.Time;
 using Kommander.Tests.Simulation.Transport;
 using Kommander.Tests.Simulation.WAL;
@@ -39,11 +40,67 @@ public sealed class SimulationCluster : IAsyncDisposable
     private readonly List<SimulationNode> nodes = [];
     private int disposed;
 
+    /// <summary>
+    /// Node-local invariant violations the library reported for this cluster's nodes, oldest
+    /// first. Written from executor threads, so every access takes <see cref="violationGate"/>.
+    /// </summary>
+    private readonly List<RaftInvariantViolation> libraryViolations = [];
+    private readonly object violationGate = new();
+    private readonly Action<RaftInvariantViolation> onLibraryViolation;
+
     private SimulationCluster(SimulationClusterOptions options, VirtualTickSource clock, SimulatedTransport transport)
     {
         Options = options;
         Clock = clock;
         Transport = transport;
+        onLibraryViolation = RecordLibraryViolation;
+    }
+
+    /// <summary>
+    /// Every violation the library's own invariant checks reported on one of this cluster's nodes,
+    /// oldest first. Empty on a healthy run.
+    ///
+    /// <para><b>Why the harness listens to these at all.</b> The library asserts the rules a node
+    /// can check on its own — its term never regresses, its frontiers never move backwards — at the
+    /// place each value is written, and reacts with a log line and, in a debug build, an exception
+    /// the partition executor catches. Neither reaches a run's verdict. FINDING 5 was such a
+    /// violation: a restarting node's term regressed inside its restore, the executor logged it and
+    /// carried on, and the run failed three hundred steps later with a message about a missing
+    /// leader. Recording the reports here lets the invariant runner fail the run on the rule that
+    /// actually broke, at the step it broke.</para>
+    ///
+    /// <para>Filtered on endpoint, because <see cref="RaftInvariants.Violated"/> is process-wide and
+    /// a unit test in another collection may violate a rule on purpose while this cluster runs.</para>
+    /// </summary>
+    public IReadOnlyList<RaftInvariantViolation> LibraryInvariantViolations
+    {
+        get
+        {
+            lock (violationGate)
+                return [.. libraryViolations];
+        }
+    }
+
+    private void RecordLibraryViolation(RaftInvariantViolation violation)
+    {
+        if (violation.LocalEndpoint is null)
+            return;
+
+        bool ours = false;
+        foreach (SimulationNode node in nodes)
+        {
+            if (string.Equals(node.Endpoint, violation.LocalEndpoint, StringComparison.Ordinal))
+            {
+                ours = true;
+                break;
+            }
+        }
+
+        if (!ours)
+            return;
+
+        lock (violationGate)
+            libraryViolations.Add(violation);
     }
 
     /// <summary>Parameters this cluster was built from.</summary>
@@ -100,6 +157,10 @@ public sealed class SimulationCluster : IAsyncDisposable
 
         for (int nodeIndex = 0; nodeIndex < options.NodeCount; nodeIndex++)
             cluster.nodes.Add(SimulationNode.Create(nodeIndex, options, clock, transport, logger));
+
+        // Subscribed before the first join, because a restore runs inside the join and a restore
+        // is where the one violation this exists for was seen. Unsubscribed in DisposeAsync.
+        RaftInvariants.Violated += cluster.onLibraryViolation;
 
         cluster.PublishRoutingTable();
 
@@ -611,6 +672,8 @@ public sealed class SimulationCluster : IAsyncDisposable
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0)
             return;
+
+        RaftInvariants.Violated -= onLibraryViolation;
 
         // Release any message still held, so a node blocked on a reply can finish its teardown.
         Transport.HoldMessages = false;

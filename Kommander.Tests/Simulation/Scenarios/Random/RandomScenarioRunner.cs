@@ -302,7 +302,9 @@ public sealed class RandomScenarioRunner
 
             Assert.Fail(
                 $"The healed cluster did not converge within {options.RecoveryStepBudget} steps. " +
-                $"Final state: {string.Join(" | ", lines)}");
+                $"Final state: {string.Join(" | ", lines)}{Environment.NewLine}" +
+                $"Unobservable: {DescribeUnobservableNodes(finalViews)}{Environment.NewLine}" +
+                $"Snapshot rescue: {DescribeSnapshotRescue()}");
         }
 
         await invariants.CheckConvergedAsync(cluster, options.PartitionId, cancellationToken)
@@ -403,6 +405,19 @@ public sealed class RandomScenarioRunner
             ? string.Join(" | ", refusals)
             : "none, so no leader was refused a repair it decided to send.";
 
+        // Snapshot rescue, from the same library diagnostic. A follower whose log the leader has
+        // already compacted past cannot be repaired by backfill at all: the entries it needs are
+        // gone, and a snapshot install is the only way back. That escalation either happened or it
+        // did not, and until now the harness could not tell — which left "no snapshot install is
+        // ever attempted" (the Caraxes anchor-1 wedge) and "the rescue was attempted and failed"
+        // reading identically from a failure message.
+        //
+        // Read the empty list carefully. The library records an entry only while a transfer is in
+        // flight or a transfer has failed, so a healthy partition is empty too. Empty is therefore
+        // only meaningful beside the stores printed below: a follower stuck under the leader's
+        // first available index with nothing here was never rescued.
+        string rescueText = DescribeSnapshotRescue();
+
         // Each node's store beside its committed frontier, which separates the two remaining
         // causes. A follower whose log holds the entry but whose frontier is short received the
         // repair and did not commit it. A follower whose log stops at its frontier was never sent
@@ -435,6 +450,25 @@ public sealed class RandomScenarioRunner
         //
         // A cluster that does have a leader, and still leaves a follower short, is the repair
         // failure the rule was written for. Only then is the leader's belief worth reading.
+        // A live node that answered no view is neither a follower nor absent, and the two verdicts
+        // below both assume the views are the whole cluster. A view read is a client-kind operation
+        // the executor refuses until the partition's restore completes, so the node this hides is
+        // typically a restarted one — and FINDING 5 was exactly that: the unobservable node was the
+        // leader, and the run was reported as leaderless. Name the node and its restore state, and
+        // stop; what the visible nodes look like is not the finding.
+        string unobservable = DescribeUnobservableNodes(views);
+
+        if (unobservable.Length > 0)
+        {
+            Assert.Fail(
+                $"idle-convergence-unobservable: after {IdleConvergenceStepBudget} steps a live node " +
+                $"answered no partition view, so the cluster's state cannot be judged from the views " +
+                $"that did arrive. Unobservable: {unobservable}. Frontiers seen: {state}.{Environment.NewLine}" +
+                $"Roles seen: {string.Join(", ", views.Select(view => $"{view.Endpoint}={view.Role}"))}{Environment.NewLine}" +
+                $"Snapshot rescue: {rescueText}{Environment.NewLine}" +
+                $"Stores: {stores}");
+        }
+
         bool leaderless = views.All(view => view.Role != RaftNodeState.Leader);
 
         if (leaderless)
@@ -444,7 +478,9 @@ public sealed class RandomScenarioRunner
                 $"{IdleConvergenceStepBudget} steps. Frontiers: {state}. With no leader there is no " +
                 "heartbeat path, so nothing could have repaired anybody — this is a liveness " +
                 $"failure, not a repair failure.{Environment.NewLine}" +
-                $"Roles: {string.Join(", ", views.Select(view => $"{view.Endpoint}={view.Role}"))}");
+                $"Roles: {string.Join(", ", views.Select(view => $"{view.Endpoint}={view.Role}"))}{Environment.NewLine}" +
+                $"Snapshot rescue: {rescueText}{Environment.NewLine}" +
+                $"Stores: {stores}");
         }
 
         Assert.Fail(
@@ -453,7 +489,70 @@ public sealed class RandomScenarioRunner
             $"prefix must be caught up by the heartbeat path alone.{Environment.NewLine}" +
             $"Leader belief: {leaderBelief}{Environment.NewLine}" +
             $"Backfill refusals: {refusalText}{Environment.NewLine}" +
+            $"Snapshot rescue: {rescueText}{Environment.NewLine}" +
             $"Stores: {stores}");
+    }
+
+
+    /// <summary>
+    /// The live nodes that answered no view for this partition, each with the executor's own account
+    /// of why, or an empty string when every live node answered.
+    ///
+    /// <para>The view read is refused while a partition's restore is incomplete, and a restore whose
+    /// second phase failed is incomplete forever. Such a node still acks appends and still runs the
+    /// election path, so it is the one node a convergence failure most needs to name — and the one
+    /// the views cannot. Printed in every convergence failure for that reason.</para>
+    /// </summary>
+    private string DescribeUnobservableNodes(IReadOnlyList<RaftPartitionView> views)
+    {
+        List<string> missing = [];
+
+        foreach (SimulationNode node in cluster.Nodes)
+        {
+            if (!node.HasLiveManager)
+                continue;
+
+            if (views.Any(view => string.Equals(view.Endpoint, node.Endpoint, StringComparison.Ordinal)))
+                continue;
+
+            missing.Add($"{node.Endpoint} ({node.DescribePartitionState(options.PartitionId)})");
+        }
+
+        return string.Join(", ", missing);
+    }
+
+    /// <summary>
+    /// What the leaders record about snapshot rescue on this partition, for a failure message.
+    ///
+    /// <para>Shared by both convergence failures on purpose. The recovery check and the idle check
+    /// end in the same place — a replica the cluster did not repair — and the reader's next question
+    /// is the same in both: was a snapshot even tried? Printing it in one and not the other is how a
+    /// run gets diagnosed twice.</para>
+    ///
+    /// <para><b>Read the empty case carefully.</b> The library records an entry only while a
+    /// transfer is in flight or a transfer has failed, so a healthy partition reports empty too.
+    /// Empty is meaningful only beside the stores: a follower under the leader's first available
+    /// index with nothing here was never rescued, and that is a different defect from a rescue that
+    /// was attempted and failed.</para>
+    /// </summary>
+    private string DescribeSnapshotRescue()
+    {
+        List<string> rescues = [];
+
+        foreach (SimulationNode node in cluster.Nodes.Where(candidate => candidate.HasLiveManager))
+        {
+            foreach (RaftSnapshotStatus status in node.Manager.GetSnapshotStatuses(options.PartitionId))
+            {
+                rescues.Add(
+                    $"{node.Endpoint}->{status.FollowerEndpoint} inFlight={status.InFlight} " +
+                    $"failedAttempts={status.FailedAttempts} unproducible={status.Unproducible} " +
+                    $"lastError={status.LastError ?? "none"}");
+            }
+        }
+
+        return rescues.Count > 0
+            ? string.Join(" | ", rescues)
+            : "none recorded, so no leader had a transfer in flight or a failed one to report.";
     }
 
     /// <summary>

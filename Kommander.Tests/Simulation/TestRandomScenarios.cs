@@ -36,6 +36,16 @@ namespace Kommander.Tests.Simulation;
 [Collection(ClusterIntegrationCollection.Name)]
 public sealed class TestRandomScenarios
 {
+    /// <summary>
+    /// Turns the frequent-compaction sweep on. Off by default — see
+    /// <see cref="AGeneratedRunUnderFrequentCompaction_HoldsEveryCheck"/> for why a second sweep
+    /// exists and why it is not part of the standing set.
+    /// </summary>
+    public const string CompactionSweepVariable = "KOMMANDER_DST_COMPACTION_SWEEP";
+
+    private static bool CompactionSweepEnabled =>
+        Environment.GetEnvironmentVariable(CompactionSweepVariable) == "1";
+
     private readonly ILogger<IRaft> logger;
     private readonly ITestOutputHelper output;
 
@@ -149,6 +159,45 @@ public sealed class TestRandomScenarios
     {
         RandomScenarioReport report = await RunSeedAsync(
             seed, new RandomScenarioOptions(), TestContext.Current.CancellationToken);
+
+        Assert.True(report.InvariantChecks > 0, "The run checked no invariants.");
+    }
+
+    /// <summary>
+    /// The same search, with compaction turned up until the leader really throws entries away.
+    ///
+    /// <para><b>Why a second sweep rather than a setting on the first.</b> Compaction opens a state
+    /// nothing else reaches: a follower that falls below the leader's first available index cannot
+    /// be repaired by backfill at all, because the entries it needs no longer exist. A snapshot
+    /// install is the only way back, so the whole rescue path — escalation, transfer, install,
+    /// convergence — is unreachable at the production cadence, where a run of this length compacts
+    /// nothing.</para>
+    ///
+    /// <para><b>Why it is off by default.</b> At a cadence of eight, roughly one run in eight ends
+    /// with a follower holding durable entries above a presence gap and a committed frontier of
+    /// zero. That state is real and reproducible, and it is <em>not</em> established as a library
+    /// defect: whether a cadence far below the working set is a configuration Kommander promises to
+    /// support is an open question for whoever owns the compaction contract. Leaving the sweep on
+    /// would keep the standing set red over that open question, and raising the cadence would hide
+    /// the state. So it runs on demand, under
+    /// <see cref="CompactionSweepVariable"/>, and it skips rather than passes when it is off —
+    /// a test that quietly returns is a test nobody knows did not run.</para>
+    /// </summary>
+    [Theory]
+    [Trait("Category", "DSTRandom")]
+    [MemberData(nameof(Seeds))]
+    public async Task AGeneratedRunUnderFrequentCompaction_HoldsEveryCheck(ulong seed)
+    {
+        if (!CompactionSweepEnabled)
+            Assert.Skip(
+                $"The frequent-compaction sweep is off. Set {CompactionSweepVariable}=1 to run it, " +
+                "and expect roughly one failure in eight from an open question about the compaction " +
+                "cadence rather than from the change under test.");
+
+        RandomScenarioReport report = await RunSeedAsync(
+            seed,
+            new RandomScenarioOptions { CompactEveryOperations = 8 },
+            TestContext.Current.CancellationToken);
 
         Assert.True(report.InvariantChecks > 0, "The run checked no invariants.");
     }

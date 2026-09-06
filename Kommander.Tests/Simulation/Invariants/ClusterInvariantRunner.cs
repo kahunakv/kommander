@@ -69,6 +69,11 @@ public sealed class ClusterInvariantRunner
         // reader looking for the run's cost anywhere but here.
         using IDisposable? timer = Metrics?.TimeInvariantCheck();
 
+        // First, before any view is read: a node whose own invariant broke may no longer answer a
+        // view at all, and every rule below would then be judging a cluster minus that node.
+        ClusterInvariantSet.CheckNoLibraryInvariantViolation(
+            cluster.StepNumber, cluster.LibraryInvariantViolations);
+
         IReadOnlyList<RaftPartitionView> views =
             await cluster.GetPartitionViewsAsync(partitionId, cancellationToken).ConfigureAwait(false);
 

@@ -200,7 +200,7 @@ public sealed class SimulationNode : IAsyncDisposable
 
         options.ConfigureNode?.Invoke(configuration);
 
-        return new RaftManager(
+        RaftManager manager = new(
             configuration,
             new StaticDiscovery(peers),
             wal,
@@ -214,6 +214,13 @@ public sealed class SimulationNode : IAsyncDisposable
                 ? new HybridLogicalClock(() => SimulatedEpochMilliseconds + clock.LogicalMilliseconds)
                 : new HybridLogicalClock(),
             logger);
+
+        // Every node can serve and receive a whole-partition state transfer. Without this the
+        // snapshot rescue path is unreachable in simulation — see SimulatedPartitionStateTransfer
+        // for why an unrescuable follower makes the entire compaction family untestable.
+        manager.RegisterPartitionStateTransfer(new SimulatedPartitionStateTransfer());
+
+        return manager;
     }
 
     /// <summary>
@@ -372,12 +379,44 @@ public sealed class SimulationNode : IAsyncDisposable
     /// <summary>
     /// Reads one partition's consensus state on the partition executor thread, so no mutable
     /// state-machine field is read by the harness thread.
-    /// Returns null when the partition is not materialized on this node yet.
+    ///
+    /// <para><b>Null does not mean dead.</b> The read is a client-kind operation, and the executor
+    /// refuses client operations until the partition's WAL restore has completed. A node that is
+    /// running, acking appends and even leading can therefore answer null for as long as its
+    /// restore is incomplete — which, when Phase 2 failed, is forever. A caller that drops null
+    /// views and reasons about the rest is reasoning about a cluster minus its most interesting
+    /// node; see <see cref="DescribePartitionState"/> for what to print instead.</para>
     /// </summary>
     public Task<RaftPartitionView?> GetPartitionViewAsync(int partitionId, CancellationToken cancellationToken) =>
         HasLiveManager
             ? Manager.GetPartitionViewAsync(partitionId, cancellationToken)
             : Task.FromResult<RaftPartitionView?>(null);
+
+    /// <summary>
+    /// Why this live node answered no view for <paramref name="partitionId"/>, from the executor's
+    /// own restore bookkeeping. For a failure message: a node with an incomplete restore and a node
+    /// that never materialized the partition are different findings, and the view read alone
+    /// returns the same null for both.
+    /// </summary>
+    public string DescribePartitionState(int partitionId)
+    {
+        if (!HasLiveManager)
+            return "no live manager";
+
+        IPartitionProvider provider = Manager;
+
+        RaftPartition? partition = partitionId == global::Kommander.System.RaftSystemConfig.SystemPartition
+            ? provider.SystemPartition
+            : provider.DataPartitions.FirstOrDefault(candidate => candidate.PartitionId == partitionId);
+
+        if (partition is null)
+            return "partition not materialized";
+
+        if (partition.RestoreTask.IsFaulted)
+            return $"restore failed: {partition.RestoreTask.Exception?.GetBaseException().Message}";
+
+        return partition.Executor.IsRestored ? "restored" : "restore incomplete";
+    }
 
     /// <summary>
     /// Waits until every partition executor on this node has drained its queues.
