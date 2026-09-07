@@ -710,6 +710,110 @@ public interface IRaft
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Test hook that intercepts the release of a committed proposal's caller, so a test can model
+    /// a leader that is <b>durable at quorum but has not yet answered</b>. Only successful
+    /// (<c>Committed</c>) completions are held; failures are released untouched.
+    ///
+    /// <para><b>Why this exists.</b> A finalize awaits the very completion its reply rides on, so
+    /// "the commit is durable on a quorum" and "the coordinator learned it committed" are the same
+    /// event in every in-process test. The interesting failures live between them — a leader that
+    /// pauses or is killed after quorum durability and before the reply, where recovery, a
+    /// competing finalize and a new leader all race to name the canonical winner.</para>
+    ///
+    /// <para><b>Only the reply is held.</b> Commit-marker fan-out to peers, the leader's local
+    /// applies, the commit-frontier advance and follower delivery all proceed exactly as they do
+    /// now. Holding the executor turn instead would model a stalled leader, which is a different
+    /// (and already testable) fault.</para>
+    ///
+    /// <para><paramref name="onHeld"/> is invoked <b>off</b> the completing turn and must not be
+    /// awaited by the partition path: act on the node from your own thread. An exception thrown by
+    /// it is logged and the reply is released. Registration is per partition; a second registration
+    /// replaces the first and releases everything the first held. A held reply is released
+    /// automatically when the returned handle is disposed, when the partition stops, or when the
+    /// hold exceeds <see cref="RaftConfiguration.ProposalTimeout"/> (logged at warning). A repeat
+    /// success completion for a ticket already held is swallowed, so the single-fsync fast path and
+    /// the commit completion produce one hold, not two. A failure for a held ticket discards the
+    /// hold and answers the failure.</para>
+    ///
+    /// <para>Returns a handle that does nothing when the partition is not hosted on this node,
+    /// mirroring <see cref="AcquireRetentionHold"/>. Disposing is idempotent.</para>
+    /// </summary>
+    /// <remarks>
+    /// For deterministic tests only. Not a production API for delaying replies, and never reachable
+    /// through REST, gRPC, discovery or server routes.
+    /// </remarks>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public IDisposable HoldCommittedProposalRepliesForTesting(
+        int partitionId,
+        Action<HeldProposalReply> onHeld);
+
+    /// <summary>
+    /// Test hook that suspends a follower-side snapshot install at a chosen point in its ordering,
+    /// so a test can observe or act while a snapshot is <b>half-installed</b> on this node.
+    ///
+    /// <para>The gate is awaited <b>inline on the partition executor turn</b> — unlike the reply
+    /// hold, freezing the operation mid-way is the entire point — and is bounded by
+    /// <see cref="RaftConfiguration.LeadershipBarrierTimeout"/>. On expiry, or if the gate throws,
+    /// the install fails with <see cref="RaftOperationStatus.Errored"/>, the phase is logged, and
+    /// the sender retries the whole snapshot exactly as it does for any other install failure. A
+    /// test gate never wedges a partition.</para>
+    ///
+    /// <para>The gate does not change the ordering: it runs strictly between the install's steps,
+    /// and the import → durable-boundary → cursor sequence, the retain/truncate decision and every
+    /// early return stay as they are. The idempotent re-install short-circuit never reaches those
+    /// steps, so it does not fire the gate.</para>
+    ///
+    /// <para>Registration is per partition; a second registration replaces the first. Disposing the
+    /// returned handle removes the gate; an install currently suspended on it is released by its own
+    /// bound. Returns a handle that does nothing when the partition is not hosted on this node.</para>
+    /// </summary>
+    /// <remarks>
+    /// For deterministic tests only. Not a production API for driving snapshot installs, and never
+    /// reachable through REST, gRPC, discovery or server routes.
+    /// </remarks>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public IDisposable SetSnapshotInstallGateForTesting(
+        int partitionId,
+        SnapshotInstallPhase phase,
+        Func<SnapshotInstallSignal, ValueTask> gate);
+
+    /// <summary>
+    /// Test hook that stops delivering committed entries to the consumer on this node, so entries
+    /// stay pending in the log. Replication, acks, the commit frontier and elections are unaffected:
+    /// the entries are committed and durable here, and only the consumer has not seen them.
+    ///
+    /// <para><b>The node advertises no progress it did not make.</b> Delivery and the applied cursor
+    /// are held together, so anything derived from the cursor — read-index confirmation, compaction
+    /// fences, backfill progress — reflects the paused position. A hook that let a node claim
+    /// progress it did not make would produce a test cell that proves nothing.</para>
+    ///
+    /// <para>One consequence follows from that honesty rather than from the hook: a node whose
+    /// applies are held cannot prove its consumer projection covers the committed prefix, so if it
+    /// is holding an unpublished promotion the barrier reverts and it stays a follower. Hold applies
+    /// on a settled node, not on one mid-promotion.</para>
+    ///
+    /// <para>Cleared when the partition stops. Returns
+    /// <see cref="RaftOperationStatus.Errored"/> when the node has not joined, is not initialized,
+    /// or does not host the partition.</para>
+    /// </summary>
+    /// <remarks>For deterministic tests only; never reachable through a network transport.</remarks>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public Task<RaftOperationStatus> HoldConsumerAppliesForTesting(
+        int partitionId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Test hook that resumes consumer delivery, draining what accumulated in log id order.
+    /// Idempotent, and exactly-once: the applied cursor is the guard, so a snapshot installed while
+    /// applies were held (which seeds the cursor at its boundary) is never re-delivered.
+    /// </summary>
+    /// <remarks>For deterministic tests only; never reachable through a network transport.</remarks>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public Task<RaftOperationStatus> ResumeConsumerAppliesForTesting(
+        int partitionId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Creates a new partition. Leader-only. Idempotent: if the partition already exists
     /// with Active state, returns its current generation without mutating the map.
     /// Throws <see cref="RaftException"/> if <paramref name="partitionId"/> is the system

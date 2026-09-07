@@ -35,6 +35,34 @@ internal sealed class LogApplicator
     private readonly ReadIndexCoordinator readIndex;
     private readonly ILogger<IRaft> logger;
 
+    /// <summary>
+    /// Test hook: while set, this node delivers nothing to the consumer and its apply cursor does
+    /// not move. Written from the caller's thread and read on the executor turn, hence volatile.
+    ///
+    /// <para><b>Delivery and cursor are held together, deliberately.</b> Suppressing only the
+    /// consumer callback while letting <see cref="RaftPartitionCoreState.LastAppliedIndex"/> advance
+    /// would make this node advertise applied progress it never made — a read-index confirmation, a
+    /// compaction fence or a backfill report derived from that cursor would then be a lie, and the
+    /// test cell would prove nothing. Every path that could advance the cursor is gated with the
+    /// delivery it belongs to.</para>
+    ///
+    /// <para>Replication, acks, the commit frontier and elections are untouched: the entries are
+    /// committed and durable in this node's WAL, and only the consumer has not seen them.</para>
+    /// </summary>
+    private volatile bool consumerAppliesHeld;
+
+    /// <summary>
+    /// Whether consumer delivery is currently held on this node. Read by the follower append path,
+    /// which delivers entries inline rather than through this type.
+    /// </summary>
+    public bool ConsumerAppliesHeld => consumerAppliesHeld;
+
+    /// <summary>
+    /// Holds or resumes consumer delivery. Resuming does not itself drain — the caller runs the
+    /// drain on the executor turn so the accumulated entries are delivered in log id order.
+    /// </summary>
+    public void SetConsumerAppliesHeldForTesting(bool held) => consumerAppliesHeld = held;
+
     public LogApplicator(
         IRaftPartitionHost host,
         IRaftWalFacade wal,
@@ -76,6 +104,12 @@ internal sealed class LogApplicator
     {
         if (upToIndex < 0 || coreState.LastAppliedIndex >= upToIndex)
             return true;
+
+        // Applies held (test hook): nothing is delivered and the cursor does not move, so the range
+        // is genuinely not covered. Reporting false is the honest answer and is exactly what a
+        // withheld drain already reports; the caller's retry delivers everything once applies resume.
+        if (consumerAppliesHeld)
+            return false;
 
         const int BatchSize = 512;
         long from = coreState.LastAppliedIndex + 1;
@@ -174,6 +208,11 @@ internal sealed class LogApplicator
     /// </summary>
     public async Task ApplyLogToConsumerAsync(RaftLog log)
     {
+        // Applies held (test hook): deliver nothing and leave the cursor where it is, so the entry
+        // stays pending and this node advertises no progress it did not make.
+        if (consumerAppliesHeld)
+            return;
+
         // Deliver each committed index to the consumer at most once. The cursor still advances below for
         // any id past the frontier (including CommittedCheckpoint entries, which are not delivered), but a
         // re-delivery of an already-applied index — which the follower path can see because the leader
@@ -254,6 +293,13 @@ internal sealed class LogApplicator
     /// </summary>
     public async Task<InheritedDrainStatus> DrainInheritedAppliesAsync(long from, long upToIndex, bool skipGaps = false)
     {
+        // Applies held (test hook). BlockedByInFlight rather than Hole on purpose: it is the outcome
+        // that tells the caller "defer, do not step down", which matches a paused consumer exactly —
+        // the entries are durable and will be delivered on resume. Reporting a Hole would step a
+        // leader down, and the hook must not touch elections.
+        if (consumerAppliesHeld && from <= upToIndex)
+            return InheritedDrainStatus.BlockedByInFlight;
+
         const int BatchSize = 512;
         long expected = from;
 
@@ -537,6 +583,10 @@ internal sealed class LogApplicator
     public async ValueTask FlushDeferredLeaderAppliesAsync()
     {
         if (deferredLeaderApplies.Count == 0)
+            return;
+
+        // Applies held (test hook): the parked batches stay parked and are flushed on resume.
+        if (consumerAppliesHeld)
             return;
 
         if (deferredLeaderAppliesTerm != coreState.CurrentTerm)

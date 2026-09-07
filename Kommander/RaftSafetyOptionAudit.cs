@@ -141,6 +141,10 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.EnableQuiescence)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.QuiesceAfter)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.LeadershipBarrierTimeout)] = RaftOptionKind.Liveness,
+        // Liveness, not Safety: it bounds only how long the write CALLER waits. The proposal is not
+        // cancelled at the bound and an already-quorum-durable entry can still commit afterwards,
+        // which is why the timeout is reported as indeterminate rather than as a failure.
+        [nameof(RaftConfiguration.ProposalTimeout)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.SelfRepairPeerDownGrace)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.LeadershipConfirmationTimeout)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.EnableCheckQuorum)] = RaftOptionKind.Safety,

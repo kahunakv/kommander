@@ -812,9 +812,91 @@ public sealed class RaftPartitionStateMachine
         CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, 0L));
     }
 
+    /// <summary>
+    /// Clears every test hook this partition can carry, restoring ordinary behaviour and releasing
+    /// anything a hook is holding. Called when the partition is disposed, so a test that exits
+    /// without disposing its registrations cannot leave a node unable to answer or unable to apply.
+    /// </summary>
     public void ResetTestingState()
     {
         heartbeats.SetHeartbeatsSuspendedForTesting(false);
+        proposals.SetReplyHoldsForTesting(null);
+        snapshotInstaller.SetInstallGateForTesting(null);
+        applier.SetConsumerAppliesHeldForTesting(false);
+    }
+
+    // ── Fault-qualification test hooks ────────────────────────────────────────────────────────
+    // Two states a consumer cannot construct from inside its own process — a commit that is durable
+    // at quorum but unanswered, and a snapshot installed over a still-pending log tail. Both are
+    // missing observability at a seam only Kommander owns; neither changes the commit protocol, the
+    // install ordering, the suffix retention rule, or any durability guarantee.
+
+    /// <summary>
+    /// Installs the reply-hold hook for this partition — see
+    /// <see cref="IRaft.HoldCommittedProposalRepliesForTesting"/>. Registration is a plain
+    /// interlocked field write rather than an executor round-trip: the returned handle must be able
+    /// to release everything it holds synchronously, including from a test's <c>finally</c> block
+    /// while the executor is busy.
+    /// </summary>
+    public IDisposable HoldCommittedProposalRepliesForTesting(Action<HeldProposalReply> onHeld)
+    {
+        ProposalReplyHoldRegistry registry = new(
+            host.PartitionId,
+            host.LocalEndpoint,
+            onHeld,
+            host.Configuration.ProposalTimeout,
+            logger,
+            proposals.ClearReplyHoldsForTesting);
+
+        proposals.SetReplyHoldsForTesting(registry);
+        return registry;
+    }
+
+    /// <summary>
+    /// Installs (or clears) the snapshot-install gate for this partition — see
+    /// <see cref="IRaft.SetSnapshotInstallGateForTesting"/>. Like the reply hold this is a field
+    /// write, not an executor operation, so a disposal can take effect while an install is
+    /// suspended on the very gate being removed.
+    /// </summary>
+    internal void SetSnapshotInstallGateForTesting(SnapshotInstallGate? gate) =>
+        snapshotInstaller.SetInstallGateForTesting(gate);
+
+    /// <summary>
+    /// Removes one gate registration, and only that one — a handle whose gate was already replaced
+    /// must not clear its replacement.
+    /// </summary>
+    internal void ClearSnapshotInstallGateForTesting(SnapshotInstallGate gate) =>
+        snapshotInstaller.ClearInstallGateForTesting(gate);
+
+    /// <summary>
+    /// Stops delivering committed entries to the consumer on this node. Runs on the executor turn
+    /// so the hold cannot land in the middle of a drain. Replication, acks, the commit frontier and
+    /// elections are unaffected — the entries are committed and durable here, and only the consumer
+    /// has not seen them.
+    /// </summary>
+    public void HoldConsumerAppliesForTesting(ulong? replyCorrelationId)
+    {
+        applier.SetConsumerAppliesHeldForTesting(true);
+        CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, coreState.LastAppliedIndex));
+    }
+
+    /// <summary>
+    /// Resumes delivery and drains what accumulated, in log id order, on the executor turn.
+    /// Exactly-once is preserved by the applied cursor: a snapshot installed while applies were
+    /// held seeded the cursor at its boundary, so the drain starts above it and never re-delivers
+    /// the imported prefix. Idempotent — resuming an unheld partition just runs the drain.
+    /// </summary>
+    public async Task ResumeConsumerAppliesForTesting(ulong? replyCorrelationId)
+    {
+        applier.SetConsumerAppliesHeldForTesting(false);
+
+        long commitFrontier = wal.GetCommitIndex();
+        if (commitFrontier > coreState.LastAppliedIndex)
+            await applier.DrainCommittedAppliesAsync(commitFrontier).ConfigureAwait(false);
+
+        await applier.FlushDeferredLeaderAppliesAsync().ConfigureAwait(false);
+
+        CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, coreState.LastAppliedIndex));
     }
 
     /// <summary>

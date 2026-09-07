@@ -389,7 +389,7 @@ internal sealed class ReplicationAckProcessor
             // Completed} as Committed, so complete the waiter the same way — otherwise the caller
             // blocks until the 10 s timeout. CompleteLeaderCommit/Rollback fire TrySetResult again
             // later; both are idempotent no-ops once this has run.
-            proposal.CompleteWaiter(RaftProposalTicketState.Committed, proposal.LastLogIndex);
+            proposals.CompleteWaiterOnSuccess(proposal, proposal.LastLogIndex, ProposalReplySite.ManualProposeQuorum);
             return;
         }
 

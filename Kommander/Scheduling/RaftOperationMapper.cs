@@ -28,6 +28,10 @@ public static class RaftOperationMapper
             RaftRequestType.CheckLeader              => RaftOperationKind.Control,
             RaftRequestType.ForceLeaderForTesting    => RaftOperationKind.Control,
             RaftRequestType.SetQuiescedForTesting    => RaftOperationKind.Control,
+            // Control, so a test can hold or resume applies on a node whose replication and client
+            // lanes are saturated — the two states these hooks construct only occur under load.
+            RaftRequestType.HoldConsumerAppliesForTesting   => RaftOperationKind.Control,
+            RaftRequestType.ResumeConsumerAppliesForTesting => RaftOperationKind.Control,
             RaftRequestType.StepDown              => RaftOperationKind.Control,
             RaftRequestType.TransferLeadership    => RaftOperationKind.Control,
             RaftRequestType.SuspendHeartbeats     => RaftOperationKind.Control,
@@ -144,6 +148,8 @@ public static class RaftOperationMapper
             RaftRequestType.CheckLeader or
             RaftRequestType.ForceLeaderForTesting or
             RaftRequestType.SetQuiescedForTesting or
+            RaftRequestType.HoldConsumerAppliesForTesting or
+            RaftRequestType.ResumeConsumerAppliesForTesting or
             RaftRequestType.StepDown or
             RaftRequestType.TransferLeadership or
             RaftRequestType.SuspendHeartbeats or

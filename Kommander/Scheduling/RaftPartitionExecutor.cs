@@ -1055,6 +1055,14 @@ public sealed class RaftPartitionExecutor : IDisposable
                     await _stateMachine.ResumeHeartbeatsAsync(RegisterReply(op)).ConfigureAwait(false);
                     break;
 
+                case RaftRequestType.HoldConsumerAppliesForTesting:
+                    _stateMachine.HoldConsumerAppliesForTesting(RegisterReply(op));
+                    break;
+
+                case RaftRequestType.ResumeConsumerAppliesForTesting:
+                    await _stateMachine.ResumeConsumerAppliesForTesting(RegisterReply(op)).ConfigureAwait(false);
+                    break;
+
                 case RaftRequestType.ReceiveStepDownNotice:
                     await _stateMachine.ReceiveStepDownNoticeAsync(request.StepDownNotice!).ConfigureAwait(false);
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);

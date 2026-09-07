@@ -455,7 +455,7 @@ internal sealed class WalCompletionRouter
         proposal.SetState(RaftProposalState.Committed);
         // Unblock event-driven waiters on the public write path. If TryReleaseTicketOnQuorumDurable
         // already fired on the fast path (WalSingleFsyncCommit + autoCommit), TrySetResult is a no-op.
-        proposal.CompleteWaiter(RaftProposalTicketState.Committed, completion.MaxLogIndex);
+        proposals.CompleteWaiterOnSuccess(proposal, completion.MaxLogIndex, ProposalReplySite.CommitCompletion);
         HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
 
         if (completion.MaxLogIndex > coreState.LocalCommittedIndex)
@@ -655,7 +655,7 @@ internal sealed class WalCompletionRouter
         proposal.SetState(RaftProposalState.RolledBack);
         // Signal failure to any event-driven waiter so the public write path is unblocked
         // immediately rather than waiting for the proposal to expire from activeProposals.
-        proposal.CompleteWaiter(RaftProposalTicketState.NotFound, -1);
+        proposals.FailWaiter(proposal, RaftProposalTicketState.NotFound, -1);
 
         AppendLogsGrpcLogCache? grpcLogCache = proposal.Logs.Count > 0 ? new() : null;
 
@@ -747,6 +747,11 @@ internal sealed class WalCompletionRouter
             // frontier, or is not yet committed (Proposed) — anything the batch cannot deliver in order.
             foreach (RaftLog log in pending.Logs ?? [])
             {
+                // Applies held (test hook): deliver nothing and leave the cursor where it is, so the
+                // entries stay pending in the log. The slow drain below withholds for the same
+                // reason, while the ack, the commit frontier and the notification are untouched.
+                if (applier.ConsumerAppliesHeld)
+                    break;
                 if (log.Id != coreState.LastAppliedIndex + 1 || log.Id > committedIndex)
                     break;
                 if (log.Type == RaftLogType.Committed)

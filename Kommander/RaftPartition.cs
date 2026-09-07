@@ -31,6 +31,8 @@ public sealed class RaftPartition : IDisposable
     private static readonly RaftRequest ConfirmLeadershipRequest = new(RaftRequestType.ConfirmLeadership);
     private static readonly RaftRequest SuspendHeartbeatsRequest = new(RaftRequestType.SuspendHeartbeats);
     private static readonly RaftRequest ResumeHeartbeatsRequest = new(RaftRequestType.ResumeHeartbeats);
+    private static readonly RaftRequest HoldConsumerAppliesRequest = new(RaftRequestType.HoldConsumerAppliesForTesting);
+    private static readonly RaftRequest ResumeConsumerAppliesRequest = new(RaftRequestType.ResumeConsumerAppliesForTesting);
 
     /// <summary>
     /// Relay sink that breaks the circular dependency between
@@ -735,6 +737,40 @@ public sealed class RaftPartition : IDisposable
     }
 
     /// <summary>
+    /// Installs the reply-hold test hook on this partition — see
+    /// <see cref="IRaft.HoldCommittedProposalRepliesForTesting"/>. Not an executor operation: the
+    /// handle must release everything it holds synchronously on disposal.
+    /// </summary>
+    internal IDisposable HoldCommittedProposalRepliesForTesting(Action<HeldProposalReply> onHeld) =>
+        stateMachine.HoldCommittedProposalRepliesForTesting(onHeld);
+
+    /// <summary>
+    /// Installs (or clears, with <see langword="null"/>) the snapshot-install gate on this
+    /// partition — see <see cref="IRaft.SetSnapshotInstallGateForTesting"/>. Not an executor
+    /// operation, so a disposal can take effect while an install is suspended on the gate.
+    /// </summary>
+    internal void SetSnapshotInstallGateForTesting(Consensus.SnapshotInstallGate? gate) =>
+        stateMachine.SetSnapshotInstallGateForTesting(gate);
+
+    /// <summary>Removes one gate registration, and only that one.</summary>
+    internal void ClearSnapshotInstallGateForTesting(Consensus.SnapshotInstallGate gate) =>
+        stateMachine.ClearSnapshotInstallGateForTesting(gate);
+
+    /// <summary>Stops delivering committed entries to this partition's consumer (test hook).</summary>
+    internal async Task<RaftOperationStatus> HoldConsumerAppliesForTestingAsync(CancellationToken cancellationToken = default)
+    {
+        RaftResponse response = await executor.Ask(HoldConsumerAppliesRequest, cancellationToken).ConfigureAwait(false);
+        return response.Status;
+    }
+
+    /// <summary>Resumes delivery, draining what accumulated in log order (test hook).</summary>
+    internal async Task<RaftOperationStatus> ResumeConsumerAppliesForTestingAsync(CancellationToken cancellationToken = default)
+    {
+        RaftResponse response = await executor.Ask(ResumeConsumerAppliesRequest, cancellationToken).ConfigureAwait(false);
+        return response.Status;
+    }
+
+    /// <summary>
     /// Waits until the same non-empty leader endpoint has remained stable for at least
     /// <paramref name="minStableFor"/>. <paramref name="minStableFor"/> is a required stability
     /// window, not a deadline: without <paramref name="timeout"/> the only exit besides success is
@@ -947,6 +983,8 @@ public sealed class RaftPartition : IDisposable
 
         semaphore.Dispose();
         executor.Stop();
+        // Clears every installed test hook and releases anything a hook is holding, so a stopped
+        // partition never leaves a caller waiting on a reply that nothing will ever complete.
         executor.ResetTestingState();
         executor.Dispose();
     }

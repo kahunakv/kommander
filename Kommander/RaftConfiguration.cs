@@ -737,6 +737,18 @@ public class RaftConfiguration
     /// </summary>
     public TimeSpan LeadershipBarrierTimeout { get; set; } = TimeSpan.FromSeconds(10);
 
+    // ── Proposal wait ────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// How long a caller of <c>ReplicateLogs</c> / <c>ReplicateCheckpoint</c> waits for its
+    /// proposal to reach a terminal state before the call returns
+    /// <see cref="Kommander.Data.RaftOperationStatus.ProposalTimeout"/>. This is the caller's own
+    /// bound, not a protocol timeout: the proposal itself is not cancelled, and an entry that was
+    /// already durable on a quorum may still commit after the caller has given up — which is why
+    /// the timeout is reported as indeterminate rather than as a failure. Default 10 s.
+    /// </summary>
+    public TimeSpan ProposalTimeout { get; set; } = TimeSpan.FromSeconds(10);
+
     // ── Promotion-gate self-repair ───────────────────────────────────────────
 
     /// <summary>
@@ -1671,6 +1683,12 @@ public class RaftConfiguration
                 "inherited uncommitted prior-term entries holds leadership unpublished until its barrier " +
                 "no-op commits; a non-positive timeout would make it revert to Follower immediately on " +
                 "every such promotion, so the partition could never elect a serving leader.");
+
+        if (ProposalTimeout <= TimeSpan.Zero)
+            throw new RaftException(
+                "[Kommander] ProposalTimeout must be positive. It bounds how long a write caller waits "
+                + "for its proposal to reach a terminal state; a non-positive value would time out every "
+                + "write before it could possibly commit.");
 
         if (SelfRepairPeerDownGrace < TimeSpan.Zero)
             throw new RaftException(

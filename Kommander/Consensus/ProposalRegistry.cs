@@ -25,7 +25,9 @@ namespace Kommander.Consensus;
 /// regressed by enlarging every dictionary entry (see <see cref="RaftPendingWalOperation"/>).</para>
 ///
 /// <para><b>Concurrency.</b> Touched only on the partition executor thread; holds no locks by
-/// design.</para>
+/// design. The one exception is the reply-hold test hook (<see cref="ProposalReplyHoldRegistry"/>),
+/// which is installed from a caller's thread and read on the turn — see the field for why it is
+/// safe and why it is a field rather than a delegate.</para>
 /// </summary>
 internal sealed class ProposalRegistry
 {
@@ -62,6 +64,18 @@ internal sealed class ProposalRegistry
     /// </summary>
     private readonly List<string> proposalResendScratch = [];
 
+    /// <summary>
+    /// The installed reply-hold test hook, or <see langword="null"/> in every ordinary run.
+    /// <para><b>The one field here that is not executor-thread-only.</b> A registration arrives
+    /// from the caller's thread (<c>IRaft.HoldCommittedProposalRepliesForTesting</c>) and is read
+    /// on the executor turn, so every access goes through <see cref="Volatile"/> or
+    /// <see cref="Interlocked"/>; the object behind it is itself thread-safe. With no hook installed
+    /// the completion paths cost exactly one null check on this field — no
+    /// allocation, no timestamp read — which is why the hook lives behind a field rather than
+    /// behind a delegate the sites always invoke.</para>
+    /// </summary>
+    private ProposalReplyHoldRegistry? replyHolds;
+
     public ProposalRegistry(
         IRaftPartitionHost host,
         RaftPartitionCoreState coreState,
@@ -75,6 +89,52 @@ internal sealed class ProposalRegistry
     }
 
     // ── active proposals ──────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Installs (or clears, with <see langword="null"/>) the reply-hold hook for this partition.
+    /// A second installation replaces the first and releases everything the first was holding, so
+    /// no caller is ever stranded by a re-registration.
+    /// </summary>
+    public void SetReplyHoldsForTesting(ProposalReplyHoldRegistry? registry)
+    {
+        ProposalReplyHoldRegistry? previous = Interlocked.Exchange(ref replyHolds, registry);
+        if (previous is not null && !ReferenceEquals(previous, registry))
+            previous.ReplaceWith();
+    }
+
+    /// <summary>
+    /// Clears the hook only if <paramref name="registry"/> is still the installed one. Used by a
+    /// registration's own disposal so a stale handle cannot detach a newer registration.
+    /// </summary>
+    public void ClearReplyHoldsForTesting(ProposalReplyHoldRegistry registry) =>
+        Interlocked.CompareExchange(ref replyHolds, null, registry);
+
+    /// <summary>
+    /// Releases a proposal's caller with the committed outcome, giving the reply-hold test hook the
+    /// chance to intercept it first. <paramref name="site"/> records which of the three success
+    /// paths produced the completion; it is reported to the hook and otherwise unused.
+    /// <para>With no hook installed this is <see cref="RaftProposalQuorum.CompleteWaiter"/> behind
+    /// one null check.</para>
+    /// </summary>
+    public void CompleteWaiterOnSuccess(RaftProposalQuorum proposal, long commitIndex, ProposalReplySite site)
+    {
+        ProposalReplyHoldRegistry? holds = Volatile.Read(ref replyHolds);
+        if (holds is not null && holds.TryHoldSuccess(proposal, commitIndex, site))
+            return;
+
+        proposal.CompleteWaiter(RaftProposalTicketState.Committed, commitIndex);
+    }
+
+    /// <summary>
+    /// Fails a proposal's caller. Failures are never held: a held success for the same ticket is
+    /// discarded first, so a proposal is never simultaneously held-as-committed and failed, and the
+    /// failure is what the caller sees.
+    /// </summary>
+    public void FailWaiter(RaftProposalQuorum proposal, RaftProposalTicketState state, long commitIndex)
+    {
+        Volatile.Read(ref replyHolds)?.DiscardOnFailure(proposal.StartTimestamp);
+        proposal.CompleteWaiter(state, commitIndex);
+    }
 
     public int ActiveCount => activeProposals.Count;
 
@@ -108,7 +168,7 @@ internal sealed class ProposalRegistry
     public void FailAllWaitersAndClear()
     {
         foreach (RaftProposalQuorum proposal in activeProposals.Values)
-            proposal.CompleteWaiter(RaftProposalTicketState.NotFound, -1);
+            FailWaiter(proposal, RaftProposalTicketState.NotFound, -1);
 
         activeProposals.Clear();
     }
@@ -177,7 +237,7 @@ internal sealed class ProposalRegistry
         proposal.SetState(RaftProposalState.Committed);
         // Unblock any caller awaiting event-driven completion; the commit completion will
         // also fire TrySetResult, but TrySetResult is idempotent so the duplicate is safe.
-        proposal.CompleteWaiter(RaftProposalTicketState.Committed, proposal.LastLogIndex);
+        CompleteWaiterOnSuccess(proposal, proposal.LastLogIndex, ProposalReplySite.QuorumDurableFastPath);
     }
 
     /// <summary>

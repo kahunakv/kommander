@@ -118,4 +118,18 @@ public enum RaftRequestType
     /// "not confirmed" and skip their destructive action.
     /// </summary>
     WaitLocalApplication,
+
+    /// <summary>
+    /// Test-only: stops delivering committed entries to the consumer on this node, so entries stay
+    /// pending in the log while replication, acks, the commit frontier and elections carry on. Runs
+    /// on the executor thread so the hold cannot land in the middle of a drain.
+    /// </summary>
+    HoldConsumerAppliesForTesting,
+
+    /// <summary>
+    /// Test-only: resumes consumer delivery and drains what accumulated in log id order, on the
+    /// executor thread. Exactly-once is preserved by the applied cursor, so a snapshot installed
+    /// while applies were held is not re-delivered.
+    /// </summary>
+    ResumeConsumerAppliesForTesting,
 }

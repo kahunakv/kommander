@@ -60,18 +60,27 @@ internal sealed class ReplicationGateway
     private readonly ILogger<IRaft> logger;
     private readonly string localEndpoint;
 
+    /// <summary>
+    /// Held for <see cref="RaftConfiguration.ProposalTimeout"/> — the bound on how long a write
+    /// caller waits for a terminal proposal state. Read per wait rather than captured, so a test
+    /// that shortens it on a running node takes effect on the next proposal.
+    /// </summary>
+    private readonly RaftConfiguration configuration;
+
     internal ReplicationGateway(
         IPartitionProvider partitionProvider,
         PartitionRoutingTable routingTable,
         ForwardReplicateLogsDelegate forwardReplicateLogs,
         ILogger<IRaft> logger,
-        string localEndpoint)
+        string localEndpoint,
+        RaftConfiguration configuration)
     {
         this.partitionProvider = partitionProvider;
         this.routingTable = routingTable;
         this.forwardReplicateLogs = forwardReplicateLogs;
         this.logger = logger;
         this.localEndpoint = localEndpoint;
+        this.configuration = configuration;
     }
 
     /// <summary>
@@ -521,8 +530,8 @@ internal sealed class ReplicationGateway
     /// One executor round-trip is made to obtain the proposal's completion task; subsequent
     /// progress is delivered without executor involvement as the state machine fires
     /// <see cref="RaftProposalQuorum.CompleteWaiter"/> on commit, rollback, or leader loss.
-    /// A 10-second timeout is enforced via <see cref="Task.WaitAsync(TimeSpan,CancellationToken)"/>
-    /// so that the caller's wait is bounded identically to the previous polling loop.
+    /// The wait is bounded by <see cref="RaftConfiguration.ProposalTimeout"/> (10 s by default) via
+    /// <see cref="Task.WaitAsync(TimeSpan,CancellationToken)"/>.
     /// </para>
     /// <para>
     /// Falls back to a single <see cref="RaftPartition.GetTicketState"/> poll when the
@@ -580,7 +589,7 @@ internal sealed class ReplicationGateway
             // proposal. Caller cancellation still surfaces as OperationCanceledException;
             // the elapsed timeout surfaces as TimeoutException instead of a filtered OCE.
             (RaftProposalTicketState ticketState, long commitIndex) = await waiterTask
-                .WaitAsync(TimeSpan.FromMilliseconds(10_000), cancellationToken).ConfigureAwait(false);
+                .WaitAsync(configuration.ProposalTimeout, cancellationToken).ConfigureAwait(false);
 
             return ticketState == RaftProposalTicketState.Committed
                 ? new(true, RaftOperationStatus.Success, ticketId, commitIndex)
@@ -588,7 +597,7 @@ internal sealed class ReplicationGateway
         }
         catch (TimeoutException)
         {
-            // 10-second timeout elapsed without a terminal state transition.
+            // ProposalTimeout elapsed without a terminal state transition.
             return new(false, RaftOperationStatus.ProposalTimeout, ticketId, -1);
         }
     }

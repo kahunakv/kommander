@@ -680,7 +680,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             (node, partitionId, type, logs, autoCommit, expectedGeneration, ct) =>
                 communication.ForwardReplicateLogs(this, node, partitionId, type, logs, autoCommit, expectedGeneration, ct),
             Logger,
-            LocalEndpoint);
+            LocalEndpoint,
+            configuration);
 
         readScheduler = new(
             logger,
@@ -1665,8 +1666,9 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     }
 
     /// <summary>
-    /// No-op retention handle returned when a hold is requested for a partition not hosted here, so
-    /// callers always receive a valid <see cref="IDisposable"/> to dispose.
+    /// No-op handle returned whenever a per-partition registration is requested for a partition not
+    /// hosted here — a retention hold, a reply hold, or a snapshot-install gate — so callers always
+    /// receive a valid <see cref="IDisposable"/> to dispose.
     /// </summary>
     private sealed class NoOpRetentionHold : IDisposable
     {
@@ -1995,6 +1997,100 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         int partitionId,
         CancellationToken cancellationToken = default) =>
         leadershipService.ResumeHeartbeatsAsync(partitionId, cancellationToken);
+
+    /// <summary>
+    /// Installs the reply-hold test hook on a hosted partition — see
+    /// <see cref="IRaft.HoldCommittedProposalRepliesForTesting"/>. A partition this node does not
+    /// host yields a handle that does nothing, mirroring <see cref="AcquireRetentionHold"/>: a test
+    /// always receives a valid <see cref="IDisposable"/>.
+    /// </summary>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public IDisposable HoldCommittedProposalRepliesForTesting(int partitionId, Action<HeldProposalReply> onHeld)
+    {
+        ArgumentNullException.ThrowIfNull(onHeld);
+
+        if (partitions.TryGetValue(partitionId, out RaftPartition? partition))
+            return partition.HoldCommittedProposalRepliesForTesting(onHeld);
+
+        return NoOpRetentionHold.Instance;
+    }
+
+    /// <summary>
+    /// Installs the snapshot-install gate on a hosted partition — see
+    /// <see cref="IRaft.SetSnapshotInstallGateForTesting"/>. Disposing the returned handle removes
+    /// the gate only if it is still the installed one, so a stale handle cannot clear a newer
+    /// registration.
+    /// </summary>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public IDisposable SetSnapshotInstallGateForTesting(
+        int partitionId,
+        SnapshotInstallPhase phase,
+        Func<SnapshotInstallSignal, ValueTask> gate)
+    {
+        ArgumentNullException.ThrowIfNull(gate);
+
+        if (!partitions.TryGetValue(partitionId, out RaftPartition? partition))
+            return NoOpRetentionHold.Instance;
+
+        Consensus.SnapshotInstallGate registration = new(phase, gate);
+        partition.SetSnapshotInstallGateForTesting(registration);
+        return new SnapshotInstallGateHandle(partition, registration);
+    }
+
+    /// <summary>
+    /// Removes one snapshot-install gate registration on disposal, and only that registration: a
+    /// handle whose gate was already replaced must not clear its replacement. Idempotent.
+    /// </summary>
+    private sealed class SnapshotInstallGateHandle : IDisposable
+    {
+        private readonly RaftPartition partition;
+        private readonly Consensus.SnapshotInstallGate registration;
+        private int disposed;
+
+        public SnapshotInstallGateHandle(RaftPartition partition, Consensus.SnapshotInstallGate registration)
+        {
+            this.partition = partition;
+            this.registration = registration;
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref disposed, 1) != 0)
+                return;
+
+            partition.ClearSnapshotInstallGateForTesting(registration);
+        }
+    }
+
+    /// <inheritdoc/>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public async Task<RaftOperationStatus> HoldConsumerAppliesForTesting(
+        int partitionId,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Joined || !IsInitialized)
+            return RaftOperationStatus.Errored;
+
+        if (!partitions.TryGetValue(partitionId, out RaftPartition? partition))
+            return RaftOperationStatus.Errored;
+
+        return await partition.HoldConsumerAppliesForTestingAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    [EditorBrowsable(EditorBrowsableState.Never)]
+    public async Task<RaftOperationStatus> ResumeConsumerAppliesForTesting(
+        int partitionId,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Joined || !IsInitialized)
+            return RaftOperationStatus.Errored;
+
+        if (!partitions.TryGetValue(partitionId, out RaftPartition? partition))
+            return RaftOperationStatus.Errored;
+
+        return await partition.ResumeConsumerAppliesForTestingAsync(cancellationToken).ConfigureAwait(false);
+    }
 
     /// <summary>
     /// Queues a request to split a partition. Splitting is an asynchronous

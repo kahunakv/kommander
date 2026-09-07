@@ -18,6 +18,12 @@ namespace Kommander.Consensus;
 /// serialized against every other partition operation. The import is passed
 /// <see cref="CancellationToken.None"/> deliberately — the caller must not be able to dispose the
 /// staged buffer while this is still reading it.</para>
+///
+/// <para><b>Test gate.</b> A registered <see cref="SnapshotInstallGate"/> suspends the install
+/// between the numbered steps so a test can observe or act while a snapshot is half-installed. It
+/// never reorders anything and is bounded by
+/// <see cref="RaftConfiguration.LeadershipBarrierTimeout"/>; on expiry the install fails and the
+/// sender retries. With no gate registered each phase costs one null check.</para>
 /// </summary>
 internal sealed class SnapshotInstaller
 {
@@ -34,6 +40,14 @@ internal sealed class SnapshotInstaller
     /// </summary>
     private readonly Func<string, long, Task> adoptLeaderAsync;
 
+    /// <summary>
+    /// The installed test gate, or <see langword="null"/> in every ordinary run. Written from the
+    /// caller's thread by <c>IRaft.SetSnapshotInstallGateForTesting</c> and read on the executor
+    /// turn, so it is published and read with <see cref="Volatile"/>; with none installed the
+    /// install costs one null check per phase.
+    /// </summary>
+    private SnapshotInstallGate? installGate;
+
     public SnapshotInstaller(
         IRaftPartitionHost host,
         IRaftWalFacade wal,
@@ -46,6 +60,72 @@ internal sealed class SnapshotInstaller
         this.coreState = coreState;
         this.logger = logger;
         this.adoptLeaderAsync = adoptLeaderAsync;
+    }
+
+    /// <summary>
+    /// Installs (or clears, with <see langword="null"/>) the install gate for this partition. A
+    /// second installation replaces the first; the replaced gate is simply never awaited again.
+    /// </summary>
+    public void SetInstallGateForTesting(SnapshotInstallGate? gate) => Volatile.Write(ref installGate, gate);
+
+    /// <summary>
+    /// Clears <paramref name="gate"/> only if it is still the installed one, so a stale handle
+    /// cannot remove a registration that already replaced it.
+    /// </summary>
+    public void ClearInstallGateForTesting(SnapshotInstallGate gate) =>
+        Interlocked.CompareExchange(ref installGate, null, gate);
+
+    /// <summary>
+    /// Suspends the install at <paramref name="phase"/> when a gate is registered for it.
+    ///
+    /// <para>Awaited <b>inline on the executor turn</b>, unlike the reply hold: freezing the
+    /// operation mid-way is the entire point. It is bounded by
+    /// <see cref="RaftConfiguration.LeadershipBarrierTimeout"/>. On expiry — or if the gate throws
+    /// — the install fails with <see cref="RaftOperationStatus.Errored"/>, which the sender retries
+    /// exactly as it retries any other install failure. A test gate must never wedge a
+    /// partition.</para>
+    ///
+    /// <para>Returns <see langword="true"/> when the install may continue.</para>
+    /// </summary>
+    private async ValueTask<bool> PassGateAsync(
+        SnapshotInstallPhase phase,
+        SnapshotInstallRequest request,
+        long boundaryTerm)
+    {
+        SnapshotInstallGate? gate = Volatile.Read(ref installGate);
+        if (gate is null || gate.Phase != phase)
+            return true;
+
+        long localMaxLogId = await wal.GetMaxLogAsync().ConfigureAwait(false);
+
+        SnapshotInstallSignal signal = new(
+            host.PartitionId,
+            request.SnapshotIndex,
+            boundaryTerm,
+            request.Kind,
+            phase,
+            localMaxLogId,
+            coreState.LastAppliedIndex);
+
+        try
+        {
+            await gate.Gate(signal).AsTask().WaitAsync(host.Configuration.LeadershipBarrierTimeout).ConfigureAwait(false);
+            return true;
+        }
+        catch (TimeoutException)
+        {
+            logger.LogError(
+                "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot test gate at {Phase} did not release within {Timeout}ms for index {Index}; failing the install so the sender retries.",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, phase, host.Configuration.LeadershipBarrierTimeout.TotalMilliseconds, request.SnapshotIndex);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(
+                "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot test gate at {Phase} threw for index {Index}: {Message}. Failing the install so the sender retries.",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, phase, request.SnapshotIndex, ex.Message);
+            return false;
+        }
     }
 
     /// <summary>
@@ -156,6 +236,9 @@ internal sealed class SnapshotInstaller
             }
         }
 
+        if (!await PassGateAsync(SnapshotInstallPhase.BeforeImport, request, boundaryTerm).ConfigureAwait(false))
+            return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Errored, -1);
+
         // Ordering step 2 — invoke the application import. Must precede the durable WAL boundary so a
         // crash between them leaves recoverable state (import is idempotent; the boundary is not yet
         // durable so the sender retries the whole snapshot).
@@ -209,6 +292,9 @@ internal sealed class SnapshotInstaller
             return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Errored, -1);
         }
 
+        if (!await PassGateAsync(SnapshotInstallPhase.AfterImport, request, boundaryTerm).ConfigureAwait(false))
+            return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Errored, -1);
+
         // Ordering step 3 + Rule 7.5/7.6 — install the durable checkpoint boundary. The backend retains
         // the suffix above the index when its stored term matches boundaryTerm and truncates it on
         // conflict, atomically.
@@ -221,6 +307,9 @@ internal sealed class SnapshotInstaller
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState, snapshotIndex, boundaryStatus);
             return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Errored, -1);
         }
+
+        if (!await PassGateAsync(SnapshotInstallPhase.AfterBoundary, request, boundaryTerm).ConfigureAwait(false))
+            return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Errored, -1);
 
         // Ordering step 4 + Rule 7.7 — reconstruct the apply cursor from the installed boundary so a later
         // promotion does not re-deliver the imported prefix (mirrors CompleteRestoreAsync's cursor seed), and

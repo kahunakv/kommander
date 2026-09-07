@@ -112,6 +112,17 @@ public sealed class RaftProposalQuorum
     public Task<(RaftProposalTicketState, long)> GetWaiterTask() => _waiter!.Task;
 
     /// <summary>
+    /// The completion source behind <see cref="GetWaiterTask"/>, or <see langword="null"/> once the
+    /// instance has been drained for pool return.
+    /// <para>Exposed for the reply-hold test hook only. A hold outlives the completion it
+    /// intercepts, and these instances are pooled, so the hook must capture <em>this</em> source
+    /// rather than the proposal: by the time the hold resolves, the pooled instance may already
+    /// describe a different ticket, and completing its waiter would answer the wrong caller.
+    /// Completing a source the pool has since drained is a harmless no-op.</para>
+    /// </summary>
+    internal TaskCompletionSource<(RaftProposalTicketState, long)>? WaiterSource => _waiter;
+
+    /// <summary>
     /// Completes the event-driven waiter with the given terminal result. Called from
     /// state-machine terminal transitions (<c>Committed</c>, <c>RolledBack</c>, leader loss).
     /// Safe to call multiple times — <see cref="TaskCompletionSource{T}.TrySetResult"/> is idempotent.
