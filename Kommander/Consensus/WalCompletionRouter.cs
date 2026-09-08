@@ -196,21 +196,34 @@ internal sealed class WalCompletionRouter
         }
 
         // ── Min-log cross-check against pending entry ──────────────────────────
+        // The envelope's MinLogIndex is the minimum of what the WAL PLANNED (FairWalScheduler builds
+        // the completion over op.Logs), while pending.Logs is the batch as RECEIVED. The two differ
+        // legitimately: RaftWriteAhead.EnqueueProposeOrCommit skips a stale Proposed copy of an id
+        // this node already resolved, which is exactly what a proposal retry or an overlapping
+        // backfill batch carries after a gap. Requiring equality treated every such batch as a
+        // mix-up and discarded its completion: the follower never acked it, never ran the fast-path
+        // apply, and the leader kept backfilling a peer whose acks it would never see (Caraxes
+        // bank-rebase soaks: dozens of these discards per minute on every follower, each a lost
+        // quorum ack). A genuine mix-up is an envelope whose min sits BELOW anything the batch
+        // carried, or names an id the batch never held — only that is discarded.
         if (pending?.Logs is { Count: > 0 } pendingLogs && completion.MinLogIndex >= 0)
         {
             // Indexed loop, not Enumerable.Min: this runs on every WAL completion (propose,
             // commit, rollback, follower append) and the LINQ path boxes the list enumerator.
             long actualMin = pendingLogs[0].Id;
+            bool envelopeMinInBatch = pendingLogs[0].Id == completion.MinLogIndex;
             for (int i = 1; i < pendingLogs.Count; i++)
             {
                 if (pendingLogs[i].Id < actualMin)
                     actualMin = pendingLogs[i].Id;
+                if (pendingLogs[i].Id == completion.MinLogIndex)
+                    envelopeMinInBatch = true;
             }
 
-            if (actualMin != completion.MinLogIndex)
+            if (completion.MinLogIndex < actualMin || !envelopeMinInBatch)
             {
                 logger.LogWarning(
-                    "[{LocalEndpoint}/{PartitionId}/{State}] WAL completion op {OperationId} min-log-index mismatch: envelope {EnvelopeMin} vs actual {ActualMin}; discarding.",
+                    "[{LocalEndpoint}/{PartitionId}/{State}] WAL completion op {OperationId} min-log-index mismatch: envelope {EnvelopeMin} is not an id of the pending batch (batch min {ActualMin}); discarding.",
                     host.LocalEndpoint, host.PartitionId, coreState.NodeState,
                     completion.OperationId, completion.MinLogIndex, actualMin);
                 // The pending entry was already taken above; this is its only completion, so
