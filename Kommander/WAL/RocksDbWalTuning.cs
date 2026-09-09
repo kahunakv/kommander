@@ -72,4 +72,30 @@ public sealed record RocksDbWalTuning
 
     /// <summary>L0 file count at which RocksDB stops writers entirely.</summary>
     public int ShardLevel0StopWritesTrigger { get; init; } = 44;
+
+    // ── Layout experiment (probe-driven; see the write-amp feature's w3 analysis) ────────────────
+    //
+    // The flush-unit lever above kills entries that die within one flush. Entries the durability
+    // floor holds longer still cascade L0→L5→L6 before their range tombstone catches them, and
+    // DeleteFilesInRange cannot reclaim them while they sit in L0/L5 (it acts on whole files in the
+    // lower levels only). The knobs below let a probe make the log NOT need a bottom level, so a
+    // range tombstone annihilates its entries in at most one rewrite (W-Amp near 2) instead of the
+    // multi-level cascade. Defaults keep the shipped leveled layout, so they are inert until set.
+
+    /// <summary>
+    /// <c>max_bytes_for_level_base</c> for the shard CFs, or 0 to leave the RocksDB default
+    /// (256 MB). Sizing this at or above the retained-log window keeps the whole live log in the
+    /// base level, where a range tombstone meets its entries in one compaction rather than after an
+    /// L5→L6 push. 0 = unchanged.
+    /// </summary>
+    public long ShardMaxBytesForLevelBase { get; init; }
+
+    /// <summary>
+    /// When true, the shard CFs use universal compaction instead of leveled. Universal keeps the
+    /// log in few large sorted runs and lets a range tombstone drop covered data without the
+    /// leveled L0→Lmax cascade — the spec's alternative when whole-file drops alone underperform.
+    /// The retention bound stays the durability floor (compaction handles it); this only changes
+    /// the physical layout. Default false (leveled, as shipped).
+    /// </summary>
+    public bool ShardUniversalCompaction { get; init; }
 }

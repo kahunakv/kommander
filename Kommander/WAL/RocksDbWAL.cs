@@ -679,6 +679,22 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <summary>1 while RocksDB has stopped writes entirely (the hard stall), else 0. See <see cref="GetActualDelayedWriteRate"/>.</summary>
     internal long GetIsWriteStopped() => ReadIntegerProperty("rocksdb.is-write-stopped");
 
+    /// <summary>
+    /// Total live SST bytes across the shard column families (the Raft-log CFs). On an
+    /// append-then-delete log this should track the retained window, not grow without bound; a
+    /// value far above the live-entry count means dead files are not being reclaimed — the L6
+    /// non-reclaim <see cref="DropFullyDeadFiles"/> targets. Fed to <c>raft.wal.shard_live_sst_bytes</c>.
+    /// </summary>
+    internal long GetShardLiveSstBytes() => SumShardProperty("rocksdb.live-sst-files-size");
+
+    /// <summary>
+    /// Total SST files in the bottom level (L6) across the shard CFs, fed to
+    /// <c>raft.wal.shard_l6_files</c>. On the append-then-delete log this is the count that stayed
+    /// flat at ~12 files / 844 MB through write probe w3 while the data below the floor was dead —
+    /// the signal that whole-file drops were not landing.
+    /// </summary>
+    internal long GetShardLevel6FileCount() => SumShardProperty("rocksdb.num-files-at-level6");
+
     private long ReadIntegerProperty(string property)
     {
         if (engineClosed)
@@ -696,14 +712,50 @@ public class RocksDbWAL : IWAL, IDisposable
     }
 
     /// <summary>
+    /// Sums a per-CF integer RocksDB property over the shard column families. A closed/failing
+    /// engine reports 0 (no reclaim evidence, not "healthy"), like the stall readers above.
+    /// </summary>
+    private long SumShardProperty(string property)
+    {
+        if (engineClosed)
+            return 0;
+
+        try
+        {
+            using EngineLease lease = AcquireEngine();
+            long sum = 0;
+            for (int i = 0; i < MaxShards; i++)
+            {
+                ColumnFamilyHandle cf = db.GetColumnFamily("shard" + i);
+                if (long.TryParse(db.GetProperty(property, cf), out long value))
+                    sum += value;
+            }
+            return sum;
+        }
+        catch (Exception)
+        {
+            return 0;
+        }
+    }
+
+    /// <summary>
     /// Test-only: forces a memtable switch on every column family that holds data, which makes RocksDB
     /// create a fresh WAL file. On a full volume that creation fails and the engine latches the
     /// unrecoverable error this recovery region exists for. Throws the engine's error to the caller.
     /// </summary>
-    internal void FlushMemTablesForTesting()
+    internal void FlushMemTablesForTesting() => FlushMemTablesForTesting(wait: false);
+
+    /// <summary>
+    /// Test-only flush with an explicit wait flag. <paramref name="wait"/> = true blocks until the
+    /// memtables are written as SST files, so a test can then read file-level stats
+    /// (<see cref="GetShardLiveSstBytes"/>) deterministically; the default (false) preserves the
+    /// fire-and-forget switch the ENOSPC recovery tests rely on.
+    /// </summary>
+    internal void FlushMemTablesForTesting(bool wait)
     {
         using EngineLease lease = AcquireEngine();
         FlushOptions flushOptions = new();
+        Native.Instance.rocksdb_flushoptions_set_wait(flushOptions.Handle, (byte)(wait ? 1 : 0));
 
         Native.Instance.rocksdb_flush_cf(db.Handle, flushOptions.Handle, metadataColumnFamily.Handle);
         Native.Instance.rocksdb_flush_cf(db.Handle, flushOptions.Handle, db.GetColumnFamily("default").Handle);
@@ -2278,6 +2330,21 @@ public class RocksDbWAL : IWAL, IDisposable
     }
 
     /// <summary>
+    /// Test-only: forces the shard CF holding <paramref name="partitionId"/> to compact its whole
+    /// key range down to the bottom level, so a test can exercise the <see cref="DropFullyDeadFiles"/>
+    /// path against L6 files (RocksDB's <c>DeleteFilesInRange</c> is a no-op on L0 — it only drops
+    /// files in L1 and below, which is why fresh, unflushed-through log data is not reclaimable by
+    /// it and the log needs a layout that lets tombstones annihilate entries before L6).
+    /// </summary>
+    internal void CompactShardToBottomForTesting(int partitionId)
+    {
+        using EngineLease lease = AcquireEngine();
+        ColumnFamilyHandle cf = GetColumnFamily(partitionId);
+        Native.Instance.rocksdb_compact_range_cf(
+            db.Handle, cf.Handle, (byte[]?)null, UIntPtr.Zero, (byte[]?)null, UIntPtr.Zero);
+    }
+
+    /// <summary>
     /// Test-only: rewrites the persisted commit frontier to model a crash that lost the frontier
     /// put (the counterpart of demoting on-disk commit rows back to Proposed — under the frontier
     /// design the marker's durability lives in the metadata key, so a faithful crash simulation
@@ -2862,7 +2929,13 @@ public class RocksDbWAL : IWAL, IDisposable
                 db.Write(writeBatch, writeOptions);
                 LastCompactionWriteCount = 1;
 
-                DropFullyDeadFiles(columnFamilyHandle, partitionId, lastRemovedId);
+                // Anchor the whole-file drop at the compaction FLOOR, not this pass's last removed
+                // id. DeleteFilesInRange physically drops SST files whose key range is entirely
+                // below the bound; it needs no tombstone, so it may reclaim every file below the
+                // floor regardless of how small a slice this (cap-bounded) pass tombstoned. Passing
+                // lastRemovedId instead left the band [lastRemovedId, floor) of dead L6 files
+                // permanently unreclaimed whenever a pass was capped (MaxEntriesPerCompaction).
+                DropFullyDeadFiles(columnFamilyHandle, partitionId, lastCheckpoint);
 
                 logger.LogDebugRemovedFromWal(removed, partitionId);
             }
@@ -2883,12 +2956,16 @@ public class RocksDbWAL : IWAL, IDisposable
     }
     
     /// <summary>
-    /// Asks RocksDB to physically delete SST files that lie ENTIRELY within the compacted prefix
-    /// <c>[key(partition, 0), key(partition, lastRemovedId)]</c> — dead data reclaimed with zero
-    /// compaction rewrite, which is what removes the bulk of the log's L5/L6 write amplification.
-    /// The inclusive upper bound is <paramref name="lastRemovedId"/> itself (never one above), so a
-    /// file whose largest key is the first surviving entry can never qualify. Files that straddle
-    /// the bound, or that also hold another partition's keys, are left to normal compaction.
+    /// Asks RocksDB to physically delete SST files that lie ENTIRELY within the dead prefix
+    /// <c>[key(partition, 0), key(partition, compactionFloor − 1)]</c> — dead data reclaimed with
+    /// zero compaction rewrite, which is what is meant to remove the bulk of the log's L5/L6 write
+    /// amplification. The bound is the compaction FLOOR (every id below it is retention-eligible),
+    /// not the last id this pass happened to tombstone: <c>DeleteFilesInRange</c> drops whole files
+    /// and needs no tombstone, so anchoring at the floor reclaims files a cap-bounded pass never
+    /// tombstoned. The exclusive-of-floor upper bound (<c>floor − 1</c>) keeps the file holding the
+    /// first surviving entry (id == floor) untouched. Files that straddle the bound, or that also
+    /// hold another partition's keys (shard CFs are shared across partitions), are left to normal
+    /// compaction.
     ///
     /// <para><b>Resume-hint reset.</b> DeleteFilesInRange may delete a file holding a range
     /// tombstone while an older version of a covered key survives in a deeper file that straddles
@@ -2899,30 +2976,42 @@ public class RocksDbWAL : IWAL, IDisposable
     /// now — the covered spans are skipped via the fragmented range-tombstone index, not ground
     /// over key by key as with point tombstones.</para>
     ///
-    /// <para>Best-effort: a failure here loses only the early reclaim (normal compaction still
-    /// removes the data), so it is logged at Debug and never fails the pass.</para>
+    /// <para><b>Failures are surfaced, not swallowed.</b> A native error here means the early
+    /// reclaim did not happen and the dead prefix stays until normal compaction removes it — which,
+    /// on an append-then-delete log with no compaction pressure, may be never (the L6 non-reclaim
+    /// seen in write probe w3). It is therefore logged at Warning with the RocksDB message, not
+    /// dropped, so the condition is visible in a run's logs. The pass itself still succeeds: the
+    /// data is logically gone via the range tombstone regardless.</para>
     /// </summary>
-    private void DropFullyDeadFiles(ColumnFamilyHandle columnFamilyHandle, int partitionId, long lastRemovedId)
+    private void DropFullyDeadFiles(ColumnFamilyHandle columnFamilyHandle, int partitionId, long compactionFloor)
     {
-        try
-        {
-            byte[] rangeBegin = new byte[LogKeyWidth];
-            BuildLogKey(rangeBegin, partitionId, 0);
-            byte[] rangeEnd = new byte[LogKeyWidth];
-            BuildLogKey(rangeEnd, partitionId, lastRemovedId);
+        // Need at least id 1 strictly below the floor for there to be anything to drop.
+        if (compactionFloor < 2)
+            return;
 
-            Native.Instance.rocksdb_delete_file_in_range_cf(
-                db.Handle, columnFamilyHandle.Handle,
-                rangeBegin, (UIntPtr)rangeBegin.Length,
-                rangeEnd, (UIntPtr)rangeEnd.Length);
+        byte[] rangeBegin = new byte[LogKeyWidth];
+        BuildLogKey(rangeBegin, partitionId, 0);
+        byte[] rangeEnd = new byte[LogKeyWidth];
+        BuildLogKey(rangeEnd, partitionId, compactionFloor - 1);
 
-            compactionResumeId[partitionId] = 0;
-        }
-        catch (RocksDbException ex)
+        IntPtr errptr = IntPtr.Zero;
+        Native.Instance.rocksdb_delete_file_in_range_cf(
+            db.Handle, columnFamilyHandle.Handle,
+            rangeBegin, (UIntPtr)rangeBegin.Length,
+            rangeEnd, (UIntPtr)rangeEnd.Length,
+            out errptr);
+
+        if (errptr != IntPtr.Zero)
         {
-            if (logger.IsEnabled(LogLevel.Debug))
-                logger.LogDebug("DeleteFilesInRange for partition {PartitionId} reported: {Message}", partitionId, ex.Message);
+            string message = global::System.Runtime.InteropServices.Marshal.PtrToStringAnsi(errptr) ?? "<unknown>";
+            Native.Instance.rocksdb_free(errptr);
+            logger.LogWarning(
+                "DeleteFilesInRange for partition {PartitionId} below floor {Floor} failed: {Message}; the dead prefix stays until normal compaction removes it",
+                partitionId, compactionFloor, message);
+            return;
         }
+
+        compactionResumeId[partitionId] = 0;
     }
 
     /// <summary>
@@ -2975,6 +3064,14 @@ public class RocksDbWAL : IWAL, IDisposable
         cfOptions.SetLevel0FileNumCompactionTrigger(tuning.ShardLevel0FileNumCompactionTrigger);
         cfOptions.SetLevel0SlowdownWritesTrigger(tuning.ShardLevel0SlowdownWritesTrigger);
         cfOptions.SetLevel0StopWritesTrigger(tuning.ShardLevel0StopWritesTrigger);
+
+        // Layout experiment (inert at the defaults): size the base level to hold the live log, or
+        // switch to universal, so range tombstones annihilate entries without the L0→L6 cascade.
+        if (tuning.ShardMaxBytesForLevelBase > 0)
+            cfOptions.SetMaxBytesForLevelBase((ulong)tuning.ShardMaxBytesForLevelBase);
+        if (tuning.ShardUniversalCompaction)
+            cfOptions.SetCompactionStyle(Compaction.Universal);
+
         return cfOptions;
     }
 

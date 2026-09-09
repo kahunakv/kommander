@@ -423,6 +423,67 @@ public sealed class TestRocksDbCommitFrontier
         }
     }
 
+    /// <summary>
+    /// The whole-file drop must physically reclaim the SST bytes of a dead prefix that has reached a
+    /// bottom level, and the drop is anchored at the compaction FLOOR — not the (cap-bounded) slice
+    /// this pass tombstoned — so a small pass still reclaims the whole dead prefix. This is the
+    /// L6-non-reclaim the w3 probe surfaced, isolated: with the old <c>lastRemovedId</c> bound a
+    /// pass capped at 500 would leave the L6 file (largest key 2000) undropped; the floor bound
+    /// (2001) drops it. The dead prefix is compacted to the bottom first because RocksDB
+    /// <c>DeleteFilesInRange</c> is a no-op on L0.
+    /// </summary>
+    [Fact]
+    public void WholeFileDrop_ReclaimsBottomLevelBytesOfDeadPrefix_AnchoredAtFloor()
+    {
+        string path = CreateTempWalPath();
+
+        try
+        {
+            using RocksDbWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false);
+
+            // Poorly-compressible payload so the on-disk size is real (a zero buffer would Snappy
+            // down to almost nothing and make the byte assertion meaningless).
+            byte[] payload = new byte[4096];
+            for (int i = 0; i < payload.Length; i++)
+                payload[i] = (byte)((i * 2654435761L) >> 13);
+
+            List<RaftLog> deadPrefix = [];
+            for (long id = 1; id <= 2000; id++)
+                deadPrefix.Add(Committed(id, 5, payload));
+            Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, deadPrefix)]));
+            wal.FlushMemTablesForTesting(wait: true);
+
+            Assert.Equal(RaftOperationStatus.Success, wal.Write(
+                [(Partition, [new RaftLog { Id = 2001, Term = 5, Type = RaftLogType.CommittedCheckpoint, LogType = "chk" }])]));
+            wal.FlushMemTablesForTesting(wait: true);
+
+            // DeleteFilesInRange only acts on L1+, so push the data down first — the natural fate of
+            // an entry that outlived L0 in production.
+            wal.CompactShardToBottomForTesting(Partition);
+
+            long before = wal.GetShardLiveSstBytes();
+            Assert.True(before > 1_000_000, $"expected the payload prefix on disk, saw {before} bytes");
+
+            // Cap the pass at 500 entries, far below the 2000-entry prefix: the floor-anchored drop
+            // must still reclaim the whole dead prefix, which the old lastRemovedId bound could not.
+            (RaftOperationStatus status, int removed) = wal.CompactLogsOlderThan(
+                Partition, lastCheckpoint: 2001, compactNumberEntries: 100, maxTotalEntries: 500);
+            Assert.Equal(RaftOperationStatus.Success, status);
+
+            long after = wal.GetShardLiveSstBytes();
+
+            Assert.True(after < before / 2,
+                $"whole-file drop did not reclaim the dead prefix: {before} -> {after} bytes (removed {removed})");
+
+            // The surviving checkpoint row is intact.
+            Assert.Equal(2001, Assert.Single(wal.ReadLogs(Partition)).Id);
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
     private static RaftLog Proposed(long id, long term, byte[]? payload = null) =>
         new() { Id = id, Term = term, Type = RaftLogType.Proposed, LogType = "op", LogData = payload };
 

@@ -390,6 +390,17 @@ public static class KommanderMetrics
             description: "1 while the RocksDB WAL engine has stopped writes entirely (hard stall), else 0.");
 
         Meter.CreateObservableGauge(
+            "raft.wal.shard_live_sst_bytes",
+            MeasureWalShardLiveSstBytes,
+            unit: "By",
+            description: "Live SST bytes across the Raft-log shard CFs. Far above the retained window means dead files are not being reclaimed.");
+
+        Meter.CreateObservableGauge(
+            "raft.wal.shard_l6_files",
+            MeasureWalShardLevel6Files,
+            description: "SST file count in the bottom level (L6) across the Raft-log shard CFs; a flat, high value signals whole-file drops are not landing.");
+
+        Meter.CreateObservableGauge(
             "raft.executor.client_queue_depth",
             MeasureClientQueueDepths,
             description: "Current number of client proposals pending in each partition executor's queue.");
@@ -454,6 +465,12 @@ public static class KommanderMetrics
 
     private static IEnumerable<Measurement<long>> MeasureWalWriteStopped() =>
         MeasureWalEngines(static wal => wal.GetIsWriteStopped());
+
+    private static IEnumerable<Measurement<long>> MeasureWalShardLiveSstBytes() =>
+        MeasureWalEngines(static wal => wal.GetShardLiveSstBytes());
+
+    private static IEnumerable<Measurement<long>> MeasureWalShardLevel6Files() =>
+        MeasureWalEngines(static wal => wal.GetShardLevel6FileCount());
 
     private static List<Measurement<long>> MeasureWalEngines(Func<Kommander.WAL.RocksDbWAL, long> read)
     {
