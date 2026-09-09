@@ -198,6 +198,77 @@ public sealed class TestRocksDbWAL
         }
     }
 
+    /// <summary>
+    /// The shard-CF sizing is applied at open time only, so a database written under one tuning
+    /// must read back identically under another (and under the default). Pins that the tuning is
+    /// an engine-configuration concern with no on-disk format footprint.
+    /// </summary>
+    [Fact]
+    public void CustomTuning_RoundTripsAndReopensUnderDifferentTuning()
+    {
+        string path = CreateTempWalPath();
+
+        try
+        {
+            RocksDbWalTuning small = new()
+            {
+                ShardWriteBufferSizeBytes = 8 * 1024 * 1024,
+                ShardMinWriteBufferNumberToMerge = 1,
+                ShardMaxWriteBufferNumber = 2,
+                ShardLevel0FileNumCompactionTrigger = 4,
+                ShardLevel0SlowdownWritesTrigger = 20,
+                ShardLevel0StopWritesTrigger = 36,
+            };
+
+            using (RocksDbWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false, tuning: small))
+            {
+                Assert.Equal(
+                    RaftOperationStatus.Success,
+                    wal.Write([(3, [CreateLog(3, id: 1, term: 7), CreateLog(3, id: 2, term: 7)])]));
+
+                Assert.Equal([1L, 2L], wal.ReadLogs(3).Select(l => l.Id));
+            }
+
+            using (RocksDbWAL reopened = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false))
+            {
+                List<RaftLog> logs = reopened.ReadLogs(3);
+                Assert.Equal([1L, 2L], logs.Select(l => l.Id));
+                Assert.All(logs, log => Assert.Equal(7, log.Term));
+            }
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    /// <summary>
+    /// A merge quorum equal to (or above) the memtable cap write-stalls every rotation: the flush
+    /// waits for the quorum while the writer waits for a free memtable. The constructor must
+    /// refuse the configuration instead of shipping a WAL that stalls the Raft path by design.
+    /// </summary>
+    [Fact]
+    public void TuningWithoutMemtableHeadroom_IsRejected()
+    {
+        string path = CreateTempWalPath();
+
+        try
+        {
+            RocksDbWalTuning deadlocked = new()
+            {
+                ShardMinWriteBufferNumberToMerge = 2,
+                ShardMaxWriteBufferNumber = 2,
+            };
+
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                new RocksDbWAL(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false, tuning: deadlocked));
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
     private static RaftLog CreateLog(int partitionId, long id, long term, RaftLogType type = RaftLogType.Committed)
     {
         return new()

@@ -126,7 +126,7 @@ public sealed class TestNodeLifecycleScenarios
     /// A crashed follower that comes back one committed entry short is repaired on an idle range,
     /// with no client write after the recovery.
     ///
-    /// <para>This is the voter half of the LiveCommitFloor confinement (vorpal 32348e83). The gap
+    /// <para>This is the voter half of the LiveCommitFloor confinement finding. The gap
     /// is far under BackfillThreshold, and the outage costs the cluster an election: the old
     /// leader is paused while the victim is down, so the third node wins the term and the missing
     /// entry is merely-restored state to it. Its LiveCommitFloor equals its committed frontier, no

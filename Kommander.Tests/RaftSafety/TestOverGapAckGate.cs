@@ -10,7 +10,7 @@ namespace Kommander.Tests.RaftSafety;
 
 /// <summary>
 /// Regression tests for the quorum-integrity gate on follower append acks (the Scenario09
-/// applied-prefix hole, Vorpal feature 84c75177-4f4d-4db5-8b72-f19b90cf5c21).
+/// applied-prefix hole).
 ///
 /// <para>The leader counts a Success append ack toward propose quorum with no further proof,
 /// while election freshness advertises only the CONTIGUOUS presence frontier. A follower that

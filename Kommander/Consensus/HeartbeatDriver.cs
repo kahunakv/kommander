@@ -180,7 +180,7 @@ internal sealed class HeartbeatDriver
             // Without this, a voter that missed one committed entry (crash-restart, a refused
             // write) on a range that then went idle behind an election was never repaired: the gap
             // sat under BackfillThreshold, and the missing entry was merely-restored state to the
-            // post-outage leader (DST finding, vorpal 32348e83). The floor still confines a voter
+            // post-outage leader (a deterministic-simulation finding). The floor still confines a voter
             // with NO reported committed prefix (frontier absent, -1, or 0): shipping a restored
             // log at a blank voter before the next live write is exactly what the floor exists to
             // prevent (the TestJoinClusterSimultAndDecideLeaderWithHighestWal/HighestTerm

@@ -187,6 +187,15 @@ public class RocksDbWAL : IWAL, IDisposable
     /// When <paramref name="sharedResources"/> is null, behavior is byte-for-byte identical to the
     /// no-arg default: no block cache is configured and RocksDB's built-in defaults apply.
     /// </para>
+    ///
+    /// <para>
+    /// <paramref name="tuning"/> sizes the shard column families (see <see cref="RocksDbWalTuning"/>);
+    /// null applies <see cref="RocksDbWalTuning.Default"/>. Throws
+    /// <see cref="ArgumentOutOfRangeException"/> when the tuning violates the stall-lock guard
+    /// (<c>ShardMaxWriteBufferNumber &lt;= ShardMinWriteBufferNumberToMerge</c>) — that
+    /// configuration write-stalls on every memtable rotation, which is worse than any sizing it
+    /// could buy.
+    /// </para>
     /// </summary>
     public RocksDbWAL(
         string path,
@@ -194,12 +203,20 @@ public class RocksDbWAL : IWAL, IDisposable
         ILogger<IRaft> logger,
         bool syncWrites = true,
         RocksDbSharedResources? sharedResources = null,
-        IMonotonicTickSource? tickSource = null)
+        IMonotonicTickSource? tickSource = null,
+        RocksDbWalTuning? tuning = null)
     {
         // Validated before the path is composed below: the revision is a single directory name under
         // the WAL path, and a separator or relative segment would silently open the database
         // somewhere else entirely.
         WalStoragePaths.ValidateRevision(revision, nameof(revision));
+
+        tuning ??= RocksDbWalTuning.Default;
+        if (tuning.ShardMaxWriteBufferNumber <= tuning.ShardMinWriteBufferNumberToMerge)
+            throw new ArgumentOutOfRangeException(nameof(tuning),
+                $"ShardMaxWriteBufferNumber ({tuning.ShardMaxWriteBufferNumber}) must exceed " +
+                $"ShardMinWriteBufferNumberToMerge ({tuning.ShardMinWriteBufferNumberToMerge}); " +
+                "a flush waits for the merge quorum, so the writer needs one memtable above it.");
 
         this.path = path;
         this.revision = revision;
@@ -245,9 +262,12 @@ public class RocksDbWAL : IWAL, IDisposable
         // Write-buffer sizing when sharing: this WAL has ~10 CFs. With the WBM bounding total memtable
         // memory across all sharing databases, per-CF write_buffer_size × max_write_buffer_number × CF
         // count should be a modest fraction of memtableBudgetBytes to leave headroom for the host DB.
-        // The RocksDB defaults (64 MB write_buffer_size, 2 max_write_buffer_number) give ~1.28 GB for
-        // 10 CFs — far above any typical WBM budget. Hosts sharing a WBM should configure lower values
-        // on both this WAL and their own DB, or accept frequent cross-CF/cross-DB flush coupling.
+        // The default tuning (64 MB write_buffer_size, 4 max_write_buffer_number on the 8 shard CFs;
+        // RocksDB defaults elsewhere) gives ~2.3 GB across 10 CFs on paper — far above any typical WBM
+        // budget, but only actively-written CFs materialize memtables (typically 1–2 shards) and an
+        // over-budget WBM flushes early, which degrades the flush-unit sizing back toward the old
+        // behavior instead of growing memory. Hosts sharing a WBM should size the budget (or pass a
+        // smaller RocksDbWalTuning), or accept frequent cross-CF/cross-DB flush coupling.
         BlockBasedTableOptions? sharedBbto = sharedResources is not null
             ? new BlockBasedTableOptions().SetBlockCache(sharedResources.BlockCache)
             : null;
@@ -267,7 +287,7 @@ public class RocksDbWAL : IWAL, IDisposable
         };
 
         for (int i = 0; i < MaxShards; i++)
-            columnFamilies.Add("shard" + i, ApplyShardCfOptions(new(), sharedBbto));
+            columnFamilies.Add("shard" + i, ApplyShardCfOptions(new(), sharedBbto, tuning));
 
         string completePath = $"{path}/{revision}";
 
@@ -2938,18 +2958,23 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <summary>
     /// Options for the shard column families, which hold the append-then-die log rows. On the
     /// RocksDB defaults (trigger 4 / slowdown 20 / stop 36) the log's write rate outran L0
-    /// compaction and RocksDB throttled the Raft writer. The raised L0 triggers give the (now
-    /// larger) background pool headroom before a slowdown, and let short-lived rows meet their
-    /// range tombstone in the L0→base compaction instead of being rewritten down the levels first.
-    /// Deliberately memory-neutral: write-buffer sizes and counts stay at the defaults, so the
-    /// shared write-buffer-manager budgeting documented in the constructor is unchanged.
+    /// compaction and RocksDB throttled the Raft writer; the raised L0 triggers give the (now
+    /// larger) background pool headroom before a slowdown. The write-buffer sizing widens the
+    /// flush unit so an entry and the range tombstone that kills it co-reside and are dropped at
+    /// flush — the CF-sizing lever against the compaction rewrite of floor-held entries measured
+    /// in probe w2 (compaction wrote 3.7x the flushed bytes). All values come from
+    /// <see cref="RocksDbWalTuning"/>, which documents the reasoning and the memory envelope.
     /// </summary>
-    private static ColumnFamilyOptions ApplyShardCfOptions(ColumnFamilyOptions cfOptions, BlockBasedTableOptions? sharedBbto)
+    private static ColumnFamilyOptions ApplyShardCfOptions(
+        ColumnFamilyOptions cfOptions, BlockBasedTableOptions? sharedBbto, RocksDbWalTuning tuning)
     {
         ApplyCfOptions(cfOptions, sharedBbto);
-        cfOptions.SetLevel0FileNumCompactionTrigger(8);
-        cfOptions.SetLevel0SlowdownWritesTrigger(28);
-        cfOptions.SetLevel0StopWritesTrigger(44);
+        cfOptions.SetWriteBufferSize((ulong)tuning.ShardWriteBufferSizeBytes);
+        cfOptions.SetMinWriteBufferNumberToMerge(tuning.ShardMinWriteBufferNumberToMerge);
+        cfOptions.SetMaxWriteBufferNumber(tuning.ShardMaxWriteBufferNumber);
+        cfOptions.SetLevel0FileNumCompactionTrigger(tuning.ShardLevel0FileNumCompactionTrigger);
+        cfOptions.SetLevel0SlowdownWritesTrigger(tuning.ShardLevel0SlowdownWritesTrigger);
+        cfOptions.SetLevel0StopWritesTrigger(tuning.ShardLevel0StopWritesTrigger);
         return cfOptions;
     }
 
