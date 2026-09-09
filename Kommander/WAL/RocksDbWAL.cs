@@ -140,7 +140,8 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <see cref="DeletePartitionWAL"/> — a wiped partition may be reused from low ids — which removes the
     /// hint. Appends only ever add keys at the tail (above the hint), and a snapshot boundary only writes a
     /// <see cref="RaftLogType.CommittedCheckpoint"/> at/above the compaction floor (never a deletable key
-    /// below the hint), so neither can break the invariant.</para>
+    /// below the hint), so neither can break the invariant. <see cref="DropFullyDeadFiles"/> can make a
+    /// dead key resurface below the hint, so it resets the hint to 0 (see its summary).</para>
     /// </summary>
     private readonly ConcurrentDictionary<int, long> compactionResumeId = new();
 
@@ -163,6 +164,13 @@ public class RocksDbWAL : IWAL, IDisposable
 
     /// <summary>For tests: number of <c>db.Write</c> calls issued by the last compaction call.</summary>
     internal int LastCompactionWriteCount { get; private set; }
+
+    /// <summary>
+    /// For tests: number of <c>Committed</c> markers this instance absorbed into the persisted
+    /// commit frontier instead of rewriting the full entry. Incremented only after the absorbing
+    /// batch was applied, so the count never runs ahead of durable state.
+    /// </summary>
+    internal long CommitMarkersAbsorbed { get; private set; }
     
     /// <summary>
     /// Opens a RocksDB WAL at <paramref name="path"/>/<paramref name="revision"/>.
@@ -244,6 +252,14 @@ public class RocksDbWAL : IWAL, IDisposable
             ? new BlockBasedTableOptions().SetBlockCache(sharedResources.BlockCache)
             : null;
 
+        // More compaction/flush workers than the RocksDB default of 2: with ten column families on
+        // a multi-core host, two background jobs cannot drain L0 under sustained log append, and
+        // the resulting l0-file-count slowdowns land directly in the Raft quorum path (measured as
+        // "Stalling writes because we have 20 level-0 files" on all three nodes of the 2026-09-09
+        // write probe). Threads are lazy in RocksDB, so an idle deployment pays nothing.
+        Native.Instance.rocksdb_options_set_max_background_jobs(
+            dbOptions.Handle, Math.Clamp(Environment.ProcessorCount / 2, 2, 8));
+
         ColumnFamilies columnFamilies = new()
         {
             { "default", ApplyCfOptions(new(), sharedBbto) },
@@ -251,7 +267,7 @@ public class RocksDbWAL : IWAL, IDisposable
         };
 
         for (int i = 0; i < MaxShards; i++)
-            columnFamilies.Add("shard" + i, ApplyCfOptions(new(), sharedBbto));
+            columnFamilies.Add("shard" + i, ApplyShardCfOptions(new(), sharedBbto));
 
         string completePath = $"{path}/{revision}";
 
@@ -270,6 +286,11 @@ public class RocksDbWAL : IWAL, IDisposable
         db = RocksDb.Open(dbOptions, completePath, columnFamilies);
 
         metadataColumnFamily = db.GetColumnFamily("metadata");
+
+        // Registered (weakly) for the raft.wal.delayed_write_rate / raft.wal.write_stalled gauges,
+        // so an engine-level write stall in the Raft path is visible in ordinary node telemetry
+        // rather than only inside the RocksDB LOG file.
+        KommanderMetrics.RegisterWalEngine(this);
 
         if (firstTime)
             SetMetaData("version", FormatVersion);
@@ -589,6 +610,10 @@ public class RocksDbWAL : IWAL, IDisposable
             // Column-family handles belong to the engine instance that issued them.
             families.Clear();
 
+            // The cached commit frontiers describe the engine instance being closed; the reopened
+            // engine reloads them from its metadata CF, which reflects exactly what was replayed.
+            commitFrontierCache.Clear();
+
             try
             {
                 db.Dispose();
@@ -621,6 +646,32 @@ public class RocksDbWAL : IWAL, IDisposable
             logger.LogCritRocksDbWalReopenFailed(enginePath, ex.Message);
 
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Bytes/second RocksDB is currently throttling writers to, or 0 when no slowdown is active.
+    /// Read from the engine's <c>rocksdb.actual-delayed-write-rate</c> property for the stall
+    /// gauge; never throws — a closed or failing engine reports 0 (no stall evidence, not "healthy").
+    /// </summary>
+    internal long GetActualDelayedWriteRate() => ReadIntegerProperty("rocksdb.actual-delayed-write-rate");
+
+    /// <summary>1 while RocksDB has stopped writes entirely (the hard stall), else 0. See <see cref="GetActualDelayedWriteRate"/>.</summary>
+    internal long GetIsWriteStopped() => ReadIntegerProperty("rocksdb.is-write-stopped");
+
+    private long ReadIntegerProperty(string property)
+    {
+        if (engineClosed)
+            return 0;
+
+        try
+        {
+            using EngineLease lease = AcquireEngine();
+            return long.TryParse(db.GetProperty(property), out long value) ? value : 0;
+        }
+        catch (Exception)
+        {
+            return 0;
         }
     }
 
@@ -696,6 +747,8 @@ public class RocksDbWAL : IWAL, IDisposable
         // checkpoint write, so restore no longer pays a reverse scan of the post-checkpoint tail.
         long lastCheckpoint = GetLastCheckpointFromMeta(partitionId);
 
+        long commitFrontier = GetCommitFrontier(partitionId);
+
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         
         long startLogId = Math.Max(0, lastCheckpoint);
@@ -719,10 +772,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 continue;
             }
 
-            //if (partitionId == 1)
-            //    Console.WriteLine("{0} {1}", iterator.StringKey(), view.Id);
-
-            result.Add(ToRaftLog(view));
+            result.Add(ToRaftLog(view, commitFrontier));
 
             iterator.Next();
         }
@@ -754,6 +804,8 @@ public class RocksDbWAL : IWAL, IDisposable
 
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
+        long commitFrontier = GetCommitFrontier(partitionId);
+
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
 
         Span<byte> seekKey = stackalloc byte[LogKeyWidth];
@@ -784,7 +836,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 break;
 
             payloadBytes += view.Log.Length;
-            result.Add(ToRaftLog(view));
+            result.Add(ToRaftLog(view, commitFrontier));
 
             iterator.Next();
 
@@ -895,6 +947,43 @@ public class RocksDbWAL : IWAL, IDisposable
                     return RaftOperationStatus.Success;
                 }
 
+                if (log.Type == RaftLogType.Committed)
+                {
+                    long frontier = GetCommitFrontier(partitionId);
+
+                    // Duplicate marker for an id the durable frontier already certifies: nothing to write.
+                    if (log.Id <= frontier)
+                        return RaftOperationStatus.Success;
+
+                    (long advanced, bool absorbed) = TryAdvanceFrontierFor(
+                        partitionId, columnFamilyHandle, frontier, log, stagedProposed: null, stagedResolved: null);
+
+                    if (absorbed)
+                    {
+                        // The whole commit is one small metadata put instead of a full-payload row
+                        // rewrite — the write-amplification fix this frontier exists for.
+                        db.Put(CommitFrontierKey(partitionId), Encoding.UTF8.GetBytes(advanced.ToString()),
+                               metadataColumnFamily, effectiveOptions);
+                        RaiseCommitFrontierCache(partitionId, advanced);
+                        CommitMarkersAbsorbed++;
+                        return RaftOperationStatus.Success;
+                    }
+
+                    if (advanced > frontier)
+                    {
+                        // Partial catch-up: the marker still writes its full row, but the certified
+                        // prefix advance is persisted alongside it so re-anchoring converges.
+                        using WriteBatch commitBatch = new();
+                        PutLogToBatch(commitBatch, partitionId, log, columnFamilyHandle);
+                        PutCommitFrontierToBatch(commitBatch, partitionId, advanced);
+                        db.Write(commitBatch, effectiveOptions);
+                        RaiseCommitFrontierCache(partitionId, advanced);
+                        return RaftOperationStatus.Success;
+                    }
+
+                    // No advance (unresolved gap / divergent term / absent row): plain full-row write.
+                }
+
                 Span<byte> buffer = stackalloc byte[LogKeyWidth];
                 BuildLogKey(buffer, partitionId, log.Id);
 
@@ -983,18 +1072,63 @@ public class RocksDbWAL : IWAL, IDisposable
             }
             
             using WriteBatch writeBatch = new();
-            
+
+            // Frontier advances computed while staging (absorbed commit markers + checkpoint seeds),
+            // applied to the cache only after db.Write succeeds. Lazily allocated: a propose-only
+            // batch (the hot leader path) never touches it.
+            Dictionary<int, long>? frontierAdvances = null;
+            long markersAbsorbedThisCall = 0;
+
             foreach ((ColumnFamilyHandle key, Dictionary<int, List<RaftLog>> raftLogs) in plan)
             {
-                //int count = 0;
-
                 foreach (KeyValuePair<int, List<RaftLog>> kv in raftLogs)
                 {
-                    foreach (RaftLog log in kv.Value)
-                        PutLogToBatch(writeBatch, kv.Key, log, key);
-                }
+                    int partitionId = kv.Key;
+                    long frontier = GetCommitFrontier(partitionId);
+                    long pendingFrontier = frontier;
 
-                //Console.WriteLine("Batch of {0}", count);
+                    // Rows staged in THIS batch, split by resolution state: the frontier probes read
+                    // the CF, which cannot see rows still staged in the write batch, so staged rows
+                    // count via these sets. A later staging of the same id replaces its membership,
+                    // mirroring RocksDB's last-put-wins within a batch.
+                    HashSet<long>? stagedProposed = null;
+                    HashSet<long>? stagedResolved = null;
+
+                    foreach (RaftLog log in kv.Value)
+                    {
+                        if (log.Type == RaftLogType.Committed)
+                        {
+                            // Marker already certified by the (pending) frontier: nothing to stage.
+                            if (log.Id <= pendingFrontier)
+                                continue;
+
+                            (long advanced, bool absorbed) = TryAdvanceFrontierFor(
+                                partitionId, key, pendingFrontier, log, stagedProposed, stagedResolved);
+                            pendingFrontier = advanced;
+                            if (absorbed)
+                            {
+                                markersAbsorbedThisCall++;
+                                continue;
+                            }
+                        }
+
+                        PutLogToBatch(writeBatch, partitionId, log, key);
+
+                        if (log.Type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
+                        {
+                            (stagedProposed ??= []).Add(log.Id);
+                            stagedResolved?.Remove(log.Id);
+                        }
+                        else
+                        {
+                            (stagedResolved ??= []).Add(log.Id);
+                            stagedProposed?.Remove(log.Id);
+                        }
+                    }
+
+                    if (pendingFrontier > frontier)
+                        (frontierAdvances ??= new())[partitionId] = pendingFrontier;
+                }
             }
 
             // Stage the persisted last-checkpoint update for any partition that committed a checkpoint in
@@ -1020,7 +1154,21 @@ public class RocksDbWAL : IWAL, IDisposable
                         partitionId, batchMaxCheckpoint, currentFloor, firstMissing);
             }
 
+            if (frontierAdvances is not null)
+            {
+                foreach ((int partitionId, long value) in frontierAdvances)
+                    PutCommitFrontierToBatch(writeBatch, partitionId, value);
+            }
+
             db.Write(writeBatch, effectiveOptions);
+
+            if (frontierAdvances is not null)
+            {
+                foreach ((int partitionId, long value) in frontierAdvances)
+                    RaiseCommitFrontierCache(partitionId, value);
+            }
+
+            CommitMarkersAbsorbed += markersAbsorbedThisCall;
 
             return RaftOperationStatus.Success;
             }
@@ -1538,14 +1686,24 @@ public class RocksDbWAL : IWAL, IDisposable
     /// outlives the iterator position the bytes came from — and after this change it is the only
     /// per-entry allocation on the range-scan path apart from the <see cref="RaftLog"/> itself, since
     /// <c>logType</c> is served from <see cref="InternLogType"/>'s cache.
+    /// <para>
+    /// <paramref name="commitFrontier"/> derives the EFFECTIVE type: a <see cref="RaftLogType.Proposed"/>
+    /// row at or below the frontier reads as <see cref="RaftLogType.Committed"/>, because the frontier
+    /// is where the commit was persisted (see the commit-frontier region) — the row itself was
+    /// deliberately not rewritten. Every other type carries its own on-disk value.
+    /// </para>
     /// </summary>
-    private static RaftLog ToRaftLog(in RaftLogWireView view)
+    private static RaftLog ToRaftLog(in RaftLogWireView view, long commitFrontier)
     {
+        RaftLogType type = (RaftLogType)view.Type;
+        if (type == RaftLogType.Proposed && view.Id <= commitFrontier)
+            type = RaftLogType.Committed;
+
         return new()
         {
             Id = view.Id,
             Term = view.Term,
-            Type = (RaftLogType)view.Type,
+            Type = type,
             Time = new(view.TimeNode, view.TimePhysical, view.TimeCounter),
             LogType = InternLogType(view.LogType),
             LogData = view.HasLog ? (view.Log.IsEmpty ? [] : view.Log.ToArray()) : null
@@ -1895,6 +2053,245 @@ public class RocksDbWAL : IWAL, IDisposable
     private void DeleteLastCheckpointFromBatch(WriteBatch writeBatch, int partitionId) =>
         writeBatch.Delete(LastCheckpointKey(partitionId), cf: metadataColumnFamily);
 
+    // ── Persisted commit frontier ────────────────────────────────────────────────────────────────
+    //
+    // Field finding (2026-09-09 write probe): every committed entry crossed the RocksDB WAL twice —
+    // once as its Proposed row, once as the byte-identical full row rewritten with Type=Committed —
+    // which made the commit path responsible for roughly half of this database's WAL bytes. The
+    // commit carries one bit of information, so it is persisted as one small metadata value instead:
+    // a per-partition COMMIT FRONTIER, the highest id F such that every row with id <= F is
+    // resolved. A Proposed row with id <= F reads as Committed (see ToRaftLog); rows above F carry
+    // their own on-disk type, exactly as before.
+    //
+    // Safety properties, all load-bearing:
+    //  * The frontier only advances over rows that are durably present with the SAME term as the
+    //    commit marker (probed via a point header read, or staged as Proposed in the same
+    //    WriteBatch, which lands atomically with the frontier put). A divergent-term row, an
+    //    absent row (backfill first-writes), a rollback, or a commit over an unresolved gap still
+    //    writes the full row, so nothing is ever representable only in memory.
+    //  * Same-partition Write calls are serialized FIFO by FairWalScheduler (single writer per
+    //    partition), so the read-modify-write of the frontier never races another Write. The
+    //    truncation/boundary paths mutate it under the exclusive side of writeGuard, which Write's
+    //    shared side already excludes.
+    //  * Truncations CLAMP the frontier to the surviving prefix. Without the clamp, a fresh
+    //    Proposed row later written at a truncated id would read as Committed.
+    //  * The frontier NEVER certifies a Proposed row it did not row-verify: reads of rows below a
+    //    checkpoint (or a snapshot boundary) keep their on-disk type exactly as before. Nodes whose
+    //    history began with a snapshot or backfill re-anchor through the bounded catch-up walk in
+    //    TryAdvanceFrontierFor, which passes only row-resolved entries and compacted ids the
+    //    persisted checkpoint certifies — see its summary.
+    //  * An older binary that ignores the frontier key reads absorbed entries as Proposed. That is
+    //    the conservative direction: restore reconstructs a lower commit frontier and the leader
+    //    re-supply / current-term re-commit paths deliver the entries, the same recovery the
+    //    two-fsync follower crash case already relies on. No format-version bump is needed —
+    //    absence of the key degrades to the pre-frontier behavior.
+    //
+    // The absorb fast path applies to plain Committed markers only. CommittedCheckpoint rows keep
+    // the full-row path (they are rare and anchor recovery); rollbacks keep full rows (rare).
+
+    /// <summary>
+    /// Bound on the gap the frontier may verify row-by-row when a commit lands above F+1. A
+    /// transient reorder of the commit broadcast leaves a short run of full-row Committed entries;
+    /// probing them lets the frontier re-chain instead of stalling until the next checkpoint. A
+    /// gap larger than this writes the full row (safe fallback), so the per-marker probe cost
+    /// stays bounded.
+    /// </summary>
+    private const int FrontierCatchUpBound = 64;
+
+    /// <summary>Cache for <see cref="CommitFrontierKey"/>; key bytes are immutable once built.</summary>
+    private readonly ConcurrentDictionary<int, byte[]> commitFrontierKeys = new();
+
+    /// <summary>
+    /// In-memory copy of the persisted commit frontier per partition. Raised only AFTER the
+    /// advancing batch was applied (never ahead of durable state), set exactly under the exclusive
+    /// write guard by the truncation paths, and cleared by <see cref="ReopenEngine"/> so a reopened
+    /// engine reloads from metadata.
+    /// </summary>
+    private readonly ConcurrentDictionary<int, long> commitFrontierCache = new();
+
+    /// <summary>Builds the metadata-CF key that stores the commit frontier for a partition.</summary>
+    private byte[] CommitFrontierKey(int partitionId) =>
+        commitFrontierKeys.GetOrAdd(partitionId, static pid => Encoding.UTF8.GetBytes($"raft_commit_frontier_p{pid}"));
+
+    /// <summary>
+    /// Returns the commit frontier for <paramref name="partitionId"/> (0 = nothing certified),
+    /// loading it from the metadata CF on first use.
+    /// </summary>
+    private long GetCommitFrontier(int partitionId)
+    {
+        if (commitFrontierCache.TryGetValue(partitionId, out long cached))
+            return cached;
+
+        byte[] value = db.Get(CommitFrontierKey(partitionId), cf: metadataColumnFamily);
+        long persisted = value is not null && long.TryParse(Encoding.UTF8.GetString(value), out long id) ? id : 0;
+
+        return commitFrontierCache.TryAdd(partitionId, persisted) ? persisted : commitFrontierCache[partitionId];
+    }
+
+    /// <summary>Stages a commit-frontier put so it lands atomically with the batch's row mutations.</summary>
+    private void PutCommitFrontierToBatch(WriteBatch writeBatch, int partitionId, long value) =>
+        writeBatch.Put(CommitFrontierKey(partitionId), Encoding.UTF8.GetBytes(value.ToString()), cf: metadataColumnFamily);
+
+    /// <summary>
+    /// Raises the cached frontier monotonically. Used after a successful advancing write; a raise
+    /// can never certify more than the value that was just made durable.
+    /// </summary>
+    private void RaiseCommitFrontierCache(int partitionId, long value) =>
+        commitFrontierCache.AddOrUpdate(partitionId, static (_, v) => v, static (_, old, v) => Math.Max(old, v), value);
+
+    /// <summary>
+    /// Reads only the header of the row at (<paramref name="partitionId"/>, <paramref name="logId"/>)
+    /// via <see cref="HeaderSpanDeserializer"/>. Returns <c>Found=false</c> when the key is absent.
+    /// </summary>
+    private (bool Found, long Term, int Type) ProbeRowHeader(int partitionId, ColumnFamilyHandle cf, long logId)
+    {
+        Span<byte> key = stackalloc byte[LogKeyWidth];
+        BuildLogKey(key, partitionId, logId);
+        return db.Get(key, HeaderSpanDeserializer.Instance, cf: cf);
+    }
+
+    /// <summary>
+    /// Decides how far the frontier may advance for the plain <see cref="RaftLogType.Committed"/>
+    /// marker <paramref name="log"/>, walking upward from <paramref name="pendingFrontier"/>.
+    /// <c>Absorbed</c> is <see langword="true"/> when the walk reached <c>log.Id</c> itself — the
+    /// marker then needs no row write at all. A partial advance (the walk certified part of the
+    /// gap before stopping or exhausting its budget) is still returned and persisted, so a node
+    /// re-anchoring after a snapshot or backfill converges across batches instead of never.
+    ///
+    /// <para>The walk may pass an id only on evidence that keeps every read byte-identical:</para>
+    /// <list type="bullet">
+    ///   <item>A durably present row of a RESOLVED type (Committed / RolledBack / either
+    ///     checkpoint), or a resolution staged in the current batch (it lands atomically with the
+    ///     frontier put). Never a Proposed row — that is precisely the state the frontier would
+    ///     re-type, and only the absorb of its own marker may certify it.</item>
+    ///   <item>An ABSENT id at or below the persisted last-checkpoint id: the checkpoint only
+    ///     advances over a verified-present prefix, so absence there means compaction removed a
+    ///     certified entry. Passing an absent id transforms no row. Absent spans are crossed with
+    ///     one iterator hop, so a compacted multi-million-entry prefix costs O(1), not O(n).</item>
+    /// </list>
+    ///
+    /// <para>The target row itself must be durably present with the marker's term as
+    /// Proposed/Committed (or staged as Proposed in this batch); a divergent term or an absent row
+    /// (a backfill first-write) refuses the absorb and the full row is written, as before.</para>
+    /// </summary>
+    private (long NewFrontier, bool Absorbed) TryAdvanceFrontierFor(
+        int partitionId,
+        ColumnFamilyHandle cf,
+        long pendingFrontier,
+        RaftLog log,
+        HashSet<long>? stagedProposed,
+        HashSet<long>? stagedResolved)
+    {
+        long target = log.Id;
+        long advanced = pendingFrontier;
+
+        if (advanced < target - 1)
+        {
+            long certifiedFloor = GetLastCheckpointFromMeta(partitionId);
+            int steps = 0;
+
+            using Iterator iterator = db.NewIterator(cf: cf);
+            Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+            BuildLogKey(seekKey, partitionId, advanced + 1);
+            iterator.Seek(seekKey);
+
+            Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
+            BuildPartitionPrefix(partitionPrefix, partitionId);
+
+            while (advanced < target - 1 && steps < FrontierCatchUpBound)
+            {
+                steps++;
+                long next = advanced + 1;
+
+                // Rows staged in the current WriteBatch are invisible to the iterator.
+                if (stagedResolved is not null && stagedResolved.Contains(next))
+                {
+                    advanced = next;
+                    continue;
+                }
+
+                if (stagedProposed is not null && stagedProposed.Contains(next))
+                    return (advanced, false);
+
+                while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix)
+                       && ParseLogIdFromKey(iterator.GetKeySpan()) < next)
+                    iterator.Next();
+
+                long present = iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix)
+                    ? ParseLogIdFromKey(iterator.GetKeySpan())
+                    : long.MaxValue;
+
+                if (present > next)
+                {
+                    if (next > certifiedFloor)
+                        return (advanced, false);
+
+                    // One hop over the whole compacted-certified absent span.
+                    advanced = Math.Min(present - 1, Math.Min(certifiedFloor, target - 1));
+                    continue;
+                }
+
+                ReadHeaderFromWire(iterator.GetValueSpan(), out _, out _, out _, out int type);
+                if (type is not ((int)RaftLogType.Committed
+                                 or (int)RaftLogType.CommittedCheckpoint
+                                 or (int)RaftLogType.RolledBack
+                                 or (int)RaftLogType.RolledBackCheckpoint))
+                    return (advanced, false);
+
+                advanced = next;
+                iterator.Next();
+            }
+
+            if (advanced < target - 1)
+                return (advanced, false);
+        }
+
+        if (stagedProposed is not null && stagedProposed.Contains(target))
+            return (target, true);
+
+        (bool found, long term, int rowType) = ProbeRowHeader(partitionId, cf, target);
+        if (found && term == log.Term
+            && rowType is (int)RaftLogType.Proposed or (int)RaftLogType.Committed)
+            return (target, true);
+
+        return (advanced, false);
+    }
+
+    /// <summary>
+    /// Test-only: rewrites the persisted commit frontier to model a crash that lost the frontier
+    /// put (the counterpart of demoting on-disk commit rows back to Proposed — under the frontier
+    /// design the marker's durability lives in the metadata key, so a faithful crash simulation
+    /// must regress both). A value &lt;= 0 removes the key entirely.
+    /// </summary>
+    internal void RegressCommitFrontierForTesting(int partitionId, long value)
+    {
+        using EngineLease lease = AcquireEngine();
+
+        if (value <= 0)
+            db.Remove(CommitFrontierKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
+        else
+            db.Put(CommitFrontierKey(partitionId), Encoding.UTF8.GetBytes(value.ToString()),
+                   metadataColumnFamily, writeOptions);
+
+        commitFrontierCache[partitionId] = Math.Max(value, 0);
+    }
+
+    /// <summary>
+    /// Cached singleton reading the header fields (term, type) of a row value in place, used by
+    /// the frontier probes. <c>Found</c> disambiguates a missing key (the deserializer only runs
+    /// on a hit).
+    /// </summary>
+    private sealed class HeaderSpanDeserializer : ISpanDeserializer<(bool Found, long Term, int Type)>
+    {
+        public static readonly HeaderSpanDeserializer Instance = new();
+
+        public (bool Found, long Term, int Type) Deserialize(ReadOnlySpan<byte> buffer)
+        {
+            ReadHeaderFromWire(buffer, out _, out _, out long term, out int type);
+            return (true, term, type);
+        }
+    }
+
     /// <summary>
     /// Bounded reverse scan for the highest <see cref="RaftLogType.CommittedCheckpoint"/> id whose id is
     /// <c>≤ upperIdInclusive</c>, or <c>-1</c> if none. Used ONLY on the rare truncation-adjustment path
@@ -1946,9 +2343,10 @@ public class RocksDbWAL : IWAL, IDisposable
 
             ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
-            // Deletes are staged straight into the WriteBatch while iterating — WriteBatch copies the
-            // key and nothing is applied until db.Write — so no per-key byte[] list is materialized
-            // (the same shape CompactLogsOlderThan uses).
+            // One range tombstone covers the partition's entire key span instead of one point
+            // tombstone per entry: a wipe of a large partition previously staged millions of
+            // tombstones that each had to flush and compact. The iterator probe below only decides
+            // whether any log row exists at all (to pick the batch vs standalone metadata delete).
             using WriteBatch writeBatch = new();
             int staged = 0;
 
@@ -1961,30 +2359,42 @@ public class RocksDbWAL : IWAL, IDisposable
                 Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
                 BuildPartitionPrefix(partitionPrefix, partitionId);
 
-                while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix))
+                if (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix))
                 {
-                    writeBatch.Delete(iterator.GetKeySpan(), cf: columnFamilyHandle);
-                    staged++;
-                    iterator.Next();
+                    byte[] rangeBegin = new byte[LogKeyWidth];
+                    BuildLogKey(rangeBegin, partitionId, 0);
+
+                    // ';' sorts above the ':' separator, so this bound is exclusive-above every
+                    // possible log key of the partition and below every key of the next partition.
+                    byte[] rangeEnd = new byte[PartitionIdWidth + 1];
+                    BuildPartitionUpperBoundKey(rangeEnd, partitionId);
+
+                    writeBatch.DeleteRange(rangeBegin, (ulong)rangeBegin.Length, rangeEnd, (ulong)rangeEnd.Length, columnFamilyHandle);
+                    staged = 1;
                 }
             }
 
-            // Always drop the persisted last-checkpoint id too: wiping the partition must not leave a stale
-            // replay floor that a subsequently-reused partition id would inherit (there is no scan fallback
-            // to correct it). Batch it with the log deletes when there are any, else delete it standalone.
+            // Always drop the persisted last-checkpoint id and commit frontier too: wiping the partition
+            // must not leave a stale replay floor — or a stale frontier that would certify rows a reused
+            // partition id later writes — for the next occupant (there is no scan fallback to correct
+            // either). Batch them with the log deletes when there are any, else delete them standalone.
             if (staged > 0)
             {
                 writeBatch.Delete(LastCheckpointKey(partitionId), cf: metadataColumnFamily);
+                writeBatch.Delete(CommitFrontierKey(partitionId), cf: metadataColumnFamily);
                 db.Write(writeBatch, writeOptions);
             }
             else
             {
                 db.Remove(LastCheckpointKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
+                db.Remove(CommitFrontierKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
             }
 
             // Drop the compaction resume hint: a reused partition id may start writing from low ids again,
-            // and a stale (higher) hint would make compaction skip — and leak — those new entries.
+            // and a stale (higher) hint would make compaction skip — and leak — those new entries. The
+            // cached frontier goes with it for the same reuse reason.
             compactionResumeId.TryRemove(partitionId, out _);
+            commitFrontierCache.TryRemove(partitionId, out _);
 
             return RaftOperationStatus.Success;
         }
@@ -2043,6 +2453,16 @@ public class RocksDbWAL : IWAL, IDisposable
                 }
             }
 
+            // Clamp the commit frontier to the truncation boundary, even when no row was staged:
+            // rows the frontier certified may already be gone (compaction can leave the frontier
+            // above the surviving tail), and a fresh Proposed row later written at a truncated id
+            // must never read as Committed through a stale frontier. Staged into the same batch so
+            // the clamp and the deletes land atomically.
+            long clampedFrontier = Math.Max(afterLogId, 0);
+            bool clampFrontier = GetCommitFrontier(partitionId) > clampedFrontier;
+            if (clampFrontier)
+                PutCommitFrontierToBatch(writeBatch, partitionId, clampedFrontier);
+
             if (staged > 0)
             {
                 // If the truncation removes the recorded checkpoint (it sits above afterLogId), recompute
@@ -2059,9 +2479,15 @@ public class RocksDbWAL : IWAL, IDisposable
                     else
                         PutLastCheckpointToBatch(writeBatch, partitionId, surviving);
                 }
-
-                db.Write(writeBatch, writeOptions);
             }
+
+            if (staged > 0 || clampFrontier)
+                db.Write(writeBatch, writeOptions);
+
+            // Exact set (not a raise): truncation is the one path allowed to LOWER the frontier.
+            // Runs under the exclusive writeGuard, so no concurrent Write can interleave a raise.
+            if (clampFrontier)
+                commitFrontierCache[partitionId] = clampedFrontier;
 
             return RaftOperationStatus.Success;
             }
@@ -2104,6 +2530,11 @@ public class RocksDbWAL : IWAL, IDisposable
             {
                 ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
+                // A Proposed row at or below the commit frontier is effectively COMMITTED (the commit
+                // was persisted as the frontier instead of a row rewrite) — deleting it would silently
+                // lose a committed entry. The frontier check therefore joins the type check below.
+                long commitFrontier = GetCommitFrontier(partitionId);
+
                 // Staged directly into the batch — see DeletePartitionWAL for the rationale. This runs
                 // once per follower group batch in steady state, so the per-key byte[] churn mattered.
                 using WriteBatch writeBatch = new();
@@ -2123,7 +2554,8 @@ public class RocksDbWAL : IWAL, IDisposable
                         // Only unresolved (Proposed / ProposedCheckpoint) entries are removable; resolved
                         // entries are quorum-agreed and load-bearing for the commit frontier.
                         ReadHeaderFromWire(iterator.GetValueSpan(), out _, out _, out _, out int type);
-                        if (type is (int)RaftLogType.Proposed or (int)RaftLogType.ProposedCheckpoint)
+                        if (type is (int)RaftLogType.Proposed or (int)RaftLogType.ProposedCheckpoint
+                            && ParseLogIdFromKey(iterator.GetKeySpan()) > commitFrontier)
                         {
                             writeBatch.Delete(iterator.GetKeySpan(), cf: columnFamilyHandle);
                             staged++;
@@ -2260,9 +2692,22 @@ public class RocksDbWAL : IWAL, IDisposable
                 : Math.Max(GetLastCheckpointFromMeta(partitionId), snapshotIndex);
             PutLastCheckpointToBatch(writeBatch, partitionId, newCheckpoint);
 
+            // When the suffix was truncated, every row above the boundary is gone, so a higher
+            // commit frontier must CLAMP to the boundary — a fresh Proposed row later written at a
+            // truncated id must never read as Committed through the stale frontier. The frontier is
+            // deliberately NOT raised to the boundary: it only ever certifies rows it row-verified,
+            // and a raise would re-type any Proposed residue below the boundary on read.
+            long currentFrontier = GetCommitFrontier(partitionId);
+            bool clampFrontier = suffixTruncated && currentFrontier > snapshotIndex;
+            if (clampFrontier)
+                PutCommitFrontierToBatch(writeBatch, partitionId, snapshotIndex);
+
             OnAfterBoundaryScanForTesting?.Invoke();
 
             db.Write(writeBatch, effectiveOptions);
+
+            if (clampFrontier)
+                commitFrontierCache[partitionId] = snapshotIndex;
 
             return (RaftOperationStatus.Success, suffixTruncated);
             }
@@ -2335,6 +2780,8 @@ public class RocksDbWAL : IWAL, IDisposable
             // recorded checkpoint id (which is >= lastCheckpoint) can never be among the deleted keys.
             using WriteBatch writeBatch = new();
             int removed = 0;
+            long firstRemovedId = -1;
+            long lastRemovedId = -1;
 
             // Resume from the hint (the head of live data left by the previous pass) instead of id 0, so we
             // do not re-scan the growing pile of point-delete tombstones below it. Everything under the hint
@@ -2349,14 +2796,21 @@ public class RocksDbWAL : IWAL, IDisposable
             Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
             BuildPartitionPrefix(partitionPrefix, partitionId);
 
-            // Deletion is decided entirely from the key (partition prefix + id), so this pass never reads
-            // an entry's value — the payload of every compacted entry stays in RocksDB's own buffers.
+            // The scan only COUNTS: deletion is decided entirely from the key (partition prefix + id), the
+            // removed count and caps keep their exact semantics, and no entry value is ever read. The
+            // deletion itself is staged below as ONE range tombstone instead of one point tombstone per
+            // entry — the per-key tombstones each had to flush and be compacted down to the level holding
+            // their entry before either disappeared, which is how deleting the log came to dominate this
+            // database's compaction writes (W-Amp 9 on an append-then-delete workload).
             while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix) && removed < passCap)
             {
-                if (ParseLogIdFromKey(iterator.GetKeySpan()) >= lastCheckpoint)
+                long id = ParseLogIdFromKey(iterator.GetKeySpan());
+                if (id >= lastCheckpoint)
                     break;
 
-                writeBatch.Delete(iterator.GetKeySpan(), cf: columnFamilyHandle);
+                if (firstRemovedId < 0)
+                    firstRemovedId = id;
+                lastRemovedId = id;
                 removed++;
 
                 iterator.Next();
@@ -2375,8 +2829,21 @@ public class RocksDbWAL : IWAL, IDisposable
 
             if (removed > 0)
             {
+                // [firstRemoved, lastRemoved + 1): ids in between with no row are covered harmlessly, and
+                // the exclusive end keeps the first surviving entry (the floor entry or the capped
+                // boundary) untouched. Disjoint from previous passes' ranges by construction (the scan
+                // starts at the resume hint), so range tombstones do not pile up over the same span.
+                byte[] rangeBegin = new byte[LogKeyWidth];
+                BuildLogKey(rangeBegin, partitionId, firstRemovedId);
+                byte[] rangeEnd = new byte[LogKeyWidth];
+                BuildLogKey(rangeEnd, partitionId, lastRemovedId + 1);
+                writeBatch.DeleteRange(rangeBegin, (ulong)rangeBegin.Length, rangeEnd, (ulong)rangeEnd.Length, columnFamilyHandle);
+
                 db.Write(writeBatch, writeOptions);
                 LastCompactionWriteCount = 1;
+
+                DropFullyDeadFiles(columnFamilyHandle, partitionId, lastRemovedId);
+
                 logger.LogDebugRemovedFromWal(removed, partitionId);
             }
             else
@@ -2395,6 +2862,49 @@ public class RocksDbWAL : IWAL, IDisposable
         }
     }
     
+    /// <summary>
+    /// Asks RocksDB to physically delete SST files that lie ENTIRELY within the compacted prefix
+    /// <c>[key(partition, 0), key(partition, lastRemovedId)]</c> — dead data reclaimed with zero
+    /// compaction rewrite, which is what removes the bulk of the log's L5/L6 write amplification.
+    /// The inclusive upper bound is <paramref name="lastRemovedId"/> itself (never one above), so a
+    /// file whose largest key is the first surviving entry can never qualify. Files that straddle
+    /// the bound, or that also hold another partition's keys, are left to normal compaction.
+    ///
+    /// <para><b>Resume-hint reset.</b> DeleteFilesInRange may delete a file holding a range
+    /// tombstone while an older version of a covered key survives in a deeper file that straddles
+    /// the bound — the deleted key "resurfaces". Every resurfaced key is dead by definition (it sat
+    /// below a durable checkpoint), but it would violate the <see cref="compactionResumeId"/>
+    /// invariant that nothing deletable lives below the hint, so the hint is reset to 0: the next
+    /// pass re-scans from the head and re-deletes anything that resurfaced. That re-scan is cheap
+    /// now — the covered spans are skipped via the fragmented range-tombstone index, not ground
+    /// over key by key as with point tombstones.</para>
+    ///
+    /// <para>Best-effort: a failure here loses only the early reclaim (normal compaction still
+    /// removes the data), so it is logged at Debug and never fails the pass.</para>
+    /// </summary>
+    private void DropFullyDeadFiles(ColumnFamilyHandle columnFamilyHandle, int partitionId, long lastRemovedId)
+    {
+        try
+        {
+            byte[] rangeBegin = new byte[LogKeyWidth];
+            BuildLogKey(rangeBegin, partitionId, 0);
+            byte[] rangeEnd = new byte[LogKeyWidth];
+            BuildLogKey(rangeEnd, partitionId, lastRemovedId);
+
+            Native.Instance.rocksdb_delete_file_in_range_cf(
+                db.Handle, columnFamilyHandle.Handle,
+                rangeBegin, (UIntPtr)rangeBegin.Length,
+                rangeEnd, (UIntPtr)rangeEnd.Length);
+
+            compactionResumeId[partitionId] = 0;
+        }
+        catch (RocksDbException ex)
+        {
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug("DeleteFilesInRange for partition {PartitionId} reported: {Message}", partitionId, ex.Message);
+        }
+    }
+
     /// <summary>
     /// The largest serialized message size that is serialized onto a <c>stackalloc</c> buffer before
     /// falling back to an <see cref="ArrayPool{T}"/> rental. Bounds stack usage on the write path while
@@ -2422,6 +2932,24 @@ public class RocksDbWAL : IWAL, IDisposable
     {
         if (sharedBbto is not null)
             cfOptions.SetBlockBasedTableFactory(sharedBbto);
+        return cfOptions;
+    }
+
+    /// <summary>
+    /// Options for the shard column families, which hold the append-then-die log rows. On the
+    /// RocksDB defaults (trigger 4 / slowdown 20 / stop 36) the log's write rate outran L0
+    /// compaction and RocksDB throttled the Raft writer. The raised L0 triggers give the (now
+    /// larger) background pool headroom before a slowdown, and let short-lived rows meet their
+    /// range tombstone in the L0→base compaction instead of being rewritten down the levels first.
+    /// Deliberately memory-neutral: write-buffer sizes and counts stay at the defaults, so the
+    /// shared write-buffer-manager budgeting documented in the constructor is unchanged.
+    /// </summary>
+    private static ColumnFamilyOptions ApplyShardCfOptions(ColumnFamilyOptions cfOptions, BlockBasedTableOptions? sharedBbto)
+    {
+        ApplyCfOptions(cfOptions, sharedBbto);
+        cfOptions.SetLevel0FileNumCompactionTrigger(8);
+        cfOptions.SetLevel0SlowdownWritesTrigger(28);
+        cfOptions.SetLevel0StopWritesTrigger(44);
         return cfOptions;
     }
 

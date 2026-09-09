@@ -373,8 +373,22 @@ public static class KommanderMetrics
     private static readonly object _schedulerLock = new();
     private static readonly List<WeakReference<FairWalScheduler>> _registeredSchedulers = [];
 
+    private static readonly object _walEngineLock = new();
+    private static readonly List<WeakReference<Kommander.WAL.RocksDbWAL>> _registeredWalEngines = [];
+
     static KommanderMetrics()
     {
+        Meter.CreateObservableGauge(
+            "raft.wal.delayed_write_rate",
+            MeasureWalDelayedWriteRates,
+            unit: "By/s",
+            description: "Bytes/second RocksDB is currently throttling WAL writers to (0 = no slowdown). Non-zero means the storage engine is stalling the Raft write path.");
+
+        Meter.CreateObservableGauge(
+            "raft.wal.write_stalled",
+            MeasureWalWriteStopped,
+            description: "1 while the RocksDB WAL engine has stopped writes entirely (hard stall), else 0.");
+
         Meter.CreateObservableGauge(
             "raft.executor.client_queue_depth",
             MeasureClientQueueDepths,
@@ -421,6 +435,47 @@ public static class KommanderMetrics
     {
         lock (_schedulerLock)
             _registeredSchedulers.Add(new WeakReference<FairWalScheduler>(scheduler));
+    }
+
+    /// <summary>
+    /// Registers a RocksDB WAL engine so its write-stall state feeds the
+    /// <c>raft.wal.delayed_write_rate</c> / <c>raft.wal.write_stalled</c> observable gauges.
+    /// Called automatically by the <see cref="Kommander.WAL.RocksDbWAL"/> constructor; weak
+    /// references let disposed engines be collected without unregistration.
+    /// </summary>
+    internal static void RegisterWalEngine(Kommander.WAL.RocksDbWAL wal)
+    {
+        lock (_walEngineLock)
+            _registeredWalEngines.Add(new WeakReference<Kommander.WAL.RocksDbWAL>(wal));
+    }
+
+    private static IEnumerable<Measurement<long>> MeasureWalDelayedWriteRates() =>
+        MeasureWalEngines(static wal => wal.GetActualDelayedWriteRate());
+
+    private static IEnumerable<Measurement<long>> MeasureWalWriteStopped() =>
+        MeasureWalEngines(static wal => wal.GetIsWriteStopped());
+
+    private static List<Measurement<long>> MeasureWalEngines(Func<Kommander.WAL.RocksDbWAL, long> read)
+    {
+        List<Measurement<long>> result;
+        lock (_walEngineLock)
+        {
+            result = new List<Measurement<long>>(_registeredWalEngines.Count);
+            List<WeakReference<Kommander.WAL.RocksDbWAL>>? dead = null;
+
+            foreach (WeakReference<Kommander.WAL.RocksDbWAL> wr in _registeredWalEngines)
+            {
+                if (wr.TryGetTarget(out Kommander.WAL.RocksDbWAL? wal))
+                    result.Add(new Measurement<long>(read(wal)));
+                else
+                    (dead ??= []).Add(wr);
+            }
+
+            if (dead is not null)
+                foreach (WeakReference<Kommander.WAL.RocksDbWAL> d in dead)
+                    _registeredWalEngines.Remove(d);
+        }
+        return result;
     }
 
     private static IEnumerable<Measurement<int>> MeasureClientQueueDepths()

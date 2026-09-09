@@ -299,11 +299,14 @@ public sealed class RecoveryReSupplyClusterTests
     /// <summary>
     /// Rewrites ids <paramref name="from"/>..<paramref name="to"/> for the partition from
     /// <see cref="RaftLogType.Committed"/> back to <see cref="RaftLogType.Proposed"/>, preserving term,
-    /// payload and time. Models the on-disk effect of a crash that dropped the lazy commit markers.
+    /// payload and time, and regresses the persisted commit frontier below <paramref name="from"/>.
+    /// Models the on-disk effect of a crash that dropped the lazy commit markers: the marker's
+    /// durability lives partly in commit rows and partly in the frontier metadata key (absorbed
+    /// contiguous markers), and a crash that loses the un-fsynced marker batches loses both together.
     /// </summary>
     private void DemoteCommitMarkers(string tmpDir, string revision, long from, long to)
     {
-        using IWAL wal = new RocksDbWAL(tmpDir, revision, logger, syncWrites: true);
+        using RocksDbWAL wal = new(tmpDir, revision, logger, syncWrites: true);
 
         List<RaftLog> demoted = [];
         foreach (RaftLog log in wal.ReadLogsRange(UserPartition, from))
@@ -315,6 +318,7 @@ public sealed class RecoveryReSupplyClusterTests
         }
 
         Assert.NotEmpty(demoted);
+        wal.RegressCommitFrontierForTesting(UserPartition, from - 1);
         Assert.Equal(RaftOperationStatus.Success, wal.Write([(UserPartition, demoted)]));
     }
 
