@@ -71,7 +71,7 @@ public sealed class TestRocksDbCompactionFloor
     }
 
     [Fact]
-    public void CappedPass_AdvancesFloorToFirstSurvivor_ThenDrainsToCheckpoint()
+    public void CappedPass_AdvancesFloorToEffectiveFloor_CountStaysExact()
     {
         string path = CreateTempWalPath();
 
@@ -82,18 +82,19 @@ public sealed class TestRocksDbCompactionFloor
             Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, Committed(1, 20))]));
             Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, [Checkpoint(21)])]));
 
-            // IWAL contract: a capped pass removes exactly the cap's worth of the oldest rows and the
-            // next pass resumes where it stopped. The floor therefore lands on the first survivor.
+            // The cap bounds the counting scan, not the deletion: the floor is the caller's effective
+            // retention floor and advances to it in one pass (one metadata put, one confined
+            // tombstone). Beyond the cap the count is completed arithmetically and stays exact.
             (_, int removed) = wal.CompactLogsOlderThan(Partition, lastCheckpoint: 21, compactNumberEntries: 4, maxTotalEntries: 8);
-            Assert.Equal(8, removed);
-            Assert.Equal(9, wal.GetCompactionFloorForTesting(Partition));
-            Assert.Equal(9, wal.ReadLogsRange(Partition, 0)[0].Id);
-
-            (_, removed) = wal.CompactLogsOlderThan(Partition, lastCheckpoint: 21, compactNumberEntries: 100, maxTotalEntries: 100);
-            Assert.Equal(12, removed);
+            Assert.Equal(20, removed);
             Assert.Equal(21, wal.GetCompactionFloorForTesting(Partition));
             Assert.Equal([21], wal.ReadLogsRange(Partition, 0).Select(l => l.Id));
             Assert.Equal(0, wal.CountRemovableLogs(Partition));
+
+            (_, removed) = wal.CompactLogsOlderThan(Partition, lastCheckpoint: 21, compactNumberEntries: 100, maxTotalEntries: 100);
+            Assert.Equal(0, removed);
+            Assert.Equal(0, wal.LastCompactionWriteCount);
+            Assert.Equal(21, wal.GetCompactionFloorForTesting(Partition));
         }
         finally
         {
@@ -453,6 +454,57 @@ public sealed class TestRocksDbCompactionFloor
             long live = wal.GetShardLiveSstBytes();
             Assert.True(live < ingested / 2,
                 $"live SST bytes {live} should track the retained window, not the {ingested} bytes ingested");
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    /// <summary>
+    /// The metadata column family (commit frontier and compaction floor puts) never fills its
+    /// memtable, and a RocksDB write-ahead log stays alive until every CF with data in it has
+    /// flushed — so without a cadence of its own it pins every log since its last flush. The WAL
+    /// flushes it once a shard flush unit of rows has been written; the alive logs must therefore
+    /// stay within a few flush units however much is ingested.
+    /// </summary>
+    [Fact]
+    public void MetadataFlushCadence_ReleasesWriteAheadLogs()
+    {
+        string path = CreateTempWalPath();
+
+        try
+        {
+            RocksDbWalTuning tuning = RocksDbWalTuning.Default with
+            {
+                ShardWriteBufferSizeBytes = 1L * 1024 * 1024,
+                ShardMinWriteBufferNumberToMerge = 1,
+                ShardMaxWriteBufferNumber = 3,
+            };
+            using RocksDbWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false, tuning: tuning);
+
+            byte[] payload = IncompressiblePayload(1024);
+            const long total = 40_000; // ~40 MB of rows = 40 flush units of 1 MB
+
+            for (long id = 1; id <= total; id += 100)
+            {
+                Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, Committed(id, id + 99, payload))]));
+                // A frontier-style metadata put per batch, as the commit path issues.
+                Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, [new RaftLog { Id = id + 99, Term = 5, Type = RaftLogType.Committed, LogType = "op" }])]));
+            }
+
+            string engineDir = Path.Combine(path, "wal");
+            long logBytes = WaitUntil(
+                () => Directory.GetFiles(engineDir, "*.log").Sum(f => new FileInfo(f).Length),
+                bytes => bytes < 6L * 1024 * 1024,
+                TimeSpan.FromSeconds(20));
+
+            Assert.True(logBytes < 6L * 1024 * 1024,
+                $"write-ahead logs are pinned: {logBytes >> 20} MB alive for ~40 MB ingested at a 1 MB flush unit");
+
+            // Everything written is still readable — the flushes released logs, not data.
+            Assert.Equal(total, wal.GetMaxLog(Partition));
+            Assert.Equal(RaftLogType.Committed, wal.ReadLogsRange(Partition, total, 1)[0].Type);
         }
         finally
         {

@@ -425,10 +425,10 @@ public sealed class TestRocksDbCommitFrontier
 
     /// <summary>
     /// The whole-file drop must physically reclaim the SST bytes of a dead prefix that has reached a
-    /// bottom level. Reclaim is anchored at the persisted compaction floor, which a capped pass
-    /// advances by exactly its cap (the IWAL contract), so a backlog is reclaimed over consecutive
-    /// passes and is fully gone once a pass removes nothing. This is the L6-non-reclaim the w3
-    /// probe surfaced, isolated. The dead prefix is compacted to the bottom first because RocksDB
+    /// bottom level. Reclaim is anchored at the persisted compaction floor, which a pass advances
+    /// straight to the caller's effective floor regardless of the entry cap (the cap bounds the
+    /// counting scan only), so one pass reclaims the whole dead prefix. This is the L6-non-reclaim
+    /// the w3 probe surfaced, isolated. The dead prefix is compacted to the bottom first because RocksDB
     /// <c>DeleteFilesInRange</c> only considers levels below L0.
     /// </summary>
     [Fact]
@@ -463,24 +463,13 @@ public sealed class TestRocksDbCommitFrontier
             long before = wal.GetShardLiveSstBytes();
             Assert.True(before > 1_000_000, $"expected the payload prefix on disk, saw {before} bytes");
 
-            // Passes capped at 500 entries against a 2000-entry prefix: each advances the floor by its
-            // cap, and once the floor reaches the checkpoint the whole dead prefix has been dropped.
-            int removed = 0;
-            int passes = 0;
-            do
-            {
-                (RaftOperationStatus status, int removedThisPass) = wal.CompactLogsOlderThan(
-                    Partition, lastCheckpoint: 2001, compactNumberEntries: 100, maxTotalEntries: 500);
-                Assert.Equal(RaftOperationStatus.Success, status);
-                removed += removedThisPass;
-                passes++;
-                if (removedThisPass == 0)
-                    break;
-            }
-            while (passes < 10);
-
+            // A pass capped at 500 entries against a 2000-entry prefix: the floor still advances to
+            // the checkpoint and the whole dead prefix is dropped; the count is completed
+            // arithmetically past the cap.
+            (RaftOperationStatus status, int removed) = wal.CompactLogsOlderThan(
+                Partition, lastCheckpoint: 2001, compactNumberEntries: 100, maxTotalEntries: 500);
+            Assert.Equal(RaftOperationStatus.Success, status);
             Assert.Equal(2000, removed);
-            Assert.Equal(5, passes);
 
             long after = wal.GetShardLiveSstBytes();
 

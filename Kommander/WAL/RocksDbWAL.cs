@@ -179,6 +179,26 @@ public class RocksDbWAL : IWAL, IDisposable
     private readonly ConcurrentDictionary<int, long> compactionFloorCache = new();
 
     /// <summary>
+    /// Shard-row bytes written since the metadata column family was last flushed by
+    /// <see cref="NoteShardBytesWritten"/>; compared against <see cref="metadataFlushEveryBytes"/>.
+    /// </summary>
+    private long shardBytesSinceMetadataFlush;
+
+    /// <summary>
+    /// Shard-row bytes after which the metadata CF is flushed so RocksDB can release its
+    /// write-ahead log files. The metadata CF receives one tiny put per Raft batch (the commit
+    /// frontier) and one per compaction pass (the floor) and never fills its memtable on its own,
+    /// yet a write-ahead log stays alive until EVERY column family with data in it has flushed —
+    /// so without this the metadata memtable pinned every log since its last flush (measured:
+    /// 454 MB of <c>.log</c> for 3 MB of SST after 150 s locally; 2.5–3.5 GB per node against
+    /// 0.2–0.9 GB live in the k175 probes), growing the on-disk log and restart replay without
+    /// bound. One shard flush unit (<c>ShardWriteBufferSizeBytes × ShardMinWriteBufferNumberToMerge</c>)
+    /// keeps the alive logs at about two units. The flush is asynchronous (a memtable switch plus
+    /// a background job writing a few-KB SST) and touches no shard memtable.
+    /// </summary>
+    private readonly long metadataFlushEveryBytes;
+
+    /// <summary>
     /// Headroom subtracted from the active-memtable span when confining a compaction tombstone.
     /// <c>rocksdb.num-entries-active-mem-table</c> counts every memtable insertion, including the
     /// tombstones and point deletes this WAL writes, so the span it implies can reach a few ids
@@ -266,6 +286,7 @@ public class RocksDbWAL : IWAL, IDisposable
         this.revision = revision;
         this.logger = logger;
         this.syncWrites = syncWrites;
+        this.metadataFlushEveryBytes = Math.Max(1, tuning.ShardWriteBufferSizeBytes * tuning.ShardMinWriteBufferNumberToMerge);
         this.writeOptions = syncWrites ? SynchronousWriteOptions : NonSynchronousWriteOptions;
         this.tickSource = tickSource ?? SystemMonotonicTickSource.Instance;
 
@@ -1176,6 +1197,8 @@ public class RocksDbWAL : IWAL, IDisposable
                         ArrayPool<byte>.Shared.Return(rented);
                 }
 
+                NoteShardBytesWritten(size);
+
                 return RaftOperationStatus.Success;
             }
             
@@ -1249,6 +1272,7 @@ public class RocksDbWAL : IWAL, IDisposable
             // batch (the hot leader path) never touches it.
             Dictionary<int, long>? frontierAdvances = null;
             long markersAbsorbedThisCall = 0;
+            long shardBytesStaged = 0;
 
             foreach ((ColumnFamilyHandle key, Dictionary<int, List<RaftLog>> raftLogs) in plan)
             {
@@ -1283,7 +1307,7 @@ public class RocksDbWAL : IWAL, IDisposable
                             }
                         }
 
-                        PutLogToBatch(writeBatch, partitionId, log, key);
+                        shardBytesStaged += PutLogToBatch(writeBatch, partitionId, log, key);
 
                         if (log.Type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
                         {
@@ -1340,6 +1364,8 @@ public class RocksDbWAL : IWAL, IDisposable
             }
 
             CommitMarkersAbsorbed += markersAbsorbedThisCall;
+
+            NoteShardBytesWritten(shardBytesStaged);
 
             return RaftOperationStatus.Success;
             }
@@ -1545,7 +1571,7 @@ public class RocksDbWAL : IWAL, IDisposable
     /// intermediates exist per entry. WriteBatch.Put copies the value synchronously, so the
     /// rented/stack buffer is safe to release as soon as the call returns.
     /// </summary>
-    private static void PutLogToBatch(WriteBatch writeBatch, int partitionId, RaftLog log, ColumnFamilyHandle columnFamilyHandle)
+    private static int PutLogToBatch(WriteBatch writeBatch, int partitionId, RaftLog log, ColumnFamilyHandle columnFamilyHandle)
     {
         Span<byte> keyBuffer = stackalloc byte[LogKeyWidth];
         BuildLogKey(keyBuffer, partitionId, log.Id);
@@ -1562,6 +1588,39 @@ public class RocksDbWAL : IWAL, IDisposable
         {
             if (rented is not null)
                 ArrayPool<byte>.Shared.Return(rented);
+        }
+
+        return size;
+    }
+
+    /// <summary>
+    /// Accounts shard-row bytes just written and, once a flush unit has accumulated, flushes the
+    /// metadata column family (asynchronously) so RocksDB can release the write-ahead logs its
+    /// tiny, never-full memtable would otherwise pin — see <see cref="metadataFlushEveryBytes"/>.
+    /// Called with the engine lease held. A flush that cannot be scheduled is logged at Debug and
+    /// retried at the next threshold; it affects disk footprint and restart replay, never data.
+    /// </summary>
+    private void NoteShardBytesWritten(long bytes)
+    {
+        if (bytes <= 0)
+            return;
+
+        long total = Interlocked.Add(ref shardBytesSinceMetadataFlush, bytes);
+        if (total < metadataFlushEveryBytes)
+            return;
+
+        if (Interlocked.CompareExchange(ref shardBytesSinceMetadataFlush, 0, total) != total)
+            return;
+
+        try
+        {
+            FlushOptions flushOptions = new();
+            Native.Instance.rocksdb_flushoptions_set_wait(flushOptions.Handle, 0);
+            Native.Instance.rocksdb_flush_cf(db.Handle, flushOptions.Handle, metadataColumnFamily.Handle);
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug("RocksDB WAL at '{Path}': metadata flush to release write-ahead logs could not be scheduled: {Message}", enginePath, ex.Message);
         }
     }
 
@@ -3046,10 +3105,20 @@ public class RocksDbWAL : IWAL, IDisposable
             long floor = GetCompactionFloor(partitionId);
             int removed = 0;
 
-            // The scan starts at the persisted floor — everything below it is already logically gone —
-            // and only COUNTS: the removed count and the caps keep their exact IWAL semantics (a capped
-            // pass removes exactly the cap's worth of the oldest rows and the next pass resumes there),
-            // no entry value is read, and a row whose file was already dropped whole costs nothing.
+            // lastCheckpoint is the caller's EFFECTIVE retention floor (checkpoint composed with the
+            // durability, hold and live-replica floors), and the persisted floor advances straight to
+            // it: logical deletion costs one metadata put however many rows it covers, and the whole-
+            // file drop below is anchored at it, so reclaim never lags the floor by more than the
+            // files still in L0. The IWAL cap therefore bounds only the WORK of the counting scan
+            // here, not the deletion — at the shipped cadence (one pass per ~1,000 Raft batches of
+            // ~100 entries) a cap-bounded floor fell behind ingest by ~8x on the 2026-09-10 k175
+            // probe and the log grew without bound; the RocksDB conformance subclass documents the
+            // relaxed cap.
+            long newFloor = Math.Max(floor, lastCheckpoint);
+
+            // Removed = rows physically present in [floor, newFloor): counted exactly up to the cap,
+            // and beyond the cap by arithmetic (ids are contiguous per partition), so a large backlog
+            // costs O(cap) iterator steps instead of one step per dead row.
             using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
             Span<byte> seekKey = stackalloc byte[LogKeyWidth];
             BuildLogKey(seekKey, partitionId, floor);
@@ -3058,25 +3127,24 @@ public class RocksDbWAL : IWAL, IDisposable
             Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
             BuildPartitionPrefix(partitionPrefix, partitionId);
 
+            long lastCountedId = -1;
             while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix) && removed < passCap)
             {
-                if (ParseLogIdFromKey(iterator.GetKeySpan()) >= lastCheckpoint)
+                long id = ParseLogIdFromKey(iterator.GetKeySpan());
+                if (id >= newFloor)
                     break;
 
+                lastCountedId = id;
                 removed++;
                 iterator.Next();
             }
 
-            // The new floor is the first id this pass did NOT remove: the row the iterator stopped on
-            // (a capped boundary, or the checkpoint row itself), or lastCheckpoint when nothing below
-            // it is left to stop on. Never above lastCheckpoint, never below the current floor. The
-            // whole-file drop below is anchored at this floor too, so a capped pass reclaims exactly
-            // what it logically removed; RaftWriteAhead re-arms a pass that hit its cap, so a backlog
-            // drains in consecutive passes instead of waiting for the next trigger.
-            long newFloor = iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix)
-                ? Math.Min(ParseLogIdFromKey(iterator.GetKeySpan()), lastCheckpoint)
-                : lastCheckpoint;
-            newFloor = Math.Max(newFloor, floor);
+            if (removed == passCap && iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix)
+                && ParseLogIdFromKey(iterator.GetKeySpan()) < newFloor)
+            {
+                long remainder = newFloor - 1 - lastCountedId;
+                removed = (int)Math.Min(int.MaxValue, removed + Math.Max(0, remainder));
+            }
 
             if (newFloor > floor)
             {

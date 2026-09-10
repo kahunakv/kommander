@@ -33,6 +33,14 @@ public abstract class WalConformanceTests
     protected virtual bool SupportsRemovableLogCount => true;
 
     /// <summary>
+    /// True when <c>CompactLogsOlderThan</c>'s entry cap bounds how many rows a single pass
+    /// deletes (row-at-a-time backends). Override to <c>false</c> for a backend whose deletion is
+    /// a single floor advance regardless of row count — the cap then bounds only the work of the
+    /// removed-count scan, and one pass removes everything below the checkpoint.
+    /// </summary>
+    protected virtual bool CapBoundsRemoval => true;
+
+    /// <summary>
     /// Whether <see cref="IWAL.GetLastCheckpoint"/> reports the real last-checkpoint id. True for all
     /// current adapters — including <see cref="InMemoryWAL"/>, which now maintains the value like the
     /// durable backends. Distinct from <see cref="SupportsCheckpoints"/>, which also gates
@@ -915,12 +923,22 @@ public abstract class WalConformanceTests
 
             (RaftOperationStatus status, int removed) = wal.CompactLogsOlderThan(20, lastCheckpoint: 5, compactNumberEntries: 2);
             Assert.Equal(RaftOperationStatus.Success, status);
-            Assert.Equal(2, removed);
-            // Exactly 2 oldest removed; ids 3, 4, 5 remain.
             List<long> remaining = wal.ReadLogs(20).Select(l => l.Id).ToList();
-            Assert.Equal(3, remaining.Count);
             Assert.DoesNotContain(1L, remaining);
             Assert.DoesNotContain(2L, remaining);
+            if (CapBoundsRemoval)
+            {
+                Assert.Equal(2, removed);
+                // Exactly 2 oldest removed; ids 3, 4, 5 remain.
+                Assert.Equal(3, remaining.Count);
+            }
+            else
+            {
+                // A floor advance removes everything below the checkpoint in one pass; the count is
+                // still exact.
+                Assert.Equal(4, removed);
+                Assert.Equal([5L], remaining);
+            }
         }
         finally { cleanup(); }
     }
@@ -957,9 +975,18 @@ public abstract class WalConformanceTests
             (_, int r3) = wal.CompactLogsOlderThan(p, lastCheckpoint: 6, compactNumberEntries: 2);
             (_, int r4) = wal.CompactLogsOlderThan(p, lastCheckpoint: 6, compactNumberEntries: 2);
 
-            Assert.Equal(2, r1); // 1,2
-            Assert.Equal(2, r2); // 3,4
-            Assert.Equal(1, r3); // 5 (only one left below the checkpoint)
+            if (CapBoundsRemoval)
+            {
+                Assert.Equal(2, r1); // 1,2
+                Assert.Equal(2, r2); // 3,4
+                Assert.Equal(1, r3); // 5 (only one left below the checkpoint)
+            }
+            else
+            {
+                Assert.Equal(5, r1); // one floor advance covers 1..5
+                Assert.Equal(0, r2);
+                Assert.Equal(0, r3);
+            }
             Assert.Equal(0, r4); // nothing left to remove
             Assert.Equal([6L], wal.ReadLogs(p).Select(l => l.Id));
         }
@@ -2109,6 +2136,10 @@ public sealed class SqliteWalSingleShardConformanceTests : WalConformanceTests
 
 public sealed class RocksDbWalConformanceTests : WalConformanceTests
 {
+    // Deletion is a persisted floor advance, so the cap bounds the counting scan only (see
+    // RocksDbWAL.CompactLogsOlderThan): a cap-bounded floor fell behind ingest on the k175 probe.
+    protected override bool CapBoundsRemoval => false;
+
     protected override IWAL CreateWal(out Action cleanup)
     {
         string path = Path.Combine(Path.GetTempPath(), $"wal-conform-rocksdb-{Guid.NewGuid():N}");

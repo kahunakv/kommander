@@ -223,7 +223,10 @@ public interface IWAL : IDisposable
     /// <param name="maxTotalEntries">
     /// When set, removes up to this many entries in one storage transaction by issuing
     /// multiple internal batches of <paramref name="compactNumberEntries"/>. When <see langword="null"/>,
-    /// only one batch is removed.
+    /// only one batch is removed. A backend whose deletion is a single floor advance rather than
+    /// row-at-a-time work (<see cref="RocksDbWAL"/>) treats the cap as a bound on the removed-count
+    /// scan only and removes everything below <paramref name="lastCheckpoint"/> in one pass; the
+    /// returned count is still exact.
     /// </param>
     public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(
         int partitionId,
