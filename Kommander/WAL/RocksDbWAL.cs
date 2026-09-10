@@ -127,23 +127,67 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </summary>
     private readonly ReaderWriterLockSlim writeGuard = new(LockRecursionPolicy.NoRecursion);
 
+    // ── Persisted compaction floor (logical deletion of the compacted prefix) ────────────────────
+    //
+    // Field finding (2026-09-10 write probes w2–w4 and the eight tuning arms): after the commit
+    // frontier removed the second full-payload write, the Raft log still paid one full compaction
+    // rewrite per flushed byte, and no memtable/L0 sizing changed it. The cause is the range
+    // tombstone itself. A tombstone written by the compaction pass covers keys that live in OLDER
+    // files, so every L0 file's key range starts below its own first entry and overlaps every other
+    // file of the partition. RocksDB then cannot trivially move L0 files into the base level (it
+    // must merge), each L0→base compaction reads and rewrites the whole live window, and
+    // DeleteFilesInRange — which only drops files that lie ENTIRELY below its bound — never
+    // qualifies an L0 file, because each one straddles the floor. Under a starved shared
+    // WriteBufferManager (every production flush was "Write Buffer Manager"-forced at ~6 MB) the
+    // entries also flushed long before their tombstone arrived, so almost nothing died in memory.
+    //
+    // The layout here removes the cross-file tombstone. Compaction persists a per-partition
+    // COMPACTION FLOOR (metadata key raft_compaction_floor_p{id}): every row with id < floor is
+    // logically deleted, and every read path clamps at it. Physical reclamation is whole-file:
+    // with no cross-file tombstones, an append-only partition produces strictly non-overlapping
+    // SST files, RocksDB moves them from L0 to the base level as a metadata-only trivial move, and
+    // the floor-anchored DeleteFilesInRange drops each file once the floor passes its largest key.
+    // No log row is ever rewritten by compaction. The pass still writes a range tombstone, but
+    // CONFINED to the span of the active memtable (see ConfinedTombstoneStart): entries that die
+    // while still in memory are dropped at flush and never reach disk, and because the tombstone
+    // starts at or above the memtable's own first entry it never widens the flushed file's key
+    // range below its first row, so the non-overlap property (and the trivial move) is preserved.
+    //
+    // Rules that keep the logical floor exact:
+    //  * Only CompactLogsOlderThan raises it, and only to a value <= its lastCheckpoint argument, so
+    //    the checkpoint row (and everything above) stays visible. It is persisted in the same batch
+    //    as the confined tombstone, BEFORE DeleteFilesInRange runs, so a crash between the two
+    //    leaves files that the next pass drops again — never a file dropped ahead of its floor.
+    //  * TruncateLogsAfter clamps it to afterLogId + 1 and InstallSnapshotBoundary to the boundary
+    //    index, so a row later written at a truncated id can never sit below the floor and read as
+    //    absent. DeletePartitionWAL deletes the key; ReopenEngine clears the cache.
+    //  * A CF shared by several partitions (partition ids congruent modulo MaxShards) cannot use
+    //    whole-file drops for one partition's dead prefix — the files hold the other partitions'
+    //    live rows — so the pass writes the full-range tombstone there, exactly as before.
+    //  * An older binary ignores the key and reads the dead-but-present rows as ordinary log rows.
+    //    They are genuine, applied entries below a durable checkpoint, so that is merely retention,
+    //    not corruption; its own compaction pass tombstones them normally. No format bump.
+
+    /// <summary>Cache for <see cref="CompactionFloorKey"/>; key bytes are immutable once built.</summary>
+    private readonly ConcurrentDictionary<int, byte[]> compactionFloorKeys = new();
+
     /// <summary>
-    /// Per-partition seek hint for <see cref="CompactLogsOlderThan"/>: the id the next compaction pass
-    /// should <c>Seek</c> to instead of restarting from id 0. Invariant: <b>no live deletable key exists
-    /// with id below this value</b> — everything under it was already deleted by an earlier pass. Without
-    /// it, each pass re-seeks from 0 and grinds forward over the accumulated point-delete tombstones of the
-    /// dead head (the forward analogue of the restore reverse-scan pathology), head-of-line-blocking every
-    /// other read queued on the partition's ReadScheduler lane. Absent → seek from 0.
-    ///
-    /// <para>Maintained single-writer per partition (compaction is serialized on the per-partition
-    /// ReadScheduler FIFO lane). The only operation that can invalidate the invariant is
-    /// <see cref="DeletePartitionWAL"/> — a wiped partition may be reused from low ids — which removes the
-    /// hint. Appends only ever add keys at the tail (above the hint), and a snapshot boundary only writes a
-    /// <see cref="RaftLogType.CommittedCheckpoint"/> at/above the compaction floor (never a deletable key
-    /// below the hint), so neither can break the invariant. <see cref="DropFullyDeadFiles"/> can make a
-    /// dead key resurface below the hint, so it resets the hint to 0 (see its summary).</para>
+    /// In-memory copy of the persisted compaction floor per partition (0 = nothing compacted).
+    /// Raised only after the advancing batch was applied; lowered exactly under the exclusive
+    /// write guard by the truncation paths; cleared by <see cref="ReopenEngine"/>.
     /// </summary>
-    private readonly ConcurrentDictionary<int, long> compactionResumeId = new();
+    private readonly ConcurrentDictionary<int, long> compactionFloorCache = new();
+
+    /// <summary>
+    /// Headroom subtracted from the active-memtable span when confining a compaction tombstone.
+    /// <c>rocksdb.num-entries-active-mem-table</c> counts every memtable insertion, including the
+    /// tombstones and point deletes this WAL writes, so the span it implies can reach a few ids
+    /// below the memtable's first row; starting the tombstone this many ids higher keeps it from
+    /// covering a key that lives in an already-flushed file (which would make the next flushed
+    /// file overlap that file and cost one real compaction). Entries left uncovered by the margin
+    /// simply flush and are reclaimed by the whole-file drop instead.
+    /// </summary>
+    private const long ConfinedTombstoneMargin = 64;
 
     /// <summary>
     /// Test-only hook fired inside <see cref="InstallSnapshotBoundary"/> after the suffix scan and while
@@ -311,6 +355,8 @@ public class RocksDbWAL : IWAL, IDisposable
         // so an engine-level write stall in the Raft path is visible in ordinary node telemetry
         // rather than only inside the RocksDB LOG file.
         KommanderMetrics.RegisterWalEngine(this);
+
+        WarnIfSharedBudgetStarvesFlushUnit(sharedResources, tuning);
 
         if (firstTime)
             SetMetaData("version", FormatVersion);
@@ -630,9 +676,11 @@ public class RocksDbWAL : IWAL, IDisposable
             // Column-family handles belong to the engine instance that issued them.
             families.Clear();
 
-            // The cached commit frontiers describe the engine instance being closed; the reopened
-            // engine reloads them from its metadata CF, which reflects exactly what was replayed.
+            // The cached commit frontiers and compaction floors describe the engine instance being
+            // closed; the reopened engine reloads them from its metadata CF, which reflects exactly
+            // what was replayed.
             commitFrontierCache.Clear();
+            compactionFloorCache.Clear();
 
             try
             {
@@ -694,6 +742,52 @@ public class RocksDbWAL : IWAL, IDisposable
     /// the signal that whole-file drops were not landing.
     /// </summary>
     internal long GetShardLevel6FileCount() => SumShardProperty("rocksdb.num-files-at-level6");
+
+    /// <summary>
+    /// Total SST files in L0 across the shard CFs, fed to <c>raft.wal.shard_l0_files</c>. Under the
+    /// floor layout L0 files are moved to the base level (not rewritten) once
+    /// <see cref="RocksDbWalTuning.ShardLevel0FileNumCompactionTrigger"/> of them accumulate and are
+    /// dropped whole from there, so this should oscillate below the trigger; a value that climbs
+    /// toward the slowdown trigger means moves are not happening (overlapping files — a shared
+    /// shard, or a burst of truncations) and the engine is compacting for real.
+    /// </summary>
+    internal long GetShardLevel0FileCount() => SumShardProperty("rocksdb.num-files-at-level0");
+
+    /// <summary>
+    /// Logs once, at open, when a shared WriteBufferManager budget cannot hold the flush unit the
+    /// shard tuning asks for. RocksDB flushes whichever memtable is oldest in the database that
+    /// trips the budget, and this WAL trips it far more often than a co-hosted store (one write per
+    /// Raft batch), so an undersized budget quietly replaces the configured 64 MB × merge-2 unit
+    /// with a few-megabyte one — every flush in the 2026-09-10 write probes was budget-forced at
+    /// ~6 MB. The floor layout keeps write amplification at ~1 regardless, but entries that would
+    /// have died in memory then reach disk once; the operator should know which regime they run in.
+    /// </summary>
+    private void WarnIfSharedBudgetStarvesFlushUnit(RocksDbSharedResources? sharedResources, RocksDbWalTuning tuning)
+    {
+        if (sharedResources is null)
+            return;
+
+        long budget;
+        try
+        {
+            budget = (long)(ulong)Native.Instance.rocksdb_write_buffer_manager_buffer_size(sharedResources.WriteBufferManagerHandle);
+        }
+        catch (Exception)
+        {
+            return;
+        }
+
+        // One flush unit for a single active shard plus one memtable of headroom for whatever
+        // shares the budget; below this the shard memtable is flushed on the budget's cadence,
+        // never on its own size.
+        long flushUnit = tuning.ShardWriteBufferSizeBytes * tuning.ShardMinWriteBufferNumberToMerge;
+        long needed = flushUnit + tuning.ShardWriteBufferSizeBytes;
+
+        if (budget > 0 && budget < needed)
+            logger.LogWarning(
+                "RocksDB WAL at '{Path}': the shared memtable budget ({BudgetMb} MB) is below the shard flush unit plus headroom ({NeededMb} MB); RocksDB will flush the Raft log on the budget's cadence instead of at {FlushUnitMb} MB, so entries that would die in memory reach disk once. Raise the shared memtable budget or lower the shard write-buffer tuning",
+                enginePath, budget >> 20, needed >> 20, flushUnit >> 20);
+    }
 
     private long ReadIntegerProperty(string property)
     {
@@ -822,8 +916,10 @@ public class RocksDbWAL : IWAL, IDisposable
         long commitFrontier = GetCommitFrontier(partitionId);
 
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
-        
-        long startLogId = Math.Max(0, lastCheckpoint);
+
+        // Rows below the compaction floor are logically deleted even where they are still physically
+        // present (the floor layout reclaims whole files, not rows), so the read starts at the floor.
+        long startLogId = Math.Max(Math.Max(0, lastCheckpoint), GetCompactionFloor(partitionId));
         Span<byte> seekKey = stackalloc byte[LogKeyWidth];
         BuildLogKey(seekKey, partitionId, startLogId);
         iterator.Seek(seekKey);
@@ -880,8 +976,11 @@ public class RocksDbWAL : IWAL, IDisposable
 
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
 
+        // Clamped at the compaction floor: a backfill request for ids below it reads exactly what
+        // it read when those rows were physically deleted — nothing — so the caller's
+        // "compacted, needs a snapshot" decision is unchanged by the floor layout.
         Span<byte> seekKey = stackalloc byte[LogKeyWidth];
-        BuildLogKey(seekKey, partitionId, Math.Max(0, startLogIndex));
+        BuildLogKey(seekKey, partitionId, Math.Max(Math.Max(0, startLogIndex), GetCompactionFloor(partitionId)));
         iterator.Seek(seekKey);
 
         Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
@@ -1508,9 +1607,13 @@ public class RocksDbWAL : IWAL, IDisposable
         SeekToLastPartitionKey(iterator, partitionId);
 
         // The key alone carries the id, so the last key in the partition answers this without reading
-        // (and copying) a single value.
+        // (and copying) a single value. A last key below the compaction floor means every row of the
+        // partition is logically deleted — the same answer a physically emptied partition gives.
         if (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
-            return ParseLogIdFromKey(iterator.GetKeySpan());
+        {
+            long id = ParseLogIdFromKey(iterator.GetKeySpan());
+            return id >= GetCompactionFloor(partitionId) ? id : 0;
+        }
 
         return 0;
     }
@@ -1538,6 +1641,10 @@ public class RocksDbWAL : IWAL, IDisposable
         using EngineLease lease = AcquireEngine();
 
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
+
+        // Below the compaction floor the row is logically gone whether or not its file was dropped yet.
+        if (logIndex < GetCompactionFloor(partitionId))
+            return -1;
 
         Span<byte> key = stackalloc byte[LogKeyWidth];
         BuildLogKey(key, partitionId, logIndex);
@@ -1859,7 +1966,8 @@ public class RocksDbWAL : IWAL, IDisposable
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         SeekToLastPartitionKey(iterator, partitionId);
 
-        if (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
+        if (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId)
+            && ParseLogIdFromKey(iterator.GetKeySpan()) >= GetCompactionFloor(partitionId))
         {
             ReadHeaderFromWire(iterator.GetValueSpan(), out _, out _, out long term, out _);
             return term;
@@ -1893,7 +2001,7 @@ public class RocksDbWAL : IWAL, IDisposable
 
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         Span<byte> seekKey = stackalloc byte[LogKeyWidth];
-        BuildLogKey(seekKey, partitionId, 0);
+        BuildLogKey(seekKey, partitionId, GetCompactionFloor(partitionId));
         iterator.Seek(seekKey);
 
         int count = 0;
@@ -1925,7 +2033,7 @@ public class RocksDbWAL : IWAL, IDisposable
 
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         Span<byte> seekKey = stackalloc byte[LogKeyWidth];
-        BuildLogKey(seekKey, partitionId, 0);
+        BuildLogKey(seekKey, partitionId, GetCompactionFloor(partitionId));
         iterator.Seek(seekKey);
 
         int count = 0;
@@ -2082,6 +2190,14 @@ public class RocksDbWAL : IWAL, IDisposable
         if (expected > checkpointId)
             return true;
 
+        // Rows below the compaction floor are logically absent even while their file is still on
+        // disk — identical to the answer the physical delete used to give for the same span.
+        if (expected < GetCompactionFloor(partitionId))
+        {
+            firstMissing = expected;
+            return false;
+        }
+
         using Iterator iterator = db.NewIterator(cf: columnFamilyHandle);
         Span<byte> seekKey = stackalloc byte[LogKeyWidth];
         BuildLogKey(seekKey, partitionId, expected);
@@ -2211,12 +2327,46 @@ public class RocksDbWAL : IWAL, IDisposable
     private void RaiseCommitFrontierCache(int partitionId, long value) =>
         commitFrontierCache.AddOrUpdate(partitionId, static (_, v) => v, static (_, old, v) => Math.Max(old, v), value);
 
+    /// <summary>Builds the metadata-CF key that stores the compaction floor for a partition.</summary>
+    private byte[] CompactionFloorKey(int partitionId) =>
+        compactionFloorKeys.GetOrAdd(partitionId, static pid => Encoding.UTF8.GetBytes($"raft_compaction_floor_p{pid}"));
+
+    /// <summary>
+    /// Returns the compaction floor for <paramref name="partitionId"/> — rows with a smaller id are
+    /// logically deleted (0 = nothing compacted) — loading it from the metadata CF on first use.
+    /// See the persisted-compaction-floor region for the design.
+    /// </summary>
+    private long GetCompactionFloor(int partitionId)
+    {
+        if (compactionFloorCache.TryGetValue(partitionId, out long cached))
+            return cached;
+
+        byte[] value = db.Get(CompactionFloorKey(partitionId), cf: metadataColumnFamily);
+        long persisted = value is not null && long.TryParse(Encoding.UTF8.GetString(value), out long id) ? id : 0;
+
+        return compactionFloorCache.TryAdd(partitionId, persisted) ? persisted : compactionFloorCache[partitionId];
+    }
+
+    /// <summary>Stages a compaction-floor put so it lands atomically with the batch's other mutations.</summary>
+    private void PutCompactionFloorToBatch(WriteBatch writeBatch, int partitionId, long value) =>
+        writeBatch.Put(CompactionFloorKey(partitionId), Encoding.UTF8.GetBytes(value.ToString()), cf: metadataColumnFamily);
+
+    /// <summary>Test-only view of the persisted compaction floor.</summary>
+    internal long GetCompactionFloorForTesting(int partitionId)
+    {
+        using EngineLease lease = AcquireEngine();
+        return GetCompactionFloor(partitionId);
+    }
+
     /// <summary>
     /// Reads only the header of the row at (<paramref name="partitionId"/>, <paramref name="logId"/>)
     /// via <see cref="HeaderSpanDeserializer"/>. Returns <c>Found=false</c> when the key is absent.
     /// </summary>
     private (bool Found, long Term, int Type) ProbeRowHeader(int partitionId, ColumnFamilyHandle cf, long logId)
     {
+        if (logId < GetCompactionFloor(partitionId))
+            return default;
+
         Span<byte> key = stackalloc byte[LogKeyWidth];
         BuildLogKey(key, partitionId, logId);
         return db.Get(key, HeaderSpanDeserializer.Instance, cf: cf);
@@ -2262,9 +2412,12 @@ public class RocksDbWAL : IWAL, IDisposable
             long certifiedFloor = GetLastCheckpointFromMeta(partitionId);
             int steps = 0;
 
+            // Seeking at the compaction floor makes every dead-but-present row below it read as
+            // absent, so the walk crosses the compacted prefix with the same one-hop rule it used
+            // when those rows were physically deleted (floor <= certified checkpoint).
             using Iterator iterator = db.NewIterator(cf: cf);
             Span<byte> seekKey = stackalloc byte[LogKeyWidth];
-            BuildLogKey(seekKey, partitionId, advanced + 1);
+            BuildLogKey(seekKey, partitionId, Math.Max(advanced + 1, GetCompactionFloor(partitionId)));
             iterator.Seek(seekKey);
 
             Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
@@ -2331,10 +2484,9 @@ public class RocksDbWAL : IWAL, IDisposable
 
     /// <summary>
     /// Test-only: forces the shard CF holding <paramref name="partitionId"/> to compact its whole
-    /// key range down to the bottom level, so a test can exercise the <see cref="DropFullyDeadFiles"/>
-    /// path against L6 files (RocksDB's <c>DeleteFilesInRange</c> is a no-op on L0 — it only drops
-    /// files in L1 and below, which is why fresh, unflushed-through log data is not reclaimable by
-    /// it and the log needs a layout that lets tombstones annihilate entries before L6).
+    /// key range down to the bottom level — a real merge, so a test can check what a (full-range)
+    /// tombstone does to rows under compaction, or exercise <see cref="DropFullyDeadFiles"/> against
+    /// bottom-level files without waiting for the background trivial move.
     /// </summary>
     internal void CompactShardToBottomForTesting(int partitionId)
     {
@@ -2389,12 +2541,17 @@ public class RocksDbWAL : IWAL, IDisposable
     /// </summary>
     private long ScanHighestCheckpointAtMost(int partitionId, ColumnFamilyHandle columnFamilyHandle, long upperIdInclusive)
     {
+        long floor = GetCompactionFloor(partitionId);
+
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         SeekToLastPartitionKey(iterator, partitionId);
 
         while (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
         {
             long id = ParseLogIdFromKey(iterator.GetKeySpan());
+            if (id < floor)
+                break;
+
             if (id <= upperIdInclusive)
             {
                 ReadHeaderFromWire(iterator.GetValueSpan(), out _, out _, out _, out int type);
@@ -2465,22 +2622,23 @@ public class RocksDbWAL : IWAL, IDisposable
             // must not leave a stale replay floor — or a stale frontier that would certify rows a reused
             // partition id later writes — for the next occupant (there is no scan fallback to correct
             // either). Batch them with the log deletes when there are any, else delete them standalone.
+            // The compaction floor goes too: a reused partition id may start writing from low ids
+            // again, and a stale (higher) floor would hide — and leak — those new entries.
             if (staged > 0)
             {
                 writeBatch.Delete(LastCheckpointKey(partitionId), cf: metadataColumnFamily);
                 writeBatch.Delete(CommitFrontierKey(partitionId), cf: metadataColumnFamily);
+                writeBatch.Delete(CompactionFloorKey(partitionId), cf: metadataColumnFamily);
                 db.Write(writeBatch, writeOptions);
             }
             else
             {
                 db.Remove(LastCheckpointKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
                 db.Remove(CommitFrontierKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
+                db.Remove(CompactionFloorKey(partitionId), cf: metadataColumnFamily, writeOptions: writeOptions);
             }
 
-            // Drop the compaction resume hint: a reused partition id may start writing from low ids again,
-            // and a stale (higher) hint would make compaction skip — and leak — those new entries. The
-            // cached frontier goes with it for the same reuse reason.
-            compactionResumeId.TryRemove(partitionId, out _);
+            compactionFloorCache.TryRemove(partitionId, out _);
             commitFrontierCache.TryRemove(partitionId, out _);
 
             return RaftOperationStatus.Success;
@@ -2550,6 +2708,13 @@ public class RocksDbWAL : IWAL, IDisposable
             if (clampFrontier)
                 PutCommitFrontierToBatch(writeBatch, partitionId, clampedFrontier);
 
+            // Same for the compaction floor: rows written later at ids above afterLogId must not sit
+            // below it and read as compacted. afterLogId + 1 keeps every surviving row's status.
+            long clampedFloor = Math.Max(afterLogId + 1, 0);
+            bool clampFloor = GetCompactionFloor(partitionId) > clampedFloor;
+            if (clampFloor)
+                PutCompactionFloorToBatch(writeBatch, partitionId, clampedFloor);
+
             if (staged > 0)
             {
                 // If the truncation removes the recorded checkpoint (it sits above afterLogId), recompute
@@ -2568,13 +2733,16 @@ public class RocksDbWAL : IWAL, IDisposable
                 }
             }
 
-            if (staged > 0 || clampFrontier)
+            if (staged > 0 || clampFrontier || clampFloor)
                 db.Write(writeBatch, writeOptions);
 
             // Exact set (not a raise): truncation is the one path allowed to LOWER the frontier.
             // Runs under the exclusive writeGuard, so no concurrent Write can interleave a raise.
             if (clampFrontier)
                 commitFrontierCache[partitionId] = clampedFrontier;
+
+            if (clampFloor)
+                compactionFloorCache[partitionId] = clampedFloor;
 
             return RaftOperationStatus.Success;
             }
@@ -2730,7 +2898,7 @@ public class RocksDbWAL : IWAL, IDisposable
 
             byte[] boundaryKey = new byte[LogKeyWidth];
             BuildLogKey(boundaryKey, partitionId, snapshotIndex);
-            byte[]? existing = db.Get(boundaryKey, cf: columnFamilyHandle);
+            byte[]? existing = snapshotIndex < GetCompactionFloor(partitionId) ? null : db.Get(boundaryKey, cf: columnFamilyHandle);
             long localTerm = existing is null ? -1 : ReadTermFromWire(existing);
 
             using WriteBatch writeBatch = new();
@@ -2789,12 +2957,22 @@ public class RocksDbWAL : IWAL, IDisposable
             if (clampFrontier)
                 PutCommitFrontierToBatch(writeBatch, partitionId, snapshotIndex);
 
+            // The boundary row itself must be readable, so a compaction floor above it clamps to the
+            // boundary — whether or not a suffix was removed. The floor is deliberately not RAISED to
+            // the boundary: rows below it stay for the ordinary compaction pass, exactly as before.
+            bool clampFloor = GetCompactionFloor(partitionId) > snapshotIndex;
+            if (clampFloor)
+                PutCompactionFloorToBatch(writeBatch, partitionId, snapshotIndex);
+
             OnAfterBoundaryScanForTesting?.Invoke();
 
             db.Write(writeBatch, effectiveOptions);
 
             if (clampFrontier)
                 commitFrontierCache[partitionId] = snapshotIndex;
+
+            if (clampFloor)
+                compactionFloorCache[partitionId] = snapshotIndex;
 
             return (RaftOperationStatus.Success, suffixTruncated);
             }
@@ -2863,86 +3041,83 @@ public class RocksDbWAL : IWAL, IDisposable
 
             ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
-            // No last-checkpoint update: compaction only removes entries with id < lastCheckpoint, so the
-            // recorded checkpoint id (which is >= lastCheckpoint) can never be among the deleted keys.
-            using WriteBatch writeBatch = new();
+            // No last-checkpoint update: the floor only ever advances to a value <= lastCheckpoint, so
+            // the recorded checkpoint id (which is >= lastCheckpoint) always stays readable.
+            long floor = GetCompactionFloor(partitionId);
             int removed = 0;
-            long firstRemovedId = -1;
-            long lastRemovedId = -1;
 
-            // Resume from the hint (the head of live data left by the previous pass) instead of id 0, so we
-            // do not re-scan the growing pile of point-delete tombstones below it. Everything under the hint
-            // was already deleted, so skipping straight to it is correct; see compactionResumeId.
-            long start = compactionResumeId.GetValueOrDefault(partitionId, 0);
-
+            // The scan starts at the persisted floor — everything below it is already logically gone —
+            // and only COUNTS: the removed count and the caps keep their exact IWAL semantics (a capped
+            // pass removes exactly the cap's worth of the oldest rows and the next pass resumes there),
+            // no entry value is read, and a row whose file was already dropped whole costs nothing.
             using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
             Span<byte> seekKey = stackalloc byte[LogKeyWidth];
-            BuildLogKey(seekKey, partitionId, start);
+            BuildLogKey(seekKey, partitionId, floor);
             iterator.Seek(seekKey);
 
             Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
             BuildPartitionPrefix(partitionPrefix, partitionId);
 
-            // The scan only COUNTS: deletion is decided entirely from the key (partition prefix + id), the
-            // removed count and caps keep their exact semantics, and no entry value is ever read. The
-            // deletion itself is staged below as ONE range tombstone instead of one point tombstone per
-            // entry — the per-key tombstones each had to flush and be compacted down to the level holding
-            // their entry before either disappeared, which is how deleting the log came to dominate this
-            // database's compaction writes (W-Amp 9 on an append-then-delete workload).
             while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix) && removed < passCap)
             {
-                long id = ParseLogIdFromKey(iterator.GetKeySpan());
-                if (id >= lastCheckpoint)
+                if (ParseLogIdFromKey(iterator.GetKeySpan()) >= lastCheckpoint)
                     break;
 
-                if (firstRemovedId < 0)
-                    firstRemovedId = id;
-                lastRemovedId = id;
                 removed++;
-
                 iterator.Next();
             }
 
-            // Advance the resume hint to the first key this pass did NOT delete. When the loop stopped on a
-            // capped/checkpoint boundary the iterator sits on that surviving key; when it drained everything
-            // reachable, fall back to max(start, lastCheckpoint) — a safe lower bound on any surviving id,
-            // since nothing below lastCheckpoint remains and we began at start. Lowering the hint is always
-            // safe (at worst it re-scans some tombstones next pass); raising it past a live key is not, and
-            // cannot happen here.
-            long newResume = iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix)
-                ? ParseLogIdFromKey(iterator.GetKeySpan())
-                : Math.Max(start, lastCheckpoint);
-            compactionResumeId[partitionId] = newResume;
+            // The new floor is the first id this pass did NOT remove: the row the iterator stopped on
+            // (a capped boundary, or the checkpoint row itself), or lastCheckpoint when nothing below
+            // it is left to stop on. Never above lastCheckpoint, never below the current floor. The
+            // whole-file drop below is anchored at this floor too, so a capped pass reclaims exactly
+            // what it logically removed; RaftWriteAhead re-arms a pass that hit its cap, so a backlog
+            // drains in consecutive passes instead of waiting for the next trigger.
+            long newFloor = iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix)
+                ? Math.Min(ParseLogIdFromKey(iterator.GetKeySpan()), lastCheckpoint)
+                : lastCheckpoint;
+            newFloor = Math.Max(newFloor, floor);
 
-            if (removed > 0)
+            if (newFloor > floor)
             {
-                // [firstRemoved, lastRemoved + 1): ids in between with no row are covered harmlessly, and
-                // the exclusive end keeps the first surviving entry (the floor entry or the capped
-                // boundary) untouched. Disjoint from previous passes' ranges by construction (the scan
-                // starts at the resume hint), so range tombstones do not pile up over the same span.
-                byte[] rangeBegin = new byte[LogKeyWidth];
-                BuildLogKey(rangeBegin, partitionId, firstRemovedId);
-                byte[] rangeEnd = new byte[LogKeyWidth];
-                BuildLogKey(rangeEnd, partitionId, lastRemovedId + 1);
-                writeBatch.DeleteRange(rangeBegin, (ulong)rangeBegin.Length, rangeEnd, (ulong)rangeEnd.Length, columnFamilyHandle);
+                using WriteBatch writeBatch = new();
+                PutCompactionFloorToBatch(writeBatch, partitionId, newFloor);
 
+                // The tombstone that lets rows die in memory. Confined to the active memtable's span
+                // when this partition owns the column family, so the flushed file's key range never
+                // reaches below its own first row and L0 files stay non-overlapping (trivial moves,
+                // whole-file drops). A shared column family gets the full range instead: its files
+                // can never be dropped whole for one partition, so the rows must be tombstoned to
+                // die at all.
+                long tombstoneStart = ShardHoldsOtherPartitions(columnFamilyHandle, partitionId)
+                    ? floor
+                    : Math.Max(floor, ConfinedTombstoneStart(columnFamilyHandle, partitionId));
+
+                if (tombstoneStart < newFloor)
+                {
+                    byte[] rangeBegin = new byte[LogKeyWidth];
+                    BuildLogKey(rangeBegin, partitionId, tombstoneStart);
+                    byte[] rangeEnd = new byte[LogKeyWidth];
+                    BuildLogKey(rangeEnd, partitionId, newFloor);
+                    writeBatch.DeleteRange(rangeBegin, (ulong)rangeBegin.Length, rangeEnd, (ulong)rangeEnd.Length, columnFamilyHandle);
+                }
+
+                // The floor is durable before any file below it is dropped (see the region comment).
                 db.Write(writeBatch, writeOptions);
+                compactionFloorCache[partitionId] = newFloor;
                 LastCompactionWriteCount = 1;
 
-                // Anchor the whole-file drop at the compaction FLOOR, not this pass's last removed
-                // id. DeleteFilesInRange physically drops SST files whose key range is entirely
-                // below the bound; it needs no tombstone, so it may reclaim every file below the
-                // floor regardless of how small a slice this (cap-bounded) pass tombstoned. Passing
-                // lastRemovedId instead left the band [lastRemovedId, floor) of dead L6 files
-                // permanently unreclaimed whenever a pass was capped (MaxEntriesPerCompaction).
-                DropFullyDeadFiles(columnFamilyHandle, partitionId, lastCheckpoint);
-
-                logger.LogDebugRemovedFromWal(removed, partitionId);
+                if (removed > 0)
+                    logger.LogDebugRemovedFromWal(removed, partitionId);
             }
             else
             {
                 LastCompactionWriteCount = 0;
             }
+
+            // Runs on every pass, not only on an advancing one: files below an unchanged floor may
+            // have been moved out of L0 since the last pass and are droppable now.
+            DropFullyDeadFiles(columnFamilyHandle, partitionId, newFloor);
 
             return (RaftOperationStatus.Success, removed);
         }
@@ -2967,21 +3142,18 @@ public class RocksDbWAL : IWAL, IDisposable
     /// hold another partition's keys (shard CFs are shared across partitions), are left to normal
     /// compaction.
     ///
-    /// <para><b>Resume-hint reset.</b> DeleteFilesInRange may delete a file holding a range
-    /// tombstone while an older version of a covered key survives in a deeper file that straddles
-    /// the bound — the deleted key "resurfaces". Every resurfaced key is dead by definition (it sat
-    /// below a durable checkpoint), but it would violate the <see cref="compactionResumeId"/>
-    /// invariant that nothing deletable lives below the hint, so the hint is reset to 0: the next
-    /// pass re-scans from the head and re-deletes anything that resurfaced. That re-scan is cheap
-    /// now — the covered spans are skipped via the fragmented range-tombstone index, not ground
-    /// over key by key as with point tombstones.</para>
+    /// <para><b>Level 0.</b> RocksDB's <c>DeleteFilesInRange</c> considers levels 1 and below only.
+    /// The floor layout makes that sufficient: with no cross-file tombstones the partition's files
+    /// do not overlap, so once <see cref="RocksDbWalTuning.ShardLevel0FileNumCompactionTrigger"/>
+    /// of them sit in L0 RocksDB moves them to the base level as a metadata-only trivial move
+    /// (measured: zero compaction bytes, files keep their numbers), and the next pass drops them
+    /// here. Files that straddle the bound (the one holding the floor row) or that also hold
+    /// another partition's keys are left to normal compaction.</para>
     ///
-    /// <para><b>Failures are surfaced, not swallowed.</b> A native error here means the early
-    /// reclaim did not happen and the dead prefix stays until normal compaction removes it — which,
-    /// on an append-then-delete log with no compaction pressure, may be never (the L6 non-reclaim
-    /// seen in write probe w3). It is therefore logged at Warning with the RocksDB message, not
-    /// dropped, so the condition is visible in a run's logs. The pass itself still succeeds: the
-    /// data is logically gone via the range tombstone regardless.</para>
+    /// <para><b>Failures are surfaced, not swallowed.</b> A native error here means the reclaim did
+    /// not happen and the dead prefix stays on disk until a later pass succeeds — the rows are
+    /// logically gone through the floor regardless, so the pass itself still succeeds. It is
+    /// logged at Warning with the RocksDB message so the condition is visible in a run's logs.</para>
     /// </summary>
     private void DropFullyDeadFiles(ColumnFamilyHandle columnFamilyHandle, int partitionId, long compactionFloor)
     {
@@ -3006,12 +3178,106 @@ public class RocksDbWAL : IWAL, IDisposable
             string message = global::System.Runtime.InteropServices.Marshal.PtrToStringAnsi(errptr) ?? "<unknown>";
             Native.Instance.rocksdb_free(errptr);
             logger.LogWarning(
-                "DeleteFilesInRange for partition {PartitionId} below floor {Floor} failed: {Message}; the dead prefix stays until normal compaction removes it",
+                "DeleteFilesInRange for partition {PartitionId} below floor {Floor} failed: {Message}; the dead prefix stays on disk until a later pass reclaims it",
                 partitionId, compactionFloor, message);
-            return;
+        }
+    }
+
+    /// <summary>
+    /// True when the shard column family physically holds a key of any partition other than
+    /// <paramref name="partitionId"/> — two seeks, no value reads. Decided from the data rather
+    /// than from the partitions this process has touched, so a partition that exists on disk but
+    /// was never accessed still counts. Dead-but-present rows of a wiped partition count too,
+    /// which errs toward the full-range tombstone (safe, merely slower) until they compact away.
+    /// </summary>
+    private bool ShardHoldsOtherPartitions(ColumnFamilyHandle columnFamilyHandle, int partitionId)
+    {
+        using Iterator iterator = db.NewIterator(cf: columnFamilyHandle);
+
+        Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
+        BuildPartitionPrefix(partitionPrefix, partitionId);
+
+        iterator.SeekToFirst();
+        if (iterator.Valid() && !iterator.GetKeySpan().StartsWith(partitionPrefix))
+            return true;
+
+        Span<byte> upperBoundKey = stackalloc byte[PartitionIdWidth + 1];
+        BuildPartitionUpperBoundKey(upperBoundKey, partitionId);
+        iterator.Seek(upperBoundKey);
+
+        return iterator.Valid();
+    }
+
+    /// <summary>
+    /// Lowest id a compaction tombstone may start at without reaching below the active memtable:
+    /// <c>head − entries-in-active-memtable + 1 + <see cref="ConfinedTombstoneMargin"/></c>. The
+    /// partition owns the column family (checked by the caller), so the active memtable's entries
+    /// are its newest rows and the arithmetic is exact up to the margin. A property read failure
+    /// yields <see cref="long.MaxValue"/> — no tombstone at all, which is safe: the rows flush and
+    /// the whole-file drop reclaims them — rather than an unconfined tombstone that would make the
+    /// flushed file overlap its predecessors and forfeit the trivial move.
+    /// </summary>
+    private long ConfinedTombstoneStart(ColumnFamilyHandle columnFamilyHandle, int partitionId)
+    {
+        if (!long.TryParse(db.GetProperty("rocksdb.num-entries-active-mem-table", columnFamilyHandle), out long activeEntries))
+            return long.MaxValue;
+
+        using Iterator iterator = db.NewIterator(cf: columnFamilyHandle);
+        SeekToLastPartitionKey(iterator, partitionId);
+
+        if (!iterator.Valid() || !KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
+            return long.MaxValue;
+
+        long head = ParseLogIdFromKey(iterator.GetKeySpan());
+        return Math.Max(0, head - activeEntries + 1 + ConfinedTombstoneMargin);
+    }
+
+    /// <summary>
+    /// Test-only: the live SST files of the shard column family holding <paramref name="partitionId"/>,
+    /// with the id span each covers, so a test can prove that files reach the base level with the
+    /// numbers they were flushed under (moved, not rewritten) and that no two files of the partition
+    /// overlap. Read through RocksDB's live-files metadata; names are relative (e.g. <c>/000012.sst</c>).
+    /// </summary>
+    internal List<(string Name, int Level, long SmallestId, long LargestId)> GetShardLiveFilesForTesting(int partitionId)
+    {
+        using EngineLease lease = AcquireEngine();
+
+        string shardName = "shard" + (partitionId % MaxShards);
+        List<(string, int, long, long)> result = [];
+
+        IntPtr files = Native.Instance.rocksdb_livefiles(db.Handle);
+        try
+        {
+            int count = Native.Instance.rocksdb_livefiles_count(files);
+            for (int i = 0; i < count; i++)
+            {
+                string? cfName = global::System.Runtime.InteropServices.Marshal.PtrToStringAnsi(Native.Instance.rocksdb_livefiles_column_family_name(files, i));
+                if (!string.Equals(cfName, shardName, StringComparison.Ordinal))
+                    continue;
+
+                string name = global::System.Runtime.InteropServices.Marshal.PtrToStringAnsi(Native.Instance.rocksdb_livefiles_name(files, i)) ?? "";
+                int level = Native.Instance.rocksdb_livefiles_level(files, i);
+
+                IntPtr smallestPtr = Native.Instance.rocksdb_livefiles_smallestkey(files, i, out UIntPtr smallestLen);
+                IntPtr largestPtr = Native.Instance.rocksdb_livefiles_largestkey(files, i, out UIntPtr largestLen);
+
+                byte[] smallest = new byte[(int)smallestLen];
+                global::System.Runtime.InteropServices.Marshal.Copy(smallestPtr, smallest, 0, smallest.Length);
+                byte[] largest = new byte[(int)largestLen];
+                global::System.Runtime.InteropServices.Marshal.Copy(largestPtr, largest, 0, largest.Length);
+
+                long smallestId = smallest.Length == LogKeyWidth && KeyBelongsToPartition(smallest, partitionId) ? ParseLogIdFromKey(smallest) : -1;
+                long largestId = largest.Length == LogKeyWidth && KeyBelongsToPartition(largest, partitionId) ? ParseLogIdFromKey(largest) : -1;
+
+                result.Add((name, level, smallestId, largestId));
+            }
+        }
+        finally
+        {
+            Native.Instance.rocksdb_livefiles_destroy(files);
         }
 
-        compactionResumeId[partitionId] = 0;
+        return result;
     }
 
     /// <summary>
@@ -3065,8 +3331,9 @@ public class RocksDbWAL : IWAL, IDisposable
         cfOptions.SetLevel0SlowdownWritesTrigger(tuning.ShardLevel0SlowdownWritesTrigger);
         cfOptions.SetLevel0StopWritesTrigger(tuning.ShardLevel0StopWritesTrigger);
 
-        // Layout experiment (inert at the defaults): size the base level to hold the live log, or
-        // switch to universal, so range tombstones annihilate entries without the L0→L6 cascade.
+        // Layout knobs (inert at the defaults, kept for probes): the floor layout no longer needs
+        // them — files move out of L0 without rewrite and are dropped whole — but a probe can still
+        // change the base-level size or switch to universal to compare.
         if (tuning.ShardMaxBytesForLevelBase > 0)
             cfOptions.SetMaxBytesForLevelBase((ulong)tuning.ShardMaxBytesForLevelBase);
         if (tuning.ShardUniversalCompaction)

@@ -401,6 +401,11 @@ public static class KommanderMetrics
             description: "SST file count in the bottom level (L6) across the Raft-log shard CFs; a flat, high value signals whole-file drops are not landing.");
 
         Meter.CreateObservableGauge(
+            "raft.wal.shard_l0_files",
+            MeasureWalShardLevel0Files,
+            description: "SST file count in L0 across the Raft-log shard CFs; should stay below the L0 compaction trigger, since non-overlapping log files are moved (not rewritten) out of L0 and dropped whole. A climb toward the slowdown trigger means real compactions are running.");
+
+        Meter.CreateObservableGauge(
             "raft.executor.client_queue_depth",
             MeasureClientQueueDepths,
             description: "Current number of client proposals pending in each partition executor's queue.");
@@ -471,6 +476,9 @@ public static class KommanderMetrics
 
     private static IEnumerable<Measurement<long>> MeasureWalShardLevel6Files() =>
         MeasureWalEngines(static wal => wal.GetShardLevel6FileCount());
+
+    private static IEnumerable<Measurement<long>> MeasureWalShardLevel0Files() =>
+        MeasureWalEngines(static wal => wal.GetShardLevel0FileCount());
 
     private static List<Measurement<long>> MeasureWalEngines(Func<Kommander.WAL.RocksDbWAL, long> read)
     {

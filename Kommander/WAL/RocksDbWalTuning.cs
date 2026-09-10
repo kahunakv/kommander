@@ -4,15 +4,17 @@ namespace Kommander.WAL;
 /// <summary>
 /// Sizing knobs for the shard column families of <see cref="RocksDbWAL"/> — the CFs that hold the
 /// append-then-die Raft log rows. Exists so a write-probe harness (and hosts with unusual log
-/// rates or memory budgets) can tune the flush unit without a new package; the defaults implement
-/// the CF-sizing lever of the write-amplification fix.
+/// rates or memory budgets) can tune the flush unit without a new package.
 ///
-/// <para><b>What the sizing is for.</b> A log entry dies when the compaction pass covers it with a
-/// range tombstone (the durability floor passed it). An entry and its tombstone that co-reside in
-/// the same flush unit are dropped AT FLUSH — zero bytes reach L0 for them. An entry flushed
-/// before its tombstone arrives survives to L0 and must be rewritten by compaction before it can
-/// die (the 3.7x compaction residue of probe w2). The flush unit should therefore span the log's
-/// typical entry lifetime.</para>
+/// <para><b>What the sizing is for.</b> The log's dead prefix is deleted logically (a persisted
+/// per-partition compaction floor) and reclaimed physically as whole files, so compaction never
+/// rewrites a log row whatever these values are — write amplification is bounded at WAL + flush.
+/// The sizing decides how much of the flush is avoidable: the compaction pass writes a range
+/// tombstone confined to the ACTIVE memtable, and every row that dies while still in that memtable
+/// is dropped at flush and never reaches disk. A memtable that spans the log's typical entry
+/// lifetime therefore flushes almost nothing; a memtable flushed early (a starved shared
+/// WriteBufferManager — see the warning <see cref="RocksDbWAL"/> logs at open) flushes each row
+/// once, after which the whole-file drop reclaims it for free.</para>
 ///
 /// <para><b>Why merge count, not memtable size.</b> The defaults double the flush-unit span by
 /// merging two 64 MB memtables per flush (<see cref="ShardMinWriteBufferNumberToMerge"/> = 2)
@@ -25,9 +27,10 @@ namespace Kommander.WAL;
 /// from 128 MB on the RocksDB defaults. Only CFs that actually receive writes materialize
 /// memtables (a typical deployment writes 1–2 of the 8 shards), and arenas grow with data rather
 /// than being preallocated. Under a shared <see cref="RocksDbSharedResources"/> WriteBufferManager
-/// the budget caps real usage: over budget, RocksDB flushes early — which safely degrades this
-/// lever back toward the old behavior instead of growing memory. Hosts that saw the 1.4 GiB abort
-/// (run Q) should size the WBM budget, not disable the merge.</para>
+/// the budget caps real usage: over budget, RocksDB flushes early, which costs one flush per row
+/// instead of growing memory. Size the budget for the flush unit plus the co-hosted store's own
+/// memtables (the 2026-09-10 write probes ran a 128 MB budget against a 128 MB flush unit and a
+/// 64 MB co-hosted memtable, and every flush was budget-forced at ~6 MB).</para>
 ///
 /// <para><b>Stall-lock guard.</b> <see cref="ShardMaxWriteBufferNumber"/> must be at least
 /// <see cref="ShardMinWriteBufferNumberToMerge"/> + 1: a flush waits for the merge quorum of
@@ -61,9 +64,11 @@ public sealed record RocksDbWalTuning
     public int ShardMaxWriteBufferNumber { get; init; } = 4;
 
     /// <summary>
-    /// L0 file count that triggers compaction into the base level. Raised from the RocksDB default
-    /// of 4 so short-lived rows meet their range tombstone in L0 instead of being rewritten down
-    /// the levels first (measured on the 2026-09-09 write probe).
+    /// L0 file count that triggers compaction into the base level. Under the floor layout the
+    /// partition's files do not overlap, so this "compaction" is a metadata-only trivial move; the
+    /// value only decides how many flushed files wait in L0 before they become droppable whole.
+    /// Kept at 8 (raised from the RocksDB default of 4 on the 2026-09-09 write probe) because a
+    /// shard shared by several partitions still merges for real, and merges less often at 8.
     /// </summary>
     public int ShardLevel0FileNumCompactionTrigger { get; init; } = 8;
 
@@ -73,14 +78,11 @@ public sealed record RocksDbWalTuning
     /// <summary>L0 file count at which RocksDB stops writers entirely.</summary>
     public int ShardLevel0StopWritesTrigger { get; init; } = 44;
 
-    // ── Layout experiment (probe-driven; see the write-amp feature's w3 analysis) ────────────────
+    // ── Layout knobs (probe-driven; see the write-amp feature's w3 analysis) ─────────────────────
     //
-    // The flush-unit lever above kills entries that die within one flush. Entries the durability
-    // floor holds longer still cascade L0→L5→L6 before their range tombstone catches them, and
-    // DeleteFilesInRange cannot reclaim them while they sit in L0/L5 (it acts on whole files in the
-    // lower levels only). The knobs below let a probe make the log NOT need a bottom level, so a
-    // range tombstone annihilates its entries in at most one rewrite (W-Amp near 2) instead of the
-    // multi-level cascade. Defaults keep the shipped leveled layout, so they are inert until set.
+    // Superseded by the floor layout — files leave L0 by trivial move and are dropped whole, so no
+    // level cascade remains to avoid — but kept so a probe can still compare a different base-level
+    // size or universal compaction. Defaults keep the shipped leveled layout; inert until set.
 
     /// <summary>
     /// <c>max_bytes_for_level_base</c> for the shard CFs, or 0 to leave the RocksDB default
