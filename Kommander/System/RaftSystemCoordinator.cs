@@ -69,7 +69,8 @@ internal sealed class RaftSystemCoordinator : IDisposable
     // ── Load-report store ──────────────────────────────────────────────────
     // All writes and internal reads are exclusive to the single-consumer loop.
     // GetLoadReports() copies a snapshot for external callers on other threads.
-    private readonly LoadReportStore _loadReportStore = new();
+    // Assigned in the constructor so receipt stamping reads the configured tick source.
+    private readonly LoadReportStore _loadReportStore;
 
     // ── Balancer controller ────────────────────────────────────────────────
     // Cooldown/outstanding tables owned by LeaderBalancer; initialized in constructor.
@@ -106,6 +107,8 @@ internal sealed class RaftSystemCoordinator : IDisposable
     {
         this.manager = manager;
         this.logger = logger;
+
+        _loadReportStore = new LoadReportStore(() => manager.Configuration.TickSource.GetTimestamp());
 
         _leaderBalancer = new LeaderBalancer(
             _loadReportStore,
@@ -603,8 +606,8 @@ internal sealed class RaftSystemCoordinator : IDisposable
     internal string? GetNodeZone(string endpoint) =>
         _loadReportStore.GetNodeZone(endpoint);
 
-    private void EvictStaleLoadReports(TimeSpan ttl, Time.HLCTimestamp now) =>
-        _loadReportStore.EvictStale(ttl, now);
+    private void EvictStaleLoadReports(TimeSpan ttl, long nowTicks) =>
+        _loadReportStore.EvictStale(ttl, nowTicks);
 
     // ── Balancer controller ────────────────────────────────────────────────
 

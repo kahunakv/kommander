@@ -67,16 +67,108 @@ public class TestHlcDriftReview
         Assert.Contains(host.Requests, r => r.Type == RaftResponderRequestType.RequestVotes);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(3_600_000)]
+    public async Task FormerLeader_FreshActivityStillSuppressesCampaign(int skew)
+    {
+        // Control for the monotonic activity guard: with GENUINELY recent activity from the new
+        // leader, the former leader must keep backing off — under skew too. Same setup as
+        // FormerLeader_CanCampaignAfterNewLeaderFails, but only 50 ms of local time passes.
+        CapturingHost host = new();
+        RaftPartitionStateMachine sm = new(host, new ProposeWal(), new NoopSink(), NullLogger<IRaft>.Instance);
+        sm.SetPostToExecutor(_ => { });
+        await sm.CompleteRestoreAsync(await sm.StartRestoreAsync());
+        sm.SetLeaderForTesting(1);
+        host.Physical += skew;
+        HLCTimestamp sent = host.HybridLogicalClock.SendOrLocalEvent(1);
+        await sm.CompleteAppendLogsAsync(VoterA, sent, RaftOperationStatus.Success, 0, 1);
+        host.Physical -= skew;
+        await sm.AppendLogsAsync(VoterA, 2, sent, null);
+        host.Requests.Clear();
+        host.Advance(50);
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.DoesNotContain(host.Requests, r => r.Type == RaftResponderRequestType.RequestVotes);
+    }
+
+    [Theory]
+    [InlineData("sqlite")]
+    [InlineData("rocksdb")]
+    public async Task Restore_EmptyLogWithDurableHlcFloor_OrdersNewProposalAfterFloor(string backend)
+    {
+        // The narrowed/empty-read acceptance: when compaction or a narrowed restore read leaves no
+        // entry carrying the maximum timestamp, the persisted HLC high-water mark alone must still
+        // restore the clock floor before the node can mint.
+        string path = Path.Combine(Path.GetTempPath(), "kommander-hlc-floor-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(path);
+        IWAL CreateWal() => backend switch {
+            "sqlite" => new SqliteWAL(path, "wal", NullLogger<IRaft>.Instance),
+            _ => new RocksDbWAL(path, "wal", NullLogger<IRaft>.Instance)
+        };
+        IWAL wal = CreateWal();
+        bool ownsWal = true;
+        try
+        {
+            CapturingHost host = new() { Nodes = [] };
+            long floorL = host.Physical + 3_600_000;
+            Assert.True(wal.PersistHlcFloor(1, floorL));
+            wal.Dispose();
+            wal = CreateWal();
+            Assert.Equal(floorL, wal.GetHlcFloor(1));
+            using RaftManager manager = new(new RaftConfiguration { Host = "localhost", Port = 9000, InitialPartitions = 0 },
+                new StaticDiscovery([]), wal, new InMemoryCommunication(), host.HybridLogicalClock, NullLogger<IRaft>.Instance);
+            ownsWal = false;
+            ((FairReadScheduler)manager.ReadScheduler).Start();
+            ((FairWalScheduler)manager.WalScheduler).Start();
+            using RaftPartition partition = new(manager, wal, 1, 0, 0, NullLogger<IRaft>.Instance);
+            RaftWriteAhead writeAhead = new(manager, _ => { }, partition, wal);
+            RaftPartitionStateMachine sm = new(host, new RaftWalFacadeAdapter(writeAhead), new NoopSink(), NullLogger<IRaft>.Instance);
+            await sm.CompleteRestoreAsync(await sm.StartRestoreAsync());
+            sm.SetPostToExecutor(_ => { });
+            await sm.ForceLeaderForTestingAsync(null);
+            (_, HLCTimestamp ticket) = sm.ReplicateLogs([new RaftLog { LogType = "review", LogData = [3] }], true);
+            Assert.True(ticket.L >= floorL, $"New proposal {ticket} predates the durable HLC floor {floorL}");
+        }
+        finally
+        {
+            if (ownsWal) wal.Dispose();
+            Directory.Delete(path, true);
+        }
+    }
+
     [Fact]
     public void FuturePeerReport_DoesNotRemainFreshAfterAnHourWithoutUpdates()
     {
+        // A report stamped one hour in the future by its sender, accepted locally at receivedAt,
+        // then one real hour passes with no further updates. The balancer path (receipt ticks
+        // supplied) must expire it despite its sender-HLC age being zero.
         const long physical = 1_800_000_000_000;
+        long receivedAt = 1_000_000_000;
+        long anHourLater = receivedAt + 3600L * global::System.Diagnostics.Stopwatch.Frequency;
         NodeLoadReport report = new() { Endpoint = VoterA, ReportVersion = 1,
-            Time = new(2, physical + 3_600_000, 0) };
+            Time = new(2, physical + 3_600_000, 0), ReceivedAtTicks = receivedAt };
         var view = GlobalLeadershipView.Build([report],
             [new ClusterMember { Endpoint = VoterA, Role = ClusterMemberRole.Voter }],
-            new HashSet<string> { VoterA }, TimeSpan.FromSeconds(20), new(1, physical + 3_600_000, 0));
+            new HashSet<string> { VoterA }, TimeSpan.FromSeconds(20), new(1, physical + 3_600_000, 0),
+            anHourLater);
         Assert.Equal(0, view.FreshReportCount);
+    }
+
+    [Fact]
+    public void LaggingPeerReport_RecentlyReceived_StaysFresh()
+    {
+        // The converse skew: a sender an hour BEHIND the receiver. Its sender-HLC age reads as
+        // an hour old, but the report was accepted locally one second ago — it must stay fresh.
+        const long physical = 1_800_000_000_000;
+        long receivedAt = 1_000_000_000;
+        long oneSecondLater = receivedAt + global::System.Diagnostics.Stopwatch.Frequency;
+        NodeLoadReport report = new() { Endpoint = VoterA, ReportVersion = 1,
+            Time = new(2, physical - 3_600_000, 0), ReceivedAtTicks = receivedAt };
+        var view = GlobalLeadershipView.Build([report],
+            [new ClusterMember { Endpoint = VoterA, Role = ClusterMemberRole.Voter }],
+            new HashSet<string> { VoterA }, TimeSpan.FromSeconds(20), new(1, physical, 0),
+            oneSecondLater);
+        Assert.Equal(1, view.FreshReportCount);
     }
 
     [Theory]
@@ -223,7 +315,7 @@ public class TestHlcDriftReview
         public CapturingHost()
         {
             HybridLogicalClock = new(() => Physical);
-            activity = new(() => HybridLogicalClock.SendOrLocalEvent(1), LocalEndpoint);
+            activity = new(() => Ticks, LocalEndpoint);
         }
         public long GetMonotonicTimestamp() => Ticks;
         public void Advance(int milliseconds)
@@ -235,6 +327,7 @@ public class TestHlcDriftReview
         public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;
 
         public HLCTimestamp GetLastNodeActivity(string e, int p) => activity.GetLastNodeActivity(e, p);
+        public long GetLastNodeActivityTicks(string e, int p) => activity.GetLastNodeActivityTicks(e, p);
         public void UpdateLastNodeActivity(string e, int p, HLCTimestamp t) => activity.UpdateLastNodeActivity(e, p, t);
         public void EnqueueResponse(string e, RaftResponderRequest r) => Requests.Add(r);
         public Task InvokeLeaderChanged(int p, string l) => Task.CompletedTask;

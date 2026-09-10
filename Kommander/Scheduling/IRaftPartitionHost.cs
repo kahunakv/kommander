@@ -100,6 +100,17 @@ public interface IRaftPartitionHost
 
     HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId);
 
+    /// <summary>
+    /// The local monotonic tick at which activity from <paramref name="endpoint"/> on
+    /// <paramref name="partitionId"/> was last recorded, or 0 when it was never heard. Elapsed-time
+    /// freshness gates (the election back-off "heard from the leader recently" checks) must measure
+    /// against this tick, never subtract <see cref="GetLastNodeActivity(string,int)"/> HLC values:
+    /// an HLC absorbed from a skewed peer freezes the subtraction at zero for the whole skew and
+    /// can block failover. Defaults to 0 ("never heard") so test hosts without an activity store
+    /// conservatively allow campaigning.
+    /// </summary>
+    long GetLastNodeActivityTicks(string endpoint, int partitionId) => 0;
+
     void UpdateLastNodeActivity(string endpoint, int partitionId, HLCTimestamp timestamp);
 
     void EnqueueResponse(string endpoint, RaftResponderRequest request);

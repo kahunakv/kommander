@@ -94,7 +94,9 @@ internal sealed class LoadReportService
     /// <para>Freshness is enforced here with <see cref="RaftConfiguration.LeaderBalancerReportTtl"/>
     /// rather than left to <see cref="LoadReportStore.EvictStale"/>, because eviction runs only on
     /// the P0 leader's balancer pass — on every other node reports accumulate forever, and an
-    /// unfiltered scan would keep returning a dead node's endpoint indefinitely.</para>
+    /// unfiltered scan would keep returning a dead node's endpoint indefinitely. Freshness is the
+    /// local elapsed time since accepted receipt (<see cref="NodeLoadReport.ReceivedAtTicks"/>),
+    /// never the sender-stamped HLC age, which sender clock skew freezes or inverts.</para>
     /// </summary>
     internal string? GetPartitionLeaderHint(int partitionId)
     {
@@ -102,13 +104,13 @@ internal sealed class LoadReportService
         if (!string.IsNullOrEmpty(local))
             return local;
 
-        HLCTimestamp now = getHlcNow();
+        long nowTicks = configuration.TickSource.GetTimestamp();
         TimeSpan ttl = configuration.LeaderBalancerReportTtl;
 
         NodeLoadReport? best = null;
         foreach (NodeLoadReport r in getLoadReports())
         {
-            if ((now - r.Time) > ttl)
+            if (Consensus.RaftMonotonic.Elapsed(r.ReceivedAtTicks, nowTicks) > ttl)
                 continue;
 
             foreach (PartitionLoad l in r.Leaderships)

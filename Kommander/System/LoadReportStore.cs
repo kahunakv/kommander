@@ -18,6 +18,18 @@ internal sealed class LoadReportStore
     private readonly ConcurrentDictionary<string, NodeLoadReport> _loadReports = new(StringComparer.Ordinal);
 
     /// <summary>
+    /// Local monotonic tick source used to stamp <see cref="NodeLoadReport.ReceivedAtTicks"/> on
+    /// accepted ingestion. Receipt ticks — not the sender-stamped HLC <see cref="NodeLoadReport.Time"/> —
+    /// are what every freshness/TTL decision measures against, because a sender's clock skew makes
+    /// the HLC age meaningless (a future-dated report otherwise never expires). Defaults to the
+    /// process clock; the coordinator wires the configured tick source.
+    /// </summary>
+    private readonly Func<long> _getReceiptTicks;
+
+    internal LoadReportStore(Func<long>? getReceiptTicks = null) =>
+        _getReceiptTicks = getReceiptTicks ?? Time.SystemMonotonicTickSource.Instance.GetTimestamp;
+
+    /// <summary>
     /// Incremented after every mutation of <see cref="_loadReports"/>. A cached snapshot is valid only
     /// while this value is unchanged, which is what lets <see cref="GetAll"/> hand out the same
     /// collection to many readers without ever showing a torn or stale view.
@@ -99,18 +111,22 @@ internal sealed class LoadReportStore
     }
 
     /// <summary>
-    /// Removes entries whose HLC age exceeds <paramref name="ttl"/> × 3. Called by the
+    /// Removes entries whose local receipt age exceeds <paramref name="ttl"/> × 3. Called by the
     /// balancer pass before consuming store contents to avoid planning moves based on stale data.
+    /// Age is measured against <see cref="NodeLoadReport.ReceivedAtTicks"/> (local monotonic) —
+    /// never against the sender-stamped HLC, whose skew previously let a future-dated report
+    /// survive eviction for the whole skew plus the TTL. A report that somehow carries no receipt
+    /// tick reads as infinitely old and is evicted.
     /// Note this runs only on the P0 leader with the balancer enabled — every other consumer of
     /// <see cref="GetAll"/> must apply its own freshness filter rather than rely on eviction.
     /// </summary>
-    internal void EvictStale(TimeSpan ttl, Time.HLCTimestamp now)
+    internal void EvictStale(TimeSpan ttl, long nowTicks)
     {
         TimeSpan maxAge = ttl * 3;
         List<string>? stale = null;
         foreach (NodeLoadReport r in _loadReports.Values)
         {
-            if ((now - r.Time) > maxAge)
+            if (Consensus.RaftMonotonic.Elapsed(r.ReceivedAtTicks, nowTicks) > maxAge)
                 (stale ??= []).Add(r.Endpoint);
         }
         if (stale is null)
@@ -135,6 +151,9 @@ internal sealed class LoadReportStore
     /// Ingests a gossiped load report, retaining only the entry with the highest
     /// <see cref="NodeLoadReport.ReportVersion"/> per sender endpoint. The check-then-set is safe
     /// without a compare-exchange because the coordinator loop is the only writer.
+    /// <para>Stamps <see cref="NodeLoadReport.ReceivedAtTicks"/> here, on acceptance only:
+    /// a re-forwarded copy of an already-seen version is rejected above, so repeated old gossip
+    /// can never refresh a report's freshness.</para>
     /// </summary>
     internal void Apply(RaftSystemRequest request)
     {
@@ -144,6 +163,7 @@ internal sealed class LoadReportStore
         if (_loadReports.TryGetValue(report.Endpoint, out NodeLoadReport? existing) &&
             report.ReportVersion <= existing.ReportVersion)
             return;
+        report.ReceivedAtTicks = _getReceiptTicks();
         _loadReports[report.Endpoint] = report;
 
         InvalidateSnapshot();

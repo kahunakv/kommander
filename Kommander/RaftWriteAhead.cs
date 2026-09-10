@@ -119,6 +119,34 @@ public sealed class RaftWriteAhead
     // only after the WAL enqueue succeeds, so a backpressure rejection needs no frontier rollback.
     private readonly List<long> resolvedThisBatch = [];
 
+    // ── Durable HLC high-water mark ──────────────────────────────────────────────────────────────
+    // Cached copy of the persisted per-partition HLC floor (see IWAL.PersistHlcFloor). The write
+    // paths keep the persisted bound HlcFloorSlackMs AHEAD of the maximum entry timestamp they
+    // observe, so persistence costs one metadata write per slack window rather than one per entry.
+    // On restore the bound (plus the maximum timestamp actually read back) is merged into the node
+    // clock before anything can mint new timestamps — without this, a node restarted after a clock
+    // correction minted timestamps BELOW entries it had just restored (reproduced on all three
+    // backends in the 2026-09-09 HLC drift review), and downstream consumers ordering by HLC then
+    // rejected newer mutations. Touched only on the partition's serialized executor path.
+    private long persistedHlcFloorL;
+
+    private const long HlcFloorSlackMs = 10_000;
+
+    /// <summary>
+    /// Advances the durable HLC high-water mark when an observed entry timestamp reaches the
+    /// persisted bound. A failed metadata write is tolerated: the cache stays behind, so the next
+    /// write retries, and the restore path independently merges the timestamps it reads back.
+    /// </summary>
+    private void RecordHlcHighWater(long observedL)
+    {
+        if (observedL <= 0 || observedL < persistedHlcFloorL)
+            return;
+
+        long target = observedL + HlcFloorSlackMs;
+        if (walAdapter.PersistHlcFloor(partition.PartitionId, target))
+            persistedHlcFloorL = target;
+    }
+
     // ── Contiguous-presence frontier ─────────────────────────────────────────────────────────────
     // The next slot after the largest id L such that every id through L is durably present in the
     // WAL (any entry type — Proposed, Committed, RolledBack, checkpoints). Unlike the raw max id
@@ -456,11 +484,18 @@ public sealed class RaftWriteAhead
         // other entry.
         long certifiedCheckpointFloor = await GetLastCheckpointAsync().ConfigureAwait(false);
 
+        // Maximum HLC timestamp across every restored entry (any type): Proposed entries carry
+        // emitted timestamps too, so they participate in the clock floor below.
+        HLCTimestamp maxRestoredTime = HLCTimestamp.Zero;
+
         foreach (RaftLog log in logs)
         {
             any = true;
             if (log.Id > maxLogId)
                 maxLogId = log.Id;
+
+            if (log.Time.L > maxRestoredTime.L || (log.Time.L == maxRestoredTime.L && log.Time.C > maxRestoredTime.C))
+                maxRestoredTime = log.Time;
 
             // A checkpoint certifies its whole prefix (it is the durable recovery anchor), so it
             // may jump the presence frontier — but only when the persisted floor covers it (see
@@ -554,6 +589,25 @@ public sealed class RaftWriteAhead
             manager.Logger.LogWarnRestoreFrontierBelowCheckpoint(
                 manager.LocalEndpoint, partition.PartitionId, commitIndex - 1, restoredCheckpoint);
             SeedCommitFrontierFromSnapshot(restoredCheckpoint, Math.Max(checkpointTerm, 0));
+        }
+
+        // ── Restore the HLC floor before anything can mint a timestamp ────────────────────
+        // Merge the durable high-water mark and the maximum restored entry timestamp into the node
+        // clock NOW — before the replay callbacks run and before this partition publishes service.
+        // The clock initializes from the physical clock alone, so a restart after a wall-clock
+        // correction otherwise mints timestamps that predate the entries just restored: Raft
+        // term/index ordering stays correct while HLC-ordering consumers reject newer mutations.
+        // The metadata bound covers what the read did not return (compacted history, a narrowed
+        // soft-floor read, an empty log); the scanned maximum covers a tail the bound had not yet
+        // been persisted for. ReceiveEvent is the standard monotonic merge, so concurrent live
+        // receives during restore stay safe.
+        persistedHlcFloorL = walAdapter.GetHlcFloor(partition.PartitionId);
+
+        long hlcFloorL = Math.Max(persistedHlcFloorL, maxRestoredTime.L);
+        if (hlcFloorL > 0)
+        {
+            uint hlcFloorC = hlcFloorL == maxRestoredTime.L ? maxRestoredTime.C : 0u;
+            manager.HybridLogicalClock.ReceiveEvent(manager.LocalNodeId, new HLClockMessage(hlcFloorL, hlcFloorC));
         }
 
         // ── Replay the committed prefix to the application ─────────────────────────────────
@@ -775,6 +829,10 @@ public sealed class RaftWriteAhead
             // that recently followed can still carry a hole below — the frontier buffers over it.
             for (int i = 0; i < count; i++)
                 AdvancePresenceFrontier(ordered[i].Id, ordered[i].Term);
+
+            // The ticket is the maximum timestamp of the batch (each entry's Time is stamped from
+            // it); keep the durable HLC high-water mark ahead of it.
+            RecordHlcHighWater(timestamp.L);
 
             // Count the durable phase from the producer side (inert unless instrumentation
             // is enabled): one LeaderPropose enqueue per single-round committed write.
@@ -1818,6 +1876,10 @@ public sealed class RaftWriteAhead
         // the max over logsToWrite, so logIndex is identical to the previous code.
         long maxLogId = -1;
 
+        // Maximum entry timestamp in this batch, for the durable HLC high-water mark: a follower's
+        // entries carry the LEADER's timestamps, and they must be covered by this node's floor too.
+        long maxBatchTimeL = 0;
+
         // EXPLICIT flatten order — proposes first, resolutions last. The physical write applies
         // the flattened list in order and the last put for a key wins, so when one batch carries
         // both a (stale duplicate) Proposed copy and the resolution of the same id, the resolved
@@ -1837,6 +1899,8 @@ public sealed class RaftWriteAhead
                 logsToWrite.Add(log);
                 if (log.Id > maxLogId)
                     maxLogId = log.Id;
+                if (log.Time.L > maxBatchTimeL)
+                    maxBatchTimeL = log.Time.L;
             }
         }
 
@@ -1884,6 +1948,8 @@ public sealed class RaftWriteAhead
         // never inflates this node's advertised log freshness.
         foreach (RaftLog log in logsToWrite)
             AdvancePresenceFrontier(log.Id, log.Term);
+
+        RecordHlcHighWater(maxBatchTimeL);
 
         // Follower-side durable phase. Followers fsync on the propose quorum's critical
         // path, so this phase's latency is measured symmetrically with the leader's.

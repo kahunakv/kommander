@@ -72,13 +72,20 @@ public sealed class TestLoadReportStoreSnapshot
     [Fact]
     public void Eviction_InvalidatesTheSnapshot()
     {
-        LoadReportStore store = new();
+        // Eviction ages a report by the LOCAL tick at which it was accepted, not by its
+        // sender-stamped HLC time. Drive the injectable tick source to make node-a old.
+        long frequency = global::System.Diagnostics.Stopwatch.Frequency;
+        long nowTicks = 0;
+        LoadReportStore store = new(() => nowTicks);
+
         store.Apply(ReportRequest("node-a:5000", 1, At(0)));
+        nowTicks = 99 * frequency;
         store.Apply(ReportRequest("node-b:5001", 1, At(100_000)));
 
         Assert.Equal(2, store.GetAll().Count);
 
-        store.EvictStale(TimeSpan.FromSeconds(1), At(100_000));
+        nowTicks = 100 * frequency;
+        store.EvictStale(TimeSpan.FromSeconds(1), nowTicks);
 
         IReadOnlyList<NodeLoadReport> after = store.GetAll();
 

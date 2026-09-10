@@ -549,7 +549,7 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         LocalNodeId = this.configuration.NodeId > 0 ? this.configuration.NodeId : HashUtils.SmallSimpleHash(LocalNodeName);
 
         nodeActivityTracker = new NodeActivityTracker(
-            () => hybridLogicalClock.TrySendOrLocalEvent(LocalNodeId),
+            () => this.configuration.TickSource.GetTimestamp(),
             LocalEndpoint);
 
         snapshotReceiver = new SnapshotReceiver(
@@ -1454,6 +1454,14 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     /// </summary>
     public HLCTimestamp GetLastNodeActivity(string endpoint, int partitionId) =>
         nodeActivityTracker.GetLastNodeActivity(endpoint, partitionId);
+
+    /// <summary>
+    /// Obtains the local monotonic tick at which activity from the node on the partition was last
+    /// recorded, or 0 when it was never heard. Elapsed-time freshness gates must use this, not the
+    /// HLC value: a skewed peer's HLC freezes HLC subtraction for the whole skew.
+    /// </summary>
+    internal long GetLastNodeActivityTicks(string endpoint, int partitionId) =>
+        nodeActivityTracker.GetLastNodeActivityTicks(endpoint, partitionId);
 
     /// <summary>
     /// Obtains the last activity known of a specific node across all partitions.

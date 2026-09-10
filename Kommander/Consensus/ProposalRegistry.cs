@@ -245,8 +245,12 @@ internal sealed class ProposalRegistry
     /// voters that still owe an ack. Bounded per round so a backlog retries across successive beats
     /// instead of flooding the transport. Proposals stay active until they resolve or leadership
     /// changes (which clears the map), so the retry naturally stops at both terminal outcomes.
+    /// <para>Ages are measured on <see cref="RaftProposalQuorum.StartTicks"/> (local monotonic),
+    /// never on the HLC ticket: a proposal minted while the node HLC ran ahead of wall time kept an
+    /// apparent HLC age of zero for the whole skew, so a lost broadcast was silently never
+    /// re-sent until wall time caught up (the HLC drift review's P1 retry finding).</para>
     /// </summary>
-    public void RetryUnresolved(HLCTimestamp currentTime)
+    public void RetryUnresolved(long nowTicks)
     {
         const int MaxProposalsPerRound = 8;
 
@@ -263,7 +267,7 @@ internal sealed class ProposalRegistry
             if (proposal.State != RaftProposalState.Incomplete || proposal.HasQuorum())
                 continue;
 
-            if (currentTime - proposal.StartTimestamp < minAge)
+            if (RaftMonotonic.Elapsed(proposal.StartTicks, nowTicks) < minAge)
                 continue;
 
             proposalResendScratch.Clear();
@@ -292,9 +296,12 @@ internal sealed class ProposalRegistry
 
     /// <summary>
     /// Releases settled proposals, returning each to the pool so its log payload is not retained
-    /// until the next leadership change.
+    /// until the next leadership change. The 30-second window is measured on
+    /// <see cref="RaftProposalQuorum.StartTicks"/> (local monotonic) for the same reason
+    /// <see cref="RetryUnresolved"/> is: an HLC age frozen by skew retained settled payloads for
+    /// the whole skew window.
     /// </summary>
-    public void PruneSettled(HLCTimestamp currentTime)
+    public void PruneSettled(long nowTicks)
     {
         TimeSpan range = TimeSpan.FromSeconds(30);
 
@@ -302,7 +309,7 @@ internal sealed class ProposalRegistry
 
         foreach (KeyValuePair<HLCTimestamp, RaftProposalQuorum> proposal in activeProposals)
         {
-            if (proposal.Value.HasQuorum() && currentTime - proposal.Value.StartTimestamp > range)
+            if (proposal.Value.HasQuorum() && RaftMonotonic.Elapsed(proposal.Value.StartTicks, nowTicks) > range)
                 settledProposalScratch.Add(proposal.Key);
         }
 

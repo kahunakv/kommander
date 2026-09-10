@@ -315,7 +315,9 @@ internal sealed class WalCompletionRouter
             return;
         }
 
-        RaftProposalQuorum proposalQuorum = RaftProposalQuorumPool.Rent(logs, autoCommit, ticketId);
+        // StartTicks = the local registration tick. Retry/prune ages measure against it (monotonic),
+        // while the HLC ticket stays the proposal's identity — an HLC age freezes under skew.
+        RaftProposalQuorum proposalQuorum = RaftProposalQuorumPool.Rent(logs, autoCommit, ticketId, host.GetMonotonicTimestamp());
 
         // Register the local leader as a voter participant and mark it completed immediately.
         // Must be done via AddExpectedNodeCompletion so MarkNodeCompleted (which now only

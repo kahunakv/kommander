@@ -81,6 +81,17 @@ public sealed class RaftProposalQuorum
     public HLCTimestamp StartTimestamp { get; private set; }
 
     /// <summary>
+    /// Local monotonic tick at which this proposal was registered, or 0 when the creator supplied
+    /// none. Retry and cleanup ages are measured against this tick, never against
+    /// <see cref="StartTimestamp"/>: the node HLC can run ahead of wall time after absorbing a
+    /// skewed peer's timestamp or a corrected forward clock step, and an HLC age then freezes at
+    /// zero for the whole skew — silently skipping lost-proposal retries and retaining settled
+    /// payloads. <see cref="StartTimestamp"/> stays the proposal's identity and causal order.
+    /// An unset (0) tick reads as "infinitely old", so such a proposal is always retry-eligible.
+    /// </summary>
+    public long StartTicks { get; private set; }
+
+    /// <summary>
     /// Retrieves the index of the last log entry within the proposal quorum.
     /// This index serves as a reference to the most recently added log entry
     /// maintained in the quorum, typically reflecting progress in the log replication process
@@ -93,7 +104,7 @@ public sealed class RaftProposalQuorum
     /// proposal-specific details such as the logs associated with the proposal,
     /// whether the proposal is set to auto-commit, and its initial timestamp.
     /// </summary>
-    public RaftProposalQuorum(List<RaftLog> logs, bool autoCommit, HLCTimestamp startTimestamp)
+    public RaftProposalQuorum(List<RaftLog> logs, bool autoCommit, HLCTimestamp startTimestamp, long startTicks = 0)
     {
         State = RaftProposalState.Incomplete;
         _waiter = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -101,6 +112,7 @@ public sealed class RaftProposalQuorum
         Logs = logs;
         AutoCommit = autoCommit;
         StartTimestamp = startTimestamp;
+        StartTicks = startTicks;
     }
 
     /// <summary>
@@ -232,7 +244,8 @@ public sealed class RaftProposalQuorum
     /// <param name="logs">The collection of Raft logs to associate with the quorum.</param>
     /// <param name="autoCommit">A boolean flag indicating whether the proposal should be auto-committed.</param>
     /// <param name="startTimestamp">The timestamp marking the start of the proposal.</param>
-    public void Reset(List<RaftLog> logs, bool autoCommit, HLCTimestamp startTimestamp)
+    /// <param name="startTicks">Local monotonic tick of registration; see <see cref="StartTicks"/>.</param>
+    public void Reset(List<RaftLog> logs, bool autoCommit, HLCTimestamp startTimestamp, long startTicks = 0)
     {
         // Drain any pending waiter from a previous pool use before replacing it.
         _waiter?.TrySetResult((RaftProposalTicketState.NotFound, -1));
@@ -244,6 +257,7 @@ public sealed class RaftProposalQuorum
         Logs = logs;
         AutoCommit = autoCommit;
         StartTimestamp = startTimestamp;
+        StartTicks = startTicks;
     }
 
     public void Clear()

@@ -117,14 +117,22 @@ public sealed class TestGetPartitionLeaderHint
     [Fact]
     public async Task StaleReport_YieldsNull()
     {
-        using RaftManager manager = MakeManager();
+        // Staleness is the LOCAL elapsed time since the report was accepted — a dead node stops
+        // reporting and its last claim ages out in real local time. The sender-stamped HLC is
+        // deliberately not consulted (a skewed sender's HLC age freezes or inverts), so this
+        // drives a virtual tick source past the TTL instead of back-dating the report.
+        Simulation.Time.VirtualTickSource ticks = new();
+        using RaftManager manager = MakeManager(c => c.TickSource = ticks);
 
         HLCTimestamp now = manager.HybridLogicalClock.SendOrLocalEvent(0);
         TimeSpan ttl = manager.Configuration.LeaderBalancerReportTtl;
-        HLCTimestamp stale = new(now.N, now.L - (long)(ttl.TotalMilliseconds * 3), 0);
 
-        manager.SystemCoordinator.Send(new RaftSystemRequest(MakeReport("dead-node:9009", 1, stale, Partition)));
+        manager.SystemCoordinator.Send(new RaftSystemRequest(MakeReport("dead-node:9009", 1, now, Partition)));
         await manager.SystemCoordinator.DrainAsync();
+
+        Assert.Equal("dead-node:9009", manager.GetPartitionLeaderHint(Partition));
+
+        ticks.AdvanceBy((long)(ttl.TotalMilliseconds * 3));
 
         Assert.Null(manager.GetPartitionLeaderHint(Partition));
     }

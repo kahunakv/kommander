@@ -196,6 +196,29 @@ public interface IWAL : IDisposable
         return true;
     }
 
+    /// <summary>
+    /// Persists the partition's durable HLC high-water mark: an upper bound (in HLC physical
+    /// milliseconds) on every timestamp this partition has written to its log. Stored via the
+    /// metadata primitive under a per-partition key. On restore the node merges this bound into its
+    /// hybrid logical clock BEFORE it can mint new timestamps, so a restart after a clock
+    /// correction can never mint a timestamp that predates entries the log already holds — even
+    /// when compaction or a narrowed restore read removed the entries that carried the maximum
+    /// timestamp. The writer persists the bound with slack ahead of the observed maximum, so this
+    /// is written once per slack window, not per entry.
+    /// <para>Durability rides the backend's fsync cadence like <see cref="PersistHardState"/>; the
+    /// restore path additionally merges the maximum timestamp actually read back, so a lost tail
+    /// write is covered by the entries themselves.</para>
+    /// </summary>
+    public bool PersistHlcFloor(int partitionId, long floorL) =>
+        SetMetaData($"raft_hlcfloor_p{partitionId}", floorL.ToString());
+
+    /// <summary>
+    /// Reads the persisted HLC high-water mark for <paramref name="partitionId"/>, or 0 when none
+    /// has been written yet (fresh node, or a legacy WAL predating the floor).
+    /// </summary>
+    public long GetHlcFloor(int partitionId) =>
+        long.TryParse(GetMetaData($"raft_hlcfloor_p{partitionId}"), out long floorL) && floorL > 0 ? floorL : 0;
+
     /// <param name="compactNumberEntries">Maximum entries removed per internal delete batch.</param>
     /// <param name="maxTotalEntries">
     /// When set, removes up to this many entries in one storage transaction by issuing

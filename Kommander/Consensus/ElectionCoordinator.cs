@@ -254,6 +254,36 @@ internal sealed class ElectionCoordinator
         return true;
     }
 
+    /// <summary>
+    /// The campaign back-off "heard from the expected leader recently" test, shared by
+    /// <see cref="StartElectionAsync"/> and <see cref="StartPreVoteAsync"/>. Measured as local
+    /// elapsed time since the peer-activity store's monotonic receipt tick — NEVER as an HLC
+    /// subtraction. The old HLC form (<c>currentTime - lastKnownHeartbeat</c>) stayed frozen at
+    /// zero for the full duration of any absorbed clock skew, and each suppressed round refreshed
+    /// the heartbeat anchor to <c>now</c>, so a former leader that once recorded an ACK from the
+    /// new leader could keep treating it as fresh long after it died — blocking failover exactly
+    /// where that node was needed to campaign (the HLC drift review's P1 finding).
+    /// <para>On suppression the heartbeat anchors are refreshed only <b>forward</b> to the genuine
+    /// receipt tick, never to <c>now</c>: a frozen difference must not extend the outer follower
+    /// election gate.</para>
+    /// </summary>
+    private bool LeaderActivityIsFresh(string expectedLeader, long nowTicks)
+    {
+        long lastActivityTicks = host.GetLastNodeActivityTicks(expectedLeader, host.PartitionId);
+
+        if (lastActivityTicks == 0 || RaftMonotonic.Elapsed(lastActivityTicks, nowTicks) >= coreState.ElectionTimeout)
+            return false;
+
+        // Back off and remember we saw the leader — anchored at the actual receipt tick.
+        if (lastActivityTicks > coreState.LastHeartbeatTicks)
+        {
+            coreState.LastHeartbeat = host.GetLastNodeActivity(expectedLeader, host.PartitionId);
+            coreState.LastHeartbeatTicks = lastActivityTicks;
+        }
+
+        return true;
+    }
+
     public async Task StartElectionAsync(HLCTimestamp currentTime, bool ignoreRecentVoteCooldown)
     {
         // Two gates: the roster role (a cluster Learner/Leaving node never campaigns anywhere)
@@ -291,23 +321,8 @@ internal sealed class ElectionCoordinator
                 return;
 
             string expectedLeader = expectedLeaders.GetValueOrDefault(coreState.CurrentTerm, "");
-            if (!string.IsNullOrEmpty(expectedLeader))
-            {
-                // NOTE (B3 residual): GetLastNodeActivity returns an HLC written locally on the last
-                // AppendLogs from this peer. The "heard from the leader recently" decision below is still an
-                // HLC subtraction and remains mildly skew-sensitive — the peer-activity store migration to
-                // monotonic ticks was deliberately deferred (contained B3 scope). On suppression we refresh
-                // BOTH the HLC anchor and its monotonic shadow so the monotonic follower election gate
-                // honours the back-off; the residual only affects whether we take this branch at all.
-                HLCTimestamp lastKnownHeartbeat = host.GetLastNodeActivity(expectedLeader, host.PartitionId);
-
-                if (lastKnownHeartbeat != HLCTimestamp.Zero && ((currentTime - lastKnownHeartbeat) < coreState.ElectionTimeout))
-                {
-                    coreState.LastHeartbeat = lastKnownHeartbeat;
-                    coreState.LastHeartbeatTicks = nowTicks;
-                    return;
-                }
-            }
+            if (!string.IsNullOrEmpty(expectedLeader) && LeaderActivityIsFresh(expectedLeader, nowTicks))
+                return;
 
             // A gapped log with a fresher live voter known: yield the round (bounded) instead of
             // winning a term this node would refuse at the promotion gates. Skipped when a
@@ -421,21 +436,10 @@ internal sealed class ElectionCoordinator
         if (coreState.LastVotationTicks != 0 && (RaftMonotonic.Elapsed(coreState.LastVotationTicks, nowTicks) < (coreState.ElectionTimeout * 2)))
             return;
 
+        // Intentional back-off write inside: remembers we saw the leader. Not a consensus mutation.
         string expectedLeader = expectedLeaders.GetValueOrDefault(coreState.CurrentTerm, "");
-        if (!string.IsNullOrEmpty(expectedLeader))
-        {
-            // B3 residual (same as StartElectionAsync): the "heard from leader recently" test is still an
-            // HLC subtraction off the HLC peer-activity store; on back-off we refresh the monotonic shadow.
-            HLCTimestamp lastKnownHeartbeat = host.GetLastNodeActivity(expectedLeader, host.PartitionId);
-
-            if (lastKnownHeartbeat != HLCTimestamp.Zero && ((currentTime - lastKnownHeartbeat) < coreState.ElectionTimeout))
-            {
-                // Intentional: back off and remember we saw the leader. Not a consensus mutation.
-                coreState.LastHeartbeat = lastKnownHeartbeat;
-                coreState.LastHeartbeatTicks = nowTicks;
-                return;
-            }
-        }
+        if (!string.IsNullOrEmpty(expectedLeader) && LeaderActivityIsFresh(expectedLeader, nowTicks))
+            return;
 
         // A gapped log with a fresher live voter known: yield the round (bounded) instead of
         // probing for a term this node would refuse at the promotion gates. Unlike the removed

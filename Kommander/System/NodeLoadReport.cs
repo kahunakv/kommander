@@ -36,6 +36,19 @@ public sealed class NodeLoadReport
     public HLCTimestamp Time { get; set; }
 
     /// <summary>
+    /// Local monotonic tick at which THIS node accepted the report (stamped by
+    /// <see cref="LoadReportStore.Apply"/> on version-accepted ingestion; 0 = never stamped).
+    /// Freshness/TTL decisions measure against this tick, never against the sender-stamped
+    /// <see cref="Time"/>: a sender an hour ahead otherwise stays "fresh" for an hour past its
+    /// death, and a sender behind reads as expired while alive. Repeatedly forwarded old gossip
+    /// does not refresh it, because the store only accepts a strictly higher
+    /// <see cref="ReportVersion"/>. Deliberately excluded from serialization — it is meaningless
+    /// on any other node.
+    /// </summary>
+    [global::System.Text.Json.Serialization.JsonIgnore]
+    public long ReceivedAtTicks { get; set; }
+
+    /// <summary>
     /// The sender's locality hint (<see cref="RaftConfiguration.Zone"/>), or null when it has
     /// none configured. Carried so every node — the P0 placement planner in particular — learns
     /// remote nodes' zones without a committed roster change; without this only the local node's

@@ -89,8 +89,9 @@ internal sealed class LogReplicator
             return (RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
 
         HLCTimestamp currentTime = host.HybridLogicalClock.SendOrLocalEvent(host.LocalNodeId);
+        long nowTicks = host.GetMonotonicTimestamp();
         coreState.LastProposalAt = currentTime;
-        coreState.LastProposalAtTicks = host.GetMonotonicTimestamp(); // B3: quiesce-after measured on monotonic clock
+        coreState.LastProposalAtTicks = nowTicks; // B3: quiesce-after measured on monotonic clock
         coreState.SetQuiesced(false); // un-quiesce on new proposal: resume normal heartbeating
 
         // Try to clear and reuse settled proposals. Only worth scanning once a few have accumulated;
@@ -98,7 +99,7 @@ internal sealed class LogReplicator
         // so an idle leader that stops proposing still releases its settled proposals rather than
         // retaining their log payloads until the next leadership change.
         if (proposals.ActiveCount > 5)
-            proposals.PruneSettled(currentTime);
+            proposals.PruneSettled(nowTicks);
 
         // No peers: a single-node leader is its own quorum. Rather than rejecting the proposal,
         // we enqueue it to the local WAL exactly like the multi-node path; CompleteLeaderPropose

@@ -12,9 +12,12 @@ namespace Kommander.System;
 /// <list type="bullet">
 ///   <item>Only the highest <see cref="NodeLoadReport.ReportVersion"/> per endpoint is retained;
 ///   out-of-order arrivals are silently discarded.</item>
-///   <item>Reports whose <see cref="NodeLoadReport.Time"/> is older than the configured TTL
-///   (evaluated at <see cref="Build"/> time) are excluded.  Stale exclusion means the planner
-///   simply sees fewer covered partitions and may abort via <see cref="IsComplete"/>.</item>
+///   <item>Reports older than the configured TTL (evaluated at <see cref="Build"/> time) are
+///   excluded. Age is the local elapsed time since accepted receipt
+///   (<see cref="NodeLoadReport.ReceivedAtTicks"/>) when the caller supplies monotonic ticks —
+///   never the sender-stamped <see cref="NodeLoadReport.Time"/>, whose skew defeats a TTL.
+///   Stale exclusion means the planner simply sees fewer covered partitions and may abort via
+///   <see cref="IsComplete"/>.</item>
 ///   <item>When two fresh reports both claim leadership of the same partition the claim from the
 ///   report with the larger <see cref="NodeLoadReport.Time"/> wins; ties favour the first seen.</item>
 /// </list>
@@ -110,13 +113,22 @@ public sealed class GlobalLeadershipView
     /// <param name="members">Committed cluster roster used to determine eligible voter set.</param>
     /// <param name="aliveEndpoints">Endpoints currently considered alive by the SWIM detector.</param>
     /// <param name="ttl">Maximum age before a report is discarded.</param>
-    /// <param name="now">Current logical time used for TTL evaluation.</param>
+    /// <param name="now">Current logical time, used for the health-sample transit estimate and
+    /// conflict ordering — never for TTL freshness when <paramref name="nowTicks"/> is supplied.</param>
+    /// <param name="nowTicks">Current local monotonic tick. When non-zero, a report is fresh only
+    /// while the local elapsed time since its accepted receipt
+    /// (<see cref="NodeLoadReport.ReceivedAtTicks"/>) is within <paramref name="ttl"/> — the
+    /// sender-stamped <see cref="NodeLoadReport.Time"/> is not consulted, because sender clock skew
+    /// makes an HLC age meaningless (a future-dated report otherwise stayed fresh for the whole
+    /// skew after its sender died, and a lagging sender's live report read as expired). When 0
+    /// (legacy callers, tests that hand-build reports), freshness falls back to the HLC age.</param>
     public static GlobalLeadershipView Build(
         IEnumerable<NodeLoadReport> reports,
         IEnumerable<ClusterMember> members,
         IReadOnlySet<string> aliveEndpoints,
         TimeSpan ttl,
-        HLCTimestamp now)
+        HLCTimestamp now,
+        long nowTicks = 0)
     {
         // Step 1: deduplicate to highest ReportVersion per endpoint.
         Dictionary<string, NodeLoadReport> best = new(StringComparer.Ordinal);
@@ -129,12 +141,17 @@ public sealed class GlobalLeadershipView
             }
         }
 
-        // Step 2: keep only fresh (non-expired) reports.
+        // Step 2: keep only fresh (non-expired) reports — by local receipt age when the caller
+        // supplies monotonic ticks (the production balancer path), by HLC age otherwise.
         List<NodeLoadReport> fresh = new(best.Count);
         HashSet<string> freshReportEndpoints = new(best.Count, StringComparer.Ordinal);
         foreach (NodeLoadReport report in best.Values)
         {
-            if ((now - report.Time) <= ttl)
+            bool isFresh = nowTicks != 0
+                ? Consensus.RaftMonotonic.Elapsed(report.ReceivedAtTicks, nowTicks) <= ttl
+                : (now - report.Time) <= ttl;
+
+            if (isFresh)
             {
                 fresh.Add(report);
                 freshReportEndpoints.Add(report.Endpoint);
@@ -144,13 +161,23 @@ public sealed class GlobalLeadershipView
         // Step 2b: node-level disk health, one entry per fresh reporter. Unlike the partition maps
         // below there is nothing to conflict-resolve: each node is the only authority on its own
         // device. The reported age is measured at the sender, so add the report's own age to it —
-        // gossip transit is otherwise invisible and would understate staleness.
+        // gossip transit is otherwise invisible and would understate staleness. The sender-clock
+        // estimate is explicitly a skew-exposed approximation: it is clamped at 0 (a negative HLC
+        // age is not evidence of recency) and floored by the local time since receipt, which is a
+        // skew-free lower bound on the true age.
         Dictionary<string, NodeHealthSample> nodeHealth = new(fresh.Count, StringComparer.Ordinal);
         foreach (NodeLoadReport report in fresh)
         {
             long transitMs = (long)(now - report.Time).TotalMilliseconds;
             if (transitMs < 0)
                 transitMs = 0;
+
+            if (nowTicks != 0 && report.ReceivedAtTicks != 0)
+            {
+                long sinceReceiptMs = (long)Consensus.RaftMonotonic.Elapsed(report.ReceivedAtTicks, nowTicks).TotalMilliseconds;
+                if (sinceReceiptMs > transitMs)
+                    transitMs = sinceReceiptMs;
+            }
 
             nodeHealth[report.Endpoint] = new NodeHealthSample(
                 report.NodeCommitWaitMs,

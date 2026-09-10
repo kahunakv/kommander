@@ -92,11 +92,12 @@ internal sealed class LeaderBalancer
 
         DateTimeOffset now = DateTimeOffset.UtcNow;
         HLCTimestamp hlcNow = getHlcNow();
+        long nowTicks = configuration.TickSource.GetTimestamp();
 
         ClusterMembership membership = getMembership();
         TimeSpan ttl = configuration.LeaderBalancerReportTtl;
 
-        loadReportStore.EvictStale(ttl, hlcNow);
+        loadReportStore.EvictStale(ttl, nowTicks);
         IReadOnlyList<NodeLoadReport> reports = loadReportStore.GetAll();
 
         HashSet<string> aliveEndpoints = new(StringComparer.Ordinal);
@@ -107,7 +108,7 @@ internal sealed class LeaderBalancer
                 aliveEndpoints.Add(m.Endpoint);
         }
 
-        GlobalLeadershipView view = GlobalLeadershipView.Build(reports, membership.Members, aliveEndpoints, ttl, hlcNow);
+        GlobalLeadershipView view = GlobalLeadershipView.Build(reports, membership.Members, aliveEndpoints, ttl, hlcNow, nowTicks);
 
         // Reconcile outstanding moves against the current view.
         List<int> toRemove = [];

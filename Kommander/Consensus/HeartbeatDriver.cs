@@ -107,7 +107,7 @@ internal sealed class HeartbeatDriver
         // site is always reached while anything needs retrying.
         if (coreState.NodeState == RaftNodeState.Leader)
         {
-            proposals.RetryUnresolved(coreState.LastHeartbeat);
+            proposals.RetryUnresolved(nowTicks);
             PublishLiveReplicaRetentionFloor(nodes);
         }
 

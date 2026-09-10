@@ -589,7 +589,7 @@ public sealed class RaftPartitionStateMachine
                     // gate below, never quiesce. Once drained, proposals.ActiveCount reaches 0 and the
                     // quiesce check can fire in this same tick.
                     if (proposals.ActiveCount > 0)
-                        proposals.PruneSettled(currentTime);
+                        proposals.PruneSettled(nowTicks);
 
                     // When quiescence is on and the partition has been idle longer than QuiesceAfter,
                     // send a quiesce marker to followers and stop heartbeating.  Followers switch to
