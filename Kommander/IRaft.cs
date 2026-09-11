@@ -416,6 +416,11 @@ public interface IRaft
     /// has committed). Unlike the raw max log id, this excludes proposed-but-uncommitted tail
     /// entries and anything sitting above an unfilled hole, so observers can tell "entries present
     /// but uncommitted" apart from "committed but not yet applied". In-memory read; safe anywhere.
+    /// <para>Covers an id only once this node holds it durably, and never decreases within one
+    /// process lifetime: a write that the disk later refuses is never reported as committed, and
+    /// the internal repair for such a write (which lowers the protocol-facing frontier so the
+    /// leader re-ships the range) is not visible here. A restart may lower it — lazy commit
+    /// markers lost in a crash are re-supplied by the leader afterwards.</para>
     /// </summary>
     public long GetCommitIndex(int partitionId);
 

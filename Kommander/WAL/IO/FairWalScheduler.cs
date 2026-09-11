@@ -1097,11 +1097,37 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     {
         List<RaftLog> logs = op.Logs.Logs;
         long minIndex = -1;
-        if (logs.Count > 0)
+        long writtenMax = -1;
+
+        // The ids a batch carries are ascending in every enqueue path (the propose allocator
+        // counts up, the commit/rollback/follower paths order by id), so one pass that checks each
+        // id is the previous one or its successor proves the batch fills its own span without
+        // allocating. A batch that fails the check is ordered and de-duplicated below; if it still
+        // fills the span (an unordered but complete batch) the ids are dropped again.
+        bool contiguous = true;
+        for (int i = 0; i < logs.Count; i++)
         {
-            minIndex = logs[0].Id;
-            for (int i = 1; i < logs.Count; i++)
-                if (logs[i].Id < minIndex) minIndex = logs[i].Id;
+            long id = logs[i].Id;
+            if (i == 0)
+            {
+                minIndex = id;
+                writtenMax = id;
+                continue;
+            }
+
+            long previous = logs[i - 1].Id;
+            if (id != previous && id != previous + 1)
+                contiguous = false;
+            if (id < minIndex) minIndex = id;
+            if (id > writtenMax) writtenMax = id;
+        }
+
+        long[]? sparseIds = null;
+        if (!contiguous)
+        {
+            sparseIds = logs.Select(static log => log.Id).Distinct().Order().ToArray();
+            if (sparseIds.Length == writtenMax - minIndex + 1)
+                sparseIds = null;
         }
 
         return new RaftWalCompletion(
@@ -1111,7 +1137,9 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             MinLogIndex: minIndex,
             MaxLogIndex: op.LogIndex,
             OperationType: op.Type,
-            Status: status
+            Status: status,
+            WrittenMaxLogIndex: writtenMax,
+            SparseLogIds: sparseIds
         );
     }
 

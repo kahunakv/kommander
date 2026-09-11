@@ -755,7 +755,12 @@ public sealed class TestLeaderBalancerIntegration
     /// on non-leader nodes through <see cref="RaftManager.GetPartitionWalQueueDepth"/>.
     /// <para>
     /// We also verify that <see cref="RaftManager.GetPartitionLogOpsPerSecond"/> is
-    /// non-zero alongside the positive depth, confirming the two signals coexist.
+    /// non-zero on the leader once the writes complete, and that a report built at that
+    /// point propagates the rate to followers. The rate is deliberately not asserted at the
+    /// moment depth is first observed: the EWMA counts an op only after the state machine
+    /// returns, whereas depth rises at WAL enqueue inside that call, so the two signals do
+    /// not rise atomically. The gossip step also re-resolves the leader, because a transient
+    /// election during the burst is a valid cluster outcome that must not fail this test.
     /// </para>
     /// </summary>
     [Fact]
@@ -831,7 +836,8 @@ public sealed class TestLeaderBalancerIntegration
                 await Task.Delay(5, ct);
             }
 
-            // Capture the load report while depth may still be positive.
+            // Capture the load report while depth may still be positive. This snapshot serves the
+            // depth assertion only; see the gossip step below for why it is not the gossip payload.
             NodeLoadReport leaderReportDuringLoad = leaderNode.BuildLocalLoadReport();
 
             // Now await all writes to confirm correctness (no lost ops).
@@ -842,35 +848,71 @@ public sealed class TestLeaderBalancerIntegration
                 $"Expected WalQueueDepth > 0 at some point during {concurrentWrites} concurrent writes " +
                 $"against a {30}ms-per-write throttled WAL. Last sampled depth: {observedDepth}.");
 
-            // Rate must also be non-zero: concurrent writes drove EWMA above 0.
-            double leaderRate = leaderNode.GetPartitionLogOpsPerSecond(testPid);
-            Assert.True(leaderRate > 0.0,
-                $"Expected GetPartitionLogOpsPerSecond({testPid}) > 0 after {concurrentWrites} writes, got {leaderRate}.");
+            // ── Gossip propagation ──
+            // Two timing hazards make the load-time snapshot the wrong payload for this step, and
+            // both showed up as "follower rate == 0" on a slow CI runner:
+            //
+            //  1. The executor records a ReplicateLogs op in the LogOpsPerSecond EWMA only after the
+            //     state machine returns, whereas the WAL queue depth rises inside that call, at
+            //     enqueue. A poll that catches depth > 0 in that gap snapshots a report with
+            //     LogOpsPerSecond == 0 for the partition, and a follower that stores it answers 0.
+            //  2. A transient election during the burst (a GC pause on a 2-vCPU runner is enough
+            //     with a 100 ms election timeout) makes the leader emit timer-gossip reports that
+            //     omit the partition, or moves leadership to a node whose EWMA is still 0. Either
+            //     way the follower's leader-keyed lookup returns 0.
+            //
+            // So: wait until every node agrees on one leader, push a few more writes through that
+            // leader so its EWMA is positive by construction, and gossip the report built after
+            // those writes. Its ReportVersion is newer than any timer-gossip report the leader
+            // emitted before it, so the follower store accepts it; any later timer report carries
+            // a positive rate too (the EWMA decays with a 10 s time constant and never reaches 0).
+            await WaitForCondition(() =>
+                nodes.All(n =>
+                    n.Partitions.TryGetValue(testPid, out RaftPartition? p) &&
+                    !string.IsNullOrEmpty(p.Leader) &&
+                    nodes.Any(m => string.Equals(m.LocalEndpoint, p.Leader, StringComparison.Ordinal))) &&
+                nodes.Select(n => n.Partitions[testPid].Leader).Distinct(StringComparer.Ordinal).Count() == 1,
+                ct);
 
-            // ── Gossip propagation: inject the captured load report into followers ──
-            // The report was built during the load so it carries a positive (or recently-
-            // positive) WalQueueDepth plus a non-zero LogOpsPerSecond.
-            foreach (RaftManager n in nodes)
+            RaftManager currentLeader = nodes.First(n =>
+                string.Equals(n.Partitions[testPid].Leader, n.LocalEndpoint, StringComparison.Ordinal));
+
+            const int topUpWrites = 4;
+            for (int i = 0; i < topUpWrites; i++)
             {
-                if (n == leaderNode) continue;
-                n.SystemCoordinator.Send(new RaftSystemRequest(leaderReportDuringLoad));
-                await n.SystemCoordinator.DrainAsync();
+                RaftReplicationResult r = await currentLeader.ReplicateLogs(testPid, "t9", payload, autoCommit: true, cancellationToken: ct);
+                Assert.True(r.Success, $"Top-up write {i} through {currentLeader.LocalEndpoint} failed: {r.Status}.");
             }
 
-            // The injected report's LogOpsPerSecond must be visible from the follower.
-            PartitionLoad? injectedLoad = leaderReportDuringLoad.Leaderships
+            // Rate must be non-zero on the leader: the writes drove the EWMA above 0.
+            double leaderRate = currentLeader.GetPartitionLogOpsPerSecond(testPid);
+            Assert.True(leaderRate > 0.0,
+                $"Expected GetPartitionLogOpsPerSecond({testPid}) > 0 on {currentLeader.LocalEndpoint} after " +
+                $"{concurrentWrites + topUpWrites} writes, got {leaderRate}.");
+
+            NodeLoadReport leaderReportAfterLoad = currentLeader.BuildLocalLoadReport();
+
+            PartitionLoad? injectedLoad = leaderReportAfterLoad.Leaderships
                 .FirstOrDefault(l => l.PartitionId == testPid);
 
             Assert.NotNull(injectedLoad);
-            Assert.True(injectedLoad.LogOpsPerSecond > 0.0 || leaderRate > 0.0,
-                "Neither the injected report's LogOpsPerSecond nor the leader fast-path returned > 0.");
+            Assert.True(injectedLoad.LogOpsPerSecond > 0.0,
+                $"Post-load report for partition {testPid} must carry LogOpsPerSecond > 0, got {injectedLoad.LogOpsPerSecond}.");
 
             foreach (RaftManager n in nodes)
             {
-                if (n == leaderNode) continue;
+                if (n == currentLeader) continue;
+                n.SystemCoordinator.Send(new RaftSystemRequest(leaderReportAfterLoad));
+                await n.SystemCoordinator.DrainAsync();
+            }
+
+            foreach (RaftManager n in nodes)
+            {
+                if (n == currentLeader) continue;
 
                 // Follower's gossip view must reflect a non-zero LogOpsPerSecond.
-                // (Injected report or a fresher timer-gossip report both count.)
+                // (The injected post-load report or a fresher timer-gossip report both count;
+                // every report built after the first batch completed carries a positive rate.)
                 double followerRate = n.GetPartitionLogOpsPerSecond(testPid);
                 Assert.True(followerRate > 0.0,
                     $"Follower {n.LocalEndpoint}: expected GetPartitionLogOpsPerSecond({testPid}) > 0 " +

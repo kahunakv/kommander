@@ -270,6 +270,10 @@ public sealed class RaftPartitionStateMachine
     /// Runs on the executor's single-writer thread (dispatched via <see cref="RaftRequestType.GetPartitionView"/>),
     /// so all mutable fields are read consistently and never observed torn by a polling thread. The WAL max
     /// index is read through the facade on the same thread.
+    /// <para>The commit index is the PUBLISHED one (<see cref="IRaftWalFacade.GetDurableCommitIndex"/>): the
+    /// view is an observer outside the replication protocol, and the protocol frontier advances before a
+    /// write lands and regresses when it fails — which the simulation's monotonicity oracle rightly reads as
+    /// an un-committed acknowledged entry.</para>
     /// </summary>
     public async Task<RaftPartitionView> GetPartitionView()
     {
@@ -280,7 +284,7 @@ public sealed class RaftPartitionStateMachine
             Role: coreState.NodeState,
             Term: coreState.CurrentTerm,
             Leader: host.Leader,
-            CommitIndex: wal.GetCommitIndex(),
+            CommitIndex: wal.GetDurableCommitIndex(),
             LastAppliedIndex: coreState.LastAppliedIndex,
             MaxWalIndex: maxWal,
             Quiesced: coreState.Quiesced,

@@ -409,6 +409,52 @@ public sealed class TestClusterInvariantSet
     }
 
     /// <summary>
+    /// A node committed past the highest id it holds. The empty-log form is the nightly's
+    /// starved-disk finding: entry 1 was accepted, published, and refused by the disk, so the node
+    /// claimed commit index 1 over an empty log before it regressed to 0.
+    /// </summary>
+    [Fact]
+    public void CommittedPrefixPresent_FiresOnAClaimAboveTheHighestHeldEntry()
+    {
+        List<RaftPartitionView> views = [View("node1", RaftNodeState.Follower, term: 1, commitIndex: 1)];
+
+        InvariantViolationException error = Assert.Throws<InvariantViolationException>(() =>
+            ClusterInvariantSet.CheckCommittedPrefixPresent(
+                stepNumber: 9,
+                views,
+                Stores(Store("node1", firstLogId: -1, maxLogId: 0, lastCheckpoint: -1, missing: []))));
+
+        Assert.Equal(ClusterInvariantSet.CommittedPrefixPresent, error.InvariantName);
+        Assert.Contains("holds nothing above 0", error.Message, StringComparison.Ordinal);
+
+        views = [View("node1", RaftNodeState.Follower, term: 3, commitIndex: 7)];
+
+        error = Assert.Throws<InvariantViolationException>(() =>
+            ClusterInvariantSet.CheckCommittedPrefixPresent(
+                stepNumber: 9,
+                views,
+                Stores(Store("node1", firstLogId: 1, maxLogId: 5, lastCheckpoint: -1, missing: []))));
+
+        Assert.Contains("holds nothing above 5", error.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A log compacted in full holds nothing, and is entitled to claim everything through the
+    /// compaction mark: the entries left on purpose.
+    /// </summary>
+    [Fact]
+    public void CommittedPrefixPresent_IsSilentOnAFullyCompactedLog()
+    {
+        List<RaftPartitionView> views = [View("node1", RaftNodeState.Follower, term: 3, commitIndex: 9)];
+
+        ClusterInvariantSet.CheckCommittedPrefixPresent(
+            stepNumber: 9,
+            views,
+            Stores(Store("node1", firstLogId: -1, maxLogId: 0, lastCheckpoint: 9, missing: [],
+                compactedThrough: 9)));
+    }
+
+    /// <summary>
     /// A node whose head is absent but whose frontier stays below it is legal, and this is the state
     /// DST FINDING 1 reached. It is a stranded replica, not a lying one — which is exactly why no
     /// per-node rule caught that defect and the run-level convergence check did.

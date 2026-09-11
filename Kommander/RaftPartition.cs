@@ -277,8 +277,10 @@ public sealed class RaftPartition : IDisposable
     /// anything above a hole. A plain in-memory read (no scheduler round-trip), safe on any path.
     /// Exposed so external observers (health checks, test harnesses) can distinguish "entries
     /// present but uncommitted" from "committed but unapplied" — the raw max log conflates them.
+    /// Reads the PUBLISHED frontier (<see cref="RaftWriteAhead.GetDurableCommitIndex"/>): gated on
+    /// durability and monotonic, unlike the protocol-facing frontier the replication paths use.
     /// </summary>
-    public long GetCommitIndex() => walHandler.GetCommitIndex();
+    public long GetCommitIndex() => walHandler.GetDurableCommitIndex();
 
     /// <summary>
     /// Number of stale <c>Proposed</c> duplicates of already-resolved ids this partition has

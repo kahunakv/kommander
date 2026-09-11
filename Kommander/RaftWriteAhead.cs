@@ -163,6 +163,32 @@ public sealed class RaftWriteAhead
     /// frontier has no entry (empty log).</summary>
     private long presentTerm;
 
+    // ── Durable presence and the published commit index ───────────────────────────────────
+    // commitIndex and presentIndex above advance at ENQUEUE time (the scheduler is per-partition
+    // FIFO, so an accepted write lands before anything enqueued after it) and are regressed by
+    // RegressFrontiersAfterFailedWriteAsync when the write later fails. That is right for the
+    // consumers INSIDE the replication protocol — election freshness, heartbeat acks, the apply
+    // bound — which must see a failed range as missing so the leader re-ships it. It is wrong for
+    // anything outside the protocol: a follower that reported "committed through 1" while entry 1
+    // was still queued and then "committed through 0" after the disk refused it told an observer
+    // that an acknowledged entry was un-committed (the nightly search's committed-ids-monotonic
+    // finding, GA run 34577216505, every night from 2026-09-06). The truth is that entry 1 was
+    // committed cluster-wide but never held here, so this node's Raft commitIndex — the
+    // min(leaderCommit, last entry it HOLDS) of §5.3 — never covered it.
+    //
+    // durablePresentIndex is the presence frontier advanced only on a SUCCESSFUL completion
+    // (MarkDurablyWritten), gap-buffered like presentIndex. publishedCommitIndex is the high-water
+    // mark of min(commitIndex, durablePresentIndex): it covers an id only once this node both knows
+    // the id resolved and holds it on disk, and it never moves backwards within one process
+    // lifetime (a restore re-derives it from the disk, which is the one legitimate reset). It is
+    // what GetDurableCommitIndex publishes to IRaft.GetCommitIndex and the partition view; the
+    // protocol paths keep reading GetCommitIndex. Single writer: the partition executor.
+    private long durablePresentIndex = 1;
+
+    private readonly SortedSet<long> pendingDurable = new();
+
+    private long publishedCommitIndex = 1;
+
     // Out-of-order present ids (with their terms) buffered until the gap below them fills — the
     // presence analog of pendingResolved.
     private readonly SortedDictionary<long, long> pendingPresent = new();
@@ -590,6 +616,17 @@ public sealed class RaftWriteAhead
                 manager.LocalEndpoint, partition.PartitionId, commitIndex - 1, restoredCheckpoint);
             SeedCommitFrontierFromSnapshot(restoredCheckpoint, Math.Max(checkpointTerm, 0));
         }
+
+        // ── Seed the durable frontier and the published commit index from the disk ──────────
+        // Everything reconstructed above was read from the disk, so it IS the durable state: the
+        // durable presence frontier starts at the contiguous present prefix, and the published
+        // commit index is re-derived rather than high-watered. A restart is the one event that may
+        // legitimately lower what this node publishes (lazy commit markers lost in a crash); the
+        // leader re-supplies the tail, and the simulation's monotonicity oracle resets on a crash
+        // for the same reason.
+        pendingDurable.Clear();
+        durablePresentIndex = presentIndex;
+        Volatile.Write(ref publishedCommitIndex, Math.Min(commitIndex, durablePresentIndex));
 
         // ── Restore the HLC floor before anything can mint a timestamp ────────────────────
         // Merge the durable high-water mark and the maximum restored entry timestamp into the node
@@ -1177,6 +1214,10 @@ public sealed class RaftWriteAhead
     /// Unlike <see cref="GetMaxLog"/> this excludes proposed-but-uncommitted tail entries,
     /// so the leader can seed its backfill cursor on election without shipping uncommitted logs.
     /// Synchronous: it reads an in-memory counter, no WAL/scheduler round-trip.
+    /// <para>This is the PROTOCOL-facing frontier: it advances when a write is accepted, before the
+    /// write lands, and <see cref="RegressFrontiersAfterFailedWriteAsync"/> lowers it when the
+    /// write fails. Anything that reports a commit index to an observer outside the replication
+    /// protocol must read <see cref="GetDurableCommitIndex"/> instead.</para>
     /// </summary>
     public long GetCommitIndex() => commitIndex - 1;
 
@@ -1281,6 +1322,8 @@ public sealed class RaftWriteAhead
             pendingResolved.Remove(next);
             commitIndex = next + 1;
         }
+
+        RefreshPublishedCommitIndex();
     }
 
     /// <summary>
@@ -1425,6 +1468,110 @@ public sealed class RaftWriteAhead
     }
 
     /// <summary>
+    /// Records that a WAL write COMPLETED successfully, so every id it carried is on disk, and
+    /// advances the durable presence frontier over those ids. The success-side twin of
+    /// <see cref="RegressFrontiersAfterFailedWriteAsync"/>, and called from the same place: the
+    /// completion router, before any fence can discard the completion — a write that reached the
+    /// disk is a fact about this node's disk whatever term submitted it or whether anything still
+    /// tracks it, and a fenced success that skipped this would pin the published commit index
+    /// below the real one for the rest of the run.
+    ///
+    /// <para><paramref name="sparseLogIds"/> is null when the write filled
+    /// [<paramref name="minLogIndex"/>, <paramref name="maxLogIndex"/>] contiguously, and the exact
+    /// ascending ids otherwise; the frontier must never certify an id from a span alone, because
+    /// the skipped id's own write may have been the one that failed. Gap-buffered like the
+    /// optimistic frontiers: completions arrive in per-partition FIFO order, but a batch written
+    /// over a hole (the unanchored live-propose broadcast) must not certify the hole. Ids at or
+    /// below the frontier are re-writes (commit markers over present rows) and are ignored. Runs
+    /// on the partition executor, the single writer of the frontier fields.</para>
+    /// </summary>
+    public void MarkDurablyWritten(long minLogIndex, long maxLogIndex, long[]? sparseLogIds)
+    {
+        if (sparseLogIds is not null)
+        {
+            foreach (long id in sparseLogIds)
+                AdvanceDurablePresence(id);
+        }
+        else
+        {
+            if (minLogIndex < 0 || maxLogIndex < minLogIndex)
+                return;
+
+            for (long id = Math.Max(minLogIndex, durablePresentIndex); id <= maxLogIndex; id++)
+                AdvanceDurablePresence(id);
+        }
+
+        RefreshPublishedCommitIndex();
+    }
+
+    /// <summary>
+    /// The commit index this node PUBLISHES outside the replication protocol
+    /// (<see cref="IRaft.GetCommitIndex"/>, the partition view): the highest id that is both
+    /// resolved and durably held here, never lower than a value returned earlier in this process
+    /// lifetime. <see cref="GetCommitIndex"/> is the protocol-facing frontier instead: it advances
+    /// when a write is accepted and the failed-write repair lowers it, which is what the leader's
+    /// re-ship needs to see and what an observer must not. Safe to read from any thread: one
+    /// volatile field, written only on the partition executor and only upwards.
+    /// </summary>
+    public long GetDurableCommitIndex() => Volatile.Read(ref publishedCommitIndex) - 1;
+
+    /// <summary>
+    /// Highest id durably present with no hole below it, as certified by successful completions
+    /// only. Test-visible so the gating can be asserted without a scheduler round-trip.
+    /// </summary>
+    public long GetDurablePresentIndex() => durablePresentIndex - 1;
+
+    private void AdvanceDurablePresence(long id)
+    {
+        if (id < durablePresentIndex)
+            return;
+
+        if (id > durablePresentIndex)
+        {
+            pendingDurable.Add(id);
+            return;
+        }
+
+        durablePresentIndex = id + 1;
+        DrainPendingDurable();
+    }
+
+    /// <summary>
+    /// Drops buffered durable ids already covered by the frontier, then absorbs any that have
+    /// become contiguous. Shared by the completion advance and the snapshot seed.
+    /// </summary>
+    private void DrainPendingDurable()
+    {
+        while (pendingDurable.Count > 0)
+        {
+            long next = pendingDurable.Min;
+            if (next < durablePresentIndex)
+            {
+                pendingDurable.Remove(next);
+                continue;
+            }
+            if (next > durablePresentIndex)
+                break;
+
+            pendingDurable.Remove(next);
+            durablePresentIndex = next + 1;
+        }
+    }
+
+    /// <summary>
+    /// Raises the published commit index to min(commitIndex, durablePresentIndex) when that is
+    /// higher. Called after every advance of either frontier; never lowers the value, which is the
+    /// whole point (see the field comment). The volatile write pairs with the volatile read in
+    /// <see cref="GetDurableCommitIndex"/> so a foreign thread never sees a torn or stale-low value.
+    /// </summary>
+    private void RefreshPublishedCommitIndex()
+    {
+        long candidate = Math.Min(commitIndex, durablePresentIndex);
+        if (candidate > publishedCommitIndex)
+            Volatile.Write(ref publishedCommitIndex, candidate);
+    }
+
+    /// <summary>
     /// Seeds the in-memory commit/propose frontier to a freshly installed snapshot boundary at
     /// <paramref name="snapshotIndex"/>. A snapshot means every id through the boundary is durably committed
     /// (the prefix is compacted away), so the frontier — which a fresh or lagging follower otherwise leaves at
@@ -1471,6 +1618,8 @@ public sealed class RaftWriteAhead
             pendingResolved.Remove(next);
             commitIndex = next + 1;
         }
+
+        RefreshPublishedCommitIndex();
     }
 
     public void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0)
@@ -1501,6 +1650,15 @@ public sealed class RaftWriteAhead
         }
 
         DrainPendingPresent();
+
+        // The boundary is installed durably (sync: true) before this runs, so the durable presence
+        // frontier jumps with the optimistic one. Mirrors presentIndex exactly: neither is lowered
+        // when the install truncated a conflicting suffix, and the published commit index is bound
+        // by commitIndex there anyway.
+        if (target > durablePresentIndex)
+            durablePresentIndex = target;
+        DrainPendingDurable();
+        RefreshPublishedCommitIndex();
     }
 
     /// <summary>
@@ -1588,6 +1746,16 @@ public sealed class RaftWriteAhead
             if (presentTerm < 0)
                 presentTerm = 0;                // boundary entry compacted/absent: legacy index-only ordering
         }
+
+        // The durable presence frontier tracks the disk, and the disk just lost everything above
+        // afterLogId. The published commit index is NOT lowered: a truncation only ever removes an
+        // uncommitted suffix (the log-hole repair fences a truncation that would reach the
+        // advertised commit frontier), so min(commitIndex, durablePresentIndex) is unchanged
+        // whenever the fence held, and a high-water mark must not be the thing that reports it.
+        while (pendingDurable.Count > 0 && pendingDurable.Max > afterLogId)
+            pendingDurable.Remove(pendingDurable.Max);
+        if (durablePresentIndex > afterLogId + 1)
+            durablePresentIndex = Math.Max(afterLogId, 0) + 1;
 
         return maxLogId;
     }

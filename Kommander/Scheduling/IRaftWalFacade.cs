@@ -148,6 +148,29 @@ public interface IRaftWalFacade
         => ValueTask.CompletedTask;
 
     /// <summary>
+    /// Records a WAL write that completed successfully — its ids are on disk — so the durable
+    /// presence frontier and the published commit index (<see cref="GetDurableCommitIndex"/>) can
+    /// advance. The success-side twin of <see cref="RegressFrontiersAfterFailedWriteAsync"/>,
+    /// called by the completion router before any fence can discard the completion.
+    /// <paramref name="sparseLogIds"/> is null when the write filled [min, max] contiguously and
+    /// the exact ascending ids otherwise (<see cref="RaftWalCompletion.SparseLogIds"/>). Default
+    /// no-op for facades that do not track frontiers (test stubs).
+    /// </summary>
+    void MarkDurablyWritten(long minLogIndex, long maxLogIndex, long[]? sparseLogIds) { }
+
+    /// <summary>
+    /// The commit index this node publishes OUTSIDE the replication protocol
+    /// (<see cref="IRaft.GetCommitIndex"/>, the partition view): the highest id both resolved and
+    /// durably held here, and never lower than a value returned earlier in this process lifetime.
+    /// <see cref="GetCommitIndex"/> is the protocol-facing frontier: it advances when a write is
+    /// accepted and the failed-write repair lowers it, which the leader's re-ship must see and an
+    /// observer must not (a follower that published 1 and then 0 for an entry its disk refused
+    /// read as a lost write to the simulation's monotonicity oracle). Defaults to
+    /// <see cref="GetCommitIndex"/> for facades that do not track durability.
+    /// </summary>
+    long GetDurableCommitIndex() => GetCommitIndex();
+
+    /// <summary>
     /// Advances the in-memory contiguous commit frontier over an entry the consensus layer has
     /// PROVEN committed but whose durable marker has not landed yet — the Raft §5.4.2 inherited
     /// prior-term entry that the promotion/commit drain delivers before its lazy re-commit marker

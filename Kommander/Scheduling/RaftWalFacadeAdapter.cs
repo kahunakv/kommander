@@ -60,6 +60,13 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
     public ValueTask RegressFrontiersAfterFailedWriteAsync(long minLogIndex, long maxLogIndex, bool regressPresence, bool regressCommit) =>
         wal.RegressFrontiersAfterFailedWriteAsync(minLogIndex, maxLogIndex, regressPresence, regressCommit);
 
+    // Explicit forwards — both members carry interface default bodies (a no-op and a fallback to
+    // GetCommitIndex) that would silently apply here if the adapter did not override them.
+    public void MarkDurablyWritten(long minLogIndex, long maxLogIndex, long[]? sparseLogIds) =>
+        wal.MarkDurablyWritten(minLogIndex, maxLogIndex, sparseLogIds);
+
+    public long GetDurableCommitIndex() => wal.GetDurableCommitIndex();
+
     public void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0) =>
         wal.SeedCommitFrontierFromSnapshot(snapshotIndex, snapshotTerm);
 

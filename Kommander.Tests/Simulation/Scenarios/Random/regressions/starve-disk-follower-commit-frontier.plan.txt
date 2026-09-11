@@ -1,0 +1,23 @@
+# Nightly random search, GA run 34577216505 (2026-09-11), seed 5040446807928117419,
+# shrunk from 24 actions to 4. The same signature failed every nightly run from 2026-09-06
+# (seed 2605968281045113834 on localhost:8003 the same way).
+#
+# A follower whose disk is full accepts a leader append, advances its in-memory commit
+# frontier at enqueue time, then fails the WAL write and regresses the frontier. The
+# harness observed the node reporting commit index 1 and then 0
+# (committed-ids-monotonic). The node's own reported commit index must never regress
+# for an entry that never reached its disk: what it publishes must be gated on
+# durability.
+seed=5040446807928117419
+partitionId=1
+stepsPerAction=6
+advanceMillisecondsPerStep=50
+maxImpairedNodes=1
+maxFaultAgeInActions=4
+recoveryStepBudget=900
+idleConvergenceStepBudget=300
+
+000 Idle
+001 StarveDisk localhost:8001
+002 AppendAtLeader localhost:8002
+003 Idle

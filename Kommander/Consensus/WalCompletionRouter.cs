@@ -98,6 +98,16 @@ internal sealed class WalCompletionRouter
             return;
         }
 
+        // ── Durable presence advance ───────────────────────────────────────────
+        // The success-side twin of the failed-write repair below, and before the fences for the
+        // same reason: a write that reached the disk is a fact about this node's disk whatever
+        // term submitted it or whether anything still tracks it. The published commit index
+        // (IRaftWalFacade.GetDurableCommitIndex) is gated on this frontier, so a fenced success
+        // that skipped it would pin what this node publishes below the truth for the rest of the
+        // run. Reads the written ids, not MaxLogIndex, whose meaning varies by operation type.
+        if (completion.Status == RaftOperationStatus.Success && completion.MinLogIndex >= 0)
+            wal.MarkDurablyWritten(completion.MinLogIndex, completion.WrittenMaxLogIndex, completion.SparseLogIds);
+
         // ── Failed-write frontier repair ───────────────────────────────────────
         // Runs BEFORE the term and pending fences: a failed WAL write is a fact about this
         // node's disk regardless of which term submitted it or whether the operation is still

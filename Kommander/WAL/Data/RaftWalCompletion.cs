@@ -36,5 +36,24 @@ public sealed record RaftWalCompletion(
     WALWriteOperationType OperationType,
 
     /// <summary>Whether the WAL write succeeded or failed.</summary>
-    RaftOperationStatus Status
+    RaftOperationStatus Status,
+
+    /// <summary>
+    /// Highest log id this write actually carried, or -1 when it carried none. Distinct from
+    /// <see cref="MaxLogIndex"/>, whose meaning depends on the operation type: the propose path
+    /// stores the allocator's NEXT id there and the commit path the last newly committed id. The
+    /// durable presence frontier needs the ids that reached the disk, so it reads this field and
+    /// <see cref="SparseLogIds"/>, never <see cref="MaxLogIndex"/>.
+    /// </summary>
+    long WrittenMaxLogIndex = -1,
+
+    /// <summary>
+    /// The distinct ascending ids this write carried, when they do NOT fill
+    /// [<see cref="MinLogIndex"/>, <see cref="WrittenMaxLogIndex"/>] contiguously; null when they
+    /// do, which is the common case and allocates nothing. A batch with a hole in its own span is
+    /// rare (a resolution batch that skips an id resolved earlier) but real, and a durability
+    /// frontier that certified the skipped id from the span alone would certify an entry whose own
+    /// write may have failed.
+    /// </summary>
+    long[]? SparseLogIds = null
 );

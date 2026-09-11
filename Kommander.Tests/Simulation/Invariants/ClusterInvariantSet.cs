@@ -273,6 +273,25 @@ public static class ClusterInvariantSet
                     $"[{store.FirstLogId}, {store.MaxLogId}].");
             }
 
+            // The tail. A node may not claim to have committed past the highest id it holds. The
+            // interior rule above cannot see this: MissingIds names holes BETWEEN retained entries,
+            // so a node that holds nothing at all — or nothing above its claim — reports no hole.
+            // This is the per-step shape of the nightly's committed-ids-monotonic finding (GA run
+            // 34577216505): a follower whose disk refused entry 1 published commit index 1 while its
+            // log was empty, and only the later regression to 0 was caught. A fully compacted log
+            // holds nothing above the compaction mark and is entitled to claim through it.
+            long highestHeld = Math.Max(store.MaxLogId, store.CompactedThrough);
+
+            if (view.CommitIndex > highestHeld)
+            {
+                throw Violation(
+                    CommittedPrefixPresent,
+                    stepNumber,
+                    $"Node '{view.Endpoint}' partition {view.Partition} is committed to " +
+                    $"{view.CommitIndex} but holds nothing above {highestHeld}. Retained range is " +
+                    $"[{store.FirstLogId}, {store.MaxLogId}], compacted through {store.CompactedThrough}.");
+            }
+
             // The head. The lowest id the node should still hold is one above whatever it compacted;
             // anything between that and its first retained id was never received, and the node may
             // not claim to have committed it.
