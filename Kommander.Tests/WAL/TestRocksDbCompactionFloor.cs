@@ -250,7 +250,7 @@ public sealed class TestRocksDbCompactionFloor
             Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, [Checkpoint(1201)])]));
 
             // Files never overlap: sorted by first id, each file ends before the next begins.
-            List<(string Name, int Level, long SmallestId, long LargestId)> files = wal.GetShardLiveFilesForTesting(Partition);
+            List<(string Name, int Level, long SmallestId, long LargestId, long SizeBytes)> files = wal.GetShardLiveFilesForTesting(Partition);
             AssertNonOverlapping(files);
 
             // With the L0 trigger at 2, RocksDB moves files out of L0 in the background. The engine
@@ -269,19 +269,44 @@ public sealed class TestRocksDbCompactionFloor
 
             // Compact to a floor inside the third chunk: every file entirely below it must be gone,
             // the straddling file and everything above must stay, and the rows must still read.
+            // The reclaim is accounted file by file, not as a fraction of the total: the four
+            // files are NOT equal in size (fixed-width decimal keys with more leading zeros
+            // compress better, so the earliest chunk is the smallest file), and the exact sizes
+            // shift with the RocksDB SST format between package versions. A ratio threshold
+            // (the two dead files being at least half the bytes) sat ~500 bytes from the truth
+            // and flipped on the 11.1 → 11.8 bump; the identity below holds on any build.
+            List<(string Name, int Level, long SmallestId, long LargestId, long SizeBytes)> beforeFiles = wal.GetShardLiveFilesForTesting(Partition);
+            List<(string Name, int Level, long SmallestId, long LargestId, long SizeBytes)> deadFiles = beforeFiles.Where(f => f.LargestId < 699).ToList();
+            List<(string Name, int Level, long SmallestId, long LargestId, long SizeBytes)> liveFiles = beforeFiles.Where(f => f.LargestId >= 699).ToList();
+            Assert.Equal(2, deadFiles.Count);
+            Assert.Equal(2, liveFiles.Count);
+            long deadBytes = deadFiles.Sum(f => f.SizeBytes);
+            Assert.True(deadBytes > 0, "the dead files report no size");
+
             long before = wal.GetShardLiveSstBytes();
+            Assert.Equal(beforeFiles.Sum(f => f.SizeBytes), before);
+
             (RaftOperationStatus status, int removed) = wal.CompactLogsOlderThan(Partition, lastCheckpoint: 700, compactNumberEntries: 100, maxTotalEntries: 1000);
             Assert.Equal(RaftOperationStatus.Success, status);
             Assert.Equal(699, removed);
 
-            List<(string Name, int Level, long SmallestId, long LargestId)> after = WaitUntil(
+            List<(string Name, int Level, long SmallestId, long LargestId, long SizeBytes)> after = WaitUntil(
                 () => wal.GetShardLiveFilesForTesting(Partition),
                 f => f.All(x => x.LargestId >= 699),
                 TimeSpan.FromSeconds(20));
 
+            // Every dead file is gone by name; every surviving file is still there under its own
+            // name and size (dropped whole or untouched — nothing rewritten); and the live bytes
+            // fell by exactly the dead files' bytes.
             Assert.DoesNotContain(after, f => f.LargestId < 699);
-            Assert.True(wal.GetShardLiveSstBytes() < before / 2,
-                $"whole-file drop did not reclaim the dead prefix: {before} -> {wal.GetShardLiveSstBytes()} bytes");
+            foreach ((string name, _, _, _, _) in deadFiles)
+                Assert.DoesNotContain(after, f => f.Name == name);
+            foreach ((string name, _, _, _, long sizeBytes) in liveFiles)
+                Assert.Contains(after, f => f.Name == name && f.SizeBytes == sizeBytes);
+
+            long reclaimed = before - wal.GetShardLiveSstBytes();
+            Assert.True(reclaimed == deadBytes,
+                $"whole-file drop did not reclaim exactly the dead prefix: {before} -> {wal.GetShardLiveSstBytes()} bytes ({reclaimed} reclaimed, {deadBytes} dead)");
 
             List<RaftLog> visible = wal.ReadLogsRange(Partition, 0);
             Assert.Equal(700, visible[0].Id);
@@ -335,7 +360,7 @@ public sealed class TestRocksDbCompactionFloor
 
             wal.FlushMemTablesForTesting(wait: true);
 
-            List<(string Name, int Level, long SmallestId, long LargestId)> files = wal.GetShardLiveFilesForTesting(Partition);
+            List<(string Name, int Level, long SmallestId, long LargestId, long SizeBytes)> files = wal.GetShardLiveFilesForTesting(Partition);
             Assert.True(files.Count >= 2, $"expected two flushed files, saw {files.Count}");
             AssertNonOverlapping(files);
             Assert.Contains(files, f => f.SmallestId >= 2001);
@@ -379,7 +404,7 @@ public sealed class TestRocksDbCompactionFloor
 
             // The full-range tombstone met the rows in compaction: the surviving file of the shard
             // begins at partition 1's first live row, i.e. the dead prefix is physically gone.
-            List<(string Name, int Level, long SmallestId, long LargestId)> files = wal.GetShardLiveFilesForTesting(Partition);
+            List<(string Name, int Level, long SmallestId, long LargestId, long SizeBytes)> files = wal.GetShardLiveFilesForTesting(Partition);
             Assert.NotEmpty(files);
             Assert.All(files.Where(f => f.SmallestId >= 0), f => Assert.True(f.SmallestId >= 401, $"dead row {f.SmallestId} survived compaction"));
 
@@ -434,7 +459,7 @@ public sealed class TestRocksDbCompactionFloor
             }
 
             wal.FlushMemTablesForTesting(wait: true);
-            List<(string Name, int Level, long SmallestId, long LargestId)> files = WaitUntil(
+            List<(string Name, int Level, long SmallestId, long LargestId, long SizeBytes)> files = WaitUntil(
                 () => wal.GetShardLiveFilesForTesting(Partition),
                 f => f.Count(x => x.Level == 0) < tuning.ShardLevel0FileNumCompactionTrigger,
                 TimeSpan.FromSeconds(20));
@@ -514,9 +539,9 @@ public sealed class TestRocksDbCompactionFloor
 
     // ───────────────────────────── helpers ─────────────────────────────
 
-    private static void AssertNonOverlapping(List<(string Name, int Level, long SmallestId, long LargestId)> files)
+    private static void AssertNonOverlapping(List<(string Name, int Level, long SmallestId, long LargestId, long SizeBytes)> files)
     {
-        List<(string Name, int Level, long SmallestId, long LargestId)> ordered = files
+        List<(string Name, int Level, long SmallestId, long LargestId, long SizeBytes)> ordered = files
             .Where(f => f.SmallestId >= 0 && f.LargestId >= 0)
             .OrderBy(f => f.SmallestId)
             .ToList();

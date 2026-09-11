@@ -3302,16 +3302,18 @@ public class RocksDbWAL : IWAL, IDisposable
 
     /// <summary>
     /// Test-only: the live SST files of the shard column family holding <paramref name="partitionId"/>,
-    /// with the id span each covers, so a test can prove that files reach the base level with the
-    /// numbers they were flushed under (moved, not rewritten) and that no two files of the partition
-    /// overlap. Read through RocksDB's live-files metadata; names are relative (e.g. <c>/000012.sst</c>).
+    /// with the id span and the on-disk size of each, so a test can prove that files reach the base
+    /// level with the numbers they were flushed under (moved, not rewritten), that no two files of
+    /// the partition overlap, and that a whole-file drop reclaims exactly the dropped files' bytes
+    /// (files of equal row counts are not equal in size, so byte accounting must be per file). Read
+    /// through RocksDB's live-files metadata; names are relative (e.g. <c>/000012.sst</c>).
     /// </summary>
-    internal List<(string Name, int Level, long SmallestId, long LargestId)> GetShardLiveFilesForTesting(int partitionId)
+    internal List<(string Name, int Level, long SmallestId, long LargestId, long SizeBytes)> GetShardLiveFilesForTesting(int partitionId)
     {
         using EngineLease lease = AcquireEngine();
 
         string shardName = "shard" + (partitionId % MaxShards);
-        List<(string, int, long, long)> result = [];
+        List<(string, int, long, long, long)> result = [];
 
         IntPtr files = Native.Instance.rocksdb_livefiles(db.Handle);
         try
@@ -3337,7 +3339,9 @@ public class RocksDbWAL : IWAL, IDisposable
                 long smallestId = smallest.Length == LogKeyWidth && KeyBelongsToPartition(smallest, partitionId) ? ParseLogIdFromKey(smallest) : -1;
                 long largestId = largest.Length == LogKeyWidth && KeyBelongsToPartition(largest, partitionId) ? ParseLogIdFromKey(largest) : -1;
 
-                result.Add((name, level, smallestId, largestId));
+                long sizeBytes = (long)Native.Instance.rocksdb_livefiles_size(files, i);
+
+                result.Add((name, level, smallestId, largestId, sizeBytes));
             }
         }
         finally
