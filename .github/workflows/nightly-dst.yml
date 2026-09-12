@@ -51,6 +51,12 @@ jobs:
       KOMMANDER_DST_SHRINK: '1'
       KOMMANDER_DST_SHRINK_BUDGET: ${{ inputs.shrink_budget || '40' }}
 
+      # The candidate budget bounds how many cluster runs a shrink makes, not how long each one
+      # takes, and the hang detector below counts silence from the last test event — a whole shrink
+      # is one silence. Twenty minutes keeps a shrink inside the thirty-minute detector window with
+      # room for the run that found the failure. Change the two numbers together.
+      KOMMANDER_DST_SHRINK_MAX_MINUTES: '20'
+
       # One replay of a promoted plan is weak evidence: these plans are not deterministic, and a
       # corpus entry is promoted precisely because it reproduced INTERMITTENTLY. Size the repeats
       # from the measured rate. The first entry reproduced about nine times in a hundred, so three
@@ -84,9 +90,16 @@ jobs:
       - name: Run the random search
         run: |
           cd Kommander.Tests
+          # The hang timeout is inactivity between test events, and this job has single tests that
+          # are legitimately silent for far longer than five minutes: the promoted-plan replay runs
+          # every corpus plan twenty-four times inside one test (three plans at ten seconds a replay
+          # is twelve minutes), and a failing seed shrinks itself for up to twenty minutes. Five
+          # minutes killed the host every night from 2026-09-05 to 2026-09-12 — the "hang" was the
+          # detector. Thirty minutes covers both with margin; a real hang now costs half an hour of
+          # a two-hour job instead of a nightly false alarm.
           dotnet test -l "console;verbosity=detailed" \
             --filter "Category=DSTRandom" \
-            --blame-hang --blame-hang-timeout 300s
+            --blame-hang --blame-hang-timeout 30m
 
       - name: Summarise what failed
         # Runs whichever way the search went. A green night should say so in one line rather than
@@ -104,6 +117,10 @@ jobs:
           # Only the files a failing seed writes. Other tests leave shrink artifacts of their own
           # under dst-artifacts/, and a wider pattern would report a green night as a failure.
           #
+          # The failure file is written before the shrink starts, so it is there even when the host
+          # died mid-shrink; the shrunk plan is there only when the shrink finished. Read the failure
+          # file first: its first line is the signature, and the rest is the exception and the plan.
+          #
           # A null-separated read loop rather than mapfile: mapfile needs bash 4, and a summary step
           # that dies on the runner would hide exactly the failure this job exists to report.
           found=0
@@ -118,10 +135,10 @@ jobs:
               echo '```'
               echo
             } >> "$GITHUB_STEP_SUMMARY"
-          done < <(find . -name 'random-seed-*.shrunk.plan.txt' -print0)
+          done < <(find . \( -name 'random-seed-*.failure.txt' -o -name 'random-seed-*.shrunk.plan.txt' \) -print0 | sort -z)
 
           if [ "$found" -eq 0 ]; then
-            echo "No plan was shrunk, so no seed failed." >> "$GITHUB_STEP_SUMMARY"
+            echo "No seed failed: no failure file and no shrunk plan was written." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 

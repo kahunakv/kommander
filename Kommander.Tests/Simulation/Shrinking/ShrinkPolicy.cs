@@ -23,6 +23,23 @@ public static class ShrinkPolicy
     /// <summary>Overrides <see cref="ShrinkOptions.MaxCandidates"/> for the nightly job.</summary>
     public const string BudgetVariable = "KOMMANDER_DST_SHRINK_BUDGET";
 
+    /// <summary>
+    /// Overrides <see cref="ShrinkOptions.MaxDuration"/>, in whole minutes, for the nightly job.
+    /// Unset or invalid means <see cref="DefaultMaxMinutes"/>; zero means no cap.
+    /// </summary>
+    public const string MaxMinutesVariable = "KOMMANDER_DST_SHRINK_MAX_MINUTES";
+
+    /// <summary>
+    /// The wall-clock cap a shrink runs under when nothing overrides it.
+    ///
+    /// <para>Sized against the test host's hang detector rather than against the budget: the
+    /// nightly job kills the host after a fixed silence, and a shrink is silent for its whole
+    /// length. Twenty minutes leaves a third of a thirty-minute detector window for the run that
+    /// found the failure and for the candidate that is allowed to finish after the cap. Whoever
+    /// changes one number must change the other.</para>
+    /// </summary>
+    public const int DefaultMaxMinutes = 20;
+
     /// <summary>Whether the environment asked for a shrink.</summary>
     public static bool Enabled()
     {
@@ -50,6 +67,23 @@ public static class ShrinkPolicy
             ? parsed
             : 40;
 
-        return new ShrinkOptions { MaxCandidates = budget, AttemptsPerCandidate = 2 };
+        return new ShrinkOptions
+        {
+            MaxCandidates = budget,
+            AttemptsPerCandidate = 2,
+            MaxDuration = ConfiguredMaxDuration(),
+        };
+    }
+
+    /// <summary>The wall-clock cap from the environment, or the default when it is unset or unreadable.</summary>
+    public static TimeSpan? ConfiguredMaxDuration()
+    {
+        string? text = Environment.GetEnvironmentVariable(MaxMinutesVariable);
+
+        int minutes = int.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out int parsed)
+            ? parsed
+            : DefaultMaxMinutes;
+
+        return minutes > 0 ? TimeSpan.FromMinutes(minutes) : null;
     }
 }

@@ -155,6 +155,38 @@ public sealed class TestPlanShrinker
     }
 
     /// <summary>
+    /// The wall clock is a hard stop too, and it is reported apart from the candidate budget.
+    ///
+    /// <para>The candidate budget bounds runs, not time: a plan whose failure sits behind a long
+    /// recovery wait costs a minute per candidate, and the nightly host kills a test that is silent
+    /// for longer than its hang window. Here every candidate takes longer than the whole cap, so
+    /// the shrinker must stop after the first one, with a plan in hand and the right flag set —
+    /// and without claiming the candidate budget ran out, which it did not.</para>
+    /// </summary>
+    [Fact]
+    [Trait("Category", "DSTSmoke")]
+    public async Task AShrink_StopsOnItsClockAndSaysSo()
+    {
+        List<RandomScenarioAction> plan = Padding(40);
+
+        PlanShrinker shrinker = new(
+            async (_, cancellationToken) =>
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(60), cancellationToken);
+                return new ShrinkAttempt(Target);
+            },
+            new ShrinkOptions { MaxCandidates = 200, MaxDuration = TimeSpan.FromMilliseconds(40) });
+
+        ShrinkResult result = await shrinker.ShrinkAsync(plan, Target, TestContext.Current.CancellationToken);
+
+        Assert.True(result.DurationExhausted, "The shrink did not report its clock as spent.");
+        Assert.False(result.BudgetExhausted, "The shrink blamed the candidate budget, which was not spent.");
+        Assert.Equal(1, result.CandidatesRun);
+        Assert.True(result.Shrunk.Count > 0, "The shrink returned no plan at all.");
+        Assert.Contains("durationExhausted=True", result.Describe(), StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// A numeric parameter comes down once the removals are done. The failure here needs a duplicate
     /// link and nothing about how many copies, so the count must fall to the smallest value that
     /// still duplicates anything.

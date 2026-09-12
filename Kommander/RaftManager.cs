@@ -714,7 +714,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         {
             executorPool = new Scheduling.RaftExecutorPool(
                 configuration.PartitionExecutorPoolSize,
-                manualExecution: !configuration.EnableInternalSchedulingThreads);
+                manualExecution: !configuration.EnableInternalSchedulingThreads,
+                logger: logger);
 
             // Start the pool here, where it is created, rather than in JoinCluster.
             // A partition executor in pool mode depends on a *running* pool: Start()

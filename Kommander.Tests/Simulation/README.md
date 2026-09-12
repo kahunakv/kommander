@@ -92,7 +92,12 @@ step count or measurements — a plan of three actions has nothing to do with th
 the plan it came from took.
 
 The nightly does this by itself. `KOMMANDER_DST_SHRINK=1` makes a failing run reduce its own plan and
-write a second artifact.
+write a second artifact. The failure is written first, as `random-seed-N.failure.txt`, so a shrink
+that is cut short still leaves the finding behind; and `KOMMANDER_DST_SHRINK_MAX_MINUTES` (default
+twenty) caps the shrink's wall clock. The cap exists because the test host's hang detector counts
+silence between test events, and a whole shrink is one silence: a shrink longer than that window
+kills the host with nothing reported. The nightly's window is thirty minutes; change the two
+together.
 
 ## Promoting a failure
 

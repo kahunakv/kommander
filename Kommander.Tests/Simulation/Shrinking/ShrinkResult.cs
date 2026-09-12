@@ -39,6 +39,13 @@ public sealed record ShrinkResult
     public required bool BudgetExhausted { get; init; }
 
     /// <summary>
+    /// Whether the shrink stopped because <see cref="ShrinkOptions.MaxDuration"/> ran out. Reported
+    /// beside <see cref="BudgetExhausted"/> for the same reason: the plan is still a reproduction,
+    /// and a reader deciding whether to spend more on it needs to know which limit it hit.
+    /// </summary>
+    public bool DurationExhausted { get; init; }
+
+    /// <summary>
     /// The run's own header — its seed and the bounds it was drawn under — written above the shrink
     /// counters.
     ///
@@ -71,6 +78,7 @@ public sealed record ShrinkResult
         text.AppendLine($"removalsAccepted={RemovalsAccepted}");
         text.AppendLine($"parametersReduced={ParametersReduced}");
         text.AppendLine($"budgetExhausted={BudgetExhausted}");
+        text.AppendLine($"durationExhausted={DurationExhausted}");
         text.AppendLine();
 
         foreach (RandomScenarioAction action in Shrunk)

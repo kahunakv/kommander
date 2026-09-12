@@ -549,15 +549,17 @@ public sealed class RaftPartitionExecutor : IDisposable
     /// </summary>
     public void Stop()
     {
-        _stopping = true;
-        _cts.Cancel();
+        SignalStop();
 
         if (_pool != null)
         {
             // Pool mode: trigger one more scheduled drain so the pool sees _stopping and
             // runs DrainAll + CancelPendingReplies under the single-owner run-lock, then
-            // signals _stopTcs so this call can return.
-            MarkRunnable();
+            // signals _stopTcs so this call can return. When a cleanup drain already ran —
+            // a restore fail-stop, or an earlier Stop — there is nothing left to schedule
+            // and this call only waits, which makes Stop safe to call more than once.
+            if (!_stopTcs.Task.IsCompleted)
+                MarkRunnable();
 
             if (_pool.IsManualExecution)
             {
@@ -586,9 +588,19 @@ public sealed class RaftPartitionExecutor : IDisposable
         else
         {
             // Dedicated-thread mode: release the semaphore so the parked worker wakes up,
-            // observes cancellation, drains remaining work, and exits.
-            _workAvailable.Release();
-            _worker!.Join();
+            // observes cancellation, drains remaining work, and exits. A repeated Stop finds
+            // the semaphore disposed, and a Stop before Start finds a thread that never ran;
+            // neither has a worker left to join.
+            try
+            {
+                _workAvailable.Release();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+
+            if (_worker is { } worker && (worker.ThreadState & global::System.Threading.ThreadState.Unstarted) == 0)
+                worker.Join();
         }
     }
 
@@ -648,6 +660,15 @@ public sealed class RaftPartitionExecutor : IDisposable
                 await DrainQueuesAsync().ConfigureAwait(false);
             }
         }
+        catch (Exception ex)
+        {
+            // A drain must never escape onto the pool thread. An unhandled exception there ends
+            // the process, and the pool thread serves every partition on the node. ExecuteOneAsync
+            // already contains operation failures, so this only sees a failure of the drain
+            // machinery itself. On the stop path the cleanup still has to complete below, or Stop()
+            // waits on _stopTcs forever and every queued caller waits with it.
+            OnDrainFailed(ex);
+        }
         finally
         {
             Volatile.Write(ref _runLock, 0);
@@ -698,7 +719,103 @@ public sealed class RaftPartitionExecutor : IDisposable
         }
         else
         {
-            _workAvailable.Release();
+            // A late producer — a restore that finished after Dispose — finds the semaphore gone.
+            // There is no worker left to wake, so the signal is dropped rather than thrown.
+            try
+            {
+                _workAvailable.Release();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+    }
+
+    /// <summary>
+    /// Moves the executor into the stopping state and cancels its token. Every stop path goes
+    /// through here: <see cref="Stop"/> and the fail-stops of both restore phases.
+    ///
+    /// <para>Safe after <see cref="Dispose"/>. A restore that failed after the executor was
+    /// disposed used to call <c>_cts.Cancel()</c> on a disposed source; the
+    /// <see cref="ObjectDisposedException"/> escaped the operation's own catch block onto the pool
+    /// thread, and an unhandled exception there ends the process (the 2026-09-12 CI crash).
+    /// Cancellation is already in effect once the source is disposed, so the throw carries no
+    /// information and is swallowed.</para>
+    /// </summary>
+    private void SignalStop()
+    {
+        _stopping = true;
+
+        try
+        {
+            _cts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Dispose already ran, so Stop already cancelled the token.
+        }
+    }
+
+    /// <summary>
+    /// Reports a drain that threw and, when the executor is stopping, completes the cleanup the
+    /// drain was doing: every operation still queued and every reply still pending is cancelled,
+    /// so no caller is left waiting on an executor that will never run again.
+    /// </summary>
+    private void OnDrainFailed(Exception ex)
+    {
+        _logger.LogError(
+            ex,
+            "[RaftPartitionExecutor/{PartitionId}] Drain failed; the executor thread stays alive. Stopping={Stopping}",
+            _partitionId, _stopping);
+
+        if (!_stopping)
+            return;
+
+        CancelQueuedOperations();
+        CancelPendingReplies();
+    }
+
+    /// <summary>
+    /// Dequeues everything still queued and cancels its reply. Used only on the stop path after a
+    /// drain failed part-way, where the normal DrainAll cannot be trusted to finish.
+    /// </summary>
+    private void CancelQueuedOperations()
+    {
+        while (_controlQueue.TryDequeue(out PendingOperation op))
+            op.Reply?.TrySetCanceled();
+
+        while (_replicationQueue.TryDequeue(out PendingOperation op))
+            op.Reply?.TrySetCanceled();
+
+        while (_clientQueue.TryDequeue(out PendingOperation op))
+        {
+            if (_maxClientQueueDepth > 0)
+                Interlocked.Decrement(ref _clientQueueDepth);
+
+            op.Reply?.TrySetCanceled();
+        }
+
+        while (_maintenanceQueue.TryDequeue(out PendingOperation op))
+            op.Reply?.TrySetCanceled();
+    }
+
+    /// <summary>
+    /// Runs one drain on the dedicated worker thread and keeps that thread alive if the drain
+    /// throws. Blocking is correct here: the thread belongs to this executor and has nothing else
+    /// to do.
+    /// </summary>
+    private void RunDrainOnWorkerThread(bool drainAll)
+    {
+        try
+        {
+            if (drainAll)
+                DrainAllAsync().AsTask().GetAwaiter().GetResult();
+            else
+                DrainQueuesAsync().AsTask().GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            OnDrainFailed(ex);
         }
     }
 
@@ -840,7 +957,7 @@ public sealed class RaftPartitionExecutor : IDisposable
             {
                 // Blocking is correct here: this thread belongs to this executor and has nothing
                 // else to do. Only an externally driven pool needs the awaiting form.
-                DrainAllAsync().AsTask().GetAwaiter().GetResult();
+                RunDrainOnWorkerThread(drainAll: true);
                 CancelPendingReplies();
                 break;
             }
@@ -860,7 +977,7 @@ public sealed class RaftPartitionExecutor : IDisposable
             while (true)
             {
                 // Drain all queues in weighted-fair order.
-                DrainQueuesAsync().AsTask().GetAwaiter().GetResult();
+                RunDrainOnWorkerThread(drainAll: false);
 
                 while (_workAvailable.Wait(0))
                 {
@@ -889,6 +1006,17 @@ public sealed class RaftPartitionExecutor : IDisposable
         {
             IReadOnlyList<RaftLog> logs = await _stateMachine.StartRestoreAsync().ConfigureAwait(false);
 
+            // The executor stopped while the logs were loading. Phase 2 would replay them into a
+            // partition that is going away, and the post would land on a queue nobody drains any
+            // more — or, after Dispose, on an executor whose token source is gone, which is how a
+            // late restore once took a pool thread and the test process down with it. Cancel the
+            // restore instead of finishing it.
+            if (_stopping)
+            {
+                _restoreTcs.TrySetCanceled();
+                return;
+            }
+
             // Deliver logs back to the executor for Phase 2 replay on the worker thread
             // (dedicated mode) or pool thread (pool mode).
             _maintenanceQueue.Enqueue(new PendingOperation(
@@ -897,15 +1025,25 @@ public sealed class RaftPartitionExecutor : IDisposable
                 RaftOperationMapper.GetKind(RaftRequestType.RestoreLogsLoaded)));
             MarkRunnable();
         }
-        catch (Exception ex) when (!token.IsCancellationRequested)
+        catch (Exception ex)
         {
+            // A load that failed because the executor stopped under it is not a restore failure.
+            // The WAL, the schedulers or the token are being torn down, and the exception says
+            // so. Settle the restore task as cancelled rather than leave it pending forever: a
+            // caller awaiting RestoreTask on a stopped partition must wake up, and a filtered
+            // catch used to let this case fall through to the unobserved-task path.
+            if (token.IsCancellationRequested || _stopping)
+            {
+                _restoreTcs.TrySetCanceled();
+                return;
+            }
+
             _logger.LogError(
                 "[RaftPartitionExecutor/{PartitionId}] WAL restore (Phase 1) failed; partition will not process operations: {Message}\n{StackTrace}",
                 _partitionId, ex.Message, ex.StackTrace);
 
             _restoreTcs.TrySetException(ex);
-            _stopping = true;
-            _cts.Cancel();
+            SignalStop();
 
             if (_pool != null)
             {
@@ -1176,6 +1314,18 @@ public sealed class RaftPartitionExecutor : IDisposable
                     // not here — otherwise RestoreTask can complete while this op's own increment
                     // is still pending, so a caller that reads TotalProcessed right after awaiting
                     // RestoreTask races the restore op's count (observed as an off-by-one baseline).
+                    //
+                    // A stopping executor skips the replay. It would run inside the cleanup drain,
+                    // against a partition whose schedulers may already be stopped, and its only
+                    // possible outcomes are wasted work or a fail-stop report about a partition
+                    // that was asked to stop anyway.
+                    if (_stopping)
+                    {
+                        _restoreTcs.TrySetCanceled();
+                        op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
+                        break;
+                    }
+
                     await _stateMachine.CompleteRestoreAsync(request.RestoredLogs ?? []).ConfigureAwait(false);
                     _restoreCompleted = true;
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
@@ -1265,8 +1415,7 @@ public sealed class RaftPartitionExecutor : IDisposable
                     _partitionId, ex.Message);
 
                 _restoreTcs.TrySetException(ex);
-                _stopping = true;
-                _cts.Cancel();
+                SignalStop();
 
                 // Wake the worker (or schedule the pool drain) so the cancellation is noticed and
                 // the cleanup drain runs. Never drain from here: this runs inside a drain already.
@@ -1421,8 +1570,12 @@ public sealed class RaftPartitionExecutor : IDisposable
     public void Dispose()
     {
         GC.SuppressFinalize(this);
-        if (!_stopping)
-            Stop();
+
+        // Unconditional on purpose. A restore fail-stop sets _stopping and only *schedules* the
+        // cleanup drain; disposing the token source while that drain is still on its way is the
+        // race that produced the 2026-09-12 crash. Stop is idempotent and always waits for the
+        // drain, so nothing below can run while a pool thread is still inside this executor.
+        Stop();
         _cts.Dispose();
         _workAvailable.Dispose();
     }

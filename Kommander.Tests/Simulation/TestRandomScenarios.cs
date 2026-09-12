@@ -418,6 +418,7 @@ public sealed class TestRandomScenarios
         Exception failure;
         string planPath;
         string replayPath;
+        string failurePath;
 
         try
         {
@@ -434,6 +435,13 @@ public sealed class TestRandomScenarios
             planPath = partial.WriteArtifact(directory, "random");
             replayPath = runner.WriteReplayLog(directory, "random");
             failure = error;
+
+            // The finding goes to disk before anything else runs. The shrink below costs tens of
+            // cluster runs, and a host that dies during it — the hang detector, a cancelled job —
+            // used to take the failure message with it: the nightly of 2026-09-12 left a plan that
+            // stopped at action 18 of 24 and not one line saying why. The file beside the plan is
+            // what survives, and the job's summary step prints it.
+            failurePath = WriteFailureArtifact(directory, seed, error, partial);
         }
 
         // The failing cluster is disposed before a shrink begins. A shrink starts a fresh cluster
@@ -448,9 +456,37 @@ public sealed class TestRandomScenarios
             $"Random run failed on seed {seed}. Re-run this seed to reproduce it exactly." +
             $"{Environment.NewLine}Plan: {planPath}" +
             $"{Environment.NewLine}Replay: {replayPath}" +
+            $"{Environment.NewLine}Failure: {failurePath}" +
             shrink +
             $"{Environment.NewLine}{partial.Describe()}",
             failure);
+    }
+
+    /// <summary>
+    /// Writes the failure beside the plan, as <c>random-seed-N.failure.txt</c>, and returns the path.
+    ///
+    /// <para>The exception first, in full, then the partial report. The first line is the failure
+    /// signature a reader would otherwise reconstruct from a stack trace, and the report under it
+    /// is the same text the test message carries — so the file stands on its own when the test
+    /// message was never printed.</para>
+    /// </summary>
+    private static string WriteFailureArtifact(
+        string directory,
+        ulong seed,
+        Exception failure,
+        RandomScenarioReport partial)
+    {
+        Directory.CreateDirectory(directory);
+
+        string path = Path.Combine(directory, $"random-seed-{seed}.failure.txt");
+
+        File.WriteAllText(
+            path,
+            $"signature={FailureSignature.Of(failure)}{Environment.NewLine}" +
+            $"{Environment.NewLine}{failure}{Environment.NewLine}" +
+            $"{Environment.NewLine}{partial.Describe()}");
+
+        return path;
     }
 
     /// <summary>

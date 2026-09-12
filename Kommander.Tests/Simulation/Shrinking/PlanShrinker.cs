@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Kommander.Tests.Simulation.Scenarios.Random;
 
 namespace Kommander.Tests.Simulation.Shrinking;
@@ -34,6 +35,7 @@ public sealed class PlanShrinker
     private int candidatesRun;
     private int removalsAccepted;
     private int parametersReduced;
+    private long startedTimestamp;
 
     public PlanShrinker(PlanOracle oracle, ShrinkOptions? options = null)
     {
@@ -66,6 +68,7 @@ public sealed class PlanShrinker
         candidatesRun = 0;
         removalsAccepted = 0;
         parametersReduced = 0;
+        startedTimestamp = Stopwatch.GetTimestamp();
 
         IReadOnlyList<RandomScenarioAction> best = PlanNormalizer.Normalize(plan);
 
@@ -83,6 +86,7 @@ public sealed class PlanShrinker
             RemovalsAccepted = removalsAccepted,
             ParametersReduced = parametersReduced,
             BudgetExhausted = candidatesRun >= options.MaxCandidates,
+            DurationExhausted = DurationSpent(),
         };
     }
 
@@ -114,7 +118,7 @@ public sealed class PlanShrinker
 
             while (start < best.Count)
             {
-                if (candidatesRun >= options.MaxCandidates)
+                if (BudgetSpent())
                     return best;
 
                 if (best.Count - width < options.MinimumPlanLength)
@@ -176,7 +180,7 @@ public sealed class PlanShrinker
 
             foreach (long attempt in new[] { minimum, minimum + (current - minimum) / 2 })
             {
-                if (candidatesRun >= options.MaxCandidates)
+                if (BudgetSpent())
                     return best;
 
                 if (attempt >= current)
@@ -200,6 +204,12 @@ public sealed class PlanShrinker
 
     // ── Helpers ───────────────────────────────────────────────────────────
 
+    /// <summary>Whether either hard stop — the candidate count or the wall clock — is spent.</summary>
+    private bool BudgetSpent() => candidatesRun >= options.MaxCandidates || DurationSpent();
+
+    private bool DurationSpent() =>
+        options.MaxDuration is { } limit && Stopwatch.GetElapsedTime(startedTimestamp) >= limit;
+
     /// <summary>
     /// Runs a candidate up to <see cref="ShrinkOptions.AttemptsPerCandidate"/> times, and reports
     /// whether any attempt reproduced the target failure.
@@ -215,7 +225,7 @@ public sealed class PlanShrinker
     {
         for (int attempt = 0; attempt < Math.Max(1, options.AttemptsPerCandidate); attempt++)
         {
-            if (candidatesRun >= options.MaxCandidates)
+            if (BudgetSpent())
                 return false;
 
             candidatesRun++;

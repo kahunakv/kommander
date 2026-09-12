@@ -1,5 +1,6 @@
 
 using System.Collections.Concurrent;
+using Microsoft.Extensions.Logging;
 
 namespace Kommander.Scheduling;
 
@@ -49,9 +50,14 @@ public sealed class RaftExecutorPool : IDisposable
     /// single-owner invariant is unaffected: the per-partition run-lock inside
     /// <see cref="RaftPartitionExecutor.DrainOnPool"/> still admits one drainer at a time.</para>
     /// </param>
-    public RaftExecutorPool(int poolSize, bool manualExecution = false)
+    /// <param name="logger">
+    /// Sink for a failure that escapes an executor drain. Optional: a pool without one still
+    /// survives the failure, it only cannot say so.
+    /// </param>
+    public RaftExecutorPool(int poolSize, bool manualExecution = false, ILogger? logger = null)
     {
         _manualExecution = manualExecution;
+        _logger = logger;
 
         int p = poolSize > 0 ? poolSize : poolSize == 0 ? Environment.ProcessorCount : 1;
         _workers = new Thread[manualExecution ? 0 : p];
@@ -68,6 +74,8 @@ public sealed class RaftExecutorPool : IDisposable
 
     /// <summary>True when this pool owns no threads and a caller drives every drain.</summary>
     private readonly bool _manualExecution;
+
+    private readonly ILogger? _logger;
 
     /// <summary>
     /// Whether this pool is externally driven. Read by <see cref="RaftPartitionExecutor.Start"/>,
@@ -139,7 +147,17 @@ public sealed class RaftExecutorPool : IDisposable
     internal void Schedule(RaftPartitionExecutor executor)
     {
         _ready.Enqueue(executor);
-        _workAvailable.Release();
+
+        // A schedule that lands after Dispose has no thread to wake. The executor behind it is
+        // stopping too (RaftManager stops every partition before the pool), so dropping the wake
+        // loses nothing a thread could still have done.
+        try
+        {
+            _workAvailable.Release();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
     }
 
     private void WorkerLoop()
@@ -160,7 +178,20 @@ public sealed class RaftExecutorPool : IDisposable
             if (!_ready.TryDequeue(out RaftPartitionExecutor? executor))
                 continue;
 
-            executor.DrainOnPool();
+            try
+            {
+                executor.DrainOnPool();
+            }
+            catch (Exception ex)
+            {
+                // Last line of defence. DrainOnPool contains its own failures; anything that still
+                // reaches here would end this thread with an unhandled exception, and an unhandled
+                // exception on a dedicated thread ends the process — every partition on the node
+                // with it. Log it and keep serving.
+                _logger?.LogError(
+                    ex,
+                    "[RaftExecutorPool] An exception escaped an executor drain; the pool thread continues.");
+            }
         }
     }
 

@@ -1620,7 +1620,8 @@ public class RocksDbWAL : IWAL, IDisposable
         }
         catch (Exception ex)
         {
-            logger.LogDebug("RocksDB WAL at '{Path}': metadata flush to release write-ahead logs could not be scheduled: {Message}", enginePath, ex.Message);
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug("RocksDB WAL at '{Path}': metadata flush to release write-ahead logs could not be scheduled: {Message}", enginePath, ex.Message);
         }
     }
 

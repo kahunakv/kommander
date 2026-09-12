@@ -23,6 +23,19 @@ public sealed record ShrinkOptions
     public int MaxCandidates { get; init; } = 60;
 
     /// <summary>
+    /// Wall-clock time the shrinker may spend in total, or null for no limit.
+    ///
+    /// <para><b>Why a second hard stop beside <see cref="MaxCandidates"/>.</b> A candidate count
+    /// bounds the number of cluster runs, not their length: a plan whose failure sits behind a
+    /// recovery wait of hundreds of steps costs a minute per run, and forty of those is most of
+    /// an hour. The test host's hang detector counts inactivity from the last test event, and a
+    /// shrink is one event, so a shrink longer than that window is killed with the finding still
+    /// unreported — which is how the nightly search failed on 2026-09-12. The cap is checked
+    /// before each candidate; a candidate already running is allowed to finish.</para>
+    /// </summary>
+    public TimeSpan? MaxDuration { get; init; }
+
+    /// <summary>
     /// Runs of one candidate before it is called a pass.
     ///
     /// <para><b>This is the setting that decides whether the result is trustworthy.</b> These plans
