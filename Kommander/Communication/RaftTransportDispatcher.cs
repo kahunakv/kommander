@@ -12,10 +12,11 @@ namespace Kommander.Communication;
 ///
 /// <para>One <see cref="Channel{T}"/>-backed worker task is created per remote endpoint on
 /// first use.  Each worker drains its channel, groups adjacent messages into natural batches
-/// (up to <see cref="MaxBatchSize"/>), and dispatches via <see cref="ICommunication"/>.
-/// Per-endpoint FIFO ordering is preserved.  Batching is opportunistic — messages that
-/// accumulate while a prior batch is in-flight are automatically grouped without any
-/// artificial delay.</para>
+/// (up to <see cref="MaxBatchSize"/> messages and
+/// <see cref="RaftConfiguration.MaxOutboundBatchBytes"/> of log payload per frame), and
+/// dispatches via <see cref="ICommunication"/>. Per-endpoint FIFO ordering is preserved.
+/// Batching is opportunistic — messages that accumulate while a prior batch is in-flight are
+/// automatically grouped without any artificial delay.</para>
 ///
 /// <para>This class has no actor or Nixie dependency.</para>
 /// </summary>
@@ -48,6 +49,20 @@ internal sealed class RaftTransportDispatcher : IDisposable
         /// <summary>1 while a drop episode is open, so the Warning fires once per episode, not per message.</summary>
         private int _dropEpisodeOpen;
 
+        /// <summary>
+        /// Payload-byte budget of one <c>BatchRequests</c> frame
+        /// (<see cref="RaftConfiguration.MaxOutboundBatchBytes"/>); &lt;= 0 means count cap only.
+        /// </summary>
+        private readonly long _maxBatchPayloadBytes;
+
+        /// <summary>
+        /// A message read from the channel that did not fit beside the messages already in the
+        /// frame being built. It opens the next frame, so the byte cap never reorders a peer's
+        /// queue. Only the single reader touches it.
+        /// </summary>
+        private RaftResponderRequest _carry;
+        private bool _hasCarry;
+
         // Send context, kept so manual mode can perform a flush without a running loop.
         private readonly RaftManager _manager;
         private readonly RaftNode _node;
@@ -60,9 +75,11 @@ internal sealed class RaftTransportDispatcher : IDisposable
             ICommunication communication,
             ILogger<IRaft> logger,
             long maxQueuedPayloadBytes,
+            long maxBatchPayloadBytes,
             bool manualExecution = false)
         {
             _maxQueuedPayloadBytes = maxQueuedPayloadBytes;
+            _maxBatchPayloadBytes = maxBatchPayloadBytes;
             _logger = logger;
             _endpoint = node.Endpoint;
             _manager = manager;
@@ -101,21 +118,51 @@ internal sealed class RaftTransportDispatcher : IDisposable
             List<RaftResponderRequest> batch = new(MaxBatchSize);
             int sent = 0;
 
-            while (_channel.Reader.TryRead(out RaftResponderRequest item))
-            {
-                batch.Add(item);
-
-                if (batch.Count < MaxBatchSize)
-                    continue;
-
-                sent += await SendBatchAsync(batch).ConfigureAwait(false);
-                batch.Clear();
-            }
-
-            if (batch.Count > 0)
+            while (FillBatch(batch) > 0)
                 sent += await SendBatchAsync(batch).ConfigureAwait(false);
 
             return sent;
+        }
+
+        /// <summary>
+        /// Builds the next frame: the carried-over message first, then whatever is immediately
+        /// readable, stopping at <see cref="MaxBatchSize"/> messages or when the next
+        /// entry-carrying message would push the frame's payload over
+        /// <see cref="_maxBatchPayloadBytes"/> — that message is carried into the following frame.
+        /// A message that alone exceeds the budget still ships, by itself: the receiver's
+        /// <see cref="RaftConfiguration.GrpcMaxMessageBytes"/> is the ceiling for that case, and
+        /// holding it back would stall its partition. Returns the frame's message count.
+        /// </summary>
+        private int FillBatch(List<RaftResponderRequest> batch)
+        {
+            batch.Clear();
+            long batchBytes = 0;
+
+            if (_hasCarry)
+            {
+                batch.Add(_carry);
+                batchBytes = PayloadBytes(_carry);
+                _carry = default;
+                _hasCarry = false;
+            }
+
+            while (batch.Count < MaxBatchSize && _channel.Reader.TryRead(out RaftResponderRequest item))
+            {
+                long itemBytes = PayloadBytes(item);
+
+                if (batch.Count > 0 && _maxBatchPayloadBytes > 0 && itemBytes > 0
+                    && batchBytes + itemBytes > _maxBatchPayloadBytes)
+                {
+                    _carry = item;
+                    _hasCarry = true;
+                    break;
+                }
+
+                batch.Add(item);
+                batchBytes += itemBytes;
+            }
+
+            return batch.Count;
         }
 
         /// <summary>
@@ -261,22 +308,23 @@ internal sealed class RaftTransportDispatcher : IDisposable
 
             while (true)
             {
-                try
+                // A carried-over message already makes a frame; only an empty hand waits.
+                if (!_hasCarry)
                 {
-                    if (!await reader.WaitToReadAsync(token).ConfigureAwait(false))
-                        break; // channel completed normally
-                }
-                catch (OperationCanceledException)
-                {
-                    break; // hard abort from Dispose(); fall through to post-loop drain
+                    try
+                    {
+                        if (!await reader.WaitToReadAsync(token).ConfigureAwait(false))
+                            break; // channel completed normally
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break; // hard abort from Dispose(); fall through to post-loop drain
+                    }
                 }
 
-                // Drain whatever is immediately available to form a natural batch.
-                batch.Clear();
-                while (batch.Count < MaxBatchSize && reader.TryRead(out RaftResponderRequest item))
-                    batch.Add(item);
-
-                if (batch.Count == 0)
+                // Drain whatever is immediately available to form a natural batch, within the
+                // count and byte caps.
+                if (FillBatch(batch) == 0)
                     continue;
 
                 try
@@ -300,28 +348,10 @@ internal sealed class RaftTransportDispatcher : IDisposable
             // Post-loop drain: flush any items that were buffered before the channel was
             // completed or before the hard-abort token fired. This covers the window where
             // Stop() (channel complete) races with the last Enqueue() call.
-            // Clear first — batch may hold the last-processed set from the main loop;
-            // the drain must only send messages that have NOT yet been dispatched.
-            batch.Clear();
-            while (reader.TryRead(out RaftResponderRequest remaining))
-            {
-                batch.Add(remaining);
-
-                if (batch.Count >= MaxBatchSize)
-                {
-                    try { await Send(batch, manager, node, communication, logger).ConfigureAwait(false); }
-                    catch (Exception ex)
-                    {
-                        logger.LogError(
-                            "[RaftTransportDispatcher/{Endpoint}] drain {Type}: {Message}",
-                            node.Endpoint, ex.GetType().Name, ex.Message);
-                    }
-                    finally { ReleaseBatchBytes(batch); }
-                    batch.Clear();
-                }
-            }
-
-            if (batch.Count > 0)
+            // FillBatch clears first — batch may hold the last-processed set from the main loop;
+            // the drain must only send messages that have NOT yet been dispatched (including a
+            // message carried over from the last frame the loop built).
+            while (FillBatch(batch) > 0)
             {
                 try { await Send(batch, manager, node, communication, logger).ConfigureAwait(false); }
                 catch (Exception ex)
@@ -532,6 +562,7 @@ internal sealed class RaftTransportDispatcher : IDisposable
     private readonly ICommunication _communication;
     private readonly ILogger<IRaft> _logger;
     private readonly long _maxQueuedPayloadBytesPerPeer;
+    private readonly long _maxBatchPayloadBytes;
     private readonly ConcurrentDictionary<string, EndpointWorker> _workers = new();
     private volatile bool _stopped;
     private int _disposed;
@@ -544,12 +575,14 @@ internal sealed class RaftTransportDispatcher : IDisposable
         ICommunication communication,
         ILogger<IRaft> logger,
         long maxQueuedPayloadBytesPerPeer = 64L * 1024 * 1024,
+        long maxBatchPayloadBytes = 4L * 1024 * 1024,
         bool manualExecution = false)
     {
         _manager = manager;
         _communication = communication;
         _logger = logger;
         _maxQueuedPayloadBytesPerPeer = maxQueuedPayloadBytesPerPeer;
+        _maxBatchPayloadBytes = maxBatchPayloadBytes;
         _manualExecution = manualExecution;
     }
 
@@ -604,7 +637,7 @@ internal sealed class RaftTransportDispatcher : IDisposable
             worker = _workers.GetOrAdd(
                 endpoint,
                 ep => new EndpointWorker(
-                    _manager, new RaftNode(ep), _communication, _logger, _maxQueuedPayloadBytesPerPeer, _manualExecution));
+                    _manager, new RaftNode(ep), _communication, _logger, _maxQueuedPayloadBytesPerPeer, _maxBatchPayloadBytes, _manualExecution));
 
         worker.Enqueue(request);
     }

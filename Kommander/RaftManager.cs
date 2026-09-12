@@ -643,6 +643,7 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             communication,
             Logger,
             configuration.MaxOutboundQueueBytesPerPeer,
+            configuration.MaxOutboundBatchBytes,
             manualExecution: !configuration.EnableInternalSchedulingThreads);
 
         rpcRouter = new RaftRpcRouter(
@@ -743,7 +744,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             // the operator's RaftConfiguration values rather than the library fallback (4, false).
             Kommander.Communication.Grpc.SharedChannels.Configure(
                 configuration.GetEffectiveGrpcChannelsPerNode(),
-                configuration.GrpcEnableMultipleHttp2Connections);
+                configuration.GrpcEnableMultipleHttp2Connections,
+                configuration.GrpcMaxMessageBytes);
         }
 
         if (communication is Kommander.Communication.Rest.RestCommunication

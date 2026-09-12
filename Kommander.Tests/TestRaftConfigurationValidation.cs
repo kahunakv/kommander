@@ -221,4 +221,49 @@ public class TestRaftConfigurationValidation
         RaftConfiguration cfg = new() { EnableSlowNodeAvoidance = true, EnableLeaderBalancer = false };
         cfg.Validate();
     }
+
+    // ── gRPC message size vs. sender budgets ──────────────────────────────────
+
+    [Fact]
+    public void Validate_DefaultGrpcMessageSize_LeavesHeadroomOverSenderBudgets()
+    {
+        RaftConfiguration cfg = new();
+
+        // The shipped pair: 4 MiB frame/backfill budgets under a 16 MiB receive limit. The gRPC
+        // library default (4 MB) was equal to the backfill budget, which is what the 1.6.x soak hit.
+        Assert.Equal(16 * 1024 * 1024, cfg.GrpcMaxMessageBytes);
+        Assert.True(cfg.MaxOutboundBatchBytes * 2 <= cfg.GrpcMaxMessageBytes);
+        Assert.True(cfg.MaxBackfillBytesPerRound * 2 <= cfg.GrpcMaxMessageBytes);
+        cfg.Validate();
+    }
+
+    [Fact]
+    public void Validate_NonPositiveGrpcMaxMessageBytes_Throws()
+    {
+        RaftConfiguration cfg = new() { GrpcMaxMessageBytes = 0 };
+        RaftException ex = Assert.Throws<RaftException>(cfg.Validate);
+        Assert.Contains("GrpcMaxMessageBytes", ex.Message);
+    }
+
+    [Fact]
+    public void Validate_OutboundBatchBudgetAboveReceiveLimit_Throws()
+    {
+        RaftConfiguration cfg = new() { GrpcMaxMessageBytes = 4 * 1024 * 1024, MaxOutboundBatchBytes = 8L * 1024 * 1024 };
+        RaftException ex = Assert.Throws<RaftException>(cfg.Validate);
+        Assert.Contains("MaxOutboundBatchBytes", ex.Message);
+        Assert.Contains("GrpcMaxMessageBytes", ex.Message);
+    }
+
+    [Fact]
+    public void Validate_BackfillBudgetAboveReceiveLimit_Throws()
+    {
+        RaftConfiguration cfg = new()
+        {
+            GrpcMaxMessageBytes = 4 * 1024 * 1024,
+            MaxOutboundBatchBytes = 1024 * 1024,
+            MaxBackfillBytesPerRound = 6 * 1024 * 1024,
+        };
+        RaftException ex = Assert.Throws<RaftException>(cfg.Validate);
+        Assert.Contains("MaxBackfillBytesPerRound", ex.Message);
+    }
 }

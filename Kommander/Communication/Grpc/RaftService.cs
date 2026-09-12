@@ -573,6 +573,15 @@ public sealed class RaftService : Rafter.RafterBase
             if (logger.IsEnabled(LogLevel.Debug))
                 logger.LogDebug("BatchRequests: stream from {Peer} closed: {Message}", context.Peer, ex.Message);
         }
+        catch (RpcException ex) when (ex.StatusCode == StatusCode.ResourceExhausted)
+        {
+            // A frame over this node's receive limit. Name the limit and the option so the
+            // operator can line it up against the sender's MaxOutboundBatchBytes and
+            // MaxBackfillBytesPerRound instead of guessing which side to change.
+            logger.LogError(
+                "BatchRequests: stream from {Peer} failed: a frame exceeded this node's gRPC receive limit ({MaxReceiveMessageBytes} bytes, RaftConfiguration.GrpcMaxMessageBytes); the sender's MaxOutboundBatchBytes and MaxBackfillBytesPerRound must stay below it. {Message}",
+                context.Peer, raft.Configuration.GrpcMaxMessageBytes, ex.Message);
+        }
         catch (Exception ex)
         {
             logger.LogError("BatchRequests: stream from {Peer} failed: {Exception}", context.Peer, ex.ToString());

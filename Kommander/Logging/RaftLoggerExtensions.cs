@@ -223,8 +223,17 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Warning, Message = "[{Endpoint}/{Partition}] Restore reconstructed a commit frontier of {ReconstructedFrontier} below the durable checkpoint {LastCheckpoint} (checkpoint log entry absent from the restore read); seeding the frontier from the checkpoint so this node does not advertise a near-zero frontier")]
     public static partial void LogWarnRestoreFrontierBelowCheckpoint(this ILogger<IRaft> logger, string endpoint, int partition, long reconstructedFrontier, long lastCheckpoint);
 
-    [LoggerMessage(Level = LogLevel.Warning, Message = "[{Endpoint}/{Partition}] Compaction blocked by application-durability floor: DurablyApplied={DurablyApplied} LastCheckpoint={LastCheckpoint} — application flusher may be stalled; WAL will grow until the floor advances")]
-    public static partial void LogWarnCompactionBlockedByDurabilityFloor(this ILogger<IRaft> logger, string endpoint, int partition, long durablyApplied, long lastCheckpoint);
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{Endpoint}/{Partition}] Compaction clamped by application-durability floor: DurablyApplied={DurablyApplied} LastCheckpoint={LastCheckpoint} Lag={Lag} — the application flusher is behind the Raft log; WAL retention grows until it catches up (further clamped passes are summarized every {ReportIntervalSeconds}s)")]
+    public static partial void LogWarnCompactionClampedByDurabilityFloor(this ILogger<IRaft> logger, string endpoint, int partition, long durablyApplied, long lastCheckpoint, long lag, long reportIntervalSeconds);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{Endpoint}/{Partition}] Compaction blocked by application-durability floor: DurablyApplied={DurablyApplied} LastCheckpoint={LastCheckpoint} Lag={Lag} — floor has not moved for {FloorUnchangedSeconds}s ({ClampedPasses} clamped passes); application flusher may be stalled; WAL will grow until the floor advances")]
+    public static partial void LogWarnCompactionBlockedByDurabilityFloor(this ILogger<IRaft> logger, string endpoint, int partition, long durablyApplied, long lastCheckpoint, long lag, long floorUnchangedSeconds, int clampedPasses);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{Endpoint}/{Partition}] Compaction still {State} by application-durability floor: DurablyApplied={DurablyApplied} LastCheckpoint={LastCheckpoint} Lag={Lag} — floor advanced {FloorAdvance} entries over {PassesSinceLastReport} clamped passes since the previous report ({ClampedPasses} passes, {StreakSeconds}s in this streak)")]
+    public static partial void LogWarnCompactionStillClampedByDurabilityFloor(this ILogger<IRaft> logger, string endpoint, int partition, string state, long durablyApplied, long lastCheckpoint, long lag, long floorAdvance, int passesSinceLastReport, int clampedPasses, long streakSeconds);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}/{Partition}] Compaction no longer clamped by application-durability floor after {ClampedPasses} clamped passes over {StreakSeconds}s: DurablyApplied={DurablyApplied} LastCheckpoint={LastCheckpoint} Removed={RemovedTotal}")]
+    public static partial void LogInfoCompactionDurabilityClampCleared(this ILogger<IRaft> logger, string endpoint, int partition, int clampedPasses, long streakSeconds, long durablyApplied, long lastCheckpoint, int removedTotal);
 
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}/{Partition}] Restore replay narrowed by soft checkpoint (application-durability floor above the last checkpoint): SoftFloor={SoftFloor} LastCheckpoint={LastCheckpoint} — replaying only the {TailCount} entries above the floor")]
     public static partial void LogInfoRestoreNarrowedBySoftFloor(this ILogger<IRaft> logger, string endpoint, int partition, long softFloor, long lastCheckpoint, int tailCount);

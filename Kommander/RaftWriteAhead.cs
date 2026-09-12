@@ -287,6 +287,12 @@ public sealed class RaftWriteAhead
     private int awaitingFirstCheckpointReported;
 
     /// <summary>
+    /// Rate-limits the durability-floor clamp Warning per streak instead of per pass. Touched only
+    /// from <see cref="RunCompactionPassAsync"/>, which the in-flight flag serializes.
+    /// </summary>
+    private readonly DurabilityClampReporter durabilityClampReporter;
+
+    /// <summary>
     /// Constructor
     /// </summary>
     /// <param name="manager"></param>
@@ -311,6 +317,9 @@ public sealed class RaftWriteAhead
         this.operations = compactEveryOperations > 0 ? compactEveryOperations : 0;
         this.liveReplicaFloorStalenessTicks = (long)(Math.Max(
             30_000, 10 * manager.Configuration.HeartbeatInterval.TotalMilliseconds) * Stopwatch.Frequency / 1000);
+        this.durabilityClampReporter = new DurabilityClampReporter(
+            (long)(manager.Configuration.CompactionDurabilityClampReportInterval.TotalSeconds
+                   * manager.Configuration.TickSource.Frequency));
     }
 
     /// <summary>
@@ -2414,6 +2423,76 @@ public sealed class RaftWriteAhead
     }
 
     /// <summary>
+    /// Feeds one effective pass to <see cref="durabilityClampReporter"/> and logs whatever it asks
+    /// for: one line when a clamp streak starts, at most one per report interval while it lasts
+    /// (wording "blocked … may be stalled" only once the floor has stopped moving for a whole
+    /// interval), and one when it clears.
+    /// </summary>
+    private void ReportDurabilityClamp(bool clamped, long durabilityFloor, long lastCheckpoint, int removedTotal)
+    {
+        Time.IMonotonicTickSource tickSource = manager.Configuration.TickSource;
+
+        DurabilityClampReporter.Outcome outcome = durabilityClampReporter.Observe(
+            clamped, durabilityFloor, tickSource.GetTimestamp());
+
+        if (outcome.Kind == DurabilityClampReporter.Report.None)
+            return;
+
+        long durablyApplied = durabilityFloor == long.MaxValue ? -1 : durabilityFloor - 1;
+        long lag = durabilityFloor == long.MaxValue ? 0 : Math.Max(0, lastCheckpoint - durabilityFloor);
+        long streakSeconds = (long)tickSource.GetElapsedTime(0, outcome.StreakElapsedTicks).TotalSeconds;
+
+        switch (outcome.Kind)
+        {
+            case DurabilityClampReporter.Report.StreakStarted:
+                logger.LogWarnCompactionClampedByDurabilityFloor(
+                    manager.LocalEndpoint,
+                    partition.PartitionId,
+                    durablyApplied,
+                    lastCheckpoint,
+                    lag,
+                    (long)manager.Configuration.CompactionDurabilityClampReportInterval.TotalSeconds);
+                break;
+
+            case DurabilityClampReporter.Report.Stalled:
+                logger.LogWarnCompactionBlockedByDurabilityFloor(
+                    manager.LocalEndpoint,
+                    partition.PartitionId,
+                    durablyApplied,
+                    lastCheckpoint,
+                    lag,
+                    (long)tickSource.GetElapsedTime(0, outcome.FloorUnchangedTicks).TotalSeconds,
+                    outcome.ClampedPasses);
+                break;
+
+            case DurabilityClampReporter.Report.Reminder:
+                logger.LogWarnCompactionStillClampedByDurabilityFloor(
+                    manager.LocalEndpoint,
+                    partition.PartitionId,
+                    outcome.Stalled ? "blocked" : "clamped",
+                    durablyApplied,
+                    lastCheckpoint,
+                    lag,
+                    outcome.FloorAdvanceSinceLastReport,
+                    outcome.PassesSinceLastReport,
+                    outcome.ClampedPasses,
+                    streakSeconds);
+                break;
+
+            case DurabilityClampReporter.Report.StreakEnded:
+                logger.LogInfoCompactionDurabilityClampCleared(
+                    manager.LocalEndpoint,
+                    partition.PartitionId,
+                    outcome.ClampedPasses,
+                    streakSeconds,
+                    durablyApplied,
+                    lastCheckpoint,
+                    removedTotal);
+                break;
+        }
+    }
+
+    /// <summary>
     /// Runs one compaction pass: resolves the truncation floor, then drains removable entries below
     /// it. Never throws — a failed pass is logged and the in-flight flag released.
     /// <para>
@@ -2563,17 +2642,15 @@ public sealed class RaftWriteAhead
             logger.LogInfoCompactionFinished(manager.LocalEndpoint, partition.PartitionId, removedTotal, effectiveFloor);
 
             // A clamped pass that removed nothing has fully drained the durably-applied prefix and
-            // is now blocked waiting on the application's flusher. Surface it loudly: a stalled
-            // flusher otherwise grows the WAL without bound and silently.
-            if (floors.IsClampedByDurabilityFloor && removedTotal == 0)
-            {
+            // is now waiting on the application's flusher. The metric counts every such pass; the
+            // log line is rate-limited per streak (see DurabilityClampReporter) because on a loaded
+            // follower this is the steady state of a flusher that lags but keeps moving, and only
+            // a floor that stops moving is the stall the Warning was written for.
+            bool clamped = floors.IsClampedByDurabilityFloor && removedTotal == 0;
+            if (clamped)
                 KommanderMetrics.RecordCompactionBlockedByDurabilityFloor(partition.PartitionId);
-                logger.LogWarnCompactionBlockedByDurabilityFloor(
-                    manager.LocalEndpoint,
-                    partition.PartitionId,
-                    durabilityFloor - 1,
-                    lastCheckpoint);
-            }
+
+            ReportDurabilityClamp(clamped, durabilityFloor, lastCheckpoint, removedTotal);
         }
         catch (Exception ex)
         {

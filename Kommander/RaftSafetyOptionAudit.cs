@@ -136,6 +136,8 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.GrpcEnableAppendLogsCoalescing)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.GrpcAppendLogsMaxCoalesceBatch)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.MaxOutboundQueueBytesPerPeer)] = RaftOptionKind.Liveness,
+        [nameof(RaftConfiguration.MaxOutboundBatchBytes)] = RaftOptionKind.Liveness,
+        [nameof(RaftConfiguration.GrpcMaxMessageBytes)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.EnableSharedExecutorPool)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.PartitionExecutorPoolSize)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.EnableQuiescence)] = RaftOptionKind.Liveness,
@@ -211,6 +213,7 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.CompactNumberEntries)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.MaxEntriesPerCompaction)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.CompactionLiveReplicaLagBudget)] = RaftOptionKind.Liveness,
+        [nameof(RaftConfiguration.CompactionDurabilityClampReportInterval)] = RaftOptionKind.Performance,
     };
 
     /// <summary>

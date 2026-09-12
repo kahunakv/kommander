@@ -201,6 +201,148 @@ public sealed class TestWalCompactionDiagnostics : IDisposable
         }
     }
 
+    private const string ClampedMarker = "Compaction clamped by application-durability floor";
+    private const string BlockedMarker = "Compaction blocked by application-durability floor";
+    private const string StillClampedMarker = "Compaction still clamped by application-durability floor";
+    private const string StillBlockedMarker = "Compaction still blocked by application-durability floor";
+    private const string ClampClearedMarker = "Compaction no longer clamped by application-durability floor";
+
+    /// <summary>Mutable durability floor, as the application's flusher would report it.</summary>
+    private sealed class FloorProvider : IApplicationDurabilityProvider
+    {
+        public long DurablyAppliedIndex { get; set; } = -1;
+
+        public long GetDurablyAppliedIndex(int partitionId) => DurablyAppliedIndex;
+    }
+
+    /// <summary>
+    /// A flusher that lags the checkpoint on every pass but keeps advancing — the loaded-follower
+    /// steady state of the 1.6.x soaks — gets one "clamped by" Warning for the whole streak, no
+    /// "blocked … may be stalled" line, and one Information line when it catches up. The metric
+    /// still counts every clamped pass.
+    /// </summary>
+    [Fact]
+    public async Task DurabilityClamp_MovingFloor_WarnsOncePerStreakAndReportsWhenCleared()
+    {
+        const int partitionId = 7104;
+        const int compactEveryOperations = 1;
+        const int operations = 40;
+
+        CapturingLogger logger = new();
+        // Zero removals per pass while the floor moves: the RocksDB whole-file reclamation shape.
+        using GatedCheckpointWal wal = new(new InMemoryWAL(logger)) { SuppressCompaction = true };
+        FloorProvider provider = new() { DurablyAppliedIndex = 0 };
+        Simulation.Time.VirtualTickSource clock = new();
+
+        RaftWriteAhead writeAhead = CreateWriteAhead(
+            wal, logger, partitionId, compactEveryOperations, out RaftManager manager, out RaftPartition partition,
+            config =>
+            {
+                config.ApplicationDurabilityProvider = provider;
+                config.TickSource = clock;
+                config.CompactionDurabilityClampReportInterval = TimeSpan.FromSeconds(60);
+            });
+
+        try
+        {
+            // Each operation writes a Committed + CommittedCheckpoint pair, so the checkpoint runs
+            // two ids ahead per operation while the floor advances one: the floor lags on every
+            // pass, moving, and no pass removes anything.
+            for (int operation = 0; operation < operations; operation++)
+            {
+                await DriveCommitsAsync(wal, writeAhead, partitionId, 1, withCheckpoints: true).ConfigureAwait(true);
+                provider.DurablyAppliedIndex += 1;
+                clock.AdvanceBy(200);
+            }
+
+            Assert.True(writeAhead.EffectiveCompactionPassCount >= operations - 1);
+
+            Assert.Equal(1, logger.CountAtLevel(LogLevel.Warning, ClampedMarker));
+            Assert.Equal(0, logger.CountAtLevel(LogLevel.Warning, BlockedMarker));
+            Assert.Equal(0, logger.CountAtLevel(LogLevel.Warning, StillClampedMarker));
+            Assert.Equal(0, logger.CountAtLevel(LogLevel.Information, ClampClearedMarker));
+
+            // The flusher catches up past the checkpoint (the next operation moves the checkpoint
+            // two ids on, so clear it by more): the clamp clears with one Information line.
+            provider.DurablyAppliedIndex = wal.GetMaxLog(partitionId) + 10;
+            await DriveCommitsAsync(wal, writeAhead, partitionId, 1, withCheckpoints: true).ConfigureAwait(true);
+
+            Assert.Equal(1, logger.CountAtLevel(LogLevel.Information, ClampClearedMarker));
+            Assert.Equal(1, logger.CountAtLevel(LogLevel.Warning, ClampedMarker));
+
+            // Lagging again is a new streak: exactly one more start line.
+            provider.DurablyAppliedIndex = 1;
+            await DriveCommitsAsync(wal, writeAhead, partitionId, 3, withCheckpoints: true).ConfigureAwait(true);
+            Assert.Equal(2, logger.CountAtLevel(LogLevel.Warning, ClampedMarker));
+        }
+        finally
+        {
+            partition.Dispose();
+            manager.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// A floor that stops moving for a whole report interval is the stall the Warning was written
+    /// for: one "blocked … may be stalled" line, then periodic "still blocked" reminders carrying
+    /// the lag, never a line per pass.
+    /// </summary>
+    [Fact]
+    public async Task DurabilityClamp_StuckFloor_ReportsStalledOnceThenRemindsPerInterval()
+    {
+        const int partitionId = 7105;
+        const int compactEveryOperations = 1;
+
+        CapturingLogger logger = new();
+        using InMemoryWAL wal = new(logger);
+        FloorProvider provider = new() { DurablyAppliedIndex = 2 };
+        Simulation.Time.VirtualTickSource clock = new();
+
+        RaftWriteAhead writeAhead = CreateWriteAhead(
+            wal, logger, partitionId, compactEveryOperations, out RaftManager manager, out RaftPartition partition,
+            config =>
+            {
+                config.ApplicationDurabilityProvider = provider;
+                config.TickSource = clock;
+                config.CompactionDurabilityClampReportInterval = TimeSpan.FromSeconds(10);
+            });
+
+        try
+        {
+            // 30 passes over 6 s with the floor pinned: streak start only.
+            for (int operation = 0; operation < 30; operation++)
+            {
+                await DriveCommitsAsync(wal, writeAhead, partitionId, 1, withCheckpoints: true).ConfigureAwait(true);
+                clock.AdvanceBy(200);
+            }
+
+            Assert.Equal(1, logger.CountAtLevel(LogLevel.Warning, ClampedMarker));
+            Assert.Equal(0, logger.CountAtLevel(LogLevel.Warning, BlockedMarker));
+
+            // Past one interval without movement: exactly one stalled line.
+            clock.AdvanceBy(10_000);
+            await DriveCommitsAsync(wal, writeAhead, partitionId, 5, withCheckpoints: true).ConfigureAwait(true);
+            Assert.Equal(1, logger.CountAtLevel(LogLevel.Warning, BlockedMarker));
+
+            // Another interval, still stuck: one reminder, worded "blocked", no second stalled line.
+            clock.AdvanceBy(10_000);
+            await DriveCommitsAsync(wal, writeAhead, partitionId, 5, withCheckpoints: true).ConfigureAwait(true);
+            Assert.Equal(1, logger.CountAtLevel(LogLevel.Warning, BlockedMarker));
+            Assert.Equal(1, logger.CountAtLevel(LogLevel.Warning, StillBlockedMarker));
+            Assert.Equal(0, logger.CountAtLevel(LogLevel.Warning, StillClampedMarker));
+
+            Assert.Contains(logger.Messages, m => m.Message.Contains(StillBlockedMarker) && m.Message.Contains("Lag="));
+
+            // Under 50 passes produced 3 Warnings, not 50.
+            Assert.Equal(3, logger.Messages.Count(m => m.Level == LogLevel.Warning && m.Message.Contains("application-durability floor")));
+        }
+        finally
+        {
+            partition.Dispose();
+            manager.Dispose();
+        }
+    }
+
     /// <summary>
     /// Writes <paramref name="operations"/> committed operations (optionally each followed by a
     /// checkpoint entry) and notifies the write-ahead after each, waiting for the triggered pass so
@@ -246,7 +388,8 @@ public sealed class TestWalCompactionDiagnostics : IDisposable
         int partitionId,
         int compactEveryOperations,
         out RaftManager manager,
-        out RaftPartition partition)
+        out RaftPartition partition,
+        Action<RaftConfiguration>? configure = null)
     {
         RaftConfiguration config = new()
         {
@@ -257,6 +400,8 @@ public sealed class TestWalCompactionDiagnostics : IDisposable
             CompactNumberEntries = 10,
             MaxEntriesPerCompaction = 100,
         };
+
+        configure?.Invoke(config);
 
         manager = new(
             config,
@@ -323,6 +468,13 @@ public sealed class TestWalCompactionDiagnostics : IDisposable
     {
         public bool HideCheckpoint { get; set; }
 
+        /// <summary>
+        /// When set, compaction reports success with nothing removed — the RocksDB backend's
+        /// ordinary answer while no whole file has fallen below the floor, which is how a pass can
+        /// be clamped and remove nothing on every pass while the floor keeps moving.
+        /// </summary>
+        public bool SuppressCompaction { get; set; }
+
         public long GetLastCheckpoint(int partitionId) =>
             HideCheckpoint ? -1 : inner.GetLastCheckpoint(partitionId);
 
@@ -347,7 +499,9 @@ public sealed class TestWalCompactionDiagnostics : IDisposable
 
         public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(
             int partitionId, long lastCheckpoint, int compactNumberEntries, int? maxTotalEntries = null) =>
-            inner.CompactLogsOlderThan(partitionId, lastCheckpoint, compactNumberEntries, maxTotalEntries);
+            SuppressCompaction
+                ? (RaftOperationStatus.Success, 0)
+                : inner.CompactLogsOlderThan(partitionId, lastCheckpoint, compactNumberEntries, maxTotalEntries);
 
         public RaftOperationStatus DeletePartitionWAL(int partitionId) => inner.DeletePartitionWAL(partitionId);
 

@@ -88,7 +88,8 @@ public class GrpcCommunication : ICommunication
                 m.Configuration.GetEffectiveGrpcChannelsPerNode(),
                 m.Configuration.GrpcEnableMultipleHttp2Connections,
                 m.Configuration.GetEffectiveTransportSecurity(),
-                m.Configuration.GrpcEnableSnapshotCompression)
+                m.Configuration.GrpcEnableSnapshotCompression,
+                m.Configuration.GrpcMaxMessageBytes)
         });
 
     //private static readonly SemaphoreSlim semaphore = new(1, 1);
@@ -242,7 +243,7 @@ public class GrpcCommunication : ICommunication
             GetPoolOptions(manager));
 
         if (manager.Configuration.GrpcEnableAppendLogsCoalescing)
-            return await AppendLogsCoalesced(streaming, request, manager.Configuration.GrpcAppendLogsMaxCoalesceBatch);
+            return await AppendLogsCoalesced(streaming, request, manager.Configuration.GrpcAppendLogsMaxCoalesceBatch, manager.Configuration.MaxOutboundBatchBytes);
 
         GrpcAppendLogsRequest appendLogsRequest = GrpcCommunicationPool.RentAppendLogsRequest();
 
@@ -292,7 +293,8 @@ public class GrpcCommunication : ICommunication
     private async Task<AppendLogsResponse> AppendLogsCoalesced(
         GrpcInterSharedStreaming streaming,
         AppendLogsRequest request,
-        int maxBatch)
+        int maxBatch,
+        long maxBatchBytes)
     {
         // Bound the pending queue. A non-flusher enqueues and returns immediately, so the
         // dispatcher's await gives NO backpressure on this path: while one flusher sits in a
@@ -335,7 +337,8 @@ public class GrpcCommunication : ICommunication
                 }
             },
             maxBatch,
-            new(requestItem, appendLogsRequest));
+            new(requestItem, appendLogsRequest),
+            maxBatchBytes);
 
         return appendLogsResponse;
     }
@@ -384,14 +387,22 @@ public class GrpcCommunication : ICommunication
         SemaphoreSlim semaphore,
         Func<GrpcBatchRequestsRequest, Task> write,
         int maxBatch,
-        PendingAppendLogs item) =>
-        FlushCoalesced(pending, semaphore, write, static (w, b) => w(b), maxBatch, item);
+        PendingAppendLogs item,
+        long maxBatchBytes = 0) =>
+        FlushCoalesced(pending, semaphore, write, static (w, b) => w(b), maxBatch, item, maxBatchBytes);
 
     /// <summary>
     /// State-carried core of <see cref="FlushCoalesced"/>: the write delegate receives
     /// <paramref name="writeState"/> explicitly so the production caller can pass a static
     /// (non-capturing) delegate — the closure-per-append the plain overload forces on it was a
     /// measured per-send allocation. Semantics are identical to the plain overload.
+    /// <para>
+    /// <paramref name="maxBatchBytes"/> bounds each frame's encoded size
+    /// (<see cref="RaftConfiguration.MaxOutboundBatchBytes"/>): an item that would push the frame
+    /// over it starts the next frame instead, so the frame stays under the peer's
+    /// <see cref="RaftConfiguration.GrpcMaxMessageBytes"/>. An item that alone exceeds the budget
+    /// is written by itself. 0 disables the byte cap (item count only).
+    /// </para>
     /// </summary>
     internal static async Task FlushCoalesced<TState>(
         ConcurrentQueue<PendingAppendLogs> pending,
@@ -399,7 +410,8 @@ public class GrpcCommunication : ICommunication
         TState writeState,
         Func<TState, GrpcBatchRequestsRequest, Task> write,
         int maxBatch,
-        PendingAppendLogs item)
+        PendingAppendLogs item,
+        long maxBatchBytes = 0)
     {
         pending.Enqueue(item);
 
@@ -413,24 +425,50 @@ public class GrpcCommunication : ICommunication
         List<GrpcAppendLogsRequest> toReturn = new(maxBatch);
         try
         {
+            // An item dequeued for a frame it did not fit in is carried into the next frame; it
+            // is never re-queued, so FIFO order on the stream is preserved.
+            bool hasCarry = false;
+            PendingAppendLogs carry = default;
+
             do
             {
                 GrpcBatchRequestsRequest batch = new();
-
-                // Cap per cycle to bound individual frame size.  The do/while re-loops for
-                // any remainder, so no items are lost regardless of backlog depth.
+                long batchBytes = 0;
                 int drained = 0;
+
+                if (hasCarry)
+                {
+                    batch.Requests.Add(carry.BatchItem);
+                    toReturn.Add(carry.PooledRequest);
+                    batchBytes = maxBatchBytes > 0 ? carry.BatchItem.CalculateSize() : 0;
+                    drained = 1;
+                    hasCarry = false;
+                }
+
+                // Cap per cycle to bound individual frame size, by count and by bytes.  The
+                // do/while re-loops for any remainder, so no items are lost regardless of
+                // backlog depth.
                 while (drained < maxBatch && pending.TryDequeue(out PendingAppendLogs p))
                 {
+                    long itemBytes = maxBatchBytes > 0 ? p.BatchItem.CalculateSize() : 0;
+
+                    if (drained > 0 && maxBatchBytes > 0 && batchBytes + itemBytes > maxBatchBytes)
+                    {
+                        carry = p;
+                        hasCarry = true;
+                        break;
+                    }
+
                     batch.Requests.Add(p.BatchItem);
                     toReturn.Add(p.PooledRequest);
+                    batchBytes += itemBytes;
                     drained++;
                 }
 
                 if (batch.Requests.Count > 0)
                     await write(writeState, batch);
             }
-            while (!pending.IsEmpty);
+            while (hasCarry || !pending.IsEmpty);
         }
         finally
         {

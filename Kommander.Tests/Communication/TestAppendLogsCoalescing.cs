@@ -352,4 +352,92 @@ public sealed class TestAppendLogsCoalescing
         Assert.Single(batches);
         Assert.Equal([1, 2, 3, 4, 5], seenPartitions);
     }
+
+    // ── Byte cap ──────────────────────────────────────────────────────────────
+
+    private static PendingAppendLogs MakePendingWithPayload(int partition, int payloadBytes)
+    {
+        GrpcAppendLogsRequest req = new() { Partition = partition, Term = 1, Endpoint = "test" };
+        req.Logs.Add(new GrpcRaftLog
+        {
+            Id = partition,
+            Term = 1,
+            LogType = "test",
+            Data = Google.Protobuf.ByteString.CopyFrom(new byte[payloadBytes]),
+        });
+        GrpcBatchRequestsRequestItem item = new()
+        {
+            Type = GrpcBatchRequestsRequestType.AppendLogs,
+            AppendLogs = req,
+        };
+        return new PendingAppendLogs(item, req);
+    }
+
+    /// <summary>
+    /// The coalescing flusher is the second place a frame is assembled from many AppendLogs, and it
+    /// too was bounded by item count only. With a byte cap it must close a frame before the item
+    /// that would exceed it, carry that item into the next frame, keep stream order, and lose
+    /// nothing. Sizes are taken from the encoded items, so the check is against wire bytes.
+    /// </summary>
+    [Fact]
+    public async Task Flusher_SplitsFramesAtTheByteCap_InOrder_LosingNothing()
+    {
+        var pending = new ConcurrentQueue<PendingAppendLogs>();
+        var sem = new SemaphoreSlim(1, 1);
+        var frames = new List<List<int>>();
+
+        // Four ~1 KB items already queued behind the flusher's own item; a cap that fits two.
+        PendingAppendLogs first = MakePendingWithPayload(partition: 1, payloadBytes: 1000);
+        long oneItemBytes = first.BatchItem.CalculateSize();
+        long cap = 2 * oneItemBytes + oneItemBytes / 2;
+
+        pending.Enqueue(MakePendingWithPayload(partition: 2, payloadBytes: 1000));
+        pending.Enqueue(MakePendingWithPayload(partition: 3, payloadBytes: 1000));
+        pending.Enqueue(MakePendingWithPayload(partition: 4, payloadBytes: 1000));
+        pending.Enqueue(MakePendingWithPayload(partition: 5, payloadBytes: 1000));
+
+        await GrpcCommunication.FlushCoalesced(
+            pending, sem,
+            b =>
+            {
+                Assert.True(b.CalculateSize() <= cap, "a frame exceeded the byte cap");
+                frames.Add([.. b.Requests.Select(r => r.AppendLogs.Partition)]);
+                return Task.CompletedTask;
+            },
+            maxBatch: 256,
+            first,
+            maxBatchBytes: cap);
+
+        // The flusher's own item is enqueued last, so it closes the sequence.
+        Assert.Equal([[2, 3], [4, 5], [1]], frames);
+        Assert.True(pending.IsEmpty);
+        Assert.Equal(1, sem.CurrentCount);
+    }
+
+    /// <summary>An item larger than the cap on its own is still written, alone.</summary>
+    [Fact]
+    public async Task Flusher_OversizedItem_IsWrittenAlone()
+    {
+        var pending = new ConcurrentQueue<PendingAppendLogs>();
+        var sem = new SemaphoreSlim(1, 1);
+        var frames = new List<List<int>>();
+
+        pending.Enqueue(MakePendingWithPayload(partition: 2, payloadBytes: 100));
+        pending.Enqueue(MakePendingWithPayload(partition: 3, payloadBytes: 5000)); // over the cap by itself
+        pending.Enqueue(MakePendingWithPayload(partition: 4, payloadBytes: 100));
+
+        await GrpcCommunication.FlushCoalesced(
+            pending, sem,
+            b =>
+            {
+                frames.Add([.. b.Requests.Select(r => r.AppendLogs.Partition)]);
+                return Task.CompletedTask;
+            },
+            maxBatch: 256,
+            MakePendingWithPayload(partition: 1, payloadBytes: 100),
+            maxBatchBytes: 1000);
+
+        Assert.Equal([[2], [3], [4, 1]], frames);
+        Assert.True(pending.IsEmpty);
+    }
 }

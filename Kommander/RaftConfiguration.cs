@@ -590,6 +590,32 @@ public class RaftConfiguration
     public bool GrpcEnableSnapshotCompression { get; set; }
 
     /// <summary>
+    /// Largest gRPC message, in bytes, this node accepts from a peer and sends to one. Applied as
+    /// the server's <c>MaxReceiveMessageSize</c> (via <c>AddKommanderGrpc</c>) and as both
+    /// <c>MaxReceiveMessageSize</c> and <c>MaxSendMessageSize</c> on every pooled client channel.
+    /// Default 16 MiB.
+    /// <para>
+    /// The gRPC library default is 4 MB, which is exactly <see cref="MaxBackfillBytesPerRound"/>'s
+    /// default: one backfill batch already filled the receiver's budget before its own framing was
+    /// counted, and the dispatcher packs up to 64 requests to the same peer into one
+    /// <c>BatchRequests</c> frame — a backfill batch beside a partition's live traffic went over it.
+    /// A frame the receiver refuses tears the replication stream down (a follower logged
+    /// <c>ResourceExhausted: Received message exceeds the maximum configured message size</c> on a
+    /// 7,200 ops/s soak), and every entry on it is re-shipped by the retry path. The sender keeps
+    /// its frames under <see cref="MaxOutboundBatchBytes"/>, which must sit comfortably below this
+    /// value; the default pair leaves 4x headroom for framing. A frame larger than this value is
+    /// refused on the client before it is written, so a misconfiguration fails on the sender with
+    /// the size in the error rather than on the peer.
+    /// </para>
+    /// <para>
+    /// Every node in a cluster must be able to receive what its peers send: raise this on the
+    /// receivers before raising <see cref="MaxOutboundBatchBytes"/> or
+    /// <see cref="MaxBackfillBytesPerRound"/> on a leader.
+    /// </para>
+    /// </summary>
+    public int GrpcMaxMessageBytes { get; set; } = 16 * 1024 * 1024;
+
+    /// <summary>
     /// When <see langword="true"/>, enables per-stream outbound <c>AppendLogs</c> coalescing:
     /// while a <c>WriteAsync</c> to a follower stream is in flight, subsequent
     /// <c>AppendLogs</c> items for that stream are queued and sent as a single
@@ -619,10 +645,9 @@ public class RaftConfiguration
     /// more items than this cap, the flusher sends the first batch and immediately loops to
     /// drain the remainder in the next batch — keeping individual frames bounded.
     /// <para>
-    /// The primary constraint is the receiver's <c>MaxReceiveMessageSize</c> (gRPC default
-    /// 4 MB). A cap of 256 items matches <see cref="MaxWalBatchSize"/> and leaves ample
-    /// headroom for typical log-entry sizes. Operators on very large entry payloads should
-    /// reduce this value; operators on tiny entries may raise it.
+    /// This is an item-count cap; the byte cap on the same frame is
+    /// <see cref="MaxOutboundBatchBytes"/>, which is what keeps the frame under the receiver's
+    /// <see cref="GrpcMaxMessageBytes"/>. A cap of 256 items matches <see cref="MaxWalBatchSize"/>.
     /// </para>
     /// <para>
     /// Only effective when <see cref="GrpcEnableAppendLogsCoalescing"/> is
@@ -647,6 +672,26 @@ public class RaftConfiguration
     /// </para>
     /// </summary>
     public long MaxOutboundQueueBytesPerPeer { get; set; } = 64L * 1024 * 1024;
+
+    /// <summary>
+    /// Maximum log-payload bytes (sum of <see cref="Data.RaftLog.LogData"/> lengths plus a
+    /// per-entry allowance for the entry's own fields) the transport dispatcher packs into one
+    /// <c>BatchRequests</c> frame to a peer. Also bounds a frame assembled by the
+    /// <see cref="GrpcEnableAppendLogsCoalescing"/> flusher, where it is measured on the encoded
+    /// items. Default 4 MiB.
+    /// <para>
+    /// The dispatcher groups whatever is queued for a peer into one frame, up to 64 requests; that
+    /// count bounded nothing in bytes, so a 4 MiB backfill batch sharing a frame with another
+    /// partition's live entries exceeded the receiver's gRPC message limit and tore the
+    /// replication stream down (see <see cref="GrpcMaxMessageBytes"/>). A request that does not fit
+    /// beside the ones already in the frame starts the next frame; FIFO order per peer is kept. A
+    /// single request larger than this budget is still sent, alone, so an oversized entry cannot
+    /// stall its partition — the receiver's <see cref="GrpcMaxMessageBytes"/> is the real ceiling
+    /// for that case, which is why <see cref="MaxBackfillBytesPerRound"/> must stay below it.
+    /// Values &lt;= 0 disable the byte cap (count cap only).
+    /// </para>
+    /// </summary>
+    public long MaxOutboundBatchBytes { get; set; } = 4L * 1024 * 1024;
 
     private const int GrpcChannelsPerNodeMax = 64;
 
@@ -1513,6 +1558,24 @@ public class RaftConfiguration
     public long CompactionLiveReplicaLagBudget { get; set; } = 100_000;
 
     /// <summary>
+    /// How often a partition whose compaction is clamped by the application-durability floor
+    /// (see <see cref="ApplicationDurabilityProvider"/>) repeats its Warning, and how long the
+    /// floor must sit unchanged before that Warning calls the flusher stalled. Default 60 s.
+    /// <para>
+    /// A clamped pass that removes nothing is logged once when the streak starts ("clamped by"),
+    /// then at most once per interval with the current lag, the clamped passes since the previous
+    /// line and how far the floor advanced in between, and once more when the streak clears. The
+    /// wording switches to "blocked by … may be stalled" only once the floor has not moved for a
+    /// whole interval: on a loaded follower the floor sits far below the checkpoint on every pass
+    /// while still advancing in a saw-tooth (the application's flusher lags the Raft log and
+    /// catches up), and the previous per-pass line fired thousands of times per soak about a
+    /// flusher that was not stalled. Values &lt;= 0 keep only the streak-start and streak-end
+    /// lines.
+    /// </para>
+    /// </summary>
+    public TimeSpan CompactionDurabilityClampReportInterval { get; set; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
     /// Returns <see cref="CompactNumberEntries"/> clamped to at least 1 when misconfigured.
     /// </summary>
     public int GetEffectiveCompactNumberEntries() =>
@@ -1593,6 +1656,25 @@ public class RaftConfiguration
         if (SlowNodeFloorMs < 0)
             throw new RaftException(
                 $"[Kommander] SlowNodeFloorMs ({SlowNodeFloorMs}) must not be negative.");
+
+        // A frame the receiver refuses tears the replication stream down and is re-shipped only to
+        // be refused again, so a sender bound above the receive limit is a guaranteed replication
+        // fault, not a tuning choice. Fail at startup with the three numbers side by side.
+        if (GrpcMaxMessageBytes <= 0)
+            throw new RaftException(
+                $"[Kommander] GrpcMaxMessageBytes ({GrpcMaxMessageBytes}) must be positive.");
+
+        if (MaxOutboundBatchBytes > GrpcMaxMessageBytes)
+            throw new RaftException(
+                $"[Kommander] MaxOutboundBatchBytes ({MaxOutboundBatchBytes}) must not exceed " +
+                $"GrpcMaxMessageBytes ({GrpcMaxMessageBytes}): a BatchRequests frame at the outbound " +
+                "budget would be refused by the peer's gRPC receive limit.");
+
+        if (MaxBackfillBytesPerRound > GrpcMaxMessageBytes)
+            throw new RaftException(
+                $"[Kommander] MaxBackfillBytesPerRound ({MaxBackfillBytesPerRound}) must not exceed " +
+                $"GrpcMaxMessageBytes ({GrpcMaxMessageBytes}): a single backfill batch would be refused " +
+                "by the peer's gRPC receive limit and the follower could never converge.");
 
         if (SlowNodeMinSamples < 1)
             throw new RaftException(

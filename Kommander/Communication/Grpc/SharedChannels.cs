@@ -149,7 +149,8 @@ internal readonly record struct GrpcChannelPoolOptions(
     int ChannelsPerNode,
     bool EnableMultipleHttp2Connections,
     RaftTransportSecurityOptions? SecurityOptions,
-    bool EnableSnapshotCompression = false);
+    bool EnableSnapshotCompression = false,
+    int MaxMessageBytes = 0);
 
 /// <summary>
 /// Provides utilities for managing and retrieving shared gRPC channels and streamings.
@@ -189,7 +190,7 @@ public static class SharedChannels
     // RaftManager calls Configure() during construction (before any peer I/O) so that
     // external consumers such as Kahuna's GrpcServerBatcher inherit the operator's
     // RaftConfiguration values rather than the library-defined (4, false) fallback.
-    private sealed record DefaultPoolConfig(int ChannelsPerNode, bool EnableMultipleHttp2Connections);
+    private sealed record DefaultPoolConfig(int ChannelsPerNode, bool EnableMultipleHttp2Connections, int MaxMessageBytes = 0);
     private static volatile DefaultPoolConfig defaultPoolConfig = new(4, false);
 
     /// <summary>
@@ -205,7 +206,15 @@ public static class SharedChannels
     /// </para>
     /// </summary>
     public static void Configure(int channelsPerNode, bool enableMultipleHttp2Connections) =>
-        defaultPoolConfig = new(channelsPerNode, enableMultipleHttp2Connections);
+        Configure(channelsPerNode, enableMultipleHttp2Connections, maxMessageBytes: 0);
+
+    /// <summary>
+    /// As <see cref="Configure(int, bool)"/>, also fixing the per-channel
+    /// <c>MaxReceiveMessageSize</c>/<c>MaxSendMessageSize</c> the public overloads apply
+    /// (<see cref="RaftConfiguration.GrpcMaxMessageBytes"/>); 0 keeps the gRPC library default.
+    /// </summary>
+    public static void Configure(int channelsPerNode, bool enableMultipleHttp2Connections, int maxMessageBytes) =>
+        defaultPoolConfig = new(channelsPerNode, enableMultipleHttp2Connections, maxMessageBytes);
 
     // Checks in debug builds that a caller for this URL uses the same scalar pool options as
     // the pool that was actually built.  Called *after* the pool's Lazy.Value is resolved so
@@ -333,7 +342,7 @@ public static class SharedChannels
     public static GrpcChannel GetChannel(string url, RaftTransportSecurityOptions? securityOptions = null)
     {
         DefaultPoolConfig cfg = defaultPoolConfig;
-        return GetChannel(url, new GrpcChannelPoolOptions(cfg.ChannelsPerNode, cfg.EnableMultipleHttp2Connections, securityOptions));
+        return GetChannel(url, new GrpcChannelPoolOptions(cfg.ChannelsPerNode, cfg.EnableMultipleHttp2Connections, securityOptions, MaxMessageBytes: cfg.MaxMessageBytes));
     }
 
     /// <summary>
@@ -353,7 +362,7 @@ public static class SharedChannels
     public static List<GrpcChannel> GetAllChannels(string url, RaftTransportSecurityOptions? securityOptions = null)
     {
         DefaultPoolConfig cfg = defaultPoolConfig;
-        return GetAllChannels(url, new GrpcChannelPoolOptions(cfg.ChannelsPerNode, cfg.EnableMultipleHttp2Connections, securityOptions));
+        return GetAllChannels(url, new GrpcChannelPoolOptions(cfg.ChannelsPerNode, cfg.EnableMultipleHttp2Connections, securityOptions, MaxMessageBytes: cfg.MaxMessageBytes));
     }
 
     public static GrpcInterSharedStreaming GetStreaming(string url, Metadata? metadata = null, RaftTransportSecurityOptions? securityOptions = null)
@@ -362,7 +371,7 @@ public static class SharedChannels
         // Backward-compatible overload for external consumers that hand in an already-built
         // Metadata instance. Wrap it in a constant factory so the slot-creation path is uniform.
         Func<Metadata?>? metadataFactory = metadata is null ? null : () => metadata;
-        return GetStreaming(url, metadataFactory, new GrpcChannelPoolOptions(cfg.ChannelsPerNode, cfg.EnableMultipleHttp2Connections, securityOptions));
+        return GetStreaming(url, metadataFactory, new GrpcChannelPoolOptions(cfg.ChannelsPerNode, cfg.EnableMultipleHttp2Connections, securityOptions, MaxMessageBytes: cfg.MaxMessageBytes));
     }
 
     /// <summary>
@@ -485,6 +494,15 @@ public static class SharedChannels
             {
                 HttpHandler = handler
             };
+
+            // Both directions: the receive side so responses honour the operator's limit, the send
+            // side so an over-budget frame fails here, on the sender, with the size in the error,
+            // instead of being written and refused by the peer as a stream teardown.
+            if (opts.MaxMessageBytes > 0)
+            {
+                channelOptions.MaxReceiveMessageSize = opts.MaxMessageBytes;
+                channelOptions.MaxSendMessageSize = opts.MaxMessageBytes;
+            }
 
             if (opts.EnableSnapshotCompression)
             {

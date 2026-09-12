@@ -448,6 +448,156 @@ public sealed class TestRaftTransportDispatcher
         }
     }
 
+    /// <summary>
+    /// Reads the AppendLogs terms carried by each frame the transport saw, in send order, so a
+    /// test can check both what each frame held and that nothing was reordered.
+    /// </summary>
+    private static List<List<long>> FramesOfAppendLogsTerms(IEnumerable<CapturingCommunication.Call> calls)
+    {
+        List<List<long>> frames = [];
+        foreach (CapturingCommunication.Call call in calls)
+        {
+            if (call.Kind == "AppendLogs")
+                frames.Add([((AppendLogsRequest)call.Payload).Term]);
+            else if (call.Kind == "BatchRequests")
+                frames.Add([.. ((BatchRequestsRequest)call.Payload).Requests!
+                    .Where(i => i.AppendLogs is not null)
+                    .Select(i => i.AppendLogs!.Term)]);
+        }
+        return frames;
+    }
+
+    /// <summary>
+    /// The 1.6.x soak fault: the frame was bounded by message count only, so a backfill batch beside
+    /// other partitions' entries exceeded the peer's gRPC receive limit and tore the stream down. The
+    /// dispatcher must now close a frame when the next entry-carrying message would push its payload
+    /// over the byte budget, carrying that message into the next frame in order.
+    /// </summary>
+    [Fact]
+    public async Task EntryCarryingMessages_AreSplitAcrossFramesByByteBudget_InFifoOrder()
+    {
+        CapturingCommunication comm = new();
+        RaftConfiguration config = new() { Host = "localhost", Port = 9000, InitialPartitions = 0 };
+
+        RaftManager manager = new(
+            config,
+            new StaticDiscovery([]),
+            new InMemoryWAL(NullLogger<IRaft>.Instance),
+            new CapturingCommunication(),
+            new HybridLogicalClock(),
+            NullLogger<IRaft>.Instance
+        );
+
+        // Frame budget of exactly two 1000-byte-payload messages (1000 + 128 overhead each);
+        // manual mode so a single FlushAsync sees the whole queue and frame boundaries are exact.
+        RaftTransportDispatcher dispatcher = new(manager, comm, NullLogger<IRaft>.Instance,
+            maxQueuedPayloadBytesPerPeer: 64L * 1024 * 1024,
+            maxBatchPayloadBytes: 2 * (1000 + 128),
+            manualExecution: true);
+
+        using (manager)
+        using (dispatcher)
+        {
+            const string Ep = "node-a:8001";
+
+            for (long term = 1; term <= 5; term++)
+                dispatcher.Enqueue(Ep, MakePayloadAppendLogs(Ep, term, payloadSize: 1000));
+
+            int sent = await dispatcher.FlushAsync();
+            Assert.Equal(5, sent);
+
+            List<List<long>> frames = FramesOfAppendLogsTerms(comm.Calls);
+
+            Assert.Equal([[1, 2], [3, 4], [5]], frames);
+        }
+    }
+
+    /// <summary>
+    /// Control messages and empty heartbeats carry no payload and never open a new frame; a
+    /// message that alone exceeds the budget still ships, by itself, rather than stalling its
+    /// partition forever behind a cap it can never satisfy.
+    /// </summary>
+    [Fact]
+    public async Task OversizedMessage_ShipsAlone_AndPayloadFreeMessagesShareFrames()
+    {
+        CapturingCommunication comm = new();
+        RaftConfiguration config = new() { Host = "localhost", Port = 9000, InitialPartitions = 0 };
+
+        RaftManager manager = new(
+            config,
+            new StaticDiscovery([]),
+            new InMemoryWAL(NullLogger<IRaft>.Instance),
+            new CapturingCommunication(),
+            new HybridLogicalClock(),
+            NullLogger<IRaft>.Instance
+        );
+
+        RaftTransportDispatcher dispatcher = new(manager, comm, NullLogger<IRaft>.Instance,
+            maxQueuedPayloadBytesPerPeer: 64L * 1024 * 1024,
+            maxBatchPayloadBytes: 1500,
+            manualExecution: true);
+
+        using (manager)
+        using (dispatcher)
+        {
+            const string Ep = "node-a:8001";
+
+            dispatcher.Enqueue(Ep, MakePayloadAppendLogs(Ep, term: 1, payloadSize: 1000)); // fits
+            dispatcher.Enqueue(Ep, MakeVote(Ep));                                          // payload-free: shares frame 1
+            dispatcher.Enqueue(Ep, MakeAppendLogs(Ep, term: 2));                           // empty heartbeat: shares frame 1
+            dispatcher.Enqueue(Ep, MakePayloadAppendLogs(Ep, term: 3, payloadSize: 5000)); // over budget alone: frame 2, by itself
+            dispatcher.Enqueue(Ep, MakePayloadAppendLogs(Ep, term: 4, payloadSize: 1000)); // frame 3
+            dispatcher.Enqueue(Ep, MakeAppendLogs(Ep, term: 5));                           // empty heartbeat: shares frame 3
+
+            Assert.Equal(6, await dispatcher.FlushAsync());
+
+            List<List<long>> frames = FramesOfAppendLogsTerms(comm.Calls);
+
+            Assert.Equal([[1, 2], [3], [4, 5]], frames);
+
+            // The vote travelled in the first frame, ahead of the oversized message.
+            CapturingCommunication.Call first = comm.Calls.First();
+            Assert.Equal("BatchRequests", first.Kind);
+            Assert.Contains(((BatchRequestsRequest)first.Payload).Requests!, i => i.Vote is not null);
+        }
+    }
+
+    /// <summary>
+    /// A byte budget of zero keeps the count-only behaviour: everything queued goes in one frame.
+    /// </summary>
+    [Fact]
+    public async Task ZeroByteBudget_DisablesTheByteCap()
+    {
+        CapturingCommunication comm = new();
+        RaftConfiguration config = new() { Host = "localhost", Port = 9000, InitialPartitions = 0 };
+
+        RaftManager manager = new(
+            config,
+            new StaticDiscovery([]),
+            new InMemoryWAL(NullLogger<IRaft>.Instance),
+            new CapturingCommunication(),
+            new HybridLogicalClock(),
+            NullLogger<IRaft>.Instance
+        );
+
+        RaftTransportDispatcher dispatcher = new(manager, comm, NullLogger<IRaft>.Instance,
+            maxQueuedPayloadBytesPerPeer: 64L * 1024 * 1024,
+            maxBatchPayloadBytes: 0,
+            manualExecution: true);
+
+        using (manager)
+        using (dispatcher)
+        {
+            const string Ep = "node-a:8001";
+
+            for (long term = 1; term <= 5; term++)
+                dispatcher.Enqueue(Ep, MakePayloadAppendLogs(Ep, term, payloadSize: 1000));
+
+            Assert.Equal(5, await dispatcher.FlushAsync());
+            Assert.Equal([[1, 2, 3, 4, 5]], FramesOfAppendLogsTerms(comm.Calls));
+        }
+    }
+
     [Fact]
     public void UnknownEndpoint_IsNeverSaturated()
     {
