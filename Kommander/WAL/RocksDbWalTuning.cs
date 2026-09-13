@@ -78,6 +78,44 @@ public sealed record RocksDbWalTuning
     /// <summary>L0 file count at which RocksDB stops writers entirely.</summary>
     public int ShardLevel0StopWritesTrigger { get; init; } = 44;
 
+    /// <summary>
+    /// Bound on the alive write-ahead <c>.log</c> files of the whole Raft-log database, in shard
+    /// flush units (<see cref="ShardWriteBufferSizeBytes"/> × <see cref="ShardMinWriteBufferNumberToMerge"/>;
+    /// 2 units = 256 MB at the defaults). Applied as RocksDB's <c>max_total_wal_size</c>.
+    ///
+    /// <para><b>Why a bound is needed.</b> RocksDB deletes a write-ahead file only once every
+    /// column family with data in it has flushed. A shard CF that receives a trickle — the
+    /// meta-partition's shard on a one-partition cluster, or any shard whose partitions are idle
+    /// while another is busy — never fills its memtable, so its first unflushed row pins every log
+    /// written after it for the life of the process (measured 2026-09-13: 2.7 GB of <c>.log</c>
+    /// per node in ten minutes and +4 s of replay on restart, once the shared memtable budget was
+    /// sized so RocksDB stopped force-flushing everything). RocksDB's own default for
+    /// <c>max_total_wal_size</c> is four times the sum of every CF's memtable envelope — about
+    /// 9 GB at this tuning — which is a bound in name only.</para>
+    ///
+    /// <para><b>What the cap does.</b> When the alive logs exceed it, RocksDB flushes exactly the
+    /// column families whose unflushed data reaches back to the oldest alive log — the pinning
+    /// families — and nothing else. A busy shard flushes on its own cadence after one flush unit
+    /// of its own ingest, so its unflushed data never spans more than one unit and it is not the
+    /// oldest pinner as long as the cap is at least two units; a trickle CF is flushed at a few
+    /// KB the moment it becomes the oldest pinner. The cost is one small SST per cap trip; the
+    /// busy shard's flush unit (the lever behind <see cref="RocksDbWAL"/>'s memtable-confined
+    /// tombstones) is untouched. The one overlap is the window in which the busy shard's own
+    /// flush is queued but not yet installed: its rows still reach the oldest log then, and a cap
+    /// trip inside that window folds its (fresh, small) active memtable into the flush already
+    /// queued — no extra flush, a few hundred KB written a moment early, and at production rates
+    /// a fraction of a percent of cap trips.</para>
+    ///
+    /// <para><b>Sizing.</b> The cap is shared by every shard CF, so with <c>N</c> busy shards
+    /// each ingesting a fraction of the log, a value of <c>N + 1</c> units keeps every one of them
+    /// on its natural cadence; below that, the slowest busy shards are flushed early on the cap's
+    /// cadence instead (one flush per <c>cap / N</c> bytes of their own ingest). The default of 2
+    /// fits the one-busy-shard deployments the write probes model. 0 leaves RocksDB's default in
+    /// place (effectively unbounded); 1 flushes the busy shard itself on the cap's cadence and is
+    /// only useful for probes.</para>
+    /// </summary>
+    public int MaxTotalWalSizeFlushUnits { get; init; } = 2;
+
     // ── Layout knobs (probe-driven; see the write-amp feature's w3 analysis) ─────────────────────
     //
     // Superseded by the floor layout — files leave L0 by trivial move and are dropped whole, so no

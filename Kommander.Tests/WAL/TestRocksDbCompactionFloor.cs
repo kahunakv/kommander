@@ -537,6 +537,175 @@ public sealed class TestRocksDbCompactionFloor
         }
     }
 
+    /// <summary>
+    /// A shard column family that only ever sees a trickle — the meta-partition's shard on a
+    /// one-partition cluster — never fills its memtable and, like the metadata CF above, pins every
+    /// write-ahead log written after its first unflushed row. No per-CF cadence can fix that (a
+    /// busy shard that just flushed looks the same as a trickle shard), so the bound is RocksDB's
+    /// <c>max_total_wal_size</c>, sized in flush units: crossing it flushes exactly the families
+    /// holding the oldest alive log. Both arms are asserted — the uncapped one is the 2026-09-13
+    /// write-probe shape (2.7 GB of <c>.log</c> per node in ten minutes) and is what makes the
+    /// bound in the capped arm a real claim rather than a number that happened to hold.
+    /// </summary>
+    [Fact]
+    public void WalSizeCap_FlushesTrickleShard_ReleasesWriteAheadLogs()
+    {
+        RocksDbWalTuning tuning = RocksDbWalTuning.Default with
+        {
+            ShardWriteBufferSizeBytes = 1L * 1024 * 1024,
+            ShardMinWriteBufferNumberToMerge = 2,
+            ShardMaxWriteBufferNumber = 4,
+        };
+        long flushUnit = tuning.ShardWriteBufferSizeBytes * tuning.ShardMinWriteBufferNumberToMerge;
+        const long ingested = 40L * 1024 * 1024; // 20 flush units of busy-shard rows
+
+        // Control: cap off (RocksDB's own default is ~4x the whole memtable envelope, never reached
+        // here). The trickle shard is never flushed and every log since its first row stays alive.
+        (long uncappedLogBytes, Dictionary<(string Cf, string Reason), int> uncappedFlushes) =
+            TrickleAndBulk(tuning with { MaxTotalWalSizeFlushUnits = 0 }, ingested);
+        Assert.Equal(0, FlushCount(uncappedFlushes, "shard0"));
+        Assert.True(uncappedLogBytes > ingested / 2,
+            $"expected the trickle shard to pin the logs without a cap, but only {uncappedLogBytes >> 20} MB of {ingested >> 20} MB ingested is alive");
+
+        // Fix: the default cap (two flush units). RocksDB flushes the trickle shard because it holds
+        // the oldest alive log ("WAL Full"), the logs it pinned are released, and the alive logs
+        // stay within a few flush units of the cap.
+        (long cappedLogBytes, Dictionary<(string Cf, string Reason), int> cappedFlushes) = TrickleAndBulk(tuning, ingested);
+        Assert.True(FlushCount(cappedFlushes, "shard0", "WAL Full") > 0,
+            $"the cap must flush the trickle shard as the family holding the oldest alive log; flushes seen: {Describe(cappedFlushes)}");
+        Assert.True(cappedLogBytes < 4 * flushUnit,
+            $"write-ahead logs are still pinned under the cap: {cappedLogBytes >> 20} MB alive for {ingested >> 20} MB ingested at a {flushUnit >> 20} MB flush unit");
+
+        // The busy shard keeps its own cadence: it flushes every flush unit on its own, so its
+        // unflushed rows do not reach back to the oldest alive log and the cap does not add flushes
+        // to it. One caveat keeps the check on the count rather than on zero: while the busy shard's
+        // own flush is still in flight its rows still reach the oldest log, and a cap trip in that
+        // window folds its (small) active memtable into the flush already queued — same flush
+        // count, one "WAL Full" reason. At the synthetic ingest rate here (40 MB in about a second
+        // against 1 MB memtables) that window is a sizeable share of each cap interval; at
+        // production rates it is a fraction of a percent. A cap sized below the flush unit, or a
+        // "flush everyone" rule, would inflate the count and make the cap the busy shard's usual
+        // flush reason, and both are caught.
+        int busyByCap = FlushCount(cappedFlushes, "shard1", "WAL Full");
+        int busyTotal = FlushCount(cappedFlushes, "shard1");
+        long naturalFlushes = ingested / flushUnit;
+        Assert.True(busyTotal <= naturalFlushes + 2,
+            $"the cap added flushes to the busy shard: {busyTotal} for {naturalFlushes} flush units ingested; flushes seen: {Describe(cappedFlushes)}");
+        Assert.True(busyByCap <= busyTotal / 4,
+            $"the cap became the busy shard's flush cadence: {busyByCap} of {busyTotal} flushes were forced by max_total_wal_size; flushes seen: {Describe(cappedFlushes)}");
+    }
+
+    private static int FlushCount(Dictionary<(string Cf, string Reason), int> flushes, string cf, string? reason = null) =>
+        flushes.Where(kv => kv.Key.Cf == cf && (reason is null || kv.Key.Reason == reason)).Sum(kv => kv.Value);
+
+    private static string Describe(Dictionary<(string Cf, string Reason), int> flushes) =>
+        string.Join(", ", flushes.OrderBy(kv => kv.Key.Cf).ThenBy(kv => kv.Key.Reason).Select(kv => $"{kv.Key.Cf}/{kv.Key.Reason}={kv.Value}"));
+
+    /// <summary>
+    /// Writes <paramref name="ingested"/> bytes of 1 KB rows to partition 1 (<c>shard1</c>) with one
+    /// small row to partition 0 (<c>shard0</c>) per 1,000 busy rows and a frontier-style metadata put
+    /// per batch, waits for the background flushes to settle, and returns the alive <c>.log</c> bytes
+    /// plus the flush jobs per (column family, reason) from the RocksDB LOG.
+    /// </summary>
+    private static (long AliveLogBytes, Dictionary<(string Cf, string Reason), int> Flushes) TrickleAndBulk(RocksDbWalTuning tuning, long ingested)
+    {
+        const int trickle = 0;
+        const int busy = 1;
+        string path = CreateTempWalPath();
+
+        try
+        {
+            using RocksDbWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false, tuning: tuning);
+
+            byte[] payload = IncompressiblePayload(1024);
+            long rows = ingested / payload.Length / 100 * 100; // whole batches of 100
+            long trickleId = 1;
+
+            for (long id = 1; id <= rows; id += 100)
+            {
+                if ((id - 1) % 1000 == 0)
+                    Assert.Equal(RaftOperationStatus.Success, wal.Write([(trickle, [new RaftLog { Id = trickleId++, Term = 5, Type = RaftLogType.Committed, LogType = "meta", LogData = [1, 2, 3] }])]));
+
+                Assert.Equal(RaftOperationStatus.Success, wal.Write([(busy, Committed(id, id + 99, payload))]));
+                Assert.Equal(RaftOperationStatus.Success, wal.Write([(busy, [new RaftLog { Id = id + 99, Term = 5, Type = RaftLogType.Committed, LogType = "op" }])]));
+            }
+
+            // Cap-triggered flushes are scheduled on the write path and complete in the background;
+            // give the last one time to land before reading the directory. With the cap off nothing
+            // is pending and the reading is immediate.
+            long alive = WaitUntil(
+                wal.GetAliveWriteAheadLogBytes,
+                bytes => bytes < 4 * tuning.ShardWriteBufferSizeBytes * tuning.ShardMinWriteBufferNumberToMerge,
+                TimeSpan.FromSeconds(tuning.MaxTotalWalSizeFlushUnits > 0 ? 20 : 0.2),
+                throwOnTimeout: false);
+
+            // Everything written is still readable — flushes released logs, not data.
+            Assert.Equal(rows, wal.GetMaxLog(busy));
+            Assert.Equal(trickleId - 1, wal.GetMaxLog(trickle));
+            Assert.Equal(RaftLogType.Committed, wal.ReadLogsRange(trickle, 1, 1)[0].Type);
+
+            return (alive, CountFlushesByColumnFamily(path));
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    /// <summary>
+    /// Flush jobs in the engine's RocksDB LOG, counted per (column family, flush reason). The
+    /// column family is named on the job's <c>[cf] [JOB n] Flushing memtable</c> line and the
+    /// reason on its <c>flush_started</c> event (which carries no <c>cf_name</c>); the two are
+    /// joined by job number. Reasons are RocksDB's strings: "Write Buffer Full" (a memtable
+    /// filled), "Manual Flush" (this WAL's cadence), "WAL Full" (<c>max_total_wal_size</c>).
+    /// </summary>
+    private static Dictionary<(string Cf, string Reason), int> CountFlushesByColumnFamily(string walPath)
+    {
+        Dictionary<(string, string), int> counts = new();
+        Dictionary<int, string> cfByJob = new();
+
+        string logPath = Path.Combine(walPath, "wal", "LOG");
+        if (!File.Exists(logPath))
+            return counts;
+
+        using FileStream stream = new(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using StreamReader reader = new(stream);
+        while (reader.ReadLine() is { } line)
+        {
+            int jobStart = line.IndexOf("] [JOB ", StringComparison.Ordinal);
+            if (jobStart >= 0 && line.Contains("] Flushing memtable", StringComparison.Ordinal))
+            {
+                int cfStart = line.LastIndexOf('[', jobStart);
+                int jobEnd = line.IndexOf(']', jobStart + 7);
+                if (cfStart >= 0 && jobEnd > 0 && int.TryParse(line.AsSpan(jobStart + 7, jobEnd - jobStart - 7), out int job))
+                    cfByJob[job] = line[(cfStart + 1)..jobStart];
+                continue;
+            }
+
+            if (!line.Contains("\"event\": \"flush_started\"", StringComparison.Ordinal))
+                continue;
+
+            string? jobText = ExtractJsonField(line, "\"job\": ", ',');
+            string? reason = ExtractJsonField(line, "\"flush_reason\": \"", '"');
+            if (jobText is null || reason is null || !int.TryParse(jobText, out int startedJob) || !cfByJob.TryGetValue(startedJob, out string? cf))
+                continue;
+
+            counts[(cf, reason)] = counts.GetValueOrDefault((cf, reason)) + 1;
+        }
+
+        return counts;
+    }
+
+    private static string? ExtractJsonField(string line, string marker, char terminator)
+    {
+        int start = line.IndexOf(marker, StringComparison.Ordinal);
+        if (start < 0)
+            return null;
+        start += marker.Length;
+        int end = line.IndexOf(terminator, start);
+        return end < 0 ? null : line[start..end];
+    }
+
     // ───────────────────────────── helpers ─────────────────────────────
 
     private static void AssertNonOverlapping(List<(string Name, int Level, long SmallestId, long LargestId, long SizeBytes)> files)
@@ -577,13 +746,17 @@ public sealed class TestRocksDbCompactionFloor
         return (moves, compactions);
     }
 
-    private static T WaitUntil<T>(Func<T> read, Func<T, bool> ready, TimeSpan timeout)
+    private static T WaitUntil<T>(Func<T> read, Func<T, bool> ready, TimeSpan timeout, bool throwOnTimeout = true)
     {
         Stopwatch clock = Stopwatch.StartNew();
         T value = read();
         while (!ready(value))
         {
-            Assert.True(clock.Elapsed < timeout, $"condition not met within {timeout}");
+            if (clock.Elapsed >= timeout)
+            {
+                Assert.False(throwOnTimeout, $"condition not met within {timeout}");
+                return value;
+            }
             Thread.Sleep(50);
             value = read();
         }

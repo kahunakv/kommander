@@ -195,6 +195,14 @@ public class RocksDbWAL : IWAL, IDisposable
     /// bound. One shard flush unit (<c>ShardWriteBufferSizeBytes × ShardMinWriteBufferNumberToMerge</c>)
     /// keeps the alive logs at about two units. The flush is asynchronous (a memtable switch plus
     /// a background job writing a few-KB SST) and touches no shard memtable.
+    ///
+    /// <para>This cadence is the proactive half; the hard bound is RocksDB's
+    /// <c>max_total_wal_size</c>, set from <see cref="RocksDbWalTuning.MaxTotalWalSizeFlushUnits"/>
+    /// in the same unit. A shard CF that only ever sees a trickle (the meta-partition's shard on a
+    /// one-partition cluster) pins logs exactly the way the metadata CF did, and no per-CF cadence
+    /// here can tell a trickle shard from a busy one that just flushed; the cap can, because
+    /// RocksDB flushes only the families holding the oldest alive log. See
+    /// <see cref="GetAliveWriteAheadLogBytes"/> for the gauge that watches the result.</para>
     /// </summary>
     private readonly long metadataFlushEveryBytes;
 
@@ -281,6 +289,9 @@ public class RocksDbWAL : IWAL, IDisposable
                 $"ShardMaxWriteBufferNumber ({tuning.ShardMaxWriteBufferNumber}) must exceed " +
                 $"ShardMinWriteBufferNumberToMerge ({tuning.ShardMinWriteBufferNumberToMerge}); " +
                 "a flush waits for the merge quorum, so the writer needs one memtable above it.");
+        if (tuning.MaxTotalWalSizeFlushUnits < 0)
+            throw new ArgumentOutOfRangeException(nameof(tuning),
+                $"MaxTotalWalSizeFlushUnits ({tuning.MaxTotalWalSizeFlushUnits}) must be 0 (RocksDB default) or a positive number of flush units.");
 
         this.path = path;
         this.revision = revision;
@@ -314,6 +325,18 @@ public class RocksDbWAL : IWAL, IDisposable
             // still refuses to open on it in this mode. Recovery.SkipAnyCorruptedRecords is the mode
             // that would swallow that, and it is not used here.
             .SetWalRecoveryMode(Recovery.TolerateCorruptedTailRecords);
+
+        // Bound on the alive write-ahead logs. Without it a column family that never fills its
+        // memtable (a trickle shard) pins every log written after its first unflushed row until
+        // the process exits — see RocksDbWalTuning.MaxTotalWalSizeFlushUnits for the measurement
+        // and the sizing rule. RocksDB reacts to the cap by flushing only the families whose
+        // unflushed data reaches the oldest alive log, so at two or more flush units a single
+        // busy shard keeps its own flush cadence and only the pinning families are flushed.
+        if (tuning.MaxTotalWalSizeFlushUnits > 0)
+        {
+            long cap = checked(metadataFlushEveryBytes * tuning.MaxTotalWalSizeFlushUnits);
+            dbOptions.SetMaxTotalWalSize((ulong)cap);
+        }
 
         // When sharing resources, apply the WBM to the DbOptions before opening. The block cache is
         // applied per-CF below. Both must be set before RocksDb.Open — they cannot be changed afterward.
@@ -747,6 +770,42 @@ public class RocksDbWAL : IWAL, IDisposable
 
     /// <summary>1 while RocksDB has stopped writes entirely (the hard stall), else 0. See <see cref="GetActualDelayedWriteRate"/>.</summary>
     internal long GetIsWriteStopped() => ReadIntegerProperty("rocksdb.is-write-stopped");
+
+    /// <summary>
+    /// Bytes of write-ahead <c>.log</c> files currently in the engine directory, fed to
+    /// <c>raft.wal.alive_log_bytes</c>. RocksDB exposes no property for this, so the directory is
+    /// summed on each observation (a handful of files). Under the cap from
+    /// <see cref="RocksDbWalTuning.MaxTotalWalSizeFlushUnits"/> the value oscillates below the
+    /// cap plus the log in flight; a value that climbs linearly with ingest means a column family
+    /// is pinning logs and the cap is off. Never throws: a missing directory or a file RocksDB
+    /// deleted mid-enumeration reports what was summed so far, and a closed engine reports the
+    /// files still on disk (they are what a reopen will replay).
+    /// </summary>
+    internal long GetAliveWriteAheadLogBytes()
+    {
+        long total = 0;
+
+        try
+        {
+            foreach (FileInfo file in new DirectoryInfo(enginePath).EnumerateFiles("*.log", SearchOption.TopDirectoryOnly))
+            {
+                try
+                {
+                    total += file.Length;
+                }
+                catch (IOException)
+                {
+                    // Deleted between enumeration and stat: it is no longer alive.
+                }
+            }
+        }
+        catch (Exception)
+        {
+            // An unreadable directory has no alive-log evidence to report.
+        }
+
+        return total;
+    }
 
     /// <summary>
     /// Total live SST bytes across the shard column families (the Raft-log CFs). On an

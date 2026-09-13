@@ -406,6 +406,12 @@ public static class KommanderMetrics
             description: "SST file count in L0 across the Raft-log shard CFs; should stay below the L0 compaction trigger, since non-overlapping log files are moved (not rewritten) out of L0 and dropped whole. A climb toward the slowdown trigger means real compactions are running.");
 
         Meter.CreateObservableGauge(
+            "raft.wal.alive_log_bytes",
+            MeasureWalAliveLogBytes,
+            unit: "By",
+            description: "Bytes of RocksDB write-ahead .log files alive in the Raft-log engine directory. Bounded by max_total_wal_size (RocksDbWalTuning.MaxTotalWalSizeFlushUnits); linear growth with ingest means a column family is pinning logs and a restart will replay all of them.");
+
+        Meter.CreateObservableGauge(
             "raft.executor.client_queue_depth",
             MeasureClientQueueDepths,
             description: "Current number of client proposals pending in each partition executor's queue.");
@@ -479,6 +485,9 @@ public static class KommanderMetrics
 
     private static IEnumerable<Measurement<long>> MeasureWalShardLevel0Files() =>
         MeasureWalEngines(static wal => wal.GetShardLevel0FileCount());
+
+    private static IEnumerable<Measurement<long>> MeasureWalAliveLogBytes() =>
+        MeasureWalEngines(static wal => wal.GetAliveWriteAheadLogBytes());
 
     private static List<Measurement<long>> MeasureWalEngines(Func<Kommander.WAL.RocksDbWAL, long> read)
     {
