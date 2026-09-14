@@ -37,6 +37,12 @@ namespace Kommander.Tests.Simulation.WAL;
 /// readable: a log whose lowest id is 5 has either compacted 1 through 4 or never received them, and
 /// nothing observable afterwards separates those two.
 /// </param>
+/// <param name="SnapshotBoundary">
+/// The snapshot boundary installed last, or 0 where none was. Ids below it are covered by the
+/// snapshot: an install writes the boundary and leaves the old prefix for a later compaction, so
+/// those ids may be present or absent and neither is a hole. <see cref="MissingIds"/> already
+/// excludes them.
+/// </param>
 public sealed record SimulatedWalPartitionSnapshot(
     int PartitionId,
     int EntryCount,
@@ -49,8 +55,16 @@ public sealed record SimulatedWalPartitionSnapshot(
     int CompactionsAboveFloor = 0,
     long WorstCompactionRequest = -1,
     long WorstCompactionCertifiedFloor = -1,
-    long CompactedThrough = 0)
+    long CompactedThrough = 0,
+    long SnapshotBoundary = 0)
 {
+    /// <summary>
+    /// Highest id this node is no longer required to hold: removed by compaction, or covered by an
+    /// installed snapshot. A rule that asks whether an id should be present reads this, not
+    /// <see cref="CompactedThrough"/> alone.
+    /// </summary>
+    public long CoveredThrough => Math.Max(CompactedThrough, SnapshotBoundary - 1);
+
     /// <summary>True when an id is absent inside the retained range.</summary>
     public bool HasHole => MissingIds.Count > 0;
 

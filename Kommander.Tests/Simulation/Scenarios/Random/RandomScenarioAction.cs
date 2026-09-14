@@ -32,6 +32,8 @@ public sealed record RandomScenarioAction(
                 $" {Target} writes={Value}",
             RandomScenarioActionKind.SlowDisk =>
                 $" {Target} latencyMs={Value}",
+            RandomScenarioActionKind.HangSnapshotExport =>
+                $" {Target} exports={Value}",
             _ => Target is null ? string.Empty : $" {Target}",
         };
 

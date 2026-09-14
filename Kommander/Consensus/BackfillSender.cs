@@ -305,6 +305,13 @@ internal sealed class BackfillSender
             return BackfillSendResult.NonContiguous;
         }
 
+        // -1 when the anchor is below this leader's compaction floor: the batch starts at the first
+        // retained entry, and the entry under it is the one compaction removed. That is not a refusal —
+        // every entry the follower needs is still here. The follower accepts a -1 anchor inside its
+        // own committed prefix (FollowerAppendHandler, DST FINDING 6). An anchor above the follower's
+        // committed frontier is still rejected there; the anchor fallback then re-anchors at the
+        // frontier the follower reported, and a frontier below the floor takes the NonContiguous
+        // refusal above into the snapshot rescue.
         long prevTerm = prevIdx > 0 ? await wal.GetAnyTermAtAsync(prevIdx).ConfigureAwait(false) : 0;
 
         BackfillRoundBatches.Batch? shared = round?.Add(from, backfill, prevTerm);

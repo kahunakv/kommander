@@ -58,8 +58,7 @@ public sealed class ClusterPlanOracle
                     NodeCount = 3,
                     PartitionCount = 1,
                     Seed = seed,
-                    ConfigureNode = configuration =>
-                        configuration.CompactEveryOperations = options.CompactEveryOperations,
+                    ConfigureNode = options.ApplyTo,
                 },
                 logger,
                 cancellationToken);

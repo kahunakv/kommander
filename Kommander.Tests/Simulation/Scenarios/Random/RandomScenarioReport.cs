@@ -42,6 +42,21 @@ public sealed record RandomScenarioReport
     public long EntriesCompacted { get; init; }
 
     /// <summary>
+    /// Snapshot exports that returned a snapshot, across every node.
+    ///
+    /// <para>Reported for the same reason as <see cref="EntriesCompacted"/>: a passing run of the
+    /// snapshot-rescue sweep says nothing about the rescue path unless a rescue really ran. Zero
+    /// here means no follower was ever seeded by a snapshot.</para>
+    /// </summary>
+    public int SnapshotExportsServed { get; init; }
+
+    /// <summary>
+    /// Snapshot exports that hung on an armed fault, across every node. A hang that was armed and
+    /// never used is not counted, because it tested nothing.
+    /// </summary>
+    public int SnapshotExportsHung { get; init; }
+
+    /// <summary>
     /// What the run cost.
     ///
     /// <para>Reported beside the plan because a run that is slow and a run that is wedged look
@@ -73,6 +88,8 @@ public sealed record RandomScenarioReport
         text.AppendLine($"finalCommitIndex={FinalCommitIndex}");
         text.AppendLine($"invariantChecks={InvariantChecks}");
         text.AppendLine($"entriesCompacted={EntriesCompacted}");
+        text.AppendLine($"snapshotExportsServed={SnapshotExportsServed}");
+        text.AppendLine($"snapshotExportsHung={SnapshotExportsHung}");
         text.AppendLine($"appendsAcknowledged={History.AcknowledgedCount}");
         text.AppendLine($"appendsUnknown={History.UnknownCount}");
 

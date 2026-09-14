@@ -368,6 +368,98 @@ public sealed class TestSimulatedWal
         Assert.Equal(6, partition.MaxLogId);
     }
 
+    /// <summary>
+    /// The ids under an installed snapshot boundary are not a hole.
+    ///
+    /// <para>An install writes the boundary and leaves the old prefix for a later compaction, so a
+    /// follower can hold entry 1, nothing up to the boundary, and the boundary itself. The snapshot
+    /// covers that range. The committed-prefix rule reported it as a hole the first time a
+    /// simulated follower was rescued by a snapshot, because the store recorded only
+    /// compaction.</para>
+    /// </summary>
+    [Fact]
+    public void Snapshot_DoesNotCallThePrefixUnderAnInstalledSnapshotAHole()
+    {
+        using SimulatedWAL wal = NewWal(out _);
+        WriteRun(wal, 1, 2);
+
+        wal.InstallSnapshotBoundary(PartitionId, snapshotIndex: 11, lastIncludedTerm: 1, sync: true);
+
+        SimulatedWalPartitionSnapshot partition = Assert.IsType<SimulatedWalPartitionSnapshot>(
+            wal.Snapshot().Partition(PartitionId));
+
+        Assert.False(partition.HasHole);
+        Assert.Equal(1, partition.FirstLogId);
+        Assert.Equal(11, partition.MaxLogId);
+        Assert.Equal(11, partition.SnapshotBoundary);
+        Assert.Equal(10, partition.CoveredThrough);
+        Assert.Equal(0, partition.CompactedThrough);
+    }
+
+    /// <summary>
+    /// A hole above the boundary is still a hole. The boundary covers only what lies under it, and a
+    /// store that stopped reporting holes after any install would hide exactly the state a rescued
+    /// follower must not be left in.
+    /// </summary>
+    [Fact]
+    public void Snapshot_StillReportsAHoleAboveAnInstalledSnapshot()
+    {
+        using SimulatedWAL wal = NewWal(out _);
+        wal.InstallSnapshotBoundary(PartitionId, snapshotIndex: 5, lastIncludedTerm: 1, sync: true);
+        WriteRun(wal, 7, 8);
+
+        SimulatedWalPartitionSnapshot partition = Assert.IsType<SimulatedWalPartitionSnapshot>(
+            wal.Snapshot().Partition(PartitionId));
+
+        Assert.Equal([6], partition.MissingIds);
+    }
+
+    /// <summary>
+    /// A crash that reverts the boundary entry also forgets the boundary. The restarted process
+    /// cannot know the snapshot was installed, so the prefix under it is no longer covered.
+    /// </summary>
+    [Fact]
+    public void Crash_ForgetsASnapshotBoundaryItReverted()
+    {
+        using SimulatedWAL wal = NewWal(out Clock clock);
+        wal.WriteLatencyMilliseconds = 50;
+        WriteRun(wal, 1, 2);
+
+        // The run is durable; the install is still inside its window when the crash lands.
+        clock.Milliseconds = 60;
+        wal.InstallSnapshotBoundary(PartitionId, snapshotIndex: 11, lastIncludedTerm: 1, sync: true);
+
+        clock.Milliseconds = 70;
+        wal.Crash();
+
+        SimulatedWalPartitionSnapshot partition = Assert.IsType<SimulatedWalPartitionSnapshot>(
+            wal.Snapshot().Partition(PartitionId));
+
+        Assert.Equal(2, partition.MaxLogId);
+        Assert.Equal(0, partition.SnapshotBoundary);
+        Assert.Equal(0, partition.CoveredThrough);
+    }
+
+    /// <summary>The same install, crashed after its window has elapsed, keeps the boundary.</summary>
+    [Fact]
+    public void Crash_KeepsADurableSnapshotBoundary()
+    {
+        using SimulatedWAL wal = NewWal(out Clock clock);
+        wal.WriteLatencyMilliseconds = 50;
+        WriteRun(wal, 1, 2);
+
+        wal.InstallSnapshotBoundary(PartitionId, snapshotIndex: 11, lastIncludedTerm: 1, sync: true);
+
+        clock.Milliseconds = 60;
+        wal.Crash();
+
+        SimulatedWalPartitionSnapshot partition = Assert.IsType<SimulatedWalPartitionSnapshot>(
+            wal.Snapshot().Partition(PartitionId));
+
+        Assert.Equal(11, partition.SnapshotBoundary);
+        Assert.False(partition.HasHole);
+    }
+
     /// <summary>The snapshot names exactly the entries a crash at that instant would take.</summary>
     [Fact]
     public void Snapshot_NamesTheEntriesInsideTheWindow()

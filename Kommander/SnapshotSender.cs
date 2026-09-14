@@ -1042,20 +1042,51 @@ internal sealed class SnapshotSender
     }
 
     /// <summary>
+    /// Longest real-time wait between two watchdog checks of one transfer step. See
+    /// <see cref="AwaitStepAsync{T}"/>.
+    /// </summary>
+    private static readonly TimeSpan StepWatchdogMaxPoll = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>
     /// Awaits <paramref name="step"/> for at most <paramref name="timeout"/>. On timeout the
     /// transfer's cancellation source is cancelled — so a token-honouring callee stops too — and a
     /// <see cref="TimeoutException"/> naming <paramref name="stepName"/> is thrown; the abandoned
     /// step task keeps running as a detached zombie and must not share resources with the caller
     /// afterwards (see the rented-buffer handling in <see cref="StreamChunksAsync"/>).
+    ///
+    /// <para><b>The timeout reads the partition's tick source, not a timer.</b> The decision is
+    /// <c>elapsed(host monotonic ticks) &gt;= timeout</c>, and a short real-time wait
+    /// (<see cref="StepWatchdogMaxPoll"/>) only schedules the next check. In production the tick
+    /// source is the process monotonic clock, so the bound is the same as a plain timer, with at
+    /// most one poll interval of extra latency on a step that really hung. Under deterministic
+    /// simulation the tick source is virtual, so the bound is measured in simulated time like every
+    /// other elapsed-time gate. A single delay timer of the full timeout measured real time instead: a
+    /// simulated cluster ran hundreds of steps inside one real second, so whether a hung step was
+    /// abandoned inside a scenario's step budget depended on the speed of the machine.</para>
+    ///
+    /// <para>The poll never ends a step early. A late check only costs latency; the check itself
+    /// cannot fire before the tick source says the timeout has passed.</para>
     /// </summary>
-    private static async Task<T> AwaitStepAsync<T>(Task<T> step, TimeSpan timeout, CancellationTokenSource transferCts, string stepName)
+    private async Task<T> AwaitStepAsync<T>(Task<T> step, TimeSpan timeout, CancellationTokenSource transferCts, string stepName)
     {
-        Task completed = await Task.WhenAny(step, Task.Delay(timeout, transferCts.Token)).ConfigureAwait(false);
-        if (completed != step)
+        long startedTicks = host.GetMonotonicTimestamp();
+        TimeSpan poll = timeout < StepWatchdogMaxPoll ? timeout : StepWatchdogMaxPoll;
+
+        while (!step.IsCompleted)
         {
-            await transferCts.CancelAsync().ConfigureAwait(false);
-            throw new TimeoutException(
-                $"snapshot transfer step '{stepName}' made no progress within {timeout.TotalSeconds:0}s (SnapshotTransferStepTimeout)");
+            // A plain tick difference, not RaftMonotonic.Elapsed: that helper reads an anchor of 0 as
+            // "never set" and reports an infinite age, which would end every step at once on a
+            // host whose tick source starts at 0.
+            if (Stopwatch.GetElapsedTime(startedTicks, host.GetMonotonicTimestamp()) >= timeout)
+            {
+                await transferCts.CancelAsync().ConfigureAwait(false);
+                throw new TimeoutException(
+                    $"snapshot transfer step '{stepName}' made no progress within {timeout.TotalSeconds:0}s (SnapshotTransferStepTimeout)");
+            }
+
+            // No cancellation token: this delay is at most one poll interval, and a cancelled token
+            // would complete it at once and spin this loop.
+            await Task.WhenAny(step, Task.Delay(poll)).ConfigureAwait(false);
         }
 
         return await step.ConfigureAwait(false);

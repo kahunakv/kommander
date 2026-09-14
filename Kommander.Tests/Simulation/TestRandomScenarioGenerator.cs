@@ -312,10 +312,64 @@ public sealed class TestRandomScenarioGenerator
 
         foreach (RandomScenarioActionKind kind in Enum.GetValues<RandomScenarioActionKind>())
         {
+            // A hung export has a weight of zero under the default options, on purpose — see
+            // RandomScenarioOptions.TransferFaultWeight. Its own test proves it is reachable.
+            if (kind == RandomScenarioActionKind.HangSnapshotExport)
+                continue;
+
             // FastDisk and FreeDisk arrive as heals, which the age bound also emits, so every kind
             // in the vocabulary must appear in a plan this long.
             Assert.Contains(kind, seen);
         }
+    }
+
+    /// <summary>
+    /// A hung export is drawn only when its weight is set, and it is always armed at the leader.
+    ///
+    /// <para><b>Why both halves.</b> At weight zero the category must not take part in the draw at
+    /// all, or every existing seed would draw a different plan and the corpus seeds would stop
+    /// meaning what their notes say. At a non-zero weight it must really be drawn, or the rescue
+    /// sweep would believe it injects a fault it never does. The leader is the node that exports,
+    /// so a hang armed anywhere else would wait for a leadership change that may never come.</para>
+    /// </summary>
+    [Fact]
+    public void AHungExport_IsDrawnOnlyWhenItsWeightIsSet_AndOnlyAtTheLeader()
+    {
+        RandomScenarioGenerator unweighted = new(new SimulationRandom(20260913), new RandomScenarioOptions());
+        RandomScenarioGenerator weighted = new(
+            new SimulationRandom(20260913), new RandomScenarioOptions { TransferFaultWeight = 8 });
+
+        List<RandomScenarioAction> hangs = [];
+
+        for (int index = 0; index < 2_000; index++)
+        {
+            Assert.NotEqual(RandomScenarioActionKind.HangSnapshotExport, unweighted.Next(Observation("node2")).Kind);
+
+            RandomScenarioAction action = weighted.Next(Observation("node2"));
+            if (action.Kind == RandomScenarioActionKind.HangSnapshotExport)
+                hangs.Add(action);
+        }
+
+        Assert.NotEmpty(hangs);
+        Assert.All(hangs, hang =>
+        {
+            Assert.Equal("node2", hang.Target);
+            Assert.Equal(1, hang.Value);
+        });
+    }
+
+    /// <summary>
+    /// With no leader there is no node to arm, so no hung export is drawn. The weight is set high
+    /// enough that a leaderless draw would otherwise pick it often.
+    /// </summary>
+    [Fact]
+    public void AHungExport_IsNotDrawnWithoutALeader()
+    {
+        RandomScenarioGenerator generator = new(
+            new SimulationRandom(20260913), new RandomScenarioOptions { TransferFaultWeight = 200 });
+
+        for (int index = 0; index < 500; index++)
+            Assert.NotEqual(RandomScenarioActionKind.HangSnapshotExport, generator.Next(Observation(leader: null)).Kind);
     }
 
     /// <summary>
@@ -444,15 +498,20 @@ public sealed class TestRandomScenarioGenerator
             "000 Idle",
             "001 BlockLink node1 -> node2",
             "002 SlowDisk node3 latencyMs=40",
+            "003 HangSnapshotExport node1 exports=1",
         ];
 
         IReadOnlyList<RandomScenarioAction> plan = RandomScenarioPlan.Parse(lines);
 
-        Assert.Equal(3, plan.Count);
+        Assert.Equal(4, plan.Count);
         Assert.Equal(RandomScenarioActionKind.BlockLink, plan[1].Kind);
         Assert.Equal("node1", plan[1].Target);
         Assert.Equal("node2", plan[1].Secondary);
         Assert.Equal(40, plan[2].Value);
+        Assert.Equal(RandomScenarioActionKind.HangSnapshotExport, plan[3].Kind);
+        Assert.Equal("node1", plan[3].Target);
+        Assert.Equal(1, plan[3].Value);
+        Assert.Equal(lines[^1], plan[3].Describe());
     }
 
     /// <summary>

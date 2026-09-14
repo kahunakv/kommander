@@ -54,6 +54,18 @@ internal sealed class ElectionCoordinator
     /// and rival elections stay suppressed.</summary>
     private readonly Func<bool, Task> sendHeartbeat;
 
+    /// <summary>
+    /// Monotonic tick of the first election this node suppressed because discovery had not yet
+    /// reported (see the startup-join gate in <see cref="StartElectionAsync"/>); 0 while no
+    /// suppression is in progress. Drives a one-shot Warning once the suppression outlasts one
+    /// election timeout, because a node stuck behind that gate otherwise looks like an idle
+    /// follower at term 0 and nothing in the log names the cause.
+    /// </summary>
+    private long discoveryGateSinceTicks;
+
+    /// <summary>Whether the discovery-gate Warning was already emitted for the current suppression.</summary>
+    private bool discoveryGateWarned;
+
     public ElectionCoordinator(
         IRaftPartitionHost host,
         IRaftWalFacade wal,
@@ -303,14 +315,37 @@ internal sealed class ElectionCoordinator
         // and the existing cluster then follows it — but the joiner has an empty log (no partition
         // map), so the join deadlocks. Suppress the election until discovery reports (peers ⇒ normal
         // quorum election; genuinely none ⇒ legitimate single-node self-election). Does not affect a
-        // real single-node cluster: its first UpdateNodes sets InitialNodesDiscovered with Nodes still
-        // empty, so the very next tick elects.
+        // real single-node cluster: UpdateNodes runs once at join time (ClusterJoinService) and sets
+        // InitialNodesDiscovered with Nodes still empty, so the very next tick elects. The periodic
+        // node-update timer is only the fallback for a join-time discovery failure.
         if (host.Nodes.Count == 0 && !host.InitialNodesDiscovered)
         {
             if (logger.IsEnabled(LogLevel.Debug))
                 logger.LogDebugSuppressingElection(host.LocalEndpoint, host.PartitionId, coreState.NodeState, host.LocalRole, host.IsVoter(host.LocalEndpoint));
+
+            // Name a stall behind this gate once it outlasts an election timeout. Before the join-time
+            // discovery call existed, exactly this stall cost every embedded start up to one
+            // UpdateNodesInterval and the log showed only a quiet follower at term 0.
+            long gateNowTicks = host.GetMonotonicTimestamp();
+            if (discoveryGateSinceTicks == 0)
+            {
+                discoveryGateSinceTicks = gateNowTicks;
+            }
+            else if (!discoveryGateWarned && RaftMonotonic.Elapsed(discoveryGateSinceTicks, gateNowTicks) > coreState.ElectionTimeout)
+            {
+                discoveryGateWarned = true;
+                logger.LogWarnElectionSuppressedByDiscoveryGate(
+                    host.LocalEndpoint,
+                    host.PartitionId,
+                    coreState.NodeState,
+                    (long)RaftMonotonic.Elapsed(discoveryGateSinceTicks, gateNowTicks).TotalMilliseconds);
+            }
+
             return;
         }
+
+        discoveryGateSinceTicks = 0;
+        discoveryGateWarned = false;
 
         long nowTicks = host.GetMonotonicTimestamp();
 

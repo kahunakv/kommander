@@ -71,6 +71,9 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Suppressing pre-vote: roster role {Role}, voter of this partition={PartitionVoter}")]
     public static partial void LogDebugSuppressingPreVote(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, ClusterMemberRole role, bool partitionVoter);
 
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Election suppressed for {ElapsedMs}ms because node discovery has not reported yet (no peers known, InitialNodesDiscovered=false). The node stays a follower until UpdateNodes runs; check that JoinCluster was called and that discovery is reachable")]
+    public static partial void LogWarnElectionSuppressedByDiscoveryGate(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, long elapsedMs);
+
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Starting pre-vote round for Term={PreVoteTerm}")]
     public static partial void LogInfoStartingPreVoteRound(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, long preVoteTerm);
 

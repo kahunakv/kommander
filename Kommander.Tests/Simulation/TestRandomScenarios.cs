@@ -203,6 +203,59 @@ public sealed class TestRandomScenarios
     }
 
     /// <summary>
+    /// The options of the snapshot-rescue sweep. Public so a plan replay or a probe can rebuild the
+    /// same run.
+    /// </summary>
+    public static RandomScenarioOptions SnapshotRescueOptions => new()
+    {
+        CompactEveryOperations = 8,
+        CompactionLiveReplicaLagBudget = 4,
+        TransferFaultWeight = 8,
+    };
+
+    /// <summary>
+    /// The same search, tuned so that followers really fall below the leader's compaction floor,
+    /// with a hung application export in the vocabulary.
+    ///
+    /// <para><b>Why a third sweep.</b> The frequent-compaction sweep compacts, but it rarely strands a
+    /// follower below the floor: the leader keeps up to 100,000 entries for a follower it counts as
+    /// alive, and a crashed simulated node can stay alive in its view for the whole run. So the
+    /// snapshot rescue — escalation, export, install — almost never runs, and the defects that live
+    /// there cannot be found. This sweep lowers that retention budget to four entries, which is the
+    /// state production reaches with a follower that lags beyond its budget.</para>
+    ///
+    /// <para><b>Why the hung export belongs here and nowhere else.</b> It changes nothing until a
+    /// rescue runs. In this sweep rescues run, and a hang during one is the shape of the Caraxes
+    /// anchor-1 wedge (vorpal <c>d11fd5f9</c>): a transfer that nothing ends, and an in-flight guard
+    /// that silently vetoes every later rescue. The existing sweeps keep their draws unchanged,
+    /// because the transfer weight is zero there.</para>
+    ///
+    /// <para><b>What its first full run found.</b> DST FINDING 6: the live-replica retention hold
+    /// compacted the entry just below a lagging follower's backfill anchor, the leader shipped the
+    /// batch with a previous term of -1, the follower rejected it as divergent, and the leader
+    /// re-shipped it forever. Corpus seed 20260902 reached it about one replay in twenty-four. Fixed
+    /// in <c>FollowerAppendHandler</c>, and pinned by
+    /// <c>TestCompactionFloorBackfillScenarios</c>.</para>
+    /// </summary>
+    [Theory]
+    [Trait("Category", "DSTRandom")]
+    [MemberData(nameof(Seeds))]
+    public async Task AGeneratedRunUnderSnapshotRescue_HoldsEveryCheck(ulong seed)
+    {
+        RandomScenarioReport report = await RunSeedAsync(
+            seed, SnapshotRescueOptions, TestContext.Current.CancellationToken);
+
+        Assert.True(report.InvariantChecks > 0, "The run checked no invariants.");
+
+        // Printed on every run. Whether the rescue path ran at all is the one number that says
+        // whether this seed tested anything this sweep exists for.
+        output.WriteLine(
+            $"seed={seed} entriesCompacted={report.EntriesCompacted} " +
+            $"snapshotExportsServed={report.SnapshotExportsServed} snapshotExportsHung={report.SnapshotExportsHung} " +
+            $"hangsArmed={report.CountOf(RandomScenarioActionKind.HangSnapshotExport)}");
+    }
+
+    /// <summary>
     /// A generated plan replays from the artifact a failure would leave behind.
     ///
     /// <para>The check the whole failure report depends on. A plan is written, read back, and
@@ -402,8 +455,7 @@ public sealed class TestRandomScenarios
 
                 // A generated run is a few dozen entries long. At the production compaction cadence
                 // no run would ever compact, and every rule about compaction would go unexercised.
-                ConfigureNode = configuration =>
-                    configuration.CompactEveryOperations = options.CompactEveryOperations,
+                ConfigureNode = options.ApplyTo,
             },
             logger,
             cancellationToken);

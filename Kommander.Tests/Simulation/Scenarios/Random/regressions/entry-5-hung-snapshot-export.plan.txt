@@ -1,0 +1,37 @@
+seed=2191575067681527364
+partitionId=1
+actionCount=24
+stepsPerAction=6
+advanceMillisecondsPerStep=50
+maxImpairedNodes=1
+maxFaultAgeInActions=4
+recoveryStepBudget=900
+idleConvergenceStepBudget=300
+clientWeight=30
+idleWeight=14
+outageWeight=12
+networkFaultWeight=12
+storageFaultWeight=12
+lifecycleFaultWeight=12
+healWeight=14
+maintenanceWeight=10
+compactEveryOperations=8
+clientWeightDuringFault=2
+enableFaultEpisodes=True
+compactionLiveReplicaLagBudget=4
+transferFaultWeight=8
+signature=exception:FailException
+originalActions=24
+shrunkActions=6
+candidatesRun=54
+removalsAccepted=6
+parametersReduced=0
+budgetExhausted=False
+durationExhausted=False
+
+000 AppendAtLeader localhost:8002
+001 Checkpoint localhost:8002
+002 AppendAtLeader localhost:8002
+003 AppendAcrossOutage localhost:8002
+004 CrashNode localhost:8001
+005 HangSnapshotExport localhost:8003 exports=1

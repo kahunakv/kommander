@@ -93,6 +93,8 @@ public sealed class RandomScenarioRunner
             FinalCommitIndex = -1,
             InvariantChecks = invariants.ChecksRun,
             EntriesCompacted = EntriesCompacted(),
+            SnapshotExportsServed = cluster.Nodes.Sum(node => node.StateTransfer.ExportsServed),
+            SnapshotExportsHung = cluster.Nodes.Sum(node => node.StateTransfer.ExportsHung),
             Metrics = Metrics,
         };
 
@@ -177,6 +179,8 @@ public sealed class RandomScenarioRunner
             FinalCommitIndex = finalCommitIndex,
             InvariantChecks = invariants.ChecksRun,
             EntriesCompacted = EntriesCompacted(),
+            SnapshotExportsServed = cluster.Nodes.Sum(node => node.StateTransfer.ExportsServed),
+            SnapshotExportsHung = cluster.Nodes.Sum(node => node.StateTransfer.ExportsHung),
             Metrics = Metrics,
         };
     }
@@ -230,6 +234,11 @@ public sealed class RandomScenarioRunner
 
             if (node.LifecycleStatus == SimulationNodeLifecycleStatus.Paused)
                 node.Resume();
+
+            // A hung export stays armed, deliberately. Ending the hang is the library's job — the
+            // per-step transfer timeout — and a heal phase that ended it would repair the state the
+            // run is looking for. A validation run once missed a defect for exactly that reason: the
+            // runner wrote to the cluster before it checked, and the write repaired the state.
         }
 
         foreach (SimulationNode node in cluster.Nodes)
@@ -297,7 +306,7 @@ public sealed class RandomScenarioRunner
                 lines.Add(
                     $"{view.Endpoint} role={view.Role} term={view.Term} commit={view.CommitIndex} " +
                     $"maxLog={store?.MaxLogId} first={store?.FirstLogId} " +
-                    $"compactedThrough={store?.CompactedThrough} missing=[{string.Join(",", store?.MissingIds ?? [])}]");
+                    $"compactedThrough={store?.CompactedThrough} snapshotBoundary={store?.SnapshotBoundary} missing=[{string.Join(",", store?.MissingIds ?? [])}]");
             }
 
             Assert.Fail(
@@ -312,10 +321,11 @@ public sealed class RandomScenarioRunner
 
         SimulationNode reader = cluster.Nodes.First(node => node.HasLiveManager);
 
-        // The reader's own compaction floor, not the cluster's. What this node threw away is what
-        // its log cannot answer for, and the history is read against this node.
+        // The reader's own compaction floor, not the cluster's. What this node threw away, or holds
+        // only as a snapshot, is what its log cannot answer for, and the history is read against
+        // this node.
         long compactedThrough = reader.SimulatedWal?.Snapshot()
-            .Partition(options.PartitionId)?.CompactedThrough ?? -1;
+            .Partition(options.PartitionId)?.CoveredThrough ?? -1;
 
         ClientHistoryChecker.Check(
             history,
@@ -853,6 +863,17 @@ public sealed class RandomScenarioRunner
             case RandomScenarioActionKind.ReleaseRetention:
                 Store(action.Target!).ClearRetentionHold(options.PartitionId);
                 return true;
+
+            case RandomScenarioActionKind.HangSnapshotExport:
+            {
+                // A crashed node has no process to hang, and a crash releases every hang anyway.
+                SimulationNode node = Node(action.Target!);
+
+                if (node.LifecycleStatus is SimulationNodeLifecycleStatus.Running or SimulationNodeLifecycleStatus.Paused)
+                    node.StateTransfer.HangNextExports((int)action.Value);
+
+                return true;
+            }
 
             default:
                 return true;

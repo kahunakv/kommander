@@ -83,6 +83,78 @@ public sealed class TestSingleNodeCluster
         }
     }
 
+    /// <summary>
+    /// Regression: the first election must not wait for the periodic node-update timer.
+    /// <para>
+    /// The election gate in <c>ElectionCoordinator</c> refuses a self-election until discovery has
+    /// run once (<c>InitialNodesDiscovered</c>). The node-update timer starts in the
+    /// <see cref="RaftManager"/> constructor and skips every tick that precedes
+    /// <see cref="IRaft.JoinCluster"/>. With <c>TimerInitialDelay</c> = 1 ms and a 50 ms
+    /// construction-to-join gap the first tick is always wasted, so before the fix the system
+    /// partition could not elect until the second tick, a full <c>UpdateNodesInterval</c> (30 s here,
+    /// 5 s by default) later, and this join took ~30 s. The join-time discovery refresh in
+    /// <c>ClusterJoinService</c> makes the election depend on the election timeout alone.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task SingleNode_JoinCluster_ElectsWithoutWaitingForUpdateNodesTimer()
+    {
+        RaftConfiguration config = new()
+        {
+            NodeName = "node1",
+            NodeId = 1,
+            Host = "localhost",
+            Port = 8001,
+            InitialPartitions = 1,
+            CompactEveryOperations = 100,
+            CompactNumberEntries = 50,
+            HeartbeatInterval = TimeSpan.FromMilliseconds(50),
+            RecentHeartbeat = TimeSpan.FromMilliseconds(25),
+            VotingTimeout = TimeSpan.FromMilliseconds(250),
+            CheckLeaderInterval = TimeSpan.FromMilliseconds(25),
+            // The periodic refresh is deliberately far away: if the election still depends on it,
+            // the join below takes ~30 s and the latency assertion fails.
+            UpdateNodesInterval = TimeSpan.FromSeconds(30),
+            TimerInitialDelay = TimeSpan.FromMilliseconds(1),
+            StartElectionTimeout = 100,
+            EnableQuiescence = false,
+            EndElectionTimeout = 250,
+        };
+
+        IRaft node = new RaftManager(
+            config,
+            new StaticDiscovery([]),
+            new InMemoryWAL(logger),
+            new InMemoryCommunication(),
+            new HybridLogicalClock(),
+            logger);
+
+        // Let the first (1 ms) timer tick fire while the node is not yet joined, exactly like an
+        // embedder whose StartAsync joins some time after construction.
+        await Task.Delay(50, TestContext.Current.CancellationToken);
+
+        using CancellationTokenSource cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(45));
+
+        try
+        {
+            long startTimestamp = Stopwatch.GetTimestamp();
+            await node.JoinCluster(cts.Token);
+            await node.WaitForLeader(0, cts.Token);
+            TimeSpan elapsed = Stopwatch.GetElapsedTime(startTimestamp);
+
+            Assert.True(node.IsInitialized);
+            Assert.True(await node.AmILeaderQuick(0));
+            Assert.True(
+                elapsed < TimeSpan.FromSeconds(1),
+                $"Partition 0 took {elapsed.TotalMilliseconds:F0} ms to elect — the first election is gated on the UpdateNodes timer again.");
+        }
+        finally
+        {
+            await node.LeaveCluster(true, CancellationToken.None);
+        }
+    }
+
     [Fact]
     public async Task SingleNode_Leader_ReplicateLogs_CommitsLocallyWithoutPeers()
     {

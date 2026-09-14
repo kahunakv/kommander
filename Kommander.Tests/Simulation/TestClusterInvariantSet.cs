@@ -388,6 +388,32 @@ public sealed class TestClusterInvariantSet
     }
 
     /// <summary>
+    /// A prefix covered by an installed snapshot is not a hole, and neither is a head that starts at
+    /// the boundary. The snapshot stands in for every id under it, whether the old entries are
+    /// still there or not.
+    /// </summary>
+    [Fact]
+    public void CommittedPrefixPresent_IsSilentOnAPrefixCoveredByAnInstalledSnapshot()
+    {
+        List<RaftPartitionView> views =
+        [
+            View("node1", RaftNodeState.Follower, term: 3, commitIndex: 20),
+            View("node2", RaftNodeState.Follower, term: 3, commitIndex: 20),
+        ];
+
+        ClusterInvariantSet.CheckCommittedPrefixPresent(
+            stepNumber: 9,
+            views,
+            Stores(
+                // The old entry 1 survived the install; 2 to 10 are covered by the snapshot.
+                Store("node1", firstLogId: 1, maxLogId: 20, lastCheckpoint: 11, missing: [],
+                    snapshotBoundary: 11),
+                // A log that starts at the boundary itself.
+                Store("node2", firstLogId: 11, maxLogId: 20, lastCheckpoint: 11, missing: [],
+                    snapshotBoundary: 11)));
+    }
+
+    /// <summary>
     /// A node claiming a frontier over a head it never received. This is the case that needs the
     /// compaction record: the log looks identical to a compacted one, and only what the store
     /// actually removed tells the two apart.
@@ -538,7 +564,8 @@ public sealed class TestClusterInvariantSet
         int compactionsAboveFloor = 0,
         long worstRequest = -1,
         long worstCertified = -1,
-        long compactedThrough = 0) =>
+        long compactedThrough = 0,
+        long snapshotBoundary = 0) =>
         (endpoint, new SimulatedWalPartitionSnapshot(
             PartitionId,
             EntryCount: (int)(maxLogId - firstLogId + 1 - missing.Length),
@@ -551,7 +578,8 @@ public sealed class TestClusterInvariantSet
             CompactionsAboveFloor: compactionsAboveFloor,
             WorstCompactionRequest: worstRequest,
             WorstCompactionCertifiedFloor: worstCertified,
-            CompactedThrough: compactedThrough));
+            CompactedThrough: compactedThrough,
+            SnapshotBoundary: snapshotBoundary));
 
     private static RaftPartitionView View(string endpoint, RaftNodeState role, long term, long commitIndex) =>
         new(

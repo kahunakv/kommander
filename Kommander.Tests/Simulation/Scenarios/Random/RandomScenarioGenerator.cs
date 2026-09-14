@@ -172,6 +172,10 @@ public sealed class RandomScenarioGenerator
         // it never joins the fault table.
         if (HasBudget && observation.Leader is not null) Offer(options.OutageWeight, 6);
 
+        // A hung export is armed on the node that would export: the leader. It costs no quorum
+        // budget, so only a leader is needed.
+        if (observation.Leader is not null) Offer(options.TransferFaultWeight, 8);
+
         int total = categories.Sum(entry => entry.Weight);
 
         if (total <= 0)
@@ -199,6 +203,7 @@ public sealed class RandomScenarioGenerator
             4 => DrawLifecycle(index, observation),
             5 => DrawHeal(index),
             7 => DrawMaintenance(index, observation),
+            8 => DrawTransfer(index, observation),
             // Two thirds of the outages carry a client write into the disruption. That overlap is
             // the only place a client can be told the wrong thing about its own operation, and the
             // two write variants disrupt different halves of it: one takes the leader away for
@@ -377,6 +382,26 @@ public sealed class RandomScenarioGenerator
             new RandomScenarioAction(index, RandomScenarioActionKind.HoldRetention, target),
             key: $"retention/{target}",
             heal: new RandomScenarioAction(index, RandomScenarioActionKind.ReleaseRetention, target),
+            costsQuorum: false,
+            index);
+    }
+
+    /// <summary>
+    /// Arms one hung export at the leader.
+    ///
+    /// <para>Recorded in the fault table with no heal and no quorum cost, for one reason: a second
+    /// arm on a node that has not used the first would stack hangs the plan does not show. The age
+    /// bound drops the entry silently, as it does for every fault that ends on its own. The hang
+    /// itself stays armed on the node until an export uses it.</para>
+    /// </summary>
+    private RandomScenarioAction DrawTransfer(int index, RandomScenarioObservation observation)
+    {
+        string leader = observation.Leader!;
+
+        return Start(
+            new RandomScenarioAction(index, RandomScenarioActionKind.HangSnapshotExport, leader, null, 1),
+            key: $"transfer/hang/{leader}",
+            heal: null,
             costsQuorum: false,
             index);
     }

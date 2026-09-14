@@ -102,6 +102,23 @@ public sealed class SimulatedWAL : IWAL
     private readonly Dictionary<int, long> compactedThrough = new();
 
     /// <summary>
+    /// The snapshot boundary installed last, per partition, while the boundary entry survives.
+    ///
+    /// <para><b>Why the store records it.</b> <c>IWAL.InstallSnapshotBoundary</c> writes a
+    /// checkpoint at the boundary and may discard the suffix above it. It does not remove the
+    /// entries below it: those stay until a later compaction pass. So after an install a follower
+    /// can hold entry 1, nothing from 2 to the boundary, and the boundary itself. The snapshot
+    /// covers every id below the boundary, so that range is not a hole. Compaction did not remove
+    /// it either, and a rule that read only <see cref="compactedThrough"/> reported a committed
+    /// prefix with a hole in it. That happened on the first scenario that installed a snapshot.</para>
+    ///
+    /// <para>Recorded at install time and dropped when a crash takes the boundary entry with it.
+    /// Inferring it afterwards from a checkpoint entry above a gap would be a guess, and the same
+    /// shape is also a real hole under a checkpoint.</para>
+    /// </summary>
+    private readonly Dictionary<int, long> snapshotBoundary = new();
+
+    /// <summary>
     /// Partitions the out-of-space fault applies to, or null for every partition. A scenario
     /// almost always wants a scope: a fault that also hits partition 0 takes down the control plane,
     /// and the run then measures how a cluster dies rather than how Raft handles a bad disk.
@@ -270,6 +287,19 @@ public sealed class SimulatedWAL : IWAL
                     durableMetadata[key] = prior;
             }
 
+            // A boundary whose checkpoint entry the crash reverted no longer covers anything: the
+            // restarted process cannot know the snapshot was ever installed.
+            foreach (int partitionId in snapshotBoundary.Keys.ToList())
+            {
+                long boundary = snapshotBoundary[partitionId];
+
+                bool survived = image.TryGetValue(partitionId, out List<RaftLog>? kept)
+                                && kept.Any(entry => entry.Id == boundary && entry.Type == RaftLogType.CommittedCheckpoint);
+
+                if (!survived)
+                    snapshotBoundary.Remove(partitionId);
+            }
+
             inner.Dispose();
             inner = new InMemoryWAL(logger);
 
@@ -333,8 +363,11 @@ public sealed class SimulatedWAL : IWAL
                 long firstId = entries.Count > 0 ? entries[0].Id : -1;
                 long maxId = entries.Count > 0 ? entries[^1].Id : 0;
 
+                // Ids below an installed snapshot boundary are covered by the snapshot, not missing.
+                long boundary = snapshotBoundary.GetValueOrDefault(partitionId);
+
                 List<long> missing = [];
-                for (long id = firstId; firstId >= 0 && id <= maxId; id++)
+                for (long id = Math.Max(firstId, boundary); firstId >= 0 && id <= maxId; id++)
                 {
                     if (!present.Contains(id))
                         missing.Add(id);
@@ -357,7 +390,8 @@ public sealed class SimulatedWAL : IWAL
                     aboveFloor,
                     worstRequest,
                     worstCertified,
-                    compacted);
+                    compacted,
+                    boundary);
             }
 
             return new SimulatedWalSnapshot(
@@ -542,6 +576,7 @@ public sealed class SimulatedWAL : IWAL
                 priorEntries.Remove(partitionId);
                 ridingEntries.Remove(partitionId);
                 compactedThrough.Remove(partitionId);
+                snapshotBoundary.Remove(partitionId);
 
                 foreach (PendingFsync pending in inFlight)
                 {
@@ -637,6 +672,12 @@ public sealed class SimulatedWAL : IWAL
                 truncations++;
                 DropVanishedTracking(partitionId);
             }
+
+            // The same rule the inner store applies to its last checkpoint: a truncating install
+            // resets the boundary, a retaining one can only raise it.
+            snapshotBoundary[partitionId] = suffixTruncated
+                ? snapshotIndex
+                : Math.Max(snapshotBoundary.GetValueOrDefault(partitionId), snapshotIndex);
 
             if (sync)
             {

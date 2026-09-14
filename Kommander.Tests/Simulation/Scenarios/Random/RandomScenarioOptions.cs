@@ -111,6 +111,44 @@ public sealed record RandomScenarioOptions
     /// </summary>
     public int CompactEveryOperations { get; init; } = 10_000;
 
+    /// <summary>
+    /// Entries a leader retains below its checkpoint for a lagging follower it counts as alive.
+    /// Null keeps the production default.
+    ///
+    /// <para><b>Why a run needs to lower it.</b> A crashed simulated node can stay alive in the
+    /// leader's view for the whole run, and the production budget of 100,000 entries then holds
+    /// compaction at that node's position for good. A run of a few dozen entries can never push a
+    /// follower below the leader's compaction floor, and the snapshot rescue path is never
+    /// reached. Production reaches the same state with a follower that lags beyond the budget; a
+    /// small budget reaches it with a short log.</para>
+    /// </summary>
+    public long? CompactionLiveReplicaLagBudget { get; init; }
+
+    /// <summary>
+    /// Weight of arming a hang in the leader's application export. Zero by default.
+    ///
+    /// <para><b>Why zero.</b> A hung export changes nothing until a follower needs a snapshot, and at
+    /// the production compaction cadence no generated run ever does. A non-zero default would only
+    /// change the draws of every existing seed, and the corpus seeds are measured evidence about
+    /// the draws they make today. The snapshot-rescue sweep turns it on together with the settings
+    /// that make a rescue happen.</para>
+    /// </summary>
+    public int TransferFaultWeight { get; init; }
+
+    /// <summary>
+    /// Applies the node configuration these options imply. One place, so the sweep, the shrinker
+    /// and the regression replay cannot build a cluster that differs from the run they reproduce.
+    /// </summary>
+    public void ApplyTo(RaftConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        configuration.CompactEveryOperations = CompactEveryOperations;
+
+        if (CompactionLiveReplicaLagBudget is { } budget)
+            configuration.CompactionLiveReplicaLagBudget = budget;
+    }
+
     /// <summary>Weight of healing something that is currently broken.</summary>
     public int HealWeight { get; init; } = 14;
 
@@ -161,6 +199,9 @@ public sealed record RandomScenarioOptions
             ["compactEveryOperations"] = CompactEveryOperations.ToString(),
             ["clientWeightDuringFault"] = ClientWeightDuringFault.ToString(),
             ["enableFaultEpisodes"] = EnableFaultEpisodes.ToString(),
+            ["compactionLiveReplicaLagBudget"] =
+                CompactionLiveReplicaLagBudget?.ToString(CultureInfo.InvariantCulture) ?? "default",
+            ["transferFaultWeight"] = TransferFaultWeight.ToString(),
         };
 
     /// <summary>
@@ -209,6 +250,8 @@ public sealed record RandomScenarioOptions
             ClientWeightDuringFault =
                 Int(parameters, "clientWeightDuringFault", defaults.ClientWeightDuringFault),
             EnableFaultEpisodes = Bool(parameters, "enableFaultEpisodes", defaults.EnableFaultEpisodes),
+            CompactionLiveReplicaLagBudget = OptionalLong(parameters, "compactionLiveReplicaLagBudget"),
+            TransferFaultWeight = Int(parameters, "transferFaultWeight", defaults.TransferFaultWeight),
         };
     }
 
@@ -218,6 +261,22 @@ public sealed record RandomScenarioOptions
             return fallback;
 
         if (!int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int value))
+            throw new FormatException($"Parameter '{key}' is not a number: '{text}'.");
+
+        return value;
+    }
+
+    /// <summary>
+    /// Reads an optional number. A missing key and the word <c>default</c> both mean "not set", so a
+    /// plan written before the key existed and a plan that left it at the production value read the
+    /// same way.
+    /// </summary>
+    private static long? OptionalLong(IReadOnlyDictionary<string, string> parameters, string key)
+    {
+        if (!parameters.TryGetValue(key, out string? text) || text == "default")
+            return null;
+
+        if (!long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out long value))
             throw new FormatException($"Parameter '{key}' is not a number: '{text}'.");
 
         return value;

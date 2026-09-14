@@ -174,6 +174,8 @@ public sealed class TestPlanRegressions
             MaintenanceWeight = 7,
             CompactEveryOperations = 8,
             EnableFaultEpisodes = false,
+            CompactionLiveReplicaLagBudget = 4,
+            TransferFaultWeight = 8,
         };
 
         RandomScenarioReport report = new()
@@ -212,6 +214,8 @@ public sealed class TestPlanRegressions
         Assert.Equal(options.MaintenanceWeight, promoted.Options.MaintenanceWeight);
         Assert.Equal(options.CompactEveryOperations, promoted.Options.CompactEveryOperations);
         Assert.Equal(options.EnableFaultEpisodes, promoted.Options.EnableFaultEpisodes);
+        Assert.Equal(options.CompactionLiveReplicaLagBudget, promoted.Options.CompactionLiveReplicaLagBudget);
+        Assert.Equal(options.TransferFaultWeight, promoted.Options.TransferFaultWeight);
     }
 
     /// <summary>
@@ -552,8 +556,7 @@ public sealed class TestPlanRegressions
                     NodeCount = 3,
                     PartitionCount = 1,
                     Seed = plan.Seed,
-                    ConfigureNode = configuration =>
-                        configuration.CompactEveryOperations = plan.Options.CompactEveryOperations,
+                    ConfigureNode = plan.Options.ApplyTo,
                 },
                 replayLogger ?? logger,
                 cancellationToken);

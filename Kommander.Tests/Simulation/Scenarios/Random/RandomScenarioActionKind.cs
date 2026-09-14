@@ -149,4 +149,22 @@ public enum RandomScenarioActionKind
 
     /// <summary>Close the fsync window again.</summary>
     FastDisk,
+
+    /// <summary>
+    /// Arm the leader's application export so that its next export never returns and ignores
+    /// cancellation.
+    ///
+    /// <para>The shape of the Caraxes anchor-1 wedge: the application's export began with a drain
+    /// that could not be cancelled, the snapshot transfer parked on it, and its in-flight guard
+    /// then vetoed every later rescue of that follower. The library's repair is the per-step
+    /// transfer timeout. Without this action no generated run can reach the state that repair
+    /// exists for.</para>
+    ///
+    /// <para><b>Armed until used, and never healed by the runner.</b> The hang bites on the next
+    /// export whenever it happens, usually long after the draw, because a follower must first fall
+    /// below a floor. The heal phase leaves it armed on purpose: ending the hang is the library's
+    /// job, and a runner that ended it would repair the state it is looking for. It takes no quorum
+    /// budget — the leader still answers everything except the export.</para>
+    /// </summary>
+    HangSnapshotExport,
 }

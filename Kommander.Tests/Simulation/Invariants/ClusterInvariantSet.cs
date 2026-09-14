@@ -280,7 +280,7 @@ public static class ClusterInvariantSet
             // 34577216505): a follower whose disk refused entry 1 published commit index 1 while its
             // log was empty, and only the later regression to 0 was caught. A fully compacted log
             // holds nothing above the compaction mark and is entitled to claim through it.
-            long highestHeld = Math.Max(store.MaxLogId, store.CompactedThrough);
+            long highestHeld = Math.Max(store.MaxLogId, store.CoveredThrough);
 
             if (view.CommitIndex > highestHeld)
             {
@@ -289,13 +289,13 @@ public static class ClusterInvariantSet
                     stepNumber,
                     $"Node '{view.Endpoint}' partition {view.Partition} is committed to " +
                     $"{view.CommitIndex} but holds nothing above {highestHeld}. Retained range is " +
-                    $"[{store.FirstLogId}, {store.MaxLogId}], compacted through {store.CompactedThrough}.");
+                    $"[{store.FirstLogId}, {store.MaxLogId}], covered through {store.CoveredThrough}.");
             }
 
-            // The head. The lowest id the node should still hold is one above whatever it compacted;
-            // anything between that and its first retained id was never received, and the node may
-            // not claim to have committed it.
-            long expectedFirst = store.CompactedThrough + 1;
+            // The head. The lowest id the node should still hold is one above whatever it compacted or
+            // a snapshot covers; anything between that and its first retained id was never received,
+            // and the node may not claim to have committed it.
+            long expectedFirst = store.CoveredThrough + 1;
 
             if (store.EntryCount > 0
                 && store.FirstLogId > expectedFirst
@@ -306,7 +306,7 @@ public static class ClusterInvariantSet
                     stepNumber,
                     $"Node '{view.Endpoint}' partition {view.Partition} is committed to " +
                     $"{view.CommitIndex} but its log starts at {store.FirstLogId} and it compacted " +
-                    $"only through {store.CompactedThrough}, so ids {expectedFirst} to " +
+                    $"only through {store.CoveredThrough}, so ids {expectedFirst} to " +
                     $"{store.FirstLogId - 1} were never received.");
             }
         }

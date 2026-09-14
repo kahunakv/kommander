@@ -249,9 +249,10 @@ public sealed class ClusterInvariantRunner
             // claims to cover an index the node deliberately discarded turns every compacted prefix
             // into a reported hole — which is exactly what the leader-completeness rule did the
             // first time a generated run ever compacted. The rule was never wrong before; it was
-            // only sound because nothing compacted.
+            // only sound because nothing compacted. An installed snapshot covers its prefix the same
+            // way, so the window starts above that too.
             long compactedThrough = stores.TryGetValue(view.Endpoint, out SimulatedWalPartitionSnapshot? store)
-                ? store.CompactedThrough
+                ? store.CoveredThrough
                 : -1;
 
             long from = Math.Max(Math.Max(1, view.CommitIndex - CommittedWindow + 1), compactedThrough + 1);

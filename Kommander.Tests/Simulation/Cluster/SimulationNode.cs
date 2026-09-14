@@ -36,6 +36,7 @@ public sealed class SimulationNode : IAsyncDisposable
         string endpoint,
         RaftManager manager,
         IWAL wal,
+        SimulatedPartitionStateTransfer stateTransfer,
         SimulationClusterOptions options,
         VirtualTickSource clock,
         SimulatedTransport transport,
@@ -46,6 +47,7 @@ public sealed class SimulationNode : IAsyncDisposable
         Manager = manager;
         Wal = wal;
         SimulatedWal = wal as SimulatedWAL;
+        StateTransfer = stateTransfer;
         this.options = options;
         this.clock = clock;
         this.transport = transport;
@@ -70,6 +72,12 @@ public sealed class SimulationNode : IAsyncDisposable
     /// </summary>
     private const long SimulatedEpochMilliseconds = 1_767_225_600_000;
 
+    /// <summary>
+    /// The <see cref="RaftConfiguration.SnapshotTransferStepTimeout"/> every simulated node uses.
+    /// See the comment where it is applied for why it is short, and why it is real time.
+    /// </summary>
+    public static readonly TimeSpan SnapshotTransferStepTimeout = TimeSpan.FromSeconds(1);
+
     /// <summary>Zero-based index of this node within the cluster.</summary>
     public int NodeIndex { get; }
 
@@ -91,6 +99,16 @@ public sealed class SimulationNode : IAsyncDisposable
     /// in-memory log. This is the handle a scenario injects a storage fault through.
     /// </summary>
     public SimulatedWAL? SimulatedWal { get; }
+
+    /// <summary>
+    /// The whole-partition state transfer this node registers, and the handle a scenario injects a
+    /// transfer fault through.
+    ///
+    /// <para>One instance for the life of the node, reused by every manager a restart builds. A
+    /// scenario keeps its handle across a restart, and the counters keep counting. A crash releases
+    /// the hang fault, because the process that owned the hung call is gone.</para>
+    /// </summary>
+    public SimulatedPartitionStateTransfer StateTransfer { get; }
 
     /// <summary>Lifecycle state as the harness last set it.</summary>
     public SimulationNodeLifecycleStatus LifecycleStatus { get; private set; } =
@@ -134,9 +152,11 @@ public sealed class SimulationNode : IAsyncDisposable
               { WriteLatencyMilliseconds = options.WalWriteLatencyMilliseconds }
             : new InMemoryWAL(logger);
 
-        RaftManager manager = BuildManager(nodeIndex, options, clock, transport, logger, wal);
+        SimulatedPartitionStateTransfer stateTransfer = new();
 
-        return new SimulationNode(nodeIndex, endpoint, manager, wal, options, clock, transport, logger);
+        RaftManager manager = BuildManager(nodeIndex, options, clock, transport, logger, wal, stateTransfer);
+
+        return new SimulationNode(nodeIndex, endpoint, manager, wal, stateTransfer, options, clock, transport, logger);
     }
 
     /// <summary>
@@ -149,7 +169,8 @@ public sealed class SimulationNode : IAsyncDisposable
         VirtualTickSource clock,
         SimulatedTransport transport,
         ILogger<IRaft> logger,
-        IWAL wal)
+        IWAL wal,
+        SimulatedPartitionStateTransfer stateTransfer)
     {
         List<RaftNode> peers = [];
         for (int peerIndex = 0; peerIndex < options.NodeCount; peerIndex++)
@@ -196,6 +217,16 @@ public sealed class SimulationNode : IAsyncDisposable
             // source. A smoke run holds time still for long stretches, so leave it off until a
             // scenario family exercises it deliberately.
             EnableQuiescence = false,
+
+            // Each awaited step of an outbound snapshot transfer must finish inside this bound.
+            // The production default is two minutes. A simulated step is an in-memory call that
+            // finishes in microseconds unless a fault holds it, so a short bound costs a healthy
+            // run nothing. A long bound would make a hung export cost two minutes of real time.
+            //
+            // Real time, not simulated time: the library measures this bound with Task.Delay, which
+            // is outside the determinism boundary. A run that hits the bound is therefore not
+            // byte-reproducible at that point. Only a transfer fault reaches it.
+            SnapshotTransferStepTimeout = SnapshotTransferStepTimeout,
         };
 
         options.ConfigureNode?.Invoke(configuration);
@@ -218,7 +249,7 @@ public sealed class SimulationNode : IAsyncDisposable
         // Every node can serve and receive a whole-partition state transfer. Without this the
         // snapshot rescue path is unreachable in simulation — see SimulatedPartitionStateTransfer
         // for why an unrescuable follower makes the entire compaction family untestable.
-        manager.RegisterPartitionStateTransfer(new SimulatedPartitionStateTransfer());
+        manager.RegisterPartitionStateTransfer(stateTransfer);
 
         return manager;
     }
@@ -352,6 +383,7 @@ public sealed class SimulationNode : IAsyncDisposable
 
         Manager.Dispose();
         SimulatedWal?.Crash();
+        StateTransfer.ReleaseHungExports();
     }
 
     /// <summary>
@@ -371,7 +403,7 @@ public sealed class SimulationNode : IAsyncDisposable
         if (LifecycleStatus == SimulationNodeLifecycleStatus.Running)
             throw new InvalidOperationException($"{Endpoint} is already running.");
 
-        Manager = BuildManager(NodeIndex, options, clock, transport, logger, Wal);
+        Manager = BuildManager(NodeIndex, options, clock, transport, logger, Wal, StateTransfer);
         transport.ThawEndpoint(Endpoint);
         transport.MarkUp(Endpoint);
     }
@@ -509,6 +541,9 @@ public sealed class SimulationNode : IAsyncDisposable
     /// </summary>
     private void ReleaseStore()
     {
+        // A hung export is a detached task. Ending it here keeps it from outliving the test.
+        StateTransfer.ReleaseHungExports();
+
         if (SimulatedWal is not null)
             SimulatedWal.DisposeStore();
         else

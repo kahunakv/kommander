@@ -590,6 +590,7 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             () => _initializedSignal.Task,
             () => LocalRole,
             StartSystemPartition,
+            UpdateNodes,
             (node, request) => communication.SendJoin(this, node, request),
             Logger,
             LocalEndpoint,
@@ -1332,7 +1333,18 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     }
 
     /// <summary>
-    /// Updates the internal state of the nodes
+    /// Updates the internal state of the nodes.
+    /// <para>
+    /// Driven by the <see cref="RaftTimerService"/> node-update timer and, once, by
+    /// <see cref="ClusterJoinService"/> at join time. The join-time call exists because the timer
+    /// starts at construction and skips every tick before <see cref="Joined"/>; without it, an
+    /// embedder whose construction-to-join gap exceeds <see cref="RaftConfiguration.TimerInitialDelay"/>
+    /// could not elect the system partition until the second tick, a full
+    /// <see cref="RaftConfiguration.UpdateNodesInterval"/> later. The join-time call may overlap a
+    /// timer tick; that is harmless because the peer set is a single reference assignment and both
+    /// coordinator sweeps below return early on a node that is not yet the system-partition leader,
+    /// which a joining node never is before its first election.
+    /// </para>
     /// </summary>
     public async Task UpdateNodes()
     {

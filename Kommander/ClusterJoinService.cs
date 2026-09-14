@@ -59,6 +59,7 @@ internal sealed class ClusterJoinService
     private readonly Func<Task> getInitializedSignal;
     private readonly Func<ClusterMemberRole> getLocalRole;
     private readonly Action startSystemPartition;
+    private readonly Func<Task> refreshNodes;
     private readonly Func<RaftNode, JoinRequest, Task<JoinResponse>> sendJoin;
     private readonly ILogger<IRaft> logger;
     private readonly string localEndpoint;
@@ -75,6 +76,7 @@ internal sealed class ClusterJoinService
         Func<Task> getInitializedSignal,
         Func<ClusterMemberRole> getLocalRole,
         Action startSystemPartition,
+        Func<Task> refreshNodes,
         Func<RaftNode, JoinRequest, Task<JoinResponse>> sendJoin,
         ILogger<IRaft> logger,
         string localEndpoint,
@@ -90,6 +92,7 @@ internal sealed class ClusterJoinService
         this.getInitializedSignal = getInitializedSignal;
         this.getLocalRole = getLocalRole;
         this.startSystemPartition = startSystemPartition;
+        this.refreshNodes = refreshNodes;
         this.sendJoin = sendJoin;
         this.logger = logger;
         this.localEndpoint = localEndpoint;
@@ -103,6 +106,43 @@ internal sealed class ClusterJoinService
     /// <summary>Returns the permanent block recorded for an endpoint, or null when it can still be promoted.</summary>
     internal string? GetJoinTerminalReason(string endpoint) =>
         _joinTerminalReasons.TryGetValue(endpoint, out string? reason) ? reason : null;
+
+    /// <summary>
+    /// Runs one discovery refresh synchronously at join time so the first election is not gated on
+    /// the periodic node-update timer.
+    /// <para>
+    /// <see cref="Consensus.ElectionCoordinator"/> refuses a self-election while the node's peer set
+    /// is empty and discovery has not yet reported (<c>InitialNodesDiscovered</c>). That flag is set
+    /// only by <see cref="RaftManager.UpdateNodes"/>, which the timer drives from construction time
+    /// and which skips every tick that precedes <see cref="ClusterHandler.Joined"/>. When the
+    /// embedder's construction-to-join gap exceeds <see cref="RaftConfiguration.TimerInitialDelay"/>
+    /// the first tick is wasted and the system partition cannot elect until the second tick, a full
+    /// <see cref="RaftConfiguration.UpdateNodesInterval"/> (5 s by default) later. Running the same
+    /// refresh here, after <c>Joined</c> and the system partition exist, makes the first election
+    /// depend on the election timeout alone while keeping the gate's safety semantics untouched: a
+    /// seed-joining node still cannot self-elect before discovery has reported its peers.
+    /// </para>
+    /// <para>
+    /// Must be called only after <see cref="ClusterHandler.Joined"/> is set and
+    /// <see cref="RaftManager.StartSystemPartition"/> ran, or the refresh is a no-op that does not
+    /// set the flag. Failures are logged and swallowed: the periodic timer retries discovery on its
+    /// own cadence, and a transient discovery error must not fail a join that
+    /// <see cref="Discovery.IDiscovery.Register"/> already accepted.
+    /// </para>
+    /// </summary>
+    private async Task RefreshNodesAtJoinAsync()
+    {
+        try
+        {
+            await refreshNodes().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                "JoinCluster: join-time node discovery failed ({Message}); the periodic UpdateNodes timer will retry",
+                ex.Message);
+        }
+    }
 
     /// <summary>
     /// One-line snapshot of how far cluster assembly has progressed, emitted on every join wait
@@ -169,6 +209,10 @@ internal sealed class ClusterJoinService
 
         startSystemPartition();
 
+        // Discovery has to run once before the system partition may self-elect; do it now instead
+        // of waiting for the node-update timer (see RefreshNodesAtJoinAsync).
+        await RefreshNodesAtJoinAsync().ConfigureAwait(false);
+
         // Wait for the system coordinator to replicate the initial partition map and start the
         // user partitions. On a slow or loaded host this can take longer than expected; the
         // unconditional ceiling (see the type summary) keeps it from blocking indefinitely.
@@ -217,6 +261,11 @@ internal sealed class ClusterJoinService
 
         // Mark as joined so timer UpdateNodes ticks start firing once the roster has us.
         clusterHandler.MarkJoined();
+
+        // Same join-time discovery refresh as the discovery-based overload: it loads whatever
+        // discovery knows so the election gate has a real peer set to judge, without waiting for
+        // the first effective timer tick.
+        await RefreshNodesAtJoinAsync().ConfigureAwait(false);
 
         // Contact seeds until a leader accepts us as a Learner.
         JoinResponse? accepted = null;

@@ -130,6 +130,19 @@ worth knowing about:
   without quorum waits ten **real** seconds inside its quorum wait. A search that reaches that state
   stops exploring and starts paying.
 
+- The snapshot-rescue sweep, `AGeneratedRunUnderSnapshotRescue_HoldsEveryCheck`, runs with the
+  others in `DSTRandom`. Its first full run found DST FINDING 6, a backfill anchored exactly at the
+  leader's compaction floor that looped forever. It sets `CompactEveryOperations` to eight and
+  `CompactionLiveReplicaLagBudget` to four, so a follower really falls below the leader's compaction
+  floor, and it turns on `TransferFaultWeight`, which arms a hung application export at the leader.
+  Each run prints `snapshotExportsServed` and `snapshotExportsHung`. Read them before you trust a
+  pass: most seeds run no rescue at all, and a pass with both at zero tested nothing this sweep is
+  for.
+
+  The leader's retention budget is the reason the frequent-compaction sweep rarely reaches a rescue.
+  A crashed simulated node can stay alive in the leader's view for the whole run, and at the
+  production budget of 100,000 entries the leader never compacts past it.
+
 A plan artifact's header records every bound, and a replay rebuilds them from the file. A plan
 replayed at three steps per action is not the plan that failed at six.
 
@@ -151,6 +164,16 @@ misread without them.
   report on its own endpoints and the invariant runner fails the run at the step the report arrived,
   ahead of every other rule. Read the named rule and values; the state three hundred steps later is
   a consequence, not the finding.
+
+## Snapshot transfer timeouts are simulated time
+
+Every simulated node sets `SnapshotTransferStepTimeout` to one second. The library measures that bound
+on the node's tick source, so it is one second of simulated time, about twenty steps. It used to be a
+real-time timer: a cluster ran hundreds of steps inside one real second, and whether a hung transfer
+step was abandoned inside a scenario's step budget depended on the speed of the machine.
+
+A hung export stays armed through the heal phase. Ending the hang is the library's job, and a runner
+that ended it would repair the state the run is looking for.
 
 ## Metrics and the budget
 

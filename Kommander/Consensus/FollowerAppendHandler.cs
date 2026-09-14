@@ -25,6 +25,14 @@ namespace Kommander.Consensus;
 /// truncate exists for the same reason: the truncate is irreversible, so a queued-but-unread append
 /// must never look like a hole.</para>
 ///
+/// <para><b>A leader-compacted anchor inside the committed prefix matches.</b> A backfill batch that
+/// starts at the leader's first retained entry carries <c>prevLogTerm = -1</c>, because the anchor is
+/// the one entry the leader compacted. When that anchor lies at or below this node's committed
+/// frontier, Leader Completeness makes the prefixes agree, so the batch is accepted. Rejecting it as
+/// divergence looped forever: the leader's read had succeeded, so it recorded no refusal, started
+/// no snapshot, and re-shipped the same batch on every heartbeat (DST FINDING 6). Above the committed
+/// frontier a <c>-1</c> anchor proves nothing and is still rejected.</para>
+///
 /// <para><b>A heartbeat ack re-raises the hole report until the hole is repaired.</b> The
 /// entry-carrying paths report a hole only at the moment a batch lands over it, and that edge
 /// signal dies with the leadership that heard it. The heartbeat branch therefore sends a second,
@@ -260,7 +268,28 @@ internal sealed class FollowerAppendHandler
             // would misread that -1 boundary term as a hole and truncate the just-shipped anchored backfill,
             // which the leader re-ships and the follower re-truncates forever — a live-lock that strands the
             // follower exactly one entry below the boundary (and its consumer's applied prefix with it).
-            if (localTermAtPrev != prevLogTerm)
+            // Leader-compacted anchor inside this follower's committed prefix (DST FINDING 6). The
+            // leader ships prevLogTerm = -1 when the anchor entry is below its own compaction floor:
+            // a backfill batch that starts at the leader's first retained entry is anchored on the
+            // one entry it no longer holds. The live-replica retention hold produces exactly that
+            // shape — it keeps a lagging follower's position + 1 and compacts the position — and so
+            // can any other floor. Treating it as term divergence rejected the batch; the batch read
+            // on the leader had succeeded, so no refusal was recorded and no snapshot was started,
+            // and the leader re-shipped the same batch on every heartbeat, forever.
+            //
+            // Accepting it is sound only inside the committed prefix. The leader compacts committed
+            // entries only, and by Leader Completeness a committed entry here at the same index is
+            // the entry the leader compacted, so the shared prefix through prevLogIndex already
+            // agrees — the argument the -1 == -1 snapshot-boundary match above rests on. An anchor
+            // ABOVE the committed frontier gets no such guarantee and still takes the divergence
+            // path below. GetCommitIndex is the protocol frontier the committed-frontier fence
+            // reads too: it only advances on the leader's commit instruction, contiguously, and it
+            // regresses when a write fails.
+            bool anchorCompactedOnLeader = prevLogTerm < 0
+                && localTermAtPrev >= 0
+                && prevLogIndex <= wal.GetCommitIndex();
+
+            if (localTermAtPrev != prevLogTerm && !anchorCompactedOnLeader)
             {
                 if (localTermAtPrev < 0)
                 {
