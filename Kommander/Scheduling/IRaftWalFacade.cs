@@ -189,10 +189,15 @@ public interface IRaftWalFacade
     /// <paramref name="snapshotTerm"/> carries the boundary's last-included term so the presence
     /// frontier's advertised (term, index) pair stays consistent after the jump.
     /// Must be called on the partition executor after the snapshot's WAL boundary is durable.
+    /// <para><paramref name="suffixTruncated"/> must be true when the boundary install truncated a
+    /// conflicting suffix: the seed then purges frontier bookkeeping buffered above the boundary
+    /// (resolutions, presence, durability) BEFORE its drains, because those buffers describe rows
+    /// the truncation deleted — draining them would certify a commit frontier over entries that no
+    /// longer exist (a deposed leader's optimistically-resolved tail).</para>
     /// <para>Default no-op: the production <c>RaftWriteAhead</c> facade overrides this; test stubs that never
     /// install snapshots inherit the no-op.</para>
     /// </summary>
-    void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0) { }
+    void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0, bool suffixTruncated = false) { }
 
     /// <summary>
     /// Removes every log entry with id &gt; <paramref name="afterLogId"/> and returns the

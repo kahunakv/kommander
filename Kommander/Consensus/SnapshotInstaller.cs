@@ -317,7 +317,7 @@ internal sealed class SnapshotInstaller
         // as committed (otherwise post-snapshot consumer delivery and backfill reporting stall below it).
         if (snapshotIndex > coreState.LastAppliedIndex)
             coreState.LastAppliedIndex = snapshotIndex;
-        wal.SeedCommitFrontierFromSnapshot(snapshotIndex, Math.Max(boundaryTerm, 0));
+        wal.SeedCommitFrontierFromSnapshot(snapshotIndex, Math.Max(boundaryTerm, 0), suffixTruncated);
 
         if (logger.IsEnabled(LogLevel.Information))
             logger.LogInfoReceiveInstallSnapshot(host.LocalEndpoint, host.PartitionId, snapshotIndex);

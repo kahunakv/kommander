@@ -162,7 +162,7 @@ public class TestSnapshotInstallGateAndApplyHold
             return ValueTask.FromResult((RaftOperationStatus.Success, truncated));
         }
 
-        public void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0)
+        public void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0, bool suffixTruncated = false)
         {
             if (snapshotIndex > _commitIndex)
                 _commitIndex = snapshotIndex;

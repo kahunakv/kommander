@@ -490,10 +490,11 @@ public sealed class RaftWriteAhead
         // Extra pre-checkpoint entries never move the frontier: they sit below the checkpoint,
         // which certifies its whole prefix and jumps the contiguous frontier over them regardless.
         // We scan once to derive the quantities used below.
-        long maxLogId = 0;              // highest durable id (any type) — the propose cursor floor
-        long contiguousCommitted = 0;   // highest id of an unbroken committed prefix
-        long contiguousPresent = 0;     // highest id of an unbroken present prefix (any type)
-        long contiguousPresentTerm = 0; // term of the entry at contiguousPresent
+        long maxLogId = 0;                // highest durable id (any type) — the propose cursor floor
+        long contiguousCommitted = 0;     // highest id of an unbroken committed prefix
+        long contiguousCommittedTerm = 0; // term of the entry at contiguousCommitted
+        long contiguousPresent = 0;       // highest id of an unbroken present prefix (any type)
+        long contiguousPresentTerm = 0;   // term of the entry at contiguousPresent
         bool any = false;
 
         // A narrowed read (soft checkpoint, see LoadRestoreLogsAsync) starts ABOVE the floor, so
@@ -505,6 +506,7 @@ public sealed class RaftWriteAhead
         {
             maxLogId = restoreSoftFloorIndex;
             contiguousCommitted = restoreSoftFloorIndex;
+            contiguousCommittedTerm = restoreSoftFloorTerm;
             contiguousPresent = restoreSoftFloorIndex;
             contiguousPresentTerm = restoreSoftFloorTerm;
             any = true;
@@ -536,9 +538,14 @@ public sealed class RaftWriteAhead
             // may jump the presence frontier — but only when the persisted floor covers it (see
             // above); every other type only extends an unbroken run — a missing id (e.g. a hole
             // left by an out-of-order append) stops it, exactly like the committed frontier below.
+            // A TERM INVERSION stops the run the same way a hole does: a valid Raft log is
+            // term-monotonic, so a row whose term sits below its predecessor's is a deposed
+            // leader's orphan the pre-crash run had refused to absorb (see IsTermInverted) —
+            // chaining over it here would re-poison the frontier a restart is rebuilding.
             if (log.Type == RaftLogType.CommittedCheckpoint && log.Id <= certifiedCheckpointFloor
                 ? log.Id > contiguousPresent
-                : log.Id == contiguousPresent + 1)
+                : log.Id == contiguousPresent + 1
+                  && (log.Term <= 0 || contiguousPresentTerm <= 0 || log.Term >= contiguousPresentTerm))
             {
                 contiguousPresent = log.Id;
                 contiguousPresentTerm = log.Term;
@@ -550,18 +557,30 @@ public sealed class RaftWriteAhead
                     // A checkpoint certifies the whole prefix ≤ its id is committed (it is the durable
                     // recovery anchor), so it may jump the contiguous frontier — again only when the
                     // persisted floor attests its prefix was present; an over-gap row extends the
-                    // chain contiguously like a plain Committed entry.
+                    // chain contiguously like a plain Committed entry, including the term-inversion
+                    // stop below (a certified checkpoint was verified at land time and is exempt).
                     if (log.Id <= certifiedCheckpointFloor
                         ? log.Id > contiguousCommitted
-                        : log.Id == contiguousCommitted + 1)
+                        : log.Id == contiguousCommitted + 1
+                          && (log.Term <= 0 || contiguousCommittedTerm <= 0 || log.Term >= contiguousCommittedTerm))
+                    {
                         contiguousCommitted = log.Id;
+                        contiguousCommittedTerm = log.Term;
+                    }
                     break;
 
                 case RaftLogType.Committed:
                     // Extend the contiguous prefix only across an unbroken run; a gap — a Proposed entry
-                    // whose commit marker was lost in a crash, or any missing id — stops it.
-                    if (log.Id == contiguousCommitted + 1)
+                    // whose commit marker was lost in a crash, or any missing id — stops it. A term
+                    // inversion stops it too (same rule as the presence chain above): a committed-typed
+                    // row carrying an older term than its predecessor was a deposed leader's optimistic
+                    // marker, never a quorum commit of the surviving chain.
+                    if (log.Id == contiguousCommitted + 1
+                        && (log.Term <= 0 || contiguousCommittedTerm <= 0 || log.Term >= contiguousCommittedTerm))
+                    {
                         contiguousCommitted = log.Id;
+                        contiguousCommittedTerm = log.Term;
+                    }
                     break;
 
                 case RaftLogType.Proposed:
@@ -1365,6 +1384,13 @@ public sealed class RaftWriteAhead
     /// duplicate re-ship (ignored), an id above it sits over an unfilled gap and is buffered with
     /// its term until the gap closes, and an id that fills the next slot advances the frontier and
     /// drains any buffered successors that have become contiguous.
+    /// <para>Term-inversion guard: an entry whose term is BELOW the frontier term is never
+    /// absorbed. A valid Raft log is term-monotonic, so such an entry is provably an orphan a
+    /// deposed leader wrote over a gap before a newer-term chain filled the prefix under it.
+    /// Absorbing it makes the log read "contiguous" through a stale row, which then passes the
+    /// promotion hole gate and gets committed by the inherited-tail drain — committing a deposed
+    /// leader's entry that quorum never accepted (nightly DST seed 745773478048735981: committed
+    /// index 5 at term 1 above index 4 at term 6).</para>
     /// </summary>
     private void AdvancePresenceFrontier(long id, long term)
     {
@@ -1387,10 +1413,35 @@ public sealed class RaftWriteAhead
             return;
         }
 
+        if (IsTermInverted(id, term))
+            return;
+
         presentIndex = id + 1;
         presentTerm = term;
 
         DrainPendingPresent();
+    }
+
+    /// <summary>
+    /// True when absorbing (<paramref name="id"/>, <paramref name="term"/>) at the presence
+    /// frontier would place an older term above a newer one — the impossible-log shape the
+    /// term-inversion guard refuses. Zero terms are exempt: a legacy row or an empty-log frontier
+    /// carries no term evidence, and refusing on it would wedge legitimate absorption.
+    /// The refused entry is dropped from frontier bookkeeping only — the physical row stays on
+    /// disk until the promotion gate's orphaned-tail truncation or a conflicting overwrite
+    /// removes it — so the node simply keeps advertising the frontier below the orphan and can
+    /// never count it as part of the contiguous log.
+    /// </summary>
+    private bool IsTermInverted(long id, long term)
+    {
+        if (term <= 0 || presentTerm <= 0 || term >= presentTerm)
+            return false;
+
+        logger.LogWarning(
+            "[{Endpoint}/{Partition}] Refusing to absorb entry {Id} at term {Term} over frontier term {PresentTerm}: an older term above a newer one is a deposed leader's orphan — leaving the presence frontier at {PresentIndex}.",
+            manager.LocalEndpoint, partition.PartitionId, id, term, presentTerm, presentIndex - 1);
+
+        return true;
     }
 
     /// <summary>
@@ -1631,8 +1682,39 @@ public sealed class RaftWriteAhead
         RefreshPublishedCommitIndex();
     }
 
-    public void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0)
+    public void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0, bool suffixTruncated = false)
     {
+        // A truncating install just removed every WAL row above the boundary, so any bookkeeping
+        // buffered above it — resolutions, presence, durability — describes rows that no longer
+        // exist. Purge it BEFORE the drains below, or the seed itself absorbs the stale ids and
+        // certifies a commit frontier over entries the truncation deleted (a deposed leader's
+        // optimistically-resolved tail is exactly what such buffers hold at this point). Mirrors
+        // the cleanup TruncateLogsAfterAsync performs for the log-hole repair truncation.
+        if (suffixTruncated)
+        {
+            while (pendingResolved.Count > 0 && pendingResolved.Max > snapshotIndex)
+                pendingResolved.Remove(pendingResolved.Max);
+            while (pendingDurable.Count > 0 && pendingDurable.Max > snapshotIndex)
+                pendingDurable.Remove(pendingDurable.Max);
+            while (pendingPresent.Count > 0)
+            {
+                long maxPending = -1;
+                foreach (KeyValuePair<long, long> kv in pendingPresent)
+                    maxPending = kv.Key;        // SortedDictionary: last key is the maximum
+                if (maxPending <= snapshotIndex)
+                    break;
+                pendingPresent.Remove(maxPending);
+            }
+
+            if (presentIndex > snapshotIndex + 1)
+            {
+                presentIndex = snapshotIndex + 1;
+                presentTerm = snapshotTerm;
+            }
+            if (durablePresentIndex > snapshotIndex + 1)
+                durablePresentIndex = snapshotIndex + 1;
+        }
+
         long target = snapshotIndex + 1;
         if (target > commitIndex)
             commitIndex = target;
@@ -1673,6 +1755,11 @@ public sealed class RaftWriteAhead
     /// <summary>
     /// Drops buffered present ids already covered by the frontier, then absorbs any that have
     /// become contiguous. Shared by the snapshot seed and (indirectly) the frontier advance.
+    /// <para>A buffered entry that fails the term-inversion guard (see
+    /// <see cref="IsTermInverted"/>) is removed from the buffer without being absorbed: it was
+    /// written over a gap by a leader whose term is older than the chain that later filled the
+    /// gap, so no valid log contains it above the frontier entry. The frontier stops below it and
+    /// the leader's backfill (or the promotion gate's orphaned-tail truncation) repairs the disk.</para>
     /// </summary>
     private void DrainPendingPresent()
     {
@@ -1694,6 +1781,12 @@ public sealed class RaftWriteAhead
             }
             if (next > presentIndex)
                 break;
+
+            if (IsTermInverted(next, nextTerm))
+            {
+                pendingPresent.Remove(next);
+                continue;
+            }
 
             pendingPresent.Remove(next);
             presentIndex = next + 1;
