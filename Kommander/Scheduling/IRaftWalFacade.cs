@@ -114,6 +114,14 @@ public interface IRaftWalFacade
     bool HasPresenceGap() => false;
 
     /// <summary>
+    /// Age, in milliseconds, of the oldest write this partition has handed to the WAL scheduler that
+    /// the storage engine has not yet answered; <c>0</c> when nothing is pending. The local
+    /// durable-write stall signal consumed by the leader's step-down watchdog and the candidacy gate.
+    /// Default 0 for facades that do not track it (test stubs).
+    /// </summary>
+    double GetOldestPendingWriteAgeMs() => 0;
+
+    /// <summary>
     /// Absorbs a prefix proven resolved by other bookkeeping (the applied cursor, capped by
     /// contiguous presence) into the commit frontier. Used at promotion so a follower-era frontier
     /// bookkeeping miss cannot be frozen for a whole leader tenure — see the implementation notes

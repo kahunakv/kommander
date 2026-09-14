@@ -147,6 +147,11 @@ public static class RaftSafetyOptionAudit
         // cancelled at the bound and an already-quorum-durable entry can still commit afterwards,
         // which is why the timeout is reported as indeterminate rather than as a failure.
         [nameof(RaftConfiguration.ProposalTimeout)] = RaftOptionKind.Liveness,
+        // Liveness: a leader whose disk stopped answering yields to a healthy replica before its
+        // proposals' callers exhaust their budgets; the same-term demotion is fenced like any
+        // voluntary step-down, so no safety argument depends on the bound.
+        [nameof(RaftConfiguration.WalStallStepDownTimeout)] = RaftOptionKind.Liveness,
+        [nameof(RaftConfiguration.WalStallWarnThreshold)] = RaftOptionKind.Diagnostics,
         [nameof(RaftConfiguration.SelfRepairPeerDownGrace)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.LeadershipConfirmationTimeout)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.EnableCheckQuorum)] = RaftOptionKind.Safety,

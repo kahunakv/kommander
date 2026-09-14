@@ -1364,6 +1364,13 @@ public sealed class RaftWriteAhead
     public long GetPresentIndex() => presentIndex - 1;
 
     /// <summary>
+    /// Age of the oldest write this partition has handed to the WAL scheduler that the storage engine has
+    /// not yet answered (queued or in flight); 0 when nothing is pending. See
+    /// <see cref="WAL.IO.IRaftWalScheduler.GetPartitionOldestPendingWriteAgeMs"/>.
+    /// </summary>
+    public double GetOldestPendingWriteAgeMs() => manager.WalScheduler.GetPartitionOldestPendingWriteAgeMs(partition.PartitionId);
+
+    /// <summary>
     /// True when this node holds durable entries buffered ABOVE an unfilled gap — the lone-high
     /// shape the unanchored live-propose broadcast leaves on a behind follower. A node in this
     /// state knows its own log is missing a range some peer may hold; the election path uses it

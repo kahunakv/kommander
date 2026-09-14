@@ -331,6 +331,31 @@ internal sealed class ProposalRegistry
     /// <summary>Registers a rented record against the WAL operation id that will complete it.</summary>
     public void TrackPending(long operationId, RaftPendingWalOperation pending) => pendingWalOperations[operationId] = pending;
 
+    /// <summary>
+    /// Detaches and returns the reply correlation ids of every pending leader-propose WAL operation — a
+    /// proposal this node accepted whose local write the storage engine has not yet answered. Such an
+    /// entry was never fanned out (the fan-out runs in the write's completion), so once this node has
+    /// stepped down it can never commit and its caller can be answered at once instead of waiting out the
+    /// reply timeout. The operations stay tracked so the completion, whenever the engine answers, is
+    /// still routed through the leader-state fence; with the reply detached it answers nobody twice.
+    /// Follower appends (which carry the sending leader's endpoint) are left untouched.
+    /// </summary>
+    public List<ulong> DetachPendingLeaderProposeReplies()
+    {
+        List<ulong> detached = [];
+
+        foreach (RaftPendingWalOperation pending in pendingWalOperations.Values)
+        {
+            if (pending.Endpoint is not null || pending.ReplyCorrelationId is not { } correlationId)
+                continue;
+
+            pending.ReplyCorrelationId = null;
+            detached.Add(correlationId);
+        }
+
+        return detached;
+    }
+
     /// <summary>Removes and yields the record for a completed WAL operation, if it is still tracked.</summary>
     public bool TryTakePending(long operationId, [MaybeNullWhen(false)] out RaftPendingWalOperation pending) =>
         pendingWalOperations.Remove(operationId, out pending);

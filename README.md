@@ -429,6 +429,8 @@ The transport entry points are intended for communication adapters and HTTP/gRPC
 | `PingInterval` | `1000 ms` | SWIM failure-detector probe cadence. With quiescence on, a quiesced follower detects a dead leader roughly one `PingInterval` after the crash; must be `> 0` and `< StartElectionTimeout`. |
 | `SlowRaftStateMachineLog` | `50 ms` | Slow partition state-machine operation warning threshold. |
 | `SlowRaftWALMachineLog` | `25 ms` | Slow WAL warning threshold. |
+| `WalStallStepDownTimeout` | `3 s` | Durable-write stall watchdog. A leader whose own WAL write has been unanswered by the storage engine for this long steps down in the same term (its waiting proposals fail at once so callers re-route), notifies the most caught-up peer so the successor's election starts within a round trip, and refuses to campaign again until the write completes. Raft's election timing only measures a leader's network liveness — a leader on a paused disk keeps heartbeating — so this is the bound that sheds it. `0` disables the watchdog and the candidacy gate. |
+| `WalStallWarnThreshold` | `500 ms` | Age past which a pending WAL write on any node is logged as a stall (one line on crossing, a reminder every 10 s, one line when it clears with the duration). The continuous signals are the `raft.wal.oldest_pending_write_age_ms` gauge and the `raft.wal.write_duration_ms` histogram. `0` disables the log lines only. |
 | `ReadIOThreads` | `8` | Fair scheduler workers for synchronous WAL reads. |
 | `WriteIOThreads` | `4` | Fair scheduler workers for synchronous WAL writes. |
 | `BackfillThreshold` | `10` | How many entries a follower may lag before the leader engages backfill. Below this, the live replication path handles catch-up. |

@@ -37,4 +37,14 @@ public interface IRaftWalScheduler
     /// load scoring only.
     /// </summary>
     int GetPartitionDepth(int partitionId);
+
+    /// <summary>
+    /// Age, in milliseconds, of the oldest operation this scheduler has accepted for
+    /// <paramref name="partitionId"/> and not yet completed — whether it is still queued or
+    /// inside the batch a worker is writing. <c>0</c> when nothing is pending. This is the
+    /// durable-write stall signal: unlike the commit-wait EWMA, which is fed only by completed
+    /// batches and so holds its last value while a write hangs, this keeps rising for as long
+    /// as the storage engine does not answer.
+    /// </summary>
+    double GetPartitionOldestPendingWriteAgeMs(int partitionId);
 }

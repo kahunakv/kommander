@@ -43,6 +43,8 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
 
     public bool HasPresenceGap() => wal.HasPresenceGap();
 
+    public double GetOldestPendingWriteAgeMs() => wal.GetOldestPendingWriteAgeMs();
+
     public void AbsorbResolvedPrefix(long throughId) => wal.AbsorbResolvedPrefix(throughId);
 
     // Explicit forward — the interface declares a default no-op body, which silently swallowed

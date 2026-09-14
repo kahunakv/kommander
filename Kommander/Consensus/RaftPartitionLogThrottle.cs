@@ -66,6 +66,16 @@ internal sealed class RaftPartitionLogThrottle
     private long lastHoleReportLogTicks;
     private int suppressedHoleReportLogs;
 
+    // Durable-write stall episode: when the oldest pending WAL write crossed the warn threshold (0 =
+    // not in an episode) and when the last reminder went out. The tick observes the age every
+    // CheckLeaderInterval, so without this the crossing would log four times a second. Executor
+    // thread only.
+    private long walStallSinceTicks;
+    private long lastWalStallReminderTicks;
+
+    /// <summary>Spacing of reminder lines while a durable-write stall persists.</summary>
+    internal static readonly TimeSpan WalStallReminderInterval = TimeSpan.FromSeconds(10);
+
     public RaftPartitionLogThrottle(IRaftPartitionHost host, RaftPartitionCoreState coreState, ILogger<IRaft> logger)
     {
         this.host = host;
@@ -196,6 +206,57 @@ internal sealed class RaftPartitionLogThrottle
 
         lastBackfillTraceTicks   = now;
         suppressedBackfillTraces = 0;
+    }
+
+    /// <summary>
+    /// Observes the age of this partition's oldest pending WAL write once per leadership tick and
+    /// reports a durable-write stall episode: one warning when the age crosses
+    /// <paramref name="threshold"/>, a reminder every <see cref="WalStallReminderInterval"/> while it
+    /// stays above it, and one line when it clears carrying how long the episode lasted. A zero
+    /// threshold disables the lines. The attribution the lines exist for: the backlog and queue-depth
+    /// gauges rise whenever a node is behind; this rises only while the storage engine is not
+    /// answering, which is what tells a device episode apart from slow code.
+    /// </summary>
+    public void ObserveWalStall(double pendingWriteAgeMs, TimeSpan threshold, long nowTicks)
+    {
+        if (threshold <= TimeSpan.Zero)
+            return;
+
+        bool stalled = pendingWriteAgeMs >= threshold.TotalMilliseconds;
+
+        if (!stalled)
+        {
+            if (walStallSinceTicks == 0)
+                return;
+
+            double lastedMs = (nowTicks - walStallSinceTicks) * 1000.0 / Stopwatch.Frequency;
+            walStallSinceTicks = 0;
+
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Durable-write stall cleared after {LastedMs:F0} ms: the storage engine is answering WAL writes again (oldest pending now {AgeMs:F0} ms)",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, lastedMs, pendingWriteAgeMs);
+            return;
+        }
+
+        if (walStallSinceTicks == 0)
+        {
+            walStallSinceTicks = nowTicks;
+            lastWalStallReminderTicks = nowTicks;
+
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Durable-write stall: the oldest pending WAL write has been unanswered by the storage engine for {AgeMs:F0} ms (threshold {Threshold}) — the device under this node is not answering; reminder every {Interval} while it persists. Term={CurrentTerm}",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, pendingWriteAgeMs, threshold, WalStallReminderInterval, coreState.CurrentTerm);
+            return;
+        }
+
+        if ((nowTicks - lastWalStallReminderTicks) * 1000.0 / Stopwatch.Frequency < WalStallReminderInterval.TotalMilliseconds)
+            return;
+
+        lastWalStallReminderTicks = nowTicks;
+
+        logger.LogWarning(
+            "[{LocalEndpoint}/{PartitionId}/{State}] Durable-write stall continues: the oldest pending WAL write has been unanswered for {AgeMs:F0} ms. Term={CurrentTerm}",
+            host.LocalEndpoint, host.PartitionId, coreState.NodeState, pendingWriteAgeMs, coreState.CurrentTerm);
     }
 
     /// <summary>

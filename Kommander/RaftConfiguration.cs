@@ -794,6 +794,36 @@ public class RaftConfiguration
     /// </summary>
     public TimeSpan ProposalTimeout { get; set; } = TimeSpan.FromSeconds(10);
 
+    // ── Local durable-write stall ────────────────────────────────────────────
+
+    /// <summary>
+    /// How long a leader's own WAL write may stay unanswered by the storage engine before the leader
+    /// steps down. Raft's election timing measures a leader's <i>network</i> liveness — a leader whose
+    /// disk has paused keeps heartbeating, so its followers never elect, while every proposal it
+    /// accepts waits on an fsync that is not coming. This watchdog measures its <i>durability</i>
+    /// liveness instead: once the oldest pending WAL write for a partition is older than this, the
+    /// leader demotes itself in the same term, fails its waiting proposals so callers re-route, sends
+    /// a step-down notice to the most caught-up peer so the successor's election starts within a
+    /// round trip, and refuses to campaign again until its own write completes.
+    /// <para>
+    /// Default 3 s: an order of magnitude above a healthy NVMe's sync tail under sustained load
+    /// (a measured p99 of 260 ms) so ordinary excursions never move leadership, and well inside the
+    /// budgets consumers put on a commit (CamusDB retries a finalize for 15 s), so a stalled leader
+    /// is shed before those budgets are exhausted. <see cref="TimeSpan.Zero"/> disables the watchdog
+    /// and the candidacy gate.
+    /// </para>
+    /// </summary>
+    public TimeSpan WalStallStepDownTimeout { get; set; } = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    /// Age past which a pending WAL write on this node (leader or follower) is reported in the log as a
+    /// stall: one warning when the oldest pending write crosses it, a reminder every 10 s while it
+    /// persists, and one line when it clears carrying how long it lasted. The continuous signal is the
+    /// <c>raft.wal.oldest_pending_write_age_ms</c> gauge and the <c>raft.wal.write_duration_ms</c>
+    /// histogram. Default 500 ms; <see cref="TimeSpan.Zero"/> disables the log lines only.
+    /// </summary>
+    public TimeSpan WalStallWarnThreshold { get; set; } = TimeSpan.FromMilliseconds(500);
+
     // ── Promotion-gate self-repair ───────────────────────────────────────────
 
     /// <summary>
@@ -1656,6 +1686,14 @@ public class RaftConfiguration
         if (SlowNodeFloorMs < 0)
             throw new RaftException(
                 $"[Kommander] SlowNodeFloorMs ({SlowNodeFloorMs}) must not be negative.");
+
+        if (WalStallStepDownTimeout < TimeSpan.Zero)
+            throw new RaftException(
+                $"[Kommander] WalStallStepDownTimeout ({WalStallStepDownTimeout}) must not be negative; use zero to disable the watchdog.");
+
+        if (WalStallWarnThreshold < TimeSpan.Zero)
+            throw new RaftException(
+                $"[Kommander] WalStallWarnThreshold ({WalStallWarnThreshold}) must not be negative; use zero to disable the log lines.");
 
         // A frame the receiver refuses tears the replication stream down and is re-shipped only to
         // be refused again, so a sender bound above the receive limit is a guaranteed replication

@@ -248,6 +248,27 @@ internal sealed class ElectionCoordinator
     /// </summary>
     private bool ShouldDeferCandidacy()
     {
+        // A node whose own WAL write is stalled must not campaign: it would win on log freshness (a
+        // deposed leader's log is the freshest by construction), then hold the partition again with a
+        // disk that is not answering — exactly the leadership the step-down watchdog just shed. Unlike
+        // the gap deferral below this is not bounded by a count: the condition is a local fact that
+        // clears the moment the write completes, and while it holds every round yielded is a round a
+        // healthy peer can win. Logged once per episode.
+        if (IsLocalWalStalled())
+        {
+            if (!walStallDeferralLogged)
+            {
+                walStallDeferralLogged = true;
+                logger.LogWarning(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] Deferring candidacy: this node's oldest pending WAL write has been unanswered for {AgeMs:F0} ms (bound {Bound}) — a stalled disk must not win the term; yielding until the write completes",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, wal.GetOldestPendingWriteAgeMs(), host.Configuration.WalStallStepDownTimeout);
+            }
+
+            return true;
+        }
+
+        walStallDeferralLogged = false;
+
         if (!wal.HasPresenceGap() || !KnowsFresherAliveVoter(wal.GetPresentIndex()))
         {
             candidacyDeferrals = 0;
@@ -265,6 +286,20 @@ internal sealed class ElectionCoordinator
 
         return true;
     }
+
+    /// <summary>
+    /// True while this node's own oldest pending WAL write is older than
+    /// <see cref="RaftConfiguration.WalStallStepDownTimeout"/> — the same bound that demotes a leader,
+    /// so a node that just stepped down for it is also barred from the next term. False when the
+    /// watchdog is disabled.
+    /// </summary>
+    internal bool IsLocalWalStalled()
+    {
+        TimeSpan bound = host.Configuration.WalStallStepDownTimeout;
+        return bound > TimeSpan.Zero && wal.GetOldestPendingWriteAgeMs() >= bound.TotalMilliseconds;
+    }
+
+    private bool walStallDeferralLogged;
 
     /// <summary>
     /// The campaign back-off "heard from the expected leader recently" test, shared by
@@ -348,6 +383,11 @@ internal sealed class ElectionCoordinator
         discoveryGateWarned = false;
 
         long nowTicks = host.GetMonotonicTimestamp();
+
+        // A stalled disk never campaigns, whether this election was reached by timeout or by a
+        // step-down notice from a peer (which skips the cooldown block below).
+        if (IsLocalWalStalled() && ShouldDeferCandidacy())
+            return;
 
         if (!ignoreRecentVoteCooldown)
         {

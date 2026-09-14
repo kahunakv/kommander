@@ -47,6 +47,30 @@ public static class KommanderMetrics
             unit: "ms",
             description: "Per-operation dispatch latency in the partition executor, by operation class.");
 
+    /// <summary>
+    /// Time one group WAL batch spent inside the storage engine's write call, success or failure alike,
+    /// tagged by <c>result</c>. The commit-wait EWMA averages this away; the histogram keeps a single
+    /// hung fsync readable as its max.
+    /// </summary>
+    internal static readonly Histogram<double> WalWriteDurationMs =
+        Meter.CreateHistogram<double>(
+            "raft.wal.write_duration_ms",
+            unit: "ms",
+            description: "Storage-engine write time per group WAL batch, success or failure, tagged by result.");
+
+    internal static readonly KeyValuePair<string, object?> WalWriteResultOk = new("result", "ok");
+    internal static readonly KeyValuePair<string, object?> WalWriteResultErrored = new("result", "errored");
+
+    /// <summary>
+    /// Leaders that stepped down because their own WAL write had been pending past
+    /// <see cref="RaftConfiguration.WalStallStepDownTimeout"/>: a leader whose disk stops answering
+    /// yields to a replica whose disk is healthy instead of holding the partition until an election.
+    /// </summary>
+    internal static readonly Counter<long> WalStallStepDownsTotal =
+        Meter.CreateCounter<long>(
+            "raft.leader.wal_stall_step_downs_total",
+            description: "Leader step-downs triggered by the local WAL write stall watchdog.");
+
     // ── WAL storage engine ────────────────────────────────────────────────────
 
     /// <summary>
@@ -422,6 +446,12 @@ public static class KommanderMetrics
             description: "Current number of pending-or-in-flight WAL operations per partition in the scheduler.");
 
         Meter.CreateObservableGauge(
+            "raft.wal.oldest_pending_write_age_ms",
+            MeasureWalOldestPendingWriteAges,
+            unit: "ms",
+            description: "Age of the oldest WAL operation accepted for each partition and not yet completed by the storage engine (0 when idle). Rises for as long as a write hangs; the durable-write stall signal.");
+
+        Meter.CreateObservableGauge(
             "raft.balancer.count_imbalance",
             static () => BalancerCountImbalance,
             description: "Max node leadership count minus target (P0 leader only; 0 when balancer is off or node is not P0).");
@@ -531,6 +561,32 @@ public static class KommanderMetrics
 
             foreach (WeakReference<RaftPartitionExecutor> d in dead)
                 _registeredExecutors.Remove(d);
+        }
+        return result;
+    }
+
+    private static IEnumerable<Measurement<double>> MeasureWalOldestPendingWriteAges()
+    {
+        List<Measurement<double>> result;
+        lock (_schedulerLock)
+        {
+            result = new List<Measurement<double>>();
+            List<WeakReference<FairWalScheduler>> dead = [];
+
+            foreach (WeakReference<FairWalScheduler> wr in _registeredSchedulers)
+            {
+                if (wr.TryGetTarget(out FairWalScheduler? scheduler))
+                {
+                    foreach ((int partitionId, double ageMs) in scheduler.SnapshotPartitionOldestPendingWriteAges())
+                        result.Add(new Measurement<double>(ageMs,
+                            new KeyValuePair<string, object?>("partition_id", partitionId)));
+                }
+                else
+                    dead.Add(wr);
+            }
+
+            foreach (WeakReference<FairWalScheduler> d in dead)
+                _registeredSchedulers.Remove(d);
         }
         return result;
     }

@@ -167,6 +167,14 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         public int Depth;
 
         /// <summary>
+        /// <see cref="WALWriteOperation.EnqueueTicks"/> of the oldest operation in the batch a worker is
+        /// currently writing for this partition, or 0 while none is in flight. Together with the head of
+        /// <see cref="Ops"/> this names the oldest uncompleted operation, which is what the stall signal
+        /// (<see cref="GetPartitionOldestPendingWriteAgeMs"/>) ages. Guarded by <see cref="Lock"/>.
+        /// </summary>
+        public long InFlightOldestEnqueueTicks;
+
+        /// <summary>
         /// Per-partition EWMA of enqueue-to-durable latency in milliseconds.
         /// Updated by the worker thread after each successful Write batch.
         /// </summary>
@@ -466,6 +474,54 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// </summary>
     public int GetPartitionDepth(int partitionId) =>
         _partitions.TryGetValue(partitionId, out PartitionState? state) ? state.Depth : 0;
+
+    /// <inheritdoc />
+    public double GetPartitionOldestPendingWriteAgeMs(int partitionId) =>
+        _partitions.TryGetValue(partitionId, out PartitionState? state)
+            ? OldestPendingWriteAgeMs(state, tickSource.GetTimestamp())
+            : 0;
+
+    /// <summary>
+    /// Age of the oldest uncompleted operation across every partition this scheduler serves — the
+    /// node-wide durable-write stall signal (a group batch holds one engine write for all of them, so
+    /// one stalled fsync ages every partition in it alike). <c>0</c> when nothing is pending.
+    /// </summary>
+    public double GetOldestPendingWriteAgeMs()
+    {
+        long now = tickSource.GetTimestamp();
+        double oldest = 0;
+
+        foreach (PartitionState state in _partitions.Values)
+        {
+            double age = OldestPendingWriteAgeMs(state, now);
+            if (age > oldest)
+                oldest = age;
+        }
+
+        return oldest;
+    }
+
+    /// <summary>Per-partition snapshot of <see cref="GetPartitionOldestPendingWriteAgeMs"/> for the metrics gauge.</summary>
+    internal IEnumerable<(int PartitionId, double AgeMs)> SnapshotPartitionOldestPendingWriteAges()
+    {
+        long now = tickSource.GetTimestamp();
+        foreach (KeyValuePair<int, PartitionState> kv in _partitions)
+            yield return (kv.Key, OldestPendingWriteAgeMs(kv.Value, now));
+    }
+
+    private double OldestPendingWriteAgeMs(PartitionState state, long nowTicks)
+    {
+        long oldest;
+        lock (state.Lock)
+        {
+            // An in-flight batch always predates anything still queued behind it.
+            oldest = state.InFlightOldestEnqueueTicks != 0
+                ? state.InFlightOldestEnqueueTicks
+                : state.Ops.TryPeek(out WALWriteOperation? head) ? head.EnqueueTicks : 0;
+        }
+
+        return oldest == 0 ? 0 : Math.Max(0, (nowTicks - oldest) * 1000.0 / tickSource.Frequency);
+    }
 
     /// <summary>
     /// Returns the current EWMA enqueue-to-durable commit-wait latency in milliseconds
@@ -815,6 +871,10 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                 // the combined Write is in progress.
                 state.Scheduled = false;
                 state.InFlight  = true;
+
+                // Ops dequeue in submission order, so the first op of the batch is its oldest: the
+                // stall signal ages it until the post-write section below clears it.
+                state.InFlightOldestEnqueueTicks = pidBatch.Count > 0 ? pidBatch[0].EnqueueTicks : 0;
             }
 
             if (pidBatch.Count > 0)
@@ -829,7 +889,10 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             {
                 // Nothing to write; clear InFlight immediately.
                 lock (state.Lock)
+                {
                     state.InFlight = false;
+                    state.InFlightOldestEnqueueTicks = 0;
+                }
             }
         }
 
@@ -895,6 +958,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
         // ── Phase 2: single cross-partition WAL write ──────────────────────
         RaftOperationStatus status;
+        long writeStartTicks = tickSource.GetTimestamp();
 
         try
         {
@@ -935,6 +999,14 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         double ticksToMs = 1000.0 / tickSource.Frequency;
 
         KommanderMetrics.WalBatchesTotal.Add(1);
+
+        // The engine's answer time for this batch, success or failure alike. The commit-wait EWMA
+        // below is fed by completed batches too, but as an average it hides a single slow fsync;
+        // the histogram keeps the max readable from a scrape, and a batch that errored is still a
+        // measurement of how long the engine held the worker.
+        KommanderMetrics.WalWriteDurationMs.Record(
+            (doneAtTicks - writeStartTicks) * ticksToMs,
+            status == RaftOperationStatus.Success ? KommanderMetrics.WalWriteResultOk : KommanderMetrics.WalWriteResultErrored);
 
         // ── Phase 3: per-partition post-write cleanup ──────────────────────
         // Node-wide wait is accumulated across every partition in this group batch and recorded
@@ -994,6 +1066,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             {
                 state.Depth   -= pidBatch.Count;
                 state.InFlight = false;
+                state.InFlightOldestEnqueueTicks = 0;
 
                 if (state.Ops.Count > 0 && !state.Scheduled)
                 {

@@ -510,6 +510,13 @@ public sealed class RaftPartitionStateMachine
         HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         long nowTicks = host.GetMonotonicTimestamp();
 
+        // Local durable-write stall: the age of the oldest WAL write this partition handed to the storage
+        // engine that has not been answered. Read once per tick; it feeds the stall log in every state and
+        // the leader's step-down watchdog below. The candidacy gate reads it again when a follower would
+        // campaign (ElectionCoordinator).
+        double pendingWriteAgeMs = wal.GetOldestPendingWriteAgeMs();
+        logThrottle.ObserveWalStall(pendingWriteAgeMs, host.Configuration.WalStallWarnThreshold, nowTicks);
+
         // Read-index expiry runs in every node state, before any early return (including the
         // leader's quiesced one): on the leader it bounds rounds and chained waiters; on
         // followers it bounds WaitLocalApplication applied-frontier waiters — a stable follower
@@ -566,6 +573,18 @@ public sealed class RaftPartitionStateMachine
                 if (host.Configuration.EnableCheckQuorum && readIndex.ShouldStepDownOnQuorumLoss(nowTicks))
                 {
                     await StepDownOnQuorumLossAsync().ConfigureAwait(false);
+                    return;
+                }
+
+                // Durable-write stall watchdog: this leader's own WAL write has been unanswered by the
+                // storage engine for longer than the bound. Its network liveness is intact — heartbeats
+                // keep flowing, so no follower will elect on its own — but every proposal it accepts is
+                // waiting on an fsync that is not coming. Yield the partition to a replica whose disk is
+                // answering, before the callers of those proposals exhaust their budgets.
+                TimeSpan stallStepDown = host.Configuration.WalStallStepDownTimeout;
+                if (stallStepDown > TimeSpan.Zero && pendingWriteAgeMs >= stallStepDown.TotalMilliseconds)
+                {
+                    await StepDownOnWalStallAsync(pendingWriteAgeMs).ConfigureAwait(false);
                     return;
                 }
 
@@ -1934,6 +1953,75 @@ public sealed class RaftPartitionStateMachine
         await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
     }
 
+
+    /// <summary>
+    /// Durable-write stall step-down: this leader's own WAL write has been pending past
+    /// <see cref="RaftConfiguration.WalStallStepDownTimeout"/>. Same-term voluntary demotion with the
+    /// bookkeeping of <see cref="StepDownAsync"/> — in particular <see cref="FailAllActiveProposalWaiters"/>,
+    /// so every caller waiting on a proposal is answered now and re-routes to the successor instead of
+    /// waiting out its own timeout — plus a step-down notice to the most caught-up peer. Unlike the
+    /// check-quorum step-down the network is healthy by hypothesis, so the notice cuts the failover to
+    /// about one round trip instead of an election timeout. <c>LastHeartbeatTicks</c> is re-anchored so
+    /// this node waits a full election timeout before it could campaign, and the candidacy gate keeps it
+    /// from campaigning at all while the write is still pending: the stalled append may complete later,
+    /// and a completion from this term that lands after the demotion is caught by the leader-state fence
+    /// in the WAL completion router (the caller is failed, nothing fans out).
+    /// </summary>
+    private async Task StepDownOnWalStallAsync(double pendingWriteAgeMs)
+    {
+        HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        RaftNode? stepDownTarget = SelectStepDownTarget();
+        long nowTicks = host.GetMonotonicTimestamp();
+
+        logger.LogWarning(
+            "[{LocalEndpoint}/{PartitionId}/{State}] Durable-write stall: this leader's oldest pending WAL write has been unanswered for {AgeMs:F0} ms (step-down bound {Bound}) — stepping down in term {CurrentTerm} and notifying {Successor}; this node will not campaign again until the write completes",
+            host.LocalEndpoint, host.PartitionId, coreState.NodeState,
+            pendingWriteAgeMs, host.Configuration.WalStallStepDownTimeout, coreState.CurrentTerm,
+            stepDownTarget?.Endpoint ?? "(no peer)");
+
+        KommanderMetrics.WalStallStepDownsTotal.Add(1);
+
+        coreState.NodeState = RaftNodeState.Follower;
+        host.Leader = "";
+        coreState.LastHeartbeat = currentTime;
+        coreState.LastVotation = currentTime;
+        coreState.LastHeartbeatTicks = nowTicks;
+        coreState.LastVotationTicks = nowTicks;
+        coreState.VotingStartedAt = HLCTimestamp.Zero;
+        coreState.VotingStartedTicks = 0;
+        election.ClearExpectedLeaders();
+        tracker.ClearAll();
+        coreState.ResetLocalCommittedIndexOnDemotion();
+        FailAllActiveProposalWaiters();
+        coreState.LastProposalAt = HLCTimestamp.Zero;
+        coreState.LastProposalAtTicks = 0;
+        coreState.SetQuiesced(false);
+
+        // The proposals stuck behind the stalled write are still pending WAL operations, not active
+        // proposals: they have no quorum waiter yet, so FailAllActiveProposalWaiters does not reach their
+        // callers and they would sit until the reply timeout — the very wait this step-down exists to
+        // cut. None of them was fanned out (that runs in the write's completion), so none can commit now
+        // that this node has stepped down: answer them NodeIsNotLeader so the caller re-routes to the
+        // successor, and leave the operations tracked for the completion's leader-state fence.
+        List<ulong> stalledCallers = proposals.DetachPendingLeaderProposeReplies();
+        foreach (ulong correlationId in stalledCallers)
+            CompleteReply(correlationId, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, 0L));
+
+        if (stalledCallers.Count > 0)
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Released {Count} proposal(s) waiting on the stalled WAL write as NodeIsNotLeader so their callers re-route to the successor",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, stalledCallers.Count);
+
+        await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
+
+        if (stepDownTarget is not null)
+        {
+            host.EnqueueResponse(stepDownTarget.Endpoint, new(
+                RaftResponderRequestType.StepDownNotice,
+                stepDownTarget,
+                new StepDownNoticeRequest(host.PartitionId, coreState.CurrentTerm, currentTime, host.LocalEndpoint)));
+        }
+    }
 
     /// <summary>
     /// Follower-side snapshot install (Raft "Rule 7") — see
