@@ -179,6 +179,17 @@ public interface IRaftWalFacade
     long GetDurableCommitIndex() => GetCommitIndex();
 
     /// <summary>
+    /// The durable contiguous commit frontier this node reports to its leader in every append ack
+    /// (<see cref="Data.CompleteAppendLogsRequest.DurableIndex"/>): the highest id both resolved and
+    /// durably present with no hole below it, read fresh (it regresses with a failed write, unlike
+    /// <see cref="GetDurableCommitIndex"/>) and never ahead of what the storage engine has answered
+    /// (unlike <see cref="GetCommitIndex"/>, which advances at enqueue). The leader holds WAL
+    /// retention on this value only. Defaults to <see cref="GetDurableCommitIndex"/> for facades that
+    /// do not track durability.
+    /// </summary>
+    long GetDurableCommitFrontier() => GetDurableCommitIndex();
+
+    /// <summary>
     /// Advances the in-memory contiguous commit frontier over an entry the consensus layer has
     /// PROVEN committed but whose durable marker has not landed yet — the Raft §5.4.2 inherited
     /// prior-term entry that the promotion/commit drain delivers before its lazy re-commit marker
@@ -268,6 +279,18 @@ public interface IRaftWalFacade
     /// the next election tick. Never throws for a storage failure.</para>
     /// </summary>
     ValueTask<bool> PersistHardStateAsync(long currentTerm, string? votedFor) => ValueTask.FromResult(true);
+
+    /// <summary>
+    /// Queues the hard-state write on the WAL scheduler and returns its operation, whose completion is
+    /// delivered through the partition's WAL completion path (type <c>HardState</c>). Returns null when
+    /// this facade cannot queue one (test stubs), in which case the caller falls back to
+    /// <see cref="PersistHardStateAsync"/>. Throws when the scheduler refuses the operation (queue full).
+    /// </summary>
+    WALWriteOperation? TryEnqueueHardState(long currentTerm, string? votedFor) => null;
+
+    /// <summary>Reports that the queued HLC high-water write for <paramref name="target"/> failed, so the
+    /// facade can regress its cached bound and retry on the next observation. Default no-op.</summary>
+    void NoteHlcFloorWriteFailed(long target) { }
 
     /// <summary>
     /// Loads the persisted hard state, or <see langword="null"/> when none exists yet (fresh node or a

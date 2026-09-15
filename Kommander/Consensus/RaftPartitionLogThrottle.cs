@@ -325,4 +325,32 @@ internal sealed class RaftPartitionLogThrottle
         lastNoProgressPauseTraceTicks   = now;
         suppressedNoProgressPauseTraces = 0;
     }
+
+    // Diagnostic throttle for the served durable-write-stall pause: probed once per entry-carrying
+    // trigger, which under load is once per ack. The episode itself is logged at Warning on entry and
+    // exit by ReplicationAckProcessor; this is the per-second Debug trace of what it withheld.
+    private long lastWalStallPauseTraceTicks;
+    private int suppressedWalStallPauseTraces;
+
+    public void LogBackfillWalStallPaused(string endpoint, long stallAgeMs, TimeSpan stalledFor)
+    {
+        long now = host.GetMonotonicTimestamp();
+
+        if (lastWalStallPauseTraceTicks != 0 && (now - lastWalStallPauseTraceTicks) < Stopwatch.Frequency)
+        {
+            suppressedWalStallPauseTraces++;
+            return;
+        }
+
+        if (logger.IsEnabled(LogLevel.Debug))
+        {
+            logger.LogDebug(
+                "[{LocalEndpoint}/{PartitionId}/{State}] DIAG backfill paused for a stalled peer peer={Endpoint} reportedStallMs={StallMs} stalledForS={StalledFor:F1} suppressedSinceLastLine={Suppressed}",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint,
+                stallAgeMs, stalledFor.TotalSeconds, suppressedWalStallPauseTraces);
+        }
+
+        lastWalStallPauseTraceTicks   = now;
+        suppressedWalStallPauseTraces = 0;
+    }
 }

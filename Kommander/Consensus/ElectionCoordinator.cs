@@ -7,6 +7,7 @@ using Kommander.Logging;
 using Kommander.Scheduling;
 using Kommander.System;
 using Kommander.Time;
+using Kommander.WAL.Data;
 using Microsoft.Extensions.Logging;
 
 namespace Kommander.Consensus;
@@ -41,6 +42,8 @@ internal sealed class ElectionCoordinator
     private readonly IRaftWalFacade wal;
     private readonly RaftPartitionCoreState coreState;
     private readonly ReplicationTracker tracker;
+
+    private readonly ProposalRegistry? proposals;
     private readonly ILogger<IRaft> logger;
 
     /// <summary>Takes office after a won election. See the class remarks for why promotion is not
@@ -74,13 +77,15 @@ internal sealed class ElectionCoordinator
         ILogger<IRaft> logger,
         Func<Task<bool>> becomeLeaderAsync,
         Action failAllActiveProposalWaiters,
-        Func<bool, Task> sendHeartbeat)
+        Func<bool, Task> sendHeartbeat,
+        ProposalRegistry? proposals = null)
     {
         this.host = host;
         this.wal = wal;
         this.coreState = coreState;
         this.tracker = tracker;
         this.logger = logger;
+        this.proposals = proposals;
         this.becomeLeaderAsync = becomeLeaderAsync;
         this.failAllActiveProposalWaiters = failAllActiveProposalWaiters;
         this.sendHeartbeat = sendHeartbeat;
@@ -822,7 +827,7 @@ internal sealed class ElectionCoordinator
             // before any log write would regress the term on restart. A grant below overwrites votedFor.
             // A rejected write is tolerated: the term stays adopted in memory, and a crash may regress it,
             // which is safe because no vote was recorded in it (a grant below persists on its own).
-            if (!await wal.PersistHardStateAsync(coreState.CurrentTerm, null).ConfigureAwait(false))
+            if (!await PersistHardStateNonBlockingAsync(coreState.CurrentTerm, null).ConfigureAwait(false))
             {
                 logger.LogWarnHardStateNotPersisted(
                     host.LocalEndpoint, host.PartitionId, coreState.NodeState, coreState.CurrentTerm, null,
@@ -859,14 +864,73 @@ internal sealed class ElectionCoordinator
         // bookkeeping so a rejected write leaves nothing to undo: the vote is simply withheld, because a
         // vote the node cannot remember across a crash is exactly the double-vote hazard above. The
         // candidate asks again on its next round, and the grant succeeds once the WAL accepts writes.
+        //
+        // The write is queued on the WAL scheduler rather than awaited on this thread wherever the
+        // facade allows it: on a stalled disk the synchronous write held the partition executor for the
+        // length of the stall, so a node that had just stepped down for that stall could neither vote
+        // for its successor nor process the successor's appends and learn it (CamusDB run sd4:
+        // `RequestVote took 10807ms`). The vote is RESERVED in memory now — expectedLeaders — so no
+        // other candidate can be granted this term while the write is pending, and the reply leaves
+        // only from the write's completion. A crash before completion forgets the reservation, which
+        // is safe: no reply was sent, so no vote was cast.
+        expectedLeaders[voteTerm] = node.Endpoint;
+
+        if (proposals is not null && TryQueueVoteGrant(node, voteTerm, timestamp, localMaxId, localLastLogTerm))
+            return;
+
         if (!await wal.PersistHardStateAsync(voteTerm, node.Endpoint).ConfigureAwait(false))
         {
+            expectedLeaders.Remove(voteTerm);
             logger.LogWarnHardStateNotPersisted(
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState, voteTerm, node.Endpoint,
                 "vote grant", "Vote withheld; the candidate may ask again.");
             return;
         }
 
+        SendVoteGrant(node, voteTerm, timestamp, localMaxId, localLastLogTerm);
+    }
+
+    /// <summary>
+    /// Queues the vote's hard-state write and arranges for <see cref="SendVoteGrant"/> to run from its
+    /// completion. False when the facade cannot queue (test stubs) or the WAL queue is full, in which
+    /// case the caller persists synchronously as before.
+    /// </summary>
+    private bool TryQueueVoteGrant(RaftNode node, long voteTerm, HLCTimestamp timestamp, long localMaxId, long localLastLogTerm)
+    {
+        WALWriteOperation? operation;
+        try
+        {
+            operation = wal.TryEnqueueHardState(voteTerm, node.Endpoint);
+        }
+        catch (WAL.IO.BackpressureExceededException)
+        {
+            return false;
+        }
+
+        if (operation is null)
+            return false;
+
+        RaftPendingWalOperation pending = proposals!.RentPending();
+        pending.OnHardStatePersisted = persisted =>
+        {
+            // The completion is term-fenced upstream, so a vote whose term the cluster has already left
+            // never reaches here; a rejected write withholds the vote and releases the reservation so the
+            // candidate's next round can be granted once the engine answers.
+            if (persisted && coreState.CurrentTerm == voteTerm && expectedLeaders.GetValueOrDefault(voteTerm, "") == node.Endpoint)
+                SendVoteGrant(node, voteTerm, timestamp, localMaxId, localLastLogTerm);
+            else if (!persisted && expectedLeaders.GetValueOrDefault(voteTerm, "") == node.Endpoint)
+                expectedLeaders.Remove(voteTerm);
+
+            return Task.CompletedTask;
+        };
+        proposals.TrackPending(operation.OperationId, pending);
+
+        return true;
+    }
+
+    /// <summary>The grant bookkeeping and reply, run only once the vote is durable.</summary>
+    private void SendVoteGrant(RaftNode node, long voteTerm, HLCTimestamp timestamp, long localMaxId, long localLastLogTerm)
+    {
         coreState.LastHeartbeat = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, timestamp);
         coreState.LastVotation = coreState.LastHeartbeat;
 
@@ -883,6 +947,27 @@ internal sealed class ElectionCoordinator
         VoteRequest request = new(host.PartitionId, voteTerm, localMaxId, localLastLogTerm, timestamp, host.LocalEndpoint);
 
         host.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.Vote, node, request));
+    }
+
+    /// <summary>
+    /// Persists <c>(currentTerm, votedFor)</c> without holding the executor on the storage engine: queued
+    /// on the WAL scheduler when the facade supports it (the completion logs a rejection), awaited inline
+    /// otherwise (test stubs). False only when the write could not even be queued (WAL queue full), which
+    /// callers treat like a rejected synchronous write.
+    /// </summary>
+    internal async ValueTask<bool> PersistHardStateNonBlockingAsync(long term, string? votedFor)
+    {
+        try
+        {
+            if (wal.TryEnqueueHardState(term, votedFor) is not null)
+                return true;
+        }
+        catch (WAL.IO.BackpressureExceededException)
+        {
+            return false;
+        }
+
+        return await wal.PersistHardStateAsync(term, votedFor).ConfigureAwait(false);
     }
 
     /// <summary>

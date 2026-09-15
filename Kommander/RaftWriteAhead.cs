@@ -143,8 +143,42 @@ public sealed class RaftWriteAhead
             return;
 
         long target = observedL + HlcFloorSlackMs;
-        if (walAdapter.PersistHlcFloor(partition.PartitionId, target))
-            persistedHlcFloorL = target;
+
+        // Queued on the WAL scheduler, never written inline: the metadata write is cheap only while the
+        // engine answers, and written on the executor it held the partition for the length of a device
+        // stall once per slack window — the 15 s ReplicateLogs and 16 s AppendLogs dispatches of the
+        // CamusDB slow-disk runs, during which the node could neither heartbeat nor learn a new leader.
+        // The cache advances at enqueue (the scheduler is per-partition FIFO, so the bound is durable no
+        // later than the entries queued after it); a failed write regresses it through
+        // NoteHlcFloorWriteFailed so the next observation retries, and the restore path independently
+        // merges the timestamps it reads back. A full queue simply defers the write to the next call.
+        WALWriteOperation operation = new(
+            onComplete,
+            Interlocked.Increment(ref walOperationSequence),
+            WALWriteOperationType.HlcFloor,
+            (partition.PartitionId, []),
+            metadataValue: target);
+
+        try
+        {
+            manager.WalScheduler.Enqueue(operation);
+        }
+        catch (WAL.IO.BackpressureExceededException)
+        {
+            return;
+        }
+
+        persistedHlcFloorL = target;
+    }
+
+    /// <summary>
+    /// Regresses the cached HLC high-water bound after the queued write for <paramref name="target"/>
+    /// failed, so the next observed timestamp above the previous bound retries the write.
+    /// </summary>
+    public void NoteHlcFloorWriteFailed(long target)
+    {
+        if (target > 0 && persistedHlcFloorL >= target)
+            persistedHlcFloorL = target - HlcFloorSlackMs;
     }
 
     // ── Contiguous-presence frontier ─────────────────────────────────────────────────────────────
@@ -1583,6 +1617,18 @@ public sealed class RaftWriteAhead
     public long GetDurableCommitIndex() => Volatile.Read(ref publishedCommitIndex) - 1;
 
     /// <summary>
+    /// The frontier a follower REPORTS to its leader as durable: the highest id that is both resolved
+    /// (<see cref="GetCommitIndex"/>) and durably present with no hole below it, read fresh rather than
+    /// high-watered. It differs from both frontiers it is built from on purpose. The protocol frontier
+    /// advances when an append is accepted into the WAL queue, so a follower whose disk has stopped
+    /// answering keeps advertising every entry it has queued — the leader's retention floor then
+    /// followed a position the follower did not hold and compaction removed the range its backfill
+    /// needed (CamusDB slow-disk run sd8). The published index is monotone for observers, so it would
+    /// hide the failed-write regression the leader's re-ship must see. Executor thread only.
+    /// </summary>
+    public long GetDurableCommitFrontier() => Math.Min(commitIndex, durablePresentIndex) - 1;
+
+    /// <summary>
     /// Highest id durably present with no hole below it, as certified by successful completions
     /// only. Test-visible so the gating can be asserted without a scheduler round-trip.
     /// </summary>
@@ -1930,6 +1976,29 @@ public sealed class RaftWriteAhead
     /// </summary>
     public bool PersistHardState(long currentTerm, string? votedFor) =>
         walAdapter.PersistHardState(partition.PartitionId, currentTerm, votedFor);
+
+    /// <summary>
+    /// Queues the hard-state write <c>(currentTerm, votedFor)</c> on the WAL scheduler instead of running it
+    /// on the caller's thread: the metadata write is "fast" only while the storage engine answers, and on a
+    /// stalled disk the synchronous form held the partition executor for the length of the stall — a node
+    /// that had just stepped down for that stall could not vote for, or even learn, its successor until its
+    /// disk healed (CamusDB run sd4: <c>RequestVote took 10807ms</c>). The completion arrives through the
+    /// ordinary WAL completion path with the operation's term, so it is term-fenced like any other write.
+    /// Throws <see cref="WAL.IO.BackpressureExceededException"/> when the partition's queue is full.
+    /// </summary>
+    public WALWriteOperation EnqueueHardState(long currentTerm, string? votedFor)
+    {
+        WALWriteOperation operation = new(
+            onComplete,
+            Interlocked.Increment(ref walOperationSequence),
+            WALWriteOperationType.HardState,
+            (partition.PartitionId, []),
+            term: currentTerm,
+            votedFor: votedFor);
+
+        manager.WalScheduler.Enqueue(operation);
+        return operation;
+    }
 
     /// <summary>
     /// Reads this partition's persisted hard state, or <see langword="null"/> when none has been written

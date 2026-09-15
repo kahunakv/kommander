@@ -263,6 +263,20 @@ internal sealed class WalCompletionRouter
                 await CompleteFollowerAppend(completion, pending).ConfigureAwait(false);
                 break;
 
+            case WALWriteOperationType.HardState:
+                await CompleteHardState(completion, pending).ConfigureAwait(false);
+                break;
+
+            case WALWriteOperationType.HlcFloor:
+                if (completion.Status != RaftOperationStatus.Success)
+                {
+                    logger.LogWarning(
+                        "[{LocalEndpoint}/{PartitionId}/{State}] HLC high-water write for {Value} was rejected by the storage engine ({Status}); the bound stays in memory and the next observation retries",
+                        host.LocalEndpoint, host.PartitionId, coreState.NodeState, completion.MetadataValue, completion.Status);
+                    wal.NoteHlcFloorWriteFailed(completion.MetadataValue);
+                }
+                break;
+
             case WALWriteOperationType.Compaction:
             default:
                 CompleteReply(pending?.ReplyCorrelationId, RaftResponseStatic.NoneResponse);
@@ -275,6 +289,27 @@ internal sealed class WalCompletionRouter
         // double-return. The Complete* handlers have finished reading `pending` by here.
         if (found && pending is not null)
             proposals.ReturnPending(pending);
+    }
+
+    /// <summary>
+    /// Completes a hard-state write. The term and vote were adopted in memory when the write was queued;
+    /// what waited for durability is the continuation the pending record carries (a vote reply must not
+    /// leave this node before the vote is on disk, or a crash could let it vote twice in the term). A
+    /// failed write runs the continuation with false so the vote is withheld; a fire-and-forget adoption
+    /// write only logs its failure, exactly as the synchronous path tolerated it.
+    /// </summary>
+    private async Task CompleteHardState(RaftWalCompletion completion, RaftPendingWalOperation? pending)
+    {
+        bool persisted = completion.Status == RaftOperationStatus.Success;
+
+        if (!persisted)
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Hard-state write for term {Term} was rejected by the storage engine ({Status}); the term stays adopted in memory{Vote}",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, completion.Term, completion.Status,
+                pending?.OnHardStatePersisted is null ? "" : " and the vote that waited on it is withheld");
+
+        if (pending?.OnHardStatePersisted is { } continuation)
+            await continuation(persisted).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -846,7 +881,7 @@ internal sealed class WalCompletionRouter
             host.EnqueueResponse(endpoint, new(
                 RaftResponderRequestType.CompleteAppendLogs,
                 new(endpoint),
-                new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, ackStatus, ackIndex)
+                FollowerAcks.Build(host, wal, leaderTerm, timestamp, ackStatus, ackIndex)
             ));
         }
 

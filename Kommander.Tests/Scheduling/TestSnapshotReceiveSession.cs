@@ -53,7 +53,9 @@ public class TestSnapshotReceiveSession
         long ttlTicks = 1_000_000,
         int maxSessions = 8,
         long maxBytes = 1_000_000,
-        bool allowLegacySenders = false) =>
+        bool allowLegacySenders = false,
+        Func<int, double>? walStallAgeMs = null,
+        double walStallRefuseThresholdMs = 0) =>
         new(
             isDisposed: () => false,
             installOnExecutor: installOnExecutor,
@@ -63,7 +65,70 @@ public class TestSnapshotReceiveSession
             maxPendingSessions: maxSessions,
             maxPendingBytes: maxBytes,
             getMonotonicTimestamp: clock,
-            allowLegacySenders: () => allowLegacySenders);
+            allowLegacySenders: () => allowLegacySenders,
+            partitionWalStallAgeMs: walStallAgeMs,
+            walStallRefuseThresholdMs: () => walStallRefuseThresholdMs);
+
+    // ── local durable-write stall ─────────────────────────────────────────────
+
+    /// <summary>
+    /// While this node's own disk reports a stall at or above the threshold, no snapshot session is
+    /// opened: the install could not run until the disk answers, and staging the chunks meanwhile is
+    /// the memory that killed a follower after a 30 s pause (CamusDB run sd8). The sender sees a
+    /// chunk rejection and retries on its backoff; once the stall clears the opener is accepted.
+    /// </summary>
+    [Fact]
+    public async Task Opener_IsRefused_WhileTheLocalWalReportsAStall()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        CapturingInstaller installer = new();
+        double stallMs = 5_000;
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000,
+            walStallAgeMs: _ => stallMs, walStallRefuseThresholdMs: 500);
+
+        byte[] data = [1, 2, 3];
+        Assert.False((await r.ReceiveInstallSnapshot(Chunk("s1", 0, isLast: true, data), ct)).Success);
+        Assert.Equal(0, installer.InstallCallCount);
+        Assert.Equal(0, r.TotalStagedByteCount);
+
+        stallMs = 0;
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("s1", 0, isLast: true, data), ct)).Success);
+        Assert.Equal(1, installer.InstallCallCount);
+    }
+
+    /// <summary>A stall that begins after the opener does not drop the bytes already staged.</summary>
+    [Fact]
+    public async Task StallAfterTheOpener_DoesNotDropTheSession()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        CapturingInstaller installer = new();
+        double stallMs = 0;
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000,
+            walStallAgeMs: _ => stallMs, walStallRefuseThresholdMs: 500);
+
+        byte[] first = [1, 2];
+        byte[] second = [3, 4];
+        byte[] whole = [1, 2, 3, 4];
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("s2", 0, isLast: false, first, wholeSnapshot: whole), ct)).Success);
+
+        stallMs = 5_000;
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("s2", 1, isLast: true, second, wholeSnapshot: whole), ct)).Success);
+        Assert.Equal(1, installer.InstallCallCount);
+        Assert.Equal(whole, installer.ReceivedBytes);
+    }
+
+    /// <summary>A zero threshold disables the refusal, as the option's documentation says.</summary>
+    [Fact]
+    public async Task ZeroThreshold_NeverRefuses()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000,
+            walStallAgeMs: _ => 60_000, walStallRefuseThresholdMs: 0);
+
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("s3", 0, isLast: true, [9]), ct)).Success);
+        Assert.Equal(1, installer.InstallCallCount);
+    }
 
     /// <summary>
     /// Builds one chunk as a sender would, including the integrity digest on the terminal chunk.

@@ -110,4 +110,55 @@ public sealed class TestWalStallSignal
         await WaitUntilAsync(() => scheduler.GetPartitionOldestPendingWriteAgeMs(partitionId) == 0, 5_000, "the age must return to zero when nothing is pending");
         Assert.Equal(0, scheduler.GetOldestPendingWriteAgeMs());
     }
+
+    [Fact]
+    public async Task HardStateOperation_PersistsOnTheWorker_AndCompletesWithItsOwnStatus()
+    {
+        const int partitionId = 3;
+        using InMemoryWAL wal = new(NullLogger<IRaft>.Instance);
+        using FairWalScheduler scheduler = new(wal, NullLogger<IRaft>.Instance, workerCount: 1);
+        scheduler.Start();
+
+        RaftWalCompletion? completion = null;
+        WALWriteOperation op = new(c => Volatile.Write(ref completion, c), operationId: 42, WALWriteOperationType.HardState,
+            (partitionId, []), term: 7, votedFor: "localhost:9999");
+
+        scheduler.Enqueue(op);
+        await WaitUntilAsync(() => Volatile.Read(ref completion) is not null, 5_000, "the hard-state operation must complete");
+
+        RaftWalCompletion done = Volatile.Read(ref completion)!;
+        Assert.Equal(RaftOperationStatus.Success, done.Status);
+        Assert.Equal(WALWriteOperationType.HardState, done.OperationType);
+        Assert.Equal(7, done.Term);
+        Assert.Equal(42, done.OperationId);
+        Assert.Equal(-1, done.MinLogIndex);
+
+        Assert.True(((IWAL)wal).TryGetHardState(partitionId, out long term, out string? votedFor));
+        Assert.Equal(7, term);
+        Assert.Equal("localhost:9999", votedFor);
+        Assert.Equal(0, scheduler.GetPartitionOldestPendingWriteAgeMs(partitionId));
+    }
+
+    [Fact]
+    public async Task HlcFloorOperation_PersistsOnTheWorker_AndCarriesItsValue()
+    {
+        const int partitionId = 4;
+        using InMemoryWAL wal = new(NullLogger<IRaft>.Instance);
+        using FairWalScheduler scheduler = new(wal, NullLogger<IRaft>.Instance, workerCount: 1);
+        scheduler.Start();
+
+        RaftWalCompletion? completion = null;
+        WALWriteOperation op = new(c => Volatile.Write(ref completion, c), operationId: 43, WALWriteOperationType.HlcFloor,
+            (partitionId, []), metadataValue: 123_456);
+
+        scheduler.Enqueue(op);
+        await WaitUntilAsync(() => Volatile.Read(ref completion) is not null, 5_000, "the HLC floor operation must complete");
+
+        RaftWalCompletion done = Volatile.Read(ref completion)!;
+        Assert.Equal(RaftOperationStatus.Success, done.Status);
+        Assert.Equal(WALWriteOperationType.HlcFloor, done.OperationType);
+        Assert.Equal(123_456, done.MetadataValue);
+        Assert.Equal(-1, done.Term);
+        Assert.Equal(123_456, ((IWAL)wal).GetHlcFloor(partitionId));
+    }
 }

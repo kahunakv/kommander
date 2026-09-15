@@ -192,6 +192,45 @@ public sealed class TestCommitFrontierDrain
         }
     }
 
+    /// <summary>
+    /// The frontier a follower reports as DURABLE trails the protocol frontier for exactly as long as
+    /// the storage engine has not answered: accepting entries 1..3 into the queue advances
+    /// <see cref="RaftWriteAhead.GetCommitIndex"/> to 3 at once, while
+    /// <see cref="RaftWriteAhead.GetDurableCommitFrontier"/> stays at 0 until the completions land,
+    /// and follows them contiguously. A leader holding WAL retention on the protocol frontier of a
+    /// follower whose disk had stalled compacted the very range the follower later needed (CamusDB
+    /// slow-disk run sd8); the durable frontier is what it must hold on instead.
+    /// </summary>
+    [Fact]
+    public void DurableCommitFrontier_TrailsTheProtocolFrontier_UntilTheEngineAnswers()
+    {
+        RaftWriteAhead writeAhead = CreateWriteAhead(out RaftManager manager, out RaftPartition partition);
+
+        try
+        {
+            Append(writeAhead, Committed(1), Committed(2), Committed(3));
+            Assert.Equal(3, writeAhead.GetCommitIndex());
+            Assert.Equal(0, writeAhead.GetDurableCommitFrontier());
+
+            // The engine answers for 1..2 only: the durable frontier follows, still below the protocol one.
+            writeAhead.MarkDurablyWritten(1, 2, null);
+            Assert.Equal(2, writeAhead.GetDurableCommitFrontier());
+            Assert.Equal(3, writeAhead.GetCommitIndex());
+
+            // An answer above a hole certifies nothing below the hole.
+            writeAhead.MarkDurablyWritten(5, 5, null);
+            Assert.Equal(2, writeAhead.GetDurableCommitFrontier());
+
+            writeAhead.MarkDurablyWritten(3, 3, null);
+            Assert.Equal(3, writeAhead.GetDurableCommitFrontier());
+        }
+        finally
+        {
+            partition.Dispose();
+            manager.Dispose();
+        }
+    }
+
     private static void Append(RaftWriteAhead writeAhead, params RaftLog[] logs) =>
         writeAhead.EnqueueProposeOrCommit(logs.ToList());
 

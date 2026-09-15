@@ -70,7 +70,7 @@ internal sealed class ReplicationAckProcessor
         this.failAllActiveProposalWaiters = failAllActiveProposalWaiters;
     }
 
-    public async ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1)
+    public async ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1, long durableIndex = -1, long walStallMs = 0)
     {
         // ── Raft §5.1: a response stamped with a HIGHER term deposes us ─────────────────────────
         // Terms only enter a node through elections, so a higher response term proves a newer term
@@ -113,7 +113,7 @@ internal sealed class ReplicationAckProcessor
 
             // A rejected write is tolerated here: the higher term stays adopted in memory and no vote was
             // recorded in it, so a crash that regresses the term cannot produce a double vote.
-            if (!await wal.PersistHardStateAsync(coreState.CurrentTerm, null).ConfigureAwait(false))
+            if (!await election.PersistHardStateNonBlockingAsync(coreState.CurrentTerm, null).ConfigureAwait(false))
             {
                 logger.LogWarnHardStateNotPersisted(
                     host.LocalEndpoint, host.PartitionId, coreState.NodeState, coreState.CurrentTerm, null,
@@ -143,6 +143,13 @@ internal sealed class ReplicationAckProcessor
 
         if (endpoint != host.LocalEndpoint)
             host.UpdateLastNodeActivity(endpoint, host.PartitionId, currentTime);
+
+        // Two facts about the peer's DISK, valid on every term-fenced ack whatever its status: the
+        // durable contiguous frontier (the only evidence WAL retention may hold on — see
+        // ReplicationTracker.durableFrontiers) and the age of its oldest unanswered write. A stall
+        // episode is logged twice, on entry and on exit, never per ack.
+        tracker.SetDurableFrontier(endpoint, durableIndex);
+        RecordPeerWalStall(endpoint, walStallMs, committedIndex, durableIndex);
         
         // LogMismatch: the follower's log diverges at the prevLogIndex we sent.
         // committedIndex carries the follower's local max log at the time of rejection.
@@ -402,5 +409,23 @@ internal sealed class ReplicationAckProcessor
         pendingAutoCommit.Proposal = proposal;
         pendingAutoCommit.TicketId = timestamp;
         proposals.TrackPending(operation.OperationId, pendingAutoCommit);
+    }
+
+    private void RecordPeerWalStall(string endpoint, long walStallMs, long committedIndex, long durableIndex)
+    {
+        switch (tracker.RecordWalStallReport(endpoint, walStallMs))
+        {
+            case ReplicationTracker.WalStallTransition.Began:
+                logger.LogWarning(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] Peer {Endpoint} reports a durable-write stall: its oldest pending WAL write has been unanswered by its storage engine for {AgeMs} ms (durable frontier {DurableIndex}, protocol frontier {CommitIndex}, committed here {LocalCommitted}). Entry-carrying backfill and snapshot transfers to it are deferred while the stall persists — neither can land until its disk answers — and WAL retention is held at its durable frontier within CompactionLiveReplicaLagBudget",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, walStallMs, durableIndex, committedIndex, coreState.LocalCommittedIndex);
+                break;
+
+            case ReplicationTracker.WalStallTransition.Ended:
+                logger.LogWarning(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] Peer {Endpoint} no longer reports a durable-write stall (durable frontier {DurableIndex}, {Behind} entries behind the committed index); backfill and snapshot transfers to it resume",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, durableIndex, Math.Max(0, coreState.LocalCommittedIndex - Math.Max(durableIndex, 0)));
+                break;
+        }
     }
 }

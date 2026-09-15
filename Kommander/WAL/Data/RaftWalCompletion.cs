@@ -55,5 +55,7 @@ public sealed record RaftWalCompletion(
     /// frontier that certified the skipped id from the span alone would certify an entry whose own
     /// write may have failed.
     /// </summary>
-    long[]? SparseLogIds = null
+    long[]? SparseLogIds = null,
+
+    long MetadataValue = -1
 );

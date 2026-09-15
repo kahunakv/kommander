@@ -972,19 +972,34 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             // markers batched alongside it. Off by default ⇒ always sync ⇒ byte-for-byte prior behaviour.
             bool sync = !lazyCommitMarkers;
 
-            foreach ((_, List<WALWriteOperation> ops) in groupBatches)
+            foreach ((int pid, List<WALWriteOperation> ops) in groupBatches)
                 foreach (WALWriteOperation op in ops)
                 {
+                    // Hard-state writes are metadata, not log rows: run each on this worker ahead of
+                    // the batch, with its own status, so a vote grant or a term adoption never blocks
+                    // the partition executor on the engine. Ordered before the batch write so a term
+                    // this batch's rows were written under is on disk no later than the rows.
+                    if (op.Type is WALWriteOperationType.HardState or WALWriteOperationType.HlcFloor)
+                    {
+                        op.MetadataStatus = PersistMetadata(pid, op);
+                        continue;
+                    }
+
                     logGroups.Add(op.Logs);
                     if (!sync && !AllCommittedMarkers(op.Logs.Logs))
                         sync = true;
                 }
 
-            status = walAdapter.Write(logGroups, sync);
-            Interlocked.Increment(ref _totalBatchesWritten);
-            if (sync)
-                Interlocked.Increment(ref _totalSyncBatchesWritten);
-            Interlocked.Add(ref _totalPartitionsBatched, groupBatches.Count);
+            if (logGroups.Count > 0)
+            {
+                status = walAdapter.Write(logGroups, sync);
+                Interlocked.Increment(ref _totalBatchesWritten);
+                if (sync)
+                    Interlocked.Increment(ref _totalSyncBatchesWritten);
+                Interlocked.Add(ref _totalPartitionsBatched, groupBatches.Count);
+            }
+            else
+                status = RaftOperationStatus.Success;
         }
         catch (Exception ex)
         {
@@ -1166,8 +1181,30 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         return true;
     }
 
+    private RaftOperationStatus PersistMetadata(int partitionId, WALWriteOperation op)
+    {
+        try
+        {
+            bool ok = op.Type == WALWriteOperationType.HardState
+                ? walAdapter.PersistHardState(partitionId, op.Term, op.VotedFor)
+                : walAdapter.PersistHlcFloor(partitionId, op.MetadataValue);
+
+            return ok ? RaftOperationStatus.Success : RaftOperationStatus.Errored;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(
+                "[FairWalScheduler] {Type} metadata write for partition {PartitionId} (term {Term}, vote {VotedFor}, value {Value}) threw: {Message}",
+                op.Type, partitionId, op.Term, op.VotedFor ?? "(none)", op.MetadataValue, ex.Message);
+            return RaftOperationStatus.Errored;
+        }
+    }
+
     private static RaftWalCompletion BuildCompletion(WALWriteOperation op, RaftOperationStatus status)
     {
+        if (op.Type is WALWriteOperationType.HardState or WALWriteOperationType.HlcFloor)
+            return new RaftWalCompletion(op.Logs.PartitionId, op.OperationId, op.Term, -1, -1, op.Type, op.MetadataStatus, MetadataValue: op.MetadataValue);
+
         List<RaftLog> logs = op.Logs.Logs;
         long minIndex = -1;
         long writtenMax = -1;

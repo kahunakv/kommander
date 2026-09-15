@@ -69,6 +69,8 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
 
     public long GetDurableCommitIndex() => wal.GetDurableCommitIndex();
 
+    public long GetDurableCommitFrontier() => wal.GetDurableCommitFrontier();
+
     public void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0, bool suffixTruncated = false) =>
         wal.SeedCommitFrontierFromSnapshot(snapshotIndex, snapshotTerm, suffixTruncated);
 
@@ -95,6 +97,11 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
 
     public ValueTask<bool> PersistHardStateAsync(long currentTerm, string? votedFor) =>
         ValueTask.FromResult(wal.PersistHardState(currentTerm, votedFor));
+
+    public WALWriteOperation? TryEnqueueHardState(long currentTerm, string? votedFor) =>
+        wal.EnqueueHardState(currentTerm, votedFor);
+
+    public void NoteHlcFloorWriteFailed(long target) => wal.NoteHlcFloorWriteFailed(target);
 
     public ValueTask<(long CurrentTerm, string? VotedFor)?> LoadHardStateAsync() =>
         ValueTask.FromResult(wal.LoadHardState());

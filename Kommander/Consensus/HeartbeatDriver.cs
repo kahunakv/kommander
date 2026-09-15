@@ -311,6 +311,11 @@ internal sealed class HeartbeatDriver
     ///   at, and a blank joiner on a compacted WAL is seeded by snapshot anyway. Position 0 counts
     ///   as no evidence — election seeding sets <c>matchIndex</c> to 0 optimistically for every
     ///   peer, including in-sync ones whose legacy acks never advance it.</item>
+    ///   <item>The position is the peer's DURABLE frontier (<see cref="ReplicationTracker.TryGetDurableFrontier"/>)
+    ///   whenever it reports one: the floor exists to keep a stalled follower's backfill servable,
+    ///   and a stalled follower's protocol frontier keeps rising with every entry it has queued but
+    ///   cannot write. A 30 s stall at the observed write rate is ~400,000 entries, inside the
+    ///   default 1,000,000-entry budget, so it is ridden out from the log rather than by snapshot.</item>
     ///   <item>Learners count too — a placement learner mid-catch-up is exactly the replica whose
     ///   backfill the floor must keep servable.</item>
     /// </list>
@@ -332,9 +337,31 @@ internal sealed class HeartbeatDriver
             if (host.GetNodeLiveness(node.Endpoint) != MemberLivenessState.Alive)
                 continue;
 
-            long position = tracker.GetKnownRemoteMaxLogId(node.Endpoint);
-            if (tracker.TryGetMatchIndex(node.Endpoint, out long match) && match > position)
-                position = match;
+            // DURABLE, contiguous evidence only, in this order of preference:
+            //   1. the peer's reported durable commit frontier (every term-valid ack carries it): the
+            //      highest id its disk has answered for with no hole below — the position it can be
+            //      backfilled FROM once its disk answers again;
+            //   2. its reported protocol commit frontier, for a peer from a release that does not
+            //      report durability;
+            //   3. matchIndex, the monotonic form for a peer that has reported no frontier yet.
+            // Two things are deliberately NOT used. The "known remote max": rejection acks (a
+            // saturated WAL, a LogMismatch) report the peer's RAW max log id, above any hole the
+            // rejections left, and a floor computed from it compacted exactly the range the peer's
+            // backfill needed (CamusDB runs sd4/sd5: anchored at 5551997, first available 5738747).
+            // And, when a durable report exists, the protocol frontier: a follower advances it when an
+            // append is merely QUEUED for its storage engine, so a follower whose disk had stopped
+            // answering kept reporting a frontier at the leader's commit for every entry it could not
+            // yet write; the floor followed, compaction ran to the checkpoint, and 16 s into the pause
+            // the follower's real position was 205,000 entries below the first retained entry — refused,
+            // escalated to a snapshot, OOM-killed on the install (CamusDB run sd8, camus3).
+            long position;
+            if (!tracker.TryGetDurableFrontier(node.Endpoint, out position) || position <= 0)
+            {
+                position = tracker.GetCommitFrontierOrDefault(node.Endpoint, -1);
+                if (position < 0 && tracker.TryGetMatchIndex(node.Endpoint, out long match))
+                    position = match;
+            }
+
 
             if (position <= 0)
                 continue;

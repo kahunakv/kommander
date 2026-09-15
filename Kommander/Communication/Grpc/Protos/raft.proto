@@ -96,6 +96,10 @@ message GrpcCompleteAppendLogsRequest {
   string Endpoint = 6;
   GrpcRaftOperationStatus Status = 7;
   int64 CommitIndex = 8;
+  // The follower's durable contiguous commit frontier (-1: not tracked; 0: no evidence).
+  int64 DurableIndex = 9;
+  // Age in ms of the follower's oldest unanswered WAL write; 0 when nothing is pending.
+  int64 WalStallMs = 10;
 }
 
 message GrpcCompleteAppendLogsResponse {

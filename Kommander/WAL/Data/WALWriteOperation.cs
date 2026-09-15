@@ -53,6 +53,15 @@ public sealed class WALWriteOperation
     /// </summary>
     internal long EnqueueTicks;
 
+    /// <summary>The vote recorded by a <see cref="WALWriteOperationType.HardState"/> operation (null = no vote); <see cref="Term"/> is the term.</summary>
+    public string? VotedFor { get; }
+
+    /// <summary>The value carried by a <see cref="WALWriteOperationType.HlcFloor"/> operation (the floor to persist); -1 otherwise.</summary>
+    public long MetadataValue { get; }
+
+    /// <summary>Outcome of a metadata write (<see cref="WALWriteOperationType.HardState"/>, <see cref="WALWriteOperationType.HlcFloor"/>), set by the worker that ran it; unused for other types.</summary>
+    internal RaftOperationStatus MetadataStatus = RaftOperationStatus.Success;
+
     public WALWriteOperation(
         Action<RaftWalCompletion> onComplete,
         long operationId,
@@ -63,9 +72,13 @@ public sealed class WALWriteOperation
         long term = -1,
         bool autoCommit = false,
         long logIndex = -1,
-        long truncateFloor = -1
+        long truncateFloor = -1,
+        string? votedFor = null,
+        long metadataValue = -1
     )
     {
+        VotedFor = votedFor;
+        MetadataValue = metadataValue;
         OnComplete = onComplete;
         OperationId = operationId;
         Type = type;

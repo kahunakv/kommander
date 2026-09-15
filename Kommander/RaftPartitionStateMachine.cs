@@ -365,7 +365,8 @@ public sealed class RaftPartitionStateMachine
             (endpoint, idx) =>
             {
                 tracker.AdvanceProgressFromSnapshotInstall(endpoint, idx);
-            });
+            },
+            deferTransferTo: endpoint => tracker.IsReportingWalStall(endpoint));
 
         sender = new BackfillSender(host, wal, coreState, tracker, backfillTracker, snapshotSender, logThrottle, logger);
         proposals = new ProposalRegistry(host, coreState, logger, (node, ticket, logs) => sender.AppendLogToNode(node, ticket, logs));
@@ -374,7 +375,7 @@ public sealed class RaftPartitionStateMachine
         readIndex = new ReadIndexCoordinator(host, coreState, replySink, logger, heartbeats.SendHeartbeat);
         applier = new LogApplicator(host, wal, coreState, proposals, readIndex, logger);
         snapshotInstaller = new SnapshotInstaller(host, wal, coreState, logger, AdoptLeaderAsync);
-        election = new ElectionCoordinator(host, wal, coreState, tracker, logger, BecomeLeaderAsync, FailAllActiveProposalWaiters, heartbeats.SendHeartbeat);
+        election = new ElectionCoordinator(host, wal, coreState, tracker, logger, BecomeLeaderAsync, FailAllActiveProposalWaiters, heartbeats.SendHeartbeat, proposals);
         followerAppend = new FollowerAppendHandler(host, wal, coreState, proposals, logThrottle, replySink, logger, AdoptLeaderAsync);
         ackProcessor = new ReplicationAckProcessor(host, wal, coreState, tracker, proposals, readIndex, sender, election, logThrottle, logger, FailAllActiveProposalWaiters);
         replicator = new LogReplicator(host, wal, coreState, proposals, sender, replySink, logger);
@@ -2057,12 +2058,35 @@ public sealed class RaftPartitionStateMachine
         // A rejected write is tolerated: the leader's term is adopted in memory, and the recorded vote
         // for the leader is a convenience (it stops this node voting for a rival in the same term after
         // a restart) rather than a Raft safety requirement — this node cast no vote in the election.
-        if (!await wal.PersistHardStateAsync(leaderTerm, leaderEndpoint).ConfigureAwait(false))
+        // Queued rather than awaited: the adoption is complete in memory above, and a node whose disk is
+        // stalled must still learn its successor now, not when the disk answers.
+        if (!await PersistHardStateNonBlockingAsync(leaderTerm, leaderEndpoint).ConfigureAwait(false))
         {
             logger.LogWarnHardStateNotPersisted(
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState, leaderTerm, leaderEndpoint,
                 "leader adoption", "The term and leader are adopted in memory only.");
         }
+    }
+
+    /// <summary>
+    /// Persists <c>(currentTerm, votedFor)</c> without holding the executor on the storage engine: queued
+    /// on the WAL scheduler when the facade supports it (the completion logs a rejection), awaited inline
+    /// otherwise (test stubs). Returns false only when the write could not even be queued — a full WAL
+    /// queue — which callers treat exactly like a rejected synchronous write.
+    /// </summary>
+    private async ValueTask<bool> PersistHardStateNonBlockingAsync(long term, string? votedFor)
+    {
+        try
+        {
+            if (wal.TryEnqueueHardState(term, votedFor) is not null)
+                return true;
+        }
+        catch (WAL.IO.BackpressureExceededException)
+        {
+            return false;
+        }
+
+        return await wal.PersistHardStateAsync(term, votedFor).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -2127,11 +2151,17 @@ public sealed class RaftPartitionStateMachine
     public void ReceiveHandshake(int remoteNodeId, string endpoint, long remoteMaxLogId) =>
         heartbeats.ReceiveHandshake(remoteNodeId, endpoint, remoteMaxLogId);
     /// <summary>
+    /// Age of this partition's oldest unanswered WAL write, for the snapshot receiver's stall
+    /// refusal (see <see cref="SnapshotReceiver"/>). Reads a scheduler counter; safe off the executor.
+    /// </summary>
+    internal double GetOldestPendingWriteAgeMs() => wal.GetOldestPendingWriteAgeMs();
+
+    /// <summary>
     /// Handles one follower's AppendEntries acknowledgement — see
     /// <see cref="ReplicationAckProcessor.CompleteAppendLogsAsync"/>.
     /// </summary>
-    public ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1) =>
-        ackProcessor.CompleteAppendLogsAsync(endpoint, timestamp, status, committedIndex, responseTerm);
+    public ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1, long durableIndex = -1, long walStallMs = 0) =>
+        ackProcessor.CompleteAppendLogsAsync(endpoint, timestamp, status, committedIndex, responseTerm, durableIndex, walStallMs);
     /// <summary>Proposes a batch of log entries — see <see cref="LogReplicator.ReplicateLogsAsync"/>.</summary>
     public Task ReplicateLogsAsync(List<RaftLog>? logs, bool autoCommit, ulong? replyCorrelationId) =>
         replicator.ReplicateLogsAsync(logs, autoCommit, replyCorrelationId);

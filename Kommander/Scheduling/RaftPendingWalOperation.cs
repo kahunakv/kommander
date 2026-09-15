@@ -59,10 +59,19 @@ public sealed class RaftPendingWalOperation
     /// </summary>
     public bool IsInheritedRecommit { get; set; }
 
+    /// <summary>
+    /// For a <see cref="Kommander.WAL.Data.WALWriteOperationType.HardState"/> operation: the work that had
+    /// to wait for the (currentTerm, votedFor) write to be durable — a vote reply, typically. Invoked on the
+    /// executor with true when the write succeeded, false when the engine rejected it. Null for the
+    /// fire-and-forget adoption writes, which are complete in memory before the write is even queued.
+    /// </summary>
+    public Func<bool, Task>? OnHardStatePersisted { get; set; }
+
     /// <summary>Clears every field before the instance is returned to the pool.</summary>
     internal void Reset()
     {
         ReplyCorrelationId = null;
+        OnHardStatePersisted = null;
         Proposal = null;
         TicketId = default;
         Logs = null;

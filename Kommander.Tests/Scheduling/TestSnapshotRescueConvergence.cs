@@ -238,6 +238,101 @@ public class TestSnapshotRescueConvergence
         Assert.Equal(long.MaxValue, h.Wal.PublishedReplicaFloor);
     }
 
+    /// <summary>
+    /// The floor holds at the peer's DURABLE frontier when it reports one, not at the protocol
+    /// frontier of the same ack: a follower advances the latter when an append is merely queued, so
+    /// during a disk stall it keeps rising with every entry the leader ships while the disk holds
+    /// none of them (CamusDB slow-disk run sd8: the floor followed it, compaction ran to the
+    /// checkpoint, and the follower was 205,000 entries below the first retained entry when its
+    /// real position surfaced). A durable report of 0 carries no evidence and falls back; a legacy
+    /// ack without the field keeps the last durable report.
+    /// </summary>
+    [Fact]
+    public async Task Heartbeat_HoldsRetentionAtTheDurableFrontier_NotTheProtocolOne()
+    {
+        Harness h = await Harness.BuildLeaderAsync(withTransfer: false);
+
+        await h.AckSuccess(199, durableIndex: 150);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(151, h.Wal.PublishedReplicaFloor);
+
+        // The stall: the protocol frontier races ahead of a disk that has answered for 180 only.
+        await h.AckSuccess(5_000, durableIndex: 180);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(181, h.Wal.PublishedReplicaFloor);
+
+        // A pre-report peer (no field) keeps the durable evidence it gave last.
+        await h.AckSuccess(6_000);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(181, h.Wal.PublishedReplicaFloor);
+
+        // Durable 0 is "no evidence": the protocol frontier is the best position left.
+        await h.AckSuccess(6_000, durableIndex: 0);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(6_001, h.Wal.PublishedReplicaFloor);
+    }
+
+    /// <summary>
+    /// A below-floor peer that reports a durable-write stall gets neither entry-carrying backfill
+    /// nor a snapshot transfer while the stall lasts — nothing shipped can land, and a buffered
+    /// snapshot is what OOM-killed the follower in run sd8 — and the refusal is not lost: the first
+    /// heartbeat after the stall clears escalates and the transfer completes.
+    /// </summary>
+    [Fact]
+    public async Task StalledPeer_GetsNoBackfillAndNoSnapshot_UntilItsStallClears()
+    {
+        Harness h = await Harness.BuildLeaderAsync();
+
+        await h.AckSuccess(199, durableIndex: 199, walStallMs: 5_000);
+
+        for (int round = 0; round < 3; round++)
+        {
+            h.AdvanceMs(200);
+            await h.Sm.CheckPartitionLeadershipAsync();
+        }
+
+        Assert.Equal(0, h.Transfer.ExportCalls);
+        Assert.Equal(0, h.Installs);
+        Assert.Equal(0, h.Host.EntryBatchesSent);
+        Assert.Empty(h.Sm.GetBackfillStatuses());
+        Assert.Empty(h.Sm.GetSnapshotStatuses());
+
+        // Still stalled, still deferred: a fresh report keeps the episode open.
+        await h.AckSuccess(199, durableIndex: 199, walStallMs: 9_000);
+        h.AdvanceMs(200);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(0, h.Transfer.ExportCalls);
+
+        // The disk answers: the next refused heartbeat escalates and the snapshot lands.
+        await h.AckSuccess(199, durableIndex: 199, walStallMs: 0);
+        h.AdvanceMs(200);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        await h.WaitForInstallsAsync(1);
+        Assert.Equal(1, h.Transfer.ExportCalls);
+    }
+
+    /// <summary>
+    /// A stall report is trusted only while fresh. A follower whose disk is stalled still answers
+    /// heartbeats, so a report that ages past the window means the peer stopped answering at all;
+    /// deferring on its behalf would hold repair for a node that may be gone, so the deferral lapses.
+    /// </summary>
+    [Fact]
+    public async Task StalledPeer_ReportGoesStale_DeferralLapses()
+    {
+        Harness h = await Harness.BuildLeaderAsync();
+
+        await h.AckSuccess(199, durableIndex: 199, walStallMs: 5_000);
+        h.AdvanceMs(200);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(0, h.Transfer.ExportCalls);
+
+        // Past the freshness window (2 s floor with a zero heartbeat interval) with no newer report.
+        h.AdvanceMs(3_000);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        await h.WaitForInstallsAsync(1);
+        Assert.Equal(1, h.Transfer.ExportCalls);
+    }
+
     [Fact]
     public async Task LagBudgetDisabled_PublishesNothing()
     {
@@ -321,9 +416,9 @@ public class TestSnapshotRescueConvergence
             await WaitForInstallsAsync(expectedInstalls);
         }
 
-        public Task AckSuccess(long committedIndex) =>
+        public Task AckSuccess(long committedIndex, long durableIndex = -1, long walStallMs = 0) =>
             Sm.CompleteAppendLogsAsync(Follower, Host.HybridLogicalClock.TrySendOrLocalEvent(1),
-                RaftOperationStatus.Success, committedIndex).AsTask();
+                RaftOperationStatus.Success, committedIndex, durableIndex: durableIndex, walStallMs: walStallMs).AsTask();
 
         public Task WaitForInstallsAsync(int n) =>
             WaitUntilAsync(
@@ -403,9 +498,18 @@ public class TestSnapshotRescueConvergence
         public HybridLogicalClock HybridLogicalClock { get; } = new();
         public IReadOnlyList<RaftNode> Nodes => [new(Follower)];
 
+        private int entryBatchesSent;
+
+        /// <summary>Entry-carrying AppendLogs handed to the transport for the follower (heartbeats excluded).</summary>
+        public int EntryBatchesSent => Volatile.Read(ref entryBatchesSent);
+
         public HLCTimestamp GetLastNodeActivity(string e, int p) => HLCTimestamp.Zero;
         public void UpdateLastNodeActivity(string e, int p, HLCTimestamp t) { }
-        public void EnqueueResponse(string e, RaftResponderRequest r) { }
+        public void EnqueueResponse(string e, RaftResponderRequest r)
+        {
+            if (r.AppendLogsRequest?.Logs is { Count: > 0 })
+                Interlocked.Increment(ref entryBatchesSent);
+        }
         public Task InvokeLeaderChanged(int p, string l) => Task.CompletedTask;
         public Task<bool> InvokeReplicationReceived(int p, RaftLog l) => Task.FromResult(true);
         public Task<bool> InvokeSystemReplicationReceived(int p, RaftLog l) => Task.FromResult(true);

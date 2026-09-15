@@ -13,6 +13,18 @@ public sealed class RaftRequest
     public long CommitIndex { get; }
 
     /// <summary>
+    /// <see cref="RaftRequestType.CompleteAppendLogs"/> only: the follower's durable contiguous
+    /// commit frontier (<see cref="CompleteAppendLogsRequest.DurableIndex"/>); -1 when not reported.
+    /// </summary>
+    public long DurableIndex { get; } = -1;
+
+    /// <summary>
+    /// <see cref="RaftRequestType.CompleteAppendLogs"/> only: the follower's oldest unanswered WAL
+    /// write age in ms (<see cref="CompleteAppendLogsRequest.WalStallMs"/>); 0 when nothing is pending.
+    /// </summary>
+    public long WalStallMs { get; }
+
+    /// <summary>
     /// Term of the sender's last log entry, carried on <see cref="RaftRequestType.RequestVote"/> /
     /// <see cref="RaftRequestType.ReceiveVote"/> alongside <see cref="CommitIndex"/> (the last log
     /// index) so the voter can apply the lexicographic §5.4.1 freshness check. <c>0</c> from peers
@@ -105,12 +117,16 @@ public sealed class RaftRequest
         long prevLogIndex = 0,
         long prevLogTerm = 0,
         bool quiesce = false,
-        long lastLogTerm = 0
+        long lastLogTerm = 0,
+        long durableIndex = -1,
+        long walStallMs = 0
     )
     {
         Type = type;
         Term = term;
         CommitIndex = commitIndex;
+        DurableIndex = durableIndex;
+        WalStallMs = walStallMs;
         LastLogTerm = lastLogTerm;
         Timestamp = timestamp;
         Endpoint = endpoint;

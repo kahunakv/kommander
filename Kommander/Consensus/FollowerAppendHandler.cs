@@ -141,7 +141,7 @@ internal sealed class FollowerAppendHandler
             host.EnqueueResponse(endpoint, new(
                 RaftResponderRequestType.CompleteAppendLogs, 
                 new(endpoint), 
-                new CompleteAppendLogsRequest(host.PartitionId, coreState.CurrentTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LeaderInOldTerm, -1)
+                FollowerAcks.Build(host, wal, coreState.CurrentTerm, timestamp, RaftOperationStatus.LeaderInOldTerm, -1)
             ));
             
             return;
@@ -160,7 +160,7 @@ internal sealed class FollowerAppendHandler
             host.EnqueueResponse(endpoint, new(
                 RaftResponderRequestType.CompleteAppendLogs,
                 new(endpoint),
-                new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogsFromAnotherLeader, -1)
+                FollowerAcks.Build(host, wal, leaderTerm, timestamp, RaftOperationStatus.LogsFromAnotherLeader, -1)
             ));
 
             return;
@@ -188,7 +188,7 @@ internal sealed class FollowerAppendHandler
             host.EnqueueResponse(endpoint, new(
                 RaftResponderRequestType.CompleteAppendLogs,
                 new(endpoint),
-                new CompleteAppendLogsRequest(host.PartitionId, coreState.CurrentTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogsFromAnotherLeader, -1)
+                FollowerAcks.Build(host, wal, coreState.CurrentTerm, timestamp, RaftOperationStatus.LogsFromAnotherLeader, -1)
             ));
 
             return;
@@ -253,7 +253,7 @@ internal sealed class FollowerAppendHandler
                 host.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs,
                     new(endpoint),
-                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, localMaxLog)
+                    FollowerAcks.Build(host, wal, leaderTerm, timestamp, RaftOperationStatus.LogMismatch, localMaxLog)
                 ));
                 return;
             }
@@ -310,7 +310,7 @@ internal sealed class FollowerAppendHandler
                         host.EnqueueResponse(endpoint, new(
                             RaftResponderRequestType.CompleteAppendLogs,
                             new(endpoint),
-                            new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, localMaxLog)
+                            FollowerAcks.Build(host, wal, leaderTerm, timestamp, RaftOperationStatus.LogMismatch, localMaxLog)
                         ));
                         return;
                     }
@@ -337,7 +337,7 @@ internal sealed class FollowerAppendHandler
                         host.EnqueueResponse(endpoint, new(
                             RaftResponderRequestType.CompleteAppendLogs,
                             new(endpoint),
-                            new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, repairAnchor)
+                            FollowerAcks.Build(host, wal, leaderTerm, timestamp, RaftOperationStatus.LogMismatch, repairAnchor)
                         ));
                         return;
                     }
@@ -355,7 +355,7 @@ internal sealed class FollowerAppendHandler
                     host.EnqueueResponse(endpoint, new(
                         RaftResponderRequestType.CompleteAppendLogs,
                         new(endpoint),
-                        new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, newMax)
+                        FollowerAcks.Build(host, wal, leaderTerm, timestamp, RaftOperationStatus.LogMismatch, newMax)
                     ));
                     return;
                 }
@@ -366,7 +366,7 @@ internal sealed class FollowerAppendHandler
                 host.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs,
                     new(endpoint),
-                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, localMaxLog)
+                    FollowerAcks.Build(host, wal, leaderTerm, timestamp, RaftOperationStatus.LogMismatch, localMaxLog)
                 ));
                 return;
             }
@@ -395,7 +395,7 @@ internal sealed class FollowerAppendHandler
                 host.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs,
                     new(endpoint),
-                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, localMaxLog)
+                    FollowerAcks.Build(host, wal, leaderTerm, timestamp, RaftOperationStatus.LogMismatch, localMaxLog)
                 ));
                 return;
             }
@@ -441,7 +441,7 @@ internal sealed class FollowerAppendHandler
                 host.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs,
                     new(endpoint),
-                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.FollowerWalSaturated, saturatedMax)
+                    FollowerAcks.Build(host, wal, leaderTerm, timestamp, RaftOperationStatus.FollowerWalSaturated, saturatedMax)
                 ));
                 return;
             }
@@ -480,8 +480,7 @@ internal sealed class FollowerAppendHandler
                 host.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs,
                     new(endpoint),
-                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.Success,
-                        wal.GetCommitIndex())
+                    FollowerAcks.Build(host, wal, leaderTerm, timestamp, RaftOperationStatus.Success, wal.GetCommitIndex())
                 ));
             }
             else if (durableMax >= alreadyHeldMax)
@@ -495,7 +494,7 @@ internal sealed class FollowerAppendHandler
                 host.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs,
                     new(endpoint),
-                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, presentIndexAtReack)
+                    FollowerAcks.Build(host, wal, leaderTerm, timestamp, RaftOperationStatus.LogMismatch, presentIndexAtReack)
                 ));
             }
 
@@ -517,7 +516,7 @@ internal sealed class FollowerAppendHandler
         host.EnqueueResponse(endpoint, new(
             RaftResponderRequestType.CompleteAppendLogs,
             new(endpoint),
-            new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.Success, reportedCommittedIndex)
+            FollowerAcks.Build(host, wal, leaderTerm, timestamp, RaftOperationStatus.Success, reportedCommittedIndex)
         ));
 
         // Level-triggered hole report (DST FINDING 1: a hole smaller than BackfillThreshold was
@@ -555,7 +554,7 @@ internal sealed class FollowerAppendHandler
                 host.EnqueueResponse(endpoint, new(
                     RaftResponderRequestType.CompleteAppendLogs,
                     new(endpoint),
-                    new CompleteAppendLogsRequest(host.PartitionId, leaderTerm, timestamp, host.LocalEndpoint, RaftOperationStatus.LogMismatch, holeAnchor)
+                    FollowerAcks.Build(host, wal, leaderTerm, timestamp, RaftOperationStatus.LogMismatch, holeAnchor)
                 ));
             }
         }

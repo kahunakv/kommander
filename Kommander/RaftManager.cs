@@ -561,7 +561,14 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             this.configuration.SnapshotMaxPendingSessions,
             this.configuration.SnapshotMaxPendingBytes,
             () => this.configuration.TickSource.GetTimestamp(),
-            () => this.configuration.AllowLegacySnapshotSenders);
+            () => this.configuration.AllowLegacySnapshotSenders,
+            partitionWalStallAgeMs: partitionId =>
+                TryGetPartition(partitionId, out RaftPartition? stalledPartition) && stalledPartition is not null
+                    ? stalledPartition.GetOldestPendingWriteAgeMs()
+                    : 0,
+            walStallRefuseThresholdMs: () => this.configuration.WalStallWarnThreshold > TimeSpan.Zero
+                ? this.configuration.WalStallWarnThreshold.TotalMilliseconds
+                : 500);
 
         clusterHandler = new(this, discovery);
 

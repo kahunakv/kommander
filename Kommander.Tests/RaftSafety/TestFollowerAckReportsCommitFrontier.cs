@@ -38,6 +38,12 @@ public sealed class TestFollowerAckReportsCommitFrontier
 
     private const long FollowerAppendOperationId = 4242;
 
+    /// <summary>The durable contiguous frontier the stub WAL reports: the engine has answered through 2.</summary>
+    private const long DurableFrontier = 2;
+
+    /// <summary>The stub WAL's oldest unanswered write age.</summary>
+    private const double PendingWriteAgeMs = 1234.6;
+
     internal sealed class StubHost : IRaftPartitionHost
     {
         private readonly RaftConfiguration _config = new()
@@ -88,6 +94,12 @@ public sealed class TestFollowerAckReportsCommitFrontier
 
         /// <summary>The gap-aware frontier: stops at the hole, well below the raw batch max.</summary>
         public long GetCommitIndex() => GapAwareCommitFrontier;
+
+        /// <summary>What the disk has answered for: one entry behind the protocol frontier.</summary>
+        public long GetDurableCommitFrontier() => DurableFrontier;
+
+        /// <summary>The oldest queued write has gone unanswered this long.</summary>
+        public double GetOldestPendingWriteAgeMs() => PendingWriteAgeMs;
 
         public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp ts, bool autoCommit) => MakeNoOp();
         public WALWriteOperation EnqueueCommit(List<RaftLog> logs) => MakeNoOp();
@@ -162,5 +174,82 @@ public sealed class TestFollowerAckReportsCommitFrontier
 
         Assert.Equal(GapAwareCommitFrontier, ack.CommitIndex);
         Assert.NotEqual(RawBatchMaxOverTheGap, ack.CommitIndex);
+    }
+
+    /// <summary>
+    /// Every ack — the completion ack of an entry-carrying append and the immediate ack of an empty
+    /// heartbeat alike — carries the follower's durable contiguous frontier and the age of its
+    /// oldest unanswered write, beside the protocol frontier it already reported. The leader holds
+    /// WAL retention on the first and defers backfill and snapshots on the second; a heartbeat ack
+    /// that reported only the protocol frontier let a stalled follower look caught up for every
+    /// entry it had merely queued (CamusDB slow-disk run sd8).
+    /// </summary>
+    [Fact]
+    public async Task FollowerAck_CarriesDurableFrontierAndStallAge_OnCompletionAndHeartbeatAcks()
+    {
+        StubHost host = new();
+        GappyWal wal = new();
+        RelaySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+        using RaftPartitionExecutor executor = new(sm, 0, slowThresholdMs: 0, NullLogger<IRaft>.Instance);
+        sink.Executor = executor;
+        executor.Start();
+        await executor.RestoreTask;
+
+        HLCTimestamp timestamp = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+
+        executor.Post(new RaftRequest(
+            RaftRequestType.AppendLogs,
+            term: 1,
+            timestamp: timestamp,
+            endpoint: "leader-node",
+            logs: [new RaftLog { Id = RawBatchMaxOverTheGap, Type = RaftLogType.Committed }]));
+
+        await executor.DrainAsync(TestContext.Current.CancellationToken)
+            .WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+        host.EnqueuedResponses.Clear();
+
+        await executor.Ask(
+            new RaftRequest(
+                RaftRequestType.WriteOperationCompleted,
+                new RaftWalCompletion(
+                    PartitionId: 0,
+                    OperationId: FollowerAppendOperationId,
+                    Term: -1,
+                    MinLogIndex: RawBatchMaxOverTheGap,
+                    MaxLogIndex: RawBatchMaxOverTheGap,
+                    OperationType: WALWriteOperationType.FollowerAppend,
+                    Status: RaftOperationStatus.Success)),
+            TestContext.Current.CancellationToken);
+
+        CompleteAppendLogsRequest completionAck = host.EnqueuedResponses
+            .Select(x => x.Request.CompleteAppendLogsRequest)
+            .OfType<CompleteAppendLogsRequest>()
+            .Single();
+
+        Assert.Equal(GapAwareCommitFrontier, completionAck.CommitIndex);
+        Assert.Equal(DurableFrontier, completionAck.DurableIndex);
+        Assert.Equal((long)PendingWriteAgeMs, completionAck.WalStallMs);
+
+        host.EnqueuedResponses.Clear();
+
+        // An empty heartbeat is acked at once, from the same facts.
+        await executor.Ask(new RaftRequest(
+            RaftRequestType.AppendLogs,
+            term: 1,
+            timestamp: host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            endpoint: "leader-node",
+            logs: null), TestContext.Current.CancellationToken);
+
+        CompleteAppendLogsRequest heartbeatAck = host.EnqueuedResponses
+            .Select(x => x.Request.CompleteAppendLogsRequest)
+            .OfType<CompleteAppendLogsRequest>()
+            .Single();
+
+        Assert.Equal(RaftOperationStatus.Success, heartbeatAck.Status);
+        Assert.Equal(GapAwareCommitFrontier, heartbeatAck.CommitIndex);
+        Assert.Equal(DurableFrontier, heartbeatAck.DurableIndex);
+        Assert.Equal((long)PendingWriteAgeMs, heartbeatAck.WalStallMs);
     }
 }

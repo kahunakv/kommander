@@ -297,6 +297,9 @@ public sealed class RaftPartition : IDisposable
     /// </summary>
     public IReadOnlyList<Data.RaftSnapshotStatus> GetSnapshotStatuses() => stateMachine.GetSnapshotStatuses();
 
+    /// <summary>Age of this partition's oldest unanswered WAL write in ms; 0 when nothing is pending.</summary>
+    internal double GetOldestPendingWriteAgeMs() => stateMachine.GetOldestPendingWriteAgeMs();
+
     /// <summary>
     /// Leader-side non-contiguous-backfill status per follower for this partition — see
     /// <see cref="IRaft.GetBackfillStatuses"/>. Empty on a healthy partition; a plain thread-safe
@@ -400,7 +403,9 @@ public sealed class RaftPartition : IDisposable
             request.Time,
             request.Endpoint,
             request.Status,
-            null
+            null,
+            durableIndex: request.DurableIndex,
+            walStallMs: request.WalStallMs
         ));
     }
 

@@ -168,14 +168,24 @@ internal sealed class SnapshotSender
         ILogger<IRaft> logger,
         Func<RaftNodeState> getNodeState,
         Func<Action<RaftRequest>?> getPostToExecutor,
-        Action<string, long> onSnapshotInstalled)
+        Action<string, long> onSnapshotInstalled,
+        Func<string, bool>? deferTransferTo = null)
     {
         this.host = host;
         this.logger = logger;
         this.getNodeState = getNodeState;
         this.getPostToExecutor = getPostToExecutor;
         this.onSnapshotInstalled = onSnapshotInstalled;
+        this.deferTransferTo = deferTransferTo ?? (static _ => false);
     }
+
+    /// <summary>
+    /// Whether a transfer to the endpoint must wait — true while the peer reports a durable-write
+    /// stall (see <c>BackfillSender.EscalateRefusalToSnapshotAsync</c>, which also logs the
+    /// deferral). Re-checked here so no present or future caller can start a transfer the peer
+    /// cannot install.
+    /// </summary>
+    private readonly Func<string, bool> deferTransferTo;
 
     /// <summary>
     /// Called on the executor thread by the refused-backfill escalation in <c>BackfillSender</c>.
@@ -188,6 +198,9 @@ internal sealed class SnapshotSender
     /// </summary>
     internal void TrySend(RaftNode node, long snapshotIndex, long leaderTerm, long lastIncludedTerm)
     {
+        if (deferTransferTo(node.Endpoint))
+            return;
+
         if (!RescueCycleAdmits(node.Endpoint))
             return;
 

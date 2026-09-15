@@ -821,6 +821,16 @@ public class RaftConfiguration
     /// persists, and one line when it clears carrying how long it lasted. The continuous signal is the
     /// <c>raft.wal.oldest_pending_write_age_ms</c> gauge and the <c>raft.wal.write_duration_ms</c>
     /// histogram. Default 500 ms; <see cref="TimeSpan.Zero"/> disables the log lines only.
+    /// <para>
+    /// The same age is what a LEADER treats as a peer's stall: every append ack carries the follower's
+    /// oldest-pending-write age, and while a peer reports one at or above this threshold the leader
+    /// ships it no entry-carrying backfill and starts no snapshot transfer to it (neither can land on a
+    /// stalled disk, and a buffered snapshot is what OOM-killed a follower after a 30 s pause), while
+    /// WAL retention is held at the peer's reported <em>durable</em> frontier within
+    /// <see cref="CompactionLiveReplicaLagBudget"/> so the catch-up is served from the log once the disk
+    /// answers. The receiving node applies the same threshold to refuse opening a snapshot session while
+    /// its own disk is stalled. With the log lines disabled the peer rules use 500 ms.
+    /// </para>
     /// </summary>
     public TimeSpan WalStallWarnThreshold { get; set; } = TimeSpan.FromMilliseconds(500);
 
@@ -1583,9 +1593,18 @@ public class RaftConfiguration
     /// below-floor condition the snapshot rescue had just repaired, so the rescue could never
     /// converge (the Caraxes <c>bank-optimistic-45m-p</c> loop). Followers only — the budget is
     /// applied on the leader from its replication tracker; it has no effect on a node's own
-    /// restart replay. Values &lt;= 0 disable the hold. Default 100000.
+    /// restart replay. Values &lt;= 0 disable the hold.
+    /// <para>
+    /// Default 1,000,000. The budget must cover the entries a live follower can miss during a device
+    /// pause and still be served from the log: at the 100,000 entries the earlier default held, a
+    /// 30-second pause on a follower under ~7,000 ops/s (CamusDB run sd4, ~300,000 entries) was
+    /// compacted past within the pause itself, the follower was seeded by a ~10 M-entry snapshot on
+    /// heal, and the install pushed it out of memory. A million entries is roughly a minute at that
+    /// rate; the retained rows cost WAL disk only while a live replica actually lags, and a replica
+    /// that is not Alive holds nothing.
+    /// </para>
     /// </summary>
-    public long CompactionLiveReplicaLagBudget { get; set; } = 100_000;
+    public long CompactionLiveReplicaLagBudget { get; set; } = 1_000_000;
 
     /// <summary>
     /// How often a partition whose compaction is clamped by the application-durability floor

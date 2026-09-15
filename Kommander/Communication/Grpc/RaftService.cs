@@ -280,7 +280,9 @@ public sealed class RaftService : Rafter.RafterBase
             new(request.TimeNode, request.TimePhysical, request.TimeCounter), 
             request.Endpoint,
             (RaftOperationStatus)request.Status,
-            request.CommitIndex
+            request.CommitIndex,
+            request.DurableIndex,
+            request.WalStallMs
         ));
         
         return completeAppendLogsResponse;
@@ -530,7 +532,9 @@ public sealed class RaftService : Rafter.RafterBase
                                     new(completeAppendLogsRequest.TimeNode, completeAppendLogsRequest.TimePhysical, completeAppendLogsRequest.TimeCounter),
                                     completeAppendLogsRequest.Endpoint,
                                     (RaftOperationStatus)completeAppendLogsRequest.Status,
-                                    completeAppendLogsRequest.CommitIndex
+                                    completeAppendLogsRequest.CommitIndex,
+                                    completeAppendLogsRequest.DurableIndex,
+                                    completeAppendLogsRequest.WalStallMs
                                 ));
 
                                 break;

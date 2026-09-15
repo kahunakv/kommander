@@ -87,6 +87,21 @@ internal sealed class BackfillSender
 
         if (logs is null || logs.Count == 0)
             request = new(host.PartitionId, coreState.CurrentTerm, timestamp, host.LocalEndpoint) { Quiesce = quiesce };
+        else if (tracker.IsBackfillPaused(node.Endpoint))
+        {
+            // The peer reported a saturated WAL queue within the backoff window. A live entry sent now is
+            // either rejected outright (more saturation acks, more churn) or accepted once the queue has
+            // a slot and lands ABOVE the entries the rejections left out — a hole the peer then reports
+            // as LogMismatch and the leader must backfill from the log. Sending nothing entry-carrying
+            // while the pause lasts lets the queue drain, and the heartbeat round's anchored backfill
+            // then closes the gap contiguously. Quorum is unaffected: the peer stays in the expected
+            // set and simply does not ack, exactly as when its append was rejected.
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] Skipping live entries for {Endpoint}: its WAL queue reported saturated; backfill resumes after the backoff",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint);
+            return;
+        }
         else
         {
             request = new(host.PartitionId, coreState.CurrentTerm, timestamp, host.LocalEndpoint, logs, prevLogIndex, prevLogTerm)
@@ -155,6 +170,21 @@ internal sealed class BackfillSender
         // a throttle attached to the heartbeat interval would not have caught it.
         if (tracker.IsBackfillPaused(node.Endpoint))
             return BackfillSendResult.SaturationPaused;
+
+        // Reported durable-write stall. The peer's acks say its storage engine has stopped answering:
+        // an entry-carrying batch shipped now can only sit in its WAL queue (or be refused as
+        // saturated), and the refusal path below must not be reached at all — a snapshot cannot
+        // land on a stalled disk either, and buffering one is what killed a follower six seconds
+        // after its heal (CamusDB run sd8). Wait, as for a saturated peer: the retention floor holds
+        // its durable position, so once the disk answers the same batch ships from the log. The
+        // anchored repair paths wait too — they are also entry-carrying, and the peer's next
+        // rejection re-records the note once it is writing again.
+        if (tracker.IsReportingWalStall(node.Endpoint, out long stallAgeMs, out TimeSpan stalledFor))
+        {
+            KommanderMetrics.RecordBackfillWalStallPause(host.PartitionId);
+            logThrottle.LogBackfillWalStallPaused(node.Endpoint, stallAgeMs, stalledFor);
+            return BackfillSendResult.SaturationPaused;
+        }
 
         // Outbound-queue saturation. Unlike the ack-driven pause above, this gate needs no reply
         // from the peer: a follower that stopped draining entirely (SIGSTOP pause, dead network)
@@ -391,6 +421,28 @@ internal sealed class BackfillSender
     {
         if (coreState.NodeState != RaftNodeState.Leader)
             return;
+
+        // Never ship a snapshot to a peer whose disk is reporting a stall: the transfer cannot be
+        // installed until the disk answers, so every chunk is buffered on the follower for the
+        // length of the stall — the memory that OOM-killed camus3 in CamusDB run sd8, six seconds
+        // after its heal, with the install still unwritten. The refusal is not lost: the peer is
+        // below the floor, and the next refused heartbeat after its stall clears escalates. Also
+        // reached from the memoized round batch, hence checked here rather than by the caller.
+        if (tracker.IsReportingWalStall(node.Endpoint, out long stallAgeMs, out TimeSpan stalledFor))
+        {
+            KommanderMetrics.RecordSnapshotDeferredForWalStall(host.PartitionId);
+
+            if (tracker.TryMarkWalStallSnapshotDeferralWarned(node.Endpoint))
+                logger.LogWarning(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] Deferring the snapshot transfer to {Endpoint}: it sits below the WAL compaction floor but reports a durable-write stall of {AgeMs} ms (for {StalledFor:F1} s so far). A transfer cannot be installed until its disk answers and would only be buffered there; it is retried on the first refused heartbeat after the stall clears",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, stallAgeMs, stalledFor.TotalSeconds);
+            else if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot transfer to {Endpoint} still deferred: durable-write stall {AgeMs} ms",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, stallAgeMs);
+
+            return;
+        }
 
         if (!snapshotSender.CanAttempt(node.Endpoint))
             return;

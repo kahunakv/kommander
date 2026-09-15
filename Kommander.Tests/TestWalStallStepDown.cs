@@ -92,7 +92,27 @@ public sealed class TestWalStallStepDown
 
         public string? GetMetaData(string key) => inner.GetMetaData(key);
 
-        public bool SetMetaData(string key, string value) => inner.SetMetaData(key, value);
+        // Hard state (term, vote) is metadata on the same engine: a real device pause holds it exactly
+        // like a log row, so the gate covers it too — this is what made a stepped-down node unable to
+        // vote for, or learn, its successor until its disk healed.
+        public bool SetMetaData(string key, string value)
+        {
+            if (!gate.IsSet)
+            {
+                StalledWrites++;
+                Interlocked.Increment(ref blockedWrites);
+                try
+                {
+                    gate.Wait();
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref blockedWrites);
+                }
+            }
+
+            return inner.SetMetaData(key, value);
+        }
 
         public (RaftOperationStatus Status, int Removed) CompactLogsOlderThan(int partitionId, long lastCheckpoint, int compactNumberEntries, int? maxTotalEntries = null) =>
             inner.CompactLogsOlderThan(partitionId, lastCheckpoint, compactNumberEntries, maxTotalEntries);
@@ -261,6 +281,18 @@ public sealed class TestWalStallStepDown
             RaftReplicationResult stalledResult = await stalledProposal.WaitAsync(TimeSpan.FromSeconds(5), ct);
             Assert.False(stalledResult.Success, "a proposal whose leader stepped down mid-write must not report success");
             Assert.True(failover.GetElapsedMilliseconds() < 8_000, $"the caller waited {failover.GetElapsedMilliseconds():F0} ms; it must be released by the step-down");
+
+            // The deposed node must LEARN its successor while its disk is still stalled: its vote for the
+            // successor's term and its adoption of the new leader are persisted through the same stalled
+            // engine, and neither may hold the partition executor — a node that cannot learn the leader
+            // cannot re-route the proposals the step-down just released (CamusDB run sd4).
+            string successorEndpoint = successor.GetLocalEndpoint();
+            await WaitUntilAsync(
+                () => leader.GetPartitionLeaderHint(Partition) == successorEndpoint,
+                timeoutMs: 3_000,
+                what: $"the stalled node must learn the successor while stalled; it believes the leader is '{leader.GetPartitionLeaderHint(Partition)}'",
+                ct);
+            Assert.True(leaderWal.BlockedWrites > 0, "the stalled node's engine must still be holding a write when it learned the successor");
 
             // While the write is still pending the deposed leader must not win the term back, however many
             // election timeouts pass: its log is the freshest, so only the candidacy gate keeps it out.

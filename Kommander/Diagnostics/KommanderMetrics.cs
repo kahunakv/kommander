@@ -223,6 +223,44 @@ public static class KommanderMetrics
         BackfillNoProgressEpisodesTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
 
     /// <summary>
+    /// Entry-carrying backfill batches not sent because the peer's acks report a durable-write stall
+    /// (<c>CompleteAppendLogsRequest.WalStallMs</c> at or above <c>WalStallWarnThreshold</c>): a
+    /// batch shipped to a stalled disk can only queue or be refused there.
+    /// </summary>
+    internal static readonly Counter<long> BackfillWalStallPausesTotal =
+        Meter.CreateCounter<long>(
+            "raft.backfill.wal_stall_pauses_total",
+            description: "Backfill batches skipped because the peer reports a durable-write stall; they ship once its disk answers.");
+
+    internal static void RecordBackfillWalStallPause(int partitionId) =>
+        BackfillWalStallPausesTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
+
+    /// <summary>
+    /// Refused-backfill escalations that did NOT start a snapshot transfer because the peer reports
+    /// a durable-write stall. One per refused heartbeat while the stall lasts; the deferral logs once
+    /// per episode.
+    /// </summary>
+    internal static readonly Counter<long> SnapshotTransfersDeferredWalStallTotal =
+        Meter.CreateCounter<long>(
+            "raft.snapshot.transfers_deferred_wal_stall_total",
+            description: "Snapshot escalations deferred because the below-floor peer reports a durable-write stall; the transfer starts once its disk answers.");
+
+    internal static void RecordSnapshotDeferredForWalStall(int partitionId) =>
+        SnapshotTransfersDeferredWalStallTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
+
+    /// <summary>
+    /// Snapshot sessions this node refused to open because its OWN disk reports a durable-write
+    /// stall (the receiver-side guard, for a leader that has not heard the peer's report).
+    /// </summary>
+    internal static readonly Counter<long> SnapshotInstallsRefusedWalStallTotal =
+        Meter.CreateCounter<long>(
+            "raft.snapshot.installs_refused_wal_stall_total",
+            description: "Snapshot sessions refused at the opener because the local WAL reports a durable-write stall.");
+
+    internal static void RecordSnapshotInstallRefusedForWalStall(int partitionId) =>
+        SnapshotInstallsRefusedWalStallTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
+
+    /// <summary>
     /// Restores whose WAL read was narrowed by the soft checkpoint: the application-durability
     /// floor sat above the last hard checkpoint, so replay started at the floor instead. This is
     /// the signal that cold-restart replay is bounded by the application's flush lag rather than

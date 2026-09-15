@@ -39,6 +39,42 @@ internal sealed class ReplicationTracker
     private readonly Dictionary<string, long> lastCommitIndexes = [];
 
     /// <summary>
+    /// Each peer's self-reported DURABLE contiguous commit frontier
+    /// (<see cref="Data.CompleteAppendLogsRequest.DurableIndex"/>), last-writer-wins, from every
+    /// term-valid ack whatever its status. This is the only positional evidence the live-replica
+    /// retention floor may use: <see cref="lastCommitIndexes"/> carries the protocol frontier, which
+    /// a follower advances when an append is merely queued for its disk — a stalled follower keeps
+    /// reporting a rising value there for every entry it cannot yet write, and a floor computed from
+    /// it compacted the range its backfill needed once the disk answered (CamusDB slow-disk run sd8:
+    /// a 205,000-entry gap opened in 16 s, refused, escalated to a snapshot that killed the node).
+    /// </summary>
+    private readonly Dictionary<string, long> durableFrontiers = [];
+
+    /// <summary>
+    /// A peer's latest durable-write stall report (<see cref="Data.CompleteAppendLogsRequest.WalStallMs"/>)
+    /// and the episode bookkeeping derived from it. Peer facts, not replication progress: they are
+    /// not cleared on step-down (they expire by freshness instead) but go with the peer on removal.
+    /// </summary>
+    private sealed class WalStallReport
+    {
+        public long AgeMs;
+        public long ReportedTicks;
+        public long BeganTicks;
+        public bool Stalled;
+        public bool SnapshotDeferralWarned;
+    }
+
+    private readonly Dictionary<string, WalStallReport> walStallReports = [];
+
+    /// <summary>Outcome of folding one stall report into a peer's episode bookkeeping.</summary>
+    public enum WalStallTransition
+    {
+        None,
+        Began,
+        Ended,
+    }
+
+    /// <summary>
     /// Where each peer's log started, as reported by handshakes and vote replies. A log id, not a
     /// committed frontier — the two are deliberately not interchangeable, which is why a vote
     /// never seeds <see cref="lastCommitIndexes"/>.
@@ -195,6 +231,7 @@ internal sealed class ReplicationTracker
     public void ClearAll()
     {
         lastCommitIndexes.Clear();
+        durableFrontiers.Clear();
         nextIndex.Clear();
         matchIndex.Clear();
         regressedFrontiers.Clear();
@@ -231,6 +268,8 @@ internal sealed class ReplicationTracker
     public bool RemovePeer(string endpoint)
     {
         bool hadProgress = lastCommitIndexes.Remove(endpoint);
+        durableFrontiers.Remove(endpoint);
+        walStallReports.Remove(endpoint);
         nextIndex.Remove(endpoint);
         matchIndex.Remove(endpoint);
         regressedFrontiers.Remove(endpoint);
@@ -276,6 +315,120 @@ internal sealed class ReplicationTracker
     public long GetCommitFrontierOrDefault(string endpoint, long fallback) => lastCommitIndexes.GetValueOrDefault(endpoint, fallback);
 
     public bool HasCommitFrontier(string endpoint) => lastCommitIndexes.ContainsKey(endpoint);
+
+    // ── reported durable frontier and durable-write stall ─────────────────────────────────────
+
+    /// <summary>
+    /// Records a peer's self-reported durable contiguous commit frontier, last-writer-wins. Fed
+    /// from every term-valid ack (Success or rejection): the value describes the peer's disk, not
+    /// the batch the ack answers. Negative values mean "not reported" and are not recorded.
+    /// </summary>
+    public void SetDurableFrontier(string endpoint, long value)
+    {
+        if (value >= 0)
+            durableFrontiers[endpoint] = value;
+    }
+
+    public bool TryGetDurableFrontier(string endpoint, out long value) => durableFrontiers.TryGetValue(endpoint, out value);
+
+    /// <summary>
+    /// Age at or above which a peer's reported pending-write age counts as a stall on this leader:
+    /// <see cref="RaftConfiguration.WalStallWarnThreshold"/>, the same bound the peer itself logs
+    /// at, or 500 ms when the log lines are disabled (the peer's report is not).
+    /// </summary>
+    public long PeerWalStallThresholdMs =>
+        host.Configuration.WalStallWarnThreshold > TimeSpan.Zero
+            ? (long)host.Configuration.WalStallWarnThreshold.TotalMilliseconds
+            : 500;
+
+    /// <summary>
+    /// How long a stall report stays trusted without a newer one: four heartbeat intervals, floored
+    /// at 2 s. A stalled follower still answers heartbeats (its network is intact), so a report that
+    /// ages past this means the peer stopped answering altogether — a dead or partitioned node —
+    /// and nothing is deferred on its behalf.
+    /// </summary>
+    private long WalStallReportFreshnessTicks =>
+        (long)(Math.Max(2_000, 4 * host.Configuration.HeartbeatInterval.TotalMilliseconds) * Stopwatch.Frequency / 1000);
+
+    /// <summary>
+    /// Folds one ack's pending-write age into the peer's stall episode. Returns
+    /// <see cref="WalStallTransition.Began"/> on the first report at or above the threshold and
+    /// <see cref="WalStallTransition.Ended"/> on the first report below it after an episode, so the
+    /// caller logs each episode exactly twice instead of once per ack.
+    /// </summary>
+    public WalStallTransition RecordWalStallReport(string endpoint, long ageMs)
+    {
+        bool stalled = ageMs >= PeerWalStallThresholdMs;
+        long now = host.GetMonotonicTimestamp();
+
+        if (!walStallReports.TryGetValue(endpoint, out WalStallReport? report))
+        {
+            if (!stalled)
+                return WalStallTransition.None;
+
+            report = new WalStallReport();
+            walStallReports[endpoint] = report;
+        }
+
+        report.AgeMs = ageMs;
+        report.ReportedTicks = now;
+
+        if (stalled && !report.Stalled)
+        {
+            report.Stalled = true;
+            report.BeganTicks = now;
+            report.SnapshotDeferralWarned = false;
+            return WalStallTransition.Began;
+        }
+
+        if (!stalled && report.Stalled)
+        {
+            report.Stalled = false;
+            return WalStallTransition.Ended;
+        }
+
+        return WalStallTransition.None;
+    }
+
+    /// <summary>
+    /// Whether the peer's latest fresh report says its disk is stalled. A report older than the
+    /// freshness window ends the episode here: deferring work for a peer that no longer answers
+    /// would hold retention and repair on a node that may be gone.
+    /// </summary>
+    public bool IsReportingWalStall(string endpoint, out long ageMs, out TimeSpan stalledFor)
+    {
+        ageMs = 0;
+        stalledFor = TimeSpan.Zero;
+
+        if (!walStallReports.TryGetValue(endpoint, out WalStallReport? report) || !report.Stalled)
+            return false;
+
+        long now = host.GetMonotonicTimestamp();
+        if (now - report.ReportedTicks > WalStallReportFreshnessTicks)
+        {
+            report.Stalled = false;
+            return false;
+        }
+
+        ageMs = report.AgeMs;
+        stalledFor = TimeSpan.FromSeconds((double)(now - report.BeganTicks) / Stopwatch.Frequency);
+        return true;
+    }
+
+    public bool IsReportingWalStall(string endpoint) => IsReportingWalStall(endpoint, out _, out _);
+
+    /// <summary>
+    /// Marks the current stall episode's snapshot deferral as warned, true exactly once per episode
+    /// so the deferral logs one Warning rather than one per refused heartbeat.
+    /// </summary>
+    public bool TryMarkWalStallSnapshotDeferralWarned(string endpoint)
+    {
+        if (!walStallReports.TryGetValue(endpoint, out WalStallReport? report) || !report.Stalled || report.SnapshotDeferralWarned)
+            return false;
+
+        report.SnapshotDeferralWarned = true;
+        return true;
+    }
 
     /// <summary>
     /// Records a peer's self-reported commit frontier, last-writer-wins. Only a

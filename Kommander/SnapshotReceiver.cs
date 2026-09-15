@@ -4,6 +4,8 @@ using System.Security.Cryptography;
 using Kommander.Data;
 using Microsoft.Extensions.Logging;
 
+using Kommander.Diagnostics;
+
 namespace Kommander;
 
 /// <summary>
@@ -66,6 +68,20 @@ internal sealed class SnapshotReceiver
     private readonly Func<long> getMonotonicTimestamp;
     private readonly Func<bool> allowLegacySenders;
 
+    /// <summary>
+    /// Age, in ms, of a partition's oldest WAL write the local storage engine has not answered, and
+    /// the age at which a new snapshot session is refused. A snapshot cannot be installed until the
+    /// disk answers, so accepting one during a stall only buffers it here for the stall's length —
+    /// the memory that OOM-killed a follower six seconds after its heal (CamusDB run sd8). The
+    /// leader defers on the peer's own report first; this is the receiver's guard for a leader that
+    /// has not heard it (a fresh leader, a report lost in transit).
+    /// </summary>
+    private readonly Func<int, double> partitionWalStallAgeMs;
+    private readonly Func<double> walStallRefuseThresholdMs;
+
+    /// <summary>Last refusal Warning per partition (monotonic ticks) — one line per 10 s per partition.</summary>
+    private readonly Dictionary<int, long> lastStallRefusalWarnTicks = [];
+
     internal SnapshotReceiver(
         Func<bool> isDisposed,
         Func<SnapshotInstallRequest, Task<SnapshotResponse>> installOnExecutor,
@@ -75,8 +91,12 @@ internal sealed class SnapshotReceiver
         int maxPendingSessions,
         long maxPendingBytes,
         Func<long> getMonotonicTimestamp,
-        Func<bool>? allowLegacySenders = null)
+        Func<bool>? allowLegacySenders = null,
+        Func<int, double>? partitionWalStallAgeMs = null,
+        Func<double>? walStallRefuseThresholdMs = null)
     {
+        this.partitionWalStallAgeMs = partitionWalStallAgeMs ?? (static _ => 0);
+        this.walStallRefuseThresholdMs = walStallRefuseThresholdMs ?? (static () => 0);
         this.isDisposed = isDisposed;
         this.installOnExecutor = installOnExecutor;
         this.logger = logger;
@@ -140,6 +160,29 @@ internal sealed class SnapshotReceiver
                 // session (skipped opener, or a late chunk after the terminal chunk detached it).
                 if (request.ChunkIndex != 0)
                     return new SnapshotResponse(false);
+
+                // Refuse to OPEN a session while this node's own disk is stalled (see the field
+                // summary). Checked at the opener only: a stall that begins mid-transfer keeps the
+                // bytes already staged — dropping them would waste the transfer for a hiccup, and
+                // the byte cap bounds them regardless. The sender records a chunk rejection and
+                // retries on its backoff; the log line here says why.
+                double stallMs = partitionWalStallAgeMs(request.PartitionId);
+                double refuseAt = walStallRefuseThresholdMs();
+                if (refuseAt > 0 && stallMs >= refuseAt)
+                {
+                    KommanderMetrics.RecordSnapshotInstallRefusedForWalStall(request.PartitionId);
+
+                    if (!lastStallRefusalWarnTicks.TryGetValue(request.PartitionId, out long lastWarn)
+                        || now - lastWarn >= TicksForDuration(TimeSpan.FromSeconds(10)))
+                    {
+                        lastStallRefusalWarnTicks[request.PartitionId] = now;
+                        logger.LogWarning(
+                            "[{Endpoint}] Refusing to open snapshot session for partition {PartitionId} at index {Index} from {Leader}: the local durable-write stall is {StallMs:F0} ms (threshold {ThresholdMs:F0} ms). The install could not run until the disk answers and the chunks would only be buffered here; the leader retries once the stall clears",
+                            localEndpoint, request.PartitionId, request.SnapshotIndex, request.LeaderEndpoint, stallMs, refuseAt);
+                    }
+
+                    return new SnapshotResponse(false);
+                }
 
                 EvictForSessionCapacityLocked();
 
