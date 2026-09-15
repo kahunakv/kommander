@@ -65,6 +65,7 @@ public sealed class TestOverGapAckGate
         TestWalCompletionFences.StubHost host = new(partitionId: 1);
         GapStubWal wal = new();
         RaftPartitionStateMachine sm = new(host, wal, new NullSink(), NullLogger<IRaft>.Instance);
+        sm.MarkRestoredForTesting();
         return (sm, host, wal);
     }
 

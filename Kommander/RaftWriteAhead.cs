@@ -87,6 +87,14 @@ public sealed class RaftWriteAhead
 
     private long restoreSoftFloorTerm;
 
+    /// <summary>
+    /// The backend's compaction floor as read in restore Phase 1 (0 when nothing was compacted or the
+    /// backend does not record it). Ids below it were compacted under a durable checkpoint, so the
+    /// frontier scan in <see cref="CompleteRestoreAsync"/> may start from floor - 1 — the one
+    /// certificate that survives a crash which reverts the checkpoint row's own commit marker.
+    /// </summary>
+    private long restoreCompactionFloor;
+
     private long proposeIndex = 1;
 
     private long commitIndex = 1;
@@ -430,6 +438,8 @@ public sealed class RaftWriteAhead
 
         List<RaftLog> logs = await manager.ReadScheduler.EnqueueTask(partition.PartitionId, () =>
         {
+            restoreCompactionFloor = walAdapter.GetCompactionFloor(partition.PartitionId);
+
             if (durablyApplied < 0)
                 return walAdapter.ReadLogs(partition.PartitionId);
 
@@ -544,6 +554,33 @@ public sealed class RaftWriteAhead
             contiguousPresent = restoreSoftFloorIndex;
             contiguousPresentTerm = restoreSoftFloorTerm;
             any = true;
+        }
+
+        // The compaction floor certifies its whole prefix too: compaction only ever runs below a
+        // durable checkpoint, and it is the one certificate that survives the checkpoint row. A crash
+        // can revert that row's commit marker inside the fsync window after the compaction that
+        // trusted it already removed every earlier checkpoint; the scan below then finds no
+        // certified row to jump from, chains nothing (the first retained id is not 1), and
+        // reconstructs a frontier of 0 for a log this node holds through the floor. It then reports
+        // that frontier, the leader anchors a backfill at 1 below its own floor, and the node is
+        // re-seeded by a snapshot for entries it never lacked (the DST restart-under-load scenario;
+        // the Caraxes bank-leader-kill shape from the restart side). Seeded with term 0: the entry
+        // at floor - 1 is gone, so its term is unknown, and a zero term is "no evidence" to every
+        // term-monotonicity guard downstream.
+        long compactionCertified = restoreCompactionFloor - 1;
+        if (compactionCertified > 0 && compactionCertified > contiguousPresent)
+        {
+            maxLogId = Math.Max(maxLogId, compactionCertified);
+            contiguousCommitted = compactionCertified;
+            contiguousCommittedTerm = 0;
+            contiguousPresent = compactionCertified;
+            contiguousPresentTerm = 0;
+            any = true;
+
+            if (manager.Logger.IsEnabled(LogLevel.Information))
+                manager.Logger.LogInformation(
+                    "[{Endpoint}/{Partition}] Restore frontier scan seeded at the compaction floor: ids through {Certified} were compacted under a durable checkpoint, so the scan chains from there instead of from 0",
+                    manager.LocalEndpoint, partition.PartitionId, compactionCertified);
         }
 
         // The persisted last-checkpoint id only advances when the checkpoint's whole prefix was

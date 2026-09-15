@@ -564,7 +564,13 @@ public sealed class RaftPartitionStateMachine
                 if (coreState.LeadershipBarrierTicket != HLCTimestamp.Zero
                     && MonotonicElapsed(coreState.LeadershipBarrierArmedTicks, nowTicks) >= host.Configuration.LeadershipBarrierTimeout)
                 {
-                    await RevertUnpublishedPromotionAsync("barrier commit timed out").ConfigureAwait(false);
+                    // Name the peers whose disks are not answering: a barrier that cannot gather
+                    // quorum while a voter reports a durable-write stall is that voter's fault, and
+                    // a cluster re-running this election every few seconds for minutes (the Caraxes
+                    // bank-leader-kill churn, terms 9 through 100+) needs the cause in the line that
+                    // reports the symptom, not in a stall line minutes earlier on another node.
+                    await RevertUnpublishedPromotionAsync(
+                        $"barrier commit timed out; peers reporting a durable-write stall: {DescribePeerWalStalls()}").ConfigureAwait(false);
                     return;
                 }
 
@@ -1010,6 +1016,16 @@ public sealed class RaftPartitionStateMachine
         coreState.CurrentTerm = term;
         BecomeLeader();
     }
+
+    /// <summary>
+    /// Marks the partition as restored without running the restore. For unit tests that drive the
+    /// state machine directly on a stub WAL: production partitions always restore first, and the
+    /// follower append path refuses entry batches and reports no position until they have.
+    /// </summary>
+    public void MarkRestoredForTesting() => coreState.Restored = true;
+
+    /// <summary>AppendEntries answered before the restore completed; see <see cref="RaftPartitionCoreState.AppendsAnsweredBeforeRestore"/>.</summary>
+    internal long AppendsAnsweredBeforeRestore => Volatile.Read(ref coreState.AppendsAnsweredBeforeRestore);
 
     /// <summary>
     /// True when at least one voter peer is not <see cref="MemberLivenessState.Alive"/> per the SWIM
@@ -1509,6 +1525,35 @@ public sealed class RaftPartitionStateMachine
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState, barrierTicket, commitFrontier + 1, inheritedTail);
 
         return false;
+    }
+
+    /// <summary>
+    /// One line naming every peer currently reporting a durable-write stall in its acks, with the
+    /// reported age and how long it has been reporting one — or "none" when no peer does.
+    /// </summary>
+    private string DescribePeerWalStalls()
+    {
+        global::System.Text.StringBuilder? stalled = null;
+
+        foreach (RaftNode node in host.Nodes)
+        {
+            if (node.Endpoint == host.LocalEndpoint)
+                continue;
+
+            if (!tracker.IsReportingWalStall(node.Endpoint, out long ageMs, out TimeSpan stalledFor))
+                continue;
+
+            stalled ??= new global::System.Text.StringBuilder();
+            if (stalled.Length > 0)
+                stalled.Append("; ");
+
+            stalled.Append(node.Endpoint)
+                   .Append(host.IsVoter(node.Endpoint) ? " (voter)" : " (learner)")
+                   .Append(": oldest pending WAL write ").Append(ageMs)
+                   .Append(" ms, reported for ").Append(stalledFor.TotalSeconds.ToString("F1")).Append(" s");
+        }
+
+        return stalled?.ToString() ?? "none";
     }
 
     /// <summary>

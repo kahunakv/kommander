@@ -259,6 +259,40 @@ internal sealed class RaftPartitionLogThrottle
             host.LocalEndpoint, host.PartitionId, coreState.NodeState, pendingWriteAgeMs, coreState.CurrentTerm);
     }
 
+    // Throttle for the pre-restore append refusal: the leader keeps shipping until the first ack
+    // that carries a position, so the refusal repeats on every batch for the length of the restore.
+    // Executor thread only.
+    private long lastRestoreRefusalLogTicks;
+    private int suppressedRestoreRefusalLogs;
+
+    /// <summary>
+    /// Reports that an entry-carrying AppendEntries was refused because this partition's restore
+    /// has not completed, at most once per second per partition with the count suppressed since the
+    /// last line. Information, not Warning: it is the expected shape of a restart under load, and
+    /// the leader logs the RestoreInProgress ack on its side at the same cadence.
+    /// </summary>
+    public void LogAppendRefusedBeforeRestore(string endpoint, int entries)
+    {
+        long now = host.GetMonotonicTimestamp();
+
+        if (lastRestoreRefusalLogTicks != 0 && (now - lastRestoreRefusalLogTicks) < Stopwatch.Frequency)
+        {
+            suppressedRestoreRefusalLogs++;
+            return;
+        }
+
+        lastRestoreRefusalLogTicks = now;
+
+        if (logger.IsEnabled(LogLevel.Information))
+        {
+            logger.LogInformation(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Refusing {Entries} replicated entries from {Endpoint} with RestoreInProgress: the WAL restore has not completed, so this node reports no log position yet. suppressedSinceLastLine={Suppressed}",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, entries, endpoint, suppressedRestoreRefusalLogs);
+        }
+
+        suppressedRestoreRefusalLogs = 0;
+    }
+
     /// <summary>
     /// Reports that this follower told the leader about a log hole on a heartbeat ack, at most
     /// once per second per partition with the count suppressed since the last line.

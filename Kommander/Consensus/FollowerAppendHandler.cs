@@ -220,6 +220,47 @@ internal sealed class FollowerAppendHandler
         // wakes us back up by clearing the flag.
         coreState.SetQuiesced(quiesce);
 
+        // ── Pre-restore fence ─────────────────────────────────────────────────────────────
+        // Until Phase 2 of the restore has run, every frontier below is at its init: the contiguous
+        // presence frontier is 0, the commit frontier is 0, and the WAL's in-memory bookkeeping has
+        // not been reconstructed from disk. The term and leader adoption above still happen (the
+        // leader must be able to teach a restarting node its term, and the ack keeps the peer
+        // counted as reachable), but nothing here may act on, write over, or REPORT that state:
+        //
+        //   * An entry-carrying batch is refused with RestoreInProgress and no position. Accepting
+        //     it would enqueue rows over a frontier of 1 whose bookkeeping the restore is about to
+        //     replace wholesale, and its completion would ack a presence frontier of 0.
+        //   * A heartbeat is acked with NO position (-1) and NO hole report. On the Caraxes
+        //     bank-leader-kill restart the pre-restore heartbeat ack reported commit index 0 and the
+        //     buffered live entries above it raised "Log hole above contiguous frontier 0"; the
+        //     leader anchored its backfill at 1, could not serve it below its compaction floor, and
+        //     escalated to a full snapshot transfer three seconds before the restore finished with
+        //     the node's real frontier at 5,460,763 — millions of entries above the floor. The
+        //     leader treats -1 as "no report" and leaves every cursor where it was; the first ack
+        //     after the restore carries the truth.
+        //
+        // The restore itself is Phase 1 (a WAL read) plus Phase 2 on this executor, so the window is
+        // the read's length — seconds on a large log — and a leader with quorum elsewhere loses
+        // nothing by waiting for it, exactly as it did while the node was down.
+        if (!coreState.Restored)
+        {
+            bool entryCarrying = logs is { Count: > 0 };
+            coreState.AppendsAnsweredBeforeRestore++;
+
+            if (entryCarrying)
+                logThrottle.LogAppendRefusedBeforeRestore(endpoint, logs!.Count);
+
+            host.EnqueueResponse(endpoint, new(
+                RaftResponderRequestType.CompleteAppendLogs,
+                new(endpoint),
+                FollowerAcks.BuildWithoutPosition(host, leaderTerm, timestamp,
+                    entryCarrying ? RaftOperationStatus.RestoreInProgress : RaftOperationStatus.Success)
+            ));
+
+            CompleteReply(replyCorrelationId, entryCarrying ? RaftResponseStatic.RestoreInProgressResponse : RaftResponseStatic.NoneResponse);
+            return;
+        }
+
         // Log Matching Property check: the follower must hold an entry at prevLogIndex whose
         // term equals prevLogTerm before it can safely append the incoming batch.
         //

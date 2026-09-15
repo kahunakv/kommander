@@ -232,10 +232,61 @@ public class TestSnapshotRescueConvergence
         await h.Sm.CheckPartitionLeadershipAsync();
         Assert.Equal(200, h.Wal.PublishedReplicaFloor);
 
-        // A peer that is no longer SWIM-Alive must not hold the floor.
+        // A peer that has gone silent keeps holding at its last position for the silent-peer
+        // window: a restart inside it must be served from the log, not re-seeded by snapshot.
         h.Host.Liveness = MemberLivenessState.Dead;
         await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(200, h.Wal.PublishedReplicaFloor);
+
+        h.AdvanceMs(90_000);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(200, h.Wal.PublishedReplicaFloor);
+
+        // Past the window it holds nothing.
+        h.AdvanceMs(31_000);
+        await h.Sm.CheckPartitionLeadershipAsync();
         Assert.Equal(long.MaxValue, h.Wal.PublishedReplicaFloor);
+
+        // Back alive: it holds again, and the window is re-armed from its next silence.
+        h.Host.Liveness = MemberLivenessState.Alive;
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(200, h.Wal.PublishedReplicaFloor);
+
+        h.Host.Liveness = MemberLivenessState.Dead;
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(200, h.Wal.PublishedReplicaFloor);
+    }
+
+    /// <summary>
+    /// A peer that was already down when this leader was elected has no position on record, and
+    /// its real position is unknowable until it answers. For the window it holds the budget's whole
+    /// depth (a published floor of 1, which the WAL clamps at checkpoint minus the budget); past the
+    /// window, or with the window disabled, it holds nothing — the pre-window behaviour.
+    /// </summary>
+    [Fact]
+    public async Task Heartbeat_HoldsTheWholeBudget_ForASilentPeerWithNoPosition_UntilTheWindowLapses()
+    {
+        Harness h = await Harness.BuildLeaderAsync(withTransfer: false);
+
+        h.Host.Liveness = MemberLivenessState.Dead;
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(1, h.Wal.PublishedReplicaFloor);
+
+        h.AdvanceMs(119_000);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(1, h.Wal.PublishedReplicaFloor);
+
+        h.AdvanceMs(2_000);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(long.MaxValue, h.Wal.PublishedReplicaFloor);
+
+        Harness disabled = await Harness.BuildLeaderAsync(
+            withTransfer: false,
+            configure: c => c.CompactionSilentPeerRetentionWindow = TimeSpan.Zero);
+
+        disabled.Host.Liveness = MemberLivenessState.Dead;
+        await disabled.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(long.MaxValue, disabled.Wal.PublishedReplicaFloor);
     }
 
     /// <summary>
@@ -343,6 +394,74 @@ public class TestSnapshotRescueConvergence
         await h.AckSuccess(199);
         await h.Sm.CheckPartitionLeadershipAsync();
         Assert.Equal(0, h.Wal.PublishCalls);
+    }
+
+    /// <summary>
+    /// The floor must also keep the row the next anchored backfill starts at. A LogMismatch ack
+    /// backtracks nextIndex to the reported anchor + 1, and the peer's durable frontier can move
+    /// past that anchor before the next heartbeat round publishes the floor; holding at the newer
+    /// frontier let compaction remove exactly the row nextIndex pointed at, and the refused read
+    /// escalated to a snapshot for a peer one entry behind (Caraxes bank-leader-kill: anchored at
+    /// 5,464,761, first available 5,464,762).
+    /// </summary>
+    [Fact]
+    public async Task Heartbeat_HoldsRetentionAtTheNextBackfillAnchor_WhenItLagsTheDurableFrontier()
+    {
+        Harness h = await Harness.BuildLeaderAsync(withTransfer: false);
+
+        await h.AckSuccess(199, durableIndex: 199);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(200, h.Wal.PublishedReplicaFloor);
+
+        // The peer asks for a repair anchored below its durable frontier: nextIndex backtracks to 151.
+        await h.Sm.CompleteAppendLogsAsync(Follower, h.Host.HybridLogicalClock.TrySendOrLocalEvent(1),
+            RaftOperationStatus.LogMismatch, 150, durableIndex: 199);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(151, h.Wal.PublishedReplicaFloor);
+
+        // A later Success ack advances both, and the floor follows the higher anchor again.
+        await h.AckSuccess(400, durableIndex: 400);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(401, h.Wal.PublishedReplicaFloor);
+    }
+
+    /// <summary>
+    /// A refused anchored backfill escalates to a snapshot only when the peer sits below what this
+    /// log can serve. When the peer's own freshest report already reaches the first entry
+    /// available, the refused anchor was merely stale (set from an older ack than the retention
+    /// floor followed); the next round re-anchors and ships, and a snapshot would be a full
+    /// transfer to a follower a single entry behind.
+    /// </summary>
+    [Fact]
+    public async Task RefusedBackfill_ForARangeThePeerReportsHolding_DoesNotEscalateToASnapshot()
+    {
+        Harness h = await Harness.BuildLeaderAsync();
+
+        // The peer is caught up and reports a durable frontier (320) above the floor (300)...
+        await h.AckSuccess(350, durableIndex: 320);
+
+        // ...then asks for a repair anchored below the floor: a stale anchor for a range it holds.
+        await h.Sm.CompleteAppendLogsAsync(Follower, h.Host.HybridLogicalClock.TrySendOrLocalEvent(1),
+            RaftOperationStatus.LogMismatch, 250, durableIndex: 320);
+
+        for (int round = 0; round < 3; round++)
+        {
+            h.AdvanceMs(200);
+            await h.Sm.CheckPartitionLeadershipAsync();
+        }
+        await Task.Delay(100, TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, h.Transfer.ExportCalls);
+        Assert.Empty(h.Sm.GetSnapshotStatuses());
+        Assert.NotEmpty(h.Sm.GetBackfillStatuses());
+
+        // The same refusal for a peer whose freshest report is below the floor still escalates.
+        await h.Sm.CompleteAppendLogsAsync(Follower, h.Host.HybridLogicalClock.TrySendOrLocalEvent(1),
+            RaftOperationStatus.LogMismatch, 250, durableIndex: 250);
+        h.AdvanceMs(200);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        await h.WaitForInstallsAsync(1);
+        Assert.Equal(1, h.Transfer.ExportCalls);
     }
 
     // ── harness ───────────────────────────────────────────────────────────────

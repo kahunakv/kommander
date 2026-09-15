@@ -215,6 +215,7 @@ public sealed class SimulatedWAL : IWAL
             failNextWrites = 0;
             failNextWritesScope = null;
             retentionHolds.Clear();
+            restoreReadHoldsUntil.Clear();
         }
     }
 
@@ -699,8 +700,47 @@ public sealed class SimulatedWAL : IWAL
     /// <inheritdoc />
     public List<RaftLog> ReadLogs(int partitionId)
     {
+        // The restore's Phase 1 read. A scenario may hold it for a span of simulated time so the
+        // partition is reachable, and answering, before its restore has landed — see HoldRestoreReads.
+        // Waited out on the read-scheduler thread with the store's lock released, so writes and the
+        // harness keep moving; only this partition's reads queue behind it. Threaded mode only.
+        while (true)
+        {
+            long until;
+            lock (gate)
+            {
+                if (disposed || !restoreReadHoldsUntil.TryGetValue(partitionId, out until) || nowMilliseconds() >= until)
+                    break;
+            }
+
+            Thread.Sleep(1);
+        }
+
         lock (gate)
             return inner.ReadLogs(partitionId);
+    }
+
+    /// <summary>
+    /// Simulated-clock deadline before which a restore read of the partition does not return, keyed
+    /// by partition. See <see cref="HoldRestoreReads"/>.
+    /// </summary>
+    private readonly Dictionary<int, long> restoreReadHoldsUntil = new();
+
+    /// <summary>
+    /// Makes the next restore read of <paramref name="partitionId"/> wait until
+    /// <paramref name="forMilliseconds"/> of simulated time have passed from now.
+    ///
+    /// <para><b>What it is for.</b> A restarted node answers AppendEntries while Phase 1 of its
+    /// restore is still reading the store, and everything those acks read is at its init. The
+    /// window is a race against the read in threaded mode, so a scenario that must reach it holds
+    /// the read for a known span of simulated time — the harness advances the clock as it steps,
+    /// so the span is a step count, not a wall-clock guess. Threaded scheduling only: in driven
+    /// mode the read runs on the driving thread and a wait there would park the driver.</para>
+    /// </summary>
+    public void HoldRestoreReads(int partitionId, long forMilliseconds)
+    {
+        lock (gate)
+            restoreReadHoldsUntil[partitionId] = nowMilliseconds() + forMilliseconds;
     }
 
     /// <inheritdoc />
@@ -743,6 +783,21 @@ public sealed class SimulatedWAL : IWAL
     {
         lock (gate)
             return inner.GetLastCheckpoint(partitionId);
+    }
+
+    /// <summary>
+    /// The floor from this store's own record of what compaction removed, not the inner store's:
+    /// a crash rebuilds the inner store and its in-memory floor with it, while deletion is durable
+    /// here by the modelled contract (see the class remarks) — exactly as a production backend
+    /// persists its floor in the same batch as the deletes.
+    /// </summary>
+    public long GetCompactionFloor(int partitionId)
+    {
+        lock (gate)
+        {
+            long through = compactedThrough.GetValueOrDefault(partitionId);
+            return through > 0 ? through + 1 : 0;
+        }
     }
 
     /// <inheritdoc />

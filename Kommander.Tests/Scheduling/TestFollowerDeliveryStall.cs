@@ -135,6 +135,8 @@ public class TestFollowerDeliveryStall
         StallWal wal = new();
 
         RaftPartitionStateMachine sm = new(host, wal, new NoopSink(), NullLogger<IRaft>.Instance);
+
+        sm.MarkRestoredForTesting();
         sm.SetPostToExecutor(_ => { });
 
         return (sm, host, wal);

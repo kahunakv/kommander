@@ -1607,6 +1607,27 @@ public class RaftConfiguration
     public long CompactionLiveReplicaLagBudget { get; set; } = 1_000_000;
 
     /// <summary>
+    /// How long the leader keeps holding compaction for a peer that has stopped answering — killed,
+    /// paused, or cut off — measured from the heartbeat round in which the leader first saw it
+    /// non-Alive. Inside the window the peer holds the floor exactly as a live one does, at its
+    /// last reported position when it reported one, and at the full depth of
+    /// <see cref="CompactionLiveReplicaLagBudget"/> when it never did (a peer that was already down
+    /// when this leader was elected). Past the window the peer holds nothing and a restart is
+    /// seeded by snapshot as before. Zero disables the hold.
+    /// <para>
+    /// Why the stall hold is not enough: a stalled peer keeps acking and reports its stall, so its
+    /// position stays protected; a killed peer reports nothing, so the floor ran past the restarting
+    /// leader of the Caraxes bank-leader-kill run twice inside one 30-second outage, and each time
+    /// it came back it was re-seeded by a full snapshot for entries it had missed by seconds —
+    /// followed by minutes of half-speed commits while its replica recovered. The budget bounds what
+    /// the hold can cost in WAL bytes and the window bounds how long; a restart inside both is
+    /// served from the log.
+    /// </para>
+    /// <para>Default two minutes: a container restart plus its join is well under a minute.</para>
+    /// </summary>
+    public TimeSpan CompactionSilentPeerRetentionWindow { get; set; } = TimeSpan.FromMinutes(2);
+
+    /// <summary>
     /// How often a partition whose compaction is clamped by the application-durability floor
     /// (see <see cref="ApplicationDurabilityProvider"/>) repeats its Warning, and how long the
     /// floor must sit unchanged before that Warning calls the flusher stalled. Default 60 s.
@@ -1709,6 +1730,10 @@ public class RaftConfiguration
         if (WalStallStepDownTimeout < TimeSpan.Zero)
             throw new RaftException(
                 $"[Kommander] WalStallStepDownTimeout ({WalStallStepDownTimeout}) must not be negative; use zero to disable the watchdog.");
+
+        if (CompactionSilentPeerRetentionWindow < TimeSpan.Zero)
+            throw new RaftException(
+                $"[Kommander] CompactionSilentPeerRetentionWindow ({CompactionSilentPeerRetentionWindow}) must not be negative; use zero to disable the hold.");
 
         if (WalStallWarnThreshold < TimeSpan.Zero)
             throw new RaftException(

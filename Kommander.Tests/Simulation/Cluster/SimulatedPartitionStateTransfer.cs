@@ -67,6 +67,14 @@ public sealed class SimulatedPartitionStateTransfer : IRaftPartitionStateTransfe
     public int ExportsArmedToHang => Volatile.Read(ref exportsToHang);
 
     /// <summary>
+    /// Called with the partition id at the start of every import, before the node's log changes.
+    /// The cluster installs it to judge whether the snapshot was needed at all (see
+    /// <see cref="SimulationCluster.UnnecessarySnapshotImports"/>). Runs on the importing
+    /// partition's executor thread.
+    /// </summary>
+    public Action<int>? ImportObserver { get; set; }
+
+    /// <summary>
     /// Makes the next <paramref name="count"/> exports on this node never complete.
     ///
     /// <para><b>Armed until used, not until a step passes.</b> The fault is a latent defect in the
@@ -140,6 +148,8 @@ public sealed class SimulatedPartitionStateTransfer : IRaftPartitionStateTransfe
 
     public async Task ImportPartitionState(int partitionId, Stream snapshot, CancellationToken ct)
     {
+        ImportObserver?.Invoke(partitionId);
+
         MemoryStream buffer = new();
         await snapshot.CopyToAsync(buffer, ct).ConfigureAwait(false);
         buffer.Position = 0;

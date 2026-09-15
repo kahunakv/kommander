@@ -73,6 +73,7 @@ public sealed class TestLeaderCompactedAnchor
         TestWalCompletionFences.StubHost host = new(partitionId: 1);
         AnchorStubWal wal = new();
         RaftPartitionStateMachine sm = new(host, wal, new NullSink(), NullLogger<IRaft>.Instance);
+        sm.MarkRestoredForTesting();
         return (sm, host, wal);
     }
 

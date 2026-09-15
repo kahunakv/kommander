@@ -38,7 +38,7 @@ internal sealed class BackfillRoundBatches
     /// read — the snapshot-fallback decision at the call site depends on it.
     /// </summary>
     internal sealed record Batch(long From, List<RaftLog> Logs, long PrevTerm, AppendLogsGrpcLogCache? GrpcLogCache,
-        BackfillSendResult EmptyResult = BackfillSendResult.CompactionFloor);
+        BackfillSendResult EmptyResult = BackfillSendResult.CompactionFloor, long FirstAvailableId = -1);
 
     // A round touches at most one entry per node, and nodes anchored at the same index collapse onto a
     // single entry, so a linear scan over a handful of items beats a dictionary's hashing and allocation.
@@ -65,10 +65,15 @@ internal sealed class BackfillRoundBatches
     /// for non-empty batches, since an empty one is never shipped. <paramref name="emptyResult"/> records
     /// the cause when <paramref name="logs"/> is empty; it is meaningless for non-empty batches.
     /// </summary>
+    /// <param name="firstAvailableId">
+    /// For a <see cref="BackfillSendResult.NonContiguous"/> refusal, the first id the read returned
+    /// above the anchor, so a follower served from the memoized refusal can be judged the same way
+    /// as the one that triggered the read. -1 otherwise.
+    /// </param>
     internal Batch Add(long from, List<RaftLog> logs, long prevTerm,
-        BackfillSendResult emptyResult = BackfillSendResult.CompactionFloor)
+        BackfillSendResult emptyResult = BackfillSendResult.CompactionFloor, long firstAvailableId = -1)
     {
-        Batch batch = new(from, logs, prevTerm, logs.Count > 0 ? new AppendLogsGrpcLogCache() : null, emptyResult);
+        Batch batch = new(from, logs, prevTerm, logs.Count > 0 ? new AppendLogsGrpcLogCache() : null, emptyResult, firstAvailableId);
         batches.Add(batch);
         return batch;
     }

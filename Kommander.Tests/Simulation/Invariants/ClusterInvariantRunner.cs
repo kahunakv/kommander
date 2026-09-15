@@ -74,6 +74,10 @@ public sealed class ClusterInvariantRunner
         ClusterInvariantSet.CheckNoLibraryInvariantViolation(
             cluster.StepNumber, cluster.LibraryInvariantViolations);
 
+        // Judged when the import began, so it is a fact about a past step and needs no view.
+        ClusterInvariantSet.CheckNoUnnecessarySnapshot(
+            cluster.StepNumber, cluster.UnnecessarySnapshotImports);
+
         IReadOnlyList<RaftPartitionView> views =
             await cluster.GetPartitionViewsAsync(partitionId, cancellationToken).ConfigureAwait(false);
 
@@ -122,6 +126,9 @@ public sealed class ClusterInvariantRunner
         int partitionId,
         CancellationToken cancellationToken)
     {
+        ClusterInvariantSet.CheckNoUnnecessarySnapshot(
+            cluster.StepNumber, cluster.UnnecessarySnapshotImports);
+
         IReadOnlyList<RaftPartitionView> views =
             await cluster.GetPartitionViewsAsync(partitionId, cancellationToken).ConfigureAwait(false);
 

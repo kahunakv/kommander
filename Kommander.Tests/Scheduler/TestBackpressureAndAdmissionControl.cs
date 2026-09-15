@@ -164,6 +164,7 @@ public sealed class TestBackpressureAndAdmissionControl
 
         RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
 
+        sm.MarkRestoredForTesting();
         RaftPartitionExecutor executor = new(
             sm,
             partitionId,
@@ -457,6 +458,7 @@ public sealed class TestBackpressureAndAdmissionControl
 
         RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
 
+        sm.MarkRestoredForTesting();
         // Must not throw: the whole point is that saturation becomes a reply, not an escape.
         await sm.AppendLogsAsync(
             endpoint: "leader-node",
@@ -633,7 +635,7 @@ public sealed class TestBackpressureAndAdmissionControl
         StubWal wal = new();
         RelayReplySink sink = new();
         RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         using RaftPartitionExecutor executor = new(
             sm,
             partitionId: 0,

@@ -124,6 +124,20 @@ public interface IWAL : IDisposable
     public long GetLastCheckpoint(int partitionId);
 
     /// <summary>
+    /// The partition's compaction floor: every id below it was removed by compaction (or is
+    /// logically deleted), and no id at or above it was. 0 when nothing has been compacted, and 0
+    /// from a backend that does not record its floor across a restart — the caller then learns
+    /// nothing, never something wrong.
+    /// <para>Compaction only ever runs below a durable checkpoint, so the floor certifies its whole
+    /// prefix as committed and applied — the same certificate a checkpoint row carries, and one that
+    /// survives the row: a crash can revert the checkpoint's commit marker inside the fsync window
+    /// while the compaction that trusted it has already deleted every earlier checkpoint. A restore
+    /// that reads only the rows then reconstructs a frontier of 0 for a log it holds through the
+    /// floor, and its leader re-seeds it by snapshot for entries it never lacked.</para>
+    /// </summary>
+    public long GetCompactionFloor(int partitionId) => 0;
+
+    /// <summary>
     /// Returns the total number of persisted log rows for the partition.
     /// Unlike <see cref="ReadLogsRange"/>, this is not capped by a range limit.
     /// </summary>

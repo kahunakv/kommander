@@ -85,6 +85,16 @@ public static class ClusterInvariantSet
     public const string LibraryInvariant = "library-invariant";
 
     /// <summary>
+    /// A node accepts a snapshot install only when its log sits below what every possible sender
+    /// still retains. A snapshot to a node whose contiguous resolved prefix reaches the sender's
+    /// first retained entry (or one below it) is a repair the log could have served — and a full
+    /// state transfer on every restart is what the Caraxes bank-leader-kill run paid for a
+    /// pre-restore ack that reported position 0. See
+    /// <see cref="SimulationCluster.UnnecessarySnapshotImports"/> for how the harness judges it.
+    /// </summary>
+    public const string NoUnnecessarySnapshot = "no-unnecessary-snapshot";
+
+    /// <summary>
     /// Committed log ids never decrease on a node.
     ///
     /// <para>The commit index is the promise a client already received. A node that lowers it has
@@ -555,6 +565,29 @@ public static class ClusterInvariantSet
             $"violation(s); the first is '{first.Invariant}' on {first.LocalEndpoint ?? "?"}/" +
             $"{first.PartitionId}: {first.Detail}. The run's later state is a consequence of this, " +
             "not a finding of its own.");
+    }
+
+    /// <summary>
+    /// Checks <see cref="NoUnnecessarySnapshot"/>: no node imported a snapshot it did not need.
+    /// Reports the first; later ones are usually the same peer being re-seeded again.
+    /// </summary>
+    public static void CheckNoUnnecessarySnapshot(
+        int stepNumber,
+        IReadOnlyList<UnnecessarySnapshotImport> imports)
+    {
+        if (imports.Count == 0)
+            return;
+
+        UnnecessarySnapshotImport first = imports[0];
+
+        throw Violation(
+            NoUnnecessarySnapshot,
+            stepNumber,
+            $"Step {stepNumber}: {imports.Count} snapshot install(s) were accepted by a node whose log " +
+            $"backfill could still have repaired; the first, at step {first.StepNumber}, was on " +
+            $"{first.Endpoint}/{first.PartitionId}, which held a contiguous resolved prefix through " +
+            $"{first.HeldThrough} while the most compacted other log ({first.RetainedBy}) still began at " +
+            $"{first.FirstRetainedElsewhere}. A backfill anchored at {first.HeldThrough + 1} would have been served.");
     }
 
     private static InvariantViolationException Violation(string name, int stepNumber, string message) =>

@@ -301,6 +301,13 @@ public sealed class RaftPartition : IDisposable
     internal double GetOldestPendingWriteAgeMs() => stateMachine.GetOldestPendingWriteAgeMs();
 
     /// <summary>
+    /// AppendEntries this partition answered before its WAL restore completed (acked with no
+    /// position; entry batches refused). Test-visible: a restart scenario uses it to prove the
+    /// leader really reached the node inside that window.
+    /// </summary>
+    internal long AppendsAnsweredBeforeRestore => stateMachine.AppendsAnsweredBeforeRestore;
+
+    /// <summary>
     /// Leader-side non-contiguous-backfill status per follower for this partition — see
     /// <see cref="IRaft.GetBackfillStatuses"/>. Empty on a healthy partition; a plain thread-safe
     /// read, no executor round-trip.

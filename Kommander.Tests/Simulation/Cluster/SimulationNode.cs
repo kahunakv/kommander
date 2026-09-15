@@ -451,6 +451,26 @@ public sealed class SimulationNode : IAsyncDisposable
     }
 
     /// <summary>
+    /// AppendEntries the partition answered before its restore completed in this node's current
+    /// life — heartbeats acked with no position and entry batches refused. A restart scenario asserts
+    /// this is positive to prove the leader really reached the node inside that window; 0 when the
+    /// node has no live manager or the partition is not materialized.
+    /// </summary>
+    public long AppendsAnsweredBeforeRestore(int partitionId)
+    {
+        if (!HasLiveManager)
+            return 0;
+
+        IPartitionProvider provider = Manager;
+
+        RaftPartition? partition = partitionId == global::Kommander.System.RaftSystemConfig.SystemPartition
+            ? provider.SystemPartition
+            : provider.DataPartitions.FirstOrDefault(candidate => candidate.PartitionId == partitionId);
+
+        return partition?.AppendsAnsweredBeforeRestore ?? 0;
+    }
+
+    /// <summary>
     /// Waits until every partition executor on this node has drained its queues.
     ///
     /// <para>This is the step barrier. The executors run on real threads, so a snapshot taken

@@ -46,6 +46,9 @@ public sealed class SimulationCluster : IAsyncDisposable
     /// </summary>
     private readonly List<RaftInvariantViolation> libraryViolations = [];
     private readonly object violationGate = new();
+
+    /// <summary>Snapshot imports judged unnecessary, oldest first; see <see cref="UnnecessarySnapshotImports"/>.</summary>
+    private readonly List<UnnecessarySnapshotImport> unnecessarySnapshotImports = [];
     private readonly Action<RaftInvariantViolation> onLibraryViolation;
 
     private SimulationCluster(SimulationClusterOptions options, VirtualTickSource clock, SimulatedTransport transport)
@@ -103,6 +106,75 @@ public sealed class SimulationCluster : IAsyncDisposable
             libraryViolations.Add(violation);
     }
 
+    /// <summary>
+    /// Every snapshot install a node accepted while its own log could still have been repaired by
+    /// backfill, oldest first. Empty on a healthy run.
+    ///
+    /// <para><b>Why the harness judges this.</b> A snapshot is the repair for a follower that sits
+    /// below what the leader's log can serve. Nothing in the protocol's own checks says anything
+    /// about a snapshot sent to a follower that was NOT below the floor: every install succeeds,
+    /// every frontier converges, and the run reports a healthy cluster. The Caraxes bank-leader-kill
+    /// restart was exactly that — a restarted node whose log covered the leader's floor by millions
+    /// of entries reported a frontier of 0 before its restore had run, and was re-seeded by a
+    /// 38-second snapshot it did not need. Judged at import time, before the install changes the
+    /// node's log, from the node's own contiguous resolved prefix against the most compacted log
+    /// among the other running nodes: if even that log still begins at or below the node's
+    /// prefix + 1, a backfill anchored there would have been served.</para>
+    /// </summary>
+    public IReadOnlyList<UnnecessarySnapshotImport> UnnecessarySnapshotImports
+    {
+        get
+        {
+            lock (violationGate)
+                return [.. unnecessarySnapshotImports];
+        }
+    }
+
+    private void RecordSnapshotImport(SimulationNode importer, int partitionId)
+    {
+        SimulatedWalPartitionSnapshot? own = importer.SimulatedWal?.Snapshot().Partition(partitionId);
+        if (own is null)
+            return;
+
+        // The node's contiguous RESOLVED prefix above whatever it is no longer required to hold. A
+        // Proposed tail above it is not evidence of position: it may be a deposed leader's orphan
+        // that backfill overwrites, so the anchor a leader would use sits at the resolved prefix.
+        long heldThrough = own.CoveredThrough;
+        foreach (RaftLog log in importer.Wal.ReadLogsRange(partitionId, heldThrough + 1))
+        {
+            if (log.Id != heldThrough + 1)
+                break;
+            if (log.Type is not (RaftLogType.Committed or RaftLogType.CommittedCheckpoint))
+                break;
+            heldThrough = log.Id;
+        }
+
+        long firstRetainedElsewhere = -1;
+        string retainedBy = "";
+        foreach (SimulationNode other in nodes)
+        {
+            if (other == importer || other.LifecycleStatus != SimulationNodeLifecycleStatus.Running)
+                continue;
+
+            SimulatedWalPartitionSnapshot? store = other.SimulatedWal?.Snapshot().Partition(partitionId);
+            if (store is null || store.FirstLogId <= 0)
+                continue;
+
+            if (store.FirstLogId > firstRetainedElsewhere)
+            {
+                firstRetainedElsewhere = store.FirstLogId;
+                retainedBy = other.Endpoint;
+            }
+        }
+
+        if (firstRetainedElsewhere < 0 || heldThrough < firstRetainedElsewhere - 1)
+            return;
+
+        lock (violationGate)
+            unnecessarySnapshotImports.Add(new UnnecessarySnapshotImport(
+                StepNumber, importer.Endpoint, partitionId, heldThrough, firstRetainedElsewhere, retainedBy));
+    }
+
     /// <summary>Parameters this cluster was built from.</summary>
     public SimulationClusterOptions Options { get; }
 
@@ -158,6 +230,11 @@ public sealed class SimulationCluster : IAsyncDisposable
         for (int nodeIndex = 0; nodeIndex < options.NodeCount; nodeIndex++)
             cluster.nodes.Add(SimulationNode.Create(nodeIndex, options, clock, transport, logger));
 
+        // The transfer stub survives a restart with the node's store, so one installation covers
+        // every life of the node.
+        foreach (SimulationNode node in cluster.nodes)
+            node.StateTransfer.ImportObserver = partitionId => cluster.RecordSnapshotImport(node, partitionId);
+
         // Subscribed before the first join, because a restore runs inside the join and a restore
         // is where the one violation this exists for was seen. Unsubscribed in DisposeAsync.
         RaftInvariants.Violated += cluster.onLibraryViolation;
@@ -209,6 +286,16 @@ public sealed class SimulationCluster : IAsyncDisposable
         node.Crash();
         Transport.PartitionNode(node.Endpoint);
 
+        // The failure detector's verdict, delivered by the harness: the simulation drives no SWIM
+        // probes, so without this a crashed node stays Alive to every peer for as long as it is
+        // down, and every rule keyed on liveness — the leader's retention hold for silent peers
+        // above all — is never exercised by a crash. Suspect is enough: the rules test for Alive.
+        foreach (SimulationNode other in nodes)
+        {
+            if (other != node && other.HasLiveManager)
+                other.Manager.Liveness.MarkSuspect(node.Endpoint);
+        }
+
         await SettleAsync(deliverMessages: true, cancellationToken).ConfigureAwait(false);
     }
 
@@ -224,6 +311,14 @@ public sealed class SimulationCluster : IAsyncDisposable
         node.Rebuild();
         PublishRoutingTable();
         Transport.HealPartition(node.Endpoint);
+
+        // The probe that would succeed now: the peers see the node alive again the moment it is
+        // reachable, as a direct probe would report it.
+        foreach (SimulationNode other in nodes)
+        {
+            if (other != node && other.HasLiveManager)
+                other.Manager.Liveness.ClearSuspicion(node.Endpoint);
+        }
 
         Task join = await node.BeginStartAsync(cancellationToken).ConfigureAwait(false);
 

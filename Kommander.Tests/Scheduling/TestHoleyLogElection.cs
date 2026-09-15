@@ -257,7 +257,7 @@ public class TestHoleyLogElection
         HoleyWalFacade wal = new() { RawMaxLog = 10, LastEntryTerm = 9, PresentId = 3, PresentTermValue = 7 };
         CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
 
         RaftResponderRequest votesMsg = Assert.Single(host.Outbound,
@@ -281,7 +281,7 @@ public class TestHoleyLogElection
         HoleyWalFacade wal = new() { RawMaxLog = 10, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1 };
         CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 5, remoteMaxLogId: 5, ts, preVote: false, remoteLastLogTerm: 1);
 
@@ -298,7 +298,7 @@ public class TestHoleyLogElection
         HoleyWalFacade wal = new() { RawMaxLog = 10, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1 };
         CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 5, remoteMaxLogId: 2, ts, preVote: false, remoteLastLogTerm: 1);
 
@@ -321,7 +321,7 @@ public class TestHoleyLogElection
         HoleyWalFacade wal = new() { RawMaxLog = 10, LastEntryTerm = 1, PresentId = 10, PresentTermValue = 0 };
         CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 5, remoteMaxLogId: 2, ts, preVote: false, remoteLastLogTerm: 5);
 
@@ -339,7 +339,7 @@ public class TestHoleyLogElection
         HoleyWalFacade wal = new() { RawMaxLog = 10, LastEntryTerm = 1, PresentId = 10, PresentTermValue = 0 };
         CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 5, remoteMaxLogId: 10, ts, preVote: false, remoteLastLogTerm: 5);
 
@@ -356,7 +356,7 @@ public class TestHoleyLogElection
         HoleyWalFacade wal = new() { RawMaxLog = 0, LastEntryTerm = 0, PresentId = 0, PresentTermValue = 0 };
         CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 5, remoteMaxLogId: 5, ts, preVote: false, remoteLastLogTerm: 5);
 
@@ -373,7 +373,7 @@ public class TestHoleyLogElection
         HoleyWalFacade wal = new() { RawMaxLog = 10, LastEntryTerm = 1, PresentId = 10, PresentTermValue = 0 };
         CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 5, remoteMaxLogId: 2, ts, preVote: true, remoteLastLogTerm: 5);
 
@@ -401,7 +401,7 @@ public class TestHoleyLogElection
         ]);
         CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         // Win a real election with the peer's vote so the promotion runs with a voter peer visible.
         await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
         await Assert.ThrowsAsync<RaftException>(() =>
@@ -434,7 +434,7 @@ public class TestHoleyLogElection
         ]);
         CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         // Three consecutive wins over the same hole are refused: a fresher peer still has every
         // chance to win one of these terms.
         for (int attempt = 1; attempt <= 3; attempt++)
@@ -490,6 +490,7 @@ public class TestHoleyLogElection
 
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
 
+        sm.MarkRestoredForTesting();
         // Far past both caps (3, and 12 with a fresher live voter known): the count alone would
         // have truncated many terms ago.
         for (int attempt = 1; attempt <= 15; attempt++)
@@ -529,6 +530,7 @@ public class TestHoleyLogElection
 
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
 
+        sm.MarkRestoredForTesting();
         // The count budget is spent here; only the grace still holds the truncation back.
         for (int attempt = 1; attempt <= 5; attempt++)
         {
@@ -576,6 +578,7 @@ public class TestHoleyLogElection
 
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
 
+        sm.MarkRestoredForTesting();
         // Past the cap of 3: the count alone would already have taken the skip-gaps escape.
         for (int attempt = 1; attempt <= 5; attempt++)
         {
@@ -616,7 +619,7 @@ public class TestHoleyLogElection
         ]);
         CapturingHost host = new();   // Nodes stays empty: sole voter
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
 
         // The contiguous prefix was applied; the unreachable lone high entry was truncated, never
@@ -656,7 +659,7 @@ public class TestHoleyLogElection
         wal.SeedNextId(4);
         CapturingHost host = new();
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         // Promote peerless (the single-voter path arms the barrier and self-commits): maxLog (3) >
         // commit frontier (0) arms the barrier; leadership is unpublished.
         await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
@@ -698,7 +701,7 @@ public class TestHoleyLogElection
         wal.SeedNextId(4);
         CapturingHost host = new();   // Nodes stays empty: sole voter throughout
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
         await sm.CompleteWalOperationAsync(ProposeCompletion(host.PartitionId, logIndex: 4));
         await sm.CompleteWalOperationAsync(CommitCompletion(host.PartitionId, minLogIndex: 4, maxLogIndex: 4));
@@ -728,7 +731,7 @@ public class TestHoleyLogElection
         wal.SeedNextId(1);
         CapturingHost host = new();
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         // Promote over an empty WAL: no inherited tail, publishes immediately.
         await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
         Assert.Equal("node-a", host.Leader);
@@ -789,7 +792,7 @@ public class TestHoleyLogElection
         wal.SeedNextId(4);
         CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         // Three consecutive wins over the same shape are refused (the granter advertises no
         // fresher position, so the default cap applies).
         for (int attempt = 1; attempt <= 3; attempt++)
@@ -831,7 +834,7 @@ public class TestHoleyLogElection
         wal.SeedNextId(4);
         CapturingHost host = new() { Nodes = [new RaftNode("node-b"), new RaftNode("node-c")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         // Five consecutive wins: node-b's grant advertises position 9 (above our contiguous 3) and
         // is ignored for quorum — but recorded as freshness evidence; node-c's grant completes the
         // quorum. With the fresher voter known, the 4th and 5th wins still refuse (the default cap
@@ -868,7 +871,7 @@ public class TestHoleyLogElection
         ]);
         CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
         Assert.Equal(RaftNodeState.Candidate, sm.NodeState);
 
@@ -899,7 +902,7 @@ public class TestHoleyLogElection
         HoleyWalFacade wal = new() { RawMaxLog = 8, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3, HasPresenceGapValue = true };
         CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         // node-b's pre-vote probe advertises contiguous position 9 — recorded as freshness
         // evidence even though the probe itself may be granted or denied.
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
@@ -922,7 +925,7 @@ public class TestHoleyLogElection
         HoleyWalFacade wal = new() { RawMaxLog = 8, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3, HasPresenceGapValue = true };
         CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         await sm.VoteAsync(new RaftNode("node-b"), voteTerm: 2, remoteMaxLogId: 9, ts, preVote: true, remoteLastLogTerm: 1);
         host.Outbound.Clear();
@@ -948,7 +951,7 @@ public class TestHoleyLogElection
         HoleyWalFacade wal = new() { RawMaxLog = 8, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3, HasPresenceGapValue = true };
         CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         await sm.CheckPartitionLeadershipAsync();
         Assert.Contains(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
     }
@@ -977,7 +980,7 @@ public class TestHoleyLogElection
         HoleyWalFacade wal = new() { RawMaxLog = 8, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3, HasPresenceGapValue = true };
         CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         await sm.AppendLogsAsync("node-b", 1, ts, logs: null);
 
@@ -1007,7 +1010,7 @@ public class TestHoleyLogElection
         HoleyWalFacade wal = new() { RawMaxLog = 8, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3, HasPresenceGapValue = true };
         CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         await sm.AppendLogsAsync("node-b", 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);
         wal.PresentId = 5; // the gap moved: entries below filled in, a higher range still buffers
         await sm.AppendLogsAsync("node-b", 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);
@@ -1027,7 +1030,7 @@ public class TestHoleyLogElection
         HoleyWalFacade wal = new() { RawMaxLog = 8, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3, HasPresenceGapValue = true };
         CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
         RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
-
+        sm.MarkRestoredForTesting();
         await sm.AppendLogsAsync("node-b", 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);
         wal.HasPresenceGapValue = false; // the transient gap healed
         await sm.AppendLogsAsync("node-b", 1, host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId), logs: null);

@@ -218,6 +218,7 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.CompactNumberEntries)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.MaxEntriesPerCompaction)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.CompactionLiveReplicaLagBudget)] = RaftOptionKind.Liveness,
+        [nameof(RaftConfiguration.CompactionSilentPeerRetentionWindow)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.CompactionDurabilityClampReportInterval)] = RaftOptionKind.Performance,
     };
 
@@ -370,6 +371,18 @@ public static class RaftSafetyOptionAudit
                 "a positive entry budget",
                 "Compaction ignores how far a live, acking follower has replicated, so an ordinary "
                 + "pass can force a healthy follower into snapshot dependence.",
+                IsShippedDefault: false));
+        }
+
+        if (configuration.CompactionSilentPeerRetentionWindow <= TimeSpan.Zero)
+        {
+            deviations.Add(new(
+                nameof(RaftConfiguration.CompactionSilentPeerRetentionWindow),
+                RaftOptionKind.Liveness,
+                configuration.CompactionSilentPeerRetentionWindow.ToString(),
+                "a positive window",
+                "A peer that is killed or cut off holds no retention while it is down, so a node restarted "
+                + "inside a short outage is re-seeded by a full snapshot instead of being backfilled from the log.",
                 IsShippedDefault: false));
         }
 

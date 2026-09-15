@@ -50,9 +50,16 @@ public sealed class TestPreRestoreVoteFence
         public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp ts, bool autoCommit) => MakeNoOp();
         public WALWriteOperation EnqueueCommit(List<RaftLog> logs) => MakeNoOp();
         public WALWriteOperation EnqueueRollback(List<RaftLog> logs) => MakeNoOp();
-        public WALWriteOperation? EnqueueProposeOrCommit(List<RaftLog>? logs, HLCTimestamp timestamp = default, string? endpoint = null, long term = -1) => MakeNoOp();
+        public WALWriteOperation? EnqueueProposeOrCommit(List<RaftLog>? logs, HLCTimestamp timestamp = default, string? endpoint = null, long term = -1)
+        {
+            ProposeOrCommitCalls++;
+            return MakeNoOp();
+        }
         public void NotifyCommitted() { }
         private static WALWriteOperation MakeNoOp() => new(_ => { }, 0, WALWriteOperationType.LeaderPropose, (0, []));
+
+        /// <summary>Entry-carrying appends the partition handed to the WAL.</summary>
+        public int ProposeOrCommitCalls { get; private set; }
     }
 
     private sealed class RelaySink : IRaftOperationReplySink
@@ -134,6 +141,112 @@ public sealed class TestPreRestoreVoteFence
 
             Assert.False(executor.IsRestored);
             Assert.DoesNotContain(host.EnqueuedResponses, r => r.Item2.Type == RaftResponderRequestType.Vote);
+        }
+        finally
+        {
+            wal.ReleaseRestore();
+            executor.Dispose();
+        }
+    }
+
+    private static RaftLog Proposed(long id) => new()
+    {
+        Id = id,
+        Term = 1,
+        Type = RaftLogType.Proposed,
+        LogType = "t",
+        LogData = [1],
+        Time = HLCTimestamp.Zero,
+    };
+
+    /// <summary>
+    /// A heartbeat that arrives before the restore completes is still answered (the leader must
+    /// keep counting the peer as reachable), but the ack carries NO position: commit index and
+    /// durable index are -1, and no hole report rides along. Everything the ack would otherwise
+    /// read is at its pre-restore init — a contiguous frontier of 0 on a disk that may hold
+    /// millions of entries — and a leader that took 0 as evidence anchored a backfill at 1 and
+    /// escalated to a snapshot the node did not need (the Caraxes bank-leader-kill restart).
+    /// </summary>
+    [Fact]
+    public async Task HeartbeatBeforeRestoreCompletes_IsAckedWithoutAPosition()
+    {
+        (RaftPartitionExecutor executor, TestWalCompletionFences.StubHost host, GatedRestoreWal wal) = Build();
+
+        try
+        {
+            await executor.Ask(
+                new RaftRequest(RaftRequestType.AppendLogs,
+                    term: 1,
+                    timestamp: host.HybridLogicalClock.SendOrLocalEvent(2),
+                    endpoint: "leader-node"),
+                TestContext.Current.CancellationToken);
+
+            Assert.False(executor.IsRestored);
+
+            (string, RaftResponderRequest) ack = Assert.Single(host.EnqueuedResponses, r => r.Item2.Type == RaftResponderRequestType.CompleteAppendLogs);
+            CompleteAppendLogsRequest payload = Assert.IsType<CompleteAppendLogsRequest>(ack.Item2.CompleteAppendLogsRequest);
+            Assert.Equal(RaftOperationStatus.Success, payload.Status);
+            Assert.Equal(-1, payload.CommitIndex);
+            Assert.Equal(-1, payload.DurableIndex);
+            Assert.Equal(0, wal.ProposeOrCommitCalls);
+        }
+        finally
+        {
+            wal.ReleaseRestore();
+            executor.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// An entry-carrying batch before the restore completes is refused with
+    /// <see cref="RaftOperationStatus.RestoreInProgress"/> and never reaches the WAL: its rows would
+    /// land over frontiers the restore is about to rebuild from disk, and its completion would ack a
+    /// presence frontier of 0. The same batch after the restore is accepted, which proves the
+    /// fence — not the stub's own state — is what refused it.
+    /// </summary>
+    [Fact]
+    public async Task EntryBatchBeforeRestoreCompletes_IsRefusedWithRestoreInProgress_AndAcceptedAfter()
+    {
+        (RaftPartitionExecutor executor, TestWalCompletionFences.StubHost host, GatedRestoreWal wal) = Build();
+
+        try
+        {
+            RaftResponse before = await executor.Ask(
+                new RaftRequest(RaftRequestType.AppendLogs,
+                    term: 1,
+                    timestamp: host.HybridLogicalClock.SendOrLocalEvent(2),
+                    endpoint: "leader-node",
+                    logs: [Proposed(7), Proposed(8)]),
+                TestContext.Current.CancellationToken);
+
+            Assert.False(executor.IsRestored);
+            Assert.Equal(RaftOperationStatus.RestoreInProgress, before.Status);
+            Assert.Equal(0, wal.ProposeOrCommitCalls);
+
+            (string, RaftResponderRequest) ack = Assert.Single(host.EnqueuedResponses, r => r.Item2.Type == RaftResponderRequestType.CompleteAppendLogs);
+            CompleteAppendLogsRequest payload = Assert.IsType<CompleteAppendLogsRequest>(ack.Item2.CompleteAppendLogsRequest);
+            Assert.Equal(RaftOperationStatus.RestoreInProgress, payload.Status);
+            Assert.Equal(-1, payload.CommitIndex);
+            Assert.Equal(-1, payload.DurableIndex);
+
+            wal.ReleaseRestore();
+            await executor.RestoreTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+            // Not awaited: an accepted batch answers from its WAL completion, which the stub's
+            // no-op operation never delivers. The WAL enqueue is the evidence the fence lifted.
+            _ = executor.Ask(
+                new RaftRequest(RaftRequestType.AppendLogs,
+                    term: 1,
+                    timestamp: host.HybridLogicalClock.SendOrLocalEvent(2),
+                    endpoint: "leader-node",
+                    logs: [Proposed(7), Proposed(8)]),
+                TestContext.Current.CancellationToken);
+
+            long deadline = Environment.TickCount64 + 5_000;
+            while (wal.ProposeOrCommitCalls == 0 && Environment.TickCount64 < deadline)
+                await Task.Delay(10, TestContext.Current.CancellationToken);
+
+            Assert.Equal(1, wal.ProposeOrCommitCalls);
         }
         finally
         {

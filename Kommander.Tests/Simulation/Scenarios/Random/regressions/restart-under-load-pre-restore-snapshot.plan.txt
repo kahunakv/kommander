@@ -1,0 +1,41 @@
+seed=20260915
+partitionId=1
+actionCount=27
+stepsPerAction=6
+advanceMillisecondsPerStep=50
+maxImpairedNodes=1
+maxFaultAgeInActions=4
+recoveryStepBudget=900
+idleConvergenceStepBudget=300
+compactEveryOperations=8
+compactionLiveReplicaLagBudget=4
+signature=invariant:no-unnecessary-snapshot
+note=Hand-written from the Caraxes bank-leader-kill restart (vorpal b24b3891): a node killed above the leader's compaction floor and restarted into live traffic must rejoin by backfill; before the pre-restore ack fence it reported position 0 and was re-seeded by snapshot.
+
+000 AppendAtLeader
+001 AppendAtLeader
+002 AppendAtLeader
+003 AppendAtLeader
+004 AppendAtLeader
+005 AppendAtLeader
+006 AppendAtLeader
+007 AppendAtLeader
+008 Checkpoint
+009 AppendAtLeader
+010 AppendAtLeader
+011 AppendAtLeader
+012 AppendAtLeader
+013 AppendAtLeader
+014 AppendAtLeader
+015 AppendAtLeader
+016 AppendAtLeader
+017 Checkpoint
+018 AppendAtLeader
+019 AppendAtLeader
+020 AppendAtLeader
+021 CrashNode localhost:8003
+022 AppendAtLeader
+023 AppendAtLeader
+024 RestartNode localhost:8003
+025 AppendAtLeader
+026 AppendAtLeader

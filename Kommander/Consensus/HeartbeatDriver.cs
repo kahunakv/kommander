@@ -42,6 +42,23 @@ internal sealed class HeartbeatDriver
     private readonly RaftPartitionLogThrottle logThrottle;
     private readonly ILogger<IRaft> logger;
 
+    /// <summary>
+    /// Monotonic tick of the heartbeat round in which each peer was first seen non-Alive, kept while
+    /// it stays so. Backs <see cref="RaftConfiguration.CompactionSilentPeerRetentionWindow"/>: the
+    /// leader cannot know when a peer that was already down at its election died, so the window
+    /// runs from the first round that saw it silent. Removed the round the peer is Alive again.
+    /// Executor thread only.
+    /// </summary>
+    private readonly Dictionary<string, long> silentSinceTicks = new();
+
+    /// <summary>
+    /// Floor published for a silent peer with no positional evidence. Any value at or below the
+    /// WAL's budget clamp reads as "the whole budget": the WAL keeps at most
+    /// <see cref="RaftConfiguration.CompactionLiveReplicaLagBudget"/> entries below the checkpoint
+    /// however low this is, and a peer whose position is unknown may need any of them.
+    /// </summary>
+    private const long UnknownPositionFloor = 1;
+
     public HeartbeatDriver(
         IRaftPartitionHost host,
         IRaftWalFacade wal,
@@ -305,8 +322,13 @@ internal sealed class HeartbeatDriver
     /// not compacted into permanent snapshot dependence (the non-converging rescue loop's deeper
     /// cause). Peer selection is deliberately conservative:
     /// <list type="bullet">
-    ///   <item>Only SWIM-Alive peers hold the floor — a paused or dead node must not grow the WAL
-    ///   (beyond what the budget already bounds while its staleness lasts).</item>
+    ///   <item>SWIM-Alive peers hold the floor. A peer that has gone silent holds it too, but only
+    ///   for <see cref="RaftConfiguration.CompactionSilentPeerRetentionWindow"/> from the round that
+    ///   first saw it silent — at its last position when it reported one, else at the budget's full
+    ///   depth — so a node killed and restarted inside the window is served from the log instead of
+    ///   being re-seeded by snapshot (the Caraxes bank-leader-kill residue: the floor ran past the
+    ///   restarting leader twice inside one 30-second outage). Past the window it holds nothing; the
+    ///   budget bounds the cost either way.</item>
     ///   <item>A peer with no positional evidence contributes nothing: there is no index to hold
     ///   at, and a blank joiner on a compacted WAL is seeded by snapshot anyway. Position 0 counts
     ///   as no evidence — election seeding sets <c>matchIndex</c> to 0 optimistically for every
@@ -328,14 +350,33 @@ internal sealed class HeartbeatDriver
             return;
 
         long floor = long.MaxValue;
+        long nowTicks = host.GetMonotonicTimestamp();
 
         foreach (RaftNode node in nodes)
         {
             if (node.Endpoint == host.LocalEndpoint)
                 continue;
 
-            if (host.GetNodeLiveness(node.Endpoint) != MemberLivenessState.Alive)
-                continue;
+            bool alive = host.GetNodeLiveness(node.Endpoint) == MemberLivenessState.Alive;
+            if (alive)
+            {
+                silentSinceTicks.Remove(node.Endpoint);
+            }
+            else
+            {
+                TimeSpan window = host.Configuration.CompactionSilentPeerRetentionWindow;
+                if (window <= TimeSpan.Zero)
+                    continue;
+
+                if (!silentSinceTicks.TryGetValue(node.Endpoint, out long since))
+                {
+                    since = nowTicks;
+                    silentSinceTicks[node.Endpoint] = since;
+                }
+
+                if (RaftMonotonic.Elapsed(since, nowTicks) > window)
+                    continue;
+            }
 
             // DURABLE, contiguous evidence only, in this order of preference:
             //   1. the peer's reported durable commit frontier (every term-valid ack carries it): the
@@ -364,9 +405,34 @@ internal sealed class HeartbeatDriver
 
 
             if (position <= 0)
+            {
+                // A live peer with no evidence holds nothing: there is no index to hold at, and a
+                // blank joiner on a compacted WAL is seeded by snapshot anyway. A SILENT peer with no
+                // evidence is different: it is usually a member that was already down when this
+                // leader was elected (the killed leader itself), whose position is at most this
+                // leader's own log and unknowable until it answers, so it holds the whole budget for
+                // the window.
+                if (alive)
+                    continue;
+
+                if (UnknownPositionFloor < floor)
+                    floor = UnknownPositionFloor;
                 continue;
+            }
 
             long needed = position + 1;
+
+            // The floor must also keep the row the NEXT anchored backfill will start at. nextIndex is
+            // set from the peer's last ack (a LogMismatch backtracks it to the reported anchor + 1),
+            // and the durable frontier above can have moved past it by the time this round runs:
+            // a catching-up follower answers many appends between two heartbeat rounds. Holding the
+            // floor at the newer, higher position let compaction remove exactly the row nextIndex
+            // pointed at; the read at the anchor then came back one id short, was refused as
+            // non-contiguous, and escalated to a snapshot for a peer that was a single entry behind
+            // (the Caraxes bank-leader-kill run: anchored at 5,464,761, first available 5,464,762).
+            if (tracker.TryGetNextIndex(node.Endpoint, out long nextIndex) && nextIndex > 0 && nextIndex < needed)
+                needed = nextIndex;
+
             if (needed < floor)
                 floor = needed;
         }

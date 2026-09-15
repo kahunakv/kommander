@@ -74,6 +74,7 @@ public sealed class TestPartialPlanCompletion
         TestWalCompletionFences.StubHost host = new(partitionId: 1);
         SubsetPlanStubWal wal = new() { PresentIndex = 8, CommitIndexValue = 8, MaxLogValue = 8 };
         RaftPartitionStateMachine sm = new(host, wal, new NullSink(), NullLogger<IRaft>.Instance);
+        sm.MarkRestoredForTesting();
         return (sm, host, wal);
     }
 

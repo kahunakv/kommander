@@ -382,6 +382,7 @@ public class InMemoryWAL : IWAL, IDisposable
             // Drop the recorded checkpoint too, so a reused partition id does not inherit a stale floor.
             lastCheckpoints.Remove(partitionId);
             maxLogIds.Remove(partitionId);
+            compactionFloors.Remove(partitionId);
             return RaftOperationStatus.Success;
         }
         finally
@@ -395,6 +396,10 @@ public class InMemoryWAL : IWAL, IDisposable
         rwLock.EnterWriteLock();
         try
         {
+            // A row later written at a truncated id must never sit below the floor and read as compacted.
+            if (compactionFloors.TryGetValue(partitionId, out long floor) && floor > afterLogId + 1)
+                compactionFloors[partitionId] = Math.Max(afterLogId + 1, 0);
+
             if (!allLogs.TryGetValue(partitionId, out SortedList<long, RaftLog>? partitionLogs))
                 return RaftOperationStatus.Success;
 
@@ -534,6 +539,10 @@ public class InMemoryWAL : IWAL, IDisposable
             bool matches = partitionLogs.TryGetValue(snapshotIndex, out RaftLog? existing)
                            && existing!.Term == lastIncludedTerm;
 
+            // The boundary row itself must be readable: a floor above it clamps to the boundary.
+            if (compactionFloors.TryGetValue(partitionId, out long floor) && floor > snapshotIndex)
+                compactionFloors[partitionId] = snapshotIndex;
+
             bool suffixTruncated = false;
             if (!matches)
             {
@@ -637,6 +646,10 @@ public class InMemoryWAL : IWAL, IDisposable
 
             UpdateMaxAfterRemoval(partitionId, partitionLogs, highestRemovedId);
 
+            // The floor is the first id retained; ids below it are gone. Monotonic: a later pass
+            // with a lower cap never lowers it.
+            compactionFloors[partitionId] = Math.Max(compactionFloors.GetValueOrDefault(partitionId), highestRemovedId + 1);
+
             // No checkpoint adjustment: only entries with id < lastCheckpoint are removed, so the recorded
             // checkpoint (>= lastCheckpoint) is never affected.
             return (RaftOperationStatus.Success, removeCount);
@@ -644,6 +657,23 @@ public class InMemoryWAL : IWAL, IDisposable
         finally
         {
             rwLock.ExitWriteLock();
+        }
+    }
+
+    /// <summary>Per-partition compaction floor (first retained id); absent when nothing was compacted.</summary>
+    private readonly Dictionary<int, long> compactionFloors = new();
+
+    /// <inheritdoc />
+    public long GetCompactionFloor(int partitionId)
+    {
+        rwLock.EnterReadLock();
+        try
+        {
+            return compactionFloors.GetValueOrDefault(partitionId);
+        }
+        finally
+        {
+            rwLock.ExitReadLock();
         }
     }
 

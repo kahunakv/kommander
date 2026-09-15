@@ -271,8 +271,13 @@ internal sealed class BackfillSender
             if (cached!.Logs.Count == 0)
             {
                 // A memoized refusal is still a refusal for THIS follower: it must escalate to the
-                // snapshot fallback exactly like the follower that triggered the original read.
-                if (cached.EmptyResult != BackfillSendResult.SaturationPaused)
+                // snapshot fallback exactly like the follower that triggered the original read —
+                // under the same exemption for a peer that already reports holding the refused range.
+                bool peerPastRefusedRange = cached.EmptyResult == BackfillSendResult.NonContiguous
+                    && cached.FirstAvailableId > 0
+                    && PeerReportsHolding(node.Endpoint, cached.FirstAvailableId - 1);
+
+                if (cached.EmptyResult != BackfillSendResult.SaturationPaused && !peerPastRefusedRange)
                     await EscalateRefusalToSnapshotAsync(node).ConfigureAwait(false);
                 return cached.EmptyResult;
             }
@@ -330,8 +335,21 @@ internal sealed class BackfillSender
         if (backfill[0].Id != from)
         {
             await backfillTracker.ReportAsync(node.Endpoint, from, backfill[0].Id).ConfigureAwait(false);
-            round?.Add(from, [], 0, BackfillSendResult.NonContiguous);
-            await EscalateRefusalToSnapshotAsync(node).ConfigureAwait(false);
+            round?.Add(from, [], 0, BackfillSendResult.NonContiguous, backfill[0].Id);
+
+            // A snapshot is the repair for a peer that sits BELOW what this log can serve. When the
+            // peer's own freshest report already reaches the first entry available here, the
+            // refused anchor is merely stale — nextIndex was set from an older ack than the one the
+            // retention floor followed (see HeartbeatDriver.PublishLiveReplicaRetentionFloor) — and
+            // the next round, anchored at the fresher report, ships normally. Escalating on that
+            // shape sent a full snapshot to a follower that was one entry behind.
+            if (!PeerReportsHolding(node.Endpoint, backfill[0].Id - 1))
+                await EscalateRefusalToSnapshotAsync(node).ConfigureAwait(false);
+            else if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] Not escalating the refused backfill for {Endpoint} (anchored at {From}, first available {FirstId}) to a snapshot: the peer's latest report already covers the refused range; re-anchoring next round",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, from, backfill[0].Id);
+
             return BackfillSendResult.NonContiguous;
         }
 
@@ -398,6 +416,21 @@ internal sealed class BackfillSender
             "[{LocalEndpoint}/{PartitionId}/{State}] Backfill to {Endpoint} shipped {Ships} consecutive batches without its reported commit frontier advancing past {Frontier}; batches are now paced and anchored at the frontier (last anchor {Anchor})",
             host.LocalEndpoint, host.PartitionId, coreState.NodeState,
             node.Endpoint, fruitlessShips, reportedFrontier, anchor);
+    }
+
+    /// <summary>
+    /// True when the peer's freshest reported position — its durable frontier when it reports one,
+    /// else its protocol commit frontier — is at or above <paramref name="index"/>, i.e. the peer
+    /// itself attests to holding every entry through it. Rejection-ack raw maxima are deliberately
+    /// not consulted: they sit above holes.
+    /// </summary>
+    private bool PeerReportsHolding(string endpoint, long index)
+    {
+        if (tracker.TryGetDurableFrontier(endpoint, out long durable) && durable > 0)
+            return durable >= index;
+
+        long committed = tracker.GetCommitFrontierOrDefault(endpoint, -1);
+        return committed > 0 && committed >= index;
     }
 
     /// <summary>

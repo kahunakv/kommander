@@ -725,6 +725,7 @@ public class RocksDbWAL : IWAL, IDisposable
             // what was replayed.
             commitFrontierCache.Clear();
             compactionFloorCache.Clear();
+            maxLogCache.Clear();
 
             try
             {
@@ -1194,6 +1195,7 @@ public class RocksDbWAL : IWAL, IDisposable
                     }
 
                     db.Write(checkpointBatch, effectiveOptions);
+                    RaiseMaxLogCache(partitionId, log.Id);
 
                     return RaftOperationStatus.Success;
                 }
@@ -1229,6 +1231,7 @@ public class RocksDbWAL : IWAL, IDisposable
                         PutCommitFrontierToBatch(commitBatch, partitionId, advanced);
                         db.Write(commitBatch, effectiveOptions);
                         RaiseCommitFrontierCache(partitionId, advanced);
+                        RaiseMaxLogCache(partitionId, log.Id);
                         return RaftOperationStatus.Success;
                     }
 
@@ -1257,6 +1260,7 @@ public class RocksDbWAL : IWAL, IDisposable
                 }
 
                 NoteShardBytesWritten(size);
+                RaiseMaxLogCache(partitionId, log.Id);
 
                 return RaftOperationStatus.Success;
             }
@@ -1333,6 +1337,10 @@ public class RocksDbWAL : IWAL, IDisposable
             long markersAbsorbedThisCall = 0;
             long shardBytesStaged = 0;
 
+            // Highest id staged as a row per partition (absorbed markers stage no row), for the
+            // max-log cache raise after the batch lands.
+            Dictionary<int, long>? stagedMaxByPartition = null;
+
             foreach ((ColumnFamilyHandle key, Dictionary<int, List<RaftLog>> raftLogs) in plan)
             {
                 foreach (KeyValuePair<int, List<RaftLog>> kv in raftLogs)
@@ -1367,6 +1375,10 @@ public class RocksDbWAL : IWAL, IDisposable
                         }
 
                         shardBytesStaged += PutLogToBatch(writeBatch, partitionId, log, key);
+
+                        stagedMaxByPartition ??= new();
+                        if (log.Id > stagedMaxByPartition.GetValueOrDefault(partitionId, -1))
+                            stagedMaxByPartition[partitionId] = log.Id;
 
                         if (log.Type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
                         {
@@ -1420,6 +1432,12 @@ public class RocksDbWAL : IWAL, IDisposable
             {
                 foreach ((int partitionId, long value) in frontierAdvances)
                     RaiseCommitFrontierCache(partitionId, value);
+            }
+
+            if (stagedMaxByPartition is not null)
+            {
+                foreach ((int partitionId, long value) in stagedMaxByPartition)
+                    RaiseMaxLogCache(partitionId, value);
             }
 
             CommitMarkersAbsorbed += markersAbsorbedThisCall;
@@ -1720,22 +1738,122 @@ public class RocksDbWAL : IWAL, IDisposable
     {
         using EngineLease lease = AcquireEngine();
 
+        long floor = GetCompactionFloor(partitionId);
+
+        if (maxLogCache.TryGetValue(partitionId, out PartitionMaxLog? cached))
+            return ClampMaxLogAtFloor(Volatile.Read(ref cached.Value), floor);
+
+        // A miss computes the value under the EXCLUSIVE guard: no append can land rows between the
+        // scan and the store (an append raises the cached value only after its own rows landed, and
+        // only when a value is cached), and no truncation can remove rows between them. The scan is
+        // the reverse seek this method always ran; it is now paid once per invalidation instead of
+        // once per call — see maxLogCache.
+        writeGuard.EnterWriteLock();
+        try
+        {
+            if (maxLogCache.TryGetValue(partitionId, out cached))
+                return ClampMaxLogAtFloor(cached.Value, floor);
+
+            long max = ScanMaxLogId(partitionId);
+            maxLogCache[partitionId] = new PartitionMaxLog(max);
+            return ClampMaxLogAtFloor(max, floor);
+        }
+        finally
+        {
+            writeGuard.ExitWriteLock();
+        }
+    }
+
+    /// <summary>
+    /// The highest physically present log id of a partition (0 when it holds no row), found with a
+    /// reverse seek from the partition's upper bound. Not clamped at the compaction floor; callers do
+    /// that at read time. Must run where no append or truncation can interleave — see
+    /// <see cref="GetMaxLog"/>.
+    /// </summary>
+    private long ScanMaxLogId(int partitionId)
+    {
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
-        
+
         using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
         SeekToLastPartitionKey(iterator, partitionId);
 
         // The key alone carries the id, so the last key in the partition answers this without reading
-        // (and copying) a single value. A last key below the compaction floor means every row of the
-        // partition is logically deleted — the same answer a physically emptied partition gives.
-        if (iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId))
-        {
-            long id = ParseLogIdFromKey(iterator.GetKeySpan());
-            return id >= GetCompactionFloor(partitionId) ? id : 0;
-        }
-
-        return 0;
+        // (and copying) a single value.
+        return iterator.Valid() && KeyBelongsToPartition(iterator.GetKeySpan(), partitionId)
+            ? ParseLogIdFromKey(iterator.GetKeySpan())
+            : 0;
     }
+
+    /// <summary>
+    /// A last key below the compaction floor means every row of the partition is logically deleted —
+    /// the same answer a physically emptied partition gives.
+    /// </summary>
+    private static long ClampMaxLogAtFloor(long id, long floor) => id >= floor ? id : 0;
+
+    // ── Cached max log id ─────────────────────────────────────────────────────────────────────
+    //
+    // GetMaxLog used to answer every call with a reverse seek from the partition's upper bound. A
+    // reverse seek must step back over every tombstone above the last live row before it can
+    // answer, and a truncating snapshot install leaves exactly such a run above its boundary (one
+    // point tombstone per deleted suffix row). On the restarted node of the Caraxes bank-leader-kill
+    // run the follower's Log Matching check calls this once per AppendEntries, and each call cost
+    // ~190 ms of tombstone skipping — the partition executor processed five appends a second, which
+    // is far below the leader's ingest, so the node could never catch up by backfill. The cache
+    // answers from memory; the reverse seek runs once per invalidation.
+    //
+    // Rules that keep the value exact:
+    //  * A value exists only after ScanMaxLogId computed it under the exclusive guard; an absent
+    //    entry means "unknown" and is never seeded by an append (an append knows its own rows, not
+    //    the rows already on disk).
+    //  * Every successful append RAISES the value (monotonic; concurrent appends race with a CAS)
+    //    after its rows landed and while it still holds the shared guard, so a scan under the
+    //    exclusive guard either sees the rows or runs after the raise.
+    //  * The truncation paths, which run under the exclusive guard, SET the value when they know
+    //    the new max exactly (a boundary install that removed the suffix leaves the boundary row as
+    //    the max) and REMOVE it when they do not (the surviving max after a truncation is below the
+    //    cut and unknown without a scan). The partition wipe removes it; ReopenEngine clears all.
+    //  * The compaction floor never touches it: the clamp happens at read time, as before.
+
+    /// <summary>One partition's cached highest physically present log id. See the region comment.</summary>
+    private sealed class PartitionMaxLog
+    {
+        public long Value;
+
+        public PartitionMaxLog(long value) => Value = value;
+    }
+
+    private readonly ConcurrentDictionary<int, PartitionMaxLog> maxLogCache = new();
+
+    /// <summary>
+    /// Raises the cached max log id of <paramref name="partitionId"/> to at least <paramref name="id"/>
+    /// after rows through that id landed durably. A partition without a cached value stays unknown.
+    /// </summary>
+    private void RaiseMaxLogCache(int partitionId, long id)
+    {
+        if (id <= 0 || !maxLogCache.TryGetValue(partitionId, out PartitionMaxLog? entry))
+            return;
+
+        long current = Volatile.Read(ref entry.Value);
+        while (current < id)
+        {
+            long seen = Interlocked.CompareExchange(ref entry.Value, id, current);
+            if (seen == current)
+                return;
+            current = seen;
+        }
+    }
+
+    /// <summary>
+    /// Records that the highest physically present id of <paramref name="partitionId"/> is exactly
+    /// <paramref name="id"/>. Exclusive-guard paths only.
+    /// </summary>
+    private void SetMaxLogCache(int partitionId, long id) => maxLogCache[partitionId] = new PartitionMaxLog(id);
+
+    /// <summary>
+    /// Forgets the cached max log id of <paramref name="partitionId"/>; the next <see cref="GetMaxLog"/>
+    /// recomputes it. Used when a mutation may have lowered the max to a value it did not observe.
+    /// </summary>
+    private void InvalidateMaxLogCache(int partitionId) => maxLogCache.TryRemove(partitionId, out _);
 
     /// <summary>
     /// Retrieves the current term of the specified partition by examining the last log entry.
@@ -2317,7 +2435,11 @@ public class RocksDbWAL : IWAL, IDisposable
             return false;
         }
 
-        using Iterator iterator = db.NewIterator(cf: columnFamilyHandle);
+        // Bounded at the checkpoint: the scan needs nothing above it, and the step past the last
+        // verified row must not pay for whatever lies there (after a truncating snapshot install
+        // that is a run of point tombstones the length of the deleted suffix).
+        using BoundedIterator bounded = NewBoundedIterator(columnFamilyHandle, partitionId, checkpointId + 1);
+        Iterator iterator = bounded.Iterator!;
         Span<byte> seekKey = stackalloc byte[LogKeyWidth];
         BuildLogKey(seekKey, partitionId, expected);
         iterator.Seek(seekKey);
@@ -2477,6 +2599,13 @@ public class RocksDbWAL : IWAL, IDisposable
         return GetCompactionFloor(partitionId);
     }
 
+    /// <inheritdoc />
+    long IWAL.GetCompactionFloor(int partitionId)
+    {
+        using EngineLease lease = AcquireEngine();
+        return GetCompactionFloor(partitionId);
+    }
+
     /// <summary>
     /// Reads only the header of the row at (<paramref name="partitionId"/>, <paramref name="logId"/>)
     /// via <see cref="HeaderSpanDeserializer"/>. Returns <c>Found=false</c> when the key is absent.
@@ -2529,61 +2658,99 @@ public class RocksDbWAL : IWAL, IDisposable
         if (advanced < target - 1)
         {
             long certifiedFloor = GetLastCheckpointFromMeta(partitionId);
+            long compactionFloor = GetCompactionFloor(partitionId);
             int steps = 0;
 
-            // Seeking at the compaction floor makes every dead-but-present row below it read as
-            // absent, so the walk crosses the compacted prefix with the same one-hop rule it used
-            // when those rows were physically deleted (floor <= certified checkpoint).
-            using Iterator iterator = db.NewIterator(cf: cf);
-            Span<byte> seekKey = stackalloc byte[LogKeyWidth];
-            BuildLogKey(seekKey, partitionId, Math.Max(advanced + 1, GetCompactionFloor(partitionId)));
-            iterator.Seek(seekKey);
-
-            Span<byte> partitionPrefix = stackalloc byte[PartitionPrefixWidth];
-            BuildPartitionPrefix(partitionPrefix, partitionId);
-
-            while (advanced < target - 1 && steps < FrontierCatchUpBound)
+            // Two probes, chosen by where the walk stands relative to the certified checkpoint.
+            //
+            // AT OR BELOW the certified floor the walk needs "the next physically present id", so it
+            // may hop over a compacted-certified absent span in one step. That is an iterator seek —
+            // but one whose upper bound is the floor itself (BoundedIterator), so it can never run
+            // into whatever sits above the checkpoint.
+            //
+            // ABOVE the floor the walk only ever asks "is the row at exactly F+1 present, and is it
+            // resolved?", which a point read answers without touching any neighbouring key.
+            //
+            // The old walk used one unbounded iterator for both and paid for it after every
+            // truncating snapshot install: the install deletes the whole suffix above the boundary
+            // with one point tombstone per row, the frontier then sits exactly at the boundary, and
+            // each commit marker's seek at boundary+1 had to skip every one of those tombstones
+            // before RocksDB could report the next live key — O(deleted suffix) per marker, O(markers
+            // × suffix) per group batch. On the restarted leader of the Caraxes bank-leader-kill run
+            // (~130k tombstones, thousands of markers per batch) that was minutes of CPU per batch:
+            // no write completed, the queue saturated, and the node voted in every election it could
+            // not append for. Seeking at the compaction floor makes every dead-but-present row below
+            // it read as absent, exactly as before.
+            BoundedIterator certified = default;
+            try
             {
-                steps++;
-                long next = advanced + 1;
-
-                // Rows staged in the current WriteBatch are invisible to the iterator.
-                if (stagedResolved is not null && stagedResolved.Contains(next))
+                while (advanced < target - 1 && steps < FrontierCatchUpBound)
                 {
-                    advanced = next;
-                    continue;
-                }
+                    steps++;
+                    long next = advanced + 1;
 
-                if (stagedProposed is not null && stagedProposed.Contains(next))
-                    return (advanced, false);
+                    // Rows staged in the current WriteBatch are invisible to the engine.
+                    if (stagedResolved is not null && stagedResolved.Contains(next))
+                    {
+                        advanced = next;
+                        continue;
+                    }
 
-                while (iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix)
-                       && ParseLogIdFromKey(iterator.GetKeySpan()) < next)
-                    iterator.Next();
-
-                long present = iterator.Valid() && iterator.GetKeySpan().StartsWith(partitionPrefix)
-                    ? ParseLogIdFromKey(iterator.GetKeySpan())
-                    : long.MaxValue;
-
-                if (present > next)
-                {
-                    if (next > certifiedFloor)
+                    if (stagedProposed is not null && stagedProposed.Contains(next))
                         return (advanced, false);
 
-                    // One hop over the whole compacted-certified absent span.
-                    advanced = Math.Min(present - 1, Math.Min(certifiedFloor, target - 1));
-                    continue;
+                    if (next <= certifiedFloor)
+                    {
+                        long seekFrom = Math.Max(next, compactionFloor);
+
+                        Iterator span;
+                        if (!certified.IsCreated)
+                        {
+                            certified = NewBoundedIterator(cf, partitionId, certifiedFloor + 1);
+                            span = certified.Iterator!;
+                            Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+                            BuildLogKey(seekKey, partitionId, seekFrom);
+                            span.Seek(seekKey);
+                        }
+                        else
+                        {
+                            // The walk only moves up, so the persisted iterator only ever moves forward.
+                            span = certified.Iterator!;
+                            while (span.Valid() && ParseLogIdFromKey(span.GetKeySpan()) < seekFrom)
+                                span.Next();
+                        }
+
+                        // The upper bound makes "nothing left below the floor" read as invalid, which is
+                        // the same answer the unbounded seek gave when the next live key sat above it.
+                        long present = span.Valid() && KeyBelongsToPartition(span.GetKeySpan(), partitionId)
+                            ? ParseLogIdFromKey(span.GetKeySpan())
+                            : long.MaxValue;
+
+                        if (present > next)
+                        {
+                            // One hop over the whole compacted-certified absent span.
+                            advanced = Math.Min(present - 1, Math.Min(certifiedFloor, target - 1));
+                            continue;
+                        }
+
+                        ReadHeaderFromWire(span.GetValueSpan(), out _, out _, out _, out int presentType);
+                        if (!IsResolvedRowType(presentType))
+                            return (advanced, false);
+
+                        advanced = next;
+                        continue;
+                    }
+
+                    (bool found, _, int rowType) = ProbeRowHeader(partitionId, cf, next);
+                    if (!found || !IsResolvedRowType(rowType))
+                        return (advanced, false);
+
+                    advanced = next;
                 }
-
-                ReadHeaderFromWire(iterator.GetValueSpan(), out _, out _, out _, out int type);
-                if (type is not ((int)RaftLogType.Committed
-                                 or (int)RaftLogType.CommittedCheckpoint
-                                 or (int)RaftLogType.RolledBack
-                                 or (int)RaftLogType.RolledBackCheckpoint))
-                    return (advanced, false);
-
-                advanced = next;
-                iterator.Next();
+            }
+            finally
+            {
+                certified.Dispose();
             }
 
             if (advanced < target - 1)
@@ -2593,12 +2760,84 @@ public class RocksDbWAL : IWAL, IDisposable
         if (stagedProposed is not null && stagedProposed.Contains(target))
             return (target, true);
 
-        (bool found, long term, int rowType) = ProbeRowHeader(partitionId, cf, target);
-        if (found && term == log.Term
-            && rowType is (int)RaftLogType.Proposed or (int)RaftLogType.Committed)
+        (bool targetFound, long term, int targetType) = ProbeRowHeader(partitionId, cf, target);
+        if (targetFound && term == log.Term
+            && targetType is (int)RaftLogType.Proposed or (int)RaftLogType.Committed)
             return (target, true);
 
         return (advanced, false);
+    }
+
+    /// <summary>True for the row types the commit frontier may absorb: a resolved entry of any kind.</summary>
+    private static bool IsResolvedRowType(int type) =>
+        type is (int)RaftLogType.Committed
+             or (int)RaftLogType.CommittedCheckpoint
+             or (int)RaftLogType.RolledBack
+             or (int)RaftLogType.RolledBackCheckpoint;
+
+    /// <summary>
+    /// An iterator with an exclusive upper bound on the log key, plus the objects the bound's
+    /// lifetime depends on. RocksDB stores the bound as a slice into the read-options object, which
+    /// the iterator keeps a pointer to, so both the options and the key bytes must outlive the
+    /// iterator; the key is allocated on the pinned heap so the slice can never dangle.
+    ///
+    /// <para><b>Why a bound at all.</b> A seek that lands inside a run of point tombstones cannot
+    /// return until the engine has skipped every one of them to find the next live key — an
+    /// unbounded seek pays for the whole run even when the caller only cares about a single id.
+    /// The bound stops the skip the moment it passes the caller's range. <c>default</c> is the
+    /// not-created state (<see cref="IsCreated"/> false), so a walk that never reaches the span
+    /// the iterator serves allocates nothing.</para>
+    /// </summary>
+    private readonly struct BoundedIterator : IDisposable
+    {
+        public readonly Iterator? Iterator;
+        private readonly ReadOptions options;
+        private readonly byte[] bound;
+
+        public BoundedIterator(Iterator iterator, ReadOptions options, byte[] bound)
+        {
+            Iterator = iterator;
+            this.options = options;
+            this.bound = bound;
+        }
+
+        public bool IsCreated => Iterator is not null;
+
+        public void Dispose()
+        {
+            Iterator?.Dispose();
+
+            // The options (and the bound they point at) must not be collected before the iterator.
+            GC.KeepAlive(options);
+            GC.KeepAlive(bound);
+        }
+    }
+
+    /// <summary>
+    /// Creates an iterator over <paramref name="cf"/> that stops at the log key of
+    /// (<paramref name="partitionId"/>, <paramref name="upperIdExclusive"/>): keys at or above it are
+    /// never visited, and the tombstones there are never skipped over.
+    /// </summary>
+    private BoundedIterator NewBoundedIterator(ColumnFamilyHandle cf, int partitionId, long upperIdExclusive)
+    {
+        byte[] bound = GC.AllocateUninitializedArray<byte>(LogKeyWidth, pinned: true);
+        BuildLogKey(bound, partitionId, upperIdExclusive);
+
+        ReadOptions options = new ReadOptions().SetIterateUpperBound(bound);
+        return new BoundedIterator(db.NewIterator(cf, options), options, bound);
+    }
+
+    /// <summary>
+    /// Creates an iterator over <paramref name="cf"/> bounded at the partition's upper-bound key,
+    /// so a scan of one partition's tail never walks into the next partition of a shared shard.
+    /// </summary>
+    private BoundedIterator NewPartitionBoundedIterator(ColumnFamilyHandle cf, int partitionId)
+    {
+        byte[] bound = GC.AllocateUninitializedArray<byte>(PartitionIdWidth + 1, pinned: true);
+        BuildPartitionUpperBoundKey(bound, partitionId);
+
+        ReadOptions options = new ReadOptions().SetIterateUpperBound(bound);
+        return new BoundedIterator(db.NewIterator(cf, options), options, bound);
     }
 
     /// <summary>
@@ -2759,6 +2998,7 @@ public class RocksDbWAL : IWAL, IDisposable
 
             compactionFloorCache.TryRemove(partitionId, out _);
             commitFrontierCache.TryRemove(partitionId, out _);
+            InvalidateMaxLogCache(partitionId);
 
             return RaftOperationStatus.Success;
         }
@@ -2855,6 +3095,10 @@ public class RocksDbWAL : IWAL, IDisposable
             if (staged > 0 || clampFrontier || clampFloor)
                 db.Write(writeBatch, writeOptions);
 
+            // Rows above the cut are gone; the surviving max is somewhere at or below it.
+            if (staged > 0)
+                InvalidateMaxLogCache(partitionId);
+
             // Exact set (not a raise): truncation is the one path allowed to LOWER the frontier.
             // Runs under the exclusive writeGuard, so no concurrent Write can interleave a raise.
             if (clampFrontier)
@@ -2914,8 +3158,16 @@ public class RocksDbWAL : IWAL, IDisposable
                 using WriteBatch writeBatch = new();
                 int staged = 0;
 
-                using (Iterator? iterator = db.NewIterator(cf: columnFamilyHandle))
+                // Highest id above the cut that survives this sweep (a resolved row, or a Proposed
+                // row at or below the frontier), or -1 when none does: the exact max after the sweep
+                // whenever it is above the cut.
+                long survivingAbove = -1;
+
+                // Bounded at the partition's upper bound so a shared shard's next partition is never
+                // walked; the tail above the cut itself is scanned in full, as it must be.
+                using (BoundedIterator bounded = NewPartitionBoundedIterator(columnFamilyHandle, partitionId))
                 {
+                    Iterator iterator = bounded.Iterator!;
                     Span<byte> seekKey = stackalloc byte[LogKeyWidth];
                     BuildLogKey(seekKey, partitionId, afterLogId + 1);
                     iterator.Seek(seekKey);
@@ -2928,18 +3180,36 @@ public class RocksDbWAL : IWAL, IDisposable
                         // Only unresolved (Proposed / ProposedCheckpoint) entries are removable; resolved
                         // entries are quorum-agreed and load-bearing for the commit frontier.
                         ReadHeaderFromWire(iterator.GetValueSpan(), out _, out _, out _, out int type);
+                        long id = ParseLogIdFromKey(iterator.GetKeySpan());
                         if (type is (int)RaftLogType.Proposed or (int)RaftLogType.ProposedCheckpoint
-                            && ParseLogIdFromKey(iterator.GetKeySpan()) > commitFrontier)
+                            && id > commitFrontier)
                         {
                             writeBatch.Delete(iterator.GetKeySpan(), cf: columnFamilyHandle);
                             staged++;
                         }
+                        else if (id > survivingAbove)
+                            survivingAbove = id;
+
                         iterator.Next();
                     }
                 }
 
                 if (staged > 0)
+                {
                     db.Write(writeBatch, writeOptions);
+
+                    // The sweep visited every row above the cut, so it knows the new max exactly
+                    // whenever a row up there survived; otherwise the max is at or below the cut and
+                    // the next GetMaxLog recomputes it (its reverse seek then crosses only the
+                    // tombstones this sweep just staged).
+                    if (maxLogCache.TryGetValue(partitionId, out PartitionMaxLog? cachedMax) && cachedMax.Value > afterLogId)
+                    {
+                        if (survivingAbove > 0)
+                            SetMaxLogCache(partitionId, survivingAbove);
+                        else
+                            InvalidateMaxLogCache(partitionId);
+                    }
+                }
 
                 // No last-checkpoint adjustment: this only removes unresolved (Proposed / ProposedCheckpoint)
                 // entries, and a CommittedCheckpoint is resolved — so the recorded checkpoint is never among
@@ -3027,8 +3297,9 @@ public class RocksDbWAL : IWAL, IDisposable
             {
                 // Staged directly into the batch — see DeletePartitionWAL for the rationale.
                 int staged = 0;
-                using (Iterator? iterator = db.NewIterator(cf: columnFamilyHandle))
+                using (BoundedIterator bounded = NewPartitionBoundedIterator(columnFamilyHandle, partitionId))
                 {
+                    Iterator iterator = bounded.Iterator!;
                     Span<byte> seekKey = stackalloc byte[LogKeyWidth];
                     BuildLogKey(seekKey, partitionId, snapshotIndex + 1);
                     iterator.Seek(seekKey);
@@ -3092,6 +3363,13 @@ public class RocksDbWAL : IWAL, IDisposable
 
             if (clampFloor)
                 compactionFloorCache[partitionId] = snapshotIndex;
+
+            // With the suffix gone the boundary row is the partition's max, exactly; with the suffix
+            // retained the boundary row can only raise a known max.
+            if (suffixTruncated)
+                SetMaxLogCache(partitionId, snapshotIndex);
+            else
+                RaiseMaxLogCache(partitionId, snapshotIndex);
 
             return (RaftOperationStatus.Success, suffixTruncated);
             }

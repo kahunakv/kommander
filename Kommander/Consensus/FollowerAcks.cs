@@ -25,6 +25,30 @@ namespace Kommander.Consensus;
 /// </summary>
 internal static class FollowerAcks
 {
+    /// <summary>
+    /// An ack that carries NO position: commit index and durable index both -1, no stall age. Sent
+    /// while this partition's WAL restore has not completed. Every frontier the other overload
+    /// reads is still at its pre-restore init then (a contiguous frontier of 0 on a node whose
+    /// disk holds millions of entries), and a leader that took 0 as evidence anchored a backfill
+    /// at 1 — below its compaction floor — and escalated straight to a snapshot transfer the node
+    /// did not need (the Caraxes bank-leader-kill restart). The leader treats -1 as "no report":
+    /// it leaves matchIndex, nextIndex, the retention floor and the backfill triggers untouched.
+    /// </summary>
+    public static CompleteAppendLogsRequest BuildWithoutPosition(
+        IRaftPartitionHost host,
+        long term,
+        HLCTimestamp timestamp,
+        RaftOperationStatus status) =>
+        new(
+            host.PartitionId,
+            term,
+            timestamp,
+            host.LocalEndpoint,
+            status,
+            -1,
+            durableIndex: -1,
+            walStallMs: 0);
+
     public static CompleteAppendLogsRequest Build(
         IRaftPartitionHost host,
         IRaftWalFacade wal,

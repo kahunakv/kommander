@@ -135,6 +135,13 @@ internal sealed class RaftPartitionCoreState
     public bool Restored;
 
     /// <summary>
+    /// AppendEntries (heartbeats and entry batches) this partition answered before its restore
+    /// completed. Every such ack carried no position and every entry batch was refused. Test-visible
+    /// so a scenario can prove the pre-restore window was actually reached.
+    /// </summary>
+    public long AppendsAnsweredBeforeRestore;
+
+    /// <summary>
     /// When <see langword="true"/> this partition is quiesced: no per-partition heartbeats are
     /// expected or sent.  Followers gate elections on SWIM node state instead of the heartbeat
     /// timer.  Only set when <see cref="RaftConfiguration.EnableQuiescence"/> is on.
