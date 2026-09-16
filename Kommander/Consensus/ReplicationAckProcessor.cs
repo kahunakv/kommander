@@ -150,6 +150,24 @@ internal sealed class ReplicationAckProcessor
         // episode is logged twice, on entry and on exit, never per ack.
         tracker.SetDurableFrontier(endpoint, durableIndex);
         RecordPeerWalStall(endpoint, walStallMs, committedIndex, durableIndex);
+
+        // Hand the same two facts to readers outside the executor (IRaft.GetFollowerProgress): an
+        // application waiting on this follower can then see, without a scheduler round-trip, that its
+        // durable frontier is far below the commit index or that its disk is stalled, and stop waiting.
+        // Leader-only, like the tracker it mirrors; the protocol frontier is the one recorded so far
+        // (this ack's own Success advance folds below), which is at most one ack behind.
+        if (coreState.NodeState == RaftNodeState.Leader && endpoint != host.LocalEndpoint)
+        {
+            host.PublishFollowerProgress(new RaftFollowerProgress(
+                endpoint,
+                coreState.CurrentTerm,
+                durableIndex,
+                tracker.GetCommitFrontierOrDefault(endpoint, -1),
+                coreState.LocalCommittedIndex,
+                walStallMs,
+                tracker.IsReportingWalStall(endpoint),
+                host.GetMonotonicTimestamp()));
+        }
         
         // LogMismatch: the follower's log diverges at the prevLogIndex we sent.
         // committedIndex carries the follower's local max log at the time of rejection.

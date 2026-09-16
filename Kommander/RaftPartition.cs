@@ -283,6 +283,39 @@ public sealed class RaftPartition : IDisposable
     public long GetCommitIndex() => walHandler.GetDurableCommitIndex();
 
     /// <summary>
+    /// Per-follower progress snapshots (<see cref="RaftFollowerProgress"/>), written by the executor's
+    /// single-writer thread on every folded acknowledgement while this node leads and read by arbitrary
+    /// caller threads through <see cref="GetFollowerProgress"/>. A concurrent map of immutable records: a
+    /// reader sees either the previous or the next whole snapshot, never a torn one, and pays a lookup —
+    /// no executor round-trip — so a hot caller consulting it per operation cannot starve the
+    /// election and heartbeat work the way an Ask-per-poll accessor did (see <see cref="GetState()"/>).
+    /// </summary>
+    private readonly global::System.Collections.Concurrent.ConcurrentDictionary<string, RaftFollowerProgress> followerProgress = new(StringComparer.Ordinal);
+
+    internal void PublishFollowerProgress(RaftFollowerProgress progress) => followerProgress[progress.Endpoint] = progress;
+
+    internal void ClearFollowerProgress(string? endpoint)
+    {
+        if (endpoint is null)
+            followerProgress.Clear();
+        else
+            followerProgress.TryRemove(endpoint, out _);
+    }
+
+    /// <summary>
+    /// The last thing this node, as leader, heard about <paramref name="endpoint"/>'s disk, or
+    /// <see langword="null"/> when this node is not the partition's published leader or the current
+    /// leadership has folded no acknowledgement from that peer yet. See <see cref="IRaft.GetFollowerProgress"/>.
+    /// </summary>
+    public RaftFollowerProgress? GetFollowerProgress(string endpoint)
+    {
+        if (Leader != manager.LocalEndpoint)
+            return null;
+
+        return followerProgress.TryGetValue(endpoint, out RaftFollowerProgress? progress) ? progress : null;
+    }
+
+    /// <summary>
     /// Number of stale <c>Proposed</c> duplicates of already-resolved ids this partition has
     /// refused to write since it last started — a floor, not a lifetime total. Diagnostic only —
     /// see <see cref="RaftWriteAhead.GetStaleProposedSkippedCount"/> for what the number does and

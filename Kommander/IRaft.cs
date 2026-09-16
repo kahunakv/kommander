@@ -535,6 +535,22 @@ public interface IRaft
     public ValueTask<long?> GetFollowerLagAsync(int partitionId, string followerEndpoint);
 
     /// <summary>
+    /// What this node, as leader of <paramref name="partitionId"/>, last heard about
+    /// <paramref name="followerEndpoint"/>'s disk: its durable contiguous commit frontier, the age of its
+    /// oldest unanswered WAL write and whether that counts as a stall, as carried in every term-valid
+    /// acknowledgement (<see cref="Data.RaftFollowerProgress"/>). <see langword="null"/> when this node does not
+    /// lead the partition, does not host it, or the current leadership has not folded an acknowledgement
+    /// from that peer yet — which callers must read as "unknown", never as "caught up".
+    /// <para>A plain concurrent-map read published from the partition executor: no scheduler
+    /// round-trip, so it can be consulted per operation by a protocol that would otherwise wait on the
+    /// follower (an attestation, an apply confirmation) to decide whether the wait can possibly be
+    /// answered. Unlike <see cref="GetFollowerLagAsync"/>, which reports the protocol commit frontier a
+    /// stalled follower keeps advancing for entries it has merely queued, this reports the frontier its
+    /// disk has actually written.</para>
+    /// </summary>
+    public Data.RaftFollowerProgress? GetFollowerProgress(int partitionId, string followerEndpoint) => null;
+
+    /// <summary>
     /// Checks if the local node is the leader in the given partition.
     /// <para>Answered from published local state (leader endpoint, then the partition's role
     /// snapshot) without an executor round-trip, so polling this is cheap and — unlike the previous

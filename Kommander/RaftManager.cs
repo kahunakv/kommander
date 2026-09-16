@@ -1056,6 +1056,10 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     public ValueTask<long?> GetFollowerLagAsync(int partitionId, string followerEndpoint)
         => GetFollowerCommittedIndexNullableAsync(partitionId, followerEndpoint);
 
+    /// <inheritdoc/>
+    public RaftFollowerProgress? GetFollowerProgress(int partitionId, string followerEndpoint) =>
+        TryGetPartition(partitionId, out RaftPartition? partition) ? partition!.GetFollowerProgress(followerEndpoint) : null;
+
     /// <summary>
     /// Returns the endpoint of the current known leader for <paramref name="partitionId"/>,
     /// or <see langword="null"/> if unknown or no leader has been observed yet.

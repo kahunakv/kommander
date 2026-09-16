@@ -162,8 +162,12 @@ backfill off for a node's partitions, set `BackfillEnabled = false`; it short-ci
 triggers *and* the snapshot fallback. Do that only when something else owns those peers' catch-up
 story, because nothing else re-ships entries they missed.
 
-> Note (`GetFollowerLagAsync`): the public `IRaft` API exposes a follower's lag so applications and
-> operators can observe catch-up progress.
+> Note (`GetFollowerLagAsync`, `GetFollowerProgress`): the public `IRaft` API exposes a follower's lag so
+> applications and operators can observe catch-up progress. `GetFollowerLagAsync` is the protocol commit
+> frontier (an executor round-trip); `GetFollowerProgress` is a lock-free read of the leader's
+> per-follower acknowledgement snapshot — the follower's *durable* frontier, its pending-write age and
+> whether that counts as a stall — cheap enough for an application to consult per operation before
+> waiting on a follower.
 
 ---
 
@@ -393,7 +397,12 @@ Kommander.Tests/
 ```
 
 `IRaft.GetFollowerLagAsync(partitionId, followerEndpoint)` is the observability entry point for
-how far a follower is behind.
+how far a follower is behind by its protocol commit frontier. `IRaft.GetFollowerProgress(partitionId,
+followerEndpoint)` returns the leader's `RaftFollowerProgress` snapshot for the peer (durable frontier,
+protocol frontier, pending-write age, stall flag, the leader's commit index when the ack was folded),
+published from the ack path (`ReplicationAckProcessor` → `IRaftPartitionHost.PublishFollowerProgress`)
+into a concurrent map on `RaftPartition` and cleared with the tracker on step-down; `null` on a
+non-leader or for a peer the leadership has not heard from.
 
 ---
 

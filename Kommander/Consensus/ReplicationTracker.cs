@@ -232,6 +232,7 @@ internal sealed class ReplicationTracker
     {
         lastCommitIndexes.Clear();
         durableFrontiers.Clear();
+        host.ClearFollowerProgress(null);
         nextIndex.Clear();
         matchIndex.Clear();
         regressedFrontiers.Clear();
@@ -270,6 +271,7 @@ internal sealed class ReplicationTracker
         bool hadProgress = lastCommitIndexes.Remove(endpoint);
         durableFrontiers.Remove(endpoint);
         walStallReports.Remove(endpoint);
+        host.ClearFollowerProgress(endpoint);
         nextIndex.Remove(endpoint);
         matchIndex.Remove(endpoint);
         regressedFrontiers.Remove(endpoint);

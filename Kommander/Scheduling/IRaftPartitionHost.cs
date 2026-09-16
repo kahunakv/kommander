@@ -186,4 +186,20 @@ public interface IRaftPartitionHost
     /// not per-partition <c>lastActivity</c> — the two signals are distinct.
     /// </summary>
     MemberLivenessState GetNodeLiveness(string endpoint);
+
+    /// <summary>
+    /// Publishes what the leader just learned about one follower's disk from its acknowledgement
+    /// (<see cref="RaftFollowerProgress"/>), for lock-free readers outside the executor
+    /// (<see cref="IRaft.GetFollowerProgress"/>). Called on the executor thread once per folded
+    /// term-valid ack while this node leads the partition. Defaults to a no-op so hosts that predate
+    /// the snapshot (unit-test stubs) are unaffected; <c>RaftPartition</c>'s adapter keeps the map.
+    /// </summary>
+    void PublishFollowerProgress(RaftFollowerProgress progress) { }
+
+    /// <summary>
+    /// Discards published follower progress: one peer's when <paramref name="endpoint"/> is given (the
+    /// peer left the partition), every peer's when it is <see langword="null"/> (this node stopped
+    /// leading, so nothing it recorded describes a leadership that still exists).
+    /// </summary>
+    void ClearFollowerProgress(string? endpoint) { }
 }

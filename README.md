@@ -386,7 +386,7 @@ Use a unique `NodeId` when you can. If `NodeId` is `0`, Kommander derives one fr
 | Leadership control | `StepDownAsync`, `TransferLeadershipAsync`, `SuspendHeartbeatsAsync`, `ResumeHeartbeatsAsync` |
 | Replication | `ReplicateLogs`, `ReplicateEntries`, `ReplicateCheckpoint`, `CommitLogs`, `RollbackLogs` |
 | Log retention | `SetMinRetainIndex`, `AcquireRetentionHold` |
-| Catch-up observability | `GetFollowerLagAsync`, `GetActiveNodes`, `GetLastNodeActivity` |
+| Catch-up observability | `GetFollowerLagAsync`, `GetFollowerProgress`, `GetActiveNodes`, `GetLastNodeActivity` |
 | Load observability | `GetPartitionLogOpsPerSecond`, `GetPartitionWalQueueDepth`, `GetPartitionCommitWaitMs` |
 | Partition routing | `GetPartitionKey`, `GetPrefixPartitionKey` |
 | Elastic partitions | `CreatePartitionAsync`, `RemovePartitionAsync`, `SplitPartitionAsync`, `MergePartitionsAsync`, `GetPartitionMap`, `GetPartitionGeneration`, `RegisterStateMachineTransfer`, `RegisterSystemStateTransfer` |
@@ -817,7 +817,14 @@ Backfill is automatic and needs no application calls. You can observe how far a 
 
 ```csharp
 long? lag = await raft.GetFollowerLagAsync(partitionId: 1, followerEndpoint: "host2:8002");
+
+// Lock-free, per-operation cheap: what the leader last heard about the follower's disk.
+RaftFollowerProgress? progress = raft.GetFollowerProgress(partitionId: 1, followerEndpoint: "host2:8002");
+if (progress is { WalStalled: false } && progress.EntriesBehind(raft.GetCommitIndex(1)) < 1_000)
+    // the follower can plausibly apply what was just committed
 ```
+
+`GetFollowerLagAsync` reports the follower's protocol commit frontier, which a follower advances for entries it has merely queued for its disk. `GetFollowerProgress` reports what its disk has actually written (the durable frontier) plus its pending-write age and stall flag, as carried in every acknowledgement — the evidence an application should use before waiting on a follower to apply something. It is `null` on a node that is not the partition's leader.
 
 See [Log Catch-Up & Backfill Developer Guide](docs/log-backfill-developer-guide.md) for the full flows, the live-vs-backfill rationale, configuration tuning, the code map, and the invariants to preserve when extending it.
 

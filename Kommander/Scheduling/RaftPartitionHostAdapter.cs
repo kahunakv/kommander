@@ -109,4 +109,8 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
         manager.Communication.SendInstallSnapshot(manager, node, request, ct);
 
     public MemberLivenessState GetNodeLiveness(string endpoint) => manager.Liveness.GetState(endpoint);
+
+    public void PublishFollowerProgress(RaftFollowerProgress progress) => partition.PublishFollowerProgress(progress);
+
+    public void ClearFollowerProgress(string? endpoint) => partition.ClearFollowerProgress(endpoint);
 }
