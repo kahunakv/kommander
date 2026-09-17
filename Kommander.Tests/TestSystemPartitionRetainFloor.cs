@@ -202,6 +202,9 @@ public sealed class TestSystemPartitionRetainFloor
     /// <see cref="SnapshotKind.SystemState"/>; n4 calls
     /// <see cref="IRaftSystemStateTransfer.ImportPartitionState"/> and its WAL receives a
     /// <see cref="RaftLogType.CommittedCheckpoint"/> entry at the snapshot index.
+    /// <para>The learner's import is observed through a recorder registered on n4 only. The voters
+    /// share a separate recorder because the <see cref="CompactableWAL"/> fake can route a lagging
+    /// voter through the same snapshot path, and that import must not be mistaken for n4's.</para>
     /// </summary>
     [Fact]
     public async Task P0_BelowFloor_SystemStateTransfer_RepairsFollower()
@@ -235,11 +238,20 @@ public sealed class TestSystemPartitionRetainFloor
             ["localhost:8514"] = n4,
         });
 
-        RecordingSystemTransfer transfer = new();
-        n1.RegisterSystemStateTransfer(transfer);
-        n2.RegisterSystemStateTransfer(transfer);
-        n3.RegisterSystemStateTransfer(transfer);
-        n4.RegisterSystemStateTransfer(transfer);
+        // Two recorders, NOT one shared instance. CompactableWAL makes every entry at or below the
+        // checkpoint unreadable the instant the checkpoint lands, so a voter that is even one entry
+        // behind at that instant is refused a backfill and receives a full SystemState snapshot too
+        // (BackfillSender escalates an empty read; observed locally in ~1 of 6 runs, sometimes before
+        // n4's join even starts). With a single shared counter that voter-side import satisfied the
+        // "learner imported" wait, the join was cancelled before n4 was admitted, and n4 — never a
+        // member, never heartbeated — never received its snapshot: the 30 s checkpoint wait below
+        // then timed out (the GA failure). Only n4's own recorder proves the learner path ran.
+        RecordingSystemTransfer voterTransfer = new();
+        RecordingSystemTransfer learnerTransfer = new();
+        n1.RegisterSystemStateTransfer(voterTransfer);
+        n2.RegisterSystemStateTransfer(voterTransfer);
+        n3.RegisterSystemStateTransfer(voterTransfer);
+        n4.RegisterSystemStateTransfer(learnerTransfer);
 
         try
         {
@@ -275,13 +287,15 @@ public sealed class TestSystemPartitionRetainFloor
             using CancellationTokenSource joinCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             Task joinTask = Task.Run(() => n4.JoinCluster(["localhost:8511"], joinCts.Token), ct);
 
-            // Wait for the SystemState snapshot to be delivered to n4 and ImportPartitionState to fire.
-            await WaitForAsync(() => transfer.ImportCount > 0, ct, timeoutMs: 15_000);
+            // Wait for the SystemState snapshot to be delivered to n4 and ImportPartitionState to fire
+            // on n4's OWN recorder. A voter-side import (see voterTransfer above) must not count: it
+            // says nothing about whether n4 was admitted, and cancelling the join on it strands n4.
+            await WaitForAsync(() => learnerTransfer.ImportCount > 0, ct, timeoutMs: 15_000);
 
             await joinCts.CancelAsync();
             try { await joinTask.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken); } catch { /* cancellation / timeout expected */ }
 
-            Assert.True(transfer.ImportCount > 0,
+            Assert.True(learnerTransfer.ImportCount > 0,
                 "ImportPartitionState must have been called at least once on the learner");
 
             // The durable boundary is written AFTER the import returns (InstallSnapshotAsync
