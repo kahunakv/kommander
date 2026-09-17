@@ -102,6 +102,26 @@ public sealed class TestNodeCommitWaitReporting
     }
 
     [Fact]
+    public async Task ObservationIsRecordedBeforeTheCompletionCallbackFires()
+    {
+        using FairWalScheduler scheduler = new(new NoOpWal(), NullLogger<IRaft>.Instance, workerCount: 1);
+        scheduler.Start();
+
+        // The callback is the moment a caller learns its write is durable, and a caller may build
+        // a load report right then. Reading the counter from inside the callback pins the ordering
+        // without a race: the sample for this batch must already be visible on the worker thread.
+        // Recording it after the callbacks let the previous GA run see 4 samples after 5 acks.
+        for (long i = 1; i <= 5; i++)
+        {
+            TaskCompletionSource<long> seen = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            scheduler.Enqueue(MakeOp(1, i, _ => seen.TrySetResult(scheduler.GetNodeCommitWaitSamples())));
+            long samplesAtAck = await seen.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+            Assert.Equal(i, samplesAtAck);
+        }
+    }
+
+    [Fact]
     public async Task GroupedBatch_RecordsOnceForTheBatchNotOncePerPartition()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;

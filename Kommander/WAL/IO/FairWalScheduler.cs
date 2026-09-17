@@ -835,9 +835,13 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// partitions.  For RocksDB this is one <c>db.Write</c> / one fsync regardless
     /// of partition count.</para>
     ///
-    /// <para>Phase 3 — per-partition post-write: run <c>FollowerAppend</c>
-    /// truncation, fire <c>OnComplete</c> callbacks, decrement depth, clear
-    /// <c>InFlight</c>, and re-schedule if new ops arrived during the write.</para>
+    /// <para>Phase 3 — post-write, in two passes. Pass 3a records every commit-wait
+    /// observation (per partition and the single node-level sample for the batch).
+    /// Pass 3b fires <c>OnComplete</c> callbacks, decrements depth, clears
+    /// <c>InFlight</c>, and re-schedules if new ops arrived during the write.
+    /// The order is a contract: a callback releases an awaiting caller, and that caller
+    /// may read the accumulators immediately, so no observation may be recorded after
+    /// any callback of the batch has fired.</para>
     /// </summary>
     private void ProcessGroupBatch(
         List<int> partitionIds,
@@ -1023,11 +1027,21 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             (doneAtTicks - writeStartTicks) * ticksToMs,
             status == RaftOperationStatus.Success ? KommanderMetrics.WalWriteResultOk : KommanderMetrics.WalWriteResultErrored);
 
-        // ── Phase 3: per-partition post-write cleanup ──────────────────────
+        // ── Phase 3a: measure the batch before anyone learns it completed ────
+        // Every commit-wait observation (per partition and node-wide) is recorded here, before
+        // Phase 3b fires a single OnComplete. A callback releases the caller's await, and that
+        // caller may read the accumulators at once — a load report built right after an ack
+        // must already include the batch it was acked for. Recording after the callbacks let a
+        // reader see the ack and a sample count one short of the writes it observed.
+        //
         // Node-wide wait is accumulated across every partition in this group batch and recorded
-        // once below, so one shared fsync yields exactly one node-level observation.
+        // once, so one shared fsync yields exactly one node-level observation.
         double groupTotalWaitMs = 0;
         int groupOpCount = 0;
+
+        // One volatile read decides whether to attribute per-op latency to its
+        // phase for the double-fsync measurement; off by default, no cost in prod.
+        bool instrument = WalPhaseInstrumentation.Enabled;
 
         foreach ((int pid, List<WALWriteOperation> pidBatch) in groupBatches)
         {
@@ -1036,25 +1050,29 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             // Record commit-wait latency for this partition's batch (enqueue→durable).
             // Average across all ops so each batch contributes one observation to the EWMA,
             // regardless of batch size, giving consistent per-partition decay behaviour.
-            if (_partitions.TryGetValue(pid, out PartitionState? waitState))
+            if (!_partitions.TryGetValue(pid, out PartitionState? waitState))
+                continue;
+
+            double totalWaitMs = 0;
+            foreach (WALWriteOperation op in pidBatch)
             {
-                // One volatile read decides whether to attribute per-op latency to its
-                // phase for the double-fsync measurement; off by default, no cost in prod.
-                bool instrument = WalPhaseInstrumentation.Enabled;
-                double totalWaitMs = 0;
-                foreach (WALWriteOperation op in pidBatch)
-                {
-                    double opWaitMs = (doneAtTicks - op.EnqueueTicks) * ticksToMs;
-                    totalWaitMs += opWaitMs;
-                    if (instrument)
-                        WalPhaseInstrumentation.RecordDurable(op.Type, opWaitMs);
-                }
-                waitState.CommitWait.RecordWaitMs(totalWaitMs / pidBatch.Count);
-
-                groupTotalWaitMs += totalWaitMs;
-                groupOpCount += pidBatch.Count;
+                double opWaitMs = (doneAtTicks - op.EnqueueTicks) * ticksToMs;
+                totalWaitMs += opWaitMs;
+                if (instrument)
+                    WalPhaseInstrumentation.RecordDurable(op.Type, opWaitMs);
             }
+            waitState.CommitWait.RecordWaitMs(totalWaitMs / pidBatch.Count);
 
+            groupTotalWaitMs += totalWaitMs;
+            groupOpCount += pidBatch.Count;
+        }
+
+        if (groupOpCount > 0)
+            _nodeCommitWait.RecordWaitMs(groupTotalWaitMs / groupOpCount);
+
+        // ── Phase 3b: per-partition completion and cleanup ───────────────────
+        foreach ((int pid, List<WALWriteOperation> pidBatch) in groupBatches)
+        {
             foreach (WALWriteOperation op in pidBatch)
             {
                 try
@@ -1094,10 +1112,6 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                 }
             }
         }
-
-        // One observation per group batch, after every partition in it is accounted for.
-        if (groupOpCount > 0)
-            _nodeCommitWait.RecordWaitMs(groupTotalWaitMs / groupOpCount);
     }
 
     /// <summary>

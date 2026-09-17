@@ -46,6 +46,7 @@ public sealed class TestExecutorStopDuringRestore
     [InlineData(false)]
     public async Task RestoreThatFinishesAfterDispose_IsCancelledAndNeverReplayed(bool sharedPool)
     {
+        CancellationToken ct = TestContext.Current.CancellationToken;
         using RaftManager manager = Build();
         ((FairReadScheduler)manager.ReadScheduler).Start();
         ((FairWalScheduler)manager.WalScheduler).Start();
@@ -57,7 +58,7 @@ public sealed class TestExecutorStopDuringRestore
         RaftPartition partition = new(
             manager, wal, partitionId: 1, startRange: 0, endRange: 0, NullLogger<IRaft>.Instance, pool);
 
-        Assert.True(wal.ReadStarted.Wait(TimeSpan.FromSeconds(10)), "Phase 1 never reached the WAL.");
+        Assert.True(wal.ReadStarted.Wait(TimeSpan.FromSeconds(10), ct), "Phase 1 never reached the WAL.");
 
         // Stop, cleanup drain, and token-source disposal all happen here, with Phase 1 still held
         // inside the gate. This is the ordering the crash needed.
@@ -67,7 +68,7 @@ public sealed class TestExecutorStopDuringRestore
         wal.Release();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => partition.RestoreTask.WaitAsync(TimeSpan.FromSeconds(10)));
+            () => partition.RestoreTask.WaitAsync(TimeSpan.FromSeconds(10), ct));
 
         Assert.Equal(0, wal.CallsAfterRelease);
 
@@ -80,7 +81,7 @@ public sealed class TestExecutorStopDuringRestore
             manager, new InMemoryWAL(NullLogger<IRaft>.Instance),
             partitionId: 2, startRange: 0, endRange: 0, NullLogger<IRaft>.Instance, pool);
 
-        await survivor.RestoreTask.WaitAsync(TimeSpan.FromSeconds(10));
+        await survivor.RestoreTask.WaitAsync(TimeSpan.FromSeconds(10), ct);
 
         survivor.Dispose();
     }

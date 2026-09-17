@@ -76,6 +76,7 @@ public sealed class TestWalStallSignal
     [Fact]
     public async Task OldestPendingWriteAge_RisesWhileTheEngineHoldsTheWrite_CoversTheQueue_AndClearsOnCompletion()
     {
+        CancellationToken ct = TestContext.Current.CancellationToken;
         const int partitionId = 7;
         using GatedWal wal = new();
         using FairWalScheduler scheduler = new(wal, NullLogger<IRaft>.Instance, workerCount: 1);
@@ -90,14 +91,14 @@ public sealed class TestWalStallSignal
         scheduler.Enqueue(MakeOp(partitionId, _ => Interlocked.Increment(ref completed)));
         await WaitUntilAsync(() => wal.Blocked == 1, 5_000, "the worker must be held inside Write");
 
-        await Task.Delay(150);
+        await Task.Delay(150, ct);
         double inFlightAge = scheduler.GetPartitionOldestPendingWriteAgeMs(partitionId);
         Assert.InRange(inFlightAge, 100, 60_000);
         Assert.InRange(scheduler.GetOldestPendingWriteAgeMs(), inFlightAge - 5, 60_000);
 
         // A second op queues behind the held batch: the signal still ages the oldest (in-flight) op, not the newest.
         scheduler.Enqueue(MakeOp(partitionId, _ => Interlocked.Increment(ref completed)));
-        await Task.Delay(50);
+        await Task.Delay(50, ct);
         double queuedAge = scheduler.GetPartitionOldestPendingWriteAgeMs(partitionId);
         Assert.True(queuedAge >= inFlightAge, $"age must keep rising: {queuedAge} < {inFlightAge}");
 

@@ -234,7 +234,7 @@ public sealed class TestStalledFollowerRetention
             {
                 try
                 {
-                    await node.LeaveCluster(true);
+                    await node.LeaveCluster(true, ct);
                 }
                 catch
                 {
