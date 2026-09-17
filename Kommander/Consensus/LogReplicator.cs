@@ -66,6 +66,49 @@ internal sealed class LogReplicator
     /// <param name="autoCommit"></param>
     /// <returns></returns>
     /// <exception cref="RaftException"></exception>
+    /// <summary>
+    /// Proposals that arrived while a leadership transfer was converging, in arrival order. See the
+    /// parking branch of <see cref="ReplicateLogs"/>. Only touched on the executor thread.
+    /// </summary>
+    private readonly List<(List<RaftLog> Logs, bool AutoCommit, ulong? ReplyCorrelationId)> parkedProposals = [];
+
+    /// <summary>Number of proposals parked behind a converging leadership transfer.</summary>
+    public int ParkedProposalCount => parkedProposals.Count;
+
+    /// <summary>
+    /// Answers every parked proposal with <paramref name="status"/>. Called once this node has
+    /// stopped leading — after the handover published the leader change, or on any other
+    /// demotion — so <see cref="RaftOperationStatus.NodeIsNotLeader"/> is exact when it is given.
+    /// </summary>
+    public void ReleaseParkedProposals(RaftOperationStatus status)
+    {
+        if (parkedProposals.Count == 0)
+            return;
+
+        List<(List<RaftLog> Logs, bool AutoCommit, ulong? ReplyCorrelationId)> parked = [.. parkedProposals];
+        parkedProposals.Clear();
+
+        foreach ((List<RaftLog> _, bool _, ulong? replyCorrelationId) in parked)
+            CompleteReply(replyCorrelationId, new(RaftResponseType.None, status, HLCTimestamp.Zero));
+    }
+
+    /// <summary>
+    /// Re-admits every parked proposal in arrival order. Called when the transfer wait ended with
+    /// this node still leading (the bound expired, or the target left the peer set): nothing was
+    /// refused, the proposals simply waited.
+    /// </summary>
+    public async Task ReadmitParkedProposalsAsync()
+    {
+        if (parkedProposals.Count == 0)
+            return;
+
+        List<(List<RaftLog> Logs, bool AutoCommit, ulong? ReplyCorrelationId)> parked = [.. parkedProposals];
+        parkedProposals.Clear();
+
+        foreach ((List<RaftLog> logs, bool autoCommit, ulong? replyCorrelationId) in parked)
+            await ReplicateLogsAsync(logs, autoCommit, replyCorrelationId).ConfigureAwait(false);
+    }
+
     public Task ReplicateLogsAsync(List<RaftLog>? logs, bool autoCommit, ulong? replyCorrelationId)
     {
         (RaftOperationStatus status, HLCTimestamp ticketId) = ReplicateLogs(logs, autoCommit, replyCorrelationId);
@@ -87,6 +130,25 @@ internal sealed class LogReplicator
 
         if (coreState.NodeState != RaftNodeState.Leader)
             return (RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
+
+        // A leadership transfer is converging on a target that is still behind: stop admitting new
+        // proposals so the leader's last index holds still and the target can reach it. The
+        // proposal is PARKED, not refused: this node still publishes itself as leader, so a
+        // NodeIsNotLeader answer here would be a contradiction its callers act on immediately (a
+        // re-drive that lands right back here, for the whole wait — the lt3 retry storm). Parked
+        // proposals are answered NodeIsNotLeader only once the handover has published the leader
+        // change, or re-admitted in arrival order if the wait expires with this node still leading.
+        // The executor's client-queue cap bounds what can be parked; past it, ProposalQueueFull is
+        // the truthful admission-control answer.
+        if (coreState.PendingTransferTarget is not null)
+        {
+            int cap = host.Configuration.MaxQueuedClientProposalsPerPartition;
+            if (cap > 0 && parkedProposals.Count >= cap)
+                return (RaftOperationStatus.ProposalQueueFull, HLCTimestamp.Zero);
+
+            parkedProposals.Add((logs, autoCommit, replyCorrelationId));
+            return (RaftOperationStatus.Pending, HLCTimestamp.Zero);
+        }
 
         HLCTimestamp currentTime = host.HybridLogicalClock.SendOrLocalEvent(host.LocalNodeId);
         long nowTicks = host.GetMonotonicTimestamp();
@@ -260,6 +322,11 @@ internal sealed class LogReplicator
     {
         if (coreState.NodeState != RaftNodeState.Leader)
             return (RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
+
+        // A checkpoint appends an entry too; hold it back while a transfer waits on its target.
+        // ActiveProposal is the existing "not now, ask again" answer for a checkpoint.
+        if (coreState.PendingTransferTarget is not null)
+            return (RaftOperationStatus.ActiveProposal, HLCTimestamp.Zero);
         
         if (proposals.HasUnresolvedProposal())
             return (RaftOperationStatus.ActiveProposal, HLCTimestamp.Zero);

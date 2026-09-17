@@ -704,8 +704,17 @@ public interface IRaft
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Test hook that transfers leadership for a partition from the local leader to
-    /// a specific up-to-date target endpoint.
+    /// Hands leadership of a partition from the local leader to <paramref name="targetEndpoint"/>.
+    /// A target whose log is behind is caught up first: the leader parks new proposals (they are
+    /// answered <see cref="RaftOperationStatus.NodeIsNotLeader"/> once the handover has published
+    /// the leader change, or re-admitted in order if the wait expires — a node never says it is
+    /// not the leader while it still is), keeps replicating, and hands over once the target is
+    /// level with its last index. The wait is bounded by one election timeout, after
+    /// which the leader resumes serving and the call returns
+    /// <see cref="RaftOperationStatus.TargetNotCaughtUp"/>. <see cref="RaftOperationStatus.Success"/>
+    /// means the target was observed leading; <see cref="RaftOperationStatus.Pending"/> means the
+    /// handover was sent but the successor was not confirmed within the settle window.
+    /// A target that is not a peer, or the local node itself, is refused immediately.
     /// </summary>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public Task<RaftOperationStatus> TransferLeadershipAsync(

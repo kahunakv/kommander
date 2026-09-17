@@ -337,4 +337,7 @@ enum GrpcRaftOperationStatus {
   // 23: accepted proposal whose outcome this node can no longer determine —
   // indeterminate for clients, never a definite failure
   PROPOSAL_OUTCOME_UNKNOWN = 23;
+  // 24: a leadership transfer's target did not reach the leader's last index within
+  // one election timeout; nothing was handed over and the leader is serving again
+  TARGET_NOT_CAUGHT_UP = 24;
 }

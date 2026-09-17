@@ -660,18 +660,16 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             () => systemCoordinator.GetMembership(),
             () => Liveness,
             transportDispatcher.Enqueue,
+            TransferLeadershipAsync,
             Logger,
             LocalEndpoint,
             LocalNodeId);
 
         leadershipService = new LeadershipService(
             this,
-            walAdapter,
             () => IsInitialized,
             () => Joined,
-            () => Nodes,
             (node, request, ct) => communication.GetReadIndex(this, node, request, ct),
-            (node, request) => communication.Handshake(this, node, request),
             Logger,
             LocalEndpoint,
             LocalNodeId);

@@ -1,5 +1,6 @@
 
 using Kommander.Data;
+using Kommander.Diagnostics;
 using Kommander.Gossip;
 using Kommander.Support.Parallelization;
 using Kommander.Logging;
@@ -33,6 +34,7 @@ internal sealed class RaftRpcRouter
     private readonly Func<ClusterMembership> getMembership;
     private readonly Func<LivenessTable> getLiveness;
     private readonly Action<string, RaftResponderRequest> enqueueResponse;
+    private readonly Func<int, string, CancellationToken, Task<RaftOperationStatus>> transferLeadership;
     private readonly ILogger<IRaft> logger;
     private readonly string localEndpoint;
     private readonly int localNodeId;
@@ -43,6 +45,7 @@ internal sealed class RaftRpcRouter
         Func<ClusterMembership> getMembership,
         Func<LivenessTable> getLiveness,
         Action<string, RaftResponderRequest> enqueueResponse,
+        Func<int, string, CancellationToken, Task<RaftOperationStatus>> transferLeadership,
         ILogger<IRaft> logger,
         string localEndpoint,
         int localNodeId)
@@ -52,6 +55,7 @@ internal sealed class RaftRpcRouter
         this.getMembership = getMembership;
         this.getLiveness = getLiveness;
         this.enqueueResponse = enqueueResponse;
+        this.transferLeadership = transferLeadership;
         this.logger = logger;
         this.localEndpoint = localEndpoint;
         this.localNodeId = localNodeId;
@@ -144,8 +148,10 @@ internal sealed class RaftRpcRouter
     /// Receives an advisory leadership-transfer suggestion from the balancer running on the
     /// system-partition leader. Validates that this node currently leads the partition, that the
     /// partition is <see cref="RaftPartitionState.Active"/>, and that the requested target is a
-    /// live voter — then fires the local transfer fire-and-forget. Drops silently on any
-    /// validation failure so a stale or misdirected suggestion is always safe.
+    /// live voter — then runs the local transfer through the same converging path the public
+    /// <see cref="IRaft.TransferLeadershipAsync"/> uses, fire-and-forget, and logs its outcome at
+    /// Information. Drops silently on any validation failure so a stale or misdirected suggestion
+    /// is always safe.
     /// </summary>
     internal void ReceiveTransferLeadershipSuggestion(TransferLeadershipSuggestionRequest request)
     {
@@ -188,8 +194,22 @@ internal sealed class RaftRpcRouter
             return;
         }
 
-        // Fire-and-forget: the executor serialises the transfer; we don't await here.
-        FireAndForget.Observe(partition.TransferLeadershipAsync(request.TargetEndpoint, CancellationToken.None), logger, "TransferLeadershipSuggestion");
+        // Fire-and-forget: the executor serialises the transfer; we don't await here. The outcome
+        // is logged rather than returned — the balancer confirms a move from the next load reports,
+        // and before this line a refused move (a busy target that never caught up, say) left no
+        // trace anywhere and simply timed out in its outstanding-move table.
+        FireAndForget.Observe(RunSuggestedTransferAsync(request), logger, "TransferLeadershipSuggestion");
+    }
+
+    private async Task RunSuggestedTransferAsync(TransferLeadershipSuggestionRequest request)
+    {
+        ValueStopwatch stopwatch = ValueStopwatch.StartNew();
+
+        RaftOperationStatus status = await transferLeadership(request.Partition, request.TargetEndpoint, CancellationToken.None).ConfigureAwait(false);
+
+        logger.LogInfoTransferSuggestionOutcome(
+            request.Partition, request.Term, localEndpoint, request.TargetEndpoint, status,
+            (long)stopwatch.GetElapsedMilliseconds(), request.SuggestedBy);
     }
 
     /// <summary>

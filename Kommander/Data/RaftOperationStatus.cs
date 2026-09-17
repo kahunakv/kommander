@@ -135,4 +135,13 @@ public enum RaftOperationStatus
     /// </para>
     /// </summary>
     ProposalOutcomeUnknown = 23,
+
+    /// <summary>
+    /// A leadership transfer was requested and the leader paused proposal admission and kept
+    /// replicating to the target, but the target's log did not reach the leader's last index
+    /// within one election timeout. Nothing was handed over and the leader is serving again.
+    /// Distinct from <see cref="ReplicationFailed"/>, which names a genuine replication error:
+    /// this is a bounded wait that expired, and the caller may simply ask again.
+    /// </summary>
+    TargetNotCaughtUp = 24,
 }

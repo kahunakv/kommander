@@ -595,6 +595,19 @@ public sealed class RaftPartitionStateMachine
                     return;
                 }
 
+                // Converging leadership transfer: hand over as soon as the target is level with the
+                // last index (the ack path usually gets there first; this covers a handshake-only
+                // advance), or give the partition back to its callers once the bounded wait expires.
+                // Either way the heartbeat below still goes out — it is what carries the target's
+                // missing tail while the wait runs.
+                if (coreState.PendingTransferTarget is not null)
+                {
+                    if (await TryCompletePendingTransferAsync().ConfigureAwait(false))
+                        return;
+
+                    await ExpirePendingTransferIfDueAsync(nowTicks).ConfigureAwait(false);
+                }
+
                 if (coreState.Quiesced)
                 {
                     // Gating entry into quiescence is only half the guarantee. A peer can appear or fall
@@ -776,21 +789,239 @@ public sealed class RaftPartitionStateMachine
             return;
         }
 
-        // The adapter read races the WAL write queue (appends still queued in the write scheduler
-        // are invisible to it), so take the enqueue-advanced presence frontier when it is higher —
-        // an understated local max would hand leadership to a target that is actually behind.
-        long localMaxLogId = await wal.GetMaxLogAsync().ConfigureAwait(false);
-        long presentIndex = wal.GetPresentIndex();
-        if (presentIndex > localMaxLogId)
-            localMaxLogId = presentIndex;
-
-        long targetMaxLogId = GetKnownRemoteMaxLogId(targetEndpoint);
-        if (targetMaxLogId < localMaxLogId)
+        if (coreState.PendingTransferTarget is not null)
         {
-            CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.ReplicationFailed, 0L));
+            // A handover is already converging. A request for the same target rides on it — the
+            // pending one resolves for both, and the caller observes the leader change — so it is
+            // answered Pending, after giving the check a turn: this is also how the ack path's
+            // nudge arrives (see CompleteAppendLogsAsync), as its own executor operation. A
+            // different target is refused rather than superseding a wait that may be one ack away
+            // from completing.
+            if (coreState.PendingTransferTarget == targetEndpoint)
+            {
+                await TryCompletePendingTransferAsync().ConfigureAwait(false);
+                CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Pending, 0L));
+            }
+            else
+                CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Errored, 0L));
+
             return;
         }
 
+        long goalIndex = await GetTransferGoalIndexAsync().ConfigureAwait(false);
+        long targetProgress = GetTransferTargetProgress(targetEndpoint);
+
+        if (targetProgress >= goalIndex)
+        {
+            await HandOverLeadershipAsync(targetNode, replyCorrelationId).ConfigureAwait(false);
+            return;
+        }
+
+        // The target is behind — under a steady write load a healthy follower is behind at almost
+        // every instant, by exactly the entries in flight to it. Refusing here made a transfer
+        // under load a race the caller had to keep re-running (CamusDB lt1/lt2: up to five asks over
+        // 1.8 s). Converge instead, the standard Raft handover (§3.10): pause proposal admission so
+        // the last index holds still, keep replicating, and hand over from the ack that shows the
+        // target level with it. The wait is bounded by one election timeout; past it the leader
+        // resumes serving and answers TargetNotCaughtUp so the caller can tell a slow target from
+        // a replication error.
+        long nowTicks = host.GetMonotonicTimestamp();
+        TimeSpan bound = coreState.ElectionTimeout > TimeSpan.Zero
+            ? coreState.ElectionTimeout
+            : TimeSpan.FromMilliseconds(host.Configuration.StartElectionTimeout);
+
+        coreState.PendingTransferTarget = targetEndpoint;
+        coreState.PendingTransferTerm = coreState.CurrentTerm;
+        coreState.PendingTransferArmedTicks = nowTicks;
+        coreState.PendingTransferBound = bound;
+        coreState.PendingTransferGoalIndex = goalIndex;
+        coreState.PendingTransferReplyCorrelationId = replyCorrelationId;
+
+        logger.LogInfoTransferWaitingForTarget(
+            host.LocalEndpoint, host.PartitionId, coreState.NodeState, targetEndpoint, targetProgress, goalIndex, bound.TotalMilliseconds);
+
+        // A quiesced leader has stopped heartbeating, and heartbeats are the only catch-up path once
+        // admission pauses: wake it, and ship to the target now rather than a heartbeat interval from now.
+        coreState.SetQuiesced(false);
+        await heartbeats.SendHeartbeat(true).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The leader's last log index as the transfer gate sees it. The adapter read races the WAL write
+    /// queue (appends still queued in the write scheduler are invisible to it), so take the
+    /// enqueue-advanced presence frontier when it is higher — an understated local max would hand
+    /// leadership to a target that is actually behind.
+    /// </summary>
+    private async ValueTask<long> GetTransferGoalIndexAsync()
+    {
+        long localMaxLogId = await wal.GetMaxLogAsync().ConfigureAwait(false);
+        long presentIndex = wal.GetPresentIndex();
+        return presentIndex > localMaxLogId ? presentIndex : localMaxLogId;
+    }
+
+    /// <summary>
+    /// The highest log position this leader has evidence the transfer target holds: the frontier it
+    /// reported in acks or its handshake, or its monotonic match index, whichever is higher.
+    /// </summary>
+    private long GetTransferTargetProgress(string endpoint)
+    {
+        long progress = GetKnownRemoteMaxLogId(endpoint);
+
+        if (tracker.TryGetMatchIndex(endpoint, out long matchIndex) && matchIndex > progress)
+            progress = matchIndex;
+
+        return progress;
+    }
+
+    /// <summary>
+    /// Hands over if the pending transfer's target has reached the leader's last index. Runs after
+    /// every ack from that target and on every leader tick. Returns <see langword="true"/> when
+    /// leadership was handed over (the caller's tick is finished — this node is a follower now).
+    /// </summary>
+    private async ValueTask<bool> TryCompletePendingTransferAsync()
+    {
+        string? target = coreState.PendingTransferTarget;
+        if (target is null)
+            return false;
+
+        // Every demotion clears the pending transfer through FailAllActiveProposalWaiters; this is
+        // the defensive fence for a path that changed state without it.
+        if (coreState.NodeState != RaftNodeState.Leader || coreState.CurrentTerm != coreState.PendingTransferTerm)
+        {
+            AbortPendingTransfer(RaftOperationStatus.NodeIsNotLeader, "leadership was lost while waiting");
+            return false;
+        }
+
+        RaftNode? targetNode = RaftPeers.FindByEndpoint(host.Nodes, target);
+        if (targetNode is null)
+        {
+            await AbortPendingTransferAndReadmitAsync(RaftOperationStatus.Errored, "the target left the peer set while waiting").ConfigureAwait(false);
+            return false;
+        }
+
+        if (!await IsPendingTransferTargetLevelAsync().ConfigureAwait(false))
+            return false;
+
+        ulong? replyCorrelationId = coreState.PendingTransferReplyCorrelationId;
+        long goalIndex = coreState.PendingTransferGoalIndex;
+        double waitedMs = MonotonicElapsed(coreState.PendingTransferArmedTicks, host.GetMonotonicTimestamp()).TotalMilliseconds;
+        ClearPendingTransfer();
+
+        logger.LogInfoTransferTargetCaughtUp(host.LocalEndpoint, host.PartitionId, coreState.NodeState, target, goalIndex, waitedMs);
+
+        await HandOverLeadershipAsync(targetNode, replyCorrelationId).ConfigureAwait(false);
+        return true;
+    }
+
+    /// <summary>
+    /// Side-effect-free: is the pending transfer's target level with this leader's last index, in
+    /// the term the transfer was armed in?
+    /// </summary>
+    private async ValueTask<bool> IsPendingTransferTargetLevelAsync()
+    {
+        string? target = coreState.PendingTransferTarget;
+        if (target is null || coreState.NodeState != RaftNodeState.Leader || coreState.CurrentTerm != coreState.PendingTransferTerm)
+            return false;
+
+        long goalIndex = await GetTransferGoalIndexAsync().ConfigureAwait(false);
+        return GetTransferTargetProgress(target) >= goalIndex;
+    }
+
+    /// <summary>
+    /// Ends the pending transfer's wait once it has run for its bound: admission resumes and the
+    /// requester learns the target never caught up, which is not a replication failure.
+    /// </summary>
+    private async ValueTask ExpirePendingTransferIfDueAsync(long nowTicks)
+    {
+        string? target = coreState.PendingTransferTarget;
+        if (target is null)
+            return;
+
+        if (MonotonicElapsed(coreState.PendingTransferArmedTicks, nowTicks) < coreState.PendingTransferBound)
+            return;
+
+        logger.LogWarnTransferTargetNotCaughtUp(
+            host.LocalEndpoint, host.PartitionId, coreState.NodeState, target,
+            GetTransferTargetProgress(target), coreState.PendingTransferGoalIndex, coreState.PendingTransferBound.TotalMilliseconds);
+
+        await AbortPendingTransferAndReadmitAsync(RaftOperationStatus.TargetNotCaughtUp, reason: null).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Drops the pending transfer and answers its requester with <paramref name="status"/>, on a
+    /// path where this node has stopped leading: the proposals parked behind the wait are answered
+    /// NodeIsNotLeader too. <paramref name="reason"/> is logged when given.
+    /// </summary>
+    private void AbortPendingTransfer(RaftOperationStatus status, string? reason)
+    {
+        if (!TakePendingTransfer(status, reason, out ulong? replyCorrelationId))
+            return;
+
+        CompleteReply(replyCorrelationId, new(RaftResponseType.None, status, 0L));
+        replicator.ReleaseParkedProposals(RaftOperationStatus.NodeIsNotLeader);
+    }
+
+    /// <summary>
+    /// Drops the pending transfer and answers its requester with <paramref name="status"/>, on a
+    /// path where this node is STILL the leader (the bound expired, the target left the peer set):
+    /// the proposals parked behind the wait are re-admitted in arrival order — they were never
+    /// refused, they waited.
+    /// </summary>
+    private async ValueTask AbortPendingTransferAndReadmitAsync(RaftOperationStatus status, string? reason)
+    {
+        if (!TakePendingTransfer(status, reason, out ulong? replyCorrelationId))
+            return;
+
+        CompleteReply(replyCorrelationId, new(RaftResponseType.None, status, 0L));
+        await replicator.ReadmitParkedProposalsAsync().ConfigureAwait(false);
+    }
+
+    private bool TakePendingTransfer(RaftOperationStatus status, string? reason, out ulong? replyCorrelationId)
+    {
+        replyCorrelationId = null;
+
+        string? target = coreState.PendingTransferTarget;
+        if (target is null)
+            return false;
+
+        replyCorrelationId = coreState.PendingTransferReplyCorrelationId;
+        ClearPendingTransfer();
+
+        if (reason is not null)
+            logger.LogInfoTransferAbandoned(host.LocalEndpoint, host.PartitionId, coreState.NodeState, target, reason, status);
+
+        return true;
+    }
+
+    /// <summary>Forgets the pending transfer without answering it; the caller owns the reply.</summary>
+    private void ClearPendingTransfer()
+    {
+        coreState.PendingTransferTarget = null;
+        coreState.PendingTransferTerm = -1;
+        coreState.PendingTransferArmedTicks = 0;
+        coreState.PendingTransferBound = TimeSpan.Zero;
+        coreState.PendingTransferGoalIndex = -1;
+        coreState.PendingTransferReplyCorrelationId = null;
+        pendingTransferNudgePosted = false;
+    }
+
+    /// <summary>
+    /// Set once the ack path has posted the handover nudge for the pending transfer, so a burst
+    /// of level acks posts it once. Cleared with the pending transfer.
+    /// </summary>
+    private bool pendingTransferNudgePosted;
+
+    /// <summary>Proposals parked behind a converging leadership transfer (diagnostics and tests).</summary>
+    internal int ParkedProposalCount => replicator.ParkedProposalCount;
+
+    /// <summary>
+    /// The handover proper: this leader steps down expecting <paramref name="targetNode"/> to win
+    /// the next term, and tells it to campaign now. Only reached once the target's log is level with
+    /// this node's, so the §5.4.1 election restriction cannot reject it.
+    /// </summary>
+    private async Task HandOverLeadershipAsync(RaftNode targetNode, ulong? replyCorrelationId)
+    {
+        string targetEndpoint = targetNode.Endpoint;
         HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         long nowTicks = host.GetMonotonicTimestamp();
         long targetTerm = coreState.CurrentTerm + 1;
@@ -810,6 +1041,11 @@ public sealed class RaftPartitionStateMachine
         FailAllActiveProposalWaiters();
 
         await host.InvokeLeaderChanged(host.PartitionId, "").ConfigureAwait(false);
+
+        // Only now — this node is a follower and has published that it leads nothing — is
+        // NodeIsNotLeader an exact answer for the proposals that waited behind the transfer. Their
+        // callers re-route to the successor, which the message below is about to elect.
+        replicator.ReleaseParkedProposals(RaftOperationStatus.NodeIsNotLeader);
 
         host.EnqueueResponse(targetNode.Endpoint, new(
             RaftResponderRequestType.TransferLeadership,
@@ -1959,6 +2195,11 @@ public sealed class RaftPartitionStateMachine
         coreState.LeadershipBarrierTerm = -1;
         coreState.LeadershipBarrierArmedTicks = 0;
 
+        // A transfer still waiting on its target dies with leadership too: the handover path takes
+        // its reply out before reaching here, so anything still pending is a demotion by another
+        // cause, and its requester must learn that this node is no longer the one to ask.
+        AbortPendingTransfer(RaftOperationStatus.NodeIsNotLeader, "this node stepped down while waiting");
+
         proposals.FailAllWaitersAndClear();
     }
 
@@ -2205,8 +2446,32 @@ public sealed class RaftPartitionStateMachine
     /// Handles one follower's AppendEntries acknowledgement — see
     /// <see cref="ReplicationAckProcessor.CompleteAppendLogsAsync"/>.
     /// </summary>
-    public ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1, long durableIndex = -1, long walStallMs = 0) =>
-        ackProcessor.CompleteAppendLogsAsync(endpoint, timestamp, status, committedIndex, responseTerm, durableIndex, walStallMs);
+    public async ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1, long durableIndex = -1, long walStallMs = 0)
+    {
+        await ackProcessor.CompleteAppendLogsAsync(endpoint, timestamp, status, committedIndex, responseTerm, durableIndex, walStallMs).ConfigureAwait(false);
+
+        // The ack that levels the transfer target with the last index is the moment to hand over:
+        // waiting for the next tick would add up to a heartbeat interval to every transfer under load.
+        // The demotion does not run inside this ack, though: this same operation may have just
+        // released client waiters on the quorum-durable fast path and enqueued their commit writes,
+        // and a step-down in the middle of that is a moment the lt3 divergence pointed at. Post the
+        // handover as its own control operation (a same-target TransferLeadership request, which
+        // re-runs the level check and hands over) so it runs after this ack has fully completed.
+        // Costs one executor hop. Without an executor (bare state-machine tests) it runs inline.
+        if (coreState.PendingTransferTarget is not null
+            && coreState.PendingTransferTarget == endpoint
+            && !pendingTransferNudgePosted
+            && await IsPendingTransferTargetLevelAsync().ConfigureAwait(false))
+        {
+            if (postToExecutor is Action<RaftRequest> post)
+            {
+                pendingTransferNudgePosted = true;
+                post(new RaftRequest(RaftRequestType.TransferLeadership, endpoint: endpoint));
+            }
+            else
+                await TryCompletePendingTransferAsync().ConfigureAwait(false);
+        }
+    }
     /// <summary>Proposes a batch of log entries — see <see cref="LogReplicator.ReplicateLogsAsync"/>.</summary>
     public Task ReplicateLogsAsync(List<RaftLog>? logs, bool autoCommit, ulong? replyCorrelationId) =>
         replicator.ReplicateLogsAsync(logs, autoCommit, replyCorrelationId);

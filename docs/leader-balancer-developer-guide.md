@@ -137,6 +137,16 @@ That's the whole loop. Notice it never blocks waiting for a transfer to finish �
 and re-checks reality next time. This is what makes it robust: every pass re-derives the truth from
 fresh reports, so a failed or lost suggestion simply gets re-planned later.
 
+The recipient, for its part, runs the move through the same converging handover as
+`IRaft.TransferLeadershipAsync`: if the target is behind (which, under a steady write load, a healthy
+follower is at almost every instant), the leader parks new proposals, keeps replicating, and hands
+over as soon as the target is level with its last index — bounded by one election timeout. Parked
+proposals are answered `NodeIsNotLeader` only after the leader change is published (or re-admitted if
+the wait expires), so a node never reports itself as not the leader while it still is. Every
+attempted move logs one `TransferSuggestion p{Partition} ... finished with {Status}` line at
+Information (partition, term, from, to, status, elapsed), so a move that did not complete is visible
+in the recipient's log rather than only as a timeout in the balancer's outstanding-move table.
+
 ---
 
 ## The two-tier balancing policy
@@ -235,8 +245,9 @@ leads the partition, and that node does the actual handoff:
 The recipient is **authoritative**: it re-checks everything at the moment of action. If the
 controller's view was stale (e.g. this node already lost leadership of P), the suggestion is simply
 dropped. The actual handoff uses Kommander's normal, Raft-correct leadership-transfer path, which
-itself re-validates terms and leadership. So a wrong suggestion can never cause an unsafe transfer —
-only a wasted one.
+itself re-validates terms and leadership and catches a lagging target up before handing over. So a
+wrong suggestion can never cause an unsafe transfer — only a wasted one, and a wasted one is logged
+with its outcome (`TargetNotCaughtUp`, `NodeIsNotLeader`, ...).
 
 > **One easy-to-miss case:** the P0 controller often *does* lead some of the overloaded partitions
 > itself. When the "from" node is the controller's own node, the suggestion is delivered **in-process**

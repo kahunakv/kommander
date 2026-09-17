@@ -2,7 +2,6 @@
 using System.Diagnostics;
 using Kommander.Data;
 using Kommander.Diagnostics;
-using Kommander.WAL;
 using Microsoft.Extensions.Logging;
 
 namespace Kommander;
@@ -42,35 +41,26 @@ internal sealed class LeadershipService
     internal Func<int, ValueTask<bool>>? AmILeaderQuickHookForTesting;
 
     private readonly IPartitionProvider partitionProvider;
-    private readonly IWAL walAdapter;
     private readonly Func<bool> isInitialized;
     private readonly Func<bool> joined;
-    private readonly Func<List<RaftNode>> getNodes;
     private readonly Func<RaftNode, GetReadIndexRequest, CancellationToken, Task<GetReadIndexResponse>> fetchReadIndex;
-    private readonly Func<RaftNode, HandshakeRequest, Task<HandshakeResponse>> sendHandshake;
     private readonly ILogger<IRaft> logger;
     private readonly string localEndpoint;
     private readonly int localNodeId;
 
     internal LeadershipService(
         IPartitionProvider partitionProvider,
-        IWAL walAdapter,
         Func<bool> isInitialized,
         Func<bool> joined,
-        Func<List<RaftNode>> getNodes,
         Func<RaftNode, GetReadIndexRequest, CancellationToken, Task<GetReadIndexResponse>> fetchReadIndex,
-        Func<RaftNode, HandshakeRequest, Task<HandshakeResponse>> sendHandshake,
         ILogger<IRaft> logger,
         string localEndpoint,
         int localNodeId)
     {
         this.partitionProvider = partitionProvider;
-        this.walAdapter = walAdapter;
         this.isInitialized = isInitialized;
         this.joined = joined;
-        this.getNodes = getNodes;
         this.fetchReadIndex = fetchReadIndex;
-        this.sendHandshake = sendHandshake;
         this.logger = logger;
         this.localEndpoint = localEndpoint;
         this.localNodeId = localNodeId;
@@ -520,9 +510,12 @@ internal sealed class LeadershipService
     }
 
     /// <summary>
-    /// Hands leadership of the partition to <paramref name="targetEndpoint"/>, retrying once
-    /// behind a handshake probe when the first attempt fails on replication, then waiting up to
-    /// 10 s for the handover to settle.
+    /// Hands leadership of the partition to <paramref name="targetEndpoint"/> and waits up to 10 s
+    /// for the handover to settle. The partition itself converges a target that is behind: it
+    /// pauses proposal admission, keeps replicating, and hands over from the ack that levels the
+    /// target with its last index, or answers <see cref="RaftOperationStatus.TargetNotCaughtUp"/>
+    /// after one election timeout — so the single request here is complete on its own and no
+    /// probe-and-retry is needed around it.
     /// </summary>
     internal async Task<RaftOperationStatus> TransferLeadershipAsync(
         int partitionId,
@@ -544,9 +537,6 @@ internal sealed class LeadershipService
         }
 
         RaftOperationStatus status = await partition.TransferLeadershipAsync(targetEndpoint, cancellationToken).ConfigureAwait(false);
-        if (status == RaftOperationStatus.ReplicationFailed)
-            status = await RetryTransferLeadershipAfterProbeAsync(partition, partitionId, targetEndpoint, cancellationToken).ConfigureAwait(false);
-
         if (status != RaftOperationStatus.Pending)
             return status;
 
@@ -616,54 +606,5 @@ internal sealed class LeadershipService
         {
             return RaftOperationStatus.Errored;
         }
-    }
-
-    /// <summary>
-    /// Second attempt at a leadership transfer that failed on replication: handshakes the target
-    /// directly to refresh its log position, feeds that back into the partition, drains, and
-    /// retries. A transfer can fail purely because the leader's view of the target's log is stale,
-    /// which the probe repairs without another election.
-    /// </summary>
-    private async Task<RaftOperationStatus> RetryTransferLeadershipAfterProbeAsync(
-        RaftPartition partition,
-        int partitionId,
-        string targetEndpoint,
-        CancellationToken cancellationToken)
-    {
-        if (string.IsNullOrWhiteSpace(targetEndpoint) || targetEndpoint == localEndpoint)
-            return RaftOperationStatus.ReplicationFailed;
-
-        RaftNode? targetNode = getNodes().FirstOrDefault(node => node.Endpoint == targetEndpoint);
-        if (targetNode is null)
-            return RaftOperationStatus.ReplicationFailed;
-
-        HandshakeResponse response;
-
-        try
-        {
-            response = await sendHandshake(targetNode, new HandshakeRequest(
-                localNodeId,
-                partitionId,
-                walAdapter.GetMaxLog(partitionId),
-                localEndpoint)).ConfigureAwait(false);
-        }
-        catch (Exception e) when (e is not OperationCanceledException)
-        {
-            logger.LogWarning("TransferLeadershipAsync probe: {Message}", e.Message);
-            return RaftOperationStatus.ReplicationFailed;
-        }
-
-        if (string.IsNullOrEmpty(response.Endpoint))
-            response = new HandshakeResponse(response.NodeId, response.MaxLogId, targetEndpoint);
-
-        partition.Handshake(new HandshakeRequest(
-            response.NodeId,
-            partitionId,
-            response.MaxLogId,
-            response.Endpoint));
-
-        await partition.DrainAsync(cancellationToken).ConfigureAwait(false);
-
-        return await partition.TransferLeadershipAsync(targetEndpoint, cancellationToken).ConfigureAwait(false);
     }
 }

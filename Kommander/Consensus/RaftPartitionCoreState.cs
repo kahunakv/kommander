@@ -369,4 +369,34 @@ internal sealed class RaftPartitionCoreState
     /// <summary>Monotonic timestamp when the barrier was armed; drives the
     /// <see cref="RaftConfiguration.LeadershipBarrierTimeout"/> revert in the leader tick.</summary>
     public long LeadershipBarrierArmedTicks;
+
+    /// <summary>
+    /// Endpoint of the peer a leadership transfer is converging on, or <see langword="null"/> when
+    /// no handover is pending. Armed by <c>TransferLeadershipAsync</c> when the target's log is
+    /// behind the leader's last index at request time. While set, the leader parks new proposals
+    /// (see <c>LogReplicator.ReplicateLogs</c>) so that its last index holds still and the target
+    /// can reach it (Raft §3.10); they are answered <see cref="Data.RaftOperationStatus.NodeIsNotLeader"/>
+    /// once the handover has published the leader change, or re-admitted if the wait expires.
+    /// Proposals already in flight keep committing: this node is still the leader and still
+    /// replicates. Cleared by the handover itself, by the bounded-wait expiry in the leader tick,
+    /// and by every leader→follower transition via <c>FailAllActiveProposalWaiters</c>.
+    /// </summary>
+    public string? PendingTransferTarget;
+
+    /// <summary>Term the pending transfer was armed in; the deferred handover is fenced on it.</summary>
+    public long PendingTransferTerm = -1;
+
+    /// <summary>Monotonic timestamp when the pending transfer was armed.</summary>
+    public long PendingTransferArmedTicks;
+
+    /// <summary>How long the pending transfer may wait for its target, drawn from the election
+    /// timeout at arm time; the leader tick expires the wait and resumes admission past it.</summary>
+    public TimeSpan PendingTransferBound;
+
+    /// <summary>The leader's last index when the pending transfer was armed, for the outcome log line.</summary>
+    public long PendingTransferGoalIndex = -1;
+
+    /// <summary>Reply correlation of the request that armed the pending transfer; completed with
+    /// <see cref="Data.RaftOperationStatus.Pending"/> on handover or with the reason the wait ended.</summary>
+    public ulong? PendingTransferReplyCorrelationId;
 }

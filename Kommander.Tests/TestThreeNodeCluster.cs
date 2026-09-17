@@ -360,8 +360,13 @@ public sealed class TestThreeNodeCluster
         await node3.LeaveCluster(true, CancellationToken.None);
     }
 
+    /// <summary>
+    /// A target that cannot catch up gets no leadership, but the answer is the bounded wait expiring
+    /// (<see cref="RaftOperationStatus.TargetNotCaughtUp"/>), not a replication error — and the
+    /// leader that waited is serving again afterwards, with proposal admission resumed.
+    /// </summary>
     [Fact]
-    public async Task TransferLeadershipAsync_StaleTarget_ReturnsReplicationFailed()
+    public async Task TransferLeadershipAsync_PartitionedTarget_ReturnsTargetNotCaughtUpAndLeaderKeepsServing()
     {
         // Seed a QUORUM (node1 + node2) with committed entries, leaving node3 empty. The quorum makes
         // one of the seeded nodes deterministically win the election — node3 alone can never assemble a
@@ -413,13 +418,90 @@ public sealed class TestThreeNodeCluster
             Assert.Equal(RaftOperationStatus.Success, r.Status);
         }
 
-        // node3 is behind the leader's committed log, so transferring leadership to it must be rejected.
+        // node3 is behind the leader's log and, partitioned, can never catch up: the leader waits one
+        // election timeout for it, then keeps the partition and reports the target as not caught up.
         RaftOperationStatus transferStatus = await leaderNode.TransferLeadershipAsync(
             1,
             node3.GetLocalEndpoint(),
             TestContext.Current.CancellationToken);
 
-        Assert.Equal(RaftOperationStatus.ReplicationFailed, transferStatus);
+        Assert.Equal(RaftOperationStatus.TargetNotCaughtUp, transferStatus);
+        Assert.True(await leaderNode.AmILeaderQuick(1));
+
+        // Admission resumed with the wait: the same leader commits again through the surviving quorum.
+        RaftReplicationResult afterwards = await leaderNode.ReplicateLogs(
+            1, "Greeting", "Hello Again"u8.ToArray(),
+            cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal(RaftOperationStatus.Success, afterwards.Status);
+
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// A target that is behind at request time but catches up within the bound receives leadership:
+    /// the transfer converges instead of being refused. node3 is held behind by a partition when the
+    /// transfer is asked for, then reconnected while the leader is waiting; the leader ships it the
+    /// missing tail and hands over from the ack that levels it.
+    /// </summary>
+    [Fact]
+    public async Task TransferLeadershipAsync_TargetBehindThenCatchesUp_HandsOver()
+    {
+        List<RaftLog> seededCommitted =
+        [
+            new() { Id = 1, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed },
+            new() { Id = 2, Term = 1, LogData = "Hello"u8.ToArray(), Time = HLCTimestamp.Zero, Type = RaftLogType.Committed },
+        ];
+
+        (IRaft node1, IRaft node2, IRaft node3, _, InMemoryCommunication communication) =
+            await AssembleThreNodeClusterWithNetwork(
+                "memory",
+                1,
+                (wal1, wal2, _) =>
+                {
+                    SeedWal(wal1, 1, seededCommitted);
+                    SeedWal(wal2, 1, seededCommitted);
+                });
+
+        IRaft[] nodes = [node1, node2, node3];
+
+        string stableLeader = await node1.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        Assert.NotEqual(node3.GetLocalEndpoint(), stableLeader);
+
+        IRaft leaderNode = GetNodeByEndpoint(nodes, stableLeader);
+
+        communication.PartitionNode(node3.GetLocalEndpoint());
+
+        for (int i = 0; i < 3; i++)
+        {
+            RaftReplicationResult r = await leaderNode.ReplicateLogs(
+                1, "Greeting", "Hello World"u8.ToArray(),
+                cancellationToken: TestContext.Current.CancellationToken);
+            Assert.Equal(RaftOperationStatus.Success, r.Status);
+        }
+
+        // Ask while node3 is still behind, then reconnect it while the leader is waiting on it. The
+        // wait is bounded by this cluster's election timeout (~170 ms here), so reconnect well inside it.
+        Task<RaftOperationStatus> transfer = leaderNode.TransferLeadershipAsync(
+            1,
+            node3.GetLocalEndpoint(),
+            TestContext.Current.CancellationToken);
+
+        await Task.Delay(20, TestContext.Current.CancellationToken);
+        communication.HealPartition(node3.GetLocalEndpoint());
+
+        Assert.Equal(RaftOperationStatus.Success, await transfer);
+
+        string newLeader = await node1.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+        Assert.Equal(node3.GetLocalEndpoint(), newLeader);
 
         await node1.LeaveCluster(true, CancellationToken.None);
         await node2.LeaveCluster(true, CancellationToken.None);

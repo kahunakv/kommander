@@ -380,6 +380,23 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Debug, Message = "TransferSuggestion p{Partition} term={Term}: dropped — target {Target} is suspect/dead, suggested by {SuggestedBy}")]
     public static partial void LogDebugTransferSuggestionDroppedSuspect(this ILogger<IRaft> logger, int partition, long term, string target, string suggestedBy);
 
+    [LoggerMessage(Level = LogLevel.Information, Message = "TransferSuggestion p{Partition} term={Term}: move {From} -> {To} finished with {Status} after {ElapsedMs}ms, suggested by {SuggestedBy}")]
+    public static partial void LogInfoTransferSuggestionOutcome(this ILogger<IRaft> logger, int partition, long term, string from, string to, RaftOperationStatus status, long elapsedMs, string suggestedBy);
+
+    // ── Converging leadership transfer ────────────────────────────────────
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Leadership transfer to {Target} is waiting for it to catch up: target at #{TargetIndex}, leader at #{GoalIndex}; proposal admission paused for up to {BoundMs}ms")]
+    public static partial void LogInfoTransferWaitingForTarget(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string target, long targetIndex, long goalIndex, double boundMs);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Leadership transfer target {Target} reached #{GoalIndex} after {WaitedMs}ms; handing over")]
+    public static partial void LogInfoTransferTargetCaughtUp(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string target, long goalIndex, double waitedMs);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Leadership transfer target {Target} is still at #{TargetIndex} of #{GoalIndex} after {BoundMs}ms; resuming proposals and answering TargetNotCaughtUp")]
+    public static partial void LogWarnTransferTargetNotCaughtUp(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string target, long targetIndex, long goalIndex, double boundMs);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Leadership transfer to {Target} abandoned: {Reason}; answering {Status}")]
+    public static partial void LogInfoTransferAbandoned(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string target, string reason, RaftOperationStatus status);
+
     // ── RaftTransportDispatcher ───────────────────────────────────────────
 
     [LoggerMessage(Level = LogLevel.Trace, Message = "[RaftTransportDispatcher/{Endpoint}] Sending batch of {Count} messages")]

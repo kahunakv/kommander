@@ -613,8 +613,155 @@ public class TestRaftPartitionStateMachine
         });
     }
 
+    /// <summary>
+    /// A target that is behind at request time is no longer refused: the leader parks new proposals
+    /// (it still leads, so it never answers NodeIsNotLeader while it does), keeps replicating, and
+    /// hands over once the target is level with its last index. The levelling ack does not demote
+    /// inside itself: it posts a same-target TransferLeadership request to the executor, and that
+    /// operation performs the handover; the parked proposals are answered NodeIsNotLeader only after
+    /// the leader change has been published. Under a steady write load a healthy follower is behind
+    /// at almost every instant, so the old instant compare turned a transfer into a race.
+    /// </summary>
     [Fact]
-    public async Task TransferLeadershipAsync_Leader_WithStaleTarget_ReturnsReplicationFailed()
+    public async Task TransferLeadershipAsync_Leader_WithBehindTarget_ParksProposalsAndHandsOverFromPostedNudge()
+    {
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [],
+            Leader = "node-a"
+        };
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+        List<RaftRequest> posted = [];
+        sm.SetPostToExecutor(posted.Add);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: 19);
+        host.NodesOverride = [new("node-b")];
+        host.ClearObservations();
+        sink.Completed.Clear();
+
+        // No evidence of node-b's log yet: it is behind the leader's last index.
+        await sm.TransferLeadershipAsync("node-b", replyCorrelationId: 20);
+
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        Assert.Empty(sink.Completed);                      // the request is waiting, not refused
+        Assert.Empty(host.LeaderChanges);
+        Assert.DoesNotContain(host.EnqueuedResponses, m => m.Type == RaftResponderRequestType.TransferLeadership);
+
+        // Proposals arriving during the wait are parked: no answer, nothing appended, still the leader.
+        await sm.ReplicateLogsAsync(Tail((100, sm.CurrentTerm)), autoCommit: true, replyCorrelationId: 50);
+        Assert.Equal(1, sm.ParkedProposalCount);
+        Assert.Empty(sink.Completed);
+
+        // A second ask for the same target rides on the pending handover (and re-checks the level, no change yet).
+        await sm.TransferLeadershipAsync("node-b", replyCorrelationId: 21);
+        Assert.Collection(sink.Completed, reply =>
+        {
+            Assert.Equal((ulong)21, reply.Id);
+            Assert.Equal(RaftOperationStatus.Pending, reply.Response.Status);
+        });
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        sink.Completed.Clear();
+        host.ClearObservations();
+
+        // The target acks the leader's last index. The ack itself does not demote: it posts the nudge.
+        long goalIndex = Math.Max(await wal.GetMaxLogAsync(), ((IRaftWalFacade)wal).GetPresentIndex());
+        await sm.CompleteAppendLogsAsync(
+            "node-b",
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            RaftOperationStatus.Success,
+            committedIndex: goalIndex,
+            responseTerm: sm.CurrentTerm);
+
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        Assert.Empty(host.LeaderChanges);
+        Assert.Collection(posted, request =>
+        {
+            Assert.Equal(RaftRequestType.TransferLeadership, request.Type);
+            Assert.Equal("node-b", request.Endpoint);
+        });
+
+        // A second level ack does not post a second nudge.
+        await sm.CompleteAppendLogsAsync(
+            "node-b",
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            RaftOperationStatus.Success,
+            committedIndex: goalIndex,
+            responseTerm: sm.CurrentTerm);
+        Assert.Single(posted);
+
+        // The executor runs the nudge as its own operation: this is the handover.
+        await sm.TransferLeadershipAsync(posted[0].Endpoint!, replyCorrelationId: null);
+
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        Assert.Equal(string.Empty, host.Leader);
+        Assert.Collection(host.LeaderChanges, leader => Assert.Equal(string.Empty, leader));
+        Assert.Contains(host.EnqueuedResponses,
+            m => m.Endpoint == "node-b" && m.Type == RaftResponderRequestType.TransferLeadership);
+        Assert.Contains(sink.Completed, r => r.Id == 20 && r.Response.Status == RaftOperationStatus.Pending);
+        // The parked proposal is released now that the node has published it leads nothing.
+        Assert.Contains(sink.Completed, r => r.Id == 50 && r.Response.Status == RaftOperationStatus.NodeIsNotLeader);
+        Assert.Equal(0, sm.ParkedProposalCount);
+    }
+
+    /// <summary>
+    /// The wait is bounded by one election timeout. A target that never catches up gets no
+    /// leadership: the leader keeps its role, resumes admitting proposals, and answers the requester
+    /// TargetNotCaughtUp rather than ReplicationFailed, which names a genuine replication error.
+    /// </summary>
+    [Fact]
+    public async Task TransferLeadershipAsync_Leader_TargetNeverCatchesUp_ExpiresAndResumesProposals()
+    {
+        FakePartitionHost host = new()
+        {
+            NodesOverride = [],
+            Leader = "node-a",
+            MonotonicOverride = 1_000_000_000
+        };
+        host.Configuration.EnableQuiescence = false;
+        FakeWalFacade wal = new();
+        CapturingReplySink sink = new();
+        RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
+
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: 30);
+        host.NodesOverride = [new("node-b")];
+        host.ClearObservations();
+        sink.Completed.Clear();
+
+        await sm.TransferLeadershipAsync("node-b", replyCorrelationId: 31);
+        Assert.Empty(sink.Completed);
+
+        // Within the bound: still waiting, parking proposals, still the leader.
+        host.MonotonicOverride += (long)((sm.ElectionTimeout.TotalSeconds / 2) * Stopwatch.Frequency);
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        Assert.Empty(sink.Completed);
+        await sm.ReplicateLogsAsync(Tail((100, sm.CurrentTerm)), autoCommit: true, replyCorrelationId: 60);
+        Assert.Equal(1, sm.ParkedProposalCount);
+        Assert.Empty(sink.Completed);
+
+        // Past the bound: the wait expires, the requester gets a distinct answer, and the parked
+        // proposal is re-admitted (it was never refused) — nobody hears NodeIsNotLeader from a leader.
+        host.MonotonicOverride += (long)((sm.ElectionTimeout.TotalSeconds / 2 + 1) * Stopwatch.Frequency);
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        Assert.Equal("node-a", host.Leader);
+        Assert.DoesNotContain(host.EnqueuedResponses, m => m.Type == RaftResponderRequestType.TransferLeadership);
+        Assert.Contains(sink.Completed, r => r.Id == 31 && r.Response.Status == RaftOperationStatus.TargetNotCaughtUp);
+        Assert.DoesNotContain(sink.Completed, r => r.Id == 60 && r.Response.Status == RaftOperationStatus.NodeIsNotLeader);
+        Assert.Equal(0, sm.ParkedProposalCount);
+        Assert.NotEqual(RaftOperationStatus.NodeIsNotLeader, sm.ReplicateLogs(Tail((101, sm.CurrentTerm)), autoCommit: true).Item1);
+    }
+
+    /// <summary>
+    /// A demotion by any other cause while the transfer waits ends it: the requester is told this
+    /// node is no longer the one to ask, instead of being left waiting for a reply that never comes.
+    /// </summary>
+    [Fact]
+    public async Task TransferLeadershipAsync_StepDownWhileWaiting_AnswersNodeIsNotLeader()
     {
         FakePartitionHost host = new()
         {
@@ -625,18 +772,21 @@ public class TestRaftPartitionStateMachine
         CapturingReplySink sink = new();
         RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);
 
-        await sm.ForceLeaderForTestingAsync(replyCorrelationId: 19);
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: 40);
         host.NodesOverride = [new("node-b")];
         sink.Completed.Clear();
 
-        await sm.TransferLeadershipAsync("node-b", replyCorrelationId: 20);
+        await sm.TransferLeadershipAsync("node-b", replyCorrelationId: 41);
+        await sm.ReplicateLogsAsync(Tail((100, sm.CurrentTerm)), autoCommit: true, replyCorrelationId: 43);
+        Assert.Empty(sink.Completed);
 
-        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
-        Assert.Collection(sink.Completed, reply =>
-        {
-            Assert.Equal((ulong)20, reply.Id);
-            Assert.Equal(RaftOperationStatus.ReplicationFailed, reply.Response.Status);
-        });
+        await sm.StepDownAsync(replyCorrelationId: 42);
+
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        Assert.Contains(sink.Completed, r => r.Id == 41 && r.Response.Status == RaftOperationStatus.NodeIsNotLeader);
+        Assert.Contains(sink.Completed, r => r.Id == 43 && r.Response.Status == RaftOperationStatus.NodeIsNotLeader);
+        Assert.Contains(sink.Completed, r => r.Id == 42 && r.Response.Status == RaftOperationStatus.Pending);
+        Assert.Equal(0, sm.ParkedProposalCount);
     }
 
     [Fact]
