@@ -1,4 +1,5 @@
 
+using System.Collections.Immutable;
 using Kommander.Data;
 using Kommander.Gossip;
 using Microsoft.Extensions.Logging;
@@ -31,12 +32,22 @@ public class InMemoryCommunication : ICommunication
     private volatile Dictionary<string, IRaft> nodes = new();
 
     /// <summary>
-    /// Endpoints currently "transport-paused". A message is dropped if either its sender or its
-    /// target is in this set, which simulates a full (both-directions) network partition without
-    /// stopping the node's timers — the node keeps running and campaigning in isolation. Used by
-    /// tests/simulations to reproduce disruptive-rejoin scenarios; empty in normal operation.
+    /// The current delivery filters: the endpoints that <see cref="PartitionNode"/> isolated, and the
+    /// directed links that <see cref="BlockLink"/> cut. Empty in normal operation.
     /// </summary>
-    private readonly HashSet<string> partitionedEndpoints = [];
+    /// <remarks>
+    /// <para>
+    /// Partition-executor threads read the filters on every message while a test or a simulation
+    /// changes them. The state is one immutable object: a writer builds a new one and publishes it
+    /// with a compare-and-swap, and a reader takes one volatile read. No reader waits or takes a
+    /// lock, so the same code also works in the thread-free (browser) build, where nothing may block.
+    /// </para>
+    /// <para>
+    /// When no filter is set the field holds <see cref="DeliveryFilters.None"/>, and the check on
+    /// each message is one reference compare.
+    /// </para>
+    /// </remarks>
+    private DeliveryFilters filters = DeliveryFilters.None;
 
     public void SetNodes(Dictionary<string, IRaft> nodes)
     {
@@ -47,26 +58,166 @@ public class InMemoryCommunication : ICommunication
     /// Drops all traffic to and from <paramref name="endpoint"/> until <see cref="HealPartition"/>
     /// is called, simulating a transport pause while the node itself keeps ticking.
     /// </summary>
+    /// <remarks>
+    /// This isolates the node from every peer. To cut only some links, use <see cref="BlockLink"/>.
+    /// The two filters are independent: a message is dropped when either one drops it, and
+    /// <see cref="HealPartition"/> does not remove link blocks.
+    /// </remarks>
     public void PartitionNode(string endpoint)
     {
-        lock (partitionedEndpoints)
-            partitionedEndpoints.Add(endpoint);
+        UpdateFilters(endpoint, static (current, e) => current with { Endpoints = current.Endpoints.Add(e) });
     }
 
     /// <summary>
     /// Restores traffic to and from <paramref name="endpoint"/> after a <see cref="PartitionNode"/> call.
+    /// Link blocks set with <see cref="BlockLink"/> stay in place.
     /// </summary>
     public void HealPartition(string endpoint)
     {
-        lock (partitionedEndpoints)
-            partitionedEndpoints.Remove(endpoint);
+        UpdateFilters(endpoint, static (current, e) => current with { Endpoints = current.Endpoints.Remove(e) });
+    }
+
+    /// <summary>
+    /// Drops every message that <paramref name="from"/> sends to <paramref name="to"/>, until
+    /// <see cref="UnblockLink"/> or <see cref="HealAll"/>. Messages from <paramref name="to"/> to
+    /// <paramref name="from"/> still arrive. Use <see cref="BlockLinkBothWays"/> to cut the link
+    /// in both directions.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A dropped message behaves like a message lost on the network: the sender gets the same
+    /// default (failed or empty) response as for an isolated node, and nothing is logged.
+    /// </para>
+    /// <para>
+    /// Most Raft messages are one-way: a vote, an append or an acknowledgement travels as its own
+    /// message, and the answer is a separate message in the other direction. A block drops only the
+    /// messages in the blocked direction. Some calls return their answer in the same call
+    /// (handshake, join, leave, set member role, gossip, ping, ping-req, read index, follower lag,
+    /// install snapshot and forwarded writes). For these, the request needs the
+    /// <paramref name="from"/> → <paramref name="to"/> direction and the answer needs the other
+    /// direction. If only the answer direction is blocked, the target still processes the request,
+    /// but the caller gets the failure response. This is the same as a real lost reply: for
+    /// example, a snapshot can be installed while the leader thinks the transfer failed.
+    /// </para>
+    /// <para>
+    /// Known liveness behavior of one-way blocks. A block applies to every partition, not only one.
+    /// A follower that receives from the leader but cannot send to it (<c>BlockLink(follower, leader)</c>)
+    /// stays a follower: its acknowledgements are lost, so the leader counts it as lagging and commits
+    /// with the other voters. A follower that cannot receive from the leader but can send to it
+    /// (<c>BlockLink(leader, follower)</c>) hears no heartbeats, so it starts a pre-vote round on every
+    /// leader check (in <c>TestInMemoryLinkBlocks</c>, about 84 rounds in 3 seconds). The other voters
+    /// still hear the leader and refuse the pre-vote, so no term goes up and the leader stays. The cost
+    /// is that the follower gets no new entries until the block is removed, and its pre-vote messages
+    /// continue for the whole block. If the leader is cut one way from a majority of voters, those
+    /// voters elect a new leader. Unless <c>EnableCheckQuorum</c> is on, the old leader thinks that it
+    /// is still the leader until it learns the new term, but it cannot commit.
+    /// </para>
+    /// </remarks>
+    public void BlockLink(string from, string to)
+    {
+        UpdateFilters((from, to), static (current, link) => current with { Links = current.Links.Add(link) });
+    }
+
+    /// <summary>
+    /// Restores the <paramref name="from"/> → <paramref name="to"/> direction after a
+    /// <see cref="BlockLink"/> call. The other direction and node isolation are not changed.
+    /// </summary>
+    public void UnblockLink(string from, string to)
+    {
+        UpdateFilters((from, to), static (current, link) => current with { Links = current.Links.Remove(link) });
+    }
+
+    /// <summary>
+    /// Cuts the link between <paramref name="a"/> and <paramref name="b"/> in both directions: a
+    /// network partition between exactly these two nodes. Their links to other nodes still work.
+    /// </summary>
+    public void BlockLinkBothWays(string a, string b)
+    {
+        UpdateFilters((a, b), static (current, link) => current with
+        {
+            Links = current.Links.Add(link).Add((link.Item2, link.Item1))
+        });
+    }
+
+    /// <summary>
+    /// Restores both directions of the link between <paramref name="a"/> and <paramref name="b"/>.
+    /// </summary>
+    public void UnblockLinkBothWays(string a, string b)
+    {
+        UpdateFilters((a, b), static (current, link) => current with
+        {
+            Links = current.Links.Remove(link).Remove((link.Item2, link.Item1))
+        });
+    }
+
+    /// <summary>
+    /// Removes every delivery filter: all node isolations from <see cref="PartitionNode"/> and all
+    /// link blocks from <see cref="BlockLink"/>.
+    /// </summary>
+    public void HealAll()
+    {
+        Interlocked.Exchange(ref filters, DeliveryFilters.None);
+    }
+
+    /// <summary>
+    /// Returns true when a message from <paramref name="from"/> to <paramref name="to"/> is dropped
+    /// now, because either endpoint is isolated or the directed link is blocked.
+    /// </summary>
+    public bool IsDeliveryBlocked(string from, string to)
+    {
+        return IsPartitioned(from, to);
+    }
+
+    /// <summary>
+    /// Applies <paramref name="change"/> to the current filters and publishes the result. The
+    /// compare-and-swap loop keeps two concurrent writers from losing each other's change.
+    /// </summary>
+    private void UpdateFilters<TArg>(TArg arg, Func<DeliveryFilters, TArg, DeliveryFilters> change)
+    {
+        while (true)
+        {
+            DeliveryFilters current = Volatile.Read(ref filters);
+            DeliveryFilters next = change(current, arg);
+
+            if (next.Endpoints.IsEmpty && next.Links.IsEmpty)
+                next = DeliveryFilters.None;
+
+            if (ReferenceEquals(Interlocked.CompareExchange(ref filters, next, current), current))
+                return;
+        }
     }
 
     private bool IsPartitioned(string source, string target)
     {
-        lock (partitionedEndpoints)
-            return partitionedEndpoints.Count > 0 &&
-                (partitionedEndpoints.Contains(source) || partitionedEndpoints.Contains(target));
+        DeliveryFilters current = Volatile.Read(ref filters);
+
+        if (ReferenceEquals(current, DeliveryFilters.None))
+            return false;
+
+        return current.Endpoints.Contains(source)
+            || current.Endpoints.Contains(target)
+            || current.Links.Contains((source, target));
+    }
+
+    /// <summary>
+    /// For a call that returns its answer in the same call: true when the request or the answer is
+    /// dropped. The caller checks the request direction before the call and the answer direction
+    /// after it, so a blocked answer still lets the target process the request.
+    /// </summary>
+    private bool IsReplyBlocked(string source, string target)
+    {
+        return IsPartitioned(target, source);
+    }
+
+    /// <summary>
+    /// Immutable snapshot of the delivery filters. <see cref="None"/> is the one instance that
+    /// means "no filter", so the hot path can test it by reference.
+    /// </summary>
+    private sealed record DeliveryFilters(ImmutableHashSet<string> Endpoints, ImmutableHashSet<(string From, string To)> Links)
+    {
+        public static readonly DeliveryFilters None = new(
+            ImmutableHashSet<string>.Empty,
+            ImmutableHashSet<(string From, string To)>.Empty);
     }
 
     public Task<HandshakeResponse> Handshake(RaftManager manager, RaftNode node, HandshakeRequest request)
@@ -79,7 +230,7 @@ public class InMemoryCommunication : ICommunication
             if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
             {
                 targetNode.Handshake(request);
-                if (targetNode is RaftManager targetManager)
+                if (targetNode is RaftManager targetManager && !IsReplyBlocked(manager.LocalEndpoint, node.Endpoint))
                     return Task.FromResult(targetManager.GetHandshakeResponse(request.Partition));
             }
             else
@@ -149,7 +300,10 @@ public class InMemoryCommunication : ICommunication
             return new LeaveResponse(false);
 
         if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode) && targetNode is RaftManager targetManager)
-            return await targetManager.ReceiveLeave(request, cancellationToken).ConfigureAwait(false);
+        {
+            LeaveResponse response = await targetManager.ReceiveLeave(request, cancellationToken).ConfigureAwait(false);
+            return IsReplyBlocked(manager.LocalEndpoint, node.Endpoint) ? new LeaveResponse(false) : response;
+        }
 
         Console.WriteLine("SendLeave Unknown node: " + node.Endpoint);
         return new LeaveResponse(false);
@@ -161,7 +315,12 @@ public class InMemoryCommunication : ICommunication
             return new SetMemberRoleResponse(false, Status: RaftOperationStatus.Errored);
 
         if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode) && targetNode is RaftManager targetManager)
-            return await targetManager.ReceiveSetMemberRole(request, cancellationToken).ConfigureAwait(false);
+        {
+            SetMemberRoleResponse response = await targetManager.ReceiveSetMemberRole(request, cancellationToken).ConfigureAwait(false);
+            return IsReplyBlocked(manager.LocalEndpoint, node.Endpoint)
+                ? new SetMemberRoleResponse(false, Status: RaftOperationStatus.Errored)
+                : response;
+        }
 
         Console.WriteLine("SendSetMemberRole Unknown node: " + node.Endpoint);
         return new SetMemberRoleResponse(false, Status: RaftOperationStatus.Errored);
@@ -173,7 +332,10 @@ public class InMemoryCommunication : ICommunication
             return Task.FromResult(new GossipAck(0, null));
 
         if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode) && targetNode is RaftManager targetManager)
-            return Task.FromResult(targetManager.ReceiveGossip(digest));
+        {
+            GossipAck ack = targetManager.ReceiveGossip(digest);
+            return Task.FromResult(IsReplyBlocked(manager.LocalEndpoint, node.Endpoint) ? new GossipAck(0, null) : ack);
+        }
 
         return Task.FromResult(new GossipAck(0, null));
     }
@@ -184,7 +346,10 @@ public class InMemoryCommunication : ICommunication
             return Task.FromResult(new Gossip.PingResponse(false, 0));
 
         if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode) && targetNode is RaftManager targetManager)
-            return Task.FromResult(targetManager.ReceivePing(request));
+        {
+            Gossip.PingResponse response = targetManager.ReceivePing(request);
+            return Task.FromResult(IsReplyBlocked(manager.LocalEndpoint, node.Endpoint) ? new Gossip.PingResponse(false, 0) : response);
+        }
 
         return Task.FromResult(new Gossip.PingResponse(false, 0));
     }
@@ -195,9 +360,16 @@ public class InMemoryCommunication : ICommunication
             return Task.FromResult(new Gossip.PingReqResponse(false));
 
         if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode) && targetNode is RaftManager targetManager)
-            return targetManager.ReceivePingReq(request, cancellationToken);
+            return SendPingReqCore(manager, node, targetManager, request, cancellationToken);
 
         return Task.FromResult(new Gossip.PingReqResponse(false));
+    }
+
+    private async Task<Gossip.PingReqResponse> SendPingReqCore(
+        RaftManager manager, RaftNode node, RaftManager targetManager, Gossip.PingReqRequest request, CancellationToken cancellationToken)
+    {
+        Gossip.PingReqResponse response = await targetManager.ReceivePingReq(request, cancellationToken).ConfigureAwait(false);
+        return IsReplyBlocked(manager.LocalEndpoint, node.Endpoint) ? new Gossip.PingReqResponse(false) : response;
     }
 
     /// <summary>
@@ -212,7 +384,10 @@ public class InMemoryCommunication : ICommunication
             return new GetReadIndexResponse(false);
 
         if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode) && targetNode is RaftManager targetManager)
-            return await targetManager.ReceiveGetReadIndex(request, cancellationToken).ConfigureAwait(false);
+        {
+            GetReadIndexResponse response = await targetManager.ReceiveGetReadIndex(request, cancellationToken).ConfigureAwait(false);
+            return IsReplyBlocked(manager.LocalEndpoint, node.Endpoint) ? new GetReadIndexResponse(false) : response;
+        }
 
         return new GetReadIndexResponse(false);
     }
@@ -223,7 +398,10 @@ public class InMemoryCommunication : ICommunication
             return null;
 
         if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
-            return await targetNode.GetFollowerLagAsync(partitionId, followerEndpoint).ConfigureAwait(false);
+        {
+            long? lag = await targetNode.GetFollowerLagAsync(partitionId, followerEndpoint).ConfigureAwait(false);
+            return IsReplyBlocked(manager.LocalEndpoint, node.Endpoint) ? null : lag;
+        }
 
         return null;
     }
@@ -234,7 +412,10 @@ public class InMemoryCommunication : ICommunication
             return new JoinResponse(false);
 
         if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode) && targetNode is RaftManager targetManager)
-            return await targetManager.ReceiveJoin(request).ConfigureAwait(false);
+        {
+            JoinResponse response = await targetManager.ReceiveJoin(request).ConfigureAwait(false);
+            return IsReplyBlocked(manager.LocalEndpoint, node.Endpoint) ? new JoinResponse(false) : response;
+        }
 
         Console.WriteLine("SendJoin Unknown node: " + node.Endpoint);
         return new JoinResponse(false);
@@ -246,7 +427,10 @@ public class InMemoryCommunication : ICommunication
             return new SnapshotResponse(false);
 
         if (nodes.TryGetValue(node.Endpoint, out IRaft? targetNode) && targetNode is RaftManager targetManager)
-            return await targetManager.ReceiveInstallSnapshot(request, cancellationToken).ConfigureAwait(false);
+        {
+            SnapshotResponse response = await targetManager.ReceiveInstallSnapshot(request, cancellationToken).ConfigureAwait(false);
+            return IsReplyBlocked(manager.LocalEndpoint, node.Endpoint) ? new SnapshotResponse(false) : response;
+        }
 
         return new SnapshotResponse(false);
     }
@@ -282,9 +466,13 @@ public class InMemoryCommunication : ICommunication
         if (IsPartitioned(manager.LocalEndpoint, node.Endpoint) || !nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
             return null;
 
-        return await targetNode.ReplicateLogs(
+        RaftReplicationResult result = await targetNode.ReplicateLogs(
             partitionId, type, logs, autoCommit, expectedGeneration, cancellationToken
         ).ConfigureAwait(false);
+
+        // A lost reply after the target accepted the write: the caller sees an unreachable replica,
+        // as on a real network. The write may still commit, so a retry can duplicate it.
+        return IsReplyBlocked(manager.LocalEndpoint, node.Endpoint) ? null : result;
     }
 
     public async Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)

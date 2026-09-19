@@ -9,12 +9,6 @@ namespace Kommander.Tests.Chaos;
 /// </summary>
 public sealed class TempFileLogger<T> : ILogger<T>
 {
-    private static readonly object Gate = new();
-
-    public static string Path { get; } =
-        Environment.GetEnvironmentVariable("CHAOS_DIAG_LOG")
-        ?? global::System.IO.Path.Combine(global::System.IO.Path.GetTempPath(), "chaos-diag.log");
-
     public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
 
     public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Information;
@@ -26,7 +20,21 @@ public sealed class TempFileLogger<T> : ILogger<T>
 
         string line = $"{DateTime.UtcNow:HH:mm:ss.fff} {logLevel switch { LogLevel.Error => "fail", LogLevel.Warning => "warn", _ => "info" }}: {formatter(state, exception)}";
 
-        lock (Gate)
-            File.AppendAllText(Path, line + Environment.NewLine);
+        lock (TempFileLogger.Gate)
+            File.AppendAllText(TempFileLogger.Path, line + Environment.NewLine);
     }
+}
+
+/// <summary>
+/// Shared state for <see cref="TempFileLogger{T}"/>. It lives on a non-generic type because a
+/// static on a generic type is duplicated per closed type: every <c>T</c> would get its own lock
+/// and could interleave appends to the one shared file.
+/// </summary>
+public static class TempFileLogger
+{
+    internal static readonly object Gate = new();
+
+    public static string Path { get; } =
+        Environment.GetEnvironmentVariable("CHAOS_DIAG_LOG")
+        ?? global::System.IO.Path.Combine(global::System.IO.Path.GetTempPath(), "chaos-diag.log");
 }

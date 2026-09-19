@@ -518,9 +518,11 @@ public sealed class TestRocksDbCompactionFloor
                 Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, [new RaftLog { Id = id + 99, Term = 5, Type = RaftLogType.Committed, LogType = "op" }])]));
             }
 
-            string engineDir = Path.Combine(path, "wal");
+            // RocksDB deletes released logs on a background thread while this polls, so the
+            // reading must tolerate a file that disappears between the listing and the stat —
+            // GetAliveWriteAheadLogBytes does; a raw GetFiles + FileInfo.Length does not.
             long logBytes = WaitUntil(
-                () => Directory.GetFiles(engineDir, "*.log").Sum(f => new FileInfo(f).Length),
+                wal.GetAliveWriteAheadLogBytes,
                 bytes => bytes < 6L * 1024 * 1024,
                 TimeSpan.FromSeconds(20));
 
