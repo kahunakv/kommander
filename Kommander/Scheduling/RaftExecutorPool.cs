@@ -59,6 +59,16 @@ public sealed class RaftExecutorPool : IDisposable
         _manualExecution = manualExecution;
         _logger = logger;
 
+#if KOMMANDER_THREAD_FREE
+        // The thread-free build has no worker threads to create. RaftConfiguration.Validate
+        // already refuses the threaded configuration, so this only guards a direct construction.
+        if (!manualExecution)
+            throw new PlatformNotSupportedException(
+                "RaftExecutorPool: the thread-free build (KOMMANDER_THREAD_FREE) supports manual execution only.");
+
+        _ = poolSize;
+        _workers = [];
+#else
         int p = poolSize > 0 ? poolSize : poolSize == 0 ? Environment.ProcessorCount : 1;
         _workers = new Thread[manualExecution ? 0 : p];
 
@@ -70,6 +80,7 @@ public sealed class RaftExecutorPool : IDisposable
                 Name = $"RaftExecutorPool-{i}"
             };
         }
+#endif
     }
 
     /// <summary>True when this pool owns no threads and a caller drives every drain.</summary>
@@ -120,6 +131,27 @@ public sealed class RaftExecutorPool : IDisposable
         return drains;
     }
 
+#if KOMMANDER_THREAD_FREE
+    /// <summary>
+    /// True when at least one executor waits in the ready queue. The host pump reads it to decide
+    /// whether to start another drain. A best-effort snapshot: a concurrent schedule can make it
+    /// stale at once, which only delays that executor to the pump's next pass.
+    /// </summary>
+    internal bool HasReadyWork => !_ready.IsEmpty;
+
+    /// <summary>
+    /// Waits until an executor is scheduled, the timeout expires, or the token is cancelled.
+    ///
+    /// <para>Reuses the wake signal that a threaded pool parks its workers on: every
+    /// <see cref="Schedule"/> releases one permit, in manual mode too. The permits are counts, not
+    /// flags, so a burst of schedules leaves surplus permits that wake the host pump for nothing.
+    /// That costs one empty pass each and loses no wake. The wait is asynchronous, so it never
+    /// blocks the one thread of a single-threaded host.</para>
+    /// </summary>
+    internal Task<bool> WaitForWorkAsync(TimeSpan timeout, CancellationToken cancellationToken) =>
+        _workAvailable.WaitAsync(timeout, cancellationToken);
+#endif
+
     /// <summary>Number of pool threads.</summary>
     public int PoolSize => _workers.Length;
 
@@ -134,8 +166,10 @@ public sealed class RaftExecutorPool : IDisposable
 
         _started = true;
 
+#if !KOMMANDER_THREAD_FREE
         foreach (Thread t in _workers)
             t.Start();
+#endif
     }
 
     /// <summary>
@@ -160,6 +194,7 @@ public sealed class RaftExecutorPool : IDisposable
         }
     }
 
+#if !KOMMANDER_THREAD_FREE
     private void WorkerLoop()
     {
         CancellationToken token = _cts.Token;
@@ -194,6 +229,7 @@ public sealed class RaftExecutorPool : IDisposable
             }
         }
     }
+#endif
 
     /// <summary>
     /// Signals all pool threads to stop and blocks until they have all exited.

@@ -24,6 +24,9 @@ Kommander/RaftPartition.cs|wall-clock-sleep 1
 Kommander/RaftPartitionStateMachine.cs|wall-clock-sleep 1
 Kommander/ReplicationGateway.cs|wall-clock-sleep 4
 Kommander/Scheduling/RaftPartitionExecutor.cs|thread-pool-hop 1
+# The host pump's idle wait. Thread-free build only (KOMMANDER_THREAD_FREE), where it replaces the
+# pool threads' park. It paces the pump and decides nothing; a simulation turns the pump off.
+Kommander/Scheduling/RaftHostPump.cs|wall-clock-sleep 1
 Kommander/SnapshotSender.cs|wall-clock-date 2
 Kommander/SnapshotSender.cs|wall-clock-sleep 1
 Kommander/System/LeaderBalancer.cs|wall-clock-date 1

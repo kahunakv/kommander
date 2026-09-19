@@ -1523,7 +1523,12 @@ internal sealed class RaftSystemCoordinator : IDisposable
     public void Dispose()
     {
         Stop(); // cancels _cts and completes channel; loop exits promptly
+#if !KOMMANDER_THREAD_FREE
         try { _loop.Wait(TimeSpan.FromSeconds(5)); } catch { /* ignore shutdown races */ }
+#endif
+        // The thread-free build does not wait: on a single-threaded host the loop cannot run while
+        // this thread waits, so the wait always spun for its full timeout. The loop is cancelled
+        // and its channel is complete, so it exits at its next await.
         _cts.Dispose();
     }
 }

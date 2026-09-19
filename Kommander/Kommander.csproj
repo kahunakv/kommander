@@ -5,11 +5,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>true</IsPackable>
-    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <TargetFrameworks>net8.0;net10.0;net8.0-browser;net10.0-browser</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>Kommander</PackageId>
-    <Version>1.6.11</Version>
+    <Version>1.7.0</Version>
     <Description>Distributed consensus with Raft for C#/.NET</Description>
     <Authors>Andres Gutierrez</Authors>
     <Company>Andres Gutierrez</Company>
@@ -21,6 +21,18 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageTags>raft;consensus;paxos;distributed consensus;leader election</PackageTags>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <!--
+    Thread-free embedded mode (KOMMANDER_THREAD_FREE). The browser targets exist so a browser-wasm
+    consumer of the package gets an assembly that creates no Thread and has no ASP.NET Core
+    reference: the single-threaded WebAssembly runtime throws on Thread.Start and has no runtime pack
+    for Microsoft.AspNetCore.App. The net8.0 and net10.0 targets do not define the symbol and compile
+    to the same code as before. -p:KommanderThreadFree=true (Directory.Build.props) defines the
+    symbol on the normal targets too, so the thread-free paths can be tested on normal .NET.
+  -->
+  <PropertyGroup Condition="$(TargetFramework.EndsWith('-browser'))">
+    <DefineConstants>$(DefineConstants);KOMMANDER_THREAD_FREE</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
@@ -43,19 +55,47 @@
     <PackageReference Include="Flurl" Version="4.0.0" />
     <PackageReference Include="Flurl.Http" Version="4.0.2" />
 
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
-    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.12" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.12" />
     <PackageReference Include="System.IO.Hashing" Version="10.0.12" />
-    <PackageReference Include="RocksDB" Version="11.8.1.4423" />
     <PackageReference Include="Google.Protobuf" Version="3.29.6" />
-    <PackageReference Include="Grpc.AspNetCore" Version="2.67.0" />
-    <PackageReference Include="Grpc.AspNetCore.Server.Reflection" Version="2.67.0" />
     <PackageReference Include="Grpc.Net.Client" Version="2.67.0" />
     <PackageReference Include="Grpc.Tools" Version="2.68.1">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
+  </ItemGroup>
+
+  <!-- The browser targets leave out two groups of code, with the packages that only they need.
+       1. The gRPC and REST server transports. They are ASP.NET Core hosting code, and their two
+          packages pull in the Microsoft.AspNetCore.App framework reference, which has no
+          browser-wasm runtime pack. The client transports and the in-memory transport stay.
+       2. The RocksDB and SQLite write-ahead logs. They need native libraries and a file system that
+          the browser does not have, so their packages only make the app download larger.
+          InMemoryWAL is the write-ahead log for the browser.
+       3. The gRPC client transport, which needs SocketsHttpHandler, and MulticastDiscovery, which
+          needs UDP sockets. The browser has neither. The REST client and the in-memory transport
+          remain.
+       Code outside these files that names a removed type is gated with the SDK's BROWSER symbol. -->
+  <ItemGroup Condition="!$(TargetFramework.EndsWith('-browser'))">
+    <PackageReference Include="Grpc.AspNetCore" Version="2.67.0" />
+    <PackageReference Include="Grpc.AspNetCore.Server.Reflection" Version="2.67.0" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.12" />
+    <PackageReference Include="RocksDB" Version="11.8.1.4423" />
+  </ItemGroup>
+
+  <ItemGroup Condition="$(TargetFramework.EndsWith('-browser'))">
+    <Compile Remove="Communication\Grpc\RaftService.cs" />
+    <Compile Remove="Communication\Grpc\GrpcCommunicationExtensions.cs" />
+    <Compile Remove="Communication\Rest\RestCommunicationExtensions.cs" />
+    <Compile Remove="WAL\RocksDbWAL.cs" />
+    <Compile Remove="WAL\RocksDbSharedResources.cs" />
+    <Compile Remove="WAL\RocksDbWalTuning.cs" />
+    <Compile Remove="WAL\SqliteWAL.cs" />
+    <Compile Remove="Communication\Grpc\GrpcCommunication.cs" />
+    <Compile Remove="Communication\Grpc\SharedChannels.cs" />
+    <Compile Remove="Communication\Grpc\GossipRosterJsonCache.cs" />
+    <Compile Remove="Discovery\MulticastDiscovery.cs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -64,7 +104,8 @@
     </Protobuf>
   </ItemGroup>
 
-  <ItemGroup>
+  <!-- Only RocksDbWAL uses this message, so the browser targets leave it out with that file. -->
+  <ItemGroup Condition="!$(TargetFramework.EndsWith('-browser'))">
     <Protobuf Include="WAL\Protos\rocksdb_raftlog.proto">
       <Generator>MSBuild:Compile</Generator>
     </Protobuf>

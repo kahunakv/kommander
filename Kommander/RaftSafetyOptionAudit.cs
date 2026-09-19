@@ -112,6 +112,10 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.TickSource)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.EnableInternalTimers)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.EnableInternalSchedulingThreads)] = RaftOptionKind.Liveness,
+#if KOMMANDER_THREAD_FREE
+        // Liveness for the same reason: with it off and no external driver, nothing is pumped.
+        [nameof(RaftConfiguration.EnableHostPumpedScheduling)] = RaftOptionKind.Liveness,
+#endif
         [nameof(RaftConfiguration.InvariantChecks)] = RaftOptionKind.Diagnostics,
         [nameof(RaftConfiguration.SlowRaftStateMachineLog)] = RaftOptionKind.Diagnostics,
         [nameof(RaftConfiguration.SlowRaftWALMachineLog)] = RaftOptionKind.Diagnostics,

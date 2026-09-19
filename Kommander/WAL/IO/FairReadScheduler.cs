@@ -477,6 +477,13 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
         if (inlineExecution)
             return;
 
+#if KOMMANDER_THREAD_FREE
+        // The thread-free build has no read workers. RaftConfiguration.Validate already refuses
+        // the threaded configuration, so this only guards a direct construction.
+        throw new PlatformNotSupportedException(
+            "FairReadScheduler: the thread-free build (KOMMANDER_THREAD_FREE) supports inline execution only.");
+#else
+
         for (int i = 0; i < _workers.Length; i++)
         {
             int workerId = i;
@@ -487,6 +494,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
             };
             _workers[i].Start();
         }
+#endif
     }
 
     /// <summary>
@@ -560,6 +568,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
 
     // ── Worker ─────────────────────────────────────────────────────────────
 
+#if !KOMMANDER_THREAD_FREE
     private void WorkerLoop(int workerId)
     {
         List<object> batch = new(MaxBatchSize);
@@ -585,6 +594,7 @@ public sealed class FairReadScheduler : IRaftReadScheduler, IDisposable
             ProcessPartition(partitionId, batch);
         }
     }
+#endif
 
     /// <summary>
     /// Runs every ready partition on the calling thread until nothing is ready.

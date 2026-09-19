@@ -173,8 +173,11 @@ public sealed class RaftPartitionExecutor : IDisposable
 
     // ── Worker thread / pool support ───────────────────────────────────────
 
+#if !KOMMANDER_THREAD_FREE
     // Non-null in dedicated-thread mode; null when driven by a RaftExecutorPool.
+    // The thread-free build has no dedicated-thread mode, so it has no field.
     private readonly Thread? _worker;
+#endif
 
     // Non-null in shared-pool mode; null in dedicated-thread mode.
     private readonly RaftExecutorPool? _pool;
@@ -435,12 +438,19 @@ public sealed class RaftPartitionExecutor : IDisposable
 
         if (pool == null)
         {
+#if KOMMANDER_THREAD_FREE
+            // The thread-free build has no dedicated-thread mode. RaftConfiguration.Validate
+            // requires the shared pool there, so this only guards a direct construction.
+            throw new PlatformNotSupportedException(
+                $"RaftPartitionExecutor({partitionId}): the thread-free build (KOMMANDER_THREAD_FREE) requires a shared executor pool.");
+#else
             // Dedicated-thread mode: one OS thread per partition.
             _worker = new Thread(WorkerLoop)
             {
                 IsBackground = true,
                 Name = $"RaftPartitionExecutor-{partitionId}",
             };
+#endif
         }
 
         KommanderMetrics.RegisterExecutor(this);
@@ -476,7 +486,9 @@ public sealed class RaftPartitionExecutor : IDisposable
 
         // In dedicated-thread mode the worker loop parks on _workAvailable and drains.
         // In pool mode there is no per-partition thread; the pool drives DrainOnPool.
+#if !KOMMANDER_THREAD_FREE
         _worker?.Start();
+#endif
     }
 
     /// <summary>
@@ -567,10 +579,30 @@ public sealed class RaftPartitionExecutor : IDisposable
                 // Waiting on _stopTcs instead would deadlock: the task is completed by the very
                 // drain that nobody is left to perform. Blocking on the pump is acceptable here
                 // and only here: teardown is past the point where an operation can await new work.
+#if KOMMANDER_THREAD_FREE
+                // A single-threaded host cannot block here. A drain that did not finish at once
+                // waits for work that only this thread can do, so a blocking wait on it never
+                // returns. Stop pumping instead: the host pump finishes that drain, and the warning
+                // below reports the barrier if it is still open.
+                while (!_stopTcs.Task.IsCompleted)
+                {
+                    ValueTask<bool> pumped = _pool.PumpOnceAsync();
+
+                    if (!pumped.IsCompleted)
+                    {
+                        FireAndForget.Observe(pumped.AsTask(), _logger, "StopDrain");
+                        break;
+                    }
+
+                    if (!pumped.Result)
+                        break;
+                }
+#else
                 while (!_stopTcs.Task.IsCompleted
                        && _pool.PumpOnceAsync().AsTask().GetAwaiter().GetResult())
                 {
                 }
+#endif
 
                 if (!_stopTcs.Task.IsCompleted)
                 {
@@ -599,8 +631,10 @@ public sealed class RaftPartitionExecutor : IDisposable
             {
             }
 
+#if !KOMMANDER_THREAD_FREE
             if (_worker is { } worker && (worker.ThreadState & global::System.Threading.ThreadState.Unstarted) == 0)
                 worker.Join();
+#endif
         }
     }
 
@@ -804,6 +838,7 @@ public sealed class RaftPartitionExecutor : IDisposable
     /// throws. Blocking is correct here: the thread belongs to this executor and has nothing else
     /// to do.
     /// </summary>
+#if !KOMMANDER_THREAD_FREE
     private void RunDrainOnWorkerThread(bool drainAll)
     {
         try
@@ -818,6 +853,7 @@ public sealed class RaftPartitionExecutor : IDisposable
             OnDrainFailed(ex);
         }
     }
+#endif
 
     private void ThrowIfNotReady()
     {
@@ -941,6 +977,7 @@ public sealed class RaftPartitionExecutor : IDisposable
 
     // ── Worker loop ────────────────────────────────────────────────────────
 
+#if !KOMMANDER_THREAD_FREE
     // Only used in dedicated-thread mode (_pool == null).
     // WAL restore Phase 1 is kicked off in Start() regardless of mode.
     private void WorkerLoop()
@@ -999,6 +1036,7 @@ public sealed class RaftPartitionExecutor : IDisposable
             // the same route the pre-collapse loop took.
         }
     }
+#endif
 
     private async Task RunRestorePhase1Async(CancellationToken token)
     {

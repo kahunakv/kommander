@@ -230,8 +230,37 @@ public class RaftConfiguration
     /// its own dedicated thread has nothing to pump. <see cref="Validate"/> enforces that.</para>
     ///
     /// <para>Never set this in production. Nothing would run.</para>
+    ///
+    /// <para>The thread-free build (<c>KOMMANDER_THREAD_FREE</c>) cannot create threads, so there
+    /// the default is false and <see cref="Validate"/> refuses true. That build pumps the node with
+    /// <see cref="EnableHostPumpedScheduling"/> instead of a simulator.</para>
     /// </summary>
+#if KOMMANDER_THREAD_FREE
+    public bool EnableInternalSchedulingThreads { get; set; }
+#else
     public bool EnableInternalSchedulingThreads { get; set; } = true;
+#endif
+
+#if KOMMANDER_THREAD_FREE
+    /// <summary>
+    /// When true, the node pumps its own scheduling work as async continuations on the ambient
+    /// scheduler: the partition executors, the write-ahead-log write scheduler, and the outbound
+    /// transport dispatcher. On single-threaded WebAssembly the ambient scheduler is the browser
+    /// event loop. No <see cref="Thread"/> is created.
+    ///
+    /// <para>Exists only in the thread-free build (<c>KOMMANDER_THREAD_FREE</c>), which is the
+    /// <c>-browser</c> target frameworks of the package, or a build with
+    /// <c>-p:KommanderThreadFree=true</c>. Default is true there, so a browser host needs no
+    /// configuration to get a running node.</para>
+    ///
+    /// <para>It reuses the manual-execution paths of
+    /// <see cref="EnableInternalSchedulingThreads"/> = false, and requires that setting and
+    /// <see cref="EnableSharedExecutorPool"/>. Set it to false only when something else pumps the
+    /// node, which is what a deterministic simulation does. With it false and no external driver,
+    /// nothing runs.</para>
+    /// </summary>
+    public bool EnableHostPumpedScheduling { get; set; } = true;
+#endif
 
     /// <summary>
     /// Interval at which the timer service refreshes the in-memory membership view
@@ -1714,6 +1743,15 @@ public class RaftConfiguration
                 "[Kommander] EnableInternalSchedulingThreads=false requires EnableSharedExecutorPool=true. " +
                 "A partition executor on a dedicated thread cannot be driven externally.");
 
+#if KOMMANDER_THREAD_FREE
+        // The thread-free build compiled out every Thread start site, so a configuration that asks
+        // for scheduling threads would fail on the first use of a missing worker. Refuse it here.
+        if (EnableInternalSchedulingThreads)
+            throw new RaftException(
+                "[Kommander] EnableInternalSchedulingThreads=true is not supported by the thread-free " +
+                "build (KOMMANDER_THREAD_FREE). Leave it false and use EnableHostPumpedScheduling.");
+#endif
+
         // Degraded-node avoidance drains leadership off a node, so a misconfigured threshold is a
         // liveness hazard rather than a tuning nuisance. A multiplier at or below 1.0 marks every
         // node at or above the median, which is at least half the cluster. Fail fast at startup.
@@ -1880,6 +1918,23 @@ public class RaftConfiguration
             throw new RaftException(
                 $"[Kommander] SnapshotMaxPendingBytes ({SnapshotMaxPendingBytes}) must be positive. " +
                 "It caps total buffered snapshot bytes across all in-progress receive sessions.");
+
+#if BROWSER
+        // The browser runs TLS itself: a page cannot load or present a client certificate, and it
+        // cannot replace the server-certificate check. Refuse every option that asks for one of
+        // these, rather than fail with PlatformNotSupportedException on the first request. This
+        // check also keeps the certificate code of the REST client unreachable in the browser
+        // targets, which BrowserPlatformSuppressions.cs relies on.
+        if (TransportSecurity.NodeAuthenticationMode == RaftNodeAuthenticationMode.MutualTls
+            || TransportSecurity.AllowInsecureCertificateValidation
+            || TransportSecurity.TrustedServerCertificateThumbprints is { Count: > 0 }
+            || TransportSecurity.ClientCertificate is not null
+            || !string.IsNullOrWhiteSpace(TransportSecurity.ClientCertificatePath))
+            throw new RaftException(
+                "[Kommander] The browser build does not support certificate-based transport security " +
+                "(NodeAuthenticationMode.MutualTls, a client certificate, pinned server thumbprints, or " +
+                "AllowInsecureCertificateValidation). The browser does TLS itself; use Disabled or SharedSecret.");
+#endif
 
         if (TransportSecurity.NodeAuthenticationMode == RaftNodeAuthenticationMode.MutualTls)
         {

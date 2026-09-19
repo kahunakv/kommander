@@ -435,11 +435,16 @@ public static class KommanderMetrics
     private static readonly object _schedulerLock = new();
     private static readonly List<WeakReference<FairWalScheduler>> _registeredSchedulers = [];
 
+#if !BROWSER
+    // The browser targets have no RocksDbWAL, so they have no engines to register and no RocksDB
+    // gauges to publish.
     private static readonly object _walEngineLock = new();
     private static readonly List<WeakReference<Kommander.WAL.RocksDbWAL>> _registeredWalEngines = [];
+#endif
 
     static KommanderMetrics()
     {
+#if !BROWSER
         Meter.CreateObservableGauge(
             "raft.wal.delayed_write_rate",
             MeasureWalDelayedWriteRates,
@@ -472,6 +477,7 @@ public static class KommanderMetrics
             MeasureWalAliveLogBytes,
             unit: "By",
             description: "Bytes of RocksDB write-ahead .log files alive in the Raft-log engine directory. Bounded by max_total_wal_size (RocksDbWalTuning.MaxTotalWalSizeFlushUnits); linear growth with ingest means a column family is pinning logs and a restart will replay all of them.");
+#endif
 
         Meter.CreateObservableGauge(
             "raft.executor.client_queue_depth",
@@ -527,6 +533,7 @@ public static class KommanderMetrics
             _registeredSchedulers.Add(new WeakReference<FairWalScheduler>(scheduler));
     }
 
+#if !BROWSER
     /// <summary>
     /// Registers a RocksDB WAL engine so its write-stall state feeds the
     /// <c>raft.wal.delayed_write_rate</c> / <c>raft.wal.write_stalled</c> observable gauges.
@@ -579,6 +586,7 @@ public static class KommanderMetrics
         }
         return result;
     }
+#endif
 
     private static IEnumerable<Measurement<int>> MeasureClientQueueDepths()
     {

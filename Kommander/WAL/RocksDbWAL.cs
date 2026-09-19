@@ -2682,6 +2682,11 @@ public class RocksDbWAL : IWAL, IDisposable
             // not append for. Seeking at the compaction floor makes every dead-but-present row below
             // it read as absent, exactly as before.
             BoundedIterator certified = default;
+
+            // Allocated once, outside the loop: a stackalloc inside a loop grows the frame on every
+            // pass (CA2014). The seek below runs only when the iterator is first created.
+            Span<byte> seekKey = stackalloc byte[LogKeyWidth];
+
             try
             {
                 while (advanced < target - 1 && steps < FrontierCatchUpBound)
@@ -2708,7 +2713,6 @@ public class RocksDbWAL : IWAL, IDisposable
                         {
                             certified = NewBoundedIterator(cf, partitionId, certifiedFloor + 1);
                             span = certified.Iterator!;
-                            Span<byte> seekKey = stackalloc byte[LogKeyWidth];
                             BuildLogKey(seekKey, partitionId, seekFrom);
                             span.Seek(seekKey);
                         }

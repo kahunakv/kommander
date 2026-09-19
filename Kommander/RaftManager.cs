@@ -107,6 +107,15 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     /// </summary>
     private readonly Scheduling.RaftExecutorPool? executorPool;
 
+#if KOMMANDER_THREAD_FREE
+    /// <summary>
+    /// Drives <see cref="executorPool"/>, the write-ahead-log write scheduler, and the transport
+    /// dispatcher as async continuations. Non-null when
+    /// <see cref="RaftConfiguration.EnableHostPumpedScheduling"/> is on. Thread-free build only.
+    /// </summary>
+    private readonly Scheduling.RaftHostPump? hostPump;
+#endif
+
     private readonly RaftSystemCoordinator systemCoordinator;
 
     private readonly RaftTimerService timerService;
@@ -739,11 +748,28 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         timerService = new RaftTimerService(this, Logger, configuration);
         timerService.Start();
 
+#if KOMMANDER_THREAD_FREE
+        // Started after everything a pass can reach is constructed, for the same reason as the
+        // timer. The pump yields before its first pass, so no work runs inside this constructor.
+        if (configuration.EnableHostPumpedScheduling && executorPool is not null)
+        {
+            hostPump = new Scheduling.RaftHostPump(
+                executorPool,
+                PumpWriteAheadLog,
+                FlushTransportAsync,
+                Logger);
+
+            hostPump.Start();
+        }
+#endif
+
         OnSystemLogRestored += SystemLogRestored;
         OnSystemReplicationReceived += SystemReplicationReceived;
         OnSystemRestoreFinished += SystemRestoreFinished;
         OnLeaderChanged += SystemLeaderChanged;
 
+#if !BROWSER
+        // The browser targets have no gRPC client transport: it needs SocketsHttpHandler.
         if (communication is Kommander.Communication.Grpc.GrpcCommunication)
         {
             // Establish process-wide gRPC pool defaults before any peer I/O fires so that
@@ -757,6 +783,9 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
 
         if (communication is Kommander.Communication.Rest.RestCommunication
                           or Kommander.Communication.Grpc.GrpcCommunication)
+#else
+        if (communication is Kommander.Communication.Rest.RestCommunication)
+#endif
         {
             RaftTransportSecurityOptions effectiveSecurity = configuration.GetEffectiveTransportSecurity();
 
@@ -1268,6 +1297,9 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         systemPartition?.Stop();
 
         // All partition executors have stopped; safe to stop the shared pool now.
+#if KOMMANDER_THREAD_FREE
+        hostPump?.Dispose();
+#endif
         executorPool?.Stop();
 
         // Complete dispatcher channels now that no executor thread is producing more
@@ -2301,6 +2333,34 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     internal bool IsOutboundQueueSaturated(string endpoint) =>
         transportDispatcher.IsOutboundQueueSaturated(endpoint);
 
+#if KOMMANDER_THREAD_FREE
+    /// <summary>
+    /// Completes a teardown drain in <see cref="Dispose"/> without blocking. Thread-free build only.
+    ///
+    /// <para>A single-threaded host cannot block on the drain: if it did not finish at once, it
+    /// waits for work that only this thread can do, and a blocking wait on it never returns. So a
+    /// drain that finished is observed as before, and one that did not is left to finish on its own
+    /// and reported. Dispose then goes on, as it already does when a drain barrier times out.</para>
+    ///
+    /// <para>A host avoids this path with <see cref="LeaveCluster"/>, which awaits both drains
+    /// before it calls <see cref="Dispose"/>. The drains here then find nothing left to do.</para>
+    /// </summary>
+    private void ObserveTeardownDrain(Task drain)
+    {
+        if (drain.IsCompleted)
+        {
+            drain.GetAwaiter().GetResult();
+            return;
+        }
+
+        Logger.LogWarning(
+            "Teardown: a partition drain did not finish at once and the thread-free build cannot wait for it; " +
+            "Dispose continues. Call LeaveCluster to drain asynchronously before disposing.");
+
+        Support.Parallelization.FireAndForget.Observe(drain, Logger, "DisposeDrain");
+    }
+#endif
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -2315,12 +2375,20 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         //    I/O schedulers while executors are still alive, so accepted WAL work can
         //    post completions back into the owning executor. Drain once more to process
         //    those completion messages before executor threads are joined.
+#if KOMMANDER_THREAD_FREE
+        ObserveTeardownDrain(DrainPartitions(CancellationToken.None));
+#else
         DrainPartitions(CancellationToken.None).GetAwaiter().GetResult();
+#endif
 
         readScheduler.Stop();
         walScheduler.Stop();
 
+#if KOMMANDER_THREAD_FREE
+        ObserveTeardownDrain(DrainPartitions(CancellationToken.None));
+#else
         DrainPartitions(CancellationToken.None).GetAwaiter().GetResult();
+#endif
 
         foreach (RaftPartition partition in partitions.Values)
             partition.Dispose();
@@ -2329,6 +2397,9 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
 
         // All partition executors have been stopped (by Dispose above); safe to stop
         // and dispose the shared executor pool now.
+#if KOMMANDER_THREAD_FREE
+        hostPump?.Dispose();
+#endif
         executorPool?.Dispose();
 
         // 3. Dispose the transport dispatcher now that all partition executors have

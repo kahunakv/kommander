@@ -207,9 +207,11 @@ internal sealed class RaftRpcRouter
 
         RaftOperationStatus status = await transferLeadership(request.Partition, request.TargetEndpoint, CancellationToken.None).ConfigureAwait(false);
 
-        logger.LogInfoTransferSuggestionOutcome(
-            request.Partition, request.Term, localEndpoint, request.TargetEndpoint, status,
-            (long)stopwatch.GetElapsedMilliseconds(), request.SuggestedBy);
+        // The elapsed time is read only when the line is written (CA1873).
+        if (logger.IsEnabled(LogLevel.Information))
+            logger.LogInfoTransferSuggestionOutcome(
+                request.Partition, request.Term, localEndpoint, request.TargetEndpoint, status,
+                (long)stopwatch.GetElapsedMilliseconds(), request.SuggestedBy);
     }
 
     /// <summary>

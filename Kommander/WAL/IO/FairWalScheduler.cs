@@ -225,8 +225,15 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     private long _totalSyncBatchesWritten;
     private long _totalOperationsCompleted;
     private long _totalPartitionsBatched;
+#if KOMMANDER_THREAD_FREE
+    // The thread-free build has no linger, so these two stay zero there.
+#pragma warning disable CS0649
+#endif
     private long _totalLingerWaits;
     private long _totalLingerPartitionsGathered;
+#if KOMMANDER_THREAD_FREE
+#pragma warning restore CS0649
+#endif
 
     /// <summary>
     /// Total number of <c>walAdapter.Write</c> calls dispatched to the storage adapter.
@@ -348,6 +355,14 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         // The ready-queue capacity is still sized from the resolved worker count, so manual mode
         // and threaded mode admit the same number of ready partitions. Only the threads differ.
         _workers = new Thread[manualExecution ? 0 : workerCount];
+
+#if KOMMANDER_THREAD_FREE
+        // The thread-free build has no worker threads. RaftConfiguration.Validate already refuses
+        // the threaded configuration, so this only guards a direct construction.
+        if (!manualExecution)
+            throw new PlatformNotSupportedException(
+                "FairWalScheduler: the thread-free build (KOMMANDER_THREAD_FREE) supports manual execution only.");
+#endif
     }
 
     // ── IRaftWalScheduler ──────────────────────────────────────────────────
@@ -443,6 +458,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         _started = true;
         KommanderMetrics.RegisterScheduler(this);
 
+#if !KOMMANDER_THREAD_FREE
         for (int i = 0; i < _workers.Length; i++)
         {
             int workerId = i;
@@ -453,6 +469,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             };
             _workers[i].Start();
         }
+#endif
     }
 
     /// <summary>
@@ -660,6 +677,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         return batches;
     }
 
+#if !KOMMANDER_THREAD_FREE
     private void WorkerLoop(int workerId)
     {
         // Per-worker reusable scratch space — never crosses iteration or worker boundaries.
@@ -724,7 +742,11 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             ProcessGroupBatch(partitionGroup, groupBatches, opListPool, logGroups);
         }
     }
+#endif
 
+#if !KOMMANDER_THREAD_FREE
+    // Group-commit linger: only the worker loop lingers, and the thread-free build has no worker
+    // loop. Manual mode writes each batch when it is enqueued.
     /// <summary>
     /// Deferred group-commit: after the opportunistic sweep, wait for more partitions to
     /// become ready so they share this worker's single fsync, until the batch is full, the
@@ -822,6 +844,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
 
         return queuedElsewhere > 0;
     }
+#endif
 
     /// <summary>
     /// Core group-commit routine.
@@ -1114,6 +1137,8 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         }
     }
 
+#if !KOMMANDER_THREAD_FREE
+    // Shutdown drain of the worker loop, which the thread-free build does not have.
     /// <summary>
     /// After the CTS fires, drain any partitions that were already in
     /// the ready-queue but not yet processed.
@@ -1156,6 +1181,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             }
         }
     }
+#endif
 
     // ── Helpers ────────────────────────────────────────────────────────────
 

@@ -1,0 +1,18 @@
+<Project>
+  <!--
+    -p:KommanderThreadFree=true builds every project with KOMMANDER_THREAD_FREE defined, so the
+    thread-free embedded mode can be tested on normal .NET. The browser targets of Kommander.csproj
+    define the symbol on their own and do not need this property.
+
+    The flagged build writes to its own bin/ and obj/ folders. It compiles different code from the
+    same sources, and a shared folder would let one build's outputs pass as the other's.
+  -->
+  <PropertyGroup Condition="'$(KommanderThreadFree)' == 'true'">
+    <DefineConstants>$(DefineConstants);KOMMANDER_THREAD_FREE</DefineConstants>
+    <BaseOutputPath>$(MSBuildProjectDirectory)/bin/threadfree/</BaseOutputPath>
+    <BaseIntermediateOutputPath>$(MSBuildProjectDirectory)/obj/threadfree/</BaseIntermediateOutputPath>
+    <!-- The moved folders no longer cover the default bin/ and obj/, whose generated sources the
+         compile glob would otherwise pick up twice. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);bin/**;obj/**</DefaultItemExcludes>
+  </PropertyGroup>
+</Project>
