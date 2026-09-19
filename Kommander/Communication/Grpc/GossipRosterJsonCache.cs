@@ -30,7 +30,7 @@ internal sealed class GossipRosterJsonCache
                 return _cachedUtf8;
         }
 
-        ByteString utf8 = ByteString.CopyFromUtf8(JsonSerializer.Serialize(roster));
+        ByteString utf8 = ByteString.CopyFromUtf8(JsonSerializer.Serialize(roster, SystemJsonContext.Default.ClusterMembership));
 
         lock (_lock)
         {

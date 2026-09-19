@@ -211,11 +211,11 @@ public class RestCommunication : ICommunication
     public async Task<GossipAck> SendGossip(RaftManager manager, RaftNode node, GossipMessage digest, CancellationToken cancellationToken = default)
     {
         string? rosterJson = digest.Roster is not null
-            ? JsonSerializer.Serialize(digest.Roster)
+            ? JsonSerializer.Serialize(digest.Roster, SystemJsonContext.Default.ClusterMembership)
             : null;
 
         string? loadReportJson = digest.LoadReport is not null
-            ? JsonSerializer.Serialize(digest.LoadReport)
+            ? JsonSerializer.Serialize(digest.LoadReport, SystemJsonContext.Default.NodeLoadReport)
             : null;
 
         GossipRequest request = new(digest.SenderEndpoint, digest.MembershipVersion, rosterJson)
@@ -235,7 +235,7 @@ public class RestCommunication : ICommunication
                 return new GossipAck(0, null);
 
             ClusterMembership? roster = response.RosterJson is not null
-                ? JsonSerializer.Deserialize<ClusterMembership>(response.RosterJson)
+                ? JsonSerializer.Deserialize(response.RosterJson, SystemJsonContext.Default.ClusterMembership)
                 : null;
 
             return new GossipAck(response.MembershipVersion, roster);

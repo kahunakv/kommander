@@ -42,7 +42,7 @@ public class MulticastDiscovery : IDiscovery, IDisposable
             };
 
             // Construct your discovery message.
-            string message = JsonSerializer.Serialize(payload); //$"Hello from node {Environment.MachineName} at {DateTime.Now}";
+            string message = JsonSerializer.Serialize(payload, Kommander.System.SystemJsonContext.Default.MulticastDiscoveryPayload); //$"Hello from node {Environment.MachineName} at {DateTime.Now}";
             byte[] data = Encoding.UTF8.GetBytes(message);
 
             while (!cancellationToken.IsCancellationRequested)
@@ -98,7 +98,7 @@ public class MulticastDiscovery : IDiscovery, IDisposable
 
                 string host = result.RemoteEndPoint.Address.ToString();
 
-                MulticastDiscoveryPayload? payload = JsonSerializer.Deserialize<MulticastDiscoveryPayload>(payloadMessage);
+                MulticastDiscoveryPayload? payload = JsonSerializer.Deserialize(payloadMessage, Kommander.System.SystemJsonContext.Default.MulticastDiscoveryPayload);
                 if (payload == null)
                 {
                     Console.WriteLine($"Received invalid message from {host}");

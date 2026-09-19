@@ -115,7 +115,7 @@ internal sealed class PartitionMapService
             return;
         }
 
-        RaftPartitionMap? map = JsonSerializer.Deserialize<RaftPartitionMap>(partitions);
+        RaftPartitionMap? map = JsonSerializer.Deserialize(partitions, SystemJsonContext.Default.RaftPartitionMap);
         if (map is null)
         {
             logger.LogError("InitializePartitions: Failed to parse partition map: {Partitions}", partitions);
@@ -188,7 +188,7 @@ internal sealed class PartitionMapService
     {
         if (systemConfiguration.TryGetValue(RaftSystemConfigKeys.Partitions, out string? partitions))
         {
-            RaftPartitionMap? existingMap = JsonSerializer.Deserialize<RaftPartitionMap>(partitions);
+            RaftPartitionMap? existingMap = JsonSerializer.Deserialize(partitions, SystemJsonContext.Default.RaftPartitionMap);
             if (existingMap is not null)
             {
                 RaftSystemMessage reassert = new()
@@ -231,7 +231,7 @@ internal sealed class PartitionMapService
         RaftSystemMessage message = new()
         {
             Key = RaftSystemConfigKeys.Partitions,
-            Value = JsonSerializer.Serialize(newMap)
+            Value = JsonSerializer.Serialize(newMap, SystemJsonContext.Default.RaftPartitionMap)
         };
 
         for (int i = 0; i < maxRetries; i++)
@@ -359,7 +359,7 @@ internal sealed class PartitionMapService
             return;
         }
 
-        RaftPartitionMap? map = JsonSerializer.Deserialize<RaftPartitionMap>(partitions);
+        RaftPartitionMap? map = JsonSerializer.Deserialize(partitions, SystemJsonContext.Default.RaftPartitionMap);
         if (map is null)
         {
             logger.LogError("TryCreatePartition: Failed to parse partition map");
@@ -437,7 +437,7 @@ internal sealed class PartitionMapService
         RaftSystemMessage sysMessage = new()
         {
             Key = RaftSystemConfigKeys.Partitions,
-            Value = JsonSerializer.Serialize(map)
+            Value = JsonSerializer.Serialize(map, SystemJsonContext.Default.RaftPartitionMap)
         };
 
         for (int i = 0; i < maxRetries; i++)
@@ -580,7 +580,7 @@ internal sealed class PartitionMapService
             return;
         }
 
-        RaftPartitionMap? map = JsonSerializer.Deserialize<RaftPartitionMap>(partitions);
+        RaftPartitionMap? map = JsonSerializer.Deserialize(partitions, SystemJsonContext.Default.RaftPartitionMap);
         if (map is null)
         {
             logger.LogError("TryRemovePartition: Failed to parse partition map");
@@ -620,7 +620,7 @@ internal sealed class PartitionMapService
         RaftSystemMessage sysMessage = new()
         {
             Key = RaftSystemConfigKeys.Partitions,
-            Value = JsonSerializer.Serialize(map)
+            Value = JsonSerializer.Serialize(map, SystemJsonContext.Default.RaftPartitionMap)
         };
 
         for (int i = 0; i < maxRetries; i++)

@@ -167,7 +167,7 @@ internal sealed class LeaderBalancer
         RaftPartitionMap partitionMap;
         if (systemConfiguration.TryGetValue(RaftSystemConfigKeys.Partitions, out string? mapJson))
         {
-            partitionMap = global::System.Text.Json.JsonSerializer.Deserialize<RaftPartitionMap>(mapJson)
+            partitionMap = global::System.Text.Json.JsonSerializer.Deserialize(mapJson, SystemJsonContext.Default.RaftPartitionMap)
                            ?? new RaftPartitionMap { Partitions = [] };
         }
         else

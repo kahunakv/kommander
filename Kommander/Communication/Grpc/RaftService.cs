@@ -701,11 +701,11 @@ public sealed class RaftService : Rafter.RafterBase
 
         ClusterMembership? roster = null;
         if (!request.RosterJson.IsEmpty)
-            roster = global::System.Text.Json.JsonSerializer.Deserialize<ClusterMembership>(request.RosterJson.Span);
+            roster = global::System.Text.Json.JsonSerializer.Deserialize(request.RosterJson.Span, Kommander.System.SystemJsonContext.Default.ClusterMembership);
 
         NodeLoadReport? loadReport = null;
         if (!request.LoadReportJson.IsEmpty)
-            loadReport = global::System.Text.Json.JsonSerializer.Deserialize<NodeLoadReport>(request.LoadReportJson.Span);
+            loadReport = global::System.Text.Json.JsonSerializer.Deserialize(request.LoadReportJson.Span, Kommander.System.SystemJsonContext.Default.NodeLoadReport);
 
         GossipMessage digest = new(request.SenderEndpoint, request.MembershipVersion, roster)
         {
@@ -717,7 +717,7 @@ public sealed class RaftService : Rafter.RafterBase
         {
             MembershipVersion = ack.MembershipVersion,
             RosterJson = ack.Roster is not null
-                ? Google.Protobuf.ByteString.CopyFromUtf8(global::System.Text.Json.JsonSerializer.Serialize(ack.Roster))
+                ? Google.Protobuf.ByteString.CopyFromUtf8(global::System.Text.Json.JsonSerializer.Serialize(ack.Roster, Kommander.System.SystemJsonContext.Default.ClusterMembership))
                 : Google.Protobuf.ByteString.Empty
         };
 

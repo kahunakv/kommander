@@ -100,7 +100,7 @@ internal sealed class SplitMergeController
             return;
         }
 
-        RaftPartitionMap? map = JsonSerializer.Deserialize<RaftPartitionMap>(partitions);
+        RaftPartitionMap? map = JsonSerializer.Deserialize(partitions, SystemJsonContext.Default.RaftPartitionMap);
         if (map is null)
         {
             logger.LogError("TrySplitPartition: Failed to parse partition map {Partitions}", partitions);
@@ -205,7 +205,7 @@ internal sealed class SplitMergeController
         RaftSystemMessage message = new()
         {
             Key   = RaftSystemConfigKeys.Partitions,
-            Value = JsonSerializer.Serialize(map)
+            Value = JsonSerializer.Serialize(map, SystemJsonContext.Default.RaftPartitionMap)
         };
 
         for (int i = 0; i < maxRetries; i++)
@@ -290,7 +290,7 @@ internal sealed class SplitMergeController
             return;
         }
 
-        RaftPartitionMap? map = JsonSerializer.Deserialize<RaftPartitionMap>(partitions);
+        RaftPartitionMap? map = JsonSerializer.Deserialize(partitions, SystemJsonContext.Default.RaftPartitionMap);
         if (map is null)
         {
             logger.LogError("TrySplitPartitionCommit: Failed to parse partition map");
@@ -335,7 +335,7 @@ internal sealed class SplitMergeController
         RaftSystemMessage message = new()
         {
             Key   = RaftSystemConfigKeys.Partitions,
-            Value = JsonSerializer.Serialize(map)
+            Value = JsonSerializer.Serialize(map, SystemJsonContext.Default.RaftPartitionMap)
         };
 
         for (int i = 0; i < maxRetries; i++)
@@ -402,7 +402,7 @@ internal sealed class SplitMergeController
             return;
         }
 
-        RaftPartitionMap? map = JsonSerializer.Deserialize<RaftPartitionMap>(partitions);
+        RaftPartitionMap? map = JsonSerializer.Deserialize(partitions, SystemJsonContext.Default.RaftPartitionMap);
         if (map is null)
         {
             logger.LogError("TryMergePartitions: Failed to parse partition map");
@@ -474,7 +474,7 @@ internal sealed class SplitMergeController
         RaftSystemMessage message = new()
         {
             Key   = RaftSystemConfigKeys.Partitions,
-            Value = JsonSerializer.Serialize(map)
+            Value = JsonSerializer.Serialize(map, SystemJsonContext.Default.RaftPartitionMap)
         };
 
         for (int i = 0; i < maxRetries; i++)
@@ -542,7 +542,7 @@ internal sealed class SplitMergeController
             return;
         }
 
-        RaftPartitionMap? map = JsonSerializer.Deserialize<RaftPartitionMap>(partitions);
+        RaftPartitionMap? map = JsonSerializer.Deserialize(partitions, SystemJsonContext.Default.RaftPartitionMap);
         if (map is null)
         {
             logger.LogError("TryMergePartitionCommit: Failed to parse partition map");
@@ -613,7 +613,7 @@ internal sealed class SplitMergeController
         RaftSystemMessage message = new()
         {
             Key   = RaftSystemConfigKeys.Partitions,
-            Value = JsonSerializer.Serialize(map)
+            Value = JsonSerializer.Serialize(map, SystemJsonContext.Default.RaftPartitionMap)
         };
 
         for (int i = 0; i < maxRetries; i++)

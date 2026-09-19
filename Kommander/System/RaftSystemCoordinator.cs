@@ -527,7 +527,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
         ];
 
         ClusterMembership seed = new() { MembershipVersion = 1, Members = allMembers };
-        string json = JsonSerializer.Serialize(seed);
+        string json = JsonSerializer.Serialize(seed, SystemJsonContext.Default.ClusterMembership);
 
         RaftSystemMessage message = new() { Key = RaftSystemConfigKeys.Members, Value = json };
 
@@ -662,7 +662,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
     /// </summary>
     internal void SetPartitionMapForTest(RaftPartitionMap map)
     {
-        string json = global::System.Text.Json.JsonSerializer.Serialize(map);
+        string json = global::System.Text.Json.JsonSerializer.Serialize(map, SystemJsonContext.Default.RaftPartitionMap);
         RaftSystemMessage proto = new() { Key = RaftSystemConfigKeys.Partitions, Value = json };
         Send(new RaftSystemRequest(RaftSystemRequestType.ConfigRestored, Serialize(proto)));
     }
@@ -675,7 +675,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
     /// </summary>
     internal void SetMembershipForTest(ClusterMembership membership)
     {
-        string json = global::System.Text.Json.JsonSerializer.Serialize(membership);
+        string json = global::System.Text.Json.JsonSerializer.Serialize(membership, SystemJsonContext.Default.ClusterMembership);
         RaftSystemMessage proto = new() { Key = RaftSystemConfigKeys.Members, Value = json };
         Send(new RaftSystemRequest(RaftSystemRequestType.ConfigRestored, Serialize(proto)));
     }
@@ -952,7 +952,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
         if (!systemConfiguration.TryGetValue(RaftSystemConfigKeys.Members, out string? membersJson))
             return;
 
-        ClusterMembership? membership = JsonSerializer.Deserialize<ClusterMembership>(membersJson);
+        ClusterMembership? membership = JsonSerializer.Deserialize(membersJson, SystemJsonContext.Default.ClusterMembership);
         if (membership is null)
         {
             logger.LogError("ApplyMembershipFromCache: Failed to parse membership record");
@@ -1060,7 +1060,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
         TaskCompletionSource<(RaftOperationStatus Status, long Generation)>? completion,
         CancellationToken cancellationToken)
     {
-        string json = JsonSerializer.Serialize(newMembership);
+        string json = JsonSerializer.Serialize(newMembership, SystemJsonContext.Default.ClusterMembership);
         RaftSystemMessage sysMessage = new() { Key = RaftSystemConfigKeys.Members, Value = json };
 
         try

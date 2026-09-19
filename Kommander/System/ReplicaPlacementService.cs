@@ -105,7 +105,7 @@ internal sealed class ReplicaPlacementService
         if (!systemConfiguration.TryGetValue(RaftSystemConfigKeys.Partitions, out string? partitions))
             return null;
 
-        return JsonSerializer.Deserialize<RaftPartitionMap>(partitions);
+        return JsonSerializer.Deserialize(partitions, SystemJsonContext.Default.RaftPartitionMap);
     }
 
     /// <summary>
@@ -121,7 +121,7 @@ internal sealed class ReplicaPlacementService
         RaftSystemMessage sysMessage = new()
         {
             Key = RaftSystemConfigKeys.Partitions,
-            Value = JsonSerializer.Serialize(map)
+            Value = JsonSerializer.Serialize(map, SystemJsonContext.Default.RaftPartitionMap)
         };
 
         for (int i = 0; i < maxRetries; i++)

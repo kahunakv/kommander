@@ -869,7 +869,7 @@ public class GrpcCommunication : ICommunication
                 ? gossipRosterJsonCache.GetUtf8(digest.MembershipVersion, digest.Roster)
                 : ByteString.Empty,
             LoadReportJson = digest.LoadReport is not null
-                ? ByteString.CopyFromUtf8(global::System.Text.Json.JsonSerializer.Serialize(digest.LoadReport))
+                ? ByteString.CopyFromUtf8(global::System.Text.Json.JsonSerializer.Serialize(digest.LoadReport, Kommander.System.SystemJsonContext.Default.NodeLoadReport))
                 : ByteString.Empty,
         };
 
@@ -883,7 +883,7 @@ public class GrpcCommunication : ICommunication
 
             Kommander.System.ClusterMembership? roster = null;
             if (!response.RosterJson.IsEmpty)
-                roster = global::System.Text.Json.JsonSerializer.Deserialize<Kommander.System.ClusterMembership>(response.RosterJson.Span);
+                roster = global::System.Text.Json.JsonSerializer.Deserialize(response.RosterJson.Span, Kommander.System.SystemJsonContext.Default.ClusterMembership);
 
             return new GossipAck(response.MembershipVersion, roster);
         }

@@ -222,11 +222,11 @@ public static class RestCommunicationExtensions
                 return new GossipResponse(0, null);
 
             ClusterMembership? roster = request.RosterJson is not null
-                ? JsonSerializer.Deserialize<ClusterMembership>(request.RosterJson)
+                ? JsonSerializer.Deserialize(request.RosterJson, SystemJsonContext.Default.ClusterMembership)
                 : null;
 
             NodeLoadReport? loadReport = request.LoadReportJson is not null
-                ? JsonSerializer.Deserialize<NodeLoadReport>(request.LoadReportJson)
+                ? JsonSerializer.Deserialize(request.LoadReportJson, SystemJsonContext.Default.NodeLoadReport)
                 : null;
 
             GossipMessage digest = new(request.SenderEndpoint, request.MembershipVersion, roster)
@@ -236,7 +236,7 @@ public static class RestCommunicationExtensions
             GossipAck ack = manager.ReceiveGossip(digest);
 
             string? ackRosterJson = ack.Roster is not null
-                ? JsonSerializer.Serialize(ack.Roster)
+                ? JsonSerializer.Serialize(ack.Roster, SystemJsonContext.Default.ClusterMembership)
                 : null;
 
             return new GossipResponse(ack.MembershipVersion, ackRosterJson);
