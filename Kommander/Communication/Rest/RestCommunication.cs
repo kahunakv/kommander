@@ -504,6 +504,23 @@ public class RestCommunication : ICommunication
     }
 
     /// <summary>
+    /// Reads REST response bodies (<c>ReceiveJson&lt;T&gt;</c>) through <see cref="RestJsonContext"/>
+    /// instead of reflection.
+    /// </summary>
+    /// <remarks>
+    /// Flurl's default serializer resolves types by reflection, so in a trimmed host with
+    /// reflection-based JSON off every REST Raft call failed. The options copy the Flurl 4 defaults
+    /// (no naming policy, case-insensitive reads; an empty body still reads as <c>null</c>), so the
+    /// accepted wire shape does not change. Do not use this serializer to write request bodies: they
+    /// are serialized once to UTF-8 and signed (see <see cref="JsonContent"/>).
+    /// </remarks>
+    internal static readonly DefaultJsonSerializer ResponseSerializer = new(new JsonSerializerOptions
+    {
+        PropertyNameCaseInsensitive = true,
+        TypeInfoResolver = RestJsonContext.Default
+    });
+
+    /// <summary>
     /// Builds a signed request against the per-manager client for <paramref name="node"/>.
     /// </summary>
     /// <remarks>
@@ -523,7 +540,11 @@ public class RestCommunication : ICommunication
             .WithHeader("Accept", "application/json")
             .WithHeader("Content-Type", "application/json")
             .WithTimeout(configuration.HttpTimeout)
-            .WithSettings(o => o.HttpVersion = configuration.HttpVersion);
+            .WithSettings(o =>
+            {
+                o.HttpVersion = configuration.HttpVersion;
+                o.JsonSerializer = ResponseSerializer;
+            });
 
 #pragma warning disable CS0618
         // Suppressed under MutualTls: the mode authenticates at the handshake and never reads this

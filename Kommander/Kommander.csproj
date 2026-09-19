@@ -9,7 +9,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>Kommander</PackageId>
-    <Version>1.7.1</Version>
+    <Version>1.7.2</Version>
     <Description>Distributed consensus with Raft for C#/.NET</Description>
     <Authors>Andres Gutierrez</Authors>
     <Company>Andres Gutierrez</Company>
@@ -31,6 +31,15 @@
     to the same code as before. -p:KommanderThreadFree=true (Directory.Build.props) defines the
     symbol on the normal targets too, so the thread-free paths can be tested on normal .NET.
   -->
+  <!--
+    The REST routes (RestCommunicationExtensions.MapRestRaftRoutes) use the compile-time request
+    delegate generator, not the runtime RequestDelegateFactory, so a trimmed host gets no IL2026
+    warnings and no reflection for them. The browser targets have no ASP.NET Core and leave that file out.
+  -->
+  <PropertyGroup Condition="!$(TargetFramework.EndsWith('-browser'))">
+    <EnableRequestDelegateGenerator>true</EnableRequestDelegateGenerator>
+  </PropertyGroup>
+
   <PropertyGroup Condition="$(TargetFramework.EndsWith('-browser'))">
     <DefineConstants>$(DefineConstants);KOMMANDER_THREAD_FREE</DefineConstants>
   </PropertyGroup>
