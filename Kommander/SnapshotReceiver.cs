@@ -214,7 +214,7 @@ internal sealed class SnapshotReceiver
                 if (session.NextExpectedChunkIndex > 0 && request.ChunkIndex == session.NextExpectedChunkIndex - 1)
                 {
                     session.LastActivityTimestamp = now;
-                    return new SnapshotResponse(true);
+                    return new SnapshotResponse(SnapshotInstallOutcome.ChunkAccepted);
                 }
 
                 // Anything other than the exact next chunk is a skip/reorder: drop the session.
@@ -247,8 +247,10 @@ internal sealed class SnapshotReceiver
             session.NextExpectedChunkIndex++;
             session.LastActivityTimestamp = now;
 
+            // A staged chunk is not an install: the outcome says so, and the sender treats a
+            // terminal chunk answered this way as a failed transfer rather than a seeded follower.
             if (!request.IsLast)
-                return new SnapshotResponse(true);
+                return new SnapshotResponse(SnapshotInstallOutcome.ChunkAccepted);
 
             // Integrity gate, immediately before the assembled bytes become eligible for install.
             // Everything checked until now is structural (term, fence, chunk order) and says nothing

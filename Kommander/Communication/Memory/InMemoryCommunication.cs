@@ -460,14 +460,14 @@ public class InMemoryCommunication : ICommunication
     /// </summary>
     public async Task<RaftReplicationResult?> ForwardReplicateLogs(
         RaftManager manager, RaftNode node, int partitionId, string type,
-        IReadOnlyList<byte[]> logs, bool autoCommit, long expectedGeneration,
+        IReadOnlyList<byte[]> logs, bool autoCommit, long expectedGeneration, long expectedTerm,
         CancellationToken cancellationToken = default)
     {
         if (IsPartitioned(manager.LocalEndpoint, node.Endpoint) || !nodes.TryGetValue(node.Endpoint, out IRaft? targetNode))
             return null;
 
         RaftReplicationResult result = await targetNode.ReplicateLogs(
-            partitionId, type, logs, autoCommit, expectedGeneration, cancellationToken
+            partitionId, type, logs, autoCommit, expectedGeneration, expectedTerm, cancellationToken
         ).ConfigureAwait(false);
 
         // A lost reply after the target accepted the write: the caller sees an unreachable replica,

@@ -50,6 +50,14 @@ internal sealed class RaftSystemCoordinator : IDisposable
     internal Action<List<RaftPartitionRange>>? StartPartitionsOverride;
 
     /// <summary>
+    /// Test hook for the membership fence of replica-set changes
+    /// (<see cref="ConfirmPartitionLeadershipAsync"/>). When set, replaces the quorum-confirmed
+    /// leadership check of the target partition so placement tests can run without a live Raft
+    /// quorum, or make the fence refuse deterministically.
+    /// </summary>
+    internal Func<int, CancellationToken, Task<bool>>? ConfirmPartitionLeadershipOverride;
+
+    /// <summary>
     /// Test hook for <see cref="ReplicateCheckpointForPartition"/>.
     /// When set, replaces the call to <see cref="RaftManager.ReplicateCheckpoint"/> so unit
     /// tests can assert checkpoint replication without a live Raft quorum.
@@ -180,6 +188,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
             endpoint => manager.Liveness.GetState(endpoint),
             GetNodeZone,
             async (partitionId, target, ct) => await manager.TransferLeadershipAsync(partitionId, target, ct).ConfigureAwait(false),
+            ConfirmPartitionLeadershipAsync,
             manager.Configuration,
             manager.LocalEndpoint,
             () => RetryDelay,
@@ -467,6 +476,66 @@ internal sealed class RaftSystemCoordinator : IDisposable
         ReplicateOverride is { } fn
             ? fn(type, data, autoCommit, ct)
             : manager.ReplicateSystemLogs(type, data, autoCommit, ct);
+
+    /// <summary>
+    /// Quorum-confirmed leadership of one data partition, as required by the membership fence of
+    /// <see cref="ReplicaPlacementService"/>. When this node hosts and leads the partition it runs
+    /// its own read-index confirmation. Otherwise it asks, through
+    /// <see cref="ICommunication.GetReadIndex"/>, for a quorum-confirmed read index — first from the
+    /// gossiped leader hint, then from every other voter replica of the range (the roster's voters
+    /// on a legacy full-replication range). Only a leader that still commands its voters can
+    /// answer; a non-leader refuses at once, so the extra candidates cost nothing on a healthy
+    /// range and make the fence independent of the hint's freshness — right after a step-down the
+    /// hint names the old leader for a few gossip rounds, and refusing every replica change until
+    /// it catches up would stall the placement pass for no safety gain. A failed or timed-out round
+    /// and a transport error fail closed. Bounded per candidate by
+    /// <see cref="RaftConfiguration.LeadershipConfirmationTimeout"/> on the answering node.
+    /// </summary>
+    private async Task<bool> ConfirmPartitionLeadershipAsync(int partitionId, CancellationToken ct)
+    {
+        if (ConfirmPartitionLeadershipOverride is { } fn)
+            return await fn(partitionId, ct).ConfigureAwait(false);
+
+        if (manager.HostsPartition(partitionId) && await manager.AmILeaderQuick(partitionId).ConfigureAwait(false))
+            return await manager.ConfirmLeadershipAsync(partitionId, ct).ConfigureAwait(false);
+
+        List<string> candidates = [];
+
+        string? hint = manager.GetPartitionLeaderHint(partitionId);
+        if (!string.IsNullOrEmpty(hint) && hint != manager.LocalEndpoint)
+            candidates.Add(hint);
+
+        IReadOnlyList<RaftReplica> replicas = manager.GetPartitionReplicas(partitionId);
+        if (replicas.Count > 0)
+        {
+            foreach (RaftReplica replica in replicas)
+            {
+                if (replica.Role == RaftReplicaRole.Voter && replica.Endpoint != manager.LocalEndpoint && !candidates.Contains(replica.Endpoint))
+                    candidates.Add(replica.Endpoint);
+            }
+        }
+        else
+        {
+            foreach (ClusterMember member in GetMembership().Members)
+            {
+                if (member.Role == ClusterMemberRole.Voter && member.Endpoint != manager.LocalEndpoint && !candidates.Contains(member.Endpoint))
+                    candidates.Add(member.Endpoint);
+            }
+        }
+
+        foreach (string endpoint in candidates)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            GetReadIndexResponse response = await manager.Communication.GetReadIndex(
+                manager, new RaftNode(endpoint), new GetReadIndexRequest(partitionId), ct).ConfigureAwait(false);
+
+            if (response.Success && response.ReadIndex >= 0)
+                return true;
+        }
+
+        return false;
+    }
 
     private Task<RaftReplicationResult> ReplicateCheckpointForPartition(int partitionId, CancellationToken ct) =>
         ReplicateCheckpointOverride is { } fn

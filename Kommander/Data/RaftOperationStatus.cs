@@ -144,4 +144,26 @@ public enum RaftOperationStatus
     /// this is a bounded wait that expired, and the caller may simply ask again.
     /// </summary>
     TargetNotCaughtUp = 24,
+
+    /// <summary>
+    /// The proposal carried an <c>expectedTerm</c> fence and this node's current term for the
+    /// partition is a different one. The proposal was refused BEFORE anything was appended, so
+    /// this is a definite "did not take effect": the caller observed leadership in an older term
+    /// (or a term this node never served in) and must re-read the term through
+    /// <see cref="IRaft.GetPartitionTerm"/> and re-decide. Distinct from
+    /// <see cref="NodeIsNotLeader"/> so a router does not retry a term-fenced write on another
+    /// replica — the fence names THIS node's term, and only the caller can decide whether its
+    /// belief-only state (staged intents, locks) survived the term change.
+    /// </summary>
+    TermMismatch = 25,
+
+    /// <summary>
+    /// A replica-set change for a partition was refused because the coordinator could not obtain
+    /// a quorum-confirmed leadership of THAT partition (a read-index round on the partition's
+    /// leader, local or remote). A membership change committed through the system partition while
+    /// the target partition's voters are unreachable would take effect on a leader that cannot
+    /// commit through those voters — the two-leader window behind lost acknowledged writes. The
+    /// caller may retry once the partition has a reachable, confirmed leader.
+    /// </summary>
+    LeadershipNotConfirmed = 26,
 }

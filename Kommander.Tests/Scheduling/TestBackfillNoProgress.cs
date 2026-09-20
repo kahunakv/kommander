@@ -223,14 +223,59 @@ public class TestBackfillNoProgress
     /// backfill threshold 10 — every anchored batch is contiguous and ships, which isolates the
     /// no-progress pacing from the refusal/escalation paths.
     /// </summary>
+    [Fact]
+    public async Task NoProgressEpisode_EscalatesToASnapshot()
+    {
+        // The anchor fallback re-anchored at the frontier the peer itself reported and the batch
+        // still produced no advance: log shipping cannot converge this peer, so once the streak
+        // reaches the warning threshold the peer is offered a snapshot from the last checkpoint.
+        // (2026-09-19: a new leader whose WAL still served the stuck learner's anchor never
+        // refused a batch, so the refusal-driven escalation never ran and the learner stayed at
+        // frontier 0 for the run.)
+        (RaftPartitionStateMachine sm, CapturingHost host, LevelCountingLogger logger) =
+            await BuildFullLogLeader(heartbeatInterval: TimeSpan.Zero, checkpoint: 100, transfer: new InstantTransfer());
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(1);
+
+        for (int i = 0; i < 10; i++)
+            await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 50);
+
+        TimeSpan budget = TestTimeouts.Scale(TimeSpan.FromSeconds(5));
+        long started = global::System.Diagnostics.Stopwatch.GetTimestamp();
+        while (host.SnapshotChunksTo(VoterA) == 0)
+        {
+            if (global::System.Diagnostics.Stopwatch.GetElapsedTime(started) > budget)
+                Assert.Fail("the no-progress episode never escalated to a snapshot transfer");
+            await Task.Delay(10, TestContext.Current.CancellationToken);
+        }
+
+        Assert.Equal(1, logger.Count(LogLevel.Warning, "offered a snapshot"));
+        Assert.Equal(0, host.SnapshotChunksTo(VoterB)); // the healthy peer is not touched
+    }
+
+    [Fact]
+    public async Task NoProgressEpisode_WithoutACheckpoint_DoesNotEscalate()
+    {
+        // No checkpoint means no consistent boundary to export from: the pacing and the
+        // re-anchoring still apply, but nothing is shipped as a snapshot.
+        (RaftPartitionStateMachine sm, CapturingHost host, _) =
+            await BuildFullLogLeader(heartbeatInterval: TimeSpan.Zero, checkpoint: 0, transfer: new InstantTransfer());
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(1);
+
+        for (int i = 0; i < 10; i++)
+            await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 50);
+
+        await Task.Delay(100, TestContext.Current.CancellationToken);
+        Assert.Equal(0, host.SnapshotChunksTo(VoterA));
+    }
+
     private static async Task<(RaftPartitionStateMachine, CapturingHost, LevelCountingLogger)> BuildFullLogLeader(
-        TimeSpan heartbeatInterval)
+        TimeSpan heartbeatInterval, long checkpoint = 0, IRaftPartitionStateTransfer? transfer = null)
     {
         LevelCountingLogger logger = new();
-        CapturingHost host = new();
+        CapturingHost host = new() { PartitionStateTransfer = transfer };
         host.Configuration.HeartbeatInterval = heartbeatInterval;
 
-        FullWal wal = new(tailThrough: 500);
+        FullWal wal = new(tailThrough: 500, checkpoint: checkpoint);
 
         RaftPartitionStateMachine sm = new(host, wal, new NoopSink(), logger);
         IReadOnlyList<RaftLog> logs = await sm.StartRestoreAsync();
@@ -284,11 +329,25 @@ public class TestBackfillNoProgress
     /// contiguous, so batches always ship and only the sender's pacing decides whether a read
     /// happens.
     /// </summary>
+    private sealed class InstantTransfer : IRaftPartitionStateTransfer
+    {
+        public Task<Stream> ExportPartitionState(int partitionId, long upToIndex, CancellationToken ct) =>
+            Task.FromResult<Stream>(new MemoryStream([0xAB, 0xCD]));
+
+        public Task ImportPartitionState(int partitionId, Stream snapshot, CancellationToken ct) =>
+            Task.CompletedTask;
+    }
+
     private sealed class FullWal : IRaftWalFacade
     {
         private readonly long tailThrough;
+        private readonly long checkpoint;
 
-        public FullWal(long tailThrough) => this.tailThrough = tailThrough;
+        public FullWal(long tailThrough, long checkpoint = 0)
+        {
+            this.tailThrough = tailThrough;
+            this.checkpoint = checkpoint;
+        }
 
         public ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync() =>
             ValueTask.FromResult<IReadOnlyList<RaftLog>>([]);
@@ -307,7 +366,7 @@ public class TestBackfillNoProgress
         }
 
         public ValueTask<long> GetAnyTermAtAsync(long logIndex) => ValueTask.FromResult(1L);
-        public ValueTask<long> GetLastCheckpointAsync() => ValueTask.FromResult(0L);
+        public ValueTask<long> GetLastCheckpointAsync() => ValueTask.FromResult(checkpoint);
         public long GetCommitIndex() => tailThrough;
         public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp ts, bool autoCommit) => MakeNoOp();
         public WALWriteOperation EnqueueCommit(List<RaftLog> logs) => MakeNoOp();
@@ -353,9 +412,17 @@ public class TestBackfillNoProgress
 
         public IRaftStateMachineTransfer? StateMachineTransfer => null;
         public IRaftSystemStateTransfer? SystemStateTransfer => null;
+        public IRaftPartitionStateTransfer? PartitionStateTransfer { get; init; }
 
-        public Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct) =>
-            Task.FromResult(new SnapshotResponse(true));
+        private readonly ConcurrentDictionary<string, int> snapshotChunks = new();
+
+        public int SnapshotChunksTo(string endpoint) => snapshotChunks.GetValueOrDefault(endpoint, 0);
+
+        public Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct)
+        {
+            snapshotChunks.AddOrUpdate(node.Endpoint, 1, static (_, n) => n + 1);
+            return Task.FromResult(new SnapshotResponse(request.IsLast ? SnapshotInstallOutcome.Installed : SnapshotInstallOutcome.ChunkAccepted));
+        }
     }
 
     private sealed class NoopSink : IRaftOperationReplySink

@@ -306,6 +306,9 @@ public class TestHlcDriftReview
         {
             Host = "leader", Port = 9000, InitialPartitions = 1, BackfillThreshold = 10,
             HeartbeatInterval = TimeSpan.FromMilliseconds(100), RecentHeartbeat = TimeSpan.Zero, EnableQuiescence = false,
+            // These tests tick a leader for seconds with no voter acks to pin heartbeat/retry
+            // mechanics; the default check-quorum step-down is a competing outcome they do not test.
+            EnableCheckQuorum = false,
         };
 
         public long Physical = 1_800_000_000_000;

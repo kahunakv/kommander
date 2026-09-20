@@ -172,7 +172,7 @@ public interface ICommunication
     /// </summary>
     public Task<RaftReplicationResult?> ForwardReplicateLogs(
         RaftManager manager, RaftNode node, int partitionId, string type,
-        IReadOnlyList<byte[]> logs, bool autoCommit, long expectedGeneration,
+        IReadOnlyList<byte[]> logs, bool autoCommit, long expectedGeneration, long expectedTerm,
         CancellationToken cancellationToken = default)
         => Task.FromResult<RaftReplicationResult?>(null);
 }

@@ -266,4 +266,96 @@ public class TestRaftConfigurationValidation
         RaftException ex = Assert.Throws<RaftException>(cfg.Validate);
         Assert.Contains("MaxBackfillBytesPerRound", ex.Message);
     }
+
+    // ── Check-quorum window must stay below the election timeout ─────────────
+
+    [Fact]
+    public void CheckQuorum_ShipsOn_WithTheWindowDerivedFromStartElectionTimeout()
+    {
+        RaftConfiguration cfg = new();
+        Assert.True(cfg.EnableCheckQuorum);
+        Assert.Equal(0, cfg.CheckQuorumIntervalMultiplier);
+        Assert.Equal(TimeSpan.FromMilliseconds(cfg.StartElectionTimeout), cfg.CheckQuorumWindow);
+        cfg.Validate();
+    }
+
+    [Fact]
+    public void CheckQuorumWindow_Derived_IsFlooredAtTwoHeartbeatIntervals()
+    {
+        RaftConfiguration cfg = new()
+        {
+            HeartbeatInterval = TimeSpan.FromMilliseconds(1500),
+            StartElectionTimeout = 2000,
+        };
+        Assert.Equal(TimeSpan.FromMilliseconds(3000), cfg.CheckQuorumWindow);
+    }
+
+    [Fact]
+    public void CheckQuorumWindow_ExplicitMultiplier_IsHeartbeatTimesMultiplier()
+    {
+        RaftConfiguration cfg = new()
+        {
+            HeartbeatInterval = TimeSpan.FromMilliseconds(500),
+            CheckQuorumIntervalMultiplier = 4,
+            StartElectionTimeout = 2000,
+        };
+        Assert.Equal(TimeSpan.FromMilliseconds(2000), cfg.CheckQuorumWindow);
+        cfg.Validate();
+    }
+
+    [Fact]
+    public void Validate_CheckQuorumWindowAboveStartElectionTimeout_Throws()
+    {
+        // 500 ms × 8 = 4 s: the old shipped shape, equal to the election-timeout CEILING. An
+        // isolated leader would outlive the followers' election timeout — the two-leader window.
+        RaftConfiguration cfg = new()
+        {
+            HeartbeatInterval = TimeSpan.FromMilliseconds(500),
+            CheckQuorumIntervalMultiplier = 8,
+            StartElectionTimeout = 2000,
+            EndElectionTimeout = 4000,
+        };
+        RaftException ex = Assert.Throws<RaftException>(cfg.Validate);
+        Assert.Contains("CheckQuorumIntervalMultiplier", ex.Message);
+        Assert.Contains("StartElectionTimeout", ex.Message);
+    }
+
+    [Fact]
+    public void Validate_CheckQuorumWindowAboveStartElectionTimeout_AllowedWhenCheckQuorumOff()
+    {
+        RaftConfiguration cfg = new()
+        {
+            EnableCheckQuorum = false,
+            HeartbeatInterval = TimeSpan.FromMilliseconds(500),
+            CheckQuorumIntervalMultiplier = 8,
+            StartElectionTimeout = 2000,
+        };
+        cfg.Validate();
+    }
+
+    [Fact]
+    public void Validate_CheckQuorumMultiplierOfOne_Throws()
+    {
+        RaftConfiguration cfg = new() { CheckQuorumIntervalMultiplier = 1 };
+        RaftException ex = Assert.Throws<RaftException>(cfg.Validate);
+        Assert.Contains("at least 2", ex.Message);
+    }
+
+    [Fact]
+    public void Validate_NegativeCheckQuorumMultiplier_Throws()
+    {
+        RaftConfiguration cfg = new() { CheckQuorumIntervalMultiplier = -1 };
+        RaftException ex = Assert.Throws<RaftException>(cfg.Validate);
+        Assert.Contains("must not be negative", ex.Message);
+    }
+
+    // ── SnapshotChunkAckTimeout must be positive ──────────────────────────────
+
+    [Fact]
+    public void Validate_NonPositiveSnapshotChunkAckTimeout_Throws()
+    {
+        RaftConfiguration cfg = new() { SnapshotChunkAckTimeout = TimeSpan.Zero };
+        RaftException ex = Assert.Throws<RaftException>(cfg.Validate);
+        Assert.Contains("SnapshotChunkAckTimeout", ex.Message);
+    }
 }

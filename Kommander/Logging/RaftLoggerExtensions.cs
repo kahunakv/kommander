@@ -173,6 +173,12 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot installed on {Endpoint} at index {Index} ({Chunks} chunk(s)) (within the re-warn cooldown)")]
     public static partial void LogDebugSnapshotInstalled(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index, int chunks);
 
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot for {Endpoint} at index {Index} ({Chunks} chunk(s)) was skipped by the receiver as already covered — nothing was imported there; the leader's replication cursors advance to the boundary")]
+    public static partial void LogWarnSnapshotSkippedAlreadyCovered(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index, int chunks);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot for {Endpoint} at index {Index} ({Chunks} chunk(s)) skipped by the receiver as already covered (within the re-warn cooldown)")]
+    public static partial void LogDebugSnapshotSkippedAlreadyCovered(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index, int chunks);
+
     [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Refusing non-contiguous backfill batch for {Endpoint}: anchored at {From} but the first committed entry available is {FirstId} — no committed entry exists at the anchor (the run below it is uncommitted, or it was compacted away; LastCheckpoint={LastCheckpoint} tells which). Repeats log at Debug; query IRaft.GetBackfillStatuses while this persists")]
     public static partial void LogWarnBackfillNonContiguous(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long from, long firstId, long lastCheckpoint);
 
@@ -260,6 +266,9 @@ public static partial class RaftLoggerExtensions
 
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}] ReceiveInstallSnapshot: partition={PartitionId} installed snapshot at index={Index}")]
     public static partial void LogInfoReceiveInstallSnapshot(this ILogger<IRaft> logger, string endpoint, int partitionId, long index);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}] ReceiveInstallSnapshot: partition={PartitionId} skipped snapshot at index={Index} as already covered by the installed boundary {Boundary}; nothing imported")]
+    public static partial void LogInfoReceiveInstallSnapshotSkipped(this ILogger<IRaft> logger, string endpoint, int partitionId, long index, long boundary);
 
     [LoggerMessage(Level = LogLevel.Information, Message = "ReceiveGossip: self was Suspect in gossip; refuting with incarnation {Inc}")]
     public static partial void LogInfoReceiveGossipRefuting(this ILogger<IRaft> logger, long inc);

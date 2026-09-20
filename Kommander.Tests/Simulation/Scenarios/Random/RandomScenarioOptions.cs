@@ -147,7 +147,25 @@ public sealed record RandomScenarioOptions
 
         if (CompactionLiveReplicaLagBudget is { } budget)
             configuration.CompactionLiveReplicaLagBudget = budget;
+
+        if (EnableCheckQuorum)
+            configuration.EnableCheckQuorum = true;
     }
+
+    /// <summary>
+    /// Runs the cluster with check-quorum on (the production default). Off here by default: the
+    /// simulation's stock election timeout equals one heartbeat ack round trip, so the derived
+    /// window would step every leader down on nearly every tick — see <c>SimulationNode</c>. A
+    /// family that turns it on must also widen <see cref="StartElectionTimeoutMs"/> and
+    /// <see cref="EndElectionTimeoutMs"/> so the window holds several round trips.
+    /// </summary>
+    public bool EnableCheckQuorum { get; init; }
+
+    /// <summary>Overrides the cluster's start election timeout in milliseconds (null = the cluster default).</summary>
+    public int? StartElectionTimeoutMs { get; init; }
+
+    /// <summary>Overrides the cluster's end election timeout in milliseconds (null = the cluster default).</summary>
+    public int? EndElectionTimeoutMs { get; init; }
 
     /// <summary>Weight of healing something that is currently broken.</summary>
     public int HealWeight { get; init; } = 14;
@@ -202,6 +220,9 @@ public sealed record RandomScenarioOptions
             ["compactionLiveReplicaLagBudget"] =
                 CompactionLiveReplicaLagBudget?.ToString(CultureInfo.InvariantCulture) ?? "default",
             ["transferFaultWeight"] = TransferFaultWeight.ToString(),
+            ["enableCheckQuorum"] = EnableCheckQuorum.ToString(),
+            ["startElectionTimeoutMs"] = StartElectionTimeoutMs?.ToString(CultureInfo.InvariantCulture) ?? "default",
+            ["endElectionTimeoutMs"] = EndElectionTimeoutMs?.ToString(CultureInfo.InvariantCulture) ?? "default",
         };
 
     /// <summary>
@@ -252,6 +273,9 @@ public sealed record RandomScenarioOptions
             EnableFaultEpisodes = Bool(parameters, "enableFaultEpisodes", defaults.EnableFaultEpisodes),
             CompactionLiveReplicaLagBudget = OptionalLong(parameters, "compactionLiveReplicaLagBudget"),
             TransferFaultWeight = Int(parameters, "transferFaultWeight", defaults.TransferFaultWeight),
+            EnableCheckQuorum = Bool(parameters, "enableCheckQuorum", defaults.EnableCheckQuorum),
+            StartElectionTimeoutMs = (int?)OptionalLong(parameters, "startElectionTimeoutMs"),
+            EndElectionTimeoutMs = (int?)OptionalLong(parameters, "endElectionTimeoutMs"),
         };
     }
 

@@ -228,6 +228,32 @@ public sealed class RaftPartitionStateMachine
             : coreState.NodeState;
     public long CurrentTerm => coreState.CurrentTerm;
 
+    /// <summary>Off-thread view of the current term — see <see cref="RaftPartitionCoreState.PublishedTerm"/>.</summary>
+    public long PublishedTerm => coreState.PublishedTerm;
+
+    /// <summary>
+    /// Raises <see cref="IRaft.OnLeadershipLost"/> if a leadership stint of this node ended and was
+    /// not reported yet (see <see cref="RaftPartitionCoreState.TryTakePendingLeadershipLoss"/>).
+    /// Executor thread only. Handler failures are logged, never propagated: the demotion already
+    /// happened and must not be undone or re-run because a consumer callback threw.
+    /// </summary>
+    internal async Task NotifyLeadershipLostIfPendingAsync()
+    {
+        if (!coreState.TryTakePendingLeadershipLoss(out long lostTerm))
+            return;
+
+        try
+        {
+            await host.InvokeLeadershipLost(host.PartitionId, lostTerm).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(
+                "[{LocalEndpoint}/{PartitionId}/{State}] OnLeadershipLost handler threw for term {Term}: {Message}",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, lostTerm, ex.Message);
+        }
+    }
+
     /// <summary>
     /// Off-thread leadership-confirmation fast path. Returns <see langword="true"/> when a
     /// published lease proves this node confirmed leadership within the last heartbeat interval
@@ -508,6 +534,11 @@ public sealed class RaftPartitionStateMachine
     /// </summary>
     public async Task CheckPartitionLeadershipAsync()
     {
+        // Backstop for OnLeadershipLost: every demotion path notifies through the host's
+        // leader-changed call, which takes the pending loss first; a path that demoted without
+        // announcing a leader change still reports the loss here, one tick later.
+        await NotifyLeadershipLostIfPendingAsync().ConfigureAwait(false);
+
         HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         long nowTicks = host.GetMonotonicTimestamp();
 
@@ -576,11 +607,22 @@ public sealed class RaftPartitionStateMachine
 
                 // Check-quorum: step down once no majority of voters has acked within the window.
                 // This does not close the stale-read hole (ConfirmLeadershipAsync does); it bounds
-                // how long an isolated leader lingers so minority-side callers fail fast.
-                if (host.Configuration.EnableCheckQuorum && readIndex.ShouldStepDownOnQuorumLoss(nowTicks))
+                // how long an isolated leader lingers so minority-side callers fail fast. A
+                // quiesced leader receives no acks by design, so past half the window it is woken
+                // for one forced round instead of being trusted (see EvaluateCheckQuorum).
+                if (host.Configuration.EnableCheckQuorum)
                 {
-                    await StepDownOnQuorumLossAsync().ConfigureAwait(false);
-                    return;
+                    switch (readIndex.EvaluateCheckQuorum(nowTicks))
+                    {
+                        case CheckQuorumVerdict.StepDown:
+                            await StepDownOnQuorumLossAsync().ConfigureAwait(false);
+                            return;
+
+                        case CheckQuorumVerdict.Probe:
+                            coreState.SetQuiesced(false);
+                            await heartbeats.SendHeartbeat(true).ConfigureAwait(false);
+                            break;
+                    }
                 }
 
                 // Durable-write stall watchdog: this leader's own WAL write has been unanswered by the
@@ -2218,7 +2260,7 @@ public sealed class RaftPartitionStateMachine
         logger.LogWarning(
             "[{LocalEndpoint}/{PartitionId}/{State}] Check-quorum: no majority of voter acks within {Window} — stepping down. Term={CurrentTerm}",
             host.LocalEndpoint, host.PartitionId, coreState.NodeState,
-            host.Configuration.HeartbeatInterval * host.Configuration.CheckQuorumIntervalMultiplier, coreState.CurrentTerm);
+            host.Configuration.CheckQuorumWindow, coreState.CurrentTerm);
 
         HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
         long nowTicks = host.GetMonotonicTimestamp();
@@ -2476,12 +2518,19 @@ public sealed class RaftPartitionStateMachine
     public Task ReplicateLogsAsync(List<RaftLog>? logs, bool autoCommit, ulong? replyCorrelationId) =>
         replicator.ReplicateLogsAsync(logs, autoCommit, replyCorrelationId);
 
+    /// <summary>
+    /// Proposes a batch of log entries under a term fence — see
+    /// <see cref="LogReplicator.ReplicateLogs(List{RaftLog}?, bool, long, ulong?)"/>.
+    /// </summary>
+    public Task ReplicateLogsAsync(List<RaftLog>? logs, bool autoCommit, long expectedTerm, ulong? replyCorrelationId) =>
+        replicator.ReplicateLogsAsync(logs, autoCommit, expectedTerm, replyCorrelationId);
+
     /// <summary>Proposes a batch of log entries — see <see cref="LogReplicator.ReplicateLogs"/>.</summary>
     public (RaftOperationStatus, HLCTimestamp ticketId) ReplicateLogs(List<RaftLog>? logs, bool autoCommit, ulong? replyCorrelationId = null) =>
         replicator.ReplicateLogs(logs, autoCommit, replyCorrelationId);
 
     /// <summary>Proposes several batches in one pass — see <see cref="LogReplicator.ReplicateLogsBatchAsync"/>.</summary>
-    public Task ReplicateLogsBatchAsync(IReadOnlyList<(List<RaftLog>? Logs, bool AutoCommit, ulong? ReplyCorrelationId)> messages) =>
+    public Task ReplicateLogsBatchAsync(IReadOnlyList<(List<RaftLog>? Logs, bool AutoCommit, long ExpectedTerm, ulong? ReplyCorrelationId)> messages) =>
         replicator.ReplicateLogsBatchAsync(messages);
 
     /// <summary>Proposes a checkpoint marker — see <see cref="LogReplicator.ReplicateCheckpointAsync"/>.</summary>

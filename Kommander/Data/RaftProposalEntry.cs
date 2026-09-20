@@ -34,9 +34,18 @@ namespace Kommander.Data;
 /// <see cref="RaftOperationStatus.PartitionMoved"/> on mismatch (its siblings are unaffected). Zero disables
 /// the fence for this entry.
 /// </param>
+/// <param name="ExpectedTerm">
+/// When non-zero, the whole batch is refused with <see cref="RaftOperationStatus.TermMismatch"/> before
+/// anything is appended unless the node's current term for the partition equals it (a term fence is a
+/// statement about the node, so it cannot be applied per entry — one entry's mismatch means every entry
+/// was proposed to a node the caller no longer knows the role of). Two entries that name different
+/// non-zero terms are a batch-level rejection too: at most one of them can be current. Zero opts the
+/// entry out of the fence. Read the term with <see cref="IRaft.GetPartitionTerm"/>.
+/// </param>
 public readonly record struct RaftProposalEntry(
     string Type,
     byte[] Data,
     bool AutoCommit = true,
-    long ExpectedGeneration = 0
+    long ExpectedGeneration = 0,
+    long ExpectedTerm = 0
 );

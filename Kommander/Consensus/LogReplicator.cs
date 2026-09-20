@@ -70,7 +70,7 @@ internal sealed class LogReplicator
     /// Proposals that arrived while a leadership transfer was converging, in arrival order. See the
     /// parking branch of <see cref="ReplicateLogs"/>. Only touched on the executor thread.
     /// </summary>
-    private readonly List<(List<RaftLog> Logs, bool AutoCommit, ulong? ReplyCorrelationId)> parkedProposals = [];
+    private readonly List<(List<RaftLog> Logs, bool AutoCommit, long ExpectedTerm, ulong? ReplyCorrelationId)> parkedProposals = [];
 
     /// <summary>Number of proposals parked behind a converging leadership transfer.</summary>
     public int ParkedProposalCount => parkedProposals.Count;
@@ -85,10 +85,10 @@ internal sealed class LogReplicator
         if (parkedProposals.Count == 0)
             return;
 
-        List<(List<RaftLog> Logs, bool AutoCommit, ulong? ReplyCorrelationId)> parked = [.. parkedProposals];
+        List<(List<RaftLog> Logs, bool AutoCommit, long ExpectedTerm, ulong? ReplyCorrelationId)> parked = [.. parkedProposals];
         parkedProposals.Clear();
 
-        foreach ((List<RaftLog> _, bool _, ulong? replyCorrelationId) in parked)
+        foreach ((List<RaftLog> _, bool _, long _, ulong? replyCorrelationId) in parked)
             CompleteReply(replyCorrelationId, new(RaftResponseType.None, status, HLCTimestamp.Zero));
     }
 
@@ -102,16 +102,19 @@ internal sealed class LogReplicator
         if (parkedProposals.Count == 0)
             return;
 
-        List<(List<RaftLog> Logs, bool AutoCommit, ulong? ReplyCorrelationId)> parked = [.. parkedProposals];
+        List<(List<RaftLog> Logs, bool AutoCommit, long ExpectedTerm, ulong? ReplyCorrelationId)> parked = [.. parkedProposals];
         parkedProposals.Clear();
 
-        foreach ((List<RaftLog> logs, bool autoCommit, ulong? replyCorrelationId) in parked)
-            await ReplicateLogsAsync(logs, autoCommit, replyCorrelationId).ConfigureAwait(false);
+        foreach ((List<RaftLog> logs, bool autoCommit, long expectedTerm, ulong? replyCorrelationId) in parked)
+            await ReplicateLogsAsync(logs, autoCommit, expectedTerm, replyCorrelationId).ConfigureAwait(false);
     }
 
-    public Task ReplicateLogsAsync(List<RaftLog>? logs, bool autoCommit, ulong? replyCorrelationId)
+    public Task ReplicateLogsAsync(List<RaftLog>? logs, bool autoCommit, ulong? replyCorrelationId) =>
+        ReplicateLogsAsync(logs, autoCommit, expectedTerm: 0, replyCorrelationId);
+
+    public Task ReplicateLogsAsync(List<RaftLog>? logs, bool autoCommit, long expectedTerm, ulong? replyCorrelationId)
     {
-        (RaftOperationStatus status, HLCTimestamp ticketId) = ReplicateLogs(logs, autoCommit, replyCorrelationId);
+        (RaftOperationStatus status, HLCTimestamp ticketId) = ReplicateLogs(logs, autoCommit, expectedTerm, replyCorrelationId);
 
         if (status != RaftOperationStatus.Pending)
             CompleteReply(replyCorrelationId, new(RaftResponseType.None, status, ticketId));
@@ -123,6 +126,22 @@ internal sealed class LogReplicator
         List<RaftLog>? logs,
         bool autoCommit,
         ulong? replyCorrelationId = null
+    ) => ReplicateLogs(logs, autoCommit, expectedTerm: 0, replyCorrelationId);
+
+    /// <summary>
+    /// Proposes a batch. Pre-accept refusals, in order: an empty batch is a no-op success; a
+    /// non-leader answers <see cref="RaftOperationStatus.NodeIsNotLeader"/>; a non-zero
+    /// <paramref name="expectedTerm"/> that is not this node's current term answers
+    /// <see cref="RaftOperationStatus.TermMismatch"/>. Both refusals happen before any entry is
+    /// appended, so they are definite. The term check runs here — on the executor thread, against
+    /// the authoritative term — and not only at the gateway, because the gateway's copy of the term
+    /// is a published snapshot that can trail a step-down by one executor write.
+    /// </summary>
+    public (RaftOperationStatus, HLCTimestamp ticketId) ReplicateLogs(
+        List<RaftLog>? logs,
+        bool autoCommit,
+        long expectedTerm,
+        ulong? replyCorrelationId
     )
     {
         if (logs is null || logs.Count == 0)
@@ -130,6 +149,9 @@ internal sealed class LogReplicator
 
         if (coreState.NodeState != RaftNodeState.Leader)
             return (RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
+
+        if (expectedTerm != 0 && expectedTerm != coreState.CurrentTerm)
+            return (RaftOperationStatus.TermMismatch, HLCTimestamp.Zero);
 
         // A leadership transfer is converging on a target that is still behind: stop admitting new
         // proposals so the leader's last index holds still and the target can reach it. The
@@ -146,7 +168,7 @@ internal sealed class LogReplicator
             if (cap > 0 && parkedProposals.Count >= cap)
                 return (RaftOperationStatus.ProposalQueueFull, HLCTimestamp.Zero);
 
-            parkedProposals.Add((logs, autoCommit, replyCorrelationId));
+            parkedProposals.Add((logs, autoCommit, expectedTerm, replyCorrelationId));
             return (RaftOperationStatus.Pending, HLCTimestamp.Zero);
         }
 
@@ -260,7 +282,7 @@ internal sealed class LogReplicator
     /// <param name="autoCommit"></param>
     /// <returns></returns>
     /// <exception cref="RaftException"></exception>
-    public async Task ReplicateLogsBatchAsync(IReadOnlyList<(List<RaftLog>? Logs, bool AutoCommit, ulong? ReplyCorrelationId)> messages)
+    public async Task ReplicateLogsBatchAsync(IReadOnlyList<(List<RaftLog>? Logs, bool AutoCommit, long ExpectedTerm, ulong? ReplyCorrelationId)> messages)
     {
         // Determine which autoCommit values to dispatch, in first-seen order among messages that carry
         // logs — a batch whose messages all have null/empty logs dispatches nothing. Only the KEYS drive
@@ -270,7 +292,7 @@ internal sealed class LogReplicator
         bool sawSecondKey = false;
         bool firstKey = false;
 
-        foreach ((List<RaftLog>? logs, bool autoCommit, ulong? replyCorrelationId) message in messages)
+        foreach ((List<RaftLog>? logs, bool autoCommit, long expectedTerm, ulong? replyCorrelationId) message in messages)
         {
             if (message.logs is null || message.logs.Count == 0)
                 continue;
@@ -294,10 +316,10 @@ internal sealed class LogReplicator
 
             bool key = keyIndex == 0 ? firstKey : !firstKey;
 
-            foreach ((List<RaftLog>? logs, bool autoCommit, ulong? replyCorrelationId) item in messages)
+            foreach ((List<RaftLog>? logs, bool autoCommit, long expectedTerm, ulong? replyCorrelationId) item in messages)
             {
                 if (item.autoCommit == key)
-                    await ReplicateLogsAsync(item.logs, item.autoCommit, item.replyCorrelationId).ConfigureAwait(false);
+                    await ReplicateLogsAsync(item.logs, item.autoCommit, item.expectedTerm, item.replyCorrelationId).ConfigureAwait(false);
             }
         }
     }

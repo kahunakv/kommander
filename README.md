@@ -738,6 +738,25 @@ if (result.Status == RaftOperationStatus.PartitionMoved)
 }
 ```
 
+The **term fence** protects writes whose preconditions were computed under a leadership that may have ended. Read the partition's term with `GetPartitionTerm` when the belief-only work starts (a staged intent, a lock check), and stamp the resulting write with `expectedTerm`. The executor refuses the write with `TermMismatch` **before anything is appended** when the node no longer serves in that term, so the answer is a definite "did not take effect":
+
+```csharp
+long term = raft.GetPartitionTerm(partitionId); // -1 when this node does not host the partition
+
+RaftReplicationResult result = await raft.ReplicateLogs(
+    partitionId,
+    type:         "MyEvent",
+    data:         payload,
+    expectedTerm: term);
+
+if (result.Status == RaftOperationStatus.TermMismatch)
+{
+    // Leadership changed since the term was read; drop the belief-only state and re-decide.
+}
+```
+
+`RaftProposalEntry.ExpectedTerm` applies the same fence to a `ReplicateEntries` batch (one mismatch refuses the whole batch). Subscribe to `OnLeadershipLost` to drop belief-only state the moment this node stops leading a partition; the event carries the term the node led in.
+
 Subscribe to `OnPartitionMapChanged` to react to map updates without polling:
 
 ```csharp

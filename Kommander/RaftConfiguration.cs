@@ -908,24 +908,54 @@ public class RaftConfiguration
 
     /// <summary>
     /// When <see langword="true"/>, a leader that has not heard a same-term append/heartbeat
-    /// ack from a majority of voters for <see cref="HeartbeatInterval"/> ×
-    /// <see cref="CheckQuorumIntervalMultiplier"/> steps down to Follower. This does not by
-    /// itself make reads safe (a stale-read window remains — that is what
+    /// ack from a majority of voters for <see cref="CheckQuorumWindow"/> steps down to Follower.
+    /// This does not by itself make reads safe (a stale-read window remains — that is what
     /// <c>ConfirmLeadershipAsync</c> closes); it bounds how long a deposed or isolated leader
-    /// lingers, so minority-side writes fail fast and clients stop hammering a dead-end node.
-    /// Suspended while the leader is quiesced: a quiesced leader stops heartbeating by design,
-    /// so an absence of acks proves nothing there. Off by default to preserve existing
-    /// behaviour.
+    /// lingers, so minority-side writes fail fast, and — because the window is validated below
+    /// <see cref="StartElectionTimeout"/> — so the isolated leader steps down before the majority
+    /// side can elect a replacement. That ordering is what keeps a two-leader window from opening
+    /// while a client still holds an acknowledgement from the old one.
+    /// <para>A quiesced leader stops heartbeating by design, so it is not trusted on silence:
+    /// past half the window without a majority contact it is woken for one forced heartbeat
+    /// round, and it steps down at the full window if the round goes unanswered.</para>
+    /// <para>On by default. Turning it off is reported by <see cref="RaftSafetyOptionAudit"/> as a
+    /// chosen safety deviation: a leader that has lost its voters then keeps accepting writes
+    /// that can never commit until it happens to learn of a newer term.</para>
     /// </summary>
-    public bool EnableCheckQuorum { get; set; }
+    public bool EnableCheckQuorum { get; set; } = true;
 
     /// <summary>
     /// Number of heartbeat intervals without a majority of same-term acks after which a leader
     /// with <see cref="EnableCheckQuorum"/> steps down. Too low a value causes spurious
-    /// step-downs when acks are merely delayed under load; the window restarts whenever a
-    /// majority is heard from, on promotion, and on un-quiesce. Default 8.
+    /// step-downs when acks are merely delayed under load; too high a value lets an isolated
+    /// leader outlive the followers' election timeout, which is the two-leader window.
+    /// <para>Default 0 = derived: the window is <see cref="StartElectionTimeout"/> (floored at
+    /// two heartbeat intervals), the largest value that still steps an isolated leader down before
+    /// any follower can start an election. An explicit value must be at least 2 and must keep
+    /// <see cref="HeartbeatInterval"/> × multiplier at or below <see cref="StartElectionTimeout"/>;
+    /// <see cref="Validate"/> rejects anything else. Read the effective window from
+    /// <see cref="CheckQuorumWindow"/>.</para>
     /// </summary>
-    public int CheckQuorumIntervalMultiplier { get; set; } = 8;
+    public int CheckQuorumIntervalMultiplier { get; set; }
+
+    /// <summary>
+    /// The effective check-quorum window: <see cref="HeartbeatInterval"/> ×
+    /// <see cref="CheckQuorumIntervalMultiplier"/> when the multiplier is set, otherwise the
+    /// derived default described there. Measured from the last instant a majority of voters was
+    /// simultaneously fresh (see <c>ReadIndexCoordinator.EvaluateCheckQuorum</c>).
+    /// </summary>
+    public TimeSpan CheckQuorumWindow
+    {
+        get
+        {
+            if (CheckQuorumIntervalMultiplier > 0)
+                return HeartbeatInterval * CheckQuorumIntervalMultiplier;
+
+            TimeSpan derived = TimeSpan.FromMilliseconds(StartElectionTimeout);
+            TimeSpan floor = HeartbeatInterval * 2;
+            return derived < floor ? floor : derived;
+        }
+    }
 
     // ── Bounded log backfill ──────────────────────────────────────────────────
 
@@ -1101,6 +1131,20 @@ public class RaftConfiguration
     /// under the normal backoff. Must be positive. Default 2 minutes.
     /// </summary>
     public TimeSpan SnapshotTransferStepTimeout { get; set; } = TimeSpan.FromMinutes(2);
+
+    /// <summary>
+    /// Upper bound on ONE snapshot chunk's acknowledgement: the time between sending a chunk and
+    /// the receiver's answer for it. Also the deadline of the transport call that carries the
+    /// chunk, so a receiver whose install path is wedged (a stalled disk, a hung executor) fails
+    /// the transfer here instead of holding the RPC open until
+    /// <see cref="SnapshotTransferStepTimeout"/>. A chunk to a reachable node is a bounded unit of
+    /// work — buffer, hash, and on the terminal chunk import plus one durable boundary write — so
+    /// it needs a bound of seconds, not the minutes a whole export may take. The effective
+    /// per-chunk bound is the smaller of the two options. On expiry the attempt is recorded as a
+    /// failure and retried under the normal backoff; a healthy receiver that was merely slow
+    /// re-receives the same chunks from the export cache. Must be positive. Default 15 s.
+    /// </summary>
+    public TimeSpan SnapshotChunkAckTimeout { get; set; } = TimeSpan.FromSeconds(15);
 
     /// <summary>
     /// Convergence breaker for the refused-backfill → snapshot rescue: the number of consecutive
@@ -1872,12 +1916,28 @@ public class RaftConfiguration
                 "(read-index) waits up to this long for a quorum ack round; a non-positive value would " +
                 "fail every confirmation immediately, making quorum-confirmed reads permanently unavailable.");
 
-        if (EnableCheckQuorum && CheckQuorumIntervalMultiplier < 2)
+        if (CheckQuorumIntervalMultiplier < 0)
             throw new RaftException(
-                "[Kommander] CheckQuorumIntervalMultiplier must be at least 2 when EnableCheckQuorum=true. " +
+                $"[Kommander] CheckQuorumIntervalMultiplier ({CheckQuorumIntervalMultiplier}) must not be negative. " +
+                "Use 0 to derive the check-quorum window from StartElectionTimeout, or a value of at least 2.");
+
+        if (EnableCheckQuorum && CheckQuorumIntervalMultiplier == 1)
+            throw new RaftException(
+                "[Kommander] CheckQuorumIntervalMultiplier must be at least 2 (or 0 = derived) when EnableCheckQuorum=true. " +
                 "The step-down window is HeartbeatInterval * CheckQuorumIntervalMultiplier; a window of a " +
                 "single heartbeat interval steps a healthy leader down whenever one ack round is merely " +
                 "delayed, causing spurious leadership churn under ordinary load.");
+
+        if (EnableCheckQuorum && CheckQuorumIntervalMultiplier >= 2
+            && HeartbeatInterval.TotalMilliseconds * CheckQuorumIntervalMultiplier > StartElectionTimeout)
+            throw new RaftException(
+                $"[Kommander] HeartbeatInterval ({HeartbeatInterval.TotalMilliseconds} ms) * CheckQuorumIntervalMultiplier " +
+                $"({CheckQuorumIntervalMultiplier}) = {HeartbeatInterval.TotalMilliseconds * CheckQuorumIntervalMultiplier} ms " +
+                $"must not exceed StartElectionTimeout ({StartElectionTimeout} ms) when EnableCheckQuorum=true. " +
+                "Check-quorum exists so an isolated leader steps down BEFORE the other voters can elect a " +
+                "replacement; a window past the election timeout leaves a two-leader window in which the " +
+                "old leader still acknowledges writes that will never commit. Lower the multiplier (0 derives " +
+                "the window from StartElectionTimeout) or raise StartElectionTimeout.");
 
         if (LeadershipBarrierTimeout <= TimeSpan.Zero)
             throw new RaftException(
@@ -1908,6 +1968,12 @@ public class RaftConfiguration
                 $"[Kommander] SnapshotTransferStepTimeout ({SnapshotTransferStepTimeout}) must be positive. " +
                 "It bounds each awaited step of an outbound snapshot transfer; without it a hung export or " +
                 "install RPC parks the transfer forever and its in-flight guard blocks every later rescue.");
+
+        if (SnapshotChunkAckTimeout <= TimeSpan.Zero)
+            throw new RaftException(
+                $"[Kommander] SnapshotChunkAckTimeout ({SnapshotChunkAckTimeout}) must be positive. " +
+                "It bounds the acknowledgement of one snapshot chunk; without it a receiver whose install " +
+                "path is wedged holds the transfer open for the whole SnapshotTransferStepTimeout.");
 
         if (SnapshotMaxPendingSessions <= 0)
             throw new RaftException(

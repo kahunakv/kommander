@@ -619,7 +619,7 @@ internal sealed class SnapshotSender
             // drain time and travels in the cache entry.
             using IncrementalHash snapshotHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
 
-            bool success;
+            SnapshotInstallOutcome outcome;
             int chunksSent;
             try
             {
@@ -640,7 +640,7 @@ internal sealed class SnapshotSender
                     }
                 }
 
-                (success, chunksSent) = cached is not null
+                (outcome, chunksSent) = cached is not null
                     ? await SendCachedChunksAsync(node, cached, sessionId, leaderTerm, lastIncludedTerm, stepTimeout, transferCts).ConfigureAwait(false)
                     : await StreamChunksAsync(node, snapshot!, overflowPrefix, sessionId, snapshotIndex, kind, leaderTerm, lastIncludedTerm, chunkSize, snapshotHash, stepTimeout, transferCts).ConfigureAwait(false);
             }
@@ -650,7 +650,19 @@ internal sealed class SnapshotSender
                     await snapshot.DisposeAsync().ConfigureAwait(false);
             }
 
-            if (success)
+            // The terminal chunk's answer is the only statement about installation. A receiver
+            // that acknowledged it as a mere staged chunk never ran the install: that is not a
+            // seeded follower, and treating it as one is exactly how a follower that imported
+            // nothing was logged as seeded while its acknowledged writes went missing.
+            if (outcome == SnapshotInstallOutcome.ChunkAccepted)
+            {
+                RecordFailure(node.Endpoint, cause: "terminal_chunk_without_install",
+                    error: $"the receiver acknowledged the terminal chunk for index {snapshotIndex} without an install outcome (an older receiver, or a chunk pipeline that answered before the install ran)",
+                    unproducible: false);
+                return;
+            }
+
+            if (outcome is SnapshotInstallOutcome.Installed or SnapshotInstallOutcome.SkippedAlreadyCovered)
             {
                 failureStates.TryRemove(node.Endpoint, out _);
 
@@ -667,10 +679,23 @@ internal sealed class SnapshotSender
 
                 // Warning outside the cooldown: this line ends a below-the-floor rescue incident
                 // and must be visible at the default consumer log level (see RescueWarnCooldownMs).
-                if (TryOpenWarnWindow(lastInstallWarnTicks, node.Endpoint))
-                    logger.LogWarnSnapshotInstalled(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex, chunksSent);
-                else if (logger.IsEnabled(LogLevel.Debug))
-                    logger.LogDebugSnapshotInstalled(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex, chunksSent);
+                // "Seeded" is written only for an install the receiver reports as an import; a
+                // skip says so, because nothing on the receiver changed.
+                bool warn = TryOpenWarnWindow(lastInstallWarnTicks, node.Endpoint);
+                if (outcome == SnapshotInstallOutcome.Installed)
+                {
+                    if (warn)
+                        logger.LogWarnSnapshotInstalled(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex, chunksSent);
+                    else if (logger.IsEnabled(LogLevel.Debug))
+                        logger.LogDebugSnapshotInstalled(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex, chunksSent);
+                }
+                else
+                {
+                    if (warn)
+                        logger.LogWarnSnapshotSkippedAlreadyCovered(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex, chunksSent);
+                    else if (logger.IsEnabled(LogLevel.Debug))
+                        logger.LogDebugSnapshotSkippedAlreadyCovered(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex, chunksSent);
+                }
 
                 getPostToExecutor()?.Invoke(new RaftRequest(
                     RaftRequestType.SnapshotInstalled,
@@ -870,8 +895,13 @@ internal sealed class SnapshotSender
         }
     }
 
-    /// <summary>Replays a fully cached export chunk-by-chunk. No stream and no rented buffer are involved.</summary>
-    private async Task<(bool Success, int ChunksSent)> SendCachedChunksAsync(
+    /// <summary>
+    /// Replays a fully cached export chunk by chunk; no stream and no rented buffer are involved.
+    /// Returns the terminal chunk's outcome (or
+    /// <see cref="SnapshotInstallOutcome.Rejected"/> at the first refused chunk) and the number
+    /// of chunks sent.
+    /// </summary>
+    private async Task<(SnapshotInstallOutcome Outcome, int ChunksSent)> SendCachedChunksAsync(
         RaftNode node,
         CachedExport cached,
         string sessionId,
@@ -884,25 +914,30 @@ internal sealed class SnapshotSender
         for (int chunkIndex = 0; chunkIndex < chunks.Count; chunkIndex++)
         {
             bool isLast = chunkIndex == chunks.Count - 1;
-            bool sent = await SendOneChunkAsync(
+            SnapshotInstallOutcome chunkOutcome = await SendOneChunkAsync(
                 node, sessionId, cached.SnapshotIndex, cached.Kind, leaderTerm, lastIncludedTerm,
                 chunkIndex, isLast, chunks[chunkIndex],
                 isLast ? cached.Checksum : "",
                 stepTimeout, transferCts).ConfigureAwait(false);
 
-            if (!sent)
-                return (false, chunkIndex);
+            if (chunkOutcome == SnapshotInstallOutcome.Rejected)
+                return (SnapshotInstallOutcome.Rejected, chunkIndex);
+
+            if (isLast)
+                return (chunkOutcome, chunks.Count);
         }
 
-        return (true, chunks.Count);
+        return (SnapshotInstallOutcome.Rejected, chunks.Count);
     }
 
     /// <summary>
     /// The streaming send path: the cache is disabled, or the export crossed the cache bound
     /// mid-drain (then <paramref name="overflowPrefix"/> carries the already-read full-size chunks
-    /// to send first, already hashed into <paramref name="snapshotHash"/>).
+    /// to send first, already hashed into <paramref name="snapshotHash"/>). Returns the terminal
+    /// chunk's outcome (or <see cref="SnapshotInstallOutcome.Rejected"/> at the first refused
+    /// chunk) and the number of chunks sent.
     /// </summary>
-    private async Task<(bool Success, int ChunksSent)> StreamChunksAsync(
+    private async Task<(SnapshotInstallOutcome Outcome, int ChunksSent)> StreamChunksAsync(
         RaftNode node,
         Stream snapshot,
         List<byte[]>? overflowPrefix,
@@ -924,12 +959,12 @@ internal sealed class SnapshotSender
             {
                 // Never terminal: the drain stops at full-size chunks only, so at least one more
                 // read (possibly returning zero bytes) always follows below.
-                bool sent = await SendOneChunkAsync(
+                SnapshotInstallOutcome prefixOutcome = await SendOneChunkAsync(
                     node, sessionId, snapshotIndex, kind, leaderTerm, lastIncludedTerm,
                     chunkIndex, isLast: false, data, "", stepTimeout, transferCts).ConfigureAwait(false);
 
-                if (!sent)
-                    return (false, chunkIndex);
+                if (prefixOutcome == SnapshotInstallOutcome.Rejected)
+                    return (SnapshotInstallOutcome.Rejected, chunkIndex);
 
                 chunkIndex++;
             }
@@ -963,18 +998,18 @@ internal sealed class SnapshotSender
                 // the next iteration overwrites the buffer, and every transport consumes Data
                 // synchronously within that send (see SnapshotRequest.Data remarks).
                 bufferDetached = true;
-                bool sent = await SendOneChunkAsync(
+                SnapshotInstallOutcome chunkOutcome = await SendOneChunkAsync(
                     node, sessionId, snapshotIndex, kind, leaderTerm, lastIncludedTerm,
                     chunkIndex, isLast, buffer.AsMemory(0, bytesRead), checksum,
                     stepTimeout, transferCts).ConfigureAwait(false);
                 bufferDetached = false;
 
-                if (!sent)
-                    return (false, chunkIndex);
+                if (chunkOutcome == SnapshotInstallOutcome.Rejected)
+                    return (SnapshotInstallOutcome.Rejected, chunkIndex);
 
                 chunkIndex++;
                 if (isLast)
-                    return (true, chunkIndex);
+                    return (chunkOutcome, chunkIndex);
             }
         }
         finally
@@ -988,11 +1023,15 @@ internal sealed class SnapshotSender
     }
 
     /// <summary>
-    /// Sends one chunk and awaits its acknowledgment under the step timeout. A rejection records
-    /// the failure and returns <see langword="false"/>; a hung send propagates as
-    /// <see cref="TimeoutException"/> to the transfer-level handler.
+    /// Sends one chunk and awaits its acknowledgment under the chunk bound — the smaller of the
+    /// step timeout and <see cref="RaftConfiguration.SnapshotChunkAckTimeout"/>, because a chunk to
+    /// a reachable node is seconds of work and a receiver whose install path is wedged must fail
+    /// the transfer in seconds, not minutes. A rejection records the failure and returns
+    /// <see cref="SnapshotInstallOutcome.Rejected"/>; any other outcome is returned as the receiver
+    /// reported it; a hung send propagates as <see cref="TimeoutException"/> to the
+    /// transfer-level handler.
     /// </summary>
-    private async Task<bool> SendOneChunkAsync(
+    private async Task<SnapshotInstallOutcome> SendOneChunkAsync(
         RaftNode node,
         string sessionId,
         long snapshotIndex,
@@ -1024,19 +1063,23 @@ internal sealed class SnapshotSender
             SnapshotChecksum = checksum,
         };
 
+        TimeSpan chunkTimeout = host.Configuration.SnapshotChunkAckTimeout;
+        if (chunkTimeout > stepTimeout)
+            chunkTimeout = stepTimeout;
+
         SnapshotResponse response = await AwaitStepAsync(
             host.SendInstallSnapshotAsync(node, chunk, transferCts.Token),
-            stepTimeout, transferCts, $"install chunk {chunkIndex}").ConfigureAwait(false);
+            chunkTimeout, transferCts, $"install chunk {chunkIndex}").ConfigureAwait(false);
 
-        if (!response.Success)
+        if (response.Outcome == SnapshotInstallOutcome.Rejected)
         {
             RecordFailure(node.Endpoint, cause: "chunk_rejected",
                 error: $"snapshot chunk {chunkIndex} for index {snapshotIndex} was rejected by the follower",
                 unproducible: false);
-            return false;
+            return SnapshotInstallOutcome.Rejected;
         }
 
-        return true;
+        return response.Outcome;
     }
 
     /// <summary>
@@ -1094,7 +1137,7 @@ internal sealed class SnapshotSender
             {
                 await transferCts.CancelAsync().ConfigureAwait(false);
                 throw new TimeoutException(
-                    $"snapshot transfer step '{stepName}' made no progress within {timeout.TotalSeconds:0}s (SnapshotTransferStepTimeout)");
+                    $"snapshot transfer step '{stepName}' made no progress within {timeout.TotalSeconds:0.##}s (SnapshotTransferStepTimeout / SnapshotChunkAckTimeout)");
             }
 
             // No cancellation token: this delay is at most one poll interval, and a cancelled token

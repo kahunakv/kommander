@@ -42,6 +42,7 @@ internal sealed class ReplicationGateway
         IReadOnlyList<byte[]> logs,
         bool autoCommit,
         long expectedGeneration,
+        long expectedTerm,
         CancellationToken cancellationToken);
 
     /// <summary>
@@ -120,7 +121,7 @@ internal sealed class ReplicationGateway
     /// with <see cref="RaftException"/> to prevent userland from forging coordinator entries.
     /// P0 is never a valid target for create, split, merge, or remove.
     /// </summary>
-    internal async Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default)
+    internal async Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, long expectedGeneration = 0, long expectedTerm = 0, CancellationToken cancellationToken = default)
     {
         if (partitionId == RaftSystemConfig.SystemPartition && type == RaftSystemConfig.RaftLogType)
             throw new RaftException("System log type is reserved on the system partition");
@@ -131,7 +132,7 @@ internal sealed class ReplicationGateway
         if (partitionId != RaftSystemConfig.SystemPartition && !partitionProvider.TryGetDataPartition(partitionId, out partition))
         {
             RaftReplicationResult? forwarded = await ForwardToReplicaAsync(
-                partitionId, type, [data], autoCommit, expectedGeneration, cancellationToken).ConfigureAwait(false);
+                partitionId, type, [data], autoCommit, expectedGeneration, expectedTerm, cancellationToken).ConfigureAwait(false);
             if (forwarded is not null)
                 return forwarded;
         }
@@ -144,7 +145,7 @@ internal sealed class ReplicationGateway
 
         do
         {
-            (success, status, ticketId) = await partition.ReplicateLogs(type, data, autoCommit, expectedGeneration).ConfigureAwait(false);
+            (success, status, ticketId) = await partition.ReplicateLogs(type, data, autoCommit, expectedGeneration, expectedTerm).ConfigureAwait(false);
 
             if (status == RaftOperationStatus.ActiveProposal)
                 await Task.Delay(ProposalRetryDelay, cancellationToken).ConfigureAwait(false);
@@ -167,13 +168,14 @@ internal sealed class ReplicationGateway
         IEnumerable<byte[]> logs,
         bool autoCommit = true,
         long expectedGeneration = 0,
+        long expectedTerm = 0,
         CancellationToken cancellationToken = default
     )
     {
         // Materialize once before the retry loop so generator inputs are not re-enumerated on each
         // retry, and list/array inputs skip the copy.
         IReadOnlyList<byte[]> materializedLogs = logs as IReadOnlyList<byte[]> ?? logs.ToList();
-        return ReplicateLogs(partitionId, type, materializedLogs, autoCommit, expectedGeneration, cancellationToken);
+        return ReplicateLogs(partitionId, type, materializedLogs, autoCommit, expectedGeneration, expectedTerm, cancellationToken);
     }
 
     /// <summary>
@@ -192,6 +194,7 @@ internal sealed class ReplicationGateway
         IReadOnlyList<byte[]> logs,
         bool autoCommit = true,
         long expectedGeneration = 0,
+        long expectedTerm = 0,
         CancellationToken cancellationToken = default
     )
     {
@@ -204,7 +207,7 @@ internal sealed class ReplicationGateway
         if (partitionId != RaftSystemConfig.SystemPartition && !partitionProvider.TryGetDataPartition(partitionId, out partition))
         {
             RaftReplicationResult? forwarded = await ForwardToReplicaAsync(
-                partitionId, type, logs, autoCommit, expectedGeneration, cancellationToken).ConfigureAwait(false);
+                partitionId, type, logs, autoCommit, expectedGeneration, expectedTerm, cancellationToken).ConfigureAwait(false);
             if (forwarded is not null)
                 return forwarded;
         }
@@ -222,7 +225,7 @@ internal sealed class ReplicationGateway
             // once before the loop and reused across retries rather than re-enumerated.
             (success, status, ticketId) = ReplicateAttemptHookForTesting is { } hook
                 ? hook()
-                : await partition.ReplicateLogs(type, logs, autoCommit, expectedGeneration).ConfigureAwait(false);
+                : await partition.ReplicateLogs(type, logs, autoCommit, expectedGeneration, expectedTerm).ConfigureAwait(false);
 
             if (status == RaftOperationStatus.ActiveProposal)
                 await Task.Delay(ProposalRetryDelay, cancellationToken).ConfigureAwait(false);
@@ -251,6 +254,7 @@ internal sealed class ReplicationGateway
         IReadOnlyList<byte[]> logs,
         bool autoCommit,
         long expectedGeneration,
+        long expectedTerm,
         CancellationToken cancellationToken)
     {
         IReadOnlyList<RaftReplica>? replicas = routingTable.TryGetPlacementReplicas(partitionId);
@@ -267,7 +271,7 @@ internal sealed class ReplicationGateway
 
             RaftReplicationResult? result = await forwardReplicateLogs(
                 new RaftNode(replica.Endpoint), partitionId, type, logs,
-                autoCommit, expectedGeneration, cancellationToken).ConfigureAwait(false);
+                autoCommit, expectedGeneration, expectedTerm, cancellationToken).ConfigureAwait(false);
 
             if (result is null)
                 continue; // unreachable or transport lacks forwarding — try the next replica
@@ -346,6 +350,27 @@ internal sealed class ReplicationGateway
         RaftPartition partition = partitionProvider.GetPartition(partitionId);
         long currentGeneration = partition.Generation;
 
+        // ── Term fence (batch-level). A non-zero ExpectedTerm names the term the caller observed this node
+        //    leading in; it is a statement about the node, so one mismatch refuses the whole batch before any
+        //    append. Two distinct non-zero terms cannot both be current, so they are refused as well. The
+        //    published term read here can trail a step-down by one executor write; the admitted proposal
+        //    carries the term so the executor re-checks it against the authoritative value. ──
+        long batchTerm = 0;
+        for (int i = 0; i < entries.Count; i++)
+        {
+            long expectedTerm = entries[i].ExpectedTerm;
+            if (expectedTerm == 0)
+                continue;
+
+            if (batchTerm != 0 && batchTerm != expectedTerm)
+                return RejectBatch(entries.Count, RaftOperationStatus.TermMismatch);
+
+            batchTerm = expectedTerm;
+        }
+
+        if (batchTerm != 0 && batchTerm != partition.Term)
+            return RejectBatch(entries.Count, RaftOperationStatus.TermMismatch);
+
         // ── Per-entry fence classification. Fenced entries take their result slot now (PartitionMoved) and are
         //    excluded from the append; admitted entries are split into the auto prefix and trailing manual
         //    group, each RaftLog carrying its input index so ids read back after propose stay index-aligned. ──
@@ -403,7 +428,7 @@ internal sealed class ReplicationGateway
         if (autoLogs.Count > 0)
         {
             (bool autoOk, RaftOperationStatus autoStatus, HLCTimestamp autoTicket) =
-                await partition.ReplicateEntries(autoLogs, admissionBackstop, autoCommit: true).ConfigureAwait(false);
+                await partition.ReplicateEntries(autoLogs, admissionBackstop, autoCommit: true, expectedTerm: batchTerm).ConfigureAwait(false);
 
             if (!autoOk)
                 return FailBatch(results, autoInputIndex, manualInputIndex, autoStatus);
@@ -424,7 +449,7 @@ internal sealed class ReplicationGateway
         if (manualLogs.Count > 0)
         {
             (bool manualOk, RaftOperationStatus manualStatus, HLCTimestamp manualTicket) =
-                await partition.ReplicateEntries(manualLogs, admissionBackstop, autoCommit: false).ConfigureAwait(false);
+                await partition.ReplicateEntries(manualLogs, admissionBackstop, autoCommit: false, expectedTerm: batchTerm).ConfigureAwait(false);
 
             if (!manualOk)
                 return FailBatch(results, [], manualInputIndex, manualStatus);

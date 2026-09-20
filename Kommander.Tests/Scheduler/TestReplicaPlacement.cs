@@ -71,12 +71,25 @@ public sealed class TestReplicaPlacement
     private static Task WaitForIdleAsync(RaftManager manager) =>
         manager.SystemCoordinator.DrainAsync().WaitAsync(TimeSpan.FromSeconds(5));
 
-    private static void AcceptReplication(RaftManager manager, List<byte[]>? payloads = null) =>
+    /// <summary>
+    /// Accepts every map replication and every membership-fence confirmation: these tests run
+    /// without a Raft quorum on the data ranges, so the quorum-confirmed leadership a replica change
+    /// requires (<see cref="RaftSystemCoordinator.ConfirmPartitionLeadershipOverride"/>) is granted
+    /// here and refused explicitly by <see cref="DenyPartitionLeadership"/> where a test needs it.
+    /// </summary>
+    private static void AcceptReplication(RaftManager manager, List<byte[]>? payloads = null)
+    {
+        manager.SystemCoordinator.ConfirmPartitionLeadershipOverride = static (_, _) => Task.FromResult(true);
         manager.SystemCoordinator.ReplicateOverride = (_, data, _, _) =>
         {
             payloads?.Add(data);
             return Task.FromResult(new RaftReplicationResult(true, RaftOperationStatus.Success, HLCTimestamp.Zero, 1));
         };
+    }
+
+    /// <summary>The membership fence cannot confirm the target partition's leadership.</summary>
+    private static void DenyPartitionLeadership(RaftManager manager) =>
+        manager.SystemCoordinator.ConfirmPartitionLeadershipOverride = static (_, _) => Task.FromResult(false);
 
     private static RaftReplica Replica(string endpoint, RaftReplicaRole role = RaftReplicaRole.Voter, long since = 1) =>
         new() { Endpoint = endpoint, Role = role, SinceGeneration = since };
@@ -450,6 +463,113 @@ public sealed class TestReplicaPlacement
             Assert.Equal(RaftOperationStatus.Success, status);
             Assert.Equal(3, generation);
             Assert.Single(payloads); // only the final drop was committed
+            Assert.DoesNotContain(MapEntry(manager, 1).Replicas, r => r.Endpoint == "c:1");
+        }
+    }
+
+    // ── Membership fence: no replica change without the partition's own confirmed leadership ──
+
+    [Fact]
+    public async Task AddReplica_LeadershipNotConfirmed_RefusedWithoutCommit()
+    {
+        // The P0 leader can commit through P0's quorum, but it cannot confirm partition 1's
+        // leadership (its voters are unreachable): the change must not take effect.
+        RaftManager manager = Build();
+        using (manager)
+        {
+            List<byte[]> payloads = [];
+            AcceptReplication(manager, payloads);
+            manager.SystemCoordinator.Send(MakeConfigReplicated(
+                PlacedRange(1, 5, Replica(Local), Replica("b:1"), Replica("c:1"))));
+            await WaitForIdleAsync(manager);
+            payloads.Clear();
+            DenyPartitionLeadership(manager);
+
+            (RaftOperationStatus status, long generation) =
+                await SendReplicaChange(manager, RaftSystemRequestType.AddReplica, 1, "d:1");
+
+            Assert.Equal(RaftOperationStatus.LeadershipNotConfirmed, status);
+            Assert.Equal(5, generation);
+            Assert.Empty(payloads); // nothing was committed through P0
+            RaftPartitionRange entry = MapEntry(manager, 1);
+            Assert.Equal(5, entry.Generation);
+            Assert.DoesNotContain(entry.Replicas, r => r.Endpoint == "d:1");
+        }
+    }
+
+    [Fact]
+    public async Task PromoteReplica_LeadershipNotConfirmed_RefusedWithoutCommit()
+    {
+        RaftManager manager = Build();
+        using (manager)
+        {
+            List<byte[]> payloads = [];
+            AcceptReplication(manager, payloads);
+            manager.SystemCoordinator.Send(MakeConfigReplicated(
+                PlacedRange(1, 5, Replica(Local), Replica("b:1"), Replica("d:1", RaftReplicaRole.Learner))));
+            await WaitForIdleAsync(manager);
+            payloads.Clear();
+            DenyPartitionLeadership(manager);
+
+            (RaftOperationStatus status, long generation) =
+                await SendReplicaChange(manager, RaftSystemRequestType.PromoteReplica, 1, "d:1");
+
+            Assert.Equal(RaftOperationStatus.LeadershipNotConfirmed, status);
+            Assert.Equal(5, generation);
+            Assert.Empty(payloads);
+            RaftReplica learner = Assert.Single(MapEntry(manager, 1).Replicas, r => r.Endpoint == "d:1");
+            Assert.Equal(RaftReplicaRole.Learner, learner.Role); // still outside the quorum
+        }
+    }
+
+    [Fact]
+    public async Task RemoveReplica_LeadershipNotConfirmed_RefusedBeforeTheQuorumChange()
+    {
+        RaftManager manager = Build();
+        using (manager)
+        {
+            List<byte[]> payloads = [];
+            AcceptReplication(manager, payloads);
+            manager.SystemCoordinator.Send(MakeConfigReplicated(
+                PlacedRange(1, 5, Replica(Local), Replica("b:1"), Replica("c:1"))));
+            await WaitForIdleAsync(manager);
+            payloads.Clear();
+            DenyPartitionLeadership(manager);
+
+            (RaftOperationStatus status, long generation) =
+                await SendReplicaChange(manager, RaftSystemRequestType.RemoveReplica, 1, "c:1");
+
+            Assert.Equal(RaftOperationStatus.LeadershipNotConfirmed, status);
+            Assert.Equal(5, generation);
+            Assert.Empty(payloads);
+            RaftReplica voter = Assert.Single(MapEntry(manager, 1).Replicas, r => r.Endpoint == "c:1");
+            Assert.Equal(RaftReplicaRole.Voter, voter.Role);
+        }
+    }
+
+    [Fact]
+    public async Task RemoveReplica_ResumesInterruptedRemoval_WithoutLeadershipConfirmation()
+    {
+        // The replica already left the quorum denominator at the first commit; the final drop
+        // changes no quorum, so it must complete even when the range has no confirmable leader
+        // (otherwise a Removing replica stays stranded exactly when the range is unhealthy).
+        RaftManager manager = Build();
+        using (manager)
+        {
+            List<byte[]> payloads = [];
+            AcceptReplication(manager, payloads);
+            manager.SystemCoordinator.Send(MakeConfigReplicated(
+                PlacedRange(1, 2, Replica(Local), Replica("b:1"), Replica("c:1", RaftReplicaRole.Removing))));
+            await WaitForIdleAsync(manager);
+            payloads.Clear();
+            DenyPartitionLeadership(manager);
+
+            (RaftOperationStatus status, long generation) =
+                await SendReplicaChange(manager, RaftSystemRequestType.RemoveReplica, 1, "c:1");
+
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Assert.Equal(3, generation);
+            Assert.Single(payloads);
             Assert.DoesNotContain(MapEntry(manager, 1).Replicas, r => r.Endpoint == "c:1");
         }
     }
@@ -833,7 +953,7 @@ public sealed class TestReplicaPlacement
         public event Action<int, RaftLog>? OnReplicationError { add { } remove { } }
         public event Func<int, RaftLog, Task<bool>>? OnLogRestored { add { } remove { } }
         public event Func<int, RaftLog, Task<bool>>? OnReplicationReceived { add { } remove { } }
-        public event Func<int, string, Task<bool>>? OnLeaderChanged { add { } remove { } }
+        public event Func<int, string, Task<bool>>? OnLeaderChanged { add { } remove { } } public event Func<int, long, Task>? OnLeadershipLost { add { } remove { } }
         public event Action<IReadOnlyList<RaftPartitionRange>>? OnPartitionMapChanged { add { } remove { } }
         public event Action<ClusterMembership>? OnMembershipChanged { add { } remove { } }
 
@@ -851,8 +971,8 @@ public sealed class TestReplicaPlacement
         public void Vote(VoteRequest request) => throw new NotImplementedException();
         public void AppendLogs(AppendLogsRequest request) => throw new NotImplementedException();
         public void CompleteAppendLogs(CompleteAppendLogsRequest request) => throw new NotImplementedException();
-        public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default) => throw new NotImplementedException();
-        public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, long expectedGeneration = 0, long expectedTerm = 0, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0, long expectedTerm = 0, CancellationToken cancellationToken = default) => throw new NotImplementedException();
         public Task<RaftBatchReplicationResult> ReplicateEntries(int partitionId, IReadOnlyList<RaftProposalEntry> entries, CancellationToken cancellationToken = default) => throw new NotImplementedException();
         public Task<RaftReplicationResult> ReplicateCheckpoint(int partitionId, CancellationToken cancellationToken = default) => throw new NotImplementedException();
         public Task<(bool success, RaftOperationStatus status, long commitLogId)> CommitLogs(int partitionId, HLCTimestamp ticketId, CancellationToken cancellationToken = default) => throw new NotImplementedException();
@@ -882,7 +1002,7 @@ public sealed class TestReplicaPlacement
         public Task<RaftPartitionLifecycleResult> RemovePartitionAsync(int partitionId, CancellationToken ct = default) => throw new NotImplementedException();
         public Task<RaftPartitionLifecycleResult> SplitPartitionAsync(int sourcePartitionId, int targetPartitionId = 0, RaftSplitPlan? plan = null, CancellationToken ct = default) => throw new NotImplementedException();
         public Task<RaftPartitionLifecycleResult> MergePartitionsAsync(int survivorPartitionId, int sourcePartitionId, RaftMergePlan? plan = null, CancellationToken ct = default) => throw new NotImplementedException();
-        public long GetPartitionGeneration(int partitionId) => throw new NotImplementedException();
+        public long GetPartitionGeneration(int partitionId) => throw new NotImplementedException(); public long GetPartitionTerm(int partitionId) => throw new NotImplementedException();
         public bool HostsPartition(int partitionId) => throw new NotImplementedException();
         public IReadOnlyList<RaftReplica> GetPartitionReplicas(int partitionId) => throw new NotImplementedException();
         public string? GetPartitionLeaderHint(int partitionId) => throw new NotImplementedException();

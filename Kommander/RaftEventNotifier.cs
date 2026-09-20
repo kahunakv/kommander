@@ -22,6 +22,7 @@ internal sealed class RaftEventNotifier
     internal event Func<int, RaftLog, Task<bool>>? OnReplicationReceived;
     internal event Func<int, RaftLog, Task<bool>>? OnSystemReplicationReceived;
     internal event Func<int, string, Task<bool>>? OnLeaderChanged;
+    internal event Func<int, long, Task>? OnLeadershipLost;
     internal event Action<IReadOnlyList<RaftPartitionRange>>? OnPartitionMapChanged;
     internal event Action<ClusterMembership>? OnMembershipChanged;
 
@@ -87,6 +88,14 @@ internal sealed class RaftEventNotifier
         if (callback is null)
             return true;
         return await callback(partitionId, node).ConfigureAwait(false);
+    }
+
+    internal async Task InvokeLeadershipLost(int partitionId, long term)
+    {
+        Func<int, long, Task>? callback = OnLeadershipLost;
+        if (callback is null)
+            return;
+        await callback(partitionId, term).ConfigureAwait(false);
     }
 
     internal void InvokePartitionMapChanged(IReadOnlyList<RaftPartitionRange> ranges) =>

@@ -81,10 +81,14 @@ internal sealed class ReadIndexCoordinator
     /// </summary>
     private readonly Dictionary<string, long> lastVoterAckTicks = [];
 
-    /// <summary>Monotonic timestamp when this leader last heard same-term acks from a majority of
-    /// voters (refreshed while quiesced, since a quiesced leader legitimately receives none).
-    /// When it falls behind the check-quorum window the leader steps down.</summary>
-    private long lastQuorumContactTicks;
+    /// <summary>Monotonic anchor of the current leadership stint for the check-quorum window: set
+    /// at promotion (the election is the last proven quorum contact) and never refreshed
+    /// afterwards — recency comes from <see cref="lastVoterAckTicks"/> alone, so a quiesced
+    /// leader cannot keep the window fresh by receiving nothing.</summary>
+    private long leadershipAnchorTicks;
+
+    /// <summary>Scratch for the majority-th freshest ack selection; executor thread only.</summary>
+    private readonly List<long> voterAckScratch = [];
 
     /// <summary>
     /// Bookkeeping for one read-index quorum round: the commit frontier captured at round start,
@@ -409,44 +413,71 @@ internal sealed class ReadIndexCoordinator
     }
 
     /// <summary>
-    /// Check-quorum evaluation for one leader tick. Returns <see langword="true"/> when this
-    /// leader has not heard same-term acks from a majority of voters for the configured window and
-    /// must therefore step down.
+    /// Check-quorum evaluation for one leader tick (<see cref="RaftConfiguration.EnableCheckQuorum"/>).
     ///
-    /// <para>A quiesced leader stops heartbeating, so an absence of acks proves nothing; the grace
-    /// window is kept fresh instead so it restarts on un-quiesce. This does not close the
-    /// stale-read hole (<see cref="ConfirmLeadershipAsync"/> does); it bounds how long an isolated
-    /// leader lingers so minority-side callers fail fast.</para>
+    /// <para><b>The measure is the age of the last moment a majority was simultaneously fresh</b>:
+    /// with the leader counting as "now", the majority-th newest same-term voter ack. The window
+    /// (<see cref="RaftConfiguration.CheckQuorumWindow"/>) is measured from that instant, or from
+    /// the promotion anchor while no acks exist yet. An earlier form counted "voters acked within
+    /// the window" and only then started a second window, so an isolated leader lingered for two
+    /// windows — eight seconds at the shipped defaults, longer than the election-timeout ceiling
+    /// it was meant to stay under.</para>
+    ///
+    /// <para><b>Quiescence does not refresh the clock.</b> A quiesced leader stops heartbeating, so
+    /// it receives no acks — and an idle leader whose peers were caught up before a network cut
+    /// would have kept the role for the length of the cut. Instead, once half the window has
+    /// passed without a majority contact, the verdict is <see cref="CheckQuorumVerdict.Probe"/>:
+    /// the caller un-quiesces and forces one heartbeat round (the same wake-up the read-index
+    /// confirmation uses). The acks of a healthy cluster refresh the contact and the leader
+    /// re-quiesces on its next heartbeat tick; an isolated leader's probes go unanswered and it
+    /// steps down when the full window elapses — the same bound as a non-quiesced leader.</para>
+    ///
+    /// <para>This does not close the stale-read hole (<see cref="ConfirmLeadershipAsync"/> does);
+    /// it bounds how long an isolated leader lingers so minority-side callers fail fast and,
+    /// with the window validated below <c>StartElectionTimeout</c>, so it steps down before the
+    /// majority side can elect a replacement.</para>
     /// </summary>
-    public bool ShouldStepDownOnQuorumLoss(long nowTicks)
+    public CheckQuorumVerdict EvaluateCheckQuorum(long nowTicks)
     {
-        if (coreState.Quiesced)
-        {
-            lastQuorumContactTicks = nowTicks;
-            return false;
-        }
+        if (leadershipAnchorTicks == 0)
+            return CheckQuorumVerdict.Hold;
 
-        TimeSpan window = host.Configuration.HeartbeatInterval * host.Configuration.CheckQuorumIntervalMultiplier;
+        TimeSpan window = host.Configuration.CheckQuorumWindow;
+
         int votersTotal = 1;    // the local leader
-        int reachable = 1;
+        voterAckScratch.Clear();
         foreach (RaftNode node in host.Nodes)
         {
             if (!host.IsVoter(node.Endpoint))
                 continue;
             votersTotal++;
-            if (lastVoterAckTicks.TryGetValue(node.Endpoint, out long ackTicks)
-                && RaftMonotonic.Elapsed(ackTicks, nowTicks) < window)
-                reachable++;
+            voterAckScratch.Add(lastVoterAckTicks.TryGetValue(node.Endpoint, out long ackTicks) ? ackTicks : 0);
         }
 
-        if (reachable >= votersTotal / 2 + 1)
+        int peersNeeded = votersTotal / 2 + 1 - 1; // majority minus the leader itself
+        long contactTicks;
+        if (peersNeeded <= 0)
         {
-            lastQuorumContactTicks = nowTicks;
-            return false;
+            contactTicks = nowTicks; // single-voter partition: the leader alone is the quorum
+        }
+        else
+        {
+            voterAckScratch.Sort();
+            voterAckScratch.Reverse();
+            contactTicks = voterAckScratch[peersNeeded - 1];
         }
 
-        return lastQuorumContactTicks != 0
-            && RaftMonotonic.Elapsed(lastQuorumContactTicks, nowTicks) >= window;
+        if (contactTicks < leadershipAnchorTicks)
+            contactTicks = leadershipAnchorTicks;
+
+        TimeSpan elapsed = RaftMonotonic.Elapsed(contactTicks, nowTicks);
+        if (elapsed >= window)
+            return CheckQuorumVerdict.StepDown;
+
+        if (coreState.Quiesced && elapsed >= window / 2)
+            return CheckQuorumVerdict.Probe;
+
+        return CheckQuorumVerdict.Hold;
     }
 
     /// <summary>
@@ -461,7 +492,7 @@ internal sealed class ReadIndexCoordinator
         lastLeadershipConfirmedTerm = -1;
         coreState.InvalidateLeadershipLease();
         lastVoterAckTicks.Clear();
-        lastQuorumContactTicks = 0;
+        leadershipAnchorTicks = 0;
 
         if (readIndexRound is not null)
         {
@@ -497,6 +528,24 @@ internal sealed class ReadIndexCoordinator
         lastLeadershipConfirmedTerm = -1;
         coreState.InvalidateLeadershipLease();
         lastVoterAckTicks.Clear();
-        lastQuorumContactTicks = nowTicks;
+        leadershipAnchorTicks = nowTicks;
     }
+}
+
+/// <summary>
+/// One leader tick's check-quorum decision — see <see cref="ReadIndexCoordinator.EvaluateCheckQuorum"/>.
+/// </summary>
+public enum CheckQuorumVerdict
+{
+    /// <summary>A majority was heard inside the window (or the probe is not due yet).</summary>
+    Hold,
+
+    /// <summary>
+    /// Quiesced and past half the window without a majority contact: un-quiesce and force one
+    /// heartbeat round so the acks (or their absence) decide before the window elapses.
+    /// </summary>
+    Probe,
+
+    /// <summary>The full window elapsed without a majority contact: step down.</summary>
+    StepDown,
 }

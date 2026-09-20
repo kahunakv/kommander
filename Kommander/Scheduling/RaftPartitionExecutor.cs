@@ -238,7 +238,7 @@ public sealed class RaftPartitionExecutor : IDisposable
     // single owner and blocks on the batch call (GetResult) before touching this again, and the
     // state machine only reads the list during the call — it never retains the reference — so reuse
     // is safe. Cleared at the start of every ExecuteBatchAsync.
-    private readonly List<(List<RaftLog>? Logs, bool AutoCommit, ulong? ReplyCorrelationId)> _batchScratch = new(256);
+    private readonly List<(List<RaftLog>? Logs, bool AutoCommit, long ExpectedTerm, ulong? ReplyCorrelationId)> _batchScratch = new(256);
 
     // ── Restore state ──────────────────────────────────────────────────────
 
@@ -1315,7 +1315,7 @@ public sealed class RaftPartitionExecutor : IDisposable
                         op.Reply?.TrySetResult(RaftResponseStatic.PartitionMovedResponse);
                         break;
                     }
-                    await _stateMachine.ReplicateLogsAsync(request.Logs, request.AutoCommit, RegisterReply(op)).ConfigureAwait(false);
+                    await _stateMachine.ReplicateLogsAsync(request.Logs, request.AutoCommit, request.ExpectedTerm, RegisterReply(op)).ConfigureAwait(false);
                     break;
 
                 case RaftRequestType.ReplicateCheckpoint:
@@ -1544,7 +1544,7 @@ public sealed class RaftPartitionExecutor : IDisposable
                 continue;
             }
 
-            _batchScratch.Add((req.Logs, req.AutoCommit, RegisterReply(op)));
+            _batchScratch.Add((req.Logs, req.AutoCommit, req.ExpectedTerm, RegisterReply(op)));
         }
 
         ValueStopwatch sw = ValueStopwatch.StartNew();

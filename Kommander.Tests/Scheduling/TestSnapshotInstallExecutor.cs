@@ -117,10 +117,53 @@ public class TestSnapshotInstallExecutor
             Install(snapshotIndex: 50, lastIncludedTerm: 5, leaderTerm: 6, leaderEndpoint: "L:1"));
 
         Assert.Equal(RaftOperationStatus.Success, resp.Status);
+        // The reply says a skip happened, so the sender can tell it from an import.
+        Assert.Equal(SnapshotInstallOutcome.SkippedAlreadyCovered, resp.SnapshotOutcome);
         Assert.False(transfer.ImportCalled);
         Assert.Equal(0, wal.BoundaryCallCount);
         Assert.Equal(RaftNodeState.Leader, sm.NodeState);  // not stepped down
         Assert.Equal(1, sm.CurrentTerm);
+    }
+
+    [Fact]
+    public async Task CheckpointMarkerOverAGap_DoesNotSkipTheInstall()
+    {
+        (RaftPartitionStateMachine sm, FakeHost host, CapturingFacade wal, CapturingTransfer transfer) = Build();
+        sm.SetLeaderForTesting(1);
+        // A follower holds entries through N-3, a CommittedCheckpoint row landed at N over the gap
+        // N-2..N-1, and the boundary reports N with a matching term. The install at N must run:
+        // the checkpoint certifies entries this node never held, which is exactly what the
+        // snapshot repairs. (Every backend withholds the checkpoint id in this state; the fence
+        // here is the second line.)
+        wal.MaxLog = 100;
+        wal.LastCheckpoint = 100;
+        wal.TermAtIndex = 5;
+        wal.PresentIndex = 97;
+
+        RaftResponse resp = await sm.InstallSnapshotAsync(
+            Install(snapshotIndex: 100, lastIncludedTerm: 5, leaderTerm: 5, leaderEndpoint: "L:1"));
+
+        Assert.Equal(RaftOperationStatus.Success, resp.Status);
+        Assert.Equal(SnapshotInstallOutcome.Installed, resp.SnapshotOutcome);
+        Assert.True(transfer.ImportCalled);
+        Assert.Equal(1, wal.BoundaryCallCount);
+    }
+
+    [Fact]
+    public async Task IdempotentSkip_WhenThePresenceFrontierCoversTheIndex()
+    {
+        (RaftPartitionStateMachine sm, FakeHost host, CapturingFacade wal, CapturingTransfer transfer) = Build();
+        sm.SetLeaderForTesting(1);
+        wal.LastCheckpoint = 100;
+        wal.TermAtIndex = 5;
+        wal.PresentIndex = 100; // the boundary is contiguously held
+
+        RaftResponse resp = await sm.InstallSnapshotAsync(
+            Install(snapshotIndex: 100, lastIncludedTerm: 5, leaderTerm: 5, leaderEndpoint: "L:1"));
+
+        Assert.Equal(SnapshotInstallOutcome.SkippedAlreadyCovered, resp.SnapshotOutcome);
+        Assert.False(transfer.ImportCalled);
+        Assert.Equal(0, wal.BoundaryCallCount);
     }
 
     [Fact]
@@ -137,6 +180,7 @@ public class TestSnapshotInstallExecutor
             Install(snapshotIndex: 50, lastIncludedTerm: 5, leaderTerm: 5, leaderEndpoint: "L:1"));
 
         Assert.Equal(RaftOperationStatus.Success, resp.Status);
+        Assert.Equal(SnapshotInstallOutcome.Installed, resp.SnapshotOutcome);
         Assert.True(transfer.ImportCalled);
         Assert.Equal(1, wal.BoundaryCallCount);
     }
@@ -155,6 +199,7 @@ public class TestSnapshotInstallExecutor
             Install(snapshotIndex: 80, lastIncludedTerm: 2, leaderTerm: 3, leaderEndpoint: "old:1"));
 
         Assert.Equal(RaftOperationStatus.Errored, resp.Status);
+        Assert.Equal(SnapshotInstallOutcome.Rejected, resp.SnapshotOutcome);
         Assert.False(transfer.ImportCalled);
         Assert.Equal(0, wal.BoundaryCallCount);
     }
@@ -402,6 +447,11 @@ public class TestSnapshotInstallExecutor
         public long MaxLog { get; set; }
         public long LastCheckpoint { get; set; } = -1;
         public long TermAtIndex { get; set; } = -1;
+
+        /// <summary>Contiguous presence frontier; -1 = not tracked (the facade default).</summary>
+        public long PresentIndex { get; set; } = -1;
+
+        public long GetPresentIndex() => PresentIndex;
         public RaftOperationStatus BoundaryStatus { get; set; } = RaftOperationStatus.Success;
 
         public int BoundaryCallCount { get; private set; }

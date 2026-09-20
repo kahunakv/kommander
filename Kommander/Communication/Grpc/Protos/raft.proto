@@ -266,6 +266,7 @@ message GrpcInstallSnapshotRequest {
 
 message GrpcInstallSnapshotResponse {
     bool Success = 1;
+    int32 Outcome = 2; // SnapshotInstallOutcome; absent (0) == Rejected, never a silent success
 }
 
 message GrpcPingRequest {

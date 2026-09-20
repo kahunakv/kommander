@@ -455,10 +455,10 @@ public sealed class SimulatedTransport : ICommunication
 
     public Task<RaftReplicationResult?> ForwardReplicateLogs(
         RaftManager manager, RaftNode node, int partitionId, string type,
-        IReadOnlyList<byte[]> logs, bool autoCommit, long expectedGeneration,
+        IReadOnlyList<byte[]> logs, bool autoCommit, long expectedGeneration, long expectedTerm,
         CancellationToken cancellationToken = default) =>
         inner.ForwardReplicateLogs(
-            manager, node, partitionId, type, logs, autoCommit, expectedGeneration, cancellationToken);
+            manager, node, partitionId, type, logs, autoCommit, expectedGeneration, expectedTerm, cancellationToken);
 
     // ── Internals ─────────────────────────────────────────────────────────
 

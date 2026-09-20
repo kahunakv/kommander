@@ -62,6 +62,14 @@ public sealed class RaftRequest
     public long ExpectedGeneration { get; }
 
     /// <summary>
+    /// When non-zero, the proposal is refused with <see cref="RaftOperationStatus.TermMismatch"/>
+    /// before anything is appended unless this node's current term for the partition equals it.
+    /// Evaluated on the executor thread, where the term is authoritative, after the leader check.
+    /// Zero means "no fence".
+    /// </summary>
+    public long ExpectedTerm { get; }
+
+    /// <summary>
     /// Log index of the entry immediately preceding the first entry in <see cref="Logs"/>.
     /// Zero when the batch starts from the beginning of the log.
     /// Carried on <see cref="RaftRequestType.AppendLogs"/> messages so the follower can
@@ -138,12 +146,13 @@ public sealed class RaftRequest
         Quiesce = quiesce;
     }
 
-    public RaftRequest(RaftRequestType type, List<RaftLog> logs, bool autoCommit, long expectedGeneration = 0)
+    public RaftRequest(RaftRequestType type, List<RaftLog> logs, bool autoCommit, long expectedGeneration = 0, long expectedTerm = 0)
     {
         Type = type;
         Logs = logs;
         AutoCommit = autoCommit;
         ExpectedGeneration = expectedGeneration;
+        ExpectedTerm = expectedTerm;
     }
     
     public RaftRequest(RaftRequestType type, HLCTimestamp timestamp, bool autoCommit)

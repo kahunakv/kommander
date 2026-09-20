@@ -311,6 +311,14 @@ Two operational notes on the handoff:
   anchor, the first index the leader could actually read, and the last checkpoint — the checkpoint is
   what tells the two causes apart: at or above the first readable index means the anchor was
   compacted away and only a snapshot can seed that follower.
+- A follower whose reported frontier **does not advance** although batches anchored at that very
+  frontier are shipped and acknowledged cannot be converged by log shipping at all. The no-progress
+  probe paces and re-anchors such batches; once the fruitless streak reaches the warning threshold
+  (four ships) the leader also offers the follower a snapshot from its last checkpoint, through the
+  same escalation path as a refused batch. This is what lets a **new** leader resume a seed the old
+  leader left unfinished: its own WAL may still serve the stuck follower's anchor (the follower's
+  position pins the retention floor), so no refusal ever occurs, and without this trigger the
+  follower stayed at frontier 0 for the rest of the run. Without a checkpoint nothing is shipped.
 
 ---
 

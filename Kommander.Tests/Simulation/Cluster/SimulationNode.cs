@@ -218,6 +218,15 @@ public sealed class SimulationNode : IAsyncDisposable
             // scenario family exercises it deliberately.
             EnableQuiescence = false,
 
+            // Check-quorum ships on, with its window derived from StartElectionTimeout. Here that
+            // window is 100 ms while a heartbeat's ack takes two 50 ms steps to return (one hop
+            // per step each way), so a leader's freshest majority contact is always at the edge
+            // of the window and it would step down on nearly every tick. A sweep run that way
+            // measures leader churn instead of the faults it drew, and the churn starved the
+            // checkpoint action's step budget on seed 3490179000269211394. Off until a scenario
+            // family exercises it with a transport latency that fits inside the window.
+            EnableCheckQuorum = false,
+
             // Each awaited step of an outbound snapshot transfer must finish inside this bound.
             // The production default is two minutes. A simulated step is an in-memory call that
             // finishes in microseconds unless a fault holds it, so a short bound costs a healthy

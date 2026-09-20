@@ -91,6 +91,23 @@ public interface IRaft
     public event Func<int, string, Task<bool>>? OnLeaderChanged;
 
     /// <summary>
+    /// Fired when THIS node stops leading a partition, with the term it led in. Every demotion
+    /// path raises it (voluntary step-down, transfer, check-quorum, WAL stall, a higher term seen
+    /// on any RPC), from the partition executor, before or together with the
+    /// <see cref="OnLeaderChanged"/> notification for the same transition.
+    /// <para>Use it to drop belief-only state the moment leadership is gone: staged intents,
+    /// locks, and any proposal the consumer fenced with this term
+    /// (<see cref="GetPartitionTerm"/>) — the executor refuses such proposals with
+    /// <see cref="Data.RaftOperationStatus.TermMismatch"/> from this point on, so nothing keyed on
+    /// the lost term can take effect afterwards. <see cref="OnLeaderChanged"/> with an empty
+    /// endpoint says only that the partition has no published leader; it carries no term and also
+    /// fires on transitions this node was never the leader for.</para>
+    /// <para><b>Threading:</b> raised on the partition executor thread; handlers must be quick and
+    /// must not call back into the partition synchronously.</para>
+    /// </summary>
+    public event Func<int, long, Task>? OnLeadershipLost;
+
+    /// <summary>
     /// Fired every time <c>StartUserPartitions</c> applies a new partition map —
     /// after <c>ConfigReplicated</c>, <c>ConfigRestored</c>, <c>LeaderChanged</c>,
     /// or any split / merge phase transition.
@@ -289,13 +306,21 @@ public interface IRaft
     /// if the partition's committed generation no longer matches this value.
     /// Zero disables the fence (default behavior).
     /// </param>
+    /// <param name="expectedTerm">
+    /// When non-zero, the proposal is refused with <see cref="RaftOperationStatus.TermMismatch"/>
+    /// BEFORE anything is appended unless this node's current term for the partition equals it.
+    /// Read the term with <see cref="GetPartitionTerm"/> when the belief-only work begins, and
+    /// fence the resulting write with it: a leader that stepped down and was re-elected in a newer
+    /// term then refuses the write definitely, instead of accepting a proposal whose preconditions
+    /// were computed under a leadership that no longer holds. Zero disables the fence.
+    /// </param>
     /// <returns></returns>
     /// <exception cref="PartitionNotHostedException">
     /// The partition is in the committed map but not materialized on this node (and forwarding to
     /// a replica was unavailable) — normal under replica placement; route to a node that hosts
     /// the range (<see cref="GetPartitionReplicas"/>).
     /// </exception>
-    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default);
+    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, long expectedGeneration = 0, long expectedTerm = 0, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Replicate logs to the followers in the partition
@@ -306,8 +331,9 @@ public interface IRaft
     /// <param name="autoCommit"></param>
     /// <param name="cancellationToken"></param>
     /// <param name="expectedGeneration"></param>
+    /// <param name="expectedTerm">See the single-payload overload.</param>
     /// <returns></returns>
-    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default);
+    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0, long expectedTerm = 0, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Replicate logs to the followers in the partition.
@@ -316,13 +342,13 @@ public interface IRaft
     /// The default implementation materializes to a list and delegates; override in
     /// <see cref="RaftManager"/> for the zero-copy path.
     /// </summary>
-    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IReadOnlyList<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default)
-        => ReplicateLogs(partitionId, type, (IEnumerable<byte[]>)logs, autoCommit, expectedGeneration, cancellationToken);
+    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IReadOnlyList<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0, long expectedTerm = 0, CancellationToken cancellationToken = default)
+        => ReplicateLogs(partitionId, type, (IEnumerable<byte[]>)logs, autoCommit, expectedGeneration, expectedTerm, cancellationToken);
 
     /// <summary>
     /// Replicate a <b>heterogeneous, per-entry-typed</b> batch to one partition as a single proposal.
     /// <para>
-    /// Where <see cref="ReplicateLogs(int,string,IReadOnlyList{byte[]},bool,long,CancellationToken)"/> forces
+    /// Where <see cref="ReplicateLogs(int,string,IReadOnlyList{byte[]},bool,long,long,CancellationToken)"/> forces
     /// one <c>type</c> and one <c>autoCommit</c> flag across every payload, this surface accepts entries that
     /// each carry their own <see cref="RaftProposalEntry.Type"/>, so a consumer can coalesce unrelated writes
     /// into <b>one</b> proposal — one AppendEntries round trip and one group-committed WAL flush — while still
@@ -903,6 +929,22 @@ public interface IRaft
     /// Reads from the in-memory partition dictionary — no WAL I/O.
     /// </summary>
     public long GetPartitionGeneration(int partitionId);
+
+    /// <summary>
+    /// The current Raft term of <paramref name="partitionId"/> on this node, or -1 when this node
+    /// does not host the partition. Readable from any thread; the value is at most one executor
+    /// write behind the authoritative term.
+    /// <para>This is the fence input for <c>ReplicateLogs(..., expectedTerm)</c> and
+    /// <see cref="RaftProposalEntry.ExpectedTerm"/>: read it once, alongside the leadership check
+    /// that admits the belief-only work (<see cref="AmILeaderQuick"/> or
+    /// <see cref="ConfirmLeadershipAsync"/>), and stamp the resulting proposal with it. The
+    /// executor compares the stamp with the authoritative term before accepting, so a stale read
+    /// here costs a <see cref="Data.RaftOperationStatus.TermMismatch"/> refusal, never a write
+    /// admitted under a leadership that ended. The term alone is not a leadership proof — a
+    /// follower has a term too — which is why the fence is combined with the leader check on the
+    /// executor, where <see cref="Data.RaftOperationStatus.NodeIsNotLeader"/> is answered first.</para>
+    /// </summary>
+    public long GetPartitionTerm(int partitionId);
 
     /// <summary>
     /// Returns whether the given partition is materialized on this node — i.e. whether the

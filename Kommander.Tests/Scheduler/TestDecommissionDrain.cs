@@ -87,9 +87,14 @@ public sealed class TestDecommissionDrain
     private static Task WaitForIdleAsync(RaftManager manager) =>
         manager.SystemCoordinator.DrainAsync().WaitAsync(TimeSpan.FromSeconds(5));
 
-    private static void AcceptReplication(RaftManager manager) =>
+    private static void AcceptReplication(RaftManager manager)
+    {
+        // No Raft quorum runs on the data ranges here, so the membership fence's quorum-confirmed
+        // leadership check is granted (TestReplicaPlacement covers the refusal).
+        manager.SystemCoordinator.ConfirmPartitionLeadershipOverride = static (_, _) => Task.FromResult(true);
         manager.SystemCoordinator.ReplicateOverride = (_, _, _, _) =>
             Task.FromResult(new RaftReplicationResult(true, RaftOperationStatus.Success, HLCTimestamp.Zero, 1));
+    }
 
     private static RaftReplica Replica(string endpoint, RaftReplicaRole role = RaftReplicaRole.Voter, long since = 1) =>
         new() { Endpoint = endpoint, Role = role, SinceGeneration = since };

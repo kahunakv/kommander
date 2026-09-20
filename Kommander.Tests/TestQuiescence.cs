@@ -439,6 +439,11 @@ public sealed class TestQuiescence
             QuiesceAfter = TimeSpan.FromMilliseconds(100),
             PingInterval = TimeSpan.FromMilliseconds(200),
             SuspicionTimeout = TimeSpan.FromSeconds(5),
+            // These tests pin the quiescence mechanics themselves. Check-quorum (on by default)
+            // wakes an idle leader for one probe round every half window — 250 ms at this
+            // StartElectionTimeout — so a leader could never stay cool for the 400 ms these tests
+            // measure. The probe is pinned separately in TestReadIndexConfirmation.
+            EnableCheckQuorum = false,
         };
 
         return new RaftManager(

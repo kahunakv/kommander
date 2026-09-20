@@ -221,8 +221,10 @@ public class TestReadIndexConfirmation
         Assert.Equal(1UL, id);
         Assert.NotEqual(RaftOperationStatus.Success, response.Status);
 
-        // Check-quorum is off by default: the isolated leader keeps its (useless) leadership.
-        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        // Check-quorum is on by default: three seconds without a majority contact is past the
+        // derived window (StartElectionTimeout, 2 s), so the isolated leader has also stepped down
+        // instead of keeping a leadership it cannot use.
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
     }
 
     // ── unpublished leadership can never confirm ──────────────────────────────
@@ -373,5 +375,79 @@ public class TestReadIndexConfirmation
         host.AdvanceMonotonic(TimeSpan.FromMilliseconds(50));
         await sm.CheckPartitionLeadershipAsync();
         Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+    }
+
+    [Fact]
+    public async Task CheckQuorum_StepsDownOneWindowAfterTheLastMajorityContact()
+    {
+        // The window is measured from the last instant a majority was simultaneously fresh, not
+        // from the moment the leader noticed the acks had aged out — the latter doubled the bound
+        // and let an isolated leader outlive the followers' election timeout.
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+        EnableCheckQuorum(host);
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+
+        await Ack(sm, host, "node-b"); // majority contact (self + node-b) at t0
+
+        host.AdvanceMonotonic(TimeSpan.FromMilliseconds(15));
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+
+        host.AdvanceMonotonic(TimeSpan.FromMilliseconds(6)); // 21 ms since the contact, window is 20 ms
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+    }
+
+    [Fact]
+    public async Task CheckQuorum_QuiescedIsolatedLeader_ProbesAtHalfWindow_AndStepsDownAtTheWindow()
+    {
+        // An idle leader quiesces with every peer caught up, then the network cuts it off. It
+        // receives no acks by design, so silence must not keep it in office: half-way through the
+        // window it is woken for one forced heartbeat round, and with that round unanswered it
+        // steps down at the full window — inside the same bound as a non-quiesced leader.
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+        EnableCheckQuorum(host);
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+
+        await Ack(sm, host, "node-b"); // last majority contact at t0
+        sm.SetQuiescedForTesting(true);
+        host.EnqueuedRequests.Clear();
+
+        host.AdvanceMonotonic(TimeSpan.FromMilliseconds(5));
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        Assert.Equal(0, host.CountEnqueued(RaftResponderRequestType.AppendLogs)); // still quiesced, still silent
+
+        host.AdvanceMonotonic(TimeSpan.FromMilliseconds(6)); // 11 ms: past half of the 20 ms window
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        Assert.Equal(2, host.CountEnqueued(RaftResponderRequestType.AppendLogs)); // the probe round
+
+        host.AdvanceMonotonic(TimeSpan.FromMilliseconds(10)); // 21 ms: the window elapsed unanswered
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+        Assert.Equal("", host.Leader);
+    }
+
+    [Fact]
+    public async Task CheckQuorum_QuiescedLeader_ProbeAnsweredByMajority_Holds()
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+        EnableCheckQuorum(host);
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+
+        await Ack(sm, host, "node-b");
+        sm.SetQuiescedForTesting(true);
+        host.EnqueuedRequests.Clear();
+
+        host.AdvanceMonotonic(TimeSpan.FromMilliseconds(11));
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(2, host.CountEnqueued(RaftResponderRequestType.AppendLogs)); // probe sent
+
+        await Ack(sm, host, "node-b"); // the probe is answered: fresh majority contact at 11 ms
+
+        host.AdvanceMonotonic(TimeSpan.FromMilliseconds(15)); // 26 ms since t0, 15 ms since the contact
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
     }
 }

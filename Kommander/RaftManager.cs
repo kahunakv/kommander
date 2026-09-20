@@ -485,6 +485,13 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         remove => eventNotifier.OnLeaderChanged -= value;
     }
 
+    /// <inheritdoc/>
+    public event Func<int, long, Task>? OnLeadershipLost
+    {
+        add => eventNotifier.OnLeadershipLost += value;
+        remove => eventNotifier.OnLeadershipLost -= value;
+    }
+
     /// <summary>
     /// Fires when a proposal reaches commit quorum, reporting the acknowledgements (the local leader plus every
     /// acking voter) that carried it. Off in production; a test subscribes to enable observation and feed a
@@ -693,8 +700,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         replicationGateway = new ReplicationGateway(
             this,
             routingTable,
-            (node, partitionId, type, logs, autoCommit, expectedGeneration, ct) =>
-                communication.ForwardReplicateLogs(this, node, partitionId, type, logs, autoCommit, expectedGeneration, ct),
+            (node, partitionId, type, logs, autoCommit, expectedGeneration, expectedTerm, ct) =>
+                communication.ForwardReplicateLogs(this, node, partitionId, type, logs, autoCommit, expectedGeneration, expectedTerm, ct),
             Logger,
             LocalEndpoint,
             configuration);
@@ -994,10 +1001,10 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     private async Task<SnapshotResponse> InstallSnapshotOnExecutorAsync(SnapshotInstallRequest request)
     {
         if (!TryGetPartition(request.PartitionId, out RaftPartition? partition) || partition is null)
-            return new SnapshotResponse(false);
+            return new SnapshotResponse(SnapshotInstallOutcome.Rejected);
 
-        bool installed = await partition.InstallSnapshotAsync(request).ConfigureAwait(false);
-        return new SnapshotResponse(installed);
+        SnapshotInstallOutcome outcome = await partition.InstallSnapshotAsync(request).ConfigureAwait(false);
+        return new SnapshotResponse(outcome);
     }
 
     /// <summary>
@@ -1819,8 +1826,8 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     /// with <see cref="RaftException"/> to prevent userland from forging coordinator entries.
     /// P0 is never a valid target for create, split, merge, or remove.
     /// </summary>
-    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default) =>
-        replicationGateway.ReplicateLogs(partitionId, type, data, autoCommit, expectedGeneration, cancellationToken);
+    public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, long expectedGeneration = 0, long expectedTerm = 0, CancellationToken cancellationToken = default) =>
+        replicationGateway.ReplicateLogs(partitionId, type, data, autoCommit, expectedGeneration, expectedTerm, cancellationToken);
 
     /// <summary>
     /// Replicates a batch of log entries to the follower nodes in the specified partition.
@@ -1832,8 +1839,9 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         IEnumerable<byte[]> logs,
         bool autoCommit = true,
         long expectedGeneration = 0,
+        long expectedTerm = 0,
         CancellationToken cancellationToken = default
-    ) => replicationGateway.ReplicateLogs(partitionId, type, logs, autoCommit, expectedGeneration, cancellationToken);
+    ) => replicationGateway.ReplicateLogs(partitionId, type, logs, autoCommit, expectedGeneration, expectedTerm, cancellationToken);
 
     /// <summary>
     /// Replicates a batch of log entries to the follower nodes in the specified partition.
@@ -1846,8 +1854,9 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         IReadOnlyList<byte[]> logs,
         bool autoCommit = true,
         long expectedGeneration = 0,
+        long expectedTerm = 0,
         CancellationToken cancellationToken = default
-    ) => replicationGateway.ReplicateLogs(partitionId, type, logs, autoCommit, expectedGeneration, cancellationToken);
+    ) => replicationGateway.ReplicateLogs(partitionId, type, logs, autoCommit, expectedGeneration, expectedTerm, cancellationToken);
 
     /// <summary>
     /// Replicates a heterogeneous, per-entry-typed batch to one partition
@@ -1923,6 +1932,9 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     /// <summary>Fires <see cref="OnLeaderChanged"/> and returns the handler result.</summary>
     internal Task<bool> InvokeLeaderChanged(int partitionId, string node) =>
         eventNotifier.InvokeLeaderChanged(partitionId, node);
+
+    internal Task InvokeLeadershipLost(int partitionId, long term) =>
+        eventNotifier.InvokeLeadershipLost(partitionId, term);
 
     /// <summary>
     /// Returns the local endpoint
@@ -2264,6 +2276,10 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
         // callers on non-replica nodes can build a correctly-fenced forwarded proposal.
         return routingTable.GetCommittedGeneration(partitionId);
     }
+
+    /// <inheritdoc/>
+    public long GetPartitionTerm(int partitionId) =>
+        partitions.TryGetValue(partitionId, out RaftPartition? partition) ? partition.Term : -1;
 
     /// <inheritdoc/>
     public double GetPartitionLogOpsPerSecond(int partitionId) =>

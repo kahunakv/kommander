@@ -145,7 +145,7 @@ public sealed class TestBatchRequestsResponseCadence
         public event Action<int, RaftLog>? OnReplicationError { add { } remove { } }
         public event Func<int, RaftLog, Task<bool>>? OnLogRestored { add { } remove { } }
         public event Func<int, RaftLog, Task<bool>>? OnReplicationReceived { add { } remove { } }
-        public event Func<int, string, Task<bool>>? OnLeaderChanged { add { } remove { } }
+        public event Func<int, string, Task<bool>>? OnLeaderChanged { add { } remove { } } public event Func<int, long, Task>? OnLeadershipLost { add { } remove { } }
         public event Action<IReadOnlyList<RaftPartitionRange>>? OnPartitionMapChanged { add { } remove { } }
         public event Action<ClusterMembership>? OnMembershipChanged { add { } remove { } }
 
@@ -161,8 +161,8 @@ public sealed class TestBatchRequestsResponseCadence
         public Task Handshake(HandshakeRequest request) => throw new NotImplementedException();
         public void RequestVote(RequestVotesRequest request) => throw new NotImplementedException();
         public void Vote(VoteRequest request) => throw new NotImplementedException();
-        public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default) => throw new NotImplementedException();
-        public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, byte[] data, bool autoCommit = true, long expectedGeneration = 0, long expectedTerm = 0, CancellationToken cancellationToken = default) => throw new NotImplementedException();
+        public Task<RaftReplicationResult> ReplicateLogs(int partitionId, string type, IEnumerable<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0, long expectedTerm = 0, CancellationToken cancellationToken = default) => throw new NotImplementedException();
         public Task<RaftBatchReplicationResult> ReplicateEntries(int partitionId, IReadOnlyList<RaftProposalEntry> entries, CancellationToken cancellationToken = default) => throw new NotImplementedException();
         public Task<RaftReplicationResult> ReplicateCheckpoint(int partitionId, CancellationToken cancellationToken = default) => throw new NotImplementedException();
         public Task<(bool success, RaftOperationStatus status, long commitLogId)> CommitLogs(int partitionId, HLCTimestamp ticketId, CancellationToken cancellationToken = default) => throw new NotImplementedException();
@@ -193,7 +193,7 @@ public sealed class TestBatchRequestsResponseCadence
         public Task<RaftPartitionLifecycleResult> RemovePartitionAsync(int partitionId, CancellationToken ct = default) => throw new NotImplementedException();
         public Task<RaftPartitionLifecycleResult> SplitPartitionAsync(int sourcePartitionId, int targetPartitionId = 0, RaftSplitPlan? plan = null, CancellationToken ct = default) => throw new NotImplementedException();
         public Task<RaftPartitionLifecycleResult> MergePartitionsAsync(int survivorPartitionId, int sourcePartitionId, RaftMergePlan? plan = null, CancellationToken ct = default) => throw new NotImplementedException();
-        public long GetPartitionGeneration(int partitionId) => throw new NotImplementedException();
+        public long GetPartitionGeneration(int partitionId) => throw new NotImplementedException(); public long GetPartitionTerm(int partitionId) => throw new NotImplementedException();
         public bool HostsPartition(int partitionId) => throw new NotImplementedException();
         public IReadOnlyList<RaftReplica> GetPartitionReplicas(int partitionId) => throw new NotImplementedException();
         public string? GetPartitionLeaderHint(int partitionId) => throw new NotImplementedException();

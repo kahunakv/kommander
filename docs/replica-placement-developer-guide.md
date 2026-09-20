@@ -162,6 +162,15 @@ it.
 Everything else — commit counting, check-quorum, read-index confirmation — follows automatically,
 because it all flows through the same two host members.
 
+A replica-set change commits through P0's log, so P0's quorum alone would let it take effect while
+the target range's own voters are unreachable. The coordinator therefore fences every `AddReplica`,
+`PromoteReplica`, and the first (quorum-changing) commit of `RemoveReplica` on a quorum-confirmed
+leadership of the target range: a read-index round on the range's leader, run locally when the P0
+leader leads the range and forwarded through `ICommunication.GetReadIndex` otherwise. A range with
+no reachable, confirmed leader answers `RaftOperationStatus.LeadershipNotConfirmed` and the map is
+untouched; the placement pass simply retries on a later tick. Re-driving an interrupted removal (a
+replica already marked `Removing`) is exempt, because its final drop changes no quorum.
+
 ---
 
 ## Partial materialization: hosting only what you replicate

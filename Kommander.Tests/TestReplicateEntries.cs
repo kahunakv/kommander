@@ -474,7 +474,7 @@ public class TestReplicateEntries
         ];
 
         await Assert.ThrowsAsync<RaftException>(() =>
-            p0Leader.ReplicateEntries(RaftSystemConfig.SystemPartition, entries, TestContext.Current.CancellationToken));
+            p0Leader.ReplicateEntries(RaftSystemConfig.SystemPartition, entries, cancellationToken: TestContext.Current.CancellationToken));
 
         await node1.LeaveCluster(true, CancellationToken.None);
         await node2.LeaveCluster(true, CancellationToken.None);

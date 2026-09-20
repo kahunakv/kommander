@@ -136,7 +136,12 @@ internal sealed class SnapshotInstaller
     /// circuit as an idempotent success when a matching boundary is already installed at or below the
     /// index; (3) invoke the application import; (4) install the durable WAL boundary
     /// (<see cref="IRaftWalFacade.InstallSnapshotBoundaryAsync"/>) which retains the suffix on a matching
-    /// boundary term and truncates it on conflict; (5) reconstruct the apply cursor; (6) acknowledge.</para>
+    /// boundary term and truncates it on conflict; (5) reconstruct the apply cursor; (6) acknowledge
+    /// with a typed outcome (<see cref="SnapshotInstallOutcome"/>): the idempotent short-circuit in (2)
+    /// answers <see cref="SnapshotInstallOutcome.SkippedAlreadyCovered"/>, a completed install answers
+    /// <see cref="SnapshotInstallOutcome.Installed"/>, and every refusal is a non-success status the
+    /// partition maps to <see cref="SnapshotInstallOutcome.Rejected"/>. The sender logs "seeded" only
+    /// for an import; a bare success bit let it write that line for a skip too.</para>
     ///
     /// <para>Import runs on the executor thread so the whole install is serialized against every other
     /// partition operation. If import succeeds but the WAL write fails, the sender receives failure and
@@ -159,8 +164,17 @@ internal sealed class SnapshotInstaller
         // high id (bypassing the term/leader validation below). The installed checkpoint boundary is the
         // authoritative "already applied" signal. Return success early — before any term adoption/step-down —
         // so a redundant re-install never disrupts a caught-up node.
+        //
+        // The boundary must also be CONTIGUOUSLY HELD: a CommittedCheckpoint row can be broadcast onto a
+        // behind follower over a replication gap (the unanchored live path), and a checkpoint that certifies
+        // entries this node never held is exactly the state a snapshot install exists to repair. Every WAL
+        // backend withholds the persisted last-checkpoint id in that case (the prefix is verified at land
+        // time), so this guard is a second fence on the same rule: when the facade tracks presence, the
+        // contiguous presence frontier must reach the index too, or the install proceeds. A facade that does
+        // not track presence (-1) leaves the decision to the boundary alone.
         long installedBoundary = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
-        if (installedBoundary >= snapshotIndex)
+        long presentIndex = wal.GetPresentIndex();
+        if (installedBoundary >= snapshotIndex && (presentIndex < 0 || presentIndex >= snapshotIndex))
         {
             // Confirm identity compatibility before treating this as a no-op. A newer installed boundary
             // (installedBoundary > snapshotIndex) supersedes the request. Otherwise the stored boundary term
@@ -177,8 +191,20 @@ internal sealed class SnapshotInstaller
                 if (snapshotIndex > coreState.LastAppliedIndex)
                     coreState.LastAppliedIndex = snapshotIndex;
                 wal.SeedCommitFrontierFromSnapshot(snapshotIndex, Math.Max(boundaryTermAtIndex, 0));
-                return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Success, snapshotIndex);
+
+                // Say so: the sender reads this outcome, and an operator reading this node's log
+                // must be able to tell a skip from an import when a follower's state is in doubt.
+                if (logger.IsEnabled(LogLevel.Information))
+                    logger.LogInfoReceiveInstallSnapshotSkipped(host.LocalEndpoint, host.PartitionId, snapshotIndex, installedBoundary);
+
+                return new RaftResponse(SnapshotInstallOutcome.SkippedAlreadyCovered, snapshotIndex);
             }
+        }
+        else if (installedBoundary >= snapshotIndex)
+        {
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot at index {Index}: the last checkpoint {Boundary} covers the index but the contiguous presence frontier {Present} does not (a checkpoint row over a replication gap); installing instead of skipping.",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, snapshotIndex, installedBoundary, presentIndex);
         }
 
         bool legacy = leaderTerm <= 0 || string.IsNullOrEmpty(leaderEndpoint);
@@ -322,6 +348,6 @@ internal sealed class SnapshotInstaller
         if (logger.IsEnabled(LogLevel.Information))
             logger.LogInfoReceiveInstallSnapshot(host.LocalEndpoint, host.PartitionId, snapshotIndex);
 
-        return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Success, snapshotIndex);
+        return new RaftResponse(SnapshotInstallOutcome.Installed, snapshotIndex);
     }
 }

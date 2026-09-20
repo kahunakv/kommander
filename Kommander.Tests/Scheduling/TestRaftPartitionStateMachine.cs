@@ -720,6 +720,9 @@ public class TestRaftPartitionStateMachine
             MonotonicOverride = 1_000_000_000
         };
         host.Configuration.EnableQuiescence = false;
+        // The target never acks, so past the election timeout check-quorum (on by default) would
+        // step this leader down — a competing, legitimate outcome that is not what this test pins.
+        host.Configuration.EnableCheckQuorum = false;
         FakeWalFacade wal = new();
         CapturingReplySink sink = new();
         RaftPartitionStateMachine sm = new(host, wal, sink, NullLogger<IRaft>.Instance);

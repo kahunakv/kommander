@@ -256,6 +256,31 @@ public sealed class TestRandomScenarios
     }
 
     /// <summary>
+    /// The check-quorum family. The stock cluster runs a 100 ms election timeout against a 100 ms
+    /// heartbeat ack round trip, so check-quorum (the production default) is off there. This family
+    /// widens the election timeouts to 300–600 ms — six heartbeats, the production ratio — and turns
+    /// it on, so the isolated-leader step-down, the quiesce-free probe path and the term fence run
+    /// under generated partitions, outages and disk faults instead of only under unit tests.
+    /// </summary>
+    public static RandomScenarioOptions CheckQuorumOptions => new()
+    {
+        EnableCheckQuorum = true,
+        StartElectionTimeoutMs = 300,
+        EndElectionTimeoutMs = 600,
+    };
+
+    [Theory]
+    [Trait("Category", "DSTRandom")]
+    [MemberData(nameof(Seeds))]
+    public async Task AGeneratedRunUnderCheckQuorum_HoldsEveryCheck(ulong seed)
+    {
+        RandomScenarioReport report = await RunSeedAsync(
+            seed, CheckQuorumOptions, TestContext.Current.CancellationToken);
+
+        Assert.True(report.InvariantChecks > 0, "The run checked no invariants.");
+    }
+
+    /// <summary>
     /// A generated plan replays from the artifact a failure would leave behind.
     ///
     /// <para>The check the whole failure report depends on. A plan is written, read back, and
@@ -446,17 +471,24 @@ public sealed class TestRandomScenarios
         RandomScenarioOptions options,
         CancellationToken cancellationToken)
     {
-        await using SimulationCluster cluster = await SimulationCluster.StartAsync(
-            new SimulationClusterOptions
-            {
-                NodeCount = 3,
-                PartitionCount = 1,
-                Seed = seed,
+        SimulationClusterOptions clusterOptions = new()
+        {
+            NodeCount = 3,
+            PartitionCount = 1,
+            Seed = seed,
 
-                // A generated run is a few dozen entries long. At the production compaction cadence
-                // no run would ever compact, and every rule about compaction would go unexercised.
-                ConfigureNode = options.ApplyTo,
-            },
+            // A generated run is a few dozen entries long. At the production compaction cadence
+            // no run would ever compact, and every rule about compaction would go unexercised.
+            ConfigureNode = options.ApplyTo,
+        };
+
+        if (options.StartElectionTimeoutMs is { } startElection)
+            clusterOptions = clusterOptions with { StartElectionTimeoutMs = startElection };
+        if (options.EndElectionTimeoutMs is { } endElection)
+            clusterOptions = clusterOptions with { EndElectionTimeoutMs = endElection };
+
+        await using SimulationCluster cluster = await SimulationCluster.StartAsync(
+            clusterOptions,
             logger,
             cancellationToken);
 

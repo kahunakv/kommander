@@ -588,8 +588,12 @@ network; "stub" means it returns a default and the feature is inert (or worse) o
 
 All three built-in transports are fully wired. Note that `ICommunication.SendInstallSnapshot` ships a
 default implementation returning `SnapshotResponse(false)` — a **custom** transport that does not
-override it leaves followers below the compaction floor unable to catch up. Keep this matrix in sync
-as capabilities land — it's the first thing a confused operator checks.
+override it leaves followers below the compaction floor unable to catch up. A custom transport must
+also carry the typed reply, `SnapshotResponse.Outcome` (`SnapshotInstallOutcome`): the sender advances
+its cursors and logs "seeded" only for `Installed`, logs a skip for `SkippedAlreadyCovered`, and
+treats a terminal chunk answered as `ChunkAccepted` as a failed transfer. A reply without an outcome
+reads as `Rejected`. Keep this matrix in sync as capabilities land — it's the first thing a confused
+operator checks.
 
 ---
 

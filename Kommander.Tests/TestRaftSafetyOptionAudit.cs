@@ -80,9 +80,11 @@ public sealed class TestRaftSafetyOptionAudit
             d.IsShippedDefault,
             $"{d.Option} is reported as a chosen deviation, but nothing was set on this configuration."));
 
-        // The three fences that ship off. Each is a deliberate compatibility choice, and each is
+        // The two fences that ship off. Each is a deliberate compatibility choice, and each is
         // reported at Information so an operator can see it without being warned every startup.
-        Assert.Contains(deviations, d => d.Option == nameof(RaftConfiguration.EnableCheckQuorum));
+        // Check-quorum ships ON: an isolated leader that keeps acknowledging writes is the
+        // two-leader window behind lost acknowledged writes, so leaving it off is a chosen deviation.
+        Assert.DoesNotContain(deviations, d => d.Option == nameof(RaftConfiguration.EnableCheckQuorum));
         Assert.Contains(deviations, d => d.Option == nameof(RaftConfiguration.ApplicationDurabilityProvider));
         Assert.Contains(deviations, d => d.Option == "TransportSecurity.NodeAuthenticationMode");
     }
@@ -95,6 +97,7 @@ public sealed class TestRaftSafetyOptionAudit
             Host = "localhost",
             Port = 8001,
             BackfillEnabled = false,
+            EnableCheckQuorum = false,
             AllowLegacySnapshotSenders = true,
             SnapshotRescueMaxConsecutiveCycles = 0,
             CompactionLiveReplicaLagBudget = 0,
@@ -110,6 +113,7 @@ public sealed class TestRaftSafetyOptionAudit
             "TransportSecurity.RequireTls",
             "TransportSecurity.AllowInsecureCertificateValidation",
             nameof(RaftConfiguration.AllowLegacySnapshotSenders),
+            nameof(RaftConfiguration.EnableCheckQuorum),
             nameof(RaftConfiguration.BackfillEnabled),
             nameof(RaftConfiguration.SnapshotRescueMaxConsecutiveCycles),
             nameof(RaftConfiguration.CompactionLiveReplicaLagBudget),

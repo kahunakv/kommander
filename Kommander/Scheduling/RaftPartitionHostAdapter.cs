@@ -87,7 +87,16 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
 
     public bool IsOutboundQueueSaturated(string endpoint) => manager.IsOutboundQueueSaturated(endpoint);
 
-    public Task InvokeLeaderChanged(int partitionId, string leader) => manager.InvokeLeaderChanged(partitionId, leader);
+    public async Task InvokeLeaderChanged(int partitionId, string leader)
+    {
+        // Every demotion path announces the leader change from the executor thread; report the
+        // loss of this node's own leadership (with its term) first, so a consumer drops its
+        // belief-only state before it learns who, if anyone, leads now.
+        await partition.NotifyLeadershipLostIfPendingAsync().ConfigureAwait(false);
+        await manager.InvokeLeaderChanged(partitionId, leader).ConfigureAwait(false);
+    }
+
+    public Task InvokeLeadershipLost(int partitionId, long term) => manager.InvokeLeadershipLost(partitionId, term);
 
     public Task<bool> InvokeReplicationReceived(int partitionId, RaftLog log) => manager.InvokeReplicationReceived(partitionId, log);
 

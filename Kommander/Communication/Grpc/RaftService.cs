@@ -797,7 +797,7 @@ public sealed class RaftService : Rafter.RafterBase
         Data.SnapshotResponse result = await manager.ReceiveInstallSnapshot(
             snapshotRequest, context.CancellationToken).ConfigureAwait(false);
 
-        return new GrpcInstallSnapshotResponse { Success = result.Success };
+        return new GrpcInstallSnapshotResponse { Success = result.Success, Outcome = (int)result.Outcome };
     }
 
     /// <summary>

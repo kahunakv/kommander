@@ -135,6 +135,16 @@ public sealed class RaftPartition : IDisposable
         internal set => Interlocked.Exchange(ref _generation, value);
     }
 
+    /// <summary>
+    /// The current Raft term of this partition on this node, readable from any thread (see
+    /// <see cref="RaftPartitionCoreState.PublishedTerm"/>). This is the value a consumer fences a
+    /// proposal with; the executor re-checks the fence against the authoritative term.
+    /// </summary>
+    public long Term => stateMachine.PublishedTerm;
+
+    /// <summary>See <see cref="RaftPartitionStateMachine.NotifyLeadershipLostIfPendingAsync"/>. Executor thread only.</summary>
+    internal Task NotifyLeadershipLostIfPendingAsync() => stateMachine.NotifyLeadershipLostIfPendingAsync();
+
     private volatile int _state = (int)RaftPartitionState.Active;
 
     /// <summary>
@@ -487,7 +497,7 @@ public sealed class RaftPartition : IDisposable
     /// <param name="autoCommit">A boolean value indicating whether the log should be committed automatically upon replication success.</param>
     /// <returns>A task that represents the asynchronous operation, containing a tuple with a boolean indicating success,
     /// a <see cref="RaftOperationStatus"/> indicating the result status, and an <see cref="HLCTimestamp"/> representing the ticket ID for the log entry.</returns>
-    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, byte[] data, bool autoCommit, long expectedGeneration = 0)
+    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, byte[] data, bool autoCommit, long expectedGeneration = 0, long expectedTerm = 0)
     {
         if (string.IsNullOrEmpty(Leader))
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
@@ -495,9 +505,12 @@ public sealed class RaftPartition : IDisposable
         if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
 
+        if (expectedTerm != 0 && expectedTerm != Term)
+            return (false, RaftOperationStatus.TermMismatch, HLCTimestamp.Zero);
+
         List<RaftLog> logsToReplicate = [new() { Type = RaftLogType.Proposed, LogType = type, LogData = data }];
 
-        RaftResponse response = await AskBounded(executor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit, expectedGeneration))).ConfigureAwait(false);
+        RaftResponse response = await AskBounded(executor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit, expectedGeneration, expectedTerm))).ConfigureAwait(false);
 
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
@@ -512,11 +525,11 @@ public sealed class RaftPartition : IDisposable
     /// <param name="logs">A collection of log entries, each represented as a byte array, to be replicated.</param>
     /// <param name="autoCommit">A boolean indicating whether the logs should be automatically committed after replication.</param>
     /// <returns>A tuple containing a boolean indicating success, the status of the operation as a <see cref="RaftOperationStatus"/> value, and the <see cref="HLCTimestamp"/> ticket ID of the operation.</returns>
-    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, IEnumerable<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0)
+    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, IEnumerable<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0, long expectedTerm = 0)
     {
         // Avoid an extra copy when the caller already provides a list or array.
         IReadOnlyList<byte[]> payloads = logs as IReadOnlyList<byte[]> ?? logs.ToList();
-        return await ReplicateLogs(type, payloads, autoCommit, expectedGeneration).ConfigureAwait(false);
+        return await ReplicateLogs(type, payloads, autoCommit, expectedGeneration, expectedTerm).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -524,7 +537,7 @@ public sealed class RaftPartition : IDisposable
     /// avoiding the intermediate copy incurred by the <see cref="IEnumerable{T}"/> overload
     /// when the caller holds an array or list.
     /// </summary>
-    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, IReadOnlyList<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0)
+    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateLogs(string type, IReadOnlyList<byte[]> logs, bool autoCommit = true, long expectedGeneration = 0, long expectedTerm = 0)
     {
         if (string.IsNullOrEmpty(Leader))
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
@@ -532,11 +545,14 @@ public sealed class RaftPartition : IDisposable
         if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
 
+        if (expectedTerm != 0 && expectedTerm != Term)
+            return (false, RaftOperationStatus.TermMismatch, HLCTimestamp.Zero);
+
         List<RaftLog> logsToReplicate = new(logs.Count);
         for (int i = 0; i < logs.Count; i++)
             logsToReplicate.Add(new() { Type = RaftLogType.Proposed, LogType = type, LogData = logs[i] });
 
-        RaftResponse response = await AskBounded(executor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit, expectedGeneration))).ConfigureAwait(false);
+        RaftResponse response = await AskBounded(executor.Ask(new(RaftRequestType.ReplicateLogs, logsToReplicate, autoCommit, expectedGeneration, expectedTerm))).ConfigureAwait(false);
 
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
@@ -559,7 +575,7 @@ public sealed class RaftPartition : IDisposable
     /// therefore not rebuilt or copied here; keep the reference stable across the call.
     /// </para>
     /// </summary>
-    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateEntries(List<RaftLog> logs, long expectedGeneration = 0, bool autoCommit = true)
+    public async Task<(bool success, RaftOperationStatus status, HLCTimestamp ticketId)> ReplicateEntries(List<RaftLog> logs, long expectedGeneration = 0, bool autoCommit = true, long expectedTerm = 0)
     {
         if (string.IsNullOrEmpty(Leader))
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
@@ -567,10 +583,14 @@ public sealed class RaftPartition : IDisposable
         if (Leader != manager.LocalEndpoint)
             return (false, RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
 
+        if (expectedTerm != 0 && expectedTerm != Term)
+            return (false, RaftOperationStatus.TermMismatch, HLCTimestamp.Zero);
+
         // Reuses the existing ReplicateLogs request path: a heterogeneous List<RaftLog> with one autoCommit
-        // flag and one generation fence is exactly what that path already accepts. RaftManager.ReplicateEntries
-        // enforces the batch shape (single trailing manual group) before splitting into auto/manual proposals.
-        RaftResponse response = await AskBounded(executor.Ask(new(RaftRequestType.ReplicateLogs, logs, autoCommit, expectedGeneration))).ConfigureAwait(false);
+        // flag, one generation fence and one term fence is exactly what that path already accepts.
+        // RaftManager.ReplicateEntries enforces the batch shape (single trailing manual group) before
+        // splitting into auto/manual proposals.
+        RaftResponse response = await AskBounded(executor.Ask(new(RaftRequestType.ReplicateLogs, logs, autoCommit, expectedGeneration, expectedTerm))).ConfigureAwait(false);
 
         if (response.Status == RaftOperationStatus.Success)
             return (true, response.Status, response.TicketId);
@@ -683,10 +703,10 @@ public sealed class RaftPartition : IDisposable
     /// uses the no-cancellation <c>Ask</c> so a transport-side cancellation cannot complete this task
     /// (and free the buffer) while the install is still running on the executor.
     /// </summary>
-    internal async Task<bool> InstallSnapshotAsync(SnapshotInstallRequest request)
+    internal async Task<SnapshotInstallOutcome> InstallSnapshotAsync(SnapshotInstallRequest request)
     {
         RaftResponse response = await executor.Ask(new(RaftRequestType.InstallSnapshot, request)).ConfigureAwait(false);
-        return response.Status == RaftOperationStatus.Success;
+        return response.Status == RaftOperationStatus.Success ? response.SnapshotOutcome : SnapshotInstallOutcome.Rejected;
     }
 
     public async Task<RaftOperationStatus> ForceLeaderForTestingAsync(CancellationToken cancellationToken = default)

@@ -37,6 +37,22 @@ public sealed class RaftResponse
     /// </summary>
     public RaftPartitionView? PartitionView { get; }
 
+    /// <summary>
+    /// Carries the receiver-side result of a <see cref="RaftRequestType.InstallSnapshot"/> so the
+    /// transport can tell an import from an idempotent skip. <see cref="Status"/> is
+    /// <see cref="RaftOperationStatus.Success"/> for every outcome but
+    /// <see cref="SnapshotInstallOutcome.Rejected"/>.
+    /// </summary>
+    public SnapshotInstallOutcome SnapshotOutcome { get; }
+
+    public RaftResponse(SnapshotInstallOutcome snapshotOutcome, long logIndex)
+    {
+        Type = RaftResponseType.None;
+        SnapshotOutcome = snapshotOutcome;
+        Status = snapshotOutcome == SnapshotInstallOutcome.Rejected ? RaftOperationStatus.Errored : RaftOperationStatus.Success;
+        LogIndex = logIndex;
+    }
+
     public RaftResponse(RaftResponseType type, RaftPartitionView partitionView)
     {
         Type = type;

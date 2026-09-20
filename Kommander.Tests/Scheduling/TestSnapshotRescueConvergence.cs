@@ -600,6 +600,9 @@ public class TestSnapshotRescueConvergence
                 HeartbeatInterval = TimeSpan.Zero, RecentHeartbeat = TimeSpan.Zero,
                 BackfillThreshold = 0,
                 MaxBackfillEntriesPerRound = 128,
+                // The rescue cycles advance the clock by minutes with a mostly silent follower; the
+                // default check-quorum step-down would end the leadership these tests observe.
+                EnableCheckQuorum = false,
             };
         }
 

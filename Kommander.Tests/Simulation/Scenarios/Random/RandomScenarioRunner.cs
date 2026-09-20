@@ -842,13 +842,27 @@ public sealed class RandomScenarioRunner
                     Task<RaftReplicationResult> checkpoint =
                         node.Manager.ReplicateCheckpoint(options.PartitionId, cancellationToken);
 
-                    await cluster.RunUntilAsync(
+                    bool settled = await cluster.RunUntilAsync(
                         () => Task.FromResult(checkpoint.IsCompleted),
                         options.StepsPerAction * OutageElectionBudgetFactor,
                         options.AdvanceMillisecondsPerStep,
                         cancellationToken).ConfigureAwait(false);
 
-                    await checkpoint.ConfigureAwait(false);
+                    // Never block on the call once the budget is spent. The library retries a
+                    // checkpoint refused as "active proposal" on the wall clock and resolves it
+                    // only through leader ticks, which this harness drives; a plain await here
+                    // stopped the stepping and could not complete (a leader churning under
+                    // check-quorum consumed the budget with elections on one seed). The write may
+                    // still land while later actions drive the cluster; its failure is observed,
+                    // not thrown, because a budget overrun is a fact about this run's timing.
+                    if (settled)
+                        await checkpoint.ConfigureAwait(false);
+                    else
+                        _ = checkpoint.ContinueWith(
+                            static t => _ = t.Exception,
+                            CancellationToken.None,
+                            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                            TaskScheduler.Default);
                 }
 
                 return true;

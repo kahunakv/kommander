@@ -221,6 +221,18 @@ matters.
 
 ---
 
+## Flow 5 — Check-quorum probes a quiesced leader
+
+A quiesced leader receives no acks by design, so silence alone cannot prove that its voters are
+still reachable. With `EnableCheckQuorum` on (the default), the leader tick measures the age of the
+last instant a majority of voters was simultaneously fresh. Once half of `CheckQuorumWindow` has
+passed without such a contact, the leader un-quiesces and forces one heartbeat round — the same
+wake-up a read-index confirmation uses. A healthy cluster answers, the contact refreshes, and the
+leader re-quiesces on its next heartbeat tick, so an idle partition pays one probe round per half
+window. A leader cut off from its voters gets no answer and steps down when the full window
+elapses, the same bound as a non-quiesced leader. Followers handle the probe as they handle any
+forced heartbeat: they leave quiescence on the append and re-enter it on the next quiesce marker.
+
 ## The timing rule that keeps failover fast
 
 There is one **safety-relevant timing constraint**, and it's worth understanding because misconfiguring

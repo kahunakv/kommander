@@ -97,9 +97,14 @@ public readonly record struct RaftProposalEntry(
     string Type,               // consumer log type for this entry
     byte[] Data,               // opaque payload
     bool AutoCommit = true,    // true: commits with the batch; false: trailing manual group
-    long ExpectedGeneration = 0 // 0: unfenced; non-zero: fence this entry against the partition generation
+    long ExpectedGeneration = 0, // 0: unfenced; non-zero: fence this entry against the partition generation
+    long ExpectedTerm = 0      // 0: unfenced; non-zero: the whole batch is refused (TermMismatch) unless the node serves in this term
 );
 ```
+
+The term fence is batch-level, unlike the per-entry generation fence: a term names the node, so one
+stale stamp means every entry was proposed to a node whose role the caller no longer knows, and two
+different non-zero stamps cannot both be current. Read the stamp with `IRaft.GetPartitionTerm`.
 
 Two shape rules are enforced **before anything is appended** (violations append nothing — no partial state):
 
@@ -357,7 +362,7 @@ Task<RaftBatchReplicationResult> ReplicateEntries(
 
 Supporting types (all in `Kommander/Data/`):
 
-- **`RaftProposalEntry`** — one typed input entry: `Type`, `Data`, `AutoCommit`, `ExpectedGeneration`.
+- **`RaftProposalEntry`** — one typed input entry: `Type`, `Data`, `AutoCommit`, `ExpectedGeneration`, `ExpectedTerm`.
 - **`RaftEntryResult`** — one per-entry outcome: `Status`, `LogIndex`, `Ticket`.
 - **`RaftBatchReplicationResult`** — the batch outcome: `Success`, `Status`, `TicketId`, `Entries`.
 

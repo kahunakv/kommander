@@ -286,7 +286,7 @@ internal sealed class BackfillSender
 
             backfillTracker.ClearIfCovered(node.Endpoint, from, "a contiguous batch was shipped at or below the episode anchor");
             AppendLogToNode(node, timestamp, cached.Logs, prevIdx, cached.PrevTerm, grpcLogCache: cached.GrpcLogCache);
-            RecordShipped(node, reportedFrontier, from);
+            await RecordShippedAsync(node, reportedFrontier, from).ConfigureAwait(false);
             return BackfillSendResult.Sent;
         }
 
@@ -368,7 +368,7 @@ internal sealed class BackfillSender
 
         backfillTracker.ClearIfCovered(node.Endpoint, from, "a contiguous batch was shipped at or below the episode anchor");
         AppendLogToNode(node, timestamp, backfill, prevIdx, prevTerm, grpcLogCache: shared?.GrpcLogCache);
-        RecordShipped(node, reportedFrontier, from);
+        await RecordShippedAsync(node, reportedFrontier, from).ConfigureAwait(false);
         return BackfillSendResult.Sent;
     }
 
@@ -402,20 +402,37 @@ internal sealed class BackfillSender
 
     /// <summary>
     /// Records a shipped batch against the peer's convergence probe and, when a fruitless streak
-    /// crosses <see cref="NoProgressWarnShips"/>, logs the episode's single Warning and counts it.
+    /// crosses <see cref="NoProgressWarnShips"/>, logs the episode's single Warning, counts it, and
+    /// escalates to a snapshot transfer.
+    ///
+    /// <para><b>Why the escalation.</b> By this point the anchor fallback has already re-anchored
+    /// at the frontier the peer itself reported and the batch still produced no advance, so log
+    /// shipping demonstrably cannot converge this peer — whatever it holds below its reported
+    /// frontier is not a log this leader can repair entry by entry. Pacing alone left such a peer
+    /// stranded for the rest of the run: after one leader's transfer failed and a new leader took
+    /// over, the new leader's WAL still served the anchored range (the stuck peer's own position
+    /// pinned its retention floor), so no refusal ever reached the snapshot path and the learner
+    /// stayed at frontier 0 (2026-09-19). A snapshot re-seeds the peer's state from the leader's
+    /// last checkpoint; the transfer is paced by the sender's failure backoff and bounded by its
+    /// convergence breaker, and it is a no-op when no checkpoint exists to export from.</para>
     /// </summary>
-    private void RecordShipped(RaftNode node, long reportedFrontier, long anchor)
+    private async Task RecordShippedAsync(RaftNode node, long reportedFrontier, long anchor)
     {
         int fruitlessShips = tracker.RecordBackfillShip(node.Endpoint, reportedFrontier);
 
-        if (fruitlessShips < NoProgressWarnShips || !tracker.TryMarkBackfillNoProgressWarned(node.Endpoint))
+        if (fruitlessShips < NoProgressWarnShips)
             return;
 
-        KommanderMetrics.RecordBackfillNoProgressEpisode(host.PartitionId);
-        logger.LogWarning(
-            "[{LocalEndpoint}/{PartitionId}/{State}] Backfill to {Endpoint} shipped {Ships} consecutive batches without its reported commit frontier advancing past {Frontier}; batches are now paced and anchored at the frontier (last anchor {Anchor})",
-            host.LocalEndpoint, host.PartitionId, coreState.NodeState,
-            node.Endpoint, fruitlessShips, reportedFrontier, anchor);
+        if (tracker.TryMarkBackfillNoProgressWarned(node.Endpoint))
+        {
+            KommanderMetrics.RecordBackfillNoProgressEpisode(host.PartitionId);
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Backfill to {Endpoint} shipped {Ships} consecutive batches without its reported commit frontier advancing past {Frontier}; batches are now paced and anchored at the frontier (last anchor {Anchor}), and the peer is offered a snapshot",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState,
+                node.Endpoint, fruitlessShips, reportedFrontier, anchor);
+        }
+
+        await EscalateRefusalToSnapshotAsync(node).ConfigureAwait(false);
     }
 
     /// <summary>

@@ -70,16 +70,64 @@ internal sealed class RaftPartitionCoreState
         get => (RaftNodeState)nodeStateValue;
         set
         {
+            RaftNodeState previous = (RaftNodeState)nodeStateValue;
+
             if (value != RaftNodeState.Leader)
                 leadershipLease = null;
+
+            // Leadership-loss bookkeeping (see PendingLeadershipLossTerm). Recorded here, in the
+            // one place every demotion path goes through, so no call site can forget it.
+            if (value == RaftNodeState.Leader)
+            {
+                if (previous != RaftNodeState.Leader)
+                    ledTerm = currentTermValue;
+            }
+            else if (previous == RaftNodeState.Leader)
+            {
+                pendingLeadershipLossTerm = ledTerm;
+            }
+
             nodeStateValue = (int)value;
         }
     }
 
-    /// <summary>Backing store for <see cref="CurrentTerm"/>. Plain (non-volatile) because only the
-    /// executor's single-writer thread reads or writes the term; off-thread readers must never
-    /// consume it directly (they read the lease, whose lifecycle the setter controls).</summary>
+    /// <summary>The term this node most recently became leader in; the term reported on leadership loss.</summary>
+    private long ledTerm = -1;
+
+    /// <summary>
+    /// The term of a leadership stint that ended and has not been reported to the application yet
+    /// (-1 = none). Set by the <see cref="NodeState"/> setter on every Leader → non-Leader
+    /// transition and consumed by <see cref="TryTakePendingLeadershipLoss"/> from the host's
+    /// leader-changed notification and from the partition tick. It carries the term the node LED
+    /// in, captured at promotion, so a demotion caused by adopting a higher term still reports the
+    /// term the consumer's belief-only state (staged intents, locks) was keyed on.
+    /// </summary>
+    private long pendingLeadershipLossTerm = -1;
+
+    /// <summary>
+    /// Takes the pending leadership-loss notification, if any. Executor thread only.
+    /// </summary>
+    public bool TryTakePendingLeadershipLoss(out long lostTerm)
+    {
+        lostTerm = pendingLeadershipLossTerm;
+        pendingLeadershipLossTerm = -1;
+        return lostTerm >= 0;
+    }
+
+    /// <summary>Backing store for <see cref="CurrentTerm"/>. Written on the executor's single-writer
+    /// thread with release semantics; the executor reads it plainly and off-thread readers go
+    /// through <see cref="PublishedTerm"/>, which is a diagnostic/fence input, never a leadership
+    /// proof (that is the lease, whose lifecycle the setter controls).</summary>
     private long currentTermValue;
+
+    /// <summary>
+    /// The current term as seen from any thread. The value is at most one executor write behind and
+    /// is what <see cref="IRaft.GetPartitionTerm"/> reports: a consumer reads it, does its
+    /// belief-only work, and fences the resulting proposal with it — the executor then re-checks the
+    /// fence against the authoritative term before accepting, so a stale read here costs a
+    /// <see cref="RaftOperationStatus.TermMismatch"/>, never a misplaced write.
+    /// </summary>
+    public long PublishedTerm => Volatile.Read(ref currentTermValue);
 
     /// <summary>Current Raft term. Persisted through the WAL hard state; see
     /// <c>CompleteRestoreAsync</c> for why the log tail alone is not authoritative.
@@ -103,7 +151,7 @@ internal sealed class RaftPartitionCoreState
                 RaftInvariants.TermMonotonic, currentTermValue, value, partitionId, localEndpoint);
 
             leadershipLease = null;
-            currentTermValue = value;
+            Volatile.Write(ref currentTermValue, value);
         }
     }
 

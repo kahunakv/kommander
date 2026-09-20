@@ -127,6 +127,14 @@ public interface IRaftPartitionHost
 
     Task InvokeLeaderChanged(int partitionId, string leader);
 
+    /// <summary>
+    /// Raises <see cref="IRaft.OnLeadershipLost"/> for a leadership stint of this node that ended
+    /// in <paramref name="term"/>. Called from the executor thread by the state machine, which
+    /// takes the pending loss recorded by <see cref="RaftPartitionCoreState.NodeState"/> on every
+    /// Leader → non-Leader transition. Defaults to a no-op so test hosts need not implement it.
+    /// </summary>
+    Task InvokeLeadershipLost(int partitionId, long term) => Task.CompletedTask;
+
     Task<bool> InvokeReplicationReceived(int partitionId, RaftLog log);
 
     Task<bool> InvokeSystemReplicationReceived(int partitionId, RaftLog log);

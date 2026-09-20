@@ -160,6 +160,8 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.LeadershipConfirmationTimeout)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.EnableCheckQuorum)] = RaftOptionKind.Safety,
         [nameof(RaftConfiguration.CheckQuorumIntervalMultiplier)] = RaftOptionKind.Liveness,
+        [nameof(RaftConfiguration.CheckQuorumWindow)] = RaftOptionKind.Derived,
+        [nameof(RaftConfiguration.SnapshotChunkAckTimeout)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.BackfillEnabled)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.BackfillThreshold)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.FollowerSaturationBackoff)] = RaftOptionKind.Performance,
@@ -231,9 +233,8 @@ public static class RaftSafetyOptionAudit
     /// first. An empty result means every fence this audit knows about is on.
     ///
     /// <para>Each entry names the option, the value in force, the value that keeps the fence on,
-    /// and the hazard. A deviation is never an error: several are legitimate, and one
-    /// (<see cref="RaftConfiguration.EnableCheckQuorum"/>) is the shipped default. The point is
-    /// that the choice is visible.</para>
+    /// and the hazard. A deviation is never an error: several are legitimate, and some are the
+    /// shipped default. The point is that the choice is visible.</para>
     /// </summary>
     public static IReadOnlyList<RaftSafetyOptionDeviation> Inspect(RaftConfiguration configuration)
     {
@@ -300,8 +301,9 @@ public static class RaftSafetyOptionAudit
                 "false",
                 "true",
                 "A leader that has lost contact with its voters does not step down on its own, so "
-                + "it keeps accepting writes that can never commit until it learns of a newer term.",
-                IsShippedDefault: true));
+                + "it keeps accepting writes that can never commit until it learns of a newer term — "
+                + "the two-leader window behind lost acknowledged writes.",
+                IsShippedDefault: false));
         }
 
         if (configuration.ApplicationDurabilityProvider is null)

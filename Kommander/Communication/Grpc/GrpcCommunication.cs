@@ -1046,7 +1046,9 @@ public class GrpcCommunication : ICommunication
                 .ResponseAsync
                 .ConfigureAwait(false);
 
-            return new SnapshotResponse(response.Success);
+            // The typed outcome is authoritative; a peer that sends no outcome reads as Rejected
+            // (the enum's zero value) — never as a silent success off the legacy bit.
+            return new SnapshotResponse((SnapshotInstallOutcome)response.Outcome);
         }
         catch (Exception ex)
         {
@@ -1179,7 +1181,10 @@ public class GrpcCommunication : ICommunication
         if (configuration.GrpcEnableSnapshotCompression)
             metadata.Add(GrpcRequestEncodingHeader, GzipRequestEncoding);
 
-        return new CallOptions(metadata, cancellationToken: cancellationToken);
+        // Per-chunk deadline: a receiver whose install path is wedged must fail the call in
+        // seconds so the sender records the failure and retries on its backoff, instead of
+        // holding the RPC open until the transfer-level step watchdog abandons it.
+        return new CallOptions(metadata, deadline: DateTime.UtcNow + configuration.SnapshotChunkAckTimeout, cancellationToken: cancellationToken);
     }
 
     private static GrpcChannelPoolOptions GetPoolOptions(RaftManager manager) =>

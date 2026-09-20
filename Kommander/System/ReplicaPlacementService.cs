@@ -48,6 +48,13 @@ internal sealed class ReplicaPlacementService
     private readonly Func<string, MemberLivenessState> getNodeLiveness;
     private readonly Func<string, string?> getNodeZone;
     private readonly Func<int, string, CancellationToken, Task> transferLeadership;
+
+    /// <summary>
+    /// Quorum-confirmed leadership of ONE data partition, asked before any replica-set mutation of
+    /// that partition commits — see <see cref="ConfirmPartitionLeadershipAsync"/>.
+    /// </summary>
+    private readonly Func<int, CancellationToken, Task<bool>> confirmPartitionLeadership;
+
     private readonly RaftConfiguration configuration;
     private readonly string localEndpoint;
     private readonly Func<TimeSpan> getRetryDelay;
@@ -72,6 +79,7 @@ internal sealed class ReplicaPlacementService
         Func<string, MemberLivenessState> getNodeLiveness,
         Func<string, string?> getNodeZone,
         Func<int, string, CancellationToken, Task> transferLeadership,
+        Func<int, CancellationToken, Task<bool>> confirmPartitionLeadership,
         RaftConfiguration configuration,
         string localEndpoint,
         Func<TimeSpan> getRetryDelay,
@@ -91,6 +99,7 @@ internal sealed class ReplicaPlacementService
         this.getNodeLiveness = getNodeLiveness;
         this.getNodeZone = getNodeZone;
         this.transferLeadership = transferLeadership;
+        this.confirmPartitionLeadership = confirmPartitionLeadership;
         this.configuration = configuration;
         this.localEndpoint = localEndpoint;
         this.getRetryDelay = getRetryDelay;
@@ -197,6 +206,47 @@ internal sealed class ReplicaPlacementService
         return (range, RaftOperationStatus.Success);
     }
 
+    /// <summary>
+    /// Membership fence for a replica-set change of <paramref name="partitionId"/>: the change
+    /// commits through P0's log, so P0's quorum alone would let it take effect while the target
+    /// partition's own voters are unreachable — on 2026-09-18 a P0 leader changed one partition's
+    /// replica set three times (learner, voter, learner) while it could reach neither of that
+    /// partition's voters, and the partition ran two leaders for 68 seconds. A membership change
+    /// of a partition must not take effect on a leader that cannot commit through that partition's
+    /// current voters, so the P0 leader first obtains a quorum-confirmed leadership of the
+    /// partition (a read-index round on its leader, local or forwarded) and refuses the change
+    /// with <see cref="RaftOperationStatus.LeadershipNotConfirmed"/> otherwise. The caller — an
+    /// operator, or the placement pass on its next tick — retries once the partition has a
+    /// reachable, confirmed leader.
+    /// </summary>
+    private async Task<bool> ConfirmPartitionLeadershipAsync(
+        int partitionId, string operation, string endpoint, CancellationToken cancellationToken)
+    {
+        bool confirmed;
+        try
+        {
+            confirmed = await confirmPartitionLeadership(partitionId, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                "{Operation}: leadership confirmation of partition {Id} threw: {Message}",
+                operation, partitionId, ex.Message);
+            confirmed = false;
+        }
+
+        if (!confirmed)
+            logger.LogWarning(
+                "{Operation}: refusing the replica change ({Endpoint}) for partition {Id}: the partition's leadership could not be quorum-confirmed, so the change could take effect on a leader that cannot commit through the partition's voters",
+                operation, endpoint, partitionId);
+
+        return confirmed;
+    }
+
     // ── Replica lifecycle mutations ────────────────────────────────────────
 
     /// <summary>
@@ -262,6 +312,12 @@ internal sealed class ReplicaPlacementService
             return;
         }
 
+        if (!await ConfirmPartitionLeadershipAsync(message.PartitionId, "TryAddReplica", endpoint, cancellationToken).ConfigureAwait(false))
+        {
+            completion?.TrySetResult((RaftOperationStatus.LeadershipNotConfirmed, range.Generation));
+            return;
+        }
+
         range.Generation++;
         range.Replicas.Add(new RaftReplica
         {
@@ -323,6 +379,12 @@ internal sealed class ReplicaPlacementService
                 "TryPromoteReplica: Replica {Endpoint} of partition {Id} is {Role}, not Learner",
                 endpoint, message.PartitionId, replica.Role);
             completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+            return;
+        }
+
+        if (!await ConfirmPartitionLeadershipAsync(message.PartitionId, "TryPromoteReplica", endpoint, cancellationToken).ConfigureAwait(false))
+        {
+            completion?.TrySetResult((RaftOperationStatus.LeadershipNotConfirmed, range.Generation));
             return;
         }
 
@@ -401,6 +463,17 @@ internal sealed class ReplicaPlacementService
                 completion?.TrySetResult((RaftOperationStatus.InsufficientVoters, 0));
                 return;
             }
+        }
+
+        // The fence guards the first commit of a removal (the quorum change). The re-drive of an
+        // interrupted removal is deliberately exempt: its replica already left the quorum
+        // denominator at the first commit, so the final drop changes no quorum, and gating it
+        // would leave a Removing replica stranded whenever the range has no confirmable leader.
+        if (replica.Role != RaftReplicaRole.Removing
+            && !await ConfirmPartitionLeadershipAsync(message.PartitionId, "TryRemoveReplica", endpoint, cancellationToken).ConfigureAwait(false))
+        {
+            completion?.TrySetResult((RaftOperationStatus.LeadershipNotConfirmed, range.Generation));
+            return;
         }
 
         // Phase 1: mark Removing (skipped when re-driving an interrupted removal).
