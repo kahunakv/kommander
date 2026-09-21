@@ -113,6 +113,75 @@ public sealed class TestWalStallSignal
     }
 
     [Fact]
+    public async Task BacklogIsReleasedBeforeTheCompletionCallbackFires()
+    {
+        const int partitionId = 5;
+        using InMemoryWAL wal = new(NullLogger<IRaft>.Instance);
+        using FairWalScheduler scheduler = new(wal, NullLogger<IRaft>.Instance, workerCount: 1);
+        scheduler.Start();
+
+        // The callback is the moment a caller learns its write is durable, and a caller may read the
+        // backlog right then (a load report, or a test asserting "a sequential writer never builds
+        // depth"). Reading both signals from inside the callback pins the ordering without a race:
+        // on the worker thread the batch must already have left the depth and the stall age.
+        // Releasing them after the callbacks let a GA run read depth 1 after an awaited ReplicateLogs.
+        for (long i = 1; i <= 5; i++)
+        {
+            TaskCompletionSource<(int Depth, double AgeMs)> seen = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            scheduler.Enqueue(MakeOp(partitionId, _ => seen.TrySetResult((
+                scheduler.GetPartitionDepth(partitionId),
+                scheduler.GetPartitionOldestPendingWriteAgeMs(partitionId)))));
+
+            (int depthAtAck, double ageAtAck) = await seen.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+            Assert.Equal(0, depthAtAck);
+            Assert.Equal(0, ageAtAck);
+        }
+    }
+
+    [Fact]
+    public async Task GroupBatch_ReleasesEveryPartitionBeforeTheFirstCallbackOfAny()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        using GatedWal wal = new();
+        using FairWalScheduler scheduler = new(wal, NullLogger<IRaft>.Instance, workerCount: 1);
+        scheduler.Start();
+
+        // Partition 1 holds the single worker inside Write, so partitions 2 and 3 queue up behind it
+        // and are drained together as one group batch once the engine answers.
+        TaskCompletionSource first = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        scheduler.Enqueue(MakeOp(1, _ => first.TrySetResult()));
+        await WaitUntilAsync(() => wal.Blocked == 1, 5_000, "the worker must be held inside Write");
+
+        // One ack can wake a reader of ANOTHER partition (a load report covers all of them), so each
+        // callback records the depth of both group members, whichever of the two fires first.
+        int worstDepthSeen = 0;
+        int remaining = 2;
+        TaskCompletionSource rest = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        void OnGroupMemberComplete(RaftWalCompletion _)
+        {
+            int seen = Math.Max(scheduler.GetPartitionDepth(2), scheduler.GetPartitionDepth(3));
+            if (seen > Volatile.Read(ref worstDepthSeen))
+                Volatile.Write(ref worstDepthSeen, seen); // single worker: callbacks never overlap
+
+            if (Interlocked.Decrement(ref remaining) == 0)
+                rest.TrySetResult();
+        }
+
+        scheduler.Enqueue(MakeOp(2, OnGroupMemberComplete));
+        scheduler.Enqueue(MakeOp(3, OnGroupMemberComplete));
+        Assert.Equal(1, scheduler.GetPartitionDepth(2));
+        Assert.Equal(1, scheduler.GetPartitionDepth(3));
+
+        wal.Release();
+        await first.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+        await rest.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+
+        Assert.Equal(0, Volatile.Read(ref worstDepthSeen));
+    }
+
+    [Fact]
     public async Task HardStateOperation_PersistsOnTheWorker_AndCompletesWithItsOwnStatus()
     {
         const int partitionId = 3;

@@ -488,9 +488,13 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// Returns the current pending-or-in-flight depth for a single partition, or 0 if the
     /// partition has no queued work. The value is approximate (no lock held) and suitable
     /// for advisory load scoring only.
+    /// <para>One ordering IS guaranteed: a batch leaves the depth before its first completion
+    /// callback fires (Phase 3b of <see cref="ProcessGroupBatch"/>), so a caller that reads the depth
+    /// after its own ack never counts the write it was acked for. The volatile read keeps that
+    /// guarantee visible to a reader on another thread.</para>
     /// </summary>
     public int GetPartitionDepth(int partitionId) =>
-        _partitions.TryGetValue(partitionId, out PartitionState? state) ? state.Depth : 0;
+        _partitions.TryGetValue(partitionId, out PartitionState? state) ? Volatile.Read(ref state.Depth) : 0;
 
     /// <inheritdoc />
     public double GetPartitionOldestPendingWriteAgeMs(int partitionId) =>
@@ -858,13 +862,16 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// partitions.  For RocksDB this is one <c>db.Write</c> / one fsync regardless
     /// of partition count.</para>
     ///
-    /// <para>Phase 3 — post-write, in two passes. Pass 3a records every commit-wait
+    /// <para>Phase 3 — post-write, in three passes. Pass 3a records every commit-wait
     /// observation (per partition and the single node-level sample for the batch).
-    /// Pass 3b fires <c>OnComplete</c> callbacks, decrements depth, clears
-    /// <c>InFlight</c>, and re-schedules if new ops arrived during the write.
+    /// Pass 3b decrements depth and clears the in-flight stall age for every partition
+    /// of the group. Pass 3c fires <c>OnComplete</c> callbacks, clears <c>InFlight</c>,
+    /// and re-schedules if new ops arrived during the write.
     /// The order is a contract: a callback releases an awaiting caller, and that caller
-    /// may read the accumulators immediately, so no observation may be recorded after
-    /// any callback of the batch has fired.</para>
+    /// may read the accumulators and the backlog signals immediately, so no observation
+    /// may be recorded, and no backlog released, after any callback of the batch has fired.
+    /// <c>InFlight</c> is the exception and must outlive the callbacks, or a second worker
+    /// could complete the partition's next batch out of submission order.</para>
     /// </summary>
     private void ProcessGroupBatch(
         List<int> partitionIds,
@@ -1093,7 +1100,34 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         if (groupOpCount > 0)
             _nodeCommitWait.RecordWaitMs(groupTotalWaitMs / groupOpCount);
 
-        // ── Phase 3b: per-partition completion and cleanup ───────────────────
+        // ── Phase 3b: release the batch's backlog before anyone learns it completed ──
+        // Same contract as 3a, for the backlog signals. The batch is finished with the engine, so its
+        // operations are no longer "pending or in flight" and no longer age the stall signal. Both
+        // were released after the callbacks, so a caller woken by its ack could read depth 1 (and a
+        // non-zero oldest-pending age) for a queue that held nothing but the write it was just acked
+        // for — a sequential writer reported a backlog it never had, and a load report built right
+        // after an ack carried it to the balancer. Every partition of the group is released before
+        // the first callback of ANY partition fires: one ack can wake a reader of another partition.
+        // InFlight deliberately stays raised until 3c; see there.
+        foreach ((int pid, List<WALWriteOperation> pidBatch) in groupBatches)
+        {
+            if (maxGlobalQueueDepth > 0)
+                Interlocked.Add(ref _globalQueueDepth, -pidBatch.Count);
+
+            if (!_partitions.TryGetValue(pid, out PartitionState? releasedState))
+                continue;
+
+            lock (releasedState.Lock)
+            {
+                releasedState.Depth -= pidBatch.Count;
+                releasedState.InFlightOldestEnqueueTicks = 0;
+            }
+        }
+
+        // ── Phase 3c: per-partition completion and re-scheduling ─────────────
+        // InFlight is cleared only AFTER the partition's callbacks: clearing it earlier would let
+        // another worker drain, write and complete the partition's next batch while these callbacks
+        // are still running, delivering completions out of submission order.
         foreach ((int pid, List<WALWriteOperation> pidBatch) in groupBatches)
         {
             foreach (WALWriteOperation op in pidBatch)
@@ -1112,17 +1146,12 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                 }
             }
 
-            if (maxGlobalQueueDepth > 0)
-                Interlocked.Add(ref _globalQueueDepth, -pidBatch.Count);
-
             if (!_partitions.TryGetValue(pid, out PartitionState? state))
                 continue;
 
             lock (state.Lock)
             {
-                state.Depth   -= pidBatch.Count;
                 state.InFlight = false;
-                state.InFlightOldestEnqueueTicks = 0;
 
                 if (state.Ops.Count > 0 && !state.Scheduled)
                 {
