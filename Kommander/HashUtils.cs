@@ -79,8 +79,8 @@ public static class HashUtils
         if (pointer == -1)
             return ConsistentHash(key, buckets);
 
-        string prefix = key[..pointer];
-        return ConsistentHash(prefix, buckets);
+        // Slice into a span rather than allocating a substring; the prefix is only hashed, never retained.
+        return ConsistentHash(key.AsSpan(0, pointer), buckets);
     }
 
     /// <summary>
@@ -137,8 +137,8 @@ public static class HashUtils
         if (pointer == -1)
             return ConsistentHash(key, buckets);
 
-        string prefix = key[..pointer];
-        return ConsistentHash(prefix, buckets);
+        // Slice into a span rather than allocating a substring; the prefix is only hashed, never retained.
+        return ConsistentHash(key.AsSpan(0, pointer), buckets);
     }
 
     /// <summary>
@@ -165,6 +165,21 @@ public static class HashUtils
     /// <param name="numBuckets">The total number of buckets.</param>
     /// <returns>The selected bucket index.</returns>
     public static int ConsistentHash(string key, int numBuckets)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+
+        return ConsistentHash(key.AsSpan(), numBuckets);
+    }
+
+    /// <summary>
+    /// Span-based sibling of the string overload: returns the same bucket for the same characters.
+    /// Lets callers place a slice of a larger string (a key's prefix, a key space's group) without
+    /// allocating a substring. The span is only encoded and hashed; it never escapes.
+    /// </summary>
+    /// <param name="key">The characters to hash.</param>
+    /// <param name="numBuckets">The total number of buckets.</param>
+    /// <returns>The selected bucket index.</returns>
+    public static int ConsistentHash(ReadOnlySpan<char> key, int numBuckets)
     {
         if (numBuckets <= 0)
             throw new ArgumentException("numBuckets must be greater than 0", nameof(numBuckets));

@@ -80,4 +80,65 @@ public sealed class HashUtilsTests
             allocated == 0,
             $"ConsistentHash allocated {allocated} bytes over {iterations} short-key calls; expected 0.");
     }
+
+    /// <summary>
+    /// The span overload must pick the bucket the string overload picks for the same characters, including
+    /// when the span is a slice of a longer string. Every node and every client routes by this value, so a
+    /// disagreement between the two overloads would send the same key to two partitions.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Golden))]
+    public void ConsistentHash_SpanOverload_MatchesStringOverload(string key, int[] expectedBuckets)
+    {
+        string padded = "<<" + key + "/tail";
+
+        for (int i = 0; i < BucketCounts.Length; i++)
+        {
+            Assert.Equal(expectedBuckets[i], HashUtils.ConsistentHash(key.AsSpan(), BucketCounts[i]));
+            Assert.Equal(expectedBuckets[i], HashUtils.ConsistentHash(padded.AsSpan(2, key.Length), BucketCounts[i]));
+        }
+    }
+
+    [Fact]
+    public void ConsistentHash_SpanOverload_RejectsNonPositiveBuckets()
+    {
+        Assert.Throws<ArgumentException>(() => HashUtils.ConsistentHash("a".AsSpan(), 0));
+        Assert.Throws<ArgumentException>(() => HashUtils.ConsistentHash(ReadOnlySpan<char>.Empty, -1));
+    }
+
+    [Fact]
+    public void ConsistentHash_NullKey_Throws()
+    {
+        Assert.Throws<ArgumentNullException>(() => HashUtils.ConsistentHash(null!, 8));
+    }
+
+    /// <summary>
+    /// A prefixed hash places the prefix exactly where hashing the prefix alone places it, and it does so
+    /// without building the prefix as a separate string.
+    /// </summary>
+    [Fact]
+    public void PrefixedHashes_MatchThePrefixAlone_AndDoNotAllocate()
+    {
+        const string key = "tenant-7/orders/000123";
+        const int iterations = 10_000;
+
+        Assert.Equal(HashUtils.ConsistentHash("tenant-7", 64), HashUtils.PrefixedHash(key, '/', 64));
+        Assert.Equal(HashUtils.ConsistentHash("tenant-7/orders", 64), HashUtils.InversePrefixedHash(key, '/', 64));
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+
+        long sink = 0;
+        for (int i = 0; i < iterations; i++)
+        {
+            sink += HashUtils.PrefixedHash(key, '/', 64);
+            sink += HashUtils.InversePrefixedHash(key, '/', 64);
+        }
+
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.True(sink >= 0); // keep the loop from being optimized away
+        Assert.True(
+            allocated == 0,
+            $"the prefixed hashes allocated {allocated} bytes over {iterations} calls; expected 0.");
+    }
 }
