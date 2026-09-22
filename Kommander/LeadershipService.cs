@@ -174,6 +174,9 @@ internal sealed class LeadershipService
     /// transport error, wait timeout, or restore in progress all map to <see langword="false"/>;
     /// no retries happen inside the primitive — the caller owns retry cadence, mirroring
     /// <see cref="ConfirmLeadershipAsync"/>.
+    /// <para>In production the fetch is <see cref="FollowerReadIndexFetcher.FetchAsync"/>, so
+    /// concurrent calls for one partition share one RPC. It only joins a caller to a fetch that is
+    /// not sent yet, so the index is still captured after this call started.</para>
     /// <para>The leader-belief routing is a fast path, not a correctness gate: a stale belief
     /// either fails the local confirmation (this node is not really the leader) or fails the
     /// remote fetch (the target is not really the leader) — both land on

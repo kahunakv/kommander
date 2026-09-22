@@ -681,11 +681,18 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             LocalEndpoint,
             LocalNodeId);
 
+        // Concurrent follower reads share one GetReadIndex RPC per partition. The shared fetch has
+        // its own bound: the leader fails its confirmation round after LeadershipConfirmationTimeout
+        // (enforced at tick granularity), and the doubled budget leaves room for the round trip.
+        FollowerReadIndexFetcher readIndexFetcher = new(
+            (node, request, ct) => communication.GetReadIndex(this, node, request, ct),
+            () => Configuration.LeadershipConfirmationTimeout * 2);
+
         leadershipService = new LeadershipService(
             this,
             () => IsInitialized,
             () => Joined,
-            (node, request, ct) => communication.GetReadIndex(this, node, request, ct),
+            readIndexFetcher.FetchAsync,
             Logger,
             LocalEndpoint,
             LocalNodeId);
