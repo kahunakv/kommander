@@ -460,6 +460,51 @@ public class TestHoleyLogElection
         Assert.Contains("LeaderChanged:node-a", host.EventLog);
     }
 
+    /// <summary>
+    /// Writes landing ABOVE an unrepaired hole do not change the hole. In CamusDB Caraxes fault
+    /// soak fs4 every other winner's barrier no-op landed above this node's hole, so the max id
+    /// grew by one per cycle while the contiguous frontier never moved. The counter was keyed on
+    /// (present, max), so each refusal read as a new hole: 598 refusals, every one <c>(1/12)</c>,
+    /// and the self-repair could never fire. The count must key on the contiguous frontier alone.
+    /// </summary>
+    [Fact]
+    public async Task Promotion_WithWalHole_GrowingTailAboveTheHole_StillReachesTheCap()
+    {
+        HoleyWalFacade wal = new() { RawMaxLog = 10, LastEntryTerm = 1, PresentId = 3, PresentTermValue = 1, CommitIndexValue = 3 };
+        wal.Entries.AddRange(
+        [
+            new RaftLog { Id = 1, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 2, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 3, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+            new RaftLog { Id = 10, Term = 1, Type = RaftLogType.Committed, LogType = "t" },
+        ]);
+        CapturingHost host = new() { Nodes = [new RaftNode("node-b")] };
+        RaftPartitionStateMachine sm = new(host, wal, new CapturingReplySink(), NullLogger<IRaft>.Instance);
+        sm.MarkRestoredForTesting();
+
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+            await Assert.ThrowsAsync<RaftException>(() =>
+                sm.ReceivedVoteAsync("node-b", sm.CurrentTerm, remoteMaxLogId: 3));
+            Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+            Assert.Empty(wal.TruncateCalls);
+
+            // Another winner's barrier no-op lands above the hole before the next election.
+            long landed = wal.RawMaxLog + 1;
+            wal.Entries.Add(new RaftLog { Id = landed, Term = 1 + attempt, Type = RaftLogType.Proposed, LogType = "barrier" });
+            wal.RawMaxLog = landed;
+        }
+
+        // The hole's lower edge never moved, so the fourth win is past the cap: truncate and serve.
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        await sm.ReceivedVoteAsync("node-b", sm.CurrentTerm, remoteMaxLogId: 3);
+
+        Assert.Equal(3, Assert.Single(wal.TruncateCalls));
+        Assert.Equal("node-a", host.Leader);
+        Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+    }
+
     // ── the peer-down grace on the destructive self-repair ────────────────────
 
     /// <summary>

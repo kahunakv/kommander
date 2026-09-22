@@ -20,8 +20,12 @@ namespace Kommander.Consensus;
 ///   the storage engine has gone unanswered. A leader that sees it above its stall threshold stops
 ///   shipping entry-carrying backfill and snapshots to this node until the disk answers — neither
 ///   can land, and buffering a snapshot is what OOM-killed a follower six seconds after its heal.</item>
+///   <item><see cref="CompleteAppendLogsRequest.PresentIndex"/> / <see cref="CompleteAppendLogsRequest.PresentTerm"/>:
+///   the contiguous presence frontier and the term there. It is the only position that can anchor
+///   the repair of a hole inside the leader's UNCOMMITTED inherited tail, which the commit
+///   frontier cannot reach until the barrier commits (see <c>HeartbeatDriver.VerifiedPresenceAnchorAsync</c>).</item>
 /// </list>
-/// Both are read on the partition executor, the single writer of the frontiers.
+/// All are read on the partition executor, the single writer of the frontiers.
 /// </summary>
 internal static class FollowerAcks
 {
@@ -64,5 +68,7 @@ internal static class FollowerAcks
             status,
             index,
             durableIndex: wal.GetDurableCommitFrontier(),
-            walStallMs: (long)wal.GetOldestPendingWriteAgeMs());
+            walStallMs: (long)wal.GetOldestPendingWriteAgeMs(),
+            presentIndex: wal.GetPresentIndex(),
+            presentTerm: wal.GetPresentTerm());
 }

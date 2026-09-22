@@ -25,6 +25,16 @@ public sealed class RaftRequest
     public long WalStallMs { get; }
 
     /// <summary>
+    /// <see cref="RaftRequestType.CompleteAppendLogs"/> only: the follower's contiguous presence
+    /// frontier and the term there (<see cref="CompleteAppendLogsRequest.PresentIndex"/>); -1 when
+    /// not reported.
+    /// </summary>
+    public long PresentIndex { get; } = -1;
+
+    /// <summary><see cref="RaftRequestType.CompleteAppendLogs"/> only: see <see cref="CompleteAppendLogsRequest.PresentTerm"/>.</summary>
+    public long PresentTerm { get; } = -1;
+
+    /// <summary>
     /// Term of the sender's last log entry, carried on <see cref="RaftRequestType.RequestVote"/> /
     /// <see cref="RaftRequestType.ReceiveVote"/> alongside <see cref="CommitIndex"/> (the last log
     /// index) so the voter can apply the lexicographic §5.4.1 freshness check. <c>0</c> from peers
@@ -127,7 +137,9 @@ public sealed class RaftRequest
         bool quiesce = false,
         long lastLogTerm = 0,
         long durableIndex = -1,
-        long walStallMs = 0
+        long walStallMs = 0,
+        long presentIndex = -1,
+        long presentTerm = -1
     )
     {
         Type = type;
@@ -135,6 +147,8 @@ public sealed class RaftRequest
         CommitIndex = commitIndex;
         DurableIndex = durableIndex;
         WalStallMs = walStallMs;
+        PresentIndex = presentIndex;
+        PresentTerm = presentTerm;
         LastLogTerm = lastLogTerm;
         Timestamp = timestamp;
         Endpoint = endpoint;

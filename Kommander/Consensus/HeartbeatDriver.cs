@@ -294,6 +294,12 @@ internal sealed class HeartbeatDriver
                 long mismatchRepairAnchor = frontierKnown && followerMaxLog >= 0
                     ? Math.Min(mismatchAnchor, followerMaxLog)
                     : mismatchAnchor;
+
+                // The commit-frontier clamp alone cannot repair a hole inside this leader's
+                // UNCOMMITTED inherited tail: see VerifiedPresenceAnchorAsync.
+                if (mismatchNote && !regressed)
+                    mismatchRepairAnchor = await VerifiedPresenceAnchorAsync(node.Endpoint, mismatchRepairAnchor).ConfigureAwait(false);
+
                 long anchorFrom = regressed ? regressedFrontier : mismatchNote ? mismatchRepairAnchor : effectiveFloor;
                 backfillRound ??= new();
                 BackfillSendResult backfillResult = await sender.TrySendBackfillBatchAsync(
@@ -311,6 +317,62 @@ internal sealed class HeartbeatDriver
 
             sender.AppendLogToNode(node, coreState.LastHeartbeat, null);
         }
+    }
+
+    /// <summary>
+    /// Raises an anchored-repair anchor from <paramref name="clampedAnchor"/> (the mismatch note
+    /// clamped to the peer's commit frontier) to the peer's reported contiguous PRESENCE frontier,
+    /// when this leader's own log verifies that position; otherwise returns the clamped anchor.
+    ///
+    /// <para><b>Why the commit-frontier clamp is not enough.</b> The clamp exists because a legacy
+    /// LogMismatch reports the peer's RAW max log, which sits above its holes. But when the hole
+    /// lies inside this leader's uncommitted inherited tail, every commit frontier stops below the
+    /// tail: the barrier that would commit it cannot gather quorum while the peers withhold their
+    /// acks over the hole. Anchoring at the commit frontier then re-ships the same
+    /// <see cref="RaftConfiguration.MaxBackfillEntriesPerRound"/> entries above it on every beat,
+    /// which the peer already holds, and never reaches the hole. CamusDB Caraxes fault soak fs4 did
+    /// exactly this: the frontier was pinned at 48,266,275, the peers were contiguous through
+    /// 48,266,403, and the leader re-shipped 48,266,276..48,266,403 627 times. Every barrier timed
+    /// out, and the partition had no leader for 59 minutes.</para>
+    ///
+    /// <para><b>Why it is safe.</b> The presence frontier is a report of what the peer holds, not
+    /// of its raw max, so it never sits above a hole. The leader anchors there only when its own
+    /// entry at that index carries the term the peer reported. That is the Raft AppendEntries
+    /// consistency check at the anchor, which the peer's append handler repeats on receipt. On a
+    /// term mismatch, or when the leader cannot read the term, the clamped anchor stands:
+    /// committed prefixes cannot diverge, and that path repairs divergence exactly as before.
+    /// The anchor is also kept below this leader's own tail, because a batch anchored at or past
+    /// it reads nothing, and an empty read escalates to a snapshot transfer.</para>
+    /// </summary>
+    private async ValueTask<long> VerifiedPresenceAnchorAsync(string endpoint, long clampedAnchor)
+    {
+        if (!tracker.TryGetPresenceFrontier(endpoint, out long presentIndex, out long presentTerm)
+            || presentIndex <= clampedAnchor)
+            return clampedAnchor;
+
+        long leaderTail = wal.GetPresentIndex();
+        if (leaderTail < 0)
+            leaderTail = await wal.GetMaxLogAsync().ConfigureAwait(false);
+
+        if (presentIndex >= leaderTail)
+            return clampedAnchor;
+
+        long leaderTermAtPresence = await wal.GetAnyTermAtAsync(presentIndex).ConfigureAwait(false);
+        if (leaderTermAtPresence != presentTerm)
+        {
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] Not anchoring the hole repair for {Endpoint} at its presence frontier {PresentIndex}: its term there is {PeerTerm}, this leader's is {LeaderTerm}; anchoring at {Anchor}",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, presentIndex, presentTerm, leaderTermAtPresence, clampedAnchor);
+            return clampedAnchor;
+        }
+
+        if (logger.IsEnabled(LogLevel.Debug))
+            logger.LogDebug(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Anchoring the hole repair for {Endpoint} at its verified presence frontier {PresentIndex} (term {Term}) instead of {Anchor}",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, presentIndex, presentTerm, clampedAnchor);
+
+        return presentIndex;
     }
 
     /// <summary>

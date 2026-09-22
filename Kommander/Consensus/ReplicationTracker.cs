@@ -51,6 +51,15 @@ internal sealed class ReplicationTracker
     private readonly Dictionary<string, long> durableFrontiers = [];
 
     /// <summary>
+    /// Each peer's self-reported contiguous PRESENCE frontier and the term of its entry there
+    /// (<see cref="Data.CompleteAppendLogsRequest.PresentIndex"/>), last-writer-wins, from every
+    /// term-valid ack whatever its status. Only the anchored hole repair reads it, and only after
+    /// checking the term against this leader's own log — see
+    /// <c>HeartbeatDriver.VerifiedPresenceAnchorAsync</c>.
+    /// </summary>
+    private readonly Dictionary<string, (long Index, long Term)> presenceFrontiers = [];
+
+    /// <summary>
     /// A peer's latest durable-write stall report (<see cref="Data.CompleteAppendLogsRequest.WalStallMs"/>)
     /// and the episode bookkeeping derived from it. Peer facts, not replication progress: they are
     /// not cleared on step-down (they expire by freshness instead) but go with the peer on removal.
@@ -232,6 +241,7 @@ internal sealed class ReplicationTracker
     {
         lastCommitIndexes.Clear();
         durableFrontiers.Clear();
+        presenceFrontiers.Clear();
         host.ClearFollowerProgress(null);
         nextIndex.Clear();
         matchIndex.Clear();
@@ -270,6 +280,7 @@ internal sealed class ReplicationTracker
     {
         bool hadProgress = lastCommitIndexes.Remove(endpoint);
         durableFrontiers.Remove(endpoint);
+        presenceFrontiers.Remove(endpoint);
         walStallReports.Remove(endpoint);
         host.ClearFollowerProgress(endpoint);
         nextIndex.Remove(endpoint);
@@ -332,6 +343,31 @@ internal sealed class ReplicationTracker
     }
 
     public bool TryGetDurableFrontier(string endpoint, out long value) => durableFrontiers.TryGetValue(endpoint, out value);
+
+    /// <summary>
+    /// Records a peer's self-reported contiguous presence frontier and the term there,
+    /// last-writer-wins. A non-positive index or term is "not reported" (a peer predating the
+    /// field sends proto defaults of 0) and is not recorded.
+    /// </summary>
+    public void SetPresenceFrontier(string endpoint, long index, long term)
+    {
+        if (index > 0 && term > 0)
+            presenceFrontiers[endpoint] = (index, term);
+    }
+
+    public bool TryGetPresenceFrontier(string endpoint, out long index, out long term)
+    {
+        if (presenceFrontiers.TryGetValue(endpoint, out (long Index, long Term) value))
+        {
+            index = value.Index;
+            term = value.Term;
+            return true;
+        }
+
+        index = -1;
+        term = -1;
+        return false;
+    }
 
     /// <summary>
     /// Age at or above which a peer's reported pending-write age counts as a stall on this leader:

@@ -455,7 +455,9 @@ public sealed class RaftPartition : IDisposable
             request.Status,
             null,
             durableIndex: request.DurableIndex,
-            walStallMs: request.WalStallMs
+            walStallMs: request.WalStallMs,
+            presentIndex: request.PresentIndex,
+            presentTerm: request.PresentTerm
         ));
     }
 

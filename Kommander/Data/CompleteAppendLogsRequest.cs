@@ -39,7 +39,25 @@ public sealed class CompleteAppendLogsRequest
     /// </summary>
     public long WalStallMs { get; set; }
 
-    public CompleteAppendLogsRequest(int partition, long term, HLCTimestamp time, string endpoint, RaftOperationStatus status, long commitIndex, long durableIndex = -1, long walStallMs = 0)
+    /// <summary>
+    /// The follower's contiguous PRESENCE frontier: the highest id it holds, of any entry type,
+    /// with no hole below it. Unlike <see cref="CommitIndex"/> it is not bounded by resolution, so
+    /// it is the only position that can anchor the repair of a hole inside the leader's
+    /// UNCOMMITTED inherited tail: the follower's commit frontier cannot pass that tail until the
+    /// promotion barrier commits, and the barrier cannot commit until the hole is filled (CamusDB
+    /// Caraxes fault soak fs4 — a leader re-shipped the same 128 entries above the commit frontier
+    /// for 59 minutes while the hole sat just past them). Paired with <see cref="PresentTerm"/> so
+    /// the leader can check it against its own log before anchoring there. -1 when not reported
+    /// (a pre-report release, or presence untracked); 0 carries no positional evidence.
+    /// </summary>
+    public long PresentIndex { get; set; } = -1;
+
+    /// <summary>
+    /// Term of the follower's entry at <see cref="PresentIndex"/>; -1 when not reported.
+    /// </summary>
+    public long PresentTerm { get; set; } = -1;
+
+    public CompleteAppendLogsRequest(int partition, long term, HLCTimestamp time, string endpoint, RaftOperationStatus status, long commitIndex, long durableIndex = -1, long walStallMs = 0, long presentIndex = -1, long presentTerm = -1)
     {
         Partition = partition;
         Term = term;
@@ -49,5 +67,7 @@ public sealed class CompleteAppendLogsRequest
         CommitIndex = commitIndex;
         DurableIndex = durableIndex;
         WalStallMs = walStallMs;
+        PresentIndex = presentIndex;
+        PresentTerm = presentTerm;
     }
 }

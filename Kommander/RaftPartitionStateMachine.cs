@@ -132,18 +132,19 @@ public sealed class RaftPartitionStateMachine
     private const int MaxPresenceGateRefusals = 3;
 
     /// <summary>
-    /// Consecutive promotions refused by the completeness gate over the same
-    /// (<see cref="lastPresenceRefusalPresent"/>, <see cref="lastPresenceRefusalMax"/>) hole.
-    /// Reset when the gate passes, when the hole changes shape (some repair or write landed), or
-    /// after the self-repair escape.
+    /// Consecutive promotions refused by the completeness gate over the same hole, identified by
+    /// its lower edge <see cref="lastPresenceRefusalPresent"/>. Reset when the gate passes, when
+    /// the contiguous frontier moves (a repair landed), or after the self-repair escape.
+    /// <para>The max log id is deliberately NOT part of the key. Entries keep landing ABOVE an
+    /// unrepaired hole — every other winner's barrier no-op is one — and none of them repairs
+    /// anything. Keying on (present, max) reset the count on every such write, so it could never
+    /// reach its cap: CamusDB Caraxes fault soak fs4 logged 598 refusals, every one of them
+    /// <c>(1/12)</c>, over a hole whose lower edge never moved in 59 minutes.</para>
     /// </summary>
     private int presenceGateRefusals;
 
     /// <summary>Contiguous frontier recorded at the last completeness-gate refusal (-1 = none).</summary>
     private long lastPresenceRefusalPresent = -1;
-
-    /// <summary>Max log id recorded at the last completeness-gate refusal (-1 = none).</summary>
-    private long lastPresenceRefusalMax = -1;
 
     /// <summary>
     /// Extended refusal cap used by both promotion gates while a fresher live voter is known
@@ -600,8 +601,11 @@ public sealed class RaftPartitionStateMachine
                     // a cluster re-running this election every few seconds for minutes (the Caraxes
                     // bank-leader-kill churn, terms 9 through 100+) needs the cause in the line that
                     // reports the symptom, not in a stall line minutes earlier on another node.
+                    // The same goes for peers that are withholding their acks over a hole in this
+                    // leader's tail: with only the stall list, 296 of the fs4 reverts read "none"
+                    // while every peer was withholding over the same hole.
                     await RevertUnpublishedPromotionAsync(
-                        $"barrier commit timed out; peers reporting a durable-write stall: {DescribePeerWalStalls()}").ConfigureAwait(false);
+                        $"barrier commit timed out; peers reporting a durable-write stall: {DescribePeerWalStalls()}; peers contiguous only below this leader's tail: {DescribePeerLogHoles()}").ConfigureAwait(false);
                     return;
                 }
 
@@ -1628,12 +1632,11 @@ public sealed class RaftPartitionStateMachine
         long presentId = wal.GetPresentIndex();
         if (presentId >= 0 && presentId < maxLog)
         {
-            bool sameHole = presentId == lastPresenceRefusalPresent && maxLog == lastPresenceRefusalMax;
+            bool sameHole = presentId == lastPresenceRefusalPresent;
             presenceGateRefusals = sameHole ? presenceGateRefusals + 1 : 1;
             if (!sameHole || presenceRefusalStreakTicks == 0)
                 presenceRefusalStreakTicks = host.GetMonotonicTimestamp();
             lastPresenceRefusalPresent = presentId;
-            lastPresenceRefusalMax = maxLog;
 
             // While a fresher live voter is known, stretch the refusal cap: that voter can win the
             // term and repair this node's hole by backfill with nothing lost, so the destructive
@@ -1692,7 +1695,6 @@ public sealed class RaftPartitionStateMachine
 
             presenceGateRefusals = 0;
             lastPresenceRefusalPresent = -1;
-            lastPresenceRefusalMax = -1;
             presenceRefusalStreakTicks = 0;
 
             if (presentId >= 0 && presentId < maxLog)
@@ -1711,7 +1713,6 @@ public sealed class RaftPartitionStateMachine
         {
             presenceGateRefusals = 0;
             lastPresenceRefusalPresent = -1;
-            lastPresenceRefusalMax = -1;
             presenceRefusalStreakTicks = 0;
         }
 
@@ -1832,6 +1833,42 @@ public sealed class RaftPartitionStateMachine
         }
 
         return stalled?.ToString() ?? "none";
+    }
+
+    /// <summary>
+    /// Lists the peers whose last reported contiguous presence frontier sits below this leader's
+    /// own, for the barrier-timeout line. Such a peer holds a hole below the barrier and withholds
+    /// its ack for the barrier until the hole is backfilled. "none" when no peer reports one,
+    /// including peers that predate the presence report.
+    /// </summary>
+    private string DescribePeerLogHoles()
+    {
+        long localPresent = wal.GetPresentIndex();
+        if (localPresent < 0)
+            return "none";
+
+        global::System.Text.StringBuilder? holed = null;
+
+        foreach (RaftNode node in host.Nodes)
+        {
+            if (node.Endpoint == host.LocalEndpoint)
+                continue;
+
+            if (!tracker.TryGetPresenceFrontier(node.Endpoint, out long peerPresent, out _) || peerPresent >= localPresent)
+                continue;
+
+            holed ??= new global::System.Text.StringBuilder();
+            if (holed.Length > 0)
+                holed.Append("; ");
+
+            holed.Append(node.Endpoint)
+                 .Append(host.IsVoter(node.Endpoint) ? " (voter)" : " (learner)")
+                 .Append(": contiguous through ").Append(peerPresent)
+                 .Append(" of ").Append(localPresent)
+                 .Append(", commit frontier ").Append(tracker.GetCommitFrontierOrDefault(node.Endpoint, -1));
+        }
+
+        return holed?.ToString() ?? "none";
     }
 
     /// <summary>
@@ -2488,9 +2525,9 @@ public sealed class RaftPartitionStateMachine
     /// Handles one follower's AppendEntries acknowledgement — see
     /// <see cref="ReplicationAckProcessor.CompleteAppendLogsAsync"/>.
     /// </summary>
-    public async ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1, long durableIndex = -1, long walStallMs = 0)
+    public async ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1, long durableIndex = -1, long walStallMs = 0, long presentIndex = -1, long presentTerm = -1)
     {
-        await ackProcessor.CompleteAppendLogsAsync(endpoint, timestamp, status, committedIndex, responseTerm, durableIndex, walStallMs).ConfigureAwait(false);
+        await ackProcessor.CompleteAppendLogsAsync(endpoint, timestamp, status, committedIndex, responseTerm, durableIndex, walStallMs, presentIndex, presentTerm).ConfigureAwait(false);
 
         // The ack that levels the transfer target with the last index is the moment to hand over:
         // waiting for the next tick would add up to a heartbeat interval to every transfer under load.

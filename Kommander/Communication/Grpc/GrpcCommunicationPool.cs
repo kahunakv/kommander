@@ -101,6 +101,10 @@ public static class GrpcCommunicationPool
         obj.Endpoint = "";
         obj.Status = default;
         obj.CommitIndex = 0;
+        obj.DurableIndex = 0;
+        obj.WalStallMs = 0;
+        obj.PresentIndex = 0;
+        obj.PresentTerm = 0;
 
         if (Interlocked.Increment(ref _completeAppendLogsCount) <= MaxRetained)
         {

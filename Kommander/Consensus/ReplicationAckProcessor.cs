@@ -70,7 +70,7 @@ internal sealed class ReplicationAckProcessor
         this.failAllActiveProposalWaiters = failAllActiveProposalWaiters;
     }
 
-    public async ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1, long durableIndex = -1, long walStallMs = 0)
+    public async ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1, long durableIndex = -1, long walStallMs = 0, long presentIndex = -1, long presentTerm = -1)
     {
         // ── Raft §5.1: a response stamped with a HIGHER term deposes us ─────────────────────────
         // Terms only enter a node through elections, so a higher response term proves a newer term
@@ -150,6 +150,11 @@ internal sealed class ReplicationAckProcessor
         // episode is logged twice, on entry and on exit, never per ack.
         tracker.SetDurableFrontier(endpoint, durableIndex);
         RecordPeerWalStall(endpoint, walStallMs, committedIndex, durableIndex);
+
+        // A third fact about the peer's log, also valid whatever the status: how far it holds
+        // entries contiguously. The anchored hole repair needs it when the hole sits in this
+        // leader's uncommitted inherited tail, above every commit frontier (HeartbeatDriver).
+        tracker.SetPresenceFrontier(endpoint, presentIndex, presentTerm);
 
         // Hand the same two facts to readers outside the executor (IRaft.GetFollowerProgress): an
         // application waiting on this follower can then see, without a scheduler round-trip, that its

@@ -1302,7 +1302,9 @@ public sealed class RaftPartitionExecutor : IDisposable
                         request.CommitIndex,
                         request.Term,
                         request.DurableIndex,
-                        request.WalStallMs
+                        request.WalStallMs,
+                        request.PresentIndex,
+                        request.PresentTerm
                     ).ConfigureAwait(false);
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
                     break;

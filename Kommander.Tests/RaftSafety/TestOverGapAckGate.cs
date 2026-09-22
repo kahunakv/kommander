@@ -46,6 +46,8 @@ public sealed class TestOverGapAckGate
         public ValueTask<long> GetLastCheckpointAsync() => ValueTask.FromResult(-1L);
         public long GetCommitIndex() => CommitIndexValue;
         public long GetPresentIndex() => PresentIndex;
+        public long PresentTermValue { get; set; } = -1;
+        public long GetPresentTerm() => PresentTermValue;
         public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp ts, bool autoCommit) => MakeNoOp();
         public WALWriteOperation EnqueueCommit(List<RaftLog> logs) => MakeNoOp();
         public WALWriteOperation EnqueueRollback(List<RaftLog> logs) => MakeNoOp();
@@ -84,6 +86,7 @@ public sealed class TestOverGapAckGate
     {
         (RaftPartitionStateMachine sm, TestWalCompletionFences.StubHost host, GapStubWal wal) = Build();
         wal.PresentIndex = 5;       // contiguous only through 5 — the batch at 7 sits over a gap
+        wal.PresentTermValue = 1;
         wal.CommitIndexValue = 5;
         wal.MaxLogValue = 7;
 
@@ -97,6 +100,11 @@ public sealed class TestOverGapAckGate
         CompleteAppendLogsRequest ack = SingleAck(host);
         Assert.Equal(RaftOperationStatus.LogMismatch, ack.Status);
         Assert.Equal(5, ack.CommitIndex);
+
+        // The presence report rides on the ack, so the leader can anchor its repair at the gap
+        // even when the gap sits above every commit frontier (TestInheritedTailHoleRepair).
+        Assert.Equal(5, ack.PresentIndex);
+        Assert.Equal(1, ack.PresentTerm);
     }
 
     [Fact]

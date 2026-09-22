@@ -100,6 +100,10 @@ message GrpcCompleteAppendLogsRequest {
   int64 DurableIndex = 9;
   // Age in ms of the follower's oldest unanswered WAL write; 0 when nothing is pending.
   int64 WalStallMs = 10;
+  // The follower's contiguous presence frontier (highest id held with no hole below it, any
+  // entry type) and the term of the entry there. 0 from peers predating the fields: no report.
+  int64 PresentIndex = 11;
+  int64 PresentTerm = 12;
 }
 
 message GrpcCompleteAppendLogsResponse {

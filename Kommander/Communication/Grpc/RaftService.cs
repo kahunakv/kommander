@@ -282,7 +282,9 @@ public sealed class RaftService : Rafter.RafterBase
             (RaftOperationStatus)request.Status,
             request.CommitIndex,
             request.DurableIndex,
-            request.WalStallMs
+            request.WalStallMs,
+            request.PresentIndex,
+            request.PresentTerm
         ));
         
         return completeAppendLogsResponse;
@@ -534,7 +536,9 @@ public sealed class RaftService : Rafter.RafterBase
                                     (RaftOperationStatus)completeAppendLogsRequest.Status,
                                     completeAppendLogsRequest.CommitIndex,
                                     completeAppendLogsRequest.DurableIndex,
-                                    completeAppendLogsRequest.WalStallMs
+                                    completeAppendLogsRequest.WalStallMs,
+                                    completeAppendLogsRequest.PresentIndex,
+                                    completeAppendLogsRequest.PresentTerm
                                 ));
 
                                 break;
