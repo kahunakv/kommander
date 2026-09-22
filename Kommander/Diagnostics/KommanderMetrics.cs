@@ -473,6 +473,30 @@ public static class KommanderMetrics
             description: "SST file count in L0 across the Raft-log shard CFs; should stay below the L0 compaction trigger, since non-overlapping log files are moved (not rewritten) out of L0 and dropped whole. A climb toward the slowdown trigger means real compactions are running.");
 
         Meter.CreateObservableGauge(
+            "raft.wal.table_readers_memory",
+            MeasureWalTableReadersMemory,
+            unit: "By",
+            description: "Native bytes held by the Raft-log engine's open table readers (per-SST index and filter blocks). Under a shared RocksDbSharedResources bundle these blocks are charged to the block cache and this stays small; without one they are bounded by nothing and grow with live SST bytes (~8.9% of them on this WAL's shape). Read it with block_cache_usage and memtable_memory to account for a node's native footprint.");
+
+        Meter.CreateObservableGauge(
+            "raft.wal.memtable_memory",
+            MeasureWalMemtableMemory,
+            unit: "By",
+            description: "Native bytes of memtable memory across the Raft-log engine's column families, including immutable memtables awaiting flush. Bounded by the shared WriteBufferManager when the host injects one.");
+
+        Meter.CreateObservableGauge(
+            "raft.wal.block_cache_usage",
+            MeasureWalBlockCacheUsage,
+            unit: "By",
+            description: "Native bytes resident in the block cache backing the Raft-log engine. Under a shared RocksDbSharedResources bundle this is the whole shared cache, not this engine's share of it.");
+
+        Meter.CreateObservableGauge(
+            "raft.wal.block_cache_pinned_usage",
+            MeasureWalBlockCachePinnedUsage,
+            unit: "By",
+            description: "Native bytes in the block cache that cannot be evicted (live iterators, and pinned index/filter blocks where enabled). Approaching the cache budget means the cache cannot make room and reads go to disk whatever its size.");
+
+        Meter.CreateObservableGauge(
             "raft.wal.alive_log_bytes",
             MeasureWalAliveLogBytes,
             unit: "By",
@@ -563,6 +587,18 @@ public static class KommanderMetrics
 
     private static IEnumerable<Measurement<long>> MeasureWalAliveLogBytes() =>
         MeasureWalEngines(static wal => wal.GetAliveWriteAheadLogBytes());
+
+    private static IEnumerable<Measurement<long>> MeasureWalTableReadersMemory() =>
+        MeasureWalEngines(static wal => wal.GetTableReadersMemoryBytes());
+
+    private static IEnumerable<Measurement<long>> MeasureWalMemtableMemory() =>
+        MeasureWalEngines(static wal => wal.GetMemtableMemoryBytes());
+
+    private static IEnumerable<Measurement<long>> MeasureWalBlockCacheUsage() =>
+        MeasureWalEngines(static wal => wal.GetBlockCacheUsageBytes());
+
+    private static IEnumerable<Measurement<long>> MeasureWalBlockCachePinnedUsage() =>
+        MeasureWalEngines(static wal => wal.GetBlockCachePinnedUsageBytes());
 
     private static List<Measurement<long>> MeasureWalEngines(Func<Kommander.WAL.RocksDbWAL, long> read)
     {

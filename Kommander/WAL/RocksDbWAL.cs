@@ -356,8 +356,26 @@ public class RocksDbWAL : IWAL, IDisposable
         // over-budget WBM flushes early, which degrades the flush-unit sizing back toward the old
         // behavior instead of growing memory. Hosts sharing a WBM should size the budget (or pass a
         // smaller RocksDbWalTuning), or accept frequent cross-CF/cross-DB flush coupling.
+        // Index and filter blocks are charged to the shared cache rather than pinned in the table
+        // readers. RocksDB's default (cache_index_and_filter_blocks = false) keeps them outside every
+        // budget, resident per open SST, so they grow with the engine's live SST bytes and no cache
+        // size bounds them: measured at ~8.9% of live SST bytes on this WAL's shape (3.0 MB of table
+        // readers per 33.5 MB of SST), which at soak scale is gigabytes. CamusDB's Phase 5 fault soaks
+        // lost two nodes to container OOM with ~3 GB of native memory per node that a 768 MiB shared
+        // budget did not touch; this is the allocation that was missing from the budget.
+        //
+        // Only on the shared path, deliberately. A host that injects RocksDbSharedResources has sized
+        // a budget and wants everything charged against it. With no shared resources the CFs keep
+        // RocksDB's defaults, including its small default block cache, and charging index/filter blocks
+        // into that would thrash rather than bound anything.
+        //
+        // L0's blocks are pinned inside the cache so the level consulted on every lookup cannot be
+        // evicted out from under the read path — the same pairing Kahuna's KV backend uses.
         BlockBasedTableOptions? sharedBbto = sharedResources is not null
-            ? new BlockBasedTableOptions().SetBlockCache(sharedResources.BlockCache)
+            ? new BlockBasedTableOptions()
+                .SetBlockCache(sharedResources.BlockCache)
+                .SetCacheIndexAndFilterBlocks(true)
+                .SetPinL0FilterAndIndexBlocksInCache(true)
             : null;
 
         // More compaction/flush workers than the RocksDB default of 2: with ten column families on
@@ -835,6 +853,54 @@ public class RocksDbWAL : IWAL, IDisposable
     internal long GetShardLevel0FileCount() => SumShardProperty("rocksdb.num-files-at-level0");
 
     /// <summary>
+    /// Bytes held by this engine's open table readers across every column family
+    /// (<c>rocksdb.estimate-table-readers-mem</c>): per-SST index blocks, filter blocks and the
+    /// reader objects themselves.
+    ///
+    /// <para><b>Whether this memory is bounded depends on how the engine was opened.</b> Under a
+    /// <see cref="RocksDbSharedResources"/> bundle the WAL sets <c>cache_index_and_filter_blocks</c>,
+    /// so index and filter blocks are charged to the shared block cache and this figure stays small.
+    /// Without one the CFs keep RocksDB's default of false: the blocks are pinned in the table
+    /// readers for every open SST, bounded by nothing, and grow with live SST bytes — measured at
+    /// ~8.9% of them on this WAL's shape. That is how it was found (CamusDB Phase 5 fault soaks
+    /// fs1/fs2: ~3 GB of native memory per node that a 768 MiB shared budget did not move, because
+    /// at the time this allocation was outside the budget on both paths).</para>
+    ///
+    /// <para>Read it next to <see cref="GetBlockCacheUsageBytes"/> and
+    /// <see cref="GetMemtableMemoryBytes"/>: those three plus the managed heap account for most of
+    /// a node's resident set, and only this one is unbounded by configuration today.</para>
+    ///
+    /// Fed to <c>raft.wal.table_readers_memory</c>.
+    /// </summary>
+    internal long GetTableReadersMemoryBytes() => SumAllColumnFamilyProperty("rocksdb.estimate-table-readers-mem");
+
+    /// <summary>
+    /// Bytes of memtable memory across every column family (<c>rocksdb.cur-size-all-mem-tables</c>),
+    /// including the immutable memtables still awaiting flush. Bounded by the shared
+    /// WriteBufferManager when the host injects one, so this is the half of the native footprint a
+    /// budget does control. Fed to <c>raft.wal.memtable_memory</c>.
+    /// </summary>
+    internal long GetMemtableMemoryBytes() => SumAllColumnFamilyProperty("rocksdb.cur-size-all-mem-tables");
+
+    /// <summary>
+    /// Bytes resident in the block cache backing this engine (<c>rocksdb.block-cache-usage</c>).
+    /// Read once at the database level rather than summed per column family: the cache is shared by
+    /// every CF — and, under <see cref="RocksDbSharedResources"/>, by the host's other databases too
+    /// — so each CF reports the same whole-cache figure and summing would multiply it by the CF
+    /// count. Fed to <c>raft.wal.block_cache_usage</c>.
+    /// </summary>
+    internal long GetBlockCacheUsageBytes() => ReadIntegerProperty("rocksdb.block-cache-usage");
+
+    /// <summary>
+    /// Bytes in the block cache that cannot be evicted (<c>rocksdb.block-cache-pinned-usage</c>) —
+    /// blocks held by live iterators and, where a build enables it, pinned index/filter blocks. A
+    /// pinned figure approaching the cache budget means the cache cannot make room and reads will
+    /// go to disk regardless of its size. Database-level for the same reason as
+    /// <see cref="GetBlockCacheUsageBytes"/>. Fed to <c>raft.wal.block_cache_pinned_usage</c>.
+    /// </summary>
+    internal long GetBlockCachePinnedUsageBytes() => ReadIntegerProperty("rocksdb.block-cache-pinned-usage");
+
+    /// <summary>
     /// Logs once, at open, when a shared WriteBufferManager budget cannot hold the flush unit the
     /// shard tuning asks for. RocksDB flushes whichever memtable is oldest in the database that
     /// trips the budget, and this WAL trips it far more often than a co-hosted store (one write per
@@ -890,6 +956,55 @@ public class RocksDbWAL : IWAL, IDisposable
     /// Sums a per-CF integer RocksDB property over the shard column families. A closed/failing
     /// engine reports 0 (no reclaim evidence, not "healthy"), like the stall readers above.
     /// </summary>
+    /// <summary>
+    /// Sums a per-CF integer RocksDB property over <b>every</b> column family this engine opens —
+    /// <c>default</c>, <c>metadata</c> and the eight shards — rather than the shards alone, because
+    /// the memory properties are asked as "what does this engine hold", and index/filter memory for
+    /// the metadata CF counts against the same container. A closed or failing engine reports 0, like
+    /// the readers above; a CF that cannot be resolved contributes 0 rather than failing the sum.
+    /// </summary>
+    private long SumAllColumnFamilyProperty(string property)
+    {
+        if (engineClosed)
+            return 0;
+
+        try
+        {
+            using EngineLease lease = AcquireEngine();
+            long sum = 0;
+
+            foreach (string name in AllColumnFamilyNames())
+            {
+                try
+                {
+                    ColumnFamilyHandle cf = db.GetColumnFamily(name);
+                    if (long.TryParse(db.GetProperty(property, cf), out long value))
+                        sum += value;
+                }
+                catch (Exception)
+                {
+                    // A CF the engine no longer exposes holds no memory this sum can attribute.
+                }
+            }
+
+            return sum;
+        }
+        catch (Exception)
+        {
+            return 0;
+        }
+    }
+
+    /// <summary>Every column-family name this engine opens, in <see cref="OpenEngine"/>'s order.</summary>
+    private static IEnumerable<string> AllColumnFamilyNames()
+    {
+        yield return "default";
+        yield return "metadata";
+
+        for (int i = 0; i < MaxShards; i++)
+            yield return "shard" + i;
+    }
+
     private long SumShardProperty(string property)
     {
         if (engineClosed)
