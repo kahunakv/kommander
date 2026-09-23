@@ -23,10 +23,13 @@ namespace Kommander.Tests.Simulation;
 /// <c>Kommander.Tests/Simulation/Scenarios/Random/regressions/</c>. The shrunk one is worth
 /// preferring: it says the same thing in fewer actions, and it carries the same header.</para>
 ///
-/// <para><b>Why one test and not a theory row per plan.</b> A theory over an empty corpus is a test
-/// run that fails for having no data, and the corpus is empty until somebody promotes something.
-/// The loop reports every plan that failed rather than only the first, which is what a row per plan
-/// would have given.</para>
+/// <para><b>Why a theory row per plan.</b> This used to be one test that looped over the corpus. At
+/// 24 replays a plan costs about three and a half minutes, so the single test ran silent for
+/// seventeen minutes over five plans, and the nightly job's hang detector kills any test that is
+/// silent for thirty. Three more promotions would have failed the nightly for a reason that has
+/// nothing to do with the library. A row per plan keeps each test to one plan's cost, and a failure
+/// names its plan in the test name. The rows are file names, not parsed plans, so an unreadable
+/// file fails its own row instead of breaking discovery for the whole class.</para>
 /// </summary>
 [Collection(ClusterIntegrationCollection.Name)]
 public sealed class TestPlanRegressions
@@ -77,23 +80,24 @@ public sealed class TestPlanRegressions
     }
 
     /// <summary>
-    /// Every promoted plan holds every check, on every replay.
+    /// The promoted corpus loads, and it is not empty.
     ///
-    /// <para><b>A corpus that loads nothing fails.</b> This test used to return early on an empty
-    /// corpus, on the reading that emptiness was a fact about the corpus rather than about the
+    /// <para><b>A corpus that loads nothing fails.</b> The replay test used to return early on an
+    /// empty corpus, on the reading that emptiness was a fact about the corpus rather than about the
     /// library. That reading was safe only while nothing had been promoted. It stopped being safe
     /// the day the first plan landed, and the cost was immediate: the project file's copy rule was
-    /// wrong, the output folder was never created, this test finished in twenty-one milliseconds,
+    /// wrong, the output folder was never created, the test finished in twenty-one milliseconds,
     /// and it passed — over a promoted plan it had never read. The failure mode of a regression
     /// corpus is silence, so the loader's silence is now the failure. A test whose subject is
     /// loaded from disk must assert that it loaded something.</para>
+    ///
+    /// <para>A theory over no rows also fails, but with a message that names neither the folder nor
+    /// the copy rule. This fact exists for its message, and it also proves every file parses.</para>
     /// </summary>
     [Fact]
     [Trait("Category", "DSTRandom")]
-    public async Task EveryPromotedPlan_StillHoldsEveryCheck()
+    public void ThePromotedCorpus_LoadsAtLeastOnePlan()
     {
-        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
-
         IReadOnlyList<RegressionPlan> plans = RegressionPlanCorpus.Load();
 
         Assert.True(plans.Count > 0,
@@ -103,55 +107,85 @@ public sealed class TestPlanRegressions
             $"means one of three things: the copy rule is broken again, {RegressionPlanCorpus.DirectoryVariable} " +
             $"points somewhere wrong, or every promoted plan was deleted on purpose — in which case " +
             $"delete this assertion in the same change, so the corpus is never silently empty.");
+    }
 
-        output.WriteLine(
-            $"Replaying {plans.Count} plan(s) from {RegressionPlanCorpus.ConfiguredDirectory()}.");
+    /// <summary>
+    /// One promoted plan holds every check, on every replay.
+    /// </summary>
+    [Theory]
+    [Trait("Category", "DSTRandom")]
+    [MemberData(nameof(PromotedPlans))]
+    public async Task EveryPromotedPlan_StillHoldsEveryCheck(string planFile)
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+
+        RegressionPlan plan = RegressionPlanCorpus.Read(
+            Path.Combine(RegressionPlanCorpus.ConfiguredDirectory(), planFile));
 
         int repeats = ConfiguredRepeats();
-        StringBuilder failures = new();
+        int failed = 0;
 
-        foreach (RegressionPlan plan in plans)
+        output.WriteLine($"Replaying {plan.Name} {repeats} time(s).");
+
+        // Grouped by the first line of the failure, which is the rule that fired. One plan can
+        // reach more than one broken state, and reporting only the first failure hides the
+        // others — including the case where the interesting one is the rarer of the two.
+        Dictionary<string, (int Count, string Text)> bySignature = [];
+
+        for (int attempt = 1; attempt <= repeats; attempt++)
         {
-            int failed = 0;
+            string? failure = await ReplayAsync(plan, cancellationToken);
 
-            // Grouped by the first line of the failure, which is the rule that fired. One plan can
-            // reach more than one broken state, and reporting only the first failure hides the
-            // others — including the case where the interesting one is the rarer of the two.
-            Dictionary<string, (int Count, string Text)> bySignature = [];
-
-            for (int attempt = 1; attempt <= repeats; attempt++)
-            {
-                string? failure = await ReplayAsync(plan, cancellationToken);
-
-                if (failure is null)
-                    continue;
-
-                failed++;
-
-                string signature = failure.Split(':', 2)[0];
-
-                bySignature[signature] = bySignature.TryGetValue(signature, out var seen)
-                    ? (seen.Count + 1, seen.Text)
-                    : (1, failure);
-            }
-
-            if (failed == 0)
+            if (failure is null)
                 continue;
 
-            // The rate, not the fact. Every failure this search finds is intermittent, and one in
-            // twenty and twenty in twenty are different findings that need different next steps:
-            // the first is a rare state to hunt, the second is a defect to fix. A message that
-            // said only "it failed" would hide which one this is.
-            failures.AppendLine($"{plan.Name} failed {failed} of {repeats} replays.");
+            failed++;
 
-            foreach ((string signature, (int count, string text)) in bySignature.OrderByDescending(
-                         entry => entry.Value.Count))
-            {
-                failures.AppendLine($"  {count}x {signature} — {text}");
-            }
+            string signature = failure.Split(':', 2)[0];
+
+            bySignature[signature] = bySignature.TryGetValue(signature, out var seen)
+                ? (seen.Count + 1, seen.Text)
+                : (1, failure);
         }
 
-        Assert.True(failures.Length == 0, failures.ToString());
+        if (failed == 0)
+            return;
+
+        // The rate, not the fact. Every failure this search finds is intermittent, and one in
+        // twenty and twenty in twenty are different findings that need different next steps:
+        // the first is a rare state to hunt, the second is a defect to fix. A message that
+        // said only "it failed" would hide which one this is.
+        StringBuilder failures = new();
+        failures.AppendLine($"{plan.Name} failed {failed} of {repeats} replays.");
+
+        foreach ((string signature, (int count, string text)) in bySignature.OrderByDescending(
+                     entry => entry.Value.Count))
+        {
+            failures.AppendLine($"  {count}x {signature} — {text}");
+        }
+
+        Assert.Fail(failures.ToString());
+    }
+
+    /// <summary>
+    /// The file names of the promoted plans, one theory row each.
+    ///
+    /// <para>Names only: parsing happens inside the row, so a broken file fails that row rather
+    /// than discovery. The names are strings, so xUnit can serialize them and list each row as its
+    /// own test, which the nightly job's hang detector needs.</para>
+    /// </summary>
+    public static TheoryData<string> PromotedPlans()
+    {
+        TheoryData<string> data = new();
+        string directory = RegressionPlanCorpus.ConfiguredDirectory();
+
+        if (!Directory.Exists(directory))
+            return data;
+
+        foreach (string path in Directory.EnumerateFiles(directory, "*.plan.txt").Order(StringComparer.Ordinal))
+            data.Add(Path.GetFileName(path));
+
+        return data;
     }
 
     /// <summary>
