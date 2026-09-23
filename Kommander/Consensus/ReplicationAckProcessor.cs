@@ -221,7 +221,7 @@ internal sealed class ReplicationAckProcessor
             // row, so that one reordered stale rejection does not cost a snapshot.
             if (coreState.NodeState == RaftNodeState.Leader)
             {
-                (int refusals, long anchor) = tracker.RecordCompactedAnchorRefusal(endpoint);
+                (int refusals, long anchor) = tracker.RecordCompactedAnchorRefusal(endpoint, durableIndex);
                 if (refusals >= CompactedAnchorRefusalsBeforeSnapshot)
                 {
                     RaftNode? node = FindNode(endpoint);

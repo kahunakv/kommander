@@ -523,8 +523,22 @@ public sealed class TestRestartUnderLoadScenarios
         await CheckpointAsync(cluster, leader, cancellationToken);
         await ConvergeAsync(cluster, invariants, await CommitIndexAsync(leader, cancellationToken), cancellationToken);
 
-        RaftFollowerProgress? before = leader.Manager.GetFollowerProgress(PartitionId, victim.Endpoint);
-        Assert.NotNull(before);
+        // Wait for the report, not only the commit index. The view's commit index follows the
+        // victim's durable presence, while the report also needs its resolutions on disk, and under
+        // load the last markers can still be queued. The state under test is a follower that
+        // REPORTED the entry as committed and durable, so the report is what must be in place.
+        long leaderCommit = await CommitIndexAsync(leader, cancellationToken);
+
+        Assert.True(
+            await cluster.RunUntilAsync(
+                () => Task.FromResult(
+                    leader.Manager.GetFollowerProgress(PartitionId, victim.Endpoint) is { } progress
+                    && progress.DurableFrontier >= leaderCommit),
+                stepCount: 100,
+                advanceMilliseconds: 50,
+                cancellationToken),
+            $"The victim never reported its committed prefix through {leaderCommit} as durable: " +
+            $"{leader.Manager.GetFollowerProgress(PartitionId, victim.Endpoint)}.");
 
         victim.SimulatedWal!.LoseResolutionsOnNextCrash(PartitionId, count: 1);
         await cluster.CrashNodeAsync(victim, cancellationToken);

@@ -804,7 +804,9 @@ internal sealed class ReplicationTracker
     /// <summary>
     /// Counts a rejection from <paramref name="endpoint"/> against its last compacted-anchor batch
     /// and returns the refusals in a row, with the anchor; (0, -1) when the last batch was not
-    /// anchored on a compacted entry.
+    /// anchored on a compacted entry, and a zero count when the rejection does not prove the anchor
+    /// is uncommitted on the peer (<paramref name="reportedDurable"/> unknown, or at or above the
+    /// anchor).
     ///
     /// <para><b>Why the leader must count these (DST FINDING 7 backstop).</b> A follower accepts a
     /// <c>-1</c> anchor only inside its own committed prefix, because only there does Leader
@@ -816,10 +818,20 @@ internal sealed class ReplicationTracker
     /// heartbeat, and the no-progress streak never grew because only <c>Success</c> acks feed it:
     /// 800 identical rejections in 400 steps, and no snapshot.</para>
     /// </summary>
-    public (int Refusals, long Anchor) RecordCompactedAnchorRefusal(string endpoint)
+    public (int Refusals, long Anchor) RecordCompactedAnchorRefusal(string endpoint, long reportedDurable)
     {
         if (!compactedAnchorShips.TryGetValue(endpoint, out (long Anchor, int Refusals) current))
             return (0, -1);
+
+        // Only a rejection that proves the anchor is not committed on the peer counts. A peer whose
+        // durable frontier reaches the anchor holds it inside its committed prefix and accepts the
+        // anchored batch, so its rejection answers something else: the over-gap ack gate, or the
+        // hole report beside a heartbeat. Counting those sent a snapshot to a healthy follower
+        // (GA flake in AFollowerThatFirstSeesAnEntryCommitted…, two over-gap rejections read as
+        // refusals of anchor 21 while the follower reported durable 21). A peer that reports no
+        // durable frontier (-1) proves nothing either way and is not counted.
+        if (reportedDurable < 0 || reportedDurable >= current.Anchor)
+            return (0, current.Anchor);
 
         current = (current.Anchor, current.Refusals + 1);
         compactedAnchorShips[endpoint] = current;
