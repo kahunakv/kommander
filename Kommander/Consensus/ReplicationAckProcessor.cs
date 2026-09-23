@@ -186,6 +186,26 @@ internal sealed class ReplicationAckProcessor
             long backtracked  = Math.Max(1, Math.Min(currentNext - 1, committedIndex + 1));
             tracker.SetNextIndex(endpoint, backtracked);
 
+            // The rejection attests to the highest id the peer holds: its raw max (or contiguous
+            // anchor) in committedIndex, plus its presence and durable reports when it carries them.
+            // Progress recorded above all of them is stale: the peer's log shrank — a member
+            // restarted with an empty log under the same endpoint, which the roster never re-admits
+            // and so never resets. Lower the records so no repair is anchored above what the peer
+            // holds (the previous incarnation's presence frontier raised every hole repair above a
+            // blank peer, forever), and so the snapshot rescue no longer believes the peer holds a
+            // range it lost. The regression note makes the next heartbeat re-ship from the reported
+            // position, exempt from no-progress pacing, exactly as a crash-restart that lost its
+            // commit markers is re-supplied.
+            long attestedMax = Math.Max(committedIndex, Math.Max(presentIndex, durableIndex));
+            if (coreState.NodeState == RaftNodeState.Leader && committedIndex >= 0 && tracker.LowerProgressTo(endpoint, attestedMax))
+            {
+                tracker.RecordRegressedFrontier(endpoint, committedIndex);
+
+                logger.LogInformation(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] {Endpoint} rejected an append reporting a log through {ReportedMax}, below the progress recorded for it; its log shrank (restarted empty?), so the recorded progress is lowered and the next heartbeat re-ships from there",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, committedIndex);
+            }
+
             // Anchored-repair note: the reported anchor is the peer's contiguous position, so the
             // next heartbeat ships an anchored batch from exactly there (SendHeartbeat's mismatch
             // trigger). This is the only repair driver when the missing range is part of the

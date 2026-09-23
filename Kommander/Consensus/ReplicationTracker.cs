@@ -294,6 +294,65 @@ internal sealed class ReplicationTracker
     }
 
     /// <summary>
+    /// Lowers every recorded position of <paramref name="endpoint"/> that sits above
+    /// <paramref name="reportedMax"/>, the highest log id the peer just reported holding in a
+    /// rejection ack. Returns whether anything was lowered.
+    ///
+    /// <para>A rejection's position report is a fact about the peer's log NOW: its committed,
+    /// durable and contiguous frontiers cannot exceed the highest entry it holds. A record above
+    /// it is therefore stale. The one way such a record arises is a peer whose log shrank behind
+    /// the leader's back — a member that crashed and restarted with an empty (or truncated) log
+    /// under the same endpoint, which never leaves the committed roster and so is never reset by
+    /// <c>ResetFollowerProgress</c>. Left standing, the stale records steered every repair above
+    /// what the peer holds: the presence frontier of the previous incarnation raised each anchored
+    /// hole repair to a position the blank peer rejected, and its commit frontier told the
+    /// snapshot rescue that the peer already held the refused range. The peer converged only when
+    /// SWIM evicted the dead incarnation and re-admitted the live one, minutes later.</para>
+    ///
+    /// <para>The presence frontier is removed rather than lowered: the peer's term at the reported
+    /// position is unknown here, and a blank peer reports no presence at all. <c>matchIndex</c> is
+    /// lowered as well — it is the leader's belief about the peer's matched prefix, and a peer that
+    /// just proved it holds nothing above <paramref name="reportedMax"/> must not be counted as
+    /// matching more (a leadership transfer, or a quorum, could otherwise be built on it).
+    /// <c>nextIndex</c> is left to the caller's backtrack. A reordered stale rejection can lower
+    /// these records once too often; that costs one redundant, idempotent anchored batch and the
+    /// peer's next Success ack restores them, whereas refusing to lower cost a stranded replica.</para>
+    /// </summary>
+    public bool LowerProgressTo(string endpoint, long reportedMax)
+    {
+        if (reportedMax < 0)
+            return false;
+
+        bool lowered = false;
+
+        if (presenceFrontiers.TryGetValue(endpoint, out (long Index, long Term) presence) && presence.Index > reportedMax)
+        {
+            presenceFrontiers.Remove(endpoint);
+            lowered = true;
+        }
+
+        if (lastCommitIndexes.TryGetValue(endpoint, out long committed) && committed > reportedMax)
+        {
+            lastCommitIndexes[endpoint] = reportedMax;
+            lowered = true;
+        }
+
+        if (durableFrontiers.TryGetValue(endpoint, out long durable) && durable > reportedMax)
+        {
+            durableFrontiers[endpoint] = reportedMax;
+            lowered = true;
+        }
+
+        if (matchIndex.TryGetValue(endpoint, out long matched) && matched > reportedMax)
+        {
+            matchIndex[endpoint] = reportedMax;
+            lowered = true;
+        }
+
+        return lowered;
+    }
+
+    /// <summary>
     /// The last repair decision made about each peer, kept for diagnosis.
     ///
     /// <para>Last writer wins, one entry per peer, overwritten every heartbeat round. It is a copy
