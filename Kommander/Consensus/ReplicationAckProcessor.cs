@@ -201,9 +201,7 @@ internal sealed class ReplicationAckProcessor
             {
                 tracker.RecordRegressedFrontier(endpoint, committedIndex);
 
-                logger.LogInformation(
-                    "[{LocalEndpoint}/{PartitionId}/{State}] {Endpoint} rejected an append reporting a log through {ReportedMax}, below the progress recorded for it; its log shrank (restarted empty?), so the recorded progress is lowered and the next heartbeat re-ships from there",
-                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, committedIndex);
+                logger.LogInfoRegressedFollowerFrontierLowered(host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, committedIndex);
             }
 
             // Anchored-repair note: the reported anchor is the peer's contiguous position, so the
