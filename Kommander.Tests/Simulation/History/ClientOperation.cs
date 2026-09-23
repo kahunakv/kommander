@@ -29,6 +29,20 @@ public enum ClientOperationOutcome
     Info = 2,
 }
 
+/// <summary>What a client asked the cluster to do.</summary>
+public enum ClientOperationKind
+{
+    /// <summary>Append one entry to the log.</summary>
+    Append = 0,
+
+    /// <summary>
+    /// Read one node's application state after the node confirmed it is current. The read uses
+    /// <c>ConfirmLocalApplicationAsync</c>, which is the leader's read-index confirmation on the
+    /// leader and the follower read on any other node.
+    /// </summary>
+    Read = 1,
+}
+
 /// <summary>
 /// One recorded client operation, from the moment it was issued to the answer it received.
 /// </summary>
@@ -52,7 +66,22 @@ public enum ClientOperationOutcome
 /// <param name="CompletedAtSequence">Position in that order when the answer arrived.</param>
 /// <param name="Outcome">How the answer is classified.</param>
 /// <param name="Status">The raw status, kept so a failure report can name it.</param>
-/// <param name="LogIndex">The index the cluster assigned, meaningful only when the outcome is Ok.</param>
+/// <param name="LogIndex">
+/// For an append, the index the cluster assigned, meaningful only when the outcome is Ok. For a read,
+/// the highest id in <paramref name="Observed"/>, or -1 when the read saw nothing.
+/// </param>
+/// <param name="Kind">Whether the client appended or read.</param>
+/// <param name="Node">The endpoint the client called. Recorded for reads, where it is the point.</param>
+/// <param name="Observed">
+/// For a read with outcome Ok, the application state the node held when its confirmation returned:
+/// entry id to <c>SimulatedPartitionStateTransfer.Hash</c>. Null for an append and for a refused read.
+///
+/// <para><b>Why a copy taken at that moment is the value the read returned.</b> The library hands
+/// an entry to the application before it moves its applied index, and the confirmation completes only
+/// when the applied index covers the read index. So the copy holds everything the confirmation
+/// promised. It can also hold entries applied later in the same round; that only makes the read look
+/// fresher, and it never hides a stale read, because a stale node receives no newer entries.</para>
+/// </param>
 public sealed record ClientOperation(
     int Id,
     string Type,
@@ -63,9 +92,14 @@ public sealed record ClientOperation(
     int CompletedAtSequence,
     ClientOperationOutcome Outcome,
     RaftOperationStatus Status,
-    long LogIndex)
+    long LogIndex,
+    ClientOperationKind Kind = ClientOperationKind.Append,
+    string? Node = null,
+    IReadOnlyDictionary<long, ulong>? Observed = null)
 {
     /// <summary>A short description for a failure message.</summary>
-    public override string ToString() =>
-        $"op{Id}({Type}) {Outcome}/{Status} index={LogIndex} steps={InvokedAtStep}..{CompletedAtStep}";
+    public override string ToString() => Kind == ClientOperationKind.Read
+        ? $"op{Id}(read at {Node}) {Outcome} saw={Observed?.Count ?? 0} through={LogIndex} " +
+          $"steps={InvokedAtStep}..{CompletedAtStep}"
+        : $"op{Id}({Type}) {Outcome}/{Status} index={LogIndex} steps={InvokedAtStep}..{CompletedAtStep}";
 }

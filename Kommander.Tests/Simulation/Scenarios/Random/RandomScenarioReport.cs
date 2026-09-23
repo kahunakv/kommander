@@ -86,6 +86,18 @@ public sealed record RandomScenarioReport
         new Dictionary<RaftOperationStatus, int>();
 
     /// <summary>
+    /// Reads at a cut leader that found another leader with a new acknowledged write. See
+    /// <see cref="RandomScenarioRunner.CutLeaderReadsReached"/>.
+    /// </summary>
+    public int CutLeaderReadsReached { get; init; }
+
+    /// <summary>
+    /// Of those, the reads the cut leader served. See
+    /// <see cref="RandomScenarioRunner.CutLeaderReadsServed"/>.
+    /// </summary>
+    public int CutLeaderReadsServed { get; init; }
+
+    /// <summary>
     /// Highest term any node held on the run's partition at the end, or -1 when no view was read.
     /// Every election raises the term, so on a run with no fault this is the leader churn: a healthy
     /// cluster that keeps its first leader ends at term 1 or 2.

@@ -189,6 +189,8 @@ public sealed class RandomScenarioRunner
             QuiescedOutagesReached = QuiescedOutagesReached,
             LateBroadcastsCommittedFirst = LateBroadcastsCommittedFirst,
             TransferAnswers = new Dictionary<RaftOperationStatus, int>(transferAnswers),
+            CutLeaderReadsReached = CutLeaderReadsReached,
+            CutLeaderReadsServed = CutLeaderReadsServed,
             FinalTerm = finalViews.Count == 0 ? -1 : finalViews.Max(view => view.Term),
         };
     }
@@ -660,6 +662,12 @@ public sealed class RandomScenarioRunner
             return resolved;
         }
 
+        if (resolved.Kind == RandomScenarioActionKind.ReadAtCutLeader && resolved.Target is not null)
+        {
+            await RunReadAtCutLeaderAsync(resolved.Target, cancellationToken).ConfigureAwait(false);
+            return resolved;
+        }
+
         if (resolved.Kind == RandomScenarioActionKind.LateBroadcast && resolved.Target is not null)
         {
             await RunLateBroadcastAsync(resolved.Target, cancellationToken).ConfigureAwait(false);
@@ -779,6 +787,150 @@ public sealed class RandomScenarioRunner
 
         await RunStepsAsync(OutageRecoverySteps, deliver: true, cancellationToken).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Reads at a cut leader that found the state they exist for: another node led, and it had
+    /// acknowledged a write the cut leader never received. A family where this stays at zero never
+    /// asked the question.
+    /// </summary>
+    public int CutLeaderReadsReached { get; private set; }
+
+    /// <summary>
+    /// Of <see cref="CutLeaderReadsReached"/>, the reads the cut leader served. On a correct build a
+    /// served read here is legal only when the cut leader held the new write anyway, which it cannot
+    /// while the cut holds; the history checker decides.
+    /// </summary>
+    public int CutLeaderReadsServed { get; private set; }
+
+    /// <summary>
+    /// Reads at the leader, cuts it off, waits until another node leads, writes through the new
+    /// leader, and reads at the cut leader before the heal. See
+    /// <see cref="RandomScenarioActionKind.ReadAtCutLeader"/>.
+    ///
+    /// <para><b>The read budget.</b> A correct cut leader cannot confirm, and it refuses the read when
+    /// its confirmation times out: <c>LeadershipConfirmationTimeout</c>, two seconds by default,
+    /// enforced from its own tick in simulated time. The cut holds for that long plus a margin, so the
+    /// answer arrives while the cut still holds. A read that is still open at the heal is waited out
+    /// after it, and the history records whatever answer it gets.</para>
+    ///
+    /// <para>The endpoint is healed in a <c>finally</c>, like every outage.</para>
+    /// </summary>
+    private async Task RunReadAtCutLeaderAsync(string endpoint, CancellationToken cancellationToken)
+    {
+        // One read at the leader before the cut, as a client that reads all the time would make.
+        // It leaves a fresh confirmation behind, and a leader that reused that confirmation after
+        // the cut without a time limit would serve the second read from it. Without this read the
+        // action cannot find such a defect: measured, a confirmation that never expires passed the
+        // scripted cut-leader scenario until it read first.
+        if (Node(endpoint).LifecycleStatus == SimulationNodeLifecycleStatus.Running)
+        {
+            Task<ClientOperation> before = history.ReadAsync(
+                cluster, Node(endpoint), options.PartitionId, cancellationToken);
+
+            await cluster.RunUntilAsync(
+                () => Task.FromResult(before.IsCompleted),
+                ReadBudgetSteps(),
+                options.AdvanceMillisecondsPerStep,
+                cancellationToken).ConfigureAwait(false);
+
+            await before.ConfigureAwait(false);
+        }
+
+        cluster.Transport.PartitionNode(endpoint);
+
+        Task<ClientOperation>? read = null;
+        bool reached = false;
+
+        try
+        {
+            string? successor = null;
+
+            await cluster.RunUntilAsync(
+                async () =>
+                {
+                    await invariants.CheckAsync(cluster, options.PartitionId, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    IReadOnlyList<RaftPartitionView> views = await cluster
+                        .GetPartitionViewsAsync(options.PartitionId, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    successor = views
+                        .FirstOrDefault(view =>
+                            view.Role == RaftNodeState.Leader
+                            && !string.Equals(view.Endpoint, endpoint, StringComparison.Ordinal))?
+                        .Endpoint;
+
+                    return successor is not null;
+                },
+                options.StepsPerAction * OutageElectionBudgetFactor,
+                options.AdvanceMillisecondsPerStep,
+                cancellationToken).ConfigureAwait(false);
+
+            ClientOperation? write = null;
+
+            if (successor is not null)
+            {
+                Task<ClientOperation> append = history.AppendUniqueAsync(
+                    cluster, Node(successor), options.PartitionId, "Greeting", cancellationToken);
+
+                await cluster.RunUntilAsync(
+                    () => Task.FromResult(append.IsCompleted),
+                    options.StepsPerAction * OutageElectionBudgetFactor,
+                    options.AdvanceMillisecondsPerStep,
+                    cancellationToken).ConfigureAwait(false);
+
+                write = await append.ConfigureAwait(false);
+            }
+
+            if (Node(endpoint).LifecycleStatus == SimulationNodeLifecycleStatus.Running)
+            {
+                read = history.ReadAsync(cluster, Node(endpoint), options.PartitionId, cancellationToken);
+
+                await cluster.RunUntilAsync(
+                    () => Task.FromResult(read.IsCompleted),
+                    ReadBudgetSteps(),
+                    options.AdvanceMillisecondsPerStep,
+                    cancellationToken).ConfigureAwait(false);
+
+                reached = write is { Outcome: ClientOperationOutcome.Ok };
+            }
+        }
+        finally
+        {
+            cluster.Transport.HealPartition(endpoint);
+        }
+
+        if (read is not null)
+        {
+            await cluster.RunUntilAsync(
+                () => Task.FromResult(read.IsCompleted),
+                ReadBudgetSteps(),
+                options.AdvanceMillisecondsPerStep,
+                cancellationToken).ConfigureAwait(false);
+
+            ClientOperation answer = await read.ConfigureAwait(false);
+
+            if (reached)
+            {
+                CutLeaderReadsReached++;
+
+                if (answer.Outcome == ClientOperationOutcome.Ok)
+                    CutLeaderReadsServed++;
+            }
+        }
+
+        await RunStepsAsync(OutageRecoverySteps, deliver: true, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Steps a read may take: the library's default confirmation timeout in simulated time, plus two
+    /// action-lengths of margin for the tick that enforces it.
+    /// </summary>
+    private int ReadBudgetSteps() =>
+        (int)(new RaftConfiguration().LeadershipConfirmationTimeout.TotalMilliseconds
+              / Math.Max(1, options.AdvanceMillisecondsPerStep))
+        + options.StepsPerAction * 2;
 
     /// <summary>
     /// Answers the leadership transfers of this run received, by status. Printed by the transfer
@@ -1150,6 +1302,23 @@ public sealed class RandomScenarioRunner
     {
         switch (action.Kind)
         {
+            case RandomScenarioActionKind.ReadAtNode:
+                if (Node(action.Target!).LifecycleStatus == SimulationNodeLifecycleStatus.Running)
+                {
+                    Task<ClientOperation> read = history.ReadAsync(
+                        cluster, Node(action.Target!), options.PartitionId, cancellationToken);
+
+                    await cluster.RunUntilAsync(
+                        () => Task.FromResult(read.IsCompleted),
+                        ReadBudgetSteps(),
+                        options.AdvanceMillisecondsPerStep,
+                        cancellationToken).ConfigureAwait(false);
+
+                    await read.ConfigureAwait(false);
+                }
+
+                return true;
+
             case RandomScenarioActionKind.AppendAtLeader:
             case RandomScenarioActionKind.AppendAtFollower:
                 await history

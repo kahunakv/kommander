@@ -291,20 +291,26 @@ public sealed class SimulatedPartitionStateTransfer : IRaftPartitionStateTransfe
     }
 
     /// <summary>The hash two nodes compare for one entry: FNV-1a over the type name and the payload.</summary>
-    public static ulong Hash(RaftLog log)
+    public static ulong Hash(RaftLog log) => Hash(log.LogType, log.LogData);
+
+    /// <summary>
+    /// The same hash from the type and payload alone, for a client history that knows what it sent
+    /// but holds no <see cref="RaftLog"/>.
+    /// </summary>
+    public static ulong Hash(string? logType, byte[]? logData)
     {
         const ulong offset = 14695981039346656037;
         const ulong prime = 1099511628211;
 
         ulong hash = offset;
 
-        foreach (char character in log.LogType ?? string.Empty)
+        foreach (char character in logType ?? string.Empty)
         {
             hash ^= character;
             hash *= prime;
         }
 
-        foreach (byte value in log.LogData ?? [])
+        foreach (byte value in logData ?? [])
         {
             hash ^= value;
             hash *= prime;

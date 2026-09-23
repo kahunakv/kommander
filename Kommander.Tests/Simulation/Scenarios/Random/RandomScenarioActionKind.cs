@@ -229,4 +229,27 @@ public enum RandomScenarioActionKind
     /// under no fault. The runner's rule <c>transfer-definite-when-healthy</c> does now.</para>
     /// </summary>
     TransferLeadership,
+
+    /// <summary>
+    /// Read one node's application state through <c>ConfirmLocalApplicationAsync</c>, as a consumer
+    /// serving reads from local state does. <c>Target</c> is the node, leader or follower.
+    ///
+    /// <para><b>Why.</b> Until this action, no simulated client read. A node that served stale state
+    /// after confirming it was current broke no rule the harness had, because every rule read node
+    /// state or the final log. The history checker judges each served read (DST-7b).</para>
+    /// </summary>
+    ReadAtNode,
+
+    /// <summary>
+    /// Read at the leader, cut it off in both directions, wait until another node leads, write one
+    /// entry through the new leader, and then read at the cut leader while the cut holds.
+    /// <c>Target</c> is the leader. The first read leaves a fresh confirmation behind, so a leader
+    /// that reuses a confirmation for too long is also in scope.
+    ///
+    /// <para><b>Why.</b> The Jepsen shape behind <c>bf275e4a</c>: a leader cut off from the majority
+    /// still believes it leads, and a read gated on that belief returns state without the writes the
+    /// new leader acknowledged. A correct node refuses the read, because it cannot confirm with a
+    /// quorum. A random read lands in this window almost never, so the action builds it.</para>
+    /// </summary>
+    ReadAtCutLeader,
 }

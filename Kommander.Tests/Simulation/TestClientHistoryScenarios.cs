@@ -130,7 +130,153 @@ public sealed class TestClientHistoryScenarios
         Assert.True(history.AcknowledgedCount >= 2, "Too few appends were acknowledged to check anything.");
     }
 
+    /// <summary>
+    /// A confirmed read at the leader and at a follower holds every write acknowledged before it.
+    /// The baseline for the read rules: a read model that failed here would be wrong about the
+    /// library's normal path.
+    /// </summary>
+    [Fact]
+    public async Task ConfirmedReadsAtTheLeaderAndAFollower_HoldEveryAcknowledgedWrite()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+
+        await using SimulationCluster cluster = await StartAsync(20260924, cancellationToken);
+
+        ClusterInvariantRunner invariants = new();
+        ClientHistory history = new();
+
+        SimulationNode leader = await ElectAsync(cluster, cancellationToken);
+
+        for (int index = 0; index < 3; index++)
+            await history.AppendUniqueAsync(cluster, leader, PartitionId, "Greeting", cancellationToken);
+
+        SimulationNode follower = cluster.Nodes.First(node => node != leader);
+
+        ClientOperation atLeader = await ReadAsync(cluster, history, leader, cancellationToken);
+        ClientOperation atFollower = await ReadAsync(cluster, history, follower, cancellationToken);
+
+        Assert.Equal(ClientOperationOutcome.Ok, atLeader.Outcome);
+        Assert.Equal(ClientOperationOutcome.Ok, atFollower.Outcome);
+
+        await ConvergeAsync(cluster, invariants, history.AcknowledgedCount, cancellationToken);
+        await VerifyAsync(cluster, invariants, history, cancellationToken);
+
+        Assert.Equal(2, history.ReadsServed);
+    }
+
+    /// <summary>
+    /// A leader cut off from the majority refuses a read after another node led and acknowledged a
+    /// write.
+    ///
+    /// <para><b>Why.</b> The Jepsen <c>register / partition</c> violation behind <c>bf275e4a</c>: the cut
+    /// leader still believes it leads, and a read gated on that belief returns state without the new
+    /// write. The read index makes the node prove its leadership with a quorum round, which it cannot
+    /// do while cut off, so the correct answer is a refusal. The read rules run before the outcome is
+    /// asserted, so a build that serves the read fails on the rule that names the stale read.</para>
+    ///
+    /// <para>The leader serves one read before the cut. Measured: without it, a leader whose
+    /// confirmation never expired passed this scenario, because it had no confirmation to reuse.</para>
+    /// </summary>
+    [Fact]
+    public async Task ALeaderCutOffFromTheMajority_RefusesARead()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+
+        await using SimulationCluster cluster = await StartAsync(20260925, cancellationToken);
+
+        ClusterInvariantRunner invariants = new();
+        ClientHistory history = new();
+
+        SimulationNode leader = await ElectAsync(cluster, cancellationToken);
+        await history.AppendUniqueAsync(cluster, leader, PartitionId, "Greeting", cancellationToken);
+
+        // A read before the cut, so a confirmation is fresh when the cut begins. A leader that
+        // reused it without a time limit would serve the read after the cut from it.
+        Assert.Equal(
+            ClientOperationOutcome.Ok,
+            (await ReadAsync(cluster, history, leader, cancellationToken)).Outcome);
+
+        cluster.Transport.PartitionNode(leader.Endpoint);
+
+        ClientOperation read;
+
+        try
+        {
+            SimulationNode successor = await ElectOtherThanAsync(cluster, leader, cancellationToken);
+
+            ClientOperation write = await history.AppendUniqueAsync(
+                cluster, successor, PartitionId, "Greeting", cancellationToken);
+
+            Assert.Equal(ClientOperationOutcome.Ok, write.Outcome);
+
+            read = await ReadAsync(cluster, history, leader, cancellationToken);
+        }
+        finally
+        {
+            cluster.Transport.HealPartition(leader.Endpoint);
+        }
+
+        ClientHistoryChecker.CheckReads(history, cluster.StepNumber);
+
+        Assert.Equal(ClientOperationOutcome.Fail, read.Outcome);
+
+        await ConvergeAsync(cluster, invariants, history.AcknowledgedCount, cancellationToken);
+        await VerifyAsync(cluster, invariants, history, cancellationToken);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Issues a read and steps the cluster until it answers. The confirmation of a cut-off leader
+    /// ends on its own timeout, which runs on simulated time, so a read that is awaited without
+    /// stepping would never finish.
+    /// </summary>
+    private static async Task<ClientOperation> ReadAsync(
+        SimulationCluster cluster,
+        ClientHistory history,
+        SimulationNode node,
+        CancellationToken cancellationToken)
+    {
+        Task<ClientOperation> read = history.ReadAsync(cluster, node, PartitionId, cancellationToken);
+
+        Assert.True(
+            await cluster.RunUntilAsync(
+                () => Task.FromResult(read.IsCompleted),
+                stepCount: 200,
+                advanceMilliseconds: 50,
+                cancellationToken),
+            $"The read at {node.Endpoint} did not answer within 200 steps.");
+
+        return await read;
+    }
+
+    /// <summary>Waits until a node other than <paramref name="excluded"/> leads, and returns it.</summary>
+    private static async Task<SimulationNode> ElectOtherThanAsync(
+        SimulationCluster cluster,
+        SimulationNode excluded,
+        CancellationToken cancellationToken)
+    {
+        string? successor = null;
+
+        bool elected = await cluster.RunUntilAsync(
+            async () =>
+            {
+                IReadOnlyList<RaftPartitionView> views =
+                    await cluster.GetPartitionViewsAsync(PartitionId, cancellationToken);
+
+                successor = views.FirstOrDefault(view =>
+                    view.Role == RaftNodeState.Leader && view.Endpoint != excluded.Endpoint)?.Endpoint;
+
+                return successor is not null;
+            },
+            stepCount: 300,
+            advanceMilliseconds: 50,
+            cancellationToken);
+
+        Assert.True(elected, $"No node other than {excluded.Endpoint} was elected within the step budget.");
+
+        return cluster.Nodes.First(node => node.Endpoint == successor);
+    }
 
     private Task<SimulationCluster> StartAsync(ulong seed, CancellationToken cancellationToken) =>
         SimulationCluster.StartAsync(

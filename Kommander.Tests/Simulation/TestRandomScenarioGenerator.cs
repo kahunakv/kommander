@@ -322,7 +322,9 @@ public sealed class TestRandomScenarioGenerator
             if (kind is RandomScenarioActionKind.LateBroadcast
                 or RandomScenarioActionKind.QuiescedLeaderOutage
                 or RandomScenarioActionKind.RestartNodeBlank
-                or RandomScenarioActionKind.TransferLeadership)
+                or RandomScenarioActionKind.TransferLeadership
+                or RandomScenarioActionKind.ReadAtNode
+                or RandomScenarioActionKind.ReadAtCutLeader)
                 continue;
 
             // FastDisk and FreeDisk arrive as heals, which the age bound also emits, so every kind
@@ -366,6 +368,39 @@ public sealed class TestRandomScenarioGenerator
         Assert.NotEmpty(quiesced);
         Assert.All(late, action => Assert.NotEqual(Observation().Leader, action.Target));
         Assert.All(quiesced, action => Assert.Equal(Observation().Leader, action.Target));
+    }
+
+    /// <summary>
+    /// The two reads are drawn only when their weights are set. The plain read targets any running
+    /// node, the read at a cut leader targets the leader.
+    /// </summary>
+    [Fact]
+    public void TheReads_AreDrawnOnlyWhenTheirWeightsAreSet()
+    {
+        RandomScenarioGenerator unweighted = new(new SimulationRandom(20260924), new RandomScenarioOptions());
+        RandomScenarioGenerator weighted = new(
+            new SimulationRandom(20260924),
+            new RandomScenarioOptions { ReadWeight = 10, CutLeaderReadWeight = 10 });
+
+        List<RandomScenarioAction> drawn = [];
+
+        for (int index = 0; index < 2_000; index++)
+        {
+            Assert.DoesNotContain(
+                unweighted.Next(Observation()).Kind,
+                new[] { RandomScenarioActionKind.ReadAtNode, RandomScenarioActionKind.ReadAtCutLeader });
+
+            drawn.Add(weighted.Next(Observation()));
+        }
+
+        List<RandomScenarioAction> reads = drawn.Where(action => action.Kind == RandomScenarioActionKind.ReadAtNode).ToList();
+        List<RandomScenarioAction> cut = drawn.Where(action => action.Kind == RandomScenarioActionKind.ReadAtCutLeader).ToList();
+
+        Assert.NotEmpty(reads);
+        Assert.NotEmpty(cut);
+        Assert.All(reads, action => Assert.Contains(action.Target, Observation().Running));
+        Assert.True(reads.Select(action => action.Target).Distinct().Count() > 1, "Every read went to one node.");
+        Assert.All(cut, action => Assert.Equal(Observation().Leader, action.Target));
     }
 
     /// <summary>

@@ -425,6 +425,41 @@ public sealed class TestRandomScenarios
     }
 
     /// <summary>
+    /// The options of the read sweep. Public so a plan replay or a probe can rebuild the same run.
+    /// </summary>
+    public static RandomScenarioOptions ReadOptions => new()
+    {
+        ReadWeight = 10,
+        CutLeaderReadWeight = 10,
+    };
+
+    /// <summary>
+    /// The read family: clients read at random nodes through <c>ConfirmLocalApplicationAsync</c>, and
+    /// read at a leader cut off from the majority after another node acknowledged a write.
+    ///
+    /// <para><b>Why.</b> DST-7b's acceptance. Before this family no simulated client read, so a node
+    /// that served stale state after confirming it was current broke no rule: the Jepsen
+    /// <c>register / partition</c> violation behind <c>bf275e4a</c>. The history checker's read rules
+    /// judge every served read at the end of the run.</para>
+    /// </summary>
+    [Theory]
+    [Trait("Category", "DSTRandom")]
+    [MemberData(nameof(Seeds))]
+    public async Task AGeneratedRunUnderReads_HoldsEveryCheck(ulong seed)
+    {
+        RandomScenarioReport report = await RunSeedAsync(
+            seed, ReadOptions, TestContext.Current.CancellationToken);
+
+        Assert.True(report.InvariantChecks > 0, "The run checked no invariants.");
+
+        output.WriteLine(
+            $"seed={seed} reads={report.CountOf(RandomScenarioActionKind.ReadAtNode)} " +
+            $"served={report.History.ReadsServed} refused={report.History.ReadsRefused} " +
+            $"cutLeaderReads={report.CountOf(RandomScenarioActionKind.ReadAtCutLeader)} " +
+            $"reached={report.CutLeaderReadsReached} servedAtCut={report.CutLeaderReadsServed}");
+    }
+
+    /// <summary>
     /// The options of the late-broadcast sweep. Public so a plan replay or a probe can rebuild the
     /// same run.
     /// </summary>

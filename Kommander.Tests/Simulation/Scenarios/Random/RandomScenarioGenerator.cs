@@ -189,6 +189,14 @@ public sealed class RandomScenarioGenerator
         if (observation.Leader is not null && observation.Running.Count >= 2)
             Offer(options.TransferLeadershipWeight, 11);
 
+        // A read takes nothing away from the cluster, so it needs no budget, only a running node.
+        if (observation.Running.Count > 0)
+            Offer(options.ReadWeight, 12);
+
+        // A read at a cut leader costs the cluster its leader like an outage does.
+        if (HasBudget && observation.Leader is not null && observation.Running.Count >= 3)
+            Offer(options.CutLeaderReadWeight, 13);
+
         int total = categories.Sum(entry => entry.Weight);
 
         if (total <= 0)
@@ -220,6 +228,11 @@ public sealed class RandomScenarioGenerator
             9 => DrawLateBroadcast(index, observation),
             10 => new RandomScenarioAction(index, RandomScenarioActionKind.QuiescedLeaderOutage, observation.Leader),
             11 => DrawLeadershipTransfer(index, observation),
+            12 => new RandomScenarioAction(
+                index,
+                RandomScenarioActionKind.ReadAtNode,
+                observation.Running[random.NextInt("read-target", 0, observation.Running.Count)]),
+            13 => new RandomScenarioAction(index, RandomScenarioActionKind.ReadAtCutLeader, observation.Leader),
             // Two thirds of the outages carry a client write into the disruption. That overlap is
             // the only place a client can be told the wrong thing about its own operation, and the
             // two write variants disrupt different halves of it: one takes the leader away for

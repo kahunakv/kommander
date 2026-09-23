@@ -1,16 +1,26 @@
 using Kommander.Data;
+using Kommander.Tests.Simulation.Cluster;
 
 namespace Kommander.Tests.Simulation.History;
 
 /// <summary>
 /// Checks a run's client history against the log the cluster ended up with.
 ///
-/// <para><b>The model is a replicated log, not a register.</b> Kommander's client surface appends
-/// entries and returns the index each one took, so the properties worth checking are the ones an
-/// append model states: an acknowledged append is present, it is present once, acknowledged appends
-/// appear in the order the client observed, and a refused append is absent. A register model with
-/// reads and compare-and-set would be a better fit for a key-value store built on top, and a worse
-/// fit for the library itself.</para>
+/// <para><b>The model is a replicated log with confirmed reads, not a register.</b> Kommander's
+/// client surface appends entries and returns the index each one took, so the properties worth
+/// checking are the ones an append model states: an acknowledged append is present, it is present
+/// once, acknowledged appends appear in the order the client observed, and a refused append is
+/// absent. A register model with compare-and-set would be a better fit for a key-value store built
+/// on top, and a worse fit for the library itself.</para>
+///
+/// <para><b>Reads.</b> A consumer serves a read from its own application state after
+/// <c>ConfirmLocalApplicationAsync</c> returns true, so the read of the log is that state. Three
+/// rules judge it: a read holds every append acknowledged before it began, a read holds no append
+/// that was refused, and a read holds everything an earlier read held. Together these are
+/// linearizability for reads of a log whose committed prefixes agree, which the run-level rules
+/// establish separately (<c>committed-entries-agree</c>, <c>applied-state-agrees</c>). The first rule is
+/// the one a deposed leader breaks when it answers a read without a quorum round
+/// (<c>bf275e4a</c>).</para>
 ///
 /// <para><b>What the checks are read against.</b> One node's committed entries. This is sound only
 /// because the run-level convergence invariant separately establishes that live nodes hold identical
@@ -58,6 +68,35 @@ public static class ClientHistoryChecker
     public const string RefusedAppendAbsent = "refused-append-absent";
 
     /// <summary>
+    /// A served read holds every append that was acknowledged before the read began, with the
+    /// payload the client sent.
+    ///
+    /// <para>The promise of a confirmed read. A node that confirmed it is current and then served
+    /// state without an acknowledged write is serving stale state as an authoritative answer: the
+    /// Jepsen <c>register / partition</c> violation behind <c>bf275e4a</c>, where a leader cut off from
+    /// the majority answered reads for eleven seconds.</para>
+    /// </summary>
+    public const string ReadObservesAcknowledgedAppends = "read-observes-acknowledged-appends";
+
+    /// <summary>
+    /// A served read holds no append that was refused.
+    ///
+    /// <para>A refused append must never take effect, so a read that shows one has shown the client
+    /// a write it was told did not happen. <see cref="RefusedAppendAbsent"/> judges the final log;
+    /// this judges what a client saw on the way.</para>
+    /// </summary>
+    public const string ReadObservesNoRefusedAppend = "read-observes-no-refused-append";
+
+    /// <summary>
+    /// A served read holds every entry that an earlier served read held, with the same content.
+    ///
+    /// <para>Two reads that did not overlap in time must not go backwards. A client that saw an
+    /// entry and then, on its next read at another node, did not see it, has watched a write
+    /// disappear, whether or not that write was its own.</para>
+    /// </summary>
+    public const string ReadsRespectRealTime = "reads-respect-real-time";
+
+    /// <summary>
     /// Runs every append-model check. Call at the end of a run, after the cluster has converged.
     /// </summary>
     /// <param name="history">What the clients were told.</param>
@@ -98,12 +137,98 @@ public static class ClientHistoryChecker
         CheckAcknowledgedPresent(history, entries, stepNumber, compactedThrough);
         CheckOrderRespectsRealTime(history, stepNumber);
         CheckRefusedAbsent(history, entries, stepNumber);
+        CheckReads(history, stepNumber);
     }
+
+    /// <summary>
+    /// Runs the three read rules. They need no log: each read carries the state it returned.
+    ///
+    /// <para>Order matters for the same reason as for appends. A read that misses an acknowledged
+    /// append names the cause at the read; a later read that goes backwards would name only a
+    /// symptom.</para>
+    /// </summary>
+    public static void CheckReads(ClientHistory history, int stepNumber)
+    {
+        List<ClientOperation> reads = history.Operations
+            .Where(op => op.Kind == ClientOperationKind.Read && op.Outcome == ClientOperationOutcome.Ok)
+            .ToList();
+
+        if (reads.Count == 0)
+            return;
+
+        List<ClientOperation> appends = Appends(history).ToList();
+
+        foreach (ClientOperation read in reads)
+        {
+            IReadOnlyDictionary<long, ulong> observed = read.Observed!;
+
+            foreach (ClientOperation append in appends)
+            {
+                ulong expected = SimulatedPartitionStateTransfer.Hash(append.Type, append.Payload);
+
+                if (append.Outcome == ClientOperationOutcome.Ok
+                    && append.CompletedAtSequence < read.InvokedAtSequence)
+                {
+                    if (!observed.TryGetValue(append.LogIndex, out ulong held))
+                    {
+                        throw Violation(
+                            ReadObservesAcknowledgedAppends,
+                            stepNumber,
+                            $"{read} began after {append} was acknowledged, yet the state it " +
+                            $"returned holds nothing at {append.LogIndex}. The node served a stale read.");
+                    }
+
+                    if (held != expected)
+                    {
+                        throw Violation(
+                            ReadObservesAcknowledgedAppends,
+                            stepNumber,
+                            $"{read} began after {append} was acknowledged, yet the state it " +
+                            $"returned holds a different entry at {append.LogIndex}.");
+                    }
+                }
+
+                if (append.Outcome == ClientOperationOutcome.Fail && observed.Values.Contains(expected))
+                {
+                    throw Violation(
+                        ReadObservesNoRefusedAppend,
+                        stepNumber,
+                        $"{read} returned the payload of {append}, which the cluster refused.");
+                }
+            }
+        }
+
+        foreach (ClientOperation earlier in reads)
+        {
+            foreach (ClientOperation later in reads)
+            {
+                if (later.Id == earlier.Id || later.InvokedAtSequence < earlier.CompletedAtSequence)
+                    continue;
+
+                foreach ((long id, ulong hash) in earlier.Observed!)
+                {
+                    if (later.Observed!.TryGetValue(id, out ulong held) && held == hash)
+                        continue;
+
+                    throw Violation(
+                        ReadsRespectRealTime,
+                        stepNumber,
+                        $"{later} began after {earlier} returned, yet it " +
+                        (later.Observed.ContainsKey(id) ? "holds a different entry" : "holds nothing") +
+                        $" at {id}, which the earlier read held.");
+                }
+            }
+        }
+    }
+
+    /// <summary>The appends of a history. The append rules ignore reads.</summary>
+    private static IEnumerable<ClientOperation> Appends(ClientHistory history) =>
+        history.Operations.Where(op => op.Kind == ClientOperationKind.Append);
 
     private static void CheckAcknowledgedPresent(
         ClientHistory history, List<RaftLog> entries, int stepNumber, long compactedThrough)
     {
-        foreach (ClientOperation operation in history.Operations)
+        foreach (ClientOperation operation in Appends(history))
         {
             if (operation.Outcome != ClientOperationOutcome.Ok)
                 continue;
@@ -140,7 +265,7 @@ public static class ClientHistoryChecker
     {
         Dictionary<long, ClientOperation> byIndex = new();
 
-        foreach (ClientOperation operation in history.Operations)
+        foreach (ClientOperation operation in Appends(history))
         {
             if (operation.Outcome != ClientOperationOutcome.Ok)
                 continue;
@@ -169,12 +294,12 @@ public static class ClientHistoryChecker
 
     private static void CheckOrderRespectsRealTime(ClientHistory history, int stepNumber)
     {
-        foreach (ClientOperation earlier in history.Operations)
+        foreach (ClientOperation earlier in Appends(history))
         {
             if (earlier.Outcome != ClientOperationOutcome.Ok)
                 continue;
 
-            foreach (ClientOperation later in history.Operations)
+            foreach (ClientOperation later in Appends(history))
             {
                 if (later.Id == earlier.Id || later.Outcome != ClientOperationOutcome.Ok)
                     continue;
@@ -200,7 +325,7 @@ public static class ClientHistoryChecker
     private static void CheckRefusedAbsent(
         ClientHistory history, List<RaftLog> entries, int stepNumber)
     {
-        foreach (ClientOperation operation in history.Operations)
+        foreach (ClientOperation operation in Appends(history))
         {
             if (operation.Outcome != ClientOperationOutcome.Fail)
                 continue;

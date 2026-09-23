@@ -182,6 +182,18 @@ public sealed record RandomScenarioOptions
     public int TransferLeadershipWeight { get; init; }
 
     /// <summary>
+    /// Weight of <see cref="RandomScenarioActionKind.ReadAtNode"/>. Zero by default, so the existing
+    /// plans do not change; the read family turns it on.
+    /// </summary>
+    public int ReadWeight { get; init; }
+
+    /// <summary>
+    /// Weight of <see cref="RandomScenarioActionKind.ReadAtCutLeader"/>. Zero by default, so the
+    /// existing plans do not change; the read family turns it on.
+    /// </summary>
+    public int CutLeaderReadWeight { get; init; }
+
+    /// <summary>
     /// Applies the node configuration these options imply. One place, so the sweep, the shrinker
     /// and the regression replay cannot build a cluster that differs from the run they reproduce.
     /// </summary>
@@ -312,6 +324,8 @@ public sealed record RandomScenarioOptions
             ["quiescedOutageWeight"] = QuiescedOutageWeight.ToString(),
             ["blankRestartPercent"] = BlankRestartPercent.ToString(),
             ["transferLeadershipWeight"] = TransferLeadershipWeight.ToString(),
+            ["readWeight"] = ReadWeight.ToString(),
+            ["cutLeaderReadWeight"] = CutLeaderReadWeight.ToString(),
             ["enableCheckQuorum"] = EnableCheckQuorum.ToString(),
             ["startElectionTimeoutMs"] = StartElectionTimeoutMs?.ToString(CultureInfo.InvariantCulture) ?? "default",
             ["endElectionTimeoutMs"] = EndElectionTimeoutMs?.ToString(CultureInfo.InvariantCulture) ?? "default",
@@ -371,6 +385,8 @@ public sealed record RandomScenarioOptions
             QuiescedOutageWeight = Int(parameters, "quiescedOutageWeight", defaults.QuiescedOutageWeight),
             BlankRestartPercent = Int(parameters, "blankRestartPercent", defaults.BlankRestartPercent),
             TransferLeadershipWeight = Int(parameters, "transferLeadershipWeight", defaults.TransferLeadershipWeight),
+            ReadWeight = Int(parameters, "readWeight", defaults.ReadWeight),
+            CutLeaderReadWeight = Int(parameters, "cutLeaderReadWeight", defaults.CutLeaderReadWeight),
             EnableCheckQuorum = Bool(parameters, "enableCheckQuorum", defaults.EnableCheckQuorum),
             StartElectionTimeoutMs = (int?)OptionalLong(parameters, "startElectionTimeoutMs"),
             EndElectionTimeoutMs = (int?)OptionalLong(parameters, "endElectionTimeoutMs"),

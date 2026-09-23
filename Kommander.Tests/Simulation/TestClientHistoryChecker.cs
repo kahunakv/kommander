@@ -1,4 +1,5 @@
 using Kommander.Data;
+using Kommander.Tests.Simulation.Cluster;
 using Kommander.Tests.Simulation.History;
 
 namespace Kommander.Tests.Simulation;
@@ -187,6 +188,135 @@ public sealed class TestClientHistoryChecker
         RaftOperationStatus status, ClientOperationOutcome expected) =>
         Assert.Equal(expected, ClientHistory.Classify(status));
 
+    // ── Reads ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The stale read of <c>bf275e4a</c>: a write was acknowledged, and a read that began afterwards
+    /// returned state without it.
+    /// </summary>
+    [Fact]
+    public void ReadObservesAcknowledgedAppends_FiresOnAStaleRead()
+    {
+        ClientHistory history = History(
+            Ok(id: 0, index: 1, payload: "a", invokedAt: 0, completedAt: 1),
+            Read(id: 1, invokedAt: 2, completedAt: 3));
+
+        InvariantViolationException error = Assert.Throws<InvariantViolationException>(() =>
+            ClientHistoryChecker.CheckReads(history, stepNumber: 5));
+
+        Assert.Equal(ClientHistoryChecker.ReadObservesAcknowledgedAppends, error.InvariantName);
+        Assert.Contains("holds nothing at 1", error.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>The read holds an entry at the index, but not the one the client was promised.</summary>
+    [Fact]
+    public void ReadObservesAcknowledgedAppends_FiresWhenTheIndexHoldsAnotherEntry()
+    {
+        ClientHistory history = History(
+            Ok(id: 0, index: 1, payload: "a", invokedAt: 0, completedAt: 1),
+            Read(id: 1, invokedAt: 2, completedAt: 3, (1, "b")));
+
+        InvariantViolationException error = Assert.Throws<InvariantViolationException>(() =>
+            ClientHistoryChecker.CheckReads(history, stepNumber: 5));
+
+        Assert.Equal(ClientHistoryChecker.ReadObservesAcknowledgedAppends, error.InvariantName);
+        Assert.Contains("a different entry at 1", error.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A read that began before the append was acknowledged may miss it. The two overlapped, and
+    /// either order is legal.
+    /// </summary>
+    [Fact]
+    public void ReadObservesAcknowledgedAppends_IsSilentWhenTheReadOverlapsTheAppend()
+    {
+        ClientHistory history = History(
+            Ok(id: 0, index: 1, payload: "a", invokedAt: 0, completedAt: 3),
+            Read(id: 1, invokedAt: 1, completedAt: 2));
+
+        ClientHistoryChecker.CheckReads(history, stepNumber: 5);
+    }
+
+    /// <summary>A read that holds every write acknowledged before it passes.</summary>
+    [Fact]
+    public void ReadObservesAcknowledgedAppends_IsSilentOnAFreshRead()
+    {
+        ClientHistory history = History(
+            Ok(id: 0, index: 1, payload: "a", invokedAt: 0, completedAt: 1),
+            Read(id: 1, invokedAt: 2, completedAt: 3, (1, "a")));
+
+        ClientHistoryChecker.CheckReads(history, stepNumber: 5);
+    }
+
+    /// <summary>A read that shows the client a write the cluster refused.</summary>
+    [Fact]
+    public void ReadObservesNoRefusedAppend_FiresOnARefusedPayload()
+    {
+        ClientHistory history = History(
+            Fail(id: 0, payload: "a", RaftOperationStatus.NodeIsNotLeader, invokedAt: 0, completedAt: 1),
+            Read(id: 1, invokedAt: 2, completedAt: 3, (1, "a")));
+
+        InvariantViolationException error = Assert.Throws<InvariantViolationException>(() =>
+            ClientHistoryChecker.CheckReads(history, stepNumber: 5));
+
+        Assert.Equal(ClientHistoryChecker.ReadObservesNoRefusedAppend, error.InvariantName);
+    }
+
+    /// <summary>A later read does not hold what an earlier read held: a write disappeared.</summary>
+    [Fact]
+    public void ReadsRespectRealTime_FiresWhenALaterReadGoesBackwards()
+    {
+        ClientHistory history = History(
+            Read(id: 0, invokedAt: 0, completedAt: 1, (1, "a")),
+            Read(id: 1, invokedAt: 2, completedAt: 3));
+
+        InvariantViolationException error = Assert.Throws<InvariantViolationException>(() =>
+            ClientHistoryChecker.CheckReads(history, stepNumber: 5));
+
+        Assert.Equal(ClientHistoryChecker.ReadsRespectRealTime, error.InvariantName);
+        Assert.Contains("holds nothing at 1", error.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>Two overlapping reads may see different prefixes.</summary>
+    [Fact]
+    public void ReadsRespectRealTime_IsSilentOnOverlappingReads()
+    {
+        ClientHistory history = History(
+            Read(id: 0, invokedAt: 0, completedAt: 3, (1, "a")),
+            Read(id: 1, invokedAt: 1, completedAt: 2));
+
+        ClientHistoryChecker.CheckReads(history, stepNumber: 5);
+    }
+
+    /// <summary>
+    /// A refused read returned nothing, so nothing about it can be wrong. This is the answer a
+    /// correct cut-off leader gives.
+    /// </summary>
+    [Fact]
+    public void ARefusedRead_IsIgnored()
+    {
+        ClientHistory history = History(
+            Ok(id: 0, index: 1, payload: "a", invokedAt: 0, completedAt: 1),
+            new ClientOperation(1, "read", [], 2, 3, 2, 3, ClientOperationOutcome.Fail,
+                RaftOperationStatus.Errored, -1, ClientOperationKind.Read, "node", Observed: null));
+
+        ClientHistoryChecker.Check(history, [Entry(1, "a")], stepNumber: 5);
+    }
+
+    /// <summary>
+    /// The append rules ignore reads. A read carries no payload and no index, and the append rules
+    /// would otherwise read it as an acknowledged append that the log does not hold.
+    /// </summary>
+    [Fact]
+    public void TheAppendRules_IgnoreReads()
+    {
+        ClientHistory history = History(
+            Ok(id: 0, index: 1, payload: "a", invokedAt: 0, completedAt: 1),
+            Read(id: 1, invokedAt: 2, completedAt: 3, (1, "a")));
+
+        ClientHistoryChecker.Check(history, [Entry(1, "a")], stepNumber: 5);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────
 
     /// <summary>
@@ -218,6 +348,21 @@ public sealed class TestClientHistoryChecker
         int id, string payload, int invokedAt = 0, int completedAt = 1) =>
         new(id, "Test", Bytes(payload), invokedAt, completedAt, invokedAt, completedAt,
             ClientOperationOutcome.Info, RaftOperationStatus.ProposalTimeout, LogIndex: -1);
+
+    /// <summary>A served read that returned the given entries, each hashed as a "Test" append.</summary>
+    private static ClientOperation Read(
+        int id, int invokedAt, int completedAt, params (long Id, string Payload)[] held)
+    {
+        Dictionary<long, ulong> observed = held.ToDictionary(
+            entry => entry.Id,
+            entry => SimulatedPartitionStateTransfer.Hash("Test", Bytes(entry.Payload)));
+
+        return new ClientOperation(
+            id, "read", [], invokedAt, completedAt, invokedAt, completedAt,
+            ClientOperationOutcome.Ok, RaftOperationStatus.Success,
+            held.Length == 0 ? -1 : held.Max(entry => entry.Id),
+            ClientOperationKind.Read, "node", observed);
+    }
 
     private static RaftLog Entry(long id, string payload) =>
         new() { Id = id, Term = 1, Type = RaftLogType.Committed, LogData = Bytes(payload) };
