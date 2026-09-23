@@ -425,8 +425,13 @@ public sealed class TestFourNodeJoin
                     .Any(m => m.Endpoint == n4Endpoint && m.Role == System.ClusterMemberRole.Voter),
                 ct, timeoutMs: 15_000);
 
-            // Confirm from n4's own view.
-            Assert.Equal(System.ClusterMemberRole.Voter, n4.LocalRole);
+            // Confirm from n4's own view. Waited for, not asserted at once: the wait above reads the
+            // P0 leader's roster, and n4 applies the same committed change a little later, through its
+            // own replication of partition 0. Under a loaded full-suite run that gap was long enough to
+            // read Learner here although the promotion had committed.
+            await WaitForConditionAsync(
+                () => n4.LocalRole == System.ClusterMemberRole.Voter,
+                ct, timeoutMs: 15_000);
 
             // Clean up n4Runtime — it should have completed once n4 was initialized.
             await n4Runtime.WaitAsync(TimeSpan.FromSeconds(5), ct);
