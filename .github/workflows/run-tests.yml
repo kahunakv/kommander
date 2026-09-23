@@ -32,6 +32,16 @@ jobs:
         # run unreplayable, and the failure is silent: the run still passes. Fail the build here
         # instead, before the run stops being reproducible.
         run: bash scripts/check-determinism-boundary.sh
+      - name: Thread-free build tests
+        # The thread-free embedded mode (KOMMANDER_THREAD_FREE) compiles only with
+        # -p:KommanderThreadFree=true, so the default test run below never sees it. This builds the
+        # flagged variant into its own bin/threadfree and obj/threadfree folders and runs its tests.
+        run: dotnet test Kommander.Tests/Kommander.Tests.csproj -p:KommanderThreadFree=true --filter "FullyQualifiedName~TestHostPumpedScheduling|FullyQualifiedName~TestSingleNodeCluster"
+      - name: Thread-free browser-wasm smoke
+        # A single-node Kommander on the default single-threaded browser-wasm runtime, under Node.js.
+        # It fails on a Thread start or a blocking wait that the runtime refuses, on a deadlock, or on
+        # missing commits. Normal .NET cannot catch a blocking wait: it has other threads to release it.
+        run: bash scripts/run-wasm-smoke.sh
       - name: Mount a small filesystem for the ENOSPC tests
         # The RocksDB storage-error latch under test is native state and needs a volume that really
         # runs out of space. A tmpfs with a small size AND a small inode count: on a block-full tmpfs
