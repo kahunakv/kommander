@@ -1470,6 +1470,15 @@ public sealed class RaftWriteAhead
     /// leader's entry that quorum never accepted (nightly DST seed 745773478048735981: committed
     /// index 5 at term 1 above index 4 at term 6).</para>
     /// </summary>
+    /// <summary>
+    /// True when this node has accepted a row for <paramref name="id"/> into its log: below the
+    /// contiguous presence frontier, or buffered above a gap. Judged from the enqueue-time
+    /// bookkeeping, never from a disk read: an accepted write that is still queued counts as held,
+    /// because anything enqueued behind it on the same partition lands after it. The safe error is
+    /// the false negative (an extra fsync); a false positive would let a first write skip its fsync.
+    /// </summary>
+    private bool IsHeld(long id) => id < presentIndex || pendingPresent.ContainsKey(id);
+
     private void AdvancePresenceFrontier(long id, long term)
     {
         if (id < presentIndex)
@@ -2051,6 +2060,18 @@ public sealed class RaftWriteAhead
     /// Processes a list of Raft log entries by proposing or committing them based on their type and ID.
     /// This method validates the logs, ensures ordering, handles outdated logs, and performs necessary actions
     /// such as proposing, committing, or skipping logs as required. This is typically used by replica nodes.
+    /// <para><b>First-durability rule.</b> A <c>Committed</c> or <c>CommittedCheckpoint</c> row this node
+    /// does not yet hold (above the contiguous presence frontier and not buffered over a gap) is its
+    /// first durable write, not a commit marker, so the batch is flagged
+    /// <see cref="WALWriteOperation.RequiresSync"/> and the scheduler's lazy-marker fast path must
+    /// fsync it. Presence is judged at enqueue time: a Proposed write for the same id that is still
+    /// queued precedes this batch in the partition's FIFO, so a marker behind it correctly rides that
+    /// write's fsync. Without the flag a follower whose propose broadcast arrived after the leader
+    /// committed the entry (the responder queue ships the leader's log instances, which the commit
+    /// path retypes in place) wrote the row sync-off, reported it durably present, and lost it on the
+    /// next crash — the leader's silent-peer retention floor had already compacted past it, and the
+    /// restart that should have been a backfill needed a snapshot (GA flake in
+    /// <c>TestRestartUnderLoadScenarios</c>: "compacted through 21 past the silent node's prefix 20").</para>
     /// </summary>
     /// <param name="logs">
     /// A list of Raft log entries to be processed. The logs can be of various types, including proposed or committed logs.
@@ -2124,6 +2145,9 @@ public sealed class RaftWriteAhead
 
         resolvedThisBatch.Clear();
 
+        // Set when a resolved-type row in this batch is not yet held here (see the summary).
+        bool requiresSync = false;
+
         // Reuse internal lists
         foreach (KeyValuePair<RaftLogAction, List<RaftLog>> keyValue in plan)
             keyValue.Value.Clear();
@@ -2195,6 +2219,9 @@ public sealed class RaftWriteAhead
                     logger.LogDebugCommittedLogs(manager.LocalEndpoint, partition.PartitionId, log.Id);
 
                     resolvedThisBatch.Add(log.Id);
+
+                    if (!IsHeld(log.Id))
+                        requiresSync = true;
                 }
                 break;    
 
@@ -2244,6 +2271,11 @@ public sealed class RaftWriteAhead
                     logger.LogDebugCommittedCheckpointLog(manager.LocalEndpoint, partition.PartitionId, log.Id);
 
                     resolvedThisBatch.Add(log.Id);
+
+                    // Never a lazy marker today (the scheduler syncs every checkpoint row), flagged
+                    // anyway so the rule does not depend on that detail.
+                    if (!IsHeld(log.Id))
+                        requiresSync = true;
                 } 
                 break;
 
@@ -2307,7 +2339,8 @@ public sealed class RaftWriteAhead
             endpoint,
             term,
             logIndex: maxLogId,
-            truncateFloor: acceptedFloor
+            truncateFloor: acceptedFloor,
+            requiresSync: requiresSync
         );
 
         try

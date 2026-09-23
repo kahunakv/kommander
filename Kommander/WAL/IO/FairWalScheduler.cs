@@ -105,8 +105,11 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
     /// When true, the single-fsync commit fast path is active: a group batch whose logs are <b>all</b>
     /// per-entry <c>Committed</c> markers is written sync-off (no fsync of its own), riding the next
     /// durable write. Any batch containing a proposed entry, a <c>CommittedCheckpoint</c>, a rollback, or
-    /// any other type is still written sync. Off (default) preserves byte-for-byte the prior always-sync
-    /// behaviour. Wired from <see cref="RaftConfiguration.WalSingleFsyncCommit"/>.
+    /// any other type is still written sync, and so is any operation flagged
+    /// <see cref="WALWriteOperation.RequiresSync"/>: a <c>Committed</c> row the enqueuing partition has
+    /// never held is a first-durability write whatever its type says, and only that partition can
+    /// tell. Off (default) preserves byte-for-byte the prior always-sync behaviour. Wired from
+    /// <see cref="RaftConfiguration.WalSingleFsyncCommit"/>.
     /// </summary>
     private readonly bool lazyCommitMarkers;
 
@@ -1003,7 +1006,11 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             // per-entry Committed marker (already quorum-durable from its propose fsync, so a lost marker
             // is reconstructible). Any proposed entry, CommittedCheckpoint (the durable recovery anchor),
             // rollback, or other type forces a sync write — and that sync write also flushes any sync-off
-            // markers batched alongside it. Off by default ⇒ always sync ⇒ byte-for-byte prior behaviour.
+            // markers batched alongside it. So does an operation flagged RequiresSync: a Committed row
+            // the partition never held is not a marker but the row's first and only durable write, and
+            // the type cannot tell the two apart (a follower that receives a propose broadcast after the
+            // leader committed it, or a backfilled committed range, sees the row typed Committed on first
+            // sight). Off by default ⇒ always sync ⇒ byte-for-byte prior behaviour.
             bool sync = !lazyCommitMarkers;
 
             foreach ((int pid, List<WALWriteOperation> ops) in groupBatches)
@@ -1020,7 +1027,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                     }
 
                     logGroups.Add(op.Logs);
-                    if (!sync && !AllCommittedMarkers(op.Logs.Logs))
+                    if (!sync && (op.RequiresSync || !AllCommittedMarkers(op.Logs.Logs)))
                         sync = true;
                 }
 

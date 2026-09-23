@@ -47,6 +47,21 @@ public sealed class WALWriteOperation
     public long TruncateFloor { get; }
 
     /// <summary>
+    /// True when this batch is a FIRST-durability write for at least one of its rows even though
+    /// the row's type says otherwise. The scheduler's single-fsync fast path classifies a batch as
+    /// lazy commit markers by log type alone (every row <c>Committed</c>), and a marker may ride the
+    /// next fsync because the row it marks is already durable from its own propose write. A
+    /// follower can receive a row typed <c>Committed</c> that it has never held: a propose broadcast
+    /// that arrived after the leader committed it, a backfill of a committed range, a re-ship to a
+    /// node that missed the propose. Such a row has no earlier durable version, so a sync-off write
+    /// of it followed by a crash loses the row itself while the follower has already reported it
+    /// as durably present — the leader's retention floor then compacts past what the node really
+    /// holds and a restart that should be backfilled needs a snapshot. Only the enqueuing partition
+    /// knows what it holds, so it sets this and the scheduler forces the fsync.
+    /// </summary>
+    public bool RequiresSync { get; }
+
+    /// <summary>
     /// Monotonic tick count stamped by <see cref="Kommander.WAL.IO.FairWalScheduler"/>
     /// at the moment the operation enters the per-partition queue. Used to compute
     /// the enqueue-to-durable latency once the write batch completes.
@@ -74,9 +89,11 @@ public sealed class WALWriteOperation
         long logIndex = -1,
         long truncateFloor = -1,
         string? votedFor = null,
-        long metadataValue = -1
+        long metadataValue = -1,
+        bool requiresSync = false
     )
     {
+        RequiresSync = requiresSync;
         VotedFor = votedFor;
         MetadataValue = metadataValue;
         OnComplete = onComplete;

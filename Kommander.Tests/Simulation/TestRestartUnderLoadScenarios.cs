@@ -292,6 +292,140 @@ public sealed class TestRestartUnderLoadScenarios
         await invariants.CheckConvergedAsync(cluster, PartitionId, cancellationToken);
     }
 
+    /// <summary>
+    /// A follower whose FIRST sight of an entry is the committed row keeps that entry across a
+    /// crash, and the leader's silent-peer hold therefore matches what the node really holds.
+    ///
+    /// <para><b>The defect this pins.</b> The leader ships its own log instances through the
+    /// responder queue and its commit path retypes them in place, so a propose broadcast that is
+    /// delivered after the leader committed the entry (through the other follower) arrives typed
+    /// <c>Committed</c>. The follower planned it as a commit marker, the scheduler's single-fsync
+    /// fast path wrote the all-<c>Committed</c> batch without an fsync, the follower reported the
+    /// entry durably present, and the leader held retention one above it. The crash then took the
+    /// row itself — it had no earlier durable version — and the node held one entry less than the
+    /// leader believed: "compacted through 21 past the silent node's prefix 20", the GA flake of
+    /// the scenario above, which reached this ordering only when the victim's executor lost the
+    /// race against the leader's commit. This scenario forces the ordering by holding the victim's
+    /// traffic across the commit, so the shape is exercised on every run.</para>
+    ///
+    /// <para><b>What proves the run was real.</b> The leader must have committed the entry while
+    /// the victim's traffic was held (else the victim just saw an ordinary propose), and the
+    /// leader's recorded durable frontier for the victim must not exceed what the victim's store
+    /// kept — the invariant the retention hold is built on.</para>
+    /// </summary>
+    [Fact]
+    public async Task AFollowerThatFirstSeesAnEntryCommitted_KeepsItAcrossACrash_AndTheHoldMatchesItsPrefix()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+
+        await using SimulationCluster cluster = await SimulationCluster.StartAsync(
+            new SimulationClusterOptions
+            {
+                NodeCount = 3,
+                PartitionCount = 1,
+                Seed = 20260916,
+                ConfigureNode = configuration =>
+                {
+                    configuration.CompactEveryOperations = CompactEveryOperations;
+                    configuration.CompactionLiveReplicaLagBudget = SilentPeerLagBudget;
+                    configuration.CompactionSilentPeerRetentionWindow = TimeSpan.FromMinutes(2);
+                },
+            },
+            logger,
+            cancellationToken);
+
+        ClusterInvariantRunner invariants = new();
+
+        SimulationNode leader = await ElectAsync(cluster, cancellationToken);
+        SimulationNode victim = cluster.Nodes.First(node => node != leader);
+
+        for (int round = 0; round < 12 && FirstRetained(leader) <= 1; round++)
+        {
+            await ProposeAsync(leader, count: CompactEveryOperations, cancellationToken);
+            await CheckpointAsync(cluster, leader, cancellationToken);
+            await ConvergeAsync(cluster, invariants, await CommitIndexAsync(leader, cancellationToken), cancellationToken);
+        }
+
+        Assert.True(FirstRetained(leader) > 1, "The leader never compacted, so there is no floor to run past.");
+
+        await ProposeAsync(leader, count: 2, cancellationToken);
+        await ConvergeAsync(cluster, invariants, await CommitIndexAsync(leader, cancellationToken), cancellationToken);
+
+        // Hold the victim's traffic across the commit of one entry: the leader commits it with the
+        // other follower, and the victim's propose broadcast is delivered only after that.
+        long beforeHold = await CommitIndexAsync(victim, cancellationToken);
+        cluster.Transport.FreezeEndpoint(victim.Endpoint);
+
+        await ProposeAsync(leader, count: 1, cancellationToken);
+        long lastId = await CommitIndexAsync(leader, cancellationToken);
+        await cluster.RunUntilAsync(() => Task.FromResult(false), stepCount: 2, advanceMilliseconds: 50, cancellationToken);
+
+        Assert.Equal(beforeHold + 1, lastId);
+        Assert.True(
+            await CommitIndexAsync(victim, cancellationToken) < lastId,
+            "The victim learned of the entry while its traffic was held, so the run does not exercise a late propose broadcast.");
+
+        cluster.Transport.ThawEndpoint(victim.Endpoint);
+        await ConvergeAsync(cluster, invariants, lastId, cancellationToken);
+
+        await cluster.CrashNodeAsync(victim, cancellationToken);
+        long victimHeld = HeldThrough(victim);
+
+        Assert.True(
+            victimHeld >= lastId,
+            $"The crashed node holds through {victimHeld} but had reported {lastId}: the entry it first saw as " +
+            "committed was written without an fsync and the crash took it.");
+
+        RaftFollowerProgress? progress = leader.Manager.GetFollowerProgress(PartitionId, victim.Endpoint);
+        Assert.NotNull(progress);
+        Assert.True(
+            progress.DurableFrontier <= victimHeld,
+            $"The leader recorded the node's durable frontier at {progress.DurableFrontier}, above the {victimHeld} its store kept.");
+
+        // The same outage cadence as the window scenario: the hold, not the budget, decides.
+        await ProposeAsync(leader, count: CompactEveryOperations, cancellationToken);
+        await CheckpointAsync(cluster, leader, cancellationToken);
+        await ProposeAsync(leader, count: CompactEveryOperations, cancellationToken);
+
+        await cluster.RunUntilAsync(
+            async () =>
+            {
+                await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
+                return false;
+            },
+            stepCount: 60,
+            advanceMilliseconds: 50,
+            cancellationToken);
+
+        long firstRetained = FirstRetained(leader);
+        Assert.True(
+            firstRetained <= victimHeld + 1,
+            $"The leader compacted through {firstRetained - 1} past the silent node's prefix {victimHeld} inside the window.");
+
+        await cluster.RestartNodeAsync(victim, cancellationToken);
+
+        await ProposeAsync(leader, count: 1, cancellationToken);
+        long target = await CommitIndexAsync(leader, cancellationToken);
+
+        Assert.True(
+            await cluster.RunUntilAsync(
+                async () =>
+                {
+                    await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
+                    return await CommitIndexAsync(victim, cancellationToken) >= target;
+                },
+                stepCount: 400,
+                advanceMilliseconds: 50,
+                cancellationToken),
+            $"The restarted node never caught up: it is at {await CommitIndexAsync(victim, cancellationToken)} " +
+            $"against the leader's {target}; the leader's log starts at {FirstRetained(leader)}.");
+
+        Assert.Equal(0, cluster.Nodes.Sum(node => node.StateTransfer.ExportsServed));
+        Assert.Empty(cluster.UnnecessarySnapshotImports);
+
+        await invariants.CheckConvergedAsync(cluster, PartitionId, cancellationToken);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────
 
     private static long FirstRetained(SimulationNode node) =>

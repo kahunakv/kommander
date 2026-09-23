@@ -102,8 +102,9 @@ public interface IWAL : IDisposable
     /// (<see cref="RaftConfiguration.WalSingleFsyncCommit"/>): the per-entry <c>Committed</c> marker is
     /// written sync-off because the entry it commits is already quorum-durable from its propose fsync, so
     /// losing the marker on a crash is recoverable by reconstruction (it never loses acknowledged data).
-    /// <c>CommittedCheckpoint</c> and any first-durability write (proposed entries) must still be written
-    /// with <paramref name="sync"/> = <see langword="true"/>.
+    /// <c>CommittedCheckpoint</c> and any first-durability write (proposed entries, and a <c>Committed</c>
+    /// row the node has never held — see <see cref="Data.WALWriteOperation.RequiresSync"/>) must still be
+    /// written with <paramref name="sync"/> = <see langword="true"/>.
     /// </para>
     /// <para>The default implementation ignores <paramref name="sync"/> and delegates to the durable
     /// <see cref="Write(List{ValueTuple{int, List{RaftLog}}})"/>, which is correct for non-durable adapters
