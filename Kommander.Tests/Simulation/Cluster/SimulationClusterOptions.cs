@@ -59,6 +59,23 @@ public sealed record SimulationClusterOptions
     public bool UseSimulatedWal { get; init; } = true;
 
     /// <summary>
+    /// When true, the harness plays the SWIM failure detector: at every step, each live node marks
+    /// a peer <c>Suspect</c> once the peer has had no probe path for one ping interval plus one ping
+    /// timeout, and clears the suspicion once a path is back. See
+    /// <see cref="SimulationCluster"/>'s <c>UpdateLivenessModel</c>.
+    ///
+    /// <para><b>Why it exists.</b> The harness turns the internal timers off, so no SWIM probe ever
+    /// runs, and every peer stays <c>Alive</c> to every node unless a crash marks it by hand. That
+    /// was harmless while quiescence was off. With quiescence on, a quiesced follower relies on
+    /// SWIM to notice its leader is gone, so a partitioned leader of a quiesced partition would never
+    /// be replaced, and a run would report the harness's missing detector as a liveness
+    /// defect.</para>
+    ///
+    /// <para>Off by default, so the existing families keep the plans and the meaning they had.</para>
+    /// </summary>
+    public bool ModelSwimLiveness { get; init; }
+
+    /// <summary>
     /// Simulated milliseconds between a durable write and its fsync, applied to every node's store.
     /// Zero, the default, leaves no window for a crash to catch. Raise it to model a slow disk.
     /// </summary>

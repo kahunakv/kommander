@@ -301,6 +301,32 @@ public sealed class SimulatedWAL : IWAL
                     snapshotBoundary.Remove(partitionId);
             }
 
+            // A disk that acknowledged an fsync and then lost the write: the newest resolved rows go
+            // back to Proposed, although they were durable by the interface's contract. See
+            // LoseResolutionsOnNextCrash.
+            foreach ((int partitionId, int count) in lyingDiskResolutions)
+            {
+                if (!image.TryGetValue(partitionId, out List<RaftLog>? kept))
+                    continue;
+
+                List<RaftLog> newest = kept
+                    .Where(entry => entry.Type == RaftLogType.Committed)
+                    .OrderByDescending(entry => entry.Id)
+                    .Take(count)
+                    .ToList();
+
+                foreach (RaftLog entry in newest)
+                {
+                    int position = kept.FindIndex(candidate => candidate.Id == entry.Id);
+                    RaftLog reverted = Copy(entry);
+                    reverted.Type = RaftLogType.Proposed;
+                    kept[position] = reverted;
+                    resolutionsLostByLyingDisk++;
+                }
+            }
+
+            lyingDiskResolutions.Clear();
+
             inner.Dispose();
             inner = new InMemoryWAL(logger);
 
@@ -324,6 +350,107 @@ public sealed class SimulatedWAL : IWAL
             entriesLostOnCrash += lostEntries;
         }
     }
+
+    /// <summary>
+    /// Makes the next <see cref="Crash"/> turn the newest <paramref name="count"/> <c>Committed</c>
+    /// rows of <paramref name="partitionId"/> back into <c>Proposed</c> rows, although they were
+    /// durable: a disk that acknowledged an fsync and then lost the write.
+    ///
+    /// <para><b>What it is for.</b> A liveness test, not a safety one. Raft's durability argument
+    /// assumes an acknowledged fsync holds, so no safety claim survives this fault. What must still
+    /// hold is that the cluster repairs the node. The shape it produces — a follower that reported an
+    /// entry as committed and durable, and after a restart holds it only as proposed — is the state
+    /// in which the leader's backfill anchored on its compacted copy of that entry is refused. DST
+    /// FINDING 7 reached that state through a library defect; this reaches it with the defect fixed,
+    /// so the leader's answer to the refusal stays tested (the FINDING 7 backstop).</para>
+    ///
+    /// <para>Armed until the next crash, which consumes it.</para>
+    /// </summary>
+    public void LoseResolutionsOnNextCrash(int partitionId, int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(count);
+
+        lock (gate)
+            lyingDiskResolutions[partitionId] = count;
+    }
+
+    /// <summary>Resolved rows the lying-disk fault turned back into proposed rows.</summary>
+    public long ResolutionsLostByLyingDisk
+    {
+        get
+        {
+            lock (gate)
+                return resolutionsLostByLyingDisk;
+        }
+    }
+
+    private readonly Dictionary<int, int> lyingDiskResolutions = [];
+    private long resolutionsLostByLyingDisk;
+
+    /// <summary>
+    /// Deletes everything the disk holds: every entry, every metadata key (the stored term and vote
+    /// included), and every record of compaction and snapshot boundaries. The next open sees an
+    /// empty store.
+    ///
+    /// <para><b>What it models.</b> A node whose data directory was lost or replaced and that comes
+    /// back under the same endpoint: the Kahuna restart behind <c>e618064e</c> and <c>3552ab9</c>.
+    /// The cluster roster still names it, so nothing in membership resets what the leader recorded
+    /// about its previous life.</para>
+    ///
+    /// <para><b>What Raft does not promise here.</b> The stored vote goes too, so the node can vote
+    /// twice in one term. Raft's safety argument assumes a vote survives a restart. A run that uses
+    /// this and then breaks one-leader-per-term has found that assumption, not necessarily a
+    /// Kommander defect, and the failure must be read with that in mind.</para>
+    ///
+    /// <para>Call it only on a crashed node, between <see cref="Crash"/> and the restart.</para>
+    /// </summary>
+    public void Wipe()
+    {
+        lock (gate)
+        {
+            inner.Dispose();
+            inner = new InMemoryWAL(logger);
+
+            priorEntries.Clear();
+            priorMetadata.Clear();
+            metadataMirror.Clear();
+            ridingEntries.Clear();
+            ridingMetadata.Clear();
+            inFlight.Clear();
+            knownPartitions.Clear();
+            compactionsAboveFloor.Clear();
+            compactedThrough.Clear();
+            snapshotBoundary.Clear();
+            restoreReadHoldsUntil.Clear();
+
+            wipes++;
+        }
+    }
+
+    /// <summary>
+    /// True while a write-refusing fault is set: out of space, or writes still to fail. A slow disk
+    /// and a retention hold are not counted, because neither refuses a write.
+    /// </summary>
+    public bool HasWriteFault
+    {
+        get
+        {
+            lock (gate)
+                return outOfSpace || failNextWrites > 0;
+        }
+    }
+
+    /// <summary>How many times <see cref="Wipe"/> emptied this store.</summary>
+    public long Wipes
+    {
+        get
+        {
+            lock (gate)
+                return wipes;
+        }
+    }
+
+    private long wipes;
 
     /// <summary>
     /// The store's state now, for the invariant checks and for a failure report. Advances durability
@@ -451,7 +578,8 @@ public sealed class SimulatedWAL : IWAL
                     CapturePriorEntry(partitionId, entry.Id);
             }
 
-            RaftOperationStatus status = inner.Write(logs, sync);
+            // The store keeps its own copies. See StoreCopies.
+            RaftOperationStatus status = inner.Write(StoreCopies(logs), sync);
             if (status != RaftOperationStatus.Success)
                 return status;
 
@@ -717,7 +845,7 @@ public sealed class SimulatedWAL : IWAL
         }
 
         lock (gate)
-            return inner.ReadLogs(partitionId);
+            return ReadCopies(inner.ReadLogs(partitionId));
     }
 
     /// <summary>
@@ -747,14 +875,14 @@ public sealed class SimulatedWAL : IWAL
     public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries = int.MaxValue)
     {
         lock (gate)
-            return inner.ReadLogsRange(partitionId, startLogIndex, maxEntries);
+            return ReadCopies(inner.ReadLogsRange(partitionId, startLogIndex, maxEntries));
     }
 
     /// <inheritdoc />
     public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries, long maxBytes)
     {
         lock (gate)
-            return inner.ReadLogsRange(partitionId, startLogIndex, maxEntries, maxBytes);
+            return ReadCopies(inner.ReadLogsRange(partitionId, startLogIndex, maxEntries, maxBytes));
     }
 
     /// <inheritdoc />
@@ -992,6 +1120,40 @@ public sealed class SimulatedWAL : IWAL
         EntriesLostOnCrash = entriesLostOnCrash,
         MetadataKeysLostOnCrash = metadataKeysLostOnCrash,
     };
+
+    /// <summary>
+    /// Copies every entry of a write before the inner store keeps it.
+    ///
+    /// <para><b>Why the store must own its rows.</b> <see cref="InMemoryWAL"/> keeps the objects it
+    /// is given. The library changes some of those objects after the write: the leader's commit path
+    /// sets <c>log.Type = Committed</c> in place on the entries it proposed. With shared objects that
+    /// change reached the stored row without a write, so the row seemed committed on disk, and the
+    /// version a crash restores was captured as <c>Committed</c> too. A crash could then never lose a
+    /// committed marker written with sync off. A real disk holds bytes, and only a write changes
+    /// them.</para>
+    /// </summary>
+    private static List<(int, List<RaftLog>)> StoreCopies(List<(int, List<RaftLog>)> logs)
+    {
+        List<(int, List<RaftLog>)> copies = new(logs.Count);
+
+        foreach ((int partitionId, List<RaftLog> entries) in logs)
+            copies.Add((partitionId, entries.Select(Copy).ToList()));
+
+        return copies;
+    }
+
+    /// <summary>
+    /// Copies every entry a read returns, for the same reason as <see cref="StoreCopies"/>: a caller
+    /// that changes a row it read must not change the stored row. A real backend deserializes new
+    /// objects on every read.
+    /// </summary>
+    private static List<RaftLog> ReadCopies(List<RaftLog> entries)
+    {
+        for (int index = 0; index < entries.Count; index++)
+            entries[index] = Copy(entries[index]);
+
+        return entries;
+    }
 
     /// <summary>
     /// Copies an entry. The store hands out its own references, so a captured version must not be an

@@ -95,6 +95,9 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] LogMismatch from {Endpoint}: backtracking nextIndex {CurrentNext} → {NextIndex} (followerMax={CommittedIndex})")]
     public static partial void LogDebugBacktrackingNextIndex(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long currentNext, long nextIndex, long committedIndex);
 
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] {Endpoint} refused {Refusals} batches in a row anchored on entry {Anchor}, which this leader has compacted; it does not hold that entry in its committed prefix and no batch can repair it, so it is offered a snapshot")]
+    public static partial void LogWarnCompactedAnchorRefused(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long anchor, int refusals);
+
     [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Log Matching rejection from {Endpoint}: prevLogIndex={PrevLogIndex} > localMaxLog={LocalMaxLog}")]
     public static partial void LogDebugLogMatchingFollowerBehind(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long prevLogIndex, long localMaxLog);
 

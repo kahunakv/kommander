@@ -551,13 +551,7 @@ public sealed class TestPlanRegressions
         try
         {
             await using SimulationCluster cluster = await SimulationCluster.StartAsync(
-                new SimulationClusterOptions
-                {
-                    NodeCount = 3,
-                    PartitionCount = 1,
-                    Seed = plan.Seed,
-                    ConfigureNode = plan.Options.ApplyTo,
-                },
+                plan.Options.ToClusterOptions(plan.Seed),
                 replayLogger ?? logger,
                 cancellationToken);
 

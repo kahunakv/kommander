@@ -1,3 +1,4 @@
+using Kommander.Data;
 using System.Text;
 using Kommander.Tests.Simulation.Diagnostics;
 using Kommander.Tests.Simulation.History;
@@ -64,6 +65,32 @@ public sealed record RandomScenarioReport
     /// continuous-integration job reports something unusual.</para>
     /// </summary>
     public SimulationMetrics? Metrics { get; init; }
+
+    /// <summary>
+    /// Quiesced outages that found the leader's partition quiesced before the cut. See
+    /// <see cref="RandomScenarioRunner.QuiescedOutagesReached"/>.
+    /// </summary>
+    public int QuiescedOutagesReached { get; init; }
+
+    /// <summary>
+    /// Late broadcasts that produced a committed first sight. See
+    /// <see cref="RandomScenarioRunner.LateBroadcastsCommittedFirst"/>.
+    /// </summary>
+    public int LateBroadcastsCommittedFirst { get; init; }
+
+    /// <summary>
+    /// Answers the run's leadership transfers received, by status. See
+    /// <see cref="RandomScenarioRunner.TransferAnswers"/>.
+    /// </summary>
+    public IReadOnlyDictionary<RaftOperationStatus, int> TransferAnswers { get; init; } =
+        new Dictionary<RaftOperationStatus, int>();
+
+    /// <summary>
+    /// Highest term any node held on the run's partition at the end, or -1 when no view was read.
+    /// Every election raises the term, so on a run with no fault this is the leader churn: a healthy
+    /// cluster that keeps its first leader ends at term 1 or 2.
+    /// </summary>
+    public long FinalTerm { get; init; } = -1;
 
     /// <summary>Actions of one kind. Used by the tests that prove the vocabulary is reachable.</summary>
     public int CountOf(RandomScenarioActionKind kind) => Actions.Count(action => action.Kind == kind);

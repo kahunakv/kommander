@@ -260,6 +260,20 @@ public sealed class SimulationNode : IAsyncDisposable
         // for why an unrescuable follower makes the entire compaction family untestable.
         manager.RegisterPartitionStateTransfer(stateTransfer);
 
+        // The application: it records every entry the library hands it, live or replayed. See
+        // SimulatedPartitionStateTransfer.Apply for why the harness keeps one.
+        manager.OnReplicationReceived += (partitionId, log) =>
+        {
+            stateTransfer.Apply(partitionId, log);
+            return Task.FromResult(true);
+        };
+
+        manager.OnLogRestored += (partitionId, log) =>
+        {
+            stateTransfer.Apply(partitionId, log);
+            return Task.FromResult(true);
+        };
+
         return manager;
     }
 

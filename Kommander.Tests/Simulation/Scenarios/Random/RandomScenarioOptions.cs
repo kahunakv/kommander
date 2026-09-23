@@ -136,9 +136,83 @@ public sealed record RandomScenarioOptions
     public int TransferFaultWeight { get; init; }
 
     /// <summary>
+    /// Weight of <see cref="RandomScenarioActionKind.LateBroadcast"/>. Zero by default, so the
+    /// existing sweeps draw exactly the plans they drew before; a category with no weight takes no
+    /// entropy. The late-broadcast sweep turns it on.
+    /// </summary>
+    public int LateBroadcastWeight { get; init; }
+
+    /// <summary>
+    /// Turns quiescence on for every node, with <see cref="QuiesceAfterMs"/> as its idle window, and
+    /// turns on the harness's SWIM model (<c>SimulationClusterOptions.ModelSwimLiveness</c>) with it.
+    ///
+    /// <para>Production ships quiescence on, and the Kahuna lost-write bug (<c>39bf62e2</c>) was a
+    /// quiesced leader that never stepped down. The other families run with it off, so that whole
+    /// class was outside the search. A quiesced follower relies on SWIM to notice a dead leader, and
+    /// the harness drives no SWIM probes, so quiescence without the model would report the missing
+    /// detector as a liveness defect.</para>
+    /// </summary>
+    public bool EnableQuiescence { get; init; }
+
+    /// <summary>
+    /// The idle window before a partition quiesces, in simulated milliseconds, when
+    /// <see cref="EnableQuiescence"/> is on. The production default is 1,500 ms, which is 30 steps
+    /// here and longer than most idle stretches a plan draws; the family shortens it so that
+    /// quiescence really happens between actions.
+    /// </summary>
+    public int QuiesceAfterMs { get; init; } = 400;
+
+    /// <summary>
+    /// Weight of <see cref="RandomScenarioActionKind.QuiescedLeaderOutage"/>. Zero by default; the
+    /// quiescence family turns it on.
+    /// </summary>
+    public int QuiescedOutageWeight { get; init; }
+
+    /// <summary>
+    /// Percentage of crash draws whose heal is <see cref="RandomScenarioActionKind.RestartNodeBlank"/>
+    /// instead of an ordinary restart. Zero by default, and at zero no entropy is drawn for it, so
+    /// the existing plans do not change.
+    /// </summary>
+    public int BlankRestartPercent { get; init; }
+
+    /// <summary>
+    /// Weight of <see cref="RandomScenarioActionKind.TransferLeadership"/>. Zero by default, so the
+    /// existing plans do not change.
+    /// </summary>
+    public int TransferLeadershipWeight { get; init; }
+
+    /// <summary>
     /// Applies the node configuration these options imply. One place, so the sweep, the shrinker
     /// and the regression replay cannot build a cluster that differs from the run they reproduce.
     /// </summary>
+    /// <summary>
+    /// The cluster a run with these options needs: three nodes, one data partition, the run's seed,
+    /// and every cluster-level setting the options carry.
+    ///
+    /// <para><b>One factory for every caller.</b> The sweep, the regression replay, and the shrink
+    /// oracle each built this by hand, and the two replay paths dropped the election timeouts. A
+    /// check-quorum plan then replayed on the stock 100 ms timeouts, which is a different run. A
+    /// setting added here reaches all three.</para>
+    /// </summary>
+    public Cluster.SimulationClusterOptions ToClusterOptions(ulong seed)
+    {
+        Cluster.SimulationClusterOptions cluster = new()
+        {
+            NodeCount = 3,
+            PartitionCount = 1,
+            Seed = seed,
+            ConfigureNode = ApplyTo,
+            ModelSwimLiveness = EnableQuiescence,
+        };
+
+        if (StartElectionTimeoutMs is { } startElection)
+            cluster = cluster with { StartElectionTimeoutMs = startElection };
+        if (EndElectionTimeoutMs is { } endElection)
+            cluster = cluster with { EndElectionTimeoutMs = endElection };
+
+        return cluster;
+    }
+
     public void ApplyTo(RaftConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(configuration);
@@ -150,6 +224,18 @@ public sealed record RandomScenarioOptions
 
         if (EnableCheckQuorum)
             configuration.EnableCheckQuorum = true;
+
+        if (EnableQuiescence)
+        {
+            configuration.EnableQuiescence = true;
+            configuration.QuiesceAfter = TimeSpan.FromMilliseconds(QuiesceAfterMs);
+
+            // The harness's SWIM model reads these for its suspicion window. Six steps: short enough
+            // that a cut leader is suspected inside one outage, long enough that a single slow step
+            // is not a verdict.
+            configuration.PingInterval = TimeSpan.FromMilliseconds(200);
+            configuration.PingTimeout = TimeSpan.FromMilliseconds(100);
+        }
     }
 
     /// <summary>
@@ -220,6 +306,12 @@ public sealed record RandomScenarioOptions
             ["compactionLiveReplicaLagBudget"] =
                 CompactionLiveReplicaLagBudget?.ToString(CultureInfo.InvariantCulture) ?? "default",
             ["transferFaultWeight"] = TransferFaultWeight.ToString(),
+            ["lateBroadcastWeight"] = LateBroadcastWeight.ToString(),
+            ["enableQuiescence"] = EnableQuiescence.ToString(),
+            ["quiesceAfterMs"] = QuiesceAfterMs.ToString(),
+            ["quiescedOutageWeight"] = QuiescedOutageWeight.ToString(),
+            ["blankRestartPercent"] = BlankRestartPercent.ToString(),
+            ["transferLeadershipWeight"] = TransferLeadershipWeight.ToString(),
             ["enableCheckQuorum"] = EnableCheckQuorum.ToString(),
             ["startElectionTimeoutMs"] = StartElectionTimeoutMs?.ToString(CultureInfo.InvariantCulture) ?? "default",
             ["endElectionTimeoutMs"] = EndElectionTimeoutMs?.ToString(CultureInfo.InvariantCulture) ?? "default",
@@ -273,6 +365,12 @@ public sealed record RandomScenarioOptions
             EnableFaultEpisodes = Bool(parameters, "enableFaultEpisodes", defaults.EnableFaultEpisodes),
             CompactionLiveReplicaLagBudget = OptionalLong(parameters, "compactionLiveReplicaLagBudget"),
             TransferFaultWeight = Int(parameters, "transferFaultWeight", defaults.TransferFaultWeight),
+            LateBroadcastWeight = Int(parameters, "lateBroadcastWeight", defaults.LateBroadcastWeight),
+            EnableQuiescence = Bool(parameters, "enableQuiescence", defaults.EnableQuiescence),
+            QuiesceAfterMs = Int(parameters, "quiesceAfterMs", defaults.QuiesceAfterMs),
+            QuiescedOutageWeight = Int(parameters, "quiescedOutageWeight", defaults.QuiescedOutageWeight),
+            BlankRestartPercent = Int(parameters, "blankRestartPercent", defaults.BlankRestartPercent),
+            TransferLeadershipWeight = Int(parameters, "transferLeadershipWeight", defaults.TransferLeadershipWeight),
             EnableCheckQuorum = Bool(parameters, "enableCheckQuorum", defaults.EnableCheckQuorum),
             StartElectionTimeoutMs = (int?)OptionalLong(parameters, "startElectionTimeoutMs"),
             EndElectionTimeoutMs = (int?)OptionalLong(parameters, "endElectionTimeoutMs"),

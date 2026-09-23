@@ -308,10 +308,20 @@ public sealed class TestRestartUnderLoadScenarios
     /// race against the leader's commit. This scenario forces the ordering by holding the victim's
     /// traffic across the commit, so the shape is exercised on every run.</para>
     ///
+    /// <para><b>How the state is built.</b> The transport gives every receiver its own copy of a
+    /// message, so the leader's later retype cannot reach a copy that already left. The late type
+    /// comes from the responder: it serializes a message when it takes it off its queue, which can be
+    /// after the commit. <see cref="Transport.SimulatedTransport.SetLateSerialization"/> models that
+    /// delay for the victim while its traffic is held. Measured: at this seed the responder already
+    /// sends after the commit, so the state appears without the late copy too. The late copy makes it
+    /// certain on a machine where the responder runs sooner. The delivery observer below is what
+    /// proves the state, whichever path produced it.</para>
+    ///
     /// <para><b>What proves the run was real.</b> The leader must have committed the entry while
-    /// the victim's traffic was held (else the victim just saw an ordinary propose), and the
-    /// leader's recorded durable frontier for the victim must not exceed what the victim's store
-    /// kept — the invariant the retention hold is built on.</para>
+    /// the victim's traffic was held, the victim's first delivery of the entry must carry the type
+    /// <c>Committed</c> (else the victim just saw an ordinary propose), and the leader's recorded
+    /// durable frontier for the victim must not exceed what the victim's store kept — the invariant
+    /// the retention hold is built on.</para>
     /// </summary>
     [Fact]
     public async Task AFollowerThatFirstSeesAnEntryCommitted_KeepsItAcrossACrash_AndTheHoldMatchesItsPrefix()
@@ -351,9 +361,25 @@ public sealed class TestRestartUnderLoadScenarios
         await ProposeAsync(leader, count: 2, cancellationToken);
         await ConvergeAsync(cluster, invariants, await CommitIndexAsync(leader, cancellationToken), cancellationToken);
 
+        // The first type each id carried when it reached the victim.
+        Dictionary<long, RaftLogType> firstSight = [];
+        cluster.Transport.AppendLogsDelivered += (_, to, logs) =>
+        {
+            if (to != victim.Endpoint)
+                return;
+
+            lock (firstSight)
+            {
+                foreach (RaftLog log in logs)
+                    firstSight.TryAdd(log.Id, log.Type);
+            }
+        };
+
         // Hold the victim's traffic across the commit of one entry: the leader commits it with the
-        // other follower, and the victim's propose broadcast is delivered only after that.
+        // other follower, and the victim's propose broadcast is serialized and delivered only after
+        // that — the lagging responder.
         long beforeHold = await CommitIndexAsync(victim, cancellationToken);
+        cluster.Transport.SetLateSerialization(victim.Endpoint, true);
         cluster.Transport.FreezeEndpoint(victim.Endpoint);
 
         await ProposeAsync(leader, count: 1, cancellationToken);
@@ -366,7 +392,16 @@ public sealed class TestRestartUnderLoadScenarios
             "The victim learned of the entry while its traffic was held, so the run does not exercise a late propose broadcast.");
 
         cluster.Transport.ThawEndpoint(victim.Endpoint);
+        cluster.Transport.SetLateSerialization(victim.Endpoint, false);
         await ConvergeAsync(cluster, invariants, lastId, cancellationToken);
+
+        RaftLogType sight;
+        lock (firstSight)
+            Assert.True(firstSight.TryGetValue(lastId, out sight), $"Entry {lastId} never reached the victim.");
+
+        Assert.True(
+            sight == RaftLogType.Committed,
+            $"The victim first saw entry {lastId} as {sight}, so the run does not exercise a committed first sight.");
 
         await cluster.CrashNodeAsync(victim, cancellationToken);
         long victimHeld = HeldThrough(victim);
@@ -424,6 +459,135 @@ public sealed class TestRestartUnderLoadScenarios
         Assert.Empty(cluster.UnnecessarySnapshotImports);
 
         await invariants.CheckConvergedAsync(cluster, PartitionId, cancellationToken);
+    }
+
+    /// <summary>
+    /// A follower that restarts holding, as proposed, an entry it had reported as committed and
+    /// durable is repaired by a snapshot, and the leader does not re-send a refused batch forever.
+    /// The DST FINDING 7 liveness backstop.
+    ///
+    /// <para><b>The state.</b> The leader compacts through the follower's reported durable frontier
+    /// N while the follower is down (the silent-peer window holds retention at N + 1, exactly as
+    /// designed). The follower's disk lied about the fsync of its last commit marker, so it restarts
+    /// holding N as <c>Proposed</c>, with a commit frontier of N - 1. The leader's backfill starts at
+    /// N + 1 and is anchored on N, which it compacted, so it carries <c>prevLogTerm = -1</c>. The
+    /// follower accepts such an anchor only inside its committed prefix (FINDING 6), and N is not in
+    /// it.</para>
+    ///
+    /// <para><b>What went wrong before the backstop.</b> The rejection took the ordinary backtrack,
+    /// the anchored-repair note re-sent the same batch on the next heartbeat, and the no-progress
+    /// streak never grew because only <c>Success</c> acks feed it: 800 identical rejections in 400
+    /// steps and no snapshot. That is how FINDING 7 wedged. Its fix removed the library's own way into
+    /// this state; the lying disk is another way in, and a real one.</para>
+    ///
+    /// <para><b>What proves the run was real.</b> The fault reverted a row, the leader compacted
+    /// through that row, and the repair was a snapshot — backfill cannot repair this state.</para>
+    /// </summary>
+    [Fact]
+    public async Task AFollowerWhoseDiskLostAReportedCommitMarker_IsRepairedByASnapshot()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+
+        await using SimulationCluster cluster = await SimulationCluster.StartAsync(
+            new SimulationClusterOptions
+            {
+                NodeCount = 3,
+                PartitionCount = 1,
+                Seed = 20260916,
+                ConfigureNode = configuration =>
+                {
+                    configuration.CompactEveryOperations = CompactEveryOperations;
+                    configuration.CompactionLiveReplicaLagBudget = SilentPeerLagBudget;
+                    configuration.CompactionSilentPeerRetentionWindow = TimeSpan.FromMinutes(2);
+                },
+            },
+            logger,
+            cancellationToken);
+
+        ClusterInvariantRunner invariants = new();
+
+        SimulationNode leader = await ElectAsync(cluster, cancellationToken);
+        SimulationNode victim = cluster.Nodes.First(node => node != leader);
+
+        for (int round = 0; round < 12 && FirstRetained(leader) <= 1; round++)
+        {
+            await ProposeAsync(leader, count: CompactEveryOperations, cancellationToken);
+            await CheckpointAsync(cluster, leader, cancellationToken);
+            await ConvergeAsync(cluster, invariants, await CommitIndexAsync(leader, cancellationToken), cancellationToken);
+        }
+
+        await ProposeAsync(leader, count: 3, cancellationToken);
+
+        // A checkpoint last: its commit row is always written with an fsync, which carries every
+        // marker before it, so the victim reports everything it has committed as durable.
+        await CheckpointAsync(cluster, leader, cancellationToken);
+        await ConvergeAsync(cluster, invariants, await CommitIndexAsync(leader, cancellationToken), cancellationToken);
+
+        RaftFollowerProgress? before = leader.Manager.GetFollowerProgress(PartitionId, victim.Endpoint);
+        Assert.NotNull(before);
+
+        victim.SimulatedWal!.LoseResolutionsOnNextCrash(PartitionId, count: 1);
+        await cluster.CrashNodeAsync(victim, cancellationToken);
+
+        Assert.Equal(1, victim.SimulatedWal.ResolutionsLostByLyingDisk);
+
+        long reverted = victim.Wal.ReadLogsRange(PartitionId, 0)
+            .Where(log => log.Type == RaftLogType.Proposed)
+            .Select(log => log.Id)
+            .DefaultIfEmpty(-1)
+            .Max();
+
+        Assert.True(reverted > 0, "The lying disk reverted no committed row.");
+
+        // A whole compaction cadence during the outage, as in the window scenario: the hold keeps the
+        // leader's log from the reported frontier + 1, so it compacts the reverted entry itself.
+        await ProposeAsync(leader, count: CompactEveryOperations, cancellationToken);
+        await CheckpointAsync(cluster, leader, cancellationToken);
+        await ProposeAsync(leader, count: CompactEveryOperations, cancellationToken);
+
+        await cluster.RunUntilAsync(
+            async () =>
+            {
+                await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
+                return FirstRetained(leader) > reverted;
+            },
+            stepCount: 60,
+            advanceMilliseconds: 50,
+            cancellationToken);
+
+        Assert.True(
+            FirstRetained(leader) > reverted,
+            $"The leader's log starts at {FirstRetained(leader)}, so it did not compact the reverted entry {reverted}, " +
+            "and the batch is not anchored on a compacted entry: this run tests nothing.");
+
+        await cluster.RestartNodeAsync(victim, cancellationToken);
+
+        await ProposeAsync(leader, count: 1, cancellationToken);
+        long target = await CommitIndexAsync(leader, cancellationToken);
+
+        bool repaired = await cluster.RunUntilAsync(
+            async () =>
+            {
+                await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
+                return await CommitIndexAsync(victim, cancellationToken) >= target;
+            },
+            stepCount: 400,
+            advanceMilliseconds: 50,
+            cancellationToken);
+
+        Assert.True(
+            repaired,
+            $"The follower was never repaired: it is at {await CommitIndexAsync(victim, cancellationToken)} against " +
+            $"{target}; the reverted entry is {reverted} and the leader's log starts at {FirstRetained(leader)}. " +
+            $"Exports served: {leader.StateTransfer.ExportsServed}. " +
+            $"Snapshot statuses: [{string.Join(" | ", leader.Manager.GetSnapshotStatuses(PartitionId))}].");
+
+        Assert.True(
+            leader.StateTransfer.ExportsServed >= 1,
+            "The follower converged without a snapshot, so the refused -1 anchor was never reached.");
+
+        await invariants.CheckConvergedAsync(cluster, PartitionId, cancellationToken);
+        await AppliedStateRule.CheckAsync(cluster, PartitionId, advanceMilliseconds: 50, cancellationToken);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────

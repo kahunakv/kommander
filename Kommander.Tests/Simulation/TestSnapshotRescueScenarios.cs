@@ -70,7 +70,35 @@ public sealed class TestSnapshotRescueScenarios
     [Fact]
     public async Task AHungExport_DoesNotStrandAFollowerBelowTheFloor()
     {
-        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        SimulationNode victim = await RunHungExportRescueAsync(skipImports: false, TestContext.Current.CancellationToken);
+
+        Assert.True(victim.StateTransfer.ImportsApplied >= 1, "The victim converged without importing a snapshot.");
+    }
+
+    /// <summary>
+    /// The permanent Control A of DST-20: the same rescue, with a receiver that reads the snapshot,
+    /// reports success, and imports nothing. Every log check still passes, because the receiver's WAL
+    /// boundary moves as it should. Only the application state shows the hole, and the rule
+    /// <c>applied-state-agrees</c> must report it.
+    ///
+    /// <para>This is the shape of <c>14b564a</c> item 6 (the Kahuna run of Sept 20): the sender logged
+    /// "seeded" and the receiver never imported. Before the simulated snapshot carried real state,
+    /// this scenario passed.</para>
+    /// </summary>
+    [Fact]
+    public async Task AReceiverThatSkipsTheImport_FailsTheAppliedStateRule()
+    {
+        InvariantViolationException violation = await Assert.ThrowsAsync<InvariantViolationException>(
+            () => RunHungExportRescueAsync(skipImports: true, TestContext.Current.CancellationToken));
+
+        Assert.Equal("applied-state-agrees", violation.InvariantName);
+    }
+
+    /// <summary>
+    /// The body of both facts above. Returns the rescued victim.
+    /// </summary>
+    private async Task<SimulationNode> RunHungExportRescueAsync(bool skipImports, CancellationToken cancellationToken)
+    {
 
         await using SimulationCluster cluster = await SimulationCluster.StartAsync(
             new SimulationClusterOptions
@@ -140,6 +168,8 @@ public sealed class TestSnapshotRescueScenarios
             $"The leader compacted only through {compactedThrough}, and the victim holds up to " +
             $"{victimMaxLog}, so the victim is not below the floor and no rescue is needed.");
 
+        victim.StateTransfer.SkipImports = skipImports;
+
         await cluster.RestartNodeAsync(victim, cancellationToken);
 
         long target = await CommitIndexAsync(leader, cancellationToken);
@@ -174,6 +204,9 @@ public sealed class TestSnapshotRescueScenarios
             "retry this scenario exists to test.");
 
         await invariants.CheckConvergedAsync(cluster, PartitionId, cancellationToken);
+        await AppliedStateRule.CheckAsync(cluster, PartitionId, advanceMilliseconds: 50, cancellationToken);
+
+        return victim;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────

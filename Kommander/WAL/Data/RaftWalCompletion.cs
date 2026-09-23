@@ -57,5 +57,21 @@ public sealed record RaftWalCompletion(
     /// </summary>
     long[]? SparseLogIds = null,
 
-    long MetadataValue = -1
+    long MetadataValue = -1,
+
+    /// <summary>
+    /// Whether the batch that carried this write was written with its own fsync. False only for a
+    /// batch of commit markers on the single-fsync fast path, which is durable only once a later
+    /// synced write on the same partition completes. True by default, which is what every write was
+    /// before the fast path existed.
+    /// </summary>
+    bool Synced = true,
+
+    /// <summary>
+    /// Highest id this write carried as a resolved row (committed or rolled back, checkpoint or
+    /// not), or -1 when it carried none. The durable resolution frontier reads it together with
+    /// <see cref="Synced"/>: a resolution is on disk only when a synced write carried it or came
+    /// after it.
+    /// </summary>
+    long ResolvedMaxLogIndex = -1
 );

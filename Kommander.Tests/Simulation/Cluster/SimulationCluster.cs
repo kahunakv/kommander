@@ -333,6 +333,27 @@ public sealed class SimulationCluster : IAsyncDisposable
     }
 
     /// <summary>
+    /// Starts a crashed node again under the same endpoint with an empty store: its data directory
+    /// is gone. See <see cref="WAL.SimulatedWAL.Wipe"/> for what that models and what Raft does not
+    /// promise about it.
+    /// </summary>
+    public async Task RestartNodeBlankAsync(SimulationNode node, CancellationToken cancellationToken)
+    {
+        if (node.LifecycleStatus != SimulationNodeLifecycleStatus.Crashed)
+            throw new InvalidOperationException($"{node.Endpoint} must be crashed before its store is wiped.");
+
+        if (node.SimulatedWal is null)
+            throw new InvalidOperationException($"{node.Endpoint} has no simulated store to wipe.");
+
+        node.SimulatedWal.Wipe();
+
+        // The application's own store lives on the same disk.
+        node.StateTransfer.ClearApplied();
+
+        await RestartNodeAsync(node, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Steps allowed for the join phase. Generous, because the join covers a system-partition
     /// election plus the partition-map commit, and a scenario that cannot get past it has a real
     /// defect rather than a tight budget.
@@ -373,6 +394,9 @@ public sealed class SimulationCluster : IAsyncDisposable
             }
         }
 
+        if (Options.ModelSwimLiveness)
+            UpdateLivenessModel();
+
         foreach (SimulationNode node in nodes)
             node.TickCheckLeader();
 
@@ -381,6 +405,73 @@ public sealed class SimulationCluster : IAsyncDisposable
 
         await SettleAsync(deliverMessages, cancellationToken).ConfigureAwait(false);
         StepNumber++;
+    }
+
+    /// <summary>
+    /// Simulated time at which each ordered pair (observer, peer) last lost its probe path, for the
+    /// pairs that have none now. See <see cref="UpdateLivenessModel"/>.
+    /// </summary>
+    private readonly Dictionary<(string Observer, string Peer), long> unreachableSince = [];
+
+    /// <summary>
+    /// Plays the SWIM failure detector for every live node. Runs once per step, before the leader
+    /// check, when <see cref="SimulationClusterOptions.ModelSwimLiveness"/> is on.
+    ///
+    /// <para><b>The model.</b> A probe from an observer reaches a peer when the ping and its answer
+    /// both get through, directly or through one relay that the observer and the peer can each reach
+    /// in both directions: the SWIM ping-req path. A peer with no such path for the observer's
+    /// <c>PingInterval + PingTimeout</c> of simulated time is marked <c>Suspect</c> in the
+    /// observer's table. A path that comes back clears the suspicion at once, as a successful probe
+    /// does.</para>
+    ///
+    /// <para><b>What it leaves out.</b> Suspicion never turns into <c>Dead</c>: that transition runs
+    /// on the SWIM tick, which the harness does not drive, and no rule under test needs more than
+    /// "not Alive". Gossip does not spread a verdict either: each node judges only its own
+    /// probes.</para>
+    /// </summary>
+    private void UpdateLivenessModel()
+    {
+        long now = Clock.LogicalMilliseconds;
+        List<SimulationNode> live = nodes.Where(node => node.HasLiveManager).ToList();
+
+        bool TwoWay(string a, string b) => Transport.CanDeliver(a, b) && Transport.CanDeliver(b, a);
+
+        foreach (SimulationNode observer in live)
+        {
+            TimeSpan window = observer.Manager.Configuration.PingInterval + observer.Manager.Configuration.PingTimeout;
+
+            foreach (SimulationNode peer in nodes)
+            {
+                if (peer == observer)
+                    continue;
+
+                bool reachable = TwoWay(observer.Endpoint, peer.Endpoint)
+                                 || live.Any(relay =>
+                                     relay != observer
+                                     && relay != peer
+                                     && TwoWay(observer.Endpoint, relay.Endpoint)
+                                     && TwoWay(relay.Endpoint, peer.Endpoint));
+
+                (string, string) key = (observer.Endpoint, peer.Endpoint);
+
+                if (reachable)
+                {
+                    if (unreachableSince.Remove(key))
+                        observer.Manager.Liveness.ClearSuspicion(peer.Endpoint);
+
+                    continue;
+                }
+
+                if (!unreachableSince.TryGetValue(key, out long since))
+                {
+                    unreachableSince[key] = now;
+                    continue;
+                }
+
+                if (now - since >= (long)window.TotalMilliseconds)
+                    observer.Manager.Liveness.MarkSuspect(peer.Endpoint);
+            }
+        }
     }
 
     /// <summary>

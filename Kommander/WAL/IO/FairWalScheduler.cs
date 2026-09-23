@@ -997,6 +997,11 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         RaftOperationStatus status;
         long writeStartTicks = tickSource.GetTimestamp();
 
+        // Whether the batch was written with its own fsync. Each completion carries it, because the
+        // follower's reported durable frontier must not count a resolution that rode sync-off and
+        // is not on disk yet (see RaftWriteAhead.MarkResolutionWritten).
+        bool batchSynced = true;
+
         try
         {
             // Reuse the worker-owned logGroups list — cleared here, populated below.
@@ -1030,6 +1035,8 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                     if (!sync && (op.RequiresSync || !AllCommittedMarkers(op.Logs.Logs)))
                         sync = true;
                 }
+
+            batchSynced = sync;
 
             if (logGroups.Count > 0)
             {
@@ -1141,7 +1148,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             {
                 try
                 {
-                    op.OnComplete(BuildCompletion(op, status));
+                    op.OnComplete(BuildCompletion(op, status, batchSynced));
                     Interlocked.Increment(ref _totalOperationsCompleted);
                     KommanderMetrics.WalOperationsTotal.Add(1);
                 }
@@ -1276,7 +1283,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         }
     }
 
-    private static RaftWalCompletion BuildCompletion(WALWriteOperation op, RaftOperationStatus status)
+    private static RaftWalCompletion BuildCompletion(WALWriteOperation op, RaftOperationStatus status, bool synced)
     {
         if (op.Type is WALWriteOperationType.HardState or WALWriteOperationType.HlcFloor)
             return new RaftWalCompletion(op.Logs.PartitionId, op.OperationId, op.Term, -1, -1, op.Type, op.MetadataStatus, MetadataValue: op.MetadataValue);
@@ -1284,6 +1291,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         List<RaftLog> logs = op.Logs.Logs;
         long minIndex = -1;
         long writtenMax = -1;
+        long resolvedMax = -1;
 
         // The ids a batch carries are ascending in every enqueue path (the propose allocator
         // counts up, the commit/rollback/follower paths order by id), so one pass that checks each
@@ -1294,6 +1302,10 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         for (int i = 0; i < logs.Count; i++)
         {
             long id = logs[i].Id;
+
+            if (logs[i].Type is not (RaftLogType.Proposed or RaftLogType.ProposedCheckpoint) && id > resolvedMax)
+                resolvedMax = id;
+
             if (i == 0)
             {
                 minIndex = id;
@@ -1325,7 +1337,9 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             OperationType: op.Type,
             Status: status,
             WrittenMaxLogIndex: writtenMax,
-            SparseLogIds: sparseIds
+            SparseLogIds: sparseIds,
+            Synced: synced,
+            ResolvedMaxLogIndex: resolvedMax
         );
     }
 

@@ -216,6 +216,27 @@ internal sealed class ReplicationAckProcessor
             if (coreState.NodeState == RaftNodeState.Leader && committedIndex >= 0)
                 tracker.RecordMismatchAnchor(endpoint, committedIndex);
 
+            // A rejection of a batch anchored on an entry this leader compacted cannot be repaired
+            // by any batch: the follower accepts such an anchor only inside its committed prefix,
+            // and the leader no longer has the anchor entry to send. Without this, the note above
+            // re-sent the same batch on every heartbeat forever (DST FINDING 7). Two refusals in a
+            // row, so that one reordered stale rejection does not cost a snapshot.
+            if (coreState.NodeState == RaftNodeState.Leader)
+            {
+                (int refusals, long anchor) = tracker.RecordCompactedAnchorRefusal(endpoint);
+                if (refusals >= CompactedAnchorRefusalsBeforeSnapshot)
+                {
+                    RaftNode? node = FindNode(endpoint);
+                    if (node is not null)
+                    {
+                        if (refusals == CompactedAnchorRefusalsBeforeSnapshot)
+                            logger.LogWarnCompactedAnchorRefused(host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, anchor, refusals);
+
+                        await sender.EscalateCompactedAnchorRefusalAsync(node).ConfigureAwait(false);
+                    }
+                }
+            }
+
             logger.LogDebugBacktrackingNextIndex(
                 host.LocalEndpoint,
                 host.PartitionId,
@@ -285,7 +306,10 @@ internal sealed class ReplicationAckProcessor
         // below, so the streak this ack proves paces this ack's own follow-on batch — that
         // ordering is what breaks the network-speed ping-pong after a single fruitless ship.
         if (committedIndex >= 0)
+        {
             tracker.RecordBackfillAckFrontier(endpoint, committedIndex);
+            tracker.ClearCompactedAnchorIfCovered(endpoint, committedIndex);
+        }
 
         // Same-term success acks double as leadership proof: they feed the read-index confirmation
         // round and the check-quorum recency window. Only term-stamped acks count — an unstamped
@@ -452,6 +476,25 @@ internal sealed class ReplicationAckProcessor
         pendingAutoCommit.Proposal = proposal;
         pendingAutoCommit.TicketId = timestamp;
         proposals.TrackPending(operation.OperationId, pendingAutoCommit);
+    }
+
+    /// <summary>
+    /// Rejections in a row of batches anchored on a compacted entry before the leader escalates to
+    /// a snapshot. Two, not one: a single reordered rejection from an earlier batch must not cost a
+    /// whole-partition transfer, and the snapshot sender's own pacing covers everything after.
+    /// </summary>
+    private const int CompactedAnchorRefusalsBeforeSnapshot = 2;
+
+    private RaftNode? FindNode(string endpoint)
+    {
+        IReadOnlyList<RaftNode> nodes = host.Nodes;
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            if (nodes[i].Endpoint == endpoint)
+                return nodes[i];
+        }
+
+        return null;
     }
 
     private void RecordPeerWalStall(string endpoint, long walStallMs, long committedIndex, long durableIndex)

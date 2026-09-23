@@ -1,3 +1,4 @@
+using Kommander.Data;
 namespace Kommander.Tests.Simulation.Cluster;
 
 /// <summary>
@@ -13,13 +14,12 @@ namespace Kommander.Tests.Simulation.Cluster;
 /// them apart. Measured, not assumed — a hunt over a reintroduced escalation defect wedged
 /// identically on the fixed build, twenty replays out of twenty each way.</para>
 ///
-/// <para><b>Why the blob is empty, and why that is honest.</b> A simulated node holds no application
-/// state: its state machine is the log itself, which Kommander ships through its own paths. So there
-/// is nothing to export, and an empty export truthfully "reflects everything applied at
-/// <c>upToIndex</c>". What the transfer buys is the part that repairs the follower — the receiver
-/// installs its WAL boundary at <c>upToIndex</c>, which lifts it back above the floor so ordinary
-/// replication can carry it forward. A scenario family that gives simulated nodes real state must
-/// replace this, not extend it.</para>
+/// <para><b>What the blob carries.</b> The node's application state at the boundary: every entry
+/// the library handed the node for application, up to <c>upToIndex</c>, as id, term and payload
+/// hash (see <see cref="Apply"/>). It used to be a header only, which was honest while the nodes kept
+/// no state, but it made a receiver that acknowledged an install and imported nothing look exactly
+/// like one that imported everything (<c>14b564a</c> item 6, the Kahuna run of Sept 20). The run-level
+/// rule <c>applied-state-agrees</c> now tells them apart (DST-20).</para>
 ///
 /// <para>The header bytes are not decoration. An import that received a truncated or foreign stream
 /// would otherwise succeed silently, and a rescue that "worked" while transferring nothing is
@@ -133,6 +133,16 @@ public sealed class SimulatedPartitionStateTransfer : IRaftPartitionStateTransfe
 
         Interlocked.Increment(ref exportsServed);
 
+        // The applied entries at or below the boundary: the state a snapshot at upToIndex stands
+        // for. Entries above it arrive afterwards through ordinary replication.
+        List<KeyValuePair<long, AppliedEntry>> exported;
+        lock (appliedLock)
+        {
+            exported = applied.TryGetValue(partitionId, out SortedDictionary<long, AppliedEntry>? state)
+                ? state.Where(pair => pair.Key <= upToIndex).ToList()
+                : [];
+        }
+
         MemoryStream blob = new();
 
         using (BinaryWriter writer = new(blob, global::System.Text.Encoding.UTF8, leaveOpen: true))
@@ -140,6 +150,14 @@ public sealed class SimulatedPartitionStateTransfer : IRaftPartitionStateTransfe
             writer.Write(Magic);
             writer.Write(partitionId);
             writer.Write(upToIndex);
+            writer.Write(exported.Count);
+
+            foreach ((long id, AppliedEntry entry) in exported)
+            {
+                writer.Write(id);
+                writer.Write(entry.Term);
+                writer.Write(entry.Hash);
+            }
         }
 
         blob.Position = 0;
@@ -172,12 +190,129 @@ public sealed class SimulatedPartitionStateTransfer : IRaftPartitionStateTransfe
             throw new InvalidOperationException(
                 $"Snapshot was exported for partition {exportedPartition} and delivered to partition {partitionId}.");
 
-        // The index is read for the same reason: a blob that cannot be read to its end is not a
-        // blob this node should call an installed state.
-        reader.ReadInt64();
+        long upToIndex = reader.ReadInt64();
+        int count = reader.ReadInt32();
+
+        SortedDictionary<long, AppliedEntry> imported = [];
+        for (int index = 0; index < count; index++)
+        {
+            long id = reader.ReadInt64();
+            long term = reader.ReadInt64();
+            ulong hash = reader.ReadUInt64();
+            imported[id] = new AppliedEntry(term, hash);
+        }
+
+        // The Control A hook of DST-20: a receiver that reads the blob, reports success, and keeps
+        // its old state. Everything above ran, so the transfer itself looks complete.
+        if (SkipImports)
+        {
+            Interlocked.Increment(ref importsSkipped);
+            return;
+        }
+
+        // A snapshot is the whole state at the boundary, so it replaces what the node had. Entries
+        // above the boundary are applied again as replication delivers them.
+        lock (appliedLock)
+            applied[partitionId] = imported;
+
+        Interlocked.Increment(ref importsApplied);
+        LastImportBoundary = upToIndex;
     }
 
+
     /// <summary>Takes one armed hang, if any is left. Lock-free, so two exports never take one.</summary>
+    // ── The application state ─────────────────────────────────────────────
+
+    /// <summary>One applied entry, reduced to what two nodes must agree on.</summary>
+    /// <param name="Term">The entry's term.</param>
+    /// <param name="Hash">A hash of the entry's type name and payload.</param>
+    public readonly record struct AppliedEntry(long Term, ulong Hash);
+
+    private readonly object appliedLock = new();
+    private readonly Dictionary<int, SortedDictionary<long, AppliedEntry>> applied = [];
+    private int importsApplied;
+    private int importsSkipped;
+
+    /// <summary>
+    /// When true, an import reads the whole blob and then keeps the old state: the receiver reports
+    /// success and imports nothing. For Control A only.
+    /// </summary>
+    public bool SkipImports { get; set; }
+
+    /// <summary>Imports that replaced the state.</summary>
+    public int ImportsApplied => Volatile.Read(ref importsApplied);
+
+    /// <summary>Imports that <see cref="SkipImports"/> discarded.</summary>
+    public int ImportsSkipped => Volatile.Read(ref importsSkipped);
+
+    /// <summary>The boundary of the last import that replaced the state, or 0.</summary>
+    public long LastImportBoundary { get; private set; }
+
+    /// <summary>
+    /// Records an entry the library delivered for application, from a live commit or a restore
+    /// replay. Idempotent by id, so a replay after a restart changes nothing it already held.
+    ///
+    /// <para><b>What survives a crash.</b> This object is not rebuilt on restart, so the state
+    /// outlives a crash: it models an application that persists what it applied, which is what
+    /// Kahuna and CamusDB do. A wiped node loses it (<see cref="ClearApplied"/>).</para>
+    /// </summary>
+    public void Apply(int partitionId, RaftLog log)
+    {
+        AppliedEntry entry = new(log.Term, Hash(log));
+
+        lock (appliedLock)
+        {
+            if (!applied.TryGetValue(partitionId, out SortedDictionary<long, AppliedEntry>? state))
+            {
+                state = [];
+                applied[partitionId] = state;
+            }
+
+            state[log.Id] = entry;
+        }
+    }
+
+    /// <summary>Forgets every applied entry: the application's own store was lost with the disk.</summary>
+    public void ClearApplied()
+    {
+        lock (appliedLock)
+            applied.Clear();
+    }
+
+    /// <summary>A copy of the applied entries of one partition, by id.</summary>
+    public IReadOnlyDictionary<long, AppliedEntry> GetApplied(int partitionId)
+    {
+        lock (appliedLock)
+        {
+            return applied.TryGetValue(partitionId, out SortedDictionary<long, AppliedEntry>? state)
+                ? new Dictionary<long, AppliedEntry>(state)
+                : new Dictionary<long, AppliedEntry>();
+        }
+    }
+
+    /// <summary>The hash two nodes compare for one entry: FNV-1a over the type name and the payload.</summary>
+    public static ulong Hash(RaftLog log)
+    {
+        const ulong offset = 14695981039346656037;
+        const ulong prime = 1099511628211;
+
+        ulong hash = offset;
+
+        foreach (char character in log.LogType ?? string.Empty)
+        {
+            hash ^= character;
+            hash *= prime;
+        }
+
+        foreach (byte value in log.LogData ?? [])
+        {
+            hash ^= value;
+            hash *= prime;
+        }
+
+        return hash;
+    }
+
     private bool TryConsumeHang()
     {
         while (true)

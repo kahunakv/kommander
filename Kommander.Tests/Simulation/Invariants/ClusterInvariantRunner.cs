@@ -90,6 +90,7 @@ public sealed class ClusterInvariantRunner
         ForgetCrashedNodes(cluster);
 
         ClusterInvariantSet.CheckOneLeaderPerTerm(cluster.StepNumber, views);
+        CheckStaleLeaderBounded(cluster, views);
         ClusterInvariantSet.CheckCommittedIdsMonotonic(cluster.StepNumber, views, highestCommitByNode);
 
         ClusterInvariantSet.CheckCommittedEntriesAgree(
@@ -111,6 +112,88 @@ public sealed class ClusterInvariantRunner
             recordedByCommittedIndex);
 
         ChecksRun++;
+    }
+
+    /// <summary>
+    /// Simulated time at which each node was first seen leading in a term below another node's
+    /// leadership, while it has kept doing so without a break.
+    /// </summary>
+    private readonly Dictionary<string, long> staleLeaderSince = [];
+
+    /// <summary>
+    /// Rule <c>stale-leader-bounded</c>: with check-quorum on, a running node does not keep
+    /// reporting itself leader for more than two check-quorum windows after another node leads in a
+    /// higher term.
+    ///
+    /// <para><b>Why this rule and not a lost write.</b> One leader per term is never broken by a
+    /// stale leader, and the stale leader cannot commit, so no log check sees it. The harm is
+    /// outside the log: a consumer that acts on the belief of leadership (Kahuna's actor-only
+    /// mutations, <c>39bf62e2</c>) acts twice. Check-quorum exists to bound that belief, and the
+    /// bound is time, so the rule measures time. The quiesced-leader defect fixed in
+    /// <c>14b564a</c> kept the belief for the whole length of a network cut.</para>
+    ///
+    /// <para><b>Why two windows.</b> A correct leader steps down one window after its last
+    /// majority contact, which comes before the cut, while the other side needs a failure verdict
+    /// and an election timeout before it has a leader at all. The measured overlap is therefore
+    /// close to zero. The second window absorbs tick granularity and the half-window probe of a
+    /// quiesced leader, so the rule fires only on a leader that did not step down.</para>
+    ///
+    /// <para>Time counts only while the stale node is running: a paused or crashed process cannot
+    /// step down, and its belief is not the defect.</para>
+    /// </summary>
+    private void CheckStaleLeaderBounded(SimulationCluster cluster, IReadOnlyList<RaftPartitionView> views)
+    {
+        long now = cluster.Clock.LogicalMilliseconds;
+        HashSet<string> stale = [];
+
+        foreach (RaftPartitionView view in views)
+        {
+            if (view.Role != RaftNodeState.Leader)
+                continue;
+
+            SimulationNode? node = cluster.Nodes.FirstOrDefault(candidate => candidate.Endpoint == view.Endpoint);
+
+            if (node is null
+                || node.LifecycleStatus != SimulationNodeLifecycleStatus.Running
+                || !node.Manager.Configuration.EnableCheckQuorum)
+                continue;
+
+            RaftPartitionView? newer = views.FirstOrDefault(other =>
+                other.Role == RaftNodeState.Leader && other.Term > view.Term);
+
+            if (newer is null)
+                continue;
+
+            stale.Add(view.Endpoint);
+
+            if (!staleLeaderSince.TryGetValue(view.Endpoint, out long since))
+            {
+                staleLeaderSince[view.Endpoint] = now;
+                continue;
+            }
+
+            long bound = 2 * (long)node.Manager.Configuration.CheckQuorumWindow.TotalMilliseconds;
+
+            if (now - since > bound)
+            {
+                throw new InvariantViolationException(
+                    "stale-leader-bounded",
+                    $"stale-leader-bounded: {view.Endpoint} has reported itself leader of term {view.Term} for " +
+                    $"{now - since} ms of simulated time while {newer.Endpoint} leads term {newer.Term}. " +
+                    $"Check-quorum is on with a {node.Manager.Configuration.CheckQuorumWindow.TotalMilliseconds} ms " +
+                    $"window, so it must step down within {bound} ms. Quiesced={view.Quiesced}.",
+                    cluster.StepNumber,
+                    selectedEvent: null,
+                    lastValidSnapshot: null,
+                    failingSnapshot: null);
+            }
+        }
+
+        foreach (string endpoint in staleLeaderSince.Keys.ToList())
+        {
+            if (!stale.Contains(endpoint))
+                staleLeaderSince.Remove(endpoint);
+        }
     }
 
     /// <summary>

@@ -53,13 +53,7 @@ public sealed class ClusterPlanOracle
         try
         {
             await using SimulationCluster cluster = await SimulationCluster.StartAsync(
-                new SimulationClusterOptions
-                {
-                    NodeCount = 3,
-                    PartitionCount = 1,
-                    Seed = seed,
-                    ConfigureNode = options.ApplyTo,
-                },
+                options.ToClusterOptions(seed),
                 logger,
                 cancellationToken);
 

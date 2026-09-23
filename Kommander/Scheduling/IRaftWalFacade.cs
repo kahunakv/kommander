@@ -167,6 +167,17 @@ public interface IRaftWalFacade
     void MarkDurablyWritten(long minLogIndex, long maxLogIndex, long[]? sparseLogIds) { }
 
     /// <summary>
+    /// Records that a successful WAL write carried resolved rows through
+    /// <paramref name="resolvedMaxLogIndex"/> (-1 when it carried none), and whether its batch was
+    /// fsynced. Feeds the durable resolution frontier that bounds
+    /// <see cref="GetDurableCommitFrontier"/>: a commit marker written sync-off on the single-fsync
+    /// fast path is not on disk until a later synced write on the partition completes, and a crash
+    /// before that returns the row to <c>Proposed</c>. Called by the completion router beside
+    /// <see cref="MarkDurablyWritten"/>. Default no-op for facades that do not track durability.
+    /// </summary>
+    void MarkResolutionWritten(long resolvedMaxLogIndex, bool synced) { }
+
+    /// <summary>
     /// The commit index this node publishes OUTSIDE the replication protocol
     /// (<see cref="IRaft.GetCommitIndex"/>, the partition view): the highest id both resolved and
     /// durably held here, and never lower than a value returned earlier in this process lifetime.

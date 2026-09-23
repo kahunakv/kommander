@@ -169,6 +169,10 @@ public sealed class RandomScenarioRunner
 
         long finalCommitIndex = await HighestCommitIndexAsync(cancellationToken).ConfigureAwait(false);
 
+        IReadOnlyList<RaftPartitionView> finalViews = await cluster
+            .GetPartitionViewsAsync(options.PartitionId, cancellationToken)
+            .ConfigureAwait(false);
+
         return new RandomScenarioReport
         {
             Seed = random.Seed,
@@ -182,6 +186,10 @@ public sealed class RandomScenarioRunner
             SnapshotExportsServed = cluster.Nodes.Sum(node => node.StateTransfer.ExportsServed),
             SnapshotExportsHung = cluster.Nodes.Sum(node => node.StateTransfer.ExportsHung),
             Metrics = Metrics,
+            QuiescedOutagesReached = QuiescedOutagesReached,
+            LateBroadcastsCommittedFirst = LateBroadcastsCommittedFirst,
+            TransferAnswers = new Dictionary<RaftOperationStatus, int>(transferAnswers),
+            FinalTerm = finalViews.Count == 0 ? -1 : finalViews.Max(view => view.Term),
         };
     }
 
@@ -317,6 +325,11 @@ public sealed class RandomScenarioRunner
         }
 
         await invariants.CheckConvergedAsync(cluster, options.PartitionId, cancellationToken)
+            .ConfigureAwait(false);
+
+        // The application's view, after the log's: a converged log with an application that never
+        // received part of it is the install that imported nothing (DST-20).
+        await AppliedStateRule.CheckAsync(cluster, options.PartitionId, options.AdvanceMillisecondsPerStep, cancellationToken)
             .ConfigureAwait(false);
 
         SimulationNode reader = cluster.Nodes.First(node => node.HasLiveManager);
@@ -633,11 +646,402 @@ public sealed class RandomScenarioRunner
             return resolved;
         }
 
+        if (resolved.Kind == RandomScenarioActionKind.QuiescedLeaderOutage && resolved.Target is not null)
+        {
+            await RunQuiescedLeaderOutageAsync(resolved.Target, cancellationToken).ConfigureAwait(false);
+            return resolved;
+        }
+
+        if (resolved.Kind == RandomScenarioActionKind.TransferLeadership
+            && resolved.Target is not null
+            && resolved.Secondary is not null)
+        {
+            await RunLeadershipTransferAsync(resolved.Target, resolved.Secondary, cancellationToken).ConfigureAwait(false);
+            return resolved;
+        }
+
+        if (resolved.Kind == RandomScenarioActionKind.LateBroadcast && resolved.Target is not null)
+        {
+            await RunLateBroadcastAsync(resolved.Target, cancellationToken).ConfigureAwait(false);
+            return resolved;
+        }
+
         bool deliver = await ApplyAsync(resolved, cancellationToken).ConfigureAwait(false);
 
         await RunStepsAsync(options.StepsPerAction, deliver, cancellationToken).ConfigureAwait(false);
 
         return resolved;
+    }
+
+    /// <summary>
+    /// Quiesced outages that found the leader's partition quiesced before the cut. A family whose
+    /// runs never reach it tested only the plain outage, and says so in its output.
+    /// </summary>
+    public int QuiescedOutagesReached { get; private set; }
+
+    /// <summary>
+    /// Steps the cut stays in place after another node leads. Long enough to pass the check-quorum
+    /// window of the quiescence family (a 300 to 600 ms election timeout), so the cut leader must
+    /// have stepped down by the end if check-quorum works.
+    /// </summary>
+    private const int QuiescedOutageExtraSteps = 16;
+
+    /// <summary>
+    /// Idles until the leader's partition quiesces, cuts the leader off, waits until another node
+    /// leads and the check-quorum window has passed, writes to the cut node, and heals. See
+    /// <see cref="RandomScenarioActionKind.QuiescedLeaderOutage"/>.
+    ///
+    /// <para>When the partition does not quiesce inside the budget, the action goes on as a plain
+    /// outage with a write. It is not skipped, because the plan already records it, and
+    /// <see cref="QuiescedOutagesReached"/> says how often the quiesced shape really ran.</para>
+    ///
+    /// <para><b>Cost.</b> The write at the cut leader has no quorum. It resolves when the leader
+    /// learns the new term after the heal, which is simulated time; in the worst case it waits the
+    /// library's ten real seconds of quorum wait. That is the price of the one write that can be
+    /// lost here.</para>
+    /// </summary>
+    private async Task RunQuiescedLeaderOutageAsync(string endpoint, CancellationToken cancellationToken)
+    {
+        int quiesceBudget = (int)(options.QuiesceAfterMs / Math.Max(1, options.AdvanceMillisecondsPerStep))
+                            + options.StepsPerAction * 2;
+
+        bool quiesced = await cluster.RunUntilAsync(
+            async () =>
+            {
+                await invariants.CheckAsync(cluster, options.PartitionId, cancellationToken)
+                    .ConfigureAwait(false);
+
+                RaftPartitionView? view = await Node(endpoint)
+                    .GetPartitionViewAsync(options.PartitionId, cancellationToken)
+                    .ConfigureAwait(false);
+
+                return view is { Role: RaftNodeState.Leader, Quiesced: true };
+            },
+            quiesceBudget,
+            options.AdvanceMillisecondsPerStep,
+            cancellationToken).ConfigureAwait(false);
+
+        if (quiesced)
+            QuiescedOutagesReached++;
+
+        cluster.Transport.PartitionNode(endpoint);
+
+        Task<ClientOperation>? append = null;
+
+        try
+        {
+            await cluster.RunUntilAsync(
+                async () =>
+                {
+                    await invariants.CheckAsync(cluster, options.PartitionId, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    IReadOnlyList<RaftPartitionView> views = await cluster
+                        .GetPartitionViewsAsync(options.PartitionId, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    return views.Any(view =>
+                        view.Role == RaftNodeState.Leader
+                        && !string.Equals(view.Endpoint, endpoint, StringComparison.Ordinal));
+                },
+                options.StepsPerAction * OutageElectionBudgetFactor * 2,
+                options.AdvanceMillisecondsPerStep,
+                cancellationToken).ConfigureAwait(false);
+
+            await RunStepsAsync(QuiescedOutageExtraSteps, deliver: true, cancellationToken).ConfigureAwait(false);
+
+            // The write comes at the end of the cut, not at its start. A proposal wakes a quiesced
+            // leader, and an awake leader is judged by the ordinary check-quorum path, so a write at
+            // the start hid the very defect this action is for: measured, the pre-14b564a shape
+            // passed every seed with the write first. By now a correct leader has stepped down and
+            // refuses the write; a stale one still takes it.
+            if (Node(endpoint).LifecycleStatus == SimulationNodeLifecycleStatus.Running)
+                append = history.AppendUniqueAsync(
+                    cluster, Node(endpoint), options.PartitionId, "Greeting", cancellationToken);
+
+            await RunStepsAsync(LateBroadcastHoldSteps, deliver: true, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            cluster.Transport.HealPartition(endpoint);
+        }
+
+        if (append is not null)
+        {
+            await cluster.RunUntilAsync(
+                () => Task.FromResult(append.IsCompleted),
+                options.StepsPerAction * OutageElectionBudgetFactor,
+                options.AdvanceMillisecondsPerStep,
+                cancellationToken).ConfigureAwait(false);
+
+            await append.ConfigureAwait(false);
+        }
+
+        await RunStepsAsync(OutageRecoverySteps, deliver: true, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Answers the leadership transfers of this run received, by status. Printed by the transfer
+    /// family, because a family whose transfers were all refused before they started tested little.
+    /// </summary>
+    public IReadOnlyDictionary<RaftOperationStatus, int> TransferAnswers => transferAnswers;
+
+    private readonly Dictionary<RaftOperationStatus, int> transferAnswers = [];
+
+    /// <summary>
+    /// The answers a leadership transfer may give when the cluster had no fault at all. Each is a
+    /// definite result or names its reason: the handover happened or was sent, the target could not
+    /// catch up inside the bound, or leadership had already moved before the call arrived.
+    /// </summary>
+    private static readonly HashSet<RaftOperationStatus> DefiniteTransferAnswers =
+    [
+        RaftOperationStatus.Success,
+        RaftOperationStatus.Pending,
+        RaftOperationStatus.TargetNotCaughtUp,
+        RaftOperationStatus.NodeIsNotLeader,
+    ];
+
+    /// <summary>
+    /// True when nothing in the harness is impairing the cluster: every node runs, the wire is
+    /// perfect, and no store refuses writes.
+    ///
+    /// <para>Read from the cluster, not from the generator's fault table, so that a replayed plan
+    /// reaches the same verdict as the drawn one.</para>
+    /// </summary>
+    private bool ClusterIsHealthy() =>
+        cluster.Nodes.All(node => node.LifecycleStatus == SimulationNodeLifecycleStatus.Running)
+        && cluster.Transport.IsHealthy
+        && cluster.Nodes.All(node => node.SimulatedWal is not { HasWriteFault: true });
+
+    /// <summary>
+    /// Starts a client write at the leader and, while it is in flight, asks the leader to hand over
+    /// to <paramref name="target"/>. Both are driven to completion and recorded.
+    ///
+    /// <para>Rule <c>transfer-definite-when-healthy</c> (DST-20 item 2): when the cluster had no fault
+    /// at the moment of the call, the answer must be one of <see cref="DefiniteTransferAnswers"/>.
+    /// A transient failure such as <c>ReplicationFailed</c> breaks no other rule, so without this
+    /// one the defect of <c>38a5e2b</c> — a target one entry behind refused at once, and the move
+    /// silently dropped — passed every check.</para>
+    ///
+    /// <para>When the node is no longer the leader, or the target is not running, the action only
+    /// lets time pass; the plan still records it.</para>
+    /// </summary>
+    private async Task RunLeadershipTransferAsync(string leader, string target, CancellationToken cancellationToken)
+    {
+        RandomScenarioObservation observation = await ObserveAsync(cancellationToken).ConfigureAwait(false);
+
+        if (observation.Leader != leader || !observation.Running.Contains(target))
+        {
+            await RunStepsAsync(options.StepsPerAction, deliver: true, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        bool healthy = ClusterIsHealthy();
+
+        Task<ClientOperation> append = history.AppendUniqueAsync(
+            cluster, Node(leader), options.PartitionId, "Greeting", cancellationToken);
+
+        Task<RaftOperationStatus> transfer = Node(leader).Manager
+            .TransferLeadershipAsync(options.PartitionId, target, cancellationToken);
+
+        await cluster.RunUntilAsync(
+            () => Task.FromResult(append.IsCompleted && transfer.IsCompleted),
+            options.StepsPerAction * OutageElectionBudgetFactor * 2,
+            options.AdvanceMillisecondsPerStep,
+            cancellationToken).ConfigureAwait(false);
+
+        await append.ConfigureAwait(false);
+        RaftOperationStatus answer = await transfer.ConfigureAwait(false);
+
+        transferAnswers[answer] = transferAnswers.GetValueOrDefault(answer) + 1;
+
+        if (healthy && !DefiniteTransferAnswers.Contains(answer))
+        {
+            Assert.Fail(
+                $"transfer-definite-when-healthy: {leader} was asked to hand leadership to {target} with no " +
+                $"fault active, and answered {answer}. With no fault the answer must be one of " +
+                $"[{string.Join(", ", DefiniteTransferAnswers)}]: a transient failure here is a move the caller " +
+                "drops, and nothing else in the run would notice.");
+        }
+
+        await RunStepsAsync(OutageRecoverySteps, deliver: true, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Steps a late broadcast holds the follower's traffic after the write completes.</summary>
+    private const int LateBroadcastHoldSteps = 2;
+
+    /// <summary>
+    /// Holds one follower's traffic with a late wire copy, writes one entry through the leader, and
+    /// then lets the traffic through. See <see cref="RandomScenarioActionKind.LateBroadcast"/>.
+    ///
+    /// <para>The write is awaited while the cluster is driven: the leader reaches its quorum through
+    /// the other follower, so it commits the entry and retypes it while the held follower's copy is
+    /// still waiting. When the target no longer follows, or no single leader is visible, the action
+    /// only lets time pass. The plan still records it, because what it did depends on the state it
+    /// found, and a replay finds the same state.</para>
+    ///
+    /// <para>The follower is released in a <c>finally</c>, so a failure inside the window does not
+    /// leave a frozen node for the teardown to time out on.</para>
+    /// </summary>
+    private async Task RunLateBroadcastAsync(string target, CancellationToken cancellationToken)
+    {
+        RandomScenarioObservation observation = await ObserveAsync(cancellationToken).ConfigureAwait(false);
+
+        if (observation.Leader is null
+            || observation.Leader == target
+            || !observation.Running.Contains(target))
+        {
+            await RunStepsAsync(options.StepsPerAction, deliver: true, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        // The first type each new id carried when it reached the target. An id the target already
+        // held is not a first sight, so only ids above its log before the hold count.
+        long heldBefore = Store(target).GetMaxLog(options.PartitionId);
+        Dictionary<long, RaftLogType> firstSight = [];
+
+        void Observe(string from, string to, IReadOnlyList<RaftLog> logs)
+        {
+            if (to != target)
+                return;
+
+            lock (firstSight)
+            {
+                foreach (RaftLog log in logs)
+                {
+                    if (log.Id > heldBefore)
+                        firstSight.TryAdd(log.Id, log.Type);
+                }
+            }
+        }
+
+        cluster.Transport.AppendLogsDelivered += Observe;
+        cluster.Transport.SetLateSerialization(target, true);
+        cluster.Transport.FreezeEndpoint(target);
+
+        try
+        {
+            Task<ClientOperation> append = history.AppendUniqueAsync(
+                cluster, Node(observation.Leader), options.PartitionId, "Greeting", cancellationToken);
+
+            await cluster.RunUntilAsync(
+                () => Task.FromResult(append.IsCompleted),
+                options.StepsPerAction * OutageElectionBudgetFactor,
+                options.AdvanceMillisecondsPerStep,
+                cancellationToken).ConfigureAwait(false);
+
+            await append.ConfigureAwait(false);
+
+            await RunStepsAsync(LateBroadcastHoldSteps, deliver: true, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            cluster.Transport.ThawEndpoint(target);
+            cluster.Transport.SetLateSerialization(target, false);
+        }
+
+        await RunStepsAsync(options.StepsPerAction, deliver: true, cancellationToken).ConfigureAwait(false);
+
+        cluster.Transport.AppendLogsDelivered -= Observe;
+
+        lock (firstSight)
+        {
+            if (firstSight.Values.Any(type => type is RaftLogType.Committed or RaftLogType.CommittedCheckpoint))
+                LateBroadcastsCommittedFirst++;
+        }
+    }
+
+    /// <summary>
+    /// Late broadcasts whose target first saw a new entry as a committed row. The state the action
+    /// exists for; a family where this stays at zero never reached it.
+    /// </summary>
+    public int LateBroadcastsCommittedFirst { get; private set; }
+
+    /// <summary>
+    /// What the leader believed about a follower's durable log just before the follower crashed.
+    /// </summary>
+    /// <param name="Leader">The leader that holds the record.</param>
+    /// <param name="Reported">The follower's last reported durable commit frontier.</param>
+    /// <param name="LeaderCommit">The leader's commit index when the record was read.</param>
+    private sealed record ReportedDurability(string Leader, long Reported, long LeaderCommit);
+
+    /// <summary>
+    /// Reads the leader's record of <paramref name="endpoint"/>'s durable frontier, or null when no
+    /// single other node leads or the leader has no report from it.
+    /// </summary>
+    private async Task<ReportedDurability?> ReadReportedDurabilityAsync(
+        string endpoint,
+        CancellationToken cancellationToken)
+    {
+        IReadOnlyList<RaftPartitionView> views = await cluster
+            .GetPartitionViewsAsync(options.PartitionId, cancellationToken)
+            .ConfigureAwait(false);
+
+        List<RaftPartitionView> leaders = views
+            .Where(view => view.Role == RaftNodeState.Leader && view.Endpoint != endpoint)
+            .ToList();
+
+        if (leaders.Count != 1)
+            return null;
+
+        RaftFollowerProgress? progress = Node(leaders[0].Endpoint).Manager
+            .GetFollowerProgress(options.PartitionId, endpoint);
+
+        if (progress is null || progress.DurableFrontier <= 0)
+            return null;
+
+        return new ReportedDurability(leaders[0].Endpoint, progress.DurableFrontier, leaders[0].CommitIndex);
+    }
+
+    /// <summary>
+    /// Rule <c>reported-durable-survives-crash</c>: every id a follower reported to its leader as
+    /// committed and durable is still there, resolved, after the follower crashes.
+    ///
+    /// <para><b>Why the report is a promise.</b> The leader holds WAL retention at the follower's
+    /// reported durable frontier plus one, and compacts below it. An id the follower reported and then
+    /// lost can therefore be gone from both logs, and the only repair left is a snapshot. The report
+    /// also has to name a resolved row, not only a present one: a restarted follower holding the id as
+    /// <c>Proposed</c> is above its own commit frontier, and it refuses the leader's backfill anchored
+    /// on the compacted id (DST FINDING 7).</para>
+    ///
+    /// <para><b>Why the rule is sound across a stale record.</b> The leader keeps a follower's last
+    /// report until it steps down, so the record can be older than the crash. A true report stays
+    /// true: resolved durable rows are never truncated, and ids that compaction or a snapshot removed
+    /// are skipped. The ids checked stop at the leader's commit index, so a report about entries the
+    /// leader itself has not committed is never in scope.</para>
+    /// </summary>
+    private void CheckReportedDurableSurvivedCrash(string endpoint, ReportedDurability? before)
+    {
+        if (before is null)
+            return;
+
+        WAL.SimulatedWAL store = Store(endpoint);
+        long covered = store.Snapshot().Partition(options.PartitionId)?.CoveredThrough ?? 0;
+        long bound = Math.Min(before.Reported, before.LeaderCommit);
+
+        Dictionary<long, RaftLogType> held = store
+            .ReadLogsRange(options.PartitionId, covered + 1)
+            .ToDictionary(log => log.Id, log => log.Type);
+
+        List<string> broken = [];
+
+        for (long id = Math.Max(covered + 1, 1); id <= bound; id++)
+        {
+            if (!held.TryGetValue(id, out RaftLogType type))
+                broken.Add($"{id}:absent");
+            else if (type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
+                broken.Add($"{id}:{type}");
+        }
+
+        if (broken.Count == 0)
+            return;
+
+        Assert.Fail(
+            $"reported-durable-survives-crash: {endpoint} reported its durable commit frontier as " +
+            $"{before.Reported} to leader {before.Leader} (leader commit {before.LeaderCommit}), and " +
+            $"after the crash its store no longer holds these ids resolved: [{string.Join(", ", broken)}]. " +
+            $"Covered by compaction or a snapshot through {covered}. The leader's WAL retention trusts " +
+            "this report, so the entries can be gone from both logs.");
     }
 
     /// <summary>
@@ -759,7 +1163,14 @@ public sealed class RandomScenarioRunner
                 SimulationNode node = Node(action.Target!);
 
                 if (node.LifecycleStatus == SimulationNodeLifecycleStatus.Running)
+                {
+                    ReportedDurability? before = await ReadReportedDurabilityAsync(node.Endpoint, cancellationToken)
+                        .ConfigureAwait(false);
+
                     await cluster.CrashNodeAsync(node, cancellationToken).ConfigureAwait(false);
+
+                    CheckReportedDurableSurvivedCrash(node.Endpoint, before);
+                }
 
                 return true;
             }
@@ -770,6 +1181,16 @@ public sealed class RandomScenarioRunner
 
                 if (node.LifecycleStatus == SimulationNodeLifecycleStatus.Crashed)
                     await cluster.RestartNodeAsync(node, cancellationToken).ConfigureAwait(false);
+
+                return true;
+            }
+
+            case RandomScenarioActionKind.RestartNodeBlank:
+            {
+                SimulationNode node = Node(action.Target!);
+
+                if (node.LifecycleStatus == SimulationNodeLifecycleStatus.Crashed)
+                    await cluster.RestartNodeBlankAsync(node, cancellationToken).ConfigureAwait(false);
 
                 return true;
             }

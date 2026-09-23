@@ -46,9 +46,11 @@ public sealed class TestCompactionFloorBackfillScenarios
     /// the batch. The batch read itself succeeded, so the leader recorded no refusal and started no
     /// snapshot, and it shipped the same batch on every heartbeat, forever.</para>
     ///
-    /// <para><b>The shape.</b> The follower commits two entries, then its disk refuses every write.
-    /// It stays alive and keeps answering heartbeats, so the leader keeps counting it and publishes
-    /// a retention floor of 3. The leader writes and checkpoints until it has compacted through 2.
+    /// <para><b>The shape.</b> The follower commits two entries and a checkpoint, then its disk
+    /// refuses every write. It stays alive and keeps answering heartbeats, so the leader keeps
+    /// counting it and publishes a retention floor one above the follower's reported durable
+    /// frontier. The checkpoint is what makes that report equal to the follower's commit index; see
+    /// the comment at the checkpoint. The leader writes and checkpoints until it has compacted through that frontier.
     /// The disk is then freed, and nobody writes. A disk fault, not a crash, because a crash can
     /// revert the follower's last commit marker, and a follower whose frontier drops below the
     /// anchor is below the floor — a different path, repaired by a snapshot.</para>
@@ -75,11 +77,27 @@ public sealed class TestCompactionFloorBackfillScenarios
         SimulationNode follower = cluster.Nodes.First(node => node != leader);
 
         await ProposeAsync(leader, count: 2, cancellationToken);
-        await ConvergeAsync(cluster, invariants, index: 2, cancellationToken);
 
-        long anchor = await CommitIndexAsync(follower, cancellationToken);
+        // A checkpoint last, so the follower's newest resolution is on disk. Its commit row is a
+        // CommittedCheckpoint, which the scheduler always writes with an fsync, and that fsync also
+        // carries the markers before it. Without it the last Committed marker can still ride
+        // sync-off, the follower then reports one entry less than it has committed (DST FINDING 7),
+        // the leader keeps that entry, and the backfill is anchored on a retained entry instead of
+        // a compacted one — the shape below is never reached.
+        await CheckpointAsync(cluster, leader, cancellationToken);
+        await ConvergeAsync(cluster, invariants, await CommitIndexAsync(leader, cancellationToken), cancellationToken);
 
         follower.SimulatedWal!.SetOutOfSpace(true, PartitionId);
+
+        // The anchor is what the follower last REPORTED as durable, read from the leader's record,
+        // because that is the value the retention hold follows. The checkpoint above makes it equal
+        // to the follower's commit index, which is asserted below.
+        await cluster.RunUntilAsync(() => Task.FromResult(false), stepCount: 4, advanceMilliseconds: 50, cancellationToken);
+
+        RaftFollowerProgress? progress = leader.Manager.GetFollowerProgress(PartitionId, follower.Endpoint);
+        Assert.NotNull(progress);
+        long anchor = progress.DurableFrontier;
+        Assert.True(anchor >= 1, $"The follower reported no durable frontier ({anchor}), so there is no anchor to compact.");
 
         // Write and checkpoint until the leader has compacted exactly through the follower's
         // frontier. The retention hold stops compaction there, which is the state under test; a
@@ -128,6 +146,148 @@ public sealed class TestCompactionFloorBackfillScenarios
         Assert.Equal(0, leader.StateTransfer.ExportsServed);
 
         await invariants.CheckConvergedAsync(cluster, PartitionId, cancellationToken);
+    }
+
+    /// <summary>
+    /// A deposed leader that holds an uncommitted entry at an index the new leader has compacted is
+    /// repaired, and does not leave the new leader re-sending a refused batch forever.
+    ///
+    /// <para><b>The state.</b> The old leader writes an entry at index N and is cut off before it
+    /// commits it. The new leader commits a different entry at N and compacts past N while the old
+    /// leader is away. After the heal, the old leader holds N in its old term, above its commit
+    /// frontier of N - 1. The new leader's first retained entry is above N, so its backfill is
+    /// anchored on N with a previous term of -1, and the FINDING 6 rule accepts such an anchor only
+    /// inside the follower's committed prefix. N is not in it, so the follower refuses.</para>
+    ///
+    /// <para><b>Why this is the FINDING 7 liveness backstop.</b> FINDING 7 was one way to reach a
+    /// refused -1 anchor; its fix removed that producer. This is another one, and it needs no
+    /// defect at all: a deposed leader's uncommitted tail is normal Raft. What must not happen is
+    /// the leader's answer to it — re-sending the same batch on every heartbeat, with no snapshot,
+    /// because the batch read itself succeeded.</para>
+    /// </summary>
+    [Fact]
+    public async Task ADeposedLeaderHoldingAnUncommittedEntryAtACompactedIndex_IsRepaired()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+
+        await using SimulationCluster cluster = await SimulationCluster.StartAsync(
+            new SimulationClusterOptions
+            {
+                NodeCount = 3,
+                PartitionCount = 1,
+                Seed = 20260923,
+                ConfigureNode = configuration =>
+                {
+                    configuration.CompactEveryOperations = CompactEveryOperations;
+
+                    // The deposed leader is silent while it is cut off. With no silent-peer window
+                    // and a small lag budget, the new leader compacts past it, which is the state.
+                    configuration.CompactionLiveReplicaLagBudget = 4;
+                    configuration.CompactionSilentPeerRetentionWindow = TimeSpan.Zero;
+                },
+            },
+            logger,
+            cancellationToken);
+
+        ClusterInvariantRunner invariants = new();
+
+        SimulationNode oldLeader = await ElectAsync(cluster, cancellationToken);
+
+        await ProposeAsync(oldLeader, count: 2, cancellationToken);
+        await ConvergeAsync(cluster, invariants, await CommitIndexAsync(oldLeader, cancellationToken), cancellationToken);
+
+        long committedBefore = await CommitIndexAsync(oldLeader, cancellationToken);
+
+        cluster.Transport.PartitionNode(oldLeader.Endpoint);
+
+        // Written on the old leader only: it cannot reach a quorum, so the entry stays uncommitted.
+        Task<RaftReplicationResult> stranded = oldLeader.Manager.ReplicateLogs(
+            PartitionId, "Greeting", "Stranded"u8.ToArray(), cancellationToken: cancellationToken);
+
+        _ = stranded.ContinueWith(
+            static task => _ = task.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
+        long strandedIndex = -1;
+
+        Assert.True(
+            await cluster.RunUntilAsync(
+                () =>
+                {
+                    strandedIndex = oldLeader.Wal.GetMaxLog(PartitionId);
+                    return Task.FromResult(strandedIndex > committedBefore);
+                },
+                stepCount: 20,
+                advanceMilliseconds: 50,
+                cancellationToken),
+            "The cut-off leader never wrote its entry.");
+
+        SimulationNode? newLeader = null;
+
+        Assert.True(
+            await cluster.RunUntilAsync(
+                async () =>
+                {
+                    foreach (SimulationNode node in cluster.Nodes.Where(node => node != oldLeader))
+                    {
+                        RaftPartitionView? view = await node.GetPartitionViewAsync(PartitionId, cancellationToken);
+                        if (view?.Role == RaftNodeState.Leader)
+                        {
+                            newLeader = node;
+                            return true;
+                        }
+                    }
+
+                    return false;
+                },
+                stepCount: 200,
+                advanceMilliseconds: 50,
+                cancellationToken),
+            "The other two nodes never elected a new leader.");
+
+        for (int round = 0; round < 12 && FirstRetained(newLeader!) <= strandedIndex + 1; round++)
+        {
+            await ProposeAsync(newLeader!, count: CompactEveryOperations, cancellationToken);
+            await CheckpointAsync(cluster, newLeader!, cancellationToken);
+
+            await cluster.RunUntilAsync(
+                () => Task.FromResult(FirstRetained(newLeader!) > strandedIndex + 1),
+                stepCount: 20,
+                advanceMilliseconds: 50,
+                cancellationToken);
+        }
+
+        Assert.True(
+            FirstRetained(newLeader!) > strandedIndex + 1,
+            $"The new leader's log starts at {FirstRetained(newLeader!)}, not above the stranded index {strandedIndex}.");
+
+        cluster.Transport.HealPartition(oldLeader.Endpoint);
+
+        long target = await CommitIndexAsync(newLeader!, cancellationToken);
+
+        bool repaired = await cluster.RunUntilAsync(
+            async () =>
+            {
+                await invariants.CheckAsync(cluster, PartitionId, cancellationToken);
+                return await CommitIndexAsync(oldLeader, cancellationToken) >= target;
+            },
+            stepCount: 400,
+            advanceMilliseconds: 50,
+            cancellationToken);
+
+        Assert.True(
+            repaired,
+            $"The deposed leader was never repaired: it is at {await CommitIndexAsync(oldLeader, cancellationToken)} " +
+            $"against {target}; it holds up to {oldLeader.Wal.GetMaxLog(PartitionId)}, the stranded entry was at " +
+            $"{strandedIndex}, and the new leader's log starts at {FirstRetained(newLeader!)}. " +
+            $"Exports served: {newLeader!.StateTransfer.ExportsServed}. " +
+            $"Backfill refusals: {string.Join(" | ", newLeader.Manager.GetBackfillStatuses(PartitionId))}. " +
+            $"Snapshot statuses: {string.Join(" | ", newLeader.Manager.GetSnapshotStatuses(PartitionId))}.");
+
+        await invariants.CheckConvergedAsync(cluster, PartitionId, cancellationToken);
+        await AppliedStateRule.CheckAsync(cluster, PartitionId, advanceMilliseconds: 50, cancellationToken);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────

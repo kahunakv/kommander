@@ -281,6 +281,188 @@ public sealed class TestRandomScenarios
     }
 
     /// <summary>
+    /// The options of the production-safety sweep: check-quorum and quiescence both on, as they
+    /// ship. Public so a plan replay or a probe can rebuild the same run.
+    /// </summary>
+    public static RandomScenarioOptions ProductionSafetyOptions => CheckQuorumOptions with
+    {
+        EnableQuiescence = true,
+        QuiescedOutageWeight = 12,
+    };
+
+    /// <summary>
+    /// The production-safety family: check-quorum and quiescence on, with an outage aimed at a
+    /// quiesced leader.
+    ///
+    /// <para><b>Why this family exists.</b> Production ships both safety features on, and every
+    /// other family turns quiescence off. The Kahuna lost-write bug (<c>39bf62e2</c>) was a quiesced
+    /// leader that never stepped down, so the search could not reach that class at all. The family
+    /// also turns on the harness's SWIM model, because a quiesced follower relies on SWIM to notice
+    /// a dead leader and the harness drives no probes.</para>
+    ///
+    /// <para>Each run prints how many quiesced outages really found the leader quiesced. A run with
+    /// none tested the plain outage only.</para>
+    /// </summary>
+    [Theory]
+    [Trait("Category", "DSTRandom")]
+    [MemberData(nameof(Seeds))]
+    public async Task AGeneratedRunUnderProductionSafetyDefaults_HoldsEveryCheck(ulong seed)
+    {
+        RandomScenarioReport report = await RunSeedAsync(
+            seed, ProductionSafetyOptions, TestContext.Current.CancellationToken);
+
+        Assert.True(report.InvariantChecks > 0, "The run checked no invariants.");
+
+        output.WriteLine(
+            $"seed={seed} quiescedOutages={report.CountOf(RandomScenarioActionKind.QuiescedLeaderOutage)} " +
+            $"reachedQuiesced={report.QuiescedOutagesReached} finalTerm={report.FinalTerm}");
+    }
+
+    /// <summary>
+    /// A healthy run with the production safety defaults keeps its leader.
+    ///
+    /// <para><b>Why this is measured.</b> Check-quorum steps a leader down when it has not heard a
+    /// majority inside its window, and quiescence stops the heartbeats that the window is fed by. A
+    /// window too tight for the transport makes a healthy leader step down over and over: the stock
+    /// simulation timeouts did exactly that, which is why check-quorum was off here at all. The
+    /// family above uses 300 to 600 ms election timeouts. This run measures the churn those timeouts
+    /// produce with no fault at all, and fails if a healthy cluster elects more than once after its
+    /// first leader.</para>
+    /// </summary>
+    [Fact]
+    [Trait("Category", "DSTSmoke")]
+    public async Task AHealthyRunUnderProductionSafetyDefaults_KeepsItsLeader()
+    {
+        RandomScenarioOptions options = ProductionSafetyOptions with
+        {
+            ActionCount = 20,
+            OutageWeight = 0,
+            NetworkFaultWeight = 0,
+            StorageFaultWeight = 0,
+            LifecycleFaultWeight = 0,
+            HealWeight = 0,
+            MaintenanceWeight = 0,
+            QuiescedOutageWeight = 0,
+        };
+
+        RandomScenarioReport report = await RunSeedAsync(
+            20260923, options, TestContext.Current.CancellationToken);
+
+        output.WriteLine($"finalTerm={report.FinalTerm} steps={report.StepsRun}");
+
+        Assert.InRange(report.FinalTerm, 1, 2);
+    }
+
+    /// <summary>
+    /// The options of the blank-restart sweep. Public so a plan replay or a probe can rebuild the
+    /// same run.
+    /// </summary>
+    public static RandomScenarioOptions BlankRestartOptions => new()
+    {
+        BlankRestartPercent = 50,
+        LifecycleFaultWeight = 20,
+    };
+
+    /// <summary>
+    /// The blank-restart family: half the crashes come back with an empty store under the same
+    /// endpoint.
+    ///
+    /// <para><b>Why.</b> DST-19 item 1 and the Kahuna finding <c>e618064e</c>: the roster still names
+    /// the node, so nothing resets what the leader recorded about its previous life, and the leader
+    /// anchored every repair above what the blank node held (fixed in <c>3552ab9</c>). The other
+    /// families always restart over the old store.</para>
+    ///
+    /// <para><b>Read a one-leader-per-term failure here with care.</b> A wiped store loses the stored
+    /// vote, and Raft's safety argument assumes a vote survives a restart. See
+    /// <c>SimulatedWAL.Wipe</c>.</para>
+    /// </summary>
+    [Theory]
+    [Trait("Category", "DSTRandom")]
+    [MemberData(nameof(Seeds))]
+    public async Task AGeneratedRunUnderBlankRestarts_HoldsEveryCheck(ulong seed)
+    {
+        RandomScenarioReport report = await RunSeedAsync(
+            seed, BlankRestartOptions, TestContext.Current.CancellationToken);
+
+        Assert.True(report.InvariantChecks > 0, "The run checked no invariants.");
+
+        output.WriteLine(
+            $"seed={seed} blankRestarts={report.CountOf(RandomScenarioActionKind.RestartNodeBlank)} " +
+            $"restarts={report.CountOf(RandomScenarioActionKind.RestartNode)}");
+    }
+
+    /// <summary>
+    /// The options of the leadership-transfer sweep. Public so a plan replay or a probe can rebuild
+    /// the same run.
+    /// </summary>
+    public static RandomScenarioOptions TransferLeadershipOptions => new()
+    {
+        TransferLeadershipWeight = 14,
+    };
+
+    /// <summary>
+    /// The leadership-transfer family: the leader is asked to hand over to a follower that is one
+    /// write behind, and the answer is judged when the cluster had no fault.
+    ///
+    /// <para><b>Why.</b> DST-19 item 2 and DST-20 item 2, for <c>38a5e2b</c> (Kahuna/CamusDB,
+    /// <c>31098233</c>): a transfer to a target one entry behind answered <c>ReplicationFailed</c> at
+    /// once, and the caller dropped it. No action transferred leadership, and no rule judged the
+    /// answer of a call made with no fault.</para>
+    /// </summary>
+    [Theory]
+    [Trait("Category", "DSTRandom")]
+    [MemberData(nameof(Seeds))]
+    public async Task AGeneratedRunUnderLeadershipTransfers_HoldsEveryCheck(ulong seed)
+    {
+        RandomScenarioReport report = await RunSeedAsync(
+            seed, TransferLeadershipOptions, TestContext.Current.CancellationToken);
+
+        Assert.True(report.InvariantChecks > 0, "The run checked no invariants.");
+
+        output.WriteLine(
+            $"seed={seed} transfers={report.CountOf(RandomScenarioActionKind.TransferLeadership)} " +
+            $"answers=[{string.Join(", ", report.TransferAnswers.Select(pair => $"{pair.Key}:{pair.Value}"))}]");
+    }
+
+    /// <summary>
+    /// The options of the late-broadcast sweep. Public so a plan replay or a probe can rebuild the
+    /// same run.
+    /// </summary>
+    public static RandomScenarioOptions LateBroadcastOptions => new()
+    {
+        LateBroadcastWeight = 12,
+    };
+
+    /// <summary>
+    /// The late-broadcast family: a follower's first sight of an entry is the committed row, and in
+    /// half the draws the follower crashes right after it.
+    ///
+    /// <para><b>Why a family of its own.</b> The state needs three things at once: the follower's
+    /// traffic held across the commit, a wire copy taken after the leader's in-place retype, and a
+    /// crash before any later synced write. The other families reach the first often and the last
+    /// two never. Before the transport gave every receiver its own copy, shared objects made the
+    /// crash harmless, so this family could not have found <c>367eac9</c> or DST FINDING 7.</para>
+    ///
+    /// <para>The check it exists for is <c>reported-durable-survives-crash</c> in the runner. It runs
+    /// on every crash in every family, and this family is where it has something to find.</para>
+    /// </summary>
+    [Theory]
+    [Trait("Category", "DSTRandom")]
+    [MemberData(nameof(Seeds))]
+    public async Task AGeneratedRunUnderLateBroadcast_HoldsEveryCheck(ulong seed)
+    {
+        RandomScenarioReport report = await RunSeedAsync(
+            seed, LateBroadcastOptions, TestContext.Current.CancellationToken);
+
+        Assert.True(report.InvariantChecks > 0, "The run checked no invariants.");
+
+        output.WriteLine(
+            $"seed={seed} lateBroadcasts={report.CountOf(RandomScenarioActionKind.LateBroadcast)} " +
+            $"committedFirst={report.LateBroadcastsCommittedFirst} " +
+            $"crashes={report.CountOf(RandomScenarioActionKind.CrashNode)}");
+    }
+
+    /// <summary>
     /// A generated plan replays from the artifact a failure would leave behind.
     ///
     /// <para>The check the whole failure report depends on. A plan is written, read back, and
@@ -471,21 +653,10 @@ public sealed class TestRandomScenarios
         RandomScenarioOptions options,
         CancellationToken cancellationToken)
     {
-        SimulationClusterOptions clusterOptions = new()
-        {
-            NodeCount = 3,
-            PartitionCount = 1,
-            Seed = seed,
-
-            // A generated run is a few dozen entries long. At the production compaction cadence
-            // no run would ever compact, and every rule about compaction would go unexercised.
-            ConfigureNode = options.ApplyTo,
-        };
-
-        if (options.StartElectionTimeoutMs is { } startElection)
-            clusterOptions = clusterOptions with { StartElectionTimeoutMs = startElection };
-        if (options.EndElectionTimeoutMs is { } endElection)
-            clusterOptions = clusterOptions with { EndElectionTimeoutMs = endElection };
+        // A generated run is a few dozen entries long. At the production compaction cadence no run
+        // would ever compact, and every rule about compaction would go unexercised, so the options
+        // carry their own node configuration.
+        SimulationClusterOptions clusterOptions = options.ToClusterOptions(seed);
 
         await using SimulationCluster cluster = await SimulationCluster.StartAsync(
             clusterOptions,

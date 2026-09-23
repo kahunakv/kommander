@@ -286,6 +286,7 @@ internal sealed class BackfillSender
 
             backfillTracker.ClearIfCovered(node.Endpoint, from, "a contiguous batch was shipped at or below the episode anchor");
             AppendLogToNode(node, timestamp, cached.Logs, prevIdx, cached.PrevTerm, grpcLogCache: cached.GrpcLogCache);
+            tracker.RecordAnchorShip(node.Endpoint, prevIdx, anchorCompacted: prevIdx > 0 && cached.PrevTerm < 0);
             await RecordShippedAsync(node, reportedFrontier, from).ConfigureAwait(false);
             return BackfillSendResult.Sent;
         }
@@ -368,6 +369,7 @@ internal sealed class BackfillSender
 
         backfillTracker.ClearIfCovered(node.Endpoint, from, "a contiguous batch was shipped at or below the episode anchor");
         AppendLogToNode(node, timestamp, backfill, prevIdx, prevTerm, grpcLogCache: shared?.GrpcLogCache);
+        tracker.RecordAnchorShip(node.Endpoint, prevIdx, anchorCompacted: prevIdx > 0 && prevTerm < 0);
         await RecordShippedAsync(node, reportedFrontier, from).ConfigureAwait(false);
         return BackfillSendResult.Sent;
     }
@@ -467,6 +469,15 @@ internal sealed class BackfillSender
     /// uncommitted run on an uncompacted WAL has nothing to snapshot from and is repaired by the
     /// inherited-tail re-commit instead.</para>
     /// </summary>
+    /// <summary>
+    /// Escalates a follower that keeps refusing batches anchored on an entry this leader compacted.
+    /// See <see cref="ReplicationTracker.RecordCompactedAnchorRefusal"/> for why no batch can repair
+    /// it. The snapshot gates of <see cref="EscalateRefusalToSnapshotAsync"/> apply unchanged: a
+    /// reported disk stall defers it, the sender's in-flight guard and backoff pace it, and a
+    /// leader with no checkpoint has nothing to send.
+    /// </summary>
+    public Task EscalateCompactedAnchorRefusalAsync(RaftNode node) => EscalateRefusalToSnapshotAsync(node);
+
     private async Task EscalateRefusalToSnapshotAsync(RaftNode node)
     {
         if (coreState.NodeState != RaftNodeState.Leader)

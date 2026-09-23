@@ -213,15 +213,62 @@ public sealed class TestCommitFrontierDrain
             Assert.Equal(0, writeAhead.GetDurableCommitFrontier());
 
             // The engine answers for 1..2 only: the durable frontier follows, still below the protocol one.
+            // The rows arrived typed Committed in a synced batch, so their resolution is on disk too.
             writeAhead.MarkDurablyWritten(1, 2, null);
+            writeAhead.MarkResolutionWritten(2, synced: true);
             Assert.Equal(2, writeAhead.GetDurableCommitFrontier());
             Assert.Equal(3, writeAhead.GetCommitIndex());
 
             // An answer above a hole certifies nothing below the hole.
             writeAhead.MarkDurablyWritten(5, 5, null);
+            writeAhead.MarkResolutionWritten(5, synced: true);
             Assert.Equal(2, writeAhead.GetDurableCommitFrontier());
 
             writeAhead.MarkDurablyWritten(3, 3, null);
+            writeAhead.MarkResolutionWritten(3, synced: true);
+            Assert.Equal(3, writeAhead.GetDurableCommitFrontier());
+        }
+        finally
+        {
+            partition.Dispose();
+            manager.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// A resolution that rode sync-off does not count as durable until a later synced write on the
+    /// partition completes (DST FINDING 7).
+    ///
+    /// <para>The single-fsync fast path writes a <c>Committed</c> marker over a present
+    /// <c>Proposed</c> row without an fsync. A crash before the next synced write returns the row to
+    /// <c>Proposed</c>, so the node restarts with a commit frontier below the id. A follower that
+    /// reported the id as durable let the leader compact it, and the leader's backfill anchored on
+    /// the compacted id was then refused forever. The reported frontier must therefore wait for the
+    /// marker to be on disk, while the row's presence alone is not enough.</para>
+    /// </summary>
+    [Fact]
+    public void DurableCommitFrontier_DoesNotCountAResolutionThatRodeSyncOff()
+    {
+        RaftWriteAhead writeAhead = CreateWriteAhead(out RaftManager manager, out RaftPartition partition);
+
+        try
+        {
+            // Entries 1..3 are present on disk, and this node knows they are committed.
+            Append(writeAhead, Committed(1), Committed(2), Committed(3));
+            writeAhead.MarkDurablyWritten(1, 3, null);
+            writeAhead.MarkResolutionWritten(2, synced: true);
+            Assert.Equal(2, writeAhead.GetDurableCommitFrontier());
+
+            // The marker for 3 rides sync-off: presence and memory both say 3, the disk does not.
+            writeAhead.MarkResolutionWritten(3, synced: false);
+            Assert.Equal(3, writeAhead.GetDurablePresentIndex());
+            Assert.Equal(2, writeAhead.GetDurableResolvedIndex());
+            Assert.Equal(2, writeAhead.GetDurableCommitFrontier());
+
+            // Any later synced write on the partition carries the marker to disk, even one that
+            // resolves nothing itself (a propose).
+            writeAhead.MarkResolutionWritten(-1, synced: true);
+            Assert.Equal(3, writeAhead.GetDurableResolvedIndex());
             Assert.Equal(3, writeAhead.GetDurableCommitFrontier());
         }
         finally

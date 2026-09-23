@@ -229,6 +229,31 @@ public sealed class RaftWriteAhead
 
     private readonly SortedSet<long> pendingDurable = new();
 
+    // ── Durable resolution ─────────────────────────────────────────────────────────────────
+    // durablePresentIndex certifies that a ROW is on disk. It says nothing about whether the row's
+    // RESOLUTION is: with WalSingleFsyncCommit a Committed marker over a present Proposed row is
+    // written sync-off and rides the next synced write on the partition, and a crash before that
+    // write returns the row to Proposed. The follower's reported durable frontier used to be
+    // min(commitIndex, durablePresentIndex), where commitIndex is in-memory knowledge, so it
+    // reported an id as committed-and-durable while the only committed copy was in memory. The
+    // leader then compacted through that id (retention holds at the report + 1), and after the
+    // crash the node held the id as Proposed above its restored commit frontier. The leader's
+    // backfill anchored on the compacted id carries prevLogTerm = -1, which the follower accepts
+    // only inside its committed prefix, so the batch was rejected and re-shipped forever (DST
+    // FINDING 7, found when the simulation stopped sharing RaftLog objects between nodes).
+    //
+    // durableResolvedIndex is the exclusive frontier of resolutions known to be on disk: advanced
+    // by a synced write that carried resolved rows, and by any synced write for the resolutions
+    // that rode sync-off before it (ridingResolvedIndex). A synced write on the partition makes
+    // every earlier write on it durable — the single-fsync contract — and completions arrive in
+    // per-partition FIFO order. A synced write on ANOTHER partition also flushes these rows on a
+    // shared-WAL backend, but this node cannot see it, so the frontier waits for its own
+    // partition's next synced write: the safe direction, since a low report only makes the leader
+    // keep more of its log. Single writer: the partition executor.
+    private long durableResolvedIndex = 1;
+
+    private long ridingResolvedIndex = 1;
+
     private long publishedCommitIndex = 1;
 
     // Out-of-order present ids (with their terms) buffered until the gap below them fills — the
@@ -726,6 +751,11 @@ public sealed class RaftWriteAhead
         pendingDurable.Clear();
         durablePresentIndex = presentIndex;
         Volatile.Write(ref publishedCommitIndex, Math.Min(commitIndex, durablePresentIndex));
+
+        // The restored commit frontier was read from resolved rows on the disk, so every
+        // resolution under it is durable by construction.
+        durableResolvedIndex = commitIndex;
+        ridingResolvedIndex = commitIndex;
 
         // ── Restore the HLC floor before anything can mint a timestamp ────────────────────
         // Merge the durable high-water mark and the maximum restored entry timestamp into the node
@@ -1672,7 +1702,31 @@ public sealed class RaftWriteAhead
     /// needed (CamusDB slow-disk run sd8). The published index is monotone for observers, so it would
     /// hide the failed-write regression the leader's re-ship must see. Executor thread only.
     /// </summary>
-    public long GetDurableCommitFrontier() => Math.Min(commitIndex, durablePresentIndex) - 1;
+    public long GetDurableCommitFrontier() =>
+        Math.Min(Math.Min(commitIndex, durablePresentIndex), durableResolvedIndex) - 1;
+
+    /// <summary>
+    /// Highest id whose resolution is known to be on disk. Test-visible for the same reason as
+    /// <see cref="GetDurablePresentIndex"/>.
+    /// </summary>
+    public long GetDurableResolvedIndex() => durableResolvedIndex - 1;
+
+    /// <summary>
+    /// Records a successful write that carried resolved rows through
+    /// <paramref name="resolvedMaxLogIndex"/> (-1 for none) in a batch that was, or was not,
+    /// fsynced. A synced write makes its own resolutions durable and every resolution that rode
+    /// sync-off before it on this partition. A sync-off write only queues its resolutions until
+    /// then. See the field comment on <c>durableResolvedIndex</c> for why the reported frontier
+    /// needs this. Executor thread only.
+    /// </summary>
+    public void MarkResolutionWritten(long resolvedMaxLogIndex, bool synced)
+    {
+        if (resolvedMaxLogIndex >= 0 && resolvedMaxLogIndex + 1 > ridingResolvedIndex)
+            ridingResolvedIndex = resolvedMaxLogIndex + 1;
+
+        if (synced && ridingResolvedIndex > durableResolvedIndex)
+            durableResolvedIndex = ridingResolvedIndex;
+    }
 
     /// <summary>
     /// Highest id durably present with no hole below it, as certified by successful completions
@@ -1848,6 +1902,13 @@ public sealed class RaftWriteAhead
         if (target > durablePresentIndex)
             durablePresentIndex = target;
         DrainPendingDurable();
+
+        // The boundary is a durable committed checkpoint, so it resolves its whole prefix on disk.
+        if (target > durableResolvedIndex)
+            durableResolvedIndex = target;
+        if (target > ridingResolvedIndex)
+            ridingResolvedIndex = target;
+
         RefreshPublishedCommitIndex();
     }
 

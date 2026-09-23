@@ -106,7 +106,13 @@ internal sealed class WalCompletionRouter
         // that skipped it would pin what this node publishes below the truth for the rest of the
         // run. Reads the written ids, not MaxLogIndex, whose meaning varies by operation type.
         if (completion.Status == RaftOperationStatus.Success && completion.MinLogIndex >= 0)
+        {
             wal.MarkDurablyWritten(completion.MinLogIndex, completion.WrittenMaxLogIndex, completion.SparseLogIds);
+
+            // The resolution twin: a commit marker that rode sync-off is written but not yet on
+            // disk, so it must not count toward the frontier this node reports as durable.
+            wal.MarkResolutionWritten(completion.ResolvedMaxLogIndex, completion.Synced);
+        }
 
         // ── Failed-write frontier repair ───────────────────────────────────────
         // Runs BEFORE the term and pending fences: a failed WAL write is a fact about this

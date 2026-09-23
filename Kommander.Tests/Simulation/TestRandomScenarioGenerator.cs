@@ -317,9 +317,91 @@ public sealed class TestRandomScenarioGenerator
             if (kind == RandomScenarioActionKind.HangSnapshotExport)
                 continue;
 
+            // The same for the late broadcast and the quiesced outage: each has its own family and
+            // its own test below.
+            if (kind is RandomScenarioActionKind.LateBroadcast
+                or RandomScenarioActionKind.QuiescedLeaderOutage
+                or RandomScenarioActionKind.RestartNodeBlank
+                or RandomScenarioActionKind.TransferLeadership)
+                continue;
+
             // FastDisk and FreeDisk arrive as heals, which the age bound also emits, so every kind
             // in the vocabulary must appear in a plan this long.
             Assert.Contains(kind, seen);
+        }
+    }
+
+    /// <summary>
+    /// The late broadcast and the quiesced outage are drawn only when their weights are set.
+    ///
+    /// <para>At weight zero the default plans must not change, or every corpus seed would stop
+    /// meaning what its note says. At a non-zero weight each must really be drawn, or its family
+    /// would believe it tests a state it never reaches. The late broadcast targets a follower,
+    /// because the leader is the node that commits through the other follower; the quiesced
+    /// outage targets the leader.</para>
+    /// </summary>
+    [Fact]
+    public void TheLateBroadcastAndTheQuiescedOutage_AreDrawnOnlyWhenTheirWeightsAreSet()
+    {
+        RandomScenarioGenerator unweighted = new(new SimulationRandom(20260923), new RandomScenarioOptions());
+        RandomScenarioGenerator weighted = new(
+            new SimulationRandom(20260923),
+            new RandomScenarioOptions { LateBroadcastWeight = 12, QuiescedOutageWeight = 12 });
+
+        List<RandomScenarioAction> drawn = [];
+
+        for (int index = 0; index < 2_000; index++)
+        {
+            Assert.DoesNotContain(
+                unweighted.Next(Observation()).Kind,
+                new[] { RandomScenarioActionKind.LateBroadcast, RandomScenarioActionKind.QuiescedLeaderOutage });
+
+            drawn.Add(weighted.Next(Observation()));
+        }
+
+        List<RandomScenarioAction> late = drawn.Where(action => action.Kind == RandomScenarioActionKind.LateBroadcast).ToList();
+        List<RandomScenarioAction> quiesced = drawn.Where(action => action.Kind == RandomScenarioActionKind.QuiescedLeaderOutage).ToList();
+
+        Assert.NotEmpty(late);
+        Assert.NotEmpty(quiesced);
+        Assert.All(late, action => Assert.NotEqual(Observation().Leader, action.Target));
+        Assert.All(quiesced, action => Assert.Equal(Observation().Leader, action.Target));
+    }
+
+    /// <summary>
+    /// A blank restart heals a crash only when its percentage is set, and it heals the node that
+    /// crashed.
+    /// </summary>
+    [Fact]
+    public void ABlankRestart_HealsACrashOnlyWhenItsPercentageIsSet()
+    {
+        RandomScenarioGenerator unweighted = new(new SimulationRandom(20260923), new RandomScenarioOptions());
+        RandomScenarioGenerator weighted = new(
+            new SimulationRandom(20260923), new RandomScenarioOptions { BlankRestartPercent = 100 });
+
+        List<RandomScenarioAction> weightedPlan = [];
+
+        for (int index = 0; index < 2_000; index++)
+        {
+            Assert.NotEqual(RandomScenarioActionKind.RestartNodeBlank, unweighted.Next(Observation()).Kind);
+            weightedPlan.Add(weighted.Next(Observation()));
+        }
+
+        weightedPlan.AddRange(weighted.HealAll());
+
+        List<RandomScenarioAction> blank = weightedPlan.Where(action => action.Kind == RandomScenarioActionKind.RestartNodeBlank).ToList();
+
+        Assert.NotEmpty(blank);
+        Assert.DoesNotContain(weightedPlan, action => action.Kind == RandomScenarioActionKind.RestartNode);
+
+        // Every blank restart follows a crash of the same node.
+        foreach (RandomScenarioAction restart in blank)
+        {
+            Assert.Contains(
+                weightedPlan,
+                action => action.Kind == RandomScenarioActionKind.CrashNode
+                          && action.Target == restart.Target
+                          && action.Index < restart.Index);
         }
     }
 

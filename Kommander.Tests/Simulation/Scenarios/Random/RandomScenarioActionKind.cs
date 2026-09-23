@@ -167,4 +167,66 @@ public enum RandomScenarioActionKind
     /// budget — the leader still answers everything except the export.</para>
     /// </summary>
     HangSnapshotExport,
+
+    /// <summary>
+    /// Hold one follower's traffic, copy it on delivery instead of on send, and write one entry
+    /// through the leader while it is held. The follower's first sight of the entry is then the
+    /// committed row, because the leader commits it through the other follower and retypes it in
+    /// place before the late copy.
+    ///
+    /// <para><b>What it models.</b> A leader's responder serializes a message when it takes it off
+    /// its queue, not when the leader decides to send it. A responder that runs late therefore sends
+    /// an entry typed <c>Committed</c> that the follower never saw as proposed (<c>367eac9</c>).
+    /// Before the transport gave every receiver its own copy, shared objects produced this state by
+    /// accident on every run and a crash could never lose what it depended on.</para>
+    ///
+    /// <para><b>Why it is paired with a crash.</b> The defects in this state are about what the
+    /// follower keeps. Half the draws crash the follower at once and restart it, before any later
+    /// synced write can carry its sync-off rows to disk, and the crash check then compares what the
+    /// follower reported as durable with what its store kept. It takes the quorum budget while it
+    /// holds the follower's traffic.</para>
+    /// </summary>
+    LateBroadcast,
+
+    /// <summary>
+    /// Let the cluster idle until the leader's partition quiesces, then cut the leader off in both
+    /// directions for longer than the check-quorum window, until another node leads.
+    ///
+    /// <para><b>Why a variant of the outage and not the outage.</b> The plain outage cuts a leader
+    /// that is heartbeating, so its followers notice at once. A quiesced leader sends nothing, its
+    /// followers hear nothing either way, and only two mechanisms end its term: SWIM on the
+    /// followers, and check-quorum on the leader, which must not count a quiesced silence as contact.
+    /// The Kahuna lost-write bug (<c>39bf62e2</c>, fixed in <c>14b564a</c>) was the second one
+    /// failing: the leader refreshed its contact clock while quiesced, never stepped down, and kept
+    /// accepting writes a new leader could not see.</para>
+    ///
+    /// <para><b>Why a client writes to the cut leader.</b> The defect loses a write only when a
+    /// client reaches the old leader during the window. The action sends one append there and takes
+    /// whatever answer it gets; the history checker decides whether that answer was a lie.</para>
+    /// </summary>
+    QuiescedLeaderOutage,
+
+    /// <summary>
+    /// Bring a crashed node back under the same endpoint with an empty store: its data directory is
+    /// gone, and the roster still names it.
+    ///
+    /// <para>The heal of a crash, chosen instead of <see cref="RestartNode"/> in
+    /// <c>BlankRestartPercent</c> of the crash draws. The Kahuna restart behind <c>e618064e</c>: the
+    /// leader kept the progress it recorded for the old incarnation, anchored every repair above
+    /// what the blank node held, and the node never caught up (<c>3552ab9</c>). The stored vote goes
+    /// too; see <c>SimulatedWAL.Wipe</c> for what Raft does not promise about that.</para>
+    /// </summary>
+    RestartNodeBlank,
+
+    /// <summary>
+    /// Start a client write at the leader, and at once ask the leader to hand leadership to a
+    /// follower, which is then behind by the entry in flight. <c>Target</c> is the leader,
+    /// <c>Secondary</c> the follower.
+    ///
+    /// <para><b>Why.</b> <c>38a5e2b</c>: a transfer whose target was one entry behind answered
+    /// <c>ReplicationFailed</c> at once, and the balancer dropped the answer, so leadership never
+    /// moved. The vocabulary had no transfer at all, and no rule judged the answer of a call made
+    /// under no fault. The runner's rule <c>transfer-definite-when-healthy</c> does now.</para>
+    /// </summary>
+    TransferLeadership,
 }

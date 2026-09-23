@@ -176,6 +176,19 @@ public sealed class RandomScenarioGenerator
         // budget, so only a leader is needed.
         if (observation.Leader is not null) Offer(options.TransferFaultWeight, 8);
 
+        // A late broadcast holds one follower's traffic, so it takes the budget, and it needs a
+        // second follower for the leader to commit through.
+        if (HasBudget && observation.Leader is not null && observation.Running.Count >= 3)
+            Offer(options.LateBroadcastWeight, 9);
+
+        // A quiesced outage costs the cluster its leader like the plain outage does.
+        if (HasBudget && observation.Leader is not null)
+            Offer(options.QuiescedOutageWeight, 10);
+
+        // A transfer moves leadership without taking a node away, so it needs no budget.
+        if (observation.Leader is not null && observation.Running.Count >= 2)
+            Offer(options.TransferLeadershipWeight, 11);
+
         int total = categories.Sum(entry => entry.Weight);
 
         if (total <= 0)
@@ -204,6 +217,9 @@ public sealed class RandomScenarioGenerator
             5 => DrawHeal(index),
             7 => DrawMaintenance(index, observation),
             8 => DrawTransfer(index, observation),
+            9 => DrawLateBroadcast(index, observation),
+            10 => new RandomScenarioAction(index, RandomScenarioActionKind.QuiescedLeaderOutage, observation.Leader),
+            11 => DrawLeadershipTransfer(index, observation),
             // Two thirds of the outages carry a client write into the disruption. That overlap is
             // the only place a client can be told the wrong thing about its own operation, and the
             // two write variants disrupt different halves of it: one takes the leader away for
@@ -341,10 +357,18 @@ public sealed class RandomScenarioGenerator
 
         if (random.NextInt("lifecycle-kind", 0, 2) == 0)
         {
+            // Drawn only when the option is set, so a plan without blank restarts consumes exactly
+            // the entropy it always did.
+            bool blank = options.BlankRestartPercent > 0
+                         && random.NextInt("blank-restart", 0, 100) < options.BlankRestartPercent;
+
             return Start(
                 new RandomScenarioAction(index, RandomScenarioActionKind.CrashNode, target),
                 key: $"life/crash/{target}",
-                heal: new RandomScenarioAction(index, RandomScenarioActionKind.RestartNode, target),
+                heal: new RandomScenarioAction(
+                    index,
+                    blank ? RandomScenarioActionKind.RestartNodeBlank : RandomScenarioActionKind.RestartNode,
+                    target),
                 costsQuorum: true,
                 index);
         }
@@ -404,6 +428,45 @@ public sealed class RandomScenarioGenerator
             heal: null,
             costsQuorum: false,
             index);
+    }
+
+    /// <summary>
+    /// Draws a late broadcast to one follower, and in half the draws queues a crash and a restart
+    /// of that follower right after it.
+    ///
+    /// <para>The crash comes at once on purpose. A sync-off row becomes durable when the next synced
+    /// write on its partition lands, so any later client write would close the window the crash is
+    /// there to test. The restart is queued too, because the crash is not a fault the run is meant to
+    /// study for several actions; it is the measurement.</para>
+    /// </summary>
+    private RandomScenarioAction DrawLateBroadcast(int index, RandomScenarioObservation observation)
+    {
+        List<string> followers = observation.Running
+            .Where(endpoint => endpoint != observation.Leader)
+            .ToList();
+
+        string target = followers[random.NextInt("late-broadcast-target", 0, followers.Count)];
+
+        if (random.NextInt("late-broadcast-crash", 0, 2) == 0)
+        {
+            pending.Enqueue((new RandomScenarioAction(0, RandomScenarioActionKind.CrashNode, target), null));
+            pending.Enqueue((new RandomScenarioAction(0, RandomScenarioActionKind.RestartNode, target), null));
+        }
+
+        return new RandomScenarioAction(index, RandomScenarioActionKind.LateBroadcast, target);
+    }
+
+    /// <summary>Draws a leadership transfer from the leader to one of its running followers.</summary>
+    private RandomScenarioAction DrawLeadershipTransfer(int index, RandomScenarioObservation observation)
+    {
+        List<string> followers = observation.Running
+            .Where(endpoint => endpoint != observation.Leader)
+            .ToList();
+
+        string target = followers[random.NextInt("transfer-target", 0, followers.Count)];
+
+        return new RandomScenarioAction(
+            index, RandomScenarioActionKind.TransferLeadership, observation.Leader, target);
     }
 
     private RandomScenarioAction DrawHeal(int index)

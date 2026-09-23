@@ -125,11 +125,66 @@ public sealed class SimulatedTransport : ICommunication
     /// <summary>Registers the cluster routing table. Delegates to the wrapped transport.</summary>
     public void SetNodes(Dictionary<string, IRaft> nodes) => inner.SetNodes(nodes);
 
+    /// <summary>Endpoints isolated by <see cref="PartitionNode"/>, mirrored from the inner transport.</summary>
+    private readonly HashSet<string> partitionedEndpoints = [];
+
     /// <summary>Drops all traffic to and from <paramref name="endpoint"/> until healed.</summary>
-    public void PartitionNode(string endpoint) => inner.PartitionNode(endpoint);
+    public void PartitionNode(string endpoint)
+    {
+        lock (gate)
+            partitionedEndpoints.Add(endpoint);
+
+        inner.PartitionNode(endpoint);
+    }
 
     /// <summary>Restores traffic to and from <paramref name="endpoint"/>.</summary>
-    public void HealPartition(string endpoint) => inner.HealPartition(endpoint);
+    public void HealPartition(string endpoint)
+    {
+        lock (gate)
+            partitionedEndpoints.Remove(endpoint);
+
+        inner.HealPartition(endpoint);
+    }
+
+    /// <summary>
+    /// True when no link fault, isolation, frozen or dead endpoint, or duplication is set: the wire is
+    /// perfect. The held-message switch is not a fault.
+    /// </summary>
+    public bool IsHealthy
+    {
+        get
+        {
+            lock (gate)
+                return partitionedEndpoints.Count == 0
+                       && frozenEndpoints.Count == 0
+                       && downEndpoints.Count == 0
+                       && linkFaults.Values.All(fault => !fault.Blocked && fault.Copies <= 1);
+        }
+    }
+
+    /// <summary>
+    /// True when a message from <paramref name="from"/> would reach a running process at
+    /// <paramref name="to"/> now: neither end is isolated, the link is not blocked in that direction,
+    /// and the receiver is neither dead nor stopped.
+    ///
+    /// <para>For the harness's failure-detector model, which asks what a SWIM probe would see. A
+    /// stopped process counts as unreachable here, although the transport still lets its control
+    /// plane answer (see "What a freeze does not cover"): a real stopped process answers no probe,
+    /// and the model is about the real one.</para>
+    /// </summary>
+    public bool CanDeliver(string from, string to)
+    {
+        lock (gate)
+        {
+            if (partitionedEndpoints.Contains(from) || partitionedEndpoints.Contains(to))
+                return false;
+
+            if (downEndpoints.Contains(to) || frozenEndpoints.Contains(to))
+                return false;
+
+            return !(linkFaults.TryGetValue((from, to), out LinkFault fault) && fault.Blocked);
+        }
+    }
 
     /// <summary>
     /// Stops <paramref name="endpoint"/> receiving consensus traffic and starts storing it.
@@ -348,8 +403,34 @@ public sealed class SimulatedTransport : ICommunication
     public Task<VoteResponse> Vote(RaftManager manager, RaftNode node, VoteRequest request) =>
         Intercept(manager, node, "Vote", () => inner.Vote(manager, node, request), EmptyVote);
 
-    public Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftNode node, AppendLogsRequest request) =>
-        Intercept(manager, node, "AppendLogs", () => inner.AppendLogs(manager, node, request), EmptyAppendLogs);
+    /// <summary>
+    /// Consensus traffic that carries log entries, copied the way a wire copies it.
+    ///
+    /// <para>See <see cref="Serialize(AppendLogsRequest, string)"/> for when the copy is taken, and
+    /// why every delivery gets its own.</para>
+    /// </summary>
+    public Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftNode node, AppendLogsRequest request)
+    {
+        string from = manager.LocalEndpoint;
+        string to = node.Endpoint;
+
+        if (IsOversized(Estimate(request)))
+            return RefuseOversized(EmptyAppendLogs);
+
+        Func<AppendLogsRequest> wire = Serialize(request, to);
+
+        return Intercept(
+            manager,
+            node,
+            "AppendLogs",
+            () =>
+            {
+                AppendLogsRequest received = wire();
+                ObserveDelivery(from, to, received);
+                return inner.AppendLogs(manager, node, received);
+            },
+            EmptyAppendLogs);
+    }
 
     public Task<CompleteAppendLogsResponse> CompleteAppendLogs(
         RaftManager manager, RaftNode node, CompleteAppendLogsRequest request) =>
@@ -371,8 +452,8 @@ public sealed class SimulatedTransport : ICommunication
     /// By then the pooled objects belong to a different batch, and the receiver enumerating the
     /// list sees it change underneath it.</para>
     ///
-    /// <para>Only the containers are pooled, so the copy stops at the item: the requests an item
-    /// points at are ordinary objects with no second owner.</para>
+    /// <para>The containers are copied at once. The log entries inside are deep-copied too, for a
+    /// different reason: see <see cref="Serialize(BatchRequestsRequest, string)"/>.</para>
     ///
     /// <para>Found by the random search on its first outing. It needed a message stored while a
     /// node was paused and released in the burst after it woke — a delay long enough for the pool
@@ -380,13 +461,156 @@ public sealed class SimulatedTransport : ICommunication
     /// </summary>
     public Task<BatchRequestsResponse> BatchRequests(RaftManager manager, RaftNode node, BatchRequestsRequest request)
     {
-        BatchRequestsRequest copy = Copy(request);
+        string from = manager.LocalEndpoint;
+        string to = node.Endpoint;
 
-        return Intercept(manager, node, "BatchRequests", () => inner.BatchRequests(manager, node, copy), EmptyBatchRequests);
+        if (IsOversized(Estimate(request)))
+            return RefuseOversized(EmptyBatchRequests);
+
+        Func<BatchRequestsRequest> wire = Serialize(request, to);
+
+        return Intercept(
+            manager,
+            node,
+            "BatchRequests",
+            () =>
+            {
+                BatchRequestsRequest received = wire();
+
+                foreach (BatchRequestsRequestItem item in received.Requests ?? [])
+                {
+                    if (item.AppendLogs is not null)
+                        ObserveDelivery(from, to, item.AppendLogs);
+                }
+
+                return inner.BatchRequests(manager, node, received);
+            },
+            EmptyBatchRequests);
     }
 
-    /// <summary>Copies a batch far enough that the pool cannot take it back.</summary>
-    private static BatchRequestsRequest Copy(BatchRequestsRequest request)
+    // ── The wire copy ─────────────────────────────────────────────────────
+
+    /// <summary>Endpoints whose inbound traffic is copied at delivery rather than at send.</summary>
+    private readonly HashSet<string> lateSerialization = [];
+
+    /// <summary>
+    /// Largest message, in estimated bytes, this transport delivers. Null, the default, delivers
+    /// everything.
+    ///
+    /// <para>The in-memory transport has no size limit, and production does: gRPC refuses a frame
+    /// above <see cref="RaftConfiguration.GrpcMaxMessageBytes"/>, and every entry on the refused frame
+    /// goes back to the retry path (<c>2ec4f92</c>). A simulation with no limit can never reach that
+    /// path. Set this to the same value as the nodes' <c>GrpcMaxMessageBytes</c>. A message over the
+    /// limit is dropped and counted in <see cref="OversizedCount"/>.</para>
+    ///
+    /// <para><b>The size is an estimate.</b> It adds each entry's payload and type name to a fixed
+    /// cost for each entry and each request. The estimate is close to the protobuf size for the
+    /// payloads Kommander ships, and it never under-counts the payload itself, which is the part
+    /// that decides whether a frame fits.</para>
+    /// </summary>
+    public long? MaxMessageBytes { get; set; }
+
+    /// <summary>Messages dropped because they were larger than <see cref="MaxMessageBytes"/>.</summary>
+    public long OversizedCount => Interlocked.Read(ref oversizedCount);
+
+    private long oversizedCount;
+
+    /// <summary>
+    /// Called on every delivery of log entries, with the entries exactly as the receiver gets them.
+    ///
+    /// <para>For a scenario that must prove it reached a state rather than assume it. Example: a
+    /// follower whose first sight of an entry is the committed row. That state depends on when the
+    /// wire copy was taken, and a scenario that does not check it can pass without the state.</para>
+    /// </summary>
+    public event Action<string, string, IReadOnlyList<RaftLog>>? AppendLogsDelivered;
+
+    /// <summary>
+    /// Takes the wire copy of traffic to <paramref name="endpoint"/> at delivery, not at send, while
+    /// <paramref name="enabled"/> is true.
+    ///
+    /// <para><b>What this models.</b> In production the leader does not serialize a message when it
+    /// decides to send it. The responder serializes it later, when it takes the message off its
+    /// queue. The leader's commit path changes <c>log.Type</c> in place on the same objects, so a
+    /// responder that runs late sends an entry typed <c>Committed</c> that the follower never saw
+    /// as proposed (<c>367eac9</c>). A held message with a late copy is that responder delay: the
+    /// message waits with its references, and the copy happens when it leaves.</para>
+    ///
+    /// <para>Off by default, because the ordinary copy at send is the ordinary case. It changes
+    /// nothing for a message that is delivered at once.</para>
+    /// </summary>
+    public void SetLateSerialization(string endpoint, bool enabled)
+    {
+        lock (gate)
+        {
+            if (enabled)
+                lateSerialization.Add(endpoint);
+            else
+                lateSerialization.Remove(endpoint);
+        }
+    }
+
+    /// <summary>
+    /// Returns a function that produces what the receiver gets: a new, deep copy of the message on
+    /// each call.
+    ///
+    /// <para><b>Why a deep copy.</b> Over gRPC a receiver deserializes new objects, and nothing the
+    /// sender does later can reach them. The in-memory transport passes references, so the leader's
+    /// in-place <c>log.Type = Committed</c> reached every follower's store directly, and a follower
+    /// seemed to hold a committed marker it never wrote. A crash could then never lose a marker,
+    /// and the random search could not find <c>367eac9</c>. A node must never hold an object that
+    /// another node can change.</para>
+    ///
+    /// <para><b>Why a copy for each delivery.</b> A duplicated message is deserialized once for each
+    /// copy in production. The receivers must not share one object, because a receiver can change
+    /// what it received.</para>
+    ///
+    /// <para><b>When the first copy is taken.</b> At send, which is when a real frame leaves the
+    /// sender. With <see cref="SetLateSerialization"/> on for the receiver, at delivery instead.</para>
+    /// </summary>
+    private Func<AppendLogsRequest> Serialize(AppendLogsRequest request, string to)
+    {
+        if (IsLateSerialized(to))
+            return () => DeepCopy(request);
+
+        AppendLogsRequest sent = DeepCopy(request);
+        return () => DeepCopy(sent);
+    }
+
+    /// <inheritdoc cref="Serialize(AppendLogsRequest, string)"/>
+    private Func<BatchRequestsRequest> Serialize(BatchRequestsRequest request, string to)
+    {
+        // The pooled containers are always copied at once: the pool takes them back when the send
+        // returns, whatever the receiver. Only the entries inside may wait for a late copy.
+        BatchRequestsRequest containers = CopyContainers(request);
+
+        if (IsLateSerialized(to))
+            return () => DeepCopy(containers);
+
+        BatchRequestsRequest sent = DeepCopy(containers);
+        return () => DeepCopy(sent);
+    }
+
+    private bool IsLateSerialized(string endpoint)
+    {
+        lock (gate)
+            return lateSerialization.Contains(endpoint);
+    }
+
+    private void ObserveDelivery(string from, string to, AppendLogsRequest request)
+    {
+        if (request.Logs is { Count: > 0 } logs)
+            AppendLogsDelivered?.Invoke(from, to, logs);
+    }
+
+    /// <summary>
+    /// Copies a batch far enough that the pool cannot take it back.
+    ///
+    /// <para><b>The copy is required, not defensive.</b> <c>RaftTransportDispatcher</c> rents the
+    /// batch wrapper, its item list, and each item from a pool and returns them as soon as the send
+    /// completes. A held message is sent later, and by then the pooled objects belong to a different
+    /// batch. Found by the random search on its first outing.</para>
+    /// </summary>
+    private static BatchRequestsRequest CopyContainers(BatchRequestsRequest request)
     {
         if (request.Requests is null)
             return new BatchRequestsRequest();
@@ -394,22 +618,102 @@ public sealed class SimulatedTransport : ICommunication
         List<BatchRequestsRequestItem> items = new(request.Requests.Count);
 
         foreach (BatchRequestsRequestItem item in request.Requests)
-        {
-            items.Add(new BatchRequestsRequestItem
-            {
-                Type = item.Type,
-                Handshake = item.Handshake,
-                Vote = item.Vote,
-                RequestVotes = item.RequestVotes,
-                StepDownNotice = item.StepDownNotice,
-                TransferLeadership = item.TransferLeadership,
-                AppendLogs = item.AppendLogs,
-                CompleteAppendLogs = item.CompleteAppendLogs,
-                TransferLeadershipSuggestion = item.TransferLeadershipSuggestion,
-            });
-        }
+            items.Add(CopyItem(item, item.AppendLogs));
 
         return new BatchRequestsRequest { Requests = items };
+    }
+
+    private static BatchRequestsRequest DeepCopy(BatchRequestsRequest request)
+    {
+        List<BatchRequestsRequestItem> items = new(request.Requests?.Count ?? 0);
+
+        foreach (BatchRequestsRequestItem item in request.Requests ?? [])
+            items.Add(CopyItem(item, item.AppendLogs is null ? null : DeepCopy(item.AppendLogs)));
+
+        return new BatchRequestsRequest { Requests = items };
+    }
+
+    /// <summary>
+    /// Copies one batch item. Only <c>AppendLogs</c> carries objects a sender changes after the
+    /// send; the other requests hold values only, and the sender never changes them.
+    /// </summary>
+    private static BatchRequestsRequestItem CopyItem(BatchRequestsRequestItem item, AppendLogsRequest? appendLogs) =>
+        new()
+        {
+            Type = item.Type,
+            Handshake = item.Handshake,
+            Vote = item.Vote,
+            RequestVotes = item.RequestVotes,
+            StepDownNotice = item.StepDownNotice,
+            TransferLeadership = item.TransferLeadership,
+            AppendLogs = appendLogs,
+            CompleteAppendLogs = item.CompleteAppendLogs,
+            TransferLeadershipSuggestion = item.TransferLeadershipSuggestion,
+        };
+
+    private static AppendLogsRequest DeepCopy(AppendLogsRequest request) =>
+        new(
+            request.Partition,
+            request.Term,
+            request.Time,
+            request.Endpoint,
+            request.Logs?.Select(DeepCopy).ToList(),
+            request.PrevLogIndex,
+            request.PrevLogTerm)
+        {
+            Quiesce = request.Quiesce,
+        };
+
+    private static RaftLog DeepCopy(RaftLog log) => new()
+    {
+        Id = log.Id,
+        Type = log.Type,
+        Term = log.Term,
+        Time = log.Time,
+        LogType = log.LogType,
+        LogData = log.LogData is null ? null : (byte[])log.LogData.Clone(),
+    };
+
+    // ── The size limit ────────────────────────────────────────────────────
+
+    /// <summary>Fixed cost of one request: partition, term, time, endpoint and anchors.</summary>
+    private const long RequestOverheadBytes = 64;
+
+    /// <summary>Fixed cost of one entry: id, type, term, time and framing.</summary>
+    private const long EntryOverheadBytes = 32;
+
+    private static long Estimate(AppendLogsRequest request)
+    {
+        long bytes = RequestOverheadBytes + (request.Endpoint?.Length ?? 0);
+
+        foreach (RaftLog log in request.Logs ?? [])
+            bytes += EntryOverheadBytes + (log.LogData?.Length ?? 0) + (log.LogType?.Length ?? 0);
+
+        return bytes;
+    }
+
+    private static long Estimate(BatchRequestsRequest request)
+    {
+        long bytes = 0;
+
+        foreach (BatchRequestsRequestItem item in request.Requests ?? [])
+            bytes += item.AppendLogs is null ? RequestOverheadBytes : Estimate(item.AppendLogs);
+
+        return bytes;
+    }
+
+    private bool IsOversized(long estimatedBytes) =>
+        MaxMessageBytes is { } limit && estimatedBytes > limit;
+
+    /// <summary>
+    /// Drops an oversized message. The sender gets the empty response, as for any lost message:
+    /// the entries on it go back to the retry path, which is what a refused gRPC frame causes.
+    /// </summary>
+    private Task<TResponse> RefuseOversized<TResponse>(Task<TResponse> emptyResponse)
+    {
+        Interlocked.Increment(ref oversizedCount);
+        Interlocked.Increment(ref droppedCount);
+        return emptyResponse;
     }
 
     // ── ICommunication: control-plane RPCs (always inline) ─────────────────

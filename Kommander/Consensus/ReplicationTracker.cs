@@ -51,6 +51,14 @@ internal sealed class ReplicationTracker
     private readonly Dictionary<string, long> durableFrontiers = [];
 
     /// <summary>
+    /// Per peer: the anchor of the last entry-carrying batch when that anchor was an entry this
+    /// leader had compacted (the batch carried <c>prevLogTerm = -1</c>), and how many rejections in
+    /// a row have answered such batches. Absent when the last batch was anchored on a retained entry.
+    /// See <see cref="RecordCompactedAnchorRefusal"/> for why it exists.
+    /// </summary>
+    private readonly Dictionary<string, (long Anchor, int Refusals)> compactedAnchorShips = [];
+
+    /// <summary>
     /// Each peer's self-reported contiguous PRESENCE frontier and the term of its entry there
     /// (<see cref="Data.CompleteAppendLogsRequest.PresentIndex"/>), last-writer-wins, from every
     /// term-valid ack whatever its status. Only the anchored hole repair reads it, and only after
@@ -248,6 +256,7 @@ internal sealed class ReplicationTracker
         regressedFrontiers.Clear();
         mismatchAnchors.Clear();
         backfillProgress.Clear();
+        compactedAnchorShips.Clear();
 
         // The diagnostic record goes with the rest. A decision from a previous term was made from
         // frontiers this reset has just discarded, so keeping it would show a reader inputs that no
@@ -269,6 +278,7 @@ internal sealed class ReplicationTracker
         regressedFrontiers.Clear();
         mismatchAnchors.Clear();
         backfillProgress.Clear();
+        compactedAnchorShips.Clear();
     }
 
     /// <summary>
@@ -288,6 +298,7 @@ internal sealed class ReplicationTracker
         regressedFrontiers.Remove(endpoint);
         startCommitIndexes.Remove(endpoint);
         backfillProgress.Remove(endpoint);
+        compactedAnchorShips.Remove(endpoint);
         backfillDecisions.Remove(endpoint);
         heartbeatSentAtTicks.Remove(endpoint);
         return hadProgress;
@@ -766,6 +777,64 @@ internal sealed class ReplicationTracker
             probe.ShipOutstanding = false;
             probe.FruitlessShips++;
         }
+    }
+
+    /// <summary>
+    /// Records the anchor of an entry-carrying batch just shipped to <paramref name="endpoint"/>.
+    /// <paramref name="anchorCompacted"/> is true when the batch carried <c>prevLogTerm = -1</c>
+    /// because this leader had compacted the anchor entry. A batch anchored on a retained entry ends
+    /// the record, since the follower can then check the anchor's real term.
+    /// </summary>
+    public void RecordAnchorShip(string endpoint, long anchor, bool anchorCompacted)
+    {
+        if (!anchorCompacted)
+        {
+            compactedAnchorShips.Remove(endpoint);
+            return;
+        }
+
+        // The refusal count carries over only while the anchor stays the same: a different anchor
+        // is a different question to the follower.
+        compactedAnchorShips[endpoint] = compactedAnchorShips.TryGetValue(endpoint, out (long Anchor, int Refusals) current)
+                                         && current.Anchor == anchor
+            ? current
+            : (anchor, 0);
+    }
+
+    /// <summary>
+    /// Counts a rejection from <paramref name="endpoint"/> against its last compacted-anchor batch
+    /// and returns the refusals in a row, with the anchor; (0, -1) when the last batch was not
+    /// anchored on a compacted entry.
+    ///
+    /// <para><b>Why the leader must count these (DST FINDING 7 backstop).</b> A follower accepts a
+    /// <c>-1</c> anchor only inside its own committed prefix, because only there does Leader
+    /// Completeness prove the prefixes agree (FINDING 6). A rejection therefore proves the anchor is
+    /// above what the follower has committed, and the leader cannot send the anchor entry itself —
+    /// it compacted it. No batch this leader can build will ever be accepted; only a snapshot at or
+    /// above the anchor can repair the follower. Before this count, the rejection took the
+    /// <c>LogMismatch</c> backtrack, the anchored-repair note re-sent the same batch on the next
+    /// heartbeat, and the no-progress streak never grew because only <c>Success</c> acks feed it:
+    /// 800 identical rejections in 400 steps, and no snapshot.</para>
+    /// </summary>
+    public (int Refusals, long Anchor) RecordCompactedAnchorRefusal(string endpoint)
+    {
+        if (!compactedAnchorShips.TryGetValue(endpoint, out (long Anchor, int Refusals) current))
+            return (0, -1);
+
+        current = (current.Anchor, current.Refusals + 1);
+        compactedAnchorShips[endpoint] = current;
+        return (current.Refusals, current.Anchor);
+    }
+
+    /// <summary>
+    /// Ends a compacted-anchor episode once the peer reports a committed frontier at or above the
+    /// anchor: it now holds the anchor inside its committed prefix and will accept the batch.
+    /// </summary>
+    public void ClearCompactedAnchorIfCovered(string endpoint, long committedFrontier)
+    {
+        if (compactedAnchorShips.TryGetValue(endpoint, out (long Anchor, int Refusals) current)
+            && committedFrontier >= current.Anchor)
+            compactedAnchorShips.Remove(endpoint);
     }
 
     /// <summary>
