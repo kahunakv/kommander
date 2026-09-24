@@ -865,18 +865,17 @@ public sealed class SimulationCluster : IAsyncDisposable
         Transport.HoldMessages = false;
         await Transport.DeliverAll().ConfigureAwait(false);
 
-        // A graceful leave commits a roster change, and a roster change needs a majority. If any
-        // node ended the run crashed or paused, the survivors lose that majority as soon as the
-        // first of them leaves, and every later leave burns its full timeout — ten seconds each,
-        // on a cluster nobody is going to use again. So the whole cluster is torn down outright
-        // when it did not end healthy. Graceful leave has its own tests.
-        bool endedHealthy = nodes.All(node =>
-            node.LifecycleStatus is SimulationNodeLifecycleStatus.Running
-                or SimulationNodeLifecycleStatus.Stopped);
-
+        // The cluster is torn down outright, never by graceful leave. A graceful leave commits a
+        // roster change, and a roster change needs a leader of the system partition. Nobody advances
+        // simulated time during teardown, so when the leaving node was that leader no successor is
+        // ever elected, and every later leave burns its full timeout: ten real seconds each, on a
+        // cluster nobody is going to use again. This used to apply only to a cluster that ended
+        // unhealthy. Measured on 2026-09-23, healthy clusters paid it too: 8 of 22 three-node read
+        // runs spent 10 or 20 seconds here against under a second for the run itself, and a
+        // five-node family paid it on almost every seed. Graceful leave has its own tests.
         foreach (SimulationNode node in nodes)
         {
-            node.SkipGracefulLeave = !endedHealthy;
+            node.SkipGracefulLeave = true;
             await node.DisposeAsync().ConfigureAwait(false);
         }
     }
