@@ -41,6 +41,14 @@ internal sealed class SnapshotInstaller
     private readonly Func<string, long, Task> adoptLeaderAsync;
 
     /// <summary>
+    /// Delivers every committed entry from the apply cursor through the given index to the
+    /// application, returning whether it covered the index (the partition's
+    /// <c>DrainCommittedAppliesAsync</c>). The already-covered skip needs it: a covering boundary
+    /// proves the log holds the entries, never that the application was handed them.
+    /// </summary>
+    private readonly Func<long, Task<bool>> drainCommittedAppliesAsync;
+
+    /// <summary>
     /// The installed test gate, or <see langword="null"/> in every ordinary run. Written from the
     /// caller's thread by <c>IRaft.SetSnapshotInstallGateForTesting</c> and read on the executor
     /// turn, so it is published and read with <see cref="Volatile"/>; with none installed the
@@ -53,13 +61,15 @@ internal sealed class SnapshotInstaller
         IRaftWalFacade wal,
         RaftPartitionCoreState coreState,
         ILogger<IRaft> logger,
-        Func<string, long, Task> adoptLeaderAsync)
+        Func<string, long, Task> adoptLeaderAsync,
+        Func<long, Task<bool>> drainCommittedAppliesAsync)
     {
         this.host = host;
         this.wal = wal;
         this.coreState = coreState;
         this.logger = logger;
         this.adoptLeaderAsync = adoptLeaderAsync;
+        this.drainCommittedAppliesAsync = drainCommittedAppliesAsync;
     }
 
     /// <summary>
@@ -133,8 +143,10 @@ internal sealed class SnapshotInstaller
     ///
     /// <para>Runs the recoverable ordering: (1) validate the leader term and, on a higher term, take the
     /// same durable step-down as other leader RPCs; reject a stale leader without importing; (2) short-
-    /// circuit as an idempotent success when a matching boundary is already installed at or below the
-    /// index; (3) invoke the application import; (4) install the durable WAL boundary
+    /// circuit as an idempotent success when the application already applied past the index, or when a
+    /// matching boundary is already installed at or below the index and every committed entry through
+    /// it has been delivered to the application; (3) invoke the
+    /// application import; (4) install the durable WAL boundary
     /// (<see cref="IRaftWalFacade.InstallSnapshotBoundaryAsync"/>) which retains the suffix on a matching
     /// boundary term and truncates it on conflict; (5) reconstruct the apply cursor; (6) acknowledge
     /// with a typed outcome (<see cref="SnapshotInstallOutcome"/>): the idempotent short-circuit in (2)
@@ -156,14 +168,51 @@ internal sealed class SnapshotInstaller
         long leaderTerm = request.LeaderTerm;
         long snapshotIndex = request.SnapshotIndex;
 
+        // The application already reflects committed entries ABOVE the index: delivery is strictly in
+        // order, so the apply cursor proves it holds everything the snapshot carries and more. An import
+        // could only rewind it. The export reflects the sender's state at some position at or above the
+        // index, which can sit below this cursor (the follower keeps applying while the chunks stream),
+        // and the cursor stays where it is across an import, so every entry between the export's
+        // position and the cursor would be erased from the application and never delivered again. That
+        // is a replica whose prepared transactions never see their settlements, or whose writes vanish.
+        // So skip the import whatever the checkpoint boundary says — the boundary certifies the log, the
+        // cursor certifies the application, and only the application is at stake here. A cursor exactly
+        // AT the index is not covered: nothing above it was applied, so an import there loses nothing.
+        // Checked before any term adoption, like the boundary skip below, so a redundant transfer never
+        // disrupts a caught-up node.
+        long appliedCursor = coreState.LastAppliedIndex;
+        if (appliedCursor > snapshotIndex)
+        {
+            // Entries through the cursor are committed, so the entry at the index is the one the sender
+            // holds there. A term that disagrees is a history conflict no import can settle without
+            // discarding applied entries: refuse rather than rewind. A -1 (compacted/unknown) term on
+            // either side is compatible, as in the boundary rule below.
+            long termAtIndex = await wal.GetAnyTermAtAsync(snapshotIndex).ConfigureAwait(false);
+            if (termAtIndex >= 0 && request.LastIncludedTerm >= 0 && termAtIndex != request.LastIncludedTerm)
+            {
+                logger.LogError(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot at index {Index} refused: the application already applied through {Applied}, but the entry at the index has term {LocalTerm} where the sender's has {SenderTerm}. An import would discard applied entries.",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, snapshotIndex, appliedCursor, termAtIndex, request.LastIncludedTerm);
+                return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Errored, -1);
+            }
+
+            if (logger.IsEnabled(LogLevel.Information))
+                logger.LogInformation(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot at index {Index} skipped: the application already applied through {Applied}; nothing imported",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, snapshotIndex, appliedCursor);
+
+            return new RaftResponse(SnapshotInstallOutcome.SkippedAlreadyCovered, snapshotIndex);
+        }
+
         // Idempotency (Rule 7.4): short-circuit ONLY when an installed snapshot BOUNDARY already covers this
         // index with a compatible identity — never merely because ordinary log entries reach the index. A
         // lagging follower can hold proposed/committed suffix entries through snapshotIndex while its
         // application state still needs the import; keying idempotency on the raw WAL max would acknowledge
         // installation without importing, and would let a stale or conflicting sender succeed off an unrelated
         // high id (bypassing the term/leader validation below). The installed checkpoint boundary is the
-        // authoritative "already applied" signal. Return success early — before any term adoption/step-down —
-        // so a redundant re-install never disrupts a caught-up node.
+        // authoritative "already held" signal; the committed entries it covers are delivered to the
+        // application before the skip answers (see below). Return success early — before any term
+        // adoption/step-down — so a redundant re-install never disrupts a caught-up node.
         //
         // The boundary must also be CONTIGUOUSLY HELD: a CommittedCheckpoint row can be broadcast onto a
         // behind follower over a replication gap (the unanchored live path), and a checkpoint that certifies
@@ -186,10 +235,27 @@ internal sealed class SnapshotInstaller
                 || boundaryTermAtIndex < 0
                 || request.LastIncludedTerm < 0
                 || boundaryTermAtIndex == request.LastIncludedTerm;
+            // The skip certifies the LOG, not the application: a follower's checkpoint arrives as a
+            // replicated row and routinely runs ahead of its apply cursor (a drain withheld at a hole
+            // that backfill filled later, an earlier install holding the executor, plain apply lag).
+            // Raising the cursor to the index would mark every committed entry in between as applied
+            // without delivering it, and nothing re-delivers below the cursor: the application would
+            // silently miss those entries (a replica serving, and electable, with prepared
+            // transactions whose settlements it never applied). The entries are held, so deliver them
+            // now; if they cannot all be delivered (an unresolved entry inside the range), the skip is
+            // not safe and the install proceeds to replace the state instead.
+            if (compatible
+                && coreState.LastAppliedIndex < snapshotIndex
+                && !await drainCommittedAppliesAsync(snapshotIndex).ConfigureAwait(false))
+            {
+                compatible = false;
+                logger.LogWarning(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot at index {Index}: the installed boundary {Boundary} covers the index but the committed entries below it could not all be delivered to the application (apply cursor {Applied}); installing instead of skipping.",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, snapshotIndex, installedBoundary, coreState.LastAppliedIndex);
+            }
+
             if (compatible)
             {
-                if (snapshotIndex > coreState.LastAppliedIndex)
-                    coreState.LastAppliedIndex = snapshotIndex;
                 wal.SeedCommitFrontierFromSnapshot(snapshotIndex, Math.Max(boundaryTermAtIndex, 0));
 
                 // Say so: the sender reads this outcome, and an operator reading this node's log

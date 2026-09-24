@@ -401,7 +401,8 @@ public sealed class RaftPartitionStateMachine
         heartbeats = new HeartbeatDriver(host, wal, coreState, tracker, proposals, sender, logThrottle, logger);
         readIndex = new ReadIndexCoordinator(host, coreState, replySink, logger, heartbeats.SendHeartbeat);
         applier = new LogApplicator(host, wal, coreState, proposals, readIndex, logger);
-        snapshotInstaller = new SnapshotInstaller(host, wal, coreState, logger, AdoptLeaderAsync);
+        snapshotInstaller = new SnapshotInstaller(host, wal, coreState, logger, AdoptLeaderAsync,
+            upToIndex => applier.DrainCommittedAppliesAsync(upToIndex));
         election = new ElectionCoordinator(host, wal, coreState, tracker, logger, BecomeLeaderAsync, FailAllActiveProposalWaiters, heartbeats.SendHeartbeat, proposals);
         followerAppend = new FollowerAppendHandler(host, wal, coreState, proposals, logThrottle, replySink, logger, AdoptLeaderAsync);
         ackProcessor = new ReplicationAckProcessor(host, wal, coreState, tracker, proposals, readIndex, sender, election, logThrottle, logger, FailAllActiveProposalWaiters);

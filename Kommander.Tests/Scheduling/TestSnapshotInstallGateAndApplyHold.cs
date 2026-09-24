@@ -61,9 +61,14 @@ public class TestSnapshotInstallGateAndApplyHold
         public void EnqueueResponse(string ep, RaftResponderRequest req) { }
         public Task InvokeLeaderChanged(int p, string leader) => Task.CompletedTask;
 
+        /// <summary>The consumer's modelled state: the ids whose effects it currently holds. Applies add
+        /// to it; an import replaces it (see <see cref="RecordingTransfer.OnImport"/>).</summary>
+        public SortedSet<long> State { get; } = [];
+
         public Task<bool> InvokeReplicationReceived(int p, RaftLog log)
         {
             EventLog.Add($"Applied:{log.Id}");
+            State.Add(log.Id);
             return Task.FromResult(true);
         }
 
@@ -84,12 +89,16 @@ public class TestSnapshotInstallGateAndApplyHold
     {
         public int ImportCount { get; private set; }
 
+        /// <summary>Optional model of what an import does to the consumer's state.</summary>
+        public Action? OnImport { get; set; }
+
         public Task<Stream> ExportRange(RaftSplitPlan plan, long upToIndex, CancellationToken ct) =>
             Task.FromResult<Stream>(new MemoryStream());
 
         public Task ImportRange(int targetPartitionId, Stream snapshot, CancellationToken ct)
         {
             ImportCount++;
+            OnImport?.Invoke();
             return Task.CompletedTask;
         }
     }
@@ -161,6 +170,12 @@ public class TestSnapshotInstallGateAndApplyHold
             LastSuffixTruncated = truncated;
             return ValueTask.FromResult((RaftOperationStatus.Success, truncated));
         }
+
+        /// <summary>
+        /// Models a replicated checkpoint row landing over a contiguously held prefix: the persisted
+        /// last-checkpoint id advances, independent of how far the consumer has applied.
+        /// </summary>
+        public void LandCheckpoint(long checkpointIndex) => _lastCheckpoint = Math.Max(_lastCheckpoint, checkpointIndex);
 
         public void SeedCommitFrontierFromSnapshot(long snapshotIndex, long snapshotTerm = 0, bool suffixTruncated = false)
         {
@@ -287,14 +302,16 @@ public class TestSnapshotInstallGateAndApplyHold
             return ValueTask.CompletedTask;
         }));
 
-        RaftResponse response = await sm.InstallSnapshotAsync(Install(snapshotIndex: 2, lastIncludedTerm: 1, leaderTerm: 5));
+        // At the apply cursor, not below it: a snapshot below what this node already applied is never
+        // imported (the import would rewind the consumer), so it would reach no gate phase.
+        RaftResponse response = await sm.InstallSnapshotAsync(Install(snapshotIndex: 3, lastIncludedTerm: 1, leaderTerm: 5));
 
         Assert.Equal(RaftOperationStatus.Success, response.Status);
 
         SnapshotInstallSignal signal = Assert.Single(seen);
         Assert.Equal(phase, signal.Phase);
         Assert.Equal(1, signal.PartitionId);
-        Assert.Equal(2L, signal.SnapshotIndex);
+        Assert.Equal(3L, signal.SnapshotIndex);
         Assert.Equal(1L, signal.BoundaryTerm);
         Assert.Equal(SnapshotKind.Range, signal.Kind);
         Assert.Equal(3L, signal.LocalMaxLogId);
@@ -354,9 +371,9 @@ public class TestSnapshotInstallGateAndApplyHold
         for (long id = 1; id <= 3; id++)
             await CommitEntryAsync(sm, wal, id);
 
-        // First install lands the boundary at 2.
+        // First install lands the boundary at 3 (the apply cursor; see the gate test above).
         Assert.Equal(RaftOperationStatus.Success,
-            (await sm.InstallSnapshotAsync(Install(snapshotIndex: 2, lastIncludedTerm: 1, leaderTerm: 5))).Status);
+            (await sm.InstallSnapshotAsync(Install(snapshotIndex: 3, lastIncludedTerm: 1, leaderTerm: 5))).Status);
 
         int fired = 0;
         sm.SetSnapshotInstallGateForTesting(new SnapshotInstallGate(SnapshotInstallPhase.BeforeImport, _ =>
@@ -365,7 +382,7 @@ public class TestSnapshotInstallGateAndApplyHold
             return ValueTask.CompletedTask;
         }));
 
-        RaftResponse repeat = await sm.InstallSnapshotAsync(Install(snapshotIndex: 2, lastIncludedTerm: 1, leaderTerm: 5));
+        RaftResponse repeat = await sm.InstallSnapshotAsync(Install(snapshotIndex: 3, lastIncludedTerm: 1, leaderTerm: 5));
 
         Assert.Equal(RaftOperationStatus.Success, repeat.Status);
         Assert.Equal(0, fired);
@@ -542,5 +559,133 @@ public class TestSnapshotInstallGateAndApplyHold
         Assert.DoesNotContain("Applied:6", host.EventLog);
         Assert.DoesNotContain("Applied:7", host.EventLog);
         Assert.DoesNotContain("Applied:8", host.EventLog);
+    }
+
+    /// <summary>
+    /// A replica whose checkpoint ran ahead of its apply cursor is sent a snapshot the boundary
+    /// already covers. The install is skipped, which is correct for the log — but the committed
+    /// entries between the cursor and the index were never handed to the consumer, so the skip must
+    /// deliver them. Moving the cursor over them instead lost them for good: the consumer's state
+    /// then differed from every replica that applied the same log (a prepared transaction whose
+    /// settlement was in the skipped range stayed prepared forever there).
+    /// </summary>
+    [Fact]
+    public async Task SkippedInstall_OverAnUndeliveredCommittedRange_DeliversIt_AndConvergesWithANeverInstalledReplica()
+    {
+        (RaftPartitionStateMachine sm, RecordingHost host, SnapshotWalFacade wal) = Build();
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+
+        for (long id = 1; id <= 5; id++)
+            await CommitEntryAsync(sm, wal, id);
+
+        // 6..20 commit and are held in the log, undelivered; the hold is then dropped WITHOUT the
+        // resume drain, leaving the apply cursor behind a committed range with nothing holding it —
+        // the state a drain withheld at a since-filled hole leaves behind.
+        sm.HoldConsumerAppliesForTesting(replyCorrelationId: null);
+        for (long id = 6; id <= 20; id++)
+            await CommitEntryAsync(sm, wal, id);
+        sm.ResetTestingState();
+
+        wal.LandCheckpoint(20);
+        Assert.Equal(5L, await AppliedCursorAsync(sm));
+
+        RaftResponse response = await sm.InstallSnapshotAsync(Install(snapshotIndex: 20, lastIncludedTerm: 1, leaderTerm: 7));
+
+        Assert.Equal(SnapshotInstallOutcome.SkippedAlreadyCovered, response.SnapshotOutcome);
+        Assert.Equal(0, host.Transfer.ImportCount);
+        Assert.Equal(0, wal.BoundaryCallCount);
+        Assert.Equal(20L, await AppliedCursorAsync(sm));
+
+        // Live traffic continues after the skip.
+        for (long id = 21; id <= 22; id++)
+            await CommitEntryAsync(sm, wal, id);
+
+        (RaftPartitionStateMachine control, RecordingHost controlHost, SnapshotWalFacade controlWal) = Build();
+        await control.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        for (long id = 1; id <= 22; id++)
+            await CommitEntryAsync(control, controlWal, id);
+
+        Assert.Equal(controlHost.EventLog, host.EventLog);
+        Assert.Equal(await AppliedCursorAsync(control), await AppliedCursorAsync(sm));
+    }
+
+    /// <summary>
+    /// The same covered snapshot while the covered range cannot be delivered (applies held): the skip
+    /// is not safe, so the install proceeds and the import replaces the state instead of the
+    /// replica answering "already covered" with entries it never applied.
+    /// </summary>
+    [Fact]
+    public async Task CoveredInstall_WhoseRangeCannotBeDelivered_ImportsInsteadOfSkipping()
+    {
+        (RaftPartitionStateMachine sm, RecordingHost host, SnapshotWalFacade wal) = Build();
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+
+        for (long id = 1; id <= 5; id++)
+            await CommitEntryAsync(sm, wal, id);
+
+        sm.HoldConsumerAppliesForTesting(replyCorrelationId: null);
+        for (long id = 6; id <= 20; id++)
+            await CommitEntryAsync(sm, wal, id);
+
+        wal.LandCheckpoint(20);
+
+        RaftResponse response = await sm.InstallSnapshotAsync(Install(snapshotIndex: 20, lastIncludedTerm: 1, leaderTerm: 7));
+
+        Assert.Equal(RaftOperationStatus.Success, response.Status);
+        Assert.Equal(SnapshotInstallOutcome.Installed, response.SnapshotOutcome);
+        Assert.Equal(1, host.Transfer.ImportCount);
+        Assert.Equal(1, wal.BoundaryCallCount);
+        Assert.Equal(20L, await AppliedCursorAsync(sm));
+
+        // The import stands in for 6..20; resuming must not deliver them on top of it.
+        await sm.ResumeConsumerAppliesForTesting(replyCorrelationId: null);
+        Assert.Equal(["Applied:1", "Applied:2", "Applied:3", "Applied:4", "Applied:5"], host.EventLog);
+    }
+
+    /// <summary>
+    /// A snapshot that arrives after the replica already applied past its index. The export behind it
+    /// reflects the sender's state at some position between the index and this replica's cursor (the
+    /// replica kept applying while the chunks streamed), so importing it would put the consumer back at
+    /// that position while the cursor stays ahead: the entries in between would be gone from the
+    /// consumer and never delivered again. The install must leave the consumer alone.
+    /// </summary>
+    [Fact]
+    public async Task SnapshotBelowTheApplyCursor_IsNotImported_AndTheConsumerKeepsEveryAppliedEntry()
+    {
+        (RaftPartitionStateMachine sm, RecordingHost host, SnapshotWalFacade wal) = Build();
+        await sm.ForceLeaderForTestingAsync(replyCorrelationId: null);
+
+        for (long id = 1; id <= 20; id++)
+            await CommitEntryAsync(sm, wal, id);
+
+        Assert.Equal(20L, await AppliedCursorAsync(sm));
+
+        // The sender exported at position 15: an import would leave the consumer holding 1..15.
+        host.Transfer.OnImport = () =>
+        {
+            host.State.Clear();
+            for (long id = 1; id <= 15; id++)
+                host.State.Add(id);
+        };
+
+        RaftResponse response = await sm.InstallSnapshotAsync(Install(snapshotIndex: 10, lastIncludedTerm: 1, leaderTerm: 7));
+
+        Assert.Equal(SnapshotInstallOutcome.SkippedAlreadyCovered, response.SnapshotOutcome);
+        Assert.Equal(0, host.Transfer.ImportCount);
+        Assert.Equal(0, wal.BoundaryCallCount);
+        Assert.Equal(Enumerable.Range(1, 20).Select(i => (long)i), host.State);
+        Assert.Equal(20L, await AppliedCursorAsync(sm));
+
+        // Nothing is re-delivered, and later entries apply on top of the intact state.
+        for (long id = 21; id <= 22; id++)
+            await CommitEntryAsync(sm, wal, id);
+
+        (RaftPartitionStateMachine control, RecordingHost controlHost, SnapshotWalFacade controlWal) = Build();
+        await control.ForceLeaderForTestingAsync(replyCorrelationId: null);
+        for (long id = 1; id <= 22; id++)
+            await CommitEntryAsync(control, controlWal, id);
+
+        Assert.Equal(controlHost.EventLog, host.EventLog);
+        Assert.Equal(controlHost.State, host.State);
     }
 }

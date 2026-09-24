@@ -167,6 +167,130 @@ public class TestSnapshotInstallExecutor
     }
 
     [Fact]
+    public async Task Skip_WithApplyCursorBehindTheBoundary_DeliversEveryCoveredEntryFirst()
+    {
+        (RaftPartitionStateMachine sm, FakeHost host, CapturingFacade wal, CapturingTransfer transfer) = Build();
+        sm.SetLeaderForTesting(1);
+        // The follower holds 1..100 contiguously and a certified checkpoint row at 100 landed, but its
+        // apply cursor never reached them (a drain withheld at a hole backfill filled later, or apply
+        // lag). The boundary covers the index, so the install is skipped — and the skip must hand the
+        // application every committed entry it covers, never just move the cursor over them.
+        wal.Logs.AddRange(CommittedRun(1, 100, term: 5));
+        wal.MaxLog = 100;
+        wal.LastCheckpoint = 100;
+        wal.TermAtIndex = 5;
+        wal.PresentIndex = 100;
+
+        RaftResponse resp = await sm.InstallSnapshotAsync(
+            Install(snapshotIndex: 100, lastIncludedTerm: 5, leaderTerm: 5, leaderEndpoint: "L:1"));
+
+        Assert.Equal(SnapshotInstallOutcome.SkippedAlreadyCovered, resp.SnapshotOutcome);
+        Assert.False(transfer.ImportCalled);
+        Assert.Equal(0, wal.BoundaryCallCount);
+        Assert.Equal(Enumerable.Range(1, 100).Select(i => (long)i), host.Delivered);
+        Assert.Equal(100, (await sm.GetPartitionView()).LastAppliedIndex);
+    }
+
+    [Fact]
+    public async Task Skip_Repeated_DoesNotRedeliver()
+    {
+        (RaftPartitionStateMachine sm, FakeHost host, CapturingFacade wal, CapturingTransfer transfer) = Build();
+        sm.SetLeaderForTesting(1);
+        wal.Logs.AddRange(CommittedRun(1, 100, term: 5));
+        wal.MaxLog = 100;
+        wal.LastCheckpoint = 100;
+        wal.TermAtIndex = 5;
+        wal.PresentIndex = 100;
+
+        await sm.InstallSnapshotAsync(Install(snapshotIndex: 60, lastIncludedTerm: 5, leaderTerm: 5, leaderEndpoint: "L:1"));
+        Assert.Equal(Enumerable.Range(1, 60).Select(i => (long)i), host.Delivered);
+
+        // A later skip delivers only what lies above the cursor; a re-skip of a covered index delivers nothing.
+        await sm.InstallSnapshotAsync(Install(snapshotIndex: 100, lastIncludedTerm: 5, leaderTerm: 5, leaderEndpoint: "L:1"));
+        await sm.InstallSnapshotAsync(Install(snapshotIndex: 100, lastIncludedTerm: 5, leaderTerm: 5, leaderEndpoint: "L:1"));
+
+        Assert.Equal(Enumerable.Range(1, 100).Select(i => (long)i), host.Delivered);
+        Assert.False(transfer.ImportCalled);
+    }
+
+    [Fact]
+    public async Task Skip_WithAnUnresolvedEntryBelowTheIndex_InstallsInstead()
+    {
+        (RaftPartitionStateMachine sm, FakeHost host, CapturingFacade wal, CapturingTransfer transfer) = Build();
+        sm.SetLeaderForTesting(1);
+        // Entry 60's commit marker never landed here: the drain cannot deliver past it, so the covered
+        // range cannot be handed to the application and skipping would lose 60..100. Import instead.
+        wal.Logs.AddRange(CommittedRun(1, 100, term: 5));
+        wal.Logs[59].Type = RaftLogType.Proposed;
+        wal.MaxLog = 100;
+        wal.LastCheckpoint = 100;
+        wal.TermAtIndex = 5;
+        wal.PresentIndex = 100;
+
+        RaftResponse resp = await sm.InstallSnapshotAsync(
+            Install(snapshotIndex: 100, lastIncludedTerm: 5, leaderTerm: 5, leaderEndpoint: "L:1"));
+
+        Assert.Equal(RaftOperationStatus.Success, resp.Status);
+        Assert.Equal(SnapshotInstallOutcome.Installed, resp.SnapshotOutcome);
+        Assert.True(transfer.ImportCalled);
+        Assert.Equal(1, wal.BoundaryCallCount);
+        Assert.Equal(Enumerable.Range(1, 59).Select(i => (long)i), host.Delivered);
+        Assert.Equal(100, (await sm.GetPartitionView()).LastAppliedIndex);
+    }
+
+    [Fact]
+    public async Task ApplicationAppliedPastTheIndex_SkipsTheImport_WhateverTheBoundarySays()
+    {
+        (RaftPartitionStateMachine sm, FakeHost host, CapturingFacade wal, CapturingTransfer transfer) = Build();
+        sm.SetLeaderForTesting(1);
+        wal.Logs.AddRange(CommittedRun(1, 100, term: 5));
+        wal.MaxLog = 100;
+        wal.LastCheckpoint = 100;
+        wal.TermAtIndex = 5;
+        wal.PresentIndex = 100;
+
+        // Bring the apply cursor to 100 through the covered-boundary skip.
+        await sm.InstallSnapshotAsync(Install(snapshotIndex: 100, lastIncludedTerm: 5, leaderTerm: 5, leaderEndpoint: "L:1"));
+        Assert.Equal(100, (await sm.GetPartitionView()).LastAppliedIndex);
+
+        // The persisted checkpoint sits below the next snapshot's index (a checkpoint row withheld
+        // because it once landed over a gap), so the boundary does not cover it — but the
+        // application does. Importing would replace state that already runs past the index.
+        wal.LastCheckpoint = 40;
+
+        RaftResponse resp = await sm.InstallSnapshotAsync(
+            Install(snapshotIndex: 60, lastIncludedTerm: 5, leaderTerm: 5, leaderEndpoint: "L:1"));
+
+        Assert.Equal(SnapshotInstallOutcome.SkippedAlreadyCovered, resp.SnapshotOutcome);
+        Assert.False(transfer.ImportCalled);
+        Assert.Equal(0, wal.BoundaryCallCount);
+        Assert.Equal(Enumerable.Range(1, 100).Select(i => (long)i), host.Delivered);
+        Assert.Equal(100, (await sm.GetPartitionView()).LastAppliedIndex);
+    }
+
+    [Fact]
+    public async Task ApplicationAppliedPastTheIndex_WithAConflictingTermThere_RefusesRatherThanImports()
+    {
+        (RaftPartitionStateMachine sm, FakeHost host, CapturingFacade wal, CapturingTransfer transfer) = Build();
+        sm.SetLeaderForTesting(1);
+        wal.Logs.AddRange(CommittedRun(1, 100, term: 5));
+        wal.MaxLog = 100;
+        wal.LastCheckpoint = 100;
+        wal.TermAtIndex = 5;
+        wal.PresentIndex = 100;
+        await sm.InstallSnapshotAsync(Install(snapshotIndex: 100, lastIncludedTerm: 5, leaderTerm: 5, leaderEndpoint: "L:1"));
+        wal.LastCheckpoint = 40;
+
+        RaftResponse resp = await sm.InstallSnapshotAsync(
+            Install(snapshotIndex: 60, lastIncludedTerm: 9, leaderTerm: 9, leaderEndpoint: "L:1"));
+
+        Assert.Equal(RaftOperationStatus.Errored, resp.Status);
+        Assert.False(transfer.ImportCalled);
+        Assert.Equal(0, wal.BoundaryCallCount);
+        Assert.Equal(100, (await sm.GetPartitionView()).LastAppliedIndex);
+    }
+
+    [Fact]
     public async Task OrdinarySuffixPastIndexWithoutBoundary_StillImports()
     {
         (RaftPartitionStateMachine sm, FakeHost host, CapturingFacade wal, CapturingTransfer transfer) = Build();
@@ -405,6 +529,12 @@ public class TestSnapshotInstallExecutor
         return (sm, host, wal, transfer);
     }
 
+    private static IEnumerable<RaftLog> CommittedRun(long from, long to, long term)
+    {
+        for (long id = from; id <= to; id++)
+            yield return new RaftLog { Id = id, Term = term, Type = RaftLogType.Committed, LogType = "app" };
+    }
+
     private static SnapshotInstallRequest Install(
         long snapshotIndex, long lastIncludedTerm, long leaderTerm, string leaderEndpoint = "L:1") =>
         new()
@@ -452,6 +582,9 @@ public class TestSnapshotInstallExecutor
         public long PresentIndex { get; set; } = -1;
 
         public long GetPresentIndex() => PresentIndex;
+
+        /// <summary>Entries the facade holds, ascending by id; read by the committed-apply drain.</summary>
+        public List<RaftLog> Logs { get; } = [];
         public RaftOperationStatus BoundaryStatus { get; set; } = RaftOperationStatus.Success;
 
         public int BoundaryCallCount { get; private set; }
@@ -489,7 +622,7 @@ public class TestSnapshotInstallExecutor
         public ValueTask<long> TruncateLogsAfterAsync(long afterLogId) => ValueTask.FromResult(afterLogId);
         public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(0L);
         public ValueTask<List<RaftLog>> GetRangeAsync(long startLogIndex, int maxEntries) =>
-            ValueTask.FromResult(new List<RaftLog>());
+            ValueTask.FromResult(Logs.Where(l => l.Id >= startLogIndex).Take(maxEntries).ToList());
         public long GetCommitIndex() => 0;
         public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp ts, bool autoCommit) => MakeNoOp();
         public WALWriteOperation EnqueueCommit(List<RaftLog> logs) => MakeNoOp();
@@ -554,7 +687,12 @@ public class TestSnapshotInstallExecutor
         public void UpdateLastNodeActivity(string e, int p, HLCTimestamp t) { }
         public void EnqueueResponse(string e, RaftResponderRequest r) { }
         public Task InvokeLeaderChanged(int p, string l) => Task.CompletedTask;
-        public Task<bool> InvokeReplicationReceived(int p, RaftLog l) => Task.FromResult(true);
+        public List<long> Delivered { get; } = [];
+        public Task<bool> InvokeReplicationReceived(int p, RaftLog l)
+        {
+            Delivered.Add(l.Id);
+            return Task.FromResult(true);
+        }
         public Task<bool> InvokeSystemReplicationReceived(int p, RaftLog l) => Task.FromResult(true);
         public void InvokeReplicationError(int p, RaftLog l) { }
         public IRaftStateMachineTransfer? StateMachineTransfer => RangeTransferEnabled ? transfer : null;
