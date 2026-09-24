@@ -253,6 +253,50 @@ public class TestBackfillNoProgress
     }
 
     [Fact]
+    public async Task NoProgressEpisode_PeerAlreadyPastTheCheckpoint_IsNotSentASnapshot()
+    {
+        // The streak builds exactly as above — a follower busy delivering a large backfill stops
+        // acknowledging progress — but the peer's own reports already reach past the checkpoint. A
+        // snapshot there carries nothing it lacks: the transfer would only cost a whole-partition
+        // export and an install the receiver must recognise as redundant. Log shipping stays the
+        // repair, and the episode is still reported.
+        (RaftPartitionStateMachine sm, CapturingHost host, LevelCountingLogger logger) =
+            await BuildFullLogLeader(heartbeatInterval: TimeSpan.Zero, checkpoint: 100, transfer: new InstantTransfer());
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(1);
+
+        for (int i = 0; i < 10; i++)
+            await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 150, durableIndex: 150);
+
+        await Task.Delay(100, TestContext.Current.CancellationToken);
+        Assert.Equal(0, host.SnapshotChunksTo(VoterA));
+        Assert.Empty(sm.GetSnapshotStatuses());
+        Assert.True(EntryBatchesTo(host, VoterA) > 0);
+        Assert.Equal(1, logger.Count(LogLevel.Warning, "without its reported commit frontier advancing"));
+    }
+
+    [Fact]
+    public async Task NoProgressEpisode_CommittedPastTheCheckpointButNotDurablyHeld_StillEscalates()
+    {
+        // The peer's commit frontier passes the checkpoint but its durable frontier does not: it does
+        // not attest to holding the range, so the snapshot remains the rescue.
+        (RaftPartitionStateMachine sm, CapturingHost host, _) =
+            await BuildFullLogLeader(heartbeatInterval: TimeSpan.Zero, checkpoint: 100, transfer: new InstantTransfer());
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(1);
+
+        for (int i = 0; i < 10; i++)
+            await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 150, durableIndex: 80);
+
+        TimeSpan budget = TestTimeouts.Scale(TimeSpan.FromSeconds(5));
+        long started = global::System.Diagnostics.Stopwatch.GetTimestamp();
+        while (host.SnapshotChunksTo(VoterA) == 0)
+        {
+            if (global::System.Diagnostics.Stopwatch.GetElapsedTime(started) > budget)
+                Assert.Fail("a peer that is not durably past the checkpoint was never offered a snapshot");
+            await Task.Delay(10, TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
     public async Task NoProgressEpisode_WithoutACheckpoint_DoesNotEscalate()
     {
         // No checkpoint means no consistent boundary to export from: the pacing and the

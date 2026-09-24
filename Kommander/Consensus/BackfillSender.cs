@@ -429,7 +429,7 @@ internal sealed class BackfillSender
         {
             KommanderMetrics.RecordBackfillNoProgressEpisode(host.PartitionId);
             logger.LogWarning(
-                "[{LocalEndpoint}/{PartitionId}/{State}] Backfill to {Endpoint} shipped {Ships} consecutive batches without its reported commit frontier advancing past {Frontier}; batches are now paced and anchored at the frontier (last anchor {Anchor}), and the peer is offered a snapshot",
+                "[{LocalEndpoint}/{PartitionId}/{State}] Backfill to {Endpoint} shipped {Ships} consecutive batches without its reported commit frontier advancing past {Frontier}; batches are now paced and anchored at the frontier (last anchor {Anchor}), and the peer is offered a snapshot unless it already reaches the checkpoint",
                 host.LocalEndpoint, host.PartitionId, coreState.NodeState,
                 node.Endpoint, fruitlessShips, reportedFrontier, anchor);
         }
@@ -450,6 +450,22 @@ internal sealed class BackfillSender
 
         long committed = tracker.GetCommitFrontierOrDefault(endpoint, -1);
         return committed > 0 && committed >= index;
+    }
+
+    /// <summary>
+    /// True when the peer's own reports put it at or past <paramref name="index"/> on both counts the
+    /// leader tracks: its commit frontier (gap-aware, so every entry through it is committed there and
+    /// deliverable) and, when it reports one, its durable frontier (every entry through it contiguously
+    /// on its disk). Stricter than <see cref="PeerReportsHolding"/>, which trusts the durable frontier
+    /// alone: a peer can hold a range whose commit markers it lost, and for that peer a snapshot is
+    /// still a repair.
+    /// </summary>
+    private bool PeerReportsCommittedThrough(string endpoint, long index)
+    {
+        if (tracker.GetCommitFrontierOrDefault(endpoint, -1) < index)
+            return false;
+
+        return !tracker.TryGetDurableFrontier(endpoint, out long durable) || durable <= 0 || durable >= index;
     }
 
     /// <summary>
@@ -511,6 +527,24 @@ internal sealed class BackfillSender
         long lastCheckpoint = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
         if (lastCheckpoint <= 0)
             return;
+
+        // A snapshot at the checkpoint repairs a peer that is missing something at or below it. A peer
+        // whose own latest reports already reach the checkpoint holds everything the snapshot would
+        // carry, so the transfer can only cost: a whole-partition export here, every chunk on the wire,
+        // and an install the receiver has to recognise as redundant. The streaks behind an escalation
+        // are built from acks that lag exactly such a peer — a follower delivering a large backfill in
+        // one executor turn stops acknowledging while it does — so without this check a follower far past
+        // the checkpoint gets a snapshot. Whatever still keeps it from converging lies above the
+        // checkpoint, where the log is retained and shipping it is the repair.
+        if (PeerReportsCommittedThrough(node.Endpoint, lastCheckpoint))
+        {
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] Not escalating to a snapshot for {Endpoint}: its reports already reach the checkpoint {Checkpoint} (commit frontier {Committed})",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, lastCheckpoint,
+                    tracker.GetCommitFrontierOrDefault(node.Endpoint, -1));
+            return;
+        }
 
         bool p0System = host.PartitionId == RaftSystemConfig.SystemPartition && host.SystemStateTransfer is not null;
         if (host.PartitionStateTransfer is not null || host.StateMachineTransfer is not null || p0System)
