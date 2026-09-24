@@ -25,7 +25,8 @@ public sealed record RandomScenarioAction(
         string detail = Kind switch
         {
             RandomScenarioActionKind.BlockLink or RandomScenarioActionKind.UnblockLink
-                or RandomScenarioActionKind.TransferLeadership =>
+                or RandomScenarioActionKind.TransferLeadership
+                or RandomScenarioActionKind.RingPartitionWrite =>
                 $" {Target} -> {Secondary}",
             RandomScenarioActionKind.DuplicateLink =>
                 $" {Target} -> {Secondary} copies={Value}",

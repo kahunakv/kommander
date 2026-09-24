@@ -262,6 +262,135 @@ public sealed class TestClusterInvariantSet
         ClusterInvariantSet.CheckLeaderCompleteness(9, views, [window], recorded);
     }
 
+    /// <summary>
+    /// The <c>681cf397</c> end state: the leader of the highest term lacks an entry the cluster
+    /// committed, at an index above its own commit index. The committed-window check cannot see it.
+    /// </summary>
+    [Fact]
+    public void CurrentLeaderCompleteness_FiresOnAnEntryAboveTheLeadersCommitIndex()
+    {
+        List<RaftPartitionView> views =
+        [
+            View("node1", RaftNodeState.Leader, term: 2, commitIndex: 1),
+            View("node2", RaftNodeState.Follower, term: 2, commitIndex: 2),
+        ];
+
+        ClusterInvariantSet.NodeLogWindow leaderLog = new(
+            "node1",
+            RangeStart: 1,
+            RangeEnd: 2,
+            ByIndex: new Dictionary<long, CommittedEntryFingerprint>
+            {
+                [1] = Fingerprint("node1", index: 1, term: 1, payload: "a"),
+            });
+
+        Dictionary<long, CommittedEntryFingerprint> recorded = new()
+        {
+            [1] = Fingerprint("node2", index: 1, term: 1, payload: "a"),
+            [2] = Fingerprint("node2", index: 2, term: 1, payload: "b"),
+        };
+
+        ClusterInvariantSet.CheckLeaderCompleteness(9, views, [], recorded);
+
+        InvariantViolationException error = Assert.Throws<InvariantViolationException>(
+            () => ClusterInvariantSet.CheckCurrentLeaderHoldsCommittedEntries(9, views, [leaderLog], recorded));
+
+        Assert.Equal(ClusterInvariantSet.LeaderCompleteness, error.InvariantName);
+        Assert.Contains("elected without a committed entry", error.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>A different entry at a committed index, in the current leader's log.</summary>
+    [Fact]
+    public void CurrentLeaderCompleteness_FiresOnADifferentEntry()
+    {
+        List<RaftPartitionView> views = [View("node1", RaftNodeState.Leader, term: 3, commitIndex: 1)];
+
+        ClusterInvariantSet.NodeLogWindow leaderLog = new(
+            "node1",
+            RangeStart: 1,
+            RangeEnd: 2,
+            ByIndex: new Dictionary<long, CommittedEntryFingerprint>
+            {
+                [2] = Fingerprint("node1", index: 2, term: 3, payload: "barrier"),
+            });
+
+        Dictionary<long, CommittedEntryFingerprint> recorded = new()
+        {
+            [2] = Fingerprint("node2", index: 2, term: 1, payload: "b"),
+        };
+
+        InvariantViolationException error = Assert.Throws<InvariantViolationException>(
+            () => ClusterInvariantSet.CheckCurrentLeaderHoldsCommittedEntries(9, views, [leaderLog], recorded));
+
+        Assert.Equal(ClusterInvariantSet.LeaderCompleteness, error.InvariantName);
+        Assert.Contains("different entry", error.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A leader cut off in a lower term may lack what the rest of the cluster committed after the
+    /// cut. Only the leader of the highest term is judged.
+    /// </summary>
+    [Fact]
+    public void CurrentLeaderCompleteness_IgnoresALeaderOfALowerTerm()
+    {
+        List<RaftPartitionView> views =
+        [
+            View("node1", RaftNodeState.Leader, term: 1, commitIndex: 1),
+            View("node2", RaftNodeState.Leader, term: 2, commitIndex: 2),
+        ];
+
+        ClusterInvariantSet.NodeLogWindow staleLog = new(
+            "node1",
+            RangeStart: 1,
+            RangeEnd: 2,
+            ByIndex: new Dictionary<long, CommittedEntryFingerprint>
+            {
+                [1] = Fingerprint("node1", index: 1, term: 1, payload: "a"),
+            });
+
+        ClusterInvariantSet.NodeLogWindow currentLog = new(
+            "node2",
+            RangeStart: 1,
+            RangeEnd: 2,
+            ByIndex: new Dictionary<long, CommittedEntryFingerprint>
+            {
+                [1] = Fingerprint("node2", index: 1, term: 1, payload: "a"),
+                [2] = Fingerprint("node2", index: 2, term: 2, payload: "b"),
+            });
+
+        Dictionary<long, CommittedEntryFingerprint> recorded = new()
+        {
+            [1] = Fingerprint("node2", index: 1, term: 1, payload: "a"),
+            [2] = Fingerprint("node2", index: 2, term: 2, payload: "b"),
+        };
+
+        ClusterInvariantSet.CheckCurrentLeaderHoldsCommittedEntries(9, views, [staleLog, currentLog], recorded);
+    }
+
+    /// <summary>An index below the leader's read range was compacted, not lost.</summary>
+    [Fact]
+    public void CurrentLeaderCompleteness_AllowsAnIndexBelowTheReadRange()
+    {
+        List<RaftPartitionView> views = [View("node1", RaftNodeState.Leader, term: 2, commitIndex: 5)];
+
+        ClusterInvariantSet.NodeLogWindow leaderLog = new(
+            "node1",
+            RangeStart: 3,
+            RangeEnd: 5,
+            ByIndex: new Dictionary<long, CommittedEntryFingerprint>
+            {
+                [3] = Fingerprint("node1", index: 3, term: 2, payload: "c"),
+            });
+
+        Dictionary<long, CommittedEntryFingerprint> recorded = new()
+        {
+            [2] = Fingerprint("node2", index: 2, term: 1, payload: "b"),
+            [3] = Fingerprint("node2", index: 3, term: 2, payload: "c"),
+        };
+
+        ClusterInvariantSet.CheckCurrentLeaderHoldsCommittedEntries(9, views, [leaderLog], recorded);
+    }
+
     // ── Quiescent convergence ─────────────────────────────────────────────
 
     [Fact]

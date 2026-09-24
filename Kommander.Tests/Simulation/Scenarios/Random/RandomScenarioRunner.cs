@@ -5,6 +5,7 @@ using Kommander.Tests.Simulation.Diagnostics;
 using Kommander.Tests.Simulation.Invariants;
 using Kommander.Tests.Simulation.Random;
 using Kommander.Tests.Simulation.Replay;
+using Kommander.Tests.Simulation.Transport;
 using Kommander.Tests.Simulation.WAL;
 
 namespace Kommander.Tests.Simulation.Scenarios.Random;
@@ -191,6 +192,8 @@ public sealed class RandomScenarioRunner
             TransferAnswers = new Dictionary<RaftOperationStatus, int>(transferAnswers),
             CutLeaderReadsReached = CutLeaderReadsReached,
             CutLeaderReadsServed = CutLeaderReadsServed,
+            RingPartitionsReached = RingPartitionsReached,
+            RingWritesAcknowledged = RingWritesAcknowledged,
             FinalTerm = finalViews.Count == 0 ? -1 : finalViews.Max(view => view.Term),
         };
     }
@@ -662,6 +665,14 @@ public sealed class RandomScenarioRunner
             return resolved;
         }
 
+        if (resolved.Kind == RandomScenarioActionKind.RingPartitionWrite
+            && resolved.Target is not null
+            && resolved.Secondary is not null)
+        {
+            await RunRingPartitionWriteAsync(resolved.Target, resolved.Secondary, cancellationToken).ConfigureAwait(false);
+            return resolved;
+        }
+
         if (resolved.Kind == RandomScenarioActionKind.ReadAtCutLeader && resolved.Target is not null)
         {
             await RunReadAtCutLeaderAsync(resolved.Target, cancellationToken).ConfigureAwait(false);
@@ -918,6 +929,156 @@ public sealed class RandomScenarioRunner
                 if (answer.Outcome == ClientOperationOutcome.Ok)
                     CutLeaderReadsServed++;
             }
+        }
+
+        await RunStepsAsync(OutageRecoverySteps, deliver: true, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Ring partitions whose far side elected a new leader with the straddler's vote, so the write at
+    /// the old leader met the state the action exists for. A family where this stays at zero never
+    /// reached it.
+    /// </summary>
+    public int RingPartitionsReached { get; private set; }
+
+    /// <summary>
+    /// Of <see cref="RingPartitionsReached"/>, the writes the old leader acknowledged. On a correct
+    /// build this stays at zero, because the straddler adopted the higher term when it voted; the
+    /// history checker and <c>leader-completeness</c> judge any that are acknowledged.
+    /// </summary>
+    public int RingWritesAcknowledged { get; private set; }
+
+    /// <summary>
+    /// Builds the ring partition of <see cref="RandomScenarioActionKind.RingPartitionWrite"/>, writes
+    /// at the old leader while it holds, and undoes every link setting it made.
+    ///
+    /// <para>When the old leader no longer leads, the straddler is not a running follower, or fewer
+    /// than five nodes run, the action only lets time pass. The plan still records it.</para>
+    ///
+    /// <para><b>Only its own links are undone.</b> The generator draws this action only while no
+    /// other fault is active, so the links it touches carry no other fault, and it restores exactly
+    /// those in a <c>finally</c>. Clearing the whole link table would end faults the generator still
+    /// tracks.</para>
+    /// </summary>
+    private async Task RunRingPartitionWriteAsync(string leader, string straddler, CancellationToken cancellationToken)
+    {
+        RandomScenarioObservation observation = await ObserveAsync(cancellationToken).ConfigureAwait(false);
+
+        List<string> rest = observation.Running
+            .Where(endpoint => endpoint != leader && endpoint != straddler)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+
+        if (observation.Leader != leader || !observation.Running.Contains(straddler) || rest.Count < 3)
+        {
+            await RunStepsAsync(options.StepsPerAction, deliver: true, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        string oldSide = rest[0];
+        string[] newSide = [rest[1], rest[2]];
+
+        long oldTerm = (await Node(leader).GetPartitionViewAsync(options.PartitionId, cancellationToken).ConfigureAwait(false))?.Term ?? 0;
+
+        SimulatedTransport transport = cluster.Transport;
+        List<(string From, string To)> blocked = [];
+        List<(string From, string To)> filtered = [];
+
+        void Block(string from, string to)
+        {
+            transport.BlockLink(from, to);
+            blocked.Add((from, to));
+        }
+
+        void Filter(string from, string to, LinkTraffic traffic)
+        {
+            transport.SetLinkTraffic(from, to, traffic);
+            filtered.Add((from, to));
+        }
+
+        Task<ClientOperation>? append = null;
+
+        try
+        {
+            foreach (string near in new[] { leader, oldSide })
+            {
+                foreach (string far in newSide)
+                {
+                    Block(near, far);
+                    Block(far, near);
+                }
+            }
+
+            foreach (string node in new[] { oldSide, newSide[0], newSide[1] })
+                Filter(straddler, node, LinkTraffic.NoVoteRequests);
+
+            foreach (string node in newSide)
+                Filter(node, straddler, LinkTraffic.ElectionOnly);
+
+            transport.BlockLink(leader, straddler);
+            transport.BlockLink(straddler, leader);
+
+            bool elected = await cluster.RunUntilAsync(
+                async () =>
+                {
+                    await invariants.CheckAsync(cluster, options.PartitionId, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    foreach (string node in newSide)
+                    {
+                        RaftPartitionView? view = await Node(node)
+                            .GetPartitionViewAsync(options.PartitionId, cancellationToken)
+                            .ConfigureAwait(false);
+
+                        if (view is { Role: RaftNodeState.Leader } && view.Term > oldTerm)
+                            return true;
+                    }
+
+                    return false;
+                },
+                options.StepsPerAction * OutageElectionBudgetFactor * 4,
+                options.AdvanceMillisecondsPerStep,
+                cancellationToken).ConfigureAwait(false);
+
+            transport.UnblockLink(leader, straddler);
+            transport.UnblockLink(straddler, leader);
+
+            if (elected)
+            {
+                RingPartitionsReached++;
+
+                append = history.AppendUniqueAsync(
+                    cluster, Node(leader), options.PartitionId, "Greeting", cancellationToken);
+
+                await cluster.RunUntilAsync(
+                    () => Task.FromResult(append.IsCompleted),
+                    options.StepsPerAction * OutageElectionBudgetFactor * 4,
+                    options.AdvanceMillisecondsPerStep,
+                    cancellationToken).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            foreach ((string from, string to) in blocked)
+                transport.UnblockLink(from, to);
+
+            foreach ((string from, string to) in filtered)
+                transport.SetLinkTraffic(from, to, LinkTraffic.All);
+
+            transport.UnblockLink(leader, straddler);
+            transport.UnblockLink(straddler, leader);
+        }
+
+        if (append is not null)
+        {
+            await cluster.RunUntilAsync(
+                () => Task.FromResult(append.IsCompleted),
+                options.StepsPerAction * OutageElectionBudgetFactor,
+                options.AdvanceMillisecondsPerStep,
+                cancellationToken).ConfigureAwait(false);
+
+            if ((await append.ConfigureAwait(false)).Outcome == ClientOperationOutcome.Ok)
+                RingWritesAcknowledged++;
         }
 
         await RunStepsAsync(OutageRecoverySteps, deliver: true, cancellationToken).ConfigureAwait(false);

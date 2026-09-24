@@ -76,7 +76,7 @@ public sealed class SimulatedTransport : ICommunication
     /// <summary>Fault settings for one ordered pair of endpoints.</summary>
     /// <param name="Blocked">Drop every message on this link, in this direction only.</param>
     /// <param name="Copies">How many times a delivered message arrives. 1 is normal.</param>
-    private readonly record struct LinkFault(bool Blocked, int Copies);
+    private readonly record struct LinkFault(bool Blocked, int Copies, LinkTraffic Traffic = LinkTraffic.All);
 
     /// <summary>
     /// When true, consensus RPCs are queued instead of delivered. The harness releases them
@@ -104,6 +104,20 @@ public sealed class SimulatedTransport : ICommunication
 
     /// <summary>Restores a link blocked by <see cref="BlockLink"/>.</summary>
     public void UnblockLink(string from, string to) => UpdateLink(from, to, fault => fault with { Blocked = false });
+
+    /// <summary>
+    /// Limits the kinds of message this link carries. <see cref="LinkTraffic.All"/> restores it.
+    ///
+    /// <para><b>Why a filter by message kind.</b> Some states need an exact order of election events
+    /// that timers alone do not give. The <c>681cf397</c> state needs a follower that votes for a new
+    /// candidate and then keeps hearing the old leader and not the new one. A link that carries
+    /// only election traffic delivers the vote and holds back the new leader's appends. A link that
+    /// carries everything except vote requests stops a node from starting its own election, so the
+    /// candidate the scenario needs is the one that wins. Each is a real network shape: loss that
+    /// hits one kind of message, or one node with a slow election timer.</para>
+    /// </summary>
+    public void SetLinkTraffic(string from, string to, LinkTraffic traffic) =>
+        UpdateLink(from, to, fault => fault with { Traffic = traffic });
 
     /// <summary>
     /// Makes every message on this link arrive <paramref name="copies"/> times.
@@ -158,7 +172,7 @@ public sealed class SimulatedTransport : ICommunication
                 return partitionedEndpoints.Count == 0
                        && frozenEndpoints.Count == 0
                        && downEndpoints.Count == 0
-                       && linkFaults.Values.All(fault => !fault.Blocked && fault.Copies <= 1);
+                       && linkFaults.Values.All(fault => !fault.Blocked && fault.Copies <= 1 && fault.Traffic == LinkTraffic.All);
         }
     }
 
@@ -783,7 +797,7 @@ public sealed class SimulatedTransport : ICommunication
 
         // A blocked link drops before anything else. The caller still gets the transport's empty
         // response, which is what it would get from a real send into a black hole.
-        if (fault.Blocked)
+        if (fault.Blocked || !Carries(fault.Traffic, messageType))
         {
             Interlocked.Increment(ref droppedCount);
             return heldResponse;
@@ -837,10 +851,18 @@ public sealed class SimulatedTransport : ICommunication
         return heldResponse;
     }
 
+    /// <summary>Whether a link with this traffic setting carries a message of this kind.</summary>
+    private static bool Carries(LinkTraffic traffic, string messageType) => traffic switch
+    {
+        LinkTraffic.ElectionOnly => messageType is "RequestVotes" or "Vote",
+        LinkTraffic.NoVoteRequests => messageType != "RequestVotes",
+        _ => true,
+    };
+
     private LinkFault GetLinkFault(string from, string to)
     {
         lock (gate)
-            return linkFaults.TryGetValue((from, to), out LinkFault fault) ? fault : new LinkFault(false, 1);
+            return linkFaults.TryGetValue((from, to), out LinkFault fault) ? fault : new LinkFault(false, 1, LinkTraffic.All);
     }
 
     private void UpdateLink(string from, string to, Func<LinkFault, LinkFault> update)
@@ -849,7 +871,7 @@ public sealed class SimulatedTransport : ICommunication
         {
             LinkFault current = linkFaults.TryGetValue((from, to), out LinkFault existing)
                 ? existing
-                : new LinkFault(false, 1);
+                : new LinkFault(false, 1, LinkTraffic.All);
 
             linkFaults[(from, to)] = update(current);
         }
@@ -884,4 +906,17 @@ public sealed class SimulatedTransport : ICommunication
         string MessageType,
         long EnqueuedLogicalTime,
         Func<Task> Send);
+}
+
+/// <summary>Which kinds of message a simulated link carries. See <see cref="SimulatedTransport.SetLinkTraffic"/>.</summary>
+public enum LinkTraffic
+{
+    /// <summary>Every message. The default.</summary>
+    All = 0,
+
+    /// <summary>Only vote requests and vote answers, pre-vote included. Appends and heartbeats are dropped.</summary>
+    ElectionOnly = 1,
+
+    /// <summary>Everything except vote requests, pre-vote included. The sender cannot start an election through this link.</summary>
+    NoVoteRequests = 2,
 }

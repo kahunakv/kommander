@@ -460,6 +460,41 @@ public sealed class TestRandomScenarios
     }
 
     /// <summary>
+    /// The options of the ring-partition sweep: five nodes. Public so a plan replay or a probe can
+    /// rebuild the same run.
+    /// </summary>
+    public static RandomScenarioOptions RingPartitionOptions => new()
+    {
+        NodeCount = 5,
+        RingPartitionWeight = 12,
+    };
+
+    /// <summary>
+    /// The ring-partition family: five nodes, and a ring partition in which one follower is in both
+    /// majorities, with a write at the old leader.
+    ///
+    /// <para><b>Why.</b> <c>681cf397</c>: a follower that voted in a higher term kept acknowledging the
+    /// old leader, which committed and acknowledged a write the new leader then overwrote (Jepsen
+    /// <c>majorities-ring</c>). Every other family runs three nodes, where two majorities cannot share
+    /// one node. The rule that names the end state is <c>leader-completeness</c>: the new leader holds no
+    /// entry at an index a majority committed.</para>
+    /// </summary>
+    [Theory]
+    [Trait("Category", "DSTRandom")]
+    [MemberData(nameof(Seeds))]
+    public async Task AGeneratedRunUnderRingPartitions_HoldsEveryCheck(ulong seed)
+    {
+        RandomScenarioReport report = await RunSeedAsync(
+            seed, RingPartitionOptions, TestContext.Current.CancellationToken);
+
+        Assert.True(report.InvariantChecks > 0, "The run checked no invariants.");
+
+        output.WriteLine(
+            $"seed={seed} rings={report.CountOf(RandomScenarioActionKind.RingPartitionWrite)} " +
+            $"reached={report.RingPartitionsReached} acknowledged={report.RingWritesAcknowledged}");
+    }
+
+    /// <summary>
     /// The options of the late-broadcast sweep. Public so a plan replay or a probe can rebuild the
     /// same run.
     /// </summary>

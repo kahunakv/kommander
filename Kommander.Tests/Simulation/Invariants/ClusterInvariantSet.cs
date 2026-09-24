@@ -445,6 +445,90 @@ public static class ClusterInvariantSet
     }
 
     /// <summary>
+    /// One node's log as read for the leader check: every entry the read returned, of any type,
+    /// keyed by index, and the lowest index the read covered.
+    /// </summary>
+    /// <param name="Endpoint">The node.</param>
+    /// <param name="RangeStart">Lowest index the read covered. Below it the node may have compacted.</param>
+    /// <param name="RangeEnd">Highest index the read could have returned.</param>
+    /// <param name="ByIndex">Entries the node holds, proposed or committed, keyed by index.</param>
+    public sealed record NodeLogWindow(
+        string Endpoint,
+        long RangeStart,
+        long RangeEnd,
+        IReadOnlyDictionary<long, CommittedEntryFingerprint> ByIndex);
+
+    /// <summary>
+    /// Checks <see cref="LeaderCompleteness"/> against the current leader's whole log, not only its
+    /// committed prefix.
+    ///
+    /// <para><b>Why a second check.</b> <see cref="CheckLeaderCompleteness"/> reads the leader's
+    /// committed window, which ends at the leader's own commit index. A newly elected leader learns
+    /// the commit point only when it commits its first entry, so its commit index is often behind
+    /// entries the cluster already committed, and a leader that lacks one of those is never read.
+    /// That is the <c>681cf397</c> end state: a straddling follower acknowledged a deposed leader's
+    /// write, three of five nodes committed it, and the new leader, elected without it, sat with its
+    /// commit index one below and the cluster stuck. Raft's property is about the log, so this check
+    /// reads the log, and an entry held as proposed counts.</para>
+    ///
+    /// <para><b>Only the leader of the highest term is judged.</b> A leader cut off in a lower term
+    /// can legally lack an entry that the rest of the cluster committed after it lost contact. A
+    /// leader of the highest term among the views cannot: a commit needs a majority, and every
+    /// majority holds a node with a term at least as high as the commit's. The views count only live
+    /// nodes, and stored terms are floors, so a crash does not lower the highest term.</para>
+    /// </summary>
+    public static void CheckCurrentLeaderHoldsCommittedEntries(
+        int stepNumber,
+        IReadOnlyList<RaftPartitionView> views,
+        IReadOnlyList<NodeLogWindow> leaderLogs,
+        IReadOnlyDictionary<long, CommittedEntryFingerprint> recordedByIndex)
+    {
+        if (views.Count == 0 || recordedByIndex.Count == 0)
+            return;
+
+        long highestTerm = views.Max(view => view.Term);
+
+        foreach (RaftPartitionView view in views)
+        {
+            if (view.Role != RaftNodeState.Leader || view.Term != highestTerm)
+                continue;
+
+            NodeLogWindow? log = leaderLogs.FirstOrDefault(
+                candidate => string.Equals(candidate.Endpoint, view.Endpoint, StringComparison.Ordinal));
+
+            if (log is null)
+                continue;
+
+            foreach ((long index, CommittedEntryFingerprint recorded) in recordedByIndex)
+            {
+                if (index < log.RangeStart || index > log.RangeEnd)
+                    continue;
+
+                if (!log.ByIndex.TryGetValue(index, out CommittedEntryFingerprint? held))
+                {
+                    throw Violation(
+                        LeaderCompleteness,
+                        stepNumber,
+                        $"Leader '{view.Endpoint}' (term {view.Term}, commit {view.CommitIndex}) holds no " +
+                        $"entry at index {index}, which '{recorded.Endpoint}' committed at term " +
+                        $"{recorded.Term}. It was elected without a committed entry. The read of its log " +
+                        $"covered [{log.RangeStart}, {log.RangeEnd}].");
+                }
+
+                if (!held.DescribesSameEntryAs(recorded))
+                {
+                    throw Violation(
+                        LeaderCompleteness,
+                        stepNumber,
+                        $"Leader '{view.Endpoint}' (term {view.Term}) holds a different entry at index " +
+                        $"{index}: term {held.Term} payload {held.PayloadHash}, against the committed term " +
+                        $"{recorded.Term} payload {recorded.PayloadHash} from '{recorded.Endpoint}'.");
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// Checks <see cref="QuiescentConvergence"/> across the nodes that are still running.
     ///
     /// <para>Call this at the end of a run, after faults have stopped and enough simulated time

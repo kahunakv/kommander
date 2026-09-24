@@ -98,6 +98,18 @@ public sealed record RandomScenarioReport
     public int CutLeaderReadsServed { get; init; }
 
     /// <summary>
+    /// Ring partitions that elected a new leader with the straddler's vote. See
+    /// <see cref="RandomScenarioRunner.RingPartitionsReached"/>.
+    /// </summary>
+    public int RingPartitionsReached { get; init; }
+
+    /// <summary>
+    /// Of those, the writes the old leader acknowledged. See
+    /// <see cref="RandomScenarioRunner.RingWritesAcknowledged"/>.
+    /// </summary>
+    public int RingWritesAcknowledged { get; init; }
+
+    /// <summary>
     /// Highest term any node held on the run's partition at the end, or -1 when no view was read.
     /// Every election raises the term, so on a run with no fault this is the leader churn: a healthy
     /// cluster that keeps its first leader ends at term 1 or 2.

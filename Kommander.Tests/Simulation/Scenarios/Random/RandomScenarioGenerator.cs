@@ -197,6 +197,11 @@ public sealed class RandomScenarioGenerator
         if (HasBudget && observation.Leader is not null && observation.Running.Count >= 3)
             Offer(options.CutLeaderReadWeight, 13);
 
+        // A ring partition cuts most of the cluster's links, so it runs only when no other fault is
+        // active and it cannot overlap one. It needs two majorities that share one node: five nodes.
+        if (active.Count == 0 && observation.Leader is not null && observation.Running.Count >= 5)
+            Offer(options.RingPartitionWeight, 14);
+
         int total = categories.Sum(entry => entry.Weight);
 
         if (total <= 0)
@@ -233,6 +238,7 @@ public sealed class RandomScenarioGenerator
                 RandomScenarioActionKind.ReadAtNode,
                 observation.Running[random.NextInt("read-target", 0, observation.Running.Count)]),
             13 => new RandomScenarioAction(index, RandomScenarioActionKind.ReadAtCutLeader, observation.Leader),
+            14 => DrawRingPartition(index, observation),
             // Two thirds of the outages carry a client write into the disruption. That overlap is
             // the only place a client can be told the wrong thing about its own operation, and the
             // two write variants disrupt different halves of it: one takes the leader away for
@@ -467,6 +473,19 @@ public sealed class RandomScenarioGenerator
         }
 
         return new RandomScenarioAction(index, RandomScenarioActionKind.LateBroadcast, target);
+    }
+
+    /// <summary>Draws a ring partition around the leader, with a random follower as the straddler.</summary>
+    private RandomScenarioAction DrawRingPartition(int index, RandomScenarioObservation observation)
+    {
+        List<string> followers = observation.Running
+            .Where(endpoint => endpoint != observation.Leader)
+            .ToList();
+
+        string straddler = followers[random.NextInt("ring-straddler", 0, followers.Count)];
+
+        return new RandomScenarioAction(
+            index, RandomScenarioActionKind.RingPartitionWrite, observation.Leader, straddler);
     }
 
     /// <summary>Draws a leadership transfer from the leader to one of its running followers.</summary>

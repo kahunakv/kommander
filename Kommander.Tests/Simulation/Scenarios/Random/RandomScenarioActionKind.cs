@@ -252,4 +252,24 @@ public enum RandomScenarioActionKind
     /// quorum. A random read lands in this window almost never, so the action builds it.</para>
     /// </summary>
     ReadAtCutLeader,
+
+    /// <summary>
+    /// Build a ring partition in which one follower, the straddler, is in both majorities, elect a
+    /// new leader on the far side with the straddler's vote, and then write at the old leader.
+    /// <c>Target</c> is the old leader, <c>Secondary</c> the straddler. Needs five running nodes.
+    ///
+    /// <para><b>Why.</b> <c>681cf397</c>, from a Jepsen <c>majorities-ring</c> run: a follower that voted in
+    /// a higher term kept its old term in memory and went on acknowledging the old leader, which then
+    /// committed and acknowledged a write that the new leader overwrote. The state needs two majorities
+    /// that share one node, so three nodes cannot reach it.</para>
+    ///
+    /// <para><b>How the nodes are placed.</b> Of the running nodes other than the old leader and the
+    /// straddler, in endpoint order, the first stays with the old leader and the next two form the new
+    /// side; any further nodes are not touched. The order of the election is fixed with the transport's
+    /// traffic filter: the straddler cannot send vote requests, the old leader and the straddler cannot
+    /// reach each other until the new side has a leader, and the new side reaches the straddler with
+    /// election traffic only. See <c>TestStraddlingVoterScenarios</c> for each step and why it is
+    /// needed.</para>
+    /// </summary>
+    RingPartitionWrite,
 }

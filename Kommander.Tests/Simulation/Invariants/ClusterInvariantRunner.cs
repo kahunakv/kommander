@@ -111,6 +111,12 @@ public sealed class ClusterInvariantRunner
             windows,
             recordedByCommittedIndex);
 
+        ClusterInvariantSet.CheckCurrentLeaderHoldsCommittedEntries(
+            cluster.StepNumber,
+            views,
+            CollectLeaderLogs(cluster, views, partitionId, stores),
+            recordedByCommittedIndex);
+
         ChecksRun++;
     }
 
@@ -370,6 +376,63 @@ public sealed class ClusterInvariantRunner
         }
 
         return windows;
+    }
+
+    /// <summary>
+    /// Reads the log of each node that reports itself leader, over the tail the recorded commit
+    /// history reaches, with every entry type.
+    ///
+    /// <para>The read starts above whatever the leader compacted or holds only as a snapshot, for
+    /// the same reason as the committed window: a compacted entry is not a hole. It ends
+    /// <see cref="CommittedWindow"/> entries past the highest committed index recorded, so an entry
+    /// the leader lacks at the top of the committed history is still inside the read.</para>
+    /// </summary>
+    private List<ClusterInvariantSet.NodeLogWindow> CollectLeaderLogs(
+        SimulationCluster cluster,
+        IReadOnlyList<RaftPartitionView> views,
+        int partitionId,
+        IReadOnlyDictionary<string, SimulatedWalPartitionSnapshot> stores)
+    {
+        List<ClusterInvariantSet.NodeLogWindow> logs = [];
+
+        if (recordedByCommittedIndex.Count == 0)
+            return logs;
+
+        long highestRecorded = recordedByCommittedIndex.Keys.Max();
+
+        foreach (RaftPartitionView view in views)
+        {
+            if (view.Role != RaftNodeState.Leader)
+                continue;
+
+            SimulationNode? node = cluster.Nodes.FirstOrDefault(
+                candidate => string.Equals(candidate.Endpoint, view.Endpoint, StringComparison.Ordinal));
+
+            if (node is null)
+                continue;
+
+            long compactedThrough = stores.TryGetValue(view.Endpoint, out SimulatedWalPartitionSnapshot? store)
+                ? store.CoveredThrough
+                : -1;
+
+            long from = Math.Max(Math.Max(1, highestRecorded - CommittedWindow + 1), compactedThrough + 1);
+            long to = highestRecorded;
+
+            if (from > to)
+                continue;
+
+            Dictionary<long, CommittedEntryFingerprint> byIndex = [];
+
+            foreach (RaftLog log in node.Wal.ReadLogsRange(partitionId, from, (int)(to - from + 1)))
+            {
+                if (log.Id <= to)
+                    byIndex[log.Id] = CommittedEntryFingerprint.From(view.Endpoint, log);
+            }
+
+            logs.Add(new ClusterInvariantSet.NodeLogWindow(view.Endpoint, from, to, byIndex));
+        }
+
+        return logs;
     }
 
     /// <summary>

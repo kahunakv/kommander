@@ -324,7 +324,8 @@ public sealed class TestRandomScenarioGenerator
                 or RandomScenarioActionKind.RestartNodeBlank
                 or RandomScenarioActionKind.TransferLeadership
                 or RandomScenarioActionKind.ReadAtNode
-                or RandomScenarioActionKind.ReadAtCutLeader)
+                or RandomScenarioActionKind.ReadAtCutLeader
+                or RandomScenarioActionKind.RingPartitionWrite)
                 continue;
 
             // FastDisk and FreeDisk arrive as heals, which the age bound also emits, so every kind
@@ -401,6 +402,39 @@ public sealed class TestRandomScenarioGenerator
         Assert.All(reads, action => Assert.Contains(action.Target, Observation().Running));
         Assert.True(reads.Select(action => action.Target).Distinct().Count() > 1, "Every read went to one node.");
         Assert.All(cut, action => Assert.Equal(Observation().Leader, action.Target));
+    }
+
+    /// <summary>
+    /// The ring partition is drawn only with its weight set and five running nodes. It targets the
+    /// leader, and its straddler is a follower.
+    /// </summary>
+    [Fact]
+    public void TheRingPartition_NeedsItsWeightAndFiveNodes()
+    {
+        string[] fiveNodes = ["node1", "node2", "node3", "node4", "node5"];
+        RandomScenarioObservation five = new() { Running = fiveNodes, Crashed = [], Paused = [], Leader = "node1" };
+
+        RandomScenarioOptions weighted = new() { RingPartitionWeight = 12, NodeCount = 5 };
+
+        RandomScenarioGenerator onThree = new(new SimulationRandom(20260926), weighted);
+        RandomScenarioGenerator onFive = new(new SimulationRandom(20260926), weighted);
+        RandomScenarioGenerator unweighted = new(new SimulationRandom(20260926), new RandomScenarioOptions { NodeCount = 5 });
+
+        List<RandomScenarioAction> drawn = [];
+
+        for (int index = 0; index < 2_000; index++)
+        {
+            Assert.NotEqual(RandomScenarioActionKind.RingPartitionWrite, onThree.Next(Observation()).Kind);
+            Assert.NotEqual(RandomScenarioActionKind.RingPartitionWrite, unweighted.Next(five).Kind);
+
+            drawn.Add(onFive.Next(five));
+        }
+
+        List<RandomScenarioAction> rings = drawn.Where(action => action.Kind == RandomScenarioActionKind.RingPartitionWrite).ToList();
+
+        Assert.NotEmpty(rings);
+        Assert.All(rings, action => Assert.Equal("node1", action.Target));
+        Assert.All(rings, action => Assert.Contains(action.Secondary, fiveNodes.Skip(1)));
     }
 
     /// <summary>

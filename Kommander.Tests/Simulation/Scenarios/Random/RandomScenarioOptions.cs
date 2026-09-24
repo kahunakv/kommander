@@ -11,6 +11,12 @@ public sealed record RandomScenarioOptions
     /// <summary>Partition the run exercises. Never zero: partition 0 is the control plane.</summary>
     public int PartitionId { get; init; } = 1;
 
+    /// <summary>
+    /// Nodes in the cluster. Three by default, which is what every family ran before the ring
+    /// partition. A ring partition with a node in both majorities needs five.
+    /// </summary>
+    public int NodeCount { get; init; } = 3;
+
     /// <summary>How many actions the run draws before it starts healing.</summary>
     public int ActionCount { get; init; } = 24;
 
@@ -194,6 +200,12 @@ public sealed record RandomScenarioOptions
     public int CutLeaderReadWeight { get; init; }
 
     /// <summary>
+    /// Weight of <see cref="RandomScenarioActionKind.RingPartitionWrite"/>. Zero by default, so the
+    /// existing plans do not change; the ring family turns it on with five nodes.
+    /// </summary>
+    public int RingPartitionWeight { get; init; }
+
+    /// <summary>
     /// Applies the node configuration these options imply. One place, so the sweep, the shrinker
     /// and the regression replay cannot build a cluster that differs from the run they reproduce.
     /// </summary>
@@ -210,7 +222,7 @@ public sealed record RandomScenarioOptions
     {
         Cluster.SimulationClusterOptions cluster = new()
         {
-            NodeCount = 3,
+            NodeCount = NodeCount,
             PartitionCount = 1,
             Seed = seed,
             ConfigureNode = ApplyTo,
@@ -326,6 +338,8 @@ public sealed record RandomScenarioOptions
             ["transferLeadershipWeight"] = TransferLeadershipWeight.ToString(),
             ["readWeight"] = ReadWeight.ToString(),
             ["cutLeaderReadWeight"] = CutLeaderReadWeight.ToString(),
+            ["ringPartitionWeight"] = RingPartitionWeight.ToString(),
+            ["nodeCount"] = NodeCount.ToString(),
             ["enableCheckQuorum"] = EnableCheckQuorum.ToString(),
             ["startElectionTimeoutMs"] = StartElectionTimeoutMs?.ToString(CultureInfo.InvariantCulture) ?? "default",
             ["endElectionTimeoutMs"] = EndElectionTimeoutMs?.ToString(CultureInfo.InvariantCulture) ?? "default",
@@ -387,6 +401,8 @@ public sealed record RandomScenarioOptions
             TransferLeadershipWeight = Int(parameters, "transferLeadershipWeight", defaults.TransferLeadershipWeight),
             ReadWeight = Int(parameters, "readWeight", defaults.ReadWeight),
             CutLeaderReadWeight = Int(parameters, "cutLeaderReadWeight", defaults.CutLeaderReadWeight),
+            RingPartitionWeight = Int(parameters, "ringPartitionWeight", defaults.RingPartitionWeight),
+            NodeCount = Int(parameters, "nodeCount", defaults.NodeCount),
             EnableCheckQuorum = Bool(parameters, "enableCheckQuorum", defaults.EnableCheckQuorum),
             StartElectionTimeoutMs = (int?)OptionalLong(parameters, "startElectionTimeoutMs"),
             EndElectionTimeoutMs = (int?)OptionalLong(parameters, "endElectionTimeoutMs"),
