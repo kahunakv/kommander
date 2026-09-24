@@ -212,7 +212,10 @@ public sealed class RaftTimerService : IDisposable
     /// Posts a <c>CheckLeader</c> message into partition executors.
     ///
     /// <para>When <see cref="RaftConfiguration.EnableSharedExecutorPool"/> is on, only the hot
-    /// (non-quiesced) partitions are ticked on each normal interval.  A coarse safety sweep
+    /// partitions are ticked on each normal interval: the non-quiesced ones, plus a quiesced
+    /// leader while <see cref="RaftConfiguration.EnableCheckQuorum"/> is on, because its
+    /// check-quorum probe is scheduled by its own tick and the sweep below is far too slow for
+    /// that (see the hot-set callback in <see cref="RaftPartition"/>).  A coarse safety sweep
     /// over all partitions fires every <c>UpdateNodesInterval / CheckLeaderInterval</c> ticks
     /// to catch anything that fell out of the hot set incorrectly.  The system partition is
     /// always ticked regardless of hot-set mode.</para>

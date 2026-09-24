@@ -230,11 +230,26 @@ public sealed class RaftPartition : IDisposable
         // Wire the hot-set callback so the manager learns immediately when this partition
         // quiesces (→ remove from hot set) or un-quiesces (→ re-add to hot set).
         // Fired under the single-owner guarantee so the ConcurrentDictionary ops are safe.
+        //
+        // A quiesced LEADER under check-quorum stays hot. Check-quorum trusts a quiesced leader
+        // on silence for half its window only; past that, EvaluateCheckQuorum answers Probe and
+        // the leader's tick sends one forced heartbeat round whose acks refresh the contact
+        // clock (RaftPartitionStateMachine.CheckPartitionLeadershipAsync). That verdict is
+        // produced by nothing but a tick, and a cool partition is ticked only by the safety
+        // sweep, every UpdateNodesInterval (5 s by default) — against a 2 s default window. So a
+        // leader that left the hot set was first ticked with the whole window already elapsed
+        // and stepped down without ever probing, on every idle partition, every term, for the
+        // life of the cluster (Kahuna Jepsen, 2026-09-24: an idle partition went from term 1 to
+        // 91 in 15 minutes with both voters reachable). The tick is cheap while quiesced (the
+        // verdict, then HasLaggingPeer), and it is what the probe cadence assumes.
         if (manager.Configuration.EnableSharedExecutorPool)
             stateMachine.SetOnQuiesceChanged(isQuiesced =>
             {
-                if (isQuiesced) manager.MarkPartitionCool(PartitionId);
-                else            manager.MarkPartitionHot(PartitionId);
+                bool leaderUnderCheckQuorum = manager.Configuration.EnableCheckQuorum
+                                              && stateMachine.NodeState == RaftNodeState.Leader;
+
+                if (isQuiesced && !leaderUnderCheckQuorum) manager.MarkPartitionCool(PartitionId);
+                else                                       manager.MarkPartitionHot(PartitionId);
             });
 
         executor.Start();

@@ -114,6 +114,70 @@ public sealed class TestQuiescence
         await node3.LeaveCluster(true, CancellationToken.None);
     }
 
+    // ── Idle leader under check-quorum ────────────────────────────────────────
+
+    /// <summary>
+    /// Production shape: quiescence on, check-quorum on, the shared executor pool's hot set on,
+    /// and a safety sweep (<c>UpdateNodesInterval</c>) many times longer than the check-quorum
+    /// window. A quiesced leader leaves the hot set, so nothing but the sweep ticks it — and the
+    /// probe round that must go out at half the window (<c>CheckQuorumVerdict.Probe</c>) is only
+    /// ever scheduled by that tick. With the 5 s default sweep against the 2 s default window,
+    /// the first tick after quiescing already sees the window elapsed and the leader steps down;
+    /// every idle partition then re-elects a leader every few seconds for the life of the
+    /// cluster (Kahuna Jepsen, 2026-09-24: partition 1 went from term 1 to 91 in 15 minutes with
+    /// no fault active). The leader must stay hot under check-quorum so its own tick probes.
+    /// </summary>
+    [Fact]
+    public async Task IdleLeader_WithQuiescenceAndCheckQuorum_SweepSlowerThanWindow_KeepsTerm()
+    {
+        InMemoryCommunication communication = new();
+        // StartElectionTimeout 500 → CheckQuorumWindow 500 ms, probe due at 250 ms.
+        // UpdateNodesInterval 1 s → a safety sweep twice the window apart, the production
+        // ratio (5 s against 2 s) compressed so the first sweep lands inside the test.
+        IRaft node1 = MakeNode(communication, 1, [new("localhost:8002"), new("localhost:8003")], enableCheckQuorum: true, updateNodesMs: 1_000);
+        IRaft node2 = MakeNode(communication, 2, [new("localhost:8001"), new("localhost:8003")], enableCheckQuorum: true, updateNodesMs: 1_000);
+        IRaft node3 = MakeNode(communication, 3, [new("localhost:8001"), new("localhost:8002")], enableCheckQuorum: true, updateNodesMs: 1_000);
+        IRaft[] nodes = [node1, node2, node3];
+
+        communication.SetNodes(new Dictionary<string, IRaft>
+        {
+            { "localhost:8001", node1 },
+            { "localhost:8002", node2 },
+            { "localhost:8003", node3 }
+        });
+
+        await Task.WhenAll(
+            node1.UpdateNodes(),
+            node2.UpdateNodes(),
+            node3.UpdateNodes());
+
+        await Task.WhenAll(
+            node1.JoinCluster(TestContext.Current.CancellationToken),
+            node2.JoinCluster(TestContext.Current.CancellationToken),
+            node3.JoinCluster(TestContext.Current.CancellationToken));
+
+        string initialLeader = await node1.WaitForLeaderStableAsync(
+            1, TimeSpan.FromMilliseconds(150), TestContext.Current.CancellationToken);
+        IRaft leaderNode = nodes.Single(n => n.GetLocalEndpoint() == initialLeader);
+        long initialTerm = leaderNode.GetPartitionTerm(1);
+
+        // Six check-quorum windows and three safety sweeps with no writes. The leader
+        // quiesces after ~150 ms; the probe must then fire at every half window, and its acks
+        // keep the leader in office through every sweep.
+        await Task.Delay(6 * 500, TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, await CountLeadersAsync(nodes, 1));
+        string currentLeader = await node1.WaitForLeaderStableAsync(
+            1, TimeSpan.FromMilliseconds(150), TestContext.Current.CancellationToken);
+        Assert.Equal(initialLeader, currentLeader);
+        Assert.Equal(initialTerm, leaderNode.GetPartitionTerm(1));
+
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
+    }
+
+    // ── Write wakes quiesced partition ────────────────────────────────────────
     // ── Write wakes quiesced partition ────────────────────────────────────────
 
     /// <summary>
@@ -418,7 +482,9 @@ public sealed class TestQuiescence
         InMemoryCommunication communication,
         int nodeId,
         IEnumerable<RaftNode> peers,
-        bool enableQuiescence = true)
+        bool enableQuiescence = true,
+        bool enableCheckQuorum = false,
+        int updateNodesMs = 100)
     {
         RaftConfiguration config = new()
         {
@@ -431,7 +497,7 @@ public sealed class TestQuiescence
             RecentHeartbeat = TimeSpan.FromMilliseconds(25),
             VotingTimeout = TimeSpan.FromMilliseconds(250),
             CheckLeaderInterval = TimeSpan.FromMilliseconds(25),
-            UpdateNodesInterval = TimeSpan.FromMilliseconds(100),
+            UpdateNodesInterval = TimeSpan.FromMilliseconds(updateNodesMs),
             TimerInitialDelay = TimeSpan.FromMilliseconds(25),
             StartElectionTimeout = 500,
             EndElectionTimeout = 1000,
@@ -439,11 +505,13 @@ public sealed class TestQuiescence
             QuiesceAfter = TimeSpan.FromMilliseconds(100),
             PingInterval = TimeSpan.FromMilliseconds(200),
             SuspicionTimeout = TimeSpan.FromSeconds(5),
-            // These tests pin the quiescence mechanics themselves. Check-quorum (on by default)
-            // wakes an idle leader for one probe round every half window — 250 ms at this
-            // StartElectionTimeout — so a leader could never stay cool for the 400 ms these tests
-            // measure. The probe is pinned separately in TestReadIndexConfirmation.
-            EnableCheckQuorum = false,
+            // Most tests here pin the quiescence mechanics themselves. Check-quorum (on by
+            // default) wakes an idle leader for one probe round every half window — 250 ms at
+            // this StartElectionTimeout — so a leader could never stay cool for the 400 ms those
+            // tests measure. The probe is pinned in TestReadIndexConfirmation, and the idle
+            // leader's survival under check-quorum in the production hot-set shape is pinned by
+            // IdleLeader_WithQuiescenceAndCheckQuorum_SweepSlowerThanWindow_KeepsTerm.
+            EnableCheckQuorum = enableCheckQuorum,
         };
 
         return new RaftManager(

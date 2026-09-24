@@ -917,7 +917,11 @@ public class RaftConfiguration
     /// while a client still holds an acknowledgement from the old one.
     /// <para>A quiesced leader stops heartbeating by design, so it is not trusted on silence:
     /// past half the window without a majority contact it is woken for one forced heartbeat
-    /// round, and it steps down at the full window if the round goes unanswered.</para>
+    /// round, and it steps down at the full window if the round goes unanswered. The wake-up is
+    /// the leader's own <c>CheckLeader</c> tick, so under <see cref="EnableSharedExecutorPool"/>
+    /// a quiesced leader stays in the hot set while this is on; the safety sweep alone
+    /// (<see cref="UpdateNodesInterval"/>) is slower than the window and would only ever find
+    /// the window already elapsed.</para>
     /// <para>On by default. Turning it off is reported by <see cref="RaftSafetyOptionAudit"/> as a
     /// chosen safety deviation: a leader that has lost its voters then keeps accepting writes
     /// that can never commit until it happens to learn of a newer term.</para>
