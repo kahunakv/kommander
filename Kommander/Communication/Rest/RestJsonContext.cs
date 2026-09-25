@@ -44,6 +44,7 @@ namespace Kommander.Communication;
 [JsonSerializable(typeof(StepDownNoticeRequest))]
 [JsonSerializable(typeof(TransferLeadershipRequest))]
 [JsonSerializable(typeof(TransferLeadershipSuggestionRequest))]
+[JsonSerializable(typeof(ReseedRequest))]
 [JsonSerializable(typeof(NodeLoadReport))]
 [JsonSerializable(typeof(PartitionLoad))]
 [JsonSerializable(typeof(HandshakeRequest))]

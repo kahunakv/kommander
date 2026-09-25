@@ -223,7 +223,19 @@ internal sealed class SnapshotInstaller
         // not track presence (-1) leaves the decision to the boundary alone.
         long installedBoundary = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
         long presentIndex = wal.GetPresentIndex();
-        if (installedBoundary >= snapshotIndex && (presentIndex < 0 || presentIndex >= snapshotIndex))
+
+        // A transfer the follower asked for (a re-seed) exists to replace application state the log
+        // already covers: the checkpoint boundary says nothing about that state, so the skip below is
+        // not consulted. The apply-cursor rule above still is, because an import below the cursor
+        // loses applied entries whoever asked for it; the requester holds its applies to keep the
+        // cursor at or below the index.
+        if (request.Forced && installedBoundary >= snapshotIndex)
+        {
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot at index {Index} answers a re-seed request: the installed boundary {Boundary} covers the index but the application state is being replaced on request; installing instead of skipping.",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, snapshotIndex, installedBoundary);
+        }
+        else if (installedBoundary >= snapshotIndex && (presentIndex < 0 || presentIndex >= snapshotIndex))
         {
             // Confirm identity compatibility before treating this as a no-op. A newer installed boundary
             // (installedBoundary > snapshotIndex) supersedes the request. Otherwise the stored boundary term

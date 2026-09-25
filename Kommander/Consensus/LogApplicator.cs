@@ -59,9 +59,15 @@ internal sealed class LogApplicator
 
     /// <summary>
     /// Holds or resumes consumer delivery. Resuming does not itself drain — the caller runs the
-    /// drain on the executor turn so the accumulated entries are delivered in log id order.
+    /// drain on the executor turn so the accumulated entries are delivered in log id order. Held in
+    /// production by a follower waiting to be re-seeded (see <see cref="IRaft.RequestReseedAsync"/>):
+    /// its apply cursor must not move past the checkpoint the leader takes for it, or the install
+    /// would be refused as an import below the cursor.
     /// </summary>
-    public void SetConsumerAppliesHeldForTesting(bool held) => consumerAppliesHeld = held;
+    public void SetConsumerAppliesHeld(bool held) => consumerAppliesHeld = held;
+
+    /// <summary>The test hooks' name for <see cref="SetConsumerAppliesHeld"/>.</summary>
+    public void SetConsumerAppliesHeldForTesting(bool held) => SetConsumerAppliesHeld(held);
 
     public LogApplicator(
         IRaftPartitionHost host,

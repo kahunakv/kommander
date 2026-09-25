@@ -36,4 +36,7 @@ public sealed class SnapshotInstallRequest
 
     /// <summary>The fully accumulated snapshot bytes, positioned at 0, ready for the application importer.</summary>
     public required Stream Snapshot { get; init; }
+
+    /// <summary>See <see cref="SnapshotRequest.Forced"/>: import even over a covering checkpoint boundary.</summary>
+    public bool Forced { get; init; }
 }

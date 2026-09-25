@@ -732,6 +732,18 @@ public class GrpcCommunication : ICommunication
                 };
                 return item;
 
+            case BatchRequestsRequestType.Reseed when requestItem.Reseed is not null:
+                item.Reseed = new()
+                {
+                    Partition = requestItem.Reseed.Partition,
+                    Term = requestItem.Reseed.Term,
+                    TimeNode = requestItem.Reseed.Time.N,
+                    TimePhysical = requestItem.Reseed.Time.L,
+                    TimeCounter = requestItem.Reseed.Time.C,
+                    Endpoint = requestItem.Reseed.Endpoint
+                };
+                return item;
+
             // The two hot payloads rent their wire children from GrpcCommunicationPool instead of
             // allocating: BatchRequests (the only production caller) returns them after the frame
             // write completes, the same after-send rule the dispatcher applies to the managed
@@ -1036,6 +1048,7 @@ public class GrpcCommunication : ICommunication
             LeaderEndpoint = request.LeaderEndpoint,
             LastIncludedTerm = request.LastIncludedTerm,
             SnapshotChecksum = request.SnapshotChecksum,
+            Forced = request.Forced,
         };
 
         Metadata metadata = BuildAuthMetadata(manager, "/Rafter/InstallSnapshot", grpcRequest);

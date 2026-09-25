@@ -136,6 +136,24 @@ public sealed class TestGrpcBatchItemMapping
         Assert.Equal("node-b:9002", item.TransferLeadershipSuggestion.TargetEndpoint);
     }
 
+    /// <summary>A follower's re-seed request crosses the batch mapper with its payload intact.</summary>
+    [Fact]
+    public void Reseed_PayloadSurvivesMapping()
+    {
+        GrpcBatchRequestsRequestItem? item = GrpcCommunication.TryMapBatchItem(new BatchRequestsRequestItem
+        {
+            Type = BatchRequestsRequestType.Reseed,
+            Reseed = new ReseedRequest(3, 9, Time, "follower:9002"),
+        });
+
+        Assert.NotNull(item);
+        Assert.Equal(GrpcBatchRequestsRequestType.Reseed, item!.Type);
+        Assert.NotNull(item.Reseed);
+        Assert.Equal(3, item.Reseed.Partition);
+        Assert.Equal(9, item.Reseed.Term);
+        Assert.Equal("follower:9002", item.Reseed.Endpoint);
+    }
+
     [Fact]
     public void AppendLogs_PayloadAndEntriesSurviveMapping()
     {
@@ -225,6 +243,9 @@ public sealed class TestGrpcBatchItemMapping
                     break;
                 case BatchRequestsRequestType.TransferLeadershipSuggestion:
                     item.TransferLeadershipSuggestion = new TransferLeadershipSuggestionRequest(1, 1, Time, "e", "t");
+                    break;
+                case BatchRequestsRequestType.Reseed:
+                    item.Reseed = new ReseedRequest(1, 1, Time, "e");
                     break;
                 case BatchRequestsRequestType.AppendLogs:
                     item.AppendLogs = new AppendLogsRequest(1, 1, Time, "e", [], 0, 0);

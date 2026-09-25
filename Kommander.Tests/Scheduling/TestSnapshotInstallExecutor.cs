@@ -518,6 +518,63 @@ public class TestSnapshotInstallExecutor
         Assert.Equal(4, wal.BoundaryTerm);
     }
 
+    /// <summary>
+    /// A transfer that answers a re-seed request replaces application state the log already covers:
+    /// the covering checkpoint boundary that would otherwise short-circuit the install as already
+    /// held is not consulted, and the import and the boundary write both run.
+    /// </summary>
+    [Fact]
+    public async Task ForcedInstall_OverACoveringBoundary_ImportsInsteadOfSkipping()
+    {
+        (RaftPartitionStateMachine sm, FakeHost host, CapturingFacade wal, CapturingTransfer transfer) = Build();
+        sm.SetLeaderForTesting(1);
+        wal.Logs.AddRange(CommittedRun(1, 100, term: 5));
+        wal.MaxLog = 100;
+        wal.LastCheckpoint = 100;
+        wal.TermAtIndex = 5;
+        wal.PresentIndex = 100;
+
+        // The ordinary install at the covered index is a skip: everything below is delivered instead.
+        RaftResponse skipped = await sm.InstallSnapshotAsync(Install(snapshotIndex: 100, lastIncludedTerm: 5, leaderTerm: 5));
+        Assert.Equal(SnapshotInstallOutcome.SkippedAlreadyCovered, skipped.SnapshotOutcome);
+        Assert.False(transfer.ImportCalled);
+        Assert.Equal(100, (await sm.GetPartitionView()).LastAppliedIndex);
+
+        // The same index, requested: imported, with the boundary re-stamped, and the cursor at the index.
+        RaftResponse forced = await sm.InstallSnapshotAsync(Install(snapshotIndex: 100, lastIncludedTerm: 5, leaderTerm: 5, forced: true));
+
+        Assert.Equal(SnapshotInstallOutcome.Installed, forced.SnapshotOutcome);
+        Assert.True(transfer.ImportCalled);
+        Assert.Equal(1, wal.BoundaryCallCount);
+        Assert.Equal(100, wal.BoundarySnapshotIndex);
+        Assert.Equal(100, (await sm.GetPartitionView()).LastAppliedIndex);
+    }
+
+    /// <summary>
+    /// Requested or not, an install below the apply cursor would erase applied entries: the cursor rule
+    /// wins over the request. The requester keeps its applies held to keep this from happening.
+    /// </summary>
+    [Fact]
+    public async Task ForcedInstall_BelowTheApplyCursor_IsStillNotImported()
+    {
+        (RaftPartitionStateMachine sm, FakeHost host, CapturingFacade wal, CapturingTransfer transfer) = Build();
+        sm.SetLeaderForTesting(1);
+        wal.Logs.AddRange(CommittedRun(1, 100, term: 5));
+        wal.MaxLog = 100;
+        wal.LastCheckpoint = 100;
+        wal.TermAtIndex = 5;
+        wal.PresentIndex = 100;
+        await sm.InstallSnapshotAsync(Install(snapshotIndex: 100, lastIncludedTerm: 5, leaderTerm: 5));
+        Assert.Equal(100, (await sm.GetPartitionView()).LastAppliedIndex);
+
+        RaftResponse resp = await sm.InstallSnapshotAsync(Install(snapshotIndex: 60, lastIncludedTerm: 5, leaderTerm: 5, forced: true));
+
+        Assert.Equal(SnapshotInstallOutcome.SkippedAlreadyCovered, resp.SnapshotOutcome);
+        Assert.False(transfer.ImportCalled);
+        Assert.Equal(0, wal.BoundaryCallCount);
+        Assert.Equal(100, (await sm.GetPartitionView()).LastAppliedIndex);
+    }
+
     // ── harness ─────────────────────────────────────────────────────────────────
 
     private static (RaftPartitionStateMachine, FakeHost, CapturingFacade, CapturingTransfer) Build()
@@ -536,7 +593,7 @@ public class TestSnapshotInstallExecutor
     }
 
     private static SnapshotInstallRequest Install(
-        long snapshotIndex, long lastIncludedTerm, long leaderTerm, string leaderEndpoint = "L:1") =>
+        long snapshotIndex, long lastIncludedTerm, long leaderTerm, string leaderEndpoint = "L:1", bool forced = false) =>
         new()
         {
             PartitionId = 1,
@@ -546,6 +603,7 @@ public class TestSnapshotInstallExecutor
             LeaderEndpoint = leaderEndpoint,
             Kind = SnapshotKind.Range,
             Snapshot = new MemoryStream([1, 2, 3, 4]),
+            Forced = forced,
         };
 
     private sealed class CapturingTransfer : IRaftStateMachineTransfer

@@ -1785,6 +1785,9 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     /// <summary>Passes a leadership-transfer command to the appropriate partition.</summary>
     internal void TransferLeadership(TransferLeadershipRequest request) => rpcRouter.TransferLeadership(request);
 
+    /// <summary>Passes a follower's re-seed request to the appropriate partition.</summary>
+    internal void ReceiveReseedRequest(Data.ReseedRequest request) => rpcRouter.ReceiveReseedRequest(request);
+
     /// <summary>
     /// Receives an advisory leadership-transfer suggestion from the balancer running on the
     /// system-partition leader.
@@ -2144,6 +2147,32 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             partition.ClearSnapshotInstallGateForTesting(registration);
         }
     }
+
+    /// <inheritdoc/>
+    public async Task<RaftOperationStatus> RequestReseedAsync(int partitionId, CancellationToken cancellationToken = default)
+    {
+        if (!Joined || !IsInitialized)
+            return RaftOperationStatus.Errored;
+
+        if (!partitions.TryGetValue(partitionId, out RaftPartition? partition))
+            return RaftOperationStatus.Errored;
+
+        return await partition.RequestReseedAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public RaftOperationStatus SetCandidacyWithheld(int partitionId, bool withheld)
+    {
+        if (!partitions.TryGetValue(partitionId, out RaftPartition? partition))
+            return RaftOperationStatus.Errored;
+
+        partition.SetCandidacyWithheld(withheld);
+        return RaftOperationStatus.Success;
+    }
+
+    /// <inheritdoc/>
+    public bool IsCandidacyWithheld(int partitionId) =>
+        partitions.TryGetValue(partitionId, out RaftPartition? partition) && partition.IsCandidacyWithheld;
 
     /// <inheritdoc/>
     [EditorBrowsable(EditorBrowsableState.Never)]

@@ -124,6 +124,13 @@ internal sealed class RaftRpcRouter
             partition!.TransferLeadership(request);
     }
 
+    /// <summary>Passes a follower's re-seed request to the addressed partition (acted on only where it leads).</summary>
+    internal void ReceiveReseedRequest(ReseedRequest request)
+    {
+        if (partitionProvider.TryGetPartition(request.Partition, out RaftPartition? partition))
+            partition!.ReceiveReseedRequest(request);
+    }
+
     /// <summary>
     /// Appends replicated logs to the addressed partition. Dropping the append when the partition
     /// does not exist here yet is safe because the leader retries on its next heartbeat.

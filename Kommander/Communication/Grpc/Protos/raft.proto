@@ -139,6 +139,7 @@ message GrpcBatchRequestsRequestItem
     GrpcStepDownNoticeRequest StepDownNotice = 8;
     GrpcTransferLeadershipRequest TransferLeadership = 9;
     GrpcTransferLeadershipSuggestionRequest TransferLeadershipSuggestion = 10;
+    GrpcReseedRequest Reseed = 11;
   }
 }
 
@@ -157,6 +158,7 @@ enum GrpcBatchRequestsRequestType {
   STEP_DOWN_NOTICE = 6;
   TRANSFER_LEADERSHIP = 7;
   TRANSFER_LEADERSHIP_SUGGESTION = 8;
+  RESEED = 9;
 }
 
 message GrpcStepDownNoticeRequest {
@@ -186,6 +188,15 @@ message GrpcTransferLeadershipSuggestionRequest {
   uint32 TimeCounter = 5;
   string SuggestedBy = 6;
   string TargetEndpoint = 7;
+}
+
+message GrpcReseedRequest {
+  int32 Partition = 1;
+  int64 Term = 2;
+  int32 TimeNode = 3;
+  int64 TimePhysical = 4;
+  uint32 TimeCounter = 5;
+  string Endpoint = 6;
 }
 
 message GrpcJoinRequest {
@@ -266,6 +277,7 @@ message GrpcInstallSnapshotRequest {
     string LeaderEndpoint = 10; // claimed sender/leader; empty == legacy sender
     int64 LastIncludedTerm = 11; // term of the entry at SnapshotIndex; 0 == legacy sender
     string SnapshotChecksum = 12; // hex SHA-256 over the whole snapshot, terminal chunk only; empty == legacy sender
+    bool Forced = 13; // answers a re-seed request: import even over a covering checkpoint boundary
 }
 
 message GrpcInstallSnapshotResponse {

@@ -164,6 +164,7 @@ public static class GrpcCommunicationPool
         obj.AppendLogs = null;
         obj.CompleteAppendLogs = null;
         obj.TransferLeadershipSuggestion = null;
+        obj.Reseed = null;
 
         if (Interlocked.Increment(ref _batchRequestsSingleItemCount) <= MaxRetained)
         {

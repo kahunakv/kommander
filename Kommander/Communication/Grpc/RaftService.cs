@@ -500,6 +500,26 @@ public sealed class RaftService : Rafter.RafterBase
                                 break;
                             }
 
+                            case GrpcBatchRequestsRequestType.Reseed:
+                            {
+                                if (raft is not RaftManager reseedManager)
+                                    throw new InvalidOperationException("raft is not a RaftManager");
+
+                                if (request.Reseed is not { } reseed)
+                                {
+                                    LogMissingBatchItemPayload(request.Type, context);
+                                    break;
+                                }
+
+                                reseedManager.ReceiveReseedRequest(new(
+                                    reseed.Partition,
+                                    reseed.Term,
+                                    new(reseed.TimeNode, reseed.TimePhysical, reseed.TimeCounter),
+                                    reseed.Endpoint
+                                ));
+                                break;
+                            }
+
                             case GrpcBatchRequestsRequestType.AppendLogs:
                             {
                                 if (request.AppendLogs is not { } appendLogsRequest)
@@ -796,6 +816,7 @@ public sealed class RaftService : Rafter.RafterBase
             LeaderEndpoint = request.LeaderEndpoint,
             LastIncludedTerm = request.LastIncludedTerm,
             SnapshotChecksum = request.SnapshotChecksum,
+            Forced = request.Forced,
         };
 
         Data.SnapshotResponse result = await manager.ReceiveInstallSnapshot(

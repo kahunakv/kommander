@@ -38,6 +38,8 @@ public readonly struct RaftResponderRequest
     public TransferLeadershipSuggestionRequest? TransferLeadershipSuggestionRequest =>
         _payload as TransferLeadershipSuggestionRequest;
 
+    public ReseedRequest? ReseedRequest => _payload as ReseedRequest;
+
     public AppendLogsRequest? AppendLogsRequest => _payload as AppendLogsRequest;
 
     public CompleteAppendLogsRequest? CompleteAppendLogsRequest => _payload as CompleteAppendLogsRequest;
@@ -71,5 +73,8 @@ public readonly struct RaftResponderRequest
         : this(type, node, (object)request) { }
 
     public RaftResponderRequest(RaftResponderRequestType type, RaftNode node, TransferLeadershipSuggestionRequest request)
+        : this(type, node, (object)request) { }
+
+    public RaftResponderRequest(RaftResponderRequestType type, RaftNode node, ReseedRequest request)
         : this(type, node, (object)request) { }
 }

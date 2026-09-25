@@ -32,6 +32,8 @@ public sealed class RaftPartition : IDisposable
     private static readonly RaftRequest SuspendHeartbeatsRequest = new(RaftRequestType.SuspendHeartbeats);
     private static readonly RaftRequest ResumeHeartbeatsRequest = new(RaftRequestType.ResumeHeartbeats);
     private static readonly RaftRequest HoldConsumerAppliesRequest = new(RaftRequestType.HoldConsumerAppliesForTesting);
+
+    private static readonly RaftRequest RequestReseedRequest = new(RaftRequestType.RequestReseed);
     private static readonly RaftRequest ResumeConsumerAppliesRequest = new(RaftRequestType.ResumeConsumerAppliesForTesting);
 
     /// <summary>
@@ -431,6 +433,25 @@ public sealed class RaftPartition : IDisposable
     {
         executor.Post(new(RaftRequestType.ReceiveTransferLeadership, request));
     }
+
+    /// <summary>Posts a follower's re-seed request to this (leader) partition's executor.</summary>
+    public void ReceiveReseedRequest(ReseedRequest request)
+    {
+        executor.Post(new(RaftRequestType.ReceiveReseedRequest, term: request.Term, endpoint: request.Endpoint));
+    }
+
+    /// <summary>Asks the leader for a whole-partition snapshot — see <see cref="IRaft.RequestReseedAsync"/>.</summary>
+    public async Task<RaftOperationStatus> RequestReseedAsync(CancellationToken cancellationToken = default)
+    {
+        RaftResponse response = await executor.Ask(RequestReseedRequest, cancellationToken).ConfigureAwait(false);
+        return response.Status;
+    }
+
+    /// <summary>Withholds or releases this replica's candidacy — see <see cref="IRaft.SetCandidacyWithheld"/>. A field write, not an executor operation.</summary>
+    public void SetCandidacyWithheld(bool withheld) => stateMachine.SetCandidacyWithheld(withheld);
+
+    /// <summary>Whether the application currently withholds this replica's candidacy.</summary>
+    public bool IsCandidacyWithheld => stateMachine.IsCandidacyWithheld;
 
     /// <summary>
     /// Append logs to the partition returning the commited index.

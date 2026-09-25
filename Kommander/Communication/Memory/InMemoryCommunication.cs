@@ -524,6 +524,11 @@ public class InMemoryCommunication : ICommunication
                                         suggestionManager.ReceiveTransferLeadershipSuggestion(item.TransferLeadershipSuggestion!);
                                     break;
 
+                                case BatchRequestsRequestType.Reseed:
+                                    if (targetNode is RaftManager reseedManager)
+                                        reseedManager.ReceiveReseedRequest(item.Reseed!);
+                                    break;
+
                                 case BatchRequestsRequestType.AppendLogs:
                                     targetNode.AppendLogs(item.AppendLogs!);
                                     break;

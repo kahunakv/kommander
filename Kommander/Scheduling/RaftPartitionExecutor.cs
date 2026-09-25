@@ -1249,6 +1249,15 @@ public sealed class RaftPartitionExecutor : IDisposable
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
                     break;
 
+                case RaftRequestType.RequestReseed:
+                    await _stateMachine.RequestReseedAsync(RegisterReply(op)).ConfigureAwait(false);
+                    break;
+
+                case RaftRequestType.ReceiveReseedRequest:
+                    await _stateMachine.ReceiveReseedRequestAsync(request.Endpoint ?? "", request.Term).ConfigureAwait(false);
+                    op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
+                    break;
+
                 case RaftRequestType.GetNodeState:
                     op.Reply?.TrySetResult(new RaftResponse(RaftResponseType.NodeState, _stateMachine.NodeState));
                     break;

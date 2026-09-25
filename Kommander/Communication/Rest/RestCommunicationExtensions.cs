@@ -140,6 +140,11 @@ public static class RestCommunicationExtensions
                                     suggestionManager.ReceiveTransferLeadershipSuggestion(item.TransferLeadershipSuggestion!);
                                 break;
 
+                            case BatchRequestsRequestType.Reseed:
+                                if (raft is RaftManager reseedManager)
+                                    reseedManager.ReceiveReseedRequest(item.Reseed!);
+                                break;
+
                             case BatchRequestsRequestType.AppendLogs:
                                 raft.AppendLogs(item.AppendLogs!);
                                 break;

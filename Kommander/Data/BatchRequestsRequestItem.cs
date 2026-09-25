@@ -20,4 +20,6 @@ public sealed class BatchRequestsRequestItem
     public CompleteAppendLogsRequest? CompleteAppendLogs { get; set; }
 
     public TransferLeadershipSuggestionRequest? TransferLeadershipSuggestion { get; set; }
+
+    public ReseedRequest? Reseed { get; set; }
 }

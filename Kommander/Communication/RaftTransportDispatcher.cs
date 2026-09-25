@@ -426,6 +426,11 @@ internal sealed class RaftTransportDispatcher : IDisposable
                             item.TransferLeadershipSuggestion = msg.TransferLeadershipSuggestionRequest;
                             break;
 
+                        case RaftResponderRequestType.Reseed:
+                            item.Type = BatchRequestsRequestType.Reseed;
+                            item.Reseed = msg.ReseedRequest;
+                            break;
+
                         case RaftResponderRequestType.AppendLogs:
                             item.Type = BatchRequestsRequestType.AppendLogs;
                             item.AppendLogs = msg.AppendLogsRequest;
@@ -494,6 +499,10 @@ internal sealed class RaftTransportDispatcher : IDisposable
                     when message.Node is not null && message.TransferLeadershipSuggestionRequest is not null
                     => SendWrappedSingle(manager, message.Node, communication, message),
 
+                RaftResponderRequestType.Reseed
+                    when message.Node is not null && message.ReseedRequest is not null
+                    => SendWrappedSingle(manager, message.Node, communication, message),
+
                 RaftResponderRequestType.AppendLogs
                     when message.Node is not null && message.AppendLogsRequest is not null
                     => communication.AppendLogs(manager, message.Node, message.AppendLogsRequest),
@@ -537,6 +546,11 @@ internal sealed class RaftTransportDispatcher : IDisposable
                 case RaftResponderRequestType.TransferLeadershipSuggestion:
                     item.Type = BatchRequestsRequestType.TransferLeadershipSuggestion;
                     item.TransferLeadershipSuggestion = message.TransferLeadershipSuggestionRequest;
+                    break;
+
+                case RaftResponderRequestType.Reseed:
+                    item.Type = BatchRequestsRequestType.Reseed;
+                    item.Reseed = message.ReseedRequest;
                     break;
             }
 

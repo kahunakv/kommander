@@ -18,12 +18,13 @@ idea up first, then walk the real flows and the code.
 7. [Flow 3 — The follower's Log Matching check](#flow-3--the-followers-log-matching-check)
 8. [Flow 4 — Multi-round convergence](#flow-4--multi-round-convergence)
 9. [Flow 5 — When backfill can't help: the compaction floor](#flow-5--when-backfill-cant-help-the-compaction-floor)
-10. [Why the live path is *not* anchored](#why-the-live-path-is-not-anchored)
-11. [Configuration](#configuration)
-12. [Code map](#code-map)
-13. [Invariants you must not break](#invariants-you-must-not-break)
-14. [Testing](#testing)
-15. [Glossary](#glossary)
+10. [Flow 6 — When the log is fine but the application is not: requested re-seed and withheld candidacy](#flow-6--when-the-log-is-fine-but-the-application-is-not-requested-re-seed-and-withheld-candidacy)
+11. [Why the live path is *not* anchored](#why-the-live-path-is-not-anchored)
+12. [Configuration](#configuration)
+13. [Code map](#code-map)
+14. [Invariants you must not break](#invariants-you-must-not-break)
+15. [Testing](#testing)
+16. [Glossary](#glossary)
 
 ---
 
@@ -319,6 +320,54 @@ Two operational notes on the handoff:
   leader left unfinished: its own WAL may still serve the stuck follower's anchor (the follower's
   position pins the retention floor), so no refusal ever occurs, and without this trigger the
   follower stayed at frontier 0 for the rest of the run. Without a checkpoint nothing is shipped.
+
+---
+
+## Flow 6 — When the log is fine but the application is not: requested re-seed and withheld candidacy
+
+Every trigger above starts from the **log**: a follower is missing entries, and backfill or a snapshot
+brings its log level with the leader's. There is a second failure shape the log cannot see — a
+replica whose WAL is complete but whose **application state** is not (an earlier install marked
+entries applied without delivering them; an import rewound the application below its cursor; the
+consumer alone rejected an entry). The apply cursor and the checkpoint boundary both say "covered",
+so the ordinary install path *skips* such a replica, and it stays electable. Two application-driven
+seams handle it (Kommander 1.8.1):
+
+```
+   APPLICATION on replica F finds F's projection incomplete
+        │
+        ├─ IRaft.SetCandidacyWithheld(p, true)        F never campaigns, ignores TransferLeadership
+        │
+        └─ IRaft.RequestReseedAsync(p)
+                │  F holds committed applies at its cursor C
+                │  F ──ReseedRequest──▶ LEADER
+                │                          proposes a checkpoint; once it commits at N (> C)
+                │                          ships a snapshot at N with Forced = true
+                │  F ◀──InstallSnapshot(N, Forced)
+                │       imports even though F's boundary/log already cover N
+                │       (an install BELOW F's cursor is still refused: C ≤ N by construction)
+                │       cursor := N, applies resume above N
+                ▼
+   APPLICATION sees ImportPartitionState land → SetCandidacyWithheld(p, false)
+```
+
+- **`RequestReseedAsync`** answers `NodeIsNotLeader` on a leader (it must relinquish first) and
+  `Errored` when no leader is known. A repeat while pending re-sends the request. The hold is bounded
+  by `RaftConfiguration.ReseedRequestTimeout` (default 3 min): with no install by then the follower
+  resumes delivering where it stopped and logs `Re-seed request expired`; the leader drops a request
+  whose checkpoint never commits inside the same bound. A replica that becomes leader while pending
+  resumes at once.
+- **The leader's side** takes a checkpoint *newer than the request* so the snapshot's index is above
+  anything the follower applied before holding; the forced transfer bypasses the convergence
+  breaker, the failure backoff and the post-success pause (those pace the leader's own rescues), but
+  not the in-flight guard or the durable-write-stall deferral.
+- **`SetCandidacyWithheld`** is a per-node in-memory flag consulted on every campaign entry
+  (unbounded, like the stall deferral) and by the transfer receive path; the replica keeps voting,
+  replicating and acknowledging.
+
+Both lines of the cycle are logged at Warning on the node that runs them (`Re-seed requested …`,
+`Re-seed of … checkpoint … committed, starting the forced snapshot transfer`, `InstallSnapshot … answers
+a re-seed request`, `Re-seed complete`, `Deferring candidacy: the application withheld …`).
 
 ---
 

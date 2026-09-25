@@ -274,6 +274,24 @@ internal sealed class ElectionCoordinator
 
         walStallDeferralLogged = false;
 
+        // The application withheld this replica's candidacy: its projection is incomplete and a term
+        // it won would be served from that state (see IRaft.SetCandidacyWithheld). Like the stall
+        // deferral this is unbounded — the condition is an application fact that clears when the
+        // application says so, and every yielded round is one a complete peer can win. Logged once
+        // per episode.
+        if (coreState.CandidacyWithheld)
+        {
+            if (!candidacyWithheldLogged)
+            {
+                candidacyWithheldLogged = true;
+                logger.LogWarnCandidacyWithheld(host.LocalEndpoint, host.PartitionId, coreState.NodeState);
+            }
+
+            return true;
+        }
+
+        candidacyWithheldLogged = false;
+
         if (!wal.HasPresenceGap() || !KnowsFresherAliveVoter(wal.GetPresentIndex()))
         {
             candidacyDeferrals = 0;
@@ -389,9 +407,10 @@ internal sealed class ElectionCoordinator
 
         long nowTicks = host.GetMonotonicTimestamp();
 
-        // A stalled disk never campaigns, whether this election was reached by timeout or by a
-        // step-down notice from a peer (which skips the cooldown block below).
-        if (IsLocalWalStalled() && ShouldDeferCandidacy())
+        // A stalled disk never campaigns, and neither does a replica whose candidacy the application
+        // withheld, whether this election was reached by timeout or by a step-down notice from a peer
+        // (which skips the cooldown block below).
+        if ((IsLocalWalStalled() || coreState.CandidacyWithheld) && ShouldDeferCandidacy())
             return;
 
         if (!ignoreRecentVoteCooldown)
@@ -1216,6 +1235,9 @@ internal sealed class ElectionCoordinator
     private int candidacyDeferrals;
 
     private const int MaxCandidacyDeferrals = 10;
+
+    // Whether the current withheld-candidacy episode has been logged (one line per episode).
+    private bool candidacyWithheldLogged;
 
     private readonly Random random;
 }

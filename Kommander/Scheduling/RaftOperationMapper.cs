@@ -38,6 +38,8 @@ public static class RaftOperationMapper
             RaftRequestType.ResumeHeartbeats      => RaftOperationKind.Control,
             RaftRequestType.ReceiveStepDownNotice => RaftOperationKind.Control,
             RaftRequestType.ReceiveTransferLeadership => RaftOperationKind.Control,
+            RaftRequestType.RequestReseed         => RaftOperationKind.Control,
+            RaftRequestType.ReceiveReseedRequest  => RaftOperationKind.Control,
             RaftRequestType.ReceiveHandshake      => RaftOperationKind.Control,
             RaftRequestType.RequestVote           => RaftOperationKind.Control,
             RaftRequestType.ReceiveVote           => RaftOperationKind.Control,
@@ -156,6 +158,8 @@ public static class RaftOperationMapper
             RaftRequestType.ResumeHeartbeats or
             RaftRequestType.ReceiveStepDownNotice or
             RaftRequestType.ReceiveTransferLeadership or
+            RaftRequestType.RequestReseed or
+            RaftRequestType.ReceiveReseedRequest or
             RaftRequestType.ReceiveHandshake or
             RaftRequestType.RequestVote or
             RaftRequestType.ReceiveVote => RaftStatePriority.High,

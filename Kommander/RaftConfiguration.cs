@@ -1137,6 +1137,15 @@ public class RaftConfiguration
     public TimeSpan SnapshotTransferStepTimeout { get; set; } = TimeSpan.FromMinutes(2);
 
     /// <summary>
+    /// How long a follower that asked to be re-seeded (<see cref="IRaft.RequestReseedAsync"/>) keeps
+    /// its committed applies held while it waits for the leader's snapshot, and how long the leader
+    /// keeps the request pending while it takes the checkpoint the transfer needs. On expiry the
+    /// follower resumes delivering and logs that no install arrived; the application may ask again.
+    /// Must be positive. Default 3 minutes: a checkpoint round plus one transfer's step budget.
+    /// </summary>
+    public TimeSpan ReseedRequestTimeout { get; set; } = TimeSpan.FromMinutes(3);
+
+    /// <summary>
     /// Upper bound on ONE snapshot chunk's acknowledgement: the time between sending a chunk and
     /// the receiver's answer for it. Also the deadline of the transport call that carries the
     /// chunk, so a receiver whose install path is wedged (a stalled disk, a hung executor) fails

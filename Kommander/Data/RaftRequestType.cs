@@ -132,4 +132,10 @@ public enum RaftRequestType
     /// while applies were held is not re-delivered.
     /// </summary>
     ResumeConsumerAppliesForTesting,
+
+    /// <summary>A follower asks its leader for a whole-partition snapshot (see <see cref="Kommander.IRaft.RequestReseedAsync"/>).</summary>
+    RequestReseed,
+
+    /// <summary>The leader receives a follower's re-seed request.</summary>
+    ReceiveReseedRequest,
 }

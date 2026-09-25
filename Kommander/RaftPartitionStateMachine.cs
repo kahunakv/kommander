@@ -44,6 +44,26 @@ public sealed class RaftPartitionStateMachine
     /// </summary>
     private readonly SnapshotSender snapshotSender;
 
+    // ── re-seed state ──────────────────────────────────────────────────────────────────────────
+    // Follower side: when this replica asked its leader for a snapshot (0 = no request pending) and
+    // which leader it asked. Committed applies are held for the life of the request.
+    private long reseedRequestedTicks;
+
+    private string reseedRequestedFrom = "";
+
+    // Leader side: followers that asked to be re-seeded, each waiting for a checkpoint newer than the
+    // one current when it asked, so the snapshot's index is above anything the follower had applied.
+    private readonly Dictionary<string, PendingReseed> pendingReseeds = [];
+
+    private sealed class PendingReseed
+    {
+        public long BaselineCheckpoint;
+
+        public long RequestedTicks;
+
+        public bool CheckpointProposed;
+    }
+
     /// <summary>
     /// Posts a <see cref="RaftRequest"/> back to the partition executor from a background thread
     /// so completions such as <see cref="RaftRequestType.SnapshotInstalled"/> can update state
@@ -576,6 +596,17 @@ public sealed class RaftPartitionStateMachine
         // Leaders are excluded: their mid-tenure delivery runs through CompleteLeaderCommit and the
         // deferred-applies buffer, and a second drain racing that is how the finding-1 hole was
         // created in the first place. This is a no-op when the frontier is already covered.
+        // A pending re-seed request holds committed applies; bound the hold so a leader that never
+        // ships the snapshot (deposed, or stalled) cannot leave this replica silently behind forever.
+        // A replica that came to lead meanwhile cannot be re-seeded either — its applies must run.
+        if (reseedRequestedTicks != 0)
+        {
+            if (coreState.NodeState == RaftNodeState.Leader)
+                await AbandonReseedRequestAsync("this replica now leads the partition").ConfigureAwait(false);
+            else if (MonotonicElapsed(reseedRequestedTicks, nowTicks) >= host.Configuration.ReseedRequestTimeout)
+                await AbandonReseedRequestAsync("the bound elapsed").ConfigureAwait(false);
+        }
+
         if (coreState.NodeState != RaftNodeState.Leader)
         {
             long commitFrontier = wal.GetCommitIndex();
@@ -654,6 +685,12 @@ public sealed class RaftPartitionStateMachine
 
                     await ExpirePendingTransferIfDueAsync(nowTicks).ConfigureAwait(false);
                 }
+
+                // Followers waiting to be re-seeded: ship the forced snapshot once a checkpoint newer
+                // than their request has committed, re-propose the checkpoint while the log is busy,
+                // and drop a request whose checkpoint never lands inside the bound.
+                if (pendingReseeds.Count > 0)
+                    await DriveReseedsAsync(nowTicks).ConfigureAwait(false);
 
                 if (coreState.Quiesced)
                 {
@@ -1136,6 +1173,9 @@ public sealed class RaftPartitionStateMachine
         proposals.SetReplyHoldsForTesting(null);
         snapshotInstaller.SetInstallGateForTesting(null);
         applier.SetConsumerAppliesHeldForTesting(false);
+        reseedRequestedTicks = 0;
+        reseedRequestedFrom = "";
+        pendingReseeds.Clear();
     }
 
     // ── Fault-qualification test hooks ────────────────────────────────────────────────────────
@@ -1999,6 +2039,15 @@ public sealed class RaftPartitionStateMachine
         if (coreState.CurrentTerm > request.Term)
             return;
 
+        // A replica whose candidacy the application withheld must not be handed the partition either:
+        // the transfer would seat exactly the incomplete projection the withhold exists to keep out.
+        // The leader's pending transfer expires on its own bound and it keeps leading.
+        if (coreState.CandidacyWithheld)
+        {
+            logger.LogWarnTransferRefusedCandidacyWithheld(host.LocalEndpoint, host.PartitionId, coreState.NodeState, request.Endpoint, request.Term);
+            return;
+        }
+
         // Membership fence: only the current leader (necessarily a roster member) may hand us
         // leadership; a non-member must not be able to trigger a disruptive election.
         if (!host.IsMember(request.Endpoint))
@@ -2394,8 +2443,244 @@ public sealed class RaftPartitionStateMachine
     /// Follower-side snapshot install (Raft "Rule 7") — see
     /// <see cref="SnapshotInstaller.InstallSnapshotAsync"/>.
     /// </summary>
-    public Task<RaftResponse> InstallSnapshotAsync(SnapshotInstallRequest request) =>
-        snapshotInstaller.InstallSnapshotAsync(request);
+    public async Task<RaftResponse> InstallSnapshotAsync(SnapshotInstallRequest request)
+    {
+        RaftResponse response = await snapshotInstaller.InstallSnapshotAsync(request).ConfigureAwait(false);
+
+        // The install this replica asked for landed: its projection is the leader's now, and the
+        // committed entries above the boundary can be delivered again.
+        if (reseedRequestedTicks != 0 && response.SnapshotOutcome == SnapshotInstallOutcome.Installed)
+        {
+            reseedRequestedTicks = 0;
+            reseedRequestedFrom = "";
+
+            logger.LogWarnReseedComplete(host.LocalEndpoint, host.PartitionId, coreState.NodeState, request.SnapshotIndex);
+
+            await ResumeCommittedAppliesAsync().ConfigureAwait(false);
+        }
+
+        return response;
+    }
+
+    // ── re-seed: follower side ─────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Asks the leader for a whole-partition snapshot and holds committed applies until it installs —
+    /// see <see cref="IRaft.RequestReseedAsync"/>. Runs on the executor turn, so the hold cannot land
+    /// in the middle of a drain and the applied index reported back is the one the hold froze.
+    /// </summary>
+    public Task RequestReseedAsync(ulong? replyCorrelationId)
+    {
+        if (coreState.NodeState == RaftNodeState.Leader)
+        {
+            CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, coreState.LastAppliedIndex));
+            return Task.CompletedTask;
+        }
+
+        string leader = host.Leader;
+        RaftNode? leaderNode = null;
+
+        if (!string.IsNullOrEmpty(leader) && leader != host.LocalEndpoint)
+        {
+            IReadOnlyList<RaftNode> nodes = host.Nodes;
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                if (nodes[i].Endpoint == leader)
+                {
+                    leaderNode = nodes[i];
+                    break;
+                }
+            }
+        }
+
+        if (leaderNode is null)
+        {
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Re-seed request refused: no leader is known to ask (leader '{Leader}')",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, leader);
+            CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Errored, coreState.LastAppliedIndex));
+            return Task.CompletedTask;
+        }
+
+        // A repeat while a request is pending re-sends it (the first may have reached a leader that
+        // was deposed before it acted) without re-arming the bound.
+        if (reseedRequestedTicks == 0)
+        {
+            applier.SetConsumerAppliesHeld(true);
+            reseedRequestedTicks = host.GetMonotonicTimestamp();
+            reseedRequestedFrom = leader;
+
+            logger.LogWarnReseedRequested(
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, leader, coreState.LastAppliedIndex,
+                host.Configuration.ReseedRequestTimeout);
+        }
+
+        HLCTimestamp currentTime = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+
+        host.EnqueueResponse(leaderNode.Endpoint, new(
+            RaftResponderRequestType.Reseed,
+            leaderNode,
+            new ReseedRequest(host.PartitionId, coreState.CurrentTerm, currentTime, host.LocalEndpoint)));
+
+        CompleteReply(replyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, coreState.LastAppliedIndex));
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Drops a pending re-seed request and resumes committed applies where the hold froze them.</summary>
+    private async Task AbandonReseedRequestAsync(string reason)
+    {
+        reseedRequestedTicks = 0;
+        reseedRequestedFrom = "";
+
+        logger.LogWarnReseedExpiredOnFollower(
+            host.LocalEndpoint, host.PartitionId, coreState.NodeState, host.Configuration.ReseedRequestTimeout,
+            coreState.LastAppliedIndex, reason);
+
+        await ResumeCommittedAppliesAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Releases the apply hold and drains what accumulated, in log id order, on the executor turn.
+    /// Exactly-once is preserved by the applied cursor: an installed snapshot seeded it at the
+    /// boundary, so the drain starts above it and never re-delivers the imported prefix.
+    /// </summary>
+    private async Task ResumeCommittedAppliesAsync()
+    {
+        applier.SetConsumerAppliesHeld(false);
+
+        long commitFrontier = wal.GetCommitIndex();
+        if (commitFrontier > coreState.LastAppliedIndex)
+            await applier.DrainCommittedAppliesAsync(commitFrontier).ConfigureAwait(false);
+
+        await applier.FlushDeferredLeaderAppliesAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>Whether a re-seed request is pending on this replica (its committed applies are held).</summary>
+    public bool IsReseedPending => Volatile.Read(ref reseedRequestedTicks) != 0;
+
+    // ── re-seed: leader side ───────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A follower asked to be re-seeded. The snapshot must sit above anything the follower applied
+    /// before it held its applies, which any checkpoint taken from now on does: record the checkpoint
+    /// current at the request and propose a new one; the tick ships the transfer once it commits.
+    /// </summary>
+    public async Task ReceiveReseedRequestAsync(string endpoint, long term)
+    {
+        if (coreState.NodeState != RaftNodeState.Leader)
+        {
+            logger.LogDebugReseedDropped(host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, "not the leader");
+            return;
+        }
+
+        if (term > coreState.CurrentTerm)
+        {
+            logger.LogDebugReseedDropped(host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, $"requester term {term} is above this leader's {coreState.CurrentTerm}");
+            return;
+        }
+
+        if (endpoint == host.LocalEndpoint || !host.IsMember(endpoint) || FindNode(endpoint) is null)
+        {
+            logger.LogDebugReseedDropped(host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, "not a peer of this partition");
+            return;
+        }
+
+        if (host.PartitionStateTransfer is null && host.StateMachineTransfer is null
+            && !(host.PartitionId == RaftSystemConfig.SystemPartition && host.SystemStateTransfer is not null))
+        {
+            logger.LogDebugReseedDropped(host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, "no state transfer is registered here");
+            return;
+        }
+
+        if (pendingReseeds.ContainsKey(endpoint))
+            return; // already being driven; the repeat changes nothing
+
+        long baseline = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
+
+        PendingReseed pending = new()
+        {
+            BaselineCheckpoint = baseline,
+            RequestedTicks = host.GetMonotonicTimestamp(),
+        };
+        pendingReseeds[endpoint] = pending;
+
+        logger.LogWarnReseedReceived(host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, baseline);
+
+        TryProposeReseedCheckpoint(pending);
+    }
+
+    private void TryProposeReseedCheckpoint(PendingReseed pending)
+    {
+        (RaftOperationStatus status, _) = replicator.ReplicateCheckpoint();
+        pending.CheckpointProposed = status == RaftOperationStatus.Pending;
+    }
+
+    private async Task DriveReseedsAsync(long nowTicks)
+    {
+        long lastCheckpoint = await wal.GetLastCheckpointAsync().ConfigureAwait(false);
+        TimeSpan bound = host.Configuration.ReseedRequestTimeout;
+
+        List<string>? done = null;
+
+        foreach ((string endpoint, PendingReseed pending) in pendingReseeds)
+        {
+            if (lastCheckpoint > pending.BaselineCheckpoint)
+            {
+                RaftNode? node = FindNode(endpoint);
+                if (node is not null)
+                {
+                    long lastIncludedTerm = await wal.GetAnyTermAtAsync(lastCheckpoint).ConfigureAwait(false);
+                    logger.LogWarnReseedTransferStarting(host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, lastCheckpoint);
+                    snapshotSender.TrySend(node, lastCheckpoint, coreState.CurrentTerm, lastIncludedTerm, forced: true);
+                }
+
+                (done ??= []).Add(endpoint);
+                continue;
+            }
+
+            if (MonotonicElapsed(pending.RequestedTicks, nowTicks) >= bound)
+            {
+                logger.LogWarnReseedExpiredOnLeader(
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, bound,
+                    pending.CheckpointProposed ? "the proposed checkpoint did not commit" : "the checkpoint could not be proposed (the log stayed busy)");
+                (done ??= []).Add(endpoint);
+                continue;
+            }
+
+            // The checkpoint could not be proposed at the request (an active proposal or a converging
+            // transfer answered "not now"), or it was and has not committed yet: propose again only in
+            // the former case, once per tick.
+            if (!pending.CheckpointProposed)
+                TryProposeReseedCheckpoint(pending);
+        }
+
+        if (done is not null)
+            foreach (string endpoint in done)
+                pendingReseeds.Remove(endpoint);
+    }
+
+    private RaftNode? FindNode(string endpoint)
+    {
+        IReadOnlyList<RaftNode> nodes = host.Nodes;
+        for (int i = 0; i < nodes.Count; i++)
+            if (nodes[i].Endpoint == endpoint)
+                return nodes[i];
+        return null;
+    }
+
+    // ── candidacy withholding ──────────────────────────────────────────────────────────────────
+
+    /// <summary>See <see cref="IRaft.SetCandidacyWithheld"/>. A volatile field write, read by the election paths on the executor.</summary>
+    public void SetCandidacyWithheld(bool withheld)
+    {
+        if (coreState.CandidacyWithheld == withheld)
+            return;
+
+        coreState.CandidacyWithheld = withheld;
+        logger.LogInfoCandidacyWithheldChanged(host.LocalEndpoint, host.PartitionId, coreState.NodeState, withheld ? "withheld" : "released");
+    }
+
+    public bool IsCandidacyWithheld => coreState.CandidacyWithheld;
 
     /// <summary>
     /// Adopts <paramref name="leaderEndpoint"/> as this partition's leader for

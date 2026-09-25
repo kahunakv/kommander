@@ -183,6 +183,14 @@ internal sealed class RaftPartitionCoreState
     public bool Restored;
 
     /// <summary>
+    /// Set by the application (<see cref="IRaft.SetCandidacyWithheld"/>) while this replica must not
+    /// lead the partition: its projection is known to be incomplete and it is waiting to be re-seeded.
+    /// Read by the election coordinator on every campaign entry and by the transfer receive path;
+    /// written from any thread, hence volatile.
+    /// </summary>
+    public volatile bool CandidacyWithheld;
+
+    /// <summary>
     /// AppendEntries (heartbeats and entry batches) this partition answered before its restore
     /// completed. Every such ack carried no position and every entry batch was refused. Test-visible
     /// so a scenario can prove the pre-restore window was actually reached.

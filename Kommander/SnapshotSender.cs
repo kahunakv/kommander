@@ -157,6 +157,10 @@ internal sealed class SnapshotSender
 
     private CachedExport? exportCache;
 
+    // Followers whose in-flight transfer answers a re-seed request: their chunks carry Forced. Set
+    // with the in-flight entry and cleared with it.
+    private readonly ConcurrentDictionary<string, byte> forcedEndpoints = new();
+
     private readonly IRaftPartitionHost host;
     private readonly ILogger<IRaft> logger;
     private readonly Func<RaftNodeState> getNodeState;
@@ -196,19 +200,38 @@ internal sealed class SnapshotSender
     /// <see cref="TrySendSnapshotAsync"/> so a later refusal can retry on failure — paced by the
     /// recorded backoff rather than per refusal.
     /// </summary>
-    internal void TrySend(RaftNode node, long snapshotIndex, long leaderTerm, long lastIncludedTerm)
+    internal void TrySend(RaftNode node, long snapshotIndex, long leaderTerm, long lastIncludedTerm) =>
+        TrySend(node, snapshotIndex, leaderTerm, lastIncludedTerm, forced: false);
+
+    /// <summary>
+    /// <see cref="TrySend(RaftNode, long, long, long)"/> for a transfer the follower asked for
+    /// (<see cref="Data.ReseedRequest"/>): the convergence breaker, the failure backoff and the
+    /// post-success pause are bypassed, because they pace the leader's own rescue attempts and this
+    /// transfer is the follower's explicit request. The in-flight guard and the durable-write stall
+    /// deferral still apply — two transfers to one follower are never useful, and a stalled disk
+    /// cannot install anything. The chunks carry <see cref="SnapshotRequest.Forced"/>.
+    /// </summary>
+    internal void TrySend(RaftNode node, long snapshotIndex, long leaderTerm, long lastIncludedTerm, bool forced)
     {
         if (deferTransferTo(node.Endpoint))
             return;
 
-        if (!RescueCycleAdmits(node.Endpoint))
-            return;
+        if (!forced)
+        {
+            if (!RescueCycleAdmits(node.Endpoint))
+                return;
 
-        if (IsBackedOff(node.Endpoint) || IsInSuccessPause(node.Endpoint))
-            return;
+            if (IsBackedOff(node.Endpoint) || IsInSuccessPause(node.Endpoint))
+                return;
+        }
 
         if (pendingSnapshotEndpoints.TryAdd(node.Endpoint, host.GetMonotonicTimestamp()))
         {
+            if (forced)
+                forcedEndpoints[node.Endpoint] = 0;
+            else
+                forcedEndpoints.TryRemove(node.Endpoint, out _);
+
             // A transfer start is always logged, and at Warning outside the cooldown: the only
             // caller is the refused-backfill escalation, so a start here means a peer sits below
             // the compaction floor — an abnormal condition whose rescue attempt must be visible at
@@ -719,6 +742,7 @@ internal sealed class SnapshotSender
         finally
         {
             pendingSnapshotEndpoints.TryRemove(node.Endpoint, out _);
+            forcedEndpoints.TryRemove(node.Endpoint, out _);
         }
     }
 
@@ -1061,6 +1085,7 @@ internal sealed class SnapshotSender
             Data = data,
             Kind = kind,
             SnapshotChecksum = checksum,
+            Forced = forcedEndpoints.ContainsKey(node.Endpoint),
         };
 
         TimeSpan chunkTimeout = host.Configuration.SnapshotChunkAckTimeout;

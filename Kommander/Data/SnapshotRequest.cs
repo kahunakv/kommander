@@ -142,4 +142,12 @@ public sealed class SnapshotRequest
     /// </para>
     /// </remarks>
     public string SnapshotChecksum { get; init; } = "";
+
+    /// <summary>
+    /// The transfer answers a <see cref="ReseedRequest"/>: the receiver asked for its application
+    /// state to be replaced, so it imports even when its own checkpoint boundary already covers the
+    /// index. The apply-cursor rule still holds — a receiver that applied past the index refuses.
+    /// Identical on every chunk of the session.
+    /// </summary>
+    public bool Forced { get; init; }
 }

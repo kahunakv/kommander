@@ -174,6 +174,7 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.SnapshotMaxPendingBytes)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.AllowLegacySnapshotSenders)] = RaftOptionKind.Safety,
         [nameof(RaftConfiguration.SnapshotTransferStepTimeout)] = RaftOptionKind.Liveness,
+        [nameof(RaftConfiguration.ReseedRequestTimeout)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.SnapshotRescueMaxConsecutiveCycles)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.SnapshotRescueProbeInterval)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.SnapshotExportRetryCacheMaxBytes)] = RaftOptionKind.Liveness,

@@ -193,6 +193,7 @@ internal sealed class SnapshotReceiver
                     LastIncludedTerm = request.LastIncludedTerm,
                     SnapshotIndex = request.SnapshotIndex,
                     Kind = request.Kind,
+                    Forced = request.Forced,
                     NextExpectedChunkIndex = 0,
                     Buffer = new SnapshotReceiveBuffer(),
                     Hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256),
@@ -286,6 +287,7 @@ internal sealed class SnapshotReceiver
             LeaderTerm = completedSession.LeaderTerm,
             LeaderEndpoint = completedSession.Key.LeaderEndpoint,
             Kind = completedSession.Kind,
+            Forced = completedSession.Forced,
             Snapshot = completeBuffer,
         };
 
@@ -581,6 +583,7 @@ internal sealed class SnapshotReceiver
         internal required long LastIncludedTerm { get; init; }
         internal required long SnapshotIndex { get; init; }
         internal required SnapshotKind Kind { get; init; }
+        internal bool Forced { get; init; }
         internal required SnapshotReceiveBuffer Buffer { get; init; }
 
         /// <summary>

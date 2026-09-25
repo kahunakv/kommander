@@ -440,4 +440,36 @@ public static partial class RaftLoggerExtensions
 
     [LoggerMessage(Level = LogLevel.Critical, Message = "RocksDB WAL at '{Path}' could not be reopened after a storage failure; every operation fails until a later write retries the reopen: {Message}")]
     public static partial void LogCritRocksDbWalReopenFailed(this ILogger<IRaft> logger, string path, string message);
+
+    // ── Re-seed requests and withheld candidacy ────────────────────────────
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Re-seed requested from leader {Leader}: committed applies are held at applied index {Applied} until the leader's snapshot installs (bound {Timeout})")]
+    public static partial void LogWarnReseedRequested(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string leader, long applied, TimeSpan timeout);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Re-seed requested by {Endpoint}: taking a checkpoint above {Baseline} and shipping a whole-partition snapshot at it")]
+    public static partial void LogWarnReseedReceived(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long baseline);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Re-seed of {Endpoint}: checkpoint {Checkpoint} committed, starting the forced snapshot transfer")]
+    public static partial void LogWarnReseedTransferStarting(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long checkpoint);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Re-seed of {Endpoint} abandoned: no checkpoint committed within {Timeout} ({Reason})")]
+    public static partial void LogWarnReseedExpiredOnLeader(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, TimeSpan timeout, string reason);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Re-seed request expired: no snapshot installed within {Timeout}; resuming committed applies from index {Applied} ({Reason})")]
+    public static partial void LogWarnReseedExpiredOnFollower(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, TimeSpan timeout, long applied, string reason);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Re-seed complete: snapshot installed at index {Index}; committed applies resume above it")]
+    public static partial void LogWarnReseedComplete(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, long index);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Re-seed request from {Endpoint} dropped: {Reason}")]
+    public static partial void LogDebugReseedDropped(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, string reason);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Deferring candidacy: the application withheld this replica's candidacy (its projection is incomplete); yielding every round until it is released")]
+    public static partial void LogWarnCandidacyWithheld(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Candidacy {Change} by the application")]
+    public static partial void LogInfoCandidacyWithheldChanged(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string change);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Ignoring TransferLeadership from {Endpoint} Term={Term}: this replica's candidacy is withheld by the application")]
+    public static partial void LogWarnTransferRefusedCandidacyWithheld(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long term);
 }

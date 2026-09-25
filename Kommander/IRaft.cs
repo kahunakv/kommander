@@ -749,6 +749,40 @@ public interface IRaft
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Asks the partition's leader to replace this replica's application state with a whole-partition
+    /// snapshot, for a replica the application has found to hold an incomplete projection (missing
+    /// applies at the same applied index as its peers). The replica stops delivering committed
+    /// entries to the application at once, so its apply cursor cannot move past the checkpoint the
+    /// leader takes for the transfer; the leader takes a fresh checkpoint, ships a snapshot at it
+    /// marked as requested, and the receiver imports it even though its own log already covers the
+    /// index. Delivery resumes above the installed boundary when the install lands, or after
+    /// <see cref="RaftConfiguration.ReseedRequestTimeout"/> when nothing arrived (logged); the
+    /// application may ask again. Returns <see cref="RaftOperationStatus.Success"/> once the request
+    /// was sent and applies are held (also when a request is already pending),
+    /// <see cref="RaftOperationStatus.NodeIsNotLeader"/> when this node leads the partition (a leader
+    /// must relinquish first), and <see cref="RaftOperationStatus.Errored"/> when no leader is known
+    /// or the partition is not hosted here. The install itself is observed through the registered
+    /// <see cref="IRaftPartitionStateTransfer.ImportPartitionState"/>.
+    /// </summary>
+    public Task<RaftOperationStatus> RequestReseedAsync(
+        int partitionId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Withholds (or releases) this replica's candidacy for a partition. While withheld the replica
+    /// never campaigns — every election-timer round and every step-down-notice election is yielded,
+    /// unbounded, like a stalled disk — and it ignores a leadership transfer addressed to it. It
+    /// keeps voting, replicating and acknowledging as a follower. Meant for a replica the application
+    /// has gated as incomplete until a re-seed replaces its projection; a replica that currently
+    /// leads is not stepped down by this call (the application does that). In-memory, per node.
+    /// Returns <see cref="RaftOperationStatus.Errored"/> when the partition is not hosted here.
+    /// </summary>
+    public RaftOperationStatus SetCandidacyWithheld(int partitionId, bool withheld);
+
+    /// <summary>Whether the application currently withholds this replica's candidacy for the partition.</summary>
+    public bool IsCandidacyWithheld(int partitionId);
+
+    /// <summary>
     /// Test hook that pauses periodic outbound heartbeats for a partition without
     /// blocking other Raft traffic.
     /// </summary>
