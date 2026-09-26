@@ -12,10 +12,12 @@ public sealed class VoteRequest
     public long MaxLogId { get; set; }
 
     /// <summary>
-    /// Term of the granter's last log entry (the entry at <see cref="MaxLogId"/>). Carried for wire
-    /// symmetry with <see cref="RequestVotesRequest.LastLogTerm"/> and future use; the grant reply's
-    /// freshness key is not consulted by the candidate tallying it (the §5.4.1 comparison happens on
-    /// the voter side against the candidate's advertised key). <c>0</c> from peers predating the field.
+    /// Term of the granter's last log entry (the entry at <see cref="MaxLogId"/>), the other half of
+    /// its Raft §5.4.1 position. The candidate tallying the grant re-checks that its own log is not
+    /// behind this pair with the same lexicographic rule the voter applied (a fence against its log
+    /// having changed since the request), so the term must travel with the index: an index-only
+    /// re-check rejected grants a voter with an older-term, longer tail had correctly given.
+    /// <c>0</c> from peers predating the field, which makes the candidate fall back to index-only.
     /// </summary>
     public long LastLogTerm { get; set; }
 

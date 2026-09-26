@@ -1395,7 +1395,7 @@ public sealed class RaftPartitionExecutor : IDisposable
                     break;
 
                 case RaftRequestType.ReceiveVote:
-                    await _stateMachine.ReceivedVoteAsync(request.Endpoint ?? "", request.Term, request.CommitIndex, request.PreVote).ConfigureAwait(false);
+                    await _stateMachine.ReceivedVoteAsync(request.Endpoint ?? "", request.Term, request.CommitIndex, request.PreVote, request.LastLogTerm).ConfigureAwait(false);
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
                     break;
 

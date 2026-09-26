@@ -953,11 +953,40 @@ internal sealed class ElectionCoordinator
         coreState.LastHeartbeat = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, timestamp);
         coreState.LastVotation = coreState.LastHeartbeat;
 
-        // B3: granting a vote counts as local activity — anchor both duration shadows to now so the
-        // follower election gate and the recent-vote cooldown measure from this moment.
+        // B3: granting a vote counts as local activity — the follower election gate measures from
+        // this moment (Raft resets the election timer on a grant), and so does the recent-vote
+        // cooldown that keeps this node from campaigning against the candidate it just backed.
+        //
+        // The cooldown is re-armed only when the PREVIOUS grant produced a leader. LastHeartbeatTicks
+        // is refreshed by every accepted leader append and by every leadership transition of this
+        // node; if it still reads the tick of our last grant, nobody has led since we cast it, and
+        // the candidate we backed then is asking again in a higher term because it failed to win
+        // (or to promote). Re-arming 2 × ElectionTimeout on each such grant made the voter's silence
+        // track the candidate's failures exactly: it re-campaigned inside our cooldown every time,
+        // and this node — possibly the only other live voter — never ran its own pre-vote (CamusDB
+        // fault soak fs11). Keeping the cooldown anchored at the first fruitless grant lets our own
+        // election timer fire; the pre-vote is side-effect-free, so a fresher candidate simply
+        // denies it and loses nothing, while an equally fresh one gives the partition a second way
+        // out. Election safety is untouched: what we grant, and to whom, does not change.
         long grantTicks = host.GetMonotonicTimestamp();
+        bool previousGrantProducedNoLeader = lastGrantTicks != 0 && coreState.LastHeartbeatTicks <= lastGrantTicks;
+
         coreState.LastHeartbeatTicks = grantTicks;
-        coreState.LastVotationTicks = grantTicks;
+
+        if (previousGrantProducedNoLeader)
+        {
+            fruitlessGrantStreak++;
+            logger.LogInfoRepeatGrantKeepsCooldownAnchor(
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm, fruitlessGrantStreak,
+                RaftMonotonic.Elapsed(coreState.LastVotationTicks, grantTicks).TotalMilliseconds);
+        }
+        else
+        {
+            fruitlessGrantStreak = 0;
+            coreState.LastVotationTicks = grantTicks;
+        }
+
+        lastGrantTicks = grantTicks;
 
         expectedLeaders[voteTerm] = node.Endpoint;
 
@@ -1000,10 +1029,15 @@ internal sealed class ElectionCoordinator
     /// </summary>
     /// <param name="endpoint">The identifier of the remote node sending the vote.</param>
     /// <param name="voteTerm">The term associated with the received vote.</param>
-    /// <param name="remoteMaxLogId">The highest log ID from the remote node.</param>
+    /// <param name="remoteMaxLogId">The granter's last log index (its §5.4.1 position).</param>
     /// <param name="preVote">When true, tally as a pre-vote grant for the open pre-vote round.</param>
+    /// <param name="remoteLastLogTerm">
+    /// Term of the granter's last log entry, paired with <paramref name="remoteMaxLogId"/>. <c>0</c>
+    /// from a peer predating the field, in which case the fresher-granter fence below falls back to
+    /// the index-only comparison.
+    /// </param>
     /// <returns>A task that represents the asynchronous operation.</returns>
-    public async Task ReceivedVoteAsync(string endpoint, long voteTerm, long remoteMaxLogId, bool preVote = false)
+    public async Task ReceivedVoteAsync(string endpoint, long voteTerm, long remoteMaxLogId, bool preVote = false, long remoteLastLogTerm = 0)
     {
         // Symmetric guard: discard grants from any endpoint that is not a committed voter.
         // Normal operation is safe without this (candidates only solicit host.Nodes, which is
@@ -1074,22 +1108,38 @@ internal sealed class ElectionCoordinator
             return;
         }
         
-        // Compare like against like: the granting voter now reports its contiguous-presence
-        // position, so the local side of this guard must use the same metric — a raw max id here
-        // could mask a hole in our own log and accept leadership we should not claim.
-        (long maxLogResponse, _) = await GetFreshnessLogPositionAsync().ConfigureAwait(false);
+        // Fresher-granter fence. The voter already applied Raft §5.4.1 — it grants only when our
+        // advertised (lastLogTerm, lastLogIndex) is at least as up to date as its own — so a grant is
+        // the voter's word that we are electable from its point of view. This re-check exists as
+        // defense in depth for the one thing the voter cannot see: our own log may have changed
+        // between the request and the reply. It MUST therefore apply the SAME lexicographic rule the
+        // voter used, with the roles mirrored (we are the candidate, the granter is the voter).
+        //
+        // It used to compare indexes alone. That rejected grants the voter had correctly given: a
+        // voter whose log ends in an OLDER term with a LONGER uncommitted tail (a deposed leader's
+        // unreplicated proposals) is behind a candidate holding one entry of the newer term, grants
+        // by §5.4.1 — and the candidate threw the grant away because the voter's index was higher.
+        // Each discarded round re-armed the voter's grant cooldown, so the voter never campaigned
+        // either, and with the third node paused the partition stayed leaderless for the whole
+        // pause (CamusDB fault soak fs11, Kommander 1.8.2: eight terms, 30 s at 0 ops/s).
+        //
+        // Both sides read the contiguous-presence position, never the raw max id (see
+        // GetFreshnessLogPositionAsync), so a hole in our own log is already excluded from what we
+        // advertise and from what we compare here; the promotion gates refuse a gapped leader on top.
+        (long maxLogResponse, long localLastLogTerm) = await GetFreshnessLogPositionAsync().ConfigureAwait(false);
 
-        if (maxLogResponse < remoteMaxLogId)
+        if (CandidateLogIsBehind(localLastLogTerm, maxLogResponse, remoteLastLogTerm, remoteMaxLogId))
         {
-            logger.LogWarning(
-                "[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} but remote node is on a higher RemoteCommitId={CommitId} Local={LocalCommitId}. Ignoring...", 
-                host.LocalEndpoint, 
-                host.PartitionId, 
-                coreState.NodeState, 
-                endpoint, 
-                remoteMaxLogId, 
-                maxLogResponse
-            );
+            logger.LogWarnVoteGrantFromFresherLog(
+                host.LocalEndpoint,
+                host.PartitionId,
+                coreState.NodeState,
+                endpoint,
+                voteTerm,
+                remoteLastLogTerm,
+                remoteMaxLogId,
+                localLastLogTerm,
+                maxLogResponse);
             return;
         }
 
@@ -1209,6 +1259,16 @@ internal sealed class ElectionCoordinator
     private long preVoteTerm = -1;
 
     private readonly Dictionary<long, string> expectedLeaders = [];
+
+    /// <summary>
+    /// Monotonic tick of the last real vote this node granted (0 = none). Compared against
+    /// <see cref="RaftPartitionCoreState.LastHeartbeatTicks"/> at the next grant to tell whether any
+    /// leader was heard in between — see <see cref="SendVoteGrant"/>.
+    /// </summary>
+    private long lastGrantTicks;
+
+    /// <summary>Consecutive grants cast with no leader heard between them; diagnostic only.</summary>
+    private int fruitlessGrantStreak;
 
     /// <summary>
     /// Last §5.4.1 log position each peer advertised on the vote paths (its RequestVotes probes

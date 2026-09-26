@@ -161,6 +161,12 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} Term={Term} Votes={Votes} Quorum={Quorum}/{Total} RemoteCommitId={CommitId} Local={LocalCommitId}")]
     public static partial void LogInfoReceivedVote(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long term, int votes, int quorum, int total, long commitId, long localCommitId);
 
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} Term={Term} but the granter's log (LastLogTerm={RemoteLastLogTerm}, MaxLogId={RemoteMaxLogId}) is ahead of ours (LastLogTerm={LocalLastLogTerm}, MaxLogId={LocalMaxLogId}) by Raft §5.4.1. Ignoring...")]
+    public static partial void LogWarnVoteGrantFromFresherLog(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long term, long remoteLastLogTerm, long remoteMaxLogId, long localLastLogTerm, long localMaxLogId);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Granting vote to {Endpoint} Term={Term}: no leader heard since the previous grant ({Streak} consecutive fruitless grants, first {SinceFirstMs:F0} ms ago) — leaving the candidacy cooldown anchored so this node can campaign if the candidate keeps failing")]
+    public static partial void LogInfoRepeatGrantKeepsCooldownAnchor(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long term, int streak, double sinceFirstMs);
+
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} and proclamed leader in {Elapsed}ms Term={Term} Votes={Votes} Quorum={Quorum}/{Total} RemoteCommitId={CommitId} Local={LocalCommitId}")]
     public static partial void LogInfoReceivedVoteProclaimedLeader(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, double elapsed, long term, int votes, int quorum, int total, long commitId, long localCommitId);
 

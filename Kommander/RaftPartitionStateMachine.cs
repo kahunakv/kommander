@@ -2793,8 +2793,8 @@ public sealed class RaftPartitionStateMachine
     /// <summary>
     /// Tallies a received (pre-)vote grant — see <see cref="ElectionCoordinator.ReceivedVoteAsync"/>.
     /// </summary>
-    public Task ReceivedVoteAsync(string endpoint, long voteTerm, long remoteMaxLogId, bool preVote = false) =>
-        election.ReceivedVoteAsync(endpoint, voteTerm, remoteMaxLogId, preVote);
+    public Task ReceivedVoteAsync(string endpoint, long voteTerm, long remoteMaxLogId, bool preVote = false, long remoteLastLogTerm = 0) =>
+        election.ReceivedVoteAsync(endpoint, voteTerm, remoteMaxLogId, preVote, remoteLastLogTerm);
     /// <summary>
     /// Records a peer's identity and log position from its handshake — see
     /// <see cref="HeartbeatDriver.ReceiveHandshake"/>.

@@ -165,6 +165,28 @@ misread without them.
   ahead of every other rule. Read the named rule and values; the state three hundred steps later is
   a consequence, not the finding.
 
+## The one liveness rule
+
+Every per-step rule but one is a safety rule, and a cluster with no leader breaks none of them. The
+CamusDB fault soak fs11 outage was exactly that shape: the leader was paused, the two live voters
+could talk, one granted its vote every round and the other threw the grant away, and the partition
+served nothing for the whole 30 s pause. The end-of-run convergence check ran after the pause and
+passed.
+
+`available-majority-leads` measures what was wrong. While a majority of nodes is running, refusing
+no writes, holding no log hole, not slowed, and connected pairwise in both directions with nothing
+filtered, a leader must be reachable from that set within forty election timeouts of simulated
+time (ten seconds at the defaults). The clock restarts whenever the set drops below a majority, a
+leader becomes reachable, or the transport is holding messages. Each exclusion is a state in which
+the library is entitled to have no leader — a starved store cannot persist a vote, a stalled disk
+defers its candidacy, a holed log yields the term — so the rule counts time only while none holds.
+
+Read its failure as a vote-path finding, not a log finding: a grant one side gives and the other
+discards, a candidacy cooldown that a repeated grant keeps re-arming, a pre-vote denied while a
+dead leader still looks fresh. `TestPausedLeaderDivergentTailScenarios` builds the fs11 state on
+every run and lowers the bound to eight timeouts, so the rule is what names the defect there; the
+random search keeps the default and treats any long leaderless window it reaches as a failure.
+
 ## Snapshot transfer timeouts are simulated time
 
 Every simulated node sets `SnapshotTransferStepTimeout` to one second. The library measures that bound

@@ -91,6 +91,7 @@ public sealed class ClusterInvariantRunner
 
         ClusterInvariantSet.CheckOneLeaderPerTerm(cluster.StepNumber, views);
         CheckStaleLeaderBounded(cluster, views);
+        CheckAvailableMajorityLeads(cluster, views, stores);
         ClusterInvariantSet.CheckCommittedIdsMonotonic(cluster.StepNumber, views, highestCommitByNode);
 
         ClusterInvariantSet.CheckCommittedEntriesAgree(
@@ -118,6 +119,151 @@ public sealed class ClusterInvariantRunner
             recordedByCommittedIndex);
 
         ChecksRun++;
+    }
+
+    /// <summary>
+    /// Election timeouts (the configured upper bound) an available majority may stay leaderless
+    /// before <see cref="ClusterInvariantSet.AvailableMajorityLeads"/> fires. See that rule for
+    /// why forty.
+    /// </summary>
+    public int LeaderlessBoundInElectionTimeouts { get; set; } = 40;
+
+    /// <summary>
+    /// Simulated time at which the current leaderless-but-available episode began, or null while
+    /// no such episode is open.
+    /// </summary>
+    private long? leaderlessSince;
+
+    /// <summary>Longest leaderless-but-available episode this run has seen, in simulated ms.</summary>
+    public long LongestLeaderlessAvailableMajorityMs { get; private set; }
+
+    /// <summary>
+    /// Rule <c>available-majority-leads</c> — see <see cref="ClusterInvariantSet.AvailableMajorityLeads"/>.
+    /// This method gathers the facts; the judgement is the pure check in the set.
+    ///
+    /// <para>Time is measured on the simulated clock and only while the condition holds without a
+    /// break: the episode restarts whenever the available set drops below a majority, a leader
+    /// becomes reachable, or the transport is holding messages (a held wire delivers nothing, so
+    /// no election can finish on it).</para>
+    /// </summary>
+    private void CheckAvailableMajorityLeads(
+        SimulationCluster cluster,
+        IReadOnlyList<RaftPartitionView> views,
+        IReadOnlyDictionary<string, SimulatedWalPartitionSnapshot> stores)
+    {
+        long now = cluster.Clock.LogicalMilliseconds;
+
+        List<SimulationNode> candidates = [];
+
+        foreach (SimulationNode node in cluster.Nodes)
+        {
+            if (node.LifecycleStatus != SimulationNodeLifecycleStatus.Running)
+                continue;
+
+            // No view: still restoring, or its partition is not materialized. It may not vote yet.
+            if (!views.Any(view => string.Equals(view.Endpoint, node.Endpoint, StringComparison.Ordinal)))
+                continue;
+
+            if (node.SimulatedWal is { } wal && (wal.HasWriteFault || wal.WriteLatencyMilliseconds > 0))
+                continue;
+
+            if (stores.TryGetValue(node.Endpoint, out SimulatedWalPartitionSnapshot? store) && store.HasHole)
+                continue;
+
+            candidates.Add(node);
+        }
+
+        // The largest set of candidates whose every pair is connected both ways. Clusters here
+        // have three to five nodes, so the subsets are few; take the first largest one.
+        List<SimulationNode> available = LargestConnectedSubset(cluster, candidates);
+
+        string? reachableLeader = null;
+
+        foreach (RaftPartitionView view in views)
+        {
+            if (view.Role != RaftNodeState.Leader)
+                continue;
+
+            SimulationNode? node = cluster.Nodes.FirstOrDefault(candidate => candidate.Endpoint == view.Endpoint);
+
+            if (node is null || node.LifecycleStatus != SimulationNodeLifecycleStatus.Running)
+                continue;
+
+            bool connected = available.All(peer =>
+                peer == node
+                || (cluster.Transport.IsLinkClean(node.Endpoint, peer.Endpoint)
+                    && cluster.Transport.IsLinkClean(peer.Endpoint, node.Endpoint)));
+
+            if (connected)
+            {
+                reachableLeader = view.Endpoint;
+                break;
+            }
+        }
+
+        int quorum = cluster.Nodes.Count / 2 + 1;
+        bool leaderlessAvailableMajority =
+            available.Count >= quorum && reachableLeader is null && !cluster.Transport.HoldMessages;
+
+        if (!leaderlessAvailableMajority)
+        {
+            leaderlessSince = null;
+            return;
+        }
+
+        leaderlessSince ??= now;
+        long leaderlessForMs = now - leaderlessSince.Value;
+        LongestLeaderlessAvailableMajorityMs = Math.Max(LongestLeaderlessAvailableMajorityMs, leaderlessForMs);
+
+        long boundMs = LeaderlessBoundInElectionTimeouts * (long)available[0].Manager.Configuration.EndElectionTimeout;
+
+        ClusterInvariantSet.CheckAvailableMajorityLeads(
+            cluster.StepNumber,
+            available.Select(node => node.Endpoint).ToList(),
+            cluster.Nodes.Count,
+            reachableLeader,
+            leaderlessForMs,
+            boundMs,
+            string.Join("; ", views.Select(view => view.ToString())));
+    }
+
+    private static List<SimulationNode> LargestConnectedSubset(SimulationCluster cluster, List<SimulationNode> candidates)
+    {
+        List<SimulationNode> best = [];
+
+        for (int mask = 1; mask < 1 << candidates.Count; mask++)
+        {
+            List<SimulationNode> subset = [];
+
+            for (int index = 0; index < candidates.Count; index++)
+            {
+                if ((mask & (1 << index)) != 0)
+                    subset.Add(candidates[index]);
+            }
+
+            if (subset.Count <= best.Count)
+                continue;
+
+            bool connected = true;
+
+            for (int a = 0; a < subset.Count && connected; a++)
+            {
+                for (int b = a + 1; b < subset.Count; b++)
+                {
+                    if (!cluster.Transport.IsLinkClean(subset[a].Endpoint, subset[b].Endpoint)
+                        || !cluster.Transport.IsLinkClean(subset[b].Endpoint, subset[a].Endpoint))
+                    {
+                        connected = false;
+                        break;
+                    }
+                }
+            }
+
+            if (connected)
+                best = subset;
+        }
+
+        return best;
     }
 
     /// <summary>
