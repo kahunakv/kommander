@@ -2575,7 +2575,8 @@ public sealed class RaftPartitionStateMachine
 
         if (term > coreState.CurrentTerm)
         {
-            logger.LogDebugReseedDropped(host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, $"requester term {term} is above this leader's {coreState.CurrentTerm}");
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebugReseedDropped(host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, $"requester term {term} is above this leader's {coreState.CurrentTerm}");
             return;
         }
 
