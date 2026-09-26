@@ -892,7 +892,16 @@ internal sealed class ElectionCoordinator
         // other candidate can be granted this term while the write is pending, and the reply leaves
         // only from the write's completion. A crash before completion forgets the reservation, which
         // is safe: no reply was sent, so no vote was cast.
+        //
+        // The election timer is reset HERE, at the reservation, not when the reply leaves. Raft resets
+        // it on granting a vote; a node whose timer keeps running through the write's fsync starts a
+        // pre-vote for the next term on its very next tick (at cluster start the timer is already
+        // expired, so that tick is at most one CheckLeaderInterval away), the candidates it is asked
+        // grant it (they have heard no leader either), and it deposes the candidate it just backed
+        // within a millisecond of that candidate's promotion — RecoveryReSupplyClusterTests under a
+        // loaded GA runner, where the vote's fsync spans several ticks. See RecordVoteCast.
         expectedLeaders[voteTerm] = node.Endpoint;
+        RecordVoteCast(node, voteTerm, timestamp);
 
         if (proposals is not null && TryQueueVoteGrant(node, voteTerm, timestamp, localMaxId, localLastLogTerm))
             return;
@@ -947,27 +956,37 @@ internal sealed class ElectionCoordinator
         return true;
     }
 
-    /// <summary>The grant bookkeeping and reply, run only once the vote is durable.</summary>
-    private void SendVoteGrant(RaftNode node, long voteTerm, HLCTimestamp timestamp, long localMaxId, long localLastLogTerm)
+    /// <summary>
+    /// The local bookkeeping of casting a vote, run at the moment the vote is reserved for
+    /// <paramref name="node"/> — before its hard-state write is queued, not when the durable reply
+    /// leaves (<see cref="SendVoteGrant"/>).
+    /// <para><b>Why at the reservation.</b> Raft resets a follower's election timer when it grants a
+    /// vote. The grant is answered only once the vote is durable, and on a loaded disk that fsync spans
+    /// several timer ticks. With the reset deferred to the reply, the voter's timer kept running through
+    /// the write: at cluster start it is already expired, so the next tick opened a pre-vote for the
+    /// following term, the candidates it asked granted it (a candidate has heard no leader either), and
+    /// the voter deposed the candidate it had just backed within a millisecond of that candidate's
+    /// promotion — a term of churn per grant while the churn lasts. Once reserved, the vote WILL be
+    /// sent unless the storage engine rejects the write, and a withheld vote costs this node at most one
+    /// election timeout of delay before it may campaign, which is the safe direction.</para>
+    /// <para><b>The cooldown</b> (<see cref="RaftPartitionCoreState.LastVotationTicks"/>, 2 × the election
+    /// timeout) is re-armed only when the PREVIOUS vote produced a leader. <see cref="RaftPartitionCoreState.LastHeartbeatTicks"/>
+    /// is refreshed by every accepted leader append and by every leadership transition of this node; if it
+    /// still reads the tick of our last vote, nobody has led since we cast it, and the candidate we backed
+    /// then is asking again in a higher term because it failed to win (or to promote). Re-arming
+    /// 2 × ElectionTimeout on each such grant made the voter's silence track the candidate's failures
+    /// exactly: it re-campaigned inside our cooldown every time, and this node — possibly the only other
+    /// live voter — never ran its own pre-vote (CamusDB fault soak fs11). Keeping the cooldown anchored at
+    /// the first fruitless vote lets our own election timer fire; the pre-vote is side-effect-free, so a
+    /// fresher candidate simply denies it and loses nothing, while an equally fresh one gives the partition
+    /// a second way out. Election safety is untouched: what we grant, and to whom, does not change.</para>
+    /// </summary>
+    private void RecordVoteCast(RaftNode node, long voteTerm, HLCTimestamp timestamp)
     {
         coreState.LastHeartbeat = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, timestamp);
         coreState.LastVotation = coreState.LastHeartbeat;
 
-        // B3: granting a vote counts as local activity — the follower election gate measures from
-        // this moment (Raft resets the election timer on a grant), and so does the recent-vote
-        // cooldown that keeps this node from campaigning against the candidate it just backed.
-        //
-        // The cooldown is re-armed only when the PREVIOUS grant produced a leader. LastHeartbeatTicks
-        // is refreshed by every accepted leader append and by every leadership transition of this
-        // node; if it still reads the tick of our last grant, nobody has led since we cast it, and
-        // the candidate we backed then is asking again in a higher term because it failed to win
-        // (or to promote). Re-arming 2 × ElectionTimeout on each such grant made the voter's silence
-        // track the candidate's failures exactly: it re-campaigned inside our cooldown every time,
-        // and this node — possibly the only other live voter — never ran its own pre-vote (CamusDB
-        // fault soak fs11). Keeping the cooldown anchored at the first fruitless grant lets our own
-        // election timer fire; the pre-vote is side-effect-free, so a fresher candidate simply
-        // denies it and loses nothing, while an equally fresh one gives the partition a second way
-        // out. Election safety is untouched: what we grant, and to whom, does not change.
+        // B3: both duration shadows are local elapsed intervals → monotonic.
         long grantTicks = host.GetMonotonicTimestamp();
         bool previousGrantProducedNoLeader = lastGrantTicks != 0 && coreState.LastHeartbeatTicks <= lastGrantTicks;
 
@@ -976,9 +995,10 @@ internal sealed class ElectionCoordinator
         if (previousGrantProducedNoLeader)
         {
             fruitlessGrantStreak++;
-            logger.LogInfoRepeatGrantKeepsCooldownAnchor(
-                host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm, fruitlessGrantStreak,
-                RaftMonotonic.Elapsed(coreState.LastVotationTicks, grantTicks).TotalMilliseconds);
+            if (logger.IsEnabled(LogLevel.Information))
+                logger.LogInfoRepeatGrantKeepsCooldownAnchor(
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm, fruitlessGrantStreak,
+                    RaftMonotonic.Elapsed(coreState.LastVotationTicks, grantTicks).TotalMilliseconds);
         }
         else
         {
@@ -987,7 +1007,14 @@ internal sealed class ElectionCoordinator
         }
 
         lastGrantTicks = grantTicks;
+    }
 
+    /// <summary>
+    /// The grant reply, sent only once the vote is durable. The timer and cooldown bookkeeping already
+    /// ran at the reservation (<see cref="RecordVoteCast"/>); this re-asserts the reservation and replies.
+    /// </summary>
+    private void SendVoteGrant(RaftNode node, long voteTerm, HLCTimestamp timestamp, long localMaxId, long localLastLogTerm)
+    {
         expectedLeaders[voteTerm] = node.Endpoint;
 
         logger.LogInfoSendingVote(host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint, voteTerm);
@@ -1261,9 +1288,9 @@ internal sealed class ElectionCoordinator
     private readonly Dictionary<long, string> expectedLeaders = [];
 
     /// <summary>
-    /// Monotonic tick of the last real vote this node granted (0 = none). Compared against
-    /// <see cref="RaftPartitionCoreState.LastHeartbeatTicks"/> at the next grant to tell whether any
-    /// leader was heard in between — see <see cref="SendVoteGrant"/>.
+    /// Monotonic tick of the last real vote this node cast (0 = none). Compared against
+    /// <see cref="RaftPartitionCoreState.LastHeartbeatTicks"/> at the next vote to tell whether any
+    /// leader was heard in between — see <see cref="RecordVoteCast"/>.
     /// </summary>
     private long lastGrantTicks;
 

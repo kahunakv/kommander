@@ -220,6 +220,82 @@ public class TestVoteGrantFreshnessAgreement
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// The election timer is reset when the vote is RESERVED, not when its durable reply leaves.
+    /// A voter whose timer kept running through the vote's fsync opened a pre-vote for the next term
+    /// on its next tick and deposed the candidate it had just backed (the RecoveryReSupplyClusterTests
+    /// GA failure). The write is left pending here to hold the window open; the tail of the test is the
+    /// positive control that this harness does campaign once both the timer and the cooldown expire.
+    /// </summary>
+    [Fact]
+    public async Task Voter_WithQueuedVoteGrant_DoesNotCampaignWhileTheVoteIsBeingPersisted()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, ContiguousWal wal) = BuildCandidate(lastTerm: 2, lastIndex: 12);
+        wal.QueueHardState = true;
+        host.AdvanceMonotonic(TimeSpan.Zero); // freeze the clock
+        TimeSpan electionTimeout = TimeSpan.FromMilliseconds(host.Config.EndElectionTimeout);
+
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        await sm.VoteAsync(new RaftNode(PeerB), voteTerm: 5, remoteMaxLogId: 9, ts, preVote: false, remoteLastLogTerm: 3);
+
+        Assert.DoesNotContain(host.Outbound, m => m.Type == RaftResponderRequestType.Vote); // still being persisted
+        Assert.NotEmpty(wal.QueuedHardStateOperationIds);
+
+        // One tick inside the fsync window: the timer must read "just granted", so no pre-vote.
+        host.AdvanceMonotonic(electionTimeout * 0.5);
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.DoesNotContain(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
+
+        // Past the timer but inside the 2 × timeout cooldown armed by the same reservation: still no pre-vote.
+        host.AdvanceMonotonic(electionTimeout);
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.DoesNotContain(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
+
+        // The write completes: the grant leaves now, for the term it was reserved in.
+        await sm.CompleteWalOperationAsync(new RaftWalCompletion(
+            host.PartitionId, OperationId: wal.QueuedHardStateOperationIds[^1], Term: 5, MinLogIndex: -1, MaxLogIndex: -1,
+            WALWriteOperationType.HardState, RaftOperationStatus.Success));
+        RaftResponderRequest grant = Assert.Single(host.Outbound, m => m.Type == RaftResponderRequestType.Vote);
+        Assert.Equal(5, grant.VoteRequest!.Term);
+
+        // Positive control: once the cooldown has run out with no leader heard, this voter campaigns.
+        host.AdvanceMonotonic(electionTimeout);
+        host.Outbound.Clear();
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.Contains(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
+    }
+
+    /// <summary>
+    /// A write the storage engine rejects withholds the vote (the reservation is released so the
+    /// candidate's retry can be granted) but keeps the timer reset: the cost is at most one election
+    /// timeout before this node may campaign, which is the safe direction.
+    /// </summary>
+    [Fact]
+    public async Task Voter_WithRejectedVoteWrite_WithholdsTheVoteButKeepsTheTimerReset()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, ContiguousWal wal) = BuildCandidate(lastTerm: 2, lastIndex: 12);
+        wal.QueueHardState = true;
+        host.AdvanceMonotonic(TimeSpan.Zero);
+        TimeSpan electionTimeout = TimeSpan.FromMilliseconds(host.Config.EndElectionTimeout);
+
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        await sm.VoteAsync(new RaftNode(PeerB), voteTerm: 5, remoteMaxLogId: 9, ts, preVote: false, remoteLastLogTerm: 3);
+
+        await sm.CompleteWalOperationAsync(new RaftWalCompletion(
+            host.PartitionId, OperationId: wal.QueuedHardStateOperationIds[^1], Term: 5, MinLogIndex: -1, MaxLogIndex: -1,
+            WALWriteOperationType.HardState, RaftOperationStatus.Errored));
+        Assert.DoesNotContain(host.Outbound, m => m.Type == RaftResponderRequestType.Vote);
+
+        host.AdvanceMonotonic(electionTimeout * 0.5);
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.DoesNotContain(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
+
+        // The candidate asks again and is granted this time.
+        wal.QueueHardState = false;
+        await sm.VoteAsync(new RaftNode(PeerB), voteTerm: 5, remoteMaxLogId: 9, ts, preVote: false, remoteLastLogTerm: 3);
+        Assert.Contains(host.Outbound, m => m.Type == RaftResponderRequestType.Vote);
+    }
+
     private static async Task Grant(RaftPartitionStateMachine sm, CapturingHost host, string candidate, long term)
     {
         host.Outbound.Clear();
@@ -337,6 +413,27 @@ public class TestVoteGrantFreshnessAgreement
         public long GetPresentIndex() => MaxId;
         public long GetPresentTerm() => Entries.Count == 0 ? 0 : Entries.MaxBy(l => l.Id)!.Term;
         public void SeedProposeAllocator(long id) => nextId = id;
+
+        /// <summary>
+        /// When set, hard-state writes are queued (as the production facade does) instead of being
+        /// persisted inline, so a test can hold a vote's fsync window open and complete it explicitly
+        /// through <see cref="RaftPartitionStateMachine.CompleteWalOperationAsync"/>.
+        /// </summary>
+        public bool QueueHardState { get; set; }
+
+        public List<long> QueuedHardStateOperationIds { get; } = [];
+
+        private long nextHardStateOperationId = 100;
+
+        public WALWriteOperation? TryEnqueueHardState(long currentTerm, string? votedFor)
+        {
+            if (!QueueHardState)
+                return null;
+
+            long id = nextHardStateOperationId++;
+            QueuedHardStateOperationIds.Add(id);
+            return new(_ => { }, id, WALWriteOperationType.HardState, (1, []), term: currentTerm, votedFor: votedFor);
+        }
 
         public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(MaxId);
         public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(GetPresentTerm());

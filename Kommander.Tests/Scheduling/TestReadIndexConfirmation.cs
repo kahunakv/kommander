@@ -377,6 +377,65 @@ public class TestReadIndexConfirmation
         Assert.Equal(RaftNodeState.Follower, sm.NodeState);
     }
 
+    /// <summary>
+    /// A same-term reply that rejects the batch still proves the voter is reachable and counts this
+    /// node as its leader, so it must refresh the check-quorum contact. Counting only Success acks made
+    /// a freshly promoted leader whose followers were answering LogMismatch (a barrier append landing
+    /// over a gap, repaired by the next heartbeat's backfill) step down as "isolated" inside the window.
+    /// </summary>
+    [Theory]
+    [InlineData(RaftOperationStatus.LogMismatch)]
+    [InlineData(RaftOperationStatus.RestoreInProgress)]
+    public async Task CheckQuorum_SameTermRejectionAcks_CountAsMajorityContact(RaftOperationStatus status)
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+        EnableCheckQuorum(host);
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+
+        for (int i = 0; i < 5; i++)
+        {
+            host.AdvanceMonotonic(TimeSpan.FromMilliseconds(8));
+            await sm.CompleteAppendLogsAsync(
+                "node-b",
+                host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+                status,
+                committedIndex: 0,
+                responseTerm: 1);
+            await sm.CheckPartitionLeadershipAsync();
+            Assert.Equal(RaftNodeState.Leader, sm.NodeState);
+        }
+
+        host.AdvanceMonotonic(TimeSpan.FromMilliseconds(50));
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+    }
+
+    /// <summary>
+    /// The two rejections that deny this node's claim to the term — rather than the batch — are not
+    /// contact: a peer that does not count this node as its leader cannot keep it in office.
+    /// </summary>
+    [Theory]
+    [InlineData(RaftOperationStatus.LogsFromAnotherLeader)]
+    [InlineData(RaftOperationStatus.LeaderInOldTerm)]
+    public async Task CheckQuorum_AcksDenyingTheLeadership_DoNotCountAsContact(RaftOperationStatus status)
+    {
+        (RaftPartitionStateMachine sm, FakePartitionHost host, _) = MakeLeader("node-b", "node-c");
+        EnableCheckQuorum(host);
+        host.MonotonicOverride = Stopwatch.GetTimestamp();
+
+        host.AdvanceMonotonic(TimeSpan.FromMilliseconds(15));
+        await sm.CompleteAppendLogsAsync(
+            "node-b",
+            host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId),
+            status,
+            committedIndex: 0,
+            responseTerm: 1);
+
+        host.AdvanceMonotonic(TimeSpan.FromMilliseconds(6)); // 21 ms since promotion, window is 20 ms
+        await sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(RaftNodeState.Follower, sm.NodeState);
+    }
+
     [Fact]
     public async Task CheckQuorum_StepsDownOneWindowAfterTheLastMajorityContact()
     {

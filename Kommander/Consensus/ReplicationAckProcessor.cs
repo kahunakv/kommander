@@ -144,6 +144,22 @@ internal sealed class ReplicationAckProcessor
         if (endpoint != host.LocalEndpoint)
             host.UpdateLastNodeActivity(endpoint, host.PartitionId, currentTime);
 
+        // Check-quorum contact. The fences above guarantee that a term-stamped ack reaching this point
+        // was produced by a peer that adopted this node as the leader of its current term, and it answers
+        // whatever this leader sent it: that is the reachability check-quorum measures, regardless of what
+        // the ack says about the batch. Counting only Success acks (as this used to) made a leader that
+        // was mid-repair step down as "isolated" while every follower was answering it in its own term:
+        // a freshly promoted leader whose barrier append lands over a gap on its followers gets
+        // LogMismatch back, the backfill that fixes it rides the next heartbeat tick, and the followers'
+        // Success acks land only after their fsync — past a two-heartbeat window on a loaded runner
+        // (RecoveryReSupplyClusterTests under GA load). The two rejections that deny the leader's claim
+        // rather than the batch are excluded: LogsFromAnotherLeader (the peer does not count this node
+        // as its leader) and LeaderInOldTerm (the peer is on a newer term; the higher-term branch above
+        // is where a member's copy of it is handled).
+        if (responseTerm >= 0 && endpoint != host.LocalEndpoint
+            && status is not (RaftOperationStatus.LogsFromAnotherLeader or RaftOperationStatus.LeaderInOldTerm))
+            readIndex.RecordVoterAck(endpoint, host.GetMonotonicTimestamp());
+
         // Two facts about the peer's DISK, valid on every term-fenced ack whatever its status: the
         // durable contiguous frontier (the only evidence WAL retention may hold on — see
         // ReplicationTracker.durableFrontiers) and the age of its oldest unanswered write. A stall
@@ -309,15 +325,12 @@ internal sealed class ReplicationAckProcessor
             tracker.ClearCompactedAnchorIfCovered(endpoint, committedIndex);
         }
 
-        // Same-term success acks double as leadership proof: they feed the read-index confirmation
-        // round and the check-quorum recency window. Only term-stamped acks count — an unstamped
-        // (-1) ack passed the term fence above by default and could belong to an earlier stint of
-        // this node's leadership.
+        // Same-term success acks double as leadership proof for the read-index confirmation round
+        // (the check-quorum contact was recorded above, for every same-term reply). Only term-stamped
+        // acks count — an unstamped (-1) ack passed the term fence above by default and could belong
+        // to an earlier stint of this node's leadership.
         if (responseTerm >= 0 && endpoint != host.LocalEndpoint && coreState.NodeState == RaftNodeState.Leader)
-        {
-            readIndex.RecordVoterAck(endpoint, host.GetMonotonicTimestamp());
             await readIndex.RegisterAckAsync(endpoint).ConfigureAwait(false);
-        }
 
         // Everything below this guard derives replication progress from committedIndex, so it
         // requires an actual report. A Success ack with committedIndex < 0 carries NO frontier
