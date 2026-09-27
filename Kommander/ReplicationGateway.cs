@@ -1,5 +1,6 @@
 
 using Kommander.Data;
+using Kommander.Diagnostics;
 using Kommander.System;
 using Kommander.Time;
 using Microsoft.Extensions.Logging;
@@ -126,6 +127,8 @@ internal sealed class ReplicationGateway
         if (partitionId == RaftSystemConfig.SystemPartition && type == RaftSystemConfig.RaftLogType)
             throw new RaftException("System log type is reserved on the system partition");
 
+        long roundStartTicks = RoundStageInstrumentation.Stamp();
+
         // Single lookup instead of a hosts-check plus a re-resolve on the per-write path.
         RaftPartition? partition = null;
 
@@ -155,7 +158,7 @@ internal sealed class ReplicationGateway
         if (!success)
             return new(success, status, ticketId, -1);
 
-        return await WaitForQuorum(partition, ticketId, autoCommit, cancellationToken).ConfigureAwait(false);
+        return await WaitForQuorum(partition, ticketId, autoCommit, cancellationToken, roundStartTicks).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -201,6 +204,8 @@ internal sealed class ReplicationGateway
         if (partitionId == RaftSystemConfig.SystemPartition && type == RaftSystemConfig.RaftLogType)
             throw new RaftException("System log type is reserved on the system partition");
 
+        long roundStartTicks = RoundStageInstrumentation.Stamp();
+
         // Single lookup instead of a hosts-check plus a re-resolve on the per-write path.
         RaftPartition? partition = null;
 
@@ -235,7 +240,7 @@ internal sealed class ReplicationGateway
         if (!success)
             return new(success, status, ticketId, -1);
 
-        return await WaitForQuorum(partition, ticketId, autoCommit, cancellationToken).ConfigureAwait(false);
+        return await WaitForQuorum(partition, ticketId, autoCommit, cancellationToken, roundStartTicks).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -565,7 +570,7 @@ internal sealed class ReplicationGateway
     /// <c>ReplicateLogs</c> response and the <c>GetTicketWaiterTask</c> request.
     /// </para>
     /// </summary>
-    private async Task<RaftReplicationResult> WaitForQuorum(RaftPartition partition, HLCTimestamp ticketId, bool autoCommit, CancellationToken cancellationToken)
+    private async Task<RaftReplicationResult> WaitForQuorum(RaftPartition partition, HLCTimestamp ticketId, bool autoCommit, CancellationToken cancellationToken, long roundStartTicks = 0)
     {
         // The proposal was already ACCEPTED (it has a ticket): if leadership moved between the
         // accept and this check, the entry is in the log and may still commit — a durable
@@ -615,6 +620,10 @@ internal sealed class ReplicationGateway
             // the elapsed timeout surfaces as TimeoutException instead of a filtered OCE.
             (RaftProposalTicketState ticketState, long commitIndex) = await waiterTask
                 .WaitAsync(configuration.ProposalTimeout, cancellationToken).ConfigureAwait(false);
+
+            // Round stages (off by default): the caller's continuation is the end of the round.
+            if (roundStartTicks != 0 && ticketState == RaftProposalTicketState.Committed)
+                RoundStageInstrumentation.RecordResume(partition.PartitionId, ticketId, roundStartTicks);
 
             return ticketState == RaftProposalTicketState.Committed
                 ? new(true, RaftOperationStatus.Success, ticketId, commitIndex)

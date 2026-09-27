@@ -18,6 +18,8 @@ Kommander.Tests/database*
 Kommander.Tests/TestResults/
 Kommander.MicroBenchmarks/bin
 Kommander.MicroBenchmarks/obj
+Kommander.Benchmark/obj
+Kommander.Benchmark/bin
 BenchmarkDotNet.Artifacts/
 Nixie/
 nupkg

@@ -333,6 +333,9 @@ internal sealed class WalCompletionRouter
     /// </summary>
     private async Task CompleteLeaderPropose(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
+        RoundStageInstrumentation.Record(RoundStage.LeaderWalCompletion, completion.DurableStageTicks);
+        long fanoutStartTicks = RoundStageInstrumentation.Stamp();
+
         HLCTimestamp ticketId = pending?.TicketId ?? HLCTimestamp.Zero;
         List<RaftLog> logs = pending?.Logs ?? [];
         bool autoCommit = pending?.AutoCommit ?? false;
@@ -401,6 +404,15 @@ internal sealed class WalCompletionRouter
         {
             CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Errored, HLCTimestamp.Zero));
             return;
+        }
+
+        // Round stages (off by default). Stamped after TryAdd: an ack cannot find the proposal
+        // before this point, so the stamp is in place before the replication stage can end.
+        if (fanoutStartTicks != 0)
+        {
+            long fanoutDoneTicks = RoundStageInstrumentation.Stamp();
+            RoundStageInstrumentation.Record(RoundStage.LeaderFanout, fanoutStartTicks, fanoutDoneTicks);
+            proposalQuorum.FanoutStageTicks = fanoutDoneTicks;
         }
 
         if (logger.IsEnabled(LogLevel.Debug))
@@ -784,6 +796,9 @@ internal sealed class WalCompletionRouter
     /// </summary>
     private async Task CompleteFollowerAppend(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
+        RoundStageInstrumentation.Record(RoundStage.FollowerWalCompletion, completion.DurableStageTicks);
+        long ackStartTicks = RoundStageInstrumentation.Stamp();
+
         string endpoint = pending!.Endpoint ?? "";
         long leaderTerm = completion.Term;
         HLCTimestamp timestamp = pending.Timestamp;
@@ -889,6 +904,8 @@ internal sealed class WalCompletionRouter
                 new(endpoint),
                 FollowerAcks.Build(host, wal, leaderTerm, timestamp, ackStatus, ackIndex)
             ));
+
+            RoundStageInstrumentation.Record(RoundStage.FollowerAck, ackStartTicks);
         }
 
         CompleteReply(pending.ReplyCorrelationId, RaftResponseStatic.NoneResponse);

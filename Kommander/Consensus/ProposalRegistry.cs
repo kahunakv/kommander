@@ -1,5 +1,6 @@
 using System.Diagnostics.CodeAnalysis;
 using Kommander.Data;
+using Kommander.Diagnostics;
 using Kommander.Scheduling;
 using Kommander.Time;
 using Microsoft.Extensions.Logging;
@@ -121,6 +122,13 @@ internal sealed class ProposalRegistry
         ProposalReplyHoldRegistry? holds = Volatile.Read(ref replyHolds);
         if (holds is not null && holds.TryHoldSuccess(proposal, commitIndex, site))
             return;
+
+        // Round stages (off by default): marked before the waiter completes, because the caller's
+        // continuation may run at once on another thread and look for this stamp. Only the first
+        // release marks: the fast path releases on quorum and the commit completion calls here
+        // again, and a second mark would sit in the side table with no caller left to take it.
+        if (RoundStageInstrumentation.IsActive && proposal.WaiterSource is { Task.IsCompleted: false })
+            RoundStageInstrumentation.MarkReleased(host.PartitionId, proposal.StartTimestamp);
 
         proposal.CompleteWaiter(RaftProposalTicketState.Committed, commitIndex);
     }

@@ -1,4 +1,5 @@
 using Kommander.Data;
+using Kommander.Diagnostics;
 using Kommander.Logging;
 using Kommander.Scheduling;
 using Kommander.Time;
@@ -126,6 +127,8 @@ internal sealed class FollowerAppendHandler
         bool quiesce = false
     )
     {
+        long appendStartTicks = logs is { Count: > 0 } ? RoundStageInstrumentation.Stamp() : 0;
+
         if (coreState.CurrentTerm > leaderTerm)
         {
             logger.LogWarning("[{LocalEndpoint}/{PartitionId}/{State}] Received logs from a leader {Endpoint} with old ReceivedTerm={Term} CurrentTerm={CurrentTerm}. Ignoring...", host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, leaderTerm, coreState.CurrentTerm);
@@ -495,6 +498,7 @@ internal sealed class FollowerAppendHandler
                 pendingAppend.Endpoint = endpoint;
                 pendingAppend.Timestamp = timestamp;
                 proposals.TrackPending(operation.OperationId, pendingAppend);
+                RoundStageInstrumentation.Record(RoundStage.FollowerAppend, appendStartTicks);
                 return;
             }
 

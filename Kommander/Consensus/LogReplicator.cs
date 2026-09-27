@@ -1,6 +1,7 @@
 using System.Buffers;
 using Kommander.Communication.Grpc;
 using Kommander.Data;
+using Kommander.Diagnostics;
 using Kommander.Logging;
 using Kommander.Scheduling;
 using Kommander.System;
@@ -147,6 +148,8 @@ internal sealed class LogReplicator
         if (logs is null || logs.Count == 0)
             return (RaftOperationStatus.Success, HLCTimestamp.Zero);
 
+        long stageStartTicks = RoundStageInstrumentation.Stamp();
+
         if (coreState.NodeState != RaftNodeState.Leader)
             return (RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
 
@@ -233,6 +236,8 @@ internal sealed class LogReplicator
             pendingPropose.Logs = logs;
             pendingPropose.AutoCommit = autoCommit;
             proposals.TrackPending(operation.OperationId, pendingPropose);
+
+            RoundStageInstrumentation.Record(RoundStage.LeaderPropose, stageStartTicks);
 
             return (RaftOperationStatus.Pending, currentTime);
         }

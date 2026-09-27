@@ -100,6 +100,14 @@ public sealed class RaftProposalQuorum
     public long LastLogIndex => Logs.Last().Id;
 
     /// <summary>
+    /// Stopwatch stamp taken when the leader finished the fan-out of this proposal, or 0 when the
+    /// round stages (<see cref="Kommander.Diagnostics.RoundStageInstrumentation"/>) are off. The ack
+    /// that makes the quorum subtracts it to time the follower round trip. Diagnostic only; reset
+    /// with the pooled instance.
+    /// </summary>
+    internal long FanoutStageTicks { get; set; }
+
+    /// <summary>
     /// Represents a quorum for a Raft proposal. The quorum is responsible for managing
     /// proposal-specific details such as the logs associated with the proposal,
     /// whether the proposal is set to auto-commit, and its initial timestamp.
@@ -254,6 +262,7 @@ public sealed class RaftProposalQuorum
         State = RaftProposalState.Incomplete;
         completed = false;
         completedNodeCount = 0;
+        FanoutStageTicks = 0;
         Logs = logs;
         AutoCommit = autoCommit;
         StartTimestamp = startTimestamp;
@@ -268,5 +277,6 @@ public sealed class RaftProposalQuorum
         Logs.Clear();
         nodes.Clear();
         completedNodeCount = 0;
+        FanoutStageTicks = 0;
     }
 }

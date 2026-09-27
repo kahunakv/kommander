@@ -72,6 +72,8 @@ internal sealed class ReplicationAckProcessor
 
     public async ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1, long durableIndex = -1, long walStallMs = 0, long presentIndex = -1, long presentTerm = -1)
     {
+        long ackStartTicks = RoundStageInstrumentation.Stamp();
+
         // ── Raft §5.1: a response stamped with a HIGHER term deposes us ─────────────────────────
         // Terms only enter a node through elections, so a higher response term proves a newer term
         // exists — this leader (or candidate) is stale and must step down and adopt it BEFORE the
@@ -446,6 +448,13 @@ internal sealed class ReplicationAckProcessor
         logger.LogInfoProposalCompletedAt(host.LocalEndpoint, host.PartitionId, coreState.NodeState, timestamp, (currentTime - proposal.StartTimestamp).TotalMilliseconds);
 
         proposal.SetState(RaftProposalState.Completed);
+
+        // Round stages (off by default): this ack made the quorum, so it ends the replication stage.
+        if (ackStartTicks != 0)
+        {
+            RoundStageInstrumentation.Record(RoundStage.LeaderReplication, proposal.FanoutStageTicks);
+            RoundStageInstrumentation.Record(RoundStage.LeaderAck, ackStartTicks);
+        }
 
         // Observability (off in production): report the acknowledgements that carried this proposal to commit
         // quorum — the local leader (a voter, implicitly durable) plus every registered voter that acked.
