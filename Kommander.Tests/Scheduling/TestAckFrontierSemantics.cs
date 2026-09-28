@@ -222,6 +222,16 @@ public class TestAckFrontierSemantics
         };
 
         public HybridLogicalClock HybridLogicalClock { get; } = new();
+
+        /// <summary>
+        /// The monotonic clock is pinned: no time elapses between the promotion and the leadership
+        /// ticks under test, so every elapsed-time gate on the tick reads zero. On the wall clock the
+        /// check-quorum window is StartElectionTimeout, and a loaded runner that exceeds it between
+        /// the promotion and the tick makes the leader step down and send nothing (the GA failure
+        /// in TestInheritedTailHoleRepair). No test here waits on the real clock.
+        /// </summary>
+        public long MonotonicTicks { get; set; } = global::System.Diagnostics.Stopwatch.GetTimestamp();
+        public long GetMonotonicTimestamp() => MonotonicTicks;
         public IReadOnlyList<RaftNode> Nodes { get; set; } = [new(VoterA), new(VoterB), new(NonVoter), new(NonVoter2)];
         public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;
 
