@@ -183,6 +183,7 @@ public sealed class TestCompactionFloorBackfillScenarios
                     // The deposed leader is silent while it is cut off. With no silent-peer window
                     // and a small lag budget, the new leader compacts past it, which is the state.
                     configuration.CompactionLiveReplicaLagBudget = 4;
+                    configuration.CompactionLiveReplicaLagWindow = TimeSpan.Zero;
                     configuration.CompactionSilentPeerRetentionWindow = TimeSpan.Zero;
                 },
             },

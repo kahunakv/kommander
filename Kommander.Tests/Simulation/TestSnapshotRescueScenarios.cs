@@ -117,6 +117,7 @@ public sealed class TestSnapshotRescueScenarios
                     // state with a follower that lags beyond the budget; a small budget reaches it
                     // with a short log.
                     configuration.CompactionLiveReplicaLagBudget = LiveReplicaLagBudget;
+                    configuration.CompactionLiveReplicaLagWindow = TimeSpan.Zero;
                 },
             },
             logger,

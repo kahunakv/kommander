@@ -100,6 +100,8 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
 
     public void SetLiveReplicaRetentionFloor(long floor) => wal.SetLiveReplicaRetentionFloor(floor);
 
+    public void SetLiveReplicaRetentionFloor(long floor, long budget) => wal.SetLiveReplicaRetentionFloor(floor, budget);
+
     public ValueTask<bool> PersistHardStateAsync(long currentTerm, string? votedFor) =>
         ValueTask.FromResult(wal.PersistHardState(currentTerm, votedFor));
 

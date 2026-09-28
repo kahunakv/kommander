@@ -1692,9 +1692,11 @@ public class RaftConfiguration
     public int MaxEntriesPerCompaction { get; set; } = 5000;
 
     /// <summary>
-    /// Maximum number of log entries the leader retains below the compaction checkpoint for a
-    /// live, acking follower that has not yet replicated them. While a reachable follower's
-    /// replicated position sits inside this budget, compaction holds its floor at that position so
+    /// Minimum number of log entries the leader retains below the compaction checkpoint for a
+    /// live, acking follower that has not yet replicated them. The retention is sized in time by
+    /// <see cref="CompactionLiveReplicaLagWindow"/>; this count is the depth it never goes below, and
+    /// the whole depth while the leader has no write-rate history. While a reachable follower's
+    /// replicated position sits inside the budget, compaction holds its floor at that position so
     /// the follower can be served by ordinary backfill; beyond the budget (or once the follower is
     /// no longer Alive) the floor advances normally and the follower must be seeded by a snapshot.
     /// Without this hold, a leader compacting on its ordinary cadence repeatedly re-created the
@@ -1711,8 +1713,49 @@ public class RaftConfiguration
     /// rate; the retained rows cost WAL disk only while a live replica actually lags, and a replica
     /// that is not Alive holds nothing.
     /// </para>
+    /// <para>
+    /// This count used to be the whole budget, and a count shrinks in time as the write rate
+    /// rises: after the round-cost work the same million entries were ~37 s of log at ~27,000
+    /// entries/s (against ~80 s before), and a 30-second kill plus restore came back 1.7 M entries
+    /// behind, below the floor, into a whole-partition snapshot. The effective budget is now
+    /// <c>max(CompactionLiveReplicaLagBudget, min(entries committed in the last
+    /// CompactionLiveReplicaLagWindow, CompactionLiveReplicaLagCap))</c>: this count always holds,
+    /// the window raises it with the write rate, and the cap bounds the raise.
+    /// </para>
     /// </summary>
     public long CompactionLiveReplicaLagBudget { get; set; } = 1_000_000;
+
+    /// <summary>
+    /// How much recent history, in time, the leader keeps below the compaction checkpoint for a
+    /// lagging or briefly absent replica: the entries committed within this window, measured from the
+    /// leader's commit index on its heartbeat rounds. It raises
+    /// <see cref="CompactionLiveReplicaLagBudget"/> (never lowers it), up to
+    /// <see cref="CompactionLiveReplicaLagCap"/>. A fresh leader extrapolates from its first
+    /// half-second of history; before that the count applies alone.
+    /// <para>
+    /// Default three minutes: one kill-restart cycle is the <see cref="CompactionSilentPeerRetentionWindow"/>
+    /// (two minutes) in which a silent peer holds the floor, plus a minute for the lag the peer already
+    /// carried when it went silent and for its restore. Because the budget is taken below the
+    /// checkpoint, a slower checkpoint cadence only adds retention: every entry committed within the
+    /// window is kept whatever the cadence. <see cref="TimeSpan.Zero"/> sizes the budget by the count
+    /// alone, as before the window existed.
+    /// </para>
+    /// </summary>
+    public TimeSpan CompactionLiveReplicaLagWindow { get; set; } = TimeSpan.FromMinutes(3);
+
+    /// <summary>
+    /// Upper bound, in entries, on how far <see cref="CompactionLiveReplicaLagWindow"/> can raise the
+    /// live-replica retention: the WAL-disk safety bound when the write rate is very high. It bounds the
+    /// window only. A <see cref="CompactionLiveReplicaLagBudget"/> configured above it still holds.
+    /// Values &lt;= 0 turn the window off.
+    /// <para>
+    /// Default 10,000,000 entries, a few GB of WAL at the payload sizes Kahuna writes. That is the
+    /// whole default window up to ~55,000 entries/s, twice the rate of the fault soak that motivated
+    /// the window. The rows are held only while a replica actually lags, and compaction removes them
+    /// once it has caught up.
+    /// </para>
+    /// </summary>
+    public long CompactionLiveReplicaLagCap { get; set; } = 10_000_000;
 
     /// <summary>
     /// How long the leader keeps holding compaction for a peer that has stopped answering — killed,

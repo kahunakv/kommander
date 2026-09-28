@@ -333,6 +333,14 @@ public sealed class RaftWriteAhead
     private long liveReplicaFloorPublishedTicks;
 
     /// <summary>
+    /// The leader's rate-scaled live-replica budget, published with <see cref="liveReplicaRetentionFloor"/>
+    /// (0 = no rate evidence: the configured count applies alone). Clamped again at use by
+    /// <see cref="LiveReplicaRetentionBudget.Compose"/>, so a value from a stale configuration cannot
+    /// exceed the current cap.
+    /// </summary>
+    private long liveReplicaRetentionBudget;
+
+    /// <summary>
     /// Staleness bound for the published live-replica floor: ten heartbeat intervals, floored at
     /// 30 s. An active leader republishes every round, so a fresh value is always present where the
     /// hold matters; anything older means the publisher stopped. Not readonly only for
@@ -403,9 +411,17 @@ public sealed class RaftWriteAhead
     /// The publish timestamp is written after the floor, so a torn observation errs toward
     /// treating the value as stale — never toward applying a stale one as fresh.
     /// </summary>
-    public void SetLiveReplicaRetentionFloor(long floor)
+    public void SetLiveReplicaRetentionFloor(long floor) => SetLiveReplicaRetentionFloor(floor, 0);
+
+    /// <summary>
+    /// Publishes the live-replica retention floor together with the leader's rate-scaled budget (see
+    /// <see cref="Scheduling.IRaftWalFacade.SetLiveReplicaRetentionFloor(long, long)"/>). Same ordering
+    /// contract as the one-argument form: both values are written before the publish timestamp.
+    /// </summary>
+    public void SetLiveReplicaRetentionFloor(long floor, long budget)
     {
         Volatile.Write(ref liveReplicaRetentionFloor, floor <= 0 ? long.MaxValue : floor);
+        Volatile.Write(ref liveReplicaRetentionBudget, Math.Max(0, budget));
         Volatile.Write(ref liveReplicaFloorPublishedTicks, manager.Configuration.TickSource.GetTimestamp());
     }
 
@@ -2880,19 +2896,27 @@ public sealed class RaftWriteAhead
             // before the next pass and is left to the snapshot path, so a slow-forever replica
             // cannot grow the WAL without bound. The staleness window bounds trust in the
             // publisher: only an active leader keeps the value fresh.
+            //
+            // The budget is the leader's rate-scaled one (LiveReplicaRetentionBudget): the configured
+            // count, raised to the entries committed within CompactionLiveReplicaLagWindow up to
+            // CompactionLiveReplicaLagCap. A count alone shrank in time as the write rate rose, and a
+            // 30-second kill at the round-cost write rate fell below it into a snapshot.
             long liveReplicaFloor = long.MaxValue;
-            long lagBudget = manager.Configuration.CompactionLiveReplicaLagBudget;
-            if (lagBudget > 0)
+            long countBudget = manager.Configuration.CompactionLiveReplicaLagBudget;
+            if (countBudget > 0)
             {
                 long publishedTicks = Volatile.Read(ref liveReplicaFloorPublishedTicks);
                 long publishedFloor = Volatile.Read(ref liveReplicaRetentionFloor);
+                long publishedBudget = Volatile.Read(ref liveReplicaRetentionBudget);
                 if (publishedTicks != 0
                     && manager.Configuration.TickSource.GetTimestamp() - publishedTicks <= liveReplicaFloorStalenessTicks
                     && publishedFloor < lastCheckpoint)
                 {
+                    long lagBudget = LiveReplicaRetentionBudget.Compose(
+                        countBudget, publishedBudget, manager.Configuration.CompactionLiveReplicaLagCap);
                     liveReplicaFloor = Math.Max(publishedFloor, lastCheckpoint - lagBudget);
                     KommanderMetrics.RecordCompactionHeldByLiveReplica(
-                        partition.PartitionId, lastCheckpoint - liveReplicaFloor);
+                        partition.PartitionId, lastCheckpoint - liveReplicaFloor, lagBudget);
                 }
             }
 

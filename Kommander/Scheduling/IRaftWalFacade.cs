@@ -290,6 +290,16 @@ public interface IRaftWalFacade
     void SetLiveReplicaRetentionFloor(long floor) { }
 
     /// <summary>
+    /// <see cref="SetLiveReplicaRetentionFloor(long)"/> with the leader's rate-scaled budget: how many
+    /// entries below the checkpoint the floor may hold, from
+    /// <see cref="RaftConfiguration.CompactionLiveReplicaLagWindow"/> over the leader's commit history.
+    /// The WAL clamps it between <see cref="RaftConfiguration.CompactionLiveReplicaLagBudget"/> and
+    /// <see cref="RaftConfiguration.CompactionLiveReplicaLagCap"/>, so a budget of 0 means "the count
+    /// alone". Defaults to the one-argument form for facades that predate the window.
+    /// </summary>
+    void SetLiveReplicaRetentionFloor(long floor, long budget) => SetLiveReplicaRetentionFloor(floor);
+
+    /// <summary>
     /// Persists this partition's Raft hard state — the current term and the endpoint we last granted our
     /// vote to in that term. Durability rides the backend's existing WAL fsync cadence (no dedicated
     /// fsync), so the last vote/term can be lost on power failure. The default is a no-op so non-durable

@@ -228,6 +228,8 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.CompactNumberEntries)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.MaxEntriesPerCompaction)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.CompactionLiveReplicaLagBudget)] = RaftOptionKind.Liveness,
+        [nameof(RaftConfiguration.CompactionLiveReplicaLagWindow)] = RaftOptionKind.Liveness,
+        [nameof(RaftConfiguration.CompactionLiveReplicaLagCap)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.CompactionSilentPeerRetentionWindow)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.CompactionDurabilityClampReportInterval)] = RaftOptionKind.Performance,
     };

@@ -258,6 +258,58 @@ public class TestSnapshotRescueConvergence
     }
 
     /// <summary>
+    /// The leader publishes the budget with the floor, sized in time: the entries committed within
+    /// <see cref="RaftConfiguration.CompactionLiveReplicaLagWindow"/>, never below
+    /// <see cref="RaftConfiguration.CompactionLiveReplicaLagBudget"/> and capped by
+    /// <see cref="RaftConfiguration.CompactionLiveReplicaLagCap"/>. A count alone shrank in time as the
+    /// write rate rose, and a 30-second kill at the round-cost rate fell below it into a snapshot.
+    /// </summary>
+    [Fact]
+    public async Task Heartbeat_PublishesARateScaledBudget_BetweenTheCountAndTheCap()
+    {
+        Harness h = await Harness.BuildLeaderAsync(withTransfer: false, configure: c =>
+        {
+            c.CompactionLiveReplicaLagBudget = 1_000;
+            c.CompactionLiveReplicaLagWindow = TimeSpan.FromSeconds(10);
+            c.CompactionLiveReplicaLagCap = 1_000_000;
+        });
+
+        // No history yet: the count applies alone.
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(1_000, h.Wal.PublishedBudget);
+
+        // 500 entries per second for 20 s: the window holds 10 s of it.
+        for (int second = 1; second <= 20; second++)
+        {
+            h.AdvanceMs(1_000);
+            h.Wal.Commit += 500;
+            await h.Sm.CheckPartitionLeadershipAsync();
+        }
+
+        Assert.InRange(h.Wal.PublishedBudget, 4_500, 5_500);
+
+        // The rate falls to zero: the budget follows the window down to the count, not below it.
+        for (int second = 1; second <= 12; second++)
+        {
+            h.AdvanceMs(1_000);
+            await h.Sm.CheckPartitionLeadershipAsync();
+        }
+
+        Assert.Equal(1_000, h.Wal.PublishedBudget);
+
+        // The cap bounds the window.
+        h.Host.Configuration.CompactionLiveReplicaLagCap = 2_000;
+        for (int second = 1; second <= 12; second++)
+        {
+            h.AdvanceMs(1_000);
+            h.Wal.Commit += 500;
+            await h.Sm.CheckPartitionLeadershipAsync();
+        }
+
+        Assert.Equal(2_000, h.Wal.PublishedBudget);
+    }
+
+    /// <summary>
     /// A peer that was already down when this leader was elected has no position on record, and
     /// its real position is unknowable until it answers. For the window it holds the budget's whole
     /// depth (a published floor of 1, which the WAL clamps at checkpoint minus the budget); past the
@@ -682,11 +734,19 @@ public class TestSnapshotRescueConvergence
     /// </summary>
     private sealed class MutableFloorWal : IRaftWalFacade
     {
-        private readonly long commitIndex;
+        private long commitIndex;
 
         public long Floor;
         public long PublishedReplicaFloor = long.MaxValue;
+        public long PublishedBudget;
         public int PublishCalls;
+
+        /// <summary>The leader's commit index; tests advance it to give the budget a write rate.</summary>
+        public long Commit
+        {
+            get => Volatile.Read(ref commitIndex);
+            set => Volatile.Write(ref commitIndex, value);
+        }
 
         public MutableFloorWal(long floor, long commitIndex)
         {
@@ -697,7 +757,7 @@ public class TestSnapshotRescueConvergence
         public ValueTask<IReadOnlyList<RaftLog>> LoadRestoreLogsAsync() =>
             ValueTask.FromResult<IReadOnlyList<RaftLog>>([]);
         public ValueTask CompleteRestoreAsync(IReadOnlyList<RaftLog> logs) => ValueTask.CompletedTask;
-        public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(commitIndex);
+        public ValueTask<long> GetMaxLogAsync() => ValueTask.FromResult(Commit);
         public ValueTask<long> TruncateLogsAfterAsync(long afterLogId) => ValueTask.FromResult(afterLogId);
         public ValueTask<long> GetCurrentTermAsync() => ValueTask.FromResult(1L);
 
@@ -705,7 +765,7 @@ public class TestSnapshotRescueConvergence
         {
             List<RaftLog> batch = [];
             long first = Math.Max(startLogIndex, Volatile.Read(ref Floor) + 1);
-            for (long id = first; id < first + 3 && id <= commitIndex; id++)
+            for (long id = first; id < first + 3 && id <= Commit; id++)
                 batch.Add(new() { Id = id, Term = 1, Type = RaftLogType.Committed, LogType = "test" });
 
             return ValueTask.FromResult(batch);
@@ -713,7 +773,7 @@ public class TestSnapshotRescueConvergence
 
         public ValueTask<long> GetAnyTermAtAsync(long logIndex) => ValueTask.FromResult(1L);
         public ValueTask<long> GetLastCheckpointAsync() => ValueTask.FromResult(Volatile.Read(ref Floor));
-        public long GetCommitIndex() => commitIndex;
+        public long GetCommitIndex() => Commit;
         public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp ts, bool autoCommit) => MakeNoOp();
         public WALWriteOperation EnqueueCommit(List<RaftLog> logs) => MakeNoOp();
         public WALWriteOperation EnqueueRollback(List<RaftLog> logs) => MakeNoOp();
@@ -725,6 +785,12 @@ public class TestSnapshotRescueConvergence
         {
             Volatile.Write(ref PublishedReplicaFloor, floor);
             Interlocked.Increment(ref PublishCalls);
+        }
+
+        public void SetLiveReplicaRetentionFloor(long floor, long budget)
+        {
+            Volatile.Write(ref PublishedBudget, budget);
+            SetLiveReplicaRetentionFloor(floor);
         }
 
         private static WALWriteOperation MakeNoOp() =>

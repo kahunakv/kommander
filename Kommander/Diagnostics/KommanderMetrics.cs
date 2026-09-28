@@ -303,9 +303,21 @@ public static class KommanderMetrics
             "raft.wal.compaction_live_replica_hold_entries",
             description: "Entries retained below the checkpoint for a live lagging follower, per pass.");
 
-    /// <summary>Records the entries held below the checkpoint for a live replica in one pass.</summary>
-    internal static void RecordCompactionHeldByLiveReplica(int partitionId, long heldEntries) =>
-        WalCompactionLiveReplicaHold.Record(heldEntries, new KeyValuePair<string, object?>("partition_id", partitionId));
+    internal static readonly Histogram<long> WalCompactionLiveReplicaBudget =
+        Meter.CreateHistogram<long>(
+            "raft.wal.compaction_live_replica_budget_entries",
+            description: "Effective live-replica retention budget (count raised by the time window, capped), per pass that held for a replica.");
+
+    /// <summary>
+    /// Records the entries held below the checkpoint for a live replica in one pass, and the effective
+    /// budget that bounded the hold.
+    /// </summary>
+    internal static void RecordCompactionHeldByLiveReplica(int partitionId, long heldEntries, long budgetEntries)
+    {
+        KeyValuePair<string, object?> tag = new("partition_id", partitionId);
+        WalCompactionLiveReplicaHold.Record(heldEntries, tag);
+        WalCompactionLiveReplicaBudget.Record(budgetEntries, tag);
+    }
 
     // ── Snapshot transfer ─────────────────────────────────────────────────────
 
