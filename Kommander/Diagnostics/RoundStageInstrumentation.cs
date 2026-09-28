@@ -74,11 +74,19 @@ public enum RoundStage
     FollowerWalCompletion,
 
     /// <summary>
-    /// Follower: the executor handles the completion until the ack is handed to the transport. This
-    /// includes delivering newly committed entries to the application (<c>OnReplicationReceived</c>),
-    /// which the follower does before it acks.
+    /// Follower: the executor handles the completion until the ack is handed to the transport. With
+    /// <c>RaftConfiguration.FollowerApplyInOwnTurn</c> off, this includes delivering newly committed
+    /// entries to the application (<c>OnReplicationReceived</c>), which the follower then does before
+    /// it acks; with it on (the default) that delivery is <see cref="FollowerApply"/>.
     /// </summary>
     FollowerAck,
+
+    /// <summary>
+    /// Follower: one apply turn that delivered committed entries to the application, when the follower
+    /// applies after its ack (<c>RaftConfiguration.FollowerApplyInOwnTurn</c>). Off the round's path; an
+    /// append that arrives during a turn waits for it in <see cref="FollowerQueue"/>.
+    /// </summary>
+    FollowerApply,
 
     /// <summary>Either side: an <c>AppendLogs</c> or <c>CompleteAppendLogs</c> waits in the transport dispatcher until its send starts.</summary>
     TransportDispatch,
@@ -153,6 +161,7 @@ public static class RoundStageInstrumentation
         "follower.wal",
         "follower.wal_completion",
         "follower.ack",
+        "follower.apply",
         "transport.dispatch",
     ];
 

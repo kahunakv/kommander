@@ -553,6 +553,38 @@ public class RaftConfiguration
     public bool FanOutBeforeLocalWrite { get; set; } = true;
 
     /// <summary>
+    /// When <c>true</c> (the default), a follower acknowledges an append before it delivers the
+    /// entries the append committed to the application, and delivers them in executor turns of their
+    /// own (maintenance class, at most <see cref="FollowerApplyTurnTime"/> each). The next proposal's
+    /// append then waits for one such turn at most, instead of for every <c>OnReplicationReceived</c>
+    /// callback of the previous commit. When <c>false</c>, the follower delivers inside the append's
+    /// completion, before its ack.
+    ///
+    /// <para>What an acknowledgement means does not change: it never carried the applied position.
+    /// Delivery stays exactly-once and in log order, and the applied cursor still only advances over
+    /// delivered entries, so read-index and <c>ConfirmLocalApplicationAsync</c> waits are unaffected
+    /// except that the cursor can trail the commit frontier by the entries still queued for a turn.
+    /// The system partition always delivers inline.</para>
+    /// </summary>
+    public bool FollowerApplyInOwnTurn { get; set; } = true;
+
+    /// <summary>
+    /// With <see cref="FollowerApplyInOwnTurn"/>, how long one follower apply turn may deliver entries
+    /// before it yields the executor to queued appends and acks — the most an append waits behind the
+    /// application's callbacks. A turn always delivers at least one entry. Measured on
+    /// <see cref="TickSource"/>. <see cref="TimeSpan.Zero"/> leaves only <see cref="FollowerApplyTurnBudget"/>.
+    /// </summary>
+    public TimeSpan FollowerApplyTurnTime { get; set; } = TimeSpan.FromMicroseconds(100);
+
+    /// <summary>
+    /// With <see cref="FollowerApplyInOwnTurn"/>, the most committed entries one follower apply turn
+    /// delivers, whatever <see cref="FollowerApplyTurnTime"/> allows. A turn delivers more when the
+    /// backlog exceeds eight times this, so a consumer slower than the commit rate still slows the
+    /// follower instead of growing the backlog. <c>0</c> or less means no entry bound.
+    /// </summary>
+    public int FollowerApplyTurnBudget { get; set; } = 1024;
+
+    /// <summary>
     /// Optional per-partition application-durability floor (see
     /// <see cref="IApplicationDurabilityProvider"/>). When set, restart replay widens down to the
     /// floor (committed entries above it are redelivered via <c>OnLogRestored</c> even when a

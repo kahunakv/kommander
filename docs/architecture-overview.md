@@ -312,7 +312,9 @@ Step by step:
    `RaftProposalQuorum`/`RaftSyncProposalQuorum`. Once a **majority** (counting the leader itself) has
    the entry, it is **committed**.
 5. On commit, every node fires `OnReplicationReceived` so the application can apply the change to its
-   own state machine. `ReplicateLogs` returns a `RaftReplicationResult`.
+   own state machine. `ReplicateLogs` returns a `RaftReplicationResult`. A follower learns of the commit
+   from the leader's commit broadcast; it acks that append first and applies in executor turns of their
+   own (`FollowerApplyInOwnTurn`), so the next proposal's append never waits for the callbacks.
 
 **Auto-commit vs. manual commit.** With `autoCommit: true` (the default) the leader commits as soon as
 quorum is reached. With `autoCommit: false`, the proposal stays pending and the application explicitly

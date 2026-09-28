@@ -132,6 +132,11 @@ public static class RaftSafetyOptionAudit
         // Either value keeps "acknowledged ⇒ durable on a quorum including the leader": the quorum
         // waits for the leader's own write whichever way the fan-out is ordered.
         [nameof(RaftConfiguration.FanOutBeforeLocalWrite)] = RaftOptionKind.Performance,
+        // Either value keeps "acknowledged ⇒ durable on a quorum" and exactly-once, in-order
+        // delivery: only when the follower's consumer sees an entry moves, relative to its ack.
+        [nameof(RaftConfiguration.FollowerApplyInOwnTurn)] = RaftOptionKind.Performance,
+        [nameof(RaftConfiguration.FollowerApplyTurnBudget)] = RaftOptionKind.Performance,
+        [nameof(RaftConfiguration.FollowerApplyTurnTime)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.ApplicationDurabilityProvider)] = RaftOptionKind.Safety,
         [nameof(RaftConfiguration.MaxDrainQuantumControl)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.MaxDrainQuantumReplication)] = RaftOptionKind.Performance,

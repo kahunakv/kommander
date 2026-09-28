@@ -83,6 +83,9 @@ public static class RaftOperationMapper
             RaftRequestType.RestoreLogsLoaded         => RaftOperationKind.Maintenance,
             RaftRequestType.SnapshotInstalled         => RaftOperationKind.Maintenance,
             RaftRequestType.ResetFollowerProgress     => RaftOperationKind.Maintenance,
+            // Maintenance, so the next proposal's append (replication) is drained before the consumer
+            // callbacks of the previous commit in every executor cycle.
+            RaftRequestType.ApplyCommittedEntries     => RaftOperationKind.Maintenance,
 
             _ => throw new ArgumentOutOfRangeException(nameof(requestType), requestType, "Unrecognised RaftRequestType"),
         };
@@ -172,7 +175,8 @@ public static class RaftOperationMapper
             RaftRequestType.DrainBarrier or
             RaftRequestType.RestoreLogsLoaded or
             RaftRequestType.SnapshotInstalled or
-            RaftRequestType.ResetFollowerProgress => RaftStatePriority.Low,
+            RaftRequestType.ResetFollowerProgress or
+            RaftRequestType.ApplyCommittedEntries => RaftStatePriority.Low,
 
             RaftRequestType.AppendLogs or
             RaftRequestType.CompleteAppendLogs or

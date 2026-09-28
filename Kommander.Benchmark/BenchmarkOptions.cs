@@ -36,6 +36,12 @@ public sealed class BenchmarkOptions
     [Option("fan-out-before-local-write", Default = true, HelpText = "RaftConfiguration.FanOutBeforeLocalWrite: send a proposal to the followers while the leader's own write is queued (false = after it is durable).")]
     public bool? FanOutBeforeLocalWrite { get; set; }
 
+    [Option("apply-cost-us", Default = 0, HelpText = "CPU the application's OnReplicationReceived spends per delivered entry, on every node (a busy spin), in microseconds. 0 = no handler. Stands in for a real consumer such as Kahuna's apply (~5 µs per entry on the CamusDB bank).")]
+    public int ApplyCostMicros { get; set; }
+
+    [Option("apply-on", Default = "all", HelpText = "Where --apply-cost-us is spent: all (every node) | followers (a node that leads the partition applies for free, which isolates the follower's apply).")]
+    public string ApplyOn { get; set; } = "all";
+
     [Option("payload-bytes", Default = 280, HelpText = "Size of each replicated entry.")]
     public int PayloadBytes { get; set; }
 

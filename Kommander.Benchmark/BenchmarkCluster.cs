@@ -1,7 +1,9 @@
+using System.Diagnostics;
 using System.Net;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using Kommander.Communication;
+using Kommander.Data;
 using Kommander.Communication.Grpc;
 using Kommander.Communication.Memory;
 using Kommander.Discovery;
@@ -131,6 +133,9 @@ public sealed class BenchmarkCluster : IAsyncDisposable
                 new HybridLogicalClock(),
                 logger
             );
+
+            if (options.ApplyCostMicros > 0)
+                manager.OnReplicationReceived += ApplyConsumer(manager, options.ApplyCostMicros, followersOnly: options.ApplyOn == "followers");
 
             Managers.Add(manager);
             Communications.Add(counting);
@@ -299,6 +304,28 @@ public sealed class BenchmarkCluster : IAsyncDisposable
     /// properties are supported; an unknown name or an unparsable value fails the run rather than
     /// silently measuring the default.
     /// </summary>
+    /// <summary>
+    /// An application apply callback that burns <paramref name="micros"/> of CPU per entry on the thread that
+    /// delivers it, synchronously, as a consumer's in-memory state update does. With
+    /// <paramref name="followersOnly"/>, a node that leads the partition applies for free.
+    /// </summary>
+    private static Func<int, RaftLog, Task<bool>> ApplyConsumer(RaftManager manager, int micros, bool followersOnly)
+    {
+        long ticks = micros * Stopwatch.Frequency / 1_000_000;
+
+        return async (partitionId, _) =>
+        {
+            if (followersOnly && await manager.AmILeaderQuick(partitionId).ConfigureAwait(false))
+                return true;
+
+            long until = Stopwatch.GetTimestamp() + ticks;
+            while (Stopwatch.GetTimestamp() < until)
+                Thread.SpinWait(8);
+
+            return true;
+        };
+    }
+
     internal static void ApplyOverrides(RaftConfiguration configuration, IEnumerable<string> overrides)
     {
         foreach (string item in overrides)

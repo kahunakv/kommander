@@ -21,7 +21,9 @@ public sealed record RunConfig(
     double WindowSeconds,
     int Seed,
     bool? FanOutBeforeLocalWrite = null,
-    IReadOnlyList<string>? Overrides = null);
+    IReadOnlyList<string>? Overrides = null,
+    int ApplyCostMicros = 0,
+    string? ApplyOn = null);
 
 /// <summary>The machine and build the run used.</summary>
 public sealed record HostInfo(int Cores, string Os, string Arch, string Framework, string KommanderVersion, bool ServerGc);
@@ -197,6 +199,7 @@ public static class BenchmarkReport
     /// <summary>Marks the arms run with the serial fan-out; results written before the option existed carry null.</summary>
     private static string FanOutSuffix(RunConfig c) =>
         (c.FanOutBeforeLocalWrite == false ? " fanout=after-local-write" : "")
+        + (c.ApplyCostMicros > 0 ? Inv($" apply={c.ApplyCostMicros}us") + (c.ApplyOn == "followers" ? "@followers" : "") : "")
         + (c.Overrides is { Count: > 0 } o ? " set=" + string.Join(',', o) : "");
 
     private static (double A, double B, double R2) LeastSquares(double[] x, double[] y)
