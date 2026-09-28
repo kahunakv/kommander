@@ -24,6 +24,8 @@
 #   SYNC_WRITES   [false]  fsync for rocksdb; false keeps fsync out like the tmpfs CamusDB runs
 #   LABEL         [git short sha]
 #   FRAMEWORK     [net10.0]
+#   EXTRA_ARGS    [""]  more Kommander.Benchmark options for every arm, e.g.
+#                       "--fan-out-before-local-write false" for the serial fan-out
 #
 # On Linux, /dev/shm is tmpfs, so SYNC_WRITES=true there still has a free fsync. macOS has no
 # tmpfs; SYNC_WRITES=false writes the RocksDB WAL to the page cache without a sync, which is the
@@ -90,6 +92,7 @@ for transport in $TRANSPORTS; do
           --base-port "$port" \
           --label "$LABEL" \
           --output "$OUTPUT" \
+          ${EXTRA_ARGS:-} \
           2>/dev/null | sed -n '/^Kommander.Benchmark$/,/^  Cost/p' || echo "   arm failed (exit $?)"
       done
     done

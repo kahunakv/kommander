@@ -175,6 +175,25 @@ A single-voter leader is its own quorum, so the propose sync that just completed
 the fast path applies there too. The client now waits for **one** sync (propose) plus the quorum
 round-trip, not two.
 
+### The leader's propose sync overlaps the followers'
+
+With `FanOutBeforeLocalWrite` on (the default), the leader sends a proposal to its followers as soon as its
+own `Proposed` write is **queued**, not once it is durable. The leader's sync and the followers' syncs run
+at the same time instead of one after the other:
+
+```
+   serial:      leader PROPOSE(fsync) ──► send ──► follower APPEND(fsync) ──► ack ──► quorum
+   overlapped:  leader PROPOSE(fsync) ─────────────────────────────┐
+                send ──► follower APPEND(fsync) ──► ack ───────────┴──► quorum
+```
+
+The quorum still counts the leader only once its own write is durable (`RaftProposalQuorum.LocalDurable`):
+two follower acks are not enough while the leader's copy is still queued. So everything that runs at quorum
+(the commit marker, the leader's applies, backfill reads up to the commit index) still finds the batch on
+the leader's disk. The one visible difference is a failed leader write. The followers may already hold the
+batch and a later leader can commit it, so the caller gets `ProposalOutcomeUnknown`, not the storage error.
+The promotion barrier keeps the serial order.
+
 ---
 
 ## Flow 4 — The lazy commit marker
@@ -256,6 +275,9 @@ crash recovery yields the same committed prefix.** The fast path preserves it be
   checkpoint-commit and snapshot-install paths. It is never made lazy.
 - **The proposed tail is preserved.** `proposeIndex = maxLogId + 1` guarantees a later propose cannot
   overwrite an acked-but-lazily-committed entry.
+- **The overlapped fan-out waits for the leader's own sync.** With `FanOutBeforeLocalWrite`, followers may
+  write a batch before the leader does, but the proposal reaches quorum only once the leader's write is
+  durable too, so an ack still means a quorum that includes the leader holds the entry.
 
 ---
 
@@ -266,6 +288,7 @@ In `RaftConfiguration.cs`:
 | Setting | Default | What it does |
 |---|---|---|
 | `WalSingleFsyncCommit` | `true` | The latency lever. Acks `autoCommit` writes on propose-quorum-durable and writes the commit marker lazily, removing one `fsync` from the critical path. Off ⇒ byte-for-byte the prior two-sync behaviour. |
+| `FanOutBeforeLocalWrite` | `true` | Sends a proposal to the followers while the leader's own write is queued, so the leader's and followers' syncs overlap. The quorum still waits for the leader's write. Off ⇒ the followers get the batch only after the leader's write is durable (two syncs in series per round). |
 | `WalGroupCommitLingerMs` | `0` | The throughput/tail lever. `> 0` lets a WAL worker linger up to this many ms to gather more ready partitions into one `fsync`. Evidence-gated: a worker waits only while another partition has queued work that must become ready soon, so low-overlap and closed-loop load pay **zero** wait. `0` keeps purely opportunistic batching. |
 | `MaxWalGroupBatchPartitions` | `64` | Max partitions coalesced into a single `walAdapter.Write` (one `fsync` on RocksDB). |
 | `MaxWalBatchSize` | `256` | Max operations drained from one partition per write. |

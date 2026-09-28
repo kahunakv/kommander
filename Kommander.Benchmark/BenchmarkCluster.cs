@@ -92,7 +92,8 @@ public sealed class BenchmarkCluster : IAsyncDisposable
                 // A steady-state benchmark: SWIM probing and quiescence add background traffic and
                 // mode changes that are not part of a proposal round.
                 EnableQuiescence = false,
-                PingInterval = TimeSpan.Zero
+                PingInterval = TimeSpan.Zero,
+                FanOutBeforeLocalWrite = options.FanOutBeforeLocalWrite ?? true
             };
 
             if (mtls)

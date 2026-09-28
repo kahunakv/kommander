@@ -33,6 +33,9 @@ public sealed class BenchmarkOptions
     [Option("sync-writes", Default = true, HelpText = "fsync for rocksdb/sqlite (ignored for memory).")]
     public bool? SyncWrites { get; set; }
 
+    [Option("fan-out-before-local-write", Default = true, HelpText = "RaftConfiguration.FanOutBeforeLocalWrite: send a proposal to the followers while the leader's own write is queued (false = after it is durable).")]
+    public bool? FanOutBeforeLocalWrite { get; set; }
+
     [Option("payload-bytes", Default = 280, HelpText = "Size of each replicated entry.")]
     public int PayloadBytes { get; set; }
 

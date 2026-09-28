@@ -3258,6 +3258,16 @@ public class RocksDbWAL : IWAL, IDisposable
 
     private RaftOperationStatus TruncateProposedLogsAfterCore(int partitionId, long afterLogId)
     {
+        // A follower append that extends the tail has nothing above its cut. The scheduler runs this
+        // before every follower append batch, and the sweep below takes the EXCLUSIVE guard (stalling
+        // every other partition's write on the shared engine) and opens an iterator only to find no
+        // row. A cached max log id is exact whenever this runs: only the WAL scheduler writes log
+        // rows, it raises the cache before the partition's previous batch completes, and it never has
+        // two batches of one partition in flight — so a cached max at or below the cut proves the
+        // sweep empty. An absent cache (unknown) takes the sweep.
+        if (maxLogCache.TryGetValue(partitionId, out PartitionMaxLog? knownMax) && Volatile.Read(ref knownMax.Value) <= afterLogId)
+            return RaftOperationStatus.Success;
+
         try
         {
             using EngineLease lease = AcquireEngine();

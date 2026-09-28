@@ -231,6 +231,41 @@ internal sealed class ReplicationTracker
 
     private readonly Dictionary<string, BackfillProgressProbe> backfillProgress = [];
 
+    /// <summary>
+    /// One live commit or rollback broadcast shipped to a peer: the contiguous id range it resolves
+    /// and the monotonic tick it was handed to the transport.
+    /// </summary>
+    private readonly record struct ResolutionShipment(long MinId, long MaxId, long ShippedTicks);
+
+    /// <summary>
+    /// Per peer, the live commit and rollback broadcasts queued for it or shipped to it that its
+    /// acks have not yet covered (<see cref="RecordResolutionShipped"/>). The ack fast-path re-supply
+    /// reads it to tell a peer that is behind from a peer whose next commit markers are already on
+    /// their way (<see cref="AreResolutionsInFlight"/>).
+    ///
+    /// <para><b>Why it exists.</b> On every proposal, the slower follower's propose ack reports a
+    /// frontier one batch below the leader's just-advanced <c>LocalCommittedIndex</c>: the quorum
+    /// follower's ack committed the batch while this ack was on its way, and the commit broadcast
+    /// follows once the leader's commit marker is written. A whole batch is more than <c>BackfillThreshold</c>, so both re-supply branches
+    /// shipped a backfill batch the commit broadcast already carried: two WAL range reads awaited
+    /// on the executor, one extra <c>AppendLogs</c> and one extra follower WAL write per proposal.
+    /// On the CamusDB tmpfs cluster each follower handled three appends and sent six acks per
+    /// proposal, and a live append waited ~0.55 ms in the follower's executor queue behind them.</para>
+    ///
+    /// <para>Pruned by the peer's Success acks, bounded by <see cref="MaxResolutionShipmentsPerPeer"/>,
+    /// and trusted only for <c>HeartbeatInterval</c> after the ship: a broadcast the peer never
+    /// answered (dropped at the outbound byte cap, lost in a restart) ages out and the re-supply
+    /// runs again as it did before this gate.</para>
+    /// </summary>
+    private readonly Dictionary<string, List<ResolutionShipment>> resolutionShipments = [];
+
+    /// <summary>
+    /// Bound on <see cref="resolutionShipments"/> per peer. A peer that stops acking keeps at most
+    /// this many; the oldest goes first, which can only open a gap in the coverage walk and so
+    /// makes the re-supply run, never skip.
+    /// </summary>
+    private const int MaxResolutionShipmentsPerPeer = 256;
+
     /// <summary>Snapshot of one peer's backfill-convergence probe, consumed by the sender.</summary>
     public readonly record struct BackfillProgress(int FruitlessShips, long LastShipTicks);
 
@@ -257,6 +292,7 @@ internal sealed class ReplicationTracker
         mismatchAnchors.Clear();
         backfillProgress.Clear();
         compactedAnchorShips.Clear();
+        resolutionShipments.Clear();
 
         // The diagnostic record goes with the rest. A decision from a previous term was made from
         // frontiers this reset has just discarded, so keeping it would show a reader inputs that no
@@ -279,6 +315,7 @@ internal sealed class ReplicationTracker
         mismatchAnchors.Clear();
         backfillProgress.Clear();
         compactedAnchorShips.Clear();
+        resolutionShipments.Clear();
     }
 
     /// <summary>
@@ -299,6 +336,7 @@ internal sealed class ReplicationTracker
         startCommitIndexes.Remove(endpoint);
         backfillProgress.Remove(endpoint);
         compactedAnchorShips.Remove(endpoint);
+        resolutionShipments.Remove(endpoint);
         backfillDecisions.Remove(endpoint);
         heartbeatSentAtTicks.Remove(endpoint);
         return hadProgress;
@@ -359,6 +397,11 @@ internal sealed class ReplicationTracker
             matchIndex[endpoint] = reportedMax;
             lowered = true;
         }
+
+        // Broadcasts shipped to the previous incarnation prove nothing about what this one will
+        // resolve.
+        if (lowered)
+            resolutionShipments.Remove(endpoint);
 
         return lowered;
     }
@@ -861,6 +904,107 @@ internal sealed class ReplicationTracker
 
         probe.Warned = true;
         return true;
+    }
+
+    // ── live resolutions in flight ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Records that a live commit or rollback broadcast resolving ids
+    /// <paramref name="minId"/>..<paramref name="maxId"/> (contiguous) was handed to the transport
+    /// for <paramref name="endpoint"/>. See <see cref="resolutionShipments"/>.
+    /// </summary>
+    public void RecordResolutionShipped(string endpoint, long minId, long maxId, long nowTicks)
+    {
+        if (minId < 0 || maxId < minId)
+            return;
+
+        if (!resolutionShipments.TryGetValue(endpoint, out List<ResolutionShipment>? shipments))
+        {
+            shipments = [];
+            resolutionShipments[endpoint] = shipments;
+        }
+
+        // Kept sorted by MinId so the coverage walk is one pass. Commits mostly arrive in id order,
+        // so the slot is found within a few steps from the end. A commit is recorded when its marker
+        // is queued and again when its broadcast ships: the second refreshes the first rather than
+        // taking a slot.
+        int insertAt = shipments.Count;
+        while (insertAt > 0 && shipments[insertAt - 1].MinId >= minId)
+        {
+            ResolutionShipment existing = shipments[insertAt - 1];
+            if (existing.MinId == minId && existing.MaxId == maxId)
+            {
+                shipments[insertAt - 1] = new(minId, maxId, nowTicks);
+                return;
+            }
+
+            insertAt--;
+        }
+
+        if (shipments.Count >= MaxResolutionShipmentsPerPeer)
+        {
+            // Drop the lowest range: the one most likely already resolved, and at worst a gap in the
+            // coverage walk, which makes the re-supply run rather than skip.
+            shipments.RemoveAt(0);
+            insertAt = Math.Max(0, insertAt - 1);
+        }
+
+        shipments.Insert(insertAt, new(minId, maxId, nowTicks));
+    }
+
+    /// <summary>
+    /// Drops the shipments a Success ack's commit frontier <paramref name="reportedFrontier"/>
+    /// already covers: the peer has resolved everything through it.
+    /// </summary>
+    public void PruneResolutionShipments(string endpoint, long reportedFrontier)
+    {
+        if (reportedFrontier < 0 || !resolutionShipments.TryGetValue(endpoint, out List<ResolutionShipment>? shipments))
+            return;
+
+        // Index loop, not RemoveAll: a capturing predicate would allocate on every Success ack.
+        int kept = 0;
+        for (int i = 0; i < shipments.Count; i++)
+        {
+            if (shipments[i].MaxId > reportedFrontier)
+                shipments[kept++] = shipments[i];
+        }
+
+        shipments.RemoveRange(kept, shipments.Count - kept);
+    }
+
+    /// <summary>
+    /// True when every id in (<paramref name="fromExclusive"/>, <paramref name="throughInclusive"/>]
+    /// is covered, contiguously from <paramref name="fromExclusive"/>, by live commit or rollback
+    /// broadcasts shipped to <paramref name="endpoint"/> within <paramref name="freshness"/>. The
+    /// peer then lacks nothing a backfill batch would carry that is not already on its way. False
+    /// on any gap in the coverage, and for a shipment older than <paramref name="freshness"/>, which
+    /// the peer should have answered by now.
+    /// </summary>
+    public bool AreResolutionsInFlight(string endpoint, long fromExclusive, long throughInclusive, long nowTicks, TimeSpan freshness)
+    {
+        if (throughInclusive <= fromExclusive)
+            return true;
+
+        if (!resolutionShipments.TryGetValue(endpoint, out List<ResolutionShipment>? shipments) || shipments.Count == 0)
+            return false;
+
+        // One pass in MinId order: a fresh shipment starting at or below cursor + 1 extends the
+        // covered prefix; the first one starting above it is a gap no later one can close.
+        long cursor = fromExclusive;
+        foreach (ResolutionShipment shipment in shipments)
+        {
+            if (shipment.MinId > cursor + 1)
+                return false;
+
+            if (shipment.MaxId > cursor && RaftMonotonic.Elapsed(shipment.ShippedTicks, nowTicks) < freshness)
+            {
+                cursor = shipment.MaxId;
+                if (cursor >= throughInclusive)
+                    return true;
+            }
+        }
+
+        return false;
     }
 
     // ── saturation back-off ───────────────────────────────────────────────────────────────────

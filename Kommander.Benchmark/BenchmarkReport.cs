@@ -19,7 +19,8 @@ public sealed record RunConfig(
     int Concurrency,
     double WarmupSeconds,
     double WindowSeconds,
-    int Seed);
+    int Seed,
+    bool? FanOutBeforeLocalWrite = null);
 
 /// <summary>The machine and build the run used.</summary>
 public sealed record HostInfo(int Cores, string Os, string Arch, string Framework, string KommanderVersion, bool ServerGc);
@@ -104,7 +105,7 @@ public static class BenchmarkReport
         RunConfig c = r.Config;
 
         sb.AppendLine("Kommander.Benchmark");
-        sb.AppendLine(Inv($"  nodes={c.Nodes} partitions={c.Partitions} transport={c.Transport} storage={c.Storage} sync={c.SyncWrites} payload={c.PayloadBytes}B batch={c.BatchSize} concurrency={c.Concurrency}"));
+        sb.AppendLine(Inv($"  nodes={c.Nodes} partitions={c.Partitions} transport={c.Transport} storage={c.Storage} sync={c.SyncWrites} payload={c.PayloadBytes}B batch={c.BatchSize} concurrency={c.Concurrency}{FanOutSuffix(c)}"));
         sb.AppendLine(Inv($"  warmup={c.WarmupSeconds:0.#}s window={c.WindowSeconds:0.#}s host={r.Host.Cores} cores {r.Host.Os} {r.Host.Arch} {r.Host.Framework} kommander={r.Host.KommanderVersion}"));
         sb.AppendLine();
         sb.AppendLine(Inv($"  Throughput : {r.EntriesPerSecond:N0} entries/s   ({r.ProposalsPerSecond:N0} proposals/s)"));
@@ -189,8 +190,11 @@ public static class BenchmarkReport
     private static string GroupKey(BenchmarkResult r)
     {
         RunConfig c = r.Config;
-        return Inv($"label={r.Label ?? "-"} transport={c.Transport} storage={c.Storage} sync={c.SyncWrites} nodes={c.Nodes} partitions={c.Partitions} payload={c.PayloadBytes}B concurrency={c.Concurrency}");
+        return Inv($"label={r.Label ?? "-"} transport={c.Transport} storage={c.Storage} sync={c.SyncWrites} nodes={c.Nodes} partitions={c.Partitions} payload={c.PayloadBytes}B concurrency={c.Concurrency}{FanOutSuffix(c)}");
     }
+
+    /// <summary>Marks the arms run with the serial fan-out; results written before the option existed carry null.</summary>
+    private static string FanOutSuffix(RunConfig c) => c.FanOutBeforeLocalWrite == false ? " fanout=after-local-write" : "";
 
     private static (double A, double B, double R2) LeastSquares(double[] x, double[] y)
     {

@@ -74,7 +74,8 @@ internal sealed class BackfillSender
     /// <param name="logs"></param>
     /// <param name="prevLogIndex">Id of the entry immediately before the first entry in <paramref name="logs"/>; 0 skips the check.</param>
     /// <param name="prevLogTerm">Term of the entry at <paramref name="prevLogIndex"/>; 0 when index is 0.</param>
-    public void AppendLogToNode(
+    /// <returns>False when entries were withheld from a saturated peer and nothing was enqueued.</returns>
+    public bool AppendLogToNode(
         RaftNode node,
         HLCTimestamp timestamp,
         List<RaftLog>? logs,
@@ -100,7 +101,7 @@ internal sealed class BackfillSender
                 logger.LogDebug(
                     "[{LocalEndpoint}/{PartitionId}/{State}] Skipping live entries for {Endpoint}: its WAL queue reported saturated; backfill resumes after the backoff",
                     host.LocalEndpoint, host.PartitionId, coreState.NodeState, node.Endpoint);
-            return;
+            return false;
         }
         else
         {
@@ -124,6 +125,67 @@ internal sealed class BackfillSender
         }
 
         host.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.AppendLogs, node, request));
+        return true;
+    }
+
+    /// <summary>
+    /// Ships a live commit or rollback broadcast of <paramref name="logs"/> to every peer, and
+    /// records each delivery against the peer's resolutions in flight
+    /// (<see cref="ReplicationTracker.AreResolutionsInFlight"/>) so the ack fast path does not
+    /// re-ship what is already on its way.
+    /// </summary>
+    public void BroadcastResolution(HLCTimestamp ticketId, List<RaftLog> logs)
+    {
+        AppendLogsGrpcLogCache? grpcLogCache = logs.Count > 0 ? new() : null;
+        bool contiguous = TryGetContiguousRange(logs, out long minId, out long maxId);
+        long nowTicks = contiguous ? host.GetMonotonicTimestamp() : 0;
+
+        // Every peer (voters and learners): host.Nodes already excludes self.
+        foreach (RaftNode node in host.Nodes)
+        {
+            if (AppendLogToNode(node, ticketId, logs, grpcLogCache: grpcLogCache) && contiguous)
+                tracker.RecordResolutionShipped(node.Endpoint, minId, maxId, nowTicks);
+        }
+    }
+
+    /// <summary>
+    /// Records <paramref name="logs"/> as in flight to every peer from the moment their commit marker
+    /// is queued at quorum, before <see cref="BroadcastResolution"/> ships it on the commit's completion.
+    /// <c>LocalCommittedIndex</c> covers the batch from quorum on (the single-fsync fast path), and the
+    /// slower follower's propose ack lands in that window far more often than after the broadcast: without
+    /// this the ack path still re-supplied most batches. A commit write that fails never broadcasts; its
+    /// record ages out like any unanswered shipment.
+    /// </summary>
+    public void RecordResolutionQueued(List<RaftLog> logs)
+    {
+        if (!TryGetContiguousRange(logs, out long minId, out long maxId))
+            return;
+
+        long nowTicks = host.GetMonotonicTimestamp();
+        foreach (RaftNode node in host.Nodes)
+            tracker.RecordResolutionShipped(node.Endpoint, minId, maxId, nowTicks);
+    }
+
+    /// <summary>
+    /// The id range of a proposal batch when it is one contiguous run. A proposal's ids are distinct
+    /// (<c>RaftWriteAhead.EnqueuePropose</c> assigns them sequentially), so a min-to-max span of exactly
+    /// Count ids is one run; anything else is not recorded, because the coverage walk reads a shipment as
+    /// its whole id range.
+    /// </summary>
+    private static bool TryGetContiguousRange(List<RaftLog> logs, out long minId, out long maxId)
+    {
+        minId = long.MaxValue;
+        maxId = -1;
+        for (int i = 0; i < logs.Count; i++)
+        {
+            long id = logs[i].Id;
+            if (id < minId)
+                minId = id;
+            if (id > maxId)
+                maxId = id;
+        }
+
+        return logs.Count > 0 && minId >= 0 && maxId - minId + 1 == logs.Count;
     }
 
     /// <summary>

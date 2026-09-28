@@ -214,6 +214,24 @@ public static class KommanderMetrics
             "raft.backfill.no_progress_episodes_total",
             description: "Backfill no-progress episodes that crossed the warning threshold.");
 
+    /// <summary>
+    /// Ack fast-path re-supplies not sent because every entry the peer is missing is already on the
+    /// wire to it as a live commit or rollback broadcast. One per proposal is the steady state of a
+    /// three-voter partition under write load (the slower follower's propose ack); each is a WAL
+    /// range read, an <c>AppendLogs</c> and a follower WAL write the leader no longer spends.
+    /// </summary>
+    internal static readonly Counter<long> BackfillResupplySkippedInFlightTotal =
+        Meter.CreateCounter<long>(
+            "raft.backfill.resupply_skipped_in_flight_total",
+            description: "Ack-path backfill re-supplies skipped because the peer's missing commits are already in flight to it.");
+
+    /// <summary>Counts one re-supply skipped as already in flight, tagged by partition. Hot path: no tag boxing without a listener.</summary>
+    internal static void RecordResupplySkippedInFlight(int partitionId)
+    {
+        if (BackfillResupplySkippedInFlightTotal.Enabled)
+            BackfillResupplySkippedInFlightTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
+    }
+
     /// <summary>Counts one paced-skip of a backfill batch, tagged by partition.</summary>
     internal static void RecordBackfillNoProgressPause(int partitionId) =>
         BackfillNoProgressPausesTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));

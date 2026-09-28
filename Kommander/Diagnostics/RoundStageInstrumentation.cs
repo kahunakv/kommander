@@ -12,7 +12,11 @@ namespace Kommander.Diagnostics;
 ///
 /// <para>The leader stages <see cref="LeaderQueue"/> … <see cref="LeaderResume"/> run in series
 /// and add up to <see cref="LeaderRound"/>, apart from the gateway's own work before the first
-/// executor hop. <see cref="LeaderReplication"/> is the leader-side view of the follower round
+/// executor hop. With <c>RaftConfiguration.FanOutBeforeLocalWrite</c> on (the default),
+/// <see cref="LeaderFanout"/> follows <see cref="LeaderPropose"/> in the same executor turn, and
+/// <see cref="LeaderWal"/> and <see cref="LeaderWalCompletion"/> run beside
+/// <see cref="LeaderReplication"/> instead of before it: the chain is queue, propose, fanout,
+/// replication, ack, resume. <see cref="LeaderReplication"/> is the leader-side view of the follower round
 /// trip; the follower stages and the leader's ack stages split it, and what is left over is
 /// transport (dispatch, serialization, sockets, TLS).</para>
 /// </summary>
@@ -30,10 +34,16 @@ public enum RoundStage
     /// <summary>Leader: the Proposed write is durable until the executor handles its completion (callback, executor queue).</summary>
     LeaderWalCompletion,
 
-    /// <summary>Leader: the executor registers the quorum and hands one <c>AppendLogs</c> per follower to the transport.</summary>
+    /// <summary>
+    /// Leader: the executor registers the quorum and hands one <c>AppendLogs</c> per follower to the transport
+    /// (when the Proposed write is queued, or after it is durable with <c>FanOutBeforeLocalWrite</c> off).
+    /// </summary>
     LeaderFanout,
 
-    /// <summary>Leader: fan-out is done until the ack that makes the quorum releases the ticket.</summary>
+    /// <summary>
+    /// Leader: fan-out is done until the step that makes the quorum releases the ticket — a follower's ack, or
+    /// the leader's own propose completion when the followers answered before its write was durable.
+    /// </summary>
     LeaderReplication,
 
     /// <summary>Leader: a follower's <c>CompleteAppendLogs</c> ack waits in the partition executor's queue (every ack).</summary>
