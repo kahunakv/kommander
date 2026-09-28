@@ -171,7 +171,15 @@ public class TestDurableButUnansweredCommit
             foreach (IRaft node in nodes)
                 await WaitForCommitIndexAsync(node, UserPartition, reply.CommitIndex);
 
-            // Force the term change the hook exists to make testable.
+            // Force the term change the hook exists to make testable. Suspending heartbeats alone
+            // does not guarantee it: the silent leader is stepped down by check-quorum, but it can
+            // campaign again and win, because vote traffic and the forced barrier heartbeat are
+            // unaffected. Every such win re-arms the followers' vote cooldown (2 × their election
+            // timeout), and when both followers drew a timeout above half the old leader's re-campaign
+            // cycle, neither ever runs its own pre-vote — the old leader wins every term for the whole
+            // wait (observed as a ~20% failure locally and on GA). Withholding its candidacy turns
+            // "usually a different node" into "always a different node"; it keeps voting and acking.
+            Assert.Equal(RaftOperationStatus.Success, leader.SetCandidacyWithheld(UserPartition, true));
             Assert.Equal(RaftOperationStatus.Success, await leader.SuspendHeartbeatsAsync(UserPartition, TestContext.Current.CancellationToken));
 
             IRaft newLeader = await WaitForLeaderAsync(nodes, UserPartition, excluding: leader);
