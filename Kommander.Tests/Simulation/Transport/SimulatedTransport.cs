@@ -201,6 +201,24 @@ public sealed class SimulatedTransport : ICommunication
     }
 
     /// <summary>
+    /// True when every consensus message from <paramref name="from"/> reaches <paramref name="to"/>
+    /// unfiltered: <see cref="CanDeliver"/>, and the link carries <see cref="LinkTraffic.All"/>.
+    /// Duplication does not count against it — a duplicated link still delivers.
+    ///
+    /// <para>For the liveness rule <c>available-majority-leads</c>: a link that drops appends or
+    /// vote requests is a fault the rule must not judge an election over, while a merely blocked
+    /// link is already excluded by <see cref="CanDeliver"/>.</para>
+    /// </summary>
+    public bool IsLinkClean(string from, string to)
+    {
+        if (!CanDeliver(from, to))
+            return false;
+
+        lock (gate)
+            return !(linkFaults.TryGetValue((from, to), out LinkFault fault) && fault.Traffic != LinkTraffic.All);
+    }
+
+    /// <summary>
     /// Stops <paramref name="endpoint"/> receiving consensus traffic and starts storing it.
     ///
     /// <para>This is a stopped process, not a cut cable. The difference is what happens on

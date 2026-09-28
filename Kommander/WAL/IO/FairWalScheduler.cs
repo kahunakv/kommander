@@ -1061,6 +1061,10 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         long doneAtTicks = tickSource.GetTimestamp();
         double ticksToMs = 1000.0 / tickSource.Frequency;
 
+        // Round stages (off by default): one stopwatch stamp per batch, carried on each completion
+        // so the executor can time the completion's trip back to the partition.
+        long durableStageTicks = RoundStageInstrumentation.Stamp();
+
         KommanderMetrics.WalBatchesTotal.Add(1);
 
         // The engine's answer time for this batch, success or failure alike. The commit-wait EWMA
@@ -1104,6 +1108,8 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
                 totalWaitMs += opWaitMs;
                 if (instrument)
                     WalPhaseInstrumentation.RecordDurable(op.Type, opWaitMs);
+                if (durableStageTicks != 0)
+                    RecordWalStage(op.Type, opWaitMs);
             }
             waitState.CommitWait.RecordWaitMs(totalWaitMs / pidBatch.Count);
 
@@ -1148,7 +1154,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             {
                 try
                 {
-                    op.OnComplete(BuildCompletion(op, status, batchSynced));
+                    op.OnComplete(BuildCompletion(op, status, batchSynced, durableStageTicks));
                     Interlocked.Increment(ref _totalOperationsCompleted);
                     KommanderMetrics.WalOperationsTotal.Add(1);
                 }
@@ -1283,7 +1289,30 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         }
     }
 
-    private static RaftWalCompletion BuildCompletion(WALWriteOperation op, RaftOperationStatus status, bool synced)
+    /// <summary>
+    /// Records the enqueue → durable wait of a round write as its
+    /// <see cref="RoundStageInstrumentation"/> stage. The wait is the scheduler's own measurement,
+    /// on its tick source (the stopwatch in production), so it matches <c>WalPhaseInstrumentation</c>.
+    /// </summary>
+    private static void RecordWalStage(WALWriteOperationType type, double waitMs)
+    {
+        switch (type)
+        {
+            case WALWriteOperationType.LeaderPropose:
+                RoundStageInstrumentation.RecordMs(RoundStage.LeaderWal, waitMs);
+                break;
+
+            case WALWriteOperationType.LeaderCommit:
+                RoundStageInstrumentation.RecordMs(RoundStage.LeaderCommitWal, waitMs);
+                break;
+
+            case WALWriteOperationType.FollowerAppend:
+                RoundStageInstrumentation.RecordMs(RoundStage.FollowerWal, waitMs);
+                break;
+        }
+    }
+
+    private static RaftWalCompletion BuildCompletion(WALWriteOperation op, RaftOperationStatus status, bool synced, long durableStageTicks = 0)
     {
         if (op.Type is WALWriteOperationType.HardState or WALWriteOperationType.HlcFloor)
             return new RaftWalCompletion(op.Logs.PartitionId, op.OperationId, op.Term, -1, -1, op.Type, op.MetadataStatus, MetadataValue: op.MetadataValue);
@@ -1340,7 +1369,10 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             SparseLogIds: sparseIds,
             Synced: synced,
             ResolvedMaxLogIndex: resolvedMax
-        );
+        )
+        {
+            DurableStageTicks = durableStageTicks
+        };
     }
 
     // ── IDisposable ────────────────────────────────────────────────────────

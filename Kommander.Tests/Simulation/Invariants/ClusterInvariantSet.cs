@@ -114,6 +114,70 @@ public static class ClusterInvariantSet
     public const string CommittedEntriesAgree = "committed-entries-agree";
 
     /// <summary>
+    /// A majority of voters that is running, unfaulted and fully connected elects a leader within a
+    /// bounded amount of simulated time.
+    ///
+    /// <para><b>Why a liveness rule among safety rules.</b> Every other rule here is silent on a
+    /// cluster that does nothing, and a cluster with no leader does nothing wrong. The CamusDB fault
+    /// soak fs11 outage was exactly that: the leader was paused, the two live voters could talk to
+    /// each other, one of them granted its vote every round and the other threw the grant away, and
+    /// for the whole 30 s pause the partition served no write. No log rule can see it; the end-of-run
+    /// convergence check ran after the pause ended and passed. This rule measures the one thing that
+    /// was wrong: an available majority that stayed leaderless.</para>
+    ///
+    /// <para><b>What "available" excludes.</b> A paused or crashed node, a node whose store refuses
+    /// writes (it cannot persist a vote), a node with a slow disk (the library defers its candidacy
+    /// while its writes stall), a node whose log has a hole (it yields the term to a fresher peer,
+    /// and refuses to promote), a node still restoring (it answers no view), and any pair of nodes
+    /// whose link is blocked or filtered in either direction. Each is a state in which the library
+    /// is entitled to have no leader, so the rule counts time only while none of them holds.</para>
+    ///
+    /// <para><b>Why the bound is many election timeouts.</b> A healthy failover takes one election
+    /// timeout plus a round trip. Split votes, a pre-vote that has to wait for a stale leader's
+    /// heartbeat to age out, and a candidate that wins and then spends its barrier timeout all take
+    /// longer, and none of them is a defect. Forty timeouts is far above all of them and far below
+    /// the length of any pause a generated run holds.</para>
+    /// </summary>
+    public const string AvailableMajorityLeads = "available-majority-leads";
+
+    /// <summary>
+    /// Checks <see cref="AvailableMajorityLeads"/> over facts the runner has already gathered.
+    /// </summary>
+    /// <param name="stepNumber">The step under check.</param>
+    /// <param name="available">Endpoints that are running, unfaulted and pairwise connected.</param>
+    /// <param name="voterCount">Denominator of the majority: every node of the cluster.</param>
+    /// <param name="reachableLeader">A running node that reports itself leader and is connected to
+    /// every available node, or null when there is none.</param>
+    /// <param name="leaderlessForMs">Simulated milliseconds the available majority has been
+    /// leaderless without a break, or 0 when the condition does not hold now.</param>
+    /// <param name="boundMs">The most it may stay leaderless.</param>
+    /// <param name="state">Every node's role, term and frontier, for the report.</param>
+    public static void CheckAvailableMajorityLeads(
+        int stepNumber,
+        IReadOnlyCollection<string> available,
+        int voterCount,
+        string? reachableLeader,
+        long leaderlessForMs,
+        long boundMs,
+        string state)
+    {
+        int quorum = voterCount / 2 + 1;
+
+        if (available.Count < quorum || reachableLeader is not null || leaderlessForMs <= boundMs)
+            return;
+
+        throw Violation(
+            AvailableMajorityLeads,
+            stepNumber,
+            $"available-majority-leads: {available.Count} of {voterCount} voters " +
+            $"({string.Join(", ", available)}) have been running, unfaulted and fully connected for " +
+            $"{leaderlessForMs} ms of simulated time with no leader among them (bound {boundMs} ms). A " +
+            "majority that can talk must elect. Look at the vote path between them: a grant that one " +
+            "side gives and the other discards, a candidacy cooldown that a repeated grant keeps " +
+            $"re-arming, or a pre-vote denied while the old leader still looks fresh. State: {state}");
+    }
+
+    /// <summary>
     /// Checks <see cref="OneLeaderPerTerm"/> against one partition's views.
     /// </summary>
     public static void CheckOneLeaderPerTerm(int stepNumber, IReadOnlyList<RaftPartitionView> views)

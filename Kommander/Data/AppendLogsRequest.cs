@@ -9,6 +9,13 @@ public sealed class AppendLogsRequest
 {
     public int Partition { get; set; }
 
+    /// <summary>
+    /// Stopwatch stamp taken when the transport dispatcher queued this message, or 0 when the round
+    /// stages (<see cref="Kommander.Diagnostics.RoundStageInstrumentation"/>) are off. Local only:
+    /// internal, so neither the REST JSON nor the gRPC mapping carries it.
+    /// </summary>
+    internal long DispatchStageTicks { get; set; }
+
     public long Term { get; set; }
 
     public HLCTimestamp Time { get; set; }

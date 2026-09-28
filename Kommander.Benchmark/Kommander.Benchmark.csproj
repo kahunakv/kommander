@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!-- Kommander.Benchmark: the round-cost benchmark. A console exe that
+       stands up a three-node cluster in one process, over real gRPC sockets or the in-memory
+       transport, and fits the per-proposal cost a + b·n. Sdk.Web supplies Kestrel for the gRPC arms.
+       It consumes the public surface of Kommander only. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>Kommander.Benchmark</RootNamespace>
+    <!-- Matches the hosts the numbers are compared against (Kahuna and CamusDB run server GC). -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CommandLineParser" Version="2.9.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Kommander\Kommander.csproj" />
+  </ItemGroup>
+
+</Project>

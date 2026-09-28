@@ -1,6 +1,7 @@
 using System.Buffers;
 using Kommander.Communication.Grpc;
 using Kommander.Data;
+using Kommander.Diagnostics;
 using Kommander.Logging;
 using Kommander.Scheduling;
 using Kommander.System;
@@ -147,6 +148,8 @@ internal sealed class LogReplicator
         if (logs is null || logs.Count == 0)
             return (RaftOperationStatus.Success, HLCTimestamp.Zero);
 
+        long stageStartTicks = RoundStageInstrumentation.Stamp();
+
         if (coreState.NodeState != RaftNodeState.Leader)
             return (RaftOperationStatus.NodeIsNotLeader, HLCTimestamp.Zero);
 
@@ -234,6 +237,14 @@ internal sealed class LogReplicator
             pendingPropose.AutoCommit = autoCommit;
             proposals.TrackPending(operation.OperationId, pendingPropose);
 
+            RoundStageInstrumentation.Record(RoundStage.LeaderPropose, stageStartTicks);
+
+            if (host.Configuration.FanOutBeforeLocalWrite && !IsLeadershipBarrier(logs))
+            {
+                pendingPropose.Proposal = FanOutBeforeLocalWrite(logs, autoCommit, currentTime, nowTicks);
+                pendingPropose.FannedOutBeforeWrite = pendingPropose.Proposal is not null;
+            }
+
             return (RaftOperationStatus.Pending, currentTime);
         }
         finally
@@ -274,6 +285,70 @@ internal sealed class LogReplicator
 
         return (RaftOperationStatus.Success, currentTime);*/
     }
+
+    /// <summary>
+    /// Registers the proposal and sends the batch to every peer while the leader's own Proposed write
+    /// is still queued (<see cref="RaftConfiguration.FanOutBeforeLocalWrite"/>), so the followers'
+    /// writes overlap the leader's instead of following it. The leader's vote is expected but not
+    /// counted: the quorum stays short until <see cref="WalCompletionRouter"/> marks the local write
+    /// durable, whichever comes first of that and the followers' acks.
+    ///
+    /// <para>The round used to hold two WAL writes in series, the leader's then the follower's, each
+    /// behind its own executor and WAL-worker hops: 0.53 ms of a 2.45 ms round on the CamusDB tmpfs
+    /// cluster, and one whole fsync on a real device.</para>
+    ///
+    /// <para>Returns null, leaving the proposal to the serial path, when no voter peer exists (the
+    /// self-quorum is completed at the local write) or the ticket is already registered.</para>
+    /// </summary>
+    private RaftProposalQuorum? FanOutBeforeLocalWrite(List<RaftLog> logs, bool autoCommit, HLCTimestamp ticketId, long nowTicks)
+    {
+        if (!sender.HasVoterPeer())
+            return null;
+
+        long fanoutStartTicks = RoundStageInstrumentation.Stamp();
+
+        RaftProposalQuorum proposalQuorum = RaftProposalQuorumPool.Rent(logs, autoCommit, ticketId, nowTicks);
+        proposalQuorum.ExpectLocalDurability(host.LocalEndpoint);
+
+        foreach (RaftNode node in host.Nodes)
+        {
+            if (node.Endpoint == host.LocalEndpoint)
+                throw new RaftException("Corrupted nodes");
+
+            // Learners receive the entries but never count toward quorum.
+            if (host.IsVoter(node.Endpoint))
+                proposalQuorum.AddExpectedNodeCompletion(node.Endpoint);
+        }
+
+        // Registered before anything is sent: an ack is handled on this executor, after this turn,
+        // and must find the proposal. Not returned to the pool on failure — the pool's Clear would
+        // empty the caller's log list, which the queued write still carries.
+        if (!proposals.TryAdd(ticketId, proposalQuorum))
+            return null;
+
+        AppendLogsGrpcLogCache grpcLogCache = new();
+        foreach (RaftNode node in host.Nodes)
+            sender.AppendLogToNode(node, ticketId, logs, grpcLogCache: grpcLogCache);
+
+        if (fanoutStartTicks != 0)
+        {
+            long fanoutDoneTicks = RoundStageInstrumentation.Stamp();
+            RoundStageInstrumentation.Record(RoundStage.LeaderFanout, fanoutStartTicks, fanoutDoneTicks);
+            proposalQuorum.FanoutStageTicks = fanoutDoneTicks;
+        }
+
+        if (logger.IsEnabled(LogLevel.Debug))
+            logger.LogDebugProposedLogs(host.LocalEndpoint, host.PartitionId, coreState.NodeState, ticketId, string.Join(',', logs.Select(x => x.Id.ToString())));
+
+        return proposalQuorum;
+    }
+
+    /// <summary>
+    /// The promotion barrier keeps the serial order: it is one entry per term, and its failure path
+    /// reverts the promotion, which the early fan-out would complicate for no gain.
+    /// </summary>
+    private static bool IsLeadershipBarrier(List<RaftLog> logs) =>
+        logs.Count == 1 && logs[0].LogType == RaftSystemConfig.LeadershipBarrierLogType;
 
     /// <summary>
     /// Puts together a plan to replicate logs to other nodes in the cluster when the node is the leader.

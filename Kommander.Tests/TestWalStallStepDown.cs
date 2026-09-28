@@ -280,6 +280,10 @@ public sealed class TestWalStallStepDown
             // The stalled proposal's caller is released by the step-down, not by its own 10 s timeout.
             RaftReplicationResult stalledResult = await stalledProposal.WaitAsync(TimeSpan.FromSeconds(5), ct);
             Assert.False(stalledResult.Success, "a proposal whose leader stepped down mid-write must not report success");
+
+            // The batch reached the followers while the leader's write was queued (FanOutBeforeLocalWrite,
+            // on by default), so the successor may still commit it: a definite refusal would be a lie.
+            Assert.Equal(RaftOperationStatus.ProposalOutcomeUnknown, stalledResult.Status);
             Assert.True(failover.GetElapsedMilliseconds() < 8_000, $"the caller waited {failover.GetElapsedMilliseconds():F0} ms; it must be released by the step-down");
 
             // The deposed node must LEARN its successor while its disk is still stalled: its vote for the

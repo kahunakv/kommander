@@ -72,6 +72,8 @@ internal sealed class ReplicationAckProcessor
 
     public async ValueTask CompleteAppendLogsAsync(string endpoint, HLCTimestamp timestamp, RaftOperationStatus status, long committedIndex, long responseTerm = -1, long durableIndex = -1, long walStallMs = 0, long presentIndex = -1, long presentTerm = -1)
     {
+        long ackStartTicks = RoundStageInstrumentation.Stamp();
+
         // ── Raft §5.1: a response stamped with a HIGHER term deposes us ─────────────────────────
         // Terms only enter a node through elections, so a higher response term proves a newer term
         // exists — this leader (or candidate) is stale and must step down and adopt it BEFORE the
@@ -143,6 +145,22 @@ internal sealed class ReplicationAckProcessor
 
         if (endpoint != host.LocalEndpoint)
             host.UpdateLastNodeActivity(endpoint, host.PartitionId, currentTime);
+
+        // Check-quorum contact. The fences above guarantee that a term-stamped ack reaching this point
+        // was produced by a peer that adopted this node as the leader of its current term, and it answers
+        // whatever this leader sent it: that is the reachability check-quorum measures, regardless of what
+        // the ack says about the batch. Counting only Success acks (as this used to) made a leader that
+        // was mid-repair step down as "isolated" while every follower was answering it in its own term:
+        // a freshly promoted leader whose barrier append lands over a gap on its followers gets
+        // LogMismatch back, the backfill that fixes it rides the next heartbeat tick, and the followers'
+        // Success acks land only after their fsync — past a two-heartbeat window on a loaded runner
+        // (RecoveryReSupplyClusterTests under GA load). The two rejections that deny the leader's claim
+        // rather than the batch are excluded: LogsFromAnotherLeader (the peer does not count this node
+        // as its leader) and LeaderInOldTerm (the peer is on a newer term; the higher-term branch above
+        // is where a member's copy of it is handled).
+        if (responseTerm >= 0 && endpoint != host.LocalEndpoint
+            && status is not (RaftOperationStatus.LogsFromAnotherLeader or RaftOperationStatus.LeaderInOldTerm))
+            readIndex.RecordVoterAck(endpoint, host.GetMonotonicTimestamp());
 
         // Two facts about the peer's DISK, valid on every term-fenced ack whatever its status: the
         // durable contiguous frontier (the only evidence WAL retention may hold on — see
@@ -307,17 +325,15 @@ internal sealed class ReplicationAckProcessor
         {
             tracker.RecordBackfillAckFrontier(endpoint, committedIndex);
             tracker.ClearCompactedAnchorIfCovered(endpoint, committedIndex);
+            tracker.PruneResolutionShipments(endpoint, committedIndex);
         }
 
-        // Same-term success acks double as leadership proof: they feed the read-index confirmation
-        // round and the check-quorum recency window. Only term-stamped acks count — an unstamped
-        // (-1) ack passed the term fence above by default and could belong to an earlier stint of
-        // this node's leadership.
+        // Same-term success acks double as leadership proof for the read-index confirmation round
+        // (the check-quorum contact was recorded above, for every same-term reply). Only term-stamped
+        // acks count — an unstamped (-1) ack passed the term fence above by default and could belong
+        // to an earlier stint of this node's leadership.
         if (responseTerm >= 0 && endpoint != host.LocalEndpoint && coreState.NodeState == RaftNodeState.Leader)
-        {
-            readIndex.RecordVoterAck(endpoint, host.GetMonotonicTimestamp());
             await readIndex.RegisterAckAsync(endpoint).ConfigureAwait(false);
-        }
 
         // Everything below this guard derives replication progress from committedIndex, so it
         // requires an actual report. A Success ack with committedIndex < 0 carries NO frontier
@@ -354,6 +370,15 @@ internal sealed class ReplicationAckProcessor
             }
             tracker.SetNextIndex(endpoint, newMatchIndex + 1);
 
+            // Both re-supply branches below skip a peer whose whole gap is already in flight to it as
+            // live commit or rollback broadcasts, queued at quorum or shipped
+            // (ReplicationTracker.AreResolutionsInFlight). That is the steady state of the slower
+            // follower: its propose ack reports a frontier one batch below the commit this leader
+            // has just made, and a re-supply then read and shipped that batch a second time on
+            // every proposal. A broadcast that does not land ages out after HeartbeatInterval and
+            // the re-supply runs again; the heartbeat's own backfill triggers are not gated.
+            long ackTicks = host.GetMonotonicTimestamp();
+
             // Immediately ship the next bounded batch only while an active catch-up is in progress,
             // so a multi-batch backfill converges without stalling a full heartbeat per batch. This
             // must honour the same BackfillThreshold gate as the heartbeat path: a follower lagging by
@@ -362,7 +387,8 @@ internal sealed class ReplicationAckProcessor
             // fresh enough to receive a leadership transfer it should not.
             if (coreState.NodeState == RaftNodeState.Leader
                 && host.Configuration.BackfillEnabled
-                && coreState.LocalCommittedIndex - newMatchIndex > host.Configuration.BackfillThreshold)
+                && coreState.LocalCommittedIndex - newMatchIndex > host.Configuration.BackfillThreshold
+                && !ResolutionsInFlight(endpoint, newMatchIndex, ackTicks))
             {
                 RaftNode? behindNode = RaftPeers.FindByEndpoint(host.Nodes, endpoint);
                 if (behindNode is not null)
@@ -378,7 +404,8 @@ internal sealed class ReplicationAckProcessor
             if (coreState.NodeState == RaftNodeState.Leader
                 && host.Configuration.BackfillEnabled
                 && committedIndex >= 0
-                && coreState.LocalCommittedIndex - committedIndex > host.Configuration.BackfillThreshold)
+                && coreState.LocalCommittedIndex - committedIndex > host.Configuration.BackfillThreshold
+                && !ResolutionsInFlight(endpoint, committedIndex, ackTicks))
             {
                 RaftNode? behindNode2 = RaftPeers.FindByEndpoint(host.Nodes, endpoint);
                 if (behindNode2 is not null)
@@ -432,7 +459,27 @@ internal sealed class ReplicationAckProcessor
 
         logger.LogInfoProposalCompletedAt(host.LocalEndpoint, host.PartitionId, coreState.NodeState, timestamp, (currentTime - proposal.StartTimestamp).TotalMilliseconds);
 
+        CompleteQuorum(proposal, timestamp, ackStartTicks);
+    }
+
+    /// <summary>
+    /// The step a proposal takes once <see cref="RaftProposalQuorum.HasQuorum"/> first holds: mark it
+    /// Completed, release the caller (the manual two-phase propose, or the single-fsync fast path),
+    /// and enqueue the commit marker. Reached from the follower ack that made the quorum, or — for a
+    /// proposal fanned out before its local write — from the leader's own propose completion when the
+    /// followers' acks got there first (<see cref="WalCompletionRouter"/>).
+    /// </summary>
+    /// <param name="quorumStartTicks">Round-stage stamp of the step that made the quorum (0 when stages are off).</param>
+    public void CompleteQuorum(RaftProposalQuorum proposal, HLCTimestamp timestamp, long quorumStartTicks)
+    {
         proposal.SetState(RaftProposalState.Completed);
+
+        // Round stages (off by default): the step that made the quorum ends the replication stage.
+        if (quorumStartTicks != 0)
+        {
+            RoundStageInstrumentation.Record(RoundStage.LeaderReplication, proposal.FanoutStageTicks);
+            RoundStageInstrumentation.Record(RoundStage.LeaderAck, quorumStartTicks);
+        }
 
         // Observability (off in production): report the acknowledgements that carried this proposal to commit
         // quorum — the local leader (a voter, implicitly durable) plus every registered voter that acked.
@@ -470,6 +517,7 @@ internal sealed class ReplicationAckProcessor
         proposals.TryReleaseTicketOnQuorumDurable(proposal);
 
         WALWriteOperation operation = wal.EnqueueCommit(proposal.Logs);
+        sender.RecordResolutionQueued(proposal.Logs);
         Scheduling.RaftPendingWalOperation pendingAutoCommit = proposals.RentPending();
         pendingAutoCommit.Proposal = proposal;
         pendingAutoCommit.TicketId = timestamp;
@@ -482,6 +530,15 @@ internal sealed class ReplicationAckProcessor
     /// whole-partition transfer, and the snapshot sender's own pacing covers everything after.
     /// </summary>
     private const int CompactedAnchorRefusalsBeforeSnapshot = 2;
+
+    private bool ResolutionsInFlight(string endpoint, long frontier, long nowTicks)
+    {
+        if (!tracker.AreResolutionsInFlight(endpoint, frontier, coreState.LocalCommittedIndex, nowTicks, host.Configuration.HeartbeatInterval))
+            return false;
+
+        KommanderMetrics.RecordResupplySkippedInFlight(host.PartitionId);
+        return true;
+    }
 
     private RaftNode? FindNode(string endpoint)
     {

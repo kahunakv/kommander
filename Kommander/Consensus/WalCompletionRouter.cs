@@ -51,6 +51,13 @@ internal sealed class WalCompletionRouter
     /// </summary>
     private readonly Func<string, Task> revertUnpublishedPromotionAsync;
 
+    /// <summary>
+    /// Completes a proposal whose quorum was just reached (<see cref="ReplicationAckProcessor.CompleteQuorum"/>).
+    /// Needed here for a proposal fanned out before its local write: when both followers ack first, it is
+    /// the leader's own propose completion that makes the quorum.
+    /// </summary>
+    private readonly Action<RaftProposalQuorum, HLCTimestamp, long> completeQuorum;
+
     public WalCompletionRouter(
         IRaftPartitionHost host,
         IRaftWalFacade wal,
@@ -60,7 +67,8 @@ internal sealed class WalCompletionRouter
         BackfillSender sender,
         IRaftOperationReplySink replySink,
         ILogger<IRaft> logger,
-        Func<string, Task> revertUnpublishedPromotionAsync)
+        Func<string, Task> revertUnpublishedPromotionAsync,
+        Action<RaftProposalQuorum, HLCTimestamp, long> completeQuorum)
     {
         this.host = host;
         this.wal = wal;
@@ -71,6 +79,7 @@ internal sealed class WalCompletionRouter
         this.replySink = replySink;
         this.logger = logger;
         this.revertUnpublishedPromotionAsync = revertUnpublishedPromotionAsync;
+        this.completeQuorum = completeQuorum;
     }
 
     private void CompleteReply(ulong? correlationId, RaftResponse response)
@@ -333,9 +342,20 @@ internal sealed class WalCompletionRouter
     /// </summary>
     private async Task CompleteLeaderPropose(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
+        RoundStageInstrumentation.Record(RoundStage.LeaderWalCompletion, completion.DurableStageTicks);
+        long fanoutStartTicks = RoundStageInstrumentation.Stamp();
+
         HLCTimestamp ticketId = pending?.TicketId ?? HLCTimestamp.Zero;
         List<RaftLog> logs = pending?.Logs ?? [];
         bool autoCommit = pending?.AutoCommit ?? false;
+
+        // Fanned out when the write was queued (RaftConfiguration.FanOutBeforeLocalWrite): the peers
+        // have the batch already, and all that is left is the leader's own vote.
+        if (pending is { FannedOutBeforeWrite: true, Proposal: { } fannedOut })
+        {
+            CompleteProposeFannedOutEarly(completion, pending, fannedOut, ticketId);
+            return;
+        }
 
         if (completion.Status != RaftOperationStatus.Success)
         {
@@ -403,6 +423,15 @@ internal sealed class WalCompletionRouter
             return;
         }
 
+        // Round stages (off by default). Stamped after TryAdd: an ack cannot find the proposal
+        // before this point, so the stamp is in place before the replication stage can end.
+        if (fanoutStartTicks != 0)
+        {
+            long fanoutDoneTicks = RoundStageInstrumentation.Stamp();
+            RoundStageInstrumentation.Record(RoundStage.LeaderFanout, fanoutStartTicks, fanoutDoneTicks);
+            proposalQuorum.FanoutStageTicks = fanoutDoneTicks;
+        }
+
         if (logger.IsEnabled(LogLevel.Debug))
             logger.LogDebugProposedLogs(host.LocalEndpoint, host.PartitionId, coreState.NodeState, ticketId, string.Join(',', logs.Select(x => x.Id.ToString())));
 
@@ -429,6 +458,54 @@ internal sealed class WalCompletionRouter
         }
 
         CompleteReply(pending?.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, ticketId));
+    }
+
+    /// <summary>
+    /// Completes the leader's own write of a proposal that was sent to the peers when the write was
+    /// queued (<see cref="LogReplicator"/>, <see cref="RaftConfiguration.FanOutBeforeLocalWrite"/>).
+    /// A durable write counts the leader's vote, and completes the quorum when the followers' acks
+    /// came first. The caller's <c>ReplicateLogs</c> is answered here, as on the serial path.
+    ///
+    /// <para><b>Answers that differ from the serial path.</b> A failed local write, or a completion
+    /// that finds the proposal no longer registered (a step-down cleared it) or this node no longer
+    /// leading, is answered <see cref="RaftOperationStatus.ProposalOutcomeUnknown"/>: the peers may
+    /// hold the batch, and a later leader can commit it (Raft §5.4.2). A failed proposal is dropped
+    /// from the registry so no ack can complete it.</para>
+    /// </summary>
+    private void CompleteProposeFannedOutEarly(RaftWalCompletion completion, RaftPendingWalOperation pending, RaftProposalQuorum proposal, HLCTimestamp ticketId)
+    {
+        // The registry holds the proposal until a demotion clears it; after that the pooled object
+        // may serve another ticket, so identity, not just presence, decides.
+        bool registered = proposals.TryGet(ticketId, out RaftProposalQuorum? current) && ReferenceEquals(current, proposal);
+
+        if (completion.Status != RaftOperationStatus.Success)
+        {
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Local propose write for ticket {Ticket} failed ({Status}) after the batch was sent to the peers; the outcome is unknown to the caller.",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, ticketId, completion.Status);
+
+            if (registered && proposals.TryRemove(ticketId, proposal))
+                proposals.FailWaiter(proposal, RaftProposalTicketState.NotFound, -1);
+
+            CompleteReply(pending.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.ProposalOutcomeUnknown, ticketId));
+            return;
+        }
+
+        if (coreState.NodeState != RaftNodeState.Leader || !registered)
+        {
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Propose completion for ticket {Ticket} landed after a step-down; the batch was already sent to the peers, so the outcome is unknown to the caller.",
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, ticketId);
+            CompleteReply(pending.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.ProposalOutcomeUnknown, 0L));
+            return;
+        }
+
+        proposal.MarkLocalDurable(host.LocalEndpoint);
+
+        if (proposal.State == RaftProposalState.Incomplete && proposal.HasQuorum())
+            completeQuorum(proposal, ticketId, RoundStageInstrumentation.Stamp());
+
+        CompleteReply(pending.ReplyCorrelationId, new(RaftResponseType.None, RaftOperationStatus.Success, ticketId));
     }
 
     /// <summary>
@@ -527,13 +604,10 @@ internal sealed class WalCompletionRouter
         if (completion.MaxLogIndex > coreState.LocalCommittedIndex)
             coreState.LocalCommittedIndex = completion.MaxLogIndex;
 
-        AppendLogsGrpcLogCache? grpcLogCache = proposal.Logs.Count > 0 ? new() : null;
-
         // Send committed entries to ALL peers (voters + learners). proposal.Nodes only tracks
         // quorum voters; learners were excluded from quorum but still need log delivery so their
-        // WAL stays in sync. host.Nodes already excludes self, so no self-skip is needed here.
-        foreach (RaftNode node in host.Nodes)
-            sender.AppendLogToNode(node, ticketId, proposal.Logs, grpcLogCache: grpcLogCache);
+        // WAL stays in sync.
+        sender.BroadcastResolution(ticketId, proposal.Logs);
 
         // Apply any inherited Proposed entries (from a prior term) that sit between the
         // last-applied cursor and this commit batch. These are entries proposed by the
@@ -723,11 +797,8 @@ internal sealed class WalCompletionRouter
         // immediately rather than waiting for the proposal to expire from activeProposals.
         proposals.FailWaiter(proposal, RaftProposalTicketState.NotFound, -1);
 
-        AppendLogsGrpcLogCache? grpcLogCache = proposal.Logs.Count > 0 ? new() : null;
-
         // Same as CompleteLeaderCommit: deliver rollback to all peers, not just quorum voters.
-        foreach (RaftNode node in host.Nodes)
-            sender.AppendLogToNode(node, ticketId, proposal.Logs, grpcLogCache: grpcLogCache);
+        sender.BroadcastResolution(ticketId, proposal.Logs);
 
         // Resolve the rolled-back range for apply ordering. Rolled-back ids are advance-only for
         // the applied cursor (ApplyLogToConsumerAsync never delivers non-Committed types), and a
@@ -784,6 +855,9 @@ internal sealed class WalCompletionRouter
     /// </summary>
     private async Task CompleteFollowerAppend(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
+        RoundStageInstrumentation.Record(RoundStage.FollowerWalCompletion, completion.DurableStageTicks);
+        long ackStartTicks = RoundStageInstrumentation.Stamp();
+
         string endpoint = pending!.Endpoint ?? "";
         long leaderTerm = completion.Term;
         HLCTimestamp timestamp = pending.Timestamp;
@@ -889,6 +963,8 @@ internal sealed class WalCompletionRouter
                 new(endpoint),
                 FollowerAcks.Build(host, wal, leaderTerm, timestamp, ackStatus, ackIndex)
             ));
+
+            RoundStageInstrumentation.Record(RoundStage.FollowerAck, ackStartTicks);
         }
 
         CompleteReply(pending.ReplyCorrelationId, RaftResponseStatic.NoneResponse);

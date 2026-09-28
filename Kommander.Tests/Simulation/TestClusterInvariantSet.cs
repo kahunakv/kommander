@@ -54,6 +54,55 @@ public sealed class TestClusterInvariantSet
         ClusterInvariantSet.CheckOneLeaderPerTerm(stepNumber: 1, views);
     }
 
+    // ── Available majority leads ──────────────────────────────────────────
+
+    [Fact]
+    public void AvailableMajorityLeads_FiresWhenAConnectedMajorityStaysLeaderlessPastTheBound()
+    {
+        InvariantViolationException error = Assert.Throws<InvariantViolationException>(() =>
+            ClusterInvariantSet.CheckAvailableMajorityLeads(
+                stepNumber: 42,
+                available: ["node1", "node3"],
+                voterCount: 3,
+                reachableLeader: null,
+                leaderlessForMs: 10_050,
+                boundMs: 10_000,
+                state: "node1 follower; node3 follower"));
+
+        Assert.Equal(ClusterInvariantSet.AvailableMajorityLeads, error.InvariantName);
+        Assert.Equal(42, error.StepNumber);
+        Assert.Contains("node1", error.Message, StringComparison.Ordinal);
+        Assert.Contains("node3", error.Message, StringComparison.Ordinal);
+        Assert.Contains("10050 ms", error.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>Two of five is no majority, however long it lasts.</summary>
+    [Fact]
+    public void AvailableMajorityLeads_AllowsALeaderlessMinority()
+    {
+        ClusterInvariantSet.CheckAvailableMajorityLeads(
+            stepNumber: 1, available: ["node1", "node2"], voterCount: 5, reachableLeader: null,
+            leaderlessForMs: 100_000, boundMs: 10_000, state: "");
+    }
+
+    /// <summary>A reachable leader ends the episode whatever the clock says.</summary>
+    [Fact]
+    public void AvailableMajorityLeads_AllowsAMajorityWithAReachableLeader()
+    {
+        ClusterInvariantSet.CheckAvailableMajorityLeads(
+            stepNumber: 1, available: ["node1", "node3"], voterCount: 3, reachableLeader: "node3",
+            leaderlessForMs: 100_000, boundMs: 10_000, state: "");
+    }
+
+    /// <summary>Inside the bound an election is still allowed to be in progress.</summary>
+    [Fact]
+    public void AvailableMajorityLeads_AllowsALeaderlessMajorityInsideTheBound()
+    {
+        ClusterInvariantSet.CheckAvailableMajorityLeads(
+            stepNumber: 1, available: ["node1", "node3"], voterCount: 3, reachableLeader: null,
+            leaderlessForMs: 10_000, boundMs: 10_000, state: "");
+    }
+
     // ── Committed ids monotonic ───────────────────────────────────────────
 
     [Fact]

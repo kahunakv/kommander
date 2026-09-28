@@ -74,4 +74,13 @@ public sealed record RaftWalCompletion(
     /// after it.
     /// </summary>
     long ResolvedMaxLogIndex = -1
-);
+)
+{
+    /// <summary>
+    /// Stopwatch stamp of the moment the scheduler saw the batch durable, or 0 when the round
+    /// stages (<see cref="Kommander.Diagnostics.RoundStageInstrumentation"/>) are off. The executor
+    /// subtracts it to time the completion's trip back to the partition. Diagnostic only; no
+    /// fencing or ordering decision reads it.
+    /// </summary>
+    public long DurableStageTicks { get; init; }
+}

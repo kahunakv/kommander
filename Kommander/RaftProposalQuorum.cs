@@ -38,6 +38,19 @@ public sealed class RaftProposalQuorum
     private bool completed;
 
     /// <summary>
+    /// False while the leader's own Proposed write of this batch is not yet durable. Only a proposal
+    /// fanned out before its local write completed (see <c>RaftConfiguration.FanOutBeforeLocalWrite</c>)
+    /// is ever registered with it false; every other proposal is registered after its local write, so
+    /// it starts and stays true.
+    ///
+    /// <para><see cref="HasQuorum"/> answers false until it is set, however many followers acked. A
+    /// majority of followers alone is quorum-durable by Raft, but everything the leader does at
+    /// quorum assumes its own copy is on disk: the commit marker, the applies read back from this
+    /// WAL, and the backfill ranges read up to <c>LocalCommittedIndex</c>.</para>
+    /// </summary>
+    private bool localDurable = true;
+
+    /// <summary>
     /// Event-driven completion source for the write path. Callers that await
     /// <see cref="GetWaiterTask"/> are unblocked as soon as the proposal reaches a
     /// terminal state (committed, rolled-back, or invalidated by leader loss) rather
@@ -98,6 +111,14 @@ public sealed class RaftProposalQuorum
     /// during distributed consensus.
     /// </summary>
     public long LastLogIndex => Logs.Last().Id;
+
+    /// <summary>
+    /// Stopwatch stamp taken when the leader finished the fan-out of this proposal, or 0 when the
+    /// round stages (<see cref="Kommander.Diagnostics.RoundStageInstrumentation"/>) are off. The ack
+    /// that makes the quorum subtracts it to time the follower round trip. Diagnostic only; reset
+    /// with the pooled instance.
+    /// </summary>
+    internal long FanoutStageTicks { get; set; }
 
     /// <summary>
     /// Represents a quorum for a Raft proposal. The quorum is responsible for managing
@@ -207,6 +228,27 @@ public sealed class RaftProposalQuorum
     /// </summary>
     /// <param name="state">The new state to apply to the Raft proposal. This state indicates the
     /// current or final status of the proposal, such as Incomplete, Completed, Committed, or RolledBack.</param>
+    /// <summary>True once the leader's own copy of the batch is durable. See <see cref="localDurable"/>.</summary>
+    internal bool LocalDurable => localDurable;
+
+    /// <summary>
+    /// Registers a proposal whose followers are sent the batch before the leader's own write is
+    /// durable: the local endpoint is expected but not completed, and <see cref="HasQuorum"/> stays
+    /// false until <see cref="MarkLocalDurable"/>.
+    /// </summary>
+    internal void ExpectLocalDurability(string localEndpoint)
+    {
+        localDurable = false;
+        AddExpectedNodeCompletion(localEndpoint);
+    }
+
+    /// <summary>The leader's own write of the batch is durable: count its vote and lift the gate.</summary>
+    internal void MarkLocalDurable(string localEndpoint)
+    {
+        localDurable = true;
+        MarkNodeCompleted(localEndpoint);
+    }
+
     public void SetState(RaftProposalState state)
     {
         State = state;
@@ -223,6 +265,9 @@ public sealed class RaftProposalQuorum
     {
         if (completed)
             return true;
+
+        if (!localDurable)
+            return false;
         
         // nodes includes the local leader, so the standard Raft majority is
         // floor(N / 2) + 1 for the full cluster size. completedNodeCount is maintained
@@ -253,7 +298,9 @@ public sealed class RaftProposalQuorum
 
         State = RaftProposalState.Incomplete;
         completed = false;
+        localDurable = true;
         completedNodeCount = 0;
+        FanoutStageTicks = 0;
         Logs = logs;
         AutoCommit = autoCommit;
         StartTimestamp = startTimestamp;
@@ -268,5 +315,7 @@ public sealed class RaftProposalQuorum
         Logs.Clear();
         nodes.Clear();
         completedNodeCount = 0;
+        localDurable = true;
+        FanoutStageTicks = 0;
     }
 }

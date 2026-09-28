@@ -106,7 +106,7 @@ public sealed class RaftPartitionExecutor : IDisposable
     /// <summary>
     /// Wraps a <see cref="RaftRequest"/> together with an optional reply channel.
     /// <para>
-    /// A <c>readonly struct</c> (two references wide, no identity, never mutated) so it is stored
+    /// A <c>readonly struct</c> (small, no identity, never mutated) so it is stored
     /// inline in the operation queues, the drain scratch list, and the reply dictionary — this
     /// removes the per-<c>Post</c>/<c>Ask</c> heap allocation that a class carried. Never compared to
     /// <c>null</c> or read from a <c>default</c> instance: dequeue/lookup sites gate on the
@@ -130,11 +130,18 @@ public sealed class RaftPartitionExecutor : IDisposable
         /// </summary>
         public RaftOperationKind Kind { get; }
 
-        public PendingOperation(RaftRequest request, AskReplySource? reply, RaftOperationKind kind)
+        /// <summary>
+        /// Stopwatch stamp taken at enqueue for <see cref="RoundStageInstrumentation"/>, or 0 when
+        /// the round stages are off. Only read by the drain to record the queue wait.
+        /// </summary>
+        public long EnqueuedTicks { get; }
+
+        public PendingOperation(RaftRequest request, AskReplySource? reply, RaftOperationKind kind, long enqueuedTicks = 0)
         {
             Request = request;
             Reply = reply;
             Kind = kind;
+            EnqueuedTicks = enqueuedTicks;
         }
     }
 
@@ -948,12 +955,12 @@ public sealed class RaftPartitionExecutor : IDisposable
             }
 
             // Slot claimed — enqueue and signal runnable.
-            _clientQueue.Enqueue(new PendingOperation(request, reply, kind));
+            _clientQueue.Enqueue(new PendingOperation(request, reply, kind, RoundStageInstrumentation.Stamp()));
             MarkRunnable();
             return;
         }
 
-        PendingOperation op = new(request, reply, kind);
+        PendingOperation op = new(request, reply, kind, RoundStageInstrumentation.Stamp());
 
         switch (kind)
         {
@@ -1141,6 +1148,9 @@ public sealed class RaftPartitionExecutor : IDisposable
             taken++;
             if (decrementClientDepth)
                 Interlocked.Decrement(ref _clientQueueDepth);
+
+            if (op.EnqueuedTicks != 0)
+                RecordQueueStage(op);
         }
 
         if (_drainBatch.Count == 0)
@@ -1166,6 +1176,29 @@ public sealed class RaftPartitionExecutor : IDisposable
 
         for (int i = dispatchStart; i < _drainBatch.Count; i++)
             await ExecuteOneAsync(_drainBatch[i]).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Records the queue wait of the three round operations (<see cref="RoundStageInstrumentation"/>):
+    /// a client proposal, an entry-carrying append on a follower, and a follower's ack on the leader.
+    /// Heartbeats (appends with no entries) are left out so the follower stage describes proposals.
+    /// </summary>
+    private static void RecordQueueStage(in PendingOperation op)
+    {
+        switch (op.Request.Type)
+        {
+            case RaftRequestType.ReplicateLogs:
+                RoundStageInstrumentation.Record(RoundStage.LeaderQueue, op.EnqueuedTicks);
+                break;
+
+            case RaftRequestType.AppendLogs when op.Request.Logs is { Count: > 0 }:
+                RoundStageInstrumentation.Record(RoundStage.FollowerQueue, op.EnqueuedTicks);
+                break;
+
+            case RaftRequestType.CompleteAppendLogs:
+                RoundStageInstrumentation.Record(RoundStage.LeaderAckQueue, op.EnqueuedTicks);
+                break;
+        }
     }
 
     private async ValueTask DrainAllAsync()
@@ -1395,7 +1428,7 @@ public sealed class RaftPartitionExecutor : IDisposable
                     break;
 
                 case RaftRequestType.ReceiveVote:
-                    await _stateMachine.ReceivedVoteAsync(request.Endpoint ?? "", request.Term, request.CommitIndex, request.PreVote).ConfigureAwait(false);
+                    await _stateMachine.ReceivedVoteAsync(request.Endpoint ?? "", request.Term, request.CommitIndex, request.PreVote, request.LastLogTerm).ConfigureAwait(false);
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
                     break;
 

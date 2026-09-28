@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Threading.Channels;
 using Kommander.Communication.Grpc;
 using Kommander.Data;
+using Kommander.Diagnostics;
 using Kommander.Logging;
 using Microsoft.Extensions.Logging;
 
@@ -220,6 +221,8 @@ internal sealed class RaftTransportDispatcher : IDisposable
 
         internal void Enqueue(RaftResponderRequest request)
         {
+            StampDispatchStage(request);
+
             long payloadBytes = PayloadBytes(request);
 
             if (payloadBytes > 0 && _maxQueuedPayloadBytes > 0)
@@ -366,6 +369,32 @@ internal sealed class RaftTransportDispatcher : IDisposable
 
         // ── Dispatch helpers ──────────────────────────────────────────────────
 
+        /// <summary>
+        /// Stamps the round messages (an entry-carrying <c>AppendLogs</c>, a <c>CompleteAppendLogs</c>
+        /// ack) for <see cref="RoundStage.TransportDispatch"/>. The stamp rides on the payload
+        /// object, not the envelope, so the envelope stays three fields wide.
+        /// </summary>
+        private static void StampDispatchStage(in RaftResponderRequest request)
+        {
+            if (!RoundStageInstrumentation.IsActive)
+                return;
+
+            if (request.AppendLogsRequest is { Logs.Count: > 0 } append)
+                append.DispatchStageTicks = RoundStageInstrumentation.Stamp();
+            else if (request.CompleteAppendLogsRequest is { } ack)
+                ack.DispatchStageTicks = RoundStageInstrumentation.Stamp();
+        }
+
+        /// <summary>Records the dispatcher queue wait of each stamped message about to be sent.</summary>
+        private static void RecordDispatchStage(List<RaftResponderRequest> messages)
+        {
+            foreach (RaftResponderRequest message in messages)
+            {
+                long ticks = message.AppendLogsRequest?.DispatchStageTicks ?? message.CompleteAppendLogsRequest?.DispatchStageTicks ?? 0;
+                RoundStageInstrumentation.Record(RoundStage.TransportDispatch, ticks);
+            }
+        }
+
         private static async Task Send(
             List<RaftResponderRequest> messages,
             RaftManager manager,
@@ -373,6 +402,8 @@ internal sealed class RaftTransportDispatcher : IDisposable
             ICommunication communication,
             ILogger<IRaft> logger)
         {
+            if (RoundStageInstrumentation.IsActive)
+                RecordDispatchStage(messages);
             if (messages.Count == 1)
             {
                 await SendSingle(messages[0], manager, node, communication).ConfigureAwait(false);

@@ -44,7 +44,7 @@ public class TestFollowerReadIndexFetcher
 
         public async Task<PendingFetch> NextCall()
         {
-            Assert.True(await called.WaitAsync(WaitBudget), "the fetcher did not call the transport");
+            Assert.True(await called.WaitAsync(WaitBudget, TestContext.Current.CancellationToken), "the fetcher did not call the transport");
 
             lock (calls)
                 return calls[^1];
@@ -63,7 +63,7 @@ public class TestFollowerReadIndexFetcher
         FakeTransport transport = new();
         FollowerReadIndexFetcher fetcher = Make(transport);
 
-        Task<GetReadIndexResponse> read = Read(fetcher);
+        Task<GetReadIndexResponse> read = Read(fetcher, token: TestContext.Current.CancellationToken);
 
         PendingFetch call = await transport.NextCall();
         Assert.Equal("leader:1", call.Node.Endpoint);
@@ -71,7 +71,7 @@ public class TestFollowerReadIndexFetcher
 
         call.Reply.SetResult(new GetReadIndexResponse(true, 42));
 
-        GetReadIndexResponse response = await read.WaitAsync(WaitBudget);
+        GetReadIndexResponse response = await read.WaitAsync(WaitBudget, TestContext.Current.CancellationToken);
         Assert.True(response.Success);
         Assert.Equal(42, response.ReadIndex);
         Assert.Equal(1, transport.CallCount);
@@ -88,16 +88,16 @@ public class TestFollowerReadIndexFetcher
         FakeTransport transport = new();
         FollowerReadIndexFetcher fetcher = Make(transport);
 
-        Task<GetReadIndexResponse> first = Read(fetcher);
+        Task<GetReadIndexResponse> first = Read(fetcher, token: TestContext.Current.CancellationToken);
         PendingFetch inFlight = await transport.NextCall();
 
-        Task<GetReadIndexResponse>[] late = Enumerable.Range(0, 16).Select(_ => Read(fetcher)).ToArray();
+        Task<GetReadIndexResponse>[] late = Enumerable.Range(0, 16).Select(_ => Read(fetcher, token: TestContext.Current.CancellationToken)).ToArray();
 
         // Nothing new is sent while the first fetch is in flight.
         Assert.Equal(1, transport.CallCount);
 
         inFlight.Reply.SetResult(new GetReadIndexResponse(true, 5));
-        Assert.Equal(5, (await first.WaitAsync(WaitBudget)).ReadIndex);
+        Assert.Equal(5, (await first.WaitAsync(WaitBudget, TestContext.Current.CancellationToken)).ReadIndex);
 
         // The late reads are still waiting: the answer to the first fetch is not theirs.
         PendingFetch next = await transport.NextCall();
@@ -106,7 +106,7 @@ public class TestFollowerReadIndexFetcher
         next.Reply.SetResult(new GetReadIndexResponse(true, 9));
 
         foreach (Task<GetReadIndexResponse> t in late)
-            Assert.Equal(9, (await t.WaitAsync(WaitBudget)).ReadIndex);
+            Assert.Equal(9, (await t.WaitAsync(WaitBudget, TestContext.Current.CancellationToken)).ReadIndex);
 
         Assert.Equal(2, transport.CallCount);
     }
@@ -123,7 +123,7 @@ public class TestFollowerReadIndexFetcher
 
         using CancellationTokenSource leaverCts = new();
         Task<GetReadIndexResponse> leaver = Read(fetcher, token: leaverCts.Token);
-        Task<GetReadIndexResponse> stayer = Read(fetcher);
+        Task<GetReadIndexResponse> stayer = Read(fetcher, token: TestContext.Current.CancellationToken);
 
         firstCts.Cancel();
         leaverCts.Cancel();
@@ -140,7 +140,7 @@ public class TestFollowerReadIndexFetcher
         Assert.False(next.Token.IsCancellationRequested);
         next.Reply.SetResult(new GetReadIndexResponse(true, 4));
 
-        Assert.Equal(4, (await stayer.WaitAsync(WaitBudget)).ReadIndex);
+        Assert.Equal(4, (await stayer.WaitAsync(WaitBudget, TestContext.Current.CancellationToken)).ReadIndex);
     }
 
     [Fact]
@@ -149,17 +149,17 @@ public class TestFollowerReadIndexFetcher
         FakeTransport transport = new();
         FollowerReadIndexFetcher fetcher = Make(transport);
 
-        Task<GetReadIndexResponse> failed = Read(fetcher);
+        Task<GetReadIndexResponse> failed = Read(fetcher, token: TestContext.Current.CancellationToken);
         PendingFetch call = await transport.NextCall();
         call.Reply.SetException(new InvalidOperationException("boom"));
 
-        Assert.False((await failed.WaitAsync(WaitBudget)).Success);
+        Assert.False((await failed.WaitAsync(WaitBudget, TestContext.Current.CancellationToken)).Success);
 
-        Task<GetReadIndexResponse> retry = Read(fetcher);
+        Task<GetReadIndexResponse> retry = Read(fetcher, token: TestContext.Current.CancellationToken);
         PendingFetch again = await transport.NextCall();
         again.Reply.SetResult(new GetReadIndexResponse(true, 11));
 
-        Assert.Equal(11, (await retry.WaitAsync(WaitBudget)).ReadIndex);
+        Assert.Equal(11, (await retry.WaitAsync(WaitBudget, TestContext.Current.CancellationToken)).ReadIndex);
     }
 
     /// <summary>
@@ -180,14 +180,14 @@ public class TestFollowerReadIndexFetcher
 
         FollowerReadIndexFetcher fetcher = Make(transport, TimeSpan.FromMilliseconds(100));
 
-        Task<GetReadIndexResponse> hung = Read(fetcher);
+        Task<GetReadIndexResponse> hung = Read(fetcher, token: TestContext.Current.CancellationToken);
         await transport.NextCall();
-        Task<GetReadIndexResponse> behind = Read(fetcher);
+        Task<GetReadIndexResponse> behind = Read(fetcher, token: TestContext.Current.CancellationToken);
 
-        Assert.False((await hung.WaitAsync(WaitBudget)).Success);
+        Assert.False((await hung.WaitAsync(WaitBudget, TestContext.Current.CancellationToken)).Success);
 
         await transport.NextCall();
-        Assert.False((await behind.WaitAsync(WaitBudget)).Success);
+        Assert.False((await behind.WaitAsync(WaitBudget, TestContext.Current.CancellationToken)).Success);
         Assert.Equal(2, transport.CallCount);
     }
 
@@ -197,13 +197,13 @@ public class TestFollowerReadIndexFetcher
         FakeTransport transport = new();
         FollowerReadIndexFetcher fetcher = Make(transport);
 
-        Task<GetReadIndexResponse> p1 = Read(fetcher, partition: 1);
+        Task<GetReadIndexResponse> p1 = Read(fetcher, partition: 1, token: TestContext.Current.CancellationToken);
         PendingFetch p1Call = await transport.NextCall();
 
-        Task<GetReadIndexResponse> p2 = Read(fetcher, partition: 2);
+        Task<GetReadIndexResponse> p2 = Read(fetcher, partition: 2, token: TestContext.Current.CancellationToken);
         PendingFetch p2Call = await transport.NextCall();
 
-        Task<GetReadIndexResponse> otherLeader = Read(fetcher, leader: "leader:2", partition: 1);
+        Task<GetReadIndexResponse> otherLeader = Read(fetcher, leader: "leader:2", partition: 1, token: TestContext.Current.CancellationToken);
         PendingFetch otherCall = await transport.NextCall();
 
         Assert.Equal(3, transport.CallCount);
@@ -214,8 +214,8 @@ public class TestFollowerReadIndexFetcher
         otherCall.Reply.SetResult(new GetReadIndexResponse(true, 30));
         p1Call.Reply.SetResult(new GetReadIndexResponse(true, 10));
 
-        Assert.Equal(10, (await p1.WaitAsync(WaitBudget)).ReadIndex);
-        Assert.Equal(20, (await p2.WaitAsync(WaitBudget)).ReadIndex);
-        Assert.Equal(30, (await otherLeader.WaitAsync(WaitBudget)).ReadIndex);
+        Assert.Equal(10, (await p1.WaitAsync(WaitBudget, TestContext.Current.CancellationToken)).ReadIndex);
+        Assert.Equal(20, (await p2.WaitAsync(WaitBudget, TestContext.Current.CancellationToken)).ReadIndex);
+        Assert.Equal(30, (await otherLeader.WaitAsync(WaitBudget, TestContext.Current.CancellationToken)).ReadIndex);
     }
 }

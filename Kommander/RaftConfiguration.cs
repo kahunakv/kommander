@@ -536,6 +536,23 @@ public class RaftConfiguration
     public bool WalSingleFsyncCommit { get; set; } = true;
 
     /// <summary>
+    /// When <c>true</c> (the default), a leader sends a new proposal to its followers as soon as its
+    /// own Proposed write is queued, so the followers' writes run while the leader's does. When
+    /// <c>false</c>, the fan-out waits for the leader's write to be durable, which puts two WAL writes
+    /// in series in every round: on a real device, two fsyncs.
+    ///
+    /// <para>What an acknowledgement means does not change. The proposal reaches quorum only once the
+    /// leader's own write is durable as well (a majority of followers is not enough on its own), so
+    /// the commit marker, the leader's applies and every backfill read still find the batch on the
+    /// leader's disk. The one visible difference is a failed local write: the followers may already
+    /// hold the batch, and a later leader can commit it (Raft §5.4.2), so the caller is answered
+    /// <see cref="Data.RaftOperationStatus.ProposalOutcomeUnknown"/> instead of the storage error.</para>
+    ///
+    /// <para>The promotion barrier and checkpoints keep the serial order.</para>
+    /// </summary>
+    public bool FanOutBeforeLocalWrite { get; set; } = true;
+
+    /// <summary>
     /// Optional per-partition application-durability floor (see
     /// <see cref="IApplicationDurabilityProvider"/>). When set, restart replay widens down to the
     /// floor (committed entries above it are redelivered via <c>OnLogRestored</c> even when a

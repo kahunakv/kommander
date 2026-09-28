@@ -20,6 +20,8 @@ Kommander.MicroBenchmarks/bin
 Kommander.MicroBenchmarks/obj
 Kommander.WasmSmoke/bin
 Kommander.WasmSmoke/obj
+Kommander.Benchmark/obj
+Kommander.Benchmark/bin
 BenchmarkDotNet.Artifacts/
 Nixie/
 nupkg
