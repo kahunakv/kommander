@@ -132,6 +132,11 @@ public static class RaftSafetyOptionAudit
         // Either value keeps "acknowledged ⇒ durable on a quorum including the leader": the quorum
         // waits for the leader's own write whichever way the fan-out is ordered.
         [nameof(RaftConfiguration.FanOutBeforeLocalWrite)] = RaftOptionKind.Performance,
+        // Either value keeps "acknowledged ⇒ durable on a quorum" and exactly-once, in-order
+        // delivery: only when the follower's consumer sees an entry moves, relative to its ack.
+        [nameof(RaftConfiguration.FollowerApplyInOwnTurn)] = RaftOptionKind.Performance,
+        [nameof(RaftConfiguration.FollowerApplyTurnBudget)] = RaftOptionKind.Performance,
+        [nameof(RaftConfiguration.FollowerApplyTurnTime)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.ApplicationDurabilityProvider)] = RaftOptionKind.Safety,
         [nameof(RaftConfiguration.MaxDrainQuantumControl)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.MaxDrainQuantumReplication)] = RaftOptionKind.Performance,
@@ -228,6 +233,8 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.CompactNumberEntries)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.MaxEntriesPerCompaction)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.CompactionLiveReplicaLagBudget)] = RaftOptionKind.Liveness,
+        [nameof(RaftConfiguration.CompactionLiveReplicaLagWindow)] = RaftOptionKind.Liveness,
+        [nameof(RaftConfiguration.CompactionLiveReplicaLagCap)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.CompactionSilentPeerRetentionWindow)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.CompactionDurabilityClampReportInterval)] = RaftOptionKind.Performance,
     };

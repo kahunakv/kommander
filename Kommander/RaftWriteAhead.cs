@@ -254,6 +254,12 @@ public sealed class RaftWriteAhead
 
     private long ridingResolvedIndex = 1;
 
+    // The highest row id of any type the last restore read from the disk. Rows written before this
+    // process started are not reported through MarkResolutionWritten, so GetReadableResolvedHighWater
+    // must cover them from here: a resolved row restored above a hole becomes deliverable once the
+    // hole is filled, however low the rows written since then are.
+    private long restoredMaxLogId;
+
     private long publishedCommitIndex = 1;
 
     // Out-of-order present ids (with their terms) buffered until the gap below them fills — the
@@ -327,6 +333,14 @@ public sealed class RaftWriteAhead
     private long liveReplicaFloorPublishedTicks;
 
     /// <summary>
+    /// The leader's rate-scaled live-replica budget, published with <see cref="liveReplicaRetentionFloor"/>
+    /// (0 = no rate evidence: the configured count applies alone). Clamped again at use by
+    /// <see cref="LiveReplicaRetentionBudget.Compose"/>, so a value from a stale configuration cannot
+    /// exceed the current cap.
+    /// </summary>
+    private long liveReplicaRetentionBudget;
+
+    /// <summary>
     /// Staleness bound for the published live-replica floor: ten heartbeat intervals, floored at
     /// 30 s. An active leader republishes every round, so a fresh value is always present where the
     /// hold matters; anything older means the publisher stopped. Not readonly only for
@@ -397,9 +411,17 @@ public sealed class RaftWriteAhead
     /// The publish timestamp is written after the floor, so a torn observation errs toward
     /// treating the value as stale — never toward applying a stale one as fresh.
     /// </summary>
-    public void SetLiveReplicaRetentionFloor(long floor)
+    public void SetLiveReplicaRetentionFloor(long floor) => SetLiveReplicaRetentionFloor(floor, 0);
+
+    /// <summary>
+    /// Publishes the live-replica retention floor together with the leader's rate-scaled budget (see
+    /// <see cref="Scheduling.IRaftWalFacade.SetLiveReplicaRetentionFloor(long, long)"/>). Same ordering
+    /// contract as the one-argument form: both values are written before the publish timestamp.
+    /// </summary>
+    public void SetLiveReplicaRetentionFloor(long floor, long budget)
     {
         Volatile.Write(ref liveReplicaRetentionFloor, floor <= 0 ? long.MaxValue : floor);
+        Volatile.Write(ref liveReplicaRetentionBudget, Math.Max(0, budget));
         Volatile.Write(ref liveReplicaFloorPublishedTicks, manager.Configuration.TickSource.GetTimestamp());
     }
 
@@ -714,6 +736,7 @@ public sealed class RaftWriteAhead
         //                  unacknowledged-but-not-durable write is never promoted.
         commitIndex = contiguousCommitted + 1;
         proposeIndex = maxLogId + 1;
+        restoredMaxLogId = maxLogId;
 
         // Presence frontier: the last id of the unbroken durable prefix (any type), independent of
         // the commit-marker reconstruction above. With no entries, mirror the commit frontier (a
@@ -1691,6 +1714,13 @@ public sealed class RaftWriteAhead
     /// volatile field, written only on the partition executor and only upwards.
     /// </summary>
     public long GetDurableCommitIndex() => Volatile.Read(ref publishedCommitIndex) - 1;
+
+    /// <summary>
+    /// See <see cref="Scheduling.IRaftWalFacade.GetReadableResolvedHighWater"/>: the highest resolved
+    /// row written by a successful completion (or installed as a snapshot boundary) in this process,
+    /// or the highest row restored from disk. Executor thread only.
+    /// </summary>
+    public long GetReadableResolvedHighWater() => Math.Max(ridingResolvedIndex - 1, restoredMaxLogId);
 
     /// <summary>
     /// The frontier a follower REPORTS to its leader as durable: the highest id that is both resolved
@@ -2866,19 +2896,27 @@ public sealed class RaftWriteAhead
             // before the next pass and is left to the snapshot path, so a slow-forever replica
             // cannot grow the WAL without bound. The staleness window bounds trust in the
             // publisher: only an active leader keeps the value fresh.
+            //
+            // The budget is the leader's rate-scaled one (LiveReplicaRetentionBudget): the configured
+            // count, raised to the entries committed within CompactionLiveReplicaLagWindow up to
+            // CompactionLiveReplicaLagCap. A count alone shrank in time as the write rate rose, and a
+            // 30-second kill at the round-cost write rate fell below it into a snapshot.
             long liveReplicaFloor = long.MaxValue;
-            long lagBudget = manager.Configuration.CompactionLiveReplicaLagBudget;
-            if (lagBudget > 0)
+            long countBudget = manager.Configuration.CompactionLiveReplicaLagBudget;
+            if (countBudget > 0)
             {
                 long publishedTicks = Volatile.Read(ref liveReplicaFloorPublishedTicks);
                 long publishedFloor = Volatile.Read(ref liveReplicaRetentionFloor);
+                long publishedBudget = Volatile.Read(ref liveReplicaRetentionBudget);
                 if (publishedTicks != 0
                     && manager.Configuration.TickSource.GetTimestamp() - publishedTicks <= liveReplicaFloorStalenessTicks
                     && publishedFloor < lastCheckpoint)
                 {
+                    long lagBudget = LiveReplicaRetentionBudget.Compose(
+                        countBudget, publishedBudget, manager.Configuration.CompactionLiveReplicaLagCap);
                     liveReplicaFloor = Math.Max(publishedFloor, lastCheckpoint - lagBudget);
                     KommanderMetrics.RecordCompactionHeldByLiveReplica(
-                        partition.PartitionId, lastCheckpoint - liveReplicaFloor);
+                        partition.PartitionId, lastCheckpoint - liveReplicaFloor, lagBudget);
                 }
             }
 

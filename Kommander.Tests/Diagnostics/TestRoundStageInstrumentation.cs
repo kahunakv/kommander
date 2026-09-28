@@ -13,9 +13,12 @@ namespace Kommander.Tests.Diagnostics;
 /// on a three-node in-memory cluster.
 ///
 /// <para>The assertions are structural, never on absolute timings: every successful call records
-/// each leader-chain stage once; the follower stages appear; and, per call, the leader-chain
-/// stages are sub-intervals of the round in series, so their totals cannot exceed the round
-/// total. That last check is what proves the stages do not overlap or double-count.</para>
+/// each leader-chain stage once; the follower stages appear; and, per call, the serial stages of
+/// the leader chain are sub-intervals of the round in series, so their totals cannot exceed the
+/// round total. That check is what proves the stages do not overlap or double-count. The leader's
+/// own write (<c>leader.wal</c>, <c>leader.wal_completion</c>) runs beside the fan-out and the
+/// replication (<see cref="RaftConfiguration.FanOutBeforeLocalWrite"/>, the default), and the
+/// quorum waits for it, so it must fit inside those two instead.</para>
 ///
 /// <para>Serialized in the cluster collection: the switch and the histogram are process-wide,
 /// and a cluster from another test would add its own stages to the listener.</para>
@@ -31,6 +34,16 @@ public sealed class TestRoundStageInstrumentation
         "leader.propose",
         "leader.wal",
         "leader.wal_completion",
+        "leader.fanout",
+        "leader.replication",
+        "leader.resume",
+    ];
+
+    /// <summary>The leader-chain stages that run one after the other with the fan-out ahead of the local write.</summary>
+    private static readonly string[] SerialChain =
+    [
+        "leader.queue",
+        "leader.propose",
         "leader.fanout",
         "leader.replication",
         "leader.resume",
@@ -97,12 +110,18 @@ public sealed class TestRoundStageInstrumentation
 
             Assert.True(stages["transport.dispatch"].Count >= Calls * 2, "at least one append per follower per call");
 
-            // Per call, the chain stages are disjoint sub-intervals of the round in series, so their
-            // total cannot exceed the round total. A small tolerance covers the WAL stage, which is
-            // measured on the scheduler's tick source (the stopwatch here) with its own rounding.
-            double chainMs = LeaderChain.Sum(s => stages[s].SumMs);
+            // Per call, the serial stages are disjoint sub-intervals of the round in series, so their
+            // total cannot exceed the round total. The leader's own write runs beside the fan-out and
+            // the replication, and the quorum waits for it, so it fits inside those two. A small
+            // tolerance covers the WAL stage, which is measured on the scheduler's tick source (the
+            // stopwatch here) with its own rounding.
+            double chainMs = SerialChain.Sum(s => stages[s].SumMs);
             double roundMs = stages["leader.round"].SumMs;
             Assert.True(chainMs <= roundMs * 1.01 + 0.5, $"leader chain {chainMs:0.000} ms exceeds the round {roundMs:0.000} ms");
+
+            double localWriteMs = stages["leader.wal"].SumMs + stages["leader.wal_completion"].SumMs;
+            double besideMs = stages["leader.fanout"].SumMs + stages["leader.replication"].SumMs;
+            Assert.True(localWriteMs <= besideMs * 1.01 + 0.5, $"leader write {localWriteMs:0.000} ms exceeds the fan-out and replication {besideMs:0.000} ms it runs beside");
         }
         finally
         {

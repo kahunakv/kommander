@@ -41,6 +41,7 @@ internal sealed class WalCompletionRouter
     private readonly RaftPartitionCoreState coreState;
     private readonly ProposalRegistry proposals;
     private readonly LogApplicator applier;
+    private readonly FollowerApplyLane applyLane;
     private readonly BackfillSender sender;
     private readonly IRaftOperationReplySink replySink;
     private readonly ILogger<IRaft> logger;
@@ -64,6 +65,7 @@ internal sealed class WalCompletionRouter
         RaftPartitionCoreState coreState,
         ProposalRegistry proposals,
         LogApplicator applier,
+        FollowerApplyLane applyLane,
         BackfillSender sender,
         IRaftOperationReplySink replySink,
         ILogger<IRaft> logger,
@@ -75,6 +77,7 @@ internal sealed class WalCompletionRouter
         this.coreState = coreState;
         this.proposals = proposals;
         this.applier = applier;
+        this.applyLane = applyLane;
         this.sender = sender;
         this.replySink = replySink;
         this.logger = logger;
@@ -852,6 +855,10 @@ internal sealed class WalCompletionRouter
     /// including non-system types on P0 — go to <c>InvokeReplicationReceived</c> (consumer).
     /// This type-based routing is what allows P0 to host consumer data alongside coordinator
     /// entries without any WAL format change.
+    ///
+    /// <para>With <see cref="RaftConfiguration.FollowerApplyInOwnTurn"/> (the default, not on P0)
+    /// the delivery happens after the ack, in <see cref="FollowerApplyLane"/> turns; otherwise here,
+    /// before it.</para>
     /// </summary>
     private async Task CompleteFollowerAppend(RaftWalCompletion completion, RaftPendingWalOperation? pending)
     {
@@ -872,7 +879,12 @@ internal sealed class WalCompletionRouter
         // the propose-ticket path), and mirrors the gap-aware heartbeat-ack report at the fast path.
         long committedIndex = completion.Status == RaftOperationStatus.Success ? wal.GetCommitIndex() : -1;
 
-        if (completion.Status == RaftOperationStatus.Success)
+        // Deliver after the ack, in the lane's own turns (RaftConfiguration.FollowerApplyInOwnTurn):
+        // the consumer's callbacks for this batch then no longer hold the executor while the next
+        // proposal's append waits behind them. The ack carries no applied position, so it is the same.
+        bool applyAfterAck = completion.Status == RaftOperationStatus.Success && applyLane.Enabled;
+
+        if (completion.Status == RaftOperationStatus.Success && !applyAfterAck)
         {
             // Exactly-once, IN-ORDER apply, bounded by the WAL's gap-aware committed frontier
             // (committedIndex = GetCommitIndex). Contract: deliver every committed id exactly once, in order,
@@ -913,14 +925,20 @@ internal sealed class WalCompletionRouter
                 coreState.LastAppliedIndex = log.Id;          // advance over delivered entries and skipped checkpoints
             }
 
+            // The loop advanced the cursor itself, so it releases the waiters it now covers. Without
+            // this a follower's ConfirmLocalApplicationAsync waiter stayed parked over a covered index
+            // until some later drain delivered through ApplyLogToConsumerAsync, or timed out.
+            applier.CompleteApplyWaiters();
+
             // Slow path (rare): the committed frontier is still ahead of the applied cursor — a hole just
             // filled, so entries buffered by earlier out-of-order batches (no longer in this batch) became
             // deliverable. Drain them from the WAL in order. A no-op when the fast path already caught up.
             if (committedIndex > coreState.LastAppliedIndex)
                 await applier.DrainCommittedAppliesAsync(committedIndex).ConfigureAwait(false);
-
-            wal.NotifyCommitted();
         }
+
+        if (completion.Status == RaftOperationStatus.Success)
+            wal.NotifyCommitted();
 
         // ── Quorum-integrity gate (the §5.4.1 dual) ──────────────────────────────────────
         // The leader counts a Success ack toward propose quorum (ReplicationAckProcessor →
@@ -966,6 +984,9 @@ internal sealed class WalCompletionRouter
 
             RoundStageInstrumentation.Record(RoundStage.FollowerAck, ackStartTicks);
         }
+
+        if (applyAfterAck)
+            applyLane.Accept(pending.Logs);
 
         CompleteReply(pending.ReplyCorrelationId, RaftResponseStatic.NoneResponse);
     }

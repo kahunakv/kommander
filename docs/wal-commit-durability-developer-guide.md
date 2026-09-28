@@ -194,6 +194,29 @@ the leader's disk. The one visible difference is a failed leader write. The foll
 batch and a later leader can commit it, so the caller gets `ProposalOutcomeUnknown`, not the storage error.
 The promotion barrier keeps the serial order.
 
+### The follower acks before it applies
+
+With `FollowerApplyInOwnTurn` on (the default), a follower acknowledges an append before it delivers the
+entries that append committed to the application (`OnReplicationReceived`). It delivers them afterwards,
+in executor turns of their own (`FollowerApplyLane`), at most `FollowerApplyTurnTime` (100 µs) per turn,
+in the maintenance class. The next proposal's append is in the replication class, so the executor runs it
+before the next apply turn. That append used to wait for every consumer callback of the previous commit:
+
+```
+   before:  [commit k completion: apply 1..N ──► ack] [append k+1 ...]
+   after:   [commit k completion: ack] [append k+1] [apply turn] [apply turn] ...
+```
+
+What an ack means does not change: it never carried the applied position. Delivery is still exactly-once
+and in log order, through `LogApplicator.ApplyLogToConsumerAsync`, so the applied cursor still advances
+only over delivered entries, and it completes the read-index and `ConfirmLocalApplicationAsync` waiters.
+The cursor can trail the commit frontier by the entries queued for a turn. Every other delivery path
+reads the WAL from that cursor: the tick's retry, promotion, snapshot install and the apply hold. The lane
+holds its entries in memory, so a compaction below the checkpoint cannot make it step over them. The turn bound is in time
+because what it protects is the append's wait: an entry bound cost a cheap consumer a turn per few dozen
+entries. A turn also delivers any backlog above eight entry caps (`FollowerApplyTurnBudget`), so a
+consumer slower than the commit rate still slows the follower. The system partition always delivers inline.
+
 ---
 
 ## Flow 4 — The lazy commit marker
@@ -289,6 +312,9 @@ In `RaftConfiguration.cs`:
 |---|---|---|
 | `WalSingleFsyncCommit` | `true` | The latency lever. Acks `autoCommit` writes on propose-quorum-durable and writes the commit marker lazily, removing one `fsync` from the critical path. Off ⇒ byte-for-byte the prior two-sync behaviour. |
 | `FanOutBeforeLocalWrite` | `true` | Sends a proposal to the followers while the leader's own write is queued, so the leader's and followers' syncs overlap. The quorum still waits for the leader's write. Off ⇒ the followers get the batch only after the leader's write is durable (two syncs in series per round). |
+| `FollowerApplyInOwnTurn` | `true` | A follower acks an append before it delivers the entries the append committed, and delivers them in executor turns of their own, so the next proposal's append does not wait for the consumer's callbacks. Off ⇒ the follower delivers inside the append's completion, before its ack. |
+| `FollowerApplyTurnTime` | `100 µs` | How long one follower apply turn delivers before it yields to queued appends and acks: the most an append waits behind the application's callbacks. At least one entry per turn. `Zero` ⇒ only the entry cap. |
+| `FollowerApplyTurnBudget` | `1024` | The entry cap of one follower apply turn. A backlog above eight caps is delivered anyway (backpressure). `0` ⇒ no cap. |
 | `WalGroupCommitLingerMs` | `0` | The throughput/tail lever. `> 0` lets a WAL worker linger up to this many ms to gather more ready partitions into one `fsync`. Evidence-gated: a worker waits only while another partition has queued work that must become ready soon, so low-overlap and closed-loop load pay **zero** wait. `0` keeps purely opportunistic batching. |
 | `MaxWalGroupBatchPartitions` | `64` | Max partitions coalesced into a single `walAdapter.Write` (one `fsync` on RocksDB). |
 | `MaxWalBatchSize` | `256` | Max operations drained from one partition per write. |

@@ -36,6 +36,12 @@ public sealed class BenchmarkOptions
     [Option("fan-out-before-local-write", Default = true, HelpText = "RaftConfiguration.FanOutBeforeLocalWrite: send a proposal to the followers while the leader's own write is queued (false = after it is durable).")]
     public bool? FanOutBeforeLocalWrite { get; set; }
 
+    [Option("apply-cost-us", Default = 0, HelpText = "CPU the application's OnReplicationReceived spends per delivered entry, on every node (a busy spin), in microseconds. 0 = no handler. Stands in for a real consumer such as Kahuna's apply (~5 µs per entry on the CamusDB bank).")]
+    public int ApplyCostMicros { get; set; }
+
+    [Option("apply-on", Default = "all", HelpText = "Where --apply-cost-us is spent: all (every node) | followers (a node that leads the partition applies for free, which isolates the follower's apply).")]
+    public string ApplyOn { get; set; } = "all";
+
     [Option("payload-bytes", Default = 280, HelpText = "Size of each replicated entry.")]
     public int PayloadBytes { get; set; }
 
@@ -59,6 +65,9 @@ public sealed class BenchmarkOptions
 
     [Option("stages", Default = true, HelpText = "Collect the raft.round.stage_ms histogram (per-stage round split).")]
     public bool? Stages { get; set; }
+
+    [Option("set", Separator = ',', HelpText = "RaftConfiguration overrides for every node, Name=Value[,Name=Value]: any settable bool, int, long, double or TimeSpan property (e.g. PartitionExecutorPoolSize=2,WriteIOThreads=2).")]
+    public IEnumerable<string> Set { get; set; } = [];
 
     [Option("label", Default = null, HelpText = "Free-form label copied into the JSON (e.g. a build id or git sha).")]
     public string? Label { get; set; }

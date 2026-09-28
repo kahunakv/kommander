@@ -1442,6 +1442,11 @@ public sealed class RaftPartitionExecutor : IDisposable
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
                     break;
 
+                case RaftRequestType.ApplyCommittedEntries:
+                    await _stateMachine.RunFollowerApplyTurnAsync().ConfigureAwait(false);
+                    op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);
+                    break;
+
                 case RaftRequestType.SnapshotInstalled:
                     _stateMachine.CompleteSnapshotInstalled(request.Endpoint ?? "", request.CommitIndex);
                     op.Reply?.TrySetResult(RaftResponseStatic.NoneResponse);

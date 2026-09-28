@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Kommander.Data;
 using Kommander.Gossip;
 using Kommander.Scheduling;
@@ -86,7 +87,7 @@ public class TestRestartedBlankFollowerRepair
         await AckCommittedPrefix(sm, host, PeerB);
 
         await sm.CompleteAppendLogsAsync(PeerB, host.HybridLogicalClock.TrySendOrLocalEvent(1),
-            RaftOperationStatus.LogMismatch, CommitFrontier,
+            RaftOperationStatus.LogMismatch, CommitFrontier, responseTerm: sm.CurrentTerm,
             presentIndex: CommitFrontier, presentTerm: 1);
 
         host.Outbound.Clear();
@@ -128,10 +129,14 @@ public class TestRestartedBlankFollowerRepair
         return (sm, host);
     }
 
-    /// <summary>A Success ack for the whole committed prefix, carrying the presence report a healthy peer sends.</summary>
+    /// <summary>
+    /// A Success ack for the whole committed prefix, carrying the presence report a healthy peer
+    /// sends. Every ack in this class is stamped with the leader's term, as a real follower's ack
+    /// is: only a term-stamped ack counts as check-quorum contact (see CapturingHost).
+    /// </summary>
     private static Task AckCommittedPrefix(RaftPartitionStateMachine sm, CapturingHost host, string peer) =>
         sm.CompleteAppendLogsAsync(peer, host.HybridLogicalClock.TrySendOrLocalEvent(1),
-            RaftOperationStatus.Success, CommitFrontier,
+            RaftOperationStatus.Success, CommitFrontier, responseTerm: sm.CurrentTerm,
             presentIndex: CommitFrontier, presentTerm: 1).AsTask();
 
     /// <summary>
@@ -140,7 +145,7 @@ public class TestRestartedBlankFollowerRepair
     /// </summary>
     private static Task RejectAsEmptyLog(RaftPartitionStateMachine sm, CapturingHost host, string peer) =>
         sm.CompleteAppendLogsAsync(peer, host.HybridLogicalClock.TrySendOrLocalEvent(1),
-            RaftOperationStatus.LogMismatch, 0,
+            RaftOperationStatus.LogMismatch, 0, responseTerm: sm.CurrentTerm,
             presentIndex: 0, presentTerm: 0).AsTask();
 
     private static AppendLogsRequest SingleBatchTo(CapturingHost host, string endpoint) =>
@@ -168,6 +173,17 @@ public class TestRestartedBlankFollowerRepair
         public HybridLogicalClock HybridLogicalClock { get; } = new();
         public IReadOnlyList<RaftNode> Nodes { get; set; } = [];
         public List<RaftResponderRequest> Outbound { get; } = [];
+
+        /// <summary>
+        /// The monotonic clock is pinned: no time elapses between the promotion and the leadership
+        /// tick under test. Every elapsed-time gate on that tick (the check-quorum window, the
+        /// barrier timeout, the heartbeat cadence) then reads zero, so a loaded runner cannot
+        /// change what the tick does. On the wall clock the check-quorum window equals
+        /// StartElectionTimeout, 50 ms here, which a GA runner exceeded between the ack and the
+        /// tick: the leader stepped down and the tick sent nothing.
+        /// </summary>
+        public long MonotonicTicks { get; set; } = Stopwatch.GetTimestamp();
+        public long GetMonotonicTimestamp() => MonotonicTicks;
 
         public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;
         public HLCTimestamp GetLastNodeActivity(string e, int p) => HLCTimestamp.Zero;

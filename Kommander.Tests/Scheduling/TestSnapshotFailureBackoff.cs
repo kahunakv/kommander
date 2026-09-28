@@ -227,6 +227,11 @@ public class TestSnapshotFailureBackoff
                 HeartbeatInterval = heartbeatInterval,
                 BackfillThreshold = 0,
                 MaxBackfillEntriesPerRound = 128,
+                // Check-quorum is off: this stub runs on the wall clock because its tests wait on real
+                // time, and the window (StartElectionTimeout) can elapse on a loaded runner between the
+                // promotion and a leadership tick, which steps the leader down and sends nothing (the
+                // GA failure in TestInheritedTailHoleRepair). No test here is about check-quorum.
+                EnableCheckQuorum = false,
             };
         }
 

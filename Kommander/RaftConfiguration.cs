@@ -553,6 +553,38 @@ public class RaftConfiguration
     public bool FanOutBeforeLocalWrite { get; set; } = true;
 
     /// <summary>
+    /// When <c>true</c> (the default), a follower acknowledges an append before it delivers the
+    /// entries the append committed to the application, and delivers them in executor turns of their
+    /// own (maintenance class, at most <see cref="FollowerApplyTurnTime"/> each). The next proposal's
+    /// append then waits for one such turn at most, instead of for every <c>OnReplicationReceived</c>
+    /// callback of the previous commit. When <c>false</c>, the follower delivers inside the append's
+    /// completion, before its ack.
+    ///
+    /// <para>What an acknowledgement means does not change: it never carried the applied position.
+    /// Delivery stays exactly-once and in log order, and the applied cursor still only advances over
+    /// delivered entries, so read-index and <c>ConfirmLocalApplicationAsync</c> waits are unaffected
+    /// except that the cursor can trail the commit frontier by the entries still queued for a turn.
+    /// The system partition always delivers inline.</para>
+    /// </summary>
+    public bool FollowerApplyInOwnTurn { get; set; } = true;
+
+    /// <summary>
+    /// With <see cref="FollowerApplyInOwnTurn"/>, how long one follower apply turn may deliver entries
+    /// before it yields the executor to queued appends and acks — the most an append waits behind the
+    /// application's callbacks. A turn always delivers at least one entry. Measured on
+    /// <see cref="TickSource"/>. <see cref="TimeSpan.Zero"/> leaves only <see cref="FollowerApplyTurnBudget"/>.
+    /// </summary>
+    public TimeSpan FollowerApplyTurnTime { get; set; } = TimeSpan.FromMicroseconds(100);
+
+    /// <summary>
+    /// With <see cref="FollowerApplyInOwnTurn"/>, the most committed entries one follower apply turn
+    /// delivers, whatever <see cref="FollowerApplyTurnTime"/> allows. A turn delivers more when the
+    /// backlog exceeds eight times this, so a consumer slower than the commit rate still slows the
+    /// follower instead of growing the backlog. <c>0</c> or less means no entry bound.
+    /// </summary>
+    public int FollowerApplyTurnBudget { get; set; } = 1024;
+
+    /// <summary>
     /// Optional per-partition application-durability floor (see
     /// <see cref="IApplicationDurabilityProvider"/>). When set, restart replay widens down to the
     /// floor (committed entries above it are redelivered via <c>OnLogRestored</c> even when a
@@ -615,6 +647,11 @@ public class RaftConfiguration
     /// Values below 1 are clamped to 1; values above 64 are capped — each unit is a
     /// permanently-held connection and handler for the lifetime of the process.
     /// Default 4.
+    /// <para>A peer's replication traffic (<c>AppendLogs</c> and the transport dispatcher's batched
+    /// frames) always uses the first streaming call, so it reaches the peer in send order; the other
+    /// calls carry votes, acks and the remaining traffic round-robin. Spreading appends over several
+    /// calls let the receiver apply them out of order, which made followers withhold acks for
+    /// batches that landed over the resulting gaps.</para>
     /// </summary>
     public int GrpcChannelsPerNode { get; set; } = 4;
 
@@ -1687,9 +1724,11 @@ public class RaftConfiguration
     public int MaxEntriesPerCompaction { get; set; } = 5000;
 
     /// <summary>
-    /// Maximum number of log entries the leader retains below the compaction checkpoint for a
-    /// live, acking follower that has not yet replicated them. While a reachable follower's
-    /// replicated position sits inside this budget, compaction holds its floor at that position so
+    /// Minimum number of log entries the leader retains below the compaction checkpoint for a
+    /// live, acking follower that has not yet replicated them. The retention is sized in time by
+    /// <see cref="CompactionLiveReplicaLagWindow"/>; this count is the depth it never goes below, and
+    /// the whole depth while the leader has no write-rate history. While a reachable follower's
+    /// replicated position sits inside the budget, compaction holds its floor at that position so
     /// the follower can be served by ordinary backfill; beyond the budget (or once the follower is
     /// no longer Alive) the floor advances normally and the follower must be seeded by a snapshot.
     /// Without this hold, a leader compacting on its ordinary cadence repeatedly re-created the
@@ -1706,8 +1745,49 @@ public class RaftConfiguration
     /// rate; the retained rows cost WAL disk only while a live replica actually lags, and a replica
     /// that is not Alive holds nothing.
     /// </para>
+    /// <para>
+    /// This count used to be the whole budget, and a count shrinks in time as the write rate
+    /// rises: after the round-cost work the same million entries were ~37 s of log at ~27,000
+    /// entries/s (against ~80 s before), and a 30-second kill plus restore came back 1.7 M entries
+    /// behind, below the floor, into a whole-partition snapshot. The effective budget is now
+    /// <c>max(CompactionLiveReplicaLagBudget, min(entries committed in the last
+    /// CompactionLiveReplicaLagWindow, CompactionLiveReplicaLagCap))</c>: this count always holds,
+    /// the window raises it with the write rate, and the cap bounds the raise.
+    /// </para>
     /// </summary>
     public long CompactionLiveReplicaLagBudget { get; set; } = 1_000_000;
+
+    /// <summary>
+    /// How much recent history, in time, the leader keeps below the compaction checkpoint for a
+    /// lagging or briefly absent replica: the entries committed within this window, measured from the
+    /// leader's commit index on its heartbeat rounds. It raises
+    /// <see cref="CompactionLiveReplicaLagBudget"/> (never lowers it), up to
+    /// <see cref="CompactionLiveReplicaLagCap"/>. A fresh leader extrapolates from its first
+    /// half-second of history; before that the count applies alone.
+    /// <para>
+    /// Default three minutes: one kill-restart cycle is the <see cref="CompactionSilentPeerRetentionWindow"/>
+    /// (two minutes) in which a silent peer holds the floor, plus a minute for the lag the peer already
+    /// carried when it went silent and for its restore. Because the budget is taken below the
+    /// checkpoint, a slower checkpoint cadence only adds retention: every entry committed within the
+    /// window is kept whatever the cadence. <see cref="TimeSpan.Zero"/> sizes the budget by the count
+    /// alone, as before the window existed.
+    /// </para>
+    /// </summary>
+    public TimeSpan CompactionLiveReplicaLagWindow { get; set; } = TimeSpan.FromMinutes(3);
+
+    /// <summary>
+    /// Upper bound, in entries, on how far <see cref="CompactionLiveReplicaLagWindow"/> can raise the
+    /// live-replica retention: the WAL-disk safety bound when the write rate is very high. It bounds the
+    /// window only. A <see cref="CompactionLiveReplicaLagBudget"/> configured above it still holds.
+    /// Values &lt;= 0 turn the window off.
+    /// <para>
+    /// Default 10,000,000 entries, a few GB of WAL at the payload sizes Kahuna writes. That is the
+    /// whole default window up to ~55,000 entries/s, twice the rate of the fault soak that motivated
+    /// the window. The rows are held only while a replica actually lags, and compaction removes them
+    /// once it has caught up.
+    /// </para>
+    /// </summary>
+    public long CompactionLiveReplicaLagCap { get; set; } = 10_000_000;
 
     /// <summary>
     /// How long the leader keeps holding compaction for a peer that has stopped answering — killed,

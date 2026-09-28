@@ -243,8 +243,14 @@ public sealed record RandomScenarioOptions
 
         configuration.CompactEveryOperations = CompactEveryOperations;
 
+        // A lowered count means "this many entries, no more". The time window would raise it to
+        // everything a short run commits and the follower would never fall below the floor, so a run
+        // that lowers the count sizes retention by the count alone, as it did before the window.
         if (CompactionLiveReplicaLagBudget is { } budget)
+        {
             configuration.CompactionLiveReplicaLagBudget = budget;
+            configuration.CompactionLiveReplicaLagWindow = TimeSpan.Zero;
+        }
 
         if (EnableCheckQuorum)
             configuration.EnableCheckQuorum = true;

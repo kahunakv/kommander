@@ -120,9 +120,24 @@ internal sealed class LogApplicator
         const int BatchSize = 512;
         long from = coreState.LastAppliedIndex + 1;
 
+        // Nothing readable can deliver the next id: no resolved row at or above it has been written
+        // in this process, and none was on disk at restore (IRaftWalFacade.GetReadableResolvedHighWater).
+        // The read below would find it Proposed or absent and withhold, which is the answer given here
+        // without reading. This is the steady state under pipelined writes: the protocol commit
+        // frontier advances when a commit is queued, so after a follower's completion delivers its own
+        // batch the frontier already covers commits still in the write queue, and every completion paid
+        // a 512-row WAL read for nothing — about nine rows read per row committed on a busy follower,
+        // and half of the cluster's allocation. skipGaps keeps the read: it advances over Proposed rows.
+        if (!skipGaps && from > wal.GetReadableResolvedHighWater())
+            return false;
+
         while (from <= upToIndex)
         {
-            List<RaftLog> batch = await wal.GetRangeAllTypesAsync(from, BatchSize).ConfigureAwait(false);
+            // No more rows than the range holds: a short range (the follower apply lane's bounded turn,
+            // a tick retry one batch behind) read 512 rows to deliver a few. Rows past the target are
+            // only ever used to stop, so reading fewer changes no decision below.
+            int readCount = (int)Math.Min(BatchSize, upToIndex - from + 1);
+            List<RaftLog> batch = await wal.GetRangeAllTypesAsync(from, readCount).ConfigureAwait(false);
             if (batch.Count == 0)
                 break;
 
@@ -203,6 +218,13 @@ internal sealed class LogApplicator
 
         return true;
     }
+
+    /// <summary>
+    /// Releases the read-index and local-application waiters the applied cursor now covers. For a
+    /// path that advances the cursor itself rather than through <see cref="ApplyLogToConsumerAsync"/>
+    /// (the follower's inline fast path).
+    /// </summary>
+    public void CompleteApplyWaiters() => readIndex.CompleteApplyWaiters();
 
     /// <summary>
     /// Delivers a single committed WAL entry to the consumer state machine and

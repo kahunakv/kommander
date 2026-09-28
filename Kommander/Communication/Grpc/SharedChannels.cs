@@ -334,6 +334,43 @@ public static class SharedChannels
         return selected;
     }
 
+    /// <summary>
+    /// The one duplex stream to <paramref name="url"/> that carries its replication traffic: always
+    /// the pool's first slot (self-healed like <see cref="GetStreaming(string, Func{Metadata?}?, GrpcChannelPoolOptions)"/>),
+    /// never the round-robin pick.
+    ///
+    /// <para><b>Why a fixed slot.</b> The receiver reads each stream in order and hands its items to
+    /// the partition executors in that order, but it reads different streams concurrently. Two
+    /// consecutive <c>AppendLogs</c> frames sent round-robin on two streams could therefore reach a
+    /// follower's executor swapped. The live broadcast is unanchored, so the later batch lands over
+    /// a gap and the follower withholds its ack until the gap fills; the withheld ack then comes
+    /// back only through the proposal retry, a few proposals per heartbeat. When both followers of
+    /// a three-voter partition were caught at once, proposals waited out
+    /// <see cref="RaftConfiguration.ProposalTimeout"/> (Kommander.Benchmark, 128 writers, ~50
+    /// timeouts per 15 s at 8,000 proposals/s). The sender side loses nothing: the transport
+    /// dispatcher already sends one frame at a time per peer.</para>
+    /// </summary>
+    internal static GrpcInterSharedStreaming GetOrderedStreaming(string url, Func<Metadata?>? metadataFactory, GrpcChannelPoolOptions opts)
+    {
+        if (!url.StartsWith("https://", StringComparison.Ordinal) && !url.StartsWith("http://", StringComparison.Ordinal))
+            url = "https://" + url;
+
+        if (!streamings.TryGetValue(url, out UrlPool<GrpcInterSharedStreaming>? pool))
+            pool = streamings.GetOrAdd(
+                url,
+                k => new UrlPool<GrpcInterSharedStreaming>
+                {
+                    Slots = new Lazy<List<GrpcInterSharedStreaming>>(
+                        () => CreateAsyncDuplexStreamingCallInternal(k, metadataFactory, opts))
+                });
+
+        List<GrpcInterSharedStreaming> streamingList = pool.Slots.Value;
+        AssertConsistentPoolConfig(url, opts);
+        GrpcInterSharedStreaming selected = streamingList[0];
+        selected.EnsureHealthy();
+        return selected;
+    }
+
     // ── Public backward-compatible overloads ──────────────────────────────────
     // Use the process-wide defaults set by Configure() (called by GrpcCommunication
     // on first use) so external callers such as Kahuna's GrpcServerBatcher inherit

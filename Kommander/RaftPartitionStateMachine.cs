@@ -112,6 +112,9 @@ public sealed class RaftPartitionStateMachine
     /// see <see cref="LogApplicator"/>.</summary>
     private readonly LogApplicator applier;
 
+    /// <summary>A follower's committed-entry delivery after its ack, in turns of its own (<see cref="RaftConfiguration.FollowerApplyInOwnTurn"/>).</summary>
+    private readonly FollowerApplyLane applyLane;
+
     /// <summary>Outbound AppendEntries and bounded catch-up reads; see
     /// <see cref="BackfillSender"/>.</summary>
     private readonly BackfillSender sender;
@@ -421,13 +424,14 @@ public sealed class RaftPartitionStateMachine
         heartbeats = new HeartbeatDriver(host, wal, coreState, tracker, proposals, sender, logThrottle, logger);
         readIndex = new ReadIndexCoordinator(host, coreState, replySink, logger, heartbeats.SendHeartbeat);
         applier = new LogApplicator(host, wal, coreState, proposals, readIndex, logger);
+        applyLane = new FollowerApplyLane(host, wal, coreState, applier, () => postToExecutor);
         snapshotInstaller = new SnapshotInstaller(host, wal, coreState, logger, AdoptLeaderAsync,
             upToIndex => applier.DrainCommittedAppliesAsync(upToIndex));
         election = new ElectionCoordinator(host, wal, coreState, tracker, logger, BecomeLeaderAsync, FailAllActiveProposalWaiters, heartbeats.SendHeartbeat, proposals);
         followerAppend = new FollowerAppendHandler(host, wal, coreState, proposals, logThrottle, replySink, logger, AdoptLeaderAsync);
         ackProcessor = new ReplicationAckProcessor(host, wal, coreState, tracker, proposals, readIndex, sender, election, logThrottle, logger, FailAllActiveProposalWaiters);
         replicator = new LogReplicator(host, wal, coreState, proposals, sender, replySink, logger);
-        walCompletions = new WalCompletionRouter(host, wal, coreState, proposals, applier, sender, replySink, logger, RevertUnpublishedPromotionAsync, ackProcessor.CompleteQuorum);
+        walCompletions = new WalCompletionRouter(host, wal, coreState, proposals, applier, applyLane, sender, replySink, logger, RevertUnpublishedPromotionAsync, ackProcessor.CompleteQuorum);
     }
 
     /// <summary>
@@ -607,12 +611,23 @@ public sealed class RaftPartitionStateMachine
                 await AbandonReseedRequestAsync("the bound elapsed").ConfigureAwait(false);
         }
 
+        // The withheld-drain retry described above. With the follower apply lane on, it is one lane
+        // turn: it delivers the entries the lane holds from memory before it reads the WAL, and stays
+        // within the turn budget (it queues the next turn when there is more). A queued turn it
+        // overtakes finds less to do; a queued turn that was lost cannot strand the entries.
         if (coreState.NodeState != RaftNodeState.Leader)
         {
-            long commitFrontier = wal.GetCommitIndex();
+            if (applyLane.Enabled)
+            {
+                await applyLane.RunTurnAsync(posted: false).ConfigureAwait(false);
+            }
+            else
+            {
+                long commitFrontier = wal.GetCommitIndex();
 
-            if (commitFrontier > coreState.LastAppliedIndex)
-                await applier.DrainCommittedAppliesAsync(commitFrontier).ConfigureAwait(false);
+                if (commitFrontier > coreState.LastAppliedIndex)
+                    await applier.DrainCommittedAppliesAsync(commitFrontier).ConfigureAwait(false);
+            }
         }
 
         switch (coreState.NodeState)
@@ -2194,6 +2209,13 @@ public sealed class RaftPartitionStateMachine
 
 
 
+
+    /// <summary>
+    /// Runs one follower apply turn (<see cref="RaftRequestType.ApplyCommittedEntries"/>): delivers
+    /// committed entries the follower has already acknowledged, a bounded number per turn. See
+    /// <see cref="FollowerApplyLane"/>.
+    /// </summary>
+    public Task RunFollowerApplyTurnAsync() => applyLane.RunTurnAsync(posted: true);
 
     /// <summary>
     /// Discards every piece of per-follower replication progress recorded for

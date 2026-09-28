@@ -105,7 +105,9 @@ public class TestFollowerDeliveryStall
 
     /// <summary>
     /// Drives one AppendLogs batch of ids 1..5 down the real follower path: the state machine
-    /// enqueues it, registers the pending WAL operation, and applies on completion.
+    /// enqueues it, registers the pending WAL operation, and applies on completion — in the apply
+    /// turns the completion queues (<see cref="RaftConfiguration.FollowerApplyInOwnTurn"/>), which
+    /// run here as the executor would run them, right after it.
     /// </summary>
     private static async Task DeliverBatchAsync(RaftPartitionStateMachine sm, StallWal wal, bool unresolvedFirst)
     {
@@ -127,6 +129,12 @@ public class TestFollowerDeliveryStall
             MinLogIndex: 1, MaxLogIndex: 5,
             OperationType: WALWriteOperationType.FollowerAppend,
             Status: RaftOperationStatus.Success));
+
+        while (wal.PostedTurns > 0)
+        {
+            wal.PostedTurns--;
+            await sm.RunFollowerApplyTurnAsync();
+        }
     }
 
     private static (RaftPartitionStateMachine, RecordingHost, StallWal) Build()
@@ -137,7 +145,11 @@ public class TestFollowerDeliveryStall
         RaftPartitionStateMachine sm = new(host, wal, new NoopSink(), NullLogger<IRaft>.Instance);
 
         sm.MarkRestoredForTesting();
-        sm.SetPostToExecutor(_ => { });
+        sm.SetPostToExecutor(request =>
+        {
+            if (request.Type == RaftRequestType.ApplyCommittedEntries)
+                wal.PostedTurns++;
+        });
 
         return (sm, host, wal);
     }
@@ -198,6 +210,9 @@ public class TestFollowerDeliveryStall
         private long _nextOperationId;
 
         public long LastOperationId => _nextOperationId;
+
+        /// <summary>Apply turns the state machine queued and the test has not run yet.</summary>
+        public int PostedTurns { get; set; }
 
         /// <summary>Flips a Proposed entry to Committed — the marker arriving late.</summary>
         public void Resolve(long id)

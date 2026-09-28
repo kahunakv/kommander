@@ -7,6 +7,7 @@ using Kommander.Logging;
 using Kommander.Scheduling;
 using Kommander.System;
 using Kommander.Time;
+using Kommander.WAL;
 using Microsoft.Extensions.Logging;
 
 namespace Kommander.Consensus;
@@ -53,11 +54,19 @@ internal sealed class HeartbeatDriver
 
     /// <summary>
     /// Floor published for a silent peer with no positional evidence. Any value at or below the
-    /// WAL's budget clamp reads as "the whole budget": the WAL keeps at most
-    /// <see cref="RaftConfiguration.CompactionLiveReplicaLagBudget"/> entries below the checkpoint
+    /// WAL's budget clamp reads as "the whole budget": the WAL keeps at most the published budget
+    /// (<see cref="RaftConfiguration.CompactionLiveReplicaLagBudget"/> raised by the time window) below the checkpoint
     /// however low this is, and a peer whose position is unknown may need any of them.
     /// </summary>
     private const long UnknownPositionFloor = 1;
+
+    /// <summary>
+    /// The leader's commit-index history, sampled each heartbeat round, that sizes the live-replica
+    /// budget in time (<see cref="RaftConfiguration.CompactionLiveReplicaLagWindow"/>). Executor thread
+    /// only. It survives leadership changes: the commit index is a position in the one log, so a sample
+    /// taken in an earlier term still counts the commits since, and a gap in the history is interpolated.
+    /// </summary>
+    private readonly LiveReplicaRetentionBudget retentionBudget = new();
 
     public HeartbeatDriver(
         IRaftPartitionHost host,
@@ -400,6 +409,12 @@ internal sealed class HeartbeatDriver
     ///   and a stalled follower's protocol frontier keeps rising with every entry it has queued but
     ///   cannot write. A 30 s stall at the observed write rate is ~400,000 entries, inside the
     ///   default 1,000,000-entry budget, so it is ridden out from the log rather than by snapshot.</item>
+    ///   <item>The depth the WAL may hold is published with the floor, sized in time: the entries
+    ///   committed within <see cref="RaftConfiguration.CompactionLiveReplicaLagWindow"/>, never below
+    ///   <see cref="RaftConfiguration.CompactionLiveReplicaLagBudget"/> and capped by
+    ///   <see cref="RaftConfiguration.CompactionLiveReplicaLagCap"/>. A count alone shrank in time as the
+    ///   write rate rose: at ~27,000 entries/s a million entries were 37 s of log, and a 30-second kill
+    ///   plus restore came back below it into a snapshot.</item>
     ///   <item>Learners count too — a placement learner mid-catch-up is exactly the replica whose
     ///   backfill the floor must keep servable.</item>
     /// </list>
@@ -413,6 +428,13 @@ internal sealed class HeartbeatDriver
 
         long floor = long.MaxValue;
         long nowTicks = host.GetMonotonicTimestamp();
+
+        // Sampled every round, whether or not a peer holds the floor this round, so the window has
+        // history when one starts to.
+        long windowEntries = retentionBudget.Observe(
+            nowTicks, wal.GetCommitIndex(), host.Configuration.CompactionLiveReplicaLagWindow);
+        long budget = LiveReplicaRetentionBudget.Compose(
+            host.Configuration.CompactionLiveReplicaLagBudget, windowEntries, host.Configuration.CompactionLiveReplicaLagCap);
 
         foreach (RaftNode node in nodes)
         {
@@ -499,7 +521,7 @@ internal sealed class HeartbeatDriver
                 floor = needed;
         }
 
-        wal.SetLiveReplicaRetentionFloor(floor);
+        wal.SetLiveReplicaRetentionFloor(floor, budget);
     }
 
     /// <summary>

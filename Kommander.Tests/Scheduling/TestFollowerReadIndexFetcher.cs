@@ -15,13 +15,15 @@ public class TestFollowerReadIndexFetcher
     private static readonly TimeSpan WaitBudget = TimeSpan.FromSeconds(5);
 
     /// <summary>A parked transport call: the token it got and the answer the test gives it.</summary>
-    private sealed record PendingFetch(RaftNode Node, int PartitionId, CancellationToken Token, TaskCompletionSource<GetReadIndexResponse> Reply);
+    private sealed record PendingFetch(RaftNode Node, int PartitionId, TaskCompletionSource<GetReadIndexResponse> Reply, CancellationToken Token);
 
     /// <summary>Records every transport call and parks it until the test completes its reply.</summary>
-    private sealed class FakeTransport
+    private sealed class FakeTransport : IDisposable
     {
         private readonly List<PendingFetch> calls = [];
         private readonly SemaphoreSlim called = new(0);
+
+        public void Dispose() => called.Dispose();
 
         public Func<RaftNode, GetReadIndexRequest, CancellationToken, Task<GetReadIndexResponse>>? Override { get; set; }
 
@@ -32,7 +34,7 @@ public class TestFollowerReadIndexFetcher
 
         public Task<GetReadIndexResponse> Fetch(RaftNode node, GetReadIndexRequest request, CancellationToken token)
         {
-            PendingFetch pending = new(node, request.PartitionId, token, new(TaskCreationOptions.RunContinuationsAsynchronously));
+            PendingFetch pending = new(node, request.PartitionId, new(TaskCreationOptions.RunContinuationsAsynchronously), token);
 
             lock (calls)
                 calls.Add(pending);
@@ -60,7 +62,7 @@ public class TestFollowerReadIndexFetcher
     [Fact]
     public async Task IdleRead_SendsAtOnce_AndReturnsTheAnswer()
     {
-        FakeTransport transport = new();
+        using FakeTransport transport = new();
         FollowerReadIndexFetcher fetcher = Make(transport);
 
         Task<GetReadIndexResponse> read = Read(fetcher, token: TestContext.Current.CancellationToken);
@@ -85,7 +87,7 @@ public class TestFollowerReadIndexFetcher
     [Fact]
     public async Task ReadsArrivingDuringAFetch_ShareTheNextFetch_NotTheOneInFlight()
     {
-        FakeTransport transport = new();
+        using FakeTransport transport = new();
         FollowerReadIndexFetcher fetcher = Make(transport);
 
         Task<GetReadIndexResponse> first = Read(fetcher, token: TestContext.Current.CancellationToken);
@@ -114,7 +116,7 @@ public class TestFollowerReadIndexFetcher
     [Fact]
     public async Task CallerCancellation_EndsOnlyThatWait_AndNeverCancelsTheSharedFetch()
     {
-        FakeTransport transport = new();
+        using FakeTransport transport = new();
         FollowerReadIndexFetcher fetcher = Make(transport);
 
         using CancellationTokenSource firstCts = new();
@@ -146,7 +148,7 @@ public class TestFollowerReadIndexFetcher
     [Fact]
     public async Task TransportException_FailsClosed_AndTheNextReadStillFetches()
     {
-        FakeTransport transport = new();
+        using FakeTransport transport = new();
         FollowerReadIndexFetcher fetcher = Make(transport);
 
         Task<GetReadIndexResponse> failed = Read(fetcher, token: TestContext.Current.CancellationToken);
@@ -169,7 +171,7 @@ public class TestFollowerReadIndexFetcher
     [Fact]
     public async Task HungFetch_IsBoundedByTheSharedTimeout_AndDoesNotParkLaterReads()
     {
-        FakeTransport transport = new()
+        using FakeTransport transport = new()
         {
             Override = static async (_, _, token) =>
             {
@@ -194,7 +196,7 @@ public class TestFollowerReadIndexFetcher
     [Fact]
     public async Task DifferentPartitionsAndLeaders_DoNotWaitForEachOther()
     {
-        FakeTransport transport = new();
+        using FakeTransport transport = new();
         FollowerReadIndexFetcher fetcher = Make(transport);
 
         Task<GetReadIndexResponse> p1 = Read(fetcher, partition: 1, token: TestContext.Current.CancellationToken);

@@ -138,4 +138,11 @@ public enum RaftRequestType
 
     /// <summary>The leader receives a follower's re-seed request.</summary>
     ReceiveReseedRequest,
+
+    /// <summary>
+    /// A follower's apply turn: delivers committed entries its appends already acknowledged to the
+    /// consumer, a bounded number per turn (<c>RaftConfiguration.FollowerApplyInOwnTurn</c>). Posted by
+    /// the partition to itself; maintenance class, so appends queued meanwhile run first.
+    /// </summary>
+    ApplyCommittedEntries,
 }

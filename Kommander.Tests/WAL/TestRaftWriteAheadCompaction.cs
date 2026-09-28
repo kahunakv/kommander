@@ -1055,6 +1055,61 @@ public sealed class TestRaftWriteAheadCompaction
     }
 
     /// <summary>
+    /// The leader's rate-scaled budget (the entries committed within
+    /// <see cref="RaftConfiguration.CompactionLiveReplicaLagWindow"/>) raises the hold above the count,
+    /// up to <see cref="RaftConfiguration.CompactionLiveReplicaLagCap"/>, and a count above the cap
+    /// still holds: effective budget = max(count, min(published, cap)), floor = checkpoint − budget.
+    /// A count alone shrank in time as the write rate rose, which is what put a 30-second kill at the
+    /// round-cost write rate below the floor and into a snapshot.
+    /// </summary>
+    [Theory]
+    // count 3, window 8, cap 100: the window wins, floor 10 − 8 = 2, at the follower's position.
+    [InlineData(3L, 100L, 8L, 2L)]
+    // count 3, window 8, cap 5: the cap bounds the window, floor 10 − 5 = 5.
+    [InlineData(3L, 5L, 8L, 5L)]
+    // count 6 above cap 2: the count still holds, floor 10 − 6 = 4.
+    [InlineData(6L, 2L, 8L, 4L)]
+    // no rate evidence (published 0): the count applies alone, floor 10 − 3 = 7.
+    [InlineData(3L, 100L, 0L, 7L)]
+    // cap 0 turns the window off: the count applies alone.
+    [InlineData(3L, 0L, 8L, 7L)]
+    public async Task LiveReplicaFloor_RateScaledBudget_HoldsBetweenTheCountAndTheCap(
+        long countBudget, long cap, long publishedBudget, long expectedFirstRetained)
+    {
+        string path = CreateTempWalPath();
+        try
+        {
+            using SqliteWAL wal = new(path, "wal", NullLogger<IRaft>.Instance);
+            const int partitionId = 1;
+            // logs 1-9 committed, checkpoint at 10
+            SeedRemovableLogs(wal, partitionId, removableCount: 9, checkpointId: 10);
+
+            RaftWriteAhead writeAhead = CreateWriteAhead(
+                wal, compactNumberEntries: 100, maxEntriesPerCompaction: 1000, compactEveryOperations: 0,
+                partitionId, out RaftManager manager, out RaftPartition partition);
+
+            try
+            {
+                manager.Configuration.CompactionLiveReplicaLagBudget = countBudget;
+                manager.Configuration.CompactionLiveReplicaLagCap = cap;
+
+                // The follower still needs entry 2.
+                writeAhead.SetLiveReplicaRetentionFloor(2, publishedBudget);
+
+                writeAhead.Compact();
+                await writeAhead.WaitForCompactionIdleAsync().ConfigureAwait(true);
+
+                long[] survivingIds = wal.ReadLogsRange(partitionId, 0).Select(l => l.Id).ToArray();
+                Assert.Equal(expectedFirstRetained, survivingIds.Min());
+                Assert.Contains(9L, survivingIds);
+                Assert.Contains(10L, survivingIds);
+            }
+            finally { partition.Dispose(); manager.Dispose(); }
+        }
+        finally { DeleteTempWalPath(path); }
+    }
+
+    /// <summary>
     /// A budget of 0 disables the hold entirely: the published floor is ignored and compaction
     /// truncates to the checkpoint — the pre-fix behaviour.
     /// </summary>

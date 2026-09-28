@@ -87,6 +87,7 @@ public sealed class TestRestartUnderLoadScenarios
                 {
                     configuration.CompactEveryOperations = CompactEveryOperations;
                     configuration.CompactionLiveReplicaLagBudget = LiveReplicaLagBudget;
+                    configuration.CompactionLiveReplicaLagWindow = TimeSpan.Zero;
                 },
             },
             logger,
@@ -213,6 +214,7 @@ public sealed class TestRestartUnderLoadScenarios
                 {
                     configuration.CompactEveryOperations = CompactEveryOperations;
                     configuration.CompactionLiveReplicaLagBudget = SilentPeerLagBudget;
+                    configuration.CompactionLiveReplicaLagWindow = TimeSpan.Zero;
                     configuration.CompactionSilentPeerRetentionWindow = windowEnabled ? TimeSpan.FromMinutes(2) : TimeSpan.Zero;
                 },
             },
@@ -338,6 +340,7 @@ public sealed class TestRestartUnderLoadScenarios
                 {
                     configuration.CompactEveryOperations = CompactEveryOperations;
                     configuration.CompactionLiveReplicaLagBudget = SilentPeerLagBudget;
+                    configuration.CompactionLiveReplicaLagWindow = TimeSpan.Zero;
                     configuration.CompactionSilentPeerRetentionWindow = TimeSpan.FromMinutes(2);
                 },
             },
@@ -498,6 +501,7 @@ public sealed class TestRestartUnderLoadScenarios
                 {
                     configuration.CompactEveryOperations = CompactEveryOperations;
                     configuration.CompactionLiveReplicaLagBudget = SilentPeerLagBudget;
+                    configuration.CompactionLiveReplicaLagWindow = TimeSpan.Zero;
                     configuration.CompactionSilentPeerRetentionWindow = TimeSpan.FromMinutes(2);
                 },
             },

@@ -190,6 +190,16 @@ public interface IRaftWalFacade
     long GetDurableCommitIndex() => GetCommitIndex();
 
     /// <summary>
+    /// An upper bound on the id of any row in the WAL that an apply drain could deliver: the highest
+    /// resolved (committed, rolled-back or checkpoint) row written by a successful completion in this
+    /// process, or the highest row of any type restored from disk, whichever is larger. A drain whose
+    /// next id is above it can only find that id Proposed or absent. It is a bound, never a frontier:
+    /// it may sit above holes, and only the drain decides what is deliverable. Defaults to
+    /// <see cref="long.MaxValue"/> (always read) for facades that do not track written resolutions.
+    /// </summary>
+    long GetReadableResolvedHighWater() => long.MaxValue;
+
+    /// <summary>
     /// The durable contiguous commit frontier this node reports to its leader in every append ack
     /// (<see cref="Data.CompleteAppendLogsRequest.DurableIndex"/>): the highest id both resolved and
     /// durably present with no hole below it, read fresh (it regresses with a failed write, unlike
@@ -278,6 +288,16 @@ public interface IRaftWalFacade
     /// compact (test stubs).
     /// </summary>
     void SetLiveReplicaRetentionFloor(long floor) { }
+
+    /// <summary>
+    /// <see cref="SetLiveReplicaRetentionFloor(long)"/> with the leader's rate-scaled budget: how many
+    /// entries below the checkpoint the floor may hold, from
+    /// <see cref="RaftConfiguration.CompactionLiveReplicaLagWindow"/> over the leader's commit history.
+    /// The WAL clamps it between <see cref="RaftConfiguration.CompactionLiveReplicaLagBudget"/> and
+    /// <see cref="RaftConfiguration.CompactionLiveReplicaLagCap"/>, so a budget of 0 means "the count
+    /// alone". Defaults to the one-argument form for facades that predate the window.
+    /// </summary>
+    void SetLiveReplicaRetentionFloor(long floor, long budget) => SetLiveReplicaRetentionFloor(floor);
 
     /// <summary>
     /// Persists this partition's Raft hard state — the current term and the endpoint we last granted our
