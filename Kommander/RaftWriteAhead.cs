@@ -254,6 +254,12 @@ public sealed class RaftWriteAhead
 
     private long ridingResolvedIndex = 1;
 
+    // The highest row id of any type the last restore read from the disk. Rows written before this
+    // process started are not reported through MarkResolutionWritten, so GetReadableResolvedHighWater
+    // must cover them from here: a resolved row restored above a hole becomes deliverable once the
+    // hole is filled, however low the rows written since then are.
+    private long restoredMaxLogId;
+
     private long publishedCommitIndex = 1;
 
     // Out-of-order present ids (with their terms) buffered until the gap below them fills — the
@@ -714,6 +720,7 @@ public sealed class RaftWriteAhead
         //                  unacknowledged-but-not-durable write is never promoted.
         commitIndex = contiguousCommitted + 1;
         proposeIndex = maxLogId + 1;
+        restoredMaxLogId = maxLogId;
 
         // Presence frontier: the last id of the unbroken durable prefix (any type), independent of
         // the commit-marker reconstruction above. With no entries, mirror the commit frontier (a
@@ -1691,6 +1698,13 @@ public sealed class RaftWriteAhead
     /// volatile field, written only on the partition executor and only upwards.
     /// </summary>
     public long GetDurableCommitIndex() => Volatile.Read(ref publishedCommitIndex) - 1;
+
+    /// <summary>
+    /// See <see cref="Scheduling.IRaftWalFacade.GetReadableResolvedHighWater"/>: the highest resolved
+    /// row written by a successful completion (or installed as a snapshot boundary) in this process,
+    /// or the highest row restored from disk. Executor thread only.
+    /// </summary>
+    public long GetReadableResolvedHighWater() => Math.Max(ridingResolvedIndex - 1, restoredMaxLogId);
 
     /// <summary>
     /// The frontier a follower REPORTS to its leader as durable: the highest id that is both resolved

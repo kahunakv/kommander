@@ -237,7 +237,8 @@ public class GrpcCommunication : ICommunication
     /// </summary>
     public async Task<AppendLogsResponse> AppendLogs(RaftManager manager, RaftNode node, AppendLogsRequest request)
     {
-        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
+        // Ordered: a peer's appends must reach it in send order (see SharedChannels.GetOrderedStreaming).
+        GrpcInterSharedStreaming streaming = SharedChannels.GetOrderedStreaming(
             GetEndpointUrl(manager, node),
             GetStreamingAuthFactory(manager),
             GetPoolOptions(manager));
@@ -570,7 +571,8 @@ public class GrpcCommunication : ICommunication
         if (request.Requests is null)
             return new();
 
-        GrpcInterSharedStreaming streaming = SharedChannels.GetStreaming(
+        // Ordered: a peer's appends must reach it in send order (see SharedChannels.GetOrderedStreaming).
+        GrpcInterSharedStreaming streaming = SharedChannels.GetOrderedStreaming(
             GetEndpointUrl(manager, node),
             GetStreamingAuthFactory(manager),
             GetPoolOptions(manager));

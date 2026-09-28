@@ -615,6 +615,11 @@ public class RaftConfiguration
     /// Values below 1 are clamped to 1; values above 64 are capped — each unit is a
     /// permanently-held connection and handler for the lifetime of the process.
     /// Default 4.
+    /// <para>A peer's replication traffic (<c>AppendLogs</c> and the transport dispatcher's batched
+    /// frames) always uses the first streaming call, so it reaches the peer in send order; the other
+    /// calls carry votes, acks and the remaining traffic round-robin. Spreading appends over several
+    /// calls let the receiver apply them out of order, which made followers withhold acks for
+    /// batches that landed over the resulting gaps.</para>
     /// </summary>
     public int GrpcChannelsPerNode { get; set; } = 4;
 

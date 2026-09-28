@@ -262,6 +262,68 @@ public sealed class TestDurableCommitFrontier
         }
     }
 
+    /// <summary>
+    /// <see cref="RaftWriteAhead.GetReadableResolvedHighWater"/> bounds what an apply drain can
+    /// deliver: it rises with resolved rows as their writes complete, never with Proposed rows, and it
+    /// may sit above a hole (it is a bound, not a frontier). A drain whose next id is above it skips
+    /// the WAL read it would have wasted.
+    /// </summary>
+    [Fact]
+    public async Task ReadableResolvedHighWater_RisesWithWrittenResolutionsOnly()
+    {
+        RaftWriteAhead writeAhead = CreateWriteAhead(out RaftManager manager, out RaftPartition partition);
+
+        try
+        {
+            Assert.Equal(0, writeAhead.GetReadableResolvedHighWater());
+
+            Written(writeAhead, await Append(writeAhead, Proposed(1), Proposed(2), Proposed(3)));
+            Assert.Equal(0, writeAhead.GetReadableResolvedHighWater());
+
+            // Accepted into the queue is not enough: the bound moves when the router records the write.
+            RaftWalCompletion commitOne = await Append(writeAhead, Committed(1));
+            Assert.Equal(0, writeAhead.GetReadableResolvedHighWater());
+            Written(writeAhead, commitOne);
+            Assert.Equal(1, writeAhead.GetReadableResolvedHighWater());
+
+            // A resolution written out of order, above the unresolved id 2.
+            Written(writeAhead, await Append(writeAhead, Committed(3)));
+            Assert.Equal(3, writeAhead.GetReadableResolvedHighWater());
+        }
+        finally
+        {
+            partition.Dispose();
+            manager.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Rows written before a restart are not reported through the completion router, so the bound
+    /// must cover everything the restore read. Otherwise a committed row restored above a hole would
+    /// stay undelivered once the hole fills: the rows written to fill it are lower than it.
+    /// </summary>
+    [Fact]
+    public async Task Restore_CoversResolvedRowsAboveAHole()
+    {
+        RaftWriteAhead writeAhead = CreateWriteAhead(out RaftManager manager, out RaftPartition partition);
+
+        try
+        {
+            await Append(writeAhead, Committed(1), Committed(3));
+
+            await writeAhead.CompleteRestoreAsync(await writeAhead.LoadRestoreLogsAsync());
+
+            Assert.Equal(1, writeAhead.GetCommitIndex());
+            Assert.True(writeAhead.GetReadableResolvedHighWater() >= 3,
+                $"high water {writeAhead.GetReadableResolvedHighWater()} is below the restored committed row 3");
+        }
+        finally
+        {
+            partition.Dispose();
+            manager.Dispose();
+        }
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────
 
     private readonly ConcurrentDictionary<long, TaskCompletionSource<RaftWalCompletion>> completions = new();
@@ -300,6 +362,13 @@ public sealed class TestDurableCommitFrontier
     /// <summary>What the completion router does for a successful completion.</summary>
     private static void Durable(RaftWriteAhead writeAhead, RaftWalCompletion completion) =>
         writeAhead.MarkDurablyWritten(completion.MinLogIndex, completion.WrittenMaxLogIndex, completion.SparseLogIds);
+
+    /// <summary>Everything the completion router records for a successful completion: presence and resolution.</summary>
+    private static void Written(RaftWriteAhead writeAhead, RaftWalCompletion completion)
+    {
+        Durable(writeAhead, completion);
+        writeAhead.MarkResolutionWritten(completion.ResolvedMaxLogIndex, completion.Synced);
+    }
 
     private static RaftLog Committed(long id, long term = 1) => new()
     {

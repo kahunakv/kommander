@@ -120,6 +120,17 @@ internal sealed class LogApplicator
         const int BatchSize = 512;
         long from = coreState.LastAppliedIndex + 1;
 
+        // Nothing readable can deliver the next id: no resolved row at or above it has been written
+        // in this process, and none was on disk at restore (IRaftWalFacade.GetReadableResolvedHighWater).
+        // The read below would find it Proposed or absent and withhold, which is the answer given here
+        // without reading. This is the steady state under pipelined writes: the protocol commit
+        // frontier advances when a commit is queued, so after a follower's completion delivers its own
+        // batch the frontier already covers commits still in the write queue, and every completion paid
+        // a 512-row WAL read for nothing — about nine rows read per row committed on a busy follower,
+        // and half of the cluster's allocation. skipGaps keeps the read: it advances over Proposed rows.
+        if (!skipGaps && from > wal.GetReadableResolvedHighWater())
+            return false;
+
         while (from <= upToIndex)
         {
             List<RaftLog> batch = await wal.GetRangeAllTypesAsync(from, BatchSize).ConfigureAwait(false);

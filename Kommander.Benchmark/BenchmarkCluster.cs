@@ -96,6 +96,8 @@ public sealed class BenchmarkCluster : IAsyncDisposable
                 FanOutBeforeLocalWrite = options.FanOutBeforeLocalWrite ?? true
             };
 
+            ApplyOverrides(configuration, options.Set);
+
             if (mtls)
             {
                 // Kommander pins SHA-256 over the DER certificate, not the SHA-1 Thumbprint property.
@@ -290,5 +292,38 @@ public sealed class BenchmarkCluster : IAsyncDisposable
         }
 
         certificate?.Dispose();
+    }
+
+    /// <summary>
+    /// Applies <c>--set Name=Value</c> overrides to a node's configuration. Only simple settable
+    /// properties are supported; an unknown name or an unparsable value fails the run rather than
+    /// silently measuring the default.
+    /// </summary>
+    internal static void ApplyOverrides(RaftConfiguration configuration, IEnumerable<string> overrides)
+    {
+        foreach (string item in overrides)
+        {
+            int eq = item.IndexOf('=');
+            if (eq <= 0)
+                throw new ArgumentException($"--set expects Name=Value, got '{item}'");
+
+            string name = item[..eq].Trim();
+            string value = item[(eq + 1)..].Trim();
+
+            global::System.Reflection.PropertyInfo property = typeof(RaftConfiguration).GetProperty(name)
+                ?? throw new ArgumentException($"--set: RaftConfiguration has no property '{name}'");
+
+            object parsed = property.PropertyType switch
+            {
+                Type t when t == typeof(bool) => bool.Parse(value),
+                Type t when t == typeof(int) => int.Parse(value, global::System.Globalization.CultureInfo.InvariantCulture),
+                Type t when t == typeof(long) => long.Parse(value, global::System.Globalization.CultureInfo.InvariantCulture),
+                Type t when t == typeof(double) => double.Parse(value, global::System.Globalization.CultureInfo.InvariantCulture),
+                Type t when t == typeof(TimeSpan) => TimeSpan.Parse(value, global::System.Globalization.CultureInfo.InvariantCulture),
+                _ => throw new ArgumentException($"--set: '{name}' is a {property.PropertyType.Name}, which --set does not support"),
+            };
+
+            property.SetValue(configuration, parsed);
+        }
     }
 }

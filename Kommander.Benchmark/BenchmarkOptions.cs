@@ -60,6 +60,9 @@ public sealed class BenchmarkOptions
     [Option("stages", Default = true, HelpText = "Collect the raft.round.stage_ms histogram (per-stage round split).")]
     public bool? Stages { get; set; }
 
+    [Option("set", Separator = ',', HelpText = "RaftConfiguration overrides for every node, Name=Value[,Name=Value]: any settable bool, int, long, double or TimeSpan property (e.g. PartitionExecutorPoolSize=2,WriteIOThreads=2).")]
+    public IEnumerable<string> Set { get; set; } = [];
+
     [Option("label", Default = null, HelpText = "Free-form label copied into the JSON (e.g. a build id or git sha).")]
     public string? Label { get; set; }
 
