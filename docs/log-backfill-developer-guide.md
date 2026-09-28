@@ -157,6 +157,16 @@ cannot heal the gap at all: once writes stop, empty heartbeats carry no entries,
 missed tail entry would strand the follower forever; and a follower that restarted and lost its lazy
 commit markers has to be re-supplied from where it says it is, however small the gap looks.
 
+The leader also ships a batch straight from a follower's ack when that ack shows it more than
+`BackfillThreshold` behind (the ack fast path), so a multi-batch catch-up does not wait a heartbeat per
+batch. Under steady writes, the slower follower's ack usually looks one batch behind: the other follower
+made the quorum while this ack was on its way, and the commit broadcast is still being sent. The fast path
+therefore skips a follower whose whole gap is already in flight to it as commit or rollback broadcasts,
+counted from the moment the commit marker is queued (`ReplicationTracker.AreResolutionsInFlight`). A
+broadcast the follower has not answered within `HeartbeatInterval` stops counting, and the heartbeat
+triggers above are not gated at all. Before this gate, every proposal cost each follower a third
+`AppendLogs` and a third WAL write.
+
 **This is why `BackfillThreshold` is not a disable switch.** Raising it suppresses backfill only while
 writes are flowing — the moment the partition goes idle, the idle-tail trigger fires anyway. To turn
 backfill off for a node's partitions, set `BackfillEnabled = false`; it short-circuits all three

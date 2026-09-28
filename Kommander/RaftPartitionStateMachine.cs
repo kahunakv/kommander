@@ -427,7 +427,7 @@ public sealed class RaftPartitionStateMachine
         followerAppend = new FollowerAppendHandler(host, wal, coreState, proposals, logThrottle, replySink, logger, AdoptLeaderAsync);
         ackProcessor = new ReplicationAckProcessor(host, wal, coreState, tracker, proposals, readIndex, sender, election, logThrottle, logger, FailAllActiveProposalWaiters);
         replicator = new LogReplicator(host, wal, coreState, proposals, sender, replySink, logger);
-        walCompletions = new WalCompletionRouter(host, wal, coreState, proposals, applier, sender, replySink, logger, RevertUnpublishedPromotionAsync);
+        walCompletions = new WalCompletionRouter(host, wal, coreState, proposals, applier, sender, replySink, logger, RevertUnpublishedPromotionAsync, ackProcessor.CompleteQuorum);
     }
 
     /// <summary>
@@ -2416,12 +2416,15 @@ public sealed class RaftPartitionStateMachine
         // The proposals stuck behind the stalled write are still pending WAL operations, not active
         // proposals: they have no quorum waiter yet, so FailAllActiveProposalWaiters does not reach their
         // callers and they would sit until the reply timeout — the very wait this step-down exists to
-        // cut. None of them was fanned out (that runs in the write's completion), so none can commit now
-        // that this node has stepped down: answer them NodeIsNotLeader so the caller re-routes to the
-        // successor, and leave the operations tracked for the completion's leader-state fence.
-        List<ulong> stalledCallers = proposals.DetachPendingLeaderProposeReplies();
-        foreach (ulong correlationId in stalledCallers)
-            CompleteReply(correlationId, new(RaftResponseType.None, RaftOperationStatus.NodeIsNotLeader, 0L));
+        // cut. One that was not fanned out can never commit now that this node has stepped down: answer
+        // it NodeIsNotLeader so the caller re-routes to the successor. One sent to the peers when its
+        // write was queued (RaftConfiguration.FanOutBeforeLocalWrite) may still be committed by the
+        // successor, so its caller gets ProposalOutcomeUnknown, never a definite refusal. The operations
+        // stay tracked for the completion's leader-state fence.
+        List<(ulong CorrelationId, bool FannedOut)> stalledCallers = proposals.DetachPendingLeaderProposeReplies();
+        foreach ((ulong correlationId, bool fannedOut) in stalledCallers)
+            CompleteReply(correlationId, new(RaftResponseType.None,
+                fannedOut ? RaftOperationStatus.ProposalOutcomeUnknown : RaftOperationStatus.NodeIsNotLeader, 0L));
 
         if (stalledCallers.Count > 0)
             logger.LogWarning(

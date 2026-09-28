@@ -332,6 +332,12 @@ internal sealed class ReplicationGateway
         if (entries is null || entries.Count == 0)
             return new(true, RaftOperationStatus.Success, HLCTimestamp.Zero, []);
 
+        // Round stages (off by default). Kahuna's write aggregator proposes through this entry point, so
+        // without this stamp leader.round and leader.resume covered only the single-type ReplicateLogs
+        // callers (16 of 190 proposals/s on the CamusDB cluster). Only the auto group is timed: it is the
+        // round a caller waits for; a trailing manual group is a second proposal whose commit comes later.
+        long roundStartTicks = RoundStageInstrumentation.Stamp();
+
         // ── Batch-level validation (shape) — reject before any append, no partial state. ──
         // An optional auto-commit prefix followed by an optional single trailing manual group: once a manual
         // (autoCommit:false) entry is seen, no later entry may be auto-commit, else the manual entries would
@@ -438,7 +444,7 @@ internal sealed class ReplicationGateway
             if (!autoOk)
                 return FailBatch(results, autoInputIndex, manualInputIndex, autoStatus);
 
-            RaftReplicationResult autoQuorum = await WaitForQuorum(partition, autoTicket, true, cancellationToken).ConfigureAwait(false);
+            RaftReplicationResult autoQuorum = await WaitForQuorum(partition, autoTicket, true, cancellationToken, roundStartTicks).ConfigureAwait(false);
 
             if (!autoQuorum.Success)
                 return FailBatch(results, autoInputIndex, manualInputIndex, autoQuorum.Status);

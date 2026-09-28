@@ -60,6 +60,14 @@ public sealed class RaftPendingWalOperation
     public bool IsInheritedRecommit { get; set; }
 
     /// <summary>
+    /// True when this <c>LeaderPropose</c> operation's batch was sent to the peers when the write was
+    /// queued (<see cref="RaftConfiguration.FanOutBeforeLocalWrite"/>); <see cref="Proposal"/> then holds
+    /// its registered quorum. The peers may hold the batch whatever happens to this write, so a caller
+    /// answered before the write completes gets an indeterminate outcome, never a definite refusal.
+    /// </summary>
+    internal bool FannedOutBeforeWrite { get; set; }
+
+    /// <summary>
     /// For a <see cref="Kommander.WAL.Data.WALWriteOperationType.HardState"/> operation: the work that had
     /// to wait for the (currentTerm, votedFor) write to be durable — a vote reply, typically. Invoked on the
     /// executor with true when the write succeeded, false when the engine rejected it. Null for the
@@ -73,6 +81,7 @@ public sealed class RaftPendingWalOperation
         ReplyCorrelationId = null;
         OnHardStatePersisted = null;
         Proposal = null;
+        FannedOutBeforeWrite = false;
         TicketId = default;
         Logs = null;
         AutoCommit = false;

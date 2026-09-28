@@ -453,15 +453,23 @@ public class InMemoryWAL : IWAL, IDisposable
             if (!allLogs.TryGetValue(partitionId, out SortedList<long, RaftLog>? partitionLogs))
                 return RaftOperationStatus.Success;
 
+            // Seek past the cut instead of walking the whole partition: the scheduler calls this before
+            // every follower append batch, and a full walk made each append O(log length) — the
+            // in-memory WAL's per-entry round cost grew with the run. A batch that extends the tail
+            // finds nothing above the cut and allocates nothing.
+            IList<long> keys = partitionLogs.Keys;
+            IList<RaftLog> values = partitionLogs.Values;
+            int first = LowerBound(keys, afterLogId + 1);
+            if (first >= keys.Count)
+                return RaftOperationStatus.Success;
+
             List<long> toRemove = [];
-            foreach (KeyValuePair<long, RaftLog> entry in partitionLogs)
+            for (int i = first; i < keys.Count; i++)
             {
-                if (entry.Key <= afterLogId)
-                    continue;
                 // Only unresolved (Proposed) entries are removable; resolved entries are quorum-agreed
                 // and are load-bearing for the commit frontier, so they must survive tail cleanup.
-                if (entry.Value.Type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
-                    toRemove.Add(entry.Key);
+                if (values[i].Type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
+                    toRemove.Add(keys[i]);
             }
 
             // Descending so suffix removal always deletes the current last element — a SortedList
