@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Kommander.Data;
 using Kommander.Gossip;
 using Kommander.Scheduling;
@@ -145,15 +146,19 @@ public class TestInheritedTailHoleRepair
     /// <summary>
     /// The follower's side of fs4: a Success ack carrying its pinned commit frontier, then the
     /// over-gap LogMismatch anchored at its presence frontier, both carrying the presence report.
+    /// Both acks are stamped with the leader's term, as every real follower's ack is: a
+    /// term-stamped ack is check-quorum contact whatever its status, and an ack without a term is
+    /// not. Without the stamp the leader's only contact is its promotion, and the tick under test
+    /// steps it down once the check-quorum window passes on the clock (see CapturingHost).
     /// </summary>
     private static async Task ReportHole(RaftPartitionStateMachine sm, CapturingHost host, string peer, long presentIndex, long presentTerm)
     {
         await sm.CompleteAppendLogsAsync(peer, host.HybridLogicalClock.TrySendOrLocalEvent(1),
-            RaftOperationStatus.Success, CommitFrontier,
+            RaftOperationStatus.Success, CommitFrontier, responseTerm: sm.CurrentTerm,
             presentIndex: presentIndex, presentTerm: presentTerm);
 
         await sm.CompleteAppendLogsAsync(peer, host.HybridLogicalClock.TrySendOrLocalEvent(1),
-            RaftOperationStatus.LogMismatch, FollowerPresent,
+            RaftOperationStatus.LogMismatch, FollowerPresent, responseTerm: sm.CurrentTerm,
             presentIndex: presentIndex, presentTerm: presentTerm);
     }
 
@@ -183,6 +188,17 @@ public class TestInheritedTailHoleRepair
         public HybridLogicalClock HybridLogicalClock { get; } = new();
         public IReadOnlyList<RaftNode> Nodes { get; set; } = [];
         public List<RaftResponderRequest> Outbound { get; } = [];
+
+        /// <summary>
+        /// The monotonic clock is pinned: no time elapses between the promotion and the leadership
+        /// tick under test. Every elapsed-time gate on that tick (the check-quorum window, the
+        /// barrier timeout, the heartbeat cadence) then reads zero, so a loaded runner cannot
+        /// change what the tick does. On the wall clock the check-quorum window equals
+        /// StartElectionTimeout, 50 ms here, which a GA runner exceeded between the ack and the
+        /// tick: the leader stepped down and the tick sent nothing.
+        /// </summary>
+        public long MonotonicTicks { get; set; } = Stopwatch.GetTimestamp();
+        public long GetMonotonicTimestamp() => MonotonicTicks;
 
         public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;
         public HLCTimestamp GetLastNodeActivity(string e, int p) => HLCTimestamp.Zero;
