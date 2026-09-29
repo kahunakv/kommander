@@ -39,6 +39,26 @@ internal readonly record struct SnapshotSessionKey(string LeaderEndpoint, int Pa
 /// <c>MemoryStream</c> could hold close to twice the payload, plus a transient copy of it, none of which
 /// the byte cap saw. <see cref="TotalStagedCapacityByteCount"/> reports the allocated total.</para>
 ///
+/// <para><b>Superseded retries.</b> A sender opens a new session for every attempt, so a retry used to
+/// leave the abandoned attempt's partial buffer staged until the byte cap or the idle TTL reclaimed it —
+/// several copies of one partition's snapshot at once while a slow install ran. Opening a session now
+/// drops the partition's older pending sessions from the same leader at or below its snapshot index, and
+/// any pending session of the partition from a lower leader term: none of them can still complete.</para>
+///
+/// <para><b>Spilling to disk.</b> With a staging directory configured, the bytes staged in memory across
+/// all sessions (pending and installing) are held within a memory budget: a chunk that would take the
+/// in-memory total past it moves its session into a temporary file first (see
+/// <see cref="SnapshotReceiveBuffer.SpillTo"/>). The byte cap then bounds staging on disk and in memory
+/// together, and the memory budget bounds what is resident, so the largest partition that can be seeded is
+/// no longer limited by memory. A failed spill or file write fails that session only. Without a staging
+/// directory every session stays in memory, as before.</para>
+///
+/// <para><b>Locking.</b> Chunk bytes are appended — and a session spilled — outside the receiver lock: the
+/// lock reserves the bytes and marks the session busy, the append runs, and the lock is re-taken to
+/// commit. A session evicted, expired or superseded while busy leaves the map at once (its bytes released
+/// from the accounting) and is disposed by the appender when it finishes. One chunk at a time per session:
+/// a chunk that arrives while the session's previous chunk is still being appended is refused.</para>
+///
 /// <para><b>Buffering only.</b> This class does not import or writes the WAL. On the terminal
 /// chunk it hands the staged buffer plus session metadata to <c>installOnExecutor</c>, which routes the
 /// install through the partition's single-writer executor where term validation, application import, and
@@ -56,6 +76,19 @@ internal sealed class SnapshotReceiver
     // executor can retain unbounded full snapshot payloads despite the pending-session/byte caps.
     private long _inInstallBytes;
     private int _inInstallCount;
+
+    // Bytes staged in memory rather than in a spill file, across pending sessions and in-install buffers
+    // alike. Held within stagingMemoryBytes when a staging directory is configured.
+    private long _inMemoryBytes;
+
+    /// <summary>Directory for spill files, or null to keep every session in memory.</summary>
+    private readonly string? stagingDirectory;
+
+    /// <summary>Budget for <see cref="_inMemoryBytes"/> when <see cref="stagingDirectory"/> is set.</summary>
+    private readonly long stagingMemoryBytes;
+
+    /// <summary>File extension of spill files; the startup sweep removes only files carrying it.</summary>
+    internal const string StagingFileExtension = ".snapshot-staging";
 
     private readonly Func<bool> isDisposed;
     private readonly Func<SnapshotInstallRequest, Task<SnapshotResponse>> installOnExecutor;
@@ -93,7 +126,9 @@ internal sealed class SnapshotReceiver
         Func<long> getMonotonicTimestamp,
         Func<bool>? allowLegacySenders = null,
         Func<int, double>? partitionWalStallAgeMs = null,
-        Func<double>? walStallRefuseThresholdMs = null)
+        Func<double>? walStallRefuseThresholdMs = null,
+        string? stagingDirectory = null,
+        long stagingMemoryBytes = long.MaxValue)
     {
         this.partitionWalStallAgeMs = partitionWalStallAgeMs ?? (static _ => 0);
         this.walStallRefuseThresholdMs = walStallRefuseThresholdMs ?? (static () => 0);
@@ -108,6 +143,46 @@ internal sealed class SnapshotReceiver
         // Read through a delegate rather than captured once: the flag lives on RaftConfiguration,
         // which tests flip after construction (see the legacy-sender cases in TestSnapshotInstallExecutor).
         this.allowLegacySenders = allowLegacySenders ?? (static () => false);
+        this.stagingMemoryBytes = Math.Max(0, stagingMemoryBytes);
+
+        if (!string.IsNullOrWhiteSpace(stagingDirectory))
+        {
+            this.stagingDirectory = stagingDirectory;
+            PrepareStagingDirectory(stagingDirectory);
+        }
+    }
+
+    /// <summary>
+    /// Creates the staging directory and removes spill files a previous process left behind. They are never
+    /// reusable: a sender restarts a transfer from its first chunk, and a spill file is deleted when its
+    /// session ends, so any file present at startup belongs to a session that died with that process. The
+    /// directory must be private to this node — the sweep would otherwise delete another live node's files.
+    /// </summary>
+    private void PrepareStagingDirectory(string directory)
+    {
+        try
+        {
+            Directory.CreateDirectory(directory);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new RaftException(
+                $"[Kommander] SnapshotStagingDirectory '{directory}' could not be created: {ex.Message}");
+        }
+
+        foreach (string leftover in Directory.EnumerateFiles(directory, "*" + StagingFileExtension))
+        {
+            try
+            {
+                File.Delete(leftover);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                logger.LogWarning(
+                    "[{Endpoint}] Could not remove leftover snapshot staging file {Path}: {Message}",
+                    localEndpoint, leftover, ex.Message);
+            }
+        }
     }
 
     /// <summary>Converts a wall-clock duration to the <see cref="Stopwatch"/>-tick units used for TTL.</summary>
@@ -136,6 +211,14 @@ internal sealed class SnapshotReceiver
 
         SnapshotReceiveBuffer completeBuffer;
         SnapshotReceiveSession completedSession;
+        SnapshotReceiveSession session;
+        SnapshotSessionKey key;
+        ReadOnlyMemory<byte> data = request.Data;
+        int incoming = data.Length;
+        bool spill;
+
+        // ── Reserve, under the lock: validate the chunk against the session, make room for its bytes, and
+        // mark the session busy so nothing disposes it while the bytes are appended outside the lock. ──
         lock (_pendingSnapshotsLock)
         {
             if (isDisposed())
@@ -144,7 +227,7 @@ internal sealed class SnapshotReceiver
             long now = getMonotonicTimestamp();
             ExpireIdleSessionsLocked(now);
 
-            SnapshotSessionKey key = new(request.LeaderEndpoint ?? "", request.PartitionId, request.SessionId ?? "");
+            key = new(request.LeaderEndpoint ?? "", request.PartitionId, request.SessionId ?? "");
 
             if (request.ChunkIndex < 0)
             {
@@ -154,7 +237,7 @@ internal sealed class SnapshotReceiver
                 return new SnapshotResponse(false);
             }
 
-            if (!_sessions.TryGetValue(key, out SnapshotReceiveSession? session))
+            if (!_sessions.TryGetValue(key, out SnapshotReceiveSession? existing))
             {
                 // A fresh session must begin at chunk 0. A non-zero first chunk means we lost the
                 // session (skipped opener, or a late chunk after the terminal chunk detached it).
@@ -184,6 +267,10 @@ internal sealed class SnapshotReceiver
                     return new SnapshotResponse(false);
                 }
 
+                // Earlier attempts of this partition's transfer that this one replaces go first, so their bytes
+                // are released before the caps are applied to the new session.
+                SupersedeLocked(key, request);
+
                 EvictForSessionCapacityLocked();
 
                 session = new SnapshotReceiveSession
@@ -204,6 +291,12 @@ internal sealed class SnapshotReceiver
             }
             else
             {
+                session = existing;
+
+                // The previous chunk is still being appended: this one cannot be ordered against it.
+                if (session.Busy)
+                    return new SnapshotResponse(false);
+
                 // Metadata must be identical across every chunk of a session.
                 if (!MetadataMatches(session, request))
                 {
@@ -226,7 +319,6 @@ internal sealed class SnapshotReceiver
                 }
             }
 
-            int incoming = request.Data.Length;
             if (!EnsureByteCapacityLocked(key, incoming))
             {
                 // Even after evicting every other session this chunk does not fit: reject and drop.
@@ -234,19 +326,89 @@ internal sealed class SnapshotReceiver
                 return new SnapshotResponse(false);
             }
 
+            // A chunk that would take the in-memory total past the budget moves its session to disk first.
+            // Its bytes already staged stay counted as in memory until the spill has actually released them
+            // (at commit), so nothing else is admitted into memory against bytes that are still resident.
+            spill = incoming > 0
+                    && session.InMemory
+                    && stagingDirectory is not null
+                    && _inMemoryBytes + incoming > stagingMemoryBytes;
+
+            if (spill)
+            {
+                session.InMemory = false;
+            }
+            else if (session.InMemory)
+            {
+                session.InMemoryBytes += incoming;
+                _inMemoryBytes += incoming;
+            }
+
+            session.AccumulatedBytes += incoming;
+            _totalPendingBytes += incoming;
+            session.LastActivityTimestamp = now;
+            session.Busy = true;
+        }
+
+        // ── Append, outside the lock: the file I/O of a spill or a spilled session's write must not hold up
+        // every other session's chunks. Only this caller touches the session's buffer and hash while busy. ──
+        Exception? appendFailure = null;
+
+        try
+        {
+            if (spill)
+            {
+                session.Buffer.SpillTo(Path.Combine(stagingDirectory!, $"snapshot-p{request.PartitionId}-{Guid.NewGuid():N}{StagingFileExtension}"));
+                KommanderMetrics.RecordSnapshotReceiveSessionSpilled(request.PartitionId);
+                logger.LogInformation(
+                    "[{Endpoint}] Snapshot session for partition {PartitionId} at index {Index} moved to disk: staging it in memory would exceed the {Budget}-byte staging memory budget",
+                    localEndpoint, request.PartitionId, request.SnapshotIndex, stagingMemoryBytes);
+            }
+
             if (incoming > 0)
             {
-                session.Buffer.Write(request.Data.Span);
-                // Hashed on the same branch that appends, so the digest tracks exactly the bytes that
-                // were staged: the duplicate-chunk and reject paths above return before reaching here
-                // and so must not advance the hash either.
-                session.Hash.AppendData(request.Data.Span);
-                session.AccumulatedBytes += incoming;
-                _totalPendingBytes += incoming;
+                session.Buffer.Write(data.Span);
+                // Hashed on the same path that appends, so the digest tracks exactly the bytes that were
+                // staged: the duplicate-chunk and reject paths above return before reaching here.
+                session.Hash.AppendData(data.Span);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            appendFailure = ex;
+        }
+
+        // ── Commit, under the lock. ──
+        lock (_pendingSnapshotsLock)
+        {
+            session.Busy = false;
+
+            // Evicted, expired or superseded while the bytes were appended (or the receiver was disposed):
+            // the accounting already released it, and disposal was left to this caller.
+            if (session.Removed)
+            {
+                DisposeSessionResources(session);
+                return new SnapshotResponse(false);
+            }
+
+            // A completed spill released the session's segments: its bytes leave the in-memory accounting.
+            if (spill && appendFailure is null)
+            {
+                _inMemoryBytes -= session.InMemoryBytes;
+                session.InMemoryBytes = 0;
+            }
+
+            if (appendFailure is not null)
+            {
+                logger.LogWarning(
+                    "[{Endpoint}] Snapshot session for partition {PartitionId} at index {Index} dropped: its staged bytes could not be written ({Message}); the sender retries the transfer",
+                    localEndpoint, request.PartitionId, request.SnapshotIndex, appendFailure.Message);
+                RemoveSessionLocked(key, session);
+                return new SnapshotResponse(false);
             }
 
             session.NextExpectedChunkIndex++;
-            session.LastActivityTimestamp = now;
+            session.LastActivityTimestamp = getMonotonicTimestamp();
 
             // A staged chunk is not an install: the outcome says so, and the sender treats a
             // terminal chunk answered this way as a failed transfer rather than a seeded follower.
@@ -268,6 +430,7 @@ internal sealed class SnapshotReceiver
             // accounting — MOVE them from the pending pool to the in-install pool rather than dropping them —
             // so the buffer that stays live while its install runs on the executor still counts against the
             // caps. Its bytes/count are released only when the install completes and the buffer is disposed.
+            // Its in-memory bytes, if any, stay counted against the staging memory budget likewise.
             _sessions.Remove(key);
             _totalPendingBytes -= session.AccumulatedBytes;
             _inInstallBytes += session.AccumulatedBytes;
@@ -307,11 +470,14 @@ internal sealed class SnapshotReceiver
             // Release the in-install reservation, then dispose the buffer. The executor read the stream to
             // completion before installOnExecutor returned, so the buffer is safe to release here (see
             // RaftPartition.InstallSnapshotAsync — it uses no-cancellation Ask). Disposal is synchronous:
-            // the buffer holds managed segments and nothing to flush.
+            // the buffer holds managed segments, or a spill file that is deleted on close.
             lock (_pendingSnapshotsLock)
             {
                 _inInstallBytes -= completedSession.AccumulatedBytes;
                 _inInstallCount--;
+
+                _inMemoryBytes -= completedSession.InMemoryBytes;
+                completedSession.InMemoryBytes = 0;
             }
             completeBuffer.Dispose();
             // The completed session was detached from _sessions above, so RemoveSessionLocked never
@@ -398,7 +564,8 @@ internal sealed class SnapshotReceiver
         List<SnapshotSessionKey>? expired = null;
         foreach (KeyValuePair<SnapshotSessionKey, SnapshotReceiveSession> pair in _sessions)
         {
-            if (now - pair.Value.LastActivityTimestamp > sessionTtlTicks)
+            // A busy session is receiving a chunk right now, so it is not idle whatever its timestamp says.
+            if (!pair.Value.Busy && now - pair.Value.LastActivityTimestamp > sessionTtlTicks)
                 (expired ??= []).Add(pair.Key);
         }
 
@@ -462,6 +629,11 @@ internal sealed class SnapshotReceiver
             if (hasExclude && pair.Key.Equals(exclude))
                 continue;
 
+            // A session mid-append is actively receiving; evicting it would discard work in progress
+            // in favour of whatever asked for room, so it is never the victim.
+            if (pair.Value.Busy)
+                continue;
+
             if (best is null
                 || pair.Value.LastActivityTimestamp < best.LastActivityTimestamp
                 || (pair.Value.LastActivityTimestamp == best.LastActivityTimestamp
@@ -485,12 +657,77 @@ internal sealed class SnapshotReceiver
         return string.CompareOrdinal(a.SessionId, b.SessionId);
     }
 
+    /// <summary>
+    /// Removes a pending session and releases its bytes from the accounting. Its buffer and hash are disposed
+    /// here, unless an append is in progress on them outside the lock: then the session is only marked
+    /// removed, and the appender disposes it when it re-takes the lock. Must hold the lock.
+    /// </summary>
     private void RemoveSessionLocked(SnapshotSessionKey key, SnapshotReceiveSession session)
     {
         if (_sessions.Remove(key))
+        {
             _totalPendingBytes -= session.AccumulatedBytes;
+            _inMemoryBytes -= session.InMemoryBytes;
+            session.InMemoryBytes = 0;
+        }
+
+        if (session.Busy)
+        {
+            session.Removed = true;
+            return;
+        }
+
+        DisposeSessionResources(session);
+    }
+
+    private static void DisposeSessionResources(SnapshotReceiveSession session)
+    {
         session.Buffer.Dispose();
         session.Hash.Dispose();
+    }
+
+    /// <summary>
+    /// Drops the pending sessions a newly opened session of the same partition makes obsolete: those from the
+    /// same leader at or below its snapshot index — the sender abandoned them when it started this attempt —
+    /// and those from a lower leader term, whose install the new term's leader has superseded. A sender that
+    /// predates leader terms (term 0) supersedes only by the same-leader rule. Must hold the lock.
+    /// </summary>
+    private void SupersedeLocked(SnapshotSessionKey newKey, SnapshotRequest opener)
+    {
+        List<SnapshotReceiveSession>? superseded = null;
+
+        foreach (KeyValuePair<SnapshotSessionKey, SnapshotReceiveSession> pair in _sessions)
+        {
+            SnapshotSessionKey key = pair.Key;
+            SnapshotReceiveSession session = pair.Value;
+
+            if (key.PartitionId != newKey.PartitionId || key.Equals(newKey))
+                continue;
+
+            bool sameLeaderOlderAttempt =
+                string.Equals(key.LeaderEndpoint, newKey.LeaderEndpoint, StringComparison.Ordinal)
+                && session.SnapshotIndex <= opener.SnapshotIndex;
+
+            bool lowerLeaderTerm = opener.LeaderTerm > 0 && session.LeaderTerm < opener.LeaderTerm;
+
+            if (sameLeaderOlderAttempt || lowerLeaderTerm)
+                (superseded ??= []).Add(session);
+        }
+
+        if (superseded is null)
+            return;
+
+        foreach (SnapshotReceiveSession session in superseded)
+        {
+            RemoveSessionLocked(session.Key, session);
+            KommanderMetrics.RecordSnapshotReceiveSessionSuperseded(newKey.PartitionId);
+
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug(
+                    "[{Endpoint}] Snapshot session {Old} for partition {PartitionId} (index {OldIndex}, term {OldTerm}, {Bytes} bytes staged) superseded by a new session at index {Index}, term {Term} from {Leader}",
+                    localEndpoint, session.Key.SessionId, newKey.PartitionId, session.SnapshotIndex, session.LeaderTerm,
+                    session.AccumulatedBytes, opener.SnapshotIndex, opener.LeaderTerm, newKey.LeaderEndpoint);
+        }
     }
 
     /// <summary>Returns the count of active receive sessions. For test assertions only.</summary>
@@ -537,6 +774,35 @@ internal sealed class SnapshotReceiver
     }
 
     /// <summary>
+    /// Bytes staged in memory rather than in spill files, across pending sessions and buffers still
+    /// installing. For test assertions only.
+    /// </summary>
+    internal long InMemoryStagedByteCount
+    {
+        get { lock (_pendingSnapshotsLock) return _inMemoryBytes; }
+    }
+
+    /// <summary>Pending sessions whose bytes have moved to a spill file. For test assertions only.</summary>
+    internal int SpilledSessionCount
+    {
+        get
+        {
+            lock (_pendingSnapshotsLock)
+            {
+                int spilled = 0;
+
+                foreach (KeyValuePair<SnapshotSessionKey, SnapshotReceiveSession> pair in _sessions)
+                {
+                    if (!pair.Value.InMemory)
+                        spilled++;
+                }
+
+                return spilled;
+            }
+        }
+    }
+
+    /// <summary>
     /// Runs the lazy idle-expiry sweep on demand. Exists so tests (which drive a controllable monotonic
     /// clock) can force expiry of abandoned sessions without another receipt; production relies on the
     /// per-receipt sweep.
@@ -559,22 +825,32 @@ internal sealed class SnapshotReceiver
         lock (_pendingSnapshotsLock)
         {
             foreach (KeyValuePair<SnapshotSessionKey, SnapshotReceiveSession> pending in _sessions)
-                pendingSessions.Add(pending.Value);
+            {
+                SnapshotReceiveSession session = pending.Value;
+
+                _inMemoryBytes -= session.InMemoryBytes;
+                session.InMemoryBytes = 0;
+
+                // An append in progress disposes its own session when it finishes (see RemoveSessionLocked).
+                if (session.Busy)
+                    session.Removed = true;
+                else
+                    pendingSessions.Add(session);
+            }
 
             _sessions.Clear();
             _totalPendingBytes = 0;
         }
 
         foreach (SnapshotReceiveSession session in pendingSessions)
-        {
-            session.Buffer.Dispose();
-            session.Hash.Dispose();
-        }
+            DisposeSessionResources(session);
     }
 
     /// <summary>
-    /// Mutable state for one in-progress snapshot-receive session. Instances are only touched under the
-    /// receiver lock. The metadata fields are captured from the first chunk and treated as immutable.
+    /// Mutable state for one in-progress snapshot-receive session. Its fields are only touched under the
+    /// receiver lock; its buffer and hash are also written outside it, by the one caller that marked the
+    /// session <see cref="Busy"/>. The metadata fields are captured from the first chunk and treated as
+    /// immutable.
     /// </summary>
     private sealed class SnapshotReceiveSession
     {
@@ -597,5 +873,18 @@ internal sealed class SnapshotReceiver
         internal int NextExpectedChunkIndex;
         internal long AccumulatedBytes;
         internal long LastActivityTimestamp;
+
+        /// <summary>Whether this session stages in memory; false once it has been chosen to spill.</summary>
+        internal bool InMemory = true;
+
+        /// <summary>This session's bytes counted in the receiver's in-memory total — resident until a spill
+        /// completes, then zero.</summary>
+        internal long InMemoryBytes;
+
+        /// <summary>A chunk is being appended outside the lock; the buffer and hash belong to that caller.</summary>
+        internal bool Busy;
+
+        /// <summary>Removed from the receiver while busy; the appender disposes it when it finishes.</summary>
+        internal bool Removed;
     }
 }

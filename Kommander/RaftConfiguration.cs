@@ -1168,6 +1168,26 @@ public class RaftConfiguration
     public long SnapshotMaxPendingBytes { get; set; } = 512L * 1024 * 1024;
 
     /// <summary>
+    /// Directory where snapshot-receive sessions are staged on disk once staging them in memory would exceed
+    /// <see cref="SnapshotStagingMemoryBytes"/>. Null (the default) keeps every session in memory, so
+    /// <see cref="SnapshotMaxPendingBytes"/> is then both the memory bound and the largest snapshot this node
+    /// can receive. With a directory, <see cref="SnapshotMaxPendingBytes"/> bounds staging on disk and in
+    /// memory together and <see cref="SnapshotStagingMemoryBytes"/> bounds what is resident, so it can be
+    /// raised to fit the largest partition without raising memory use. Spill files are deleted when their
+    /// session ends, and any left by a crashed process are removed at startup — so the directory must be
+    /// private to this node. A write failure there (a full disk) fails only that session; the sender retries.
+    /// </summary>
+    public string? SnapshotStagingDirectory { get; set; }
+
+    /// <summary>
+    /// Memory budget for staged snapshot bytes across every receive session, including snapshots whose
+    /// install is running, when <see cref="SnapshotStagingDirectory"/> is set: a session whose next chunk
+    /// would exceed it moves to a spill file first. Zero stages every session on disk from its first chunk.
+    /// Ignored without a staging directory. Must not be negative. Default 64 MiB.
+    /// </summary>
+    public long SnapshotStagingMemoryBytes { get; set; } = 64L * 1024 * 1024;
+
+    /// <summary>
     /// When <see langword="true"/>, snapshot chunks whose new session-metadata fields
     /// (<c>LeaderTerm</c>/<c>LeaderEndpoint</c>/<c>LastIncludedTerm</c>) are zero/empty are treated as a
     /// legacy sender that pre-dates those fields and are accepted with a warning under the old behaviour.
@@ -2094,6 +2114,17 @@ public class RaftConfiguration
             throw new RaftException(
                 $"[Kommander] SnapshotMaxPendingBytes ({SnapshotMaxPendingBytes}) must be positive. " +
                 "It caps total buffered snapshot bytes across all in-progress receive sessions.");
+
+        if (SnapshotStagingMemoryBytes < 0)
+            throw new RaftException(
+                $"[Kommander] SnapshotStagingMemoryBytes ({SnapshotStagingMemoryBytes}) must not be negative. " +
+                "It is the memory budget for staged snapshot bytes when a SnapshotStagingDirectory is set; " +
+                "zero stages every session on disk.");
+
+        if (SnapshotStagingDirectory is not null && string.IsNullOrWhiteSpace(SnapshotStagingDirectory))
+            throw new RaftException(
+                "[Kommander] SnapshotStagingDirectory is blank. Set a node-private directory to stage large " +
+                "snapshots on disk, or leave it null to stage them in memory.");
 
 #if BROWSER
         // The browser runs TLS itself: a page cannot load or present a client certificate, and it

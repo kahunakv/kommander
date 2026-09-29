@@ -279,6 +279,32 @@ can never be seeded until the dedicated transfer is registered. This mirrors wha
 `IRaftSystemStateTransfer` already does for the system partition (id 0) — see the system partition
 state snapshots guide for the P0 story.
 
+### How the receiver stages a snapshot
+
+The receiving node stages the whole snapshot before calling `ImportPartitionState`, and hands the
+importer a seekable stream it may read more than once. Staging is bounded by:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `SnapshotMaxPendingBytes` | 512 MiB | Staged bytes across all receive sessions, including snapshots whose install is running. A session that cannot fit, even after evicting others, is refused. |
+| `SnapshotMaxPendingSessions` | 8 | Concurrent receive sessions. |
+| `SnapshotStagingDirectory` | null | Node-private directory for spill files. Null keeps every session in memory. |
+| `SnapshotStagingMemoryBytes` | 64 MiB | With a staging directory, the resident budget: a session whose next chunk would exceed it moves to a spill file first. |
+
+Without a staging directory, `SnapshotMaxPendingBytes` is both the memory bound and the largest
+snapshot the node can receive, so a partition that outgrows it can never be re-seeded there. Set a
+staging directory on memory-limited nodes; `SnapshotMaxPendingBytes` can then be sized for the largest
+partition (it bounds disk plus memory) while `SnapshotStagingMemoryBytes` bounds what is resident.
+Spill files are deleted when their session ends, and any a crashed process left behind are removed at
+startup. A failed spill write (for example a full disk) fails only that session, and the leader
+retries it.
+
+A leader starts a new session for every transfer attempt. When one opens, the receiver drops the
+same partition's older pending sessions from that leader at or below its snapshot index, and any
+from a lower leader term. A slow install that makes the leader retry therefore never leaves several
+abandoned copies of one partition staged. Counters: `raft.snapshot.receive_sessions_superseded_total`
+and `raft.snapshot.receive_sessions_spilled_total` (both tagged `partition_id`).
+
 ---
 
 ## The placement planner and the P0 controller

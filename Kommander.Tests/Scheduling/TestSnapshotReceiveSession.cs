@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 
 using System.Security.Cryptography;
 using Kommander;
@@ -55,7 +56,9 @@ public class TestSnapshotReceiveSession
         long maxBytes = 1_000_000,
         bool allowLegacySenders = false,
         Func<int, double>? walStallAgeMs = null,
-        double walStallRefuseThresholdMs = 0) =>
+        double walStallRefuseThresholdMs = 0,
+        string? stagingDirectory = null,
+        long stagingMemoryBytes = long.MaxValue) =>
         new(
             isDisposed: () => false,
             installOnExecutor: installOnExecutor,
@@ -67,7 +70,9 @@ public class TestSnapshotReceiveSession
             getMonotonicTimestamp: clock,
             allowLegacySenders: () => allowLegacySenders,
             partitionWalStallAgeMs: walStallAgeMs,
-            walStallRefuseThresholdMs: () => walStallRefuseThresholdMs);
+            walStallRefuseThresholdMs: () => walStallRefuseThresholdMs,
+            stagingDirectory: stagingDirectory,
+            stagingMemoryBytes: stagingMemoryBytes);
 
     // ── local durable-write stall ─────────────────────────────────────────────
 
@@ -703,5 +708,360 @@ public class TestSnapshotReceiveSession
             await Task.Delay(10, ct);
         }
         throw new TimeoutException("condition not met");
+    }
+
+    // ── superseded retries ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A sender opens a new session for every attempt. The abandoned attempt's partial buffer is dropped the
+    /// moment the retry opens — not when the byte cap or the idle TTL gets to it — so a partition never stages
+    /// more than one pending copy of its snapshot from one leader.
+    /// </summary>
+    [Fact]
+    public async Task Retry_SupersedesTheAbandonedAttempt_AndReleasesItsBytesAtOnce()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        CapturingInstaller installer = new();
+        SnapshotReceiver r = NewReceiver(installer.Install, () => 1000);
+
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("try1", 0, false, new byte[40]), ct)).Success);
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("try1", 1, false, new byte[40]), ct)).Success);
+        Assert.Equal(80, r.PendingByteCount);
+
+        // The retry, at the same index, replaces it.
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("try2", 0, false, new byte[10]), ct)).Success);
+        Assert.Equal(1, r.PendingSessionCount);
+        Assert.Equal(10, r.PendingByteCount);
+
+        // A later retry at a higher index replaces that one too.
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("try3", 0, false, new byte[7], snapshotIndex: 150), ct)).Success);
+        Assert.Equal(1, r.PendingSessionCount);
+        Assert.Equal(7, r.PendingByteCount);
+
+        // A straggling chunk of an abandoned attempt finds no session, as after an eviction.
+        Assert.False((await r.ReceiveInstallSnapshot(Chunk("try1", 2, false, new byte[1]), ct)).Success);
+
+        // The surviving attempt completes normally.
+        byte[] last = [1, 2, 3];
+        byte[] whole = [.. new byte[7], .. last];
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("try3", 1, true, last, snapshotIndex: 150, wholeSnapshot: whole), ct)).Success);
+        Assert.Equal(whole, installer.ReceivedBytes);
+        Assert.Equal(0, r.TotalStagedByteCount);
+    }
+
+    [Fact]
+    public async Task Supersession_IsScopedToThePartition_TheLeaderAndTheTerm()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        ClockBox clock = new(1000);
+        SnapshotReceiver r = NewReceiver(new CapturingInstaller().Install, clock.Read);
+
+        // Partition 1 from leader:1 at a high index, partition 2 from leader:1, partition 1 from leader:2 (same term).
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("high", 0, false, [1], snapshotIndex: 500), ct)).Success);
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("other-partition", 0, false, [1], partitionId: 2), ct)).Success);
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("other-leader", 0, false, [1], leader: "leader:2"), ct)).Success);
+
+        // A same-leader session at a LOWER index than an existing one does not replace it (the sender only moves
+        // its index forward, so the higher one is not an abandoned attempt of this one); the other partition and
+        // the same-term peer leader are untouched.
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("low", 0, false, [1], snapshotIndex: 100), ct)).Success);
+        Assert.Equal(4, r.PendingSessionCount);
+
+        // A new leader term replaces every pending session of the partition from a lower term, whoever sent it,
+        // and leaves the other partition alone.
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("new-term", 0, false, [1], leader: "leader:3", leaderTerm: 4), ct)).Success);
+        Assert.Equal(2, r.PendingSessionCount);
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("other-partition", 1, false, [2], partitionId: 2), ct)).Success);
+        Assert.True((await r.ReceiveInstallSnapshot(Chunk("new-term", 1, false, [2], leader: "leader:3", leaderTerm: 4), ct)).Success);
+    }
+
+    // ── spilling to disk ───────────────────────────────────────────────────────
+
+    private static string NewStagingDirectory() =>
+        Path.Combine(Path.GetTempPath(), "kommander-staging-" + Guid.NewGuid().ToString("N"));
+
+    private static void DeleteDirectory(string directory)
+    {
+        try
+        {
+            if (Directory.Exists(directory))
+            {
+                File.SetUnixFileMode(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+        catch
+        {
+            // Best-effort temp cleanup.
+        }
+    }
+
+    /// <summary>
+    /// A session whose next chunk would take the in-memory total past the staging memory budget moves to a
+    /// spill file: the resident bytes stay within the budget, the install still sees exactly the staged bytes
+    /// (the digest verifies over them) through a seekable stream it can read twice, and the file is gone once
+    /// the session ends.
+    /// </summary>
+    [Fact]
+    public async Task SessionPastTheMemoryBudget_SpillsToDisk_AndInstallsFromTheFile()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        string directory = NewStagingDirectory();
+
+        try
+        {
+            byte[]? firstRead = null, secondRead = null;
+            bool sawSpilledFile = false;
+
+            async Task<SnapshotResponse> Install(SnapshotInstallRequest request)
+            {
+                sawSpilledFile = Directory.GetFiles(directory).Length == 1;
+                Assert.True(request.Snapshot.CanSeek);
+
+                using MemoryStream first = new();
+                await request.Snapshot.CopyToAsync(first, ct);
+                firstRead = first.ToArray();
+
+                request.Snapshot.Position = 0;
+                byte[] second = new byte[request.Snapshot.Length];
+                int total = 0;
+                while (total < second.Length)
+                    total += await request.Snapshot.ReadAsync(second.AsMemory(total), ct);
+                secondRead = second;
+
+                return new SnapshotResponse(true);
+            }
+
+            SnapshotReceiver r = NewReceiver(Install, () => 1000, stagingDirectory: directory, stagingMemoryBytes: 10);
+
+            byte[] c0 = [1, 2, 3, 4, 5, 6];
+            byte[] c1 = [7, 8, 9, 10, 11, 12];
+            byte[] c2 = [13, 14, 15];
+            byte[] whole = [.. c0, .. c1, .. c2];
+
+            Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 0, false, c0), ct)).Success);
+            Assert.Equal(6, r.InMemoryStagedByteCount);
+            Assert.Equal(0, r.SpilledSessionCount);
+
+            // 6 + 6 > 10: the session moves to disk before the chunk lands.
+            Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 1, false, c1), ct)).Success);
+            Assert.Equal(1, r.SpilledSessionCount);
+            Assert.Equal(0, r.InMemoryStagedByteCount);
+            Assert.Equal(12, r.PendingByteCount);
+
+            Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 2, true, c2, wholeSnapshot: whole), ct)).Success);
+
+            Assert.True(sawSpilledFile);
+            Assert.Equal(whole, firstRead);
+            Assert.Equal(whole, secondRead);
+            Assert.Empty(Directory.GetFiles(directory));
+            Assert.Equal(0, r.TotalStagedByteCount);
+            Assert.Equal(0, r.InMemoryStagedByteCount);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Fact]
+    public async Task ZeroMemoryBudget_StagesEverySessionOnDisk_FromItsFirstChunk()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        string directory = NewStagingDirectory();
+
+        try
+        {
+            CapturingInstaller installer = new();
+            SnapshotReceiver r = NewReceiver(installer.Install, () => 1000, stagingDirectory: directory, stagingMemoryBytes: 0);
+
+            Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 0, false, [1, 2]), ct)).Success);
+            Assert.Equal(1, r.SpilledSessionCount);
+            Assert.Equal(0, r.InMemoryStagedByteCount);
+            Assert.Single(Directory.GetFiles(directory));
+
+            Assert.True((await r.ReceiveInstallSnapshot(Chunk("s", 1, true, [3], wholeSnapshot: [1, 2, 3]), ct)).Success);
+            Assert.Equal([1, 2, 3], installer.ReceivedBytes);
+            Assert.Empty(Directory.GetFiles(directory));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>
+    /// A snapshot whose install is running keeps its in-memory bytes counted against the budget, so a second
+    /// session that arrives meanwhile is staged on disk instead of doubling the resident bytes.
+    /// </summary>
+    [Fact]
+    public async Task InstallingSnapshot_CountsAgainstTheMemoryBudget_SoTheNextSessionSpills()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        string directory = NewStagingDirectory();
+
+        try
+        {
+            TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            int installs = 0;
+
+            async Task<SnapshotResponse> Install(SnapshotInstallRequest _)
+            {
+                if (Interlocked.Increment(ref installs) == 1)
+                    await release.Task;
+                return new SnapshotResponse(true);
+            }
+
+            SnapshotReceiver r = NewReceiver(Install, () => 1000, stagingDirectory: directory, stagingMemoryBytes: 10);
+
+            Task<SnapshotResponse> first = r.ReceiveInstallSnapshot(Chunk("a", 0, true, [1, 2, 3, 4, 5, 6], leader: "A:1"), ct);
+            await WaitUntil(() => r.TotalStagedByteCount == 6, ct);
+            Assert.Equal(6, r.InMemoryStagedByteCount);
+
+            Assert.True((await r.ReceiveInstallSnapshot(Chunk("b", 0, false, [7, 8, 9, 10, 11, 12], leader: "B:1", partitionId: 2), ct)).Success);
+            Assert.Equal(1, r.SpilledSessionCount);
+            Assert.Equal(6, r.InMemoryStagedByteCount);
+
+            release.SetResult();
+            Assert.True((await first).Success);
+            await WaitUntil(() => r.InMemoryStagedByteCount == 0, ct);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>A spill that cannot be written (here: a directory the process may not write) fails that session,
+    /// releases its bytes, and leaves the receiver working for sessions that fit in memory.</summary>
+    [Fact]
+    public async Task SpillFailure_FailsOnlyThatSession()
+    {
+        Assert.SkipWhen(Environment.UserName == "root", "root ignores directory permissions");
+
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        string directory = NewStagingDirectory();
+
+        try
+        {
+            CapturingInstaller installer = new();
+            SnapshotReceiver r = NewReceiver(installer.Install, () => 1000, stagingDirectory: directory, stagingMemoryBytes: 4);
+            File.SetUnixFileMode(directory, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+
+            Assert.True((await r.ReceiveInstallSnapshot(Chunk("big", 0, false, [1, 2, 3]), ct)).Success);
+            Assert.False((await r.ReceiveInstallSnapshot(Chunk("big", 1, false, [4, 5, 6]), ct)).Success);
+
+            Assert.Equal(0, r.PendingSessionCount);
+            Assert.Equal(0, r.TotalStagedByteCount);
+            Assert.Equal(0, r.InMemoryStagedByteCount);
+
+            Assert.True((await r.ReceiveInstallSnapshot(Chunk("small", 0, true, [9], partitionId: 2), ct)).Success);
+            Assert.Equal([9], installer.ReceivedBytes);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Fact]
+    public void Startup_RemovesLeftoverSpillFiles_AndNothingElse()
+    {
+        string directory = NewStagingDirectory();
+
+        try
+        {
+            Directory.CreateDirectory(directory);
+            string leftover = Path.Combine(directory, "snapshot-p1-dead" + SnapshotReceiver.StagingFileExtension);
+            string unrelated = Path.Combine(directory, "notes.txt");
+            File.WriteAllBytes(leftover, [1, 2, 3]);
+            File.WriteAllBytes(unrelated, [4]);
+
+            _ = NewReceiver(new CapturingInstaller().Install, () => 1000, stagingDirectory: directory, stagingMemoryBytes: 10);
+
+            Assert.False(File.Exists(leftover));
+            Assert.True(File.Exists(unrelated));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>
+    /// Chunk bytes are appended outside the receiver lock. Many sessions — some spilling, some superseding one
+    /// another — racing through the receiver must each install exactly their own bytes and leave every counter
+    /// at zero.
+    /// </summary>
+    [Fact]
+    public async Task ConcurrentSessions_WithSpillsAndRetries_InstallTheirOwnBytes_AndBalanceTheAccounting()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        string directory = NewStagingDirectory();
+
+        try
+        {
+            ConcurrentDictionary<int, byte[]> installed = new();
+
+            async Task<SnapshotResponse> Install(SnapshotInstallRequest request)
+            {
+                using MemoryStream ms = new();
+                await request.Snapshot.CopyToAsync(ms, ct);
+                installed[request.PartitionId] = ms.ToArray();
+                return new SnapshotResponse(true);
+            }
+
+            SnapshotReceiver r = NewReceiver(Install, () => 1000, maxSessions: 64, maxBytes: 64L * 1024 * 1024,
+                stagingDirectory: directory, stagingMemoryBytes: 256 * 1024);
+
+            async Task Send(int partition)
+            {
+                Random random = new(partition);
+
+                // An abandoned partial attempt first, then the attempt that completes.
+                byte[] abandoned = new byte[64 * 1024];
+                random.NextBytes(abandoned);
+                Assert.True((await r.ReceiveInstallSnapshot(Chunk($"p{partition}-a", 0, false, abandoned, partitionId: partition), ct)).Success);
+
+                byte[][] chunks = new byte[6][];
+                for (int i = 0; i < chunks.Length; i++)
+                {
+                    chunks[i] = new byte[48 * 1024 + partition];
+                    random.NextBytes(chunks[i]);
+                }
+
+                byte[] whole = [.. chunks.SelectMany(c => c)];
+                for (int i = 0; i < chunks.Length; i++)
+                {
+                    bool last = i == chunks.Length - 1;
+                    SnapshotResponse response = await r.ReceiveInstallSnapshot(
+                        Chunk($"p{partition}-b", i, last, chunks[i], partitionId: partition, wholeSnapshot: last ? whole : null), ct);
+                    Assert.True(response.Success, $"partition {partition} chunk {i}");
+                }
+
+                Assert.Equal(whole, installed[partition]);
+            }
+
+            await Task.WhenAll(Enumerable.Range(1, 16).Select(p => Task.Run(() => Send(p), ct)));
+
+            Assert.Equal(16, installed.Count);
+            Assert.Equal(0, r.PendingSessionCount);
+            Assert.Equal(0, r.TotalStagedByteCount);
+            Assert.Equal(0, r.InMemoryStagedByteCount);
+            Assert.Empty(Directory.GetFiles(directory));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    [Theory]
+    [InlineData(-1L, null)]
+    [InlineData(0L, "   ")]
+    public void StagingOptions_AreValidated(long memoryBytes, string? directory)
+    {
+        RaftConfiguration configuration = new() { SnapshotStagingMemoryBytes = memoryBytes, SnapshotStagingDirectory = directory };
+        Assert.Throws<RaftException>(() => configuration.Validate());
     }
 }

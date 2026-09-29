@@ -279,6 +279,30 @@ public static class KommanderMetrics
         SnapshotInstallsRefusedWalStallTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
 
     /// <summary>
+    /// Pending snapshot-receive sessions dropped because a newer session of the same partition made them
+    /// obsolete (a retry from the same leader, or a transfer from a higher leader term).
+    /// </summary>
+    internal static readonly Counter<long> SnapshotReceiveSessionsSupersededTotal =
+        Meter.CreateCounter<long>(
+            "raft.snapshot.receive_sessions_superseded_total",
+            description: "Pending snapshot-receive sessions dropped because a newer session of the same partition replaced them.");
+
+    internal static void RecordSnapshotReceiveSessionSuperseded(int partitionId) =>
+        SnapshotReceiveSessionsSupersededTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
+
+    /// <summary>
+    /// Snapshot-receive sessions moved from memory to a spill file because staging them in memory would
+    /// have exceeded the staging memory budget.
+    /// </summary>
+    internal static readonly Counter<long> SnapshotReceiveSessionsSpilledTotal =
+        Meter.CreateCounter<long>(
+            "raft.snapshot.receive_sessions_spilled_total",
+            description: "Snapshot-receive sessions moved to a spill file to stay within the staging memory budget.");
+
+    internal static void RecordSnapshotReceiveSessionSpilled(int partitionId) =>
+        SnapshotReceiveSessionsSpilledTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
+
+    /// <summary>
     /// Restores whose WAL read was narrowed by the soft checkpoint: the application-durability
     /// floor sat above the last hard checkpoint, so replay started at the floor instead. This is
     /// the signal that cold-restart replay is bounded by the application's flush lag rather than

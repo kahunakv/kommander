@@ -137,6 +137,84 @@ public sealed class TestSnapshotIntegration
         }
     }
 
+    // ── snapshot staged on disk ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// A learner whose snapshot staging memory budget is zero stages the whole multi-chunk snapshot in a spill
+    /// file, installs it from there — the importer reads the exact exported bytes twice — and is promoted; the
+    /// spill file is gone afterwards.
+    /// </summary>
+    [Fact]
+    public async Task Learner_BelowCompactionFloor_InstallsASnapshotStagedOnDisk()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        InMemoryCommunication comm = new();
+        string stagingDirectory = Path.Combine(Path.GetTempPath(), "kommander-staging-" + Guid.NewGuid().ToString("N"));
+
+        CompactableWAL wal1 = new(new InMemoryWAL(logger));
+        CompactableWAL wal2 = new(new InMemoryWAL(logger));
+        CompactableWAL wal3 = new(new InMemoryWAL(logger));
+
+        RaftManager n1 = BuildNode(comm, "localhost", 8411, 1, ["localhost:8412", "localhost:8413"], wal1, logger);
+        RaftManager n2 = BuildNode(comm, "localhost", 8412, 2, ["localhost:8411", "localhost:8413"], wal2, logger);
+        RaftManager n3 = BuildNode(comm, "localhost", 8413, 3, ["localhost:8411", "localhost:8412"], wal3, logger);
+        RaftManager n4 = BuildNode(comm, "localhost", 8414, 4,
+            ["localhost:8411", "localhost:8412", "localhost:8413"],
+            new InMemoryWAL(logger), logger, initialPartitions: 0,
+            stagingDirectory: stagingDirectory, stagingMemoryBytes: 0);
+
+        comm.SetNodes(new Dictionary<string, IRaft>
+        {
+            ["localhost:8411"] = n1,
+            ["localhost:8412"] = n2,
+            ["localhost:8413"] = n3,
+            ["localhost:8414"] = n4,
+        });
+
+        // Larger than one 3 MB chunk, so the session spans several chunks appended to the file.
+        byte[] payload = new byte[7 * 1024 * 1024 + 123];
+        new Random(42).NextBytes(payload);
+
+        RecordingTransfer transfer = new(payload);
+        n1.RegisterStateMachineTransfer(transfer);
+        n2.RegisterStateMachineTransfer(transfer);
+        n3.RegisterStateMachineTransfer(transfer);
+        n4.RegisterStateMachineTransfer(transfer);
+
+        try
+        {
+            await Task.WhenAll(n1.JoinCluster(ct), n2.JoinCluster(ct), n3.JoinCluster(ct));
+            await WaitForAsync(() => n1.IsInitialized && n2.IsInitialized && n3.IsInitialized, ct);
+
+            RaftManager leader = await FindLeaderAsync([n1, n2, n3], ct);
+            int userPartitionId = leader.Partitions.Keys.FirstOrDefault(k => k != 0);
+            Assert.NotEqual(0, userPartitionId);
+
+            for (int i = 0; i < 5; i++)
+                await leader.ReplicateLogs(userPartitionId, "test", [1, 2, 3], cancellationToken: ct);
+
+            Assert.Equal(RaftOperationStatus.Success, (await leader.ReplicateCheckpoint(userPartitionId, ct)).Status);
+
+            await WaitForAsync(() =>
+                wal1.GetLastCheckpoint(userPartitionId) > 0 ||
+                wal2.GetLastCheckpoint(userPartitionId) > 0 ||
+                wal3.GetLastCheckpoint(userPartitionId) > 0,
+                ct);
+
+            await n4.JoinCluster(["localhost:8411"], ct);
+
+            Assert.Equal(ClusterMemberRole.Voter, n4.LocalRole);
+            Assert.True(transfer.VerifiedImportCount >= 1, "the learner's import did not read the exported bytes back from the staged file");
+            Assert.Empty(Directory.GetFiles(stagingDirectory));
+        }
+        finally
+        {
+            n1.Dispose(); n2.Dispose(); n3.Dispose(); n4.Dispose();
+
+            try { Directory.Delete(stagingDirectory, recursive: true); } catch { /* best-effort temp cleanup */ }
+        }
+    }
+
     // ── no transfer registered → join blocked ───────────────────────────────────
 
     /// <summary>
@@ -229,10 +307,14 @@ public sealed class TestSnapshotIntegration
         string[] peers,
         IWAL wal,
         ILogger<IRaft> logger,
-        int initialPartitions = 1)
+        int initialPartitions = 1,
+        string? stagingDirectory = null,
+        long stagingMemoryBytes = 64L * 1024 * 1024)
     {
         RaftConfiguration cfg = new()
         {
+            SnapshotStagingDirectory = stagingDirectory,
+            SnapshotStagingMemoryBytes = stagingMemoryBytes,
             NodeId = nodeId, Host = host, Port = port,
             InitialPartitions = initialPartitions,
             HeartbeatInterval = TimeSpan.FromMilliseconds(50),
@@ -293,20 +375,38 @@ public sealed class TestSnapshotIntegration
     /// <see cref="ExportRange"/> returns a tiny but non-empty stream so the chunking logic
     /// has bytes to send.
     /// </summary>
-    private sealed class RecordingTransfer : IRaftStateMachineTransfer
+    private sealed class RecordingTransfer(byte[]? payload = null) : IRaftStateMachineTransfer
     {
         private int _importCount;
+        private int _verifiedImports;
 
         public bool ImportWasCalled => _importCount > 0;
         public int ImportCallCount => _importCount;
 
-        public Task<Stream> ExportRange(RaftSplitPlan plan, long upToIndex, CancellationToken ct) =>
-            Task.FromResult<Stream>(new MemoryStream([0xDE, 0xAD, 0xBE, 0xEF]));
+        /// <summary>Imports whose stream carried exactly the exported payload on two reads from the start.</summary>
+        public int VerifiedImportCount => _verifiedImports;
 
-        public Task ImportRange(int targetPartitionId, Stream snapshot, CancellationToken ct)
+        public Task<Stream> ExportRange(RaftSplitPlan plan, long upToIndex, CancellationToken ct) =>
+            Task.FromResult<Stream>(new MemoryStream(payload ?? [0xDE, 0xAD, 0xBE, 0xEF]));
+
+        public async Task ImportRange(int targetPartitionId, Stream snapshot, CancellationToken ct)
         {
             Interlocked.Increment(ref _importCount);
-            return Task.CompletedTask;
+
+            if (payload is null)
+                return;
+
+            // An importer may verify before it applies, reading the stream twice.
+            for (int pass = 0; pass < 2; pass++)
+            {
+                snapshot.Position = 0;
+                using MemoryStream copy = new();
+                await snapshot.CopyToAsync(copy, ct);
+                if (!copy.ToArray().AsSpan().SequenceEqual(payload))
+                    return;
+            }
+
+            Interlocked.Increment(ref _verifiedImports);
         }
     }
 

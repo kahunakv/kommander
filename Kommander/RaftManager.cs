@@ -584,7 +584,9 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
                     : 0,
             walStallRefuseThresholdMs: () => this.configuration.WalStallWarnThreshold > TimeSpan.Zero
                 ? this.configuration.WalStallWarnThreshold.TotalMilliseconds
-                : 500);
+                : 500,
+            stagingDirectory: this.configuration.SnapshotStagingDirectory,
+            stagingMemoryBytes: this.configuration.SnapshotStagingMemoryBytes);
 
         clusterHandler = new(this, discovery);
 

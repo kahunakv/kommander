@@ -204,4 +204,90 @@ public sealed class TestSnapshotReceiveBuffer
         Assert.Throws<ObjectDisposedException>(() => buffer.Position);
         Assert.Throws<ObjectDisposedException>(() => buffer.Write(Pattern(4)));
     }
+
+    // ── spilled to a file ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// After a spill the buffer reads, seeks and copies exactly as before — the bytes staged before the spill
+    /// and those appended after it — while holding no segments in memory, and disposing it deletes the file.
+    /// </summary>
+    [Fact]
+    public async Task Spilled_BehavesLikeTheInMemoryBuffer_AndDisposingDeletesTheFile()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        string path = Path.Combine(Path.GetTempPath(), "kommander-spill-" + Guid.NewGuid().ToString("N") + ".snapshot-staging");
+
+        byte[] before = Pattern(SnapshotReceiveBuffer.SegmentSize + 1000, seed: 1);
+        byte[] after = Pattern(3 * SnapshotReceiveBuffer.SegmentSize + 7, seed: 2);
+        byte[] expected = [.. before, .. after];
+
+        SnapshotReceiveBuffer buffer = new();
+        buffer.Write(before);
+        Assert.Equal(2L * SnapshotReceiveBuffer.SegmentSize, buffer.AllocatedByteCount);
+
+        buffer.SpillTo(path);
+        Assert.True(buffer.IsSpilled);
+        Assert.Equal(0, buffer.AllocatedByteCount);
+        Assert.True(File.Exists(path));
+
+        buffer.Write(after);
+        Assert.Equal(expected.Length, buffer.Length);
+
+        buffer.Position = 0;
+        Assert.Equal(expected, await ReadAllAsync(buffer, ct));
+
+        buffer.Seek(before.Length - 3, SeekOrigin.Begin);
+        Assert.Equal(expected[before.Length - 3], buffer.ReadByte());
+        byte[] window = new byte[10];
+        Assert.Equal(10, buffer.Read(window, 0, 10));
+        Assert.Equal(expected[(before.Length - 2)..(before.Length + 8)], window);
+
+        buffer.Seek(-5, SeekOrigin.End);
+        Assert.Equal(5, buffer.Read(new byte[100], 0, 100));
+        Assert.Equal(-1, buffer.ReadByte());
+
+        buffer.Position = 0;
+        using (MemoryStream copy = new())
+        {
+            buffer.CopyTo(copy);
+            Assert.Equal(expected, copy.ToArray());
+        }
+
+        buffer.Position = 0;
+        using (MemoryStream copy = new())
+        {
+            await buffer.CopyToAsync(copy, ct);
+            Assert.Equal(expected, copy.ToArray());
+        }
+
+        buffer.Dispose();
+        Assert.False(File.Exists(path));
+    }
+
+    [Fact]
+    public void SpillThatCannotCreateItsFile_LeavesTheBufferInMemoryAndIntact()
+    {
+        byte[] data = Pattern(1000, seed: 3);
+        using SnapshotReceiveBuffer buffer = new();
+        buffer.Write(data);
+
+        string missingDirectory = Path.Combine(Path.GetTempPath(), "kommander-missing-" + Guid.NewGuid().ToString("N"), "f.snapshot-staging");
+        Assert.ThrowsAny<IOException>(() => buffer.SpillTo(missingDirectory));
+
+        Assert.False(buffer.IsSpilled);
+        buffer.Position = 0;
+        byte[] read = new byte[data.Length];
+        Assert.Equal(data.Length, buffer.Read(read, 0, read.Length));
+        Assert.Equal(data, read);
+    }
+
+    private static async Task<byte[]> ReadAllAsync(Stream stream, CancellationToken ct)
+    {
+        using MemoryStream copy = new();
+        byte[] chunk = new byte[4096];
+        int read;
+        while ((read = await stream.ReadAsync(chunk.AsMemory(), ct)) > 0)
+            copy.Write(chunk, 0, read);
+        return copy.ToArray();
+    }
 }

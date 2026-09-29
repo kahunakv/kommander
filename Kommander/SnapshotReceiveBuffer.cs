@@ -28,8 +28,15 @@ namespace Kommander;
 /// <see cref="Length"/>, so an importer that does more than a forward pass still works.
 /// </para>
 /// <para>
-/// Not thread-safe. The receiver serializes every access to one session under its own lock, and the
-/// importer runs after the buffer has been detached from the session map.
+/// <b>Spilling to disk.</b> <see cref="SpillTo"/> moves the bytes staged so far into a temporary file
+/// (deleted when the buffer is disposed) and releases the segments; every later append and read goes to
+/// the file. The receiver spills a session when keeping it in memory would exceed its staging memory
+/// budget, so a snapshot of any size can be staged without being held in memory. The stream contract is
+/// the same in both modes: seekable, <see cref="Length"/> reported, reads from any position.
+/// </para>
+/// <para>
+/// Not thread-safe. The receiver lets one caller at a time append to a session, and the importer runs
+/// after the buffer has been detached from the session map.
 /// </para>
 /// </remarks>
 internal sealed class SnapshotReceiveBuffer : Stream
@@ -48,6 +55,9 @@ internal sealed class SnapshotReceiveBuffer : Stream
 
     private readonly List<byte[]> segments = [];
 
+    /// <summary>The spill file once <see cref="SpillTo"/> ran; null while the bytes are in memory.</summary>
+    private FileStream? file;
+
     private long length;
     private long position;
     private bool disposed;
@@ -57,6 +67,45 @@ internal sealed class SnapshotReceiveBuffer : Stream
     /// number of segments, so it exceeds the payload by less than <see cref="SegmentSize"/>.
     /// </summary>
     internal long AllocatedByteCount => (long)segments.Count * SegmentSize;
+
+    /// <summary>Whether the staged bytes live in a spill file rather than in memory.</summary>
+    internal bool IsSpilled => file is not null;
+
+    /// <summary>
+    /// Moves the bytes staged so far into a new file at <paramref name="path"/> and releases the in-memory
+    /// segments; later appends and reads use the file, which is deleted when this buffer is disposed. A
+    /// no-op once spilled. On failure (for example a full disk) the buffer is left as it was, in memory, and
+    /// the partial file is removed.
+    /// </summary>
+    internal void SpillTo(string path)
+    {
+        ObjectDisposedException.ThrowIf(disposed, this);
+
+        if (file is not null)
+            return;
+
+        FileStream created = new(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 64 * 1024, FileOptions.DeleteOnClose);
+
+        try
+        {
+            long remaining = length;
+
+            foreach (byte[] segment in segments)
+            {
+                int take = (int)Math.Min(SegmentSize, remaining);
+                created.Write(segment, 0, take);
+                remaining -= take;
+            }
+        }
+        catch
+        {
+            created.Dispose();
+            throw;
+        }
+
+        file = created;
+        segments.Clear();
+    }
 
     public override bool CanRead => !disposed;
 
@@ -133,6 +182,15 @@ internal sealed class SnapshotReceiveBuffer : Stream
                 "A snapshot receive buffer only accepts appends; the position must be at the end.");
         }
 
+        if (file is not null)
+        {
+            file.Position = length;
+            file.Write(buffer);
+            length += buffer.Length;
+            position = length;
+            return;
+        }
+
         while (!buffer.IsEmpty)
         {
             int offsetInSegment = (int)(length % SegmentSize);
@@ -168,6 +226,9 @@ internal sealed class SnapshotReceiveBuffer : Stream
     {
         ObjectDisposedException.ThrowIf(disposed, this);
 
+        if (file is not null)
+            return ReadFromFile(buffer);
+
         int total = 0;
 
         while (!buffer.IsEmpty && position < length)
@@ -194,19 +255,28 @@ internal sealed class SnapshotReceiveBuffer : Stream
         if (position >= length)
             return -1;
 
+        if (file is not null)
+        {
+            Span<byte> single = stackalloc byte[1];
+            return ReadFromFile(single) == 1 ? single[0] : -1;
+        }
+
         byte value = segments[(int)(position / SegmentSize)][(int)(position % SegmentSize)];
         position++;
         return value;
     }
 
     /// <summary>
-    /// Completes synchronously. The bytes are already in memory, so the default
-    /// <see cref="Stream"/> implementation would only add a thread hop per call.
+    /// Completes synchronously while the bytes are in memory, where the default <see cref="Stream"/>
+    /// implementation would only add a thread hop per call; reads the spill file asynchronously once spilled.
     /// </summary>
     public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
         if (cancellationToken.IsCancellationRequested)
             return ValueTask.FromCanceled<int>(cancellationToken);
+
+        if (file is not null && !disposed)
+            return ReadFromFileAsync(buffer, cancellationToken);
 
         try
         {
@@ -233,6 +303,15 @@ internal sealed class SnapshotReceiveBuffer : Stream
         ArgumentNullException.ThrowIfNull(destination);
         ObjectDisposedException.ThrowIf(disposed, this);
 
+        if (file is not null)
+        {
+            // The file holds exactly the staged bytes (appends only), so copying to its end copies to ours.
+            file.Position = position;
+            file.CopyTo(destination, bufferSize);
+            position = length;
+            return;
+        }
+
         while (position < length)
         {
             ReadOnlySpan<byte> slice = NextReadableSlice();
@@ -247,6 +326,14 @@ internal sealed class SnapshotReceiveBuffer : Stream
         ArgumentNullException.ThrowIfNull(destination);
         ObjectDisposedException.ThrowIf(disposed, this);
 
+        if (file is not null)
+        {
+            file.Position = position;
+            await file.CopyToAsync(destination, bufferSize, cancellationToken).ConfigureAwait(false);
+            position = length;
+            return;
+        }
+
         while (position < length)
         {
             (int segmentIndex, int offsetInSegment, int count) = NextReadableRange();
@@ -257,6 +344,34 @@ internal sealed class SnapshotReceiveBuffer : Stream
 
             position += count;
         }
+    }
+
+    private int ReadFromFile(Span<byte> buffer)
+    {
+        if (position >= length || buffer.IsEmpty)
+            return 0;
+
+        if (buffer.Length > length - position)
+            buffer = buffer[..(int)(length - position)];
+
+        file!.Position = position;
+        int read = file.Read(buffer);
+        position += read;
+        return read;
+    }
+
+    private async ValueTask<int> ReadFromFileAsync(Memory<byte> buffer, CancellationToken cancellationToken)
+    {
+        if (position >= length || buffer.IsEmpty)
+            return 0;
+
+        if (buffer.Length > length - position)
+            buffer = buffer[..(int)(length - position)];
+
+        file!.Position = position;
+        int read = await file.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+        position += read;
+        return read;
     }
 
     private ReadOnlySpan<byte> NextReadableSlice()
@@ -284,6 +399,8 @@ internal sealed class SnapshotReceiveBuffer : Stream
         {
             disposed = true;
             segments.Clear();
+            file?.Dispose();
+            file = null;
             length = 0;
             position = 0;
         }
