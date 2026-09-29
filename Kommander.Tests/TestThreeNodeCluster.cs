@@ -521,6 +521,12 @@ public sealed class TestThreeNodeCluster
 
         IRaft initialLeaderNode = GetNodeByEndpoint(nodes, initialLeader);
 
+        // A silent leader is stepped down by check-quorum but can win the next term again (vote
+        // traffic and the forced barrier heartbeat are not suspended), and each such win re-arms
+        // the followers' vote cooldown — see TestDurableButUnansweredCommit for the livelock this
+        // produces. Withhold its candidacy so the leader change is guaranteed, not merely likely.
+        Assert.Equal(RaftOperationStatus.Success, initialLeaderNode.SetCandidacyWithheld(1, true));
+
         RaftOperationStatus suspendStatus = await initialLeaderNode.SuspendHeartbeatsAsync(
             1,
             TestContext.Current.CancellationToken);
@@ -535,6 +541,10 @@ public sealed class TestThreeNodeCluster
 
         Assert.NotEqual(initialLeader, newLeader);
         Assert.False(await initialLeaderNode.AmILeaderQuick(1));
+
+        // Restore ordinary behaviour before resuming: the split-brain check below must run against
+        // a node that could campaign, not one the test is still holding back.
+        Assert.Equal(RaftOperationStatus.Success, initialLeaderNode.SetCandidacyWithheld(1, false));
 
         RaftOperationStatus resumeStatus = await initialLeaderNode.ResumeHeartbeatsAsync(
             1,
