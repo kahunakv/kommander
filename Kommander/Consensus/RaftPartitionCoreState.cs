@@ -405,8 +405,26 @@ internal sealed class RaftPartitionCoreState
     public HLCTimestamp LastVotation = HLCTimestamp.Zero;
 
     /// <summary>Monotonic shadow of <see cref="LastVotation"/>, driving the recent-vote cooldown
-    /// that keeps a node that just granted a vote from immediately campaigning against it.</summary>
+    /// that keeps a node that just granted a vote from immediately campaigning against it.
+    /// The cooldown holds only until a leader is heard after this anchor — see
+    /// <see cref="LastLeaderContactTicks"/>.</summary>
     public long LastVotationTicks;
+
+    /// <summary>
+    /// Monotonic tick of the last accepted leader RPC (an AppendLogs that passed the term and
+    /// leadership fences, or an InstallSnapshot that adopted its sender). 0 = no leader heard since
+    /// this partition started. Unlike <see cref="LastHeartbeatTicks"/> it is written ONLY by
+    /// contact from a leader — never by a vote grant, a step-down or any other local transition —
+    /// so comparing it with <see cref="LastVotationTicks"/> answers exactly "has a leader been heard
+    /// since the cooldown was armed". That is the question the recent-vote cooldown exists to ask:
+    /// it covers the window between a grant and the elected leader's first append; once the leader
+    /// has been heard, the standard election timer (one <see cref="ElectionTimeout"/> of silence
+    /// since <see cref="LastHeartbeatTicks"/>) is the correct gate. Keeping the cooldown in force
+    /// past that point let a leader that stepped down within its voters' cooldown re-win every
+    /// term, because its own cooldown ran from its later step-down and was shorter (GA flake
+    /// TestDurableButUnansweredCommit.HeldReply, 2026-09-28).
+    /// </summary>
+    public long LastLeaderContactTicks;
 
     /// <summary>HLC timestamp when the current candidacy began; Zero when not campaigning.</summary>
     public HLCTimestamp VotingStartedAt = HLCTimestamp.Zero;

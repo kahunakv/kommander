@@ -2361,8 +2361,11 @@ public sealed class RaftPartitionStateMachine
     /// for the configured window, so it is almost certainly isolated and possibly already deposed.
     /// Mirrors the bookkeeping of <see cref="StepDownAsync"/> but sends no step-down notice — the
     /// peers are unreachable by hypothesis, and the majority side elects on its own timeout.
-    /// Setting <c>coreState.LastHeartbeatTicks</c> here means this node waits a full election timeout before
-    /// campaigning, giving a majority-side leader time to adopt it as a follower first.
+    /// Setting <c>coreState.LastHeartbeatTicks</c> and <c>coreState.LastVotationTicks</c> here means this
+    /// node waits 2 × its election timeout before campaigning — unless a majority-side leader adopts it
+    /// as a follower first, which releases the cooldown (<c>LastLeaderContactTicks</c>). The wait is
+    /// deliberately longer than a follower's: a follower that heard this node's last heartbeat campaigns
+    /// one election timeout after it, so the followers, not the deposed leader, win the next term.
     /// </summary>
     private async Task StepDownOnQuorumLossAsync()
     {
@@ -2724,6 +2727,9 @@ public sealed class RaftPartitionStateMachine
         coreState.NodeState = RaftNodeState.Follower;
         host.Leader = leaderEndpoint;
         coreState.CurrentTerm = leaderTerm;
+        // Both leader RPCs count as leader contact (the AppendLogs path also stamps it on every later
+        // accepted append); it releases the recent-vote cooldown in favour of the election timer.
+        coreState.LastLeaderContactTicks = host.GetMonotonicTimestamp();
         tracker.ClearAll();
         coreState.ResetLocalCommittedIndexOnDemotion();
         FailAllActiveProposalWaiters();

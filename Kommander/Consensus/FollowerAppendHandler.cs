@@ -218,6 +218,11 @@ internal sealed class FollowerAppendHandler
         // silence interval on the local clock — this is the exact site whose HLC subtraction used to
         // freeze the timeout for the length of a leader's clock skew.
         coreState.LastHeartbeatTicks = host.GetMonotonicTimestamp();
+        // Leader contact proper: the sender passed every fence above, so it IS the term's leader.
+        // Recorded even when the batch below is refused (LogMismatch, RestoreInProgress...) — a
+        // refusal still proves the leader is alive, and this tick only releases the recent-vote
+        // cooldown in favour of the standard election timer.
+        coreState.LastLeaderContactTicks = coreState.LastHeartbeatTicks;
         // A quiesce-flagged message tells us to stop expecting heartbeats and gate elections
         // on SWIM liveness instead.  Any non-quiesce AppendLogs (real logs or normal heartbeat)
         // wakes us back up by clearing the flag.

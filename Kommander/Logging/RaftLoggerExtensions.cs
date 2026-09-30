@@ -167,6 +167,9 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Granting vote to {Endpoint} Term={Term}: no leader heard since the previous grant ({Streak} consecutive fruitless grants, first {SinceFirstMs:F0} ms ago) — leaving the candidacy cooldown anchored so this node can campaign if the candidate keeps failing")]
     public static partial void LogInfoRepeatGrantKeepsCooldownAnchor(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long term, int streak, double sinceFirstMs);
 
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Recent-vote cooldown released: a leader was heard after the cooldown was armed ({SinceAnchorMs:F0} ms ago; last leader contact {SinceContactMs:F0} ms ago), so the election timer governs candidacy")]
+    public static partial void LogDebugRecentVoteCooldownReleasedByLeaderContact(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, double sinceAnchorMs, double sinceContactMs);
+
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Received vote from {Endpoint} and proclamed leader in {Elapsed}ms Term={Term} Votes={Votes} Quorum={Quorum}/{Total} RemoteCommitId={CommitId} Local={LocalCommitId}")]
     public static partial void LogInfoReceivedVoteProclaimedLeader(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, double elapsed, long term, int votes, int quorum, int total, long commitId, long localCommitId);
 

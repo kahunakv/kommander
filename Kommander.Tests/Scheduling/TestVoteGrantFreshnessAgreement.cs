@@ -31,6 +31,15 @@ namespace Kommander.Tests.Scheduling;
 ///         again to a candidate that never led leaves the cooldown anchored at the first grant, so
 ///         the voter's own election timer can fire.</item>
 /// </list>
+///
+/// <para><b>The sibling defect (GA flake TestDurableButUnansweredCommit.HeldReply, 2026-09-28).</b>
+/// The fs11 anchoring covers a grant that produced NO leader. A grant that produced a leader for
+/// ~125 ms re-armed the cooldown every term: the leader won, sent its barrier heartbeat, stepped
+/// down on check-quorum, and re-campaigned 2 × its own timeout later — always inside its voters'
+/// longer cooldown, because per-node timeouts were drawn once. Two more rules, tested in the
+/// "leader contact releases the cooldown" section: the cooldown ends at the first leader contact
+/// after it was armed (from then on the standard election timer governs), and every grant re-draws
+/// the election timeout.</para>
 /// </summary>
 public class TestVoteGrantFreshnessAgreement
 {
@@ -218,6 +227,137 @@ public class TestVoteGrantFreshnessAgreement
         Assert.DoesNotContain(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
     }
 
+    // ── leader contact releases the cooldown (GA flake HeldReply, 2026-09-28) ─
+
+    /// <summary>
+    /// The voter grants to B, hears B's barrier heartbeat 5 ms later, and then nothing. One election
+    /// timeout after the barrier the voter's timer fires. That instant is still inside the
+    /// 2 × ElectionTimeout grant cooldown — and on the old logic the cooldown won, so the voter stayed
+    /// silent while the deposed leader (whose own, shorter cooldown ran from its later step-down)
+    /// re-campaigned first every time. Once a leader has been heard the cooldown has done its job and
+    /// the standard timer governs: the voter opens its own pre-vote round.
+    /// </summary>
+    [Fact]
+    public async Task Voter_HeardTheLeaderItElected_ThenSilence_CampaignsOneTimeoutLaterInsideTheGrantCooldown()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, _) = BuildCandidate(lastTerm: 2, lastIndex: 12);
+        host.AdvanceMonotonic(TimeSpan.Zero);
+        TimeSpan electionTimeout = TimeSpan.FromMilliseconds(host.Config.EndElectionTimeout);
+
+        await Grant(sm, host, PeerB, term: 5);
+
+        host.AdvanceMonotonic(TimeSpan.FromMilliseconds(5));
+        await BarrierHeartbeat(sm, host, PeerB, term: 5);
+
+        // One and a half timeouts after the barrier: past the timer, inside the grant cooldown.
+        host.AdvanceMonotonic(electionTimeout * 1.5);
+        host.Outbound.Clear();
+        await sm.CheckPartitionLeadershipAsync();
+
+        List<RaftResponderRequest> probes = host.Outbound.Where(m => m.Type == RaftResponderRequestType.RequestVotes).ToList();
+        Assert.Equal(2, probes.Count);
+        Assert.All(probes, probe => Assert.True(probe.RequestVotesRequest!.PreVote, "the voter's own election timer should open a pre-vote round"));
+    }
+
+    /// <summary>
+    /// Control: contact must come AFTER the anchor. B led term 4 and was heard; then B, restarted,
+    /// asks for term 5 and is granted. The grant re-arms the cooldown and nothing has been heard
+    /// since, so one and a half timeouts later the voter still yields to the candidate it backed.
+    /// </summary>
+    [Fact]
+    public async Task Voter_LeaderHeardBeforeTheGrant_DoesNotReleaseTheCooldown()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, _) = BuildCandidate(lastTerm: 2, lastIndex: 12);
+        host.AdvanceMonotonic(TimeSpan.Zero);
+        TimeSpan electionTimeout = TimeSpan.FromMilliseconds(host.Config.EndElectionTimeout);
+
+        await BarrierHeartbeat(sm, host, PeerB, term: 4);
+
+        host.AdvanceMonotonic(TimeSpan.FromMilliseconds(5));
+        await Grant(sm, host, PeerB, term: 5);
+
+        host.AdvanceMonotonic(electionTimeout * 1.5);
+        host.Outbound.Clear();
+        await sm.CheckPartitionLeadershipAsync();
+
+        Assert.DoesNotContain(host.Outbound, m => m.Type == RaftResponderRequestType.RequestVotes);
+    }
+
+    /// <summary>
+    /// The GA shape, from the voter's side, with the numbers of the failing run. The voter's timeout
+    /// is 200 ms (the losing followers drew above ~187). B wins, sends its barrier, steps down on
+    /// check-quorum 125 ms later, and re-campaigns 250 ms after that (2 × its own 125 ms timeout):
+    /// one request every 375 ms. The voter's cooldown lasted 400 ms from each grant, and each grant
+    /// re-armed it because B's barrier had been heard, so on the old logic the voter never ran a
+    /// pre-vote in any cycle. Now it runs one 200 ms after each barrier, in every cycle — before B
+    /// can ask again.
+    /// </summary>
+    [Fact]
+    public async Task Voter_ShortLivedLeaderReCampaigningInsideTheCooldown_DoesNotStarveTheVoter()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, _) = BuildCandidate(lastTerm: 2, lastIndex: 12, startElectionTimeout: 200, endElectionTimeout: 201);
+        host.AdvanceMonotonic(TimeSpan.Zero);
+        TimeSpan voterTimeout = TimeSpan.FromMilliseconds(200);
+        TimeSpan leaderTenure = TimeSpan.FromMilliseconds(125);   // barrier → check-quorum step-down
+        TimeSpan leaderCooldown = TimeSpan.FromMilliseconds(250); // 2 × the deposed leader's timeout
+
+        long term = 5;
+        for (int cycle = 1; cycle <= 3; cycle++)
+        {
+            await Grant(sm, host, PeerB, term);
+
+            host.AdvanceMonotonic(TimeSpan.FromMilliseconds(5));
+            await BarrierHeartbeat(sm, host, PeerB, term);
+
+            // The voter's timer fires one timeout after the barrier: 205 ms into a 375 ms cycle.
+            host.AdvanceMonotonic(voterTimeout + TimeSpan.FromMilliseconds(5));
+            host.Outbound.Clear();
+            await sm.CheckPartitionLeadershipAsync();
+
+            Assert.True(
+                host.Outbound.Any(m => m.Type == RaftResponderRequestType.RequestVotes && m.RequestVotesRequest!.PreVote),
+                $"cycle {cycle}: the voter should have opened its own pre-vote round before the deposed leader could ask again");
+
+            // Nobody answers the probe here; B asks again at the end of its cycle, in the next term.
+            host.AdvanceMonotonic(leaderTenure + leaderCooldown - voterTimeout - TimeSpan.FromMilliseconds(10));
+            term++;
+        }
+    }
+
+    /// <summary>
+    /// A grant re-draws the election timeout, so the order in which nodes campaign is not fixed for
+    /// the life of the process. With a wide band, twenty grants cannot all draw the same value.
+    /// </summary>
+    [Fact]
+    public async Task Voter_RedrawsItsElectionTimeoutOnEveryGrant()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, _) = BuildCandidate(lastTerm: 2, lastIndex: 12, startElectionTimeout: 100, endElectionTimeout: 10_000);
+        host.AdvanceMonotonic(TimeSpan.Zero);
+
+        HashSet<TimeSpan> drawn = [];
+        for (long term = 5; term < 25; term++)
+        {
+            await Grant(sm, host, PeerB, term);
+            drawn.Add(sm.ElectionTimeout);
+        }
+
+        Assert.True(drawn.Count > 1, "twenty grants drew one election timeout: the timeout is not re-drawn on a grant");
+        Assert.All(drawn, t => Assert.InRange(t.TotalMilliseconds, 100, 10_000));
+    }
+
+    /// <summary>An empty AppendLogs from <paramref name="leader"/> for <paramref name="term"/>: the
+    /// barrier heartbeat a fresh leader sends. Accepted, so it counts as leader contact.</summary>
+    private static async Task BarrierHeartbeat(RaftPartitionStateMachine sm, CapturingHost host, string leader, long term)
+    {
+        host.Outbound.Clear();
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(host.LocalNodeId);
+        await sm.AppendLogsAsync(leader, term, ts, logs: null);
+
+        RaftResponderRequest ack = Assert.Single(host.Outbound, m => m.Type == RaftResponderRequestType.CompleteAppendLogs);
+        Assert.Equal(RaftOperationStatus.Success, ack.CompleteAppendLogsRequest!.Status);
+        Assert.Equal(leader, host.Leader);
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -310,7 +450,8 @@ public class TestVoteGrantFreshnessAgreement
     /// the last entry at <paramref name="lastTerm"/> and everything before it one term earlier. Two
     /// voter peers, so quorum is two and one counted grant wins.
     /// </summary>
-    private static (RaftPartitionStateMachine, CapturingHost, ContiguousWal) BuildCandidate(long lastTerm, long lastIndex)
+    private static (RaftPartitionStateMachine, CapturingHost, ContiguousWal) BuildCandidate(
+        long lastTerm, long lastIndex, int startElectionTimeout = 100, int endElectionTimeout = 101)
     {
         ContiguousWal wal = new();
         for (long id = 1; id <= lastIndex; id++)
@@ -327,6 +468,8 @@ public class TestVoteGrantFreshnessAgreement
         wal.SeedProposeAllocator(lastIndex + 1);
 
         CapturingHost host = new() { Nodes = [new RaftNode(PeerB), new RaftNode(PeerC)] };
+        host.Config.StartElectionTimeout = startElectionTimeout;
+        host.Config.EndElectionTimeout = endElectionTimeout;
         RaftPartitionStateMachine sm = new(host, wal, new NullSink(), NullLogger<IRaft>.Instance);
         sm.MarkRestoredForTesting();
 

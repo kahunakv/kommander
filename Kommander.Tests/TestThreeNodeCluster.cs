@@ -575,6 +575,75 @@ public sealed class TestThreeNodeCluster
         await node3.LeaveCluster(true, CancellationToken.None);
     }
 
+    /// <summary>
+    /// The election-fairness regression (GA flake TestDurableButUnansweredCommit.HeldReply,
+    /// 2026-09-28), with NO candidacy withheld: the silent leader keeps voting, acking and
+    /// campaigning. It is stepped down by check-quorum ~125 ms after its last heartbeat and may
+    /// campaign again 2 × its own timeout after that. On the old logic each of its re-wins
+    /// re-armed the followers' 2 × timeout grant cooldown, and with per-node timeouts drawn once
+    /// the followers never ran a pre-vote (28 identical terms in 10 s). Now a follower that heard
+    /// the leader's last heartbeat campaigns one timeout after it — inside the deposed leader's
+    /// cooldown — so a different node wins the next term without any help from the test.
+    /// <para>The heartbeats are suspended the moment a leader exists, not after a stability wait:
+    /// the livelock needs the suspension to land inside the followers' grant cooldown from the
+    /// election just won, which is what the GA test did between its election and its write.</para>
+    /// </summary>
+    [Fact]
+    public async Task SuspendHeartbeatsAsync_WithoutWithholdingCandidacy_AFollowerWinsTheNextTerm()
+    {
+        (IRaft node1, IRaft node2, IRaft node3) = await AssembleThreNodeCluster("memory", 1);
+
+        IRaft[] nodes = [node1, node2, node3];
+
+        IRaft? initialLeaderNode = null;
+        for (int attempt = 0; attempt < 2000 && initialLeaderNode is null; attempt++)
+        {
+            foreach (IRaft node in nodes)
+            {
+                if (await node.AmILeaderQuick(1))
+                {
+                    initialLeaderNode = node;
+                    break;
+                }
+            }
+
+            if (initialLeaderNode is null)
+                await Task.Delay(5, TestContext.Current.CancellationToken);
+        }
+
+        Assert.NotNull(initialLeaderNode);
+        string initialLeader = initialLeaderNode.GetLocalEndpoint();
+
+        Assert.Equal(RaftOperationStatus.Success, await initialLeaderNode.SuspendHeartbeatsAsync(
+            1,
+            TestContext.Current.CancellationToken));
+
+        string newLeader = await WaitForDifferentStableLeader(
+            nodes,
+            1,
+            initialLeader,
+            TestContext.Current.CancellationToken);
+
+        Assert.NotEqual(initialLeader, newLeader);
+
+        Assert.Equal(RaftOperationStatus.Success, await initialLeaderNode.ResumeHeartbeatsAsync(
+            1,
+            TestContext.Current.CancellationToken));
+
+        string settledLeader = await node1.WaitForLeaderStableAsync(
+            1,
+            TimeSpan.FromMilliseconds(150),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(settledLeader, await node2.WaitForLeaderStableAsync(1, TimeSpan.FromMilliseconds(150), TestContext.Current.CancellationToken));
+        Assert.Equal(settledLeader, await node3.WaitForLeaderStableAsync(1, TimeSpan.FromMilliseconds(150), TestContext.Current.CancellationToken));
+        Assert.Equal(1, await CountLeaders(nodes, 1));
+
+        await node1.LeaveCluster(true, CancellationToken.None);
+        await node2.LeaveCluster(true, CancellationToken.None);
+        await node3.LeaveCluster(true, CancellationToken.None);
+    }
+
     [Fact]
     public async Task GetActiveNodes_LeaderPerspective_ReturnsReachableFollowers()
     {

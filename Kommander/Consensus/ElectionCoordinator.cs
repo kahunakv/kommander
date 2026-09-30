@@ -108,7 +108,9 @@ internal sealed class ElectionCoordinator
     /// Re-draws the election timeout from the full configured range rather than capping an
     /// incremented value. Incremental backoff converges competing nodes to EndElectionTimeout after
     /// one or two failed elections, so they fire at the same instant every time — a persistent
-    /// split-vote livelock. Called at construction and on every failed candidacy.
+    /// split-vote livelock. Called at construction, on every failed candidacy, and on every vote
+    /// grant (<see cref="RecordVoteCast"/>), so the order in which nodes campaign is re-drawn each
+    /// term rather than fixed for the life of the process.
     /// </summary>
     public void RandomizeElectionTimeout() =>
         coreState.ElectionTimeout = TimeSpan.FromMilliseconds(
@@ -337,6 +339,50 @@ internal sealed class ElectionCoordinator
     /// receipt tick, never to <c>now</c>: a frozen difference must not extend the outer follower
     /// election gate.</para>
     /// </summary>
+    /// <summary>
+    /// The recent-vote cooldown, shared by <see cref="StartElectionAsync"/> and
+    /// <see cref="StartPreVoteAsync"/>: true while this node must not campaign because it granted a
+    /// vote (or stepped down) less than 2 × <see cref="RaftPartitionCoreState.ElectionTimeout"/>
+    /// ago AND no leader has been heard since.
+    /// <para><b>Why the leader-contact release.</b> The cooldown covers one window: between a grant
+    /// and the elected leader's first append, when the voter's timer alone would let it campaign
+    /// against the candidate it just backed (the vote's fsync on a loaded disk spans several ticks —
+    /// feature b4176e8e). Once a leader has been heard, that window is closed and the standard Raft
+    /// rule applies: one election timeout of silence since the last heartbeat. Keeping the cooldown
+    /// in force past the first contact made elections unfair. A leader that won, sent its barrier
+    /// and stepped down inside its voters' cooldown (check-quorum, ~125 ms) had its own, shorter
+    /// cooldown run from its later step-down, so it was always the first node eligible to campaign;
+    /// every re-win re-armed the voters' cooldown, and with per-node timeouts drawn once the
+    /// ordering never changed (28 identical terms in the GA flake
+    /// TestDurableButUnansweredCommit.HeldReply, 2026-09-28). With the release a voter that heard
+    /// the short-lived leader campaigns one timeout after its last append — before the deposed
+    /// leader's 2 × timeout cooldown ends — and the fs11 anchoring (no leader heard between grants)
+    /// keeps working unchanged, because it is exactly the no-contact case.</para>
+    /// <para>Measured on the monotonic clock (B3): both anchors are local ticks. The contact tick
+    /// must be strictly later than the anchor — a step-down stamps the anchor after any contact it
+    /// had, and a grant precedes the append it produces.</para>
+    /// </summary>
+    private bool InsideRecentVoteCooldown(long nowTicks)
+    {
+        if (coreState.LastVotationTicks == 0)
+            return false;
+
+        if (RaftMonotonic.Elapsed(coreState.LastVotationTicks, nowTicks) >= coreState.ElectionTimeout * 2)
+            return false;
+
+        if (coreState.LastLeaderContactTicks > coreState.LastVotationTicks)
+        {
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebugRecentVoteCooldownReleasedByLeaderContact(
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState,
+                    RaftMonotonic.Elapsed(coreState.LastVotationTicks, nowTicks).TotalMilliseconds,
+                    RaftMonotonic.Elapsed(coreState.LastLeaderContactTicks, nowTicks).TotalMilliseconds);
+            return false;
+        }
+
+        return true;
+    }
+
     private bool LeaderActivityIsFresh(string expectedLeader, long nowTicks)
     {
         long lastActivityTicks = host.GetLastNodeActivityTicks(expectedLeader, host.PartitionId);
@@ -415,8 +461,7 @@ internal sealed class ElectionCoordinator
 
         if (!ignoreRecentVoteCooldown)
         {
-            // B3: the recent-vote cooldown is a local elapsed interval → monotonic.
-            if (coreState.LastVotationTicks != 0 && (RaftMonotonic.Elapsed(coreState.LastVotationTicks, nowTicks) < (coreState.ElectionTimeout * 2)))
+            if (InsideRecentVoteCooldown(nowTicks))
                 return;
 
             string expectedLeader = expectedLeaders.GetValueOrDefault(coreState.CurrentTerm, "");
@@ -531,8 +576,7 @@ internal sealed class ElectionCoordinator
         // point of pre-vote. The one local write below (coreState.LastHeartbeat) is a back-off bookkeeping
         // refresh on the "leader still fresh" path, mirroring StartElectionAsync, not a consensus
         // mutation: it just records that we observed the leader so we don't immediately re-trigger.
-        // B3: the recent-vote cooldown is a local elapsed interval → monotonic.
-        if (coreState.LastVotationTicks != 0 && (RaftMonotonic.Elapsed(coreState.LastVotationTicks, nowTicks) < (coreState.ElectionTimeout * 2)))
+        if (InsideRecentVoteCooldown(nowTicks))
             return;
 
         // Intentional back-off write inside: remembers we saw the leader. Not a consensus mutation.
@@ -979,12 +1023,21 @@ internal sealed class ElectionCoordinator
     /// live voter — never ran its own pre-vote (CamusDB fault soak fs11). Keeping the cooldown anchored at
     /// the first fruitless vote lets our own election timer fire; the pre-vote is side-effect-free, so a
     /// fresher candidate simply denies it and loses nothing, while an equally fresh one gives the partition
-    /// a second way out. Election safety is untouched: what we grant, and to whom, does not change.</para>
+    /// a second way out. Election safety is untouched: what we grant, and to whom, does not change.
+    /// The cooldown is also released early by leader contact — see <see cref="InsideRecentVoteCooldown"/>.</para>
+    /// <para><b>The election timeout is re-drawn on every grant.</b> Raft re-randomises the timeout on
+    /// every timer reset; a grant is the reset that starts a new term, so it is the natural point. A
+    /// per-node draw taken once at construction (and only on a failed candidacy after that) made the
+    /// order in which nodes campaign a fixed property of the cluster: the node with the shortest draw
+    /// won every race, and a follower that lost once lost forever. A fresh draw per term makes each
+    /// race independent, so no node can be starved by a fixed ordering whatever the configured band.</para>
     /// </summary>
     private void RecordVoteCast(RaftNode node, long voteTerm, HLCTimestamp timestamp)
     {
         coreState.LastHeartbeat = host.HybridLogicalClock.ReceiveEvent(host.LocalNodeId, timestamp);
         coreState.LastVotation = coreState.LastHeartbeat;
+
+        RandomizeElectionTimeout();
 
         // B3: both duration shadows are local elapsed intervals → monotonic.
         long grantTicks = host.GetMonotonicTimestamp();
