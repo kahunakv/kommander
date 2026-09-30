@@ -282,8 +282,11 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}] ReceiveInstallSnapshot: partition={PartitionId} installed snapshot at index={Index}")]
     public static partial void LogInfoReceiveInstallSnapshot(this ILogger<IRaft> logger, string endpoint, int partitionId, long index);
 
-    [LoggerMessage(Level = LogLevel.Information, Message = "[{Endpoint}] ReceiveInstallSnapshot: partition={PartitionId} skipped snapshot at index={Index} as already covered by the installed boundary {Boundary}; nothing imported")]
-    public static partial void LogInfoReceiveInstallSnapshotSkipped(this ILogger<IRaft> logger, string endpoint, int partitionId, long index, long boundary);
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{Endpoint}/{PartitionId}/{State}] InstallSnapshot at index {Index} skipped as already covered — nothing imported. Rule: {Rule}. Applied cursor {Applied}, installed boundary {Boundary}, contiguous presence frontier {Present} (-1 = not tracked), commit frontier {Committed}")]
+    public static partial void LogWarnReceiveInstallSnapshotSkipped(this ILogger<IRaft> logger, string endpoint, int partitionId, RaftNodeState state, long index, string rule, long applied, long boundary, long present, long committed);
+
+    [LoggerMessage(Level = LogLevel.Error, Message = "[{Endpoint}/{PartitionId}/{State}] InstallSnapshot at index {Index} skipped as already covered while this node's contiguous presence frontier {Present} sits below the index: the application applied through {Applied}, so an import would rewind it, but the log under the cursor has a hole. Installed boundary {Boundary}, commit frontier {Committed}. The skip is answered so the sender does not export again; the leader's backfill repairs the hole, and the presence-gap candidacy deferral and the promotion hole gate stand until it does")]
+    public static partial void LogErrorReceiveInstallSnapshotSkippedOverHole(this ILogger<IRaft> logger, string endpoint, int partitionId, RaftNodeState state, long index, long present, long applied, long boundary, long committed);
 
     [LoggerMessage(Level = LogLevel.Information, Message = "ReceiveGossip: self was Suspect in gossip; refuting with incarnation {Inc}")]
     public static partial void LogInfoReceiveGossipRefuting(this ILogger<IRaft> logger, long inc);

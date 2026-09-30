@@ -139,6 +139,27 @@ internal sealed class SnapshotInstaller
     }
 
     /// <summary>
+    /// The one line a skipped install writes, at Warning so it is visible at the default consumer log level,
+    /// naming the rule that answered and the three positions its premise rests on. A skip whose contiguous
+    /// presence frontier sits below the index is written at Error instead: the application is past the
+    /// index while the log under it has a hole, which no rule here should be able to produce.
+    /// </summary>
+    private void LogSkipped(string rule, long snapshotIndex, long applied, long installedBoundary, long presentIndex)
+    {
+        long committed = wal.GetCommitIndex();
+
+        if (presentIndex >= 0 && presentIndex < snapshotIndex)
+        {
+            logger.LogErrorReceiveInstallSnapshotSkippedOverHole(
+                host.LocalEndpoint, host.PartitionId, coreState.NodeState, snapshotIndex, presentIndex, applied, installedBoundary, committed);
+            return;
+        }
+
+        logger.LogWarnReceiveInstallSnapshotSkipped(
+            host.LocalEndpoint, host.PartitionId, coreState.NodeState, snapshotIndex, rule, applied, installedBoundary, presentIndex, committed);
+    }
+
+    /// <summary>
     /// Follower-side snapshot install on the single-writer executor path (Raft "Rule 7").
     ///
     /// <para>Runs the recoverable ordering: (1) validate the leader term and, on a higher term, take the
@@ -196,10 +217,14 @@ internal sealed class SnapshotInstaller
                 return new RaftResponse(RaftResponseType.None, RaftOperationStatus.Errored, -1);
             }
 
-            if (logger.IsEnabled(LogLevel.Information))
-                logger.LogInformation(
-                    "[{LocalEndpoint}/{PartitionId}/{State}] InstallSnapshot at index {Index} skipped: the application already applied through {Applied}; nothing imported",
-                    host.LocalEndpoint, host.PartitionId, coreState.NodeState, snapshotIndex, appliedCursor);
+            // Warning, with the three numbers a reader needs to tell this rule from the boundary rule and to
+            // check its premise: the CamusDB sn1 hand-off could not say which rule had answered a skip, or
+            // whether the follower's log was contiguous under its cursor, because the line was Information
+            // and named only the cursor. The cursor only ever advances over delivered entries, so a presence
+            // frontier below the index here is a contradiction worth an Error of its own — the skip is still
+            // the right answer (an import would rewind the application), and the hole is the backfill's.
+            LogSkipped("apply cursor above the index", snapshotIndex, appliedCursor,
+                await wal.GetLastCheckpointAsync().ConfigureAwait(false), wal.GetPresentIndex());
 
             return new RaftResponse(SnapshotInstallOutcome.SkippedAlreadyCovered, snapshotIndex);
         }
@@ -272,8 +297,7 @@ internal sealed class SnapshotInstaller
 
                 // Say so: the sender reads this outcome, and an operator reading this node's log
                 // must be able to tell a skip from an import when a follower's state is in doubt.
-                if (logger.IsEnabled(LogLevel.Information))
-                    logger.LogInfoReceiveInstallSnapshotSkipped(host.LocalEndpoint, host.PartitionId, snapshotIndex, installedBoundary);
+                LogSkipped("installed boundary covers the index", snapshotIndex, coreState.LastAppliedIndex, installedBoundary, presentIndex);
 
                 return new RaftResponse(SnapshotInstallOutcome.SkippedAlreadyCovered, snapshotIndex);
             }
