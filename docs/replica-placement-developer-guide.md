@@ -301,9 +301,37 @@ retries it.
 
 A leader starts a new session for every transfer attempt. When one opens, the receiver drops the
 same partition's older pending sessions from that leader at or below its snapshot index, and any
-from a lower leader term. A slow install that makes the leader retry therefore never leaves several
-abandoned copies of one partition staged. Counters: `raft.snapshot.receive_sessions_superseded_total`
+from a lower leader term. Counters: `raft.snapshot.receive_sessions_superseded_total`
 and `raft.snapshot.receive_sessions_spilled_total` (both tagged `partition_id`).
+
+### The install is a step of its own
+
+The last chunk starts the install on the partition executor and is answered at once with
+`InstallPending`; the leader asks for the outcome separately and waits for as long as the install
+reports progress. `ImportPartitionState` can therefore take as long as it needs — it is not under
+`SnapshotChunkAckTimeout`, which bounds a chunk acknowledgement and each of those questions, not the
+import. (A leader from a release that does not ask keeps the older behaviour: its last chunk's call is
+held until the install completes.)
+
+A node runs **one install per partition**. While it is queued or running, the receiver stages nothing
+else for that partition: the partition's other pending sessions are dropped when the install starts,
+and a chunk that would open another is answered with `InstallPending` naming the running install, so
+its sender waits for that install's outcome instead of sending a second snapshot. At most one staged
+snapshot per partition sits beside the running import, whatever the leader — or a new leader — does.
+Counter: `raft.snapshot.receive_sessions_refused_installing_total` (`partition_id`).
+
+What an install costs is published, one figure per process:
+
+| Instrument | Meaning |
+|---|---|
+| `raft.snapshot.receive_staged_bytes` | Bytes staged by sessions whose last chunk has not arrived. |
+| `raft.snapshot.receive_installing_bytes` | Staged bytes held by installs that are queued or running. |
+| `raft.snapshot.receive_in_memory_bytes` | The part of both that is resident rather than in a spill file. |
+| `raft.snapshot.install_peak_heap_bytes` | Highest managed-heap size sampled while an install was starting, running or ending. A high-water mark. |
+| `raft.snapshot.install_duration_ms` | Histogram: last chunk to outcome, tagged `partition_id` and `outcome`. |
+
+Each finished install also logs one Information line with its outcome, duration, staged and resident
+bytes, and the managed heap before and after.
 
 ---
 

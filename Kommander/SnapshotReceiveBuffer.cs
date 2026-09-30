@@ -72,6 +72,13 @@ internal sealed class SnapshotReceiveBuffer : Stream
     internal bool IsSpilled => file is not null;
 
     /// <summary>
+    /// How far the reader has got, in bytes; 0 once disposed. Unlike <see cref="Position"/> it never
+    /// throws and may be read from another thread while the importer reads: the receiver reports it as
+    /// the progress of a running install.
+    /// </summary>
+    internal long ConsumedBytes => Volatile.Read(ref position);
+
+    /// <summary>
     /// Moves the bytes staged so far into a new file at <paramref name="path"/> and releases the in-memory
     /// segments; later appends and reads use the file, which is deleted when this buffer is disposed. A
     /// no-op once spilled. On failure (for example a full disk) the buffer is left as it was, in memory, and

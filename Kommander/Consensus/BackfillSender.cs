@@ -124,6 +124,14 @@ internal sealed class BackfillSender
                 );
         }
 
+        // Every AppendLogs carries the floor, heartbeat or batch: a follower applies the latest one it
+        // accepted, and its hold must not depend on which kind of message happened to arrive last.
+        if (coreState.NodeState == RaftNodeState.Leader && coreState.ReplicatedRetentionTerm == coreState.CurrentTerm)
+        {
+            request.RetentionFloor = coreState.ReplicatedRetentionFloor;
+            request.RetentionBudget = coreState.ReplicatedRetentionBudget;
+        }
+
         host.EnqueueResponse(node.Endpoint, new(RaftResponderRequestType.AppendLogs, node, request));
         return true;
     }

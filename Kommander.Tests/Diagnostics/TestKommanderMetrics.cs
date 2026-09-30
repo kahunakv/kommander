@@ -374,4 +374,87 @@ public sealed class TestKommanderMetrics : IDisposable
         Assert.True(Count("raft.executor.client_queue_depth") >= 1,
             "Observable gauge infrastructure reachable via RecordObservableInstruments");
     }
+
+    /// <summary>
+    /// The snapshot staging gauges report the receiver's own accounting: bytes staged by pending
+    /// sessions, bytes held by an install that is queued or running, the part of both that is in
+    /// memory, and the heap high-water mark sampled around installs. The figures are summed over the
+    /// receivers alive in the process, so other tests' receivers can only add to them.
+    /// </summary>
+    [Fact]
+    public async Task SnapshotStagingGauges_ReportStagedAndInstallingBytes()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource finished = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        SnapshotReceiver receiver = new(
+            isDisposed: () => false,
+            installOnExecutor: async request =>
+            {
+                await release.Task;
+                await request.Snapshot.CopyToAsync(Stream.Null);
+                finished.SetResult();
+                return new SnapshotResponse(SnapshotInstallOutcome.Installed);
+            },
+            logger: NullLogger<IRaft>.Instance,
+            localEndpoint: "metrics:1",
+            sessionTtlTicks: 1_000_000,
+            maxPendingSessions: 8,
+            maxPendingBytes: 1_000_000,
+            getMonotonicTimestamp: () => 1000);
+
+        byte[] installing = new byte[700];
+        byte[] pending = new byte[300];
+
+        await receiver.ReceiveInstallSnapshot(SnapshotChunk("installing", 1, isLast: true, installing), ct);
+        await receiver.ReceiveInstallSnapshot(SnapshotChunk("pending", 2, isLast: false, pending), ct);
+
+        _listener.RecordObservableInstruments();
+
+        Assert.True(Last("raft.snapshot.receive_installing_bytes") >= 700);
+        Assert.True(Last("raft.snapshot.receive_staged_bytes") >= 300);
+        Assert.True(Last("raft.snapshot.receive_in_memory_bytes") >= 1000);
+        Assert.True(Last("raft.snapshot.install_peak_heap_bytes") > 0);
+
+        release.SetResult();
+        await finished.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
+
+        // The duration is recorded after the install's accounting has been released, so it is the
+        // last thing to appear.
+        for (int i = 0; i < 400 && (receiver.ActiveInstallCount > 0 || Count("raft.snapshot.install_duration_ms") == 0); i++)
+            await Task.Delay(5, ct);
+
+        Assert.True(Count("raft.snapshot.install_duration_ms") >= 1,
+            "Expected the install's duration to be recorded when it ended");
+
+        Assert.Equal(0, receiver.InstallingByteCount);
+        Assert.Equal(300, receiver.PendingByteCount);
+        Assert.Equal(300, receiver.InMemoryStagedByteCount);
+
+        GC.KeepAlive(receiver);
+    }
+
+    private double Last(string name)
+    {
+        lock (_lock)
+            return _measurements.TryGetValue(name, out List<double>? list) && list.Count > 0 ? list[^1] : -1;
+    }
+
+    private static SnapshotRequest SnapshotChunk(string session, int partitionId, bool isLast, byte[] data) =>
+        new()
+        {
+            SessionId = session,
+            PartitionId = partitionId,
+            SnapshotIndex = 100,
+            FollowerEndpoint = "metrics:1",
+            LeaderEndpoint = "leader:1",
+            LeaderTerm = 3,
+            LastIncludedTerm = 2,
+            ChunkIndex = 0,
+            IsLast = isLast,
+            Data = data,
+            SnapshotChecksum = isLast ? Convert.ToHexString(global::System.Security.Cryptography.SHA256.HashData(data)) : "",
+            InstallPolling = true,
+        };
 }

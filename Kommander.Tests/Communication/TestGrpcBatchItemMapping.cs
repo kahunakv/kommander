@@ -162,13 +162,19 @@ public sealed class TestGrpcBatchItemMapping
             Type = BatchRequestsRequestType.AppendLogs,
             AppendLogs = new AppendLogsRequest(3, 9, Time, "node-a:9001",
                 [new RaftLog { Id = 5, Term = 9, Type = RaftLogType.Committed, LogType = "t", LogData = [1, 2] }],
-                prevLogIndex: 4, prevLogTerm: 9),
+                prevLogIndex: 4, prevLogTerm: 9)
+            {
+                RetentionFloor = 200,
+                RetentionBudget = 1_000,
+            },
         });
 
         Assert.NotNull(item);
         Assert.Equal(GrpcBatchRequestsRequestType.AppendLogs, item!.Type);
         Assert.NotNull(item.AppendLogs);
         Assert.Equal(4, item.AppendLogs.PrevLogIndex);
+        Assert.Equal(200, item.AppendLogs.RetentionFloor);
+        Assert.Equal(1_000, item.AppendLogs.RetentionBudget);
         Assert.Single(item.AppendLogs.Logs);
         Assert.Equal(5, item.AppendLogs.Logs[0].Id);
     }

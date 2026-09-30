@@ -246,6 +246,22 @@ internal sealed class RaftPartitionCoreState
     public long LastProposalAtTicks;
 
     /// <summary>
+    /// The live-replica retention floor this leader sends its followers on every AppendLogs, the
+    /// budget that goes with it, and the term the heartbeat round computed them in
+    /// (<see cref="HeartbeatDriver"/>). They are sent only while <see cref="ReplicatedRetentionTerm"/>
+    /// equals <see cref="CurrentTerm"/>: a node that leads again must not send the floor of an
+    /// earlier leadership before its first round has computed a new one, and until then its
+    /// followers keep the floor the previous leader gave them.
+    /// </summary>
+    public long ReplicatedRetentionFloor;
+
+    /// <inheritdoc cref="ReplicatedRetentionFloor"/>
+    public long ReplicatedRetentionBudget;
+
+    /// <inheritdoc cref="ReplicatedRetentionFloor"/>
+    public long ReplicatedRetentionTerm = -1;
+
+    /// <summary>
     /// Highest log index the leader has durably committed (set by <c>CompleteLeaderCommit</c>).
     /// Compared against the per-peer commit frontiers in <c>SendHeartbeat</c> to decide whether
     /// a follower gap warrants backfill. Intentionally excludes in-flight proposed-but-uncommitted

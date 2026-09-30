@@ -29,4 +29,25 @@ public enum SnapshotInstallOutcome
     /// advance, but nothing on the receiver changed.
     /// </summary>
     SkippedAlreadyCovered = 3,
+
+    /// <summary>
+    /// An install of this partition is queued or running on the receiver and its outcome is not known
+    /// yet. Answered to a sender that set <see cref="SnapshotRequest.InstallPolling"/>: on the terminal
+    /// chunk (the snapshot is staged and verified, and the install was handed to the partition
+    /// executor), on the opener of a session the receiver refused because another install of the
+    /// partition is running, and on a <see cref="SnapshotRequest.StatusQuery"/>. The response names the
+    /// install (<see cref="SnapshotResponse.InstallSessionId"/>, <see cref="SnapshotResponse.InstallIndex"/>)
+    /// and the sender polls until the receiver reports what became of it. The install can take far
+    /// longer than one chunk acknowledgement may, so its outcome is a step of its own; holding the
+    /// terminal chunk's call open for it made every slow install read as a rejected chunk.
+    /// </summary>
+    InstallPending = 4,
+
+    /// <summary>
+    /// Answer to a <see cref="SnapshotRequest.StatusQuery"/> only: no install of the partition is queued
+    /// or running on the receiver, and it holds no outcome for the session the query named (it never
+    /// saw that session's terminal chunk, or it restarted since). A sender that was waiting for an
+    /// install starts the transfer again.
+    /// </summary>
+    NoInstall = 5,
 }

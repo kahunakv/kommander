@@ -122,6 +122,9 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
 
     private int _disposed;
 
+    /// <summary>True once <see cref="Dispose"/> has begun.</summary>
+    internal bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+
     private IRaftStateMachineTransfer? _stateMachineTransfer;
 
     private IRaftSystemStateTransfer? _systemStateTransfer;

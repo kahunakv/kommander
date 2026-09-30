@@ -223,9 +223,10 @@ public class TestSnapshotRescueConvergence
         // tracker, so the published floor stays derived from the ack alone.
         Harness h = await Harness.BuildLeaderAsync(withTransfer: false);
 
-        // No positional evidence for the peer yet — nothing constrains retention.
+        // No positional evidence for the peer yet: a fresh leader holds the whole budget for it
+        // (a published floor of 1, which the WAL clamps at checkpoint minus the budget).
         await h.Sm.CheckPartitionLeadershipAsync();
-        Assert.Equal(long.MaxValue, h.Wal.PublishedReplicaFloor);
+        Assert.Equal(1, h.Wal.PublishedReplicaFloor);
 
         // The follower reported frontier 199: the first index it still needs is 200.
         await h.AckSuccess(199);
@@ -339,6 +340,98 @@ public class TestSnapshotRescueConvergence
         disabled.Host.Liveness = MemberLivenessState.Dead;
         await disabled.Sm.CheckPartitionLeadershipAsync();
         Assert.Equal(long.MaxValue, disabled.Wal.PublishedReplicaFloor);
+    }
+
+    /// <summary>
+    /// A freshly elected leader has a position for nobody in its first round. While SWIM still calls
+    /// such a peer Alive it used to hold nothing, so a compaction pass between the election and the
+    /// first acks ran to the checkpoint — past a replica the previous leader had been holding the
+    /// log for. It now holds the budget's whole depth, as for a silent peer, until the peer reports
+    /// or the window has passed since this leader first saw it without a position.
+    /// </summary>
+    [Fact]
+    public async Task Heartbeat_HoldsTheWholeBudget_ForALivePeerThatHasNotReportedYet_UntilTheWindowLapses()
+    {
+        Harness h = await Harness.BuildLeaderAsync(withTransfer: false);
+
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(1, h.Wal.PublishedReplicaFloor);
+
+        h.AdvanceMs(119_000);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(1, h.Wal.PublishedReplicaFloor);
+
+        // A peer that never reports a position stops holding once the window has passed.
+        h.AdvanceMs(2_000);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(long.MaxValue, h.Wal.PublishedReplicaFloor);
+
+        // Its first report holds at its position, as always.
+        await h.AckSuccess(199);
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(200, h.Wal.PublishedReplicaFloor);
+
+        Harness disabled = await Harness.BuildLeaderAsync(
+            withTransfer: false,
+            configure: c => c.CompactionSilentPeerRetentionWindow = TimeSpan.Zero);
+
+        await disabled.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(long.MaxValue, disabled.Wal.PublishedReplicaFloor);
+    }
+
+    /// <summary>
+    /// The floor and its budget travel on every AppendLogs, so a follower holds its own compaction
+    /// where the leader holds. Only the leader held before, and the hold was lost at every leader
+    /// change: a successor that had been a follower had compacted to its checkpoint, and the replica
+    /// its predecessor was serving by backfill needed a whole-partition snapshot (CamusDB fault soak
+    /// rl5, 04:00:38-04:00:41).
+    /// </summary>
+    [Fact]
+    public async Task Heartbeat_SendsItsFloorAndBudgetToTheFollowers()
+    {
+        Harness h = await Harness.BuildLeaderAsync(
+            withTransfer: false,
+            configure: c =>
+            {
+                c.CompactionLiveReplicaLagBudget = 1_000;
+                c.CompactionLiveReplicaLagWindow = TimeSpan.Zero;
+            });
+
+        // Before the first round of the term nothing has been computed: no statement is sent, and
+        // a follower keeps the floor the previous leader gave it.
+        await h.AckSuccess(199);
+        Assert.Equal(0, h.Host.LastAppendLogs?.RetentionFloor ?? 0);
+
+        await h.Sm.CheckPartitionLeadershipAsync();
+
+        AppendLogsRequest sent = Assert.IsType<AppendLogsRequest>(h.Host.LastAppendLogs);
+        Assert.Equal(200, sent.RetentionFloor);
+        Assert.Equal(1_000, sent.RetentionBudget);
+        Assert.Equal(200, h.Wal.PublishedReplicaFloor);
+    }
+
+    /// <summary>
+    /// The leader is the replica a kill or a disk stall takes out, and its disk can be behind a
+    /// checkpoint it has already replicated. The floor its followers hold therefore includes its own
+    /// durable frontier; its local floor does not need to, since a node cannot compact what its own
+    /// disk has yet to write.
+    /// </summary>
+    [Fact]
+    public async Task ReplicatedFloor_IsLoweredToTheLeadersOwnDurableFrontier()
+    {
+        Harness h = await Harness.BuildLeaderAsync(withTransfer: false);
+        h.Wal.OwnDurableFrontier = 120;
+
+        await h.AckSuccess(199);
+        await h.Sm.CheckPartitionLeadershipAsync();
+
+        Assert.Equal(200, h.Wal.PublishedReplicaFloor);
+        Assert.Equal(121, h.Host.LastAppendLogs!.RetentionFloor);
+
+        // Its disk catches up: the follower's position is the lower one again.
+        h.Wal.OwnDurableFrontier = null;
+        await h.Sm.CheckPartitionLeadershipAsync();
+        Assert.Equal(200, h.Host.LastAppendLogs!.RetentionFloor);
     }
 
     /// <summary>
@@ -681,9 +774,15 @@ public class TestSnapshotRescueConvergence
         public void UpdateLastNodeActivity(string e, int p, HLCTimestamp t) { }
         public void EnqueueResponse(string e, RaftResponderRequest r)
         {
+            if (r.AppendLogsRequest is { } append)
+                LastAppendLogs = append;
+
             if (r.AppendLogsRequest?.Logs is { Count: > 0 })
                 Interlocked.Increment(ref entryBatchesSent);
         }
+
+        /// <summary>The most recent AppendLogs (heartbeat or batch) handed to the transport for the follower.</summary>
+        public volatile AppendLogsRequest? LastAppendLogs;
         public Task InvokeLeaderChanged(int p, string l) => Task.CompletedTask;
         public Task<bool> InvokeReplicationReceived(int p, RaftLog l) => Task.FromResult(true);
         public Task<bool> InvokeSystemReplicationReceived(int p, RaftLog l) => Task.FromResult(true);
@@ -774,6 +873,12 @@ public class TestSnapshotRescueConvergence
         public ValueTask<long> GetAnyTermAtAsync(long logIndex) => ValueTask.FromResult(1L);
         public ValueTask<long> GetLastCheckpointAsync() => ValueTask.FromResult(Volatile.Read(ref Floor));
         public long GetCommitIndex() => Commit;
+
+        /// <summary>This leader's own durable commit frontier; the commit index unless a test holds it back.</summary>
+        public long? OwnDurableFrontier;
+
+        public long GetDurableCommitFrontier() => OwnDurableFrontier ?? Commit;
+
         public WALWriteOperation EnqueuePropose(long term, List<RaftLog> logs, HLCTimestamp ts, bool autoCommit) => MakeNoOp();
         public WALWriteOperation EnqueueCommit(List<RaftLog> logs) => MakeNoOp();
         public WALWriteOperation EnqueueRollback(List<RaftLog> logs) => MakeNoOp();

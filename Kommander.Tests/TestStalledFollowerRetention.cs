@@ -246,4 +246,139 @@ public sealed class TestStalledFollowerRetention
                 wal.Dispose();
         }
     }
+
+    /// <summary>
+    /// The hold must survive a leader change. The leader sends its retention floor with every
+    /// AppendLogs and the other follower holds its own compaction there, so when leadership moves to
+    /// it while the paused follower is still behind, the new leader's log still starts at or below
+    /// the paused follower's durable frontier and the catch-up is a backfill.
+    ///
+    /// <para>Only the leader held before. A follower compacted to its checkpoint, and a successor
+    /// that had been one could not serve the replica its predecessor was holding the log for: CamusDB
+    /// fault soak rl5 — a restarted node 100,000 entries behind was being backfilled, the leader
+    /// stepped down on a disk stall, and the successor answered "anchored at 53696438 but the first
+    /// committed entry available is 53799642" and re-seeded it with a whole-partition snapshot.</para>
+    /// </summary>
+    [Fact]
+    public async Task PausedFollower_IsHeldForByTheOtherFollowerToo_AndASuccessorLeaderServesItFromTheLog()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        (IRaft[] nodes, Dictionary<IRaft, TestWalStallStepDown.GatedWal> wals) = await AssembleAsync(new TempFileLogger<IRaft>(), ct);
+
+        try
+        {
+            IRaft leader = await WaitForLeaderAsync(nodes, ct);
+            IRaft[] followers = nodes.Where(n => !ReferenceEquals(n, leader)).ToArray();
+            IRaft paused = followers[0];
+            IRaft healthy = followers[1];
+            TestWalStallStepDown.GatedWal pausedWal = wals[paused];
+
+            await ReplicateAsync(leader, 20, "baseline", ct);
+            long baselineMax = leader.WalAdapter.GetMaxLog(Partition);
+            await WaitUntilAsync(
+                () => nodes.All(n => n.WalAdapter.GetMaxLog(Partition) >= baselineMax),
+                timeoutMs: 15_000,
+                () => $"every replica must hold the baseline through {baselineMax}; got [{string.Join(",", nodes.Select(n => n.WalAdapter.GetMaxLog(Partition)))}]",
+                ct);
+
+            pausedWal.Stall();
+            long durableAtStall = paused.WalAdapter.GetMaxLog(Partition);
+            await ReplicateAsync(leader, 5, "into-the-stall", ct);
+            await Task.Delay(400, ct);
+
+            await ReplicateAsync(leader, 60, "during", ct);
+            await Task.Delay(150, ct);
+            RaftReplicationResult checkpoint = await leader.ReplicateCheckpoint(Partition, ct);
+            Assert.True(checkpoint.Success, $"checkpoint failed: {checkpoint.Status}");
+            await ReplicateAsync(leader, 60, "after-checkpoint", ct);
+            await Task.Delay(150, ct);
+            await ReplicateAsync(leader, 30, "after-checkpoint-2", ct);
+
+            Assert.True(pausedWal.BlockedWrites > 0, "the paused follower's engine must be holding a write");
+
+            // The healthy follower compacts on its own cadence against the same checkpoint. It must
+            // have removed its prefix, and must have stopped where the leader told it the paused
+            // follower still needs the log.
+            await WaitUntilAsync(
+                () => FirstRetainedId(healthy) > 1,
+                timeoutMs: 15_000,
+                () => $"the healthy follower must have compacted its prefix; first retained is {FirstRetainedId(healthy)} with checkpoint {healthy.WalAdapter.GetLastCheckpoint(Partition)}",
+                ct);
+
+            Assert.True(healthy.WalAdapter.GetLastCheckpoint(Partition) > durableAtStall + 1,
+                "the healthy follower's checkpoint must sit above the paused follower's position, or the floor was never what held its retention");
+
+            for (int i = 0; i < 10; i++)
+            {
+                long firstRetained = FirstRetainedId(healthy);
+                Assert.True(firstRetained <= durableAtStall + 1,
+                    $"the healthy follower compacted past the paused follower: first retained {firstRetained}, paused durable {durableAtStall}, checkpoint {healthy.WalAdapter.GetLastCheckpoint(Partition)}");
+                await Task.Delay(50, ct);
+            }
+
+            // Leadership moves to the healthy follower while the third replica is still paused.
+            string successor = ((RaftManager)healthy).LocalEndpoint;
+            RaftOperationStatus handover = await leader.TransferLeadershipAsync(Partition, successor, ct);
+            Assert.True(handover is RaftOperationStatus.Success or RaftOperationStatus.Pending, $"handover failed: {handover}");
+
+            bool leads = false;
+            ValueStopwatch settle = ValueStopwatch.StartNew();
+            while (!leads && settle.GetElapsedMilliseconds() < 15_000)
+            {
+                leads = await healthy.AmILeaderQuick(Partition);
+                if (!leads)
+                    await Task.Delay(25, ct);
+            }
+            Assert.True(leads, "the healthy follower must lead after the handover");
+
+            // The new leader keeps writing and compacting. It holds for the paused follower on its
+            // own account now: the whole budget until that follower's first ack, then its position.
+            await ReplicateAsync(healthy, 40, "under-the-successor", ct);
+            await Task.Delay(150, ct);
+
+            for (int i = 0; i < 10; i++)
+            {
+                long firstRetained = FirstRetainedId(healthy);
+                Assert.True(firstRetained <= durableAtStall + 1,
+                    $"the successor compacted past the paused follower: first retained {firstRetained}, paused durable {durableAtStall}, checkpoint {healthy.WalAdapter.GetLastCheckpoint(Partition)}");
+                Assert.Empty(healthy.GetBackfillStatuses(Partition));
+                Assert.Empty(healthy.GetSnapshotStatuses(Partition));
+                await Task.Delay(50, ct);
+            }
+
+            // The disk answers, and the successor brings the follower level from its log: no refused
+            // batch and no snapshot attempt (none is registered, so an attempt would show as a status).
+            pausedWal.Release();
+
+            long expectedMax = healthy.WalAdapter.GetMaxLog(Partition);
+            await WaitUntilAsync(
+                () => paused.WalAdapter.GetMaxLog(Partition) >= expectedMax && paused.GetCommitIndex(Partition) >= healthy.GetCommitIndex(Partition),
+                timeoutMs: 20_000,
+                () => $"the paused follower must converge to max {expectedMax} / commit {healthy.GetCommitIndex(Partition)}; it is at {paused.WalAdapter.GetMaxLog(Partition)} / {paused.GetCommitIndex(Partition)}",
+                ct);
+
+            Assert.Empty(healthy.GetBackfillStatuses(Partition));
+            Assert.Empty(healthy.GetSnapshotStatuses(Partition));
+        }
+        finally
+        {
+            foreach (TestWalStallStepDown.GatedWal wal in wals.Values)
+                wal.Release();
+
+            foreach (IRaft node in nodes)
+            {
+                try
+                {
+                    await node.LeaveCluster(true, ct);
+                }
+                catch
+                {
+                    // best effort teardown
+                }
+            }
+
+            foreach (TestWalStallStepDown.GatedWal wal in wals.Values)
+                wal.Dispose();
+        }
+    }
 }

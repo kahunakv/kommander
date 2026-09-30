@@ -265,7 +265,12 @@ public sealed class RaftService : Rafter.RafterBase
             GetLogs(request.Logs),
             request.PrevLogIndex,
             request.PrevLogTerm
-        ) { Quiesce = request.Quiesce });
+        )
+        {
+            Quiesce = request.Quiesce,
+            RetentionFloor = request.RetentionFloor,
+            RetentionBudget = request.RetentionBudget,
+        });
 
         return appendLogsResponse;
     }
@@ -536,7 +541,12 @@ public sealed class RaftService : Rafter.RafterBase
                                     GetLogs(appendLogsRequest.Logs),
                                     appendLogsRequest.PrevLogIndex,
                                     appendLogsRequest.PrevLogTerm
-                                ) { Quiesce = appendLogsRequest.Quiesce });
+                                )
+                                {
+                                    Quiesce = appendLogsRequest.Quiesce,
+                                    RetentionFloor = appendLogsRequest.RetentionFloor,
+                                    RetentionBudget = appendLogsRequest.RetentionBudget,
+                                });
                                 break;
                             }
 
@@ -817,12 +827,23 @@ public sealed class RaftService : Rafter.RafterBase
             LastIncludedTerm = request.LastIncludedTerm,
             SnapshotChecksum = request.SnapshotChecksum,
             Forced = request.Forced,
+            InstallPolling = request.InstallPolling,
+            StatusQuery = request.StatusQuery,
         };
 
         Data.SnapshotResponse result = await manager.ReceiveInstallSnapshot(
             snapshotRequest, context.CancellationToken).ConfigureAwait(false);
 
-        return new GrpcInstallSnapshotResponse { Success = result.Success, Outcome = (int)result.Outcome };
+        return new GrpcInstallSnapshotResponse
+        {
+            Success = result.Success,
+            Outcome = (int)result.Outcome,
+            InstallSessionId = result.InstallSessionId,
+            InstallIndex = result.InstallIndex,
+            InstallLeaderTerm = result.InstallLeaderTerm,
+            InstallLeaderEndpoint = result.InstallLeaderEndpoint,
+            InstallProgress = result.InstallProgress,
+        };
     }
 
     /// <summary>

@@ -471,7 +471,9 @@ public sealed class RaftPartition : IDisposable
             preVote: false,
             prevLogIndex: request.PrevLogIndex,
             prevLogTerm: request.PrevLogTerm,
-            quiesce: request.Quiesce
+            quiesce: request.Quiesce,
+            retentionFloor: request.RetentionFloor,
+            retentionBudget: request.RetentionBudget
         ));
     }
     

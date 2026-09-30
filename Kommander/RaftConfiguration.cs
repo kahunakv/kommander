@@ -1199,8 +1199,11 @@ public class RaftConfiguration
 
     /// <summary>
     /// Upper bound on ONE awaited step of an outbound snapshot transfer: the application export
-    /// call, one stream read, or one chunk send. A step that makes progress resets the clock, so a
-    /// large snapshot on a slow link is never cut off — only a step that stops moving is. Without
+    /// call, one stream read, one chunk send, or — while the leader waits for the follower to
+    /// install what it staged — the time the install may go without reporting progress (the
+    /// follower reports how far its importer has read into the staged snapshot). A step that makes
+    /// progress resets the clock, so a large snapshot on a slow link or a long import is never cut
+    /// off — only a step that stops moving is. Without
     /// this bound a hung export or a deadline-less install RPC parked the transfer task forever,
     /// and its in-flight guard then silently blocked every later rescue attempt for that follower
     /// (the Caraxes wedge, second occurrence: refusals escalated, but each new leader's single
@@ -1222,14 +1225,23 @@ public class RaftConfiguration
     /// <summary>
     /// Upper bound on ONE snapshot chunk's acknowledgement: the time between sending a chunk and
     /// the receiver's answer for it. Also the deadline of the transport call that carries the
-    /// chunk, so a receiver whose install path is wedged (a stalled disk, a hung executor) fails
-    /// the transfer here instead of holding the RPC open until
-    /// <see cref="SnapshotTransferStepTimeout"/>. A chunk to a reachable node is a bounded unit of
-    /// work — buffer, hash, and on the terminal chunk import plus one durable boundary write — so
-    /// it needs a bound of seconds, not the minutes a whole export may take. The effective
-    /// per-chunk bound is the smaller of the two options. On expiry the attempt is recorded as a
-    /// failure and retried under the normal backoff; a healthy receiver that was merely slow
-    /// re-receives the same chunks from the export cache. Must be positive. Default 15 s.
+    /// chunk, so a receiver whose chunk path is wedged (a stalled disk under its staging
+    /// directory, a node that stopped answering) fails the transfer here instead of holding the
+    /// RPC open until <see cref="SnapshotTransferStepTimeout"/>. A chunk to a reachable node is a
+    /// bounded unit of work — buffer and hash — so it needs a bound of seconds, not the minutes a
+    /// whole export may take. The effective per-chunk bound is the smaller of the two options.
+    /// On expiry the attempt is recorded as a failure and retried under the normal backoff; a
+    /// healthy receiver that was merely slow re-receives the same chunks from the export cache.
+    /// <para>
+    /// The follower's INSTALL is not under this bound. The receiver acknowledges the terminal chunk
+    /// once the snapshot is staged and verified, and the leader then asks for the install's outcome
+    /// in calls of their own, each bounded by this option, for as long as the install reports
+    /// progress (see <see cref="SnapshotTransferStepTimeout"/>). When the terminal chunk's call was
+    /// held open for the install, an import that took longer than this — any large partition on a
+    /// busy disk — was recorded as a rejected last chunk and sent again. The option also bounds how
+    /// long the leader keeps asking a follower that has stopped answering those questions.
+    /// </para>
+    /// Must be positive. Default 15 s.
     /// </summary>
     public TimeSpan SnapshotChunkAckTimeout { get; set; } = TimeSpan.FromSeconds(15);
 
@@ -1753,9 +1765,11 @@ public class RaftConfiguration
     /// no longer Alive) the floor advances normally and the follower must be seeded by a snapshot.
     /// Without this hold, a leader compacting on its ordinary cadence repeatedly re-created the
     /// below-floor condition the snapshot rescue had just repaired, so the rescue could never
-    /// converge (the Caraxes <c>bank-optimistic-45m-p</c> loop). Followers only — the budget is
-    /// applied on the leader from its replication tracker; it has no effect on a node's own
-    /// restart replay. Values &lt;= 0 disable the hold.
+    /// converge (the Caraxes <c>bank-optimistic-45m-p</c> loop). The floor is computed on the
+    /// leader from its replication tracker and sent to the followers with every AppendLogs; each
+    /// follower holds its own compaction at it, within this budget, so the log a lagging replica
+    /// needs is still there on whichever node leads next. It has no effect on a node's own restart
+    /// replay. Values &lt;= 0 disable the hold on the node that sets them.
     /// <para>
     /// Default 1,000,000. The budget must cover the entries a live follower can miss during a device
     /// pause and still be served from the log: at the 100,000 entries the earlier default held, a
@@ -1817,6 +1831,12 @@ public class RaftConfiguration
     /// <see cref="CompactionLiveReplicaLagBudget"/> when it never did (a peer that was already down
     /// when this leader was elected). Past the window the peer holds nothing and a restart is
     /// seeded by snapshot as before. Zero disables the hold.
+    /// <para>
+    /// The same window bounds the hold for a peer that is Alive but has not reported a position to
+    /// this leader yet — every peer, in a freshly elected leader's first heartbeat round. It holds
+    /// the budget's full depth until its first report, measured from the round this leader first saw
+    /// it without one in its current term.
+    /// </para>
     /// <para>
     /// Why the stall hold is not enough: a stalled peer keeps acking and reports its stall, so its
     /// position stays protected; a killed peer reports nothing, so the floor ran past the restarting

@@ -215,6 +215,84 @@ public sealed class TestSnapshotIntegration
         }
     }
 
+    // ── an install slower than a chunk acknowledgement ──────────────────────────
+
+    /// <summary>
+    /// The learner's import takes several times <see cref="RaftConfiguration.SnapshotChunkAckTimeout"/>.
+    /// The leader must wait for it: one export, one import, and the learner is promoted. When the
+    /// terminal chunk's call was held open for the install, that call expired, the attempt was
+    /// recorded as failed, and each retry exported the partition again and queued another import
+    /// behind the one still running (the retry cache is off here so every re-export would show).
+    /// </summary>
+    [Fact]
+    public async Task Learner_WhoseInstallOutlastsTheChunkAckTimeout_IsSeededByOneExportAndOneImport()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        InMemoryCommunication comm = new();
+
+        CompactableWAL wal1 = new(new InMemoryWAL(logger));
+        CompactableWAL wal2 = new(new InMemoryWAL(logger));
+        CompactableWAL wal3 = new(new InMemoryWAL(logger));
+
+        void Configure(RaftConfiguration c)
+        {
+            c.SnapshotChunkAckTimeout = TimeSpan.FromMilliseconds(200);
+            c.SnapshotExportRetryCacheMaxBytes = 0;
+        }
+
+        RaftManager n1 = BuildNode(comm, "localhost", 8421, 1, ["localhost:8422", "localhost:8423"], wal1, logger, configure: Configure);
+        RaftManager n2 = BuildNode(comm, "localhost", 8422, 2, ["localhost:8421", "localhost:8423"], wal2, logger, configure: Configure);
+        RaftManager n3 = BuildNode(comm, "localhost", 8423, 3, ["localhost:8421", "localhost:8422"], wal3, logger, configure: Configure);
+        RaftManager n4 = BuildNode(comm, "localhost", 8424, 4,
+            ["localhost:8421", "localhost:8422", "localhost:8423"],
+            new InMemoryWAL(logger), logger, initialPartitions: 0, configure: Configure);
+
+        comm.SetNodes(new Dictionary<string, IRaft>
+        {
+            ["localhost:8421"] = n1,
+            ["localhost:8422"] = n2,
+            ["localhost:8423"] = n3,
+            ["localhost:8424"] = n4,
+        });
+
+        SlowImportTransfer transfer = new(importTime: TimeSpan.FromMilliseconds(1500));
+        n1.RegisterStateMachineTransfer(transfer);
+        n2.RegisterStateMachineTransfer(transfer);
+        n3.RegisterStateMachineTransfer(transfer);
+        n4.RegisterStateMachineTransfer(transfer);
+
+        try
+        {
+            await Task.WhenAll(n1.JoinCluster(ct), n2.JoinCluster(ct), n3.JoinCluster(ct));
+            await WaitForAsync(() => n1.IsInitialized && n2.IsInitialized && n3.IsInitialized, ct);
+
+            RaftManager leader = await FindLeaderAsync([n1, n2, n3], ct);
+            int userPartitionId = leader.Partitions.Keys.FirstOrDefault(k => k != 0);
+            Assert.NotEqual(0, userPartitionId);
+
+            for (int i = 0; i < 5; i++)
+                await leader.ReplicateLogs(userPartitionId, "test", [1, 2, 3], cancellationToken: ct);
+
+            Assert.Equal(RaftOperationStatus.Success, (await leader.ReplicateCheckpoint(userPartitionId, ct)).Status);
+
+            await WaitForAsync(() =>
+                wal1.GetLastCheckpoint(userPartitionId) > 0 ||
+                wal2.GetLastCheckpoint(userPartitionId) > 0 ||
+                wal3.GetLastCheckpoint(userPartitionId) > 0,
+                ct);
+
+            await n4.JoinCluster(["localhost:8421"], ct);
+
+            Assert.Equal(ClusterMemberRole.Voter, n4.LocalRole);
+            Assert.Equal(1, transfer.Imports(userPartitionId));
+            Assert.Equal(1, transfer.Exports(userPartitionId));
+        }
+        finally
+        {
+            n1.Dispose(); n2.Dispose(); n3.Dispose(); n4.Dispose();
+        }
+    }
+
     // ── no transfer registered → join blocked ───────────────────────────────────
 
     /// <summary>
@@ -309,7 +387,8 @@ public sealed class TestSnapshotIntegration
         ILogger<IRaft> logger,
         int initialPartitions = 1,
         string? stagingDirectory = null,
-        long stagingMemoryBytes = 64L * 1024 * 1024)
+        long stagingMemoryBytes = 64L * 1024 * 1024,
+        Action<RaftConfiguration>? configure = null)
     {
         RaftConfiguration cfg = new()
         {
@@ -331,6 +410,7 @@ public sealed class TestSnapshotIntegration
             LearnerPromotionLag = 5,
             LearnerPromotionStableWindow = TimeSpan.FromMilliseconds(500),
         };
+        configure?.Invoke(cfg);
         return new RaftManager(cfg,
             new StaticDiscovery(peers.Select(e => new RaftNode(e)).ToList()),
             wal, comm, new HybridLogicalClock(), logger);
@@ -407,6 +487,32 @@ public sealed class TestSnapshotIntegration
             }
 
             Interlocked.Increment(ref _verifiedImports);
+        }
+    }
+
+    /// <summary>
+    /// A transfer whose import takes <paramref name="importTime"/>, and which counts exports and
+    /// imports per partition.
+    /// </summary>
+    private sealed class SlowImportTransfer(TimeSpan importTime) : IRaftStateMachineTransfer
+    {
+        private readonly ConcurrentDictionary<int, int> exports = new();
+        private readonly ConcurrentDictionary<int, int> imports = new();
+
+        public int Exports(int partitionId) => exports.GetValueOrDefault(partitionId);
+        public int Imports(int partitionId) => imports.GetValueOrDefault(partitionId);
+
+        public Task<Stream> ExportRange(RaftSplitPlan plan, long upToIndex, CancellationToken ct)
+        {
+            exports.AddOrUpdate(plan.TargetPartitionId, 1, static (_, count) => count + 1);
+            return Task.FromResult<Stream>(new MemoryStream([0xDE, 0xAD, 0xBE, 0xEF]));
+        }
+
+        public async Task ImportRange(int targetPartitionId, Stream snapshot, CancellationToken ct)
+        {
+            imports.AddOrUpdate(targetPartitionId, 1, static (_, count) => count + 1);
+            await Task.Delay(importTime, CancellationToken.None);
+            await snapshot.CopyToAsync(Stream.Null, CancellationToken.None);
         }
     }
 

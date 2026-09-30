@@ -25,6 +25,8 @@ public class TestGrpcCommunicationPoolReset
         obj.PrevLogIndex = 55;
         obj.PrevLogTerm = 6;
         obj.Quiesce = true;
+        obj.RetentionFloor = 200;
+        obj.RetentionBudget = 1_000;
         obj.Logs.Add(new GrpcRaftLog { Id = 1, Term = 7, Data = ByteString.CopyFrom([1, 2, 3]) });
 
         GrpcCommunicationPool.Return(obj);
@@ -41,6 +43,8 @@ public class TestGrpcCommunicationPoolReset
         Assert.Equal(0, rented.PrevLogIndex);
         Assert.Equal(0, rented.PrevLogTerm);
         Assert.False(rented.Quiesce);
+        Assert.Equal(0, rented.RetentionFloor);
+        Assert.Equal(0, rented.RetentionBudget);
         Assert.Empty(rented.Logs);
     }
 

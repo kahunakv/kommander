@@ -117,6 +117,11 @@ internal sealed class RaftPartitionHostAdapter : Scheduling.IRaftPartitionHost
     public Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct) =>
         manager.Communication.SendInstallSnapshot(manager, node, request, ct);
 
+    public bool IsStopped => manager.IsDisposed;
+
+    public Task<SnapshotResponse> QuerySnapshotInstallAsync(RaftNode node, SnapshotRequest query, CancellationToken ct) =>
+        manager.Communication.SendInstallSnapshot(manager, node, query, ct);
+
     public MemberLivenessState GetNodeLiveness(string endpoint) => manager.Liveness.GetState(endpoint);
 
     public void PublishFollowerProgress(RaftFollowerProgress progress) => partition.PublishFollowerProgress(progress);

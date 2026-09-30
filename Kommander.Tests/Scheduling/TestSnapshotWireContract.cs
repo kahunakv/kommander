@@ -138,4 +138,155 @@ public class TestSnapshotWireContract
         Assert.Equal("", legacy.LeaderEndpoint);
         Assert.Equal(0, legacy.LastIncludedTerm);
     }
+
+    // ── the install as a step of its own: InstallPolling / StatusQuery and the install an answer names ──
+
+    [Fact]
+    public void GrpcInstallSnapshot_InstallStepFields_RoundTrip()
+    {
+        GrpcInstallSnapshotRequest request = new()
+        {
+            SessionId = "sess-3",
+            PartitionId = 7,
+            SnapshotIndex = 4242,
+            ChunkIndex = -1,
+            InstallPolling = true,
+            StatusQuery = true,
+        };
+
+        GrpcInstallSnapshotRequest parsedRequest = GrpcInstallSnapshotRequest.Parser.ParseFrom(request.ToByteArray());
+        Assert.True(parsedRequest.InstallPolling);
+        Assert.True(parsedRequest.StatusQuery);
+        Assert.Equal(-1, parsedRequest.ChunkIndex);
+
+        GrpcInstallSnapshotResponse response = new()
+        {
+            Outcome = (int)SnapshotInstallOutcome.InstallPending,
+            InstallSessionId = "sess-3",
+            InstallIndex = 4242,
+            InstallLeaderTerm = 11,
+            InstallLeaderEndpoint = "leader:9001",
+            InstallProgress = 1_048_576,
+        };
+
+        GrpcInstallSnapshotResponse parsedResponse = GrpcInstallSnapshotResponse.Parser.ParseFrom(response.ToByteArray());
+        Assert.Equal((int)SnapshotInstallOutcome.InstallPending, parsedResponse.Outcome);
+        Assert.Equal("sess-3", parsedResponse.InstallSessionId);
+        Assert.Equal(4242, parsedResponse.InstallIndex);
+        Assert.Equal(11, parsedResponse.InstallLeaderTerm);
+        Assert.Equal("leader:9001", parsedResponse.InstallLeaderEndpoint);
+        Assert.Equal(1_048_576, parsedResponse.InstallProgress);
+    }
+
+    [Fact]
+    public void GrpcInstallSnapshot_InstallStepFieldNumbersAreStable()
+    {
+        Assert.Equal(14, GrpcInstallSnapshotRequest.InstallPollingFieldNumber);
+        Assert.Equal(15, GrpcInstallSnapshotRequest.StatusQueryFieldNumber);
+
+        Assert.Equal(3, GrpcInstallSnapshotResponse.InstallSessionIdFieldNumber);
+        Assert.Equal(4, GrpcInstallSnapshotResponse.InstallIndexFieldNumber);
+        Assert.Equal(5, GrpcInstallSnapshotResponse.InstallLeaderTermFieldNumber);
+        Assert.Equal(6, GrpcInstallSnapshotResponse.InstallLeaderEndpointFieldNumber);
+        Assert.Equal(7, GrpcInstallSnapshotResponse.InstallProgressFieldNumber);
+    }
+
+    [Fact]
+    public void RestSnapshot_InstallStepFields_RoundTrip()
+    {
+        SnapshotRequest query = new()
+        {
+            SessionId = "sess-4",
+            PartitionId = 4,
+            SnapshotIndex = 500,
+            ChunkIndex = -1,
+            InstallPolling = true,
+            StatusQuery = true,
+        };
+
+        SnapshotRequest? parsedQuery = JsonSerializer.Deserialize(
+            JsonSerializer.Serialize(query, RestJsonContext.Default.SnapshotRequest),
+            RestJsonContext.Default.SnapshotRequest);
+
+        Assert.NotNull(parsedQuery);
+        Assert.True(parsedQuery!.InstallPolling);
+        Assert.True(parsedQuery.StatusQuery);
+        Assert.Equal(-1, parsedQuery.ChunkIndex);
+
+        SnapshotResponse pending = new(SnapshotInstallOutcome.InstallPending)
+        {
+            InstallSessionId = "sess-4",
+            InstallIndex = 500,
+            InstallLeaderTerm = 13,
+            InstallLeaderEndpoint = "leader:9004",
+            InstallProgress = 77,
+        };
+
+        SnapshotResponse? parsed = JsonSerializer.Deserialize(
+            JsonSerializer.Serialize(pending, RestJsonContext.Default.SnapshotResponse),
+            RestJsonContext.Default.SnapshotResponse);
+
+        Assert.NotNull(parsed);
+        Assert.Equal(SnapshotInstallOutcome.InstallPending, parsed!.Outcome);
+        Assert.Equal("sess-4", parsed.InstallSessionId);
+        Assert.Equal(500, parsed.InstallIndex);
+        Assert.Equal(13, parsed.InstallLeaderTerm);
+        Assert.Equal("leader:9004", parsed.InstallLeaderEndpoint);
+        Assert.Equal(77, parsed.InstallProgress);
+    }
+
+    [Fact]
+    public void SnapshotInstallOutcome_ValuesAreStable()
+    {
+        // The outcome travels as a raw int; a sender that reads 0 where a newer peer meant
+        // something else would treat an install as refused, or the reverse.
+        Assert.Equal(0, (int)SnapshotInstallOutcome.Rejected);
+        Assert.Equal(1, (int)SnapshotInstallOutcome.ChunkAccepted);
+        Assert.Equal(2, (int)SnapshotInstallOutcome.Installed);
+        Assert.Equal(3, (int)SnapshotInstallOutcome.SkippedAlreadyCovered);
+        Assert.Equal(4, (int)SnapshotInstallOutcome.InstallPending);
+        Assert.Equal(5, (int)SnapshotInstallOutcome.NoInstall);
+    }
+
+    /// <summary>
+    /// The legacy bit says "staged or installed". A pending install and "no install on record" are
+    /// neither, so a peer that reads only the bit never takes them for a seeded follower.
+    /// </summary>
+    [Theory]
+    [InlineData(SnapshotInstallOutcome.Rejected, false)]
+    [InlineData(SnapshotInstallOutcome.ChunkAccepted, true)]
+    [InlineData(SnapshotInstallOutcome.Installed, true)]
+    [InlineData(SnapshotInstallOutcome.SkippedAlreadyCovered, true)]
+    [InlineData(SnapshotInstallOutcome.InstallPending, false)]
+    [InlineData(SnapshotInstallOutcome.NoInstall, false)]
+    public void SuccessBit_FollowsTheOutcome(SnapshotInstallOutcome outcome, bool success)
+    {
+        SnapshotResponse response = new(outcome);
+        Assert.Equal(success, response.Success);
+
+        SnapshotResponse? parsed = JsonSerializer.Deserialize(
+            JsonSerializer.Serialize(response, RestJsonContext.Default.SnapshotResponse),
+            RestJsonContext.Default.SnapshotResponse);
+
+        Assert.NotNull(parsed);
+        Assert.Equal(outcome, parsed!.Outcome);
+        Assert.Equal(success, parsed.Success);
+    }
+
+    [Fact]
+    public void RequestFromASenderThatPredatesTheFields_IsAChunkFromASenderThatDoesNotPoll()
+    {
+        SnapshotRequest? legacy = JsonSerializer.Deserialize(
+            """{"sessionId":"old","partitionId":1,"snapshotIndex":10,"chunkIndex":0,"isLast":true}""",
+            RestJsonContext.Default.SnapshotRequest);
+
+        Assert.NotNull(legacy);
+        Assert.False(legacy!.InstallPolling);
+        Assert.False(legacy.StatusQuery);
+
+        GrpcInstallSnapshotRequest grpcLegacy = GrpcInstallSnapshotRequest.Parser.ParseFrom(
+            new GrpcInstallSnapshotRequest { SessionId = "old", PartitionId = 1, SnapshotIndex = 10, IsLast = true }.ToByteArray());
+        Assert.False(grpcLegacy.InstallPolling);
+        Assert.False(grpcLegacy.StatusQuery);
+    }
 }

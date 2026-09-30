@@ -188,6 +188,25 @@ public interface IRaftPartitionHost
     Task<SnapshotResponse> SendInstallSnapshotAsync(RaftNode node, SnapshotRequest request, CancellationToken ct);
 
     /// <summary>
+    /// True once the node that hosts this partition has been disposed. Background work done on the
+    /// partition's behalf that waits on something outside it — a snapshot transfer waiting for a
+    /// follower's install — checks it and ends, instead of polling on behalf of a node that no
+    /// longer exists. Defaults to <see langword="false"/> for test hosts, which have no lifetime.
+    /// </summary>
+    bool IsStopped => false;
+
+    /// <summary>
+    /// Asks <paramref name="node"/> what became of a snapshot install on this partition
+    /// (<paramref name="query"/> is a <see cref="SnapshotRequest.StatusQuery"/> request, not a chunk).
+    /// The production adapter sends it over the same transport call as a chunk. The default answers
+    /// <see cref="SnapshotInstallOutcome.Rejected"/> with no install named — what a receiver that
+    /// predates the query answers — which the sender reads as "nothing known" and proceeds with the
+    /// transfer, so a test host that models no receiver needs no implementation.
+    /// </summary>
+    Task<SnapshotResponse> QuerySnapshotInstallAsync(RaftNode node, SnapshotRequest query, CancellationToken ct) =>
+        Task.FromResult(new SnapshotResponse(SnapshotInstallOutcome.Rejected));
+
+    /// <summary>
     /// SWIM failure-detector view of <paramref name="endpoint"/>. Returns
     /// <see cref="MemberLivenessState.Alive"/> for unknown endpoints (same default as
     /// <see cref="Gossip.LivenessTable.GetState"/>). This reflects the SWIM probing result,

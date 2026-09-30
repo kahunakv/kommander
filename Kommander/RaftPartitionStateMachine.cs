@@ -2259,8 +2259,8 @@ public sealed class RaftPartitionStateMachine
     /// <param name="timestamp"></param>
     /// <param name="logs"></param>
     /// <returns></returns>
-    public Task AppendLogsAsync(string endpoint, long term, HLCTimestamp timestamp, List<RaftLog>? logs, long prevLogIndex = 0, long prevLogTerm = 0, ulong? replyCorrelationId = null, bool quiesce = false) =>
-        followerAppend.AppendLogsCoreAsync(endpoint, term, timestamp, logs, prevLogIndex, prevLogTerm, replyCorrelationId, quiesce);
+    public Task AppendLogsAsync(string endpoint, long term, HLCTimestamp timestamp, List<RaftLog>? logs, long prevLogIndex = 0, long prevLogTerm = 0, ulong? replyCorrelationId = null, bool quiesce = false, long retentionFloor = 0, long retentionBudget = 0) =>
+        followerAppend.AppendLogsCoreAsync(endpoint, term, timestamp, logs, prevLogIndex, prevLogTerm, replyCorrelationId, quiesce, retentionFloor, retentionBudget);
 
 
 

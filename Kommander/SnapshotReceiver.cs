@@ -5,6 +5,7 @@ using Kommander.Data;
 using Microsoft.Extensions.Logging;
 
 using Kommander.Diagnostics;
+using Kommander.Support.Parallelization;
 
 namespace Kommander;
 
@@ -63,6 +64,27 @@ internal readonly record struct SnapshotSessionKey(string LeaderEndpoint, int Pa
 /// chunk it hands the staged buffer plus session metadata to <c>installOnExecutor</c>, which routes the
 /// install through the partition's single-writer executor where term validation, application import, and
 /// the durable WAL boundary run serialized against every other partition operation.</para>
+///
+/// <para><b>The install is a step of its own.</b> The terminal chunk starts the install as a task this
+/// class owns (<see cref="RunInstallAsync"/>) and answers a sender that polls
+/// (<see cref="SnapshotRequest.InstallPolling"/>) at once with
+/// <see cref="SnapshotInstallOutcome.InstallPending"/>; the sender then asks for the outcome with
+/// <see cref="SnapshotRequest.StatusQuery"/>. An install takes as long as the application's import does —
+/// tens of seconds for a large partition on a busy disk — and a chunk acknowledgement may take
+/// <see cref="RaftConfiguration.SnapshotChunkAckTimeout"/>. Answering the terminal chunk only when the
+/// install had finished made every slow install read as a rejected last chunk, and the sender answered
+/// that with a new export at a newer index while this node was still importing the first one. A sender
+/// that does not poll keeps the old answer: its terminal chunk is held until the install completes.</para>
+///
+/// <para><b>One install per partition.</b> While an install of a partition is queued or running, no other
+/// session of that partition is staged: its pending sessions are dropped when the install starts, and a
+/// chunk that would open or continue another one is answered with
+/// <see cref="SnapshotInstallOutcome.InstallPending"/> naming the running install (or refused, for a
+/// sender that does not poll). A second snapshot staged beside the running one could not be installed
+/// until the first finished, and by then its sender has usually moved to a newer index; all it did was
+/// hold a second copy of the partition in memory next to the import's working set. The record of the
+/// last install of each partition is kept after it completes, so a sender whose call was cut off can
+/// still learn the outcome by naming the session.</para>
 /// </summary>
 internal sealed class SnapshotReceiver
 {
@@ -80,6 +102,15 @@ internal sealed class SnapshotReceiver
     // Bytes staged in memory rather than in a spill file, across pending sessions and in-install buffers
     // alike. Held within stagingMemoryBytes when a staging directory is configured.
     private long _inMemoryBytes;
+
+    // The install of each partition that is queued or running, and after it completes its outcome, until
+    // the partition's next install replaces it. At most one per partition is not completed. Guarded by
+    // the receiver lock.
+    private readonly Dictionary<int, SnapshotInstallRecord> _installs = new();
+
+    // Highest managed-heap size seen at the start or end of an install, or when a sender asked about one
+    // that was running. Published as a gauge so a run can report what an install cost without a profiler.
+    private long _installPeakHeapBytes;
 
     /// <summary>Directory for spill files, or null to keep every session in memory.</summary>
     private readonly string? stagingDirectory;
@@ -150,6 +181,8 @@ internal sealed class SnapshotReceiver
             this.stagingDirectory = stagingDirectory;
             PrepareStagingDirectory(stagingDirectory);
         }
+
+        KommanderMetrics.RegisterSnapshotReceiver(this);
     }
 
     /// <summary>
@@ -195,10 +228,14 @@ internal sealed class SnapshotReceiver
     /// <summary>
     /// Accumulates one snapshot chunk. Returns success for a well-ordered non-final chunk; on the
     /// terminal chunk it detaches the completed session (so its buffer is no longer counted against the
-    /// caps or visible to eviction) and then imports outside the lock. A protocol violation
+    /// caps or visible to eviction) and starts the install outside the lock. A protocol violation
     /// (metadata change, skipped/out-of-order/negative chunk index, byte-budget overflow) drops the
     /// session and returns failure; an exact duplicate of the immediately-previous chunk is an
     /// idempotent success that is not appended again.
+    /// <para>The terminal chunk of a sender that polls is answered as soon as the install is handed to
+    /// the executor; one that does not poll is answered when the install completes. A
+    /// <see cref="SnapshotRequest.StatusQuery"/> stages nothing and reports the partition's install.
+    /// See the class summary for both, and for what a chunk meets while an install is running.</para>
     /// </summary>
     internal async Task<SnapshotResponse> ReceiveInstallSnapshot(
         SnapshotRequest request,
@@ -209,9 +246,14 @@ internal sealed class SnapshotReceiver
 
         cancellationToken.ThrowIfCancellationRequested();
 
+        if (request.StatusQuery)
+            return AnswerStatusQuery(request);
+
         SnapshotReceiveBuffer completeBuffer;
         SnapshotReceiveSession completedSession;
-        SnapshotReceiveSession session;
+        SnapshotInstallRecord installRecord;
+        SnapshotInstallRecord? duplicateOf = null;
+        SnapshotReceiveSession? session = null;
         SnapshotSessionKey key;
         ReadOnlyMemory<byte> data = request.Data;
         int incoming = data.Length;
@@ -237,13 +279,54 @@ internal sealed class SnapshotReceiver
                 return new SnapshotResponse(false);
             }
 
-            if (!_sessions.TryGetValue(key, out SnapshotReceiveSession? existing))
+            _installs.TryGetValue(request.PartitionId, out SnapshotInstallRecord? partitionInstall);
+
+            if (_sessions.TryGetValue(key, out SnapshotReceiveSession? existing))
+            {
+                // Handled below, with the session in hand.
+            }
+            else if (request.IsLast
+                     && partitionInstall is not null
+                     && partitionInstall.Key.Equals(key)
+                     && request.ChunkIndex == partitionInstall.TerminalChunkIndex)
+            {
+                // The terminal chunk again, for the session whose install it already started: the
+                // sender (or its transport) never saw the first answer. The snapshot is staged and
+                // the install is running or done, so this is a question about that install, not a
+                // chunk of a session that was lost.
+                duplicateOf = partitionInstall;
+            }
+            else if (partitionInstall is { Completed: false })
+            {
+                // An install of this partition is queued or running. Nothing else of the partition is
+                // staged meanwhile: a second snapshot could not be installed until the first has
+                // finished, and would only sit beside it in memory. Covers the opener of a new
+                // session and a later chunk of one that was dropped when the install started.
+                KommanderMetrics.RecordSnapshotReceiveSessionRefusedInstalling(request.PartitionId);
+
+                if (logger.IsEnabled(LogLevel.Debug))
+                    logger.LogDebug(
+                        "[{Endpoint}] Not staging chunk {Chunk} of a snapshot session for partition {PartitionId} at index {Index} from {Leader}: the install at index {InstallIndex} from {InstallLeader} is still running",
+                        localEndpoint, request.ChunkIndex, request.PartitionId, request.SnapshotIndex, request.LeaderEndpoint,
+                        partitionInstall.SnapshotIndex, partitionInstall.Key.LeaderEndpoint);
+
+                return request.InstallPolling
+                    ? DescribeInstallLocked(partitionInstall)
+                    : new SnapshotResponse(false);
+            }
+            else if (request.ChunkIndex != 0)
             {
                 // A fresh session must begin at chunk 0. A non-zero first chunk means we lost the
                 // session (skipped opener, or a late chunk after the terminal chunk detached it).
-                if (request.ChunkIndex != 0)
-                    return new SnapshotResponse(false);
+                return new SnapshotResponse(false);
+            }
 
+            if (duplicateOf is not null)
+            {
+                // Answered below, outside the lock: a sender that does not poll waits for the install.
+            }
+            else if (existing is null)
+            {
                 // Refuse to OPEN a session while this node's own disk is stalled (see the field
                 // summary). Checked at the opener only: a stall that begins mid-transfer keeps the
                 // bytes already staged — dropping them would waste the transfer for a hiccup, and
@@ -319,36 +402,44 @@ internal sealed class SnapshotReceiver
                 }
             }
 
-            if (!EnsureByteCapacityLocked(key, incoming))
-            {
-                // Even after evicting every other session this chunk does not fit: reject and drop.
-                RemoveSessionLocked(key, session);
-                return new SnapshotResponse(false);
-            }
+            spill = false;
 
-            // A chunk that would take the in-memory total past the budget moves its session to disk first.
-            // Its bytes already staged stay counted as in memory until the spill has actually released them
-            // (at commit), so nothing else is admitted into memory against bytes that are still resident.
-            spill = incoming > 0
-                    && session.InMemory
-                    && stagingDirectory is not null
-                    && _inMemoryBytes + incoming > stagingMemoryBytes;
-
-            if (spill)
+            if (session is not null)
             {
-                session.InMemory = false;
-            }
-            else if (session.InMemory)
-            {
-                session.InMemoryBytes += incoming;
-                _inMemoryBytes += incoming;
-            }
+                if (!EnsureByteCapacityLocked(key, incoming))
+                {
+                    // Even after evicting every other session this chunk does not fit: reject and drop.
+                    RemoveSessionLocked(key, session);
+                    return new SnapshotResponse(false);
+                }
 
-            session.AccumulatedBytes += incoming;
-            _totalPendingBytes += incoming;
-            session.LastActivityTimestamp = now;
-            session.Busy = true;
+                // A chunk that would take the in-memory total past the budget moves its session to disk first.
+                // Its bytes already staged stay counted as in memory until the spill has actually released them
+                // (at commit), so nothing else is admitted into memory against bytes that are still resident.
+                spill = incoming > 0
+                        && session.InMemory
+                        && stagingDirectory is not null
+                        && _inMemoryBytes + incoming > stagingMemoryBytes;
+
+                if (spill)
+                {
+                    session.InMemory = false;
+                }
+                else if (session.InMemory)
+                {
+                    session.InMemoryBytes += incoming;
+                    _inMemoryBytes += incoming;
+                }
+
+                session.AccumulatedBytes += incoming;
+                _totalPendingBytes += incoming;
+                session.LastActivityTimestamp = now;
+                session.Busy = true;
+            }
         }
+
+        if (session is null)
+            return await AnswerForInstallAsync(duplicateOf!, request.InstallPolling).ConfigureAwait(false);
 
         // ── Append, outside the lock: the file I/O of a spill or a spilled session's write must not hold up
         // every other session's chunks. Only this caller touches the session's buffer and hash while busy. ──
@@ -388,6 +479,14 @@ internal sealed class SnapshotReceiver
             if (session.Removed)
             {
                 DisposeSessionResources(session);
+
+                // Dropped because another session's terminal chunk started the partition's install
+                // meanwhile: a sender that polls waits for that install instead of failing.
+                if (request.InstallPolling
+                    && _installs.TryGetValue(request.PartitionId, out SnapshotInstallRecord? started)
+                    && !started.Completed)
+                    return DescribeInstallLocked(started);
+
                 return new SnapshotResponse(false);
             }
 
@@ -438,6 +537,26 @@ internal sealed class SnapshotReceiver
             completedSession = session;
             completeBuffer = session.Buffer;
             completeBuffer.Position = 0;
+
+            // The partition's other pending sessions go now: none of them can be installed while
+            // this one runs (see the class summary), and their senders learn to wait at their next chunk.
+            DropPartitionSessionsLocked(request.PartitionId, completedSession);
+
+            installRecord = new SnapshotInstallRecord
+            {
+                Key = key,
+                SnapshotIndex = completedSession.SnapshotIndex,
+                LeaderTerm = completedSession.LeaderTerm,
+                TerminalChunkIndex = request.ChunkIndex,
+                StagedBytes = completedSession.AccumulatedBytes,
+                InMemoryBytes = completedSession.InMemoryBytes,
+                StartedTimestamp = getMonotonicTimestamp(),
+                Buffer = completeBuffer,
+            };
+
+            // Replaces the record of the partition's previous install, which has completed: a sender
+            // still waiting for that one is told there is a new install and waits for it instead.
+            _installs[request.PartitionId] = installRecord;
         }
 
         // Hand the staged snapshot to the partition executor's single-writer install path. All term
@@ -454,19 +573,44 @@ internal sealed class SnapshotReceiver
             Snapshot = completeBuffer,
         };
 
+        // The install runs as a task of its own, owned by its record: it outlives this call when the
+        // sender polls, and it must finish (and release the buffer) even if this call is abandoned.
+        FireAndForget.Observe(RunInstallAsync(installRecord, completedSession, install), logger, "SnapshotReceiver.RunInstall");
+
+        return await AnswerForInstallAsync(installRecord, request.InstallPolling).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Runs one install on the partition executor and records its outcome. Never throws: a failed or
+    /// faulted install is a <see cref="SnapshotInstallOutcome.Rejected"/> outcome on the record, and the
+    /// staged buffer and its accounting are released on every path.
+    /// </summary>
+    private async Task RunInstallAsync(
+        SnapshotInstallRecord record,
+        SnapshotReceiveSession completedSession,
+        SnapshotInstallRequest install)
+    {
+        SnapshotInstallOutcome outcome = SnapshotInstallOutcome.Rejected;
+        long heapBefore = SampleInstallHeap();
+
         try
         {
-            return await installOnExecutor(install).ConfigureAwait(false);
+            SnapshotResponse response = await installOnExecutor(install).ConfigureAwait(false);
+            outcome = response.Outcome;
         }
         catch (Exception ex)
         {
             logger.LogError(
                 "[{Endpoint}] ReceiveInstallSnapshot: install partition={PartitionId} index={Index} failed: {Message}",
-                localEndpoint, request.PartitionId, request.SnapshotIndex, ex.Message);
-            return new SnapshotResponse(false);
+                localEndpoint, install.PartitionId, install.SnapshotIndex, ex.Message);
         }
         finally
         {
+            long heapAfter = SampleInstallHeap();
+            SnapshotReceiveBuffer buffer = record.Buffer!;
+            SnapshotResponse answer;
+            long elapsedTicks;
+
             // Release the in-install reservation, then dispose the buffer. The executor read the stream to
             // completion before installOnExecutor returned, so the buffer is safe to release here (see
             // RaftPartition.InstallSnapshotAsync — it uses no-cancellation Ask). Disposal is synchronous:
@@ -478,11 +622,143 @@ internal sealed class SnapshotReceiver
 
                 _inMemoryBytes -= completedSession.InMemoryBytes;
                 completedSession.InMemoryBytes = 0;
+
+                // The record stops reading the buffer before it is disposed: progress is frozen at
+                // what the importer had consumed.
+                record.FinalProgress = buffer.ConsumedBytes;
+                record.Buffer = null;
+                record.Outcome = outcome;
+                record.Completed = true;
+
+                elapsedTicks = getMonotonicTimestamp() - record.StartedTimestamp;
+                answer = DescribeInstallLocked(record);
             }
-            completeBuffer.Dispose();
+
+            buffer.Dispose();
             // The completed session was detached from _sessions above, so RemoveSessionLocked never
             // runs for it and this is the only place its hash is released.
             completedSession.Hash.Dispose();
+
+            double elapsedMs = elapsedTicks * 1000.0 / Stopwatch.Frequency;
+            KommanderMetrics.RecordSnapshotInstallDuration(install.PartitionId, outcome, elapsedMs);
+
+            if (logger.IsEnabled(LogLevel.Information))
+                logger.LogInformation(
+                    "[{Endpoint}] Snapshot install for partition {PartitionId} at index {Index} from {Leader} ended {Outcome} after {ElapsedMs:F0} ms: {StagedBytes} staged bytes ({InMemoryBytes} in memory), managed heap {HeapBefore} -> {HeapAfter} bytes (highest seen during any install {PeakHeap})",
+                    localEndpoint, install.PartitionId, install.SnapshotIndex, install.LeaderEndpoint, outcome, elapsedMs,
+                    record.StagedBytes, record.InMemoryBytes, heapBefore, heapAfter, Volatile.Read(ref _installPeakHeapBytes));
+
+            record.Completion.TrySetResult(answer);
+        }
+    }
+
+    /// <summary>
+    /// The answer for a chunk that belongs to <paramref name="record"/>'s install: a sender that polls
+    /// is told where the install stands right now, one that does not is answered when it completes.
+    /// </summary>
+    private async Task<SnapshotResponse> AnswerForInstallAsync(SnapshotInstallRecord record, bool installPolling)
+    {
+        if (!installPolling)
+            return await record.Completion.Task.ConfigureAwait(false);
+
+        lock (_pendingSnapshotsLock)
+            return DescribeInstallLocked(record);
+    }
+
+    /// <summary>
+    /// Answers a <see cref="SnapshotRequest.StatusQuery"/>. An install of the partition that is queued
+    /// or running is reported whichever session it belongs to — that is what the asker has to wait for.
+    /// A completed install is reported only to a query that names its session: its outcome is an
+    /// answer for the sender that was waiting for it, and not a statement about a transfer that
+    /// has not been sent yet (a re-seed at the same index must still be sent).
+    /// </summary>
+    private SnapshotResponse AnswerStatusQuery(SnapshotRequest request)
+    {
+        lock (_pendingSnapshotsLock)
+        {
+            if (isDisposed())
+                return new SnapshotResponse(false);
+
+            if (!_installs.TryGetValue(request.PartitionId, out SnapshotInstallRecord? record))
+                return new SnapshotResponse(SnapshotInstallOutcome.NoInstall);
+
+            if (!record.Completed)
+            {
+                SampleInstallHeap();
+                return DescribeInstallLocked(record);
+            }
+
+            if (!string.IsNullOrEmpty(request.SessionId)
+                && string.Equals(record.Key.SessionId, request.SessionId, StringComparison.Ordinal))
+                return DescribeInstallLocked(record);
+
+            return new SnapshotResponse(SnapshotInstallOutcome.NoInstall);
+        }
+    }
+
+    /// <summary>
+    /// The response that describes <paramref name="record"/>: <see cref="SnapshotInstallOutcome.InstallPending"/>
+    /// while it is queued or running, its outcome once it has completed. Must hold the lock.
+    /// </summary>
+    private static SnapshotResponse DescribeInstallLocked(SnapshotInstallRecord record) =>
+        new(record.Completed ? record.Outcome : SnapshotInstallOutcome.InstallPending)
+        {
+            InstallSessionId = record.Key.SessionId,
+            InstallIndex = record.SnapshotIndex,
+            InstallLeaderTerm = record.LeaderTerm,
+            InstallLeaderEndpoint = record.Key.LeaderEndpoint,
+            InstallProgress = record.Buffer?.ConsumedBytes ?? record.FinalProgress,
+        };
+
+    /// <summary>
+    /// Reads the managed heap size and raises <see cref="_installPeakHeapBytes"/> to it. Called when an
+    /// install starts, when it ends, and whenever a sender asks about one that is running — a sender
+    /// that polls asks several times a second, so the high-water mark follows the import closely
+    /// without a timer of its own.
+    /// </summary>
+    private long SampleInstallHeap()
+    {
+        long heap = GC.GetTotalMemory(forceFullCollection: false);
+
+        long seen = Volatile.Read(ref _installPeakHeapBytes);
+        while (heap > seen)
+        {
+            long previous = Interlocked.CompareExchange(ref _installPeakHeapBytes, heap, seen);
+            if (previous == seen)
+                break;
+            seen = previous;
+        }
+
+        return heap;
+    }
+
+    /// <summary>
+    /// Drops every pending session of <paramref name="partitionId"/> except <paramref name="keep"/>.
+    /// Called when an install of the partition starts. Must hold the lock.
+    /// </summary>
+    private void DropPartitionSessionsLocked(int partitionId, SnapshotReceiveSession keep)
+    {
+        List<SnapshotReceiveSession>? dropped = null;
+
+        foreach (KeyValuePair<SnapshotSessionKey, SnapshotReceiveSession> pair in _sessions)
+        {
+            if (pair.Key.PartitionId == partitionId && !ReferenceEquals(pair.Value, keep))
+                (dropped ??= []).Add(pair.Value);
+        }
+
+        if (dropped is null)
+            return;
+
+        foreach (SnapshotReceiveSession session in dropped)
+        {
+            RemoveSessionLocked(session.Key, session);
+            KommanderMetrics.RecordSnapshotReceiveSessionSuperseded(partitionId);
+
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug(
+                    "[{Endpoint}] Snapshot session {Old} for partition {PartitionId} (index {OldIndex}, {Bytes} bytes staged) dropped: the install at index {Index} from {Leader} started",
+                    localEndpoint, session.Key.SessionId, partitionId, session.SnapshotIndex, session.AccumulatedBytes,
+                    keep.SnapshotIndex, keep.Key.LeaderEndpoint);
         }
     }
 
@@ -736,7 +1012,7 @@ internal sealed class SnapshotReceiver
         get { lock (_pendingSnapshotsLock) return _sessions.Count; }
     }
 
-    /// <summary>Returns total buffered snapshot bytes across active sessions. For test assertions only.</summary>
+    /// <summary>Total buffered snapshot bytes across active sessions. Published as a gauge.</summary>
     internal long PendingByteCount
     {
         get { lock (_pendingSnapshotsLock) return _totalPendingBytes; }
@@ -775,12 +1051,32 @@ internal sealed class SnapshotReceiver
 
     /// <summary>
     /// Bytes staged in memory rather than in spill files, across pending sessions and buffers still
-    /// installing. For test assertions only.
+    /// installing. Published as a gauge.
     /// </summary>
     internal long InMemoryStagedByteCount
     {
         get { lock (_pendingSnapshotsLock) return _inMemoryBytes; }
     }
+
+    /// <summary>
+    /// Staged bytes of buffers whose install is queued or running. Published as a gauge.
+    /// </summary>
+    internal long InstallingByteCount
+    {
+        get { lock (_pendingSnapshotsLock) return _inInstallBytes; }
+    }
+
+    /// <summary>Installs queued or running across all partitions. For test assertions only.</summary>
+    internal int ActiveInstallCount
+    {
+        get { lock (_pendingSnapshotsLock) return _inInstallCount; }
+    }
+
+    /// <summary>
+    /// Highest managed-heap size sampled while an install was starting, running or ending on this
+    /// node (see <see cref="SampleInstallHeap"/>); 0 before the first install. Published as a gauge.
+    /// </summary>
+    internal long InstallPeakHeapBytes => Volatile.Read(ref _installPeakHeapBytes);
 
     /// <summary>Pending sessions whose bytes have moved to a spill file. For test assertions only.</summary>
     internal int SpilledSessionCount
@@ -844,6 +1140,46 @@ internal sealed class SnapshotReceiver
 
         foreach (SnapshotReceiveSession session in pendingSessions)
             DisposeSessionResources(session);
+    }
+
+    /// <summary>
+    /// One install of a partition: queued or running until <see cref="Completed"/>, then the record of
+    /// how it ended. Mutable fields are only touched under the receiver lock.
+    /// </summary>
+    private sealed class SnapshotInstallRecord
+    {
+        internal required SnapshotSessionKey Key { get; init; }
+        internal required long SnapshotIndex { get; init; }
+        internal required long LeaderTerm { get; init; }
+
+        /// <summary>Index of the session's terminal chunk: a repeat of exactly that chunk asks about this install.</summary>
+        internal required int TerminalChunkIndex { get; init; }
+
+        internal required long StagedBytes { get; init; }
+
+        /// <summary>The part of <see cref="StagedBytes"/> held in memory rather than in a spill file.</summary>
+        internal required long InMemoryBytes { get; init; }
+
+        internal required long StartedTimestamp { get; init; }
+
+        /// <summary>The staged snapshot while the install reads it; null once it has been released.</summary>
+        internal SnapshotReceiveBuffer? Buffer;
+
+        internal bool Completed;
+
+        /// <summary>How the install ended. Meaningful once <see cref="Completed"/>.</summary>
+        internal SnapshotInstallOutcome Outcome;
+
+        /// <summary>Bytes the importer had consumed when the install ended.</summary>
+        internal long FinalProgress;
+
+        /// <summary>
+        /// Completes with the install's answer. Continuations run asynchronously: the install completes
+        /// on the path that released the partition executor, and a waiting transport call must not
+        /// resume inline there.
+        /// </summary>
+        internal TaskCompletionSource<SnapshotResponse> Completion { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
     /// <summary>

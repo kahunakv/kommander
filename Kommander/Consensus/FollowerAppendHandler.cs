@@ -124,7 +124,9 @@ internal sealed class FollowerAppendHandler
         long prevLogIndex = 0,
         long prevLogTerm = 0,
         ulong? replyCorrelationId = null,
-        bool quiesce = false
+        bool quiesce = false,
+        long retentionFloor = 0,
+        long retentionBudget = 0
     )
     {
         long appendStartTicks = logs is { Count: > 0 } ? RoundStageInstrumentation.Stamp() : 0;
@@ -227,6 +229,16 @@ internal sealed class FollowerAppendHandler
         // on SWIM liveness instead.  Any non-quiesce AppendLogs (real logs or normal heartbeat)
         // wakes us back up by clearing the flag.
         coreState.SetQuiesced(quiesce);
+
+        // Hold this node's WAL compaction where the leader holds its own. The leader keeps the log
+        // for a replica that is behind; without the same hold here, this node compacts to its
+        // checkpoint and, if it leads next, cannot serve that replica from the log — the leader
+        // change turns a catch-up by backfill into a whole-partition snapshot. Applied from every
+        // accepted AppendLogs, so it stays fresh while the leader beats and goes stale (the WAL
+        // ignores it) when the leader stops. Zero is no statement: a leader that predates the field,
+        // or one that has not computed a floor in its term yet, leaves the last floor in place.
+        if (retentionFloor > 0)
+            wal.SetLiveReplicaRetentionFloor(retentionFloor, retentionBudget);
 
         // ── Pre-restore fence ─────────────────────────────────────────────────────────────
         // Until Phase 2 of the restore has run, every frontier below is at its init: the contiguous

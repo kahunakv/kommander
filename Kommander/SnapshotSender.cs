@@ -49,6 +49,23 @@ namespace Kommander;
 /// allocation-hungry operation in the process on a 100–200 ms failure backoff. Exports above
 /// <see cref="RaftConfiguration.SnapshotExportRetryCacheMaxBytes"/> stream chunk-by-chunk exactly
 /// as before and are not cached.</para>
+///
+/// <para><b>The install is awaited, not timed.</b> A chunk acknowledgement is bounded by
+/// <see cref="RaftConfiguration.SnapshotChunkAckTimeout"/>; the follower's install is not, because
+/// it takes as long as the application's import does. The receiver therefore answers the terminal
+/// chunk with <see cref="SnapshotInstallOutcome.InstallPending"/> and this sender polls for the
+/// outcome (<see cref="AwaitInstallAsync"/>), bounded by the install's reported progress rather than
+/// by a fixed time. When the terminal chunk's call was instead held open for the install, a large
+/// partition on a busy disk missed the deadline every time: the attempt was recorded as a rejected
+/// last chunk, and the retry exported the partition again at a newer index while the follower was
+/// still importing the first one — six exports in four minutes, and a follower that ran out of
+/// memory under the copies (CamusDB fault soak rl5).</para>
+///
+/// <para><b>A retry resumes.</b> Every attempt asks the follower, before exporting anything, whether
+/// an install of the partition is already queued or running there — this leader's earlier attempt,
+/// or a previous leader's. If one is, the attempt waits for it and exports nothing. The session whose
+/// terminal chunk went unanswered is remembered per follower (<see cref="unresolvedInstalls"/>), so
+/// an install that finished while no call was open is adopted instead of being sent again.</para>
 /// </summary>
 internal sealed class SnapshotSender
 {
@@ -79,6 +96,40 @@ internal sealed class SnapshotSender
     /// snapshot bytes soon after.
     /// </summary>
     private const long ExportCacheTtlMs = 2 * MaxPauseMs;
+
+    /// <summary>First pause before asking the follower what became of an install; doubles per poll.</summary>
+    private static readonly TimeSpan InstallPollMinPause = TimeSpan.FromMilliseconds(10);
+
+    /// <summary>
+    /// Longest pause between two polls of a running install: what a finished install waits, at most,
+    /// before its leader hears of it.
+    /// </summary>
+    private static readonly TimeSpan InstallPollMaxPause = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>
+    /// A follower-side install a transfer is waiting for, or stopped waiting for without learning
+    /// how it ended.
+    /// </summary>
+    private readonly record struct AwaitedInstall(string SessionId, long SnapshotIndex);
+
+    /// <summary>
+    /// Per follower, the install whose outcome this leader does not know: the session of a terminal
+    /// chunk that was never answered, or an install a transfer stopped waiting for (a step timeout,
+    /// unanswered polls, a lost leadership). The next attempt names it in its first question to the
+    /// follower, so an install that has finished meanwhile is adopted and one that is still running
+    /// is waited for — neither is sent again. Removed once the follower reports an outcome for it or
+    /// no longer knows it.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, AwaitedInstall> unresolvedInstalls = new();
+
+    /// <summary>
+    /// Per follower, the snapshot index of the install its in-flight transfer is currently waiting
+    /// for. Diagnostic: surfaced as <see cref="RaftSnapshotStatus.AwaitingInstall"/>.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, long> awaitingInstallIndexes = new();
+
+    /// <summary>Last Warning-level "waiting for an install already running" line per endpoint — see <see cref="RescueWarnCooldownMs"/>.</summary>
+    private readonly ConcurrentDictionary<string, long> lastWaitWarnTicks = new();
 
     /// <summary>
     /// In-flight guard, keyed by follower endpoint. The value is the transfer's start timestamp
@@ -447,6 +498,7 @@ internal sealed class SnapshotSender
         {
             long remainingTicks = Volatile.Read(ref state.PausedUntilTicks) - now;
             bool inFlight = pendingSnapshotEndpoints.TryGetValue(endpoint, out long startedTicks);
+            bool awaiting = awaitingInstallIndexes.TryGetValue(endpoint, out long awaitedIndex);
             (bool notConverging, int cycles) = ReadRescueView(endpoint);
             statuses.Add(new RaftSnapshotStatus
             {
@@ -455,6 +507,8 @@ internal sealed class SnapshotSender
                 LastError = state.LastError,
                 Unproducible = state.Unproducible,
                 InFlight = inFlight,
+                AwaitingInstall = awaiting,
+                AwaitingInstallIndex = awaiting ? awaitedIndex : null,
                 InFlightFor = inFlight
                     ? TimeSpan.FromSeconds((double)(now - startedTicks) / Stopwatch.Frequency)
                     : null,
@@ -474,11 +528,14 @@ internal sealed class SnapshotSender
             if (!reported.Add(endpoint))
                 continue;
 
+            bool awaiting = awaitingInstallIndexes.TryGetValue(endpoint, out long awaitedIndex);
             (bool notConverging, int cycles) = ReadRescueView(endpoint);
             statuses.Add(new RaftSnapshotStatus
             {
                 FollowerEndpoint = endpoint,
                 InFlight = true,
+                AwaitingInstall = awaiting,
+                AwaitingInstallIndex = awaiting ? awaitedIndex : null,
                 InFlightFor = TimeSpan.FromSeconds((double)(now - startedTicks) / Stopwatch.Frequency),
                 RescueNotConverging = notConverging,
                 ConsecutiveRescueCycles = cycles,
@@ -618,6 +675,47 @@ internal sealed class SnapshotSender
 
         try
         {
+            // Ask before exporting. An install of this partition may already be queued or running
+            // on the follower — the one an earlier attempt of this leader sent, or a previous
+            // leader's — and a second snapshot cannot be installed until it has finished. Waiting
+            // for it costs nothing here; exporting again costs the whole partition on this node
+            // and a second copy of it on the follower.
+            unresolvedInstalls.TryGetValue(node.Endpoint, out AwaitedInstall remembered);
+
+            SnapshotResponse known = await QueryInstallAsync(
+                node, remembered.SessionId ?? "", snapshotIndex, leaderTerm, stepTimeout, transferCts).ConfigureAwait(false);
+
+            switch (known.Outcome)
+            {
+                case SnapshotInstallOutcome.InstallPending:
+                {
+                    SnapshotResponse? ended = await AwaitInstallAsync(
+                        node, known, snapshotIndex, leaderTerm, stepTimeout, transferCts, sentByThisTransfer: false).ConfigureAwait(false);
+
+                    if (ended is not null)
+                        CompleteTransfer(node, ended.Outcome, InstalledIndex(ended, snapshotIndex), chunksSent: 0);
+
+                    return;
+                }
+
+                case SnapshotInstallOutcome.Installed or SnapshotInstallOutcome.SkippedAlreadyCovered:
+                    // The install this leader sent earlier and never heard back about has finished.
+                    unresolvedInstalls.TryRemove(node.Endpoint, out _);
+                    CompleteTransfer(node, known.Outcome, InstalledIndex(known, snapshotIndex), chunksSent: 0);
+                    return;
+
+                case SnapshotInstallOutcome.NoInstall:
+                case SnapshotInstallOutcome.Rejected when known.InstallIndex > 0:
+                    // The follower no longer knows the remembered install, or it failed there:
+                    // nothing to wait for, the transfer starts over.
+                    unresolvedInstalls.TryRemove(node.Endpoint, out _);
+                    break;
+
+                // Anything else is no answer at all (a receiver that predates the question, or a
+                // call that failed): nothing is known, so the transfer proceeds as it always did
+                // and the remembered install, if any, is asked about again next time.
+            }
+
             CachedExport? cached = TryGetReusableExport(snapshotIndex);
 
             Stream? snapshot = null;
@@ -642,7 +740,7 @@ internal sealed class SnapshotSender
             // drain time and travels in the cache entry.
             using IncrementalHash snapshotHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
 
-            SnapshotInstallOutcome outcome;
+            SnapshotResponse answer;
             int chunksSent;
             try
             {
@@ -663,7 +761,7 @@ internal sealed class SnapshotSender
                     }
                 }
 
-                (outcome, chunksSent) = cached is not null
+                (answer, chunksSent) = cached is not null
                     ? await SendCachedChunksAsync(node, cached, sessionId, leaderTerm, lastIncludedTerm, stepTimeout, transferCts).ConfigureAwait(false)
                     : await StreamChunksAsync(node, snapshot!, overflowPrefix, sessionId, snapshotIndex, kind, leaderTerm, lastIncludedTerm, chunkSize, snapshotHash, stepTimeout, transferCts).ConfigureAwait(false);
             }
@@ -673,11 +771,27 @@ internal sealed class SnapshotSender
                     await snapshot.DisposeAsync().ConfigureAwait(false);
             }
 
+            // The receiver has the snapshot (or refused to stage it because another install of the
+            // partition is running) and the install's outcome is a separate question: wait for it.
+            // The export stream and the read buffer are released by now; only the retry cache, if
+            // the export fitted it, outlives the wait.
+            if (answer.Outcome == SnapshotInstallOutcome.InstallPending)
+            {
+                SnapshotResponse? ended = await AwaitInstallAsync(
+                    node, answer, snapshotIndex, leaderTerm, stepTimeout, transferCts,
+                    sentByThisTransfer: string.Equals(answer.InstallSessionId, sessionId, StringComparison.Ordinal)).ConfigureAwait(false);
+
+                if (ended is null)
+                    return; // failure recorded, or the wait was given up, by AwaitInstallAsync
+
+                answer = ended;
+            }
+
             // The terminal chunk's answer is the only statement about installation. A receiver
             // that acknowledged it as a mere staged chunk never ran the install: that is not a
             // seeded follower, and treating it as one is exactly how a follower that imported
             // nothing was logged as seeded while its acknowledged writes went missing.
-            if (outcome == SnapshotInstallOutcome.ChunkAccepted)
+            if (answer.Outcome == SnapshotInstallOutcome.ChunkAccepted)
             {
                 RecordFailure(node.Endpoint, cause: "terminal_chunk_without_install",
                     error: $"the receiver acknowledged the terminal chunk for index {snapshotIndex} without an install outcome (an older receiver, or a chunk pipeline that answered before the install ran)",
@@ -685,45 +799,10 @@ internal sealed class SnapshotSender
                 return;
             }
 
-            if (outcome is SnapshotInstallOutcome.Installed or SnapshotInstallOutcome.SkippedAlreadyCovered)
+            if (answer.Outcome is SnapshotInstallOutcome.Installed or SnapshotInstallOutcome.SkippedAlreadyCovered)
             {
-                failureStates.TryRemove(node.Endpoint, out _);
-
-                // Arm the post-success pause before the pending guard is released (finally below):
-                // the refusal-path escalation can fire again on the very next ack, and the follower
-                // legitimately keeps reporting a below-floor frontier until the install lands.
-                successPauseUntilTicks[node.Endpoint] =
-                    host.GetMonotonicTimestamp() + MsToTicks(BasePauseMs());
-
-                // Convergence accounting must be armed before the pending guard is released too:
-                // if the next escalation for this endpoint pairs with this install, that is one
-                // non-converging rescue cycle (see RescueCycleAdmits).
-                RecordInstallForConvergenceTracking(node.Endpoint);
-
-                // Warning outside the cooldown: this line ends a below-the-floor rescue incident
-                // and must be visible at the default consumer log level (see RescueWarnCooldownMs).
-                // "Seeded" is written only for an install the receiver reports as an import; a
-                // skip says so, because nothing on the receiver changed.
-                bool warn = TryOpenWarnWindow(lastInstallWarnTicks, node.Endpoint);
-                if (outcome == SnapshotInstallOutcome.Installed)
-                {
-                    if (warn)
-                        logger.LogWarnSnapshotInstalled(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex, chunksSent);
-                    else if (logger.IsEnabled(LogLevel.Debug))
-                        logger.LogDebugSnapshotInstalled(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex, chunksSent);
-                }
-                else
-                {
-                    if (warn)
-                        logger.LogWarnSnapshotSkippedAlreadyCovered(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex, chunksSent);
-                    else if (logger.IsEnabled(LogLevel.Debug))
-                        logger.LogDebugSnapshotSkippedAlreadyCovered(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex, chunksSent);
-                }
-
-                getPostToExecutor()?.Invoke(new RaftRequest(
-                    RaftRequestType.SnapshotInstalled,
-                    commitIndex: snapshotIndex,
-                    endpoint: node.Endpoint));
+                unresolvedInstalls.TryRemove(node.Endpoint, out _);
+                CompleteTransfer(node, answer.Outcome, InstalledIndex(answer, snapshotIndex), chunksSent);
             }
         }
         catch (TimeoutException ex)
@@ -744,6 +823,259 @@ internal sealed class SnapshotSender
             pendingSnapshotEndpoints.TryRemove(node.Endpoint, out _);
             forcedEndpoints.TryRemove(node.Endpoint, out _);
         }
+    }
+
+    /// <summary>
+    /// The index the follower's boundary now covers: the one the install carried when the receiver
+    /// names it (an awaited install can be an earlier attempt's, at an older checkpoint), else the
+    /// index this transfer sent.
+    /// </summary>
+    private static long InstalledIndex(SnapshotResponse answer, long snapshotIndex) =>
+        answer.InstallIndex > 0 ? answer.InstallIndex : snapshotIndex;
+
+    /// <summary>
+    /// Closes a transfer whose follower reports the snapshot installed or already covered at
+    /// <paramref name="installedIndex"/>: clears the failure episode, arms the post-success pause and
+    /// the convergence accounting, logs the outcome, and posts the cursor advance to the executor.
+    /// <paramref name="chunksSent"/> is 0 when this transfer sent nothing and only waited for an
+    /// install that was already running.
+    /// <para>The index is trusted whoever sent that install. It is a checkpoint of the leader that
+    /// exported it, so it is committed and this leader holds the same entries through it; and the
+    /// receiver validated that sender's term and membership before it imported anything.</para>
+    /// </summary>
+    private void CompleteTransfer(RaftNode node, SnapshotInstallOutcome outcome, long installedIndex, int chunksSent)
+    {
+        failureStates.TryRemove(node.Endpoint, out _);
+
+        // Arm the post-success pause before the pending guard is released (the caller's finally):
+        // the refusal-path escalation can fire again on the very next ack, and the follower
+        // legitimately keeps reporting a below-floor frontier until the install lands.
+        successPauseUntilTicks[node.Endpoint] =
+            host.GetMonotonicTimestamp() + MsToTicks(BasePauseMs());
+
+        // Convergence accounting must be armed before the pending guard is released too:
+        // if the next escalation for this endpoint pairs with this install, that is one
+        // non-converging rescue cycle (see RescueCycleAdmits).
+        RecordInstallForConvergenceTracking(node.Endpoint);
+
+        // Warning outside the cooldown: this line ends a below-the-floor rescue incident
+        // and must be visible at the default consumer log level (see RescueWarnCooldownMs).
+        // "Seeded" is written only for an install the receiver reports as an import; a
+        // skip says so, because nothing on the receiver changed.
+        bool warn = TryOpenWarnWindow(lastInstallWarnTicks, node.Endpoint);
+        if (outcome == SnapshotInstallOutcome.Installed)
+        {
+            if (warn)
+                logger.LogWarnSnapshotInstalled(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, installedIndex, chunksSent);
+            else if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebugSnapshotInstalled(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, installedIndex, chunksSent);
+        }
+        else
+        {
+            if (warn)
+                logger.LogWarnSnapshotSkippedAlreadyCovered(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, installedIndex, chunksSent);
+            else if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebugSnapshotSkippedAlreadyCovered(host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, installedIndex, chunksSent);
+        }
+
+        getPostToExecutor()?.Invoke(new RaftRequest(
+            RaftRequestType.SnapshotInstalled,
+            commitIndex: installedIndex,
+            endpoint: node.Endpoint));
+    }
+
+    /// <summary>
+    /// Asks the follower what became of an install of this partition: the one named by
+    /// <paramref name="sessionId"/>, or, with an empty id, whether any is queued or running. One
+    /// transport call bounded like a chunk acknowledgement; a call that fails reads as
+    /// <see cref="SnapshotInstallOutcome.Rejected"/> with no install named.
+    /// </summary>
+    private Task<SnapshotResponse> QueryInstallAsync(
+        RaftNode node,
+        string sessionId,
+        long snapshotIndex,
+        long leaderTerm,
+        TimeSpan stepTimeout,
+        CancellationTokenSource transferCts)
+    {
+        SnapshotRequest query = new()
+        {
+            StatusQuery = true,
+            InstallPolling = true,
+            SessionId = sessionId,
+            PartitionId = host.PartitionId,
+            SnapshotIndex = snapshotIndex,
+            FollowerEndpoint = node.Endpoint,
+            LeaderTerm = leaderTerm,
+            LeaderEndpoint = host.LocalEndpoint,
+            // Not a chunk. A receiver that predates the query reads a negative index as an
+            // invalid chunk and refuses it without opening or touching a session.
+            ChunkIndex = -1,
+        };
+
+        return AwaitStepAsync(
+            host.QuerySnapshotInstallAsync(node, query, transferCts.Token),
+            ChunkAckTimeout(stepTimeout), transferCts, "install status query");
+    }
+
+    /// <summary>
+    /// Waits for the follower-side install described by <paramref name="pending"/> and returns the
+    /// answer that reports it <see cref="SnapshotInstallOutcome.Installed"/> or
+    /// <see cref="SnapshotInstallOutcome.SkippedAlreadyCovered"/>; returns <see langword="null"/>
+    /// when the wait ended any other way (the failure is recorded here, or the wait was given up
+    /// because this node stopped leading).
+    ///
+    /// <para><b>Bounded by progress.</b> The follower reports how far the install has read into its
+    /// staged snapshot. The wait ends with a <see cref="TimeoutException"/> — recorded by the caller
+    /// as <c>step_timeout</c>, like any step that stopped moving — only when that figure has not
+    /// changed for <see cref="RaftConfiguration.SnapshotTransferStepTimeout"/>. How long the install
+    /// takes in total is the application's business: a 200,000-record import on a disk at 90% busy
+    /// takes tens of seconds, and a fixed bound sized for a chunk cut every one of them off.</para>
+    ///
+    /// <para><b>What ends it otherwise.</b> The follower reports the install failed
+    /// (<c>install_failed</c>); it no longer knows the install, because it restarted
+    /// (<c>install_lost</c>); or it has not answered any poll for
+    /// <see cref="RaftConfiguration.SnapshotChunkAckTimeout"/> (<c>install_status_unanswered</c>).
+    /// In the last case, and on a timeout, the install stays remembered in
+    /// <see cref="unresolvedInstalls"/> and the next attempt asks about it before exporting.</para>
+    ///
+    /// <para>The follower runs one install per partition, so the install being waited for can be
+    /// replaced by another while this loop runs (the first ended, a different sender's began). The
+    /// loop then waits for that one: it is what stands between this follower and a new transfer.</para>
+    /// </summary>
+    private async Task<SnapshotResponse?> AwaitInstallAsync(
+        RaftNode node,
+        SnapshotResponse pending,
+        long snapshotIndex,
+        long leaderTerm,
+        TimeSpan stepTimeout,
+        CancellationTokenSource transferCts,
+        bool sentByThisTransfer)
+    {
+        AwaitedInstall awaited = new(pending.InstallSessionId, pending.InstallIndex);
+        unresolvedInstalls[node.Endpoint] = awaited;
+        awaitingInstallIndexes[node.Endpoint] = awaited.SnapshotIndex;
+
+        if (!sentByThisTransfer)
+            LogWaitingForRunningInstall(node.Endpoint, snapshotIndex, pending);
+        else if (logger.IsEnabled(LogLevel.Debug))
+            logger.LogDebug(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot for {Endpoint} at index {Index} is staged there; waiting for its install",
+                host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, awaited.SnapshotIndex);
+
+        long progress = pending.InstallProgress;
+        long lastProgressTicks = host.GetMonotonicTimestamp();
+        long lastAnswerTicks = lastProgressTicks;
+        TimeSpan pause = InstallPollMinPause;
+        TimeSpan unansweredBound = ChunkAckTimeout(stepTimeout);
+
+        try
+        {
+            while (true)
+            {
+                await PauseAsync(pause).ConfigureAwait(false);
+                if (pause < InstallPollMaxPause)
+                    pause = pause + pause < InstallPollMaxPause ? pause + pause : InstallPollMaxPause;
+
+                // A deposed leader has no use for the outcome: its successor asks the follower
+                // itself. The install stays remembered in case this node leads again. A node that
+                // has been disposed has no use for anything.
+                if (host.IsStopped || getNodeState() != RaftNodeState.Leader)
+                {
+                    if (logger.IsEnabled(LogLevel.Debug))
+                        logger.LogDebug(
+                            "[{LocalEndpoint}/{PartitionId}/{State}] No longer waiting for the snapshot install on {Endpoint} at index {Index}: this node stopped leading",
+                            host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, awaited.SnapshotIndex);
+                    return null;
+                }
+
+                SnapshotResponse answer = await QueryInstallAsync(
+                    node, awaited.SessionId, snapshotIndex, leaderTerm, stepTimeout, transferCts).ConfigureAwait(false);
+
+                long now = host.GetMonotonicTimestamp();
+
+                switch (answer.Outcome)
+                {
+                    case SnapshotInstallOutcome.InstallPending:
+                        lastAnswerTicks = now;
+
+                        if (!string.Equals(answer.InstallSessionId, awaited.SessionId, StringComparison.Ordinal))
+                        {
+                            awaited = new AwaitedInstall(answer.InstallSessionId, answer.InstallIndex);
+                            unresolvedInstalls[node.Endpoint] = awaited;
+                            awaitingInstallIndexes[node.Endpoint] = awaited.SnapshotIndex;
+                            progress = answer.InstallProgress;
+                            lastProgressTicks = now;
+                        }
+                        else if (answer.InstallProgress != progress)
+                        {
+                            progress = answer.InstallProgress;
+                            lastProgressTicks = now;
+                        }
+                        else if (Stopwatch.GetElapsedTime(lastProgressTicks, now) >= stepTimeout)
+                        {
+                            throw new TimeoutException(
+                                $"the snapshot install at index {awaited.SnapshotIndex} on the follower made no progress within {stepTimeout.TotalSeconds:0.##}s (SnapshotTransferStepTimeout; {progress} staged bytes read); it is still running there and the next attempt waits for it instead of sending again");
+                        }
+
+                        continue;
+
+                    case SnapshotInstallOutcome.Installed or SnapshotInstallOutcome.SkippedAlreadyCovered:
+                        unresolvedInstalls.TryRemove(node.Endpoint, out _);
+                        return answer;
+
+                    case SnapshotInstallOutcome.NoInstall:
+                        unresolvedInstalls.TryRemove(node.Endpoint, out _);
+                        RecordFailure(node.Endpoint, cause: "install_lost",
+                            error: $"the follower no longer reports the snapshot install at index {awaited.SnapshotIndex} that was running there (it restarted, or another install replaced it and ended)",
+                            unproducible: false);
+                        return null;
+
+                    case SnapshotInstallOutcome.Rejected when answer.InstallIndex > 0:
+                        unresolvedInstalls.TryRemove(node.Endpoint, out _);
+                        RecordFailure(node.Endpoint, cause: "install_failed",
+                            error: $"the snapshot install at index {answer.InstallIndex} failed on the follower (its log says why)",
+                            unproducible: false);
+                        return null;
+
+                    default:
+                        // No answer: the call failed or the follower refused the question. The
+                        // install may well be running; keep asking until the follower has been
+                        // silent for as long as a chunk acknowledgement may take.
+                        if (Stopwatch.GetElapsedTime(lastAnswerTicks, now) >= unansweredBound)
+                        {
+                            RecordFailure(node.Endpoint, cause: "install_status_unanswered",
+                                error: $"the follower has not answered for {unansweredBound.TotalSeconds:0.##}s what became of the snapshot install at index {awaited.SnapshotIndex} (SnapshotChunkAckTimeout); the next attempt asks again before sending anything",
+                                unproducible: false);
+                            return null;
+                        }
+
+                        continue;
+                }
+            }
+        }
+        finally
+        {
+            awaitingInstallIndexes.TryRemove(node.Endpoint, out _);
+        }
+    }
+
+    /// <summary>
+    /// One line when a transfer finds an install it did not send already running on the follower and
+    /// waits for it. Warning outside the cooldown: the line explains why an escalation at one index
+    /// is followed by no export and by an install reported at another.
+    /// </summary>
+    private void LogWaitingForRunningInstall(string endpoint, long snapshotIndex, SnapshotResponse pending)
+    {
+        if (TryOpenWarnWindow(lastWaitWarnTicks, endpoint))
+            logger.LogWarning(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot transfer to {Endpoint} at index {Index} is waiting for an install already running there (index {InstallIndex}, sent by {InstallLeader} in term {InstallTerm}, {Progress} staged bytes read). Nothing more is staged on the follower until that install ends; its outcome decides whether a transfer is still needed",
+                host.LocalEndpoint, host.PartitionId, getNodeState(), endpoint, snapshotIndex,
+                pending.InstallIndex, pending.InstallLeaderEndpoint, pending.InstallLeaderTerm, pending.InstallProgress);
+        else if (logger.IsEnabled(LogLevel.Debug))
+            logger.LogDebug(
+                "[{LocalEndpoint}/{PartitionId}/{State}] Snapshot transfer to {Endpoint} at index {Index} is waiting for the install already running there at index {InstallIndex}",
+                host.LocalEndpoint, host.PartitionId, getNodeState(), endpoint, snapshotIndex, pending.InstallIndex);
     }
 
     /// <summary>
@@ -921,11 +1253,12 @@ internal sealed class SnapshotSender
 
     /// <summary>
     /// Replays a fully cached export chunk by chunk; no stream and no rented buffer are involved.
-    /// Returns the terminal chunk's outcome (or
-    /// <see cref="SnapshotInstallOutcome.Rejected"/> at the first refused chunk) and the number
-    /// of chunks sent.
+    /// Returns the terminal chunk's answer and the number of chunks sent — or, from the chunk that
+    /// stopped the transfer, a <see cref="SnapshotInstallOutcome.Rejected"/> answer or the
+    /// <see cref="SnapshotInstallOutcome.InstallPending"/> one of a receiver that stages nothing
+    /// while another install of the partition runs.
     /// </summary>
-    private async Task<(SnapshotInstallOutcome Outcome, int ChunksSent)> SendCachedChunksAsync(
+    private async Task<(SnapshotResponse Answer, int ChunksSent)> SendCachedChunksAsync(
         RaftNode node,
         CachedExport cached,
         string sessionId,
@@ -938,30 +1271,39 @@ internal sealed class SnapshotSender
         for (int chunkIndex = 0; chunkIndex < chunks.Count; chunkIndex++)
         {
             bool isLast = chunkIndex == chunks.Count - 1;
-            SnapshotInstallOutcome chunkOutcome = await SendOneChunkAsync(
+            SnapshotResponse chunkAnswer = await SendOneChunkAsync(
                 node, sessionId, cached.SnapshotIndex, cached.Kind, leaderTerm, lastIncludedTerm,
                 chunkIndex, isLast, chunks[chunkIndex],
                 isLast ? cached.Checksum : "",
                 stepTimeout, transferCts).ConfigureAwait(false);
 
-            if (chunkOutcome == SnapshotInstallOutcome.Rejected)
-                return (SnapshotInstallOutcome.Rejected, chunkIndex);
-
+            // The terminal chunk's answer is the transfer's, whatever it says; a refused one was
+            // not delivered and does not count as sent.
             if (isLast)
-                return (chunkOutcome, chunks.Count);
+                return (chunkAnswer, chunkAnswer.Outcome == SnapshotInstallOutcome.Rejected ? chunkIndex : chunks.Count);
+
+            if (StopsTheTransfer(chunkAnswer))
+                return (chunkAnswer, chunkIndex);
         }
 
-        return (SnapshotInstallOutcome.Rejected, chunks.Count);
+        return (new SnapshotResponse(SnapshotInstallOutcome.Rejected), chunks.Count);
     }
+
+    /// <summary>
+    /// Whether a chunk's answer ends the chunk loop before the terminal chunk: the receiver refused
+    /// the chunk, or it is staging nothing for this partition because another install is running.
+    /// </summary>
+    private static bool StopsTheTransfer(SnapshotResponse chunkAnswer) =>
+        chunkAnswer.Outcome is SnapshotInstallOutcome.Rejected or SnapshotInstallOutcome.InstallPending;
 
     /// <summary>
     /// The streaming send path: the cache is disabled, or the export crossed the cache bound
     /// mid-drain (then <paramref name="overflowPrefix"/> carries the already-read full-size chunks
     /// to send first, already hashed into <paramref name="snapshotHash"/>). Returns the terminal
-    /// chunk's outcome (or <see cref="SnapshotInstallOutcome.Rejected"/> at the first refused
-    /// chunk) and the number of chunks sent.
+    /// chunk's answer and the number of chunks sent, or the answer of the chunk that stopped the
+    /// transfer (see <see cref="StopsTheTransfer"/>).
     /// </summary>
-    private async Task<(SnapshotInstallOutcome Outcome, int ChunksSent)> StreamChunksAsync(
+    private async Task<(SnapshotResponse Answer, int ChunksSent)> StreamChunksAsync(
         RaftNode node,
         Stream snapshot,
         List<byte[]>? overflowPrefix,
@@ -983,12 +1325,12 @@ internal sealed class SnapshotSender
             {
                 // Never terminal: the drain stops at full-size chunks only, so at least one more
                 // read (possibly returning zero bytes) always follows below.
-                SnapshotInstallOutcome prefixOutcome = await SendOneChunkAsync(
+                SnapshotResponse prefixAnswer = await SendOneChunkAsync(
                     node, sessionId, snapshotIndex, kind, leaderTerm, lastIncludedTerm,
                     chunkIndex, isLast: false, data, "", stepTimeout, transferCts).ConfigureAwait(false);
 
-                if (prefixOutcome == SnapshotInstallOutcome.Rejected)
-                    return (SnapshotInstallOutcome.Rejected, chunkIndex);
+                if (StopsTheTransfer(prefixAnswer))
+                    return (prefixAnswer, chunkIndex);
 
                 chunkIndex++;
             }
@@ -1022,18 +1364,21 @@ internal sealed class SnapshotSender
                 // the next iteration overwrites the buffer, and every transport consumes Data
                 // synchronously within that send (see SnapshotRequest.Data remarks).
                 bufferDetached = true;
-                SnapshotInstallOutcome chunkOutcome = await SendOneChunkAsync(
+                SnapshotResponse chunkAnswer = await SendOneChunkAsync(
                     node, sessionId, snapshotIndex, kind, leaderTerm, lastIncludedTerm,
                     chunkIndex, isLast, buffer.AsMemory(0, bytesRead), checksum,
                     stepTimeout, transferCts).ConfigureAwait(false);
                 bufferDetached = false;
 
-                if (chunkOutcome == SnapshotInstallOutcome.Rejected)
-                    return (SnapshotInstallOutcome.Rejected, chunkIndex);
+                // The terminal chunk's answer is the transfer's, whatever it says; a refused one
+                // was not delivered and does not count as sent.
+                if (isLast)
+                    return (chunkAnswer, chunkAnswer.Outcome == SnapshotInstallOutcome.Rejected ? chunkIndex : chunkIndex + 1);
+
+                if (StopsTheTransfer(chunkAnswer))
+                    return (chunkAnswer, chunkIndex);
 
                 chunkIndex++;
-                if (isLast)
-                    return (chunkOutcome, chunkIndex);
             }
         }
         finally
@@ -1049,13 +1394,16 @@ internal sealed class SnapshotSender
     /// <summary>
     /// Sends one chunk and awaits its acknowledgment under the chunk bound — the smaller of the
     /// step timeout and <see cref="RaftConfiguration.SnapshotChunkAckTimeout"/>, because a chunk to
-    /// a reachable node is seconds of work and a receiver whose install path is wedged must fail
-    /// the transfer in seconds, not minutes. A rejection records the failure and returns
-    /// <see cref="SnapshotInstallOutcome.Rejected"/>; any other outcome is returned as the receiver
-    /// reported it; a hung send propagates as <see cref="TimeoutException"/> to the
-    /// transfer-level handler.
+    /// a reachable node is seconds of work and a receiver whose chunk path is wedged must fail
+    /// the transfer in seconds, not minutes. A rejection records the failure; every answer is
+    /// returned as the receiver reported it; a hung send propagates as
+    /// <see cref="TimeoutException"/> to the transfer-level handler.
+    /// <para>A terminal chunk that is not answered, or is answered with a bare rejection, may still
+    /// have started the install — the answer can be lost after the receiver staged the chunk. Its
+    /// session is remembered in <see cref="unresolvedInstalls"/> so the next attempt asks the
+    /// follower about it before it exports anything.</para>
     /// </summary>
-    private async Task<SnapshotInstallOutcome> SendOneChunkAsync(
+    private async Task<SnapshotResponse> SendOneChunkAsync(
         RaftNode node,
         string sessionId,
         long snapshotIndex,
@@ -1086,25 +1434,43 @@ internal sealed class SnapshotSender
             Kind = kind,
             SnapshotChecksum = checksum,
             Forced = forcedEndpoints.ContainsKey(node.Endpoint),
+            InstallPolling = true,
         };
 
-        TimeSpan chunkTimeout = host.Configuration.SnapshotChunkAckTimeout;
-        if (chunkTimeout > stepTimeout)
-            chunkTimeout = stepTimeout;
-
-        SnapshotResponse response = await AwaitStepAsync(
-            host.SendInstallSnapshotAsync(node, chunk, transferCts.Token),
-            chunkTimeout, transferCts, $"install chunk {chunkIndex}").ConfigureAwait(false);
+        SnapshotResponse response;
+        try
+        {
+            response = await AwaitStepAsync(
+                host.SendInstallSnapshotAsync(node, chunk, transferCts.Token),
+                ChunkAckTimeout(stepTimeout), transferCts, $"install chunk {chunkIndex}").ConfigureAwait(false);
+        }
+        catch (TimeoutException) when (isLast)
+        {
+            unresolvedInstalls[node.Endpoint] = new AwaitedInstall(sessionId, snapshotIndex);
+            throw;
+        }
 
         if (response.Outcome == SnapshotInstallOutcome.Rejected)
         {
+            if (isLast && response.InstallIndex <= 0)
+                unresolvedInstalls[node.Endpoint] = new AwaitedInstall(sessionId, snapshotIndex);
+
             RecordFailure(node.Endpoint, cause: "chunk_rejected",
                 error: $"snapshot chunk {chunkIndex} for index {snapshotIndex} was rejected by the follower",
                 unproducible: false);
-            return SnapshotInstallOutcome.Rejected;
         }
 
-        return response.Outcome;
+        return response;
+    }
+
+    /// <summary>
+    /// The bound on one acknowledgement from the follower — a chunk's, or a status answer's: the
+    /// smaller of <see cref="RaftConfiguration.SnapshotChunkAckTimeout"/> and the step timeout.
+    /// </summary>
+    private TimeSpan ChunkAckTimeout(TimeSpan stepTimeout)
+    {
+        TimeSpan chunkTimeout = host.Configuration.SnapshotChunkAckTimeout;
+        return chunkTimeout > stepTimeout ? stepTimeout : chunkTimeout;
     }
 
     /// <summary>
@@ -1165,11 +1531,33 @@ internal sealed class SnapshotSender
                     $"snapshot transfer step '{stepName}' made no progress within {timeout.TotalSeconds:0.##}s (SnapshotTransferStepTimeout / SnapshotChunkAckTimeout)");
             }
 
-            // No cancellation token: this delay is at most one poll interval, and a cancelled token
-            // would complete it at once and spin this loop.
-            await Task.WhenAny(step, Task.Delay(poll)).ConfigureAwait(false);
+            await Task.WhenAny(step, RealTimePoll(poll)).ConfigureAwait(false);
         }
 
         return await step.ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Waits until <paramref name="duration"/> has passed on the partition's tick source. Like
+    /// <see cref="AwaitStepAsync{T}"/>, the decision reads the tick source and the real-time wait only
+    /// schedules the next check, so under simulation the pause between two polls of a running install
+    /// is simulated time and the number of polls does not depend on the speed of the machine.
+    /// Returns early once the node is disposed: a simulated clock stops with its run, and the pause
+    /// would otherwise never end.
+    /// </summary>
+    private async Task PauseAsync(TimeSpan duration)
+    {
+        long startedTicks = host.GetMonotonicTimestamp();
+        TimeSpan poll = duration < StepWatchdogMaxPoll ? duration : StepWatchdogMaxPoll;
+
+        while (!host.IsStopped && Stopwatch.GetElapsedTime(startedTicks, host.GetMonotonicTimestamp()) < duration)
+            await RealTimePoll(poll).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The one real-time wait in this type: it schedules the next look at the tick source and never
+    /// decides anything itself. No cancellation token: it is at most one poll interval, and a
+    /// cancelled token would complete it at once and spin the loop that awaits it.
+    /// </summary>
+    private static Task RealTimePoll(TimeSpan poll) => Task.Delay(poll);
 }

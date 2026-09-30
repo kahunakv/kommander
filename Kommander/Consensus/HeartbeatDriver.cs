@@ -53,7 +53,17 @@ internal sealed class HeartbeatDriver
     private readonly Dictionary<string, long> silentSinceTicks = new();
 
     /// <summary>
-    /// Floor published for a silent peer with no positional evidence. Any value at or below the
+    /// The term and monotonic tick of the heartbeat round in which this leader first saw each peer
+    /// without positional evidence while SWIM still called it Alive. Backs the same
+    /// <see cref="RaftConfiguration.CompactionSilentPeerRetentionWindow"/> as
+    /// <see cref="silentSinceTicks"/>, for the peer a fresh leader has not heard a position from yet.
+    /// Scoped to the term: a node that leads again starts the window again. Removed when the peer
+    /// reports a position. Executor thread only.
+    /// </summary>
+    private readonly Dictionary<string, (long Term, long Ticks)> unreportedSince = new();
+
+    /// <summary>
+    /// Floor published for a peer with no positional evidence. Any value at or below the
     /// WAL's budget clamp reads as "the whole budget": the WAL keeps at most the published budget
     /// (<see cref="RaftConfiguration.CompactionLiveReplicaLagBudget"/> raised by the time window) below the checkpoint
     /// however low this is, and a peer whose position is unknown may need any of them.
@@ -400,10 +410,23 @@ internal sealed class HeartbeatDriver
     ///   being re-seeded by snapshot (the Caraxes bank-leader-kill residue: the floor ran past the
     ///   restarting leader twice inside one 30-second outage). Past the window it holds nothing; the
     ///   budget bounds the cost either way.</item>
-    ///   <item>A peer with no positional evidence contributes nothing: there is no index to hold
-    ///   at, and a blank joiner on a compacted WAL is seeded by snapshot anyway. Position 0 counts
-    ///   as no evidence — election seeding sets <c>matchIndex</c> to 0 optimistically for every
-    ///   peer, including in-sync ones whose legacy acks never advance it.</item>
+    ///   <item>A live peer with no positional evidence holds the budget's full depth, like a silent
+    ///   one, until it reports a position or the same window has passed since this leader first saw
+    ///   it without one in its current term. A fresh leader has evidence for nobody in its first
+    ///   round: holding nothing then let a compaction pass run to the checkpoint before the first
+    ///   acks arrived, past the replica the previous leader had been holding the log for. Past the
+    ///   window the peer holds nothing — a blank joiner on a compacted WAL is seeded by snapshot
+    ///   anyway. Position 0 counts as no evidence — election seeding sets <c>matchIndex</c> to 0
+    ///   optimistically for every peer, including in-sync ones whose legacy acks never advance it.</item>
+    ///   <item>The floor is also sent to the followers (<see cref="RaftPartitionCoreState.ReplicatedRetentionFloor"/>),
+    ///   lowered to this leader's own durable commit frontier + 1 when that is the lower of the two.
+    ///   Followers hold their compaction there, so the log a lagging replica needs survives a leader
+    ///   change: only the leader held it before, and a successor that had been a follower had
+    ///   compacted to its checkpoint (CamusDB fault soak rl5 — a replica 100,000 entries behind,
+    ///   served by backfill until the leader stepped down on a disk stall, then re-seeded by
+    ///   snapshot by a successor whose log began at the checkpoint). The leader's own frontier is in
+    ///   it because the leader is the replica a kill or a stall takes out, and its disk can be
+    ///   behind a checkpoint it has already replicated.</item>
     ///   <item>The position is the peer's DURABLE frontier (<see cref="ReplicationTracker.TryGetDurableFrontier"/>)
     ///   whenever it reports one: the floor exists to keep a stalled follower's backfill servable,
     ///   and a stalled follower's protocol frontier keeps rising with every entry it has queued but
@@ -490,19 +513,36 @@ internal sealed class HeartbeatDriver
 
             if (position <= 0)
             {
-                // A live peer with no evidence holds nothing: there is no index to hold at, and a
-                // blank joiner on a compacted WAL is seeded by snapshot anyway. A SILENT peer with no
-                // evidence is different: it is usually a member that was already down when this
-                // leader was elected (the killed leader itself), whose position is at most this
-                // leader's own log and unknowable until it answers, so it holds the whole budget for
-                // the window.
+                // No position on record. A SILENT peer in this state is usually a member that was
+                // already down when this leader was elected (the killed leader itself); a LIVE one
+                // is a peer this leader has not heard from yet — every peer, in a fresh leader's
+                // first round. Either way its position is at most this leader's own log and
+                // unknowable until it answers, so it holds the whole budget: the silent peer for the
+                // window checked above, the live one for the same window from the round this leader
+                // first saw it without a position in this term.
                 if (alive)
-                    continue;
+                {
+                    TimeSpan window = host.Configuration.CompactionSilentPeerRetentionWindow;
+                    if (window <= TimeSpan.Zero)
+                        continue;
+
+                    if (!unreportedSince.TryGetValue(node.Endpoint, out (long Term, long Ticks) since)
+                        || since.Term != coreState.CurrentTerm)
+                    {
+                        since = (coreState.CurrentTerm, nowTicks);
+                        unreportedSince[node.Endpoint] = since;
+                    }
+
+                    if (RaftMonotonic.Elapsed(since.Ticks, nowTicks) > window)
+                        continue;
+                }
 
                 if (UnknownPositionFloor < floor)
                     floor = UnknownPositionFloor;
                 continue;
             }
+
+            unreportedSince.Remove(node.Endpoint);
 
             long needed = position + 1;
 
@@ -522,6 +562,19 @@ internal sealed class HeartbeatDriver
         }
 
         wal.SetLiveReplicaRetentionFloor(floor, budget);
+
+        // What the followers hold. The leader's own durable frontier joins the minimum here and not
+        // above: this node's compaction cannot remove what its own disk has yet to write, but a
+        // follower's can, and this node is the replica that comes back behind after a kill. A
+        // frontier of 0 is no evidence, as it is for a peer.
+        long replicated = floor;
+        long ownDurable = wal.GetDurableCommitFrontier();
+        if (ownDurable > 0 && ownDurable + 1 < replicated)
+            replicated = ownDurable + 1;
+
+        coreState.ReplicatedRetentionFloor = replicated;
+        coreState.ReplicatedRetentionBudget = budget;
+        coreState.ReplicatedRetentionTerm = coreState.CurrentTerm;
     }
 
     /// <summary>

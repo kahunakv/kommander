@@ -37,11 +37,24 @@ public sealed class RaftSnapshotStatus
     public bool InFlight { get; init; }
 
     /// <summary>
-    /// How long the in-flight transfer has been running, or null when none is in flight. A value
-    /// far above the configured <c>SnapshotTransferStepTimeout</c> should be impossible; a value
-    /// near it points at a slow or hung step about to be abandoned and retried.
+    /// How long the in-flight transfer has been running, or null when none is in flight. While the
+    /// transfer is sending, a value near the configured <c>SnapshotTransferStepTimeout</c> points
+    /// at a slow or hung step about to be abandoned and retried. While it is
+    /// <see cref="AwaitingInstall"/> the value can exceed that bound legitimately: the wait lasts
+    /// as long as the follower's install keeps reporting progress.
     /// </summary>
     public TimeSpan? InFlightFor { get; init; }
+
+    /// <summary>
+    /// True while the in-flight transfer has nothing left to send and is waiting for the follower to
+    /// finish installing a snapshot — the one this transfer sent, or one that was already running
+    /// there when it started. A slow install shows here, with <see cref="InFlightFor"/> growing,
+    /// and not as a failed attempt.
+    /// </summary>
+    public bool AwaitingInstall { get; init; }
+
+    /// <summary>The snapshot index of the install the transfer is waiting for, or null when it is not waiting.</summary>
+    public long? AwaitingInstallIndex { get; init; }
 
     /// <summary>When the current failure episode started (UTC), or null if nothing has failed.</summary>
     public DateTimeOffset? FirstFailureAt { get; init; }

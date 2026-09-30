@@ -47,6 +47,29 @@ public sealed class AppendLogsRequest
     public bool Quiesce { get; set; }
 
     /// <summary>
+    /// The leader's live-replica retention floor: the lowest log index a replica of this partition
+    /// still needs from the log — the slowest peer's durable position + 1, or the leader's own when
+    /// its disk is the one behind. A follower holds its WAL compaction there (within
+    /// <see cref="RetentionBudget"/>), exactly as the leader does, so that whichever node leads next
+    /// can still serve that replica by backfill.
+    /// <para><see cref="long.MaxValue"/> says no replica constrains retention. Zero says nothing:
+    /// a leader that predates the field, or one that has not computed a floor in its term yet. The
+    /// follower then keeps whatever floor it last received until that goes stale.</para>
+    /// <para>Without it only the leader held the log for a lagging replica, and the hold was lost
+    /// at every leader change: a successor that had been a follower had compacted to its
+    /// checkpoint, and a replica 100,000 entries behind — served by backfill a second earlier —
+    /// needed a whole-partition snapshot (CamusDB fault soak rl5).</para>
+    /// </summary>
+    public long RetentionFloor { get; set; }
+
+    /// <summary>
+    /// The leader's rate-scaled retention budget in entries, sent with <see cref="RetentionFloor"/>:
+    /// how far below its checkpoint a node keeps entries for that floor. Zero leaves the receiver's
+    /// configured <see cref="RaftConfiguration.CompactionLiveReplicaLagBudget"/> to apply alone.
+    /// </summary>
+    public long RetentionBudget { get; set; }
+
+    /// <summary>
     /// Shared gRPC log payload for one batch fanned out to multiple followers. Populated by the
     /// leader before fan-out; ignored by REST and not serialized on the wire.
     /// </summary>

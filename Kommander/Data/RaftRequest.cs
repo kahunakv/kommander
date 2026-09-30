@@ -97,6 +97,15 @@ public sealed class RaftRequest
     /// </summary>
     public bool Quiesce { get; }
 
+    /// <summary>
+    /// Mirrors <see cref="AppendLogsRequest.RetentionFloor"/>: the leader's live-replica retention
+    /// floor for the follower to apply to its own WAL compaction. Zero carries no statement.
+    /// </summary>
+    public long RetentionFloor { get; }
+
+    /// <summary>Mirrors <see cref="AppendLogsRequest.RetentionBudget"/>.</summary>
+    public long RetentionBudget { get; }
+
     public WALWriteOperation? WalOperation { get; }
 
     /// <summary>
@@ -139,7 +148,9 @@ public sealed class RaftRequest
         long durableIndex = -1,
         long walStallMs = 0,
         long presentIndex = -1,
-        long presentTerm = -1
+        long presentTerm = -1,
+        long retentionFloor = 0,
+        long retentionBudget = 0
     )
     {
         Type = type;
@@ -158,6 +169,8 @@ public sealed class RaftRequest
         PrevLogIndex = prevLogIndex;
         PrevLogTerm = prevLogTerm;
         Quiesce = quiesce;
+        RetentionFloor = retentionFloor;
+        RetentionBudget = retentionBudget;
     }
 
     public RaftRequest(RaftRequestType type, List<RaftLog> logs, bool autoCommit, long expectedGeneration = 0, long expectedTerm = 0)

@@ -1,5 +1,6 @@
 
 using System.Diagnostics.Metrics;
+using Kommander.Data;
 using Kommander.Scheduling;
 using Kommander.WAL.IO;
 
@@ -303,6 +304,40 @@ public static class KommanderMetrics
         SnapshotReceiveSessionsSpilledTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
 
     /// <summary>
+    /// Snapshot chunks not staged because an install of the same partition was queued or running on
+    /// this node. The sender is told to wait for that install (or refused, if it does not poll).
+    /// </summary>
+    internal static readonly Counter<long> SnapshotReceiveSessionsRefusedInstallingTotal =
+        Meter.CreateCounter<long>(
+            "raft.snapshot.receive_sessions_refused_installing_total",
+            description: "Snapshot chunks not staged because an install of the same partition was queued or running.");
+
+    internal static void RecordSnapshotReceiveSessionRefusedInstalling(int partitionId) =>
+        SnapshotReceiveSessionsRefusedInstallingTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
+
+    /// <summary>
+    /// How long a snapshot install took on this node, from the terminal chunk to the install's outcome
+    /// (the wait for the partition executor included), tagged by <c>partition_id</c> and <c>outcome</c>.
+    /// </summary>
+    internal static readonly Histogram<double> SnapshotInstallDurationMs =
+        Meter.CreateHistogram<double>(
+            "raft.snapshot.install_duration_ms",
+            unit: "ms",
+            description: "Duration of a follower-side snapshot install, from the terminal chunk to its outcome.");
+
+    internal static void RecordSnapshotInstallDuration(int partitionId, SnapshotInstallOutcome outcome, double elapsedMs) =>
+        SnapshotInstallDurationMs.Record(elapsedMs,
+            new KeyValuePair<string, object?>("partition_id", partitionId),
+            new KeyValuePair<string, object?>("outcome", OutcomeTag(outcome)));
+
+    private static string OutcomeTag(SnapshotInstallOutcome outcome) => outcome switch
+    {
+        SnapshotInstallOutcome.Installed => "installed",
+        SnapshotInstallOutcome.SkippedAlreadyCovered => "skipped",
+        _ => "rejected",
+    };
+
+    /// <summary>
     /// Restores whose WAL read was narrowed by the soft checkpoint: the application-durability
     /// floor sat above the last hard checkpoint, so replay started at the floor instead. This is
     /// the signal that cold-restart replay is bounded by the application's flush lag rather than
@@ -489,6 +524,9 @@ public static class KommanderMetrics
     private static readonly object _schedulerLock = new();
     private static readonly List<WeakReference<FairWalScheduler>> _registeredSchedulers = [];
 
+    private static readonly object _snapshotReceiverLock = new();
+    private static readonly List<WeakReference<SnapshotReceiver>> _registeredSnapshotReceivers = [];
+
 #if !BROWSER
     // The browser targets have no RocksDbWAL, so they have no engines to register and no RocksDB
     // gauges to publish.
@@ -574,6 +612,30 @@ public static class KommanderMetrics
             description: "Age of the oldest WAL operation accepted for each partition and not yet completed by the storage engine (0 when idle). Rises for as long as a write hangs; the durable-write stall signal.");
 
         Meter.CreateObservableGauge(
+            "raft.snapshot.receive_staged_bytes",
+            static () => SumSnapshotReceivers(static receiver => receiver.PendingByteCount),
+            unit: "By",
+            description: "Snapshot bytes staged on this node by receive sessions whose terminal chunk has not arrived, in memory and in spill files together.");
+
+        Meter.CreateObservableGauge(
+            "raft.snapshot.receive_installing_bytes",
+            static () => SumSnapshotReceivers(static receiver => receiver.InstallingByteCount),
+            unit: "By",
+            description: "Staged snapshot bytes held on this node by installs that are queued or running. At most one snapshot per partition; the import's own working set is on top of it.");
+
+        Meter.CreateObservableGauge(
+            "raft.snapshot.receive_in_memory_bytes",
+            static () => SumSnapshotReceivers(static receiver => receiver.InMemoryStagedByteCount),
+            unit: "By",
+            description: "The part of the staged and installing snapshot bytes that is resident in memory rather than in a spill file. Equal to their sum when no SnapshotStagingDirectory is configured.");
+
+        Meter.CreateObservableGauge(
+            "raft.snapshot.install_peak_heap_bytes",
+            static () => MaxSnapshotReceivers(static receiver => receiver.InstallPeakHeapBytes),
+            unit: "By",
+            description: "Highest managed-heap size sampled on this node while a snapshot install was starting, running or ending (0 before the first install). A high-water mark: it does not fall after the install.");
+
+        Meter.CreateObservableGauge(
             "raft.balancer.count_imbalance",
             static () => BalancerCountImbalance,
             description: "Max node leadership count minus target (P0 leader only; 0 when balancer is off or node is not P0).");
@@ -609,6 +671,57 @@ public static class KommanderMetrics
     {
         lock (_schedulerLock)
             _registeredSchedulers.Add(new WeakReference<FairWalScheduler>(scheduler));
+    }
+
+    /// <summary>
+    /// Registers a snapshot receiver so its staging figures feed the <c>raft.snapshot.receive_*</c>
+    /// and <c>raft.snapshot.install_peak_heap_bytes</c> observable gauges. Called by the
+    /// <see cref="SnapshotReceiver"/> constructor; weak references let a disposed node's receiver be
+    /// collected without unregistration.
+    /// </summary>
+    internal static void RegisterSnapshotReceiver(SnapshotReceiver receiver)
+    {
+        lock (_snapshotReceiverLock)
+            _registeredSnapshotReceivers.Add(new WeakReference<SnapshotReceiver>(receiver));
+    }
+
+    /// <summary>
+    /// One figure for the process: a process normally hosts one node, and where it hosts several (an
+    /// embedded test cluster) their staged bytes share the one heap the figure is read against.
+    /// </summary>
+    private static long SumSnapshotReceivers(Func<SnapshotReceiver, long> read)
+    {
+        long total = 0;
+        ForEachSnapshotReceiver(receiver => total += read(receiver));
+        return total;
+    }
+
+    private static long MaxSnapshotReceivers(Func<SnapshotReceiver, long> read)
+    {
+        long max = 0;
+        ForEachSnapshotReceiver(receiver => max = Math.Max(max, read(receiver)));
+        return max;
+    }
+
+    private static void ForEachSnapshotReceiver(Action<SnapshotReceiver> visit)
+    {
+        // Read outside the registry lock: each figure takes the receiver's own lock.
+        List<SnapshotReceiver> live;
+        lock (_snapshotReceiverLock)
+        {
+            live = new List<SnapshotReceiver>(_registeredSnapshotReceivers.Count);
+
+            for (int i = _registeredSnapshotReceivers.Count - 1; i >= 0; i--)
+            {
+                if (_registeredSnapshotReceivers[i].TryGetTarget(out SnapshotReceiver? receiver))
+                    live.Add(receiver);
+                else
+                    _registeredSnapshotReceivers.RemoveAt(i);
+            }
+        }
+
+        foreach (SnapshotReceiver receiver in live)
+            visit(receiver);
     }
 
 #if !BROWSER

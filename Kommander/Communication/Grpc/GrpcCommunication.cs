@@ -495,6 +495,8 @@ public class GrpcCommunication : ICommunication
         target.PrevLogIndex = request.PrevLogIndex;
         target.PrevLogTerm = request.PrevLogTerm;
         target.Quiesce = request.Quiesce;
+        target.RetentionFloor = request.RetentionFloor;
+        target.RetentionBudget = request.RetentionBudget;
 
         if (request.Logs is { Count: > 0 })
             AddGrpcLogs(target.Logs, request);
@@ -763,6 +765,8 @@ public class GrpcCommunication : ICommunication
                 appendRequest.PrevLogIndex = requestItem.AppendLogs.PrevLogIndex;
                 appendRequest.PrevLogTerm = requestItem.AppendLogs.PrevLogTerm;
                 appendRequest.Quiesce = requestItem.AppendLogs.Quiesce;
+                appendRequest.RetentionFloor = requestItem.AppendLogs.RetentionFloor;
+                appendRequest.RetentionBudget = requestItem.AppendLogs.RetentionBudget;
 
                 if (requestItem.AppendLogs.Logs is { Count: > 0 })
                     AddGrpcLogs(appendRequest.Logs, requestItem.AppendLogs);
@@ -1051,6 +1055,8 @@ public class GrpcCommunication : ICommunication
             LastIncludedTerm = request.LastIncludedTerm,
             SnapshotChecksum = request.SnapshotChecksum,
             Forced = request.Forced,
+            InstallPolling = request.InstallPolling,
+            StatusQuery = request.StatusQuery,
         };
 
         Metadata metadata = BuildAuthMetadata(manager, "/Rafter/InstallSnapshot", grpcRequest);
@@ -1067,7 +1073,14 @@ public class GrpcCommunication : ICommunication
 
             // The typed outcome is authoritative; a peer that sends no outcome reads as Rejected
             // (the enum's zero value) — never as a silent success off the legacy bit.
-            return new SnapshotResponse((SnapshotInstallOutcome)response.Outcome);
+            return new SnapshotResponse((SnapshotInstallOutcome)response.Outcome)
+            {
+                InstallSessionId = response.InstallSessionId,
+                InstallIndex = response.InstallIndex,
+                InstallLeaderTerm = response.InstallLeaderTerm,
+                InstallLeaderEndpoint = response.InstallLeaderEndpoint,
+                InstallProgress = response.InstallProgress,
+            };
         }
         catch (Exception ex)
         {

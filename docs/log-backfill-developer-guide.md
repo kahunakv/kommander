@@ -305,12 +305,28 @@ RPC and follower-side state replacement); backfill's job is just to *detect* the
 cleanly. Brand-new nodes joining a long-running cluster typically hit this path first, then switch to
 backfill once they're above the floor.
 
-Two operational notes on the handoff:
+Operational notes on the handoff:
 
 - A follower whose snapshot **fails** (the export throws, a chunk is rejected) is retried with
   exponential backoff — heartbeat-interval base, capped at 30 s — instead of once per heartbeat, and a
   follower that is merely **saturated** (pausing entry batches to drain its WAL queue) is never
   escalated to a snapshot at all.
+- The follower's **install is awaited, not timed**. The receiver acknowledges the last chunk as soon as
+  the snapshot is staged and verified (`InstallPending`), and the leader then asks for the install's
+  outcome in short calls of their own until the follower reports `Installed`, `SkippedAlreadyCovered`
+  or a failure. The wait is bounded by progress: the follower reports how far its importer has read
+  into the staged snapshot, and only `SnapshotTransferStepTimeout` without a change ends the attempt.
+  `IRaft.GetSnapshotStatuses` shows such a transfer as `InFlight` with `AwaitingInstall` set.
+- A retry **resumes**. Before it exports anything, every attempt asks the follower whether an install
+  of the partition is already queued or running — its own earlier attempt's, or a previous leader's —
+  and if so waits for that install instead of sending another snapshot. A follower runs one install
+  per partition and stages nothing else for that partition meanwhile.
+- The floor is held on **every replica**, not only on the leader. The leader sends its live-replica
+  retention floor (the slowest replica's durable position, or its own when its disk is the one behind)
+  with every AppendLogs, and each follower holds its own compaction there within
+  `CompactionLiveReplicaLagBudget`. A leader change therefore does not strand a replica that was being
+  caught up from the log: the successor's log still reaches back to it. A freshly elected leader holds
+  the budget's full depth for a peer until that peer's first ack reports its position.
 - A follower that needs a snapshot when **no snapshot transfer is registered** cannot catch up; the
   condition is recorded once per episode and reported — together with in-flight transfers, attempt
   counts and last errors — through `IRaft.GetSnapshotStatuses(partitionId)`.

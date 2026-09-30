@@ -81,6 +81,10 @@ message GrpcAppendLogsRequest {
   // When true, this is the leader's final AppendLogs before suppressing heartbeats.
   // Receivers switch to SWIM-based election gating instead of the heartbeat timer.
   bool Quiesce = 10;
+  // The leader's live-replica retention floor and budget, which a follower applies to its own WAL
+  // compaction. Floor 0 (absent) == no statement; int64 max == no replica constrains retention.
+  int64 RetentionFloor = 11;
+  int64 RetentionBudget = 12;
 }
 
 message GrpcAppendLogsResponse {
@@ -278,11 +282,19 @@ message GrpcInstallSnapshotRequest {
     int64 LastIncludedTerm = 11; // term of the entry at SnapshotIndex; 0 == legacy sender
     string SnapshotChecksum = 12; // hex SHA-256 over the whole snapshot, terminal chunk only; empty == legacy sender
     bool Forced = 13; // answers a re-seed request: import even over a covering checkpoint boundary
+    bool InstallPolling = 14; // the sender polls for the install's outcome; absent == the terminal chunk's call is held open for it
+    bool StatusQuery = 15; // not a chunk: asks for the state of the partition's install (ChunkIndex is -1)
 }
 
 message GrpcInstallSnapshotResponse {
     bool Success = 1;
     int32 Outcome = 2; // SnapshotInstallOutcome; absent (0) == Rejected, never a silent success
+    // The install the answer describes (set with InstallPending and with an install's own outcome).
+    string InstallSessionId = 3;
+    int64 InstallIndex = 4;
+    int64 InstallLeaderTerm = 5;
+    string InstallLeaderEndpoint = 6;
+    int64 InstallProgress = 7; // staged bytes the install has read so far
 }
 
 message GrpcPingRequest {

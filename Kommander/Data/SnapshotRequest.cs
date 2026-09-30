@@ -150,4 +150,26 @@ public sealed class SnapshotRequest
     /// Identical on every chunk of the session.
     /// </summary>
     public bool Forced { get; init; }
+
+    /// <summary>
+    /// The sender understands <see cref="SnapshotInstallOutcome.InstallPending"/> and asks for the
+    /// install's outcome separately (<see cref="StatusQuery"/>), so the receiver answers the terminal
+    /// chunk as soon as the snapshot is staged and verified. Identical on every chunk of the session.
+    /// A sender that leaves it unset predates the outcome: the receiver holds its terminal chunk open
+    /// until the install completes, and refuses with <see cref="SnapshotInstallOutcome.Rejected"/>
+    /// where it would otherwise tell the sender to wait.
+    /// </summary>
+    public bool InstallPolling { get; init; }
+
+    /// <summary>
+    /// Not a chunk: asks what became of an install on <see cref="PartitionId"/>. The receiver stages
+    /// nothing and opens no session. <see cref="SessionId"/> names the install the sender is waiting
+    /// for, or is empty when it only asks whether one is running. <see cref="ChunkIndex"/> is -1, so a
+    /// receiver that predates this field refuses the request without touching a session.
+    /// <para>Answers: <see cref="SnapshotInstallOutcome.InstallPending"/> while an install of the
+    /// partition is queued or running (whichever session it belongs to); the install's outcome when
+    /// the named session's install has completed; <see cref="SnapshotInstallOutcome.NoInstall"/>
+    /// otherwise.</para>
+    /// </summary>
+    public bool StatusQuery { get; init; }
 }

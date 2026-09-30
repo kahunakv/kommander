@@ -67,6 +67,8 @@ public static class GrpcCommunicationPool
         obj.PrevLogIndex = 0;
         obj.PrevLogTerm = 0;
         obj.Quiesce = false;
+        obj.RetentionFloor = 0;
+        obj.RetentionBudget = 0;
 
         if (Interlocked.Increment(ref _appendLogsCount) <= MaxRetained)
         {

@@ -1332,7 +1332,9 @@ public sealed class RaftPartitionExecutor : IDisposable
                         request.PrevLogIndex,
                         request.PrevLogTerm,
                         RegisterReply(op),
-                        request.Quiesce
+                        request.Quiesce,
+                        request.RetentionFloor,
+                        request.RetentionBudget
                     ).ConfigureAwait(false);
                     break;
 
