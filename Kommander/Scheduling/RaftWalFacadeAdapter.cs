@@ -67,8 +67,8 @@ internal sealed class RaftWalFacadeAdapter : Scheduling.IRaftWalFacade
     public void MarkDurablyWritten(long minLogIndex, long maxLogIndex, long[]? sparseLogIds) =>
         wal.MarkDurablyWritten(minLogIndex, maxLogIndex, sparseLogIds);
 
-    public void MarkResolutionWritten(long resolvedMaxLogIndex, bool synced) =>
-        wal.MarkResolutionWritten(resolvedMaxLogIndex, synced);
+    public void MarkResolutionWritten(long resolvedMinLogIndex, long resolvedMaxLogIndex, bool synced) =>
+        wal.MarkResolutionWritten(resolvedMinLogIndex, resolvedMaxLogIndex, synced);
 
     public long GetDurableCommitIndex() => wal.GetDurableCommitIndex();
 

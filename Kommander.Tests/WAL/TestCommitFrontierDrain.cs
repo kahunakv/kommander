@@ -215,17 +215,17 @@ public sealed class TestCommitFrontierDrain
             // The engine answers for 1..2 only: the durable frontier follows, still below the protocol one.
             // The rows arrived typed Committed in a synced batch, so their resolution is on disk too.
             writeAhead.MarkDurablyWritten(1, 2, null);
-            writeAhead.MarkResolutionWritten(2, synced: true);
+            writeAhead.MarkResolutionWritten(1, 2, synced: true);
             Assert.Equal(2, writeAhead.GetDurableCommitFrontier());
             Assert.Equal(3, writeAhead.GetCommitIndex());
 
             // An answer above a hole certifies nothing below the hole.
             writeAhead.MarkDurablyWritten(5, 5, null);
-            writeAhead.MarkResolutionWritten(5, synced: true);
+            writeAhead.MarkResolutionWritten(5, 5, synced: true);
             Assert.Equal(2, writeAhead.GetDurableCommitFrontier());
 
             writeAhead.MarkDurablyWritten(3, 3, null);
-            writeAhead.MarkResolutionWritten(3, synced: true);
+            writeAhead.MarkResolutionWritten(3, 3, synced: true);
             Assert.Equal(3, writeAhead.GetDurableCommitFrontier());
         }
         finally
@@ -256,20 +256,71 @@ public sealed class TestCommitFrontierDrain
             // Entries 1..3 are present on disk, and this node knows they are committed.
             Append(writeAhead, Committed(1), Committed(2), Committed(3));
             writeAhead.MarkDurablyWritten(1, 3, null);
-            writeAhead.MarkResolutionWritten(2, synced: true);
+            writeAhead.MarkResolutionWritten(1, 2, synced: true);
             Assert.Equal(2, writeAhead.GetDurableCommitFrontier());
 
             // The marker for 3 rides sync-off: presence and memory both say 3, the disk does not.
-            writeAhead.MarkResolutionWritten(3, synced: false);
+            writeAhead.MarkResolutionWritten(3, 3, synced: false);
             Assert.Equal(3, writeAhead.GetDurablePresentIndex());
             Assert.Equal(2, writeAhead.GetDurableResolvedIndex());
             Assert.Equal(2, writeAhead.GetDurableCommitFrontier());
 
             // Any later synced write on the partition carries the marker to disk, even one that
             // resolves nothing itself (a propose).
-            writeAhead.MarkResolutionWritten(-1, synced: true);
+            writeAhead.MarkResolutionWritten(-1, -1, synced: true);
             Assert.Equal(3, writeAhead.GetDurableResolvedIndex());
             Assert.Equal(3, writeAhead.GetDurableCommitFrontier());
+        }
+        finally
+        {
+            partition.Dispose();
+            manager.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// A resolution that rides sync-off BELOW the synced high-water is not durable either, and the
+    /// reported frontier must drop under it until the next synced write (GA nightly run
+    /// 36551556947, seed 7923056534695766174).
+    ///
+    /// <para>Resolutions do not always land in id order. A follower holding 6 as
+    /// <c>Proposed</c> received the marker for 7 first, then a synced propose (which carried 7's
+    /// marker to disk and moved the high-water past 6), and only then the marker for 6, when the
+    /// leader re-committed the inherited entry. The marker for 6 rode sync-off under a frontier that
+    /// only ever advanced, so the follower reported 7 as durable, and the crash returned 6 to
+    /// <c>Proposed</c> with the leader's retention already trusting the report.</para>
+    /// </summary>
+    [Fact]
+    public void DurableCommitFrontier_DropsUnderASyncOffResolutionBelowTheSyncedHighWater()
+    {
+        RaftWriteAhead writeAhead = CreateWriteAhead(out RaftManager manager, out RaftPartition partition);
+
+        try
+        {
+            // Entries 1..7 are present on disk; this node knows 1..5 committed, and their
+            // resolutions are synced.
+            Append(writeAhead, Committed(1), Committed(2), Committed(3), Committed(4), Committed(5));
+            writeAhead.MarkDurablyWritten(1, 7, null);
+            writeAhead.MarkResolutionWritten(1, 5, synced: true);
+            Assert.Equal(5, writeAhead.GetDurableCommitFrontier());
+
+            // The marker for 7 rides sync-off, then a synced propose above it carries it to disk.
+            writeAhead.MarkResolutionWritten(7, 7, synced: false);
+            writeAhead.MarkResolutionWritten(-1, -1, synced: true);
+            Assert.Equal(7, writeAhead.GetDurableResolvedIndex());
+
+            // The marker for 6 arrives last and rides sync-off: memory now resolves 1..7, the
+            // disk resolves 1..5 and 7. The frontier must say 5, not 7.
+            Append(writeAhead, Committed(6), Committed(7));
+            Assert.Equal(7, writeAhead.GetCommitIndex());
+            writeAhead.MarkResolutionWritten(6, 6, synced: false);
+            Assert.Equal(5, writeAhead.GetDurableResolvedIndex());
+            Assert.Equal(5, writeAhead.GetDurableCommitFrontier());
+
+            // The next synced write on the partition carries the marker for 6 too.
+            writeAhead.MarkResolutionWritten(-1, -1, synced: true);
+            Assert.Equal(7, writeAhead.GetDurableResolvedIndex());
+            Assert.Equal(7, writeAhead.GetDurableCommitFrontier());
         }
         finally
         {

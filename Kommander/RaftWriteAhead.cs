@@ -250,9 +250,22 @@ public sealed class RaftWriteAhead
     // shared-WAL backend, but this node cannot see it, so the frontier waits for its own
     // partition's next synced write: the safe direction, since a low report only makes the leader
     // keep more of its log. Single writer: the partition executor.
+    //
+    // The high-water alone is not enough, because resolutions do not always land in id order. A
+    // follower that holds 6 as Proposed can receive the marker for 7 first (or a synced propose
+    // above it) and the marker for 6 only later, when the leader re-commits an inherited entry or
+    // fills a hole: 7's resolution is then on disk under a synced write and 6's rides sync-off
+    // BELOW the frontier. A frontier that only ever advanced counted 6 as durable, the follower
+    // reported 7, and the crash returned 6 to Proposed with the leader's retention already past it
+    // (GA nightly run 36551556947, seed 7923056534695766174, rule reported-durable-survives-crash).
+    // ridingResolvedFloor is the lowest id resolved by a sync-off write since the partition's last
+    // synced write (long.MaxValue when none is waiting): the reported frontier is bounded by it
+    // until that carrier completes, whatever the high-water says.
     private long durableResolvedIndex = 1;
 
     private long ridingResolvedIndex = 1;
+
+    private long ridingResolvedFloor = long.MaxValue;
 
     // The highest row id of any type the last restore read from the disk. Rows written before this
     // process started are not reported through MarkResolutionWritten, so GetReadableResolvedHighWater
@@ -776,9 +789,11 @@ public sealed class RaftWriteAhead
         Volatile.Write(ref publishedCommitIndex, Math.Min(commitIndex, durablePresentIndex));
 
         // The restored commit frontier was read from resolved rows on the disk, so every
-        // resolution under it is durable by construction.
+        // resolution under it is durable by construction, and nothing written before this process
+        // started is still waiting for a carrier.
         durableResolvedIndex = commitIndex;
         ridingResolvedIndex = commitIndex;
+        ridingResolvedFloor = long.MaxValue;
 
         // ── Restore the HLC floor before anything can mint a timestamp ────────────────────
         // Merge the durable high-water mark and the maximum restored entry timestamp into the node
@@ -1733,29 +1748,45 @@ public sealed class RaftWriteAhead
     /// hide the failed-write regression the leader's re-ship must see. Executor thread only.
     /// </summary>
     public long GetDurableCommitFrontier() =>
-        Math.Min(Math.Min(commitIndex, durablePresentIndex), durableResolvedIndex) - 1;
+        Math.Min(Math.Min(commitIndex, durablePresentIndex), DurableResolvedFrontier()) - 1;
 
     /// <summary>
-    /// Highest id whose resolution is known to be on disk. Test-visible for the same reason as
+    /// Highest id below which every resolution is known to be on disk: the synced high-water,
+    /// capped by the lowest resolution still riding sync-off. Test-visible for the same reason as
     /// <see cref="GetDurablePresentIndex"/>.
     /// </summary>
-    public long GetDurableResolvedIndex() => durableResolvedIndex - 1;
+    public long GetDurableResolvedIndex() => DurableResolvedFrontier() - 1;
+
+    // Exclusive: every resolution under it is on disk. The cap is what makes an out-of-order
+    // sync-off marker count against the frontier instead of hiding under the high-water.
+    private long DurableResolvedFrontier() => Math.Min(durableResolvedIndex, ridingResolvedFloor);
 
     /// <summary>
-    /// Records a successful write that carried resolved rows through
-    /// <paramref name="resolvedMaxLogIndex"/> (-1 for none) in a batch that was, or was not,
-    /// fsynced. A synced write makes its own resolutions durable and every resolution that rode
-    /// sync-off before it on this partition. A sync-off write only queues its resolutions until
-    /// then. See the field comment on <c>durableResolvedIndex</c> for why the reported frontier
-    /// needs this. Executor thread only.
+    /// Records a successful write that carried resolved rows spanning
+    /// <paramref name="resolvedMinLogIndex"/>..<paramref name="resolvedMaxLogIndex"/> (-1 for none)
+    /// in a batch that was, or was not, fsynced. A synced write makes its own resolutions durable
+    /// and every resolution that rode sync-off before it on this partition, so it also clears the
+    /// riding floor. A sync-off write only queues its resolutions until then, and lowers the floor
+    /// to its lowest id when that id sits under the synced high-water: the marker is NOT on disk,
+    /// whatever was synced above it. See the field comment on <c>durableResolvedIndex</c> for why
+    /// the reported frontier needs both. Executor thread only.
     /// </summary>
-    public void MarkResolutionWritten(long resolvedMaxLogIndex, bool synced)
+    public void MarkResolutionWritten(long resolvedMinLogIndex, long resolvedMaxLogIndex, bool synced)
     {
         if (resolvedMaxLogIndex >= 0 && resolvedMaxLogIndex + 1 > ridingResolvedIndex)
             ridingResolvedIndex = resolvedMaxLogIndex + 1;
 
-        if (synced && ridingResolvedIndex > durableResolvedIndex)
-            durableResolvedIndex = ridingResolvedIndex;
+        if (synced)
+        {
+            if (ridingResolvedIndex > durableResolvedIndex)
+                durableResolvedIndex = ridingResolvedIndex;
+
+            ridingResolvedFloor = long.MaxValue;
+            return;
+        }
+
+        if (resolvedMinLogIndex >= 0 && resolvedMinLogIndex < ridingResolvedFloor)
+            ridingResolvedFloor = resolvedMinLogIndex;
     }
 
     /// <summary>
@@ -1933,11 +1964,13 @@ public sealed class RaftWriteAhead
             durablePresentIndex = target;
         DrainPendingDurable();
 
-        // The boundary is a durable committed checkpoint, so it resolves its whole prefix on disk.
+        // The boundary is a durable committed checkpoint, so it resolves its whole prefix on disk,
+        // and its synced install carried every marker that was riding sync-off before it.
         if (target > durableResolvedIndex)
             durableResolvedIndex = target;
         if (target > ridingResolvedIndex)
             ridingResolvedIndex = target;
+        ridingResolvedFloor = long.MaxValue;
 
         RefreshPublishedCommitIndex();
     }

@@ -1321,6 +1321,7 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         long minIndex = -1;
         long writtenMax = -1;
         long resolvedMax = -1;
+        long resolvedMin = -1;
 
         // The ids a batch carries are ascending in every enqueue path (the propose allocator
         // counts up, the commit/rollback/follower paths order by id), so one pass that checks each
@@ -1332,8 +1333,13 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
         {
             long id = logs[i].Id;
 
-            if (logs[i].Type is not (RaftLogType.Proposed or RaftLogType.ProposedCheckpoint) && id > resolvedMax)
-                resolvedMax = id;
+            if (logs[i].Type is not (RaftLogType.Proposed or RaftLogType.ProposedCheckpoint))
+            {
+                if (id > resolvedMax)
+                    resolvedMax = id;
+                if (resolvedMin < 0 || id < resolvedMin)
+                    resolvedMin = id;
+            }
 
             if (i == 0)
             {
@@ -1368,7 +1374,8 @@ public sealed class FairWalScheduler : IRaftWalScheduler, IDisposable
             WrittenMaxLogIndex: writtenMax,
             SparseLogIds: sparseIds,
             Synced: synced,
-            ResolvedMaxLogIndex: resolvedMax
+            ResolvedMaxLogIndex: resolvedMax,
+            ResolvedMinLogIndex: resolvedMin
         )
         {
             DurableStageTicks = durableStageTicks

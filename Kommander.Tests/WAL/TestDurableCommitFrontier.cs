@@ -324,6 +324,66 @@ public sealed class TestDurableCommitFrontier
         }
     }
 
+    /// <summary>
+    /// The out-of-order marker case end to end through the scheduler (GA nightly run 36551556947,
+    /// seed 7923056534695766174): the marker for a held row lands sync-off BELOW resolutions a
+    /// synced write already carried, and the reported frontier must exclude it until the next synced
+    /// write on the partition.
+    ///
+    /// <para>The completion must carry the batch's lowest resolved id, not only its highest — the
+    /// frontier cannot tell a marker under the high-water from one above it otherwise — and the
+    /// scheduler's single-fsync fast path must still write the marker sync-off, or the case is not
+    /// reached at all. Both are asserted here, so a change to either side fails this test rather
+    /// than silently passing the mechanism test beside it.</para>
+    /// </summary>
+    [Fact]
+    public async Task MarkerBelowTheSyncedHighWater_IsNotReportedDurable_UntilTheNextSyncedWrite()
+    {
+        RaftWriteAhead writeAhead = CreateWriteAhead(out RaftManager manager, out RaftPartition partition);
+
+        try
+        {
+            // Entries 1..5 committed and synced; 6 and 7 held as Proposed.
+            Written(writeAhead, await Append(writeAhead, Committed(1), Committed(2), Committed(3), Committed(4), Committed(5)));
+            Written(writeAhead, await Append(writeAhead, Proposed(6), Proposed(7)));
+            Assert.Equal(5, writeAhead.GetDurableCommitFrontier());
+
+            // The marker for 7 first: a held row, so the fast path writes it sync-off.
+            RaftWalCompletion seven = await Append(writeAhead, Committed(7));
+            Assert.False(seven.Synced, "a marker over a held row must ride sync-off for this case to exist");
+            Assert.Equal(7, seven.ResolvedMinLogIndex);
+            Assert.Equal(7, seven.ResolvedMaxLogIndex);
+            Written(writeAhead, seven);
+
+            // A synced propose above it carries 7's marker to disk.
+            RaftWalCompletion eight = await Append(writeAhead, Proposed(8));
+            Assert.True(eight.Synced);
+            Assert.Equal(-1, eight.ResolvedMinLogIndex);
+            Written(writeAhead, eight);
+            Assert.Equal(7, writeAhead.GetDurableResolvedIndex());
+            Assert.Equal(5, writeAhead.GetDurableCommitFrontier());
+
+            // The marker for 6 last, sync-off and below the high-water. Memory resolves 1..7 now;
+            // the disk does not hold 6's marker, so the frontier stays at 5.
+            RaftWalCompletion six = await Append(writeAhead, Committed(6));
+            Assert.False(six.Synced);
+            Assert.Equal(6, six.ResolvedMinLogIndex);
+            Written(writeAhead, six);
+            Assert.Equal(7, writeAhead.GetCommitIndex());
+            Assert.Equal(5, writeAhead.GetDurableCommitFrontier());
+
+            // The next synced write on the partition carries the marker for 6, and the frontier
+            // reaches 7: 8 is still Proposed.
+            Written(writeAhead, await Append(writeAhead, Proposed(9)));
+            Assert.Equal(7, writeAhead.GetDurableCommitFrontier());
+        }
+        finally
+        {
+            partition.Dispose();
+            manager.Dispose();
+        }
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────
 
     private readonly ConcurrentDictionary<long, TaskCompletionSource<RaftWalCompletion>> completions = new();
@@ -367,7 +427,8 @@ public sealed class TestDurableCommitFrontier
     private static void Written(RaftWriteAhead writeAhead, RaftWalCompletion completion)
     {
         Durable(writeAhead, completion);
-        writeAhead.MarkResolutionWritten(completion.ResolvedMaxLogIndex, completion.Synced);
+        writeAhead.MarkResolutionWritten(
+            completion.ResolvedMinLogIndex, completion.ResolvedMaxLogIndex, completion.Synced);
     }
 
     private static RaftLog Committed(long id, long term = 1) => new()

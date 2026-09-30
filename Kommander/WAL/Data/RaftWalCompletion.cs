@@ -73,7 +73,17 @@ public sealed record RaftWalCompletion(
     /// <see cref="Synced"/>: a resolution is on disk only when a synced write carried it or came
     /// after it.
     /// </summary>
-    long ResolvedMaxLogIndex = -1
+    long ResolvedMaxLogIndex = -1,
+
+    /// <summary>
+    /// Lowest id this write carried as a resolved row, or -1 when it carried none. A sync-off
+    /// batch is not always the next step up the log: a commit marker for a hole the leader filled
+    /// late lands BELOW resolutions an earlier synced write already carried. The durable resolution
+    /// frontier must drop to this id until the next synced write on the partition, or it reports
+    /// the marker as on disk while a crash still returns the row to <c>Proposed</c> (GA nightly
+    /// run 36551556947, seed 7923056534695766174: "reported 7 ... after the crash 6:Proposed").
+    /// </summary>
+    long ResolvedMinLogIndex = -1
 )
 {
     /// <summary>
