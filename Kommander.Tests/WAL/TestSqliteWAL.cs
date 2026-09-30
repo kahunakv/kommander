@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using Kommander.Data;
 using Kommander.WAL;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Kommander.Tests.WAL;
@@ -397,6 +399,180 @@ public sealed class TestSqliteWAL
         finally
         {
             DeleteTempWalPath(path);
+        }
+    }
+
+    /// <summary>
+    /// Every entry point called after <see cref="SqliteWAL.Dispose"/> has a defined outcome and never
+    /// touches a closed connection: reads throw <see cref="ObjectDisposedException"/>, status-returning
+    /// calls report their failure value, and nothing reopens a shard or the metadata DB. Before the
+    /// disposal fence, a late metadata read ran a command on the closed connection (the field was not
+    /// cleared) and a late call on a never-opened shard created its file.
+    /// </summary>
+    [Fact]
+    public void Dispose_IsIdempotent_AndLaterCallsFailWithoutReopening()
+    {
+        string path = CreateTempWalPath();
+
+        try
+        {
+            ErrorCapturingLogger logger = new();
+            SqliteWAL wal = new(path, "wal", logger, shardCount: 2);
+
+            // Opens shard 0 and the metadata DB; shard 1 stays unopened.
+            Assert.Equal(RaftOperationStatus.Success, wal.Write([(0, [CreateLog(id: 1)])]));
+            Assert.True(wal.SetMetaData("key", "value"));
+
+            wal.Dispose();
+            wal.Dispose();
+
+            Assert.Throws<ObjectDisposedException>(() => wal.ReadLogs(0));
+            Assert.Throws<ObjectDisposedException>(() => wal.ReadLogsRange(0, 1, 10));
+            Assert.Throws<ObjectDisposedException>(() => wal.GetTermAt(0, 1));
+            Assert.Throws<ObjectDisposedException>(() => wal.GetCurrentTerm(0));
+            Assert.Throws<ObjectDisposedException>(() => wal.GetLastCheckpoint(0));
+            Assert.Throws<ObjectDisposedException>(() => wal.CountPersistedLogs(0));
+            Assert.Throws<ObjectDisposedException>(() => wal.CountRemovableLogs(0));
+            Assert.Throws<ObjectDisposedException>(() => wal.GetMetaData("key"));
+
+            Assert.False(wal.SetMetaData("key", "late"));
+            Assert.Equal(0, wal.GetMaxLog(0));
+            Assert.Equal(RaftOperationStatus.Errored, wal.Write([(0, [CreateLog(id: 2)])]));
+            Assert.Equal(RaftOperationStatus.Errored, wal.TruncateLogsAfter(0, 0));
+            Assert.Equal(RaftOperationStatus.Errored, wal.TruncateProposedLogsAfter(0, 0));
+            Assert.Equal((RaftOperationStatus.Errored, 0L), wal.TruncateLogsAfterAndGetMax(0, 0));
+            Assert.Equal((RaftOperationStatus.Errored, false), wal.InstallSnapshotBoundary(0, 1, 1, sync: true));
+            Assert.Equal((RaftOperationStatus.Errored, 0), wal.CompactLogsOlderThan(0, 1, 10));
+            Assert.Equal(RaftOperationStatus.Errored, wal.DeletePartitionWAL(0));
+
+            // A late call on a shard that was never opened must not create it.
+            Assert.Throws<ObjectDisposedException>(() => wal.ReadLogs(1));
+            Assert.Equal(RaftOperationStatus.Errored, wal.Write([(1, [CreateLog(id: 1)])]));
+            Assert.False(File.Exists(Path.Combine(path, "raft_shard1_wal.db")));
+
+            // Rejections after disposal are expected teardown traffic, not storage failures.
+            Assert.Empty(logger.Errors);
+
+            // Nothing written before disposal was lost, and the rejected late calls changed nothing.
+            using SqliteWAL reopened = new(path, "wal", NullLogger<IRaft>.Instance);
+            Assert.Single(reopened.ReadLogs(0));
+            Assert.Equal("value", reopened.GetMetaData("key"));
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    /// <summary>
+    /// Regression for the Kahuna teardown NRE (<c>SqliteConnection.Close</c> inside
+    /// <see cref="SqliteWAL.Dispose"/>): a host that still reads <see cref="IRaft.WalAdapter"/> while
+    /// Raft is disposed. Workers hammer metadata and shard reads and writes while the WAL is disposed
+    /// under them. Each call must either complete on an open connection or be rejected as disposed —
+    /// never fault inside SQLite. Status-returning calls swallow storage exceptions into an error log,
+    /// so a logged error fails the run too.
+    /// </summary>
+    [Fact]
+    public void Dispose_RacingLiveCalls_CompletesOrRejectsButNeverFaultsInsideSqlite()
+    {
+        const int iterations = 40;
+
+        for (int iteration = 0; iteration < iterations; iteration++)
+            RunDisposeRace(iteration);
+    }
+
+    private static void RunDisposeRace(int iteration)
+    {
+        string path = CreateTempWalPath();
+
+        try
+        {
+            ErrorCapturingLogger logger = new();
+            SqliteWAL wal = new(path, "wal", logger, syncWrites: false, shardCount: 2);
+
+            // Open both shards and the metadata DB so Dispose has live connections to close.
+            Assert.Equal(RaftOperationStatus.Success, wal.Write([(0, [CreateLog(id: 1)]), (1, [CreateLog(id: 1)])]));
+            Assert.True(wal.SetMetaData("key", "value"));
+
+            Action<int>[] operations =
+            [
+                i => wal.GetMetaData("key"),
+                i => wal.SetMetaData("key", i.ToString()),
+                i => wal.ReadLogsRange(i % 2, 0, 16),
+                i => wal.GetTermAt(i % 2, 1),
+                i => wal.GetMaxLog(i % 2),
+                i => wal.Write([(i % 2, [CreateLog(id: i + 2)])]),
+            ];
+
+            ConcurrentQueue<Exception> unexpected = new();
+            using CountdownEvent warmedUp = new(operations.Length);
+            int stop = 0;
+
+            Thread[] workers = operations.Select(operation => new Thread(() =>
+            {
+                for (int i = 0; Volatile.Read(ref stop) == 0; i++)
+                {
+                    try
+                    {
+                        operation(i);
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // The defined outcome for a read that arrives after disposal.
+                    }
+                    catch (Exception ex)
+                    {
+                        unexpected.Enqueue(ex);
+                    }
+
+                    if (i == 0)
+                        warmedUp.Signal();
+                }
+            }) { IsBackground = true }).ToArray();
+
+            foreach (Thread worker in workers)
+                worker.Start();
+
+            // Dispose only once every worker is live, so the close lands on calls in flight.
+            Assert.True(warmedUp.Wait(TimeSpan.FromSeconds(10)), $"iteration {iteration}: workers did not start");
+            wal.Dispose();
+
+            // Let every worker also run against the disposed WAL for a while.
+            Thread.Sleep(5);
+            Volatile.Write(ref stop, 1);
+
+            foreach (Thread worker in workers)
+                Assert.True(worker.Join(TimeSpan.FromSeconds(10)), $"iteration {iteration}: worker did not stop");
+
+            Assert.True(unexpected.IsEmpty, $"iteration {iteration}: {string.Join("\n", unexpected)}");
+            Assert.True(logger.Errors.Count == 0, $"iteration {iteration}: {string.Join("\n", logger.Errors)}");
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    /// <summary>Records Error-level messages: the status-returning WAL calls report a storage exception only there.</summary>
+    private sealed class ErrorCapturingLogger : ILogger<IRaft>
+    {
+        private readonly ConcurrentQueue<string> errors = new();
+
+        public IReadOnlyCollection<string> Errors => errors.ToArray();
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Error;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel >= LogLevel.Error)
+                errors.Enqueue(formatter(state, exception));
         }
     }
 

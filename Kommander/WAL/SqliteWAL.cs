@@ -32,6 +32,16 @@ namespace Kommander.WAL;
 /// serialize through the shard's <c>Lock</c>.  Partitions on different shards can
 /// run concurrently; partitions on the same shard serialize — the deliberate
 /// concurrency/amortization trade.</para>
+///
+/// <para><b>Disposal.</b>  <see cref="Dispose"/> can overlap live calls: <see cref="IRaft.WalAdapter"/> is
+/// public, so a host can still be reading the WAL while <see cref="RaftManager"/> tears it down, and
+/// <see cref="SqliteConnection"/> is not safe against a close that overlaps a command on another thread.
+/// Dispose therefore closes each connection under the same lock that guards its use, and every entry
+/// point re-checks <see cref="disposed"/> under that lock. A call that already holds the lock finishes
+/// on the open connection first; a later call is rejected without touching the closed one — reads
+/// throw <see cref="ObjectDisposedException"/>, status-returning calls report their failure value
+/// (<see cref="RaftOperationStatus.Errored"/>, <see langword="false"/>, or <c>0</c>). Nothing reopens a
+/// shard or the metadata DB after disposal.</para>
 /// </summary>
 public class SqliteWAL : IWAL, IDisposable
 {
@@ -90,6 +100,30 @@ public class SqliteWAL : IWAL, IDisposable
         public SqliteCommand? PreparedTruncateProposed { get; set; }
 
         public ShardDatabase(SqliteConnection connection) => Connection = connection;
+
+        /// <summary>
+        /// Finalizes the cached commands, then closes the connection. The caller must hold
+        /// <see cref="Lock"/>: a close that overlaps a command on another thread faults inside
+        /// <see cref="SqliteConnection.Close"/> (it walks the connection's live-command list while
+        /// that command adds or removes itself).
+        /// </summary>
+        public void DisposeResources()
+        {
+            PreparedUpsert?.Dispose();
+            PreparedGetTermAt?.Dispose();
+            PreparedGetCurrentTerm?.Dispose();
+            PreparedGetMaxLog?.Dispose();
+            PreparedGetLastCheckpoint?.Dispose();
+            PreparedReadLogsRangeLimited?.Dispose();
+            PreparedReadLogsRangeUnlimited?.Dispose();
+            PreparedCheckpointRead?.Dispose();
+            PreparedCheckpointUpsert?.Dispose();
+            PreparedCheckpointDelete?.Dispose();
+            PreparedPragmaSyncOff?.Dispose();
+            PreparedPragmaSyncFull?.Dispose();
+            PreparedTruncateProposed?.Dispose();
+            Connection.Dispose();
+        }
     }
 
     /// <summary>
@@ -109,6 +143,18 @@ public class SqliteWAL : IWAL, IDisposable
     /// the store from any thread without an explicit memory barrier.
     /// </summary>
     private volatile SqliteConnection? metaDataConnection;
+
+    /// <summary>
+    /// Set by <see cref="Dispose"/> before it closes anything. Entry points read it under the lock
+    /// that guards the connection they are about to use (<see cref="ShardDatabase.Lock"/> or
+    /// <see cref="_metaDataLock"/>), and <see cref="Dispose"/> closes each connection under that same
+    /// lock, so a reader that sees <see langword="false"/> is guaranteed an open connection for the
+    /// rest of its critical section.
+    /// </summary>
+    private volatile bool disposed;
+
+    /// <summary>Makes <see cref="Dispose"/> run once; set with <see cref="Interlocked.Exchange(ref int, int)"/>.</summary>
+    private int disposeStarted;
 
     private readonly ILogger<IRaft> logger;
     private readonly bool syncWrites;
@@ -179,16 +225,28 @@ public class SqliteWAL : IWAL, IDisposable
 
     /// <summary>
     /// Returns the database state for <paramref name="shardId"/>, creating and initialising
-    /// the shard file on first access.
+    /// the shard file on first access. Returns <see langword="null"/> once the WAL is disposed.
+    ///
+    /// <para>A non-null result can still be closed by a concurrent <see cref="Dispose"/> before the
+    /// caller takes its lock, so callers must re-check <see cref="disposed"/> under
+    /// <see cref="ShardDatabase.Lock"/>. The check under <see cref="semaphore"/> pairs with the
+    /// semaphore barrier in <see cref="Dispose"/>: a shard is either created before Dispose collects
+    /// the shards to close, or not created at all — never opened and leaked.</para>
     /// </summary>
-    private ShardDatabase TryOpenShard(int shardId)
+    private ShardDatabase? TryOpenShard(int shardId)
     {
+        if (disposed)
+            return null;
+
         if (shards.TryGetValue(shardId, out ShardDatabase? shard))
             return shard;
 
         semaphore.Wait();
         try
         {
+            if (disposed)
+                return null;
+
             if (shards.TryGetValue(shardId, out shard))
                 return shard;
 
@@ -291,10 +349,14 @@ public class SqliteWAL : IWAL, IDisposable
 
     /// <summary>
     /// Returns the metadata <see cref="SqliteConnection"/>, creating it on first access.
-    /// Must be called with <see cref="_metaDataLock"/> already held.
+    /// Must be called with <see cref="_metaDataLock"/> already held. Throws once the WAL is disposed,
+    /// so a late call can never reopen the metadata DB (callers that report a status check
+    /// <see cref="disposed"/> first).
     /// </summary>
     private SqliteConnection TryOpenMetaDataDatabase()
     {
+        ThrowIfDisposed();
+
         if (metaDataConnection is not null)
             return metaDataConnection;
 
@@ -331,10 +393,12 @@ public class SqliteWAL : IWAL, IDisposable
     /// </summary>
     public List<RaftLog> ReadLogs(int partitionId)
     {
-        ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
+        ShardDatabase shard = TryOpenShard(ShardOf(partitionId)) ?? throw DisposedException();
 
         lock (shard.Lock)
         {
+            ThrowIfDisposed();
+
             List<RaftLog> result = [];
             long lastCheckpoint = GetLastCheckpointInternal(shard, partitionId);
 
@@ -369,10 +433,12 @@ public class SqliteWAL : IWAL, IDisposable
     /// </summary>
     public List<RaftLog> ReadLogsRange(int partitionId, long startLogIndex, int maxEntries, long maxBytes)
     {
-        ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
+        ShardDatabase shard = TryOpenShard(ShardOf(partitionId)) ?? throw DisposedException();
 
         lock (shard.Lock)
         {
+            ThrowIfDisposed();
+
             List<RaftLog> result = [];
 
             bool applyLimit = maxEntries != int.MaxValue;
@@ -407,15 +473,21 @@ public class SqliteWAL : IWAL, IDisposable
 
     /// <summary>
     /// Retrieves the highest log identifier from the logs for a specific partition.
-    /// Returns 0 if no logs are found or an error occurs.
+    /// Returns 0 if no logs are found, an error occurs, or the WAL is disposed.
     /// </summary>
     public long GetMaxLog(int partitionId)
     {
         try
         {
-            ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
+            ShardDatabase? shard = TryOpenShard(ShardOf(partitionId));
+            if (shard is null)
+                return 0;
+
             lock (shard.Lock)
             {
+                if (disposed)
+                    return 0;
+
                 SqliteCommand command = GetOrCreateGetMaxLog(shard);
                 command.Parameters[0].Value = partitionId;
                 using SqliteDataReader reader = command.ExecuteReader();
@@ -443,9 +515,11 @@ public class SqliteWAL : IWAL, IDisposable
     /// </summary>
     public long GetTermAt(int partitionId, long logIndex)
     {
-        ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
+        ShardDatabase shard = TryOpenShard(ShardOf(partitionId)) ?? throw DisposedException();
         lock (shard.Lock)
         {
+            ThrowIfDisposed();
+
             SqliteCommand command = GetOrCreateGetTermAt(shard);
             command.Parameters[0].Value = partitionId;
             command.Parameters[1].Value = logIndex;
@@ -458,9 +532,11 @@ public class SqliteWAL : IWAL, IDisposable
 
     public long GetCurrentTerm(int partitionId)
     {
-        ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
+        ShardDatabase shard = TryOpenShard(ShardOf(partitionId)) ?? throw DisposedException();
         lock (shard.Lock)
         {
+            ThrowIfDisposed();
+
             SqliteCommand command = GetOrCreateGetCurrentTerm(shard);
             command.Parameters[0].Value = partitionId;
             using SqliteDataReader reader = command.ExecuteReader();
@@ -476,17 +552,22 @@ public class SqliteWAL : IWAL, IDisposable
     /// </summary>
     public long GetLastCheckpoint(int partitionId)
     {
-        ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
+        ShardDatabase shard = TryOpenShard(ShardOf(partitionId)) ?? throw DisposedException();
         lock (shard.Lock)
+        {
+            ThrowIfDisposed();
             return GetLastCheckpointInternal(shard, partitionId);
+        }
     }
 
     /// <inheritdoc/>
     public int CountPersistedLogs(int partitionId)
     {
-        ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
+        ShardDatabase shard = TryOpenShard(ShardOf(partitionId)) ?? throw DisposedException();
         lock (shard.Lock)
         {
+            ThrowIfDisposed();
+
             const string query = "SELECT COUNT(*) FROM logs WHERE partitionId = @partitionId";
             using SqliteCommand command = new(query, shard.Connection);
             command.Parameters.AddWithValue("@partitionId", partitionId);
@@ -497,9 +578,11 @@ public class SqliteWAL : IWAL, IDisposable
     /// <inheritdoc/>
     public int CountRemovableLogs(int partitionId)
     {
-        ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
+        ShardDatabase shard = TryOpenShard(ShardOf(partitionId)) ?? throw DisposedException();
         lock (shard.Lock)
         {
+            ThrowIfDisposed();
+
             long lastCheckpoint = GetLastCheckpointInternal(shard, partitionId);
             if (lastCheckpoint <= 0)
                 return 0;
@@ -583,10 +666,17 @@ public class SqliteWAL : IWAL, IDisposable
         {
             foreach (KeyValuePair<int, Dictionary<int, List<RaftLog>>> shardEntry in shardPlan)
             {
-                ShardDatabase shard = TryOpenShard(shardEntry.Key);
+                // A multi-shard batch that meets disposal part-way reports Errored with the earlier
+                // shards committed — the same partial outcome as a storage failure on a later shard.
+                ShardDatabase? shard = TryOpenShard(shardEntry.Key);
+                if (shard is null)
+                    return RaftOperationStatus.Errored;
 
                 lock (shard.Lock)
                 {
+                    if (disposed)
+                        return RaftOperationStatus.Errored;
+
                     if (downgradeSync)
                         SetSynchronousPragma(shard, off: true);
 
@@ -701,6 +791,9 @@ public class SqliteWAL : IWAL, IDisposable
     {
         int shardId = ShardOf(partitionId);
 
+        if (disposed)
+            return RaftOperationStatus.Errored;
+
         // Fast path: shard file does not exist and no connection is open — nothing to do.
         if (!shards.TryGetValue(shardId, out ShardDatabase? shard))
         {
@@ -710,10 +803,15 @@ public class SqliteWAL : IWAL, IDisposable
 
             // File exists but connection not yet open — open it to perform the delete.
             shard = TryOpenShard(shardId);
+            if (shard is null)
+                return RaftOperationStatus.Errored;
         }
 
         lock (shard.Lock)
         {
+            if (disposed)
+                return RaftOperationStatus.Errored;
+
             try
             {
                 // Drop the logs and the persisted last-checkpoint row atomically. Wiping the partition must
@@ -755,9 +853,15 @@ public class SqliteWAL : IWAL, IDisposable
     /// <inheritdoc/>
     public RaftOperationStatus TruncateLogsAfter(int partitionId, long afterLogId)
     {
-        ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
+        ShardDatabase? shard = TryOpenShard(ShardOf(partitionId));
+        if (shard is null)
+            return RaftOperationStatus.Errored;
+
         lock (shard.Lock)
         {
+            if (disposed)
+                return RaftOperationStatus.Errored;
+
             try
             {
                 // Delete + checkpoint adjustment in one transaction so the persisted last-checkpoint can
@@ -817,9 +921,15 @@ public class SqliteWAL : IWAL, IDisposable
     /// <inheritdoc/>
     public RaftOperationStatus TruncateProposedLogsAfter(int partitionId, long afterLogId)
     {
-        ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
+        ShardDatabase? shard = TryOpenShard(ShardOf(partitionId));
+        if (shard is null)
+            return RaftOperationStatus.Errored;
+
         lock (shard.Lock)
         {
+            if (disposed)
+                return RaftOperationStatus.Errored;
+
             try
             {
                 // Only unresolved (Proposed / ProposedCheckpoint) entries above the anchor are removable;
@@ -847,11 +957,17 @@ public class SqliteWAL : IWAL, IDisposable
     /// <inheritdoc/>
     public (RaftOperationStatus Status, long MaxLogId) TruncateLogsAfterAndGetMax(int partitionId, long afterLogId)
     {
-        ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
+        ShardDatabase? shard = TryOpenShard(ShardOf(partitionId));
+        if (shard is null)
+            return (RaftOperationStatus.Errored, 0);
+
         // Delete and read-max under one shard-lock acquisition so the pair is atomic against the
         // WAL-scheduler write path, which serializes on the same shard.Lock.
         lock (shard.Lock)
         {
+            if (disposed)
+                return (RaftOperationStatus.Errored, 0);
+
             try
             {
                 using SqliteTransaction transaction = shard.Connection.BeginTransaction();
@@ -910,10 +1026,15 @@ public class SqliteWAL : IWAL, IDisposable
         int partitionId, long snapshotIndex, long lastIncludedTerm, bool sync)
     {
         bool downgradeSync = !sync && syncWrites;
-        ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
+        ShardDatabase? shard = TryOpenShard(ShardOf(partitionId));
+        if (shard is null)
+            return (RaftOperationStatus.Errored, false);
 
         lock (shard.Lock)
         {
+            if (disposed)
+                return (RaftOperationStatus.Errored, false);
+
             if (downgradeSync)
                 SetSynchronousPragma(shard, off: true);
 
@@ -1013,12 +1134,17 @@ public class SqliteWAL : IWAL, IDisposable
         int? maxTotalEntries = null)
     {
         int passCap = maxTotalEntries ?? compactNumberEntries;
-        ShardDatabase shard = TryOpenShard(ShardOf(partitionId));
+        ShardDatabase? shard = TryOpenShard(ShardOf(partitionId));
+        if (shard is null)
+            return (RaftOperationStatus.Errored, 0);
 
         try
         {
             lock (shard.Lock)
             {
+                if (disposed)
+                    return (RaftOperationStatus.Errored, 0);
+
                 using SqliteTransaction transaction = shard.Connection.BeginTransaction();
 
                 try
@@ -1080,7 +1206,8 @@ public class SqliteWAL : IWAL, IDisposable
 
     /// <summary>
     /// Retrieves a metadata value by key from the metadata database.
-    /// Returns <see langword="null"/> if the key does not exist.
+    /// Returns <see langword="null"/> if the key does not exist. Throws
+    /// <see cref="ObjectDisposedException"/> once the WAL is disposed.
     /// </summary>
     public string? GetMetaData(string key)
     {
@@ -1099,12 +1226,16 @@ public class SqliteWAL : IWAL, IDisposable
 
     /// <summary>
     /// Upserts a metadata key/value pair into the metadata database.
-    /// Returns <see langword="true"/> on success.
+    /// Returns <see langword="true"/> on success, and <see langword="false"/> once the WAL is disposed
+    /// (the <see cref="IWAL.SetMetaData"/> contract reports failure as a status, not an exception).
     /// </summary>
     public bool SetMetaData(string key, string value)
     {
         lock (_metaDataLock)
         {
+            if (disposed)
+                return false;
+
             SqliteConnection connection = TryOpenMetaDataDatabase();
 
             const string upsertSql = """
@@ -1401,28 +1532,51 @@ public class SqliteWAL : IWAL, IDisposable
 
     // ── IDisposable ───────────────────────────────────────────────────────────
 
+    private void ThrowIfDisposed()
+    {
+        if (disposed)
+            throw DisposedException();
+    }
+
+    private ObjectDisposedException DisposedException() =>
+        new(nameof(SqliteWAL), $"The SQLite WAL at '{path}' is disposed.");
+
+    /// <summary>
+    /// Closes every connection. Idempotent, and safe to call while other threads are still inside
+    /// WAL calls (see the class summary's disposal note).
+    ///
+    /// <para>Order matters. <see cref="disposed"/> is set first, so no new shard or metadata
+    /// connection can open. The <see cref="semaphore"/> round-trip then waits for a shard creation
+    /// that passed its disposed check before the flag was set, so that shard is in
+    /// <see cref="shards"/> when it is enumerated below. Each connection is then closed under its own
+    /// lock, which waits for a command in flight on it and makes every later caller see the flag.</para>
+    ///
+    /// <para><see cref="semaphore"/> is deliberately not disposed: a late <see cref="TryOpenShard"/>
+    /// can still be between its <c>Wait</c> and <c>Release</c>, and a disposed semaphore would turn that
+    /// release into an <see cref="ObjectDisposedException"/>. It owns no unmanaged handle, because
+    /// <c>AvailableWaitHandle</c> is never read.</para>
+    /// </summary>
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref disposeStarted, 1) != 0)
+            return;
+
         GC.SuppressFinalize(this);
-        semaphore.Dispose();
-        metaDataConnection?.Dispose();
+        disposed = true;
+
+        semaphore.Wait();
+        semaphore.Release();
+
+        lock (_metaDataLock)
+        {
+            metaDataConnection?.Dispose();
+            metaDataConnection = null;
+        }
 
         foreach (ShardDatabase shard in shards.Values)
         {
-            shard.PreparedUpsert?.Dispose();
-            shard.PreparedGetTermAt?.Dispose();
-            shard.PreparedGetCurrentTerm?.Dispose();
-            shard.PreparedGetMaxLog?.Dispose();
-            shard.PreparedGetLastCheckpoint?.Dispose();
-            shard.PreparedReadLogsRangeLimited?.Dispose();
-            shard.PreparedReadLogsRangeUnlimited?.Dispose();
-            shard.PreparedCheckpointRead?.Dispose();
-            shard.PreparedCheckpointUpsert?.Dispose();
-            shard.PreparedCheckpointDelete?.Dispose();
-            shard.PreparedPragmaSyncOff?.Dispose();
-            shard.PreparedPragmaSyncFull?.Dispose();
-            shard.PreparedTruncateProposed?.Dispose();
-            shard.Connection.Dispose();
+            lock (shard.Lock)
+                shard.DisposeResources();
         }
     }
 }
