@@ -451,9 +451,11 @@ internal sealed class SnapshotReceiver
             {
                 session.Buffer.SpillTo(Path.Combine(stagingDirectory!, $"snapshot-p{request.PartitionId}-{Guid.NewGuid():N}{StagingFileExtension}"));
                 KommanderMetrics.RecordSnapshotReceiveSessionSpilled(request.PartitionId);
-                logger.LogInformation(
-                    "[{Endpoint}] Snapshot session for partition {PartitionId} at index {Index} moved to disk: staging it in memory would exceed the {Budget}-byte staging memory budget",
-                    localEndpoint, request.PartitionId, request.SnapshotIndex, stagingMemoryBytes);
+
+                if (logger.IsEnabled(LogLevel.Information))
+                    logger.LogInformation(
+                        "[{Endpoint}] Snapshot session for partition {PartitionId} at index {Index} moved to disk: staging it in memory would exceed the {Budget}-byte staging memory budget",
+                        localEndpoint, request.PartitionId, request.SnapshotIndex, stagingMemoryBytes);
             }
 
             if (incoming > 0)
