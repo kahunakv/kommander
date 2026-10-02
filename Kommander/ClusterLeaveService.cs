@@ -16,7 +16,9 @@ namespace Kommander;
 /// Two latches live here and mean different things. <see cref="IsLeaving"/> suppresses
 /// campaigning and is deliberately <i>not</i> sticky: a node whose leave was refused is still a
 /// full member and must keep contending, so the flag is raised only once departure is real (or
-/// unconditionally by <see cref="LeaveCluster"/>, where teardown follows regardless).
+/// by <see cref="LeaveCluster"/> once its commit attempt has ended, where teardown follows
+/// regardless). Neither path raises it while the removal is still being committed: the node may
+/// have to win the system-partition election to commit its own removal.
 /// <see cref="IsLeaveRequested"/> <i>is</i> sticky and never clears, even for an attempt that
 /// reported failure: the removal can still land later, and auto-rejoin would silently undo an
 /// operator-ordered decommission.
@@ -36,22 +38,23 @@ namespace Kommander;
 internal sealed class ClusterLeaveService : IDisposable
 {
     /// <summary>
-    /// Raised by <see cref="LeaveCluster"/> before the removal is committed so that the local role
-    /// immediately reports <see cref="ClusterMemberRole.Leaving"/> and the election / pre-vote gate
-    /// suppresses campaigning on all partitions.
+    /// While raised, the local role reports <see cref="ClusterMemberRole.Leaving"/> and the
+    /// election / pre-vote gate suppresses campaigning on all partitions.
     /// <para>
-    /// <see cref="RequestLeaveAsync"/> raises it only once the removal has committed: until then
-    /// the node is still a full member, and it may need to win the system-partition election in
-    /// order to commit its own removal at all.
+    /// Never raised while a removal is still being committed: until then the node is a full
+    /// member, and it may need to win the system-partition election in order to commit its own
+    /// removal at all. <see cref="RequestLeaveAsync"/> raises it once the removal has committed;
+    /// <see cref="LeaveCluster"/> raises it once its commit attempt has ended, whatever the
+    /// outcome, because teardown follows.
     /// </para>
     /// </summary>
     private volatile bool _leaving;
 
     /// <summary>
-    /// Set by the first <see cref="RequestLeaveAsync"/> and never cleared, even when that attempt
-    /// fails. Departure was requested by an operator, so this node must never re-admit itself: the
-    /// removal can still land after a timed-out attempt, and auto-rejoin would silently undo the
-    /// decommission the operator asked for. Election suppression (<see cref="_leaving"/>) is
+    /// Set by the first <see cref="RequestLeaveAsync"/> or <see cref="LeaveCluster"/> and never
+    /// cleared, even when that attempt fails. Departure was requested, so this node must never
+    /// re-admit itself: the removal can still land after a timed-out attempt, and auto-rejoin
+    /// would silently undo the departure that was asked for. Election suppression (<see cref="_leaving"/>) is
     /// deliberately <i>not</i> sticky — a node that was refused is still a full member and must keep
     /// campaigning.
     /// </summary>
@@ -257,13 +260,17 @@ internal sealed class ClusterLeaveService : IDisposable
     /// <summary>
     /// Leaves the cluster and tears the node down.
     /// <para>
-    /// When the local node is part of a committed roster (MembershipVersion &gt; 0) this first
-    /// sets the <b>local</b> <see cref="_leaving"/> latch — the local role then reports
-    /// <see cref="ClusterMemberRole.Leaving"/>, suppressing elections immediately; this is not a
-    /// committed roster change and no replica drain happens — commits a <c>RemoveMember</c> entry
-    /// on the system partition, and waits up to 10 s for the removal to propagate back to this
-    /// node before tearing down. Use <see cref="RequestLeaveAsync"/> for a decommission that
-    /// evacuates replicas first.
+    /// When the local node is part of a committed roster (MembershipVersion &gt; 0) this commits a
+    /// <c>RemoveMember</c> entry on the system partition and waits up to 10 s for the removal to
+    /// propagate back to this node. No replica drain happens; use <see cref="RequestLeaveAsync"/>
+    /// for a decommission that evacuates replicas first.
+    /// </para>
+    /// <para>
+    /// The node keeps campaigning until that commit attempt ends — it can be the only node able to
+    /// lead the system partition, and so the only one able to commit its own removal. Only then is
+    /// the <b>local</b> <see cref="_leaving"/> latch set (the local role reports
+    /// <see cref="ClusterMemberRole.Leaving"/> and elections are suppressed; this is not a
+    /// committed roster change), and the node tears down whether or not the removal committed.
     /// If the cluster has no committed roster (pre-seed transient or test teardown path), or if
     /// the roster contains no other <c>Voter</c> peer, the round-trip is skipped and the node
     /// stops immediately (single-voter short-circuit — no 10 s spin).
@@ -275,9 +282,9 @@ internal sealed class ClusterLeaveService : IDisposable
     /// </param>
     internal async Task LeaveCluster(bool dispose = false, CancellationToken cancellationToken = default)
     {
-        // Suppress elections on all partitions immediately: teardown follows unconditionally, so
-        // this node must not win a leadership it is about to abandon.
-        _leaving = true;
+        // Departure is decided before anything else runs: teardown follows whatever the commit
+        // attempt reports, so the roster that excludes this node must never start an auto-rejoin.
+        _leaveRequested = true;
 
         // If we are part of a committed roster AND there is at least one other Voter peer,
         // commit the removal before stopping so surviving nodes drop us from their peer list
@@ -291,8 +298,18 @@ internal sealed class ClusterLeaveService : IDisposable
 
         if (roster.MembershipVersion > 0 && clusterHandler.Joined && hasOtherVoter)
         {
+            // Campaigning stays open while the attempt runs. The removal is committed by the
+            // system-partition leader, and this node can be the only one able to become it: when
+            // the previous leader left with its last entry acknowledged by this node alone, every
+            // other voter's log is behind and loses the election. Suppressing here left that
+            // partition leaderless for the whole deadline, and the node then stopped with its
+            // removal uncommitted — the survivors counted a dead node towards quorum for good.
             await CommitGracefulLeaveAsync(cancellationToken).ConfigureAwait(false);
         }
+
+        // The attempt is over, committed or not, and teardown is next: from here the node must not
+        // win a leadership it is about to abandon.
+        _leaving = true;
 
         await clusterHandler.LeaveCluster(configuration).ConfigureAwait(false);
 

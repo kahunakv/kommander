@@ -130,9 +130,12 @@ public interface IRaft
     /// <para>
     /// <see cref="System.ClusterMemberRole.Leaving"/> can arrive two ways: as the <b>committed
     /// roster role</b> while a decommission drain is evacuating this node's replicas (see
-    /// <see cref="RequestLeaveAsync"/> — reversible, the node keeps serving), or immediately and
-    /// locally when <see cref="LeaveCluster"/> has been called, even before any removal commits.
-    /// Either way the election gates suppress campaigning while the role is not Voter.
+    /// <see cref="RequestLeaveAsync"/> — reversible, the node keeps serving), or locally once
+    /// <see cref="LeaveCluster"/> has finished its attempt to commit the removal and is about to
+    /// tear the node down, whether or not that removal committed. While the attempt runs the
+    /// roster role is still reported, because the node may have to win the system partition to
+    /// commit its own removal. Either way the election gates suppress campaigning while the role
+    /// is not Voter.
     /// </para>
     /// <para>
     /// Returns <see cref="System.ClusterMemberRole.Voter"/> during the pre-seed transient

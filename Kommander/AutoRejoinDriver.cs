@@ -121,7 +121,7 @@ internal sealed class AutoRejoinDriver
     /// Background rejoin loop for an evicted member: sends the (idempotent) Join RPC to the
     /// remaining roster members and discovery peers with exponential backoff until this node is
     /// back in the committed roster (role leaves <c>NotMember</c> when the re-admission commit
-    /// reaches us via replication or gossip), or the node starts leaving / disposing. Re-uses
+    /// reaches us via replication or gossip), or the node is asked to leave / is disposing. Re-uses
     /// the same admission path as a first-time seed join, so the node re-enters as a Learner
     /// and is promoted back to Voter by the normal learner-promotion machinery once caught up
     /// — an evicted-but-live node is typically already caught up, so promotion is quick.
@@ -137,7 +137,9 @@ internal sealed class AutoRejoinDriver
             TimeSpan backoff = TimeSpan.FromSeconds(1);
             TimeSpan maxBackoff = TimeSpan.FromSeconds(30);
 
-            while (!isLeaving() && !isDisposed())
+            // A leave asked for while the loop runs ends it at once, before the leave has committed
+            // anything: a Join sent from here on would re-admit a node that is on its way out.
+            while (!isLeaving() && !isLeaveRequested() && !isDisposed())
             {
                 ClusterMemberRole role = getLocalRole();
                 if (role != ClusterMemberRole.NotMember)
@@ -158,7 +160,7 @@ internal sealed class AutoRejoinDriver
 
                 foreach (string target in targets)
                 {
-                    if (isLeaving() || isDisposed())
+                    if (isLeaving() || isLeaveRequested() || isDisposed())
                         return;
 
                     if (await TrySendJoinAsync(target).ConfigureAwait(false))

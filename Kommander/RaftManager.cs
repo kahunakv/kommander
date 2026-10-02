@@ -222,9 +222,11 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     /// <see cref="System.ClusterMemberRole.Voter"/>, <see cref="System.ClusterMemberRole.Learner"/>,
     /// <see cref="System.ClusterMemberRole.Leaving"/>, or <see cref="System.ClusterMemberRole.NotMember"/>.
     /// <para>
-    /// Returns <see cref="System.ClusterMemberRole.Leaving"/> immediately when
-    /// <see cref="LeaveCluster"/> has been called, even before the removal commits, so
-    /// election / pre-vote gates suppress campaigning during the drain window.
+    /// Returns <see cref="System.ClusterMemberRole.Leaving"/> once <see cref="LeaveCluster"/> has
+    /// finished its attempt to commit the removal (whatever the outcome) and is about to tear the
+    /// node down, so election / pre-vote gates suppress campaigning during teardown. While that
+    /// attempt runs the roster role is reported and the node still campaigns: it may have to win
+    /// the system partition to commit its own removal.
     /// </para>
     /// <para>
     /// Returns <see cref="System.ClusterMemberRole.Voter"/> during the pre-seed transient

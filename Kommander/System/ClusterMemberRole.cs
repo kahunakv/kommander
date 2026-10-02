@@ -16,8 +16,10 @@ public enum ClusterMemberRole
     /// campaign gates suppress elections for any node whose roster role is not Voter.
     /// <para>
     /// <see cref="RaftManager.LocalRole"/> also returns this value locally (without a committed
-    /// role change) once teardown has begun, so election suppression kicks in immediately on
-    /// shutdown.
+    /// role change) once a shutdown-coupled leave has finished its attempt to commit the removal
+    /// and teardown is next, so the node cannot win a leadership it is about to abandon. Until
+    /// that attempt ends the node still reports its roster role and keeps campaigning: it may be
+    /// the only node able to lead the system partition and commit its own removal.
     /// </para>
     /// </summary>
     Leaving,

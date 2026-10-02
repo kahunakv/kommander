@@ -187,8 +187,8 @@ public sealed class ClusterMember
   whose committed replica set still names it, until that replica is explicitly dropped. It stops
   campaigning while in this state, **reversibly**: a drain that is refused or times out rolls the
   role back to `Voter`. Only one member may be `Leaving` at a time. (`LeaveCluster` also reports
-  `LocalRole == Leaving` locally via a latch, without any committed role change — that variant
-  does not drain.)
+  `LocalRole == Leaving` locally via a latch, without any committed role change, once its attempt
+  to commit the removal has ended and teardown is next — that variant does not drain.)
 - **NotMember** — not a stored role; it's the value `RaftManager.LocalRole` returns when the local
   node isn't in the committed roster at all.
 
@@ -296,11 +296,17 @@ tighter control. Internally, `JoinCluster(seeds)`:
 await raft.LeaveCluster(dispose: true);
 ```
 
-`LeaveCluster` marks the node `Leaving` locally (so it stops campaigning immediately), commits a
-`RemoveMember(self)` on P0, waits up to ~10 s for the removal to propagate back, then tears the node
-down regardless. If this node is the P0 leader, it commits its own removal under the old quorum and
-steps down so another node takes over. It never drains replicas — it is the shutdown-coupled
-variant.
+`LeaveCluster` commits a `RemoveMember(self)` on P0, waits up to ~10 s for the removal to propagate
+back, then marks the node `Leaving` locally (so it stops campaigning) and tears it down regardless.
+If this node is the P0 leader, it commits its own removal under the old quorum and steps down so
+another node takes over. It never drains replicas — it is the shutdown-coupled variant.
+
+The node keeps campaigning until the commit attempt ends, on purpose. The removal is committed by
+the P0 leader, and the leaving node can be the only one able to become it: when the previous P0
+leader left with its last entry acknowledged by this node alone, every other voter's log is behind
+and loses the election. A leaver that stopped campaigning first would leave P0 leaderless for the
+whole deadline and then stop with its removal uncommitted, and the survivors would count a dead
+node towards quorum.
 
 ### Decommission a node (drain, then leave)
 
@@ -376,11 +382,12 @@ throughout; the new node is a pure receiver until promotion.
 ```
 Leaving node                P0 leader
    |                            |
-   |  LocalRole = Leaving (local latch: stops campaigning; no committed role change)
+   |  (still campaigning: it may have to become the P0 leader itself)
    |--LeaveRequest(endpoint)--->|
    |                            |--AppendLogs(RemoveMember)-->voters
    |                            |<--ack majority → commit → roster shrinks
    |<--LeaveResponse(ok)--------|
+   |  LocalRole = Leaving (local latch: stops campaigning; no committed role change)
    |  shutdown
 ```
 

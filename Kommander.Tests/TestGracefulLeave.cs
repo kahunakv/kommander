@@ -243,6 +243,114 @@ public sealed class TestGracefulLeave
         await n1.LeaveCluster(dispose: true, cancellationToken: ct);
     }
 
+    // ── A leaver that must win the system partition to commit its own removal ──
+
+    /// <summary>
+    /// Two nodes leave a 3-node cluster back to back, and the first one led the system partition.
+    /// It commits its own removal with the acknowledgement of the second leaver alone — the
+    /// survivor is cut off for that moment — and stops. The second leaver now holds the only
+    /// complete system-partition log: the survivor cannot win that election (its log is behind),
+    /// so the removal of the second leaver can only be committed by the second leaver itself.
+    /// <para>
+    /// A leaver that stopped campaigning the moment it was asked to leave deadlocked here: nobody
+    /// could lead the system partition, the leave ran out its deadline, the node stopped anyway,
+    /// and the survivor was left counting a dead node towards a quorum it could never reach.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task LeaveCluster_LeaverHoldingTheFreshestSystemLog_CommitsItsRemovalAndTheSurvivorLeads()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        InMemoryCommunication comm = new();
+        RaftManager n1 = MakeNode(comm, "localhost", 9260, 1, ["localhost:9261", "localhost:9262"], _logger);
+        RaftManager n2 = MakeNode(comm, "localhost", 9261, 2, ["localhost:9260", "localhost:9262"], _logger);
+        RaftManager n3 = MakeNode(comm, "localhost", 9262, 3, ["localhost:9260", "localhost:9261"], _logger);
+
+        comm.SetNodes(new Dictionary<string, IRaft>
+        {
+            ["localhost:9260"] = n1,
+            ["localhost:9261"] = n2,
+            ["localhost:9262"] = n3,
+        });
+
+        await n1.UpdateNodes();
+        await n2.UpdateNodes();
+        await n3.UpdateNodes();
+
+        RaftManager[] nodes = [n1, n2, n3];
+
+        try
+        {
+            await Task.WhenAll(n1.JoinCluster(ct), n2.JoinCluster(ct), n3.JoinCluster(ct));
+            await WaitForLeader(nodes, partitionId: 1, ct);
+
+            await WaitForCondition(
+                () => nodes.All(n => n.SystemCoordinator.GetMembership().Members.Count(m => m.Role == ClusterMemberRole.Voter) == 3), ct);
+
+            await WaitForLeader(nodes, RaftSystemConfig.SystemPartition, ct);
+
+            RaftManager? firstLeaver = null;
+            foreach (RaftManager n in nodes)
+            {
+                if (await n.AmILeaderQuick(RaftSystemConfig.SystemPartition))
+                    firstLeaver = n;
+            }
+
+            Assert.NotNull(firstLeaver);
+
+            RaftManager[] rest = [.. nodes.Where(n => !ReferenceEquals(n, firstLeaver))];
+            RaftManager survivor = rest[0];
+            RaftManager secondLeaver = rest[1];
+
+            // The survivor is cut off while the first leaver goes, so the removal commits with the
+            // second leaver's acknowledgement only, and nobody can lead the system partition until
+            // the cut is healed: the survivor's log stays behind.
+            comm.PartitionNode(survivor.LocalEndpoint);
+            await firstLeaver.LeaveCluster(dispose: false, cancellationToken: ct);
+
+            // The first leaver applied its own removal, so a quorum — itself and the second leaver —
+            // holds that entry; the survivor never saw it.
+            Assert.DoesNotContain(
+                firstLeaver.SystemCoordinator.GetMembership().Members, m => m.Endpoint == firstLeaver.LocalEndpoint);
+            Assert.Contains(
+                survivor.SystemCoordinator.GetMembership().Members, m => m.Endpoint == firstLeaver.LocalEndpoint);
+
+            // The second leave starts while the system partition has no leader. The second leaver
+            // has to win it, bring the survivor up to date and commit its own removal — well inside
+            // the 10 s the leave allows itself.
+            ValueStopwatch sw = ValueStopwatch.StartNew();
+            Task secondLeave = secondLeaver.LeaveCluster(dispose: false, cancellationToken: ct);
+            comm.HealAll();
+            await secondLeave;
+            long elapsedMs = sw.GetElapsedMilliseconds();
+
+            Assert.True(elapsedMs < TestTimeouts.Scale(5_000),
+                $"The second leave took {elapsedMs} ms: it ran out its deadline instead of committing the removal.");
+
+            await WaitForCondition(
+                () =>
+                {
+                    ClusterMembership roster = survivor.SystemCoordinator.GetMembership();
+                    return roster.Members.Count == 1 &&
+                           roster.Members[0].Endpoint == survivor.LocalEndpoint &&
+                           roster.Members[0].Role == ClusterMemberRole.Voter;
+                },
+                ct, timeoutMs: 15_000);
+
+            // Alone in the roster, the survivor is a quorum of one and leads.
+            await WaitForLeader([survivor], RaftSystemConfig.SystemPartition, ct);
+            await WaitForLeader([survivor], partitionId: 1, ct);
+        }
+        finally
+        {
+            comm.HealAll();
+
+            foreach (RaftManager n in nodes)
+                n.Dispose();
+        }
+    }
+
     // ── Runtime decommission: RequestLeaveAsync ──────────────────────────────
 
     /// <summary>
