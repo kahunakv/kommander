@@ -199,6 +199,11 @@ public interface IRaftWalFacade
     /// next id is above it can only find that id Proposed or absent. It is a bound, never a frontier:
     /// it may sit above holes, and only the drain decides what is deliverable. Defaults to
     /// <see cref="long.MaxValue"/> (always read) for facades that do not track written resolutions.
+    /// <para>The bound trails the log: a row is readable from the moment its write lands, and the
+    /// bound covers it only once that write's completion has been routed on the partition executor.
+    /// A caller may therefore use it to skip a read only if it returns to the executor loop between
+    /// attempts. One that retries inside a single executor operation must read instead (see
+    /// <c>LogApplicator.DrainCommittedAppliesAsync</c>).</para>
     /// </summary>
     long GetReadableResolvedHighWater() => long.MaxValue;
 

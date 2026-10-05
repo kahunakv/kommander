@@ -1567,7 +1567,10 @@ public sealed class RaftPartitionStateMachine
 
             bool drainCovered = true;
 
-            while (!await applier.DrainCommittedAppliesAsync(commitFrontier).ConfigureAwait(false))
+            // Every attempt reads the log. This loop holds the executor, so the WAL completions that
+            // raise the drain's readable bound are queued behind it: a drain that trusted the bound
+            // here would answer "not covered" on every attempt for a row that has already landed.
+            while (!await applier.DrainCommittedAppliesAsync(commitFrontier, trustReadableBound: false).ConfigureAwait(false))
             {
                 if (Stopwatch.GetElapsedTime(drainDeadlineTicks) > drainBound)
                 {

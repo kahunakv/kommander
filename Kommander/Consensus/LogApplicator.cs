@@ -105,8 +105,19 @@ internal sealed class LogApplicator
     /// is fenced) it means the projection genuinely cannot cover the frontier and the caller must
     /// not serve. A no-op returning <see langword="true"/> when <see cref="RaftPartitionCoreState.LastAppliedIndex"/>
     /// already covers <paramref name="upToIndex"/>.</para>
+    ///
+    /// <para><paramref name="trustReadableBound"/> must be <see langword="false"/> for a caller that
+    /// retries the drain inside ONE executor operation (the promotion). The bound that lets a drain
+    /// answer "not covered" without reading (<see cref="IRaftWalFacade.GetReadableResolvedHighWater"/>)
+    /// moves only when a WAL completion is routed, and routing a completion is an executor operation
+    /// queued behind that caller: the bound cannot move while the caller waits on it. A promotion that
+    /// trusted it waited out its whole barrier timeout for a commit marker that was already readable,
+    /// whenever the marker's completion was still queued when the election was won — a leadership
+    /// transfer issued right after a write — and was then refused, with the partition executor held
+    /// for the full timeout. Such a caller reads the log on every attempt instead: the rows become
+    /// readable when the write scheduler lands them, which needs no executor turn.</para>
     /// </summary>
-    public async Task<bool> DrainCommittedAppliesAsync(long upToIndex, bool skipGaps = false)
+    public async Task<bool> DrainCommittedAppliesAsync(long upToIndex, bool skipGaps = false, bool trustReadableBound = true)
     {
         if (upToIndex < 0 || coreState.LastAppliedIndex >= upToIndex)
             return true;
@@ -128,7 +139,9 @@ internal sealed class LogApplicator
         // batch the frontier already covers commits still in the write queue, and every completion paid
         // a 512-row WAL read for nothing — about nine rows read per row committed on a busy follower,
         // and half of the cluster's allocation. skipGaps keeps the read: it advances over Proposed rows.
-        if (!skipGaps && from > wal.GetReadableResolvedHighWater())
+        // So does a caller that holds the executor across its retries: the bound is raised by routed
+        // completions, which cannot run until that caller returns.
+        if (trustReadableBound && !skipGaps && from > wal.GetReadableResolvedHighWater())
             return false;
 
         while (from <= upToIndex)
