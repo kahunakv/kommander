@@ -243,7 +243,16 @@ public class RocksDbWAL : IWAL, IDisposable
     /// batch was applied, so the count never runs ahead of durable state.
     /// </summary>
     internal long CommitMarkersAbsorbed { get; private set; }
-    
+
+    private long markerHeadersPrefetched;
+
+    /// <summary>
+    /// For tests: number of marker-target row headers this instance read through the batched
+    /// MultiGet prefetch of the group-commit path (see <see cref="PrefetchMarkerHeaders"/>). Lets a
+    /// test prove that the batched path ran, not only that the frontier decisions came out right.
+    /// </summary>
+    internal long MarkerHeadersPrefetched => Interlocked.Read(ref markerHeadersPrefetched);
+
     /// <summary>
     /// Opens a RocksDB WAL at <paramref name="path"/>/<paramref name="revision"/>.
     ///
@@ -1111,7 +1120,10 @@ public class RocksDbWAL : IWAL, IDisposable
 
         long commitFrontier = GetCommitFrontier(partitionId);
 
-        using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
+        // Bounded at the partition so the step past its last row stops there, even when a run of
+        // tombstones (a truncated suffix) lies beyond it. Async I/O: restore replays the whole tail.
+        using BoundedIterator bounded = NewPartitionBoundedIterator(columnFamilyHandle, partitionId, asyncIO: true);
+        Iterator iterator = bounded.Iterator!;
 
         // Rows below the compaction floor are logically deleted even where they are still physically
         // present (the floor layout reclaims whole files, not rows), so the read starts at the floor.
@@ -1170,7 +1182,10 @@ public class RocksDbWAL : IWAL, IDisposable
 
         long commitFrontier = GetCommitFrontier(partitionId);
 
-        using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
+        // Bounded at the partition (see ReadLogs). Async I/O: a backfill batch usually reads a lagging
+        // follower's range, which is often cold in SST files rather than in the memtable.
+        using BoundedIterator bounded = NewPartitionBoundedIterator(columnFamilyHandle, partitionId, asyncIO: true);
+        Iterator iterator = bounded.Iterator!;
 
         // Clamped at the compaction floor: a backfill request for ids below it reads exactly what
         // it read when those rows were physically deleted — nothing — so the caller's
@@ -1471,6 +1486,9 @@ public class RocksDbWAL : IWAL, IDisposable
                     HashSet<long>? stagedProposed = null;
                     HashSet<long>? stagedResolved = null;
 
+                    // One batched read of the markers' target headers instead of a point read per marker.
+                    using MarkerHeaderPrefetch? prefetched = PrefetchMarkerHeaders(partitionId, key, kv.Value, frontier);
+
                     foreach (RaftLog log in kv.Value)
                     {
                         if (log.Type == RaftLogType.Committed)
@@ -1480,7 +1498,7 @@ public class RocksDbWAL : IWAL, IDisposable
                                 continue;
 
                             (long advanced, bool absorbed) = TryAdvanceFrontierFor(
-                                partitionId, key, pendingFrontier, log, stagedProposed, stagedResolved);
+                                partitionId, key, pendingFrontier, log, stagedProposed, stagedResolved, prefetched);
                             pendingFrontier = advanced;
                             if (absorbed)
                             {
@@ -2351,7 +2369,11 @@ public class RocksDbWAL : IWAL, IDisposable
 
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
-        using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
+        // A maintenance scan over the whole partition: bounded at the partition, async I/O, and no
+        // block-cache fill, so a count never evicts the tail blocks the hot paths read.
+        using BoundedIterator bounded = NewPartitionBoundedIterator(
+            columnFamilyHandle, partitionId, asyncIO: true, fillCache: false);
+        Iterator iterator = bounded.Iterator!;
         Span<byte> seekKey = stackalloc byte[LogKeyWidth];
         BuildLogKey(seekKey, partitionId, GetCompactionFloor(partitionId));
         iterator.Seek(seekKey);
@@ -2383,7 +2405,11 @@ public class RocksDbWAL : IWAL, IDisposable
 
         ColumnFamilyHandle columnFamilyHandle = GetColumnFamily(partitionId);
 
-        using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
+        // Bounded at the checkpoint: only the rows below it are removable, so the scan never reads
+        // the live tail. Async I/O and no block-cache fill, as in CountPersistedLogs.
+        using BoundedIterator bounded = NewBoundedIterator(
+            columnFamilyHandle, partitionId, lastCheckpoint, asyncIO: true, fillCache: false);
+        Iterator iterator = bounded.Iterator!;
         Span<byte> seekKey = stackalloc byte[LogKeyWidth];
         BuildLogKey(seekKey, partitionId, GetCompactionFloor(partitionId));
         iterator.Seek(seekKey);
@@ -2724,11 +2750,17 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <summary>
     /// Reads only the header of the row at (<paramref name="partitionId"/>, <paramref name="logId"/>)
     /// via <see cref="HeaderSpanDeserializer"/>. Returns <c>Found=false</c> when the key is absent.
+    /// When <paramref name="prefetched"/> holds <paramref name="logId"/>, its batched read answers
+    /// instead of a point read; an id it does not hold falls back to the point read.
     /// </summary>
-    private (bool Found, long Term, int Type) ProbeRowHeader(int partitionId, ColumnFamilyHandle cf, long logId)
+    private (bool Found, long Term, int Type) ProbeRowHeader(
+        int partitionId, ColumnFamilyHandle cf, long logId, MarkerHeaderPrefetch? prefetched = null)
     {
         if (logId < GetCompactionFloor(partitionId))
             return default;
+
+        if (prefetched is not null && prefetched.TryGet(logId, out (bool Found, long Term, int Type) header))
+            return header;
 
         Span<byte> key = stackalloc byte[LogKeyWidth];
         BuildLogKey(key, partitionId, logId);
@@ -2758,6 +2790,9 @@ public class RocksDbWAL : IWAL, IDisposable
     /// <para>The target row itself must be durably present with the marker's term as
     /// Proposed/Committed (or staged as Proposed in this batch); a divergent term or an absent row
     /// (a backfill first-write) refuses the absorb and the full row is written, as before.</para>
+    ///
+    /// <para><paramref name="prefetched"/> only changes how the point probes read, never what they
+    /// decide: see <see cref="PrefetchMarkerHeaders"/>.</para>
     /// </summary>
     private (long NewFrontier, bool Absorbed) TryAdvanceFrontierFor(
         int partitionId,
@@ -2765,7 +2800,8 @@ public class RocksDbWAL : IWAL, IDisposable
         long pendingFrontier,
         RaftLog log,
         HashSet<long>? stagedProposed,
-        HashSet<long>? stagedResolved)
+        HashSet<long>? stagedResolved,
+        MarkerHeaderPrefetch? prefetched = null)
     {
         long target = log.Id;
         long advanced = pendingFrontier;
@@ -2860,7 +2896,7 @@ public class RocksDbWAL : IWAL, IDisposable
                         continue;
                     }
 
-                    (bool found, _, int rowType) = ProbeRowHeader(partitionId, cf, next);
+                    (bool found, _, int rowType) = ProbeRowHeader(partitionId, cf, next, prefetched);
                     if (!found || !IsResolvedRowType(rowType))
                         return (advanced, false);
 
@@ -2879,7 +2915,7 @@ public class RocksDbWAL : IWAL, IDisposable
         if (stagedProposed is not null && stagedProposed.Contains(target))
             return (target, true);
 
-        (bool targetFound, long term, int targetType) = ProbeRowHeader(partitionId, cf, target);
+        (bool targetFound, long term, int targetType) = ProbeRowHeader(partitionId, cf, target, prefetched);
         if (targetFound && term == log.Term
             && targetType is (int)RaftLogType.Proposed or (int)RaftLogType.Committed)
             return (target, true);
@@ -2893,6 +2929,187 @@ public class RocksDbWAL : IWAL, IDisposable
              or (int)RaftLogType.CommittedCheckpoint
              or (int)RaftLogType.RolledBack
              or (int)RaftLogType.RolledBackCheckpoint;
+
+    /// <summary>
+    /// Keys per MultiGet when <see cref="PrefetchMarkerHeaders"/> reads marker targets. Each value a
+    /// MultiGet finds is a full row (payload included) that stays pinned until the call returns, so
+    /// this bounds the memory one call holds. It also keeps the packed keys on the stack
+    /// (128 × <see cref="LogKeyWidth"/> bytes).
+    /// </summary>
+    private const int MarkerHeaderReadBatchSize = 128;
+
+    /// <summary>
+    /// Reads the row headers that the frontier probes of one partition's slice of a group batch will
+    /// ask for, as batched MultiGets: the target row of each <see cref="RaftLogType.Committed"/>
+    /// marker above the durable <paramref name="frontier"/>. A group batch can carry thousands of
+    /// markers, and each one used to cost a separate native point read. MultiGet shares the
+    /// per-call work (superversion, filter and index checks per file) and, where the native library
+    /// has io_uring, reads the data blocks of one file in parallel.
+    ///
+    /// <para><b>Why the decisions do not change.</b> The prefetch is only a cache for
+    /// <see cref="ProbeRowHeader"/>; <see cref="TryAdvanceFrontierFor"/> runs the same checks in the
+    /// same order. The probes already read the column family before <c>db.Write</c>, so they never
+    /// saw rows staged in this batch; the staged sets cover those, as before, and they are checked
+    /// before any probe. The prefetch only moves the read point to the start of the slice, which
+    /// is still inside the same Write call. The set of prefetched ids does not affect correctness
+    /// either: an id that was not prefetched falls back to a point read, and a prefetched id that
+    /// no probe asks for costs only its read.</para>
+    ///
+    /// <para><b>Which ids.</b> Markers whose Proposed row is staged earlier in the same slice are left
+    /// out: the walk accepts them from the staged set and never probes them (the leader often
+    /// writes a proposal and its commit marker in one group batch). Ids below the compaction floor
+    /// are left out, because the probe answers them without a read. Returns <see langword="null"/>
+    /// when fewer than two ids remain: one MultiGet key gains nothing over one point read.</para>
+    /// </summary>
+    private MarkerHeaderPrefetch? PrefetchMarkerHeaders(
+        int partitionId, ColumnFamilyHandle cf, List<RaftLog> logs, long frontier)
+    {
+        // Cheap first pass with no allocation: the hot propose-only leader batch has no markers.
+        int candidates = 0;
+        foreach (RaftLog log in logs)
+        {
+            if (log.Type == RaftLogType.Committed && log.Id > frontier)
+                candidates++;
+        }
+
+        if (candidates < 2)
+            return null;
+
+        long compactionFloor = GetCompactionFloor(partitionId);
+        long[] ids = ArrayPool<long>.Shared.Rent(candidates);
+        int count = 0;
+        HashSet<long>? proposedAhead = null;
+
+        foreach (RaftLog log in logs)
+        {
+            if (log.Type is RaftLogType.Proposed or RaftLogType.ProposedCheckpoint)
+                (proposedAhead ??= []).Add(log.Id);
+            else if (log.Type == RaftLogType.Committed && log.Id > frontier && log.Id >= compactionFloor
+                     && (proposedAhead is null || !proposedAhead.Contains(log.Id)))
+                ids[count++] = log.Id;
+        }
+
+        // Sorted and de-duplicated: TryGet binary-searches the ids, and a duplicate key would only
+        // repeat a read.
+        Array.Sort(ids, 0, count);
+        int distinct = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (distinct == 0 || ids[distinct - 1] != ids[i])
+                ids[distinct++] = ids[i];
+        }
+
+        if (distinct < 2)
+        {
+            ArrayPool<long>.Shared.Return(ids);
+            return null;
+        }
+
+        MarkerHeaderPrefetch prefetch = new(ids, distinct);
+
+        try
+        {
+            Span<byte> packedKeys = stackalloc byte[MarkerHeaderReadBatchSize * LogKeyWidth];
+            Span<int> keyLengths = stackalloc int[MarkerHeaderReadBatchSize];
+            keyLengths.Fill(LogKeyWidth);
+
+            for (int start = 0; start < distinct; start += MarkerHeaderReadBatchSize)
+            {
+                int chunk = Math.Min(MarkerHeaderReadBatchSize, distinct - start);
+
+                for (int i = 0; i < chunk; i++)
+                    BuildLogKey(packedKeys.Slice(i * LogKeyWidth, LogKeyWidth), partitionId, ids[start + i]);
+
+                MarkerHeaderVisitor visitor = new(prefetch, start);
+                db.MultiGet(packedKeys[..(chunk * LogKeyWidth)], keyLengths[..chunk], ref visitor, cf: cf);
+            }
+        }
+        catch
+        {
+            prefetch.Dispose();
+            throw;
+        }
+
+        Interlocked.Add(ref markerHeadersPrefetched, distinct);
+        return prefetch;
+    }
+
+    /// <summary>
+    /// The row headers <see cref="PrefetchMarkerHeaders"/> read for a sorted set of ids. An id in the
+    /// set with no stored row reads as <c>Found=false</c>, exactly as a point probe of an absent key
+    /// does; an id outside the set is not answered, so the probe falls back to a point read. Owns
+    /// pooled arrays: dispose it when the slice is staged.
+    /// </summary>
+    private sealed class MarkerHeaderPrefetch : IDisposable
+    {
+        private long[]? ids;
+        private (bool Found, long Term, int Type)[]? headers;
+        private readonly int count;
+
+        public MarkerHeaderPrefetch(long[] ids, int count)
+        {
+            this.ids = ids;
+            this.count = count;
+            headers = ArrayPool<(bool Found, long Term, int Type)>.Shared.Rent(count);
+
+            // A rented array holds stale entries; a key the MultiGet does not find must read as absent.
+            headers.AsSpan(0, count).Clear();
+        }
+
+        /// <summary>Records the header of the row at position <paramref name="position"/> of the sorted ids.</summary>
+        public void Set(int position, long term, int type) => headers![position] = (true, term, type);
+
+        public bool TryGet(long logId, out (bool Found, long Term, int Type) header)
+        {
+            int position = Array.BinarySearch(ids!, 0, count, logId);
+            if (position < 0)
+            {
+                header = default;
+                return false;
+            }
+
+            header = headers![position];
+            return true;
+        }
+
+        public void Dispose()
+        {
+            if (ids is not null)
+            {
+                ArrayPool<long>.Shared.Return(ids);
+                ids = null;
+            }
+
+            if (headers is not null)
+            {
+                ArrayPool<(bool Found, long Term, int Type)>.Shared.Return(headers);
+                headers = null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Decodes each row a marker-header MultiGet finds in place over the pinned native value (no
+    /// payload copy) and records it at its position in the sorted ids: <c>offset</c> is the
+    /// position of the chunk's first key.
+    /// </summary>
+    private readonly struct MarkerHeaderVisitor : IMultiGetValueVisitor
+    {
+        private readonly MarkerHeaderPrefetch prefetch;
+        private readonly int offset;
+
+        public MarkerHeaderVisitor(MarkerHeaderPrefetch prefetch, int offset)
+        {
+            this.prefetch = prefetch;
+            this.offset = offset;
+        }
+
+        public void OnValue(int index, ReadOnlySpan<byte> value)
+        {
+            ReadHeaderFromWire(value, out _, out _, out long term, out int type);
+            prefetch.Set(offset + index, term, type);
+        }
+    }
 
     /// <summary>
     /// An iterator with an exclusive upper bound on the log key, plus the objects the bound's
@@ -2936,27 +3153,61 @@ public class RocksDbWAL : IWAL, IDisposable
     /// Creates an iterator over <paramref name="cf"/> that stops at the log key of
     /// (<paramref name="partitionId"/>, <paramref name="upperIdExclusive"/>): keys at or above it are
     /// never visited, and the tombstones there are never skipped over.
+    /// See <see cref="NewScanReadOptions"/> for <paramref name="asyncIO"/> and <paramref name="fillCache"/>.
     /// </summary>
-    private BoundedIterator NewBoundedIterator(ColumnFamilyHandle cf, int partitionId, long upperIdExclusive)
+    private BoundedIterator NewBoundedIterator(
+        ColumnFamilyHandle cf, int partitionId, long upperIdExclusive, bool asyncIO = false, bool fillCache = true)
     {
         byte[] bound = GC.AllocateUninitializedArray<byte>(LogKeyWidth, pinned: true);
         BuildLogKey(bound, partitionId, upperIdExclusive);
 
-        ReadOptions options = new ReadOptions().SetIterateUpperBound(bound);
+        ReadOptions options = NewScanReadOptions(bound, asyncIO, fillCache);
         return new BoundedIterator(db.NewIterator(cf, options), options, bound);
     }
 
     /// <summary>
     /// Creates an iterator over <paramref name="cf"/> bounded at the partition's upper-bound key,
-    /// so a scan of one partition's tail never walks into the next partition of a shared shard.
+    /// so a scan of one partition's tail never walks into the next partition of a shared shard,
+    /// and the step past the partition's last row never skips the tombstones beyond it.
+    /// See <see cref="NewScanReadOptions"/> for <paramref name="asyncIO"/> and <paramref name="fillCache"/>.
     /// </summary>
-    private BoundedIterator NewPartitionBoundedIterator(ColumnFamilyHandle cf, int partitionId)
+    private BoundedIterator NewPartitionBoundedIterator(
+        ColumnFamilyHandle cf, int partitionId, bool asyncIO = false, bool fillCache = true)
     {
         byte[] bound = GC.AllocateUninitializedArray<byte>(PartitionIdWidth + 1, pinned: true);
         BuildPartitionUpperBoundKey(bound, partitionId);
 
-        ReadOptions options = new ReadOptions().SetIterateUpperBound(bound);
+        ReadOptions options = NewScanReadOptions(bound, asyncIO, fillCache);
         return new BoundedIterator(db.NewIterator(cf, options), options, bound);
+    }
+
+    /// <summary>
+    /// Read options for a bounded iterator.
+    ///
+    /// <para><paramref name="asyncIO"/> is for scans that walk many rows: restore replay, backfill
+    /// range reads and the maintenance counts. RocksDB then issues its own readahead without
+    /// blocking the scan on each block miss, and a seek can read the first block of each level in
+    /// parallel. The reads go through io_uring only where the native library has it (the Linux glibc
+    /// build); elsewhere RocksDB falls back to synchronous reads, so the option is safe on every
+    /// platform. The gain is smaller than with direct reads, because this WAL does not use direct
+    /// reads and the OS page cache already reads ahead for sequential scans. Short walks of one or
+    /// two blocks keep it off: they never reach the readahead threshold.</para>
+    ///
+    /// <para><paramref name="fillCache"/> false is for scans of rows that no hot path reads again,
+    /// such as the dead prefix a compaction pass counts. Those blocks must not evict the
+    /// recent-tail blocks that the commit probes and backfill reads depend on.</para>
+    /// </summary>
+    private static ReadOptions NewScanReadOptions(byte[] upperBound, bool asyncIO, bool fillCache)
+    {
+        ReadOptions options = new ReadOptions().SetIterateUpperBound(upperBound);
+
+        if (asyncIO)
+            options.SetAsyncIO(true);
+
+        if (!fillCache)
+            options.SetFillCache(false);
+
+        return options;
     }
 
     /// <summary>
@@ -3586,7 +3837,13 @@ public class RocksDbWAL : IWAL, IDisposable
             // Removed = rows physically present in [floor, newFloor): counted exactly up to the cap,
             // and beyond the cap by arithmetic (ids are contiguous per partition), so a large backlog
             // costs O(cap) iterator steps instead of one step per dead row.
-            using Iterator? iterator = db.NewIterator(cf: columnFamilyHandle);
+            //
+            // Bounded at the new floor: the count needs nothing at or above it, so the step past the
+            // last counted row never reads the live tail. The rows it reads are about to die, so they
+            // must not fill the block cache; async I/O because a pass can walk up to the cap.
+            using BoundedIterator bounded = NewBoundedIterator(
+                columnFamilyHandle, partitionId, newFloor, asyncIO: true, fillCache: false);
+            Iterator iterator = bounded.Iterator!;
             Span<byte> seekKey = stackalloc byte[LogKeyWidth];
             BuildLogKey(seekKey, partitionId, floor);
             iterator.Seek(seekKey);

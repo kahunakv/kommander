@@ -485,6 +485,118 @@ public sealed class TestRocksDbCommitFrontier
         }
     }
 
+    [Fact]
+    public void ManyMarkersInOneBatch_ReadThroughBatchedPrefetch_DecideLikePointProbes()
+    {
+        string path = CreateTempWalPath();
+
+        try
+        {
+            byte[] payload = [7, 7, 7];
+
+            using (RocksDbWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false))
+            {
+                // Id 150 holds a stale term: its marker must not be absorbed over it.
+                List<RaftLog> proposals = [];
+                for (long id = 1; id <= 300; id++)
+                    proposals.Add(Proposed(id, id == 150 ? 4 : 5, payload));
+                Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, proposals)]));
+
+                // One group batch with more markers than one MultiGet takes, so the target headers are
+                // read over several chunks. It also mixes the three other probe outcomes:
+                //   150: divergent term  -> full row, the frontier stops below it;
+                //   301: absent row      -> full row (a backfill first-write);
+                //   302: proposal staged earlier in the batch -> absorbed from the staged set, never read.
+                List<RaftLog> batch = [];
+                for (long id = 1; id <= 301; id++)
+                    batch.Add(Committed(id, 5, payload));
+                batch.Add(Proposed(302, 5, payload));
+                batch.Add(Committed(302, 5, payload));
+                Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, batch)]));
+
+                // Absorbed: 1..149, 151..300 (the walk passes 150 on its staged full row), and 302.
+                Assert.Equal(149 + 150 + 1, wal.CommitMarkersAbsorbed);
+
+                AssertAllCommitted(wal.ReadLogs(Partition));
+
+                // Checked last, so a run with the prefetch off shows the decisions match the point probes.
+                // 1..301 went through the prefetch; 302 was left out because its proposal is staged.
+                Assert.Equal(301, wal.MarkerHeadersPrefetched);
+            }
+
+            using (RocksDbWAL reopened = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false))
+                AssertAllCommitted(reopened.ReadLogs(Partition));
+
+            void AssertAllCommitted(List<RaftLog> logs)
+            {
+                Assert.Equal(Enumerable.Range(1, 302).Select(i => (long)i), logs.Select(l => l.Id));
+                Assert.All(logs, log => Assert.Equal(RaftLogType.Committed, log.Type));
+                Assert.All(logs, log => Assert.Equal(5, log.Term));
+                Assert.All(logs, log => Assert.Equal(payload, log.LogData));
+            }
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
+    [Fact]
+    public void BoundedScans_StopAtTheirPartition_PastATruncatedSuffix_OnASharedShard()
+    {
+        string path = CreateTempWalPath();
+
+        try
+        {
+            using RocksDbWAL wal = new(path, "wal", NullLogger<IRaft>.Instance, syncWrites: false);
+
+            // Partitions 1 and 9 share shard 1, so partition 9's rows sit right after partition 1's
+            // truncated suffix in the same column family.
+            const int sibling = 9;
+
+            List<RaftLog> rows = [];
+            List<RaftLog> siblingRows = [];
+            for (long id = 1; id <= 20; id++)
+            {
+                rows.Add(Committed(id, 5));
+                siblingRows.Add(Committed(id, 5));
+            }
+            Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, rows), (sibling, siblingRows)]));
+
+            Assert.Equal(RaftOperationStatus.Success, wal.Write(
+                [(Partition, [new RaftLog { Id = 21, Term = 5, Type = RaftLogType.CommittedCheckpoint, LogType = "chk" }])]));
+
+            // Tombstones for 22..40 above the checkpoint: the run every partition scan used to skip.
+            List<RaftLog> suffix = [];
+            for (long id = 22; id <= 40; id++)
+                suffix.Add(Proposed(id, 5));
+            Assert.Equal(RaftOperationStatus.Success, wal.Write([(Partition, suffix)]));
+            Assert.Equal(RaftOperationStatus.Success, wal.TruncateLogsAfter(Partition, 21));
+
+            Assert.Equal(Enumerable.Range(1, 21).Select(i => (long)i),
+                wal.ReadLogsRange(Partition, 1).Select(l => l.Id));
+            Assert.Equal([21L], wal.ReadLogs(Partition).Select(l => l.Id));
+            Assert.Equal(21, wal.CountPersistedLogs(Partition));
+            Assert.Equal(20, wal.CountRemovableLogs(Partition));
+
+            (RaftOperationStatus status, int removed) = wal.CompactLogsOlderThan(
+                Partition, lastCheckpoint: 21, compactNumberEntries: 100);
+            Assert.Equal(RaftOperationStatus.Success, status);
+            Assert.Equal(20, removed);
+            Assert.Equal(1, wal.CountPersistedLogs(Partition));
+            Assert.Equal(0, wal.CountRemovableLogs(Partition));
+
+            // The sibling partition is untouched by every scan above.
+            Assert.Equal(20, wal.CountPersistedLogs(sibling));
+            Assert.Equal(Enumerable.Range(1, 20).Select(i => (long)i),
+                wal.ReadLogsRange(sibling, 1).Select(l => l.Id));
+        }
+        finally
+        {
+            DeleteTempWalPath(path);
+        }
+    }
+
     private static RaftLog Proposed(long id, long term, byte[]? payload = null) =>
         new() { Id = id, Term = term, Type = RaftLogType.Proposed, LogType = "op", LogData = payload };
 
