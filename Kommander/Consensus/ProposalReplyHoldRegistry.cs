@@ -28,10 +28,34 @@ namespace Kommander.Consensus;
 /// thread auto-releases, and any thread may dispose. The single arbiter is
 /// <see cref="HeldProposalReply.TryClaim"/> — whoever wins it owns the outcome, and every path
 /// carries the entry it claimed rather than looking it up again, so clearing the map can never
-/// strand a caller mid-resolution. The lock guards only the map.</para>
+/// strand a caller mid-resolution. The lock guards the map and each entry's
+/// <see cref="Entry.Outcome"/> / <see cref="Entry.AwaitsCommitCompletion"/>.</para>
+///
+/// <para><b>One ticket, one hold.</b> A ticket can complete successfully more than once: the
+/// single-fsync fast path releases it on quorum-durable and the commit completion fires the same
+/// waiter again. The second completion can land at any point relative to the test resolving the
+/// first — before it, after it, or between the resolution leaving the map and the waiter being
+/// completed — so "is the ticket in the map" and "is the waiter completed" cannot between them
+/// recognise it. A hold whose commit completion is still owed therefore stays in the map after it
+/// is resolved, recording how, until that completion arrives and consumes it: a released ticket is
+/// then completed normally (a no-op), a dropped one stays unanswered, and neither is offered to the
+/// callback a second time.</para>
 /// </summary>
 internal sealed class ProposalReplyHoldRegistry : IDisposable
 {
+    /// <summary>How a hold ended, for the success completion of the same ticket that follows it.</summary>
+    private enum HoldOutcome
+    {
+        /// <summary>Not resolved yet: the caller is still waiting.</summary>
+        Held,
+
+        /// <summary>The caller was answered with the committed outcome.</summary>
+        Released,
+
+        /// <summary>The caller was abandoned and must stay unanswered.</summary>
+        Dropped
+    }
+
     /// <summary>One held reply plus the machinery that resolves it exactly once.</summary>
     private sealed class Entry
     {
@@ -52,6 +76,16 @@ internal sealed class ProposalReplyHoldRegistry : IDisposable
         public required long CommitIndex { get; init; }
 
         public Timer? Timer;
+
+        /// <summary>How this hold ended. Read and written under the registry lock.</summary>
+        public HoldOutcome Outcome;
+
+        /// <summary>
+        /// Whether the ticket's commit completion — the last success completion a ticket receives —
+        /// has yet to arrive. True for a hold taken at an earlier site; while it is true the entry
+        /// stays in the map even after it is resolved. Read and written under the registry lock.
+        /// </summary>
+        public bool AwaitsCommitCompletion;
     }
 
     private readonly object gate = new();
@@ -99,10 +133,11 @@ internal sealed class ProposalReplyHoldRegistry : IDisposable
     ///
     /// <para>Returns <see langword="false"/> — meaning "complete normally" — when the registration
     /// is disposed, or when the proposal has no live waiter left to hold (already answered, or the
-    /// pooled instance was drained). A repeat success completion for a ticket that is already held
-    /// returns <see langword="true"/> and is swallowed: the single-fsync fast path and the commit
-    /// completion both fire for one auto-commit proposal, and that must produce one hold, not
-    /// two.</para>
+    /// pooled instance was drained). A repeat success completion for a ticket this registration
+    /// already took never produces a second hold: the single-fsync fast path and the commit
+    /// completion both fire for one auto-commit proposal, and that must reach the callback once.
+    /// The repeat is swallowed (<see langword="true"/>) while the reply is still held or after it
+    /// was dropped, and completes normally (<see langword="false"/>) after it was released.</para>
     ///
     /// <para>Called on the partition executor thread. <c>onHeld</c> is queued to the thread pool
     /// rather than invoked here, so a callback that wants to act while the reply is held does not
@@ -113,29 +148,52 @@ internal sealed class ProposalReplyHoldRegistry : IDisposable
         if (Volatile.Read(ref disposed) != 0)
             return false;
 
-        TaskCompletionSource<(RaftProposalTicketState, long)>? waiter = proposal.WaiterSource;
-        if (waiter is null || waiter.Task.IsCompleted)
-            return false;
-
         HLCTimestamp ticket = proposal.StartTimestamp;
-        Entry entry = new() { Waiter = waiter, CommitIndex = commitIndex };
 
-        long term = proposal.Logs.Count > 0 ? proposal.Logs[0].Term : -1;
-        long[] logIds = new long[proposal.Logs.Count];
-        for (int i = 0; i < logIds.Length; i++)
-            logIds[i] = proposal.Logs[i].Id;
+        // The commit completion is the last success completion a ticket receives; a hold taken at
+        // an earlier site is owed one more.
+        bool isCommitCompletion = site == ProposalReplySite.CommitCompletion;
 
-        entry.Reply = new HeldProposalReply(
-            partitionId, ticket, commitIndex, term, logIds, site,
-            release => Resolve(entry, release));
+        Entry entry;
 
         lock (gate)
         {
             if (disposed != 0)
                 return false;
 
-            if (holds.ContainsKey(ticket))
-                return true;
+            // Looked up before the waiter is inspected: a ticket this registration already took is
+            // answered from what the test decided for it, whatever state its waiter is in by now.
+            if (holds.TryGetValue(ticket, out Entry? known))
+            {
+                if (known.Outcome == HoldOutcome.Held)
+                {
+                    if (isCommitCompletion)
+                        known.AwaitsCommitCompletion = false;
+
+                    return true;
+                }
+
+                if (isCommitCompletion)
+                    holds.Remove(ticket);
+
+                return known.Outcome == HoldOutcome.Dropped;
+            }
+
+            TaskCompletionSource<(RaftProposalTicketState, long)>? waiter = proposal.WaiterSource;
+            if (waiter is null || waiter.Task.IsCompleted)
+                return false;
+
+            entry = new() { Waiter = waiter, CommitIndex = commitIndex, AwaitsCommitCompletion = !isCommitCompletion };
+
+            long term = proposal.Logs.Count > 0 ? proposal.Logs[0].Term : -1;
+            long[] logIds = new long[proposal.Logs.Count];
+            for (int i = 0; i < logIds.Length; i++)
+                logIds[i] = proposal.Logs[i].Id;
+
+            Entry held = entry;
+            entry.Reply = new HeldProposalReply(
+                partitionId, ticket, commitIndex, term, logIds, site,
+                release => Resolve(held, release));
 
             holds[ticket] = entry;
         }
@@ -239,8 +297,9 @@ internal sealed class ProposalReplyHoldRegistry : IDisposable
         {
             entry.Timer?.Dispose();
 
-            // Lost the claim: whoever won it is completing this waiter through Resolve, which
-            // carries the entry and no longer needs the map. Nothing to strand.
+            // Lost the claim: the hold was already resolved and only awaited its commit completion,
+            // or whoever won it is completing this waiter through Resolve, which carries the entry
+            // and no longer needs the map. Nothing to strand.
             if (!entry.Reply.TryClaim())
                 continue;
 
@@ -258,11 +317,20 @@ internal sealed class ProposalReplyHoldRegistry : IDisposable
     /// <para>Takes the entry rather than a ticket so it never depends on the map still holding it:
     /// a concurrent dispose may already have cleared it, and looking the ticket up would then leave
     /// the caller waiting forever.</para>
+    /// <para>A hold whose commit completion is still owed is not removed here: it stays in the map
+    /// carrying its outcome, so that completion is recognised as a repeat of a resolved ticket
+    /// rather than held afresh. It leaves the map when the completion arrives, when the proposal
+    /// fails, or with the registration.</para>
     /// </summary>
     private void Resolve(Entry entry, bool release)
     {
         lock (gate)
-            holds.Remove(entry.Reply.TicketId);
+        {
+            if (entry.AwaitsCommitCompletion)
+                entry.Outcome = release ? HoldOutcome.Released : HoldOutcome.Dropped;
+            else
+                holds.Remove(entry.Reply.TicketId);
+        }
 
         entry.Timer?.Dispose();
 

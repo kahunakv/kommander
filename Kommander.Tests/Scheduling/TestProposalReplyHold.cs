@@ -381,6 +381,134 @@ public class TestProposalReplyHold
     }
 
     /// <summary>
+    /// A reply dropped on the fast path stays dropped: the commit completion that follows fires the
+    /// same waiter again, and it must neither answer the abandoned caller nor be reported as a
+    /// second hold for a ticket the test already resolved.
+    /// </summary>
+    [Fact]
+    public async Task DroppedOnFastPath_TheCommitCompletionIsNotHeldAgain()
+    {
+        (RaftPartitionStateMachine sm, RecordingHost host, PipelinedWalFacade wal, CapturingReplySink sink) = Build();
+        host.Configuration.WalSingleFsyncCommit = true;
+        await BecomeSoleLeaderAsync(sm);
+
+        using HoldCollector collector = new();
+        using IDisposable registration = sm.HoldCommittedProposalRepliesForTesting(collector.OnHeld);
+
+        sm.ReplicateLogs([new() { Id = 1, Term = 1, LogType = "t" }], autoCommit: true, replyCorrelationId: 10);
+        await sm.CompleteWalOperationAsync(MakeCompletion(wal.LastOperationId, WALWriteOperationType.LeaderPropose, -1, 1));
+
+        HeldProposalReply held = await collector.WaitForNextAsync();
+        Assert.Equal(ProposalReplySite.QuorumDurableFastPath, held.Site);
+
+        HLCTimestamp ticket = TicketOf(sink, 10);
+        Task<(RaftProposalTicketState, long)>? waiter = sm.GetTicketWaiterTask(ticket);
+        Assert.NotNull(waiter);
+
+        held.Drop();
+
+        await sm.CompleteWalOperationAsync(MakeCompletion(wal.LastOperationId, WALWriteOperationType.LeaderCommit, 1, 1));
+        await collector.AssertNoMoreAsync();
+
+        Assert.Single(collector.Replies);
+        Assert.False(waiter.IsCompleted);
+
+        // The next proposal is unaffected by the resolved ticket: it is held once, as usual.
+        sm.ReplicateLogs([new() { Id = 2, Term = 1, LogType = "t" }], autoCommit: true, replyCorrelationId: 11);
+        await sm.CompleteWalOperationAsync(MakeCompletion(wal.LastOperationId, WALWriteOperationType.LeaderPropose, -1, 2));
+
+        HeldProposalReply next = await collector.WaitForNextAsync();
+        Assert.Equal(TicketOf(sink, 11), next.TicketId);
+
+        await sm.CompleteWalOperationAsync(MakeCompletion(wal.LastOperationId, WALWriteOperationType.LeaderCommit, 2, 2));
+        await collector.AssertNoMoreAsync();
+        Assert.Equal(2, collector.Replies.Count);
+    }
+
+    /// <summary>
+    /// A reply released on the fast path and then completed again by the commit completion is
+    /// answered once and never held a second time, including after the release finished.
+    /// </summary>
+    [Fact]
+    public async Task ReleasedOnFastPath_TheCommitCompletionIsNotHeldAgain()
+    {
+        (RaftPartitionStateMachine sm, RecordingHost host, PipelinedWalFacade wal, CapturingReplySink sink) = Build();
+        host.Configuration.WalSingleFsyncCommit = true;
+        await BecomeSoleLeaderAsync(sm);
+
+        using HoldCollector collector = new();
+        using IDisposable registration = sm.HoldCommittedProposalRepliesForTesting(collector.OnHeld);
+
+        sm.ReplicateLogs([new() { Id = 1, Term = 1, LogType = "t" }], autoCommit: true, replyCorrelationId: 10);
+        await sm.CompleteWalOperationAsync(MakeCompletion(wal.LastOperationId, WALWriteOperationType.LeaderPropose, -1, 1));
+
+        HeldProposalReply held = await collector.WaitForNextAsync();
+
+        HLCTimestamp ticket = TicketOf(sink, 10);
+        Task<(RaftProposalTicketState, long)>? waiter = sm.GetTicketWaiterTask(ticket);
+        Assert.NotNull(waiter);
+
+        held.Release();
+        Assert.Equal((RaftProposalTicketState.Committed, 1L), await waiter.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+
+        await sm.CompleteWalOperationAsync(MakeCompletion(wal.LastOperationId, WALWriteOperationType.LeaderCommit, 1, 1));
+        await collector.AssertNoMoreAsync();
+
+        Assert.Single(collector.Replies);
+        Assert.Equal(["Applied:1"], host.EventLog);
+    }
+
+    /// <summary>
+    /// A callback that releases at once runs on the thread pool while the partition delivers the
+    /// commit completion for the same ticket. However the two interleave, each ticket is offered to
+    /// the callback exactly once: a second offer is a hold on a caller that was already answered.
+    /// </summary>
+    [Fact]
+    public async Task ReleaseRacingTheCommitCompletion_OffersEachTicketOnce()
+    {
+        const int proposals = 20_000;
+
+        (RaftPartitionStateMachine sm, RecordingHost host, PipelinedWalFacade wal, _) = Build();
+        host.Configuration.WalSingleFsyncCommit = true;
+        await BecomeSoleLeaderAsync(sm);
+
+        int offers = 0;
+        global::System.Collections.Concurrent.ConcurrentDictionary<HLCTimestamp, int> offersByTicket = new();
+
+        using IDisposable registration = sm.HoldCommittedProposalRepliesForTesting(reply =>
+        {
+            offersByTicket.AddOrUpdate(reply.TicketId, 1, static (_, seen) => seen + 1);
+            Interlocked.Increment(ref offers);
+            reply.Release();
+        });
+
+        for (int id = 1; id <= proposals; id++)
+        {
+            sm.ReplicateLogs([new() { Id = id, Term = 1, LogType = "t" }], autoCommit: true, replyCorrelationId: null);
+
+            // The fast path queues the callback; the commit completion follows on this thread at once.
+            await sm.CompleteWalOperationAsync(MakeCompletion(wal.LastOperationId, WALWriteOperationType.LeaderPropose, -1, id));
+            await sm.CompleteWalOperationAsync(MakeCompletion(wal.LastOperationId, WALWriteOperationType.LeaderCommit, id, id));
+        }
+
+        // Every callback is queued by the time the loop ends; wait for the queue to go quiet.
+        long deadline = Environment.TickCount64 + 30_000;
+        int settled = -1;
+        while (Environment.TickCount64 < deadline)
+        {
+            int seen = Volatile.Read(ref offers);
+            if (seen >= proposals && seen == settled)
+                break;
+
+            settled = seen;
+            await Task.Delay(100, TestContext.Current.CancellationToken);
+        }
+
+        Assert.Equal(proposals, offersByTicket.Count);
+        Assert.Equal(proposals, Volatile.Read(ref offers));
+    }
+
+    /// <summary>
     /// The manual two-phase propose completes its caller on propose-quorum-durable, so that site is
     /// held too — and the site is reported.
     /// </summary>
