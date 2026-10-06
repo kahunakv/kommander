@@ -9,7 +9,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>Kommander</PackageId>
-    <Version>1.9.7</Version>
+    <Version>1.10.0</Version>
     <Description>Distributed consensus with Raft for C#/.NET</Description>
     <Authors>Andres Gutierrez</Authors>
     <Company>Andres Gutierrez</Company>
@@ -90,7 +90,7 @@
     <PackageReference Include="Grpc.AspNetCore.Server.Reflection" Version="2.67.0" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
     <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.12" />
-    <PackageReference Include="RocksDB" Version="11.8.1.4423" />
+    <PackageReference Include="Kommander.RocksDB" Version="11.8.1.9001" />
   </ItemGroup>
 
   <ItemGroup Condition="$(TargetFramework.EndsWith('-browser'))">
