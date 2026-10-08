@@ -15,6 +15,18 @@ public sealed class RaftSystemRequest
 
     public byte[]? LogData { get; }
 
+    /// <summary>
+    /// System-partition log index of the entry that carries <see cref="LogData"/>, for
+    /// <see cref="RaftSystemRequestType.ConfigReplicated"/>,
+    /// <see cref="RaftSystemRequestType.ConfigRestored"/> and
+    /// <see cref="RaftSystemRequestType.ConfigCheckpointRestored"/> requests. The coordinator
+    /// installs system entries in log order and skips a delivery at or below the index it already
+    /// installed: the handler that committed an entry installs it at once, and the log applicator
+    /// delivers the same entry again later. Zero means the index is unknown (a test or a legacy
+    /// sender); such a delivery is installed unconditionally.
+    /// </summary>
+    public long LogIndex { get; init; }
+
     /// <summary>Routing mode for CreatePartition requests.</summary>
     public RaftRoutingMode RoutingMode { get; }
 

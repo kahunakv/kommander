@@ -872,7 +872,7 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             // checkpoint time. Replay delivers it before any config delta above the
             // checkpoint, so a WAL compacted past the original members/partitions records
             // still reconstructs the roster and partition map on restart.
-            systemCoordinator.Send(new(RaftSystemRequestType.ConfigCheckpointRestored, log.LogData));
+            systemCoordinator.Send(new(RaftSystemRequestType.ConfigCheckpointRestored, log.LogData) { LogIndex = log.Id });
 
             return Task.FromResult(true);
         }
@@ -886,7 +886,7 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             return Task.FromResult(true);
         }
 
-        systemCoordinator.Send(new(RaftSystemRequestType.ConfigRestored, log.LogData));
+        systemCoordinator.Send(new(RaftSystemRequestType.ConfigRestored, log.LogData) { LogIndex = log.Id });
 
         return Task.FromResult(true);
     }
@@ -902,7 +902,7 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             return Task.FromResult(true);
         }
 
-        systemCoordinator.Send(new(RaftSystemRequestType.ConfigReplicated, log.LogData));
+        systemCoordinator.Send(new(RaftSystemRequestType.ConfigReplicated, log.LogData) { LogIndex = log.Id });
 
         return Task.FromResult(true);
     }

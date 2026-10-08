@@ -26,6 +26,23 @@ internal sealed class RaftSystemCoordinator : IDisposable
     // checkpoint is proposed, so reads must be safe against a concurrent loop-side mutation.
     private readonly ConcurrentDictionary<string, string> systemConfiguration = new();
 
+    /// <summary>
+    /// Highest system-partition log index whose entry is installed in <see cref="systemConfiguration"/>,
+    /// or -1 before the first one. Touched only on the coordinator loop.
+    /// <para>
+    /// Two deliveries install every entry this node commits: the handler writes the entry into
+    /// <see cref="systemConfiguration"/> as soon as its proposal commits, and the log applicator
+    /// delivers the same entry again as a <see cref="RaftSystemRequestType.ConfigReplicated"/>
+    /// request. A handler can hold the loop for a long time (a leadership confirmation under a
+    /// network partition), so that second delivery can land after later entries were installed.
+    /// Installing it then regresses the local map, and the next handler rewrites the whole map from
+    /// the stale base, discarding every entry committed in between — a partition tombstone among
+    /// them, which is how a spent partition id got a second life. Every install therefore checks
+    /// the entry's index against this one and a delivery at or below it is ignored.
+    /// </para>
+    /// </summary>
+    private long appliedSystemLogIndex = -1;
+
     private readonly RaftManager manager;
 
     private readonly ILogger<IRaft> logger;
@@ -317,6 +334,9 @@ internal sealed class RaftSystemCoordinator : IDisposable
                     return;
                 }
 
+                if (!TryAdvanceAppliedIndex(message))
+                    return;
+
                 RaftSystemMessage systemMessage = Unserialize(message.LogData);
                 systemConfiguration[systemMessage.Key] = systemMessage.Value;
                 logger.LogInfoRestoredSystemConfiguration(systemMessage.Key);
@@ -334,6 +354,9 @@ internal sealed class RaftSystemCoordinator : IDisposable
                     return;
                 }
 
+                if (!TryAdvanceAppliedIndex(message))
+                    return;
+
                 ApplyRestoredCheckpointSnapshot(message.LogData);
             }
             break;
@@ -345,6 +368,12 @@ internal sealed class RaftSystemCoordinator : IDisposable
                     logger.LogWarning("Replication message is null");
                     return;
                 }
+
+                // The handler that committed this entry installed it already; this is the log
+                // applicator's delivery of the same entry, or of an older one. Installing it again
+                // would move the local map backwards.
+                if (!TryAdvanceAppliedIndex(message))
+                    return;
 
                 RaftSystemMessage systemMessage = Unserialize(message.LogData);
                 systemConfiguration[systemMessage.Key] = systemMessage.Value;
@@ -472,10 +501,48 @@ internal sealed class RaftSystemCoordinator : IDisposable
 
     // ── Partition helpers ──────────────────────────────────────────────────
 
-    private Task<RaftReplicationResult> Replicate(string type, byte[] data, bool autoCommit, CancellationToken ct) =>
-        ReplicateOverride is { } fn
-            ? fn(type, data, autoCommit, ct)
-            : manager.ReplicateSystemLogs(type, data, autoCommit, ct);
+    private async Task<RaftReplicationResult> Replicate(string type, byte[] data, bool autoCommit, CancellationToken ct)
+    {
+        RaftReplicationResult result = ReplicateOverride is { } fn
+            ? await fn(type, data, autoCommit, ct).ConfigureAwait(false)
+            : await manager.ReplicateSystemLogs(type, data, autoCommit, ct).ConfigureAwait(false);
+
+        // The caller installs the committed entry into systemConfiguration right after this
+        // returns, and nothing else runs on the loop in between, so the entry counts as applied
+        // from here on: the applicator's later delivery of it (or of anything older) is a
+        // duplicate. Recorded before the caller's write rather than after so no caller can forget.
+        if (result.Success && result.LogIndex > appliedSystemLogIndex)
+            appliedSystemLogIndex = result.LogIndex;
+
+        return result;
+    }
+
+    /// <summary>
+    /// Decides whether a delivered system entry is newer than everything installed so far, and
+    /// records it as installed when it is. A request without an index (zero or negative: a test
+    /// or a legacy sender) cannot be ordered and is always installed, moving nothing.
+    /// </summary>
+    private bool TryAdvanceAppliedIndex(RaftSystemRequest message)
+    {
+        if (message.LogIndex <= 0)
+            return true;
+
+        if (message.LogIndex <= appliedSystemLogIndex)
+        {
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug(
+                    "[RaftSystemCoordinator] Ignored {Type} of system entry {LogIndex}: entry {AppliedLogIndex} is already installed",
+                    message.Type, message.LogIndex, appliedSystemLogIndex);
+
+            return false;
+        }
+
+        appliedSystemLogIndex = message.LogIndex;
+        return true;
+    }
+
+    /// <summary>The highest installed system-partition log index, for tests.</summary>
+    internal long AppliedSystemLogIndexForTest => appliedSystemLogIndex;
 
     /// <summary>
     /// Quorum-confirmed leadership of one data partition, as required by the membership fence of
