@@ -1134,10 +1134,12 @@ public interface IRaft
 
     /// <summary>
     /// The lowest partition id that has never been allocated: one past the highest id present in the
-    /// committed partition map in <b>any</b> lifecycle state, tombstones included. A removed
+    /// committed partition map in <b>any</b> lifecycle state, tombstones included, and one past the
+    /// map's committed floor (<see cref="RaftPartitionMap.HighestPartitionIdEver"/>). A removed
     /// partition keeps its entry forever and can never be recreated, so an allocator must skip its
     /// id — even though <see cref="GetPartitionMap"/>, whose callers route, place and back up, stops
-    /// reporting it. Never returns the system partition id.
+    /// reporting it. The floor keeps an id spent even when its tombstone is no longer in the map.
+    /// Never returns the system partition id.
     /// <para>
     /// Advisory, not a reservation: nothing is claimed here, concurrent callers get the same answer,
     /// and <see cref="CreatePartitionAsync"/> remains the arbiter of who gets the id.

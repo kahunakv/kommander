@@ -38,7 +38,7 @@ internal sealed class SplitMergeController
     private readonly Func<string, byte[], bool, CancellationToken, Task<RaftReplicationResult>> replicate;
     private readonly Func<int, CancellationToken, Task<RaftReplicationResult>> replicateCheckpoint;
     private readonly Action<RaftSystemRequest> send;
-    private readonly Action<List<RaftPartitionRange>> startPartitions;
+    private readonly Action<RaftPartitionMap> startPartitions;
     private readonly Func<IRaftStateMachineTransfer?> getStateMachineTransfer;
     private readonly Func<int, long> getMaxLog;
     private readonly Func<int, RaftPartition?> getPartition;
@@ -56,7 +56,7 @@ internal sealed class SplitMergeController
         Func<string, byte[], bool, CancellationToken, Task<RaftReplicationResult>> replicate,
         Func<int, CancellationToken, Task<RaftReplicationResult>> replicateCheckpoint,
         Action<RaftSystemRequest> send,
-        Action<List<RaftPartitionRange>> startPartitions,
+        Action<RaftPartitionMap> startPartitions,
         Func<IRaftStateMachineTransfer?> getStateMachineTransfer,
         Func<int, long> getMaxLog,
         Func<int, RaftPartition?> getPartition,
@@ -138,13 +138,24 @@ internal sealed class SplitMergeController
 
         int targetPartitionId = (plan?.TargetPartitionId > 0)
             ? plan.TargetPartitionId
-            : RaftPartitionMap.NextAvailablePartitionId(ranges);
+            : map.NextAvailablePartitionId();
 
         if (ranges.Any(r => r.PartitionId == targetPartitionId))
         {
             logger.LogError(
                 "TrySplitPartition: Target partition id {Id} already exists in map",
                 targetPartitionId);
+            completion?.TrySetResult((RaftOperationStatus.Errored, partitionRange.Generation));
+            return;
+        }
+
+        // An explicit target below the floor was handed out before and its entry is gone: the id
+        // is spent. Minting it again would revive a retired partition under a new voter set.
+        if (map.IsPartitionIdSpent(targetPartitionId))
+        {
+            logger.LogError(
+                "TrySplitPartition: Target partition id {Id} was already handed out (highest ever {Highest}); a spent id cannot be reused",
+                targetPartitionId, map.HighestPartitionIdEver);
             completion?.TrySetResult((RaftOperationStatus.Errored, partitionRange.Generation));
             return;
         }
@@ -200,6 +211,7 @@ internal sealed class SplitMergeController
         };
 
         ranges.Add(newRange);
+        map.RecordPartitionId(targetPartitionId);
         map.MapVersion++;
 
         RaftSystemMessage message = new()
@@ -250,7 +262,7 @@ internal sealed class SplitMergeController
         }
 
         systemConfiguration[RaftSystemConfigKeys.Partitions] = message.Value;
-        startPartitions(ranges);
+        startPartitions(map);
 
         if (getStateMachineTransfer() is { } transfer)
         {
@@ -381,7 +393,7 @@ internal sealed class SplitMergeController
 
         systemConfiguration[RaftSystemConfigKeys.Partitions] = message.Value;
         _pendingSplits.Remove(sourcePartitionId);
-        startPartitions(map.Partitions);
+        startPartitions(map);
         split.Completion?.TrySetResult((RaftOperationStatus.Success, targetRange.Generation));
     }
 
@@ -515,7 +527,7 @@ internal sealed class SplitMergeController
         }
 
         systemConfiguration[RaftSystemConfigKeys.Partitions] = message.Value;
-        startPartitions(map.Partitions);
+        startPartitions(map);
 
         _pendingMerges[plan.SourcePartitionId] = new MergeInProgress(plan.SurvivorPartitionId, completion);
         send(new RaftSystemRequest(RaftSystemRequestType.MergePartitionCommit, plan.SourcePartitionId));
@@ -665,7 +677,7 @@ internal sealed class SplitMergeController
 
         deletePartitionWAL(sourcePartitionId);
 
-        startPartitions(map.Partitions);
+        startPartitions(map);
 
         merge.Completion?.TrySetResult((RaftOperationStatus.Success, surv.Generation));
     }

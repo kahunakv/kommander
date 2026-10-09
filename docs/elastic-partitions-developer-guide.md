@@ -247,6 +247,8 @@ The caller specifies an explicit partition id and routing mode. For `HashRange` 
 - The system partition map must already exist.
 - The partition id must not already appear in the map (unless it is `Active` — idempotent
   return in that case).
+- The partition id must be above the map's `HighestPartitionIdEver`. The map records the
+  highest id it ever handed out, so an id whose tombstone is missing is still refused.
 - For `HashRange`, `start <= end` (no inverted ranges).
 - For `HashRange`, the new range must not overlap any existing `HashRange` entry.
 
@@ -890,6 +892,11 @@ These invariants must hold at all times. Violation corrupts the partition map.
 
 6. **`Removed` entries are never re-added.** Once a partition id enters `Removed` state
    it is never reused or upgraded back to `Active`. The tombstone persists in the map.
+   The map also carries `HighestPartitionIdEver`, raised by every create and split in the
+   same committed entry and never lowered. `GetNextAvailablePartitionId` steps past it, and
+   create/split refuse an id at or below it, so a spent id stays spent even if its tombstone
+   is ever lost. Maps written before the field existed load it as 0, which disables the
+   floor until the first id is minted on the new version.
 
 7. **`OnPartitionMapChanged` fires on leader and followers.** The leader fires it from
    `StartPartitions` at the end of each successful mutation. Followers fire it via

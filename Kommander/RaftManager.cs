@@ -1133,12 +1133,40 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     /// the absence from the committed replica set is exactly the final <c>RemoveReplica</c>
     /// commit, so no later configuration of the range can need this node's copy.
     /// </para>
+    /// <para>
+    /// This overload is the production path: it carries the map's
+    /// <see cref="RaftPartitionMap.HighestPartitionIdEver"/> into the routing table together with
+    /// the ranges, so the allocator floor and the tombstones commit and publish as one unit.
+    /// </para>
     /// </summary>
-    /// <param name="ranges"></param>
+    internal void StartUserPartitions(RaftPartitionMap map)
+    {
+        routingTable.ApplyCommittedMap(map.Partitions, map.HighestPartitionIdEver);
+        StartUserPartitionsCore(map.Partitions);
+    }
+
+    /// <summary>
+    /// Test seam used by <c>StartPartitionsOverride</c> lambdas, which receive the ranges alone.
+    /// The allocator floor keeps its current value: the coordinator publishes the committed
+    /// floor through <see cref="PublishHighestPartitionIdEver"/> right before it invokes the
+    /// override, so this call never pairs new ranges with a stale floor.
+    /// </summary>
     internal void StartUserPartitions(List<RaftPartitionRange> ranges)
     {
-        routingTable.ApplyCommittedMap(ranges);
+        routingTable.ApplyCommittedMap(ranges, routingTable.GetHighestPartitionIdEver());
+        StartUserPartitionsCore(ranges);
+    }
 
+    /// <summary>
+    /// Publishes the committed map's allocator floor on its own. Only the coordinator's
+    /// <c>StartPartitionsOverride</c> seam needs this; production goes through
+    /// <see cref="StartUserPartitions(RaftPartitionMap)"/>, which publishes floor and ranges together.
+    /// </summary>
+    internal void PublishHighestPartitionIdEver(int highestPartitionIdEver) =>
+        routingTable.PublishHighestPartitionIdEver(highestPartitionIdEver);
+
+    private void StartUserPartitionsCore(List<RaftPartitionRange> ranges)
+    {
         foreach (RaftPartitionRange range in ranges)
         {
             // Tombstone entries must never re-create a stopped partition.

@@ -46,6 +46,16 @@ internal sealed class PartitionRoutingTable
     private volatile List<RaftPartitionRange> committedRanges = [];
 
     /// <summary>
+    /// <see cref="RaftPartitionMap.HighestPartitionIdEver"/> of the last committed map: the id
+    /// floor the allocator must stay above even when the tombstone that spent an id is gone from
+    /// <see cref="committedRanges"/>. Written before <see cref="committedRanges"/> on every
+    /// application, so a reader that takes the ranges first sees a floor at least as new as the
+    /// ranges; the allocator takes the maximum of both, and both only grow in a correct history,
+    /// so any interleaving stays safe.
+    /// </summary>
+    private volatile int committedHighestPartitionIdEver;
+
+    /// <summary>
     /// Per-partition placement resolution derived from <see cref="committedRanges"/>: the range's
     /// peer set (replicas minus self) and voter endpoints. Only populated for ranges with a
     /// non-empty replica set — absence means legacy full replication and the whole-cluster
@@ -74,13 +84,20 @@ internal sealed class PartitionRoutingTable
     }
 
     /// <summary>
-    /// Adopts a newly committed partition map: publishes the routing snapshot, then rebuilds the
-    /// derived placement entries. Tombstoned (<see cref="RaftPartitionState.Removed"/>) ranges and
-    /// ranges with an empty replica set carry no placement — the first are gone, the second are
-    /// legacy full replication where the whole-cluster fallback applies.
+    /// Adopts a newly committed partition map: publishes the id floor and the routing snapshot,
+    /// then rebuilds the derived placement entries. Tombstoned
+    /// (<see cref="RaftPartitionState.Removed"/>) ranges and ranges with an empty replica set carry
+    /// no placement — the first are gone, the second are legacy full replication where the
+    /// whole-cluster fallback applies.
     /// </summary>
-    internal void ApplyCommittedMap(List<RaftPartitionRange> ranges)
+    /// <param name="ranges">The committed map's entries, tombstones included.</param>
+    /// <param name="highestPartitionIdEver">
+    /// The committed map's <see cref="RaftPartitionMap.HighestPartitionIdEver"/>. Published before
+    /// the ranges so the allocator never pairs new ranges with an older floor.
+    /// </param>
+    internal void ApplyCommittedMap(List<RaftPartitionRange> ranges, int highestPartitionIdEver)
     {
+        committedHighestPartitionIdEver = highestPartitionIdEver;
         committedRanges = ranges;
 
         foreach (RaftPartitionRange range in ranges)
@@ -258,15 +275,29 @@ internal sealed class PartitionRoutingTable
     }
 
     /// <summary>
+    /// Publishes the allocator floor without touching the ranges. Used by the coordinator's test
+    /// seam, which hands the override lambda the ranges alone; the floor goes first, then the
+    /// lambda's <c>StartUserPartitions(ranges)</c> re-applies it with the new ranges.
+    /// </summary>
+    internal void PublishHighestPartitionIdEver(int highestPartitionIdEver) =>
+        committedHighestPartitionIdEver = highestPartitionIdEver;
+
+    /// <summary>The allocator floor of the last committed map; 0 before any map was applied.</summary>
+    internal int GetHighestPartitionIdEver() => committedHighestPartitionIdEver;
+
+    /// <summary>
     /// Returns the lowest partition id no committed range has ever claimed.
     /// </summary>
     internal int GetNextAvailablePartitionId()
     {
         // Unlike GetPartitionMap this keeps Removed entries: a tombstoned id can never be recreated,
-        // so it is spent and the allocator has to step past it.
+        // so it is spent and the allocator has to step past it. The committed floor covers an id
+        // whose tombstone is gone. Ranges are read first: the floor is written first on apply, so
+        // the floor read here is never older than the ranges.
         List<RaftPartitionRange> ranges = committedRanges;
-        if (ranges.Count > 0)
-            return RaftPartitionMap.NextAvailablePartitionId(ranges);
+        int highestPartitionIdEver = committedHighestPartitionIdEver;
+        if (ranges.Count > 0 || highestPartitionIdEver > RaftSystemConfig.SystemPartition)
+            return RaftPartitionMap.NextAvailablePartitionId(ranges, highestPartitionIdEver);
 
         // Fallback for hosts that never applied a committed map (unit-test harnesses that
         // populate the partition registry directly). No tombstones exist there — a removal takes

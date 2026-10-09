@@ -609,8 +609,23 @@ internal sealed class RaftSystemCoordinator : IDisposable
             ? fn(partitionId, ct)
             : manager.ReplicateCheckpoint(partitionId, ct);
 
-    private void StartPartitions(List<RaftPartitionRange> ranges) =>
-        (StartPartitionsOverride ?? manager.StartUserPartitions)(ranges);
+    /// <summary>
+    /// Applies a committed map to the manager. Production takes the whole map so the allocator
+    /// floor (<see cref="RaftPartitionMap.HighestPartitionIdEver"/>) and the ranges publish
+    /// together. The test override still receives the ranges alone, so the floor is published
+    /// first and the override's own <c>StartUserPartitions(ranges)</c> call then keeps it.
+    /// </summary>
+    private void StartPartitions(RaftPartitionMap map)
+    {
+        if (StartPartitionsOverride is { } fn)
+        {
+            manager.PublishHighestPartitionIdEver(map.HighestPartitionIdEver);
+            fn(map.Partitions);
+            return;
+        }
+
+        manager.StartUserPartitions(map);
+    }
 
     // ── Membership seeding ─────────────────────────────────────────────────
 

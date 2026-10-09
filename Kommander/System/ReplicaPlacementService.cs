@@ -33,7 +33,7 @@ internal sealed class ReplicaPlacementService
     private readonly ConcurrentDictionary<string, string> systemConfiguration;
     private readonly Func<string, byte[], bool, CancellationToken, Task<RaftReplicationResult>> replicate;
     private readonly Action<RaftSystemRequest> send;
-    private readonly Action<List<RaftPartitionRange>> startPartitions;
+    private readonly Action<RaftPartitionMap> startPartitions;
     private readonly Func<ClusterMembership> getMembership;
     private readonly Func<int, ValueTask<bool>> amILeaderQuick;
 
@@ -69,7 +69,7 @@ internal sealed class ReplicaPlacementService
         ConcurrentDictionary<string, string> systemConfiguration,
         Func<string, byte[], bool, CancellationToken, Task<RaftReplicationResult>> replicate,
         Action<RaftSystemRequest> send,
-        Action<List<RaftPartitionRange>> startPartitions,
+        Action<RaftPartitionMap> startPartitions,
         Func<ClusterMembership> getMembership,
         Func<int, ValueTask<bool>> amILeaderQuick,
         Func<int, bool> hostsPartition,
@@ -174,7 +174,7 @@ internal sealed class ReplicaPlacementService
         }
 
         systemConfiguration[RaftSystemConfigKeys.Partitions] = sysMessage.Value;
-        startPartitions(map.Partitions);
+        startPartitions(map);
         return true;
     }
 

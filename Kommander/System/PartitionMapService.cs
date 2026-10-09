@@ -33,7 +33,7 @@ internal sealed class PartitionMapService
     private readonly ConcurrentDictionary<string, string> systemConfiguration;
     private readonly Func<string, byte[], bool, CancellationToken, Task<RaftReplicationResult>> replicate;
     private readonly Action<RaftSystemRequest> send;
-    private readonly Action<List<RaftPartitionRange>> startPartitions;
+    private readonly Action<RaftPartitionMap> startPartitions;
     private readonly Action<int> deletePartitionWAL;
     private readonly Func<int, RaftPartition?> getPartition;
     private readonly Action<int> removePartition;
@@ -56,7 +56,7 @@ internal sealed class PartitionMapService
         ConcurrentDictionary<string, string> systemConfiguration,
         Func<string, byte[], bool, CancellationToken, Task<RaftReplicationResult>> replicate,
         Action<RaftSystemRequest> send,
-        Action<List<RaftPartitionRange>> startPartitions,
+        Action<RaftPartitionMap> startPartitions,
         Action<int> deletePartitionWAL,
         Func<int, RaftPartition?> getPartition,
         Action<int> removePartition,
@@ -122,7 +122,7 @@ internal sealed class PartitionMapService
             return;
         }
 
-        startPartitions(map.Partitions);
+        startPartitions(map);
 
         foreach (RaftPartitionRange range in map.Partitions)
         {
@@ -216,7 +216,7 @@ internal sealed class PartitionMapService
                     logger.LogWarning("[RaftSystemCoordinator] TrySetInitialPartitions re-assert aborted on shutdown");
                 }
 
-                startPartitions(existingMap.Partitions);
+                startPartitions(existingMap);
                 await seedInitialMembership(cancellationToken).ConfigureAwait(false);
                 return;
             }
@@ -227,6 +227,8 @@ internal sealed class PartitionMapService
         AssignInitialPlacement(initialRanges);
 
         RaftPartitionMap newMap = new() { MapVersion = 1, Partitions = initialRanges };
+        foreach (RaftPartitionRange range in initialRanges)
+            newMap.RecordPartitionId(range.PartitionId);
 
         RaftSystemMessage message = new()
         {
@@ -283,7 +285,7 @@ internal sealed class PartitionMapService
         }
 
         systemConfiguration[RaftSystemConfigKeys.Partitions] = message.Value;
-        startPartitions(initialRanges);
+        startPartitions(newMap);
         await seedInitialMembership(cancellationToken).ConfigureAwait(false);
     }
 
@@ -384,6 +386,18 @@ internal sealed class PartitionMapService
             return;
         }
 
+        // No entry, but the id was handed out before: its tombstone is gone (a stale-base
+        // whole-map rewrite once dropped one). The id stays spent — recreating it would revive a
+        // retired partition under a different voter set and split the cluster's view of it.
+        if (map.IsPartitionIdSpent(message.PartitionId))
+        {
+            logger.LogError(
+                "TryCreatePartition: Partition id {Id} was already handed out (highest ever {Highest}) and its entry is gone; a spent id cannot be reused",
+                message.PartitionId, map.HighestPartitionIdEver);
+            completion?.TrySetResult((RaftOperationStatus.Errored, 0));
+            return;
+        }
+
         int newStart = 0, newEnd = 0;
         if (message.RoutingMode == RaftRoutingMode.HashRange)
         {
@@ -432,6 +446,7 @@ internal sealed class PartitionMapService
             Replicas = PickReplicasForNewRange(map)
         };
         map.Partitions.Add(newRange);
+        map.RecordPartitionId(newRange.PartitionId);
         map.MapVersion++;
 
         RaftSystemMessage sysMessage = new()
@@ -483,7 +498,7 @@ internal sealed class PartitionMapService
         }
 
         systemConfiguration[RaftSystemConfigKeys.Partitions] = sysMessage.Value;
-        startPartitions(map.Partitions);
+        startPartitions(map);
         completion?.TrySetResult((RaftOperationStatus.Success, 1));
     }
 
@@ -678,7 +693,7 @@ internal sealed class PartitionMapService
 
         logger.LogInfoRemovePartitionReclaimedWal(partitionId);
 
-        startPartitions(map.Partitions);
+        startPartitions(map);
 
         completion?.TrySetResult((RaftOperationStatus.Success, entry.Generation));
     }
