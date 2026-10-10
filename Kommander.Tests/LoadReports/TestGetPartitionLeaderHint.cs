@@ -137,6 +137,41 @@ public sealed class TestGetPartitionLeaderHint
         Assert.Null(manager.GetPartitionLeaderHint(Partition));
     }
 
+    /// <summary>
+    /// The Kahuna 2026-10-09 stall in one test: a range leader restarts, its version counter
+    /// restarts at 1, and the hint on the P0 node must follow the restarted process's reports
+    /// instead of keeping the dead lifetime's entry until it ages out — after which, before the
+    /// fix, the hint was null for every range the node led and no learner on them was promoted.
+    /// </summary>
+    [Fact]
+    public async Task LeaderRestarts_HintFollowsTheNewIncarnationDespiteTheLowerVersion()
+    {
+        Simulation.Time.VirtualTickSource ticks = new();
+        using RaftManager manager = MakeManager(c => c.TickSource = ticks);
+
+        HLCTimestamp now = manager.HybridLogicalClock.SendOrLocalEvent(0);
+        TimeSpan ttl = manager.Configuration.LeaderBalancerReportTtl;
+
+        NodeLoadReport beforeRestart = MakeReport("leader:9001", 300, now, Partition);
+        beforeRestart.Incarnation = 1_000;
+        manager.SystemCoordinator.Send(new RaftSystemRequest(beforeRestart));
+        await manager.SystemCoordinator.DrainAsync();
+        Assert.Equal("leader:9001", manager.GetPartitionLeaderHint(Partition));
+
+        // The node is down for a while, then its new process reports version 1 claiming the
+        // same range (it re-won the sole-voter election).
+        ticks.AdvanceBy((long)(ttl.TotalMilliseconds / 2));
+        NodeLoadReport afterRestart = MakeReport("leader:9001", 1, manager.HybridLogicalClock.SendOrLocalEvent(0), Partition);
+        afterRestart.Incarnation = 2_000;
+        manager.SystemCoordinator.Send(new RaftSystemRequest(afterRestart));
+        await manager.SystemCoordinator.DrainAsync();
+
+        // Past the dead lifetime's TTL the hint must still name the node: the post-restart
+        // report was accepted and is fresh.
+        ticks.AdvanceBy((long)(ttl.TotalMilliseconds * 0.75));
+        Assert.Equal("leader:9001", manager.GetPartitionLeaderHint(Partition));
+    }
+
     [Fact]
     public void UnknownPartition_ReturnsNull_NoThrow()
     {

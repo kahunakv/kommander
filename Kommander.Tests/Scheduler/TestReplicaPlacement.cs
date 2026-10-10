@@ -8,6 +8,7 @@ using Kommander.System.Protos;
 using Kommander.Time;
 using Kommander.WAL;
 using Kommander.WAL.IO;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Google.Protobuf;
 
@@ -32,7 +33,9 @@ public sealed class TestReplicaPlacement
         int replicationFactor = 0, List<RaftNode>? peers = null, int initialPartitions = 0,
         bool enablePlacementRebalancer = false,
         Kommander.Communication.Memory.InMemoryCommunication? communication = null,
-        TimeSpan? learnerPromotionStableWindow = null)
+        TimeSpan? learnerPromotionStableWindow = null,
+        TimeSpan? learnerPromotionStallWarningAfter = null,
+        ILogger<IRaft>? logger = null)
     {
         RaftConfiguration config = new()
         {
@@ -44,14 +47,40 @@ public sealed class TestReplicaPlacement
         };
         if (learnerPromotionStableWindow is { } window)
             config.LearnerPromotionStableWindow = window;
+        if (learnerPromotionStallWarningAfter is { } warnAfter)
+            config.LearnerPromotionStallWarningAfter = warnAfter;
         return new(
             config,
             new StaticDiscovery(peers ?? []),
             new InMemoryWAL(NullLogger<IRaft>.Instance),
             communication ?? new Kommander.Communication.Memory.InMemoryCommunication(),
             new HybridLogicalClock(),
-            NullLogger<IRaft>.Instance
+            logger ?? NullLogger<IRaft>.Instance
         );
+    }
+
+    /// <summary>Collects log lines by level so a test can assert on the placement diagnostics.</summary>
+    private sealed class CapturingLogger : ILogger<IRaft>
+    {
+        private readonly List<(LogLevel Level, string Message)> messages = [];
+        private readonly object sync = new();
+
+        public int Count(LogLevel level, string substring)
+        {
+            lock (sync)
+                return messages.Count(m => m.Level == level && m.Message.Contains(substring, StringComparison.Ordinal));
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => logLevel != LogLevel.None;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+                                Func<TState, Exception?, string> formatter)
+        {
+            lock (sync)
+                messages.Add((logLevel, formatter(state, exception)));
+        }
     }
 
     private static byte[] SerializeMessage(string key, string value)
@@ -1128,6 +1157,124 @@ public sealed class TestReplicaPlacement
             // Range 1 was skipped for this pass; range 2's Removing replica completed its drop.
             Assert.DoesNotContain(MapEntry(manager, 2).Replicas, r => r.Endpoint == "d:1");
             Assert.Contains(MapEntry(manager, 1).Replicas, r => r.Endpoint == "c:1");
+        }
+    }
+
+    // ── Leader resolution when the gossiped hint fails (Kahuna 2026-10-09 RF 1 stall) ───────
+
+    /// <summary>
+    /// The nightly's shape: the range leader restarted, the P0 controller's hint for the range
+    /// went empty, and the caught-up learner was never promoted. The pass must fall back to the
+    /// quorum-confirmed leader (a read-index round over the range's voters) and measure the lag
+    /// there. Red before the fix: an empty hint returned "not caught up" with no log line.
+    /// </summary>
+    [Fact]
+    public async Task RunPlacementPass_NoLeaderHint_ResolvesLeaderByReadIndexAndPromotes()
+    {
+        Kommander.Communication.Memory.InMemoryCommunication communication = new();
+        RaftManager manager = Build(
+            replicationFactor: 3, communication: communication,
+            learnerPromotionStableWindow: TimeSpan.Zero);
+        using (manager)
+        {
+            communication.SetNodes(new Dictionary<string, IRaft>
+            {
+                ["b:1"] = new FollowerLagRaft { Lag = (_, _) => 100 }
+            });
+
+            AcceptReplication(manager);
+            manager.SystemCoordinator.ResolvePartitionLeaderOverride = static (_, _) => Task.FromResult<string?>("b:1");
+            manager.SystemCoordinator.Send(MakeConfigReplicated(
+                PlacedRange(1, 2, Replica("b:1"), Replica("c:1", RaftReplicaRole.Learner))));
+            await WaitForIdleAsync(manager);
+
+            // No SeedLeaderHintAsync: the hint stays null for the whole test.
+            Assert.Null(manager.GetPartitionLeaderHint(1));
+            ForceP0Leadership(manager);
+
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+
+            RaftReplica promoted = Assert.Single(MapEntry(manager, 1).Replicas, r => r.Endpoint == "c:1");
+            Assert.Equal(RaftReplicaRole.Voter, promoted.Role);
+        }
+    }
+
+    /// <summary>
+    /// A hint that names a node which no longer answers (restarted, partitioned, or demoted)
+    /// must not pin the learner either: the probe failure routes to the confirmed leader.
+    /// </summary>
+    [Fact]
+    public async Task RunPlacementPass_HintedLeaderDoesNotAnswer_FallsBackToConfirmedLeader()
+    {
+        Kommander.Communication.Memory.InMemoryCommunication communication = new();
+        RaftManager manager = Build(
+            replicationFactor: 3, communication: communication,
+            learnerPromotionStableWindow: TimeSpan.Zero);
+        using (manager)
+        {
+            communication.SetNodes(new Dictionary<string, IRaft>
+            {
+                // Only the real leader is reachable; the hinted "old:1" is not registered, so
+                // its probe answers null (the transport's "unknown node").
+                ["b:1"] = new FollowerLagRaft { Lag = (_, _) => 100 }
+            });
+
+            AcceptReplication(manager);
+            manager.SystemCoordinator.ResolvePartitionLeaderOverride = static (_, _) => Task.FromResult<string?>("b:1");
+            manager.SystemCoordinator.Send(MakeConfigReplicated(
+                PlacedRange(1, 2, Replica("b:1"), Replica("c:1", RaftReplicaRole.Learner))));
+            await WaitForIdleAsync(manager);
+
+            await SeedLeaderHintAsync(manager, "old:1", 1);
+            Assert.Equal("old:1", manager.GetPartitionLeaderHint(1));
+            ForceP0Leadership(manager);
+
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+            manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+            await RunEnqueuedPassToCompletionAsync(manager);
+
+            RaftReplica promoted = Assert.Single(MapEntry(manager, 1).Replicas, r => r.Endpoint == "c:1");
+            Assert.Equal(RaftReplicaRole.Voter, promoted.Role);
+        }
+    }
+
+    /// <summary>
+    /// A learner that cannot be measured at all (no hint, no confirmed leader) must say so: a
+    /// Debug line with the failed check on every pass, and exactly one Warning per stall
+    /// episode once <see cref="RaftConfiguration.LearnerPromotionStallWarningAfter"/> elapses.
+    /// Before this the three stuck learners of the nightly produced no log line in 150 s.
+    /// </summary>
+    [Fact]
+    public async Task RunPlacementPass_LearnerNeverMeasurable_WarnsOncePerStallEpisode()
+    {
+        CapturingLogger logger = new();
+        RaftManager manager = Build(
+            replicationFactor: 3,
+            learnerPromotionStallWarningAfter: TimeSpan.Zero,
+            logger: logger);
+        using (manager)
+        {
+            AcceptReplication(manager);
+            manager.SystemCoordinator.ResolvePartitionLeaderOverride = static (_, _) => Task.FromResult<string?>(null);
+            manager.SystemCoordinator.Send(MakeConfigReplicated(
+                PlacedRange(1, 2, Replica("b:1"), Replica("c:1", RaftReplicaRole.Learner))));
+            await WaitForIdleAsync(manager);
+            ForceP0Leadership(manager);
+
+            for (int pass = 0; pass < 3; pass++)
+            {
+                manager.SystemCoordinator.Send(new RaftSystemRequest(RaftSystemRequestType.RunPlacementPass));
+                await RunEnqueuedPassToCompletionAsync(manager);
+            }
+
+            Assert.Equal(RaftReplicaRole.Learner, Assert.Single(MapEntry(manager, 1).Replicas, r => r.Endpoint == "c:1").Role);
+            Assert.Equal(3, logger.Count(LogLevel.Debug, "not promotable this pass: no gossiped leader hint"));
+            // Pass 1 opens the episode, pass 2 crosses the (zero) window and warns, pass 3 stays quiet.
+            Assert.Equal(1, logger.Count(LogLevel.Warning, "has not been promotable for"));
         }
     }
 

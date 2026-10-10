@@ -55,6 +55,13 @@ internal sealed class ReplicaPlacementService
     /// </summary>
     private readonly Func<int, CancellationToken, Task<bool>> confirmPartitionLeadership;
 
+    /// <summary>
+    /// Quorum-confirmed leader of a range (endpoint, or null when no voter answers a read-index
+    /// round). The fallback leader source of <see cref="IsLearnerCaughtUp"/>; see there for why
+    /// the gossiped hint alone is not enough.
+    /// </summary>
+    private readonly Func<int, CancellationToken, Task<string?>> resolvePartitionLeader;
+
     private readonly RaftConfiguration configuration;
     private readonly string localEndpoint;
     private readonly Func<TimeSpan> getRetryDelay;
@@ -64,6 +71,12 @@ internal sealed class ReplicaPlacementService
     // Keyed by (partitionId, endpoint): when the learner replica first appeared caught up.
     // Advisory only — cleared on P0 leadership loss and rebuilt from observation.
     private readonly Dictionary<(int PartitionId, string Endpoint), DateTimeOffset> _replicaCaughtUpSince = new();
+
+    // Keyed by (partitionId, endpoint): when the learner was first observed NOT promotable in the
+    // current stall episode, and whether the one-per-episode Warning has fired. Advisory only —
+    // feeds the stall diagnostic, never a decision. Cleared on P0 leadership loss, and the entry
+    // is dropped the moment the learner is observed caught up or leaves the transitional set.
+    private readonly Dictionary<(int PartitionId, string Endpoint), (DateTimeOffset Since, bool Warned)> _learnerStalledSince = new();
 
     internal ReplicaPlacementService(
         ConcurrentDictionary<string, string> systemConfiguration,
@@ -80,12 +93,14 @@ internal sealed class ReplicaPlacementService
         Func<string, string?> getNodeZone,
         Func<int, string, CancellationToken, Task> transferLeadership,
         Func<int, CancellationToken, Task<bool>> confirmPartitionLeadership,
+        Func<int, CancellationToken, Task<string?>> resolvePartitionLeader,
         RaftConfiguration configuration,
         string localEndpoint,
         Func<TimeSpan> getRetryDelay,
         int maxRetries,
         ILogger<IRaft> logger)
     {
+        this.resolvePartitionLeader = resolvePartitionLeader;
         this.systemConfiguration = systemConfiguration;
         this.replicate = replicate;
         this.send = send;
@@ -594,6 +609,7 @@ internal sealed class ReplicaPlacementService
         if (!await amILeaderQuick(RaftSystemConfig.SystemPartition).ConfigureAwait(false))
         {
             _replicaCaughtUpSince.Clear();
+            _learnerStalledSince.Clear();
             return;
         }
 
@@ -697,16 +713,20 @@ internal sealed class ReplicaPlacementService
                         logger.LogInfoPlacementLearnerHostGone(localEndpoint, transitional.Endpoint, range.PartitionId);
 
                     _replicaCaughtUpSince.Remove((range.PartitionId, transitional.Endpoint));
+                    _learnerStalledSince.Remove((range.PartitionId, transitional.Endpoint));
                     send(new RaftSystemRequest(
                         RaftSystemRequestType.RemoveReplica, range.PartitionId, transitional.Endpoint, transitional.NodeId));
                     continue;
                 }
 
                 // Learner: promote once caught up for the stable window.
-                if (await IsLearnerCaughtUp(range.PartitionId, transitional.Endpoint).ConfigureAwait(false))
+                (int, string) key = (range.PartitionId, transitional.Endpoint);
+                DateTimeOffset now = DateTimeOffset.UtcNow;
+
+                LearnerLagVerdict verdict = await IsLearnerCaughtUp(range.PartitionId, transitional.Endpoint, cancellationToken).ConfigureAwait(false);
+                if (verdict.CaughtUp)
                 {
-                    (int, string) key = (range.PartitionId, transitional.Endpoint);
-                    DateTimeOffset now = DateTimeOffset.UtcNow;
+                    _learnerStalledSince.Remove(key);
 
                     if (!_replicaCaughtUpSince.TryGetValue(key, out DateTimeOffset since))
                         _replicaCaughtUpSince[key] = now;
@@ -718,7 +738,10 @@ internal sealed class ReplicaPlacementService
                     }
                 }
                 else
-                    _replicaCaughtUpSince.Remove((range.PartitionId, transitional.Endpoint));
+                {
+                    _replicaCaughtUpSince.Remove(key);
+                    NoteLearnerNotPromotable(key, now, verdict.Reason);
+                }
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -785,22 +808,82 @@ internal sealed class ReplicaPlacementService
     }
 
     /// <summary>
+    /// Records one not-promotable observation of a learner: a Debug line every pass with the
+    /// failed check, and one Warning per stall episode once the learner has been continuously
+    /// not promotable for <see cref="RaftConfiguration.LearnerPromotionStallWarningAfter"/>.
+    /// The episode starts at the first not-promotable pass and ends when the pass observes the
+    /// learner caught up (the caller drops the entry). Diagnostic only.
+    /// </summary>
+    private void NoteLearnerNotPromotable((int PartitionId, string Endpoint) key, DateTimeOffset now, string reason)
+    {
+        logger.LogDebugPlacementLearnerNotPromotable(localEndpoint, key.Endpoint, key.PartitionId, reason);
+
+        if (!_learnerStalledSince.TryGetValue(key, out (DateTimeOffset Since, bool Warned) stall))
+        {
+            _learnerStalledSince[key] = (now, false);
+            return;
+        }
+
+        if (stall.Warned)
+            return;
+
+        TimeSpan stalledFor = now - stall.Since;
+        if (stalledFor < configuration.LearnerPromotionStallWarningAfter)
+            return;
+
+        logger.LogWarningPlacementLearnerStalled(localEndpoint, key.Endpoint, key.PartitionId, stalledFor.TotalSeconds, reason);
+        _learnerStalledSince[key] = (stall.Since, true);
+    }
+
+    /// <summary>
+    /// Outcome of one learner-lag measurement: whether the learner is within
+    /// <see cref="RaftConfiguration.LearnerPromotionLag"/> of its leader, and when it is not, the
+    /// check that failed, in words. The reason is what the pass logs — before it existed a learner
+    /// that was never promoted produced no log line at all.
+    /// </summary>
+    internal readonly record struct LearnerLagVerdict(bool CaughtUp, string Reason)
+    {
+        internal static LearnerLagVerdict Yes => new(true, "");
+        internal static LearnerLagVerdict No(string reason) => new(false, reason);
+    }
+
+    /// <summary>
+    /// One probe of a range leader's follower-progress table: the leader's own committed index
+    /// and the learner's reported frontier. <see cref="Failure"/> is non-null when the probe did
+    /// not produce a usable pair — the leader did not answer, answered a negative index (a node
+    /// that does not lead the range answers its demoted frontier, −1), or has never heard from
+    /// the learner — and is the caller's cue to try another leader source.
+    /// </summary>
+    private readonly record struct LeaderProbe(long LeaderCommitted, long LearnerCommitted, string? Failure);
+
+    /// <summary>
     /// Measures the learner replica's commit lag on its range, from the range leader's
     /// follower-progress table (directly when this node leads the range, via
     /// <c>GetRemoteFollowerLag</c> otherwise). The remote branch is the <b>normal</b> case
     /// under per-partition placement — the P0 leader usually does not host the range it is
-    /// repairing — and its leader endpoint comes from <c>getPartitionLeader</c>, wired to the
-    /// gossiped leader hint precisely because the local Leader field does not exist for a
-    /// non-hosted range. Returns false on any probe failure (no hint, no answer, lagging):
-    /// the next pass simply re-measures. Unlike the roster promotion driver, a null
-    /// learner index counts as <b>not caught up</b>: under per-partition placement the learner
-    /// is explicitly expected to ack this range, so "never acked" means replication has not
-    /// reached it yet — the expected-partition-set distinction the join-all model couldn't make.
+    /// repairing. Its leader comes from two sources, tried in order:
+    /// <list type="number">
+    ///   <item>The gossiped leader hint (<c>getPartitionLeader</c>): cheap, usually right, and
+    ///   the only leader source the pass had until 2026-10-09.</item>
+    ///   <item>A quorum-confirmed leader resolved through a read-index round over the range's
+    ///   voters (<c>resolvePartitionLeader</c>), used when the hint is empty or the node it
+    ///   names does not answer the probe. The hint is reduced from load reports and goes empty
+    ///   for every range a node leads when that node's reports stop being accepted — which is
+    ///   exactly what happened after a range leader restarted (Kahuna RF 1 nightly: three
+    ///   caught-up learners stuck for 70–150 s with no log line). Trusting the hint alone made
+    ///   promotion hostage to gossip bookkeeping; the read-index answer is proof of current
+    ///   leadership, so this fallback is authoritative whenever it answers.</item>
+    /// </list>
+    /// Returns a verdict carrying the failed check so the pass can log it. Unlike the roster
+    /// promotion driver, a null learner index counts as <b>not caught up</b>: under
+    /// per-partition placement the learner is explicitly expected to ack this range, so "never
+    /// acked" means replication has not reached it yet — the expected-partition-set distinction
+    /// the join-all model couldn't make.
     /// </summary>
-    private async Task<bool> IsLearnerCaughtUp(int partitionId, string endpoint)
+    private async Task<LearnerLagVerdict> IsLearnerCaughtUp(int partitionId, string endpoint, CancellationToken cancellationToken)
     {
         long leaderCommitted;
-        long? learnerCommitted;
+        long learnerCommitted;
 
         // The hosted gate must come first: AmILeaderQuick throws the typed
         // PartitionNotHostedException for a range this node does not host — calling it blind
@@ -811,30 +894,92 @@ internal sealed class ReplicaPlacementService
         {
             long? own = await getFollowerCommitted(partitionId, localEndpoint).ConfigureAwait(false);
             if (own is null or < 0)
-                return false;
+                return LearnerLagVerdict.No("local leader has no committed frontier yet");
+
+            long? learner = await getFollowerCommitted(partitionId, endpoint).ConfigureAwait(false);
+            if (learner is null)
+                return LearnerLagVerdict.No("local leader has never received an ack from the learner");
 
             leaderCommitted = own.Value;
-            learnerCommitted = await getFollowerCommitted(partitionId, endpoint).ConfigureAwait(false);
+            learnerCommitted = learner.Value;
         }
         else
         {
-            string? leaderEndpoint = getPartitionLeader(partitionId);
-            if (string.IsNullOrEmpty(leaderEndpoint))
-                return false;
+            string? hint = getPartitionLeader(partitionId);
+            string? hintFailure = string.IsNullOrEmpty(hint) ? "no gossiped leader hint" : null;
 
-            RaftNode leaderNode = new(leaderEndpoint);
+            LeaderProbe probe = default;
+            if (hintFailure is null)
+            {
+                probe = await ProbeLeader(hint!, partitionId, endpoint).ConfigureAwait(false);
+                hintFailure = probe.Failure is null ? null : $"hinted leader {hint}: {probe.Failure}";
+            }
 
-            long? remoteLeaderCommitted = await getRemoteFollowerLag(leaderNode, partitionId, leaderEndpoint).ConfigureAwait(false);
-            if (remoteLeaderCommitted is null or < 0)
-                return false;
+            if (hintFailure is not null)
+            {
+                string? resolved = await resolvePartitionLeader(partitionId, cancellationToken).ConfigureAwait(false);
+                if (string.IsNullOrEmpty(resolved))
+                    return LearnerLagVerdict.No($"{hintFailure}; no voter of the range confirmed leadership through a read-index round");
 
-            leaderCommitted = remoteLeaderCommitted.Value;
-            learnerCommitted = await getRemoteFollowerLag(leaderNode, partitionId, endpoint).ConfigureAwait(false);
+                logger.LogDebugPlacementLeaderResolvedByReadIndex(localEndpoint, partitionId, hint ?? "", hintFailure, resolved);
+
+                if (resolved == hint)
+                    return LearnerLagVerdict.No($"{hintFailure} (read-index round confirmed the same node)");
+
+                probe = resolved == localEndpoint
+                    ? await ProbeLocalLeader(partitionId, endpoint).ConfigureAwait(false)
+                    : await ProbeLeader(resolved, partitionId, endpoint).ConfigureAwait(false);
+
+                if (probe.Failure is not null)
+                    return LearnerLagVerdict.No($"{hintFailure}; confirmed leader {resolved}: {probe.Failure}");
+            }
+
+            leaderCommitted = probe.LeaderCommitted;
+            learnerCommitted = probe.LearnerCommitted;
         }
 
-        if (learnerCommitted is null)
-            return false;
+        long lag = leaderCommitted - learnerCommitted;
+        return lag <= configuration.LearnerPromotionLag
+            ? LearnerLagVerdict.Yes
+            : LearnerLagVerdict.No($"lag {lag} (leader {leaderCommitted}, learner {learnerCommitted}) exceeds LearnerPromotionLag {configuration.LearnerPromotionLag}");
+    }
 
-        return leaderCommitted - learnerCommitted.Value <= configuration.LearnerPromotionLag;
+    /// <summary>
+    /// Asks <paramref name="leaderEndpoint"/>, over the transport, for its own committed index and
+    /// for the learner's frontier on the range. Both come from the same node so the lag is
+    /// measured against one consistent progress table.
+    /// </summary>
+    private async Task<LeaderProbe> ProbeLeader(string leaderEndpoint, int partitionId, string learnerEndpoint)
+    {
+        RaftNode leaderNode = new(leaderEndpoint);
+
+        long? leaderCommitted = await getRemoteFollowerLag(leaderNode, partitionId, leaderEndpoint).ConfigureAwait(false);
+        if (leaderCommitted is null)
+            return new LeaderProbe(0, 0, "did not answer the committed-index probe");
+        if (leaderCommitted.Value < 0)
+            return new LeaderProbe(0, 0, $"answered committed index {leaderCommitted.Value} (not leading the range)");
+
+        long? learnerCommitted = await getRemoteFollowerLag(leaderNode, partitionId, learnerEndpoint).ConfigureAwait(false);
+        if (learnerCommitted is null)
+            return new LeaderProbe(0, 0, "has never received an ack from the learner");
+
+        return new LeaderProbe(leaderCommitted.Value, learnerCommitted.Value, null);
+    }
+
+    /// <summary>
+    /// The local-table twin of <see cref="ProbeLeader"/>, for the rare case where the read-index
+    /// fallback names this node (it leads the range, but the hosted fast path did not see it).
+    /// </summary>
+    private async Task<LeaderProbe> ProbeLocalLeader(int partitionId, string learnerEndpoint)
+    {
+        long? own = await getFollowerCommitted(partitionId, localEndpoint).ConfigureAwait(false);
+        if (own is null or < 0)
+            return new LeaderProbe(0, 0, "has no committed frontier yet");
+
+        long? learner = await getFollowerCommitted(partitionId, learnerEndpoint).ConfigureAwait(false);
+        if (learner is null)
+            return new LeaderProbe(0, 0, "has never received an ack from the learner");
+
+        return new LeaderProbe(own.Value, learner.Value, null);
     }
 }

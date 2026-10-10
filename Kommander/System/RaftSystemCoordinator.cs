@@ -75,6 +75,16 @@ internal sealed class RaftSystemCoordinator : IDisposable
     internal Func<int, CancellationToken, Task<bool>>? ConfirmPartitionLeadershipOverride;
 
     /// <summary>
+    /// Test hook for <see cref="ResolvePartitionLeaderAsync"/>, the confirmed-leader fallback the
+    /// placement pass uses when the gossiped leader hint is empty or does not answer. When set,
+    /// replaces the read-index scan over the range's voters so a unit test can name the leader
+    /// without a live Raft quorum. Independent of <see cref="ConfirmPartitionLeadershipOverride"/>:
+    /// tests that only grant the membership fence keep the real (and, without registered peers,
+    /// empty) resolution.
+    /// </summary>
+    internal Func<int, CancellationToken, Task<string?>>? ResolvePartitionLeaderOverride;
+
+    /// <summary>
     /// Test hook for <see cref="ReplicateCheckpointForPartition"/>.
     /// When set, replaces the call to <see cref="RaftManager.ReplicateCheckpoint"/> so unit
     /// tests can assert checkpoint replication without a live Raft quorum.
@@ -133,7 +143,9 @@ internal sealed class RaftSystemCoordinator : IDisposable
         this.manager = manager;
         this.logger = logger;
 
-        _loadReportStore = new LoadReportStore(() => manager.Configuration.TickSource.GetTimestamp());
+        _loadReportStore = new LoadReportStore(
+            () => manager.Configuration.TickSource.GetTimestamp(),
+            manager.Configuration.LeaderBalancerReportTtl);
 
         _leaderBalancer = new LeaderBalancer(
             _loadReportStore,
@@ -206,6 +218,7 @@ internal sealed class RaftSystemCoordinator : IDisposable
             GetNodeZone,
             async (partitionId, target, ct) => await manager.TransferLeadershipAsync(partitionId, target, ct).ConfigureAwait(false),
             ConfirmPartitionLeadershipAsync,
+            ResolvePartitionLeaderAsync,
             manager.Configuration,
             manager.LocalEndpoint,
             () => RetryDelay,
@@ -563,8 +576,32 @@ internal sealed class RaftSystemCoordinator : IDisposable
         if (ConfirmPartitionLeadershipOverride is { } fn)
             return await fn(partitionId, ct).ConfigureAwait(false);
 
+        return await ResolvePartitionLeaderAsync(partitionId, ct).ConfigureAwait(false) is not null;
+    }
+
+    /// <summary>
+    /// Finds the quorum-confirmed leader of one data partition and returns its endpoint, or null
+    /// when no candidate answers a read-index round. Same candidate order as
+    /// <see cref="ConfirmPartitionLeadershipAsync"/> (which is this method's boolean view): the
+    /// local node when it leads the partition, then the gossiped leader hint, then every other
+    /// voter of the committed replica set (the roster's voters on a legacy full-replication
+    /// range).
+    /// <para>This is the leader source the placement pass falls back to when the gossiped hint
+    /// is empty or does not answer the learner-lag probe. The hint is cheap but advisory: it is
+    /// reduced from load reports that a restarted or silent node may fail to refresh, and a pass
+    /// that trusted it alone left caught-up learners unpromoted for as long as the hint stayed
+    /// empty (the 2026-10-09 Kahuna RF 1 stall). A read-index answer is proof of current
+    /// leadership, so a lag measured on the node it names is authoritative.</para>
+    /// </summary>
+    internal async Task<string?> ResolvePartitionLeaderAsync(int partitionId, CancellationToken ct)
+    {
+        if (ResolvePartitionLeaderOverride is { } fn)
+            return await fn(partitionId, ct).ConfigureAwait(false);
+
         if (manager.HostsPartition(partitionId) && await manager.AmILeaderQuick(partitionId).ConfigureAwait(false))
-            return await manager.ConfirmLeadershipAsync(partitionId, ct).ConfigureAwait(false);
+            return await manager.ConfirmLeadershipAsync(partitionId, ct).ConfigureAwait(false)
+                ? manager.LocalEndpoint
+                : null;
 
         List<string> candidates = [];
 
@@ -598,10 +635,10 @@ internal sealed class RaftSystemCoordinator : IDisposable
                 manager, new RaftNode(endpoint), new GetReadIndexRequest(partitionId), ct).ConfigureAwait(false);
 
             if (response.Success && response.ReadIndex >= 0)
-                return true;
+                return endpoint;
         }
 
-        return false;
+        return null;
     }
 
     private Task<RaftReplicationResult> ReplicateCheckpointForPartition(int partitionId, CancellationToken ct) =>

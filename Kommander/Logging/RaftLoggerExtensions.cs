@@ -388,6 +388,15 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "[{Local}] Dropping learner {Endpoint} of partition {Id}: host is no longer a roster member")]
     public static partial void LogInfoPlacementLearnerHostGone(this ILogger<IRaft> logger, string local, string endpoint, int id);
 
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{Local}] Learner {Endpoint} of partition {Id} not promotable this pass: {Reason}")]
+    public static partial void LogDebugPlacementLearnerNotPromotable(this ILogger<IRaft> logger, string local, string endpoint, int id, string reason);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{Local}] Leader hint for partition {Id} was '{Hint}' ({Reason}); resolved its leader as {Leader} through a read-index round")]
+    public static partial void LogDebugPlacementLeaderResolvedByReadIndex(this ILogger<IRaft> logger, string local, int id, string hint, string reason, string leader);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{Local}] Learner {Endpoint} of partition {Id} has not been promotable for {Seconds:F0} s; last failed check: {Reason}")]
+    public static partial void LogWarningPlacementLearnerStalled(this ILogger<IRaft> logger, string local, string endpoint, int id, double seconds, string reason);
+
     // ── RestCommunication ─────────────────────────────────────────────────
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "[{Endpoint}/{Partition}] Logs replicated to {RemoteEndpoint}")]

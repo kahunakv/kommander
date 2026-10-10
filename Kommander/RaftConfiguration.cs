@@ -1327,6 +1327,18 @@ public class RaftConfiguration
     /// </summary>
     public TimeSpan LearnerPromotionStableWindow { get; set; } = TimeSpan.FromSeconds(3);
 
+    /// <summary>
+    /// How long a placement-added Learner may stay <em>not promotable</em> — its lag probe failing
+    /// or its lag above <see cref="LearnerPromotionLag"/> on every pass — before the P0 placement
+    /// controller logs one Warning naming the last failed check (no leader hint, leader probe
+    /// unanswered, learner frontier absent, lag too large). Diagnostic only: it changes no
+    /// decision. Before this, a learner that was never promoted produced no log line at all, so a
+    /// stalled move could not be classified from the logs (Kahuna 2026-10-09). One warning per
+    /// stall episode; the episode resets when the learner is observed caught up.
+    /// Default 30 seconds.
+    /// </summary>
+    public TimeSpan LearnerPromotionStallWarningAfter { get; set; } = TimeSpan.FromSeconds(30);
+
     // ── Gossip anti-entropy ───────────────────────────────────────────────────
 
     /// <summary>

@@ -26,8 +26,20 @@ internal sealed class LoadReportStore
     /// </summary>
     private readonly Func<long> _getReceiptTicks;
 
-    internal LoadReportStore(Func<long>? getReceiptTicks = null) =>
+    /// <summary>
+    /// Receipt age past which a retained entry no longer blocks a report that loses the
+    /// incarnation/version ordering (see <see cref="Apply"/>). Wired to
+    /// <see cref="RaftConfiguration.LeaderBalancerReportTtl"/>: an entry older than the TTL is
+    /// already invisible to every TTL-filtered consumer, so replacing it with any newer-received
+    /// report is strictly better than keeping it.
+    /// </summary>
+    private readonly TimeSpan _staleAfter;
+
+    internal LoadReportStore(Func<long>? getReceiptTicks = null, TimeSpan? staleAfter = null)
+    {
         _getReceiptTicks = getReceiptTicks ?? Time.SystemMonotonicTickSource.Instance.GetTimestamp;
+        _staleAfter = staleAfter ?? TimeSpan.FromSeconds(20);
+    }
 
     /// <summary>
     /// Incremented after every mutation of <see cref="_loadReports"/>. A cached snapshot is valid only
@@ -148,24 +160,57 @@ internal sealed class LoadReportStore
         _loadReports.TryGetValue(endpoint, out NodeLoadReport? report) ? report.Zone : null;
 
     /// <summary>
-    /// Ingests a gossiped load report, retaining only the entry with the highest
-    /// <see cref="NodeLoadReport.ReportVersion"/> per sender endpoint. The check-then-set is safe
-    /// without a compare-exchange because the coordinator loop is the only writer.
-    /// <para>Stamps <see cref="NodeLoadReport.ReceivedAtTicks"/> here, on acceptance only:
-    /// a re-forwarded copy of an already-seen version is rejected above, so repeated old gossip
-    /// can never refresh a report's freshness.</para>
+    /// Ingests a gossiped load report, retaining one entry per sender endpoint. The check-then-set
+    /// is safe without a compare-exchange because the coordinator loop is the only writer.
+    /// <para>Acceptance order, per sender:</para>
+    /// <list type="number">
+    ///   <item>No retained entry: accept.</item>
+    ///   <item>A newer <see cref="NodeLoadReport.Incarnation"/> than the retained entry: accept,
+    ///   whatever the <see cref="NodeLoadReport.ReportVersion"/>. The sender restarted and its
+    ///   version counter restarted with it; comparing versions across lifetimes rejected every
+    ///   post-restart report and left the P0 placement controller without a leader hint for each
+    ///   range the restarted node led (the 2026-10-09 Kahuna learner-promotion stall).</item>
+    ///   <item>The same incarnation: accept only a strictly higher version, as before.</item>
+    ///   <item>An older incarnation (an in-flight report of the dead lifetime, or a restart whose
+    ///   clock stepped backwards): reject while the retained entry is fresh. Once the retained
+    ///   entry's receipt age exceeds the TTL it blocks nothing — every freshness-filtered consumer
+    ///   already ignores it — so any report then replaces it. This backstop bounds the damage of
+    ///   any ordering failure to one TTL instead of forever.</item>
+    /// </list>
+    /// <para>Stamps <see cref="NodeLoadReport.ReceivedAtTicks"/> here, on acceptance only, so
+    /// gossip that loses the ordering can never refresh a report's freshness.</para>
     /// </summary>
     internal void Apply(RaftSystemRequest request)
     {
         NodeLoadReport? report = request.GossipedLoadReport;
         if (report is null || string.IsNullOrEmpty(report.Endpoint))
             return;
+
+        long nowTicks = _getReceiptTicks();
+
         if (_loadReports.TryGetValue(report.Endpoint, out NodeLoadReport? existing) &&
-            report.ReportVersion <= existing.ReportVersion)
+            !Supersedes(report, existing, nowTicks))
             return;
-        report.ReceivedAtTicks = _getReceiptTicks();
+
+        report.ReceivedAtTicks = nowTicks;
         _loadReports[report.Endpoint] = report;
 
         InvalidateSnapshot();
+    }
+
+    /// <summary>
+    /// The ordering rule of <see cref="Apply"/>, isolated so it can be read as one predicate:
+    /// newer incarnation wins; same incarnation orders by version; an older incarnation wins only
+    /// over a retained entry that has aged past the TTL.
+    /// </summary>
+    private bool Supersedes(NodeLoadReport candidate, NodeLoadReport existing, long nowTicks)
+    {
+        if (candidate.Incarnation > existing.Incarnation)
+            return true;
+
+        if (candidate.Incarnation == existing.Incarnation)
+            return candidate.ReportVersion > existing.ReportVersion;
+
+        return Consensus.RaftMonotonic.Elapsed(existing.ReceivedAtTicks, nowTicks) > _staleAfter;
     }
 }

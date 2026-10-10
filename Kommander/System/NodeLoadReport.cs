@@ -12,8 +12,9 @@ namespace Kommander.System;
 /// violate Raft safety, because every actual leadership transfer is validated and executed
 /// by <c>TransferLeadershipAsync</c> at the time of the move.</para>
 ///
-/// <para>The receiver keeps the highest <see cref="ReportVersion"/> per
-/// <see cref="Endpoint"/> and expires entries older than a configured TTL. A node that
+/// <para>The receiver keeps one entry per <see cref="Endpoint"/> — the newest
+/// <see cref="Incarnation"/>, and within it the highest <see cref="ReportVersion"/> — and
+/// expires entries older than a configured TTL. A node that
 /// goes silent is simply excluded from the next planning pass; its phantom leaderships
 /// are not carried forward.</para>
 /// </summary>
@@ -26,11 +27,28 @@ public sealed class NodeLoadReport
     public string Endpoint { get; set; } = "";
 
     /// <summary>
-    /// Monotonically increasing counter bumped on every emission by this node.
-    /// The receiver retains only the entry with the highest version per endpoint,
-    /// discarding older reports that arrive out of order.
+    /// Monotonically increasing counter bumped on every emission by this node <b>within one
+    /// process lifetime</b>. The receiver retains only the entry with the highest version per
+    /// endpoint for the same <see cref="Incarnation"/>, discarding older reports that arrive out
+    /// of order. The counter restarts at 1 when the process restarts, which is why the version
+    /// alone cannot order reports across a restart — see <see cref="Incarnation"/>.
     /// </summary>
     public long ReportVersion { get; set; }
+
+    /// <summary>
+    /// Identifies the sender's process lifetime: the wall-clock Unix milliseconds at which the
+    /// sender's load-report service was created. A receiver that holds a report from an earlier
+    /// incarnation accepts the first report of a newer incarnation regardless of
+    /// <see cref="ReportVersion"/>; only reports of the same incarnation are ordered by version.
+    /// <para>Without this a restarted node was silently invisible: its counter restarted at 1,
+    /// every post-restart report lost the version check against the pre-restart entry the
+    /// receiver still held, that entry aged past the hint TTL, and the P0 placement controller
+    /// then had no leader hint for any range the restarted node led — the Kahuna 2026-10-09
+    /// "learner never promoted after the range leader restarted" stall. <c>0</c> is what a sender
+    /// too old to carry the field produces; two zero incarnations compare by version alone, which
+    /// keeps the old behaviour for mixed-version clusters.</para>
+    /// </summary>
+    public long Incarnation { get; set; }
 
     /// <summary>HLC timestamp at which this report was built.</summary>
     public HLCTimestamp Time { get; set; }

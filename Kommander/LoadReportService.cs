@@ -17,6 +17,14 @@ internal sealed class LoadReportService
 {
     private long _reportVersion;
 
+    /// <summary>
+    /// Process-lifetime identity stamped on every report as <see cref="NodeLoadReport.Incarnation"/>.
+    /// Wall-clock based so a restart produces a higher value than the previous lifetime without
+    /// any persisted state; a clock that steps backwards across a restart is covered by the
+    /// receiver's stale-entry backstop (<see cref="LoadReportStore.Apply"/>).
+    /// </summary>
+    private readonly long _incarnation = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
     private readonly IPartitionProvider partitionProvider;
     private readonly FairWalScheduler walScheduler;
     private readonly Func<IReadOnlyList<NodeLoadReport>> getLoadReports;
@@ -77,6 +85,7 @@ internal sealed class LoadReportService
         {
             Endpoint = localEndpoint,
             ReportVersion = Interlocked.Increment(ref _reportVersion),
+            Incarnation = _incarnation,
             Time = getHlcNow(),
             Zone = configuration.Zone,
             NodeCommitWaitMs = walScheduler.GetNodeCommitWaitMs(),

@@ -191,6 +191,7 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.MaxPreAuthRequestBodyBytes)] = RaftOptionKind.Safety,
         [nameof(RaftConfiguration.LearnerPromotionLag)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.LearnerPromotionStableWindow)] = RaftOptionKind.Liveness,
+        [nameof(RaftConfiguration.LearnerPromotionStallWarningAfter)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.GossipInterval)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.GossipFanout)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.PingTimeout)] = RaftOptionKind.Liveness,
