@@ -36,8 +36,8 @@ public sealed class NodeLoadReport
     public long ReportVersion { get; set; }
 
     /// <summary>
-    /// Identifies the sender's process lifetime: the wall-clock Unix milliseconds at which the
-    /// sender's load-report service was created. A receiver that holds a report from an earlier
+    /// Identifies the sender's process lifetime: the physical component (Unix milliseconds) of the
+    /// sender's hybrid logical clock when its load-report service was created. A receiver that holds a report from an earlier
     /// incarnation accepts the first report of a newer incarnation regardless of
     /// <see cref="ReportVersion"/>; only reports of the same incarnation are ordered by version.
     /// <para>Without this a restarted node was silently invisible: its counter restarted at 1,

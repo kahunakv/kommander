@@ -19,11 +19,16 @@ internal sealed class LoadReportService
 
     /// <summary>
     /// Process-lifetime identity stamped on every report as <see cref="NodeLoadReport.Incarnation"/>.
-    /// Wall-clock based so a restart produces a higher value than the previous lifetime without
-    /// any persisted state; a clock that steps backwards across a restart is covered by the
+    /// Taken once, at construction, from the physical component (L) of the node's hybrid logical
+    /// clock, so a restart produces a higher value than the previous lifetime without any
+    /// persisted state; a clock that steps backwards across a restart is covered by the
     /// receiver's stale-entry backstop (<see cref="LoadReportStore.Apply"/>).
+    /// <para>Read through the HLC, never from the process wall clock: the incarnation
+    /// decides which report a receiver keeps, so it is a consensus-path input. A deterministic
+    /// simulation injects simulated physical time into the HLC, which keeps a replayed run
+    /// identical; a direct wall-clock read would not (scripts/check-determinism-boundary.sh).</para>
     /// </summary>
-    private readonly long _incarnation = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+    private readonly long _incarnation;
 
     private readonly IPartitionProvider partitionProvider;
     private readonly FairWalScheduler walScheduler;
@@ -49,6 +54,8 @@ internal sealed class LoadReportService
         this.getPartitionLeaderEndpoint = getPartitionLeaderEndpoint;
         this.configuration = configuration;
         this.localEndpoint = localEndpoint;
+
+        _incarnation = getHlcNow().L;
     }
 
     internal NodeLoadReport BuildLocalLoadReport()
