@@ -414,7 +414,7 @@ public sealed class RaftPartitionStateMachine
             () => postToExecutor,
             (endpoint, idx) =>
             {
-                tracker.AdvanceProgressFromSnapshotInstall(endpoint, idx);
+                tracker.AdvanceProgressFromSnapshotInstall(endpoint, idx, coreState.LocalCommittedIndex);
             },
             deferTransferTo: endpoint => tracker.IsReportingWalStall(endpoint));
 
@@ -2663,7 +2663,8 @@ public sealed class RaftPartitionStateMachine
                 {
                     long lastIncludedTerm = await wal.GetAnyTermAtAsync(lastCheckpoint).ConfigureAwait(false);
                     logger.LogWarnReseedTransferStarting(host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, lastCheckpoint);
-                    snapshotSender.TrySend(node, lastCheckpoint, coreState.CurrentTerm, lastIncludedTerm, forced: true);
+                    snapshotSender.TrySend(node, lastCheckpoint, coreState.CurrentTerm, lastIncludedTerm,
+                        SnapshotTransferTrigger.FollowerReseedRequest, "the follower asked to be re-seeded (ReseedRequest)", forced: true);
                 }
 
                 (done ??= []).Add(endpoint);

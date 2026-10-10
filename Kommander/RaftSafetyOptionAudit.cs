@@ -177,6 +177,7 @@ public static class RaftSafetyOptionAudit
         [nameof(RaftConfiguration.MaxBackfillBytesPerRound)] = RaftOptionKind.Performance,
         [nameof(RaftConfiguration.BackfillNoProgressPauseCap)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.BackfillNoProgressAnchorFallbackShips)] = RaftOptionKind.Liveness,
+        [nameof(RaftConfiguration.BackfillSeededCatchUpGraceCap)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.SnapshotReceiveSessionTtl)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.SnapshotMaxPendingSessions)] = RaftOptionKind.Liveness,
         [nameof(RaftConfiguration.SnapshotMaxPendingBytes)] = RaftOptionKind.Liveness,

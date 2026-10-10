@@ -212,10 +212,40 @@ internal sealed class ReplicationTracker
     /// reports one (a pre-frontier-report release during a rolling upgrade) has its catch-up
     /// driven by snapshot installs rather than frontier advances, and pacing it on a frontier
     /// that can never move would throttle a healthy catch-up.</para>
+    ///
+    /// <para><b>Progress is any frontier the peer reports moving, not only the commit frontier.</b>
+    /// A follower closing a log hole while the live stream keeps landing above the hole reports a
+    /// commit frontier pinned under the hole for as long as the hole is open — every entry above it
+    /// is present but uncommittable — while its durable frontier and its contiguous presence
+    /// frontier advance with every batch that lands at the hole. Judged on the commit frontier
+    /// alone, four such ships read as fruitless inside ten seconds and the probe offered a
+    /// whole-partition snapshot to a follower that was converging (CamusDB fault soak rl6: three
+    /// installs in a row for one 30-s pause, each leaving the follower a million entries behind
+    /// again). The durable frontier is trusted outright: it is the durable contiguous commit
+    /// frontier, and the wedge this probe exists for pins it along with the commit frontier. The
+    /// presence frontier is trusted only when a ship could have extended it — see
+    /// <see cref="PresenceCreditThreshold"/> — because in that wedge the live stream lands
+    /// contiguously above the pinned frontier and the presence frontier climbs with the leader's
+    /// head while nothing below it is repaired.</para>
     /// </summary>
     private sealed class BackfillProgressProbe
     {
         public long FrontierAtLastShip;
+
+        /// <summary>The peer's reported durable frontier at the last ship; -1 when it had reported none.</summary>
+        public long DurableAtLastShip;
+
+        /// <summary>
+        /// The presence frontier above which a report counts as progress, or <see cref="long.MaxValue"/>
+        /// when no ship of the current streak could have extended it. A ship can extend the peer's
+        /// contiguous presence only when the peer's presence frontier at ship time was at or below the
+        /// batch's last entry — a batch wholly below that frontier is a duplicate in presence terms,
+        /// and crediting it with an advance the live stream produced is exactly the marker-loss wedge's
+        /// signature. The lowest such ship-time frontier in the streak is kept, so a credited ship is
+        /// recognised whichever ship's acknowledgement arrives first.
+        /// </summary>
+        public long PresenceCreditThreshold = long.MaxValue;
+
         public long LastShipTicks;
         public int FruitlessShips;
         public bool Warned;
@@ -230,6 +260,15 @@ internal sealed class ReplicationTracker
     }
 
     private readonly Dictionary<string, BackfillProgressProbe> backfillProgress = [];
+
+    /// <summary>
+    /// Per peer, the most recent snapshot install this leader confirmed: when, at which index, and
+    /// where this leader's commit index stood — the lag the install handed the follower. Read by the
+    /// no-progress probe's escalation (<c>BackfillSender</c>) to give a freshly seeded follower a
+    /// bounded window to close that lag from the log before it may be offered another snapshot.
+    /// Replaced by the next install; cleared with the rest of the peer's progress.
+    /// </summary>
+    private readonly Dictionary<string, SnapshotSeed> snapshotSeeds = [];
 
     /// <summary>
     /// One live commit or rollback broadcast shipped to a peer: the contiguous id range it resolves
@@ -291,6 +330,7 @@ internal sealed class ReplicationTracker
         regressedFrontiers.Clear();
         mismatchAnchors.Clear();
         backfillProgress.Clear();
+        snapshotSeeds.Clear();
         compactedAnchorShips.Clear();
         resolutionShipments.Clear();
 
@@ -314,6 +354,7 @@ internal sealed class ReplicationTracker
         regressedFrontiers.Clear();
         mismatchAnchors.Clear();
         backfillProgress.Clear();
+        snapshotSeeds.Clear();
         compactedAnchorShips.Clear();
         resolutionShipments.Clear();
     }
@@ -335,6 +376,7 @@ internal sealed class ReplicationTracker
         regressedFrontiers.Remove(endpoint);
         startCommitIndexes.Remove(endpoint);
         backfillProgress.Remove(endpoint);
+        snapshotSeeds.Remove(endpoint);
         compactedAnchorShips.Remove(endpoint);
         resolutionShipments.Remove(endpoint);
         backfillDecisions.Remove(endpoint);
@@ -620,14 +662,16 @@ internal sealed class ReplicationTracker
     /// boundary is dropped: the installed state supersedes the regressed range it pointed at, and
     /// acting on it would re-anchor below the floor again.</para>
     /// </summary>
-    public void AdvanceProgressFromSnapshotInstall(string endpoint, long snapshotIndex)
+    public void AdvanceProgressFromSnapshotInstall(string endpoint, long snapshotIndex, long leaderCommitIndex)
     {
         AdvanceCommitFrontier(endpoint, snapshotIndex);
         AdvanceStartCommitIndex(endpoint, snapshotIndex);
 
         // The installed boundary supersedes whatever range log shipping was failing to converge;
-        // the peer earns a fresh, undamped backfill start from the new position.
+        // the peer earns a fresh, undamped backfill start from the new position — and a bounded
+        // grace before the probe may offer it another snapshot (see snapshotSeeds).
         backfillProgress.Remove(endpoint);
+        snapshotSeeds[endpoint] = new SnapshotSeed(host.GetMonotonicTimestamp(), snapshotIndex, Math.Max(leaderCommitIndex, snapshotIndex));
 
         if (!matchIndex.TryGetValue(endpoint, out long match) || snapshotIndex > match)
             matchIndex[endpoint] = snapshotIndex;
@@ -741,7 +785,7 @@ internal sealed class ReplicationTracker
         if (!backfillProgress.TryGetValue(endpoint, out BackfillProgressProbe? probe))
             return default;
 
-        if (reportedFrontier > probe.FrontierAtLastShip)
+        if (HasProgressed(endpoint, probe, reportedFrontier))
         {
             backfillProgress.Remove(endpoint);
             return default;
@@ -751,6 +795,42 @@ internal sealed class ReplicationTracker
     }
 
     /// <summary>
+    /// Whether the peer's reports show progress since the probe's last ship: a commit frontier above
+    /// the one at the ship, a durable frontier above the one at the ship, or a contiguous presence
+    /// frontier above the streak's credit threshold (see
+    /// <see cref="BackfillProgressProbe.PresenceCreditThreshold"/>). The durable and presence
+    /// frontiers are read from this tracker, where every term-valid ack records them before the
+    /// Success-only commit report is fed in.
+    /// </summary>
+    private bool HasProgressed(string endpoint, BackfillProgressProbe probe, long reportedFrontier)
+    {
+        if (reportedFrontier > probe.FrontierAtLastShip)
+            return true;
+
+        if (probe.DurableAtLastShip >= 0
+            && durableFrontiers.TryGetValue(endpoint, out long durable)
+            && durable > 0
+            && durable > probe.DurableAtLastShip)
+            return true;
+
+        return probe.PresenceCreditThreshold != long.MaxValue
+            && presenceFrontiers.TryGetValue(endpoint, out (long Index, long Term) present)
+            && present.Index > probe.PresenceCreditThreshold;
+    }
+
+    /// <summary>
+    /// A confirmed snapshot install of a peer: when this leader learned of it, the installed index,
+    /// and this leader's commit index at that moment (never below the installed index).
+    /// </summary>
+    public readonly record struct SnapshotSeed(long Ticks, long Index, long LeaderCommitIndex);
+
+    /// <summary>The most recent install confirmed for <paramref name="endpoint"/>, if one is on record.</summary>
+    public bool TryGetSnapshotSeed(string endpoint, out SnapshotSeed seed) => snapshotSeeds.TryGetValue(endpoint, out seed);
+
+    /// <summary>Forgets the peer's install record (its grace lapsed, or the peer converged).</summary>
+    public void ClearSnapshotSeed(string endpoint) => snapshotSeeds.Remove(endpoint);
+
+    /// <summary>
     /// Records that an entry-carrying batch shipped to <paramref name="endpoint"/> while its
     /// reported commit frontier stood at <paramref name="reportedFrontier"/>, and returns the
     /// current fruitless streak. The ship itself never grows the streak — only a later ack proves
@@ -758,8 +838,11 @@ internal sealed class ReplicationTracker
     /// <see cref="BackfillProgressProbe"/> for why silent ships must not count. A negative
     /// frontier (no report) clears any probe and returns 0 — pacing on a frontier that can never
     /// move would throttle a healthy legacy-path catch-up.
+    /// <paramref name="lastShippedId"/> is the highest entry id in the batch: a ship whose batch
+    /// reaches the peer's reported presence frontier can extend that frontier, and only such a ship
+    /// lets a later presence advance count as progress (<see cref="BackfillProgressProbe.PresenceCreditThreshold"/>).
     /// </summary>
-    public int RecordBackfillShip(string endpoint, long reportedFrontier)
+    public int RecordBackfillShip(string endpoint, long reportedFrontier, long lastShippedId)
     {
         if (reportedFrontier < 0)
         {
@@ -768,29 +851,31 @@ internal sealed class ReplicationTracker
         }
 
         long nowTicks = host.GetMonotonicTimestamp();
+        long durable = durableFrontiers.TryGetValue(endpoint, out long d) && d > 0 ? d : -1;
+        bool presenceKnown = presenceFrontiers.TryGetValue(endpoint, out (long Index, long Term) present);
 
         if (backfillProgress.TryGetValue(endpoint, out BackfillProgressProbe? probe))
         {
-            if (reportedFrontier > probe.FrontierAtLastShip)
+            if (HasProgressed(endpoint, probe, reportedFrontier))
             {
                 probe.FruitlessShips = 0;
                 probe.Warned = false;
+                probe.PresenceCreditThreshold = long.MaxValue;
             }
-
-            probe.FrontierAtLastShip = reportedFrontier;
-            probe.LastShipTicks = nowTicks;
-            probe.ShipOutstanding = true;
-            return probe.FruitlessShips;
+        }
+        else
+        {
+            probe = new() { FruitlessShips = 0 };
+            backfillProgress[endpoint] = probe;
         }
 
-        backfillProgress[endpoint] = new()
-        {
-            FrontierAtLastShip = reportedFrontier,
-            LastShipTicks = nowTicks,
-            FruitlessShips = 0,
-            ShipOutstanding = true,
-        };
-        return 0;
+        probe.FrontierAtLastShip = reportedFrontier;
+        probe.DurableAtLastShip = durable;
+        if (presenceKnown && present.Index <= lastShippedId && present.Index < probe.PresenceCreditThreshold)
+            probe.PresenceCreditThreshold = present.Index;
+        probe.LastShipTicks = nowTicks;
+        probe.ShipOutstanding = true;
+        return probe.FruitlessShips;
     }
 
     /// <summary>
@@ -809,7 +894,7 @@ internal sealed class ReplicationTracker
         if (!backfillProgress.TryGetValue(endpoint, out BackfillProgressProbe? probe))
             return;
 
-        if (reportedFrontier > probe.FrontierAtLastShip)
+        if (HasProgressed(endpoint, probe, reportedFrontier))
         {
             backfillProgress.Remove(endpoint);
             return;

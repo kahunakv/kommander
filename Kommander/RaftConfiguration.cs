@@ -1140,6 +1140,27 @@ public class RaftConfiguration
     /// </summary>
     public int BackfillNoProgressAnchorFallbackShips { get; set; } = 2;
 
+    /// <summary>
+    /// Upper bound on the grace a follower is given after a snapshot install before the backfill
+    /// no-progress probe may escalate it to another snapshot. Default 3 minutes; zero disables the
+    /// grace (the probe escalates a freshly seeded follower like any other).
+    /// <para>
+    /// An install hands the follower a lag the leader created: everything committed while the
+    /// snapshot was exported, sent and imported (0.5–1 M entries for a 60–100 s install at
+    /// 5,000–17,000 entries/s, CamusDB fault soak rl6). The follower closes it from the log at the
+    /// rate its disk has left over after the live stream; its reported frontiers can stand still
+    /// for several ships while it does, and a second install inside that window can only repeat
+    /// the first, at the same cost (a whole-partition export, every chunk on the wire, 90%+ of the
+    /// follower's memory during the import). So after an install at index <c>I</c> with the leader
+    /// at <c>C</c>, the probe defers its escalation for <c>BackfillNoProgressPauseCap</c> plus the
+    /// time the follower needs to close <c>C − I</c> at the leader's commit rate observed since the
+    /// install, bounded by this cap. The grace defers the probe only: a backfill refused because
+    /// the follower really is below the compaction floor still escalates at once, and a transfer
+    /// the follower asks for (<c>ReseedRequest</c>) is never deferred.
+    /// </para>
+    /// </summary>
+    public TimeSpan BackfillSeededCatchUpGraceCap { get; set; } = TimeSpan.FromMinutes(3);
+
     // ── Snapshot receive session ──────────────────────────────────────────────
 
     /// <summary>
@@ -1974,6 +1995,10 @@ public class RaftConfiguration
         if (WalStallStepDownTimeout < TimeSpan.Zero)
             throw new RaftException(
                 $"[Kommander] WalStallStepDownTimeout ({WalStallStepDownTimeout}) must not be negative; use zero to disable the watchdog.");
+
+        if (BackfillSeededCatchUpGraceCap < TimeSpan.Zero)
+            throw new RaftException(
+                $"[Kommander] BackfillSeededCatchUpGraceCap ({BackfillSeededCatchUpGraceCap}) must not be negative; use zero to disable the grace.");
 
         if (CompactionSilentPeerRetentionWindow < TimeSpan.Zero)
             throw new RaftException(

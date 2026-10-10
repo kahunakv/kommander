@@ -213,7 +213,7 @@ public class TestBackfillNoProgress
         for (int i = 0; i < 10; i++)
             await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 50);
 
-        Assert.Equal(1, logger.Count(LogLevel.Warning, "without its reported commit frontier advancing"));
+        Assert.Equal(1, logger.Count(LogLevel.Warning, "without any of its reported frontiers advancing"));
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -250,6 +250,265 @@ public class TestBackfillNoProgress
 
         Assert.Equal(1, logger.Count(LogLevel.Warning, "offered a snapshot"));
         Assert.Equal(0, host.SnapshotChunksTo(VoterB)); // the healthy peer is not touched
+
+        // The transfer-start line names the trigger and the numbers behind it. It used to assert
+        // "sits below the WAL compaction floor" for every path, which on the rl6 soak was false
+        // three times per arm and sent the first reading toward retention.
+        Assert.Equal(1, logger.Count(LogLevel.Warning, "triggered by NoProgressProbe: 4 consecutive batches (last anchor"));
+        Assert.Equal(1, logger.Count(LogLevel.Warning, "leader checkpoint 100"));
+        Assert.True(logger.Count(LogLevel.Warning, "peer commit 50") >= 1);
+        Assert.Equal(0, logger.Count(LogLevel.Warning, "below the WAL compaction floor"));
+    }
+
+    // ── Slow is not stuck ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The rl6 shape (CamusDB fault soak, 2026-10-10): a voter resuming from a 30-s pause closes a
+    /// log hole while the live stream keeps landing above it. Its commit frontier is pinned under
+    /// the hole for as long as the hole is open, but every batch anchored at the hole advances its
+    /// contiguous presence frontier. The probe escalated after four such ships and re-seeded the
+    /// follower three times. A presence advance through the shipped range is progress: no streak,
+    /// no Warning, no snapshot.
+    /// </summary>
+    [Fact]
+    public async Task PresenceAdvanceThroughTheShippedRange_IsProgress_AndNeverEscalates()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, LevelCountingLogger logger) =
+            await BuildFullLogLeader(heartbeatInterval: TimeSpan.Zero, checkpoint: 100, transfer: new InstantTransfer());
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(1);
+
+        // Commit frontier pinned at 50 under the hole. Each round is what the rl6 follower sent:
+        // Success acks (heartbeats) reporting the pinned frontier and its presence frontier, and the
+        // hole report — a LogMismatch anchored at the presence frontier — which the next heartbeat
+        // answers with a batch anchored there (VerifiedPresenceAnchorAsync). The ack fast path
+        // meanwhile keeps shipping duplicates at nextIndex = 51, which can extend nothing. Each
+        // round the presence frontier has moved past the anchored batch's anchor: that ship is
+        // credited, the streak resets, and the duplicates never reach the threshold.
+        long present = 50;
+        for (int round = 0; round < 5; round++)
+        {
+            for (int ack = 0; ack < 3; ack++)
+                await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 50, presentIndex: present, presentTerm: 1);
+
+            await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.LogMismatch, committedIndex: present, presentIndex: present, presentTerm: 1);
+            await sm.ResumeHeartbeatsAsync(null);
+
+            Assert.Contains(host.Requests, r => r.Node?.Endpoint == VoterA
+                && r.AppendLogsRequest?.Logs is { Count: > 0 }
+                && r.AppendLogsRequest.PrevLogIndex == present);
+
+            present += 100;
+        }
+
+        await Task.Delay(100, TestContext.Current.CancellationToken);
+        Assert.Equal(0, host.SnapshotChunksTo(VoterA));
+        Assert.Empty(sm.GetSnapshotStatuses());
+        Assert.Equal(0, logger.Count(LogLevel.Warning, "without any of its reported frontiers advancing"));
+    }
+
+    /// <summary>
+    /// The wedge the probe exists for, under load: a follower that lost a commit marker holds the
+    /// live stream contiguously above its pinned commit frontier, so its presence frontier climbs
+    /// with the leader's head while every batch anchored at the frontier is a duplicate the batch
+    /// can never extend. That presence advance is NOT progress: the streak builds, the episode warns
+    /// once, and the peer is offered a snapshot — exactly as before.
+    /// </summary>
+    [Fact]
+    public async Task PresenceAdvanceAboveTheShippedRange_IsNotProgress_AndStillEscalates()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, LevelCountingLogger logger) =
+            await BuildFullLogLeader(heartbeatInterval: TimeSpan.Zero, checkpoint: 100, transfer: new InstantTransfer());
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(1);
+
+        // Batches anchored at 51 reach 178; the presence frontier reported is always above that.
+        long present = 400;
+        for (int i = 0; i < 10; i++)
+        {
+            await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 50, presentIndex: present, presentTerm: 1);
+            present += 10;
+        }
+
+        TimeSpan budget = TestTimeouts.Scale(TimeSpan.FromSeconds(5));
+        long started = global::System.Diagnostics.Stopwatch.GetTimestamp();
+        while (host.SnapshotChunksTo(VoterA) == 0)
+        {
+            if (global::System.Diagnostics.Stopwatch.GetElapsedTime(started) > budget)
+                Assert.Fail("a presence frontier climbing above the shipped range must not be read as progress");
+            await Task.Delay(10, TestContext.Current.CancellationToken);
+        }
+
+        Assert.Equal(1, logger.Count(LogLevel.Warning, "offered a snapshot"));
+    }
+
+    /// <summary>
+    /// The durable frontier is the durable contiguous commit frontier: a peer whose disk keeps
+    /// answering for more of its log is converging even while its in-memory commit report is
+    /// stale. An advance in it is progress on its own.
+    /// </summary>
+    [Fact]
+    public async Task DurableFrontierAdvance_IsProgress_AndNeverEscalates()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, LevelCountingLogger logger) =
+            await BuildFullLogLeader(heartbeatInterval: TimeSpan.Zero, checkpoint: 100, transfer: new InstantTransfer());
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(1);
+
+        long durable = 40;
+        for (int i = 0; i < 12; i++)
+        {
+            await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 50, durableIndex: durable);
+            durable += 5;
+        }
+
+        await Task.Delay(100, TestContext.Current.CancellationToken);
+        Assert.Equal(0, host.SnapshotChunksTo(VoterA));
+        Assert.Equal(0, logger.Count(LogLevel.Warning, "without any of its reported frontiers advancing"));
+    }
+
+    /// <summary>
+    /// A durable frontier that stands still proves nothing either way: the streak is still judged
+    /// on the commit frontier, and the stuck peer still escalates.
+    /// </summary>
+    [Fact]
+    public async Task FlatDurableFrontier_DoesNotMaskAStuckPeer()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, _) =
+            await BuildFullLogLeader(heartbeatInterval: TimeSpan.Zero, checkpoint: 100, transfer: new InstantTransfer());
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(1);
+
+        for (int i = 0; i < 10; i++)
+            await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 50, durableIndex: 50);
+
+        TimeSpan budget = TestTimeouts.Scale(TimeSpan.FromSeconds(5));
+        long started = global::System.Diagnostics.Stopwatch.GetTimestamp();
+        while (host.SnapshotChunksTo(VoterA) == 0)
+        {
+            if (global::System.Diagnostics.Stopwatch.GetElapsedTime(started) > budget)
+                Assert.Fail("a peer whose every frontier is flat must still be offered a snapshot");
+            await Task.Delay(10, TestContext.Current.CancellationToken);
+        }
+    }
+
+    // ── A seeded follower gets a grace ───────────────────────────────────────
+
+    /// <summary>
+    /// After an install the follower is behind by everything committed during the transfer, and
+    /// closing that from the log can leave its frontiers flat for several ships. A second
+    /// escalation inside that window can only repeat the install (rl6: the second escalation came
+    /// five seconds after the first install landed). The probe still paces and still warns, but the
+    /// snapshot is deferred.
+    /// </summary>
+    [Fact]
+    public async Task SeededFollower_IsNotReEscalatedInsideItsGrace()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, LevelCountingLogger logger) =
+            await BuildFullLogLeader(heartbeatInterval: TimeSpan.Zero, checkpoint: 100, transfer: new InstantTransfer());
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(1);
+
+        // The install landed at 60 with the leader at 500: a 440-entry lag handed to the follower,
+        // which is still below the checkpoint (100) the next export would be taken at.
+        sm.CompleteSnapshotInstalled(VoterA, 60);
+
+        for (int i = 0; i < 10; i++)
+            await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 60);
+
+        await Task.Delay(100, TestContext.Current.CancellationToken);
+        Assert.Equal(0, host.SnapshotChunksTo(VoterA));
+        Assert.Equal(1, logger.Count(LogLevel.Warning, "a further snapshot is deferred"));
+        Assert.Equal(0, logger.Count(LogLevel.Warning, "offered a snapshot"));
+        Assert.True(EntryBatchesTo(host, VoterA) > 0, "the seeded peer is still backfilled");
+    }
+
+    /// <summary>
+    /// The grace is bounded: once it lapses, a peer whose frontiers are still flat is offered the
+    /// snapshot. Here the leader committed nothing since the install, so the catch-up estimate is
+    /// the cap, and the clock is moved past the cap plus the pause cap.
+    /// </summary>
+    [Fact]
+    public async Task SeededFollower_IsEscalatedOnceItsGraceLapses()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, _) =
+            await BuildFullLogLeader(heartbeatInterval: TimeSpan.Zero, checkpoint: 100, transfer: new InstantTransfer());
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(1);
+
+        host.MonotonicTicks = global::System.Diagnostics.Stopwatch.GetTimestamp();
+        sm.CompleteSnapshotInstalled(VoterA, 60);
+
+        TimeSpan grace = host.Configuration.BackfillSeededCatchUpGraceCap + host.Configuration.BackfillNoProgressPauseCap;
+        host.MonotonicTicks += (long)(grace.TotalSeconds * global::System.Diagnostics.Stopwatch.Frequency) + global::System.Diagnostics.Stopwatch.Frequency;
+
+        for (int i = 0; i < 10; i++)
+            await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 60);
+
+        TimeSpan budget = TestTimeouts.Scale(TimeSpan.FromSeconds(5));
+        long started = global::System.Diagnostics.Stopwatch.GetTimestamp();
+        while (host.SnapshotChunksTo(VoterA) == 0)
+        {
+            if (global::System.Diagnostics.Stopwatch.GetElapsedTime(started) > budget)
+                Assert.Fail("a seeded peer still stuck after its grace must be offered a snapshot");
+            await Task.Delay(10, TestContext.Current.CancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// The grace scales with the lag the install handed the follower and the commit rate the
+    /// leader has sustained since: a lag the follower can close in under a second at that rate
+    /// adds under a second to the pause cap, and once that has passed the stuck peer escalates —
+    /// well inside the 3-minute cap a rate that could not be measured would have earned it.
+    /// </summary>
+    [Fact]
+    public async Task SeededFollower_GraceIsSizedByTheLagAndTheCommitRate()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, _) =
+            await BuildFullLogLeader(heartbeatInterval: TimeSpan.Zero, checkpoint: 100, transfer: new InstantTransfer());
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(1);
+
+        long frequency = global::System.Diagnostics.Stopwatch.Frequency;
+        host.MonotonicTicks = global::System.Diagnostics.Stopwatch.GetTimestamp();
+        host.Configuration.BackfillNoProgressPauseCap = TimeSpan.FromSeconds(2);
+
+        // Installed at 60 with the leader at 500: a 440-entry lag.
+        sm.CompleteSnapshotInstalled(VoterA, 60);
+
+        // Three seconds later the leader is 2,000 entries further on (667 entries/s): the follower
+        // needs 0.66 s for its lag, so the grace is the 2-s pause cap plus 0.66 s — already lapsed.
+        host.MonotonicTicks += 3 * frequency;
+        sm.SetLocalCommittedIndexForTesting(2500);
+
+        for (int i = 0; i < 10; i++)
+            await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 60);
+
+        TimeSpan budget = TestTimeouts.Scale(TimeSpan.FromSeconds(5));
+        long started = global::System.Diagnostics.Stopwatch.GetTimestamp();
+        while (host.SnapshotChunksTo(VoterA) == 0)
+        {
+            if (global::System.Diagnostics.Stopwatch.GetElapsedTime(started) > budget)
+                Assert.Fail("a grace sized by a small lag must have lapsed");
+            await Task.Delay(10, TestContext.Current.CancellationToken);
+        }
+    }
+
+    /// <summary>A zero cap disables the grace: a seeded peer escalates like any other.</summary>
+    [Fact]
+    public async Task SeededFollower_WithTheGraceDisabled_EscalatesAtOnce()
+    {
+        (RaftPartitionStateMachine sm, CapturingHost host, _) =
+            await BuildFullLogLeader(heartbeatInterval: TimeSpan.Zero, checkpoint: 100, transfer: new InstantTransfer());
+        HLCTimestamp ts = host.HybridLogicalClock.TrySendOrLocalEvent(1);
+
+        host.Configuration.BackfillSeededCatchUpGraceCap = TimeSpan.Zero;
+        sm.CompleteSnapshotInstalled(VoterA, 60);
+
+        for (int i = 0; i < 10; i++)
+            await sm.CompleteAppendLogsAsync(VoterA, ts, RaftOperationStatus.Success, committedIndex: 60);
+
+        TimeSpan budget = TestTimeouts.Scale(TimeSpan.FromSeconds(5));
+        long started = global::System.Diagnostics.Stopwatch.GetTimestamp();
+        while (host.SnapshotChunksTo(VoterA) == 0)
+        {
+            if (global::System.Diagnostics.Stopwatch.GetElapsedTime(started) > budget)
+                Assert.Fail("with the grace disabled the seeded peer must be offered a snapshot");
+            await Task.Delay(10, TestContext.Current.CancellationToken);
+        }
     }
 
     [Fact]
@@ -271,7 +530,7 @@ public class TestBackfillNoProgress
         Assert.Equal(0, host.SnapshotChunksTo(VoterA));
         Assert.Empty(sm.GetSnapshotStatuses());
         Assert.True(EntryBatchesTo(host, VoterA) > 0);
-        Assert.Equal(1, logger.Count(LogLevel.Warning, "without its reported commit frontier advancing"));
+        Assert.Equal(1, logger.Count(LogLevel.Warning, "without any of its reported frontiers advancing"));
     }
 
     [Fact]
@@ -445,6 +704,11 @@ public class TestBackfillNoProgress
         public HybridLogicalClock HybridLogicalClock { get; } = new();
         public IReadOnlyList<RaftNode> Nodes { get; set; } = [new(VoterA), new(VoterB)];
         public MemberLivenessState GetNodeLiveness(string endpoint) => MemberLivenessState.Alive;
+
+        /// <summary>When set, the monotonic clock every elapsed-time gate reads; null means the real one.</summary>
+        public long? MonotonicTicks { get; set; }
+
+        public long GetMonotonicTimestamp() => MonotonicTicks ?? global::System.Diagnostics.Stopwatch.GetTimestamp();
 
         public HLCTimestamp GetLastNodeActivity(string e, int p) => HLCTimestamp.Zero;
         public void UpdateLastNodeActivity(string e, int p, HLCTimestamp t) { }

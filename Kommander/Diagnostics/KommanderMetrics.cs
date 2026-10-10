@@ -242,6 +242,20 @@ public static class KommanderMetrics
         BackfillNoProgressEpisodesTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
 
     /// <summary>
+    /// No-progress escalations the probe withheld because the peer was seeded by a snapshot
+    /// install recently and is still inside the grace it was given to close the lag that install
+    /// handed it (<c>RaftConfiguration.BackfillSeededCatchUpGraceCap</c>). One per ship that would
+    /// otherwise have escalated.
+    /// </summary>
+    internal static readonly Counter<long> BackfillNoProgressEscalationsDeferredTotal =
+        Meter.CreateCounter<long>(
+            "raft.backfill.no_progress_escalations_deferred_total",
+            description: "No-progress snapshot escalations deferred because the peer was seeded by a snapshot install recently.");
+
+    internal static void RecordBackfillNoProgressEscalationDeferred(int partitionId) =>
+        BackfillNoProgressEscalationsDeferredTotal.Add(1, new KeyValuePair<string, object?>("partition_id", partitionId));
+
+    /// <summary>
     /// Entry-carrying backfill batches not sent because the peer's acks report a durable-write stall
     /// (<c>CompleteAppendLogsRequest.WalStallMs</c> at or above <c>WalStallWarnThreshold</c>): a
     /// batch shipped to a stalled disk can only queue or be refused there.
@@ -390,6 +404,24 @@ public static class KommanderMetrics
         Meter.CreateCounter<long>(
             "raft.snapshot.transfer_failures_total",
             description: "Failed leader-to-follower snapshot transfer attempts, by cause.");
+
+    /// <summary>
+    /// Snapshot transfers started, by what triggered them (<c>SnapshotTransferTrigger</c>): a
+    /// refused backfill (the peer is below what the log can serve), the no-progress probe (the log
+    /// serves the peer and shipping does not move it), a compacted anchor, or the follower's own
+    /// re-seed request. The split is what a run needs to tell a retention problem from a
+    /// convergence problem.
+    /// </summary>
+    internal static readonly Counter<long> SnapshotTransfersStartedTotal =
+        Meter.CreateCounter<long>(
+            "raft.snapshot.transfers_started_total",
+            description: "Leader-to-follower snapshot transfers started, by trigger.");
+
+    /// <summary>Counts one started snapshot transfer, tagged by partition and trigger.</summary>
+    internal static void RecordSnapshotTransferStarted(int partitionId, SnapshotTransferTrigger trigger) =>
+        SnapshotTransfersStartedTotal.Add(1,
+            new KeyValuePair<string, object?>("partition_id", partitionId),
+            new KeyValuePair<string, object?>("trigger", trigger.ToString()));
 
     /// <summary>Counts one failed snapshot transfer attempt, tagged by partition and cause.</summary>
     internal static void RecordSnapshotTransferFailure(int partitionId, string cause) =>

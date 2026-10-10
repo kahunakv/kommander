@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Kommander.Communication.Grpc;
 using Kommander.Data;
 using Kommander.Diagnostics;
@@ -348,7 +349,12 @@ internal sealed class BackfillSender
                     && PeerReportsHolding(node.Endpoint, cached.FirstAvailableId - 1);
 
                 if (cached.EmptyResult != BackfillSendResult.SaturationPaused && !peerPastRefusedRange)
-                    await EscalateRefusalToSnapshotAsync(node).ConfigureAwait(false);
+                {
+                    SnapshotTransferTrigger trigger = cached.EmptyResult == BackfillSendResult.NonContiguous
+                        ? SnapshotTransferTrigger.NonContiguousBackfill
+                        : SnapshotTransferTrigger.EmptyBackfillRead;
+                    await EscalateRefusalToSnapshotAsync(node, trigger, from, cached.FirstAvailableId).ConfigureAwait(false);
+                }
                 return cached.EmptyResult;
             }
 
@@ -357,7 +363,7 @@ internal sealed class BackfillSender
             backfillTracker.ClearIfCovered(node.Endpoint, from, "a contiguous batch was shipped at or below the episode anchor");
             AppendLogToNode(node, timestamp, cached.Logs, prevIdx, cached.PrevTerm, grpcLogCache: cached.GrpcLogCache);
             tracker.RecordAnchorShip(node.Endpoint, prevIdx, anchorCompacted: prevIdx > 0 && cached.PrevTerm < 0);
-            await RecordShippedAsync(node, reportedFrontier, from).ConfigureAwait(false);
+            await RecordShippedAsync(node, reportedFrontier, from, cached.Logs[^1].Id).ConfigureAwait(false);
             return BackfillSendResult.Sent;
         }
 
@@ -383,7 +389,7 @@ internal sealed class BackfillSender
             // Memoize the empty result as well: every follower anchored here would otherwise repeat the
             // same read before falling through to the snapshot path.
             round?.Add(from, backfill, 0);
-            await EscalateRefusalToSnapshotAsync(node).ConfigureAwait(false);
+            await EscalateRefusalToSnapshotAsync(node, SnapshotTransferTrigger.EmptyBackfillRead, from).ConfigureAwait(false);
             return BackfillSendResult.CompactionFloor;
         }
 
@@ -415,7 +421,7 @@ internal sealed class BackfillSender
             // the next round, anchored at the fresher report, ships normally. Escalating on that
             // shape sent a full snapshot to a follower that was one entry behind.
             if (!PeerReportsHolding(node.Endpoint, backfill[0].Id - 1))
-                await EscalateRefusalToSnapshotAsync(node).ConfigureAwait(false);
+                await EscalateRefusalToSnapshotAsync(node, SnapshotTransferTrigger.NonContiguousBackfill, from, backfill[0].Id).ConfigureAwait(false);
             else if (logger.IsEnabled(LogLevel.Debug))
                 logger.LogDebug(
                     "[{LocalEndpoint}/{PartitionId}/{State}] Not escalating the refused backfill for {Endpoint} (anchored at {From}, first available {FirstId}) to a snapshot: the peer's latest report already covers the refused range; re-anchoring next round",
@@ -440,7 +446,7 @@ internal sealed class BackfillSender
         backfillTracker.ClearIfCovered(node.Endpoint, from, "a contiguous batch was shipped at or below the episode anchor");
         AppendLogToNode(node, timestamp, backfill, prevIdx, prevTerm, grpcLogCache: shared?.GrpcLogCache);
         tracker.RecordAnchorShip(node.Endpoint, prevIdx, anchorCompacted: prevIdx > 0 && prevTerm < 0);
-        await RecordShippedAsync(node, reportedFrontier, from).ConfigureAwait(false);
+        await RecordShippedAsync(node, reportedFrontier, from, backfill[^1].Id).ConfigureAwait(false);
         return BackfillSendResult.Sent;
     }
 
@@ -487,24 +493,150 @@ internal sealed class BackfillSender
     /// stayed at frontier 0 (2026-09-19). A snapshot re-seeds the peer's state from the leader's
     /// last checkpoint; the transfer is paced by the sender's failure backoff and bounded by its
     /// convergence breaker, and it is a no-op when no checkpoint exists to export from.</para>
+    ///
+    /// <para><b>What counts as "no advance".</b> The streak grows only while none of the peer's
+    /// reported frontiers moves: commit, durable, and — for a ship that could have extended it —
+    /// contiguous presence (<see cref="ReplicationTracker.RecordBackfillShip"/>). A follower closing
+    /// a hole under a live stream that keeps landing above the hole reports a pinned commit frontier
+    /// for as long as the hole is open; judged on that frontier alone, the probe escalated a
+    /// converging follower four ships after it resumed and re-seeded it three times for one 30-s
+    /// pause (CamusDB fault soak rl6).</para>
+    ///
+    /// <para><b>A freshly seeded follower gets a grace.</b> An install hands the follower the lag
+    /// the leader accrued while exporting, sending and importing it; a second install inside the
+    /// time it needs to close that lag can only repeat the first. The escalation — not the pacing,
+    /// not the Warning — is deferred for <see cref="RaftConfiguration.BackfillSeededCatchUpGraceCap"/>
+    /// at most (see <see cref="IsInsideSeededCatchUpGrace"/>).</para>
     /// </summary>
-    private async Task RecordShippedAsync(RaftNode node, long reportedFrontier, long anchor)
+    private async Task RecordShippedAsync(RaftNode node, long reportedFrontier, long anchor, long lastShippedId)
     {
-        int fruitlessShips = tracker.RecordBackfillShip(node.Endpoint, reportedFrontier);
+        int fruitlessShips = tracker.RecordBackfillShip(node.Endpoint, reportedFrontier, lastShippedId);
 
         if (fruitlessShips < NoProgressWarnShips)
             return;
 
+        bool deferred = IsInsideSeededCatchUpGrace(node.Endpoint, out TimeSpan graceRemaining, out TimeSpan sinceSeed, out long seededLag, out long seededIndex);
+
         if (tracker.TryMarkBackfillNoProgressWarned(node.Endpoint))
         {
             KommanderMetrics.RecordBackfillNoProgressEpisode(host.PartitionId);
-            logger.LogWarning(
-                "[{LocalEndpoint}/{PartitionId}/{State}] Backfill to {Endpoint} shipped {Ships} consecutive batches without its reported commit frontier advancing past {Frontier}; batches are now paced and anchored at the frontier (last anchor {Anchor}), and the peer is offered a snapshot unless it already reaches the checkpoint",
-                host.LocalEndpoint, host.PartitionId, coreState.NodeState,
-                node.Endpoint, fruitlessShips, reportedFrontier, anchor);
+            if (deferred)
+                logger.LogWarning(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] Backfill to {Endpoint} shipped {Ships} consecutive batches without any of its reported frontiers advancing ({Positions}); batches are now paced and anchored at the frontier (last anchor {Anchor}). It was seeded by a snapshot at index {SeededIndex} {SinceSeed:F0} s ago with a lag of {Lag} entries, so a further snapshot is deferred for {Remaining:F0} s while it closes that lag from the log",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState,
+                    node.Endpoint, fruitlessShips, PeerPositions(node.Endpoint), anchor,
+                    seededIndex, sinceSeed.TotalSeconds, seededLag, graceRemaining.TotalSeconds);
+            else
+                logger.LogWarning(
+                    "[{LocalEndpoint}/{PartitionId}/{State}] Backfill to {Endpoint} shipped {Ships} consecutive batches without any of its reported frontiers advancing ({Positions}); batches are now paced and anchored at the frontier (last anchor {Anchor}), and the peer is offered a snapshot unless it already reaches the checkpoint",
+                    host.LocalEndpoint, host.PartitionId, coreState.NodeState,
+                    node.Endpoint, fruitlessShips, PeerPositions(node.Endpoint), anchor);
         }
 
-        await EscalateRefusalToSnapshotAsync(node).ConfigureAwait(false);
+        if (deferred)
+        {
+            KommanderMetrics.RecordBackfillNoProgressEscalationDeferred(host.PartitionId);
+            return;
+        }
+
+        await EscalateRefusalToSnapshotAsync(node, SnapshotTransferTrigger.NoProgressProbe, anchor, fruitlessShips: fruitlessShips).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Whether the no-progress probe must hold its escalation for <paramref name="endpoint"/> because
+    /// a snapshot install was confirmed for it recently. The grace is
+    /// <see cref="RaftConfiguration.BackfillNoProgressPauseCap"/> plus the time the follower needs to
+    /// close the lag the install handed it (the leader's commit index at the install minus the
+    /// installed index) at the commit rate this leader has sustained since the install, the whole
+    /// bounded by <see cref="RaftConfiguration.BackfillSeededCatchUpGraceCap"/>. A rate that cannot
+    /// be measured yet (under a second since the install) or a leader that has committed nothing
+    /// since count as the bound: the cost of deferring a snapshot the follower turns out to need is
+    /// a few minutes inside the retention window its own position holds; the cost of not deferring
+    /// was an export, a transfer and a 90%-of-memory import that repeated the one before.
+    /// A lapsed grace forgets the install record.
+    /// </summary>
+    private bool IsInsideSeededCatchUpGrace(string endpoint, out TimeSpan remaining, out TimeSpan sinceSeed, out long lag, out long seededIndex)
+    {
+        remaining = TimeSpan.Zero;
+        sinceSeed = TimeSpan.Zero;
+        lag = 0;
+        seededIndex = -1;
+
+        if (!tracker.TryGetSnapshotSeed(endpoint, out ReplicationTracker.SnapshotSeed seed))
+            return false;
+
+        TimeSpan cap = host.Configuration.BackfillSeededCatchUpGraceCap;
+        if (cap <= TimeSpan.Zero)
+        {
+            tracker.ClearSnapshotSeed(endpoint);
+            return false;
+        }
+
+        seededIndex = seed.Index;
+        lag = Math.Max(0, seed.LeaderCommitIndex - seed.Index);
+        sinceSeed = Stopwatch.GetElapsedTime(seed.Ticks, host.GetMonotonicTimestamp());
+        if (sinceSeed < TimeSpan.Zero)
+            sinceSeed = TimeSpan.Zero;
+
+        TimeSpan catchUp;
+        if (lag == 0)
+            catchUp = TimeSpan.Zero;
+        else
+        {
+            long committedSince = coreState.LocalCommittedIndex - seed.LeaderCommitIndex;
+            double seconds = sinceSeed.TotalSeconds;
+            if (seconds >= 1 && committedSince > 0)
+            {
+                double needed = lag / (committedSince / seconds);
+                catchUp = needed >= cap.TotalSeconds ? cap : TimeSpan.FromSeconds(needed);
+            }
+            else
+                catchUp = cap;
+        }
+
+        TimeSpan pauseCap = host.Configuration.BackfillNoProgressPauseCap;
+        if (pauseCap < TimeSpan.Zero)
+            pauseCap = TimeSpan.Zero;
+
+        TimeSpan grace = pauseCap + catchUp;
+        if (sinceSeed >= grace)
+        {
+            tracker.ClearSnapshotSeed(endpoint);
+            return false;
+        }
+
+        remaining = grace - sinceSeed;
+        return true;
+    }
+
+    /// <summary>
+    /// The peer's reported positions for a log line: its commit frontier, durable frontier and
+    /// contiguous presence frontier, each "none" when it has reported no such value.
+    /// </summary>
+    private string PeerPositions(string endpoint)
+    {
+        long commit = tracker.GetCommitFrontierOrDefault(endpoint, -1);
+        string durable = tracker.TryGetDurableFrontier(endpoint, out long d) && d > 0 ? d.ToString() : "none";
+        string present = tracker.TryGetPresenceFrontier(endpoint, out long p, out _) ? p.ToString() : "none";
+        return $"peer commit {(commit >= 0 ? commit.ToString() : "none")}, durable {durable}, present {present}";
+    }
+
+    /// <summary>
+    /// The leader's own bounds for a log line: its last checkpoint and the live-replica retention
+    /// floor it is publishing this term ("none" when nothing constrains compaction, "unpublished"
+    /// before its first heartbeat round of the term).
+    /// </summary>
+    private string LeaderBounds(long lastCheckpoint)
+    {
+        string floor;
+        if (coreState.ReplicatedRetentionTerm != coreState.CurrentTerm)
+            floor = "unpublished";
+        else if (coreState.ReplicatedRetentionFloor == long.MaxValue || coreState.ReplicatedRetentionFloor <= 0)
+            floor = "none";
+        else
+            floor = $"{coreState.ReplicatedRetentionFloor} (budget {coreState.ReplicatedRetentionBudget})";
+
+        return $"leader checkpoint {lastCheckpoint}, retention floor {floor}";
     }
 
     /// <summary>
@@ -562,9 +694,15 @@ internal sealed class BackfillSender
     /// reported disk stall defers it, the sender's in-flight guard and backoff pace it, and a
     /// leader with no checkpoint has nothing to send.
     /// </summary>
-    public Task EscalateCompactedAnchorRefusalAsync(RaftNode node) => EscalateRefusalToSnapshotAsync(node);
+    public Task EscalateCompactedAnchorRefusalAsync(RaftNode node, long anchor) =>
+        EscalateRefusalToSnapshotAsync(node, SnapshotTransferTrigger.CompactedAnchorRefusal, anchor);
 
-    private async Task EscalateRefusalToSnapshotAsync(RaftNode node)
+    /// <param name="node">The peer to seed.</param>
+    /// <param name="trigger">Which path is escalating; carried on the transfer-start line and the snapshot status.</param>
+    /// <param name="anchor">The anchor the refused or fruitless batch was read from.</param>
+    /// <param name="firstAvailable">For a non-contiguous refusal, the first entry the read returned (-1 otherwise).</param>
+    /// <param name="fruitlessShips">For the no-progress probe, the streak length (0 otherwise).</param>
+    private async Task EscalateRefusalToSnapshotAsync(RaftNode node, SnapshotTransferTrigger trigger, long anchor, long firstAvailable = -1, int fruitlessShips = 0)
     {
         if (coreState.NodeState != RaftNodeState.Leader)
             return;
@@ -624,7 +762,7 @@ internal sealed class BackfillSender
             // LastIncludedTerm is the term at the checkpoint index (may be -1 when compacted away,
             // in which case the receiver falls back to its own matching rules).
             long lastIncludedTerm = await wal.GetAnyTermAtAsync(lastCheckpoint).ConfigureAwait(false);
-            snapshotSender.TrySend(node, lastCheckpoint, coreState.CurrentTerm, lastIncludedTerm);
+            snapshotSender.TrySend(node, lastCheckpoint, coreState.CurrentTerm, lastIncludedTerm, trigger, EscalationDetail(node.Endpoint, trigger, anchor, firstAvailable, fruitlessShips, lastCheckpoint));
         }
         else
         {
@@ -657,6 +795,30 @@ internal sealed class BackfillSender
     /// &lt; 0 means "not set" (legacy / in-process / test callers) and bypasses the fence, mirroring
     /// <see cref="CompleteWalOperationAsync"/>.
     /// </param>
+    /// <summary>
+    /// The numbers that justify an escalation, for the transfer-start line: what the trigger saw
+    /// (the anchor, the first entry the read returned, the fruitless streak), the peer's reported
+    /// positions, and the leader's own bounds. Built only once the escalation has passed every gate
+    /// and a transfer is about to start, so a refusal storm costs no string.
+    /// </summary>
+    private string EscalationDetail(string endpoint, SnapshotTransferTrigger trigger, long anchor, long firstAvailable, int fruitlessShips, long lastCheckpoint)
+    {
+        string cause = trigger switch
+        {
+            SnapshotTransferTrigger.NonContiguousBackfill =>
+                $"the backfill anchored at {anchor} could only be read from {firstAvailable}: no entry exists at the anchor on this leader",
+            SnapshotTransferTrigger.EmptyBackfillRead =>
+                $"the backfill anchored at {anchor} read nothing: this leader's log holds nothing it can ship from there",
+            SnapshotTransferTrigger.NoProgressProbe =>
+                $"{fruitlessShips} consecutive batches (last anchor {anchor}) were acknowledged without any of the peer's reported frontiers advancing; the log serves the anchor, shipping does not move the peer",
+            SnapshotTransferTrigger.CompactedAnchorRefusal =>
+                $"the peer keeps rejecting batches anchored at {anchor}, an entry this leader compacted, so no batch can carry a verifiable anchor",
+            _ => trigger.ToString(),
+        };
+
+        return $"{cause}; {PeerPositions(endpoint)}; {LeaderBounds(lastCheckpoint)}";
+    }
+
     /// <summary>
     /// True when at least one peer is a voter. Replaces LINQ <c>Any</c> with a plain loop on
     /// paths that run per propose/commit — the capturing lambda allocated a closure per call.

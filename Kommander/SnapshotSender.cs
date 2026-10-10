@@ -141,6 +141,9 @@ internal sealed class SnapshotSender
     /// <summary>Last Warning-level transfer-start line per endpoint — see <see cref="RescueWarnCooldownMs"/>.</summary>
     private readonly ConcurrentDictionary<string, long> lastStartWarnTicks = new();
 
+    /// <summary>What started the most recent transfer to each follower (see <see cref="RaftSnapshotStatus.Trigger"/>).</summary>
+    private readonly ConcurrentDictionary<string, SnapshotTransferTrigger> lastTriggers = new();
+
     /// <summary>Last Warning-level install-complete line per endpoint — see <see cref="RescueWarnCooldownMs"/>.</summary>
     private readonly ConcurrentDictionary<string, long> lastInstallWarnTicks = new();
 
@@ -251,8 +254,8 @@ internal sealed class SnapshotSender
     /// <see cref="TrySendSnapshotAsync"/> so a later refusal can retry on failure — paced by the
     /// recorded backoff rather than per refusal.
     /// </summary>
-    internal void TrySend(RaftNode node, long snapshotIndex, long leaderTerm, long lastIncludedTerm) =>
-        TrySend(node, snapshotIndex, leaderTerm, lastIncludedTerm, forced: false);
+    internal void TrySend(RaftNode node, long snapshotIndex, long leaderTerm, long lastIncludedTerm, SnapshotTransferTrigger trigger, string detail) =>
+        TrySend(node, snapshotIndex, leaderTerm, lastIncludedTerm, trigger, detail, forced: false);
 
     /// <summary>
     /// <see cref="TrySend(RaftNode, long, long, long)"/> for a transfer the follower asked for
@@ -261,8 +264,12 @@ internal sealed class SnapshotSender
     /// transfer is the follower's explicit request. The in-flight guard and the durable-write stall
     /// deferral still apply — two transfers to one follower are never useful, and a stalled disk
     /// cannot install anything. The chunks carry <see cref="SnapshotRequest.Forced"/>.
+    /// <para><paramref name="trigger"/> and <paramref name="detail"/> say why the transfer starts:
+    /// the trigger is kept for <see cref="GetStatuses"/> and both go on the start line. The line
+    /// used to assert the compaction floor for every path, which sent the first reading of a run
+    /// toward retention when the no-progress probe had fired on a follower the floor covered.</para>
     /// </summary>
-    internal void TrySend(RaftNode node, long snapshotIndex, long leaderTerm, long lastIncludedTerm, bool forced)
+    internal void TrySend(RaftNode node, long snapshotIndex, long leaderTerm, long lastIncludedTerm, SnapshotTransferTrigger trigger, string detail, bool forced)
     {
         if (deferTransferTo(node.Endpoint))
             return;
@@ -283,16 +290,19 @@ internal sealed class SnapshotSender
             else
                 forcedEndpoints.TryRemove(node.Endpoint, out _);
 
-            // A transfer start is always logged, and at Warning outside the cooldown: the only
-            // caller is the refused-backfill escalation, so a start here means a peer sits below
-            // the compaction floor — an abnormal condition whose rescue attempt must be visible at
-            // the default consumer log level (see RescueWarnCooldownMs).
+            lastTriggers[node.Endpoint] = trigger;
+            KommanderMetrics.RecordSnapshotTransferStarted(host.PartitionId, trigger);
+
+            // A transfer start is always logged, and at Warning outside the cooldown: a start here
+            // means log shipping could not converge a peer — an abnormal condition whose rescue
+            // attempt must be visible at the default consumer log level (see RescueWarnCooldownMs).
+            // The line names the trigger and the numbers behind it; it must not claim a cause.
             if (TryOpenWarnWindow(lastStartWarnTicks, node.Endpoint))
                 logger.LogWarnStartingSnapshotTransfer(
-                    host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex);
+                    host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex, trigger, detail);
             else if (logger.IsEnabled(LogLevel.Debug))
                 logger.LogDebugStartingSnapshotTransfer(
-                    host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex);
+                    host.LocalEndpoint, host.PartitionId, getNodeState(), node.Endpoint, snapshotIndex, trigger, detail);
 
             FireAndForget.Observe(TrySendSnapshotAsync(node, snapshotIndex, leaderTerm, lastIncludedTerm), logger, "SnapshotSender.TrySend");
         }
@@ -507,6 +517,7 @@ internal sealed class SnapshotSender
                 LastError = state.LastError,
                 Unproducible = state.Unproducible,
                 InFlight = inFlight,
+                Trigger = lastTriggers.TryGetValue(endpoint, out SnapshotTransferTrigger trigger) ? trigger : null,
                 AwaitingInstall = awaiting,
                 AwaitingInstallIndex = awaiting ? awaitedIndex : null,
                 InFlightFor = inFlight
@@ -534,6 +545,7 @@ internal sealed class SnapshotSender
             {
                 FollowerEndpoint = endpoint,
                 InFlight = true,
+                Trigger = lastTriggers.TryGetValue(endpoint, out SnapshotTransferTrigger trigger) ? trigger : null,
                 AwaitingInstall = awaiting,
                 AwaitingInstallIndex = awaiting ? awaitedIndex : null,
                 InFlightFor = TimeSpan.FromSeconds((double)(now - startedTicks) / Stopwatch.Frequency),

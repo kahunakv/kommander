@@ -37,6 +37,14 @@ public sealed class RaftSnapshotStatus
     public bool InFlight { get; init; }
 
     /// <summary>
+    /// What started the most recent transfer to this follower (in flight or the last one that ran),
+    /// or null when this leader has not started one. The refused-backfill triggers mean the follower
+    /// sits below what the log can serve; <see cref="SnapshotTransferTrigger.NoProgressProbe"/> means
+    /// the log could serve it and shipping did not move it.
+    /// </summary>
+    public SnapshotTransferTrigger? Trigger { get; init; }
+
+    /// <summary>
     /// How long the in-flight transfer has been running, or null when none is in flight. While the
     /// transfer is sending, a value near the configured <c>SnapshotTransferStepTimeout</c> points
     /// at a slow or hung step about to be abandoned and retried. While it is

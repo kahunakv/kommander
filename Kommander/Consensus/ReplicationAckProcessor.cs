@@ -248,7 +248,7 @@ internal sealed class ReplicationAckProcessor
                         if (refusals == CompactedAnchorRefusalsBeforeSnapshot)
                             logger.LogWarnCompactedAnchorRefused(host.LocalEndpoint, host.PartitionId, coreState.NodeState, endpoint, anchor, refusals);
 
-                        await sender.EscalateCompactedAnchorRefusalAsync(node).ConfigureAwait(false);
+                        await sender.EscalateCompactedAnchorRefusalAsync(node, anchor).ConfigureAwait(false);
                     }
                 }
             }

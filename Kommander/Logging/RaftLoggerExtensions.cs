@@ -77,11 +77,11 @@ public static partial class RaftLoggerExtensions
     [LoggerMessage(Level = LogLevel.Information, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Starting pre-vote round for Term={PreVoteTerm}")]
     public static partial void LogInfoStartingPreVoteRound(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, long preVoteTerm);
 
-    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Escalating refused backfill to a snapshot transfer for {Endpoint} at index {Index} — the follower sits below the WAL compaction floor and only a snapshot can seed it. Repeats within the cooldown log at Debug; query IRaft.GetSnapshotStatuses while this persists")]
-    public static partial void LogWarnStartingSnapshotTransfer(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index);
+    [LoggerMessage(Level = LogLevel.Warning, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Starting a snapshot transfer to {Endpoint} at index {Index}, triggered by {Trigger}: {Detail}. Repeats within the cooldown log at Debug; query IRaft.GetSnapshotStatuses while this persists")]
+    public static partial void LogWarnStartingSnapshotTransfer(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index, SnapshotTransferTrigger trigger, string detail);
 
-    [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Starting another snapshot transfer to {Endpoint} at index {Index} (within the re-warn cooldown)")]
-    public static partial void LogDebugStartingSnapshotTransfer(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index);
+    [LoggerMessage(Level = LogLevel.Debug, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Starting another snapshot transfer to {Endpoint} at index {Index} (within the re-warn cooldown), triggered by {Trigger}: {Detail}")]
+    public static partial void LogDebugStartingSnapshotTransfer(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, string endpoint, long index, SnapshotTransferTrigger trigger, string detail);
 
     [LoggerMessage(Level = LogLevel.Critical, Message = "[{LocalEndpoint}/{PartitionId}/{State}] Same node id was found in the cluster {NodeId} {RemoteNodeId}")]
     public static partial void LogCritSameNodeId(this ILogger<IRaft> logger, string localEndpoint, int partitionId, RaftNodeState state, int nodeId, int remoteNodeId);

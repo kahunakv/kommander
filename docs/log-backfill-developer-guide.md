@@ -338,7 +338,7 @@ Operational notes on the handoff:
   anchor, the first index the leader could actually read, and the last checkpoint — the checkpoint is
   what tells the two causes apart: at or above the first readable index means the anchor was
   compacted away and only a snapshot can seed that follower.
-- A follower whose reported frontier **does not advance** although batches anchored at that very
+- A follower whose reported frontiers **do not advance** although batches anchored at its very
   frontier are shipped and acknowledged cannot be converged by log shipping at all. The no-progress
   probe paces and re-anchors such batches; once the fruitless streak reaches the warning threshold
   (four ships) the leader also offers the follower a snapshot from its last checkpoint, through the
@@ -346,6 +346,30 @@ Operational notes on the handoff:
   leader left unfinished: its own WAL may still serve the stuck follower's anchor (the follower's
   position pins the retention floor), so no refusal ever occurs, and without this trigger the
   follower stayed at frontier 0 for the rest of the run. Without a checkpoint nothing is shipped.
+- **Slow is not stuck.** The probe counts a ship fruitless only when *none* of the follower's
+  reported frontiers moved: its commit frontier, its durable frontier, and — for a ship whose batch
+  reached the follower's contiguous presence frontier and so could have extended it — that presence
+  frontier. A follower closing a log hole while the live stream keeps landing above the hole reports
+  a commit frontier pinned under the hole for as long as the hole is open, while every batch anchored
+  at the hole advances its presence frontier; judged on the commit frontier alone, four such ships
+  read as fruitless inside ten seconds and the follower was re-seeded three times for one 30-second
+  pause (CamusDB fault soak rl6). The presence frontier is credited only through a ship that reached
+  it because in the marker-loss wedge the live stream lands contiguously above the pinned frontier
+  and the presence frontier climbs with the leader's head while nothing below it is repaired.
+- **A freshly seeded follower gets a grace.** An install hands the follower the lag the leader
+  accrued while the snapshot was exported, sent and imported; the follower closes it from the log,
+  and its frontiers can stand still for several ships while it does. After a confirmed install the
+  probe defers its escalation — not its pacing, not its Warning — for `BackfillNoProgressPauseCap`
+  plus the time the follower needs to close that lag at the commit rate the leader has sustained
+  since, bounded by `BackfillSeededCatchUpGraceCap` (3 minutes). A refused backfill still escalates
+  at once: the grace is for the probe, whose verdict is inference, not for a floor the log cannot serve.
+- **The transfer-start line says why.** Every snapshot transfer starts with a Warning that names
+  its trigger (`SnapshotTransferTrigger`: a non-contiguous or empty backfill read, the no-progress
+  probe, a compacted anchor, the follower's own re-seed request) and the numbers behind it — the
+  anchor and first readable entry, the fruitless streak, the follower's commit, durable and presence
+  frontiers, the leader's checkpoint and retention floor. The trigger is also on
+  `RaftSnapshotStatus.Trigger` and tags `raft.snapshot.transfers_started_total`. The line used to
+  assert "below the WAL compaction floor" for every path.
 
 ---
 
@@ -436,6 +460,8 @@ In `RaftConfiguration.cs`:
 | `BackfillEnabled` | `true` | Master switch. `false` means this node never backfills and never falls back to a snapshot transfer for a lagging follower — peers converge only through the live path, and a follower that misses entries stays behind. |
 | `BackfillThreshold` | `10` | A follower must lag by more than this many entries before the *actively-behind* trigger engages. Below it, the live path handles catch-up. Does not gate the idle-tail or crash-restart triggers — see Flow 1. |
 | `MaxBackfillEntriesPerRound` | `128` | Maximum entries shipped in a single backfill round. Caps message size and keeps backfill sharing the partition fairly. |
+| `BackfillNoProgressPauseCap` | `30 s` | Cap on the exponential pause between batches to a follower none of whose reported frontiers is advancing. |
+| `BackfillSeededCatchUpGraceCap` | `3 min` | Upper bound on the grace a follower gets after a snapshot install before the no-progress probe may offer it another one (Flow 5). Zero disables the grace. |
 
 Tuning notes:
 
