@@ -250,6 +250,13 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
     }
 
     /// <summary>
+    /// True while an operator-requested departure is in force and auto-rejoin is therefore
+    /// suppressed. Released when a leave attempt provably left the node a full Voter (a refusal,
+    /// or a drain whose rollback to Voter was confirmed). Exposed for tests.
+    /// </summary>
+    internal bool IsLeaveRequested => leaveService.IsLeaveRequested;
+
+    /// <summary>
     /// Returns the system partition
     /// </summary>
     internal RaftPartition? SystemPartition => systemPartition;
@@ -659,6 +666,7 @@ public sealed class RaftManager : IRaft, IPartitionProvider, Scheduling.IRaftTim
             this,
             eventNotifier,
             autoRejoinDriver,
+            leaveService,
             Logger,
             LocalEndpoint);
 

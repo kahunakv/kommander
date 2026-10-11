@@ -89,8 +89,10 @@ internal sealed class AutoRejoinDriver
     /// Starts the rejoin loop when a committed roster no longer contains this node.
     /// <para>
     /// Deliberately NOT triggered when: auto-rejoin is disabled; the node initiated a graceful
-    /// leave (the removal is intentional — including an attempt that reported failure, because the
-    /// removal may still land later and re-admitting would undo an operator-ordered decommission);
+    /// leave that is still in force (the removal is intentional — including an attempt that timed
+    /// out, because the removal may still land later and re-admitting would undo an
+    /// operator-ordered decommission; an attempt that was refused, or whose drain was rolled back
+    /// to Voter, releases the latch because the node is provably a full member again);
     /// this node has never been in a committed roster (first-time joins own their admission retry
     /// loop in the seed-join path, and a booting learner or a bare test manager routinely observes
     /// rosters that don't include it); or the roster is the pre-seed version 0.

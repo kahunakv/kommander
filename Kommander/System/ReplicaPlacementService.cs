@@ -723,7 +723,7 @@ internal sealed class ReplicaPlacementService
                 (int, string) key = (range.PartitionId, transitional.Endpoint);
                 DateTimeOffset now = DateTimeOffset.UtcNow;
 
-                LearnerLagVerdict verdict = await IsLearnerCaughtUp(range.PartitionId, transitional.Endpoint, cancellationToken).ConfigureAwait(false);
+                LearnerLagVerdict verdict = await IsLearnerCaughtUp(range.PartitionId, transitional.Endpoint, roster, cancellationToken).ConfigureAwait(false);
                 if (verdict.CaughtUp)
                 {
                     _learnerStalledSince.Remove(key);
@@ -879,8 +879,16 @@ internal sealed class ReplicaPlacementService
     /// per-partition placement the learner is explicitly expected to ack this range, so "never
     /// acked" means replication has not reached it yet — the expected-partition-set distinction
     /// the join-all model couldn't make.
+    /// <para>
+    /// A range leader that is <b>not a roster member</b> is named as such in the verdict instead
+    /// of being probed: an evicted node that still leads a range never receives the P0 entries
+    /// that would install the learner into its peer set, so the learner can never be fed and the
+    /// move cannot progress until that node rejoins (its auto-rejoin) or steps down. Before this
+    /// the stall logged only "has never received an ack from the learner", which hid the evicted
+    /// leader behind the learner (Kahuna nightly, 2026-10-11).
+    /// </para>
     /// </summary>
-    private async Task<LearnerLagVerdict> IsLearnerCaughtUp(int partitionId, string endpoint, CancellationToken cancellationToken)
+    private async Task<LearnerLagVerdict> IsLearnerCaughtUp(int partitionId, string endpoint, ClusterMembership roster, CancellationToken cancellationToken)
     {
         long leaderCommitted;
         long learnerCommitted;
@@ -906,7 +914,9 @@ internal sealed class ReplicaPlacementService
         else
         {
             string? hint = getPartitionLeader(partitionId);
-            string? hintFailure = string.IsNullOrEmpty(hint) ? "no gossiped leader hint" : null;
+            string? hintFailure = string.IsNullOrEmpty(hint) ? "no gossiped leader hint"
+                : IsNotRosterMember(roster, hint!) ? $"hinted leader {hint} is not a roster member"
+                : null;
 
             LeaderProbe probe = default;
             if (hintFailure is null)
@@ -922,6 +932,9 @@ internal sealed class ReplicaPlacementService
                     return LearnerLagVerdict.No($"{hintFailure}; no voter of the range confirmed leadership through a read-index round");
 
                 logger.LogDebugPlacementLeaderResolvedByReadIndex(localEndpoint, partitionId, hint ?? "", hintFailure, resolved);
+
+                if (IsNotRosterMember(roster, resolved))
+                    return LearnerLagVerdict.No($"{hintFailure}; confirmed leader {resolved} is not a roster member (evicted or removed while still leading the range) and cannot feed the learner until it rejoins or steps down");
 
                 if (resolved == hint)
                     return LearnerLagVerdict.No($"{hintFailure} (read-index round confirmed the same node)");
@@ -943,6 +956,13 @@ internal sealed class ReplicaPlacementService
             ? LearnerLagVerdict.Yes
             : LearnerLagVerdict.No($"lag {lag} (leader {leaderCommitted}, learner {learnerCommitted}) exceeds LearnerPromotionLag {configuration.LearnerPromotionLag}");
     }
+
+    /// <summary>
+    /// True when <paramref name="endpoint"/> is absent from a committed (version &gt; 0) roster.
+    /// The pre-seed roster (version 0) names nobody and must not flag every leader as evicted.
+    /// </summary>
+    private static bool IsNotRosterMember(ClusterMembership roster, string endpoint) =>
+        roster.MembershipVersion > 0 && roster.Members.All(m => m.Endpoint != endpoint);
 
     /// <summary>
     /// Asks <paramref name="leaderEndpoint"/>, over the transport, for its own committed index and

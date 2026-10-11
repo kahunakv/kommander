@@ -6,8 +6,10 @@ namespace Kommander;
 
 /// <summary>
 /// Reacts to every advance of the committed cluster roster: notifies the application, repairs
-/// per-follower replication progress for members the new roster (re)admits, and hands an eviction
-/// of this node to the auto-rejoin driver.
+/// per-follower replication progress for members the new roster (re)admits, lets the leave
+/// service observe its own role (a drain rolled back to Voter releases the leave latch), and
+/// hands an eviction of this node to the auto-rejoin driver — in that order, so a release is
+/// visible to the eviction check of the same or any later roster.
 /// <para>
 /// Concurrency: this runs only on the system coordinator's event path, which delivers roster
 /// versions one at a time in increasing order. That single-threadedness is what lets
@@ -30,6 +32,7 @@ internal sealed class MembershipChangeHandler
     private readonly IPartitionProvider partitionProvider;
     private readonly RaftEventNotifier eventNotifier;
     private readonly AutoRejoinDriver autoRejoinDriver;
+    private readonly ClusterLeaveService leaveService;
     private readonly ILogger<IRaft> logger;
     private readonly string localEndpoint;
 
@@ -37,12 +40,14 @@ internal sealed class MembershipChangeHandler
         IPartitionProvider partitionProvider,
         RaftEventNotifier eventNotifier,
         AutoRejoinDriver autoRejoinDriver,
+        ClusterLeaveService leaveService,
         ILogger<IRaft> logger,
         string localEndpoint)
     {
         this.partitionProvider = partitionProvider;
         this.eventNotifier = eventNotifier;
         this.autoRejoinDriver = autoRejoinDriver;
+        this.leaveService = leaveService;
         this.logger = logger;
         this.localEndpoint = localEndpoint;
     }
@@ -57,6 +62,11 @@ internal sealed class MembershipChangeHandler
         eventNotifier.RaiseMembershipChanged(membership);
 
         ResetProgressForReadmittedMembers(membership);
+
+        // A drain rolled back to Voter releases the leave latch here, BEFORE the rejoin check:
+        // the auto-rejoin driver consults that latch, and a node whose decommission was not
+        // honoured must be treated as the full Voter it is.
+        leaveService.ObserveCommittedRoster(membership);
 
         // Record self-inclusion BEFORE the rejoin check: during startup restore the
         // self-including roster and the eviction record arrive back-to-back on the coordinator
