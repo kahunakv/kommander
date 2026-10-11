@@ -188,7 +188,8 @@ internal sealed class ClusterLeaveService : IDisposable
         _leaveRequested = false;
         Volatile.Write(ref _drainRoleCommittedVersion, 0);
 
-        logger.LogInformation("[{LocalEndpoint}] Leave request released: {Reason}; the node stays a full member and will auto-rejoin after an eviction", localEndpoint, reason);
+        if (logger.IsEnabled(LogLevel.Information))
+            logger.LogInformation("[{LocalEndpoint}] Leave request released: {Reason}; the node stays a full member and will auto-rejoin after an eviction", localEndpoint, reason);
     }
 
     /// <summary>
