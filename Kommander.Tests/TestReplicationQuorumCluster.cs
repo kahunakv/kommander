@@ -140,8 +140,10 @@ public sealed class TestReplicationQuorumCluster
     /// With both followers cut off, a per-entry batch is admitted by the leader (its entries
     /// reach the leader's WAL) but can never commit: the quorum wait expires, and the failure is
     /// stamped on every admitted entry — auto-commit and manual alike — with no log index and no
-    /// ticket left behind for the caller. Once the links heal, the stuck entry settles and a
-    /// fresh batch commits — the failed wait leaked nothing that wedges the partition.
+    /// ticket left behind for the caller. Once the links heal, a fresh batch commits on every
+    /// node — the failed wait leaked nothing that wedges the partition. The stuck entries are
+    /// uncommitted, so a newer leader may legitimately truncate them; the test does not require
+    /// them to survive.
     /// </summary>
     [Fact]
     public async Task ReplicateEntries_QuorumUnreachable_FailsEveryAdmittedEntryAndRecoversAfterHeal()
@@ -186,18 +188,35 @@ public sealed class TestReplicationQuorumCluster
             Assert.True(maxLogDuringFailure > maxLogBefore,
                 "The batch never reached the leader's WAL; the path under test did not run.");
 
-            // Heal: the stranded entry settles everywhere and the partition takes new writes.
+            // Heal: the partition takes new writes and every node converges on them. The stranded
+            // entries were never committed, so they need not survive: a follower that timed out
+            // during the cut can win the next term after the heal with a log that lacks them (its
+            // log is as up to date as the other follower's), and the new leader then truncates
+            // them from the old one. The contract is that nothing wedges, not that they settle.
             comm.HealAll();
-            await WaitForCondition(
-                () => followers.All(f => f.WalAdapter.GetMaxLog(partitionId) >= maxLogDuringFailure),
-                ct, timeoutMs: 20_000);
 
-            RaftManager settledLeader = await LeaderOf(nodes, partitionId, ct);
-            RaftBatchReplicationResult recovered = await settledLeader.ReplicateEntries(
-                partitionId, [new("batch", "after-heal"u8.ToArray())], ct);
+            // A leader of the pre-heal term can still believe it leads until a newer term reaches
+            // it; its write fails and the next round retries on whoever leads then.
+            RaftBatchReplicationResult recovered;
+            ValueStopwatch healWatch = ValueStopwatch.StartNew();
+            while (true)
+            {
+                RaftManager settledLeader = await LeaderOf(nodes, partitionId, ct);
+                recovered = await settledLeader.ReplicateEntries(
+                    partitionId, [new("batch", "after-heal"u8.ToArray())], ct);
+                if (recovered.Success || healWatch.GetElapsedMilliseconds() >= TestTimeouts.Scale(20_000))
+                    break;
+                await Task.Delay(50, ct);
+            }
+
             Assert.True(recovered.Success, $"Batch after healing failed: {recovered.Status}");
             Assert.Equal(RaftOperationStatus.Success, recovered.Entries[0].Status);
             Assert.True(recovered.Entries[0].LogIndex > 0);
+
+            long recoveredIndex = recovered.Entries[0].LogIndex;
+            await WaitForCondition(
+                () => nodes.All(n => n.WalAdapter.GetMaxLog(partitionId) >= recoveredIndex),
+                ct, timeoutMs: 20_000);
         }
         finally
         {
