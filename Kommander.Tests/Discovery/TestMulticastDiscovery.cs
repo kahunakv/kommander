@@ -175,12 +175,28 @@ public sealed class TestMulticastDiscoveryRoundTrip
             IPEndPoint groupEndpoint = new(Group, MulticastPort);
             using UdpClient sender = new();
             sender.MulticastLoopback = true;
-            await sender.SendAsync(nullPayload, nullPayload.Length, groupEndpoint);
-            await sender.SendAsync(validPayload, validPayload.Length, groupEndpoint);
+            // Send out of the interface the listener joined on, not whatever the default route picks.
+            sender.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastInterface, localAddress!.GetAddressBytes());
 
-            // If the null payload had killed the listener, the valid announcement sent right
+            // Register only starts the listener; it binds and joins the group on a background task,
+            // so a single send right after it can land before anyone is listening and be lost. Keep
+            // re-sending the pair until the valid announcement is observed. Every round puts the
+            // null payload first: if it had killed the listener, the valid announcement sent right
             // after it would never be observed.
-            List<RaftNode> nodes = await PollUntilNodes(discovery, $"{localAddress}:57009", TimeSpan.FromSeconds(30));
+            string expected = $"{localAddress}:57009";
+            List<RaftNode> nodes = [];
+            DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+
+            while (DateTime.UtcNow < deadline)
+            {
+                await sender.SendAsync(nullPayload, nullPayload.Length, groupEndpoint);
+                await sender.SendAsync(validPayload, validPayload.Length, groupEndpoint);
+
+                nodes = await PollUntilNodes(discovery, expected, TimeSpan.FromMilliseconds(500));
+                if (nodes.Any(n => n.Endpoint == expected))
+                    break;
+            }
+
             Assert.Contains(nodes, n => n.Endpoint == $"{localAddress}:57009");
             Assert.DoesNotContain(nodes, n => n.Endpoint == $"{localAddress}:57003");
         }

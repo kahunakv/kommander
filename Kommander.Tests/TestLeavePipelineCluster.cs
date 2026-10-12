@@ -325,19 +325,50 @@ public sealed class TestLeavePipelineCluster
             Assert.Equal(RaftOperationStatus.NodeIsNotLeader, hinted.Status);
             Assert.Equal(leader.LocalEndpoint, hinted.LeaderHint);
 
-            // The leader commits the demotion; the version advances and every node sees the role.
-            SetMemberRoleResponse demotedResponse = await leader.ReceiveSetMemberRole(
-                new SetMemberRoleRequest(demotedEndpoint, demotedNodeId, ClusterMemberRole.Leaving), ct);
-            Assert.True(demotedResponse.Success);
-            Assert.Equal(RaftOperationStatus.Success, demotedResponse.Status);
-            Assert.Equal(versionBefore + 1, demotedResponse.MembershipVersion);
-
             // Convergence of the committed roster and every OTHER node's cache. The demoted
             // node's own view of its demotion is not this test's contract (a Leaving node's
             // cache refresh rides gossip), so it is excluded from the wait.
+            //
+            // The Leaving role is transient here: with no replication factor no range names the
+            // demoted node, so the placement pass the commit kicks completes its drain at once
+            // and removes it, and the unlatched node then auto-rejoins. Polling the live cache
+            // can miss that window entirely on a slow host, so each survivor records every
+            // roster it advances through and the wait asks whether one of them named the
+            // demoted node Leaving.
             RaftManager[] survivors = [.. nodes.Where(n => !ReferenceEquals(n, demoted))];
-            await WaitForCondition(
-                () => survivors.All(n => InRoster(n, demotedEndpoint, ClusterMemberRole.Leaving)), ct);
+            int[] sawLeaving = new int[survivors.Length];
+            Action<ClusterMembership>[] observers = new Action<ClusterMembership>[survivors.Length];
+            for (int i = 0; i < survivors.Length; i++)
+            {
+                int slot = i;
+                observers[i] = roster =>
+                {
+                    if (roster.Members.Any(m => m.Endpoint == demotedEndpoint && m.Role == ClusterMemberRole.Leaving))
+                        Volatile.Write(ref sawLeaving[slot], 1);
+                };
+                survivors[i].OnMembershipChanged += observers[i];
+            }
+
+            try
+            {
+                // The leader commits the demotion; the version advances and every node sees the role.
+                SetMemberRoleResponse demotedResponse = await leader.ReceiveSetMemberRole(
+                    new SetMemberRoleRequest(demotedEndpoint, demotedNodeId, ClusterMemberRole.Leaving), ct);
+                Assert.True(demotedResponse.Success);
+                Assert.Equal(RaftOperationStatus.Success, demotedResponse.Status);
+                Assert.Equal(versionBefore + 1, demotedResponse.MembershipVersion);
+
+                await WaitForCondition(
+                    () => Enumerable.Range(0, survivors.Length).All(i =>
+                        Volatile.Read(ref sawLeaving[i]) == 1 ||
+                        InRoster(survivors[i], demotedEndpoint, ClusterMemberRole.Leaving)),
+                    ct);
+            }
+            finally
+            {
+                for (int i = 0; i < survivors.Length; i++)
+                    survivors[i].OnMembershipChanged -= observers[i];
+            }
 
             // A direct Leaving→Voter restore is the drain-rollback flow's transition (covered
             // by the leave-latch test in this file), not the raw handler's; it is deliberately

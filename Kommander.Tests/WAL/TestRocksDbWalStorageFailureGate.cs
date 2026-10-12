@@ -76,10 +76,11 @@ public sealed class TestRocksDbWalStorageFailureGate
         Assert.NotNull(wal.LastStorageFailureMessage);
 
         // Reads do not take the failing write path: everything acknowledged before the outage is
-        // still readable through the latched engine.
+        // still readable through the latched engine. That includes the writes WriteUntilErrored
+        // landed in preallocated WAL space after the fill, i.e. ids 1..failedId-1.
         List<RaftLog> duringOutage = wal.ReadLogs(Partition);
-        Assert.Equal(entries, duringOutage.Count);
-        Assert.Equal(entries, duringOutage[^1].Id);
+        Assert.Equal(failedId - 1, duringOutage.Count);
+        Assert.Equal(failedId - 1, duringOutage[^1].Id);
 
         // Hard-state persistence reports failure as false, not as an exception.
         Assert.False(hardState.PersistHardState(Partition, currentTerm: 3, votedFor: "node-a"));
